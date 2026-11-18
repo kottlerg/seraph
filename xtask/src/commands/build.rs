@@ -299,7 +299,8 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     // The hotplug fixture `test-hotplug` stages: it waits for the `test-dma`
-    // fixture on a hot-added `edu` device and checks its DMA and MSI.
+    // fixture on a hot-added `edu` device and checks its DMA and MSI, its
+    // withdrawal at the device's removal, and the device added again.
     Spec {
         name: "hotplug-check",
         install_name: None,

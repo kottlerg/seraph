@@ -313,6 +313,7 @@ dependencies = [
  "driver-binding",
  "ipc",
  "syscall",
+ "syscall-abi",
 ]
 
 [[package]]

@@ -796,11 +796,119 @@ impl DmaTable
     }
 }
 
+/// The DMA translation faults devmgr has taken for each device an IOMMU
+/// confines, by requester ID: the count and the latest's IOVA. A requester ID
+/// is counted only while a live device's grant tracks it ([`Self::track`],
+/// [`Self::untrack`]), so a fault taken once the device is withdrawn, from
+/// a device still writing until its slot is powered off, is not counted, and
+/// a function that arrives later at the same address, a record of its own,
+/// starts with none.
+#[derive(Default)]
+pub struct FaultCounts
+{
+    /// `(requester ID, count, latest IOVA)` of each tracked device.
+    tracked: Vec<(u64, u64, u64)>,
+}
+
+impl FaultCounts
+{
+    /// No requester ID tracked.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            tracked: Vec::new(),
+        }
+    }
+
+    /// Count the faults of requester ID `rid` from zero, from now on: a
+    /// device was given DMA under it. The caller takes the faults the IOMMU
+    /// driver recorded before, so none raised by an earlier device at the
+    /// same address is counted.
+    ///
+    /// # Errors
+    /// The allocation error when the table cannot grow; `rid` is not
+    /// tracked then.
+    pub fn track(&mut self, rid: u64) -> Result<(), TryReserveError>
+    {
+        if let Some(e) = self.tracked.iter_mut().find(|e| e.0 == rid)
+        {
+            *e = (rid, 0, 0);
+            return Ok(());
+        }
+        self.tracked.try_reserve(1)?;
+        self.tracked.push((rid, 0, 0));
+        Ok(())
+    }
+
+    /// Stop counting requester ID `rid`: its device's DMA was withdrawn.
+    pub fn untrack(&mut self, rid: u64)
+    {
+        self.tracked.retain(|e| e.0 != rid);
+    }
+
+    /// Count a DMA translation fault of requester ID `rid` at `iova`;
+    /// returns whether `rid` is tracked, so the fault was counted.
+    pub fn record(&mut self, rid: u64, iova: u64) -> bool
+    {
+        let Some(e) = self.tracked.iter_mut().find(|e| e.0 == rid)
+        else
+        {
+            return false;
+        };
+        e.1 = e.1.saturating_add(1);
+        e.2 = iova;
+        true
+    }
+
+    /// The faults counted for requester ID `rid` since it was tracked, and
+    /// the latest's IOVA; `(0, 0)` for one not tracked.
+    #[must_use]
+    pub fn count(&self, rid: u64) -> (u64, u64)
+    {
+        self.tracked
+            .iter()
+            .find(|e| e.0 == rid)
+            .map_or((0, 0), |e| (e.1, e.2))
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
     use ipc::devmgr_dma_labels::ACCESS_DEVICE_READ;
+
+    #[test]
+    fn a_fault_is_counted_only_for_a_tracked_device_and_a_new_record_starts_at_zero()
+    {
+        let mut faults = FaultCounts::new();
+        let rid = 0x0100;
+        // Before the grant: not counted.
+        assert!(!faults.record(rid, 0x1000));
+        assert_eq!(faults.count(rid), (0, 0));
+        faults.track(rid).unwrap();
+        assert!(faults.record(rid, 0x2000));
+        assert!(faults.record(rid, 0x3000));
+        assert_eq!(faults.count(rid), (2, 0x3000));
+        // Another device's faults are its own.
+        faults.track(0x0200).unwrap();
+        assert!(faults.record(0x0200, 0x4000));
+        assert_eq!(faults.count(rid), (2, 0x3000));
+        // Withdrawn: a fault the removed device still raises is not counted.
+        faults.untrack(rid);
+        assert!(!faults.record(rid, 0x5000));
+        assert_eq!(faults.count(rid), (0, 0));
+        // A function that arrives at the same address starts with none.
+        faults.track(rid).unwrap();
+        assert_eq!(faults.count(rid), (0, 0));
+        assert!(faults.record(rid, 0x6000));
+        assert_eq!(faults.count(rid), (1, 0x6000));
+        // Tracked again while tracked: counted from zero.
+        faults.track(rid).unwrap();
+        assert_eq!(faults.count(rid), (0, 0));
+        assert_eq!(faults.count(0x0200), (1, 0x4000));
+    }
 
     #[test]
     fn a_withdrawal_keeps_the_mapping_caps_of_a_device_neither_blocked_nor_stopped()

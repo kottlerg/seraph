@@ -361,6 +361,15 @@ uses the partition.) The split mirrors real deployments: anything the
 firmware must reach lives on the ESP; everything else lives on the root
 partition, except the discoverable `/data` mountpoint.
 
+The ESP is derived from the root partition ([boot-media.md](boot-media.md)): every object on it,
+the bootloader and the kernel included, is a byte copy of a file installed on the root partition,
+and composing it copies files and signs nothing. That is design intent, not yet implemented: the
+kernel and the bootloader are installed under `esp/` alone, and the bundle's entries are chosen by
+the lists in `xtask/src/bundle.rs` ([#1264](https://github.com/kottlerg/seraph/issues/1264));
+its data entries are read from the repository (`ARCH_TABLES`, `LOG_LEVELS_SOURCE`), and the
+composer signs each entry again under its entry name
+([#1263](https://github.com/kottlerg/seraph/issues/1263)).
+
 The `esp/` and root-partition trees are populated from two sources:
 
 - Compiled binaries are installed by `cargo xtask build` to their
@@ -382,7 +391,8 @@ The `esp/` and root-partition trees are populated from two sources:
 Each packing of a disk image signs the kernel and the ELF images under `services/`,
 `programs/` and `tests/` in place, so each ends in a signature trailer
 ([signing.md § Signed Object Format](signing.md#signed-object-format)); the bootloader verifies
-the kernel and each bundle entry, and procmgr's loader ignores the trailer. In
+the kernel and each bundle entry, and procmgr every image it creates, and each loads only the body
+the verifier returns. In
 `bootstrap.bundle` every entry is its body plus a trailer, the data entries included
 ([xtask/README.md § Signing](../xtask/README.md#signing)).
 
@@ -583,7 +593,7 @@ The merge-gating rule (CI must pass green before merge) lives in
 [RISC-V UEFI Boot](../core/boot/docs/riscv-uefi-boot.md),
 [core/kernel/README.md](../core/kernel/README.md),
 [Return-Address Integrity](../core/kernel/docs/return-address-integrity.md),
-[System Bootstrap](bootstrap.md),
+[Boot Media](boot-media.md), [System Bootstrap](bootstrap.md),
 [Coding Standards](coding-standards.md), [Platform Requirements](platform-requirements.md),
 [docs/releases/README.md](releases/README.md), [Testing](testing.md),
 [rootfs/README.md](../rootfs/README.md),

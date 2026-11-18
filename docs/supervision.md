@@ -80,12 +80,13 @@ teardown, still reaches devmgr, which withdraws the driver.
 init launches only the bootstrap substrate, the services that must run before svcmgr can read a
 recipe: memmgr and procmgr, by raw syscalls; devmgr and vfsd, from boot modules through procmgr; and
 svcmgr, from the root filesystem through procmgr. devmgr and vfsd start the drivers carried as boot
-modules, which the console and the root mount need. Every other top-level service MUST be
-first-launched by svcmgr from its recipe, never by init, so that one recipe defines its first launch
-and its restart, and the authority it receives is what that recipe grants. A new service adds a
-recipe under `/config/svcmgr/services/`, not an init stage. The stage-by-stage bring-up is specified
-in [Process Lifecycle § Userspace Boot Order](process-lifecycle.md#userspace-boot-order) and [init
-Bootstrap Stages](../services/init/docs/bootstrap.md).
+modules, the bootstrap closure the root mount needs ([Boot Media](boot-media.md) § The Bootstrap
+Closure). Every other top-level service MUST be first-launched by svcmgr from its recipe, never by
+init, so that one recipe defines its first launch and its restart, and the authority it receives is
+what that recipe grants. A new service adds a recipe under `/config/svcmgr/services/`, not an init
+stage. The stage-by-stage bring-up is specified in
+[Process Lifecycle § Userspace Boot Order](process-lifecycle.md#userspace-boot-order) and
+[init Bootstrap Stages](../services/init/docs/bootstrap.md).
 
 ---
 
@@ -245,7 +246,8 @@ Each item below is specified above or in the document it names, and is not yet i
 
 ## Summarized By
 
-[Architecture Overview](architecture.md), [Process Lifecycle](process-lifecycle.md),
+[Architecture Overview](architecture.md), [Boot Media](boot-media.md),
+[Process Lifecycle](process-lifecycle.md),
 [Session Supervision](session-supervision.md),
 [services/procmgr/README.md](../services/procmgr/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),

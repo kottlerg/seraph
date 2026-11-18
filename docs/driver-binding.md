@@ -66,7 +66,7 @@ knows its bus or firmware standard and no driver.
 | ACPI namespace | Static `Device` objects of the DSDT and SSDTs whose `_HID`, `_CID`, `_UID`, and `_CRS` are `Name` objects | `_HID`, each `_CID` |
 | ACPI SPCR | The Serial Port Console Redirection table | The console UART's interface type |
 | Boot framebuffer | The bootloader's framebuffer description | One fixed key, `boot-framebuffer` |
-| Platform description | A per-machine data table in the boot bundle, chosen by the ACPI OEM table ID | The key each entry names |
+| Platform description | A per-machine data table (§ Platform Description Tables), chosen by the ACPI OEM table ID | The key each entry names |
 | IOMMU | The ACPI DMAR's remapping units (x86-64) or the RIMT's IOMMUs (riscv64) | One record per IOMMU family, keyed `dmar` or `rimt`, holding every unit's register range and scope |
 
 devmgr evaluates no AML. AML is firmware code whose methods reach I/O ports, memory and
@@ -162,6 +162,14 @@ Tables live in the tree at `services/devmgr/platform/<machine>.platform`. `xtask
 forwards them to devmgr with the driver modules, and devmgr tells one from a driver image by
 its content. devmgr uses the table whose `oem_table_id` equals the XSDT's OEM table ID. With no
 such table there are no platform-table records, and devmgr logs that once.
+
+A table belongs to the bundle only when it describes a device the root mount needs, since the
+bundle is the bootstrap closure ([boot-media.md](boot-media.md) § The Bootstrap Closure); any other
+table is installed on the root filesystem and read by devmgr from there. `qemu-virt.platform`
+describes the RTC and the hotplug grant, neither of which the root mount needs. That is design
+intent, not yet implemented ([#I_CLOSURE](https://github.com/kottlerg/seraph/issues/I_CLOSURE)):
+devmgr reads tables from its boot modules alone, and the bundle carries every table of the
+architecture.
 
 ---
 
@@ -320,7 +328,9 @@ at `BIND_DRIVERS`, and for a hot-added device:
    Interrupts), after the DMA grant, since on riscv64 a vector's interrupt file is mapped into the
    device's IOMMU domain before the function may signal it.
 4. Create the driver through procmgr with the flags and priority its declaration implies,
-   within § Declaration Bounds, from its boot module or its file.
+   within § Declaration Bounds, from its boot module or its file. Only the IOMMU pass and the boot
+   pass start a driver from a boot module ([boot-media.md](boot-media.md) § Bootstrap-Only Boot
+   Copies).
 5. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
    each capability with its resource kind and its fields, then the service endpoint, the
    devmgr query capability, and the DMA capability. One delivery shape serves every driver.
@@ -456,8 +466,8 @@ attaches (`cargo xtask run --test-devices`), like any driver, and a test reaches
 
 ## Summarized By
 
-[Architecture Overview](architecture.md), [Device Management](device-management.md),
-[services/acpid/README.md](../services/acpid/README.md),
+[Architecture Overview](architecture.md), [Boot Media](boot-media.md),
+[Device Management](device-management.md), [services/acpid/README.md](../services/acpid/README.md),
 [PCI Enumeration](../services/devmgr/docs/pci-enumeration.md),
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
 [services/drivers/README.md](../services/drivers/README.md),

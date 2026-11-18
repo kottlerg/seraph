@@ -158,7 +158,8 @@ to teardown), then runs
    * **parked AND defined** — bind death-notification, record the
      recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
      log-sink, debug-authority, stop-authority, `oom_stop` and `reserve`
-     flags, and scheduling fields in the parallel `RestartRecipe` table.
+     flags, `stop_source` class, and scheduling fields in the parallel
+     `RestartRecipe` table.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
    * **parked without definition** — log `registered without
      definition: <name>; refusing to bind`.

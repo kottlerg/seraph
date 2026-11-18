@@ -150,8 +150,8 @@ svcmgr/
   re-spawn the service from the recorded recipe. The `.svc` file is the
   single source of truth for both launch and restart — fixed fields on
   `ServiceEntry`, the argv/env/cwd/seed, the log-sink, debug-authority,
-  stop-authority, `oom_stop` and `reserve` flags, and the scheduling
-  fields on a parallel `RestartRecipe` — so a restart reproduces the
+  stop-authority, `oom_stop` and `reserve` flags, the `stop_source`
+  class, and the scheduling fields on a parallel `RestartRecipe` — so a restart reproduces the
   first-launch surfaces
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Recipe storage).
   Whether a service restarts is decided by its `restart` policy + budget

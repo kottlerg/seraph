@@ -245,7 +245,8 @@ The launch path is documented in
 `.svc` recipe is the single source of truth for both paths: the fixed
 fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
 the log-sink, debug-authority, stop-authority, `oom_stop` and `reserve`
-flags, and the scheduling fields on the parallel `RestartRecipe`, so
+flags, the `stop_source` class, and the scheduling fields on the parallel
+`RestartRecipe`, so
 a restart reproduces the first-launch spawn shape byte-for-byte, except the
 log-sink round, whose history-pull SEND is absent on a restart (per
 [service-definitions.md](service-definitions.md#log_sink)). The binary path

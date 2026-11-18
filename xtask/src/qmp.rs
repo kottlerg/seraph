@@ -281,7 +281,7 @@ fn string_field<'a>(line: &'a str, key: &str) -> Option<&'a str>
 }
 
 /// Hot-add the device `driver`, its id `id`, on the bus `bus` (a port's id),
-/// with the further properties `properties`, each a name and a JSON number.
+/// with the further properties `properties`, each a name and a value.
 pub fn device_add(
     socket: &Path,
     driver: &str,
@@ -306,6 +306,8 @@ pub enum Property<'a>
     Number(u64),
     /// A string, such as the block node a `drive` property names.
     Text(&'a str),
+    /// A boolean, such as `iommu_platform`.
+    Flag(bool),
 }
 
 /// Add a raw-format block node named `node` over the image file `path`
@@ -352,6 +354,7 @@ fn device_add_message(
         {
             Property::Number(n) => write!(arguments, ",{}:{n}", json_string(name)),
             Property::Text(s) => write!(arguments, ",{}:{}", json_string(name), json_string(s)),
+            Property::Flag(b) => write!(arguments, ",{}:{b}", json_string(name)),
         };
     }
     format!(r#"{{"execute":"device_add","arguments":{{{arguments}}}}}"#)
@@ -544,9 +547,12 @@ mod tests
                 "virtio-blk-pci",
                 "d",
                 "p",
-                &[("drive", Property::Text("n\"1"))]
+                &[
+                    ("drive", Property::Text("n\"1")),
+                    ("iommu_platform", Property::Flag(true))
+                ]
             ),
-            r#"{"execute":"device_add","arguments":{"driver":"virtio-blk-pci","id":"d","bus":"p","drive":"n\"1"}}"#
+            r#"{"execute":"device_add","arguments":{"driver":"virtio-blk-pci","id":"d","bus":"p","drive":"n\"1","iommu_platform":true}}"#
         );
         assert_eq!(
             device_add_message("edu", "a", "b", &[]),

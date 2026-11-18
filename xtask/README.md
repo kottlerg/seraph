@@ -1304,10 +1304,10 @@ pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socke
    for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
    then hot-adds the device again and waits for the fixture's `[hotplug-check] PASS` line. It
    then adds a raw block node over a zero-filled 1 MiB image (QMP `blockdev-add`) and hot-adds a
-   `virtio-blk-pci` on it behind the second port, and passes once devmgr logs
-   `[devmgr] virtio-blk: binds PCI` and `virtio-blk: declares boot-only class block; not
-   considered` and the driver logs `[virtio-blk] ready, entering service loop`, failing on a
-   `boot tier not granted from the drivers directory` line.
+   `virtio-blk-pci` on it behind the second port and the IOMMU (`iommu_platform=on`), and passes
+   once devmgr logs `[devmgr] virtio-blk: binds PCI` and `virtio-blk: declares boot-only class
+   block; not considered` and the driver logs `[virtio-blk] ready, entering service loop`, failing
+   on a `boot tier not granted from the drivers directory` line.
 
 It kills QEMU after each boot, then removes the staged files and repacks the images in that layout
 again, whatever the outcome. [docs/testing.md](../docs/testing.md) § PCI Express hotplug

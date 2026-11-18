@@ -104,6 +104,11 @@ const REFUSED_MARKER: &str = "not managed: _OSC control";
 /// The id `device_add` gives the hot-added `edu`.
 const DEVICE_ID: &str = "hotplug-edu";
 
+/// Whether the boot attaches the IOMMU: attached, as every launch's
+/// default, so the hot-added disk is put behind it as the launchers put a
+/// boot `virtio-pci` device (`iommu_platform=on`).
+const IOMMU: Iommu = Iommu::Attached;
+
 /// The id `device_add` gives the hot-added disk.
 const DISK_ID: &str = "hotplug-disk";
 
@@ -273,7 +278,7 @@ fn boot(
         riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
-        iommu: Iommu::Attached,
+        iommu: IOMMU,
         debug_port: None,
         test_devices: false,
         hotplug_port: Some(control),
@@ -396,16 +401,28 @@ fn watch(child: &mut Child, socket: &Path, disk: &Path, control: HotplugControl)
         bail!("the fixture failed: {verdict}");
     }
     step("hotplug test: the fixture passed; hot-adding a virtio-blk disk");
+    add_disk(socket, disk)?;
+    lines.start = Instant::now();
+    disk_bound(&lines)
+}
+
+/// Hot-add the disk behind the second port: a raw block node over the image
+/// `disk` (QMP `blockdev-add`), then a `virtio-blk-pci` on it, behind the
+/// IOMMU when the boot attaches one, as the launchers put a boot disk.
+fn add_disk(socket: &Path, disk: &Path) -> Result<()>
+{
     qmp::blockdev_add_raw(socket, DISK_NODE, disk)?;
     qmp::device_add(
         socket,
         "virtio-blk-pci",
         DISK_ID,
         HOTPLUG_DISK_PORT_ID,
-        &[("drive", Property::Text(DISK_NODE))],
-    )?;
-    lines.start = Instant::now();
-    disk_bound(&lines)
+        &[
+            ("drive", Property::Text(DISK_NODE)),
+            ("disable-legacy", Property::Text("on")),
+            ("iommu_platform", Property::Flag(IOMMU == Iommu::Attached)),
+        ],
+    )
 }
 
 /// Read the lines of the hot-added disk's bind, in any order: devmgr binds

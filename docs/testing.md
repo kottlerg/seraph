@@ -662,7 +662,8 @@ makes a disk arrive:
    ordinal 1, its probes pass, and its IOMMU fault count equals the first device's, so no fault is
    carried across the removal.
 7. Hot-add a `virtio-blk-pci` disk over a zero-filled 1 MiB raw image behind the second port (QMP
-   `blockdev-add`, then `device_add`), a device of the boot-only class `block`, and require, in
+   `blockdev-add`, then `device_add` with `disable-legacy=on` and `iommu_platform=on`, behind the
+   IOMMU as a boot disk is), a device of the boot-only class `block`, and require, in
    any order, devmgr's `virtio-blk: binds PCI` line, the hotplug batch's refusal of the drivers
    directory's virtio-blk (`declares boot-only class block; not considered`), and the driver's
    `ready, entering service loop` line, with no `boot tier not granted from the drivers

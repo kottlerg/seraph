@@ -544,8 +544,9 @@ pub struct QemuLaunchSpec<'a>
     /// the `pci-testdev` functions svctest's devmgr phases drive through the
     /// test-only drivers ([`test_device_args`]).
     pub test_devices: bool,
-    /// When set, attach an empty PCI Express root port a device can be
-    /// hot-added behind (`test-hotplug`), its hotplug under this control
+    /// When set, attach the two empty PCI Express root ports devices can be
+    /// hot-added behind (`test-hotplug`: `HOTPLUG_PORT_DEVICE` and
+    /// `HOTPLUG_DISK_PORT_DEVICE`), their hotplug under this control
     /// ([`hotplug_port_args`]).
     pub hotplug_port: Option<HotplugControl>,
 }

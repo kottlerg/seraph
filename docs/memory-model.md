@@ -378,8 +378,9 @@ handler sees it, and the syscall fails with `InvalidAddress`
 ([fault-handling.md § Kernel Copies](fault-handling.md#kernel-copies)). Policy beyond that
 is a userspace service holding only the capabilities its supervisor endows it. The crash
 service holds such a fault when its recipe sets a stall
-([fault-handling.md § Crash Reports](fault-handling.md#crash-reports)); the policy service is
-design intent; not yet implemented.
+([fault-handling.md § Crash Reports](fault-handling.md#crash-reports)); the policy service, oomd,
+stops a service that opted in to being stopped when memory stays critical
+([services/oomd/README.md](../services/oomd/README.md)).
 
 ---
 
@@ -426,4 +427,5 @@ Retype and pool allocation MUST be handled as fallible at every call site.
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md), [Limits](limits.md),
 [Platform Requirements](platform-requirements.md),
-[Userspace Memory Model](userspace-memory-model.md), [xtask/README.md](../xtask/README.md)
+[Userspace Memory Model](userspace-memory-model.md),
+[services/oomd/README.md](../services/oomd/README.md), [xtask/README.md](../xtask/README.md)

@@ -1131,15 +1131,13 @@ fn admit(
         }
     }
     let spans = spans.get(..count).unwrap_or(&[]);
-    if let Err(e) =
-        caps.apertures
-            .move_all(
-                &mut caps.slot_bars,
-                spans,
-                PAGE_SIZE,
-                crate::split_mmio,
-                crate::merge_mmio,
-            )
+    if let Err(e) = caps.apertures.move_all(
+        &mut caps.slot_bars,
+        spans,
+        PAGE_SIZE,
+        crate::split_mmio,
+        crate::merge_mmio,
+    )
     {
         std::os::seraph::log!(
             warn: "hotplug: {}:{}:0.{} {:04x}:{:04x}: BAR pages not held ({:?}); not recorded, no \

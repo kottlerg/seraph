@@ -1689,6 +1689,7 @@ pub fn split_mmio(span: &Span<u64>, at: u64) -> Result<(u64, u64), SplitError>
 /// with different derivation parents), a cap with a derivation of its own,
 /// or a joined cap the `CSpace` cannot back. Neither cap is changed then, and the table keeps
 /// both.
+#[must_use]
 pub fn merge_mmio(lower: &Span<u64>, upper: &Span<u64>) -> Option<u64>
 {
     syscall::mmio_merge(lower.slot, upper.slot).ok()

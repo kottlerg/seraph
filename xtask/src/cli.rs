@@ -163,6 +163,15 @@ subcommands! {
         /// unstage the fixture again (see xtask/README.md).
         TestDebugPort(TestDebugPortArgs),
 
+        /// Check that each signature verifier refuses what it is owed to: boot
+        /// the current sysroot four times from disk images carrying a tampered
+        /// kernel, a tampered bundle entry, a bootloader revoking the signing
+        /// key, and tampered, wrong-kind and foreign-signed rootfs images, and
+        /// assert each refusal line. Builds that bootloader; leaves the
+        /// sysroot as it was and packs the disk images again (see
+        /// xtask/README.md).
+        TestSigning(TestSigningArgs),
+
         /// Check the reboot path: stage the `reboot` fixture, boot the current
         /// sysroot once with a QMP socket, and pass when the fixture's REBOOT
         /// resets the machine (QMP's SHUTDOWN event with reason `guest-reset`)
@@ -302,6 +311,7 @@ impl CliCommand
             Self::Test(args) => Some(&args.host),
             Self::CryptoVectors(args) => Some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
+            Self::TestSigning(args) => Some(&args.host.common),
             Self::Run(_)
             | Self::RunParallel(_)
             | Self::KtestTiming(_)
@@ -928,6 +938,35 @@ args! {
         /// free on `127.0.0.1` when the boot starts.
         #[arg(long)]
         pub port: Option<u16>,
+
+        /// Number of vCPUs to expose to the guest (QEMU -smp).
+        #[arg(long, default_value = "4")]
+        pub cpus: u32,
+
+        /// Guest memory size in MiB (QEMU -m).
+        #[arg(long, default_value = "512")]
+        pub mem: u32,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+// ── TestSigning ──────────────────────────────────────────────────────────────
+
+args! {
+    pub struct TestSigningArgs
+    {
+        /// Target architecture.
+        #[arg(long, default_value = "x86_64")]
+        pub arch: Arch,
+
+        /// Build the revoking bootloader in release mode, as the sysroot's
+        /// was built (default: debug).
+        #[arg(long)]
+        pub release: bool,
 
         /// Number of vCPUs to expose to the guest (QEMU -smp).
         #[arg(long, default_value = "4")]

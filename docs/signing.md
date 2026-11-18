@@ -53,14 +53,15 @@ kernel and a program whose untrusted record both verifiers skip ([testing.md](te
 Signature refusals).
 
 The role set and the names of § Signed Attributes, their checks in § Verification and § Signature
-Policy in procmgr, and the copied bundle entries of § Signing are design intent, not yet implemented
+Policy in procmgr, the install-path entry names and their width in § Which Stage Verifies What, and
+the copied bundle entries of § Signing are design intent, not yet implemented
 ([#1263](https://github.com/kottlerg/seraph/issues/1263); the bundle list and the installed data
 entries, [#1264](https://github.com/kottlerg/seraph/issues/1264)). The code encodes each record's
 attributes under the domain tag `seraph/obj/v1` with one `kind` in place of the role set (byte 28
-holds the role's value, 1 to 7, not its bit), names a bundle entry by a short entry name (`devmgr`),
-signs the bundle's copy of an installed image again as a boot module under that name, and gives
-procmgr's creators the boot-module kind. [boot-media.md](boot-media.md) states why one object
-carries one signature.
+holds the role's value, 1 to 7, not its bit), names a bundle entry by a short entry name (`devmgr`)
+in a 32-byte field, signs the bundle's copy of an installed image again as a boot module under that
+name, and gives procmgr's creators the boot-module kind. [boot-media.md](boot-media.md) states why
+one object carries one signature.
 
 ---
 
@@ -95,7 +96,7 @@ trusted to execute as built.
 |---|---|---|
 | **Tampering.** Change the bytes of a signed object. | The signed attributes carry the SHA-512 of the body and the body's length; the verifier hashes the bytes it will load. | None within the chain. |
 | **Signature substitution.** Copy a valid record onto another body. | The record signs the body's hash, so it verifies only over the body it was made for. | None. |
-| **Object swap.** Put one legitimately signed object where another is expected (a signed program in place of a service, `fatfs` in place of `procmgr`). | The signed attributes carry the object's roles and name; the verifier requires a role its caller accepts and the name it is loading. | None. |
+| **Object swap.** Put one legitimately signed object where another is expected (a signed program in place of a service, `fatfs` in place of `procmgr`). | The signed attributes carry the object's roles and name; the verifier requires a role its caller accepts and the name it is loading. | An image packed with a test harness in its `init` slot carries the harness signed `init` (§ Signing); a system whose store trusts the key that signed that image boots the harness if it is copied into its own `init` slot. |
 | **Replay.** Replace an object with an older, legitimately signed one that has a known vulnerability. | The signed attributes carry a security version; the trust store sets a floor, a key's certificate bounds the versions it may sign, and a compromised key is revoked. | A whole older image, bootloader included, boots: its trust store holds the older floor. Persistent anti-rollback is [#1070](https://github.com/kottlerg/seraph/issues/1070). |
 | **Key compromise.** Steal a signing key. | A key signs only the object roles and security versions its certificate names; the chain is at most two keys deep; a revoked key id is refused. | Revocation reaches only systems whose bootloader carries the updated trust store. A locally generated root's compromise is its builder's own risk. |
 | **Verifier bypass.** Reach a path that loads without verifying, or that continues after a failed check. | Every check has one exit on failure and no fallback; the verifier returns the body only on success, and loaders read only what it returns. | None. |
@@ -501,10 +502,15 @@ with the same key produce the same image.
 `tests/` ([build-system.md](build-system.md) § Build Output: the Sysroot). An image under a
 `drivers/` directory is a driver, one under a `programs/` directory a program, and every other a
 service; an image the bundle list names carries boot module beside that role. The kernel is
-signed `kernel`, and the object of the bundle's `init` slot (`/services/init`, or `/tests/ktest`
-for the ktest harness) `init`, each with its one role. The bundle's data entries (the platform
-tables and the log-level configuration) are installed files signed with the boot-module role, and
-their readers take the body through the parse-only split (§ Verifier Discipline). The bundle is
+signed `kernel` and `/services/init` `init`, each with its one role. `/tests/ktest` is signed
+`init` with the init role only in an image packed with the ktest harness in its `init` slot, and in
+every other image as the service its location makes it, so an image that does not boot the harness
+carries no second object that boots as init. The bundle's data entries (the platform tables and the
+log-level configuration) are installed files signed with the boot-module role, and their readers
+take the body through the parse-only split (§ Verifier Discipline). A platform table devmgr reads
+from the root filesystem is signed with the data role, and devmgr verifies it before it parses it
+(design intent, not yet implemented: [#1267](https://github.com/kottlerg/seraph/issues/1267),
+[#1071](https://github.com/kottlerg/seraph/issues/1071)). The bundle is
 composed by copying installed files and signs nothing, so each entry is its installed file byte
 for byte ([boot-media.md](boot-media.md) § The ESP). The sysroot's objects are signed in place
 each time a disk image is packed. The refusal test's pack alone writes objects as it is given

@@ -27,11 +27,11 @@ mount in [storage.md](storage.md).
 
 ## Implementation Status
 
-Partly implemented. Implemented: every service, driver, filesystem driver, program and test
-image is installed on the root filesystem at its install path and signed there
-([signing.md](signing.md) § Signing); the bundle's executables are read from those installed
-images; the bundle is used during bootstrap alone (§ Bootstrap-Only Boot Copies); and the ESP
-holds no secret.
+Partly implemented. Implemented: every service, driver, filesystem driver, program and test image is
+installed on the root filesystem at its install path and signed there ([signing.md](signing.md) §
+Signing); the bundle's executables are read from those installed images; the bundle is used during
+bootstrap alone (§ Bootstrap-Only Boot Copies); the loss of the root filesystem's driver or of its
+disk is system death; and the ESP holds no secret.
 
 Design intent, not yet implemented:
 
@@ -47,12 +47,11 @@ Design intent, not yet implemented:
   ([#1263](https://github.com/kottlerg/seraph/issues/1263)).
 - No step checks that the ESP's objects equal their installed files
   ([#1265](https://github.com/kottlerg/seraph/issues/1265)).
-- The loss of the root filesystem's driver or of its disk's driver is not fatal
-  (§ Bootstrap-Only Boot Copies; [#1077](https://github.com/kottlerg/seraph/issues/1077),
-  [#1078](https://github.com/kottlerg/seraph/issues/1078)).
 - The bundle carries more than the bootstrap closure: the serial and framebuffer drivers and,
   on riscv64, the platform description table, none of which the root mount needs
-  ([#1267](https://github.com/kottlerg/seraph/issues/1267)).
+  ([#1267](https://github.com/kottlerg/seraph/issues/1267)). A table leaves the bundle only once
+  devmgr verifies the tables it reads from the root filesystem
+  ([#1071](https://github.com/kottlerg/seraph/issues/1071)).
 
 ---
 
@@ -109,10 +108,13 @@ loading from it, and nothing else. On the default boot that is:
 - the driver of the root filesystem's disk (`virtio-blk`) and the root filesystem's driver
   (`fatfs`).
 
-A test harness in the `init` slot (ktest) is its own closure. Anything else is loaded from the
-root filesystem once vfsd has mounted it: by svcmgr from its recipes, by devmgr from
-`/services/drivers/`, by vfsd from `/services/fs/`. An object outside the closure costs memory on
-every boot and is a second path by which the same object starts.
+A test harness in the `init` slot (ktest) is its own closure. Anything else is loaded from the root
+filesystem once vfsd has mounted it: by svcmgr from its recipes, by devmgr from
+`/services/drivers/`, by vfsd from `/services/fs/`. Each is verified before it is used: an image by
+procmgr as it creates the process, and a data file by its reader, as devmgr verifies a platform
+description table ([driver-binding.md](driver-binding.md) § Platform Description Tables; design
+intent for data files, [#1071](https://github.com/kottlerg/seraph/issues/1071)). An object outside
+the closure costs memory on every boot and is a second path by which the same object starts.
 
 ---
 
@@ -136,11 +138,11 @@ Loss of what the root filesystem stands on is fatal: the root filesystem's drive
 of the disk under it are never restarted, and the root is not remounted in a running system. No
 image is kept from boot for a restart, since a copy kept for that purpose would be a second real
 copy, kept in memory for the life of the system, that no update of the installed file reaches.
-The fatal loss is design intent, not yet implemented: today the root mount stays installed
-against the endpoint of a dead filesystem driver, and devmgr withdraws a dead disk driver, with
-the system running on ([supervision.md](supervision.md);
-[#1078](https://github.com/kottlerg/seraph/issues/1078) for the filesystem driver,
-[#1077](https://github.com/kottlerg/seraph/issues/1077) for the disk's driver).
+vfsd ends on the death of the root mount's driver or the loss of its disk, and its death is
+system death ([storage.md](storage.md) § Failure and Revocation Invariants;
+[supervision.md](supervision.md) § Core Set and System Death); the restarts of
+[#1077](https://github.com/kottlerg/seraph/issues/1077) and
+[#1078](https://github.com/kottlerg/seraph/issues/1078) exclude both drivers.
 
 ---
 

@@ -165,11 +165,16 @@ such table there are no platform-table records, and devmgr logs that once.
 
 A table belongs to the bundle only when it describes a device the root mount needs, since the
 bundle is the bootstrap closure ([boot-media.md](boot-media.md) § The Bootstrap Closure); any other
-table is installed on the root filesystem and read by devmgr from there. `qemu-virt.platform`
-describes the RTC and the hotplug grant, neither of which the root mount needs. That is design
-intent, not yet implemented ([#1267](https://github.com/kottlerg/seraph/issues/1267)):
-devmgr reads tables from its boot modules alone, and the bundle carries every table of the
-architecture.
+table is installed on the root filesystem, signed with the data role under its install path, and
+read by devmgr from there. A table grants a driver register ranges, I/O ports and interrupt lines,
+and can grant native hotplug control, so devmgr verifies a table it reads from the root filesystem
+against the trust store before it parses it, as the bootloader verifies a bundle entry
+([signing.md](signing.md) § Signed Attributes, role 7). `qemu-virt.platform` describes the RTC and
+the hotplug grant, neither of which the root mount needs. That is design intent, not yet
+implemented ([#1267](https://github.com/kottlerg/seraph/issues/1267); the verification of data
+files by their readers, [#1071](https://github.com/kottlerg/seraph/issues/1071)): devmgr reads
+tables from its boot modules alone, and the bundle carries every table of the architecture. A table
+leaves the bundle only once devmgr verifies the tables it reads from the root filesystem.
 
 ---
 

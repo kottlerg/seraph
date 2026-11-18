@@ -183,6 +183,11 @@ fn main() -> !
         watch.job_note(),
         caps.self_aspace,
     );
+    // A copy of each boot driver module a hot-added function could match,
+    // taken before the boot pass releases the module caps, so the hotplug
+    // batch binds such a function from the boot bundle as the boot pass
+    // would have.
+    hotplug.keep_images(&boot_modules, &caps, ipc_buf);
 
     // VT-d interrupt remapping, turned on before any line is routed or any
     // message target minted, which the kernel's switch requires; each
@@ -2454,8 +2459,7 @@ fn create_service_endpoint() -> Option<u64>
 }
 
 /// Spawn and settle the batch of a drivers-directory pass, on the control
-/// thread, as the job `SET_DRIVERS_DIR` or `BIND_DRIVERS` posts or a hotplug
-/// arrival runs: the pass
+/// thread, as the job `SET_DRIVERS_DIR` or `BIND_DRIVERS` posts: the pass
 /// over the records no earlier driver was bound to
 /// ([`bind::drivers_dir_pass`]), each binary read through `dir_cap`, the
 /// `LOOKUP | READ | READDIR`-attenuated directory cap the request delivered
@@ -2499,6 +2503,89 @@ fn spawn_dir_drivers(
         },
         ipc_buf,
     );
+    settle_batch(
+        batch,
+        roster,
+        watch,
+        carve.catalog,
+        registry,
+        &mut carve.caps.slot_bars,
+        settle::SETTLE_TIMEOUT,
+        ipc_buf,
+    );
+}
+
+/// Spawn and settle the hotplug batch, on the control thread, as a hotplug
+/// arrival's add job runs it, its two passes in one settle batch: the boot
+/// pass ([`bind::boot_pass`]) over a derivation of each kept boot image of
+/// `images` ([`decls::BootImage`]), under the bounds of a boot module; then,
+/// once `SET_DRIVERS_DIR` installed the drivers directory (`dir_cap` not 0,
+/// named `dir_path`), the drivers-directory pass over the records still
+/// unbound ([`bind::drivers_dir_pass`]), whose declarations of a boot-only
+/// class are refused as in every such pass. A hot-added function is so bound
+/// as it would have been at boot: from the boot bundle's declarations first,
+/// then from the drivers directory. Before `SET_DRIVERS_DIR` a function no
+/// boot image binds waits for that directory's pass.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the batch takes the records, the carve tables, the boot images, the directory cap \
+              and its path, and the watch, registry and IPC buffer it settles with"
+)]
+fn spawn_hotplug_drivers(
+    records: &mut bind::Records,
+    carve: &mut bind::Carve,
+    images: &[decls::BootImage],
+    dir_cap: u64,
+    dir_path: &[u8],
+    watch: &mut settle::DriverWatch,
+    registry: &Registry,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(batch) = settle::SettleBatch::new()
+    else
+    {
+        std::os::seraph::log!(warn: "hotplug batch: no settle batch; no driver spawned");
+        return;
+    };
+    let mut roster = Roster::new();
+    let mut modules = Vec::new();
+    if modules.try_reserve_exact(images.len()).is_ok()
+    {
+        modules.extend(images.iter().filter_map(decls::BootImage::module));
+    }
+    else
+    {
+        std::os::seraph::log!(warn: "hotplug batch: no memory to consider the boot images");
+    }
+    let mut pass = bind::Pass {
+        batch: &batch,
+        watch,
+        roster: &mut roster,
+    };
+    if !modules.is_empty()
+    {
+        bind::boot_pass(records, modules, carve, &mut pass, ipc_buf);
+    }
+    if dir_cap == 0
+    {
+        std::os::seraph::log!(
+            "hotplug: drivers directory not installed; its pass binds the functions added that \
+             no boot image bound"
+        );
+    }
+    else
+    {
+        bind::drivers_dir_pass(
+            records,
+            dir_cap,
+            dir_path,
+            |decl| registry.class_admits(decl),
+            carve,
+            &mut pass,
+            ipc_buf,
+        );
+    }
     settle_batch(
         batch,
         roster,

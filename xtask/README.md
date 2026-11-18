@@ -1282,13 +1282,15 @@ cargo xtask test-signing [--arch x86_64|riscv64] [--release] [--cpus N] [--mem M
 
 ### `cargo xtask test-hotplug`
 
-Check devmgr's PCI Express native hotplug add and removal paths, on either arch. Stages the
+Check devmgr's PCI Express native hotplug add and removal paths, and its bind of a hot-added
+device of a boot-only class, on either arch. Stages the
 `hotplug-check` fixture's recipe
 ([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
 `config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
 `config/devmgr/tests/` into `config/devmgr/classes/`, and repacks the disk images in the layout they
-have. It boots the current sysroot headless, with an empty `pcie-root-port` (`-device
-pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c`) and a QMP socket:
+have. It boots the current sysroot headless, with two empty `pcie-root-port`s (`-device
+pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c` and `-device
+pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socket:
 
 1. on x86_64 only, under the machine's default, whose `_OSC` withholds native hotplug control:
    it passes when devmgr logs the slot `not managed: _OSC control`;
@@ -1300,7 +1302,12 @@ pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c`) and a QMP socket:
    `edu` has). Once the fixture logs `[hotplug-check] READY for the removal`, it removes the
    device (QMP `device_del`) and waits up to a minute for QEMU's `DEVICE_DELETED` event, then
    for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
-   then hot-adds the device again, and passes on the fixture's `[hotplug-check] PASS` line.
+   then hot-adds the device again and waits for the fixture's `[hotplug-check] PASS` line. It
+   then adds a raw block node over a zero-filled 1 MiB image (QMP `blockdev-add`) and hot-adds a
+   `virtio-blk-pci` on it behind the second port, and passes once devmgr logs
+   `[devmgr] virtio-blk: binds PCI` and `virtio-blk: declares boot-only class block; not
+   considered` and the driver logs `[virtio-blk] ready, entering service loop`, failing on a
+   `boot tier not granted from the drivers directory` line.
 
 It kills QEMU after each boot, then removes the staged files and repacks the images in that layout
 again, whatever the outcome. [docs/testing.md](../docs/testing.md) § PCI Express hotplug
@@ -1319,9 +1326,9 @@ cargo xtask test-hotplug [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 | `--cpus` | `4` | vCPUs of the guest |
 | `--mem` | `512` | Guest memory size in MiB |
 
-Each boot to its markers is bounded by five minutes and the fixture's verdict by three minutes
-after the hot-add. The boots are the hotplug device cell of the local and release host runs
-([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
+Each boot to its markers is bounded by five minutes, and the fixture's verdict and the disk's bind
+by three minutes after their hot-add. The boots are the hotplug device cell of the local and release
+host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---
 

@@ -247,16 +247,17 @@ driver's instance limit counts its devices in record order (the boot scan's PCI 
 segment, bus, device, function, then each PCI function appended later in its order of arrival; then
 the platform records in the firmware's table order). A device no declaration matches stays recorded
 and unbound, and a later declaration (a driver installed afterwards, through `BIND_DRIVERS`, or a
-hotplug pass) can still match it. A hotplug pass is a drivers-directory pass over the directory
-`SET_DRIVERS_DIR` installed, run against the records still unbound once a hotplug arrival has
-appended one ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding)
-§ Binding). A limited driver's bound devices are counted by driver name, within a pass and across
-passes, so two declarations of one name share one count and a later pass binds the driver only to
-the devices its limit leaves. A PCI device's hotplug removal returns its instance once the removal
-has withdrawn the driver and removed the record, so the limit bounds the devices the driver serves
-at once, and a later pass can bind the driver to the device that replaces it. A withdrawal for any
-other cause, the driver's death among them, returns nothing: the record stays, and a record is
-bound at most once a boot.
+hotplug pass) can still match it. A hotplug arrival that has appended a record runs, against the
+records still unbound, a pass over the boot bundle's declarations that carry a PCI key, then a
+drivers-directory pass over the directory `SET_DRIVERS_DIR` installed
+([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding) § Binding). A limited
+driver's bound devices are counted by driver name, within a pass and across passes, so two
+declarations of one name share one count and a later pass binds the driver only to the devices its
+limit leaves. A PCI device's hotplug removal returns its instance once the removal has withdrawn the
+driver and removed the record, so the limit bounds the devices the driver serves at once, and a
+later pass can bind the driver to the device that replaces it. A withdrawal for any other cause, the
+driver's death among them, returns nothing: the record stays, and a record is bound at most once a
+boot.
 
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process
@@ -320,9 +321,9 @@ replies at once and its control thread runs a drivers-directory pass over it aga
 still unbound, under the declaration bounds of the `SET_DRIVERS_DIR` pass, and settles the drivers
 it binds within the production settle bound. A record is bound at most once a boot.
 
-Each bind pass is one settle batch: the IOMMU pass, the boot pass over boot-module drivers,
-the pass at `SET_DRIVERS_DIR`, one pass per `BIND_DRIVERS`, and a hotplug pass. Withdrawing a
-driver runs three steps in order:
+Each bind pass is one settle batch (the IOMMU pass, the boot pass over boot-module drivers, the
+pass at `SET_DRIVERS_DIR`, and one pass per `BIND_DRIVERS`), but for a hotplug arrival's two
+passes, which share one (§ Hotplug). Withdrawing a driver runs three steps in order:
 
 1. the DMA and Bus Master Enable steps that apply to every DMA-capable device;
 2. for a PCI function, setting the Interrupt Disable bit of its Command register through the
@@ -411,8 +412,13 @@ edits no existing crate.
 ## Hotplug
 
 Hotplug adds no binding path: an enumerator that learns of an added device appends its
-record and runs a bind pass over it; one that learns of a removed device withdraws its
-driver, which leaves a tombstone at its ordinal. Either change signals the class's watches
+record and binds it as the boot would have, the boot bundle's declarations first, under the
+bounds of their source, then the drivers directory's (§ Declaration Bounds). A hot-added device
+of a boot-only class is so bound to the boot bundle's driver, and a drivers-directory
+declaration of the class is still refused; devmgr keeps a copy of each boot-bundle driver that
+declares a PCI key for this, since the boot pass releases the boot modules themselves. An
+enumerator that learns of a removed device withdraws its driver, which leaves a tombstone at
+its ordinal. Either change signals the class's watches
 (§ Device Classes), so a consumer learns of it without probing. The event sources are
 specified in [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md): devmgr
 appends and binds a function added to a PCI Express slot it controls natively, under the host

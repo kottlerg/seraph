@@ -8,7 +8,8 @@
 //! handshake, and issues the handful of commands the harnesses need:
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
 //! and `quit` (snapshot-resume test), `stop` + `pmemsave` (the ACPI table
-//! capture), `device_add` and `device_del` (the hotplug test), and
+//! capture), `blockdev-add`, `device_add` and `device_del` (the hotplug
+//! test), and
 //! `system_powerdown` (the power-button test); and waits for the
 //! `SHUTDOWN` event (the reboot and power-button tests) and the
 //! `DEVICE_DELETED` event (the hotplug test).
@@ -286,7 +287,7 @@ pub fn device_add(
     driver: &str,
     id: &str,
     bus: &str,
-    properties: &[(&str, u64)],
+    properties: &[(&str, Property<'_>)],
 ) -> Result<()>
 {
     let mut client = Client::connect(socket)?;
@@ -297,8 +298,46 @@ pub fn device_add(
     Ok(())
 }
 
+/// A property value [`device_add`] sets on the device it adds.
+#[derive(Clone, Copy, Debug)]
+pub enum Property<'a>
+{
+    /// A number, such as a DMA mask.
+    Number(u64),
+    /// A string, such as the block node a `drive` property names.
+    Text(&'a str),
+}
+
+/// Add a raw-format block node named `node` over the image file `path`
+/// (QMP `blockdev-add`), which a device [`device_add`] adds then names
+/// in its `drive` property.
+pub fn blockdev_add_raw(socket: &Path, node: &str, path: &Path) -> Result<()>
+{
+    let mut client = Client::connect(socket)?;
+    client.send(&blockdev_add_raw_message(node, path_str(path)?))?;
+    client
+        .read_result()
+        .with_context(|| format!("blockdev-add {node}"))?;
+    Ok(())
+}
+
+/// The `blockdev-add` command of [`blockdev_add_raw`].
+fn blockdev_add_raw_message(node: &str, path: &str) -> String
+{
+    format!(
+        r#"{{"execute":"blockdev-add","arguments":{{"driver":"raw","node-name":{},"file":{{"driver":"file","filename":{}}}}}}}"#,
+        json_string(node),
+        json_string(path)
+    )
+}
+
 /// The `device_add` command of [`device_add`].
-fn device_add_message(driver: &str, id: &str, bus: &str, properties: &[(&str, u64)]) -> String
+fn device_add_message(
+    driver: &str,
+    id: &str,
+    bus: &str,
+    properties: &[(&str, Property<'_>)],
+) -> String
 {
     let mut arguments = format!(
         r#""driver":{},"id":{},"bus":{}"#,
@@ -309,7 +348,11 @@ fn device_add_message(driver: &str, id: &str, bus: &str, properties: &[(&str, u6
     for (name, value) in properties
     {
         // Writing to a `String` cannot fail.
-        let _ = write!(arguments, ",{}:{value}", json_string(name));
+        let _ = match value
+        {
+            Property::Number(n) => write!(arguments, ",{}:{n}", json_string(name)),
+            Property::Text(s) => write!(arguments, ",{}:{}", json_string(name), json_string(s)),
+        };
     }
     format!(r#"{{"execute":"device_add","arguments":{{{arguments}}}}}"#)
 }
@@ -485,15 +528,38 @@ mod tests
     }
 
     #[test]
-    fn device_add_names_the_driver_id_bus_and_numeric_properties()
+    fn device_add_names_the_driver_id_bus_and_properties()
     {
         assert_eq!(
-            device_add_message("edu", "hp\"0", "port", &[("dma_mask", 0xFFFF_FFFF)]),
+            device_add_message(
+                "edu",
+                "hp\"0",
+                "port",
+                &[("dma_mask", Property::Number(0xFFFF_FFFF))]
+            ),
             r#"{"execute":"device_add","arguments":{"driver":"edu","id":"hp\"0","bus":"port","dma_mask":4294967295}}"#
+        );
+        assert_eq!(
+            device_add_message(
+                "virtio-blk-pci",
+                "d",
+                "p",
+                &[("drive", Property::Text("n\"1"))]
+            ),
+            r#"{"execute":"device_add","arguments":{"driver":"virtio-blk-pci","id":"d","bus":"p","drive":"n\"1"}}"#
         );
         assert_eq!(
             device_add_message("edu", "a", "b", &[]),
             r#"{"execute":"device_add","arguments":{"driver":"edu","id":"a","bus":"b"}}"#
+        );
+    }
+
+    #[test]
+    fn blockdev_add_names_a_raw_node_over_the_file()
+    {
+        assert_eq!(
+            blockdev_add_raw_message("disk", "/t/a\"b.img"),
+            r#"{"execute":"blockdev-add","arguments":{"driver":"raw","node-name":"disk","file":{"driver":"file","filename":"/t/a\"b.img"}}}"#
         );
     }
 

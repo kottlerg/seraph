@@ -155,13 +155,29 @@ apertures (§ Removal).
 
 ### Binding
 
-Once an arrival appended a record and the drivers directory is installed (`SET_DRIVERS_DIR`), devmgr
-runs a drivers-directory pass over the directory cap it keeps, against the records still unbound,
-the appended ones among them, under the bounds of the `SET_DRIVERS_DIR` pass, as its own settle
-batch, the hotplug batch ([docs/driver-binding.md](../../../docs/driver-binding.md#hotplug) §
-Hotplug). Before `SET_DRIVERS_DIR` the record is only appended, and the directory's pass binds it. A
-hot-added function takes the next ordinal of its class, and a bound driver signals the class's
-watches.
+Once an arrival appended a record, devmgr binds the records still unbound, the appended ones among
+them, as it would have bound them at boot, in a settle batch of their own, the hotplug batch
+([docs/driver-binding.md](../../../docs/driver-binding.md#hotplug) § Hotplug). The batch runs two
+passes. The first is a boot pass over the boot bundle's drivers whose declarations carry a PCI key,
+under the bounds of a boot-bundle declaration, so a function of a boot-only class (a hot-added disk)
+is bound to the boot bundle's driver at the boot tier. The second, once the drivers directory is
+installed (`SET_DRIVERS_DIR`), is a drivers-directory pass over the directory cap devmgr keeps,
+under the bounds of the `SET_DRIVERS_DIR` pass, which refuses a drivers-directory declaration of a
+boot-only class as every such pass does. Before `SET_DRIVERS_DIR` a function the first pass does
+not bind is only appended, and the directory's pass binds it. A hot-added function takes the next
+ordinal of its class, and a bound driver signals the class's watches.
+
+The boot pass at enumeration releases every boot module's cap once it ends, since a held module cap
+pins the pool run init donated it from. So, when the boot scan found a hotplug slot, devmgr first
+copies each boot driver module whose declaration carries a PCI key (`firmware::binding::pci_keyed`;
+virtio-blk in the boot bundle) into one contiguous grant of its own from memmgr, and keeps the copy,
+with its declaration and bundle entry name, for its life (`decls::BootImage`). The hotplug batch's
+first pass starts drivers from derivations of these copies. procmgr copies and verifies every
+create's object under the bundle entry name the create gives
+([docs/signing.md](../../../docs/signing.md#verifier-discipline) § Verifier Discipline), so a driver
+started from a copy is the signed boot object or nothing. A module that cannot be copied is logged
+and not kept, and a function only its declaration matches is then bound from the drivers directory
+alone, which refuses a boot-only class.
 
 A hot-added function's `INTx` route is computed through the bridges of the records
 (`PciRecords::append`). On x86-64 no firmware programmed its Interrupt Line and devmgr reads no

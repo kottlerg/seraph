@@ -11,9 +11,11 @@
 //! Two passes bind: the boot pass, over the declarations of the boot modules
 //! devmgr holds, in the boot settle batch; and the drivers-directory pass,
 //! over the declarations of the `/services/drivers/` entries, once svcmgr
-//! hands devmgr that directory. Each pass collects the declarations that
-//! match an unbound record ([`crate::decls`]) into a
-//! [`MatchTable`], walks the records in record order, and binds each to the
+//! hands devmgr that directory. A hotplug arrival's batch runs both, the boot
+//! pass over the boot images devmgr keeps ([`decls::BootImage`]) and then the
+//! drivers-directory pass ([`crate::spawn_hotplug_drivers`]). Each pass
+//! collects the declarations that match an unbound record ([`crate::decls`])
+//! into a [`MatchTable`], walks the records in record order, and binds each to the
 //! declaration the table chooses ([`bind_pci`]). A record is bound at most
 //! once a boot: once a driver was started for it, or, for a RISC-V IOMMU's
 //! function, once devmgr took it as a unit for the IOMMU driver
@@ -214,9 +216,11 @@ pub struct Carve<'a>
 }
 
 /// The boot pass: bind the unbound records to the declarations of `modules`,
-/// the declared boot modules the IOMMU pass left ([`decls::BootModules`]),
-/// and release every module cap, which would otherwise pin the pool run init
-/// donated it from.
+/// as boot modules, and release every module cap. At boot `modules` are the
+/// declared boot modules the IOMMU pass left ([`decls::BootModules`]), whose
+/// caps would otherwise pin the pool run init donated them from; in a hotplug
+/// batch they are derivations of the boot images devmgr keeps
+/// ([`decls::BootImage::module`]).
 pub fn boot_pass(
     records: &mut Records,
     modules: Vec<(DriverDecl, Binary)>,

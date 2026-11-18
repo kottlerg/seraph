@@ -23,9 +23,9 @@
 use driver_binding::DRIVER_NOTE_SECTION;
 use driver_binding::decl::DriverDecl;
 use firmware::platform::{ModuleError, PlatformTable};
-use ipc::IpcMessage;
+use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{NT_SERAPH_DRIVER, SERAPH_NOTE_OWNER};
-use std::os::seraph::reserve_pages;
+use std::os::seraph::{reserve_pages, startup_info};
 use syscall_abi::PAGE_SIZE;
 
 use crate::{arch, caps, spawn};
@@ -60,8 +60,9 @@ const ELF_MAGIC: &[u8] = b"\x7fELF";
 /// procmgr verifies its signature under.
 pub enum Binary
 {
-    /// A boot module: devmgr's Memory cap on it, its size in bytes, and its
-    /// bundle entry name.
+    /// A boot module: devmgr's Memory cap on it (the module's own, or a
+    /// derivation of the copy devmgr keeps of it, [`BootImage`]), its size
+    /// in bytes, and its bundle entry name.
     Module
     {
         cap: u64,
@@ -106,7 +107,8 @@ impl Binary
 
     /// Delete devmgr's cap on the binary. A retained module cap pins the
     /// donated pool run it was derived from, so every module cap is released
-    /// once the boot pass ends.
+    /// once the boot pass ends; a derivation of a kept boot image is released
+    /// once the pass it was made for ends ([`BootImage::module`]).
     pub fn release(&self)
     {
         let _ = syscall::cap_delete(self.cap());
@@ -353,6 +355,259 @@ fn with_module<R>(
     // of it.
     unsafe { crate::unmap_window(caps.self_aspace, range) };
     Some(out)
+}
+
+/// A boot driver module devmgr keeps for its life, so that a function a
+/// hotplug arrival appends is bound from the boot bundle's declarations as it
+/// would have been at boot ([docs/driver-binding.md](../../../docs/driver-binding.md)
+/// § Hotplug): a copy of the module's signed object, in one contiguous grant
+/// devmgr takes from memmgr, with the module's declaration and bundle entry
+/// name ([`keep_images`]). The module cap itself is released with the others
+/// when the boot pass ends, since held it would pin the pool run init donated
+/// it from (`spawn::ModuleCapGuard`). procmgr copies every create's object
+/// into frames of its own and verifies the copy under the name the create
+/// gives (docs/signing.md § Verifier Discipline), so a driver started from the
+/// copy is verified as one started from the module: the signed boot object
+/// under its bundle entry name, or nothing.
+pub struct BootImage
+{
+    decl: DriverDecl,
+    /// devmgr's cap on the grant that holds the copy.
+    cap: u64,
+    /// The object's size in bytes, the module's.
+    size: u64,
+    /// The module's bundle entry name.
+    name: Box<[u8]>,
+}
+
+impl BootImage
+{
+    /// The image's declaration with a [`Binary::Module`] on a derivation of
+    /// its copy, for one bind pass, which releases the derivation
+    /// (`bind::boot_pass`); `None`, logged, when the derivation or the
+    /// name's copy cannot be had.
+    pub fn module(&self) -> Option<(DriverDecl, Binary)>
+    {
+        let mut name = Vec::new();
+        if name.try_reserve_exact(self.name.len()).is_err()
+        {
+            std::os::seraph::log!(
+                warn: "{}: no memory to consider the boot image; not bound",
+                self.decl.name.as_str()
+            );
+            return None;
+        }
+        name.extend_from_slice(&self.name);
+        let Ok(cap) = syscall::cap_derive(self.cap, syscall::RIGHTS_ALL)
+        else
+        {
+            std::os::seraph::log!(
+                warn: "{}: boot image not derived; not bound",
+                self.decl.name.as_str()
+            );
+            return None;
+        };
+        Some((
+            self.decl,
+            Binary::Module {
+                cap,
+                size: self.size,
+                name: name.into_boxed_slice(),
+            },
+        ))
+    }
+}
+
+/// Keep a copy ([`BootImage`]) of each boot driver module of `modules` whose
+/// declaration carries a PCI key ([`firmware::binding::pci_keyed`]), the
+/// only declarations a hot-added function's record can match. A module that
+/// cannot be copied (memmgr refuses the grant, or a mapping fails) is logged
+/// and not kept: its boot devices are bound as before, and a hot-added
+/// function only from the drivers directory. `ipc_buf` is devmgr's
+/// registered IPC buffer.
+pub fn keep_images(
+    caps: &caps::DevmgrCaps,
+    modules: &[(DriverDecl, Binary)],
+    ipc_buf: *mut u64,
+) -> Vec<BootImage>
+{
+    let mut images = Vec::new();
+    for (decl, binary) in modules
+    {
+        let Binary::Module { cap, size, name } = binary
+        else
+        {
+            continue;
+        };
+        if !firmware::binding::pci_keyed(decl)
+        {
+            continue;
+        }
+        if images.try_reserve(1).is_err()
+        {
+            std::os::seraph::log!(
+                warn: "{}: no memory to keep the boot image; a hot-added device binds only from \
+                       the drivers directory",
+                decl.name.as_str()
+            );
+            continue;
+        }
+        if let Some(image) = copy_module(caps, decl, *cap, *size, name, ipc_buf)
+        {
+            std::os::seraph::log!(
+                debug: "{}: boot image kept ({} bytes)",
+                decl.name.as_str(),
+                size
+            );
+            images.push(image);
+        }
+    }
+    images
+}
+
+/// Copy the `size`-byte object of the boot module `module_cap` into one
+/// contiguous grant from memmgr (`REQUIRE_CONTIGUOUS`, so the copy is one
+/// Memory cap, as a `CREATE_PROCESS` object is), the grant mapped writable
+/// for the copy and unmapped after. `None`, logged under the declaration's
+/// name, when memmgr refuses the grant or answers it malformed, or a mapping
+/// fails; a grant taken is returned to memmgr.
+fn copy_module(
+    caps: &caps::DevmgrCaps,
+    decl: &DriverDecl,
+    module_cap: u64,
+    size: u64,
+    name: &[u8],
+    ipc_buf: *mut u64,
+) -> Option<BootImage>
+{
+    let label = decl.name.as_str();
+    let pages = size.div_ceil(PAGE_SIZE);
+    let mut kept_name = Vec::new();
+    let want = u32::try_from(pages).ok().filter(|&p| p != 0);
+    let (Some(want), Ok(())) = (want, kept_name.try_reserve_exact(name.len()))
+    else
+    {
+        std::os::seraph::log!(warn: "{}: boot image not kept (size or memory)", label);
+        return None;
+    };
+    kept_name.extend_from_slice(name);
+    let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
+        .word(
+            0,
+            u64::from(want) | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32),
+        )
+        .build();
+    // SAFETY: `ipc_buf` is devmgr's registered IPC buffer.
+    let Ok(reply) = (unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, &msg, ipc_buf) })
+    else
+    {
+        std::os::seraph::log!(warn: "{}: boot image not kept: memmgr call failed", label);
+        return None;
+    };
+    let layout = ipc::memmgr_grant_layout(&reply);
+    let grant = match (layout, reply.caps())
+    {
+        (Some((&[count], &[region])), &[cap]) if count == pages => Some((cap, region)),
+        _ => None,
+    };
+    let Some((cap, region)) = grant
+    else
+    {
+        for &c in reply.caps()
+        {
+            let _ = syscall::cap_delete(c);
+        }
+        if let Some((_, regions)) = layout
+        {
+            release_regions(regions, ipc_buf);
+        }
+        if reply.label == memmgr_errors::SUCCESS
+        {
+            std::os::seraph::log!(warn: "{}: boot image not kept: malformed memmgr grant", label);
+        }
+        else
+        {
+            std::os::seraph::log!(
+                warn: "{}: boot image not kept: memmgr refused {} contiguous pages ({})",
+                label,
+                pages,
+                reply.label
+            );
+        }
+        return None;
+    };
+    let copied = with_module(caps, module_cap, size, |bytes| {
+        u64::try_from(bytes.len()) == Ok(size) && fill(caps.self_aspace, cap, pages, bytes)
+    });
+    if copied != Some(true)
+    {
+        let _ = syscall::cap_delete(cap);
+        release_regions(&[region], ipc_buf);
+        std::os::seraph::log!(warn: "{}: boot image not kept: the copy failed", label);
+        return None;
+    }
+    Some(BootImage {
+        decl: *decl,
+        cap,
+        size,
+        name: kept_name.into_boxed_slice(),
+    })
+}
+
+/// Map the `pages`-page grant `cap` writable in devmgr's address space
+/// `aspace` at fresh VA, copy `bytes` to its start, and unmap it. Returns
+/// whether the copy was made: `false` when `bytes` exceeds the grant, or
+/// the reservation or the mapping fails.
+fn fill(aspace: u64, cap: u64, pages: u64, bytes: &[u8]) -> bool
+{
+    let fits = u64::try_from(bytes.len())
+        .ok()
+        .zip(pages.checked_mul(PAGE_SIZE))
+        .is_some_and(|(len, room)| len <= room);
+    if !fits
+    {
+        return false;
+    }
+    let Ok(range) = reserve_pages(pages)
+    else
+    {
+        return false;
+    };
+    let va = range.va_start();
+    // SAFETY: `range` is a fresh reservation of `pages` pages from the
+    // per-process arena, owned here: VA no Rust object or IPC page occupies.
+    let mapped = unsafe {
+        std::os::seraph::mem_map_funded(cap, aspace, va, 0, pages, syscall::MAP_WRITABLE)
+    };
+    if mapped.is_ok()
+    {
+        // SAFETY: the grant's `pages` pages are mapped writable from `va`,
+        // and `bytes.len()` is within them; the grant is devmgr's alone, so
+        // nothing else maps it, and `bytes`, the module's read-only mapping,
+        // lies in another reservation, so the two do not overlap.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), va as *mut u8, bytes.len()) };
+    }
+    // SAFETY: the span is this call's own reservation, which no reference
+    // reaches: the copy above wrote it through a raw pointer.
+    unsafe { crate::unmap_window(aspace, range) };
+    mapped.is_ok()
+}
+
+/// Return the memmgr grants `regions` names (`RELEASE_MEMORY_CAPS`), every
+/// cap on them already deleted; memmgr takes a region back once no cap names
+/// it and it is mapped nowhere.
+fn release_regions(regions: &[u64], ipc_buf: *mut u64)
+{
+    if regions.is_empty()
+    {
+        return;
+    }
+    let msg = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
+        .word(0, u64::try_from(regions.len()).unwrap_or(0))
+        .words(1, regions)
+        .build();
+    // SAFETY: `ipc_buf` is devmgr's registered IPC buffer.
+    let _ = unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, &msg, ipc_buf) };
 }
 
 /// The declaration of the drivers-directory entry `name`, whose file node

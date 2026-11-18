@@ -10,7 +10,7 @@
 //!
 //! Stages the `hotplug-check` fixture's recipe and the `test-dma` class into the
 //! boot set, repacks the disk images in the layout they have, and boots the
-//! current sysroot with an empty `pcie-root-port` and a QMP socket. Once devmgr
+//! current sysroot with two empty `pcie-root-port`s and a QMP socket. Once devmgr
 //! logs the slot managed ([`MANAGED_MARKER`]) and the fixture logs
 //! [`READY_MARKER`], the host hot-adds QEMU's `edu` device behind the port
 //! (QMP `device_add`). Once the fixture logs [`REMOVE_MARKER`], the host
@@ -18,7 +18,12 @@
 //! and waits for QEMU's `DEVICE_DELETED`, which QEMU sends once devmgr powers
 //! the slot off; devmgr's removal lines must come in their order
 //! ([`REMOVAL_MARKERS`]). Once the fixture logs [`READD_MARKER`], the host
-//! adds the device again and waits for the fixture's verdict. On `x86_64` that boot
+//! adds the device again and waits for the fixture's verdict. Once the
+//! fixture passes, the host hot-adds a `virtio-blk-pci` disk behind a second
+//! root port, a class the boot only binds from the boot bundle: devmgr must
+//! bind it from the copy it keeps of the boot bundle's virtio-blk, refuse
+//! the drivers directory's copy, and the driver must come up
+//! ([`disk_bound`]). On `x86_64` that boot
 //! turns QEMU's ACPI PCI hotplug off, so `_OSC` grants native control; a boot
 //! before it, with the machine's default, checks that devmgr leaves the slot
 //! alone when `_OSC` withholds it ([`REFUSED_MARKER`]). On riscv64 the
@@ -42,11 +47,11 @@ use crate::disk::DiskLayout;
 use crate::error::{Context as _, Result, bail};
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    EDU_DMA_MASK, GdbMode, HOTPLUG_PORT_ID, HotplugControl, Iommu, QemuDisplay, QemuLaunchSpec,
-    RiscvMmu, RiscvZkr, SecondDisk, X86Paging, X86ShadowStack, build_qemu_argv,
-    prepare_riscv_firmware, validate_sysroot_for_launch,
+    EDU_DMA_MASK, GdbMode, HOTPLUG_DISK_PORT_ID, HOTPLUG_PORT_ID, HotplugControl, Iommu,
+    QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging, X86ShadowStack,
+    build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
-use crate::qmp;
+use crate::qmp::{self, Property};
 use crate::util::{require_tool, step};
 
 /// The fixture's recipe, as `cargo xtask build` installs it under
@@ -99,6 +104,35 @@ const REFUSED_MARKER: &str = "not managed: _OSC control";
 /// The id `device_add` gives the hot-added `edu`.
 const DEVICE_ID: &str = "hotplug-edu";
 
+/// The id `device_add` gives the hot-added disk.
+const DISK_ID: &str = "hotplug-disk";
+
+/// The block node of the hot-added disk's image, which its `drive`
+/// property names.
+const DISK_NODE: &str = "hotplug-disk-node";
+
+/// The size of the hot-added disk's raw image, zero-filled: the disk is only
+/// bound, never read.
+const DISK_BYTES: u64 = 1 << 20;
+
+/// devmgr's line once it binds a virtio-blk function: after the disk's
+/// hot-add, the disk's. Kept in sync with `services/devmgr/src/bind.rs`.
+const DISK_BIND_MARKER: &str = "[devmgr] virtio-blk: binds PCI";
+
+/// The virtio-blk driver's line once it serves its disk. Kept in sync with
+/// `services/drivers/virtio/blk/src/main.rs`.
+const DISK_READY_MARKER: &str = "[virtio-blk] ready, entering service loop";
+
+/// devmgr's line when a drivers-directory pass refuses virtio-blk's
+/// directory copy, of the boot-only class `block`. Kept in sync with
+/// `services/devmgr/src/bind.rs`.
+const DISK_REFUSED_MARKER: &str = "virtio-blk: declares boot-only class block; not considered";
+
+/// devmgr's line for a driver started from the drivers directory that
+/// declares the boot tier, which virtio-blk does: the disk bound from the
+/// directory's copy. Kept in sync with `services/devmgr/src/bind.rs`.
+const DIRECTORY_TIER_MARKER: &str = "boot tier not granted from the drivers directory";
+
 /// Budget for a boot to reach its markers.
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -141,7 +175,8 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
     booted?;
     step(
         "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
-         driver and powered the slot off, and it was bound again)",
+         driver and powered the slot off, and it was bound again; a hot-added disk was bound \
+         from the boot bundle's driver)",
     );
     Ok(())
 }
@@ -210,6 +245,10 @@ fn boot(
         .with_context(|| format!("creating {}", sock_dir.display()))?;
     let sock_path = sock_dir.join("hotplug-test-qmp.sock");
     let _ = std::fs::remove_file(&sock_path);
+    let disk_image = sock_dir.join("hotplug-disk.img");
+    std::fs::File::create(&disk_image)
+        .and_then(|f| f.set_len(DISK_BYTES))
+        .with_context(|| format!("creating {}", disk_image.display()))?;
     let disk_path = ctx.disk_image();
     let data_image = layout.second_image(ctx);
     let spec = QemuLaunchSpec {
@@ -252,18 +291,20 @@ fn boot(
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
-    let result = watch(&mut child, &sock_path, control);
+    let result = watch(&mut child, &sock_path, &disk_image, control);
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&disk_image);
     result
 }
 
 /// Read the serial stream of `child` and run the check of a boot under
 /// `control`: under the machine's default on `x86_64`, devmgr refuses the slot;
 /// under native control, devmgr manages it, the host hot-adds `edu` once
-/// the fixture is ready, and the fixture passes.
-fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()>
+/// the fixture is ready, the fixture passes, and a disk over the image
+/// `disk` hot-added after it is bound ([`disk_bound`]).
+fn watch(child: &mut Child, socket: &Path, disk: &Path, control: HotplugControl) -> Result<()>
 {
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     // Serial lines on a worker thread, so each wait has a deadline; the
@@ -325,7 +366,7 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
             "edu",
             DEVICE_ID,
             HOTPLUG_PORT_ID,
-            &[("dma_mask", EDU_DMA_MASK)],
+            &[("dma_mask", Property::Number(EDU_DMA_MASK))],
         )
     };
     add()?;
@@ -353,6 +394,44 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
     if !verdict.contains(PASS_MARKER)
     {
         bail!("the fixture failed: {verdict}");
+    }
+    step("hotplug test: the fixture passed; hot-adding a virtio-blk disk");
+    qmp::blockdev_add_raw(socket, DISK_NODE, disk)?;
+    qmp::device_add(
+        socket,
+        "virtio-blk-pci",
+        DISK_ID,
+        HOTPLUG_DISK_PORT_ID,
+        &[("drive", Property::Text(DISK_NODE))],
+    )?;
+    lines.start = Instant::now();
+    disk_bound(&lines)
+}
+
+/// Read the lines of the hot-added disk's bind, in any order: devmgr binds
+/// virtio-blk to it ([`DISK_BIND_MARKER`]), the hotplug batch's
+/// drivers-directory pass refuses the directory's copy of virtio-blk
+/// ([`DISK_REFUSED_MARKER`]), and the driver serves the disk
+/// ([`DISK_READY_MARKER`]). A driver started from the directory's copy
+/// ([`DIRECTORY_TIER_MARKER`]) fails the check: the disk was bound from the
+/// copy devmgr keeps of the boot bundle's virtio-blk.
+fn disk_bound(lines: &Lines) -> Result<()>
+{
+    let markers = [DISK_BIND_MARKER, DISK_REFUSED_MARKER, DISK_READY_MARKER];
+    let mut seen = [false; 3];
+    while !seen.iter().all(|&s| s)
+    {
+        let line = lines.until(VERDICT_TIMEOUT, "the hot-added disk's bind", |l| {
+            l.contains(DIRECTORY_TIER_MARKER) || markers.iter().any(|m| l.contains(m))
+        })?;
+        if line.contains(DIRECTORY_TIER_MARKER)
+        {
+            bail!("a driver was started from the drivers directory at the hot-add: {line}");
+        }
+        for (s, m) in seen.iter_mut().zip(markers)
+        {
+            *s |= line.contains(m);
+        }
     }
     Ok(())
 }

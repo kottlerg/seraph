@@ -286,6 +286,17 @@ pub const HOTPLUG_PORT_ID: &str = "hotplug-port";
 /// a launch places.
 const HOTPLUG_PORT_DEVICE: &str = "pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c";
 
+/// The id of the second PCI Express root port a hotplug launch attaches,
+/// which `device_add` names as the bus of the disk it hot-adds
+/// (`test-hotplug`).
+pub const HOTPLUG_DISK_PORT_ID: &str = "hotplug-disk-port";
+
+/// The second PCI Express root port a hotplug launch attaches, empty at
+/// boot, for a hot-added disk: its own chassis and slot number, pinned at
+/// slot `0x1d`, beside [`HOTPLUG_PORT_DEVICE`].
+const HOTPLUG_DISK_PORT_DEVICE: &str =
+    "pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d";
+
 /// The q35 property that turns QEMU's ACPI PCI hotplug off, so the
 /// firmware's `_OSC` grants the operating system native hotplug control.
 const X86_NATIVE_HOTPLUG_GLOBAL: &str = "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off";
@@ -306,9 +317,9 @@ pub enum HotplugControl
     Native,
 }
 
-/// The arguments that attach the hotplug root port of `spec`, none when it
-/// asks for none: the port, and on q35 under native control the property
-/// that turns ACPI PCI hotplug off.
+/// The arguments that attach the hotplug root ports of `spec`, none when it
+/// asks for none: the two ports, and on q35 under native control the
+/// property that turns ACPI PCI hotplug off.
 fn hotplug_port_args(spec: &QemuLaunchSpec) -> Vec<String>
 {
     let Some(control) = spec.hotplug_port
@@ -316,7 +327,12 @@ fn hotplug_port_args(spec: &QemuLaunchSpec) -> Vec<String>
     {
         return Vec::new();
     };
-    let mut args = vec!["-device".to_string(), HOTPLUG_PORT_DEVICE.to_string()];
+    let mut args = vec![
+        "-device".to_string(),
+        HOTPLUG_PORT_DEVICE.to_string(),
+        "-device".to_string(),
+        HOTPLUG_DISK_PORT_DEVICE.to_string(),
+    ];
     if spec.arch == Arch::X86_64 && control == HotplugControl::Native
     {
         args.extend(["-global".to_string(), X86_NATIVE_HOTPLUG_GLOBAL.to_string()]);
@@ -1902,19 +1918,23 @@ mod tests
             spec.hotplug_port = None;
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(!devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert!(!devices(&argv).contains(&HOTPLUG_DISK_PORT_DEVICE));
             assert!(!global(&argv));
 
             spec.hotplug_port = Some(HotplugControl::Firmware);
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert!(devices(&argv).contains(&HOTPLUG_DISK_PORT_DEVICE));
             assert!(!global(&argv));
 
             spec.hotplug_port = Some(HotplugControl::Native);
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert!(devices(&argv).contains(&HOTPLUG_DISK_PORT_DEVICE));
             assert_eq!(global(&argv), spec.arch == Arch::X86_64);
         }
         assert!(HOTPLUG_PORT_DEVICE.contains(&format!("id={HOTPLUG_PORT_ID},")));
+        assert!(HOTPLUG_DISK_PORT_DEVICE.contains(&format!("id={HOTPLUG_DISK_PORT_ID},")));
         assert!(EDU_DEVICE.ends_with(&format!("dma_mask={EDU_DMA_MASK:#x}")));
     }
 

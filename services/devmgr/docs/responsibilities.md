@@ -207,8 +207,9 @@ devmgr's responsibilities are:
   device is attached), the boot batch (the boot pass, over the PCI and platform records the boot
   modules' declarations match), and the on-disk batch (the drivers-directory
   pass, which binds the RTC driver to its platform record). Each hotplug arrival that appends a
-  record after `SET_DRIVERS_DIR` runs one more drivers-directory pass, in a batch of its own,
-  the hotplug batch ([hotplug.md](hotplug.md#binding) § Binding).
+  record runs, in a batch of its own, the hotplug batch, a boot pass over the copies devmgr keeps
+  of the boot bundle's PCI drivers, then, after `SET_DRIVERS_DIR`, one more drivers-directory
+  pass ([hotplug.md](hotplug.md#binding) § Binding).
   Each driver's devmgr query cap is a
   SEND, badged with its device badge, on its batch's private endpoint; the
   IOMMU driver's badge, and those of PCI-bound drivers given no VirtIO
@@ -489,7 +490,11 @@ devmgr's responsibilities are:
     logged and released. devmgr spawns the drivers during initial enumeration, before the registry
     loop opens: the IOMMU driver, matched against the IOMMU family record in a pass of its own, and
     every other module by the declaration it carries, read from the module mapped read-only and
-    bound in the boot pass (above). Every module cap is released once its pass ends.
+    bound in the boot pass (above). Every module cap is released once its pass ends. When the boot
+    scan found a hotplug slot, devmgr first copies each driver module whose declaration carries a
+    PCI key into one contiguous grant of its own from memmgr and keeps the copy for its life, from
+    which the hotplug batch binds a hot-added function ([hotplug.md](hotplug.md#binding)
+    § Binding).
   - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among
     them the per-arch RTC, virtio-input, virtio-console, test-dma, and a copy
     of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr
@@ -663,7 +668,8 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and acpid's FADT register-block ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64, and the RIMT's PCI IOMMUs and ID mappings on riscv64 |
-| Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer, and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table, untagged and held in `DevmgrCaps.modules`; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed; a module that is neither, or that fails to read, is logged and released |
+| Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer, and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table, untagged and held in `DevmgrCaps.modules`; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed; a module that is neither, or that fails to read, is logged and released; every module cap is released once the boot pass ends |
+| Memory (kept boot images, from memmgr) | Every right of the pool frames (devmgr is phys-class) | When the boot scan found a hotplug slot, one contiguous grant per boot-bundle driver whose declaration carries a PCI key (virtio-blk), holding a copy of its module, kept for devmgr's life; the hotplug batch spawns a hot-added function's driver via `CREATE_PROCESS` from a derivation of it ([hotplug.md](hotplug.md#binding) § Binding) |
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
 | SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (each driver of the boot tier from a boot module, the serial and IOMMU drivers and each PCI-bound one, at 26; every other driver, the framebuffer and RTC drivers included, at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, the IOMMU fault-log thread at 24, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 

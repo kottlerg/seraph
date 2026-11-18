@@ -26,6 +26,7 @@ use std::os::seraph::thread::BuilderExt;
 use syscall_abi::PAGE_SIZE;
 
 use crate::bind::{self, ConfigRegs};
+use crate::decls::{self, Binary, BootImage};
 use crate::{Registry, caps, settle};
 
 /// The step of the poller's waits for a Slot Control command and for a
@@ -99,6 +100,10 @@ pub struct Hotplug
     /// The jobs' channel, which the poller posts on.
     posted: mpsc::Sender<Job>,
     jobs: mpsc::Receiver<Job>,
+    /// The boot driver modules a hot-added function can be bound from, kept
+    /// for devmgr's life when the boot scan found a slot
+    /// ([`Self::keep_images`]); empty when it found none.
+    images: Vec<BootImage>,
 }
 
 /// The control thread's ends of the poller's channels.
@@ -200,6 +205,25 @@ impl Hotplug
             poller: None,
             posted,
             jobs,
+            images: Vec::new(),
+        }
+    }
+
+    /// Keep a copy of each boot driver module of `modules` that a hot-added
+    /// function could match ([`decls::keep_images`]), when the boot scan
+    /// found a slot devmgr may manage; called before the boot pass releases
+    /// the module caps. With no slot nothing is kept, since no function can
+    /// be added.
+    pub fn keep_images(
+        &mut self,
+        modules: &[(driver_binding::decl::DriverDecl, Binary)],
+        caps: &caps::DevmgrCaps,
+        ipc_buf: *mut u64,
+    )
+    {
+        if !self.candidates.is_empty()
+        {
+            self.images = decls::keep_images(caps, modules, ipc_buf);
         }
     }
 
@@ -356,11 +380,13 @@ impl Hotplug
     /// its end before the next: one slot's removal job posted while its add
     /// job waits runs after it, and withdraws what it bound.
     ///
-    /// An add job records the functions behind the slot ([`add`]), then,
-    /// once the drivers directory is installed, binds them in a
-    /// drivers-directory pass of their own settle batch, the hotplug batch.
-    /// Before `SET_DRIVERS_DIR` the functions are only recorded, and its pass
-    /// binds them. A removal job withdraws and removes them ([`remove`]),
+    /// An add job records the functions behind the slot ([`add`]), then
+    /// binds them in a settle batch of their own, the hotplug batch
+    /// ([`crate::spawn_hotplug_drivers`]): first from the kept boot images
+    /// ([`Self::keep_images`]), under the bounds of a boot module, then, once
+    /// the drivers directory is installed, from it. Before `SET_DRIVERS_DIR`
+    /// a function no boot image binds is only recorded, and that directory's
+    /// pass binds it. A removal job withdraws and removes them ([`remove`]),
     /// then posts the slot to the poller, which powers it off.
     pub fn run(
         &self,
@@ -407,17 +433,10 @@ impl Hotplug
                 let state = registry.lock();
                 (state.drivers_dir_cap, state.drivers_dir_path)
             };
-            if dir == 0
-            {
-                std::os::seraph::log!(
-                    "hotplug: drivers directory not installed; its pass binds the functions added"
-                );
-                continue;
-            }
-            crate::spawn_dir_drivers(
-                "hotplug batch",
+            crate::spawn_hotplug_drivers(
                 records,
                 carve,
+                &self.images,
                 dir,
                 dir_path.as_bytes(),
                 watch,

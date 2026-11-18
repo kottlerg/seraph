@@ -449,8 +449,9 @@ fn probe(fixture: u64, phase: &str, what: &str) -> (u64, u64)
 /// From the fill to the fixture's stop the fixture holds the pool at the
 /// reserve, so a process outside the system reserve takes no free page, except
 /// the pages another process frees in the window, which the fixture takes back
-/// only at its next tick (`mem_fill::TICK_MS`). Fails `phase` when no read of
-/// the level after the fill gave `CRITICAL`. `during` and the wait must
+/// only at its next tick (`mem_fill::TICK_MS`). Fails `phase` when the level
+/// does not read `CRITICAL` after the fill, or `NORMAL` after the window,
+/// within [`NORMAL_WAIT`]. `during`, the reads of the level and the stop must
 /// allocate nothing and write no log line; the stack they use is touched
 /// before the fill.
 pub(super) fn critical_window(caps: &Caps, phase: &str, hold: Duration, during: impl FnOnce())
@@ -480,6 +481,7 @@ pub(super) fn critical_window(caps: &Caps, phase: &str, hold: Duration, during: 
     });
     touch_stack();
     let _ = hog_call(fixture, phase);
+    await_level(MemoryPressure::Critical, phase, "after the fill");
     during();
     if let Some((cap, key)) = own_stop
     {
@@ -491,7 +493,7 @@ pub(super) fn critical_window(caps: &Caps, phase: &str, hold: Duration, during: 
             "{phase}: STOP_CANDIDATE(memhog) replied {label:#x}"
         );
     }
-    await_fall(phase);
+    await_level(MemoryPressure::Normal, phase, "after the window");
     let (next, pages) = probe(fixture, phase, "PROBE after the window");
     assert_ne!(next, first, "{phase}: the hogging instance still answered");
     assert_eq!(
@@ -499,37 +501,6 @@ pub(super) fn critical_window(caps: &Caps, phase: &str, hold: Duration, during: 
         "{phase}: memhog's next instance holds {pages} pages"
     );
     let _ = syscall::cap_delete(fixture);
-}
-
-/// Wait up to [`NORMAL_WAIT`] for the level to read `NORMAL`. Fails `phase`
-/// when no read before the fall gave `CRITICAL`. Allocates nothing until it
-/// fails.
-fn await_fall(phase: &str)
-{
-    let start = Instant::now();
-    let mut critical = false;
-    loop
-    {
-        match std::os::seraph::memory_pressure()
-        {
-            Some(MemoryPressure::Critical) => critical = true,
-            Some(MemoryPressure::Normal) =>
-            {
-                assert!(
-                    critical,
-                    "{phase}: the level never read CRITICAL after the fill"
-                );
-                return;
-            }
-            _ =>
-            {}
-        }
-        assert!(
-            start.elapsed() < NORMAL_WAIT,
-            "{phase}: the level did not read NORMAL {NORMAL_WAIT:?} after the fill"
-        );
-        std::thread::sleep(LEVEL_POLL);
-    }
 }
 
 /// Microseconds since boot, the clock logd stamps each history entry with

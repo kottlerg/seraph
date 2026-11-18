@@ -17,6 +17,11 @@
 //! how long it took, or the hold times out and the process dies of the fault.
 //! Neither allocates while the level is `CRITICAL`. The fill is
 //! `mem_fill`'s, shared with the `memhog` fixture.
+//!
+//! `crashme oom-hold <pages>` touches `<pages>` pages of heap, prints
+//! `holding <pages>` and waits to be destroyed: a program of an operator
+//! session that svctest's `oom_policy` phase starts through the session's
+//! shell, for oomd to stop as a job (docs/session-supervision.md).
 
 use std::io::{BufRead, Write};
 use std::process::exit;
@@ -35,6 +40,11 @@ const FILL_BALLAST_FAILED: i32 = 4;
 const FILL_USAGE: i32 = 5;
 /// Exit code: `oom-touch` could not register its page or read its stdin.
 const TOUCH_SETUP_FAILED: i32 = 6;
+/// Exit code: `oom-hold`'s argument is not a number of pages.
+const HOLD_USAGE: i32 = 7;
+
+/// The page size `oom-hold` touches its heap at.
+const PAGE_BYTES: usize = 4096;
 
 /// Bytes of stack each mode touches before the window, below its frame.
 const STACK_TOUCH_BYTES: usize = 16 * 1024;
@@ -109,6 +119,32 @@ pub fn touch() -> !
     let held = start.elapsed().as_millis();
     println!("touched held_ms={held}");
     exit(0);
+}
+
+/// `crashme oom-hold <pages>`: touch `<pages>` pages of heap, print
+/// `holding <pages>`, and wait to be destroyed.
+pub fn hold(arg: Option<&str>) -> !
+{
+    let Some(pages) = arg.and_then(|p| p.parse::<usize>().ok())
+    else
+    {
+        println!("usage: crashme oom-hold <pages>");
+        exit(HOLD_USAGE);
+    };
+    let mut held = vec![0u8; pages.saturating_mul(PAGE_BYTES)];
+    for page in held.chunks_mut(PAGE_BYTES)
+    {
+        if let Some(byte) = page.first_mut()
+        {
+            *byte = 1;
+        }
+    }
+    std::hint::black_box(&mut held);
+    say(&format!("holding {pages}"));
+    loop
+    {
+        let _ = syscall::thread_sleep(60_000);
+    }
 }
 
 /// Print `line` and flush it, so the tester reads it at once.

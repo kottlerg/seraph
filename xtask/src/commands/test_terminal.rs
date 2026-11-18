@@ -84,7 +84,7 @@ const CHILD_LINE: &str = "shell built-ins:";
 const ECHO_SUBSEQUENCE: &str = "helpx";
 
 /// The shell's prompt, rendered to serial via the terminal. Acceptance for
-/// #112 requires it appears once the shell is the terminal's child.
+/// #112 requires it appears once the shell is the terminal session's leader.
 const PROMPT: &str = "$ ";
 
 /// Serial RX round (#291): bytes written to the guest UART via QEMU's

@@ -26,7 +26,8 @@
 //! `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND
 //! without `GRANT`, apart from [`published_names::DEVMGR_BIND`](crate::published_names::DEVMGR_BIND), which its
 //! seeds receive with `GRANT`, since `devmgr_labels::BIND_DRIVERS` moves a cap
-//! to devmgr; `QUERY_ENDPOINT` never yields `GRANT`.
+//! to devmgr, and `sessiond.operator` (a `:grant` entry), whose seeds move caps to sessiond;
+//! `QUERY_ENDPOINT` never yields `GRANT`.
 //! [`published_names::VFSD_DENY`](crate::published_names::VFSD_DENY) carries no authority but is seed-only
 //! too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`, and any
 //! name published through [`svcmgr_labels::PUBLISH_ENDPOINT`](crate::svcmgr_labels::PUBLISH_ENDPOINT) are public
@@ -131,3 +132,10 @@ pub const VFSD_SWAP: &[u8] = b"vfsd.swap";
 /// Seed-only; seeded only by svctest, whose `logd_death_forward` phase
 /// reads a dead child's retired slot through it.
 pub const LOGD_QUERY: &[u8] = b"logd.query";
+
+/// SEND on sessiond's service endpoint badged
+/// `sessiond_labels::OPERATOR_AUTHORITY`: the interface labels, through
+/// which an interface opens operator sessions
+/// (services/sessiond/docs/ipc-interface.md). Seed-only; seeded by the
+/// terminal, and by svctest, whose sessiond phases open sessions through it.
+pub const SESSIOND_OPERATOR: &[u8] = b"sessiond.operator";

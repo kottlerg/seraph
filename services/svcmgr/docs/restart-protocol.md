@@ -321,7 +321,7 @@ spawns are not in its table, and none of them flows through the handover endowme
 
 The table below lists the services svcmgr currently binds or launches
 (per the shipped and staged `.svc` files). A `restart = never` service
-svcmgr launches (`svctest`, `usertest`, `terminal`) is launched one-shot:
+svcmgr launches (`svctest`, `usertest`) is launched one-shot:
 svcmgr binds no death notification for it and records no `ServiceEntry`
 ([service-definitions.md](service-definitions.md#reconciliation)).
 
@@ -349,7 +349,8 @@ that the functional harness boots drop `terminal` (per
 | `timed` | svcmgr-launched (provider) | `on_failure` | `no` |
 | `pwrmgr` | svcmgr-launched (provider) | `on_failure` | `no` |
 | `crashd` | svcmgr-launched | `on_failure` | `no` |
-| `terminal` | svcmgr-launched | `never` | `no` |
+| `sessiond` | svcmgr-launched (stop source) | `on_failure` | `no` |
+| `terminal` | svcmgr-launched | `on_failure` | `no` |
 
 memmgr and procmgr are in the core set and never restart; devmgr and vfsd
 are not, but no restart of either is designed. svcmgr holds none of the

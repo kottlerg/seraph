@@ -73,6 +73,7 @@ pub mod pwrmgr;
 pub mod random;
 pub mod recv_guard;
 pub mod recv_pool;
+pub mod sessiond;
 pub mod shmem;
 pub mod startup;
 pub mod svcmgr;
@@ -120,6 +121,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_ipc::relative_only());
     out.extend_from_slice(pwrmgr::deny_only());
     out.extend_from_slice(svcmgr::phases());
+    out.extend_from_slice(sessiond::phases());
     out.extend_from_slice(oom::phases());
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(log_client::phases());

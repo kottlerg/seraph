@@ -391,8 +391,8 @@ devmgr's responsibilities are:
 
   A further batch runs for each `devmgr_labels::BIND_DRIVERS`, gated on
   `BIND_AUTHORITY`, which only svctest's seed-only `devmgr.bind` cap carries
-  (the one published name a seed receives as `SEND|GRANT`, since the request
-  moves a directory cap to devmgr). devmgr replies `SUCCESS` at once; its
+  (seeded as `SEND|GRANT`, as only it and each `:grant` name are, since the
+  request moves a directory cap to devmgr). devmgr replies `SUCCESS` at once; its
   control thread then runs a drivers-directory pass over the directory cap,
   named by the directory's absolute path the request carries as a name block
   from data word `DRIVERS_DIR_PATH_WORD`, under the same declaration bounds as

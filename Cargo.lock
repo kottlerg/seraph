@@ -723,6 +723,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sessiond"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "sessiond-table",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "sessiond-table"
+version = "0.1.4"
+
+[[package]]
 name = "shell"
 version = "0.0.1"
 dependencies = [

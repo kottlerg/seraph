@@ -99,8 +99,8 @@
 //! use, does so in few rounds or none. So, after the fixed rounds, while the
 //! waiters have consumed no delivery or, in a double-stop phase, no second
 //! stop has committed, the phase runs held rounds, up to
-//! [`MAX_EXTRA_ROUNDS`] of them, logged as `extra_rounds`: the controller
-//! stops the waiter only once it has consumed a delivery in the round and, in
+//! [`super::MAX_EXTRA_ROUNDS`] of them, logged as `extra_rounds`: the
+//! controller stops the waiter only once it has consumed a delivery in the round and, in
 //! a double-stop phase, once the second stopper has published that it is
 //! taking its stop ([`STOPPER_ENTERED`]), each wait bounded by
 //! [`ACK_WAIT_US`] and busy at first, so the two stops still meet within
@@ -131,10 +131,6 @@ const CELL: &str = "stress::stop_claimed_delete";
 /// Fixed rounds per phase; each creates and deletes one source and one
 /// waiter.
 const CYCLES: u32 = 1000;
-
-/// Bound on the held rounds a phase runs after its fixed rounds while the
-/// race it requires has not armed ([`race_unarmed`]).
-const MAX_EXTRA_ROUNDS: u32 = 1000;
 
 /// CPUs needed: one each for the controller, the waiter, the sender, and
 /// the second stopper.
@@ -547,8 +543,8 @@ fn release_helpers(helpers: &Helpers) -> TestResult
 
 /// Run the phase's [`CYCLES`] fixed rounds and then, while the race the
 /// phase requires has not armed ([`race_unarmed`]), held rounds until it has
-/// or [`MAX_EXTRA_ROUNDS`] have run, stopping at the first round that fails.
-/// Returns the controller-side tallies.
+/// or [`super::MAX_EXTRA_ROUNDS`] have run, stopping at the first round that
+/// fails. Returns the controller-side tallies.
 fn rounds(ctx: &TestContext, phase: Phase) -> Result<Seen, &'static str>
 {
     let mut seen = Seen::default();
@@ -556,7 +552,7 @@ fn rounds(ctx: &TestContext, phase: Phase) -> Result<Seen, &'static str>
     {
         round(ctx, phase, cycle, Timing::Raced, &mut seen)?;
     }
-    while race_unarmed(phase.stops) && seen.extra_rounds < MAX_EXTRA_ROUNDS
+    while race_unarmed(phase.stops) && seen.extra_rounds < super::MAX_EXTRA_ROUNDS
     {
         let cycle = CYCLES.saturating_add(seen.extra_rounds);
         round(ctx, phase, cycle, Timing::Held, &mut seen)?;

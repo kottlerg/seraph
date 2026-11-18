@@ -176,7 +176,7 @@ endpoint, from which svcmgr launches and restarts real logd (per
 § Supervision hierarchy). svcmgr — not init — then publishes the
 well-known names it owns into its own registry
 (`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`,
-`DEVMGR_SHUTDOWN`, `DEVMGR_BIND` (seed-only, the one name a seed receives as `SEND|GRANT`), the
+`DEVMGR_SHUTDOWN`, `DEVMGR_BIND` (seed-only, a name whose seeds receive `SEND|GRANT`), the
 `DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`, `VFSD_DENY`, `VFSD_SWAP`, `LOGD_QUERY`, minted
 from the endowed sources) and
 installs devmgr's `/services/drivers/` cap via

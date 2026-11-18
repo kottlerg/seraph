@@ -39,6 +39,26 @@
 //! refuses; then a line and a record with the bit, which must be refused and
 //! not retained; then, once it has registered a name, a line with the bit,
 //! which is accepted.
+//!
+//! The `logd_reserve` phase before it requires logd's budget node to be a
+//! system-reserve node (`services/svcmgr/docs/service-definitions.md`
+//! § `reserve`), on the running instance and on the next: each attach must
+//! report `ATTACH_FLAG_RESERVE`, so the phase fails whenever logd's recipe
+//! leaves it outside the reserve. Between the two it kills logd in the same way
+//! while the `memhog` fixture holds memory at the system reserve, and requires
+//! the next instance to run and serve before the level falls. While the
+//! fixture holds the pool there, memmgr refuses every page to a budget node
+//! outside the reserve (`services/memmgr/docs/memory-pool.md` § Distribution
+//! policy), and the create of a new process and every first touch of its heap
+//! and stacks take fresh pages. The kill frees the old instance's frames,
+//! though, and the fixture takes back what others free only at its next tick
+//! (`mem_fill::TICK_MS`), so a create that falls in that gap is served from
+//! them whatever its node: the restart check shows that a logd in the reserve
+//! restarts while memory is critical, and the attach flags are what fail for a
+//! logd outside it. The phase attaches to logd before the fill, faults it once
+//! the level reads `CRITICAL`, and, once the level has fallen, finds svcmgr's
+//! restart line in the new instance's history stamped no later than the last
+//! reading of the level that gave `CRITICAL`.
 
 use std::time::{Duration, Instant};
 
@@ -48,13 +68,20 @@ use crate::arch::current::{IP_OFFSET, REGS_SIZE};
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
-/// The logd restart check; see [`super::all`] for its place.
+/// The logd restart checks, in memory critical and not; see [`super::all`]
+/// for their place.
 pub fn phases() -> &'static [Phase]
 {
-    &[Phase {
-        name: "logd_restart",
-        run: logd_restart_phase,
-    }]
+    &[
+        Phase {
+            name: "logd_reserve",
+            run: logd_reserve_phase,
+        },
+        Phase {
+            name: "logd_restart",
+            run: logd_restart_phase,
+        },
+    ]
 }
 
 /// logd's process name: the first word of its recipe's `argv`.
@@ -75,6 +102,65 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// next instance runs (`services/svcmgr/src/restart.rs` `handle_death`).
 const SVCMGR_LINES: [&[u8]; 2] = [b"service died: logd", b"service restarted: logd"];
 
+/// How long the `logd_reserve` phase holds memory critical when no oomd stops
+/// the `memhog` fixture, and svctest stops it: longer than a restart of logd
+/// takes (a few hundred milliseconds under TCG). A test wait bound.
+const RESERVE_HOLD: Duration = Duration::from_secs(5);
+
+/// Kill logd while memory is critical and require its next instance to run
+/// and serve before the level falls (see the module documentation).
+pub fn logd_reserve_phase(caps: &Caps)
+{
+    let phase = "logd_reserve";
+    if !super::svcmgr::recipe_staged(super::oom::MEMHOG_RECIPE, phase)
+    {
+        std::os::seraph::log!("logd_reserve phase passed (memhog.svc not staged)");
+        return;
+    }
+    let authority = caps.debug_authority;
+    assert_ne!(authority, 0, "{phase}: no debug authority");
+    assert_ne!(caps.logd_query, 0, "{phase}: no logd.query seed");
+    let killed = super::crash::badge_named(authority, LOGD_NAME)
+        .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no logd"));
+    let (threads, flags) = attach(authority, killed, phase);
+    require_reserve(flags, phase, "the running");
+    let mut killed_us = 0;
+    let critical_until = super::oom::critical_window(caps, phase, RESERVE_HOLD, || {
+        killed_us = super::oom::elapsed_us();
+        fault_main(&threads, phase);
+    });
+    for cap in threads
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    await_restart(caps.logd_query, authority, killed, phase);
+    let restarted_us = super::procmgr::logd_history_with(caps.logd_query, None, |entry| {
+        (entry.us, contains(entry.bytes, SVCMGR_LINES[1]))
+    })
+    .into_iter()
+    .find_map(|(us, restart)| restart.then_some(us))
+    .unwrap_or_else(|| panic!("{phase}: the next instance holds no restart line"));
+    let next = super::crash::badge_named(authority, LOGD_NAME)
+        .filter(|&badge| badge != killed)
+        .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no next logd"));
+    let (threads, flags) = attach(authority, next, phase);
+    for cap in threads
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    require_reserve(flags, phase, "the restarted");
+    assert!(
+        restarted_us <= critical_until,
+        "{phase}: logd's next instance took svcmgr's restart line at {restarted_us} us, after the \
+         level last read CRITICAL at {critical_until} us: logd restarted only once memory was freed"
+    );
+    let took = restarted_us.saturating_sub(killed_us) / 1000;
+    std::os::seraph::log!(
+        "logd_reserve phase passed (logd killed while memory was critical, and restarted and \
+         serving {took} ms later, before the level fell)"
+    );
+}
+
 /// Kill logd, wait for its next instance, and check the new instance's
 /// history and its death forward (see the module documentation).
 pub fn logd_restart_phase(caps: &Caps)
@@ -86,7 +172,7 @@ pub fn logd_restart_phase(caps: &Caps)
         .expect("logd_restart: LIST_PROCESSES lists no logd");
     let start = Instant::now();
     kill(authority, killed, "logd_restart: logd");
-    await_restart(caps.logd_query, authority, killed);
+    await_restart(caps.logd_query, authority, killed, "logd_restart");
     let took = start.elapsed().as_millis();
     std::os::seraph::log!("logd_restart: logd restarted in {took} ms");
     check_first_line_named(caps.logd_query);
@@ -262,6 +348,20 @@ pub fn reentry_main(role: &str)
 /// a failure.
 pub(crate) fn kill(authority: u64, process: u64, what: &str)
 {
+    let (threads, _) = attach(authority, process, what);
+    fault_main(&threads, what);
+    for cap in threads
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+}
+
+/// Attach to the process `process`, which must report it on the core path:
+/// its thread caps, its main thread's first, which the caller deletes, and the
+/// reply's `ATTACH_WORD_FLAGS`. `what` names the phase and the process in a
+/// failure.
+fn attach(authority: u64, process: u64, what: &str) -> (Vec<u64>, u64)
+{
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let attach = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
         .word(0, process)
@@ -276,18 +376,41 @@ pub(crate) fn kill(authority: u64, process: u64, what: &str)
         "{what}: ATTACH_PROCESS refused ({:#x})",
         reply.label
     );
+    let flags = reply.word(procmgr_labels::ATTACH_WORD_FLAGS);
     assert_ne!(
-        reply.word(procmgr_labels::ATTACH_WORD_FLAGS) & procmgr_labels::ATTACH_FLAG_NO_CORE,
+        flags & procmgr_labels::ATTACH_FLAG_NO_CORE,
         0,
         "{what}: the process is not on the core path (no DECLARE_NO_CORE)"
     );
     let threads = reply.caps().to_vec();
+    assert!(
+        !threads.is_empty(),
+        "{what}: the attach returned no main thread"
+    );
+    (threads, flags)
+}
+
+/// Require the attach `flags` of the logd instance `which` names to report
+/// a system-reserve budget node (`ATTACH_FLAG_RESERVE`).
+fn require_reserve(flags: u64, phase: &str, which: &str)
+{
+    assert_ne!(
+        flags & procmgr_labels::ATTACH_FLAG_RESERVE,
+        0,
+        "{phase}: {which} logd's budget node is outside the system reserve (reserve = yes)"
+    );
+}
+
+/// Stop the main thread of an attached process, the first of `threads`, set
+/// its instruction pointer to [`UNMAPPED_IP`], and start it. Allocates
+/// nothing until it fails.
+fn fault_main(threads: &[u64], what: &str)
+{
     let Some(&main) = threads.first()
     else
     {
         panic!("{what}: the attach returned no main thread");
     };
-
     syscall::thread_stop(main).unwrap_or_else(|e| panic!("{what}: stopping the main thread ({e})"));
     let mut regs = [0u8; REGS_SIZE];
     syscall::thread_read_regs(main, &mut regs)
@@ -302,16 +425,12 @@ pub(crate) fn kill(authority: u64, process: u64, what: &str)
         .unwrap_or_else(|e| panic!("{what}: writing its instruction pointer ({e})"));
     syscall::thread_start(main)
         .unwrap_or_else(|e| panic!("{what}: starting the main thread ({e})"));
-
-    for cap in threads
-    {
-        let _ = syscall::cap_delete(cap);
-    }
 }
 
 /// Wait until the history of logd's instance after `killed` holds every line
 /// of [`SVCMGR_LINES`], which svcmgr writes once it has restarted logd.
-fn await_restart(query: u64, authority: u64, killed: u64)
+/// `phase` names the phase in a failure.
+fn await_restart(query: u64, authority: u64, killed: u64, phase: &str)
 {
     let start = Instant::now();
     loop
@@ -329,7 +448,7 @@ fn await_restart(query: u64, authority: u64, killed: u64)
         }
         assert!(
             start.elapsed() < RESTART_TIMEOUT,
-            "logd_restart: no next logd instance holding svcmgr's restart lines"
+            "{phase}: no next logd instance holding svcmgr's restart lines"
         );
         std::thread::sleep(POLL_INTERVAL);
     }

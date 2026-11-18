@@ -6,7 +6,7 @@
 //! procmgr's process tree (`services/procmgr/docs/ipc-interface.md`
 //! § Process Tree): the parent of each process, the destroy of a process
 //! with every process below it, the re-parenting of the children of a
-//! process that ends, containment, `LIST_CHILDREN` and `DESTROY_CHILD`, and
+//! process that ends, a destroy that follows an end, containment, `LIST_CHILDREN` and `DESTROY_CHILD`, and
 //! the one post of each end to the death relay and the end queue.
 //!
 //! The phases build their trees with raw creates: a create sent on a child's
@@ -40,6 +40,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "process_tree_reparent",
             run: reparent_phase,
+        },
+        Phase {
+            name: "process_tree_destroy_after_end",
+            run: destroy_after_end_phase,
         },
         Phase {
             name: "process_tree_contain",
@@ -80,8 +84,8 @@ const QUEUE_CAPACITY: u32 = 2;
 const POST_TIMEOUT_MS: u64 = 10_000;
 
 /// How long a phase waits, after the post it expects, for a second post or
-/// a post it does not expect. Every post procmgr makes for one end is made
-/// before it replies to the destroy, or before its post to the relay, so this
+/// a post it does not expect. procmgr makes every post of one end at that
+/// end's one teardown, and the expected post has already arrived, so this
 /// only guards against a post that should not exist.
 const QUIET_MS: u64 = 100;
 
@@ -536,6 +540,63 @@ pub fn reparent_phase(_: &Caps)
         node.release();
     }
     std::os::seraph::log!("process_tree_reparent phase passed");
+}
+
+/// Rounds of [`destroy_after_end_phase`]: each races svctest's destroy
+/// against procmgr's reaper for the same end.
+const DESTROY_AFTER_END_ROUNDS: usize = 4;
+
+/// A destroy that reaches procmgr after a process has ended, before or after
+/// procmgr's reaper takes the end, re-parents its children as the reap does:
+/// a middle process runs to its exit, which svctest learns of from its main
+/// thread's own death observer and destroys at once, racing the reaper. The
+/// middle process's relay receives its exit once, and its child is then
+/// listed under the root, its relay given no post.
+pub fn destroy_after_end_phase(_: &Caps)
+{
+    let procmgr = startup_info().procmgr_endpoint;
+    for round in 0..DESTROY_AFTER_END_ROUNDS
+    {
+        let root = create(procmgr, None, 0, "the root");
+        let middle = create(root.handle, None, 0, "the ending middle process");
+        let leaf = create(middle.handle, None, 0, "the middle process's child");
+        let leaf_badge = only_child(middle.handle, "the middle process");
+
+        let observed = std::os::seraph::object_slab_retype(
+            syscall_abi::event_queue_retype_bytes(1, 1),
+            |slab| syscall::event_queue_create_observed(slab, 1, 1).ok(),
+        )
+        .expect("process_tree: observed queue creation failed");
+        syscall::thread_bind_notification(middle.thread, observed, 0)
+            .expect("process_tree: binding the middle process's main thread failed");
+        crate::phases::budget::start(middle.handle, "the middle process");
+        await_entry(observed, "the middle process's main thread");
+        destroy(middle.handle, "the ended middle process");
+
+        expect_one_post(
+            middle.relay,
+            HELLO_EXIT_REASON,
+            "the ended, destroyed middle process",
+        );
+        assert_eq!(
+            child_badges(root.handle, "the root"),
+            [leaf_badge],
+            "process_tree: round {round}: a destroy after the end took the ended process's child"
+        );
+        expect_no_post(
+            leaf.relay,
+            "the relay of a child re-parented by a destroy after its creator's end",
+        );
+
+        destroy(root.handle, "the root");
+        expect_one_post(root.relay, EXIT_KILLED, "the destroyed root");
+        let _ = syscall::cap_delete(observed);
+        for node in [root, middle, leaf]
+        {
+            node.release();
+        }
+    }
+    std::os::seraph::log!("process_tree_destroy_after_end phase passed");
 }
 
 /// The end of a process created with `CREATE_CONTAIN` destroys what is left

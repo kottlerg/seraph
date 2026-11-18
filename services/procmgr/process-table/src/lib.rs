@@ -1025,6 +1025,26 @@ impl ProcessTable
         Some(entry)
     }
 
+    /// Take the entry `badge` of a child whose create procmgr refuses after it
+    /// was inserted (a reply it cannot deliver, a hold it cannot arm), as
+    /// [`Self::take_ended`] takes an ended one, and call `delete_relay` with
+    /// the entry's own death relay too, which is then zero: the creator was
+    /// told the create failed, so no end of the child is posted to it.
+    /// Returns `None` when no live entry holds `badge`.
+    pub fn take_refused(
+        &mut self,
+        badge: u64,
+        mut delete_relay: impl FnMut(u64),
+    ) -> Option<ProcessEntry>
+    {
+        let mut entry = self.take_ended(badge, &mut delete_relay)?;
+        if entry.relay != 0
+        {
+            delete_relay(core::mem::take(&mut entry.relay));
+        }
+        Some(entry)
+    }
+
     /// Take a doomed entry out of the table ([`Self::take_ended`]), the
     /// lowest-badged; `None` when none is doomed. A destroy takes the doomed
     /// entries one by one, each teardown in its own hold of the table lock.
@@ -1047,14 +1067,15 @@ impl ProcessTable
             .filter(move |e| e.parent == parent && !e.doomed)
     }
 
-    /// Whether the live entry `child` is a child of `parent`.
+    /// Whether the live entry `child` is a child of `parent` that no destroy
+    /// has marked, as [`Self::children_after`] lists the children.
     #[must_use]
     pub fn is_child(&self, parent: u64, child: u64) -> bool
     {
         parent != 0
             && self
                 .find_by_badge(child)
-                .is_some_and(|e| e.parent == parent)
+                .is_some_and(|e| e.parent == parent && !e.doomed)
     }
 
     /// Record `queue` (a slot in procmgr's `CSpace`) as the end queue of the
@@ -3270,6 +3291,26 @@ mod tests
         assert_eq!(parent_of(&table, 0x40), 0x60);
     }
 
+    // Defect guarded: the teardown of a child whose create procmgr refused
+    // after inserting it posted `EXIT_KILLED` to the creator's death relay,
+    // which the creator, told the create failed, could read as the end of
+    // its next child on the same queue.
+    #[test]
+    fn a_refused_create_drops_its_own_relay_unposted()
+    {
+        let mut table = tree(&[(0x10, 0), (0x20, 0x10)]);
+        table.find_mut_by_badge(0x20).expect("live").relay = 66;
+        let mut dropped = Vec::new();
+        let taken = table
+            .take_refused(0x20, |relay| dropped.push(relay))
+            .expect("the refused child's entry");
+        assert_eq!(taken.badge, 0x20);
+        assert_eq!(taken.relay, 0);
+        assert_eq!(dropped, [66]);
+        assert!(table.find_by_badge(0x20).is_none());
+        assert!(table.take_refused(0x20, |_| ()).is_none());
+    }
+
     #[test]
     fn an_end_re_parents_to_the_nearest_live_ancestor_and_drops_the_relays()
     {
@@ -3369,7 +3410,9 @@ mod tests
             .collect();
         assert_eq!(rest, [0x40]);
         assert!(table.is_child(0x10, 0x20));
-        assert!(table.is_child(0x10, 0x50));
+        // A marked child is no child for `DESTROY_CHILD` either, which
+        // refuses it with `INVALID_BADGE` as § Label 28 says.
+        assert!(!table.is_child(0x10, 0x50));
         assert!(!table.is_child(0x10, 0x30));
         assert!(!table.is_child(0, 0x10));
         assert!(!table.is_child(0x10, 0x99));

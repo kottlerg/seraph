@@ -165,7 +165,8 @@ What procmgr records and guarantees. The labels and their wire format are
 - **Subtree destroy.** `DESTROY_PROCESS` destroys the process together with every process below
   it. Once a destroy begins, procmgr refuses a create from any process of that subtree, so none
   escapes it by starting a child during the teardown. A supervisor stopping a service or a program
-  thereby stops everything it started.
+  thereby stops everything it started. A destroy of a process that has already ended, before
+  procmgr reaped it, is that end's reap, so its children are re-parented whichever comes first.
 - **Children.** On a process handle, procmgr lists the process's children, each with its badge,
   its name and the pages of its subtree, and destroys one child, named by its badge, with its
   subtree. procmgr reads a child's subtree pages from memmgr with `QUERY_MEMORY_USAGE` over the

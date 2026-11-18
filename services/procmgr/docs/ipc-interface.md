@@ -459,7 +459,11 @@ removes the process entry, revokes and deletes the process's `Thread`, `CSpace`,
 `ProcessInfo` Memory cap, and TLS Memory cap, deletes any namespace caps never consumed by
 `START_PROCESS`, sends memmgr `PROCESS_DIED` for its memmgr badge, unless it was created with
 `CREATE_DMA_HOLD` and started, whose reclaim waits for `RELEASE_HOLD` (§ Label 3), and posts its
-end to its death relay (§ Label 1, **Death relay**) and its end queue (§ Label 29).
+end to its death relay (§ Label 1, **Death relay**) and its end queue (§ Label 29). A process
+that has already ended, by an exit of its main thread or a terminal fault of any of its threads,
+and that procmgr has not reaped yet, is reaped instead, in the same hold of the table lock, with
+the reason it ended with: its children are re-parented, or destroyed when it was created contained,
+as at its reap (§ Process Tree), so whether the destroy or the reaper comes first changes nothing.
 
 **Reply:** label 0 (success), always, once the subtree is torn down. An unknown or
 already-destroyed badge is a no-op.
@@ -675,7 +679,8 @@ parent link is the session model's process tree
   names no live process, and a marked create's child is destroyed when it is built, its create
   refused the same way, so no process escapes the destroy by creating a child during it.
   `LIST_CHILDREN` lists no marked process, and `START_PROCESS` refuses one with `INVALID_BADGE`.
-  Each destroyed process posts its end to its relay and end queue.
+  Each destroyed process posts its end to its relay and end queue. A destroy of a process that
+  has already ended, before procmgr reaped it, is that end's reap (§ Label 8).
 
 ### Label 27: `LIST_CHILDREN`
 
@@ -710,12 +715,12 @@ failed query, reports `0`. Refusals: `INVALID_BADGE` when the handle names no li
 | caps | none; procmgr deletes any cap the message carried |
 
 Destroy the named child together with every process below it, as `DESTROY_PROCESS` destroys a
-process (§ Label 8). The check that the badge names a child and the mark of its subtree are one
-hold of the table lock, so a re-parenting cannot move the child out from under the check. The
-handle is the authority: its holder may already destroy the parent with every process below it,
-and the badge only names one of its children. Replies `SUCCESS` once the subtree is torn down;
-`INVALID_BADGE` when `data[0]` names no live child of the process, a grandchild or a child a
-destroy has marked among them.
+process (§ Label 8), a child that has already ended included. The check that the badge names a child
+and the mark of its subtree are one hold of the table lock, so a re-parenting cannot move the child
+out from under the check. The handle is the authority: its holder may already destroy the parent
+with every process below it, and the badge only names one of its children. Replies `SUCCESS` once
+the subtree is torn down; `INVALID_BADGE` when `data[0]` names no live child of the process, a
+grandchild or a child a destroy has marked among them.
 
 ### Label 29: `REGISTER_END_QUEUE`
 

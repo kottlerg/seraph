@@ -383,10 +383,11 @@ observers, its pager and crash bindings) with no lock held. It inserts the compl
 taking the parent from the reservation, so no other worker sees a half-built child, and an insert
 whose creator a destroy has marked meanwhile is refused. A destroy (`DESTROY_PROCESS`,
 `DESTROY_CHILD`) marks its whole subtree in one hold of the table lock, then tears the marked
-entries down one per hold. A teardown, by the reaper or by a destroy, takes the entry, re-parents
-or marks its children, records the exit, releases the child's kernel objects, and parks a held
-reclaim in one hold of the table lock, and sends `PROCESS_DIED` to memmgr and posts the end to the
-child's death relay and end queue after releasing it. So a destroy that finds no entry finds the
+entries down one per hold; in that hold, a process that has already ended and is not reaped yet is
+reaped instead, as the reaper would. A teardown, by the reaper or by a destroy, takes the entry,
+re-parents or marks its children, records the exit, releases the child's kernel objects, and parks a
+held reclaim in one hold of the table lock, and sends `PROCESS_DIED` to memmgr and posts the end to
+the child's death relay and end queue after releasing it. So a destroy that finds no entry finds the
 child's kernel objects released, and a `RELEASE_HOLD` after it finds the reclaim parked.
 
 The reaper checks, after each pass, for a gone crash service and for gone debuggers, whose deaths

@@ -50,7 +50,8 @@ services/svctest/
         │                      # forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── process_tree.rs    # procmgr's process tree: subtree destroy, re-parenting,
-        │                      #   containment, child list and destroy, end post, end queue
+        │                      #   destroy after an end, containment, child list and
+        │                      #   destroy, end post, end queue
         ├── crash.rs           # procmgr's crash endpoint: registration, handover, take-back
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence

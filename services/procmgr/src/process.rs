@@ -3317,12 +3317,41 @@ impl Drop for CapGuard
 /// `CREATE_DMA_HOLD` child's teardown holds back ([`teardown_entry`]).
 pub fn destroy_process(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables) -> bool
 {
-    if !tables.lock().table.doom_subtree(badge)
+    let ended = {
+        let mut state = tables.lock();
+        match take_if_ended(&mut state, badge)
+        {
+            Some(tail) => Some(tail),
+            None if state.table.doom_subtree(badge) => None,
+            None => return false,
+        }
+    };
+    if let Some(tail) = ended
     {
-        return false;
+        tail.finish(memmgr_ep, ipc_buf);
     }
     drain_doomed(memmgr_ep, ipc_buf, tables);
     true
+}
+
+/// Under the table lock, reap the process `badge` names as its death would
+/// ([`reap_dead`]) when it has already ended, by an exit of its main thread
+/// or a terminal fault of any of its threads, and no destroy has marked it:
+/// a destroy that reaches procmgr before the reaper does takes the end as
+/// the reaper would, so the process's children are re-parented (or, for a
+/// contained process, marked) whichever comes first. `None`, with nothing
+/// done, when no live entry holds `badge`, when a destroy has marked it, or
+/// when it is still running.
+fn take_if_ended(state: &mut TableState, badge: u64) -> Option<TeardownTail>
+{
+    let exit_reason = state
+        .table
+        .find_by_badge(badge)
+        .filter(|entry| !entry.doomed)
+        .and_then(ended_exit_reason)?;
+    let entry = state.table.take_ended(badge, delete_relay)?;
+    state.recent.record(badge, exit_reason, crate::now_ns());
+    Some(teardown_entry(entry, exit_reason, &mut state.table))
 }
 
 /// Destroy the child `child` of the process `parent` together with every
@@ -3339,12 +3368,22 @@ pub fn destroy_child(
     tables: &Tables,
 ) -> bool
 {
-    {
+    let ended = {
         let mut state = tables.lock();
-        if !state.table.is_child(parent, child) || !state.table.doom_subtree(child)
+        if !state.table.is_child(parent, child)
         {
             return false;
         }
+        match take_if_ended(&mut state, child)
+        {
+            Some(tail) => Some(tail),
+            None if state.table.doom_subtree(child) => None,
+            None => return false,
+        }
+    };
+    if let Some(tail) = ended
+    {
+        tail.finish(memmgr_ep, ipc_buf);
     }
     drain_doomed(memmgr_ep, ipc_buf, tables);
     true
@@ -3379,12 +3418,15 @@ fn drain_doomed(memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables)
 /// Destroy the child `badge` names whose create procmgr refuses after its
 /// entry was inserted (a reply it cannot deliver, a hold it cannot arm). The
 /// child never ran, so it started no process; its exit is not recorded,
-/// since no handle to it survives. Nothing when the badge is unknown.
+/// since no handle to it survives. Its death relay is deleted unposted, as
+/// for a create refused before its entry was inserted (`CREATE_DEATH_RELAY`):
+/// the creator was told the create failed, and holds no child to end.
+/// Nothing when the badge is unknown.
 pub fn destroy_created(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables)
 {
     let tail = {
         let mut state = tables.lock();
-        let Some(entry) = state.table.take_ended(badge, delete_relay)
+        let Some(entry) = state.table.take_refused(badge, delete_relay)
         else
         {
             return;
@@ -3404,6 +3446,15 @@ pub fn destroy_created(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &T
 /// only, under the table lock.
 fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
 {
+    ended_exit_reason(entry).unwrap_or(EXIT_KILLED)
+}
+
+/// The reason `entry`'s process ended with when it has ended before procmgr
+/// reaped it: the reason the kernel retained when its main thread has
+/// exited, or else the first terminal fault any of its threads took
+/// ([`resync_exit_reason`]); `None` while it runs. Reads kernel state only.
+fn ended_exit_reason(entry: &ProcessEntry) -> Option<u64>
+{
     let main_thread = syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
     let terminal_fault = syscall::cap_info(
         entry.aspace_cap,
@@ -3415,7 +3466,6 @@ fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
         syscall_abi::THREAD_STATE_EXITED,
         terminal_fault,
     )
-    .unwrap_or(EXIT_KILLED)
 }
 
 /// Delete the death relay of a re-parented child

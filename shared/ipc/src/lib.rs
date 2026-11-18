@@ -532,8 +532,10 @@ pub mod procmgr_labels
     /// create from any process of that subtree, then deletes each one's
     /// kernel objects, sends memmgr `PROCESS_DIED` for it unless
     /// [`CREATE_DMA_HOLD`] holds the reclaim back, and posts its end to its
-    /// death relay and end queue. Replies `SUCCESS` once the subtree is torn
-    /// down, also when the process was gone already.
+    /// death relay and end queue. A process that has already ended and that
+    /// procmgr has not reaped yet is reaped instead, its children re-parented
+    /// as at its reap. Replies `SUCCESS` once the subtree is torn down, also
+    /// when the process was gone already.
     /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 8:
     /// `DESTROY_PROCESS`.
     pub const DESTROY_PROCESS: u64 = 8;
@@ -589,7 +591,7 @@ pub mod procmgr_labels
     /// holder may destroy the parent with everything below it, and the badge
     /// only names one of its children. Replies `SUCCESS` once the subtree is
     /// torn down; `INVALID_BADGE` when `data[0]` names no live child of the
-    /// process. Specified in `services/procmgr/docs/ipc-interface.md`
+    /// process, or one a destroy has marked. Specified in `services/procmgr/docs/ipc-interface.md`
     /// § Label 28: `DESTROY_CHILD`.
     pub const DESTROY_CHILD: u64 = 28;
     /// Register an end queue on the sender itself, sent on its own procmgr

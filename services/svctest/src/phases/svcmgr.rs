@@ -200,8 +200,9 @@ pub(super) struct Listed
 /// boot.
 pub(super) const STOPSRC_RECIPE: &str = "/config/svcmgr/services/stopsrc.svc";
 
-/// The name procmgr lists the `stopsrc` fixture's processes under, its
-/// instance and its job alike: the path both are created from.
+/// The name procmgr lists `stopsrc`'s job under: the first word of its argv,
+/// the path the fixture creates it from. The fixture's own instance, which
+/// svcmgr creates with no argv, is listed with an empty name.
 const STOPSRC_PATH: &[u8] = b"/tests/stopsrc";
 
 /// The pages of the job [`check_source_contained`] has `stopsrc` start: one,
@@ -423,11 +424,12 @@ fn check_stop_sources(stop_cap: u64, phase: &str)
 /// The containment of a stop source (services/svcmgr/docs/service-definitions.md
 /// § `stop_source`): svcmgr creates `stopsrc` contained, so the job an
 /// instance started ends with that instance. Through the debug authority
-/// `authority`, `LIST_PROCESSES` lists one process under `stopsrc`'s path,
-/// then a second once `START_JOB` has the instance start a job; once the
-/// instance has exited (`EXIT`) and its restarted successor answers, the
-/// job's badge leaves the list within [`CONTAIN_WAIT_MS`]. Created
-/// uncontained, the job would be re-parented and listed on.
+/// `authority`, `LIST_PROCESSES` lists one new process named
+/// [`STOPSRC_PATH`], the job, once `START_JOB` has the instance start one;
+/// once the instance has exited (`EXIT`, which leaves the job running) and
+/// its restarted successor answers, the job's badge leaves the list within
+/// [`CONTAIN_WAIT_MS`]. Created uncontained, the job would be re-parented
+/// and listed on.
 fn check_source_contained(authority: u64, phase: &str)
 {
     use super::crash::badges_named;
@@ -438,7 +440,7 @@ fn check_source_contained(authority: u64, phase: &str)
         "{phase}: no debug-authority cap in slot 15 (debug_authority = yes)"
     );
     let fixture = provided_endpoint(src::NAME, phase);
-    let alone = badges_named(authority, STOPSRC_PATH);
+    let before = badges_named(authority, STOPSRC_PATH);
     let (first, _, _) = src_call(fixture, src::PROBE, 0, phase, "stopsrc PROBE");
     let _ = src_call(
         fixture,
@@ -449,18 +451,13 @@ fn check_source_contained(authority: u64, phase: &str)
     );
     let jobs: Vec<u64> = badges_named(authority, STOPSRC_PATH)
         .into_iter()
-        .filter(|badge| !alone.contains(badge))
+        .filter(|badge| !before.contains(badge))
         .collect();
     let [job] = jobs[..]
     else
     {
-        panic!("{phase}: LIST_PROCESSES lists stopsrc's instance {alone:#x?} and jobs {jobs:#x?}");
+        panic!("{phase}: LIST_PROCESSES lists {jobs:#x?} as stopsrc's new job");
     };
-    assert_eq!(
-        alone.len(),
-        1,
-        "{phase}: LIST_PROCESSES lists {alone:#x?} under stopsrc's path before its job"
-    );
     let _ = src_call(fixture, src::EXIT, 0, phase, "stopsrc EXIT");
     let (next, _, _) = src_call(fixture, src::PROBE, 0, phase, "stopsrc PROBE after EXIT");
     assert_ne!(next, first, "{phase}: stopsrc did not restart");

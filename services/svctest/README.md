@@ -294,7 +294,7 @@ otherwise; through the SEND it carries, the fixture's `LIST_CANDIDATES` must rep
 `STOP_CANDIDATE` of a key it never gave `NO_CANDIDATE`, and through the fixture's `:deny` SEND,
 which `QUERY_ENDPOINT` resolves, both must reply `UNAUTHORIZED`. With `stopsrc.svc` staged, the
 phase also checks that svcmgr creates the source contained: through `caps[15]`, `LIST_PROCESSES`
-must list one process under `/tests/stopsrc` before `START_JOB` and a second, the job, after it;
+must list one new process named `/tests/stopsrc`, the job's first argv word, after `START_JOB`;
 once the fixture has exited (`EXIT`, which leaves the job running) and its next instance answers
 `PROBE` with a new nonce, the job's badge must leave the list within 2 s. With
 `crasher-worker.svc` staged,

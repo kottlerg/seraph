@@ -595,11 +595,12 @@ pub mod procmgr_labels
     /// Register an end queue on the sender itself, sent on its own procmgr
     /// cap (its process badge names it; `INVALID_BADGE` on a
     /// [`PROCESS_HANDLE_TAG`] badge): `caps[0]` a `POST` cap on an
-    /// `EventQueue`, `data[0]` the correlator. procmgr posts the process's
-    /// end to the queue once, as the entry `(reason, correlator)` a death
+    /// `EventQueue` (not checked: a post to any other cap fails), `data[0]`
+    /// the correlator. procmgr posts the process's end to the queue once, as the entry `(reason, correlator)` a death
     /// observer receives: the fault class, the exit reason, or the reason a
     /// destroy tore it down with, whoever ended it. Replies `SUCCESS`;
-    /// `INVALID_ARGUMENT` without a queue cap; `END_QUEUE_PRESENT` when the
+    /// `INVALID_ARGUMENT` without a queue cap; `INVALID_BADGE` when the badge
+    /// names no live process; `END_QUEUE_PRESENT` when the
     /// process registered one before, so no process replaces the queue another
     /// holder watches its end through. Caps past `caps[0]`, and the queue of a
     /// refused request, are deleted. Specified in

@@ -512,7 +512,10 @@ The death-notification flow:
 1. **Procmgr observes.** Procmgr's existing supervision path detects
    the death (a death notification on the child's main thread, an
    address-space death notification for the first terminal fault in any thread,
-   or an explicit `DESTROY_PROCESS` teardown). When one of its death
+   or an explicit `DESTROY_PROCESS` or `DESTROY_CHILD` teardown, which
+   takes every process below the destroyed one too, see
+   [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md#process-tree)
+   § Process Tree). When one of its death
    queues was full and a post was dropped, procmgr recovers the
    main-thread deaths from the kernel's thread states, and the
    address-space terminal faults from each address space's retained
@@ -558,6 +561,14 @@ The death-notification flow:
    queue as a death observer (see
    [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md)
    § `REGISTER_DEATH_EQ`).
+7. **Procmgr → relay, end queue, children.** After the teardown and the
+   reclaim, procmgr posts the process's end once to the death relay its
+   creator passed (`CREATE_DEATH_RELAY`) and to the end queue the process
+   registered (`REGISTER_END_QUEUE`). The children of a process that exited
+   or faulted take its parent as theirs, or are destroyed when it was
+   created contained (see
+   [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md#process-tree)
+   § Process Tree).
 
 Memory caps the dead process held in its CSpace become unreachable when
 procmgr's teardown revokes and deletes the child's `CSpace`; a copy the

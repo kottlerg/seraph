@@ -2081,8 +2081,9 @@ enum ObjectSource
 /// its object is copied (a file's opened, read and closed first), the creator
 /// endpoint once the child holds its own copy, the argv/env cap once its
 /// blobs are copied, the charge node's handle goes to memmgr with the
-/// registration, and the relay is consumed by `finalize_creation` on
-/// success; every cap of a refused request is deleted here. Stdio pipe
+/// registration, and the relay is kept in the child's table entry by
+/// `finalize_creation` on success; every cap of a refused request is
+/// deleted here. Stdio pipe
 /// wiring is installed by separate `CONFIGURE_PIPE` IPCs on the returned
 /// `process_handle` between create and `START_PROCESS`.
 fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: ObjectSource)

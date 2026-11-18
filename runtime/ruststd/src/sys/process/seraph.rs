@@ -25,7 +25,7 @@
 //!   * Kill: ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
 //!           revokes + deletes the child's kernel objects, with every
 //!           process the child started, and posts the child's end to the
-//!           death relay before it replies — then event_post(event_queue_cap,
+//!           death relay once — then event_post(event_queue_cap,
 //!           EXIT_KILLED), so `wait` after `kill` reports `EXIT_KILLED`,
 //!           unless the child had already died and its own exit reason,
 //!           posted first, is reported. A failed teardown is returned as
@@ -1041,10 +1041,10 @@ impl Process {
         }
         // The kernel posts to the main-thread binding only on voluntary
         // exit (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
-        // silent. procmgr posted the child's end to the relay before its
-        // reply, which the bridge (or `wait` directly, for non-piped
-        // spawns) reads first; the event posted here as well keeps a
-        // status after kill independent of that post. Value chosen outside
+        // silent. procmgr posts the child's end to the relay once, at the
+        // teardown, which the bridge (or `wait` directly, for non-piped
+        // spawns) reads when it is first; the event posted here as well
+        // keeps a status after kill independent of when that post lands. Value chosen outside
         // the kernel fault range (0x1000..0x2000) so callers can tell apart
         // a user-initiated kill from a hardware fault.
         let _ = syscall::event_post(self.death_eq, EXIT_KILLED);

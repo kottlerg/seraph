@@ -397,7 +397,7 @@ devmgr's responsibilities are:
   named by the directory's absolute path the request carries as a name block
   from data word `DRIVERS_DIR_PATH_WORD`, under the same declaration bounds as
   the `SET_DRIVERS_DIR` pass (auxiliary tier, no physical access, no IOMMU
-  family key, no boot-only class) against the device records still unbound,
+  family key) against the device records still unbound,
   starts the drivers it binds in a settle batch of its own, and serves them once
   it settles, within `SETTLE_TIMEOUT`. A record is bound at most once a boot, so
   a second request over the same directory binds nothing; a limited driver's
@@ -553,23 +553,21 @@ devmgr's responsibilities are:
 
   devmgr mints class SENDs on `MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`
   (badge bit 59), which svcmgr and init each derive from their badge-0
-  registry source and no published name carries. The request carries the verbs, the flags
-  (`CLASS_BOOT_ONLY`), and the class name (at most `MAX_CLASS_NAME_BYTES`, 32,
-  bytes); devmgr interns the class into its class table and replies a SEND
-  whose badge carries the class's slot and the verbs. svcmgr sends one per
+  registry source and no published name carries. The request carries the verbs
+  and the class name (at most `MAX_CLASS_NAME_BYTES`, 32, bytes); devmgr
+  interns the class into its class table and replies a SEND whose badge
+  carries the class's slot and the verbs. svcmgr sends one per
   class file before `SET_DRIVERS_DIR` ([service-definitions.md § Device class
   files](../../svcmgr/docs/service-definitions.md#device-class-files)); init requests the
   `block` class SEND for vfsd. The class table holds at most
   `MAX_CLASSES` (64) classes: a new class's request past it is refused, and a
-  ready driver of a new class is withdrawn, logged. devmgr refuses, logging
-  and not binding, a drivers-directory declaration whose class a request
-  marked boot-only, and refuses `INVALID_REQUEST` a boot-only mark after the
-  drivers-directory pass began. After the drivers-directory settle devmgr logs
+  ready driver of a new class is withdrawn, logged. After the drivers-directory
+  settle devmgr logs
   each class configured with no served driver and each served class no class
   file configured.
 
-  The `block` class's reply is the `MOUNT_AUTHORITY`-badged whole-disk cap, so
-  its class file marks it boot-only, and it reaches only vfsd, through the
+  The `block` class's reply is the `MOUNT_AUTHORITY`-badged whole-disk cap,
+  and it reaches only vfsd, through the
   class SEND init requests for it, and a service whose definition seeds
   `devmgr.class.block`, which no shipped definition does. The `debug-port`
   class answers with the debug port: the driver served under that class,

@@ -253,10 +253,8 @@ pub fn boot_pass(
 
 /// The drivers-directory pass: list `dir_cap`, the `/services/drivers/`
 /// directory svcmgr handed devmgr, read the declaration of each entry, and
-/// bind the records still unbound to them. A declaration `admits` refuses
-/// (one of a class a class request marked boot-only,
-/// [`firmware::binding::class_admits`]) is not considered, logged. Every file
-/// cap is released once the pass ends. `dir_path` is the absolute path of the
+/// bind the records still unbound to them. Every file cap is released once
+/// the pass ends. `dir_path` is the absolute path of the
 /// directory `dir_cap` names; each entry is named `dir_path/entry`, its install
 /// path, which procmgr verifies the driver's signature under. An entry whose
 /// name exceeds [`procmgr_labels::CREATE_NAME_MAX`] or cannot be allocated is
@@ -265,7 +263,6 @@ pub fn drivers_dir_pass(
     records: &mut Records,
     dir_cap: u64,
     dir_path: &[u8],
-    admits: impl Fn(&DriverDecl) -> bool,
     carve: &mut Carve,
     pass: &mut Pass,
     ipc_buf: *mut u64,
@@ -294,16 +291,7 @@ pub fn drivers_dir_pass(
             let _ = syscall::cap_delete(walked.file_cap);
             return;
         };
-        let mut decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
-        if let Some(d) = decl.filter(|d| !admits(d))
-        {
-            std::os::seraph::log!(
-                warn: "{}: declares boot-only class {}; not considered",
-                d.name.as_str(),
-                d.class.as_ref().map_or("", |c| c.as_str())
-            );
-            decl = None;
-        }
+        let decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
         let binary = Binary::File {
             cap: walked.file_cap,
             size: walked.size,

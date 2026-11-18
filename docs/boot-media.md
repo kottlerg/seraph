@@ -27,24 +27,21 @@ mount in [storage.md](storage.md).
 
 ## Implementation Status
 
-Partly implemented. Implemented: every service, driver, filesystem driver, program and test image is
-installed on the root filesystem at its install path and signed there ([signing.md](signing.md) §
-Signing); the bundle's executables are read from those installed images; the bundle is used during
-bootstrap alone (§ Bootstrap-Only Boot Copies); the loss of the root filesystem's driver or of its
-disk is system death; and the ESP holds no secret.
+Partly implemented. Implemented: every service, driver, filesystem driver, program and test image,
+and each of the bundle's data entries (the log-level configuration and the platform description
+tables), is installed on the root filesystem at its install path and signed there once, with the
+set of roles it may be loaded in ([signing.md](signing.md) § Signing); every bundle entry other
+than `init` is named by its install path and is its installed file byte for byte, and the
+composition of the bundle copies files and signs nothing; the bootloader refuses an entry without
+the boot-module role; the bundle is used during bootstrap alone (§ Bootstrap-Only Boot Copies); the
+loss of the root filesystem's driver or of its disk is system death; and the ESP holds no secret.
 
 Design intent, not yet implemented:
 
 - The kernel and the bootloader have no installed copy: they exist only on the ESP
   ([#1264](https://github.com/kottlerg/seraph/issues/1264)).
-- A bundle entry is not a copy of its installed file: xtask signs it again as it composes the
-  bundle, as a boot module under a short entry name, so the entry and the installed file differ
-  in their trailers ([#1263](https://github.com/kottlerg/seraph/issues/1263)).
 - The bundle is chosen by lists in xtask (`xtask/src/bundle.rs`), not by a list in
   configuration ([#1264](https://github.com/kottlerg/seraph/issues/1264)).
-- The bundle's data entries (the log-level configuration and the platform description tables)
-  are read from the repository and have no installed copy
-  ([#1263](https://github.com/kottlerg/seraph/issues/1263)).
 - No step checks that the ESP's objects equal their installed files
   ([#1265](https://github.com/kottlerg/seraph/issues/1265)).
 - The bundle carries more than the bootstrap closure: the serial and framebuffer drivers and,
@@ -64,8 +61,7 @@ installed file, made by a step that needs no key.
 
 The signature belongs to the object, not to the place it is copied to: an object has one
 identity, signed once, under its install path, with the set of roles it may be loaded in
-(design intent, [#1263](https://github.com/kottlerg/seraph/issues/1263);
-[signing.md](signing.md) § Signed Attributes). A copy therefore verifies wherever it lies as
+([signing.md](signing.md) § Signed Attributes). A copy therefore verifies wherever it lies as
 the installed file does. The kernel and the object in the bundle's `init` slot are signed under
 their slot names, `kernel` and `init`, since the bootloader loads them by slot, not by path.
 
@@ -84,8 +80,7 @@ object on the ESP is signed and public, and the trust store the bootloader verif
 built into the bootloader ([signing.md](signing.md) § Trust Store). The build composes the ESP
 this way, and so does any later recomposition on a running system. The list names only objects
 that carry the boot-module role; the bootloader refuses an entry without it, so writing the list
-cannot make an object bootable that its signer did not permit (design intent,
-[#1263](https://github.com/kottlerg/seraph/issues/1263)).
+cannot make an object bootable that its signer did not permit.
 
 An ESP whose objects all equal their installed files verifies as those files do. Composition
 checks that equality, and refuses an ESP it cannot establish it for (design intent,

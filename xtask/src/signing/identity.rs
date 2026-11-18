@@ -27,7 +27,7 @@ use std::process::{Command, Stdio};
 
 use objsig::store::LABEL_LEN;
 use objsig::{
-    AnchorSpec, Certificate, CertificateBody, KindSet, PublicKey, Signature, TrustStore, Usage,
+    AnchorSpec, Certificate, CertificateBody, PublicKey, RoleSet, Signature, TrustStore, Usage,
     key_id,
 };
 
@@ -398,7 +398,7 @@ fn local_identity(fill: &mut dyn FnMut(&mut [u8; 32])) -> Result<LocalFiles>
         issuer_key_id: key_id(&root_key),
         serial: 1,
         usage: Usage {
-            kinds: KindSet::ALL,
+            roles: RoleSet::ALL,
             certify: false,
         },
         min_security_version: 0,
@@ -416,7 +416,7 @@ fn local_identity(fill: &mut dyn FnMut(&mut [u8; 32])) -> Result<LocalFiles>
     let anchor = AnchorSpec {
         key: root_key,
         usage: Usage {
-            kinds: KindSet::ALL,
+            roles: RoleSet::ALL,
             certify: true,
         },
         local: true,

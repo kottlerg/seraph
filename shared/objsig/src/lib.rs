@@ -41,7 +41,7 @@ mod testutil;
 
 pub use attrs::Attributes;
 pub use cert::{Certificate, CertificateBody};
-pub use name::{NAME_MAX, name_is_canonical};
+pub use name::{NAME_MAX, name_is_canonical, name_is_install_path};
 pub use store::{Anchor, AnchorSpec, TrustStore};
 pub use trailer::{Record, RecordSpec, Records, Signed, encode_trailer, split, trailer_len};
 pub use verify::{
@@ -74,31 +74,32 @@ pub fn key_id(key: &PublicKey) -> KeyId
     id
 }
 
-/// The kind of a signed object, which binds a signature to the role its
-/// object is loaded in.
+/// A role an object may be loaded in, which a record's role set grants
+/// ([docs/signing.md](../../../docs/signing.md) § Signed Attributes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Kind
+pub enum Role
 {
     /// The kernel image.
     Kernel = 1,
-    /// The bundle entry `init`.
+    /// The object of the bundle's `init` slot.
     Init = 2,
-    /// Every other bundle entry.
+    /// An object the bootloader may load as a bundle entry other than
+    /// `init`, whatever its content.
     BootModule = 3,
-    /// A service image on the root filesystem.
+    /// A service image.
     Service = 4,
-    /// A driver image on the root filesystem.
+    /// A driver image.
     Driver = 5,
-    /// A program image on the root filesystem.
+    /// A program image.
     Program = 6,
-    /// A data file on the root filesystem.
+    /// A data file.
     Data = 7,
 }
 
-impl Kind
+impl Role
 {
-    /// Every kind, in wire order.
+    /// Every role, in bit order.
     pub const ALL: [Self; 7] = [
         Self::Kernel,
         Self::Init,
@@ -109,24 +110,7 @@ impl Kind
         Self::Data,
     ];
 
-    /// The kind a wire value names; `None` for a value no kind has.
-    #[must_use]
-    pub const fn from_u8(value: u8) -> Option<Self>
-    {
-        match value
-        {
-            1 => Some(Self::Kernel),
-            2 => Some(Self::Init),
-            3 => Some(Self::BootModule),
-            4 => Some(Self::Service),
-            5 => Some(Self::Driver),
-            6 => Some(Self::Program),
-            7 => Some(Self::Data),
-            _ => None,
-        }
-    }
-
-    /// The kind's bit in a [`KindSet`] and in a usage mask.
+    /// The role's bit in a [`RoleSet`] and in a usage mask.
     const fn bit(self) -> u8
     {
         1u8.wrapping_shl(self as u32)
@@ -160,54 +144,105 @@ impl Arch
     }
 }
 
-/// A set of [`Kind`]s: those a key may sign, or those a caller accepts.
+/// A set of [`Role`]s: those a record grants, those a key may sign, or
+/// those a caller accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct KindSet(u8);
+pub struct RoleSet(u8);
 
-impl KindSet
+impl RoleSet
 {
-    /// No kind.
+    /// No role.
     pub const EMPTY: Self = Self(0);
 
-    /// Every kind.
+    /// Every role.
     pub const ALL: Self = Self(0xfe);
 
-    /// The set of the given kinds.
+    /// The set of the given roles.
     #[must_use]
-    pub const fn of(kinds: &[Kind]) -> Self
+    pub const fn of(roles: &[Role]) -> Self
     {
         let mut bits = 0u8;
-        let mut rest = kinds;
-        while let [kind, tail @ ..] = rest
+        let mut rest = roles;
+        while let [role, tail @ ..] = rest
         {
-            bits |= kind.bit();
+            bits |= role.bit();
             rest = tail;
         }
         Self(bits)
     }
 
-    /// Whether the set holds `kind`.
+    /// The set a signed `roles` byte encodes; `None` unless it obeys
+    /// docs/signing.md § Signed Attributes: bit 0 clear, at least one role,
+    /// and kernel or init only alone.
     #[must_use]
-    pub const fn contains(self, kind: Kind) -> bool
+    pub const fn from_signed(bits: u8) -> Option<Self>
     {
-        self.0 & kind.bit() != 0
+        let set = Self(bits);
+        if set.is_signable() { Some(set) } else { None }
     }
 
-    /// The kinds both sets hold.
+    /// Whether the set may be a record's `roles`: no bit outside the
+    /// roles', not empty, and a set holding kernel or init holds no other
+    /// role.
+    #[must_use]
+    pub const fn is_signable(self) -> bool
+    {
+        let slot = Self::of(&[Role::Kernel, Role::Init]).0;
+        self.0 & !Self::ALL.0 == 0
+            && self.0 != 0
+            && (self.0 & slot == 0 || self.0.is_power_of_two())
+    }
+
+    /// The set's byte, bit `n` for role `n`.
+    #[must_use]
+    pub const fn bits(self) -> u8
+    {
+        self.0
+    }
+
+    /// Whether the set holds `role`.
+    #[must_use]
+    pub const fn contains(self, role: Role) -> bool
+    {
+        self.0 & role.bit() != 0
+    }
+
+    /// Whether every role of the set is in `other`.
+    #[must_use]
+    pub const fn is_subset(self, other: Self) -> bool
+    {
+        self.0 & !other.0 == 0
+    }
+
+    /// Whether the set and `other` hold a role in common.
+    #[must_use]
+    pub const fn meets(self, other: Self) -> bool
+    {
+        self.0 & other.0 != 0
+    }
+
+    /// The roles both sets hold.
     #[must_use]
     pub const fn intersection(self, other: Self) -> Self
     {
         Self(self.0 & other.0)
     }
+
+    /// The roles either set holds.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self
+    {
+        Self(self.0 | other.0)
+    }
 }
 
-/// A key's usage mask: the kinds it may sign, and whether it may issue
+/// A key's usage mask: the roles it may sign, and whether it may issue
 /// certificates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage
 {
-    /// The kinds the key may sign.
-    pub kinds: KindSet,
+    /// The roles the key may sign.
+    pub roles: RoleSet,
     /// Whether the key may issue certificates (`CERTIFY`, bit 31).
     pub certify: bool,
 }
@@ -217,18 +252,18 @@ impl Usage
     /// The `CERTIFY` bit of a wire usage mask.
     pub const CERTIFY_BIT: u32 = 1 << 31;
 
-    /// The usage a wire mask encodes; `None` when a bit other than a kind's
+    /// The usage a wire mask encodes; `None` when a bit other than a role's
     /// bit or `CERTIFY` is set.
     #[must_use]
     pub fn from_bits(bits: u32) -> Option<Self>
     {
-        let kinds = u8::try_from(bits & !Self::CERTIFY_BIT).ok()?;
-        if kinds & !KindSet::ALL.0 != 0
+        let roles = u8::try_from(bits & !Self::CERTIFY_BIT).ok()?;
+        if roles & !RoleSet::ALL.0 != 0
         {
             return None;
         }
         Some(Self {
-            kinds: KindSet(kinds),
+            roles: RoleSet(roles),
             certify: bits & Self::CERTIFY_BIT != 0,
         })
     }
@@ -238,7 +273,7 @@ impl Usage
     pub fn to_bits(self) -> u32
     {
         let certify = if self.certify { Self::CERTIFY_BIT } else { 0 };
-        u32::from(self.kinds.0) | certify
+        u32::from(self.roles.0) | certify
     }
 }
 
@@ -256,6 +291,8 @@ pub enum EncodeError
     RecordCount,
     /// A name is empty.
     EmptyName,
+    /// A record's role set breaks a rule of [`RoleSet::is_signable`].
+    Roles,
     /// A certificate's usage has `CERTIFY`, or its security-version range
     /// is empty.
     Certificate,
@@ -298,15 +335,15 @@ pub enum ParseError
     AttributesLength,
     /// The signed attributes do not begin with their domain tag.
     AttributesDomain,
-    /// The signed `kind` names no [`Kind`].
-    Kind,
+    /// The signed `roles` is not a set [`RoleSet::from_signed`] accepts.
+    Roles,
     /// The signed `arch` names no [`Arch`].
     Arch,
     /// The signed name is empty.
     EmptyName,
     /// A certificate does not begin with its domain tag.
     CertificateDomain,
-    /// A certificate's usage has a bit no kind and not `CERTIFY` has.
+    /// A certificate's usage has a bit no role and not `CERTIFY` has.
     CertificateUsage,
     /// A certificate's usage has `CERTIFY`.
     CertificateCertify,
@@ -332,7 +369,7 @@ pub enum StoreError
     Version,
     /// `anchor_count` is 0.
     NoAnchor,
-    /// An anchor's usage has a bit no kind and not `CERTIFY` has.
+    /// An anchor's usage has a bit no role and not `CERTIFY` has.
     AnchorUsage,
     /// An anchor's flags have a bit other than `LOCAL`.
     AnchorFlags,

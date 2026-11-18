@@ -32,15 +32,21 @@ pub const MAGIC: [u8; 8] = *b"SRPHBNDL";
 
 /// Bundle format version. Incremented on any non-backwards-compatible
 /// layout change.
-pub const VERSION: u32 = 1;
+///
+/// v2: [`ENTRY_NAME_LEN`] rose from 32 to 256, so [`ENTRY_HEADER_SIZE`]
+///     rose from 48 to 272.
+pub const VERSION: u32 = 2;
 
-/// Length of [`BundleEntryHeader::name`] — also the size of
-/// [`crate::BootModule::name`], by convention, so producers copy the name
-/// straight through.
+/// Length of [`BundleEntryHeader::name`], and of
+/// [`crate::BootModule::name`], so the bootloader copies the name straight
+/// through: `objsig::NAME_MAX`, the longest name an object is signed under,
+/// so the field holds every install path whole. This crate depends on
+/// nothing, so the bootloader and xtask, which see both, assert the two are
+/// equal.
 ///
 /// The value is an ABI width of the bundle wire format (it fixes
-/// [`ENTRY_HEADER_SIZE`]) and bounds only the length of a module identifier.
-pub const ENTRY_NAME_LEN: usize = 32;
+/// [`ENTRY_HEADER_SIZE`]).
+pub const ENTRY_NAME_LEN: usize = 256;
 
 /// Bundle body alignment in bytes. The bootloader allocates the whole
 /// bundle as one UEFI page region, then exposes each entry as a slice at
@@ -53,8 +59,9 @@ pub const BODY_ALIGNMENT: u64 = 4096;
 /// The bootloader ELF-parses the entry whose name matches this constant
 /// (after NUL trimming) and places the result in
 /// [`crate::BootInfo::init_image`]. Exactly one entry MUST carry this
-/// name; absence is a hard boot failure. No entry may carry the name
-/// [`crate::TRUST_STORE_MODULE`], which the bootloader reserves for the
+/// name; absence is a hard boot failure. Every other entry MUST be named by
+/// an install path (`objsig::name_is_install_path`), so none carries the
+/// name [`crate::TRUST_STORE_MODULE`], which the bootloader reserves for the
 /// module it adds.
 pub const INIT_ENTRY_NAME: &[u8] = b"init";
 
@@ -65,7 +72,7 @@ pub const HEADER_SIZE: usize = 16;
 
 /// On-disk size of [`BundleEntryHeader`] in bytes.
 ///
-/// `name (32) + offset (8) + size (8)` with no padding.
+/// `name (256) + offset (8) + size (8)` with no padding.
 pub const ENTRY_HEADER_SIZE: usize = ENTRY_NAME_LEN + 8 + 8;
 
 /// Bundle file header.
@@ -90,9 +97,11 @@ pub struct BundleHeader
 #[derive(Clone, Copy, Debug)]
 pub struct BundleEntryHeader
 {
-    /// Entry identifier, NUL-padded. Producers MUST write the name's bytes
-    /// from index 0 and fill the remainder with zeros; consumers MUST trim
-    /// at the first NUL before comparison.
+    /// Entry name: [`INIT_ENTRY_NAME`], or the install path of the file the
+    /// entry copies, NUL-padded. Producers MUST write the name's bytes from
+    /// index 0 and fill the remainder with zeros; consumers MUST trim at the
+    /// first NUL before comparison. A name of [`ENTRY_NAME_LEN`] bytes has no
+    /// NUL.
     pub name: [u8; ENTRY_NAME_LEN],
     /// Byte offset within the bundle file at which the body starts. MUST
     /// be a multiple of [`BODY_ALIGNMENT`].
@@ -379,6 +388,14 @@ mod tests
         buf[12..16].copy_from_slice(&2u32.to_le_bytes());
         let short = &buf[..HEADER_SIZE + ENTRY_HEADER_SIZE + 10];
         assert_eq!(parse_header(short).unwrap_err(), BundleError::TooSmall);
+    }
+
+    // ABI contract: the entry header's size is part of [`VERSION`].
+    #[test]
+    fn entry_header_size_is_stable()
+    {
+        assert_eq!(ENTRY_HEADER_SIZE, 272);
+        assert_eq!(ENTRY_HEADER_SIZE, core::mem::size_of::<BundleEntryHeader>());
     }
 
     #[test]

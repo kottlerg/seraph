@@ -363,12 +363,12 @@ partition, except the discoverable `/data` mountpoint.
 
 The ESP is derived from the root partition ([boot-media.md](boot-media.md)): every object on it,
 the bootloader and the kernel included, is a byte copy of a file installed on the root partition,
-and composing it copies files and signs nothing. That is design intent, not yet implemented: the
-kernel and the bootloader are installed under `esp/` alone, and the bundle's entries are chosen by
-the lists in `xtask/src/bundle.rs` ([#1264](https://github.com/kottlerg/seraph/issues/1264));
-its data entries are read from the repository (`ARCH_TABLES`, `LOG_LEVELS_SOURCE`), and the
-composer signs each entry again under its entry name
-([#1263](https://github.com/kottlerg/seraph/issues/1263)).
+and composing it copies files and signs nothing. The bundle is composed so: each entry is a byte
+copy of its installed file, the data entries included, which the build installs under `/config/`
+from the repository (`ARCH_TABLES`, `LOG_LEVELS`). The rest is design intent, not yet
+implemented: the kernel and the bootloader are installed under `esp/` alone, and the bundle's
+entries are chosen by the lists in `xtask/src/bundle.rs`
+([#1264](https://github.com/kottlerg/seraph/issues/1264)).
 
 The `esp/` and root-partition trees are populated from two sources:
 
@@ -388,8 +388,9 @@ The `esp/` and root-partition trees are populated from two sources:
   synthesised `data/svctest/` fixtures are left untouched (see
   [`rootfs/README.md`](../rootfs/README.md)).
 
-Each packing of a disk image signs the kernel and the ELF images under `services/`,
-`programs/` and `tests/` in place, so each ends in a signature trailer
+Each packing of a disk image, and each composition of the bundle, signs the kernel, the ELF images
+under `services/`, `programs/` and `tests/` and the bundle's data entries in place, so each ends in
+a signature trailer
 ([signing.md § Signed Object Format](signing.md#signed-object-format)); the bootloader verifies
 the kernel and each bundle entry, and procmgr every image it creates, and each loads only the body
 the verifier returns. In

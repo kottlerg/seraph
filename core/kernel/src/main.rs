@@ -1185,9 +1185,9 @@ unsafe fn kernel_entry_post_rebase(
             };
 
             // The descriptors are already in the InitInfo region, written
-            // there in Phases 7 and 8 right after the header, within the
-            // capacity Phase 7 sized the region for.
-            let descriptors_offset = core::mem::size_of::<InitInfo>() as u32;
+            // there in Phases 7 and 8 right after the header and the
+            // boot-module name table, within the capacity Phase 7 sized the
+            // region for.
             // SAFETY: single-threaded boot; cspace_layout produced by Phases 7
             // and 8.
             let desc_slice = unsafe { cap::descriptors(&cspace_layout) };
@@ -1211,12 +1211,15 @@ unsafe fn kernel_entry_post_rebase(
             // physical contiguity. Every page of the region is mapped and
             // minted below; Phase 7 sized it for this boot's descriptors, and
             // the region was zeroed then, before they were written into it.
-            let (block_phys, info_pages) = cap::take_init_info_block();
+            let (block_phys, info_pages, descriptors_offset) = cap::take_init_info_block();
             debug_assert!(
-                core::mem::size_of::<InitInfo>().saturating_add(core::mem::size_of_val(desc_slice))
+                descriptors_offset.saturating_add(core::mem::size_of_val(desc_slice))
                     <= info_pages.saturating_mul(mm::PAGE_SIZE),
                 "Phase 9: {desc_count} descriptors overrun the {info_pages}-page InitInfo region"
             );
+            // Below the region's 64-page ceiling (the debug_assert above
+            // states it; Phase 7 sized the region), so it fits a u32.
+            let descriptors_offset = descriptors_offset as u32;
             for pg in 0..info_pages
             {
                 let phys = pages_above(block_phys, pg, "Phase 9: InitInfo extent wraps");
@@ -1237,7 +1240,7 @@ unsafe fn kernel_entry_post_rebase(
 
             // Write the InitInfo header's fields in place (it always fits in
             // the first page). Phase 7 zeroed the region and wrote the
-            // boot-module name table and its count into the header
+            // boot-module name table after the header and its count into it
             // (`cap::mint_module_memory_caps`); those stay as written, and
             // the fields patched below stay zero until then. No copy of the
             // header is built on this stack.

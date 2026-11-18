@@ -68,7 +68,7 @@ pub const START_PROCESS: u64 = 2;
 ///
 /// The name is the install path the creator expects the file to have been
 /// signed under; a create whose object does not verify under it, or
-/// whose kind the creator's signature policy does not allow, is refused
+/// whose roles meet none the creator's signature policy allows, is refused
 /// with `procmgr_errors::SIGNATURE_REFUSED`.
 ///
 /// Reply: `data[0]` is the max the child's memmgr budget node took after
@@ -251,8 +251,8 @@ pub const ARGV_ENV_HEADER_WORDS: usize = 4;
 /// the name block start, in that order, each present or not.
 pub const CREATE_FIRST_WORD: usize = 1;
 /// Longest name, in bytes, a create request's name block carries: an
-/// install path or a bundle entry name, the longest name in the canonical
-/// form an object is signed under (`objsig::NAME_MAX`, which procmgr's
+/// install path, the longest name in the canonical form an object is
+/// signed under (`objsig::NAME_MAX`, which procmgr's
 /// host tests pin this to; docs/signing.md § Signed Attributes). 32 data
 /// words; with the length word and the words before it a request stays
 /// under `MSG_DATA_WORDS_MAX`.

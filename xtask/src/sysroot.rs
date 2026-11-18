@@ -4,7 +4,7 @@
 // xtask/src/sysroot.rs
 
 //! Sysroot architecture consistency checks, arch recording, and rootfs
-//! installation.
+//! installation, the bundle's data entries included.
 //!
 //! The sysroot is built for one architecture at a time. The active arch is
 //! recorded in `sysroot/.arch`. Switching architectures requires `cargo xtask
@@ -55,7 +55,8 @@ pub fn record_arch(ctx: &BuildContext, arch: Arch) -> Result<()>
 }
 
 /// Top-level sysroot subtrees the rootfs mirror owns exclusively: rootfs static
-/// files plus the synthesised `data/svctest/` fixtures. The prune pass is
+/// files, the bundle's data entries ([`install_data_entries`]) and the
+/// synthesised `data/svctest/` fixtures. The prune pass is
 /// authoritative over these and only these. Build-owned trees (`esp/`,
 /// `services/`, `programs/`, `tests/`) and metadata (`.arch`, `NvVars`) are
 /// deliberately absent, so a scoping mistake cannot delete a binary.
@@ -67,7 +68,8 @@ const ROOTFS_MANAGED_ROOTS: &[&str] = &["config", "data"];
 /// sysroot directory, empty or not.
 const EMPTY_DIRS: &[&str] = &["crash"];
 
-/// Mirror `rootfs/` into the sysroot (skipping README.md), create
+/// Mirror `rootfs/` into the sysroot (skipping README.md), install the data
+/// entries of `arch`'s bundle ([`install_data_entries`]), create
 /// [`EMPTY_DIRS`], then make the mirror authoritative over
 /// [`ROOTFS_MANAGED_ROOTS`].
 ///
@@ -77,20 +79,22 @@ const EMPTY_DIRS: &[&str] = &["crash"];
 /// changes required.
 ///
 /// After copying, files under the managed roots with no `rootfs/` source (nor a
-/// synthesised-fixture origin) are removed, so deleting a file from `rootfs/` is
+/// data-entry or synthesised-fixture origin) are removed, so deleting a file from `rootfs/` is
 /// reflected in the sysroot and the disk image on the next build. Build-owned
 /// subtrees are never touched. `mkdisk --repack-only` bypasses this whole step
-/// to pack a hand-staged sysroot as it stands, its images re-signed as every
+/// to pack a hand-staged sysroot as it stands, its objects re-signed as every
 /// pack signs them.
-pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
+pub fn install_rootfs(ctx: &BuildContext, arch: Arch) -> Result<()>
 {
     let src_root = ctx.root.join("rootfs");
-    if !src_root.exists()
+    let mut files = if src_root.exists()
     {
-        return Ok(());
+        collect_files(&src_root)?
     }
-
-    let mut files = collect_files(&src_root)?;
+    else
+    {
+        Vec::new()
+    };
     files.sort();
 
     let mut keep: HashSet<PathBuf> = HashSet::new();
@@ -117,6 +121,7 @@ pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
         keep.insert(dst);
     }
 
+    keep.extend(install_data_entries(ctx, arch)?);
     keep.insert(synthesise_svctest_large_bin(ctx)?);
     keep.insert(synthesise_svctest_bench_bin(ctx)?);
     for dir in EMPTY_DIRS
@@ -133,6 +138,34 @@ pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
     prune_stale(&roots, &keep)?;
 
     Ok(())
+}
+
+/// Install each data entry of `arch`'s default-init bundle
+/// (`crate::bundle::data_entries`): copy its repository source to its install
+/// path, unsigned, for the sign that precedes every compose and pack
+/// (`crate::signing::sign_sysroot`). Returns the installed paths, which the
+/// prune pass keeps.
+///
+/// # Errors
+///
+/// When a source is missing or a copy fails.
+pub fn install_data_entries(ctx: &BuildContext, arch: Arch) -> Result<Vec<PathBuf>>
+{
+    let mut installed = Vec::new();
+    for entry in crate::bundle::data_entries(arch)
+    {
+        let src = ctx.root.join(entry.source);
+        let dst = ctx.sysroot.join(entry.relative());
+        if let Some(parent) = dst.parent()
+        {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::copy(&src, &dst)
+            .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
+        step(&format!("Rootfs: {} (bundle data entry)", dst.display()));
+        installed.push(dst);
+    }
+    Ok(installed)
 }
 
 const SVCTEST_LARGE_BIN_PAGES: usize = 4;
@@ -338,9 +371,9 @@ mod tests
         fs::remove_dir_all(&sysroot).unwrap();
     }
 
-    /// End-to-end: `install_rootfs` mirrors `rootfs/`, synthesises the fixtures,
-    /// and prunes a stale sysroot recipe while leaving a build-owned binary
-    /// untouched. Covers `ROOTFS_MANAGED_ROOTS` and the keep-set construction —
+    /// End-to-end: `install_rootfs` mirrors `rootfs/`, installs the bundle's
+    /// data entries, synthesises the fixtures, and prunes a stale sysroot
+    /// recipe while leaving a build-owned binary untouched. Covers `ROOTFS_MANAGED_ROOTS` and the keep-set construction —
     /// the pieces that make the prune safe — which the `prune_stale` unit tests,
     /// rebuilding roots and keep by hand, do not.
     #[test]
@@ -360,6 +393,15 @@ mod tests
         .unwrap();
         fs::create_dir_all(root.join("rootfs/data")).unwrap();
         fs::write(root.join("rootfs/data/test.txt"), b"marker").unwrap();
+        // The repository sources of the bundle's data entries.
+        let arch = Arch::Riscv64;
+        let data = crate::bundle::data_entries(arch);
+        for entry in &data
+        {
+            let src = root.join(entry.source);
+            fs::create_dir_all(src.parent().unwrap()).unwrap();
+            fs::write(&src, entry.install.as_bytes()).unwrap();
+        }
 
         // Pre-existing sysroot: a stale recipe under a managed root (no rootfs
         // source) and a build-owned binary outside the managed roots.
@@ -379,7 +421,7 @@ mod tests
             sysroot: sysroot.clone(),
             target_dir: base.join("target"),
         };
-        install_rootfs(&ctx).unwrap();
+        install_rootfs(&ctx, arch).unwrap();
 
         assert!(
             sys_services.join("procmgr.svc").exists(),
@@ -409,6 +451,16 @@ mod tests
             sysroot.join("crash").is_dir(),
             "empty image directory created"
         );
+        // Defect caught: a data entry not installed, or pruned as a file with
+        // no `rootfs/` source, so the sign before a compose fails.
+        assert!(data.len() >= 2, "riscv64 installs a platform table");
+        for entry in &data
+        {
+            assert_eq!(
+                fs::read(sysroot.join(entry.relative())).unwrap(),
+                entry.install.as_bytes()
+            );
+        }
 
         fs::remove_dir_all(&base).unwrap();
     }

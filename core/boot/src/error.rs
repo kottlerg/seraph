@@ -104,18 +104,24 @@ pub enum BootError
 
 /// The name of an object the verifier refused, copied, so a [`BootError`]
 /// does not borrow the buffer the object was read into. A name longer than
-/// [`ObjectName::CAPACITY`] is cut at it.
+/// [`ObjectName::CAPACITY`] is cut at it, and printed with `...` after the
+/// cut.
 #[derive(Clone, Copy, Debug)]
 pub struct ObjectName
 {
     bytes: [u8; Self::CAPACITY],
     len: usize,
+    cut: bool,
 }
 
 impl ObjectName
 {
-    /// The longest name kept: a bundle entry name's width.
-    pub const CAPACITY: usize = boot_protocol::BOOT_MODULE_NAME_LEN;
+    /// The longest name kept. Every name a build gives an object fits; a
+    /// copy of the bundle entry name's full width
+    /// (`boot_protocol::BOOT_MODULE_NAME_LEN`) would make every
+    /// `Result<_, BootError>` of the bootloader carry a quarter-kilobyte
+    /// error, to print a name no build makes whole.
+    pub const CAPACITY: usize = 64;
 
     /// A copy of `name`, cut at [`Self::CAPACITY`] bytes.
     pub fn new(name: &[u8]) -> Self
@@ -126,7 +132,11 @@ impl ObjectName
         {
             *out = byte;
         }
-        Self { bytes, len }
+        Self {
+            bytes,
+            len,
+            cut: name.len() > Self::CAPACITY,
+        }
     }
 
     /// The name's bytes.
@@ -142,9 +152,14 @@ impl core::fmt::Display for ObjectName
     {
         match core::str::from_utf8(self.as_bytes())
         {
-            Ok(name) => f.write_str(name),
-            Err(_) => f.write_str("<a name that is not UTF-8>"),
+            Ok(name) => f.write_str(name)?,
+            Err(_) => f.write_str("<a name that is not UTF-8>")?,
         }
+        if self.cut
+        {
+            f.write_str("...")?;
+        }
+        Ok(())
     }
 }
 
@@ -367,15 +382,25 @@ mod tests
     fn a_signature_refusal_names_the_object_and_the_refusal()
     {
         let err = BootError::SignatureRefused {
-            object: ObjectName::new(b"platform-qemu-virt"),
+            object: ObjectName::new(b"/config/devmgr/platform/qemu-virt.platform"),
             refusal: objsig::Refusal::Failed(objsig::RecordFailure::BodyHash),
         };
         assert_eq!(
             std::format!("{err}"),
-            "signature verification refused: platform-qemu-virt: Failed(BodyHash)"
+            "signature verification refused: /config/devmgr/platform/qemu-virt.platform: \
+             Failed(BodyHash)"
         );
-        let long = ObjectName::new(&[b'a'; 40]);
+        let long = ObjectName::new(&[b'a'; boot_protocol::BOOT_MODULE_NAME_LEN]);
         assert_eq!(long.as_bytes().len(), ObjectName::CAPACITY);
+        assert_eq!(
+            std::format!("{long}"),
+            std::format!("{}...", "a".repeat(ObjectName::CAPACITY))
+        );
+        let fits = ObjectName::new(b"/config/devmgr/platform/qemu-virt.platform");
+        assert_eq!(
+            std::format!("{fits}"),
+            "/config/devmgr/platform/qemu-virt.platform"
+        );
     }
 
     // ── detail() — variants without string payloads return None ──────────────

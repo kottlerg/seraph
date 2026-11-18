@@ -191,10 +191,10 @@ pub struct ProcessEntry
     /// The child's name, the first string of its argv, which
     /// `LIST_PROCESSES` reports.
     pub name: ProcessName,
-    /// The kinds of object the child's own creates may load: its signature
+    /// The roles of object the child's own creates may load: its signature
     /// policy ([`sign_policy`]), its creator's narrowed by the child's own
-    /// verified kind ([`sign_policy::child_kinds`]).
-    pub sign_kinds: objsig::KindSet,
+    /// verified role set ([`sign_policy::child_roles`]).
+    pub sign_roles: objsig::RoleSet,
     /// Slot in procmgr's `CSpace` of the main-thread cap of the debugger
     /// attached to the child (`ATTACH_PROCESS` `caps[0]`); `0` with none.
     /// Once that thread has exited, procmgr restores the child's crash
@@ -1240,7 +1240,7 @@ impl ProcessTable
                 memmgr_badge: e.memmgr_badge,
                 reserve: e.reserve,
                 unbadged: false,
-                sign_kinds: e.sign_kinds,
+                sign_roles: e.sign_roles,
             })
     }
 }
@@ -1250,7 +1250,7 @@ impl ProcessTable
 /// What a create request's child takes from its creator
 /// ([`ProcessTable::creator_of`]): its spawn ceiling, its memmgr budget
 /// node's parent, whether it may be phys-class or a reserve node, and the
-/// kinds of object it may be loaded from.
+/// roles of object its creates may load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Creator
 {
@@ -1265,9 +1265,9 @@ pub struct Creator
     /// Whether the creator is un-badged (badge `0`): init, or svcmgr's mint
     /// source.
     pub unbadged: bool,
-    /// The creator's signature policy: the kinds of object its creates may
+    /// The creator's signature policy: the roles of object its creates may
     /// load ([`sign_policy`]).
-    pub sign_kinds: objsig::KindSet,
+    pub sign_roles: objsig::RoleSet,
 }
 
 impl Creator
@@ -1278,13 +1278,13 @@ impl Creator
     /// node handle are top-level reserve nodes (init's own record parents no
     /// process), a charged child sits under the handle's node outside the
     /// reserve, it may ask for a phys-class child, and its creates may load
-    /// every kind procmgr loads ([`sign_policy::LOADABLE`]).
+    /// every role a process runs in ([`sign_policy::LOADABLE`]).
     pub const UNBADGED: Creator = Creator {
         band_max: ipc::sched_policy::BASELINE_PRIORITY_MAX,
         memmgr_badge: 0,
         reserve: true,
         unbadged: true,
-        sign_kinds: sign_policy::LOADABLE,
+        sign_roles: sign_policy::LOADABLE,
     };
 
     /// Whether the creator may ask for a phys-class child: an un-badged one,
@@ -1907,7 +1907,7 @@ mod tests
             image: ImageSpan::default(),
             threads: ThreadRegistry::new(),
             name: ProcessName::EMPTY,
-            sign_kinds: objsig::KindSet::EMPTY,
+            sign_roles: objsig::RoleSet::EMPTY,
             debugger: 0,
             parent: 0,
             contained: false,
@@ -2911,7 +2911,7 @@ mod tests
             memmgr_badge,
             reserve: true,
             unbadged: false,
-            sign_kinds: sign_policy::LOADABLE,
+            sign_roles: sign_policy::LOADABLE,
         }
     }
 
@@ -3114,7 +3114,7 @@ mod tests
         entry.memmgr_badge = 0x77;
         entry.band_max = 9;
         entry.reserve = true;
-        entry.sign_kinds = objsig::KindSet::of(&[objsig::Kind::Program]);
+        entry.sign_roles = objsig::RoleSet::of(&[objsig::Role::Program]);
         assert_eq!(table.insert(entry), Ok(()));
         assert_eq!(table.creator_of(0), Some(Creator::UNBADGED));
         assert_eq!(
@@ -3124,7 +3124,7 @@ mod tests
                 memmgr_badge: 0x77,
                 reserve: true,
                 unbadged: false,
-                sign_kinds: objsig::KindSet::of(&[objsig::Kind::Program]),
+                sign_roles: objsig::RoleSet::of(&[objsig::Role::Program]),
             })
         );
         // A reaped process's badge, and a verb-badged cap's.

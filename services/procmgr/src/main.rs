@@ -1832,7 +1832,7 @@ fn check_create_request<'a>(
 /// against the creator's spawn ceiling, and the child's memmgr registration
 /// (its budget node's parent, its max, reserve membership and class) against
 /// the creator's node and class; the child's signature policy starts as the
-/// creator's (`process_table::Creator::sign_kinds`). `None` means the request
+/// creator's (`process_table::Creator::sign_roles`). `None` means the request
 /// must be rejected with
 /// `INVALID_ARGUMENT`: still-reserved label bits are set, the badge names no
 /// creator (`process_table::ProcessTable::creator_of`), the requested band
@@ -1891,7 +1891,7 @@ fn resolve_create_sched(
         priority,
         band_max,
         budget,
-        sign_kinds: creator.sign_kinds,
+        sign_roles: creator.sign_roles,
         creator: req.badge,
         contained: label & procmgr_labels::CREATE_CONTAIN != 0,
     })
@@ -2205,7 +2205,7 @@ struct CreateRequest<'a>
 /// argv and env, read its object once into a buffer on its account
 /// ([`image::read_module`], [`image::read_file`]), verify the copy under the
 /// request's name and `sched`'s signature policy ([`image::verify`]), narrow
-/// the policy by the verified kind, and load the verified body
+/// the policy by the verified role set, and load the verified body
 /// (`process::create_process_from_bytes`). The buffer goes back to memmgr
 /// before the registration settles. Single exit: any failure, a refused
 /// signature among them, creates nothing and releases what it took.
@@ -2279,10 +2279,10 @@ fn create_child(
             ipc_buf,
         ),
     }?;
-    let verified = image::verify(ctx, buffer.bytes(), request.name, sched.sign_kinds)
+    let verified = image::verify(ctx, buffer.bytes(), request.name, sched.sign_roles)
         .map_err(|_| procmgr_errors::SIGNATURE_REFUSED)?;
-    sched.sign_kinds =
-        process_table::sign_policy::child_kinds(sched.sign_kinds, verified.attrs.kind);
+    sched.sign_roles =
+        process_table::sign_policy::child_roles(sched.sign_roles, verified.attrs.roles);
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,

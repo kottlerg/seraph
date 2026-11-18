@@ -709,12 +709,12 @@ pub struct KernelObjectHeader
 When a slot is cleared (for example by deletion, revocation, or the teardown of the CSpace holding
 it) or a kernel-internal owner releases its reference, the reference count is decremented. When it
 reaches zero, the object's bytes are returned to the Memory object it was retyped from
-(`retype_free`). Apart from a never-published body that a failed split or a failed
-`SYS_CAP_CREATE_*` insert rolls back at its initial count, this is the only mechanism by which
-kernel objects are freed — there is no explicit "destroy" syscall (see
+(`retype_free`). Apart from a never-published body that a failed split, a failed `SYS_MMIO_MERGE`,
+or a failed `SYS_CAP_CREATE_*` insert rolls back at its initial count, this is the only mechanism by
+which kernel objects are freed — there is no explicit "destroy" syscall (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim). A holder reads
-whether the count holds anything beyond its own slot with `SYS_CAP_INFO`'s
-`CAP_INFO_SOLE_REFERENCE` ([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO`).
+whether the count holds anything beyond its own slot with `SYS_CAP_INFO`'s `CAP_INFO_SOLE_REFERENCE`
+([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO`).
 
 A Memory object also counts, apart from its reference count, the capability slots that name it
 (`MemoryObject::slot_count`): `CSpace::fill_slot`, the one fill every insert goes through, raises
@@ -835,16 +835,16 @@ The principal kernel-internal owners:
   § Wait Set Add/Remove.
 
 **Pin invariant.** A syscall pin may be taken only on an object whose count is not zero, so
-`pin_slot` takes it under the CSpace lock while the slot it reads is still occupied, and every
-path that frees an occupied slot clears the slot under that CSpace's lock before it releases the
+`pin_slot` takes it under the CSpace lock while the slot it reads is still occupied, and every path
+that frees an occupied slot clears the slot under that CSpace's lock before it releases the
 reference the slot held: `SYS_CAP_DELETE`, the revoke batch's `unlink_free_collect`, the range
 splits' consume of the original (`install_split_children`) and their rollback of a child, the
-`SYS_MEMORY_MERGE` tail, and a move's freed source (`free_source`, released through
-`release_moved_object`). A slot observed occupied under the lock therefore still holds its
-reference, and the increment lands before any release can reach zero. The one release that
-clears no slot, the dying CSpace's `for_each_object` drop in its `dealloc_object` arm, runs only
-after every thread bound to the CSpace is stopped and off every CPU and the CSpace is unregistered,
-so no `pin_slot` can be reading it.
+`SYS_MEMORY_MERGE` tail, both caps a `SYS_MMIO_MERGE` consumes (`commit_mmio_merge`), and a move's
+freed source (`free_source`, released through `release_moved_object`). A slot observed occupied
+under the lock therefore still holds its reference, and the increment lands before any release can
+reach zero. The one release that clears no slot, the dying CSpace's `for_each_object` drop in its
+`dealloc_object` arm, runs only after every thread bound to the CSpace is stopped and off every CPU
+and the CSpace is unregistered, so no `pin_slot` can be reading it.
 
 ---
 

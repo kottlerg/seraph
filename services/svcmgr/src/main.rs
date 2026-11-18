@@ -138,8 +138,7 @@ fn main() -> !
     // classes and publish their SENDs, and hand devmgr its drivers dir — all
     // from the handover endowment caps — before the event loop, so they are
     // in place before `HANDOVER_COMPLETE` drives reconciliation and any
-    // launched consumer resolves them. The classes go first: a class file's
-    // boot-only mark must reach devmgr before its drivers-directory pass.
+    // launched consumer resolves them.
     publish_well_known(&mut state.registry, &caps);
     classes::configure(
         &mut state.registry,

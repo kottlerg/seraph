@@ -38,8 +38,6 @@ struct Entry<T>
     watchers: Watchers,
     /// A class request named it.
     configured: bool,
-    /// A class request marked its drivers boot-bundle only.
-    boot_only: bool,
 }
 
 /// Why [`Classes::configure`] refused a class request.
@@ -49,9 +47,6 @@ pub enum ConfigureError
     /// The class is new and the table holds [`MAX_CLASSES`] classes or
     /// cannot grow.
     Full,
-    /// A boot-only mark once the drivers-directory pass has begun, which
-    /// could no longer keep that pass's drivers of the class out.
-    BootOnlyTooLate,
 }
 
 /// What [`Classes::mismatches`] reports of a class.
@@ -109,7 +104,6 @@ impl<T> Classes<T>
             served: Served::new(),
             watchers: Watchers::new(),
             configured: false,
-            boot_only: false,
         });
         Some(index)
     }
@@ -123,43 +117,19 @@ impl<T> Classes<T>
         self.entries.get_mut(slot).map(|e| &mut e.served)
     }
 
-    /// Record a class request for `name`: intern it, mark it configured,
-    /// and boot-only when `boot_only` is set (a mark that stays for the
-    /// boot). Returns the class's slot. A boot-only mark is refused once
-    /// `pass_begun`, the drivers-directory pass having begun.
+    /// Record a class request for `name`: intern it and mark it configured.
+    /// Returns the class's slot.
     ///
     /// # Errors
     /// [`ConfigureError`].
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "`boot_only` is the request's boot-only mark, stored on the class, and \
-                  `pass_begun` the registry's pass state, compared to refuse a late mark"
-    )]
-    pub fn configure(
-        &mut self,
-        name: &ClassName,
-        boot_only: bool,
-        pass_begun: bool,
-    ) -> Result<usize, ConfigureError>
+    pub fn configure(&mut self, name: &ClassName) -> Result<usize, ConfigureError>
     {
-        if boot_only && pass_begun && !self.is_boot_only(name.as_str())
-        {
-            return Err(ConfigureError::BootOnlyTooLate);
-        }
         let slot = self.slot(name).ok_or(ConfigureError::Full)?;
         if let Some(entry) = self.entries.get_mut(slot)
         {
             entry.configured = true;
-            entry.boot_only |= boot_only;
         }
         Ok(slot)
-    }
-
-    /// Whether a class request marked class `name` boot-only.
-    #[must_use]
-    pub fn is_boot_only(&self, name: &str) -> bool
-    {
-        self.find(name).is_some_and(|e| e.boot_only)
     }
 
     /// The served list of the class named `name`; `None` when the class is
@@ -273,56 +243,36 @@ mod tests
         }
         assert!(classes.intern(&class("one-more")).is_none());
         assert_eq!(
-            classes.configure(&class("one-more"), false, false),
+            classes.configure(&class("one-more")),
             Err(ConfigureError::Full)
         );
         // A class already held is still found, and configured.
         assert!(classes.intern(&class("c0")).is_some());
-        assert_eq!(classes.configure(&class("c0"), false, false), Ok(0));
+        assert_eq!(classes.configure(&class("c0")), Ok(0));
     }
 
     #[test]
     fn a_configured_class_keeps_its_slot_and_the_served_list_it_names()
     {
         let mut classes = Classes::new();
-        assert_eq!(classes.configure(&class("serial"), false, false), Ok(0));
-        assert_eq!(classes.configure(&class("input"), false, false), Ok(1));
+        assert_eq!(classes.configure(&class("serial")), Ok(0));
+        assert_eq!(classes.configure(&class("input")), Ok(1));
         let input = classes.intern(&class("input")).unwrap();
         input.try_reserve(1).unwrap();
         input.push(3, "kbd").unwrap();
         // A repeated request names the same slot.
-        assert_eq!(classes.configure(&class("input"), false, true), Ok(1));
+        assert_eq!(classes.configure(&class("input")), Ok(1));
         assert_eq!(classes.get_slot(1).unwrap().get(0), Lookup::Live(&"kbd"));
         assert_eq!(classes.get_slot(0).unwrap().get(0), Lookup::Absent);
         assert!(classes.get_slot(2).is_none());
     }
 
     #[test]
-    fn a_boot_only_mark_is_sticky_and_refused_once_the_pass_began()
-    {
-        let mut classes = Classes::<()>::new();
-        assert!(!classes.is_boot_only("block"));
-        assert_eq!(classes.configure(&class("block"), true, false), Ok(0));
-        assert!(classes.is_boot_only("block"));
-        // A later request without the mark does not clear it, and one with
-        // it after the pass began is admitted for a class already marked.
-        assert_eq!(classes.configure(&class("block"), false, true), Ok(0));
-        assert!(classes.is_boot_only("block"));
-        assert_eq!(classes.configure(&class("block"), true, true), Ok(0));
-        assert_eq!(
-            classes.configure(&class("rtc"), true, true),
-            Err(ConfigureError::BootOnlyTooLate)
-        );
-        assert!(!classes.is_boot_only("rtc"));
-        assert!(classes.get("rtc").is_none());
-    }
-
-    #[test]
     fn a_watch_reads_the_ordinals_with_the_registration_and_a_signal_reaches_its_class()
     {
         let mut classes = Classes::new();
-        assert_eq!(classes.configure(&class("block"), false, false), Ok(0));
-        assert_eq!(classes.configure(&class("input"), false, false), Ok(1));
+        assert_eq!(classes.configure(&class("block")), Ok(0));
+        assert_eq!(classes.configure(&class("input")), Ok(1));
         assert_eq!(classes.watch(0, 10, |_| false), Ok(0));
         let block = classes.intern(&class("block")).unwrap();
         block.try_reserve(2).unwrap();
@@ -352,8 +302,8 @@ mod tests
     fn a_full_class_refuses_a_watcher_and_others_are_unaffected()
     {
         let mut classes = Classes::<()>::new();
-        classes.configure(&class("serial"), false, false).unwrap();
-        classes.configure(&class("input"), false, false).unwrap();
+        classes.configure(&class("serial")).unwrap();
+        classes.configure(&class("input")).unwrap();
         for cap in 0..crate::watchers::MAX_CLASS_WATCHERS as u64
         {
             assert_eq!(classes.watch(0, cap, |_| false), Ok(0));
@@ -368,8 +318,8 @@ mod tests
     fn mismatches_name_a_configured_class_without_a_driver_and_the_reverse()
     {
         let mut classes = Classes::new();
-        classes.configure(&class("serial"), false, false).unwrap();
-        classes.configure(&class("rtc"), false, false).unwrap();
+        classes.configure(&class("serial")).unwrap();
+        classes.configure(&class("rtc")).unwrap();
         for name in ["serial", "test-dma"]
         {
             let served = classes.intern(&class(name)).unwrap();

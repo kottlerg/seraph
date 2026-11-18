@@ -13,8 +13,9 @@
 //! each add their value, the last of them below 255. The literals follow, then,
 //! unless they complete the page, the match: a two-byte little-endian offset
 //! back from the current position, and the match length's extra bytes. The
-//! sequence that completes the page carries no match, and the stream ends
-//! with it.
+//! stream ends with the sequence that completes the page: one whose literals
+//! complete it, which carries no match, or one whose match reaches its last
+//! byte.
 //!
 //! The compressor is a greedy single pass over a hash table of the page's
 //! 4-byte prefixes, which the caller supplies, so the codec takes no large

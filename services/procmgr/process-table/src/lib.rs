@@ -21,8 +21,11 @@
 //! ([`death_queues::FIRST_POOL_OBSERVERS`]), the registry of the threads a
 //! process registers with their crash badges ([`threads`]), and the
 //! registered crash service with its registration's generation
-//! ([`crash_registrant`]), and the signature policy each creator's record
-//! carries ([`sign_policy`]). None of these
+//! ([`crash_registrant`]), the signature policy each creator's record
+//! carries ([`sign_policy`]), and the process tree: each entry's parent, the
+//! marking of a subtree a destroy has begun on, and the re-parenting or
+//! containment at a process's end ([`ProcessTable::doom_subtree`],
+//! [`ProcessTable::take_ended`]). None of these
 //! touch a syscall, IPC, or `std::os::seraph` surface — the cap fields are
 //! slot *indices* (plain integers), never live capabilities, and the decoder
 //! reads a stack [`ipc::IpcMessage`] snapshot — so the whole crate is
@@ -87,9 +90,9 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 /// each one step no other thread interleaves.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "`reserve`, `started`, `dma_hold`, `no_debug` and `no_core` are independent facts \
-              set at different points of the child's life (creation, start, create flag, \
-              declarations), not states of one machine"
+    reason = "`reserve`, `started`, `dma_hold`, `no_debug`, `no_core`, `contained` and \
+              `doomed` are independent facts set at different points of the child's life \
+              (creation, start, create flags, declarations, a destroy), not states of one machine"
 )]
 pub struct ProcessEntry
 {
@@ -198,6 +201,42 @@ pub struct ProcessEntry
     /// bindings, as `DETACH_PROCESS` does. The child's `DECLARE_NO_DEBUG`
     /// takes it ([`ProcessTable::declare_no_debug`]).
     pub debugger: u64,
+    /// The badge of the child's parent: the process whose create request
+    /// made it (the badge the request came on, [`ProcessTable::creator_of`]),
+    /// or that process's nearest live ancestor once it has ended
+    /// ([`ProcessTable::take_ended`]); `0` for none, a child of the
+    /// un-badged creator or of a line none of whose processes lives. A nonzero
+    /// parent names a live entry. [`ProcessTable::insert`] sets it from the
+    /// create's reservation.
+    pub parent: u64,
+    /// Set by `CREATE_CONTAIN`: the child's end destroys what is left of its
+    /// subtree instead of re-parenting its children
+    /// ([`ProcessTable::take_ended`]).
+    pub contained: bool,
+    /// Set once a destroy of a subtree that holds the child has begun
+    /// ([`ProcessTable::doom_subtree`]): the entry waits for its teardown,
+    /// procmgr refuses a create from it ([`ProcessTable::creator_of`]) and
+    /// a start of it, and the child list omits it.
+    pub doomed: bool,
+    /// Slot in procmgr's `CSpace` of the death relay the create request
+    /// carried (`CREATE_DEATH_RELAY`), to which procmgr posts the child's
+    /// end once; `0` with none, and once the child is re-parented.
+    pub relay: u64,
+    /// Set from the insert until procmgr's reply to the create that made the
+    /// entry has delivered the child's handle ([`ProcessTable::answer_create`]).
+    /// Until then the create owns the entry's teardown, and the death relay
+    /// with it: a destroy that marks the entry does not take it
+    /// ([`ProcessTable::take_doomed`]), and the create refuses itself instead
+    /// and deletes the relay unposted ([`ProcessTable::take_refused`]), so a
+    /// failed creation never posts to its relay.
+    pub unanswered: bool,
+    /// Slot in procmgr's `CSpace` of the end queue the child registered on
+    /// itself (`REGISTER_END_QUEUE`, [`ProcessTable::register_end_queue`]),
+    /// to which procmgr posts the child's end once; `0` with none.
+    pub end_queue: u64,
+    /// The correlator posted with the child's end to its end queue, as the
+    /// tag word.
+    pub end_correlator: u64,
 }
 
 /// Where the loader placed a child's image: the load bias it drew and the
@@ -472,7 +511,8 @@ impl RecentExits
     }
 }
 
-/// Why [`ProcessTable::insert`] refused an entry.
+/// Why [`ProcessTable::insert`] refused an entry, or
+/// [`ProcessTable::reserve_badge`] a reservation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsertError
 {
@@ -480,6 +520,48 @@ pub enum InsertError
     BadgeInUse,
     /// The heap could not grow the table.
     OutOfMemory,
+    /// The creator has ended, or a destroy of a subtree that holds it has
+    /// begun: its child would escape that destroy.
+    CreatorEnded,
+}
+
+/// How [`ProcessTable::answer_create`] ended a create whose child's entry was
+/// inserted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateAnswer
+{
+    /// The reply delivered the child's handle; the child is its creator's.
+    Answered,
+    /// A destroy marked the entry before the reply, which was not made: the
+    /// create is refused, as for a create a destroy marked before its insert.
+    Refused,
+    /// The reply could not be delivered: the create is refused.
+    Undelivered,
+}
+
+/// Why [`ProcessTable::register_end_queue`] registered nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndQueueRefusal
+{
+    /// No live entry holds the badge.
+    NotFound,
+    /// The process registered an end queue before.
+    Present,
+}
+
+/// A create in progress ([`ProcessTable::reserve_badge`]).
+#[derive(Clone, Copy, Debug)]
+struct Pending
+{
+    /// The badge reserved for the child.
+    badge: u64,
+    /// The badge of the process the child takes as its parent: its creator,
+    /// moved to the creator's nearest live ancestor as an entry's parent is
+    /// ([`ProcessTable::take_ended`]); `0` for none.
+    creator: u64,
+    /// Set once a destroy of a subtree that held the creator has begun: the
+    /// insert is refused, so the child does not escape it.
+    doomed: bool,
 }
 
 /// Why [`ProcessTable::arm_dma_hold`] armed nothing.
@@ -507,9 +589,9 @@ pub struct ProcessTable
     entries: Vec<ProcessEntry>,
     holds: DmaHolds,
     crash_badges: CrashBadges,
-    /// Badges of the creates in progress ([`Self::reserve_badge`]): few, one
-    /// per create a worker is serving.
-    pending: Vec<u64>,
+    /// The creates in progress ([`Self::reserve_badge`]): few, one per
+    /// create a worker is serving.
+    pending: Vec<Pending>,
 }
 
 impl ProcessTable
@@ -684,28 +766,48 @@ impl ProcessTable
     {
         self.index_of_badge(badge).is_some()
             || self.holds.holds(badge)
-            || self.pending.contains(&badge)
+            || self.pending.iter().any(|p| p.badge == badge)
     }
 
-    /// Reserve `badge` for a create in progress, which builds the child
-    /// under it with no table lock held and inserts its entry later
+    /// Whether `badge` may create: the un-badged creator (`0`), or a live
+    /// entry no destroy has begun on.
+    fn creates(&self, badge: u64) -> bool
+    {
+        badge == 0 || self.find_by_badge(badge).is_some_and(|e| !e.doomed)
+    }
+
+    /// Reserve `badge` for a create in progress from `creator` (the badge
+    /// the request came on, `0` for the un-badged creator), which builds the
+    /// child under it with no table lock held and inserts its entry later
     /// ([`Self::insert`] ends the reservation), or ends the reservation on
-    /// failure ([`Self::release_badge`]).
+    /// failure ([`Self::release_badge`]). The reservation keeps the child's
+    /// parent current until the insert, as an entry's is
+    /// ([`Self::take_ended`]), and a destroy of a subtree that holds it
+    /// dooms the create ([`Self::doom_subtree`]).
     ///
     /// # Errors
     /// [`InsertError::BadgeInUse`] when [`Self::badge_in_use`] holds for
-    /// `badge`; [`InsertError::OutOfMemory`] when the heap cannot hold the
-    /// reservation.
-    pub fn reserve_badge(&mut self, badge: u64) -> Result<(), InsertError>
+    /// `badge`; [`InsertError::CreatorEnded`] when `creator` names no live
+    /// entry, or one a destroy has begun on; [`InsertError::OutOfMemory`]
+    /// when the heap cannot hold the reservation.
+    pub fn reserve_badge(&mut self, badge: u64, creator: u64) -> Result<(), InsertError>
     {
         if self.badge_in_use(badge)
         {
             return Err(InsertError::BadgeInUse);
         }
+        if !self.creates(creator)
+        {
+            return Err(InsertError::CreatorEnded);
+        }
         self.pending
             .try_reserve(1)
             .map_err(|_| InsertError::OutOfMemory)?;
-        self.pending.push(badge);
+        self.pending.push(Pending {
+            badge,
+            creator,
+            doomed: false,
+        });
         Ok(())
     }
 
@@ -713,7 +815,7 @@ impl ProcessTable
     /// reserved changes nothing.
     pub fn release_badge(&mut self, badge: u64)
     {
-        self.pending.retain(|&b| b != badge);
+        self.pending.retain(|p| p.badge != badge);
     }
 
     /// Arm the live entry `badge` for a held reclaim (`CREATE_DMA_HOLD`),
@@ -747,18 +849,34 @@ impl ProcessTable
     }
 
     /// Insert `entry`, ending the reservation of its badge
-    /// ([`Self::reserve_badge`]), and changing nothing on refusal.
+    /// ([`Self::reserve_badge`]), and changing nothing on refusal. A reserved
+    /// badge's entry takes the reservation's creator as its parent; an entry
+    /// inserted without one keeps the parent it carries.
     ///
     /// # Errors
     /// [`InsertError::BadgeInUse`] when a live entry already holds the badge;
+    /// [`InsertError::CreatorEnded`] when a destroy doomed the reservation, or
+    /// the parent names no live entry or one a destroy has begun on;
     /// [`InsertError::OutOfMemory`] when the heap cannot grow the table.
-    pub fn insert(&mut self, entry: ProcessEntry) -> Result<(), InsertError>
+    pub fn insert(&mut self, mut entry: ProcessEntry) -> Result<(), InsertError>
     {
         let Err(idx) = self.search(entry.badge)
         else
         {
             return Err(InsertError::BadgeInUse);
         };
+        if let Some(pending) = self.pending.iter().find(|p| p.badge == entry.badge)
+        {
+            if pending.doomed
+            {
+                return Err(InsertError::CreatorEnded);
+            }
+            entry.parent = pending.creator;
+        }
+        if !self.creates(entry.parent)
+        {
+            return Err(InsertError::CreatorEnded);
+        }
         self.entries
             .try_reserve(1)
             .map_err(|_| InsertError::OutOfMemory)?;
@@ -820,6 +938,226 @@ impl ProcessTable
     {
         let idx = self.index_of_badge(badge)?;
         Some(self.entries.remove(idx))
+    }
+
+    /// Mark the live entry `badge` and every entry below it doomed, and
+    /// every create in progress from one of them, at the start of a destroy of
+    /// that subtree: from then on procmgr refuses a create from any of them
+    /// and an insert of such a create's child, so no process escapes the
+    /// destroy by starting a child during the teardown. Returns `false` when
+    /// no live entry holds `badge`. The entries stay in the table until
+    /// their teardown takes each ([`Self::take_doomed`]), or, for an entry
+    /// whose create is unanswered, until that create's refusal takes it
+    /// ([`Self::answer_create`], [`Self::take_refused`]).
+    pub fn doom_subtree(&mut self, badge: u64) -> bool
+    {
+        let Some(root) = self.find_mut_by_badge(badge)
+        else
+        {
+            return false;
+        };
+        root.doomed = true;
+        self.doom_descendants();
+        true
+    }
+
+    /// Mark doomed every entry below a doomed one, and every create in
+    /// progress from a doomed one. Each pass marks the entries whose parent
+    /// is doomed, so the passes end within the depth of the deepest subtree.
+    fn doom_descendants(&mut self)
+    {
+        loop
+        {
+            let mut marked = false;
+            for idx in 0..self.entries.len()
+            {
+                let Some(entry) = self.entries.get(idx)
+                else
+                {
+                    break;
+                };
+                if entry.doomed || entry.parent == 0
+                {
+                    continue;
+                }
+                let parent_doomed = self.find_by_badge(entry.parent).is_some_and(|p| p.doomed);
+                if let Some(entry) = self.entries.get_mut(idx).filter(|_| parent_doomed)
+                {
+                    entry.doomed = true;
+                    marked = true;
+                }
+            }
+            if !marked
+            {
+                break;
+            }
+        }
+        for idx in 0..self.pending.len()
+        {
+            let Some(creator) = self.pending.get(idx).map(|p| p.creator)
+            else
+            {
+                break;
+            };
+            let creator_doomed = self.find_by_badge(creator).is_some_and(|e| e.doomed);
+            if let Some(pending) = self.pending.get_mut(idx)
+            {
+                pending.doomed |= creator_doomed;
+            }
+        }
+    }
+
+    /// Take the entry `badge` out of the table at its end (an exit, a fault,
+    /// or its turn in a destroy), and settle the processes it started: its
+    /// children, and the creates it has in progress, take its parent as
+    /// theirs, the nearest live ancestor, since a nonzero parent names a live
+    /// entry. When the entry was created with `CREATE_CONTAIN`, everything
+    /// below it is doomed instead ([`Self::doom_subtree`]), so the caller's
+    /// teardowns then take it ([`Self::take_doomed`]). A child that is not
+    /// doomed is re-parented: `delete_relay` is called with its death relay's
+    /// slot, which no end of the child is then posted to. Returns `None` when
+    /// no live entry holds `badge`.
+    pub fn take_ended(
+        &mut self,
+        badge: u64,
+        mut delete_relay: impl FnMut(u64),
+    ) -> Option<ProcessEntry>
+    {
+        let idx = self.index_of_badge(badge)?;
+        let entry = self.entries.remove(idx);
+        let heir = entry.parent;
+        let doom =
+            entry.contained || entry.doomed || self.find_by_badge(heir).is_some_and(|e| e.doomed);
+        for child in self.entries.iter_mut().filter(|e| e.parent == badge)
+        {
+            child.parent = heir;
+            child.doomed |= doom;
+            if !child.doomed && child.relay != 0
+            {
+                delete_relay(core::mem::take(&mut child.relay));
+            }
+        }
+        for pending in self.pending.iter_mut().filter(|p| p.creator == badge)
+        {
+            pending.creator = heir;
+            pending.doomed |= doom;
+        }
+        if doom
+        {
+            self.doom_descendants();
+        }
+        Some(entry)
+    }
+
+    /// Answer the create that made the entry `badge`: unless a destroy has
+    /// marked the entry, call `reply`, which delivers the child's handle to its
+    /// creator and returns whether it did, and on delivery clear
+    /// [`ProcessEntry::unanswered`], so a destroy takes the entry from then on.
+    /// The reply is made under the caller's hold of the table, so no destroy
+    /// marks the entry between the check and the delivery: a destroy that
+    /// comes first leaves the create refused, one that comes after finds a
+    /// child its creator holds. An unknown badge is refused too.
+    pub fn answer_create(&mut self, badge: u64, reply: impl FnOnce() -> bool) -> CreateAnswer
+    {
+        let Some(entry) = self.find_mut_by_badge(badge).filter(|e| !e.doomed)
+        else
+        {
+            return CreateAnswer::Refused;
+        };
+        if !reply()
+        {
+            return CreateAnswer::Undelivered;
+        }
+        entry.unanswered = false;
+        CreateAnswer::Answered
+    }
+
+    /// Take the entry `badge` of a child whose create procmgr refuses after it
+    /// was inserted (a reply it cannot deliver, a hold it cannot arm), as
+    /// [`Self::take_ended`] takes an ended one, and call `delete_relay` with
+    /// the entry's own death relay too, which is then zero: the creator was
+    /// told the create failed, so no end of the child is posted to it.
+    /// Returns `None` when no live entry holds `badge`.
+    pub fn take_refused(
+        &mut self,
+        badge: u64,
+        mut delete_relay: impl FnMut(u64),
+    ) -> Option<ProcessEntry>
+    {
+        let mut entry = self.take_ended(badge, &mut delete_relay)?;
+        if entry.relay != 0
+        {
+            delete_relay(core::mem::take(&mut entry.relay));
+        }
+        Some(entry)
+    }
+
+    /// Take a doomed entry out of the table ([`Self::take_ended`]), the
+    /// lowest-badged; `None` when none is doomed. A destroy takes the doomed
+    /// entries one by one, each teardown in its own hold of the table lock.
+    /// An entry whose create is unanswered ([`ProcessEntry::unanswered`]) is
+    /// left to that create, which refuses itself once it finds the entry
+    /// doomed ([`Self::answer_create`]).
+    pub fn take_doomed(&mut self, delete_relay: impl FnMut(u64)) -> Option<ProcessEntry>
+    {
+        let badge = self
+            .entries
+            .iter()
+            .find(|e| e.doomed && !e.unanswered)?
+            .badge;
+        self.take_ended(badge, delete_relay)
+    }
+
+    /// The children of `parent` above `after` (every child when `after` is
+    /// `None`), in badge order, without the doomed: the walk `LIST_CHILDREN`
+    /// pages through.
+    pub fn children_after(
+        &self,
+        parent: u64,
+        after: Option<u64>,
+    ) -> impl Iterator<Item = &ProcessEntry>
+    {
+        self.entries_after(after)
+            .filter(move |e| e.parent == parent && !e.doomed)
+    }
+
+    /// Whether the live entry `child` is a child of `parent` that no destroy
+    /// has marked, as [`Self::children_after`] lists the children.
+    #[must_use]
+    pub fn is_child(&self, parent: u64, child: u64) -> bool
+    {
+        parent != 0
+            && self
+                .find_by_badge(child)
+                .is_some_and(|e| e.parent == parent && !e.doomed)
+    }
+
+    /// Record `queue` (a slot in procmgr's `CSpace`) as the end queue of the
+    /// live entry `badge`, posted `correlator` with its end
+    /// (`REGISTER_END_QUEUE`, sent on the process's own procmgr cap).
+    ///
+    /// # Errors
+    /// [`EndQueueRefusal::NotFound`] when no live entry holds `badge`;
+    /// [`EndQueueRefusal::Present`] when the entry registered one before, so
+    /// a process cannot replace the queue another holder watches its end
+    /// through.
+    pub fn register_end_queue(
+        &mut self,
+        badge: u64,
+        queue: u64,
+        correlator: u64,
+    ) -> Result<(), EndQueueRefusal>
+    {
+        let entry = self
+            .find_mut_by_badge(badge)
+            .ok_or(EndQueueRefusal::NotFound)?;
+        if entry.end_queue != 0
+        {
+            return Err(EndQueueRefusal::Present);
+        }
+        entry.end_queue = queue;
+        entry.end_correlator = correlator;
+        Ok(())
     }
 
     /// Visit every live entry in badge order. Used by the death resync to
@@ -886,6 +1224,8 @@ impl ProcessTable
     /// holder can still send on), a verb-badged cap, or a release token.
     /// procmgr refuses a create from such a badge: its child would have no
     /// creator's node to sit under, and so would escape every memory max.
+    /// `None` too for a live entry a destroy has begun on
+    /// ([`Self::doom_subtree`]), whose child would escape the destroy.
     #[must_use]
     pub fn creator_of(&self, badge: u64) -> Option<Creator>
     {
@@ -893,13 +1233,15 @@ impl ProcessTable
         {
             return Some(Creator::UNBADGED);
         }
-        self.find_by_badge(badge).map(|e| Creator {
-            band_max: e.band_max,
-            memmgr_badge: e.memmgr_badge,
-            reserve: e.reserve,
-            unbadged: false,
-            sign_kinds: e.sign_kinds,
-        })
+        self.find_by_badge(badge)
+            .filter(|e| !e.doomed)
+            .map(|e| Creator {
+                band_max: e.band_max,
+                memmgr_badge: e.memmgr_badge,
+                reserve: e.reserve,
+                unbadged: false,
+                sign_kinds: e.sign_kinds,
+            })
     }
 }
 
@@ -1139,9 +1481,9 @@ pub fn request_badge(badge: u64) -> (u64, bool)
 }
 
 /// Whether procmgr serves `opcode` (a label's low 16 bits) on a process
-/// handle: every label but `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE` and
-/// `REGISTER_THREAD`, which name their sender itself and are served on the
-/// child's own procmgr cap alone.
+/// handle: every label but `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`,
+/// `REGISTER_THREAD` and `REGISTER_END_QUEUE`, which name their sender
+/// itself and are served on the child's own procmgr cap alone.
 #[must_use]
 pub fn served_on_handle(opcode: u64) -> bool
 {
@@ -1150,16 +1492,24 @@ pub fn served_on_handle(opcode: u64) -> bool
         ipc::procmgr_labels::DECLARE_NO_DEBUG
             | ipc::procmgr_labels::DECLARE_NO_CORE
             | ipc::procmgr_labels::REGISTER_THREAD
+            | ipc::procmgr_labels::REGISTER_END_QUEUE
     )
 }
 
 /// Whether procmgr serves `opcode` on a process handle alone:
 /// `BIND_DEATH_OBSERVER`, through which only the child's creator chooses who
-/// observes the child's address space.
+/// observes the child's address space, and `LIST_CHILDREN` and
+/// `DESTROY_CHILD`, whose authority is the handle's over the process and
+/// everything below it.
 #[must_use]
 pub fn served_on_handle_only(opcode: u64) -> bool
 {
-    opcode == ipc::procmgr_labels::BIND_DEATH_OBSERVER
+    matches!(
+        opcode,
+        ipc::procmgr_labels::BIND_DEATH_OBSERVER
+            | ipc::procmgr_labels::LIST_CHILDREN
+            | ipc::procmgr_labels::DESTROY_CHILD
+    )
 }
 
 /// The error procmgr refuses `opcode` with for the kind of cap it came on,
@@ -1559,6 +1909,13 @@ mod tests
             name: ProcessName::EMPTY,
             sign_kinds: objsig::KindSet::EMPTY,
             debugger: 0,
+            parent: 0,
+            contained: false,
+            doomed: false,
+            relay: 0,
+            unanswered: false,
+            end_queue: 0,
+            end_correlator: 0,
         }
     }
 
@@ -2359,9 +2716,9 @@ mod tests
     fn a_reserved_badge_is_in_use_and_refused_a_second_reservation()
     {
         let mut table = ProcessTable::new();
-        assert_eq!(table.reserve_badge(0x20), Ok(()));
+        assert_eq!(table.reserve_badge(0x20, 0), Ok(()));
         assert!(table.badge_in_use(0x20));
-        assert_eq!(table.reserve_badge(0x20), Err(InsertError::BadgeInUse));
+        assert_eq!(table.reserve_badge(0x20, 0), Err(InsertError::BadgeInUse));
         // A reservation is no live entry: nothing finds it.
         assert!(table.find_by_badge(0x20).is_none());
         assert_eq!(table.len(), 0);
@@ -2372,19 +2729,19 @@ mod tests
     {
         let mut table = ProcessTable::new();
         assert_eq!(table.insert(entry_with_badge(0x20)), Ok(()));
-        assert_eq!(table.reserve_badge(0x20), Err(InsertError::BadgeInUse));
+        assert_eq!(table.reserve_badge(0x20, 0), Err(InsertError::BadgeInUse));
         assert_eq!(table.arm_dma_hold(0x20), Ok(()));
         let mut entry = table.take_by_badge(0x20).expect("live entry");
         entry.started = true;
         assert!(table.holds_mut().park(&entry));
-        assert_eq!(table.reserve_badge(0x20), Err(InsertError::BadgeInUse));
+        assert_eq!(table.reserve_badge(0x20, 0), Err(InsertError::BadgeInUse));
     }
 
     #[test]
     fn insert_ends_the_reservation_of_its_badge()
     {
         let mut table = ProcessTable::new();
-        assert_eq!(table.reserve_badge(0x20), Ok(()));
+        assert_eq!(table.reserve_badge(0x20, 0), Ok(()));
         assert_eq!(table.insert(entry_with_badge(0x20)), Ok(()));
         assert!(table.find_by_badge(0x20).is_some());
         // Taken out again, the badge is free: no reservation outlived it.
@@ -2396,15 +2753,15 @@ mod tests
     fn a_released_reservation_frees_its_badge_and_no_other()
     {
         let mut table = ProcessTable::new();
-        assert_eq!(table.reserve_badge(0x20), Ok(()));
-        assert_eq!(table.reserve_badge(0x40), Ok(()));
+        assert_eq!(table.reserve_badge(0x20, 0), Ok(()));
+        assert_eq!(table.reserve_badge(0x40, 0), Ok(()));
         table.release_badge(0x20);
         assert!(!table.badge_in_use(0x20));
         assert!(table.badge_in_use(0x40));
         // Releasing a badge never reserved changes nothing.
         table.release_badge(0x60);
         assert!(table.badge_in_use(0x40));
-        assert_eq!(table.reserve_badge(0x20), Ok(()));
+        assert_eq!(table.reserve_badge(0x20, 0), Ok(()));
     }
 
     #[test]
@@ -2883,5 +3240,344 @@ mod tests
         assert!(table.badge_in_use(16));
         table.holds_mut().release(release_token_badge(16)).unwrap();
         assert!(!table.badge_in_use(16));
+    }
+
+    fn child_of(badge: u64, parent: u64) -> ProcessEntry
+    {
+        let mut entry = entry_with_badge(badge);
+        entry.parent = parent;
+        entry
+    }
+
+    /// A table holding `(badge, parent)` for each pair, inserted in order.
+    fn tree(pairs: &[(u64, u64)]) -> ProcessTable
+    {
+        let mut table = ProcessTable::new();
+        for &(badge, parent) in pairs
+        {
+            assert_eq!(table.insert(child_of(badge, parent)), Ok(()));
+        }
+        table
+    }
+
+    fn parent_of(table: &ProcessTable, badge: u64) -> u64
+    {
+        table.find_by_badge(badge).expect("entry is live").parent
+    }
+
+    fn doomed(table: &ProcessTable, badge: u64) -> bool
+    {
+        table.find_by_badge(badge).expect("entry is live").doomed
+    }
+
+    #[test]
+    fn an_insert_takes_its_parent_from_the_reservation()
+    {
+        let mut table = tree(&[(0x40, 0)]);
+        assert_eq!(table.reserve_badge(0x50, 0x40), Ok(()));
+        assert_eq!(table.insert(entry_with_badge(0x50)), Ok(()));
+        assert_eq!(parent_of(&table, 0x50), 0x40);
+        assert!(!table.badge_in_use(0x60));
+        assert_eq!(table.reserve_badge(0x60, 0), Ok(()));
+        assert_eq!(table.insert(child_of(0x60, 0x40)), Ok(()));
+        assert_eq!(parent_of(&table, 0x60), 0);
+    }
+
+    #[test]
+    fn a_create_from_an_ended_or_doomed_creator_is_refused()
+    {
+        let mut table = tree(&[(0x40, 0), (0x50, 0x40)]);
+        assert_eq!(
+            table.reserve_badge(0x60, 0x99),
+            Err(InsertError::CreatorEnded)
+        );
+        assert!(!table.badge_in_use(0x60));
+        assert_eq!(table.reserve_badge(0x60, 0x50), Ok(()));
+        assert!(table.doom_subtree(0x40));
+        assert!(table.creator_of(0x40).is_none());
+        assert!(table.creator_of(0x50).is_none());
+        assert_eq!(
+            table.reserve_badge(0x70, 0x50),
+            Err(InsertError::CreatorEnded)
+        );
+        assert_eq!(
+            table.insert(entry_with_badge(0x60)),
+            Err(InsertError::CreatorEnded)
+        );
+        assert_eq!(
+            table.insert(child_of(0x80, 0x40)),
+            Err(InsertError::CreatorEnded)
+        );
+        assert!(!table.doom_subtree(0x99));
+    }
+
+    #[test]
+    fn a_destroy_dooms_the_subtree_and_nothing_else()
+    {
+        // 0x30 sits below 0x20, which sits below 0x60: badge order is not
+        // tree order, so the marking takes more than one pass.
+        let mut table = tree(&[
+            (0x60, 0),
+            (0x20, 0x60),
+            (0x30, 0x20),
+            (0x10, 0x30),
+            (0x40, 0x60),
+            (0x50, 0),
+        ]);
+        assert!(table.doom_subtree(0x20));
+        for badge in [0x20, 0x30, 0x10]
+        {
+            assert!(doomed(&table, badge), "{badge:#x} is below the root");
+        }
+        for badge in [0x60, 0x40, 0x50]
+        {
+            assert!(!doomed(&table, badge), "{badge:#x} is outside the subtree");
+        }
+        let mut taken = Vec::new();
+        while let Some(entry) = table.take_doomed(|_| panic!("no doomed child is re-parented"))
+        {
+            taken.push(entry.badge);
+        }
+        taken.sort_unstable();
+        assert_eq!(taken, [0x10, 0x20, 0x30]);
+        assert_eq!(table.len(), 3);
+        assert_eq!(parent_of(&table, 0x40), 0x60);
+    }
+
+    // Defect guarded: a destroy that marked a child after its insert but
+    // before procmgr answered its create tore the child down and posted
+    // `EXIT_KILLED` to the creator's death relay, after which procmgr refused
+    // the create: a failed creation posted to its relay. The create owns an
+    // unanswered entry: the destroy leaves it, and the create refuses itself
+    // and drops the relay unposted.
+    #[test]
+    fn a_destroy_leaves_an_unanswered_create_to_refuse_itself()
+    {
+        let mut table = tree(&[(0x10, 0)]);
+        let mut child = child_of(0x20, 0x10);
+        child.unanswered = true;
+        child.relay = 44;
+        assert_eq!(table.insert(child), Ok(()));
+        assert!(table.doom_subtree(0x10));
+        let taken = table.take_doomed(|_| panic!("no relay is dropped by the destroy"));
+        assert_eq!(taken.map(|e| e.badge), Some(0x10));
+        assert!(
+            table.take_doomed(|_| ()).is_none(),
+            "the destroy took an entry whose create is unanswered"
+        );
+        let answer = table.answer_create(0x20, || panic!("a marked child's create is answered"));
+        assert_eq!(answer, CreateAnswer::Refused);
+        let mut dropped = Vec::new();
+        let refused = table
+            .take_refused(0x20, |relay| dropped.push(relay))
+            .expect("the refused child's entry");
+        assert_eq!(refused.relay, 0);
+        assert_eq!(dropped, [44]);
+    }
+
+    #[test]
+    fn an_answered_create_is_its_creators_child_for_a_destroy()
+    {
+        let mut table = tree(&[(0x10, 0)]);
+        let mut child = child_of(0x20, 0x10);
+        child.unanswered = true;
+        child.relay = 44;
+        assert_eq!(table.insert(child), Ok(()));
+        assert_eq!(table.answer_create(0x20, || true), CreateAnswer::Answered);
+        assert!(!table.find_by_badge(0x20).expect("live").unanswered);
+        assert!(table.doom_subtree(0x10));
+        let mut taken: Vec<u64> = Vec::new();
+        while let Some(entry) = table.take_doomed(|_| ())
+        {
+            taken.push(entry.badge);
+            // The answered child keeps its relay for the end post.
+            if entry.badge == 0x20
+            {
+                assert_eq!(entry.relay, 44);
+            }
+        }
+        assert_eq!(taken, [0x10, 0x20]);
+    }
+
+    #[test]
+    fn an_undelivered_answer_leaves_the_create_unanswered()
+    {
+        let mut table = tree(&[(0x10, 0)]);
+        let mut child = child_of(0x20, 0x10);
+        child.unanswered = true;
+        assert_eq!(table.insert(child), Ok(()));
+        assert_eq!(
+            table.answer_create(0x20, || false),
+            CreateAnswer::Undelivered
+        );
+        assert!(table.find_by_badge(0x20).expect("live").unanswered);
+        assert_eq!(table.answer_create(0x99, || true), CreateAnswer::Refused);
+    }
+
+    // Defect guarded: the teardown of a child whose create procmgr refused
+    // after inserting it posted `EXIT_KILLED` to the creator's death relay,
+    // which the creator, told the create failed, could read as the end of
+    // its next child on the same queue.
+    #[test]
+    fn a_refused_create_drops_its_own_relay_unposted()
+    {
+        let mut table = tree(&[(0x10, 0), (0x20, 0x10)]);
+        table.find_mut_by_badge(0x20).expect("live").relay = 66;
+        let mut dropped = Vec::new();
+        let taken = table
+            .take_refused(0x20, |relay| dropped.push(relay))
+            .expect("the refused child's entry");
+        assert_eq!(taken.badge, 0x20);
+        assert_eq!(taken.relay, 0);
+        assert_eq!(dropped, [66]);
+        assert!(table.find_by_badge(0x20).is_none());
+        assert!(table.take_refused(0x20, |_| ()).is_none());
+    }
+
+    #[test]
+    fn an_end_re_parents_to_the_nearest_live_ancestor_and_drops_the_relays()
+    {
+        let mut table = tree(&[(0x10, 0), (0x20, 0x10), (0x30, 0x20), (0x40, 0x20)]);
+        table.find_mut_by_badge(0x30).expect("live").relay = 77;
+        assert_eq!(table.reserve_badge(0x50, 0x20), Ok(()));
+        let mut dropped = Vec::new();
+        let ended = table.take_ended(0x20, |relay| dropped.push(relay));
+        assert_eq!(ended.map(|e| e.badge), Some(0x20));
+        assert_eq!(dropped, [77]);
+        assert_eq!(parent_of(&table, 0x30), 0x10);
+        assert_eq!(parent_of(&table, 0x40), 0x10);
+        assert_eq!(table.find_by_badge(0x30).expect("live").relay, 0);
+        assert_eq!(table.insert(entry_with_badge(0x50)), Ok(()));
+        assert_eq!(parent_of(&table, 0x50), 0x10);
+        // With no live ancestor left, the children have no parent.
+        assert!(table.take_ended(0x10, |_| ()).is_some());
+        for badge in [0x30, 0x40, 0x50]
+        {
+            assert_eq!(parent_of(&table, badge), 0);
+            assert!(!doomed(&table, badge));
+        }
+        assert!(table.take_ended(0x10, |_| ()).is_none());
+    }
+
+    #[test]
+    fn a_contained_end_dooms_what_is_left_of_its_subtree()
+    {
+        let mut table = tree(&[
+            (0x10, 0),
+            (0x20, 0x10),
+            (0x30, 0x20),
+            (0x40, 0x30),
+            (0x50, 0x10),
+        ]);
+        table.find_mut_by_badge(0x20).expect("live").contained = true;
+        table.find_mut_by_badge(0x30).expect("live").relay = 5;
+        assert_eq!(table.reserve_badge(0x60, 0x40), Ok(()));
+        let ended = table.take_ended(0x20, |_| panic!("a doomed child keeps its relay"));
+        assert!(ended.is_some_and(|e| e.contained));
+        assert!(doomed(&table, 0x30));
+        assert!(doomed(&table, 0x40));
+        assert!(!doomed(&table, 0x50));
+        assert!(!doomed(&table, 0x10));
+        assert_eq!(table.find_by_badge(0x30).expect("live").relay, 5);
+        assert_eq!(
+            table.insert(entry_with_badge(0x60)),
+            Err(InsertError::CreatorEnded)
+        );
+        // The doomed child lists under no one, and is taken as any doomed.
+        assert_eq!(
+            table
+                .children_after(0x10, None)
+                .map(|e| e.badge)
+                .collect::<Vec<_>>(),
+            [0x50]
+        );
+        while table
+            .take_doomed(|_| panic!("no doomed child is re-parented"))
+            .is_some()
+        {}
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn a_doomed_create_stays_doomed_when_its_creator_ends_first()
+    {
+        let mut table = tree(&[(0x10, 0), (0x20, 0x10)]);
+        assert_eq!(table.reserve_badge(0x30, 0x20), Ok(()));
+        assert!(table.doom_subtree(0x10));
+        // The root goes first; the create's creator, then the create, take its
+        // parent, none, and stay doomed.
+        assert!(table.take_ended(0x10, |_| ()).is_some());
+        assert!(table.take_ended(0x20, |_| ()).is_some());
+        assert_eq!(
+            table.insert(entry_with_badge(0x30)),
+            Err(InsertError::CreatorEnded)
+        );
+    }
+
+    #[test]
+    fn the_child_walk_pages_the_live_children_in_badge_order()
+    {
+        let mut table = tree(&[
+            (0x10, 0),
+            (0x40, 0x10),
+            (0x20, 0x10),
+            (0x30, 0x20),
+            (0x50, 0x10),
+        ]);
+        assert!(table.doom_subtree(0x50));
+        let all: Vec<u64> = table.children_after(0x10, None).map(|e| e.badge).collect();
+        assert_eq!(all, [0x20, 0x40]);
+        let rest: Vec<u64> = table
+            .children_after(0x10, Some(0x20))
+            .map(|e| e.badge)
+            .collect();
+        assert_eq!(rest, [0x40]);
+        assert!(table.is_child(0x10, 0x20));
+        // A marked child is no child for `DESTROY_CHILD` either, which
+        // refuses it with `INVALID_BADGE` as § Label 28 says.
+        assert!(!table.is_child(0x10, 0x50));
+        assert!(!table.is_child(0x10, 0x30));
+        assert!(!table.is_child(0, 0x10));
+        assert!(!table.is_child(0x10, 0x99));
+    }
+
+    #[test]
+    fn an_end_queue_registers_once()
+    {
+        let mut table = tree(&[(0x10, 0)]);
+        assert_eq!(
+            table.register_end_queue(0x20, 9, 1),
+            Err(EndQueueRefusal::NotFound)
+        );
+        assert_eq!(table.register_end_queue(0x10, 9, 1), Ok(()));
+        assert_eq!(
+            table.register_end_queue(0x10, 10, 2),
+            Err(EndQueueRefusal::Present)
+        );
+        let entry = table.find_by_badge(0x10).expect("live");
+        assert_eq!((entry.end_queue, entry.end_correlator), (9, 1));
+    }
+
+    #[test]
+    fn the_tree_labels_are_served_on_the_cap_their_authority_needs()
+    {
+        use ipc::procmgr_labels::{
+            DESTROY_CHILD, LIST_CHILDREN, PROCESS_HANDLE_TAG, REGISTER_END_QUEUE,
+        };
+        let own = 0x40;
+        let handle = own | PROCESS_HANDLE_TAG;
+        assert_eq!(
+            sender_refusal(REGISTER_END_QUEUE, handle),
+            Some(ipc::procmgr_errors::INVALID_BADGE)
+        );
+        assert_eq!(sender_refusal(REGISTER_END_QUEUE, own), None);
+        for opcode in [LIST_CHILDREN, DESTROY_CHILD]
+        {
+            assert_eq!(sender_refusal(opcode, handle), None);
+            assert_eq!(
+                sender_refusal(opcode, own),
+                Some(ipc::procmgr_errors::UNAUTHORIZED)
+            );
+        }
     }
 }

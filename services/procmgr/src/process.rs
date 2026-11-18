@@ -33,7 +33,8 @@ use syscall_abi::{
 /// (writes the badged SEND derivation into `pi.log_send_cap`) AND
 /// `finalize_creation` (table key, death-EQ correlator, process-handle badge).
 /// The badge is reserved in the table from the draw
-/// (`ProcessTable::reserve_badge`), so no concurrent create draws it, until
+/// (`ProcessTable::reserve_badge`), with `creator`, the badge the create
+/// request came on, so no concurrent create draws it, until
 /// `finalize_creation` inserts its entry or the returned reservation drops.
 ///
 /// Redraws until the badge clears `LOG_BADGE_FIRST_CHILD` — keeping it out
@@ -49,8 +50,10 @@ use syscall_abi::{
 /// `services/procmgr/docs/ipc-interface.md` give a failed badge allocation,
 /// when the entropy draw fails (a kernel-contract violation), failing the
 /// spawn rather than minting a weak badge, or when the heap cannot hold the
-/// reservation.
-fn next_process_badge(tables: &Tables) -> Result<BadgeReservation<'_>, u64>
+/// reservation; `procmgr_errors::INVALID_ARGUMENT` when `creator` has ended
+/// or a destroy of it has begun since the request's checks, as for a create
+/// from a badge that names no live process.
+fn next_process_badge(tables: &Tables, creator: u64) -> Result<BadgeReservation<'_>, u64>
 {
     loop
     {
@@ -64,7 +67,7 @@ fn next_process_badge(tables: &Tables) -> Result<BadgeReservation<'_>, u64>
         {
             continue;
         }
-        let reserved = tables.lock().table.reserve_badge(t);
+        let reserved = tables.lock().table.reserve_badge(t, creator);
         match reserved
         {
             Ok(()) => return Ok(BadgeReservation { tables, badge: t }),
@@ -72,6 +75,10 @@ fn next_process_badge(tables: &Tables) -> Result<BadgeReservation<'_>, u64>
             Err(process_table::InsertError::OutOfMemory) =>
             {
                 return Err(procmgr_errors::OUT_OF_MEMORY);
+            }
+            Err(process_table::InsertError::CreatorEnded) =>
+            {
+                return Err(procmgr_errors::INVALID_ARGUMENT);
             }
         }
     }
@@ -560,6 +567,11 @@ pub struct ChildSched
     /// verified, the kinds the image may be; then the child's own
     /// (`process_table::sign_policy::child_kinds`), which its entry keeps.
     pub sign_kinds: objsig::KindSet,
+    /// The badge the create request came on, the child's parent in the
+    /// process tree: a live process, or `0` for the un-badged creator.
+    pub creator: u64,
+    /// Whether the label set `procmgr_labels::CREATE_CONTAIN`.
+    pub contained: bool,
 }
 
 /// What memmgr's `REGISTER_PROCESS` reply gave procmgr for a child
@@ -1970,17 +1982,24 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
 }
 
 /// Derive caller-facing caps, wire the child's pager and crash binding, and
-/// record the process in the table.
+/// record the process in the table, with the death relay
+/// (`parent_relay_cap`, `0` for none), which its entry then owns. procmgr
+/// posts the child's end to the relay itself at its reap or destroy
+/// ([`TeardownTail::finish`]) rather than binding it to the child's address
+/// space, so the relay receives one post whoever ends the child, and a
+/// re-parent takes it away.
 ///
 /// The entry is inserted last, under the table lock, so a request served on
 /// another worker never finds a child whose wiring is still in progress; the
-/// pager's delegation, an IPC call to memmgr, runs with no lock held. Only
-/// the death relay's bind follows the insertion.
+/// pager's delegation, an IPC call to memmgr, runs with no lock held.
 ///
 /// # Errors
 /// `procmgr_errors::OUT_OF_MEMORY` when a death observer cannot be bound,
 /// a caller-facing cap cannot be derived, or the table cannot grow: each is
-/// procmgr's own memory or slots running out.
+/// procmgr's own memory or slots running out. `INVALID_ARGUMENT` when the
+/// creator ended, or a destroy of it began, while the child was built
+/// (`process_table::InsertError::CreatorEnded`). On every error the caller
+/// still owns the relay.
 #[expect(
     clippy::similar_names,
     reason = "child_aspace/child_cspace are intentionally parallel"
@@ -2122,37 +2141,26 @@ fn finalize_creation(
         name: info_caps.name,
         sign_kinds: sched.sign_kinds,
         debugger: 0,
+        // The insert takes the parent from the badge's reservation.
+        parent: sched.creator,
+        contained: sched.contained,
+        doomed: false,
+        relay: parent_relay_cap,
+        // The create owns the entry until its reply delivers the handle.
+        unanswered: true,
+        end_queue: 0,
+        end_correlator: 0,
     });
-    if inserted.is_err()
+    if let Err(e) = inserted
     {
-        // Heap exhausted (the badge was reserved when it was minted, so no
-        // other entry holds it): drop the caps we minted for the caller; the caller's
-        // guards still own the child kernel objects and per-child memory caps
-        // and will release them when finalize returns an error.
+        // The badge was reserved when it was minted, so no other entry holds
+        // it: the heap is exhausted, or the creator ended. Drop the caps we
+        // minted for the caller; the caller's guards still own the child
+        // kernel objects and per-child memory caps and will release them when
+        // finalize returns an error.
         let _ = syscall::cap_delete(thread_for_caller);
         let _ = syscall::cap_delete(process_handle);
-        return Err(procmgr_errors::OUT_OF_MEMORY);
-    }
-
-    // If the spawner supplied a death-relay POST cap, bind it as a second
-    // address-space observer (correlator 0) so the first terminal fault in any
-    // child thread posts the fault class straight to the spawner's death
-    // queue, once, and `Child::wait()` returns. The kernel captures the EventQueue state at
-    // bind time, so procmgr drops its copy afterwards (mirrors how the
-    // main-thread death binding leaves no procmgr-side ownership concern).
-    // Consumed only here, after the last failure return, so on every `Err`
-    // the caller still owns the cap and releases it.
-    if parent_relay_cap != 0
-    {
-        if let Err(e) = syscall::aspace_bind_notification(child_aspace, parent_relay_cap, 0)
-        {
-            // The creation is complete; the spawner's own main-thread
-            // observer still reports the child's exit.
-            std::os::seraph::log!(
-                warn: "death-relay bind failed (err={e}); a worker-thread fault will not reach the spawner"
-            );
-        }
-        let _ = syscall::cap_delete(parent_relay_cap);
+        return Err(insert_refusal(e));
     }
 
     Ok(CreateResult {
@@ -2163,6 +2171,22 @@ fn finalize_creation(
         node_handle: 0,
         image_bias,
     })
+}
+
+/// The create reply code for a refused insert of a child's entry: the creator
+/// ended, or a destroy of it began, while the child was built, as for a create
+/// from a badge that names no live process; else the table could not grow (the
+/// badge was reserved, so no other entry holds it).
+fn insert_refusal(e: process_table::InsertError) -> u64
+{
+    match e
+    {
+        process_table::InsertError::CreatorEnded => procmgr_errors::INVALID_ARGUMENT,
+        process_table::InsertError::BadgeInUse | process_table::InsertError::OutOfMemory =>
+        {
+            procmgr_errors::OUT_OF_MEMORY
+        }
+    }
 }
 
 /// Bind a child's main thread's exception class to the crash endpoint
@@ -2889,7 +2913,7 @@ pub fn create_process_from_bytes(
 
     let main_tls_memory = CapGuard::new(main_tls.memory_cap);
 
-    let reservation = next_process_badge(tables)?;
+    let reservation = next_process_badge(tables, sched.creator)?;
     let process_badge = reservation.badge();
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
@@ -3261,17 +3285,32 @@ impl Drop for CapGuard
 
 // ── Process destruction ─────────────────────────────────────────────────────
 
-/// Destroy a process identified by `badge`.
+/// Destroy the process `badge` names together with every process below it
+/// (`DESTROY_PROCESS`, `DESTROY_CHILD`). Returns `false` when no live
+/// process holds `badge` (already destroyed or reaped).
 ///
-/// For each kernel object procmgr held on behalf of the child
-/// (`thread`, `aspace`, `cspace`, `ProcessInfo` memory cap) we first `cap_revoke`
-/// to kill every descendant cap anywhere in the system — crucially, the
-/// self-ref copies procmgr installed inside the child's `CSpace` during
-/// `populate_child_info`. Without the revoke, those descendants keep the
-/// object alive: e.g. the child's own `cspace_cap` slot inside its `CSpace`
-/// holds a reference to the `CSpace` itself, so `cap_delete` on procmgr's
-/// copy alone would leave refcount at 1 and leak the whole aspace +
-/// everything the `CSpace` references.
+/// The destroy marks the subtree doomed first, in one hold of the table lock
+/// (`ProcessTable::doom_subtree`): from then on procmgr refuses a create
+/// from any of its processes, and the insert of a child one of them was
+/// creating, so none escapes the destroy by starting a child during the
+/// teardown. Then it tears the doomed entries down one by one
+/// ([`drain_doomed`]), each in its own hold, and returns once none is left
+/// but the children whose create procmgr has not answered yet
+/// (`ProcessEntry::unanswered`): each stays for its create, which is refused
+/// and takes it, so the destroy can return before that child is torn down.
+/// A doomed process that dies meanwhile is reaped as any other
+/// ([`reap_dead`]), and a destroy on another worker may take some of the
+/// doomed entries; each entry is torn down once, by whichever takes it.
+///
+/// For each kernel object procmgr held on behalf of a child
+/// (`thread`, `aspace`, `cspace`, `ProcessInfo` memory cap) the teardown
+/// first `cap_revoke`s to kill every descendant cap anywhere in the system —
+/// crucially, the self-ref copies procmgr installed inside the child's
+/// `CSpace` during `populate_child_info`. Without the revoke, those
+/// descendants keep the object alive: e.g. the child's own `cspace_cap` slot
+/// inside its `CSpace` holds a reference to the `CSpace` itself, so
+/// `cap_delete` on procmgr's copy alone would leave refcount at 1 and leak
+/// the whole aspace + everything the `CSpace` references.
 ///
 /// Once revoked, `cap_delete` on procmgr's remaining root cap drops the
 /// final reference. The kernel's `dealloc_object` path then tears down the
@@ -3281,80 +3320,181 @@ impl Drop for CapGuard
 /// frees nothing to the sealed buddy; memmgr reclaims those pages into its
 /// pool via the process-death notification, which a started
 /// `CREATE_DMA_HOLD` child's teardown holds back ([`teardown_entry`]).
-///
-/// Returns the exit reason the process is torn down with, for the caller to
-/// record in the recent-exits ring so `QUERY_PROCESS` answers `EXITED` for
-/// it: the reason the kernel retained when the main thread had already
-/// exited, or else the first terminal fault any of its threads took (a death
-/// procmgr's drain had not reaped yet, [`resync_exit_reason`]), else
-/// `EXIT_KILLED`,
-/// the reason the kernel records for a thread its teardown stops. The death
-/// forwarded to logd carries the same reason.
-///
-/// With [`ExitRecord::Record`], the exit is recorded in the recent-exits ring
-/// under the same lock that takes the entry, so a `QUERY_PROCESS` served on
-/// another worker finds the process either live or exited, never unknown.
-///
-/// Idempotent: returns `None` if the badge is unknown (already destroyed).
-pub fn destroy_process(
-    badge: u64,
+pub fn destroy_process(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables) -> bool
+{
+    let ended = {
+        let mut state = tables.lock();
+        match take_if_ended(&mut state, badge)
+        {
+            Some(tail) => Some(tail),
+            None if state.table.doom_subtree(badge) => None,
+            None => return false,
+        }
+    };
+    if let Some(tail) = ended
+    {
+        tail.finish(memmgr_ep, ipc_buf);
+    }
+    drain_doomed(memmgr_ep, ipc_buf, tables);
+    true
+}
+
+/// Under the table lock, reap the process `badge` names as its death would
+/// ([`reap_dead`]) when it has already ended, by an exit of its main thread
+/// or a terminal fault of any of its threads, and no destroy has marked it:
+/// a destroy that reaches procmgr before the reaper does takes the end as
+/// the reaper would, so the process's children are re-parented (or, for a
+/// contained process, marked) whichever comes first. `None`, with nothing
+/// done, when no live entry holds `badge`, when a destroy has marked it, or
+/// when it is still running.
+fn take_if_ended(state: &mut TableState, badge: u64) -> Option<TeardownTail>
+{
+    let exit_reason = state
+        .table
+        .find_by_badge(badge)
+        .filter(|entry| !entry.doomed)
+        .and_then(ended_exit_reason)?;
+    let entry = state.table.take_ended(badge, delete_relay)?;
+    state.recent.record(badge, exit_reason, crate::now_ns());
+    Some(teardown_entry(entry, exit_reason, &mut state.table))
+}
+
+/// Destroy the child `child` of the process `parent` together with every
+/// process below it, as [`destroy_process`] does (`DESTROY_CHILD`). The
+/// check that `child` is a child of `parent` and the marking of its subtree
+/// are one hold of the table lock, so a re-parenting cannot move the child
+/// out from under the check. Returns `false` when `child` names no live
+/// child of `parent`.
+pub fn destroy_child(
+    parent: u64,
+    child: u64,
     memmgr_ep: u64,
     ipc_buf: *mut u64,
     tables: &Tables,
-    record: ExitRecord,
-) -> Option<u64>
+) -> bool
 {
-    let (tail, exit_reason) = {
+    let ended = {
         let mut state = tables.lock();
-        let entry = state.table.take_by_badge(badge)?;
-        let main_thread =
-            syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
-        let terminal_fault = syscall::cap_info(
-            entry.aspace_cap,
-            syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
-        )
-        .ok();
-        let exit_reason = resync_exit_reason(
-            main_thread,
-            syscall_abi::THREAD_STATE_EXITED,
-            terminal_fault,
-        )
-        .unwrap_or(EXIT_KILLED);
-        match record
+        if !state.table.is_child(parent, child)
         {
-            ExitRecord::Record => state.recent.record(badge, exit_reason, crate::now_ns()),
-            ExitRecord::Omit => (),
+            return false;
         }
-        (
-            teardown_entry(entry, exit_reason, &mut state.table),
-            exit_reason,
-        )
+        match take_if_ended(&mut state, child)
+        {
+            Some(tail) => Some(tail),
+            None if state.table.doom_subtree(child) => None,
+            None => return false,
+        }
     };
-    tail.finish(memmgr_ep, ipc_buf);
-    Some(exit_reason)
+    if let Some(tail) = ended
+    {
+        tail.finish(memmgr_ep, ipc_buf);
+    }
+    drain_doomed(memmgr_ep, ipc_buf, tables);
+    true
 }
 
-/// Whether [`destroy_process`] records the destroyed process's exit in the
-/// recent-exits ring, for `QUERY_PROCESS`.
-#[derive(Clone, Copy)]
-pub enum ExitRecord
+/// Tear down every doomed entry (`ProcessTable::take_doomed`) but those whose
+/// create is unanswered, which their create's refusal takes, one per hold
+/// of the table lock, each with the reason [`destroyed_exit_reason`] gives,
+/// recorded in the recent-exits ring under the same hold, so a
+/// `QUERY_PROCESS` served on another worker finds the process either live
+/// or exited, never unknown; each teardown's tail runs after its hold.
+fn drain_doomed(memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables)
 {
-    /// Recorded: a handle to the process may still query its exit.
-    Record,
-    /// Not recorded: no handle to the process survives the destroy.
-    Omit,
+    loop
+    {
+        let tail = {
+            let mut state = tables.lock();
+            let Some(entry) = state.table.take_doomed(delete_relay)
+            else
+            {
+                return;
+            };
+            let exit_reason = destroyed_exit_reason(&entry);
+            state
+                .recent
+                .record(entry.badge, exit_reason, crate::now_ns());
+            teardown_entry(entry, exit_reason, &mut state.table)
+        };
+        tail.finish(memmgr_ep, ipc_buf);
+    }
+}
+
+/// Destroy the child `badge` names whose create procmgr refuses after its
+/// entry was inserted (a reply it cannot deliver, a hold it cannot arm). The
+/// child never ran, so it started no process; its exit is not recorded,
+/// since no handle to it survives. Its death relay is deleted unposted, as
+/// for a create refused before its entry was inserted (`CREATE_DEATH_RELAY`):
+/// the creator was told the create failed, and holds no child to end.
+/// Nothing when the badge is unknown.
+pub fn destroy_created(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables)
+{
+    let tail = {
+        let mut state = tables.lock();
+        let Some(entry) = state.table.take_refused(badge, delete_relay)
+        else
+        {
+            return;
+        };
+        let exit_reason = destroyed_exit_reason(&entry);
+        teardown_entry(entry, exit_reason, &mut state.table)
+    };
+    tail.finish(memmgr_ep, ipc_buf);
+}
+
+/// The exit reason a destroy tears `entry` down with, which the death
+/// relay, the end queue, logd and `QUERY_PROCESS` then read: the reason the
+/// kernel retained when the main thread had already exited, or else the
+/// first terminal fault any of its threads took (a death procmgr's drain had
+/// not reaped yet, [`resync_exit_reason`]), else `EXIT_KILLED`, the reason
+/// the kernel records for a thread its teardown stops. Reads kernel state
+/// only, under the table lock.
+fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
+{
+    ended_exit_reason(entry).unwrap_or(EXIT_KILLED)
+}
+
+/// The reason `entry`'s process ended with when it has ended before procmgr
+/// reaped it: the reason the kernel retained when its main thread has
+/// exited, or else the first terminal fault any of its threads took
+/// ([`resync_exit_reason`]); `None` while it runs. Reads kernel state only.
+fn ended_exit_reason(entry: &ProcessEntry) -> Option<u64>
+{
+    let main_thread = syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
+    let terminal_fault = syscall::cap_info(
+        entry.aspace_cap,
+        syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
+    )
+    .ok();
+    resync_exit_reason(
+        main_thread,
+        syscall_abi::THREAD_STATE_EXITED,
+        terminal_fault,
+    )
+}
+
+/// Delete the death relay of a re-parented child
+/// (`ProcessTable::take_ended`): its creator has ended, and no end of the
+/// child is posted to it.
+fn delete_relay(relay: u64)
+{
+    let _ = syscall::cap_delete(relay);
 }
 
 /// Reap the process `badge` names after its death, with `exit_reason`, as
-/// [`destroy_process`] tears down a destroyed one: take its entry, record
-/// the exit in the recent-exits ring, and tear it down, under one hold of the
-/// table lock, then tell memmgr after it. Nothing when the badge is unknown
-/// (a destroy or an earlier event already reaped it).
+/// [`destroy_process`] tears down a destroyed one: take its entry
+/// (`ProcessTable::take_ended`, which re-parents its children, or dooms
+/// them when it was created contained), record the exit in the recent-exits
+/// ring, and tear it down, under one hold of the table lock, then tell
+/// memmgr after it; then tear down what its containment doomed
+/// ([`drain_doomed`]). Nothing when the badge is unknown (a destroy or an
+/// earlier event already reaped it).
 pub fn reap_dead(badge: u64, exit_reason: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables)
 {
     let tail = {
         let mut state = tables.lock();
-        let Some(entry) = state.table.take_by_badge(badge)
+        let Some(entry) = state.table.take_ended(badge, delete_relay)
         else
         {
             return;
@@ -3363,6 +3503,7 @@ pub fn reap_dead(badge: u64, exit_reason: u64, memmgr_ep: u64, ipc_buf: *mut u64
         teardown_entry(entry, exit_reason, &mut state.table)
     };
     tail.finish(memmgr_ep, ipc_buf);
+    drain_doomed(memmgr_ep, ipc_buf, tables);
 }
 
 /// Send memmgr the held-back `PROCESS_DIED` of the torn-down
@@ -3409,9 +3550,9 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
 /// and the auto-reap path ([`reap_dead`], from `dispatch_death` and
 /// `resync_deaths` in `main.rs`). Revokes and deletes every kernel object
 /// procmgr held on behalf of the child, and returns the steps left for
-/// after the table lock ([`TeardownTail::finish`]): the memmgr reclaim and
-/// the death forward, with `exit_reason`, to logd
-/// ([`forward_death_to_logd`]).
+/// after the table lock ([`TeardownTail::finish`]): the memmgr reclaim, the
+/// post of `exit_reason` to the child's death relay and end queue, and the
+/// death forward, with it, to logd ([`forward_death_to_logd`]).
 ///
 /// The caller holds the table lock from the entry's take to the return, and
 /// the steps here are syscalls that wait on no other process. So the
@@ -3494,6 +3635,9 @@ pub fn teardown_entry(
         badge: entry.badge,
         exit_reason,
         reclaim: (!parked).then_some((entry.memmgr_badge, entry.memmgr_send_cap)),
+        relay: entry.relay,
+        end_queue: entry.end_queue,
+        end_correlator: entry.end_correlator,
     }
 }
 
@@ -3506,13 +3650,27 @@ pub struct TeardownTail
     /// The child's memmgr badge and procmgr's badged memmgr SEND for it,
     /// unless its reclaim was parked.
     reclaim: Option<(u64, u64)>,
+    /// The child's death relay, `0` for none.
+    relay: u64,
+    /// The child's end queue, `0` for none, and the correlator posted to it.
+    end_queue: u64,
+    end_correlator: u64,
 }
 
 impl TeardownTail
 {
     /// Notify memmgr to reclaim the child's memory, then drop procmgr's
-    /// badged SEND copy, unless the reclaim was parked; then forward the
-    /// death to logd. Called with no lock held.
+    /// badged SEND copy, unless the reclaim was parked; then post the child's
+    /// end; then forward the death to logd. Called with no lock held.
+    ///
+    /// The end goes to the death relay as the entry `(exit_reason, 0)` and to
+    /// the end queue as `(exit_reason, end_correlator)`, the entries a death
+    /// observer bound with those correlators receives, and each cap is
+    /// deleted after its post. Each is posted here alone, and the teardown
+    /// that leads here takes the entry once, so each receives one post in the
+    /// child's life. They follow the reclaim, so a holder that learns of the
+    /// end finds the child's pages back in memmgr's pool, unless held. A post
+    /// to a full queue is dropped, as the kernel drops a death post.
     pub fn finish(self, memmgr_ep: u64, ipc_buf: *mut u64)
     {
         if let Some((memmgr_badge, memmgr_send_cap)) = self.reclaim
@@ -3521,6 +3679,18 @@ impl TeardownTail
             if memmgr_send_cap != 0
             {
                 let _ = syscall::cap_delete(memmgr_send_cap);
+            }
+        }
+        for (queue, tag) in [(self.relay, 0), (self.end_queue, self.end_correlator)]
+        {
+            if queue != 0
+            {
+                let entry = syscall::EventEntry {
+                    payload: self.exit_reason,
+                    tag,
+                };
+                let _ = syscall::event_post_entry(queue, entry);
+                let _ = syscall::cap_delete(queue);
             }
         }
         forward_death_to_logd(self.badge, self.exit_reason);
@@ -3542,7 +3712,7 @@ impl TeardownTail
 /// Returns the `START_PROCESS` reply code (`services/procmgr/docs/ipc-interface.md`
 /// § Label 2):
 /// - `procmgr_errors::INVALID_BADGE` (4) — no process in `table` carries
-///   `badge`.
+///   `badge`, or a destroy of it has begun.
 /// - `procmgr_errors::ALREADY_STARTED` (5) — the process was started before.
 /// - `procmgr_errors::OUT_OF_MEMORY` (2) — a namespace or cwd override is
 ///   pending and either the scratch mapping of the child's `ProcessInfo`
@@ -3559,6 +3729,10 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u64) -> 
         .find_mut_by_badge(badge)
         .ok_or(procmgr_errors::INVALID_BADGE)?;
 
+    if entry.doomed
+    {
+        return Err(procmgr_errors::INVALID_BADGE);
+    }
     if entry.started
     {
         return Err(procmgr_errors::ALREADY_STARTED);

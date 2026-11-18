@@ -23,8 +23,9 @@
 //!           the exit reason on thread exit, encoded as
 //!           docs/process-lifecycle.md § Exit reason defines.
 //!   * Kill: ipc_call(process_handle, DESTROY_PROCESS, 0, &[]) — procmgr
-//!           revokes + deletes the child's kernel objects, a teardown that
-//!           posts nothing itself — then event_post(event_queue_cap,
+//!           revokes + deletes the child's kernel objects, with every
+//!           process the child started, and posts the child's end to the
+//!           death relay once — then event_post(event_queue_cap,
 //!           EXIT_KILLED), so `wait` after `kill` reports `EXIT_KILLED`,
 //!           unless the child had already died and its own exit reason,
 //!           posted first, is reported. A failed teardown is returned as
@@ -412,17 +413,17 @@ impl Command {
 
         // Create the per-child death `EventQueue` BEFORE issuing
         // CREATE_FROM_FILE so a POST-only copy can ride along as the
-        // death-relay cap. procmgr binds that copy as an address-space death
-        // observer on the child, so the first terminal fault in *any* of the
-        // child's threads (not just the main thread) posts the fault class to
-        // this queue, once, and `wait()` returns. Four covers one post from each source
-        // that targets the queue: the main thread's death, the address-space
-        // death observer, `kill`'s `EXIT_KILLED`, and the bridge's drop
-        // sentinel.
+        // death-relay cap. procmgr posts the child's end to that copy once,
+        // whoever ends it: the fault class of a terminal fault in *any* of the
+        // child's threads (not just the main thread), its exit reason, or the
+        // reason a destroy tore it down with, and `wait()` returns. Four
+        // covers one post from each source that targets the queue: the main
+        // thread's death, procmgr's post to the relay, `kill`'s
+        // `EXIT_KILLED`, and the bridge's drop sentinel.
         const DEATH_EQ_CAPACITY: u32 = 4;
-        // Two observer nodes: the main-thread binding below and procmgr's
-        // address-space binding of the relay.
-        const DEATH_EQ_OBSERVERS: u32 = 2;
+        // One observer node: the main-thread binding below. procmgr's post
+        // to the relay is a post, not a binding, and takes none.
+        const DEATH_EQ_OBSERVERS: u32 = 1;
         let bytes = syscall_abi::event_queue_retype_bytes(
             u64::from(DEATH_EQ_CAPACITY),
             u64::from(DEATH_EQ_OBSERVERS),
@@ -488,7 +489,8 @@ impl Command {
         // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
         // file_cap, the argv/env cap and death_relay ownership transfer to
         // procmgr via the IPC; procmgr cap_deletes the file cap and the
-        // argv/env cap before it replies, and binds-then-deletes the relay.
+        // argv/env cap before it replies, and keeps the relay for the child's
+        // life.
         let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) };
         // procmgr holds no copy of the argv/env cap now; the run goes back
         // to memmgr unless procmgr may still map its pages.
@@ -1037,12 +1039,13 @@ impl Process {
         if !destroy_child(self.process_handle) {
             return Err(io::Error::other("Child::kill: DESTROY_PROCESS failed"));
         }
-        // Kernel posts to `death_notification` only on voluntary exit
-        // (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
-        // silent. Synthesize the event ourselves on `death_eq` so the
-        // bridge (or `wait` directly, for non-piped spawns) returns a
-        // well-defined status after kill. Value chosen outside the
-        // kernel fault range (0x1000..0x2000) so callers can tell apart
+        // The kernel posts to the main-thread binding only on voluntary
+        // exit (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
+        // silent. procmgr posts the child's end to the relay once, at the
+        // teardown, which the bridge (or `wait` directly, for non-piped
+        // spawns) reads when it is first; the event posted here as well
+        // keeps a status after kill independent of when that post lands. Value chosen outside
+        // the kernel fault range (0x1000..0x2000) so callers can tell apart
         // a user-initiated kill from a hardware fault.
         let _ = syscall::event_post(self.death_eq, EXIT_KILLED);
         Ok(())

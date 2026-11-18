@@ -215,28 +215,28 @@ jobs:
       - name: Run ${{ matrix.tester }}
         # Per-cell run-parallel budget, for HANG classification, derived as
         # docs/build-system.md § Continuous Integration states from each
-        # cell's worst pass over the 28 build-test runs of 2026-11-03 (the
-        # latest attempt of each); the worst passes are beside the values.
-        # riscv64 debug svctest's is re-derived from its worst pass over the
-        # 144 build-test runs from 2026-11-04 03:21 to 2026-11-05 01:36 UTC
-        # that ran the cell to a pass: 89.5 s, against the 179.0 s of
-        # 2026-11-03, when its fsbench phase ran up to about 3x slower on a
-        # contended 4-core runner, as the fs client and server's CPU
-        # placement allows (#762).
+        # cell's worst pass, over every boot the budget bounds (run-parallel,
+        # test-map-redo, test-log-level), in the 174 build-test runs from
+        # 2026-11-17 22:44 to 2026-11-18 15:28 UTC (the latest attempt of
+        # each); the worst passes are beside the values. riscv64 debug
+        # svctest's three runs that the previous 300 s budget cut short were
+        # still passing phases; its worst is the slowest one's projected
+        # completion (the phases it had left, at its own pace, from a passing
+        # run's log), above the 297.5 s of its worst observed pass.
         run: |
           case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
-            riscv64-debug-svctest)    budget=300 ;;  # worst pass 89.5 s
-            riscv64-debug-usertest)   budget=360 ;;  # worst pass 108.2 s
-            riscv64-debug-ktest)      budget=300 ;;  # worst pass 97.9 s
-            riscv64-release-svctest)  budget=300 ;;  # worst pass 89.5 s
-            riscv64-release-usertest) budget=180 ;;  # worst pass 46.8 s
-            riscv64-release-ktest)    budget=300 ;;  # worst pass 88.6 s
-            x86_64-debug-svctest)     budget=360 ;;  # worst pass 114.6 s
-            x86_64-debug-usertest)    budget=180 ;;  # worst pass 56.9 s
-            x86_64-debug-ktest)       budget=360 ;;  # worst pass 112.7 s
-            x86_64-release-svctest)   budget=240 ;;  # worst pass 69.1 s
-            x86_64-release-usertest)  budget=180 ;;  # worst pass 24.6 s
-            x86_64-release-ktest)     budget=360 ;;  # worst pass 116.3 s
+            riscv64-debug-svctest)    budget=1140 ;;  # worst pass 372.3 s
+            riscv64-debug-usertest)   budget=540 ;;   # worst pass 168.4 s
+            riscv64-debug-ktest)      budget=300 ;;   # worst pass 81.9 s
+            riscv64-release-svctest)  budget=660 ;;   # worst pass 201.0 s
+            riscv64-release-usertest) budget=240 ;;   # worst pass 66.4 s
+            riscv64-release-ktest)    budget=240 ;;   # worst pass 70.9 s
+            x86_64-debug-svctest)     budget=480 ;;   # worst pass 159.0 s
+            x86_64-debug-usertest)    budget=240 ;;   # worst pass 61.4 s
+            x86_64-debug-ktest)       budget=480 ;;   # worst pass 153.3 s
+            x86_64-release-svctest)   budget=420 ;;   # worst pass 129.5 s
+            x86_64-release-usertest)  budget=180 ;;   # worst pass 39.3 s
+            x86_64-release-ktest)     budget=540 ;;   # worst pass 175.8 s
             *) echo "no budget for this cell" >&2; exit 1 ;;
           esac
           # The svctest boot attaches the test devices its devmgr phases drive.
@@ -247,10 +247,19 @@ jobs:
           # --save-logs keeps every run's log, a PASS included, for the
           # run-parallel-saved artifact below, so a cell's per-phase timings
           # can be compared across heads.
+          started=$SECONDS
           cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
             --parallel 1 --runs 1 --timeout "$budget" \
             --save-logs target/xtask/run-parallel-saved $test_devices
+          # A pass over half its budget has outgrown the worst pass the budget
+          # was derived from, a third of the budget or less, so the budget is
+          # due for re-derivation before a slower draw of the same boot reaches
+          # it; a warning annotation on the run says so and fails nothing.
+          took=$((SECONDS - started))
+          if [ "$took" -gt $((budget / 2)) ]; then
+            echo "::warning title=run-parallel budget::The boot took ${took} s, over half of the cell's ${budget} s budget; re-derive the budgets (docs/build-system.md § Continuous Integration)."
+          fi
           if [ "${{ matrix.tester }}" = "svctest" ]; then
             # No extra boot: the image staged no crashd, so the log must hold
             # no crash report.

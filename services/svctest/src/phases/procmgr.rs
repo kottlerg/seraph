@@ -1518,7 +1518,7 @@ fn debug_authority_refused(procmgr: u64)
 }
 
 /// Look up `/programs/hello` and return `(file_cap, size)`.
-fn hello_file() -> (u64, u64)
+pub(crate) fn hello_file() -> (u64, u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let root = std::os::seraph::root_dir_cap();

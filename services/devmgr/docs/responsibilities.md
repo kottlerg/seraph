@@ -397,7 +397,7 @@ devmgr's responsibilities are:
   named by the directory's absolute path the request carries as a name block
   from data word `DRIVERS_DIR_PATH_WORD`, under the same declaration bounds as
   the `SET_DRIVERS_DIR` pass (auxiliary tier, no physical access, no IOMMU
-  family key, no boot-only class) against the device records still unbound,
+  family key) against the device records still unbound,
   starts the drivers it binds in a settle batch of its own, and serves them once
   it settles, within `SETTLE_TIMEOUT`. A record is bound at most once a boot, so
   a second request over the same directory binds nothing; a limited driver's
@@ -553,23 +553,21 @@ devmgr's responsibilities are:
 
   devmgr mints class SENDs on `MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`
   (badge bit 59), which svcmgr and init each derive from their badge-0
-  registry source and no published name carries. The request carries the verbs, the flags
-  (`CLASS_BOOT_ONLY`), and the class name (at most `MAX_CLASS_NAME_BYTES`, 32,
-  bytes); devmgr interns the class into its class table and replies a SEND
-  whose badge carries the class's slot and the verbs. svcmgr sends one per
+  registry source and no published name carries. The request carries the verbs
+  and the class name (at most `MAX_CLASS_NAME_BYTES`, 32, bytes); devmgr
+  interns the class into its class table and replies a SEND whose badge
+  carries the class's slot and the verbs. svcmgr sends one per
   class file before `SET_DRIVERS_DIR` ([service-definitions.md § Device class
   files](../../svcmgr/docs/service-definitions.md#device-class-files)); init requests the
   `block` class SEND for vfsd. The class table holds at most
   `MAX_CLASSES` (64) classes: a new class's request past it is refused, and a
-  ready driver of a new class is withdrawn, logged. devmgr refuses, logging
-  and not binding, a drivers-directory declaration whose class a request
-  marked boot-only, and refuses `INVALID_REQUEST` a boot-only mark after the
-  drivers-directory pass began. After the drivers-directory settle devmgr logs
+  ready driver of a new class is withdrawn, logged. After the drivers-directory
+  settle devmgr logs
   each class configured with no served driver and each served class no class
   file configured.
 
-  The `block` class's reply is the `MOUNT_AUTHORITY`-badged whole-disk cap, so
-  its class file marks it boot-only, and it reaches only vfsd, through the
+  The `block` class's reply is the `MOUNT_AUTHORITY`-badged whole-disk cap,
+  and it reaches only vfsd, through the
   class SEND init requests for it, and a service whose definition seeds
   `devmgr.class.block`, which no shipped definition does. The `debug-port`
   class answers with the debug port: the driver served under that class,
@@ -599,10 +597,10 @@ devmgr's responsibilities are:
   a seed-only name pwrmgr alone seeds, which svcmgr's `QUERY_ENDPOINT`
   refuses.
 - **Serve acpid** — acpid, the service that evaluates AML, calls devmgr and devmgr never calls
-  acpid. Labels 24 to 29 (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`,
-  `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`) are gated on `ACPI_AUTHORITY`, which only the
-  seed-only `devmgr.acpi` cap carries, seeded by acpid's recipe alone
-  ([acpid and devmgr](../../acpid/docs/devmgr.md) § Capabilities).
+  acpid. Labels 24 to 29 and 31 (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`,
+  `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`, `ACPI_HOTPLUG`) are gated on
+  `ACPI_AUTHORITY`, which only the seed-only `devmgr.acpi` cap carries, seeded by acpid's
+  recipe alone ([acpid and devmgr](../../acpid/docs/devmgr.md) § Capabilities).
   - devmgr grants each operation region acpid's AML reaches against its policy, and makes
     each configuration-space access for it
     ([acpid and devmgr](../../acpid/docs/devmgr.md) § Region grants and § Configuration access).
@@ -622,8 +620,10 @@ devmgr's responsibilities are:
   them in a hotplug batch (above). When a card leaves, or its removal is asked for with the
   attention button, the poller posts the removal; the control thread withdraws each driver behind
   the slot as below, quiesces the functions, returns their BAR pages to the apertures and removes
-  their records, and the poller then powers the slot off. The ACPI hotplug source is design
-  intent; not yet implemented. See [`docs/hotplug.md`](hotplug.md).
+  their records, and the poller then powers the slot off. A slot whose firmware drives hotplug
+  (its `_OSC` withholds native control) is left to the firmware: devmgr holds the BAR pages
+  behind it, and runs the add or removal job for each `ACPI_HOTPLUG` event acpid posts. See
+  [`docs/hotplug.md`](hotplug.md).
 
 ---
 
@@ -657,7 +657,7 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 
 | Capability | Rights | Purpose |
 |---|---|---|
-| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`, `QUERY_HOST_BRIDGE`), acpid's labels (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
+| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`, `QUERY_HOST_BRIDGE`), acpid's labels (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`, `ACPI_HOTPLUG`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr delivers to the IOMMU driver, keeping no copy; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify, Mint | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps, each routed with `SYS_IRQ_ROUTE` when carved and kept for the boot, whose derivations are delegated to drivers; mint message-signaled targets with `SYS_IRQ_MSG_ALLOC` through a copy carrying `RIGHTS_IRQ_MINT` alone, derived at startup ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and acpid's FADT register-block ports |

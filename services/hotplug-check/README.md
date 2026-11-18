@@ -1,14 +1,15 @@
 # hotplug-check
 
-Test-tier fixture with two modes. The device mode proves devmgr's PCI Express native hotplug add and
-removal paths: it waits for devmgr to serve the `test-dma` fixture on an `edu` device the host
-hot-adds behind a root port and checks that the device's DMA and its MSI work; then that devmgr
-withdraws the driver when the host removes the device, and that the device added again is served
-anew, works, and is charged none of its predecessor's IOMMU faults. So `cargo xtask test-hotplug`
-follows an arrival from the slot to a bound driver, and a removal back to an empty slot. The disk
-mode (`hotplug-check disk`) proves vfsd's handling of a disk removed and added again behind the root
-port, and of the loss of its root filesystem's driver. It is gated and opt-in: its recipes live in
-`/config/svcmgr/tests/`, and only `test-hotplug` stages them, each for its own boots.
+Test-tier fixture with two modes. The device mode proves devmgr's PCI Express hotplug add and
+removal paths, native and through acpid: it waits for devmgr to serve the `test-dma` fixture on an
+`edu` device the host hot-adds behind a root port and checks that the device's DMA and its MSI
+work; then that devmgr withdraws the driver when the host removes the device, and that the device
+added again is served anew, works, and is charged none of its predecessor's IOMMU faults. So
+`cargo xtask test-hotplug` follows an arrival from the slot to a bound driver, and a removal back to
+an empty slot, under each hotplug control. The disk mode (`hotplug-check disk`) proves vfsd's
+handling of a disk removed and added again behind a root port, and of the loss of its root
+filesystem's driver. It is gated and opt-in: its recipes live in `/config/svcmgr/tests/`, and only
+`test-hotplug` stages them, each for its own boots.
 
 ---
 
@@ -71,8 +72,8 @@ fault count. It invokes no shutdown: the host test computes the verdict and kill
 
 ### Disk mode
 
-The mode runs on the split-data layout with the data disk behind the root port from boot, so vfsd
-mounts `/data` at startup. It finds the root mount's driver by its process name `fatfs:/`
+The mode runs on the split-data layout with the data disk behind the first root port from boot,
+so vfsd mounts `/data` at startup. It finds the root mount's driver by its process name `fatfs:/`
 (`LIST_PROCESSES`), writes a file under `/data`, holds it open, and logs `HOLDING a file open on
 /data; READY for the removal of its disk`, on which the host removes the disk. It then checks that:
 

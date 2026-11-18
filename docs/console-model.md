@@ -76,7 +76,15 @@ direct console paths remain as fallbacks for the life of the system.
    signals it, and it emits both received log lines and its own diagnostics through it — including
    its own panic / alloc-error output, routed here via a `std::os::seraph::set_panic_sink` sink
    rather than the log endpoint logd serves (logd deletes its seeded `log_send_cap` at startup so a
-   fault cannot self-IPC into it). Outside the serial driver, UART hardware authority is held only
+   fault cannot self-IPC into it). Every line reaches the driver through logd's serial sink: a
+   bounded queue drained by one writer thread, the only logd thread that waits on the driver. A
+   line's producer waits for its write for at most `SINK_STALL_MS`, so a driver that is stopped
+   or dead holds the log stream for that bound once and then costs it nothing until it writes
+   again. A sink whose writer logd could not spawn is written by each line's producer instead, and
+   a stopped driver then costs every line up to that bound. The panic sink's direct calls are
+   bounded the same way
+   ([services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md#output-sinks)
+   § Output sinks). Outside the serial driver, UART hardware authority is held only
    by init, whose init-logd thread uses it (on riscv64 until init-logd exits after the handover and
    deletes init's UART Mmio capability), and by devmgr, whose I/O-port and MMIO caps it carves the
    driver's cap from.
@@ -105,7 +113,9 @@ direct console paths remain as fallbacks for the life of the system.
      `WATCH_CLASS` watch handled as the serial driver's, and mirrors
      every log line it writes to serial onto the framebuffer too, so the
      steady-state userspace log stream reaches the screen as well as the
-     UART. The framebuffer driver, when present, is spawned before svcmgr launches logd;
+     UART. The mirror is a sink of its own, with its own queue and writer, so a framebuffer driver
+     that is stopped or dead holds neither the serial output nor the log stream beyond
+     `SINK_STALL_MS`. The framebuffer driver, when present, is spawned before svcmgr launches logd;
      logd's emit path never calls devmgr and, while no framebuffer driver is resolved (headless
      boot), skips the mirror, so serial stays the authoritative channel.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
@@ -176,11 +186,14 @@ primitives, no input. The driver's IPC contract is specified in
 
 ## Logging constraint on the serial and framebuffer drivers
 
-The serial driver and the framebuffer driver MUST NOT emit `std::os::seraph::log!`. logd routes
-its own output to these drivers (its UART mirror and its framebuffer mirror are blocking
-`SERIAL_WRITE_BYTES` and `FB_WRITE_BYTES` calls), so a log call from either driver would
-deadlock: driver → log endpoint → logd → driver. Both drivers therefore drop diagnostics, and
-fatal bootstrap failures end the driver's thread without output. The pre-driver boot window is
+The serial driver and the framebuffer driver MUST NOT emit `std::os::seraph::log!`. logd writes
+every log line to both, so a line either driver logged would be written back through it: a
+diagnostic on its write path would feed itself, one more line per line written. Both drivers
+therefore drop diagnostics, and fatal bootstrap failures end the driver's thread without output.
+Neither driver's service thread waits on logd, and no thread of logd's but a sink's writer waits
+on a driver for longer than `SINK_STALL_MS`, so both drivers can be stopped by a debugger and
+are covered by the crash service like any other driver
+([fault-handling.md](fault-handling.md)). The pre-driver boot window is
 covered by init-logd's direct-UART path (see § Why the direct paths remain), and the kernel
 renderer is the early-boot and panic fallback for the framebuffer. The other userspace drivers
 are not under this constraint.

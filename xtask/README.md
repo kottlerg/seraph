@@ -1251,13 +1251,13 @@ times, each from images packed with those objects in place of the sysroot's file
 
 The untrusted key is a local identity generated for the run in a directory under the host's
 temporary directory, outside the work tree, and removed again. A boot passes once every owed line
-has appeared, in any order; it fails at once on another refusal line or a fatal marker
-(`KERNEL EXCEPTION`, `FATAL:`, a panic, the watchdog), and fails at its deadline, three minutes
-for a boot the bootloader ends and six for `rootfs`, naming the lines still missing. A staged
-test harness's own verdict is not judged. The host kills QEMU. Every boot's serial log is saved
-as `target/xtask/test-signing/<arch>/<case>.log`, and the command reports every case before it
-fails. The images are packed again from the sysroot in the layout they had, whatever the outcome;
-no case changes a sysroot file, so a later pack cannot sign a tampered body.
+has appeared, in any order; it fails at once on another refusal line or a fatal marker (`KERNEL
+EXCEPTION`, `FATAL:`, a panic, the watchdog, the entropy self-test), and fails at its deadline,
+three minutes for a boot the bootloader ends and six for `rootfs`, naming the lines still missing. A
+staged test harness's own verdict is not judged. The host kills QEMU. Every boot's serial log is
+saved as `target/xtask/test-signing/<arch>/<case>.log`, and the command reports every case before it
+fails. The images are packed again from the sysroot in the layout they had, whatever the outcome; no
+case changes a sysroot file, so a later pack cannot sign a tampered body.
 
 The command compiles the bootloader of the `revoked` case, so the host admits it as a build and
 then its boots as one boot of `--cpus` vCPUs (§ Host launch rules). The compile reuses the
@@ -1282,36 +1282,44 @@ cargo xtask test-signing [--arch x86_64|riscv64] [--release] [--cpus N] [--mem M
 
 ### `cargo xtask test-hotplug`
 
-Check devmgr's PCI Express native hotplug add and removal paths, on either arch. Stages the
-`hotplug-check` fixture's recipe
-([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
+Check devmgr's PCI Express hotplug add and removal paths, native and through acpid, and its bind of
+a hot-added disk from the drivers directory, on either arch. Stages the `hotplug-check` fixture's
+recipe ([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
 `config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
 `config/devmgr/tests/` into `config/devmgr/classes/`, and repacks the disk images in the layout they
-have. It boots the current sysroot headless, with an empty `pcie-root-port` (`-device
-pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c`) and a QMP socket:
+have. It boots the current sysroot headless, with two empty `pcie-root-port`s (`-device
+pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c` and `-device
+pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socket:
 
-1. on x86_64 only, under the machine's default, whose `_OSC` withholds native hotplug control:
-   it passes when devmgr logs the slot `not managed: _OSC control`;
+1. on x86_64 only, under the machine's default, the firmware's ACPI PCI hotplug, whose `_OSC`
+   withholds native hotplug control: devmgr must log the slot `firmware hotplug: _OSC control`,
+   and the cycle of step 2 runs with the firmware's removal: devmgr's removal lines on its eject
+   request, then acpid's `ejected (_EJ0) once devmgr removed 1 functions`;
 2. under native control (on x86_64 with
    `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off`, so `_OSC` grants it; on riscv64
    the `qemu-virt.platform` key grants it): once devmgr logs the slot `managed (native control
    by` and the fixture logs `[hotplug-check] READY for the hot-added device`, it hot-adds QEMU's
-   `edu` device behind the port (QMP `device_add`, `dma_mask=0xffffffff` as the test devices'
+   `edu` device behind the first port (QMP `device_add`, `dma_mask=0xffffffff` as the test devices'
    `edu` has). Once the fixture logs `[hotplug-check] READY for the removal`, it removes the
    device (QMP `device_del`) and waits up to a minute for QEMU's `DEVICE_DELETED` event, then
    for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
-   then hot-adds the device again, and passes on the fixture's `[hotplug-check] PASS` line.
+   then hot-adds the device again and waits for the fixture's `[hotplug-check] PASS` line. It
+   then adds a raw block node over a zero-filled 1 MiB image (QMP `blockdev-add`) and hot-adds a
+   `virtio-blk-pci` on it behind the second port and the IOMMU (`iommu_platform=on`), and passes
+   once devmgr logs `[devmgr] virtio-blk: binds PCI` and `virtio-blk: boot tier not granted from
+   the drivers directory` (the drivers directory's copy, at the auxiliary tier) and the driver
+   logs `[virtio-blk] ready, entering service loop`.
 
 Then two storage boots on the split-data layout, under native control, with the disk-mode recipe
 (`hotplug-check-disk.svc`) staged alone:
 
-3. the data disk (`disk-data.img`) behind the root port from boot: the host removes it (QMP
+3. the data disk (`disk-data.img`) behind the first port from boot: the host removes it (QMP
    `device_del`), requires devmgr's removal lines and vfsd's `disk N: removed; tearing down its
    mounts`, adds it again (`device_add` of a `virtio-blk-pci` on the kept block node), then
    requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`, svcmgr's `critical service
    unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
-4. the boot disk behind the port and the data disk on a slot of its own: the host removes the boot
-   disk and requires the same last three.
+4. the boot disk behind the first port and the data disk on a slot of its own: the host removes
+   the boot disk and requires the same last three.
 
 It kills QEMU after each boot, then removes the staged files and repacks the images in that layout
 again, whatever the outcome. [docs/testing.md](../docs/testing.md) § PCI Express hotplug
@@ -1330,9 +1338,9 @@ cargo xtask test-hotplug [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 | `--cpus` | `4` | vCPUs of the guest |
 | `--mem` | `512` | Guest memory size in MiB |
 
-Each boot to its markers is bounded by five minutes and the fixture's verdict by three minutes
-after the hot-add. The boots are the hotplug device cell of the local and release host runs
-([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
+Each boot to its markers is bounded by five minutes, and the fixture's verdict and the disk's bind
+by three minutes after their hot-add. The boots are the hotplug device cell of the local and release
+host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---
 
@@ -1996,7 +2004,7 @@ test`, which rewrites every screen and outcome from the current table; the diff 
 | [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
 | [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md) | The debug port `--debug-port` attaches and `test-debug-port` drives |
 | [services/gdbstub/README.md](../services/gdbstub/README.md) | The GDB stub `--debug-target` stages and `test-gdb` drives |
-| [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md) | The PCI Express native hotplug `test-hotplug` drives |
+| [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md) | The PCI Express hotplug `test-hotplug` drives, native and through acpid |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` and `test` enforce; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
 | [targets/README.md](targets/README.md) | Custom target specs |

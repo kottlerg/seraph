@@ -8,7 +8,8 @@
 //! handshake, and issues the handful of commands the harnesses need:
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
 //! and `quit` (snapshot-resume test), `stop` + `pmemsave` (the ACPI table
-//! capture), `device_add` and `device_del` (the hotplug test), and
+//! capture), `blockdev-add`, `device_add` and `device_del` (the hotplug
+//! test), and
 //! `system_powerdown` (the power-button test); and waits for the
 //! `SHUTDOWN` event (the reboot and power-button tests) and the
 //! `DEVICE_DELETED` event (the hotplug test).
@@ -279,19 +280,6 @@ fn string_field<'a>(line: &'a str, key: &str) -> Option<&'a str>
     rest.split_once('"').map(|(v, _)| v)
 }
 
-/// The value of a device property `device_add` sets: a JSON number, string
-/// or boolean, as the property's type takes it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Property<'a>
-{
-    /// An integer or a size (`dma_mask`, `logical_block_size`).
-    Number(u64),
-    /// A string, an id or an enumeration (`drive`, `disable-legacy`).
-    String(&'a str),
-    /// A boolean (`iommu_platform`).
-    Bool(bool),
-}
-
 /// Hot-add the device `driver`, its id `id`, on the bus `bus` (a port's id),
 /// with the further properties `properties`, each a name and a value.
 pub fn device_add(
@@ -310,6 +298,41 @@ pub fn device_add(
     Ok(())
 }
 
+/// A property value [`device_add`] sets on the device it adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Property<'a>
+{
+    /// A number, such as a DMA mask.
+    Number(u64),
+    /// A string, such as the block node a `drive` property names.
+    Text(&'a str),
+    /// A boolean, such as `iommu_platform`.
+    Flag(bool),
+}
+
+/// Add a raw-format block node named `node` over the image file `path`
+/// (QMP `blockdev-add`), which a device [`device_add`] adds then names
+/// in its `drive` property.
+pub fn blockdev_add_raw(socket: &Path, node: &str, path: &Path) -> Result<()>
+{
+    let mut client = Client::connect(socket)?;
+    client.send(&blockdev_add_raw_message(node, path_str(path)?))?;
+    client
+        .read_result()
+        .with_context(|| format!("blockdev-add {node}"))?;
+    Ok(())
+}
+
+/// The `blockdev-add` command of [`blockdev_add_raw`].
+fn blockdev_add_raw_message(node: &str, path: &str) -> String
+{
+    format!(
+        r#"{{"execute":"blockdev-add","arguments":{{"driver":"raw","node-name":{},"file":{{"driver":"file","filename":{}}}}}}}"#,
+        json_string(node),
+        json_string(path)
+    )
+}
+
 /// The `device_add` command of [`device_add`].
 fn device_add_message(
     driver: &str,
@@ -326,14 +349,13 @@ fn device_add_message(
     );
     for (name, value) in properties
     {
-        let value = match *value
-        {
-            Property::Number(n) => n.to_string(),
-            Property::String(s) => json_string(s),
-            Property::Bool(b) => b.to_string(),
-        };
         // Writing to a `String` cannot fail.
-        let _ = write!(arguments, ",{}:{value}", json_string(name));
+        let _ = match value
+        {
+            Property::Number(n) => write!(arguments, ",{}:{n}", json_string(name)),
+            Property::Text(s) => write!(arguments, ",{}:{}", json_string(name), json_string(s)),
+            Property::Flag(b) => write!(arguments, ",{}:{b}", json_string(name)),
+        };
     }
     format!(r#"{{"execute":"device_add","arguments":{{{arguments}}}}}"#)
 }
@@ -541,6 +563,18 @@ mod tests
             r#"{"execute":"device_add","arguments":{"driver":"edu","id":"hp\"0","bus":"port","dma_mask":4294967295}}"#
         );
         assert_eq!(
+            device_add_message(
+                "virtio-blk-pci",
+                "d",
+                "p",
+                &[
+                    ("drive", Property::Text("n\"1")),
+                    ("iommu_platform", Property::Flag(true))
+                ]
+            ),
+            r#"{"execute":"device_add","arguments":{"driver":"virtio-blk-pci","id":"d","bus":"p","drive":"n\"1","iommu_platform":true}}"#
+        );
+        assert_eq!(
             device_add_message("edu", "a", "b", &[]),
             r#"{"execute":"device_add","arguments":{"driver":"edu","id":"a","bus":"b"}}"#
         );
@@ -550,8 +584,8 @@ mod tests
                 "d",
                 "p",
                 &[
-                    ("drive", Property::String("n\"1")),
-                    ("iommu_platform", Property::Bool(true)),
+                    ("drive", Property::Text("n\"1")),
+                    ("iommu_platform", Property::Flag(true)),
                     ("logical_block_size", Property::Number(512)),
                 ]
             ),
@@ -565,6 +599,15 @@ mod tests
         assert_eq!(
             device_del_message("hp\"0"),
             r#"{"execute":"device_del","arguments":{"id":"hp\"0"}}"#
+        );
+    }
+
+    #[test]
+    fn blockdev_add_names_a_raw_node_over_the_file()
+    {
+        assert_eq!(
+            blockdev_add_raw_message("disk", "/t/a\"b.img"),
+            r#"{"execute":"blockdev-add","arguments":{"driver":"raw","node-name":"disk","file":{"driver":"file","filename":"/t/a\"b.img"}}}"#
         );
     }
 

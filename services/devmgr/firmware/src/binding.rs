@@ -28,8 +28,6 @@ use alloc::vec::Vec;
 
 use driver_binding::decl::{DriverDecl, DriverName, MatchKey, Tier};
 
-use crate::classes::Classes;
-
 /// Where a declaration came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source
@@ -63,6 +61,30 @@ pub struct RecordKeys<'a>
     pub platform: Option<&'a [u8]>,
     pub iommu_family: Option<&'a [u8]>,
     pub boot_framebuffer: bool,
+}
+
+/// The ACPI IDs that reserve resources for the firmware and the chipset
+/// rather than name a device a driver drives: `PNP0A05` and `PNP0A06`, the
+/// generic container devices, `PNP0C02`, motherboard resources, and
+/// `ACPI0004`, the module device.
+pub const CONTAINER_IDS: [&[u8]; 4] = [b"PNP0A05", b"PNP0A06", b"PNP0C02", b"ACPI0004"];
+
+/// Whether `record` is a resource container: its ACPI `_HID` and each
+/// `_CID` are [`CONTAINER_IDS`], and it has no other key. Its resources are
+/// the firmware's own registers (on QEMU, the PCI and CPU hotplug blocks the
+/// AML reads): no pass binds it, and devmgr grants acpid its ranges
+/// (docs/driver-binding.md § Device Records).
+#[must_use]
+pub fn container(record: &RecordKeys<'_>) -> bool
+{
+    let is = |id: &[u8]| CONTAINER_IDS.contains(&id);
+    record.acpi_hid.is_some_and(is)
+        && record.acpi_cids.iter().all(|id| is(id))
+        && record.pci.is_none()
+        && record.spcr.is_none()
+        && record.platform.is_none()
+        && record.iommu_family.is_none()
+        && !record.boot_framebuffer
 }
 
 /// How specific a match is: 1 is the most specific, 6 the least
@@ -114,19 +136,6 @@ pub fn decl_rank(decl: &DriverDecl, source: Source, record: &RecordKeys<'_>) -> 
         .filter(|key| source == Source::BootModule || !matches!(key, MatchKey::IommuFamily(_)))
         .filter_map(|key| rank(key, record))
         .min()
-}
-
-/// Whether `decl`, from `source`, may be considered at all: a declaration of
-/// a class a class request marked boot-only is accepted only from a boot
-/// module (docs/driver-binding.md § Declaration Bounds), so a
-/// drivers-directory binary cannot claim a boot-only class's devices.
-#[must_use]
-pub fn class_admits<T>(classes: &Classes<T>, decl: &DriverDecl, source: Source) -> bool
-{
-    source == Source::BootModule
-        || decl
-            .class
-            .is_none_or(|class| !classes.is_boot_only(class.as_str()))
 }
 
 /// What a declaration from `source` is given, within the source bounds, and
@@ -502,6 +511,35 @@ mod tests
             }),
             ..RecordKeys::default()
         }
+    }
+
+    #[test]
+    fn only_a_record_of_container_ids_alone_is_a_container()
+    {
+        let keys = |hid: Option<&'static [u8]>, cids: &'static [&'static [u8]]| RecordKeys {
+            pci: None,
+            acpi_hid: hid,
+            acpi_cids: cids,
+            spcr: None,
+            platform: None,
+            iommu_family: None,
+            boot_framebuffer: false,
+        };
+        // QEMU's PCI and CPU hotplug blocks: PNP0A06.
+        assert!(container(&keys(Some(b"PNP0A06"), &[])));
+        assert!(container(&keys(Some(b"PNP0C02"), &[b"PNP0A05"])));
+        assert!(container(&keys(Some(b"ACPI0004"), &[])));
+        // A device's ID, as HID or beside a container CID, is not one.
+        assert!(!container(&keys(Some(b"PNP0501"), &[])));
+        assert!(!container(&keys(Some(b"PNP0C02"), &[b"PNP0501"])));
+        assert!(!container(&keys(None, &[b"PNP0C02"])));
+        // Any other key makes it a device a driver may match.
+        let mut spcr = keys(Some(b"PNP0A06"), &[]);
+        spcr.spcr = Some(3);
+        assert!(!container(&spcr));
+        let mut platform = keys(Some(b"PNP0A06"), &[]);
+        platform.platform = Some(b"virt-rtc");
+        assert!(!container(&platform));
     }
 
     #[test]
@@ -938,24 +976,27 @@ mod tests
     }
 
     #[test]
-    fn a_boot_only_class_admits_a_boot_module_declaration_alone()
+    fn a_device_unbound_after_the_boot_pass_binds_the_directory_driver_at_auxiliary()
     {
+        // virtio-blk's declaration: class `c` (`decl_with`), the boot tier.
         let m = [Match::PciId {
-            vendor: 1,
-            device: 2,
+            vendor: 0x1af4,
+            device: 0x1042,
         }];
-        // `decl_with` declares class `c`.
-        let declared = decl_with("d", &m, None, Tier::Auxiliary, false);
-        let mut classless = declared;
-        classless.class = None;
-        let mut classes = Classes::<()>::new();
-        assert!(class_admits(&classes, &declared, Source::DriversDir));
-        let c = driver_binding::decl::ClassName::class(b"c").unwrap();
-        classes.configure(&c, false, false).unwrap();
-        assert!(class_admits(&classes, &declared, Source::DriversDir));
-        classes.configure(&c, true, false).unwrap();
-        assert!(!class_admits(&classes, &declared, Source::DriversDir));
-        assert!(class_admits(&classes, &declared, Source::BootModule));
-        assert!(class_admits(&classes, &classless, Source::DriversDir));
+        let blk = decl_with("virtio-blk", &m, None, Tier::Boot, false);
+        // The boot pass bound one disk from the bundle's copy; a disk
+        // hot-added later meets the drivers directory's copy alone.
+        let mut table = MatchTable::new();
+        let only = table.add(blk, Source::DriversDir, (), 1).unwrap();
+        assert_eq!(table.choose(&pci(0x1af4, 0x1042, 0)), Choice::Bind(only));
+        assert_eq!(
+            grants(&blk, Source::DriversDir, false),
+            Grants {
+                tier: Tier::Auxiliary,
+                phys_access: false,
+                tier_ignored: true,
+                phys_access_ignored: false,
+            }
+        );
     }
 }

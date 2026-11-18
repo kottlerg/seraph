@@ -18,12 +18,11 @@ enumerates every kind of device record of § Device Records (PCI, the ACPI names
 the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
 against the records (§ Matching), binds each matched PCI, platform, and IOMMU record through one
 path that delivers the resource list (§ Binding), and withdraws a bound driver in the order
-§ Binding gives. PCI Express native hotplug's add and removal paths are implemented; the ACPI
-hotplug source is design intent, not yet implemented (§ Hotplug,
-[#1096](https://github.com/kottlerg/seraph/issues/1096)).
+§ Binding gives. Both hotplug sources are implemented: PCI Express native hotplug, and the
+firmware's ACPI PCI hotplug, whose events acpid posts to devmgr (§ Hotplug).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
-`MINT_CLASS_SEND`, the class files, and the boot-only mark.
+`MINT_CLASS_SEND`, and the class files.
 
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
 § Responsibilities specifies the running system.
@@ -74,8 +73,8 @@ devmgr evaluates no AML. AML is firmware code whose methods reach I/O ports, mem
 configuration space, so it runs in acpid, a restartable service that holds only the register
 blocks the FADT declares and the regions devmgr grants it, one at a time, against the policy of
 [services/acpid/README.md](../services/acpid/README.md) (§ Region grants). devmgr consumes
-acpid's results: the `_OSC` grant and the `_PRT` routes, and the hotplug events (design intent;
-not yet implemented, #1096). The ACPI namespace enumerator itself still reads only `Device`
+acpid's results: the `_OSC` grant and the `_PRT` routes, and the hotplug events of the slots the
+firmware drives. The ACPI namespace enumerator itself still reads only `Device`
 objects whose identifying and resource objects are static `Name` objects, and skips one that
 defines any of them as a `Method`. It does not evaluate `_STA`: a `Device` whose `_STA` is a
 `Name` with bit 0 clear is not reported, and one whose `_STA` is a `Method` is reported. The
@@ -98,6 +97,24 @@ does not take keeps an unbound record, as any other function does. devmgr marks 
 Express hotplug slot's port bound the same way once it manages the slot, since its poller writes the
 port's slot registers ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)
 § Grant).
+
+A platform record is a resource container when its `_HID` and each of its `_CID`s is one of the
+IDs below and it carries no other key. The firmware describes its own registers with such a
+record, not a device a driver drives (on QEMU q35, the PCI and CPU hotplug blocks at ports
+0xCC0-0xCE3, which its AML reads), so the record is the firmware's: no bind pass binds it, and
+devmgr does not refuse acpid a region for overlapping it. Any other refusal still holds, another
+record's resource the region overlaps among them
+([services/acpid/docs/devmgr.md](../services/acpid/docs/devmgr.md) § Region grants). A record
+with any other key, a container `_CID` beside a device's `_HID` among them, is a device's.
+
+| ID | Meaning | Definition |
+|---|---|---|
+| `PNP0A05` | Generic container device | ACPI 6.5 § 5.6.7 (Device Class-Specific Objects) and § 9.6 (Generic Container Device) |
+| `PNP0A06` | Generic container device, extended I/O bus | ACPI 6.5 § 5.6.7 and § 9.6 |
+| `ACPI0004` | Module device | ACPI 6.5 § 5.6.7 and § 9.10 (Module Device) |
+| `PNP0C02` | Motherboard resources: ranges the platform reserves | Not an ACPI-defined ID: the Plug and Play ID list, whose IDs ACPI 6.5 § 6.1.5 admits as `_HID` values |
+
+The list is `firmware::binding::CONTAINER_IDS`.
 
 A record carries the device's resources, typed:
 
@@ -203,11 +220,14 @@ never claims more than its device and the system's policy give it:
 - **No preemption.** A bind pass binds only unbound records, and the passes over boot-bundle
   declarations run first. A drivers-directory declaration cannot take a device a boot driver
   holds, however specific its key.
-- **Source.** The boot priority tier, an IOMMU family key, and a class whose class file marks
-  it boot-only (§ Device Classes) are accepted only from a boot-bundle declaration. Physical
-  access is accepted only from a boot-bundle declaration that matches an IOMMU record. A
-  drivers-directory declaration of any of them is logged and ignored, and a drivers-directory
-  driver runs at the auxiliary tier.
+- **Source.** The boot priority tier and an IOMMU family key are accepted only from a
+  boot-bundle declaration. Physical access is accepted only from a boot-bundle declaration that
+  matches an IOMMU record. A drivers-directory declaration of any of them is logged and
+  ignored, and a drivers-directory driver runs at the auxiliary tier. A boot-bundle copy of a
+  driver runs only for the bootstrap, in the boot pass; every later start of a driver, a
+  device's bind after a hot-add included, is from its canonical path under
+  `/services/drivers/`, as vfsd starts fatfs from the bundle for the root mount alone and from
+  `/services/fs/fatfs` for every later mount.
 - **Withdrawal.** devmgr shares a wired line only among PCI functions; it carves the line of
   any other record exclusive, as it carves the console UART's. Whatever reset a declaration
   names, withdrawing the driver of a PCI function disables the function's wired interrupt
@@ -345,18 +365,16 @@ driver:
 
 - **Class file.** `/config/devmgr/classes/<name>.class`, in the `.svc` grammar
   ([service-definitions.md](../services/svcmgr/docs/service-definitions.md#grammar)), gives
-  the class's name (an optional `class = <name>` key; the file's stem when absent), the client
-  verb mask devmgr stamps on the SEND it hands out, and whether the class is boot-only
-  (§ Declaration Bounds).
+  the class's name (an optional `class = <name>` key; the file's stem when absent) and the
+  client verb mask devmgr stamps on the SEND it hands out.
 - **Publication.** For each class file, svcmgr sends devmgr `MINT_CLASS_SEND`, a label gated on
   `CLASS_AUTHORITY` that only svcmgr and init hold, and receives a class SEND: a SEND on
   devmgr's registry endpoint whose badge carries the class's slot and its verb mask. The
-  request carries the verbs, the boot-only flag, and the class name (at most
-  `MAX_CLASS_NAME_BYTES` = 32 bytes). svcmgr publishes the class SEND seed-only as
-  `devmgr.class.<stem>` (the file's stem, so a second file publishes a differently attenuated
-  SEND on one class) before it sends `SET_DRIVERS_DIR`, so devmgr knows which classes are
-  boot-only before it reads any drivers-directory declaration. A service reaches a class only
-  when its `.svc` `seed` line names that publication.
+  request carries the verbs and the class name (at most `MAX_CLASS_NAME_BYTES` = 32 bytes).
+  svcmgr publishes the class SEND seed-only as `devmgr.class.<stem>` (the file's stem, so a
+  second file publishes a differently attenuated SEND on one class) before it sends
+  `SET_DRIVERS_DIR`. A service reaches a class only when its `.svc` `seed` line names that
+  publication.
 - **Bootstrap.** The one class a bootstrap service needs before svcmgr runs is block, for
   vfsd's root mount. init requests it over the same label, with the block protocol's mount
   verb, as part of the fixed bootstrap structure (§ Principle), and reads no class file for
@@ -382,9 +400,7 @@ ordinals are assigned in the order its drivers are first served: within one pass
 order, and a later pass appends after every ordinal an earlier pass assigned. An ordinal never
 moves once its pass settles, and a withdrawn driver's ordinal stays as a tombstone. A
 class configured with no served driver, and a served class no class file configured, are
-logged after the drivers-directory settle. A drivers-directory declaration whose class a class
-request marked boot-only is logged and not bound; a boot-only mark after the drivers-directory
-pass began is refused `INVALID_REQUEST`. devmgr's class table holds at most 64 classes.
+logged after the drivers-directory settle. devmgr's class table holds at most 64 classes.
 
 A consumer learns that a class changed through a second label on its class SEND,
 `WATCH_CLASS`, refused `UNAUTHORIZED` like `QUERY_DEVICE` to a SEND without a class slot.
@@ -412,13 +428,16 @@ edits no existing crate.
 
 Hotplug adds no binding path: an enumerator that learns of an added device appends its
 record and runs a bind pass over it; one that learns of a removed device withdraws its
-driver, which leaves a tombstone at its ordinal. Either change signals the class's watches
+driver, which leaves a tombstone at its ordinal. The pass is a drivers-directory pass, so an
+added device binds from `/services/drivers/` at the auxiliary tier, whatever its class, a disk
+included (§ Declaration Bounds, Source). Either change signals the class's watches
 (§ Device Classes), so a consumer learns of it without probing. The event sources are
 specified in [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md): devmgr
 appends and binds a function added to a PCI Express slot it controls natively, under the host
 bridge's `_OSC` or the platform description table's `pcie_native_hotplug` grant, and withdraws
-the driver of a function removed from one before it powers the slot off. The ACPI hotplug source
-is design intent; not yet implemented ([#1096](https://github.com/kottlerg/seraph/issues/1096)).
+the driver of a function removed from one before it powers the slot off. On a slot the firmware
+drives, it does the same on the device checks and eject requests acpid posts from the firmware's
+`Notify`, and withdraws before acpid ejects the card.
 
 ---
 

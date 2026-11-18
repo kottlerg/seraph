@@ -286,6 +286,17 @@ pub const HOTPLUG_PORT_ID: &str = "hotplug-port";
 /// a launch places.
 const HOTPLUG_PORT_DEVICE: &str = "pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c";
 
+/// The id of the second PCI Express root port a hotplug launch attaches,
+/// which `device_add` names as the bus of the disk it hot-adds
+/// (`test-hotplug`).
+pub const HOTPLUG_DISK_PORT_ID: &str = "hotplug-disk-port";
+
+/// The second PCI Express root port a hotplug launch attaches, empty at
+/// boot, for a hot-added disk: its own chassis and slot number, pinned at
+/// slot `0x1d`, beside [`HOTPLUG_PORT_DEVICE`].
+const HOTPLUG_DISK_PORT_DEVICE: &str =
+    "pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d";
+
 /// The q35 property that turns QEMU's ACPI PCI hotplug off, so the
 /// firmware's `_OSC` grants the operating system native hotplug control.
 const X86_NATIVE_HOTPLUG_GLOBAL: &str = "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off";
@@ -368,8 +379,8 @@ pub fn port_disk_properties(
 {
     use crate::qmp::Property;
     let mut properties = vec![
-        ("drive", Property::String(PORT_DISK_NODE)),
-        ("disable-legacy", Property::String("on")),
+        ("drive", Property::Text(PORT_DISK_NODE)),
+        ("disable-legacy", Property::Text("on")),
         (
             "logical_block_size",
             Property::Number(u64::from(block_size)),
@@ -381,16 +392,16 @@ pub fn port_disk_properties(
     ];
     if iommu == Iommu::Attached
     {
-        properties.push(("iommu_platform", Property::Bool(true)));
+        properties.push(("iommu_platform", Property::Flag(true)));
     }
     properties
 }
 
-/// The arguments that attach the hotplug root port of `spec`, none when it
-/// asks for none: the port, on q35 under native control the property that
-/// turns ACPI PCI hotplug off, and the disk behind it: the boot disk's
-/// device, or the data image's node and device, each after the port it sits
-/// on.
+/// The arguments that attach the hotplug root ports of `spec`, none when it
+/// asks for none: the two ports, on q35 under native control the property
+/// that turns ACPI PCI hotplug off, and the disk behind the first port: the
+/// boot disk's device, or the data image's node and device, each after the
+/// port it sits on.
 fn hotplug_port_args(spec: &QemuLaunchSpec) -> Vec<String>
 {
     let Some(port) = spec.hotplug_port
@@ -398,7 +409,12 @@ fn hotplug_port_args(spec: &QemuLaunchSpec) -> Vec<String>
     {
         return Vec::new();
     };
-    let mut args = vec!["-device".to_string(), HOTPLUG_PORT_DEVICE.to_string()];
+    let mut args = vec![
+        "-device".to_string(),
+        HOTPLUG_PORT_DEVICE.to_string(),
+        "-device".to_string(),
+        HOTPLUG_DISK_PORT_DEVICE.to_string(),
+    ];
     if spec.arch == Arch::X86_64 && port.control == HotplugControl::Native
     {
         args.extend(["-global".to_string(), X86_NATIVE_HOTPLUG_GLOBAL.to_string()]);
@@ -656,9 +672,11 @@ pub struct QemuLaunchSpec<'a>
     /// the `pci-testdev` functions svctest's devmgr phases drive through the
     /// test-only drivers ([`test_device_args`]).
     pub test_devices: bool,
-    /// When set, attach a PCI Express root port a device can be hot-added
-    /// behind or removed from (`test-hotplug`), its hotplug under its
-    /// control, with the disk it places behind it ([`hotplug_port_args`]).
+    /// When set, attach the two PCI Express root ports devices can be
+    /// hot-added behind or removed from (`test-hotplug`:
+    /// `HOTPLUG_PORT_DEVICE` and `HOTPLUG_DISK_PORT_DEVICE`), their hotplug
+    /// under the port's control, with the disk it places behind the first
+    /// ([`hotplug_port_args`]).
     pub hotplug_port: Option<HotplugPort<'a>>,
 }
 
@@ -2038,19 +2056,23 @@ mod tests
             spec.hotplug_port = None;
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(!devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert!(!devices(&argv).contains(&HOTPLUG_DISK_PORT_DEVICE));
             assert!(!global(&argv));
 
             spec.hotplug_port = Some(HotplugPort::empty(HotplugControl::Firmware));
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert!(devices(&argv).contains(&HOTPLUG_DISK_PORT_DEVICE));
             assert!(!global(&argv));
 
             spec.hotplug_port = Some(HotplugPort::empty(HotplugControl::Native));
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert!(devices(&argv).contains(&HOTPLUG_DISK_PORT_DEVICE));
             assert_eq!(global(&argv), spec.arch == Arch::X86_64);
         }
         assert!(HOTPLUG_PORT_DEVICE.contains(&format!("id={HOTPLUG_PORT_ID},")));
+        assert!(HOTPLUG_DISK_PORT_DEVICE.contains(&format!("id={HOTPLUG_DISK_PORT_ID},")));
         assert!(EDU_DEVICE.ends_with(&format!("dma_mask={EDU_DMA_MASK:#x}")));
     }
 
@@ -2111,14 +2133,14 @@ mod tests
             port_disk_properties(4096, iommu)
                 .iter()
                 .any(|(name, value)| {
-                    *name == "iommu_platform" && *value == crate::qmp::Property::Bool(true)
+                    *name == "iommu_platform" && *value == crate::qmp::Property::Flag(true)
                 })
         };
         assert!(iommu_platform(Iommu::Attached));
         assert!(!iommu_platform(Iommu::Absent));
         assert!(
             port_disk_properties(4096, Iommu::Absent)
-                .contains(&("drive", crate::qmp::Property::String(PORT_DISK_NODE)))
+                .contains(&("drive", crate::qmp::Property::Text(PORT_DISK_NODE)))
         );
     }
 

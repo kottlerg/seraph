@@ -131,23 +131,37 @@ impl Records
             .find(|&state| state != RecordState::Removed)
     }
 
-    /// Every memory and I/O range a record not removed holds, bound or not:
-    /// each PCI BAR, and each platform record's `Mmio` and `IoPort`.
-    pub fn resource_ranges(&self) -> impl Iterator<Item = firmware::acpid::Range> + '_
+    /// Every memory and I/O range a record not removed holds, bound or not,
+    /// each marked with whether its record is a resource container
+    /// ([`container`]): each PCI BAR, and each platform record's `Mmio` and
+    /// `IoPort`.
+    pub fn resource_ranges(&self) -> impl Iterator<Item = firmware::acpid::HeldRange> + '_
     {
-        let pci = self.live_pci().flat_map(firmware::acpid::pci_ranges);
+        let pci = self
+            .live_pci()
+            .flat_map(firmware::acpid::pci_ranges)
+            .map(|range| firmware::acpid::HeldRange {
+                range,
+                container: false,
+            });
         let platform = self
             .platform
             .records()
             .iter()
             .zip(&self.platform_states)
             .filter(|(_, state)| **state != RecordState::Removed)
-            .flat_map(|(record, _)| record.resources())
-            .filter_map(firmware::acpid::platform_range);
+            .flat_map(|(record, _)| {
+                let container = container(record);
+                record
+                    .resources()
+                    .filter_map(firmware::acpid::platform_range)
+                    .map(move |range| firmware::acpid::HeldRange { range, container })
+            });
         pci.chain(platform)
     }
 
-    /// The platform records a pass may bind, with their indices.
+    /// The platform records a pass may bind, with their indices: each
+    /// unbound one but a resource container ([`container`]).
     fn unbound_platform(&self) -> impl Iterator<Item = (usize, &PlatformRecord)>
     {
         self.platform
@@ -155,7 +169,7 @@ impl Records
             .iter()
             .zip(&self.platform_states)
             .enumerate()
-            .filter(|(_, (_, state))| **state == RecordState::Unbound)
+            .filter(|(_, (record, state))| **state == RecordState::Unbound && !container(record))
             .map(|(index, (record, _))| (index, record))
     }
 
@@ -239,10 +253,8 @@ pub fn boot_pass(
 
 /// The drivers-directory pass: list `dir_cap`, the `/services/drivers/`
 /// directory svcmgr handed devmgr, read the declaration of each entry, and
-/// bind the records still unbound to them. A declaration `admits` refuses
-/// (one of a class a class request marked boot-only,
-/// [`firmware::binding::class_admits`]) is not considered, logged. Every file
-/// cap is released once the pass ends. `dir_path` is the absolute path of the
+/// bind the records still unbound to them. Every file cap is released once
+/// the pass ends. `dir_path` is the absolute path of the
 /// directory `dir_cap` names; each entry is named `dir_path/entry`, its install
 /// path, which procmgr verifies the driver's signature under. An entry whose
 /// name exceeds [`procmgr_labels::CREATE_NAME_MAX`] or cannot be allocated is
@@ -251,7 +263,6 @@ pub fn drivers_dir_pass(
     records: &mut Records,
     dir_cap: u64,
     dir_path: &[u8],
-    admits: impl Fn(&DriverDecl) -> bool,
     carve: &mut Carve,
     pass: &mut Pass,
     ipc_buf: *mut u64,
@@ -280,16 +291,7 @@ pub fn drivers_dir_pass(
             let _ = syscall::cap_delete(walked.file_cap);
             return;
         };
-        let mut decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
-        if let Some(d) = decl.filter(|d| !admits(d))
-        {
-            std::os::seraph::log!(
-                warn: "{}: declares boot-only class {}; not considered",
-                d.name.as_str(),
-                d.class.as_ref().map_or("", |c| c.as_str())
-            );
-            decl = None;
-        }
+        let decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
         let binary = Binary::File {
             cap: walked.file_cap,
             size: walked.size,
@@ -388,7 +390,7 @@ fn bind_records(
             .platform
             .records()
             .get(index)
-            .filter(|_| *state == RecordState::Unbound)
+            .filter(|r| *state == RecordState::Unbound && !container(r))
         else
         {
             continue;
@@ -2832,4 +2834,12 @@ impl FunctionConfig
         }
         completed
     }
+}
+
+/// Whether `record` is a resource container, the firmware's
+/// (`firmware::binding::container`): no pass binds it, and its ranges are
+/// not among those devmgr refuses acpid.
+fn container(record: &PlatformRecord) -> bool
+{
+    record.with_keys(firmware::binding::container)
 }

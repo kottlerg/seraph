@@ -3,35 +3,46 @@
 
 // xtask/src/commands/test_hotplug.rs
 
-//! PCI Express native hotplug test: a device hot-added behind a root port is
-//! found by devmgr, given its BARs, recorded, and bound, and its driver's DMA
-//! and MSI work; removed, its driver is withdrawn and the slot powered off;
-//! added again, it is bound anew and works. A disk hot-added behind the port
-//! is mounted through vfsd, torn down at its removal and mounted again; and
-//! the loss of the root filesystem's driver, or of the boot disk, ends vfsd
-//! and shuts the system down.
+//! PCI Express hotplug test: a device hot-added behind a root port is found by
+//! devmgr, given its BARs, recorded, and bound, and its driver's DMA and MSI
+//! work; removed, its driver is withdrawn and the slot powered off or
+//! ejected; added again, it is bound anew and works. A disk behind the port
+//! is torn down at its removal and mounted again through vfsd; and the loss
+//! of the root filesystem's driver, or of the boot disk, ends vfsd and shuts
+//! the system down.
 //!
 //! The device boots stage the `hotplug-check` fixture's recipe and the
 //! `test-dma` class into the boot set, repack the disk images in the layout
-//! they have, and boot the current sysroot with an empty `pcie-root-port`
-//! and a QMP socket. Once devmgr logs the slot managed ([`MANAGED_MARKER`])
-//! and the fixture logs [`READY_MARKER`], the host hot-adds QEMU's `edu`
-//! device behind the port (QMP `device_add`). Once the fixture logs
-//! [`REMOVE_MARKER`], the host removes it (QMP `device_del`, which presses
-//! the slot's attention button) and waits for QEMU's `DEVICE_DELETED`, which
-//! QEMU sends once devmgr powers the slot off; devmgr's removal lines must
-//! come in their order ([`REMOVAL_MARKERS`]). Once the fixture logs
-//! [`READD_MARKER`], the host adds the device again and waits for the
-//! fixture's verdict. On `x86_64` that boot turns QEMU's ACPI PCI hotplug
-//! off, so `_OSC` grants native control; a boot before it, with the
-//! machine's default, checks that devmgr leaves the slot alone when `_OSC`
-//! withholds it ([`REFUSED_MARKER`]). On riscv64 the platform description
-//! table grants it.
+//! they have, and boot the current sysroot with two empty `pcie-root-port`s
+//! and a QMP socket. Once devmgr logs the first slot's grant and the fixture
+//! logs [`READY_MARKER`], the host hot-adds QEMU's `edu` device behind that
+//! port (QMP `device_add`). Once the fixture logs [`REMOVE_MARKER`], the
+//! host removes it (QMP `device_del`) and waits for QEMU's
+//! `DEVICE_DELETED`; devmgr's removal lines must come in their order. Once
+//! the fixture logs [`READD_MARKER`], the host adds the device again and
+//! waits for the fixture's verdict. Once the fixture passes, the host
+//! hot-adds a `virtio-blk-pci` disk behind the second port: devmgr must bind
+//! it from the drivers directory's virtio-blk, at the auxiliary tier, as it
+//! binds every device unbound after the boot pass, and the driver must come
+//! up ([`disk_bound`]).
+//!
+//! Each device boot runs that cycle under one hotplug control. Under native
+//! control devmgr manages the slot ([`MANAGED_MARKER`]): `device_del`
+//! presses the slot's attention button, and QEMU deletes the device once
+//! devmgr powers the slot off ([`NATIVE_REMOVAL`]). Under the firmware's,
+//! q35's default on `x86_64`, `_OSC` withholds native control and devmgr
+//! leaves the slot to the firmware ([`FIRMWARE_MARKER`]): QEMU's GPE method
+//! notifies the slot's device, acpid posts devmgr's job, and `device_del`
+//! completes once acpid runs the slot's `_EJ0` after devmgr's removal
+//! ([`FIRMWARE_REMOVAL`], [`EJECT_MARKER`]). On `x86_64` both boots run,
+//! the firmware's first, the native one with QEMU's ACPI PCI hotplug off, so
+//! `_OSC` grants native control; on riscv64 the platform description table
+//! grants it.
 //!
 //! The storage boots stage the fixture's disk-mode recipe alone and repack
 //! the images in the split-data layout at the same block size, so the data
 //! partition is on `disk-data.img`. The first places that image's
-//! `virtio-blk-pci` behind the port from boot (`PortDisk::Data`), so vfsd
+//! `virtio-blk-pci` behind the first port from boot (`PortDisk::Data`), so vfsd
 //! mounts `/data` on it at startup: once devmgr manages the slot and the
 //! fixture holds a file open there ([`DISK_REMOVE_MARKER`]), the host
 //! removes the disk and requires devmgr's removal lines and vfsd's
@@ -39,7 +50,7 @@
 //! adds the disk again on the same block node. The fixture then stops and
 //! kills the root mount's driver, and the host requires its verdict, vfsd's
 //! [`ROOT_LOST_MARKER`], svcmgr's [`SHUTDOWN_MARKER`], and QEMU's exit. The
-//! second boots with the boot disk itself behind the port (`PortDisk::Boot`)
+//! second boots with the boot disk itself behind that port (`PortDisk::Boot`)
 //! and the data disk on a slot of its own; once the slot is managed and the
 //! fixture ready, the host removes the boot disk and requires the same last
 //! three. Both run under native control.
@@ -64,12 +75,12 @@ use crate::disk::{DataPlacement, DiskLayout};
 use crate::error::{Context as _, Result, bail};
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    EDU_DMA_MASK, GdbMode, HOTPLUG_PORT_ID, HotplugControl, HotplugPort, Iommu, PORT_DISK_ID,
-    PortDisk, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
-    X86ShadowStack, build_qemu_argv, port_disk_properties, prepare_riscv_firmware,
+    EDU_DMA_MASK, GdbMode, HOTPLUG_DISK_PORT_ID, HOTPLUG_PORT_ID, HotplugControl, HotplugPort,
+    Iommu, PORT_DISK_ID, PortDisk, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
+    X86Paging, X86ShadowStack, build_qemu_argv, port_disk_properties, prepare_riscv_firmware,
     validate_sysroot_for_launch,
 };
-use crate::qmp;
+use crate::qmp::{self, Property};
 use crate::util::{require_tool, step};
 
 /// The fixture's recipe for the device boots, as `cargo xtask build`
@@ -109,17 +120,32 @@ const DISK_REMOVE_MARKER: &str =
 const DISK_READD_MARKER: &str =
     "[hotplug-check] TORN DOWN /data, its disk removed; READY for the re-added disk";
 
-/// devmgr's lines of a removal, in the order they must come: the poller
-/// starts the removal at the end of the attention button's abort window, the
-/// driver's held memory is released once its device is withdrawn, the
-/// removal job ends, and the poller powers the slot off. Kept in sync with
-/// `services/devmgr/src/hotplug.rs` and `services/devmgr/src/bind.rs`.
-const REMOVAL_MARKERS: [&str; 4] = [
+/// devmgr's lines of a native removal, in the order they must come: the
+/// poller starts the removal at the end of the attention button's abort
+/// window, the driver's held memory is released once its device is
+/// withdrawn, the removal job ends, and the poller powers the slot off. Kept
+/// in sync with `services/devmgr/src/hotplug.rs` and
+/// `services/devmgr/src/bind.rs`.
+const NATIVE_REMOVAL: [&str; 4] = [
     "removing its functions (its attention button's abort window elapsed)",
     "driver withdrawn, its memory released",
     "functions removed: 1, drivers withdrawn: 1,",
     "powered off (empty)",
 ];
+
+/// devmgr's lines of a removal the firmware asks for, in the order they must
+/// come: acpid's job starts the removal, the driver's held memory is released
+/// once its device is withdrawn, and the removal job ends. Kept in sync with
+/// `services/devmgr/src/hotplug.rs` and `services/devmgr/src/bind.rs`.
+const FIRMWARE_REMOVAL: [&str; 3] = [
+    "removing its functions (the firmware's eject request)",
+    "driver withdrawn, its memory released",
+    "functions removed: 1, drivers withdrawn: 1,",
+];
+
+/// acpid's line once it ran the slot's `_EJ0` after devmgr's removal job.
+/// Kept in sync with `services/acpid/src/server.rs`.
+const EJECT_MARKER: &str = "ejected (_EJ0) once devmgr removed 1 functions";
 
 /// vfsd's line once it found a disk it holds removed. Kept in sync with
 /// `services/vfsd/src/watch.rs`.
@@ -144,11 +170,42 @@ const FAIL_MARKER: &str = "[hotplug-check] FAIL";
 const MANAGED_MARKER: &str = "managed (native control by";
 
 /// devmgr's line for a slot whose host bridge's `_OSC` withholds native
-/// control. Kept in sync with `services/devmgr/src/hotplug.rs`.
-const REFUSED_MARKER: &str = "not managed: _OSC control";
+/// control, which it leaves to the firmware. Kept in sync with
+/// `services/devmgr/src/hotplug.rs`.
+const FIRMWARE_MARKER: &str = "firmware hotplug: _OSC control";
 
 /// The id `device_add` gives the hot-added `edu`.
 const DEVICE_ID: &str = "hotplug-edu";
+
+/// Whether the boot attaches the IOMMU: attached, as every launch's
+/// default, so the hot-added disk is put behind it as the launchers put a
+/// boot `virtio-pci` device (`iommu_platform=on`).
+const IOMMU: Iommu = Iommu::Attached;
+
+/// The id `device_add` gives the hot-added disk.
+const DISK_ID: &str = "hotplug-disk";
+
+/// The block node of the hot-added disk's image, which its `drive`
+/// property names.
+const DISK_NODE: &str = "hotplug-disk-node";
+
+/// The size of the hot-added disk's raw image, zero-filled: the disk is only
+/// bound, never read.
+const DISK_BYTES: u64 = 1 << 20;
+
+/// devmgr's line once it binds a virtio-blk function: after the disk's
+/// hot-add, the disk's. Kept in sync with `services/devmgr/src/bind.rs`.
+const DISK_BIND_MARKER: &str = "[devmgr] virtio-blk: binds PCI";
+
+/// devmgr's line when it binds virtio-blk from the drivers directory, whose
+/// declaration asks for the boot tier: the driver runs at the auxiliary
+/// tier. After the disk's hot-add, it shows the disk bound from the drivers
+/// directory. Kept in sync with `services/devmgr/src/bind.rs`.
+const DISK_DIRECTORY_MARKER: &str = "virtio-blk: boot tier not granted from the drivers directory";
+
+/// The virtio-blk driver's line once it serves its disk. Kept in sync with
+/// `services/drivers/virtio/blk/src/main.rs`.
+const DISK_READY_MARKER: &str = "[virtio-blk] ready, entering service loop";
 
 /// Budget for a boot to reach its markers.
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
@@ -159,7 +216,7 @@ const VERDICT_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Budget for a removal, from `device_del` to devmgr's last removal line:
 /// past the poller's period, the attention button's five-second abort
-/// window, and the withdrawal.
+/// window, and the withdrawal, or acpid's job and `_EJ0`.
 const REMOVAL_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Budget for the loss of the root, from the kill of its driver or the
@@ -208,9 +265,10 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
     booted?;
     step(
         "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
-         driver and powered the slot off, and it was bound again; the data disk's mount was \
-         torn down at its removal and the disk mounted again when added back; the loss of the root driver and \
-         of the boot disk shut the system down)",
+         driver and powered the slot off or ejected it, and it was bound again; a hot-added \
+         disk was bound from the drivers directory; the data disk's mount was torn down at its \
+         removal and the disk mounted again when added back; the loss of the root driver and of \
+         the boot disk shut the system down)",
     );
     Ok(())
 }
@@ -244,21 +302,34 @@ fn unstage(staged: &[(PathBuf, PathBuf)]) -> Result<()>
     result
 }
 
-/// The device boots: on `x86_64` the machine's default first, which must
-/// leave the slot unmanaged, then native control; on riscv64 native control
-/// (the platform table's grant).
+/// The device boots: on `x86_64` the machine's default first, the
+/// firmware's hotplug through acpid, then native control; on riscv64 native
+/// control (the platform table's grant).
 fn device_boots(ctx: &Context, args: &TestHotplugArgs, layout: DiskLayout) -> Result<()>
 {
     let data_image = layout.second_image(ctx);
-    if args.arch == Arch::X86_64
+    let disk_image = ctx.target_dir.join("xtask").join("hotplug-disk.img");
+    let controls: &[HotplugControl] = match args.arch
     {
-        let port = HotplugPort::empty(HotplugControl::Firmware);
-        boot(ctx, args, data_image.as_deref(), port, |lines, _| {
-            refused(lines)
-        })?;
+        Arch::X86_64 => &[HotplugControl::Firmware, HotplugControl::Native],
+        Arch::Riscv64 => &[HotplugControl::Native],
+    };
+    for &control in controls
+    {
+        std::fs::File::create(&disk_image)
+            .and_then(|f| f.set_len(DISK_BYTES))
+            .with_context(|| format!("creating {}", disk_image.display()))?;
+        let booted = boot(
+            ctx,
+            args,
+            data_image.as_deref(),
+            HotplugPort::empty(control),
+            |lines, socket| device_check(lines, socket, &disk_image, control),
+        );
+        let _ = std::fs::remove_file(&disk_image);
+        booted?;
     }
-    let port = HotplugPort::empty(HotplugControl::Native);
-    boot(ctx, args, data_image.as_deref(), port, device_check)
+    Ok(())
 }
 
 /// The storage boots, on the split-data layout under native control: the
@@ -330,7 +401,7 @@ fn boot(
         riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
-        iommu: Iommu::Attached,
+        iommu: IOMMU,
         debug_port: None,
         test_devices: false,
         hotplug_port: Some(port),
@@ -340,9 +411,9 @@ fn boot(
 
     let behind = match port.disk
     {
-        None => "an empty root port",
-        Some(PortDisk::Data { .. }) => "the data disk behind the root port",
-        Some(PortDisk::Boot) => "the boot disk behind the root port",
+        None => "two empty root ports",
+        Some(PortDisk::Data { .. }) => "two root ports, the data disk behind the first",
+        Some(PortDisk::Boot) => "two root ports, the boot disk behind the first",
     };
     step(&format!(
         "hotplug test: booting with {behind}, hotplug control {:?}",
@@ -366,60 +437,59 @@ fn boot(
     result
 }
 
-/// The check of the boot under the machine's default on `x86_64`: devmgr
-/// refuses the slot.
-fn refused(lines: &Lines) -> Result<()>
+/// Wait for devmgr's grant of the slot under `control` and for the
+/// fixture's line `ready_marker`; fails on the other grant or a failed check.
+fn granted_and_ready(lines: &Lines, control: HotplugControl, ready_marker: &str) -> Result<()>
 {
-    let line = lines.until(BOOT_TIMEOUT, "devmgr's refusal of the slot", |l| {
-        l.contains(MANAGED_MARKER) || l.contains(REFUSED_MARKER)
-    })?;
-    if !line.contains(REFUSED_MARKER)
+    // The grant devmgr must log for the slot, and the one it must not.
+    let (grant, wrong) = match control
     {
-        bail!("devmgr managed the slot while _OSC withholds native control: {line}");
-    }
-    Ok(())
-}
-
-/// Wait for devmgr to manage the slot and for the fixture's line `ready`;
-/// fails on a refusal of the slot or a failed check.
-fn managed_and_ready(lines: &Lines, ready_marker: &str) -> Result<()>
-{
-    let (mut managed, mut ready) = (false, false);
-    while !(managed && ready)
+        HotplugControl::Firmware => (FIRMWARE_MARKER, MANAGED_MARKER),
+        HotplugControl::Native => (MANAGED_MARKER, FIRMWARE_MARKER),
+    };
+    let (mut granted, mut ready) = (false, false);
+    while !(granted && ready)
     {
         let line = lines.until(
             BOOT_TIMEOUT,
-            "the slot managed and the fixture ready",
+            "the slot's grant and the fixture ready",
             |l| {
-                [MANAGED_MARKER, REFUSED_MARKER, ready_marker, FAIL_MARKER]
+                [grant, wrong, ready_marker, FAIL_MARKER]
                     .iter()
                     .any(|m| l.contains(m))
             },
         )?;
-        if line.contains(REFUSED_MARKER) || line.contains(FAIL_MARKER)
+        if line.contains(wrong) || line.contains(FAIL_MARKER)
         {
-            bail!("before the hot-plug: {line}");
+            bail!("before the hot-plug, under {control:?} control: {line}");
         }
-        managed |= line.contains(MANAGED_MARKER);
+        granted |= line.contains(grant);
         ready |= line.contains(ready_marker);
     }
     Ok(())
 }
 
-/// The check of the device boot under native control: devmgr manages the
-/// slot, the host hot-adds `edu` once the fixture is ready, removes it and
-/// adds it again on the fixture's lines, and the fixture passes.
-fn device_check(lines: &mut Lines, socket: &Path) -> Result<()>
+/// The check of a device boot under `control`: devmgr takes the slot's
+/// grant (managed, or left to the firmware), the host hot-adds `edu` once
+/// the fixture is ready, removes it and adds it again on the fixture's
+/// lines, and the fixture passes; then a disk over the image `disk`
+/// hot-added behind the second port is bound ([`disk_bound`]).
+fn device_check(
+    lines: &mut Lines,
+    socket: &Path,
+    disk: &Path,
+    control: HotplugControl,
+) -> Result<()>
 {
-    managed_and_ready(lines, READY_MARKER)?;
-    step("hotplug test: slot managed and the fixture ready; hot-adding edu");
+    granted_and_ready(lines, control, READY_MARKER)?;
+    step("hotplug test: slot granted and the fixture ready; hot-adding edu");
     let add = || {
         qmp::device_add(
             socket,
             "edu",
             DEVICE_ID,
             HOTPLUG_PORT_ID,
-            &[("dma_mask", qmp::Property::Number(EDU_DMA_MASK))],
+            &[("dma_mask", Property::Number(EDU_DMA_MASK))],
         )
     };
     add()?;
@@ -437,11 +507,62 @@ fn device_check(lines: &mut Lines, socket: &Path) -> Result<()>
     qmp::device_del(socket, DEVICE_ID, REMOVAL_TIMEOUT)?;
     step("hotplug test: QEMU deleted the device");
     lines.start = Instant::now();
-    removal(lines, READD_MARKER, &[])?;
-    step("hotplug test: devmgr withdrew the driver and powered the slot off; adding edu again");
+    match control
+    {
+        HotplugControl::Firmware =>
+        {
+            removal(lines, &FIRMWARE_REMOVAL, READD_MARKER, &[EJECT_MARKER])?;
+        }
+        HotplugControl::Native => removal(lines, &NATIVE_REMOVAL, READD_MARKER, &[])?,
+    }
+    step("hotplug test: devmgr withdrew the driver and the slot let the card go; adding edu again");
     add()?;
     lines.start = Instant::now();
-    verdict(lines)
+    verdict(lines)?;
+    step("hotplug test: the fixture passed; hot-adding a virtio-blk disk");
+    add_disk(socket, disk)?;
+    lines.start = Instant::now();
+    disk_bound(lines)
+}
+
+/// Hot-add the disk behind the second port: a raw block node over the image
+/// `disk` (QMP `blockdev-add`), then a `virtio-blk-pci` on it, behind the
+/// IOMMU when the boot attaches one, as the launchers put a boot disk.
+fn add_disk(socket: &Path, disk: &Path) -> Result<()>
+{
+    qmp::blockdev_add_raw(socket, DISK_NODE, disk)?;
+    qmp::device_add(
+        socket,
+        "virtio-blk-pci",
+        DISK_ID,
+        HOTPLUG_DISK_PORT_ID,
+        &[
+            ("drive", Property::Text(DISK_NODE)),
+            ("disable-legacy", Property::Text("on")),
+            ("iommu_platform", Property::Flag(IOMMU == Iommu::Attached)),
+        ],
+    )
+}
+
+/// Read the lines of the hot-added disk's bind, in any order: devmgr binds
+/// virtio-blk to it ([`DISK_BIND_MARKER`]), from the drivers directory, at the
+/// auxiliary tier ([`DISK_DIRECTORY_MARKER`]), and the driver serves the disk
+/// ([`DISK_READY_MARKER`]).
+fn disk_bound(lines: &Lines) -> Result<()>
+{
+    let markers = [DISK_BIND_MARKER, DISK_DIRECTORY_MARKER, DISK_READY_MARKER];
+    let mut seen = [false; 3];
+    while !seen.iter().all(|&s| s)
+    {
+        let line = lines.until(VERDICT_TIMEOUT, "the hot-added disk's bind", |l| {
+            markers.iter().any(|m| l.contains(m))
+        })?;
+        for (s, m) in seen.iter_mut().zip(markers)
+        {
+            *s |= line.contains(m);
+        }
+    }
+    Ok(())
 }
 
 /// The check of the storage boot with the data disk behind the port: once
@@ -452,12 +573,12 @@ fn device_check(lines: &mut Lines, socket: &Path) -> Result<()>
 /// shuts down ([`root_lost`]).
 fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32) -> Result<()>
 {
-    managed_and_ready(lines, DISK_REMOVE_MARKER)?;
+    granted_and_ready(lines, HotplugControl::Native, DISK_REMOVE_MARKER)?;
     step("hotplug test: slot managed and a file open on its disk; removing the data disk");
     qmp::device_del(socket, PORT_DISK_ID, REMOVAL_TIMEOUT)?;
     step("hotplug test: QEMU deleted the disk");
     lines.start = Instant::now();
-    removal(lines, DISK_READD_MARKER, &[VFSD_REMOVED_MARKER])?;
+    removal(lines, &NATIVE_REMOVAL, DISK_READD_MARKER, &[VFSD_REMOVED_MARKER])?;
     step(
         "hotplug test: devmgr withdrew the driver and powered the slot off, vfsd tore the mount \
          down; adding the disk again",
@@ -467,7 +588,7 @@ fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32) -> Result<()>
         "virtio-blk-pci",
         PORT_DISK_ID,
         HOTPLUG_PORT_ID,
-        &port_disk_properties(block_size, Iommu::Attached),
+        &port_disk_properties(block_size, IOMMU),
     )?;
     lines.start = Instant::now();
     verdict(lines)?;
@@ -484,7 +605,7 @@ fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32) -> Result<()>
 /// ends its calls.
 fn boot_disk_check(lines: &mut Lines, socket: &Path) -> Result<()>
 {
-    managed_and_ready(lines, DISK_REMOVE_MARKER)?;
+    granted_and_ready(lines, HotplugControl::Native, DISK_REMOVE_MARKER)?;
     step("hotplug test: slot managed with the boot disk behind it; removing the boot disk");
     // The guest shuts down at the loss and may power off before it powers
     // the slot off, so no `DEVICE_DELETED` is waited for.
@@ -520,21 +641,21 @@ fn root_lost(lines: &Lines) -> Result<()>
     lines.end(SHUTDOWN_TIMEOUT, "QEMU's exit at the shutdown")
 }
 
-/// Read the lines of a removal: each of devmgr's [`REMOVAL_MARKERS`] once, in
-/// their order, each of `also` at least once in any order, and the fixture's
-/// `readd`, which may come among them, since the fixture sees the removal
-/// as devmgr takes the driver out of its class.
-fn removal(lines: &Lines, readd: &str, also: &[&str]) -> Result<()>
+/// Read the lines of a removal: each of devmgr's `markers` once, in their
+/// order; each of `also`, lines of other services, at least once in any
+/// order; and the fixture's `readd`, which may come among them, since the
+/// fixture sees the removal as devmgr takes the driver out of its class.
+fn removal(lines: &Lines, markers: &[&str], readd: &str, also: &[&str]) -> Result<()>
 {
     let mut next = 0usize;
     let mut withdrawn = false;
     let mut seen = vec![false; also.len()];
-    while next < REMOVAL_MARKERS.len() || !withdrawn || seen.contains(&false)
+    while next < markers.len() || !withdrawn || seen.contains(&false)
     {
         let line = lines.until(REMOVAL_TIMEOUT, "the removal's lines", |l| {
             l.contains(readd)
                 || l.contains(FAIL_MARKER)
-                || REMOVAL_MARKERS.iter().chain(also).any(|m| l.contains(m))
+                || markers.iter().chain(also).any(|m| l.contains(m))
         })?;
         if line.contains(FAIL_MARKER)
         {
@@ -553,7 +674,7 @@ fn removal(lines: &Lines, readd: &str, also: &[&str]) -> Result<()>
             }
             continue;
         }
-        match REMOVAL_MARKERS.iter().position(|m| line.contains(m))
+        match markers.iter().position(|m| line.contains(m))
         {
             Some(at) if at == next => next = next.saturating_add(1),
             _ => bail!("removal line out of order or repeated: {line}"),

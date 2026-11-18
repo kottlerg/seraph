@@ -87,20 +87,21 @@ the mount's driver and to tear it down:
 | `partition` | The partition cap virtio-blk returned on `REGISTER_PARTITION`; the driver holds a `cap_derive` (`SEND_GRANT`) of it, so `cap_revoke_all` on this cap cuts the driver off the partition |
 | `disk` | The index, in vfsd's disk list, of the disk that holds the partition |
 
-The death queue is an event queue of capacity 2 with 2 death-observer
-nodes, one per binding. vfsd binds the driver's main thread to it with
-the create reply's `Thread` cap before `START_PROCESS`, so the main
-thread's exit or terminal fault posts to it, and then deletes the
+The death queue is an event queue of capacity 2 with 1 death-observer
+node, the main thread's binding. vfsd binds the driver's main thread to
+it with the create reply's `Thread` cap before `START_PROCESS`, so the
+main thread's exit or terminal fault posts to it, and then deletes the
 `Thread` cap. The create request carries a `POST`-only derivation of the
-queue under `CREATE_DEATH_RELAY`, which procmgr binds to the driver's
-address space, so the first terminal fault in any of the driver's
-threads posts to it as well
+queue under `CREATE_DEATH_RELAY`, to which procmgr posts the driver's
+end once, whoever ends it, a terminal fault in any of its threads
+included
 ([procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)
-§ Label 1, **Death relay**). Both spawn paths, `CREATE_PROCESS` from the
-boot module and `CREATE_FROM_FILE`, set up both bindings. While lookups
-cross the mount, the queue is a member of the watch set, and its death
-ends the mount (§ Driver death and device loss); an unmount waits on it
-for the driver's death (§ Unmount).
+§ Label 1, **Death relay**); the post takes no observer node, and the
+two posts fill the queue's two entries. Both spawn paths,
+`CREATE_PROCESS` from the boot module and `CREATE_FROM_FILE`, set up
+both. While lookups cross the mount, the queue is a member of the watch
+set, and its death ends the mount (§ Driver death and device loss); an
+unmount waits on it for the driver's death (§ Unmount).
 
 A record is in one of two states. While *mounted*, lookups cross it.
 Removing a mount below `/` takes two steps:

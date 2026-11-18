@@ -7,23 +7,25 @@ What acpid does on each start, from loading the tables to the pushes, and how it
 ## Threads
 
 The main thread takes the bootstrap round (the RECV on acpid's service endpoint and the
-`devmgr.acpi` seed), spawns the evaluation thread, and waits for any of acpid's threads to end.
-The evaluation thread runs the whole sequence below and then, for acpid's lifetime, every
-evaluation the service needs, so one thread owns the namespace. It blocks only on its work
-channel, from which it takes a power request a receiver forwards, a GPE the event thread found,
-or the power button to enable again ([README.md](../README.md) § Power requests and § Events).
-Two receiver threads serve acpid's endpoint, so one can hold a `WAIT_EVENT` while the other
-serves `SLEEP` and `RESET`, and on x86-64 an event thread takes the SCI. The evaluation thread's
-stack is the larger of the evaluator's and the parser's stack bounds plus 256 KiB for acpid's
-own frames ([docs/limits.md](../../../docs/limits.md)): a spawned thread's stack is at least the
-size it asks for, while the main thread's grows past its first pages only in a demand-paged
-process. acpid stays alive after the sequence, serving, so that svcmgr does not restart it into
-the same start-up and so that it keeps the grants it holds. When the evaluation thread, a
-receiver or the event thread ends, in a panic too, or the evaluation thread cannot be spawned,
-the main thread exits acpid, since a request or an event would wait unanswered, and svcmgr
-restarts it. A failed bootstrap round keeps acpid alive instead, since a restart would
-fail the same way: a round that delivered the service endpoint without the `devmgr.acpi` seed has
-the main thread answer each power request `NO_DEVICE`, and one that delivered no endpoint parks it.
+`devmgr.acpi` seed), spawns the evaluation thread, and waits for any of acpid's threads to end. The
+evaluation thread runs the whole sequence below and then, for acpid's lifetime, every evaluation the
+service needs, so one thread owns the namespace. It blocks only on its work channel, from which it
+takes a power request a receiver forwards, a GPE the event thread found, the power button to enable
+again, or the end of devmgr's job of a hotplug event ([README.md](../README.md) § Power requests, §
+Events and § Hotplug). Two receiver threads serve acpid's endpoint, so one can hold a `WAIT_EVENT`
+while the other serves `SLEEP` and `RESET`; on x86-64 an event thread takes the SCI, and a hotplug
+thread makes the `ACPI_HOTPLUG` calls, so the evaluation thread does not wait while devmgr runs a
+hotplug job. The evaluation thread's stack is the larger of the evaluator's and the parser's stack
+bounds plus 256 KiB for acpid's own frames ([docs/limits.md](../../../docs/limits.md)): a spawned
+thread's stack is at least the size it asks for, while the main thread's grows past its first pages
+only in a demand-paged process. acpid stays alive after the sequence, serving, so that svcmgr does
+not restart it into the same start-up and so that it keeps the grants it holds. When the evaluation
+thread, a receiver, the event thread or the hotplug thread ends, in a panic too, or the evaluation
+thread cannot be spawned, the main thread exits acpid, since a request or an event would wait
+unanswered, and svcmgr restarts it. A failed bootstrap round keeps acpid alive instead, since a
+restart would fail the same way: a round that delivered the service endpoint without the
+`devmgr.acpi` seed has the main thread answer each power request `NO_DEVICE`, and one that delivered
+no endpoint parks it.
 
 ---
 
@@ -104,8 +106,10 @@ Every hardware access of the evaluator goes through devmgr ([devmgr.md](devmgr.m
   remembered and not asked for again. A memory write is
   followed by an MMIO ordering barrier.
 - A configuration-space access is one `ACPI_PCI_CONFIG` call.
-- `Notify` is logged and dropped: no consumer of the notifications runs. On QEMU q35, the
-  ACPI PCI hotplug GPE's method (`\_GPE._E01`) notifies the slots that changed.
+- A `Notify` of a hotplug event is kept, once per object and event, and acted on once the
+  evaluation ends: a hotplug event of a slot below a PCI-to-PCI bridge is posted
+  to devmgr ([README.md](../README.md) § Hotplug), any other `Notify` logged and dropped. On QEMU
+  q35 the ACPI PCI hotplug GPE's method (`\_GPE._E01`) notifies the slots that changed.
 - The Global Lock is refused: devmgr refuses acpid the FACS, so a field whose access rule takes
   the lock fails.
 - `_OSI` answers false for every string.
@@ -116,9 +120,6 @@ On QEMU q35 these refusals follow, each logged and none fatal:
   it faults and the HPET reads absent. Its registers at 0xFED0_0000 also lie in no `Mmio`
   aperture, and devmgr would refuse the region. The kernel and the services use no HPET
   ([docs/platform-requirements.md](../../../docs/platform-requirements.md)).
-- The CPU hotplug block at ports 0xCD8-0xCE3 is the `IoPort` of a device record, so devmgr
-  refuses it, and the processors' `_STA` fault and read absent. acpid does not act on
-  processors.
 - devmgr refuses the FACS by name; it also lies in memory the memory map reports as reserved,
   outside every `Mmio` aperture.
 

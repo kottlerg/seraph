@@ -557,7 +557,8 @@ pub fn refuse(service: u64) -> !
 type SleepEvents<'a> = (&'a Armed, &'a Mailbox, &'a Sender<Work>);
 
 /// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then, with the
-/// events `armed`, [`events::quiesce`], then the `PM1a_CNT` writes. When
+/// events `armed`, [`events::quiesce`], which hands on each event it takes,
+/// then the `PM1a_CNT` writes. When
 /// the writes return, the events stay quiesced for [`SLEEP_GRACE`]; when the
 /// platform still runs then, the GPEs are enabled again
 /// ([`events::resume`]) and what latched is handed on, each event once. The
@@ -600,7 +601,11 @@ fn sleep(
     {
         std::os::seraph::log!(warn: "\\_PTS({state}) faulted: {fault:?}; sleeping anyway");
     }
-    let quiesced = armed.map(|(armed, ..)| events::quiesce(&mut *lock(&armed.regs), &armed.layout));
+    let quiesced = armed.map(|(armed, mailbox, work)| {
+        let (taken, quiesced) = events::quiesce(&mut *lock(&armed.regs), &armed.layout);
+        deliver(&taken, mailbox, work);
+        quiesced
+    });
     let entered = power.sleep(state, slp_typ);
     if let (Some((armed, mailbox, work)), Some(quiesced)) = (armed, quiesced)
     {

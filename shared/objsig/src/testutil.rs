@@ -22,7 +22,7 @@ use crate::attrs::Attributes;
 use crate::cert::{Certificate, CertificateBody};
 use crate::store::{AnchorSpec, TrustStore};
 use crate::trailer::{RecordSpec, encode_trailer, trailer_len};
-use crate::{Arch, KeyId, Kind, KindSet, PublicKey, Signature, Usage, key_id};
+use crate::{Arch, KeyId, PublicKey, Role, RoleSet, Signature, Usage, key_id};
 
 /// An Ed25519 key pair.
 pub(crate) struct Key
@@ -101,9 +101,9 @@ pub(crate) fn keys() -> &'static Keys
     })
 }
 
-/// A root's usage: every kind, and `CERTIFY`.
+/// A root's usage: every role, and `CERTIFY`.
 pub(crate) const ROOT: Usage = Usage {
-    kinds: KindSet::ALL,
+    roles: RoleSet::ALL,
     certify: true,
 };
 
@@ -131,7 +131,7 @@ pub(crate) fn store(floor: u32, anchors: &[(&Key, Usage)], revoked: &[KeyId]) ->
 pub(crate) fn certify(
     issuer: &Key,
     subject: &Key,
-    kinds: KindSet,
+    roles: RoleSet,
     min: u32,
     max: u32,
 ) -> Certificate
@@ -141,7 +141,7 @@ pub(crate) fn certify(
         issuer_key_id: issuer.id(),
         serial: 7,
         usage: Usage {
-            kinds,
+            roles,
             certify: false,
         },
         min_security_version: min,
@@ -153,10 +153,11 @@ pub(crate) fn certify(
     }
 }
 
-/// The attributes of `body` as a `kind` named `name` for x86-64.
+/// The attributes of `body` with the set of `roles`, named `name`, for
+/// x86-64.
 pub(crate) fn attrs<'n>(
     body: &[u8],
-    kind: Kind,
+    roles: &[Role],
     name: &'n [u8],
     security_version: u32,
 ) -> Attributes<'n>
@@ -164,7 +165,7 @@ pub(crate) fn attrs<'n>(
     Attributes {
         body_len: u64::try_from(body.len()).unwrap(),
         security_version,
-        kind,
+        roles: RoleSet::of(roles),
         arch: Arch::X86_64,
         body_hash: crypto::sha512(body),
         name,

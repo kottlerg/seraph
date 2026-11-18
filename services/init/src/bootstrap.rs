@@ -926,7 +926,7 @@ pub(crate) fn descriptor_for(info: &InitInfo, slot: u64) -> Option<&CapDescripto
 /// `creator_endpoint_cap`.
 ///
 /// The memmgr boot module is located in [`InitInfo`] by name via
-/// [`crate::find_module_by_name`] (init-protocol v7+).
+/// [`crate::find_module_by_name`].
 ///
 /// `mm_service_ep` is the full-rights cap on memmgr's service endpoint
 /// (created in init's `CSpace`); init keeps a copy and minted SENDs from it
@@ -950,7 +950,7 @@ pub fn bootstrap_memmgr(
 ) -> Option<MemmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;
-    let module_memory_cap = crate::find_module_by_name(info, b"memmgr")?;
+    let module_memory_cap = crate::find_module_by_name(info, crate::module_name::MEMMGR)?;
     let module_size = descriptor_for(info, module_memory_cap).map(|d| d.aux1)?;
     let Some(module_pages) = module_scratch_pages(module_size)
     else
@@ -1813,7 +1813,7 @@ pub fn bootstrap_procmgr(
     // `env_len` is at most the entry buffer's length.
     let env_entry = env_entry.get(..env_len).unwrap_or_default();
 
-    let module_memory_cap = crate::find_module_by_name(info, b"procmgr")?;
+    let module_memory_cap = crate::find_module_by_name(info, crate::module_name::PROCMGR)?;
     let module_size = crate::descriptors(info)
         .iter()
         .find(|d| d.slot == module_memory_cap)

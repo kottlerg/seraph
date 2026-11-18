@@ -11,7 +11,7 @@ publish.workspace = true
 # `IpcMessage` and `ArgvEnvHeader`: the create-request header decoder reads the
 # message snapshot directly, so its bounds checks are host-tested.
 ipc = { path = "../../../shared/ipc" }
-# `Kind` and `KindSet`: the signature policy on each creator's record
+# `Role` and `RoleSet`: the signature policy on each creator's record
 # (`sign_policy`).
 objsig = { path = "../../../shared/objsig" }
 

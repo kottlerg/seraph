@@ -640,12 +640,13 @@ base/size pairs; cap-less `RAM_EXTENT` rounds carry the base/size pair of every
 extent of RAM memmgr pools, against which devmgr checks the regions firmware reserves
 for a device
 ([docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming)
-§ IOMMU Discovery and Programming); `MODULE` rounds of up to four Memory caps (round data
-`[MODULE, n, size_0, ..., size_n-1, name_0 (4 words), ..., name_n-1 (4 words)]`, each module's
-size in bytes, since a module's cap covers whole pages and devmgr reads no byte past the
-module's end, then each module's bundle entry name: 32 bytes, little-endian, NUL-padded, which
+§ IOMMU Discovery and Programming); `MODULE` rounds of one Memory cap each (round data
+`[MODULE, 1, size, name (32 words)]`, the module's size in bytes, since a module's cap covers
+whole pages and devmgr reads no byte past the module's end, then the module's bundle entry
+name, its install path: `BOOT_MODULE_NAME_LEN` (256) bytes, little-endian, NUL-padded, which
 devmgr gives procmgr to verify the module's signature under) carry every boot module outside
-init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels, trust-store),
+init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, the log-level configuration,
+trust-store),
 untagged: the driver images and any platform description table; a cap-less
 `FRAMEBUFFER_INFO` round carries the framebuffer geometry (a zero base means no framebuffer); and
 the terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch shutdown-authority

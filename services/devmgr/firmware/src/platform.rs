@@ -561,10 +561,10 @@ mod tests
             attrs: objsig::Attributes {
                 body_len: u64::try_from(body.len()).unwrap(),
                 security_version: 1,
-                kind: objsig::Kind::BootModule,
+                roles: objsig::RoleSet::of(&[objsig::Role::BootModule]),
                 arch: objsig::Arch::Riscv64,
                 body_hash: [0; 64],
-                name: b"platform-qemu-virt",
+                name: b"/config/devmgr/platform/qemu-virt.platform",
             },
             certificate: None,
             signature: [0; 64],

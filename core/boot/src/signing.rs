@@ -15,7 +15,7 @@
 //! the body the caller then parses and loads, or the one [`BootError`] that
 //! halts the boot.
 
-use objsig::{Arch, CertificateCache, Expectation, Kind, KindSet, TrustStore, verify_cached};
+use objsig::{Arch, CertificateCache, Expectation, Role, RoleSet, TrustStore, verify_cached};
 
 use crate::bprintln;
 use crate::error::{BootError, ObjectName};
@@ -107,8 +107,9 @@ impl<'s> Verifier<'s>
         }
     }
 
-    /// Verify `object` as a `kind` named `name` for this architecture, and
-    /// return its body, the only bytes the caller may parse or load.
+    /// Verify `object` in `role` under `name` for this architecture: its
+    /// signed role set holds `role`. Return its body, the only bytes the
+    /// caller may parse or load.
     ///
     /// # Errors
     /// [`BootError::SignatureRefused`], naming the object and the verifier's
@@ -116,12 +117,12 @@ impl<'s> Verifier<'s>
     pub fn object<'a>(
         &mut self,
         object: &'a [u8],
-        kind: Kind,
+        role: Role,
         name: &[u8],
     ) -> Result<&'a [u8], BootError>
     {
         let expect = Expectation {
-            kinds: KindSet::of(&[kind]),
+            roles: RoleSet::of(&[role]),
             name,
             arch: ARCH,
         };
@@ -157,7 +158,7 @@ impl core::fmt::Display for KeyIdHex<'_>
 pub(crate) mod testing
 {
     use objsig::{
-        AnchorSpec, Attributes, Kind, KindSet, RecordSpec, TrustStore, Usage, encode_trailer,
+        AnchorSpec, Attributes, RecordSpec, Role, RoleSet, TrustStore, Usage, encode_trailer,
         key_id, trailer_len,
     };
 
@@ -168,13 +169,13 @@ pub(crate) mod testing
     /// The seed of a key no test store trusts.
     pub(crate) const STRANGER_SEED: [u8; 32] = [9; 32];
 
-    /// A store of one anchor, the key of `seed`, which may sign every kind.
+    /// A store of one anchor, the key of `seed`, which may sign every role.
     pub(crate) fn store_of(seed: &[u8; 32]) -> Vec<u8>
     {
         let spec = AnchorSpec {
             key: crypto::ed25519_public_key(seed),
             usage: Usage {
-                kinds: KindSet::ALL,
+                roles: RoleSet::ALL,
                 certify: true,
             },
             local: true,
@@ -185,13 +186,14 @@ pub(crate) mod testing
         out
     }
 
-    /// `body` signed by the key of `seed` as a `kind` named `name`.
-    pub(crate) fn signed(seed: &[u8; 32], body: &[u8], kind: Kind, name: &[u8]) -> Vec<u8>
+    /// `body` signed by the key of `seed` with the set of `roles`, named
+    /// `name`.
+    pub(crate) fn signed(seed: &[u8; 32], body: &[u8], roles: &[Role], name: &[u8]) -> Vec<u8>
     {
         let attrs = Attributes {
             body_len: u64::try_from(body.len()).unwrap(),
             security_version: 1,
-            kind,
+            roles: RoleSet::of(roles),
             arch: ARCH,
             body_hash: crypto::sha512(body),
             name,
@@ -225,12 +227,26 @@ mod tests
     {
         let bytes = store_of(&ROOT_SEED);
         let mut verifier = Verifier::new(parse_store(&bytes).unwrap());
-        let object = signed(&ROOT_SEED, b"\x7fELF kernel", Kind::Kernel, b"kernel");
+        let object = signed(&ROOT_SEED, b"\x7fELF kernel", &[Role::Kernel], b"kernel");
         assert_eq!(
-            verifier.object(&object, Kind::Kernel, b"kernel").unwrap(),
+            verifier.object(&object, Role::Kernel, b"kernel").unwrap(),
             b"\x7fELF kernel"
         );
+        // An installed service the bootstrap needs, loaded as a bundle entry.
+        let devmgr = signed(
+            &ROOT_SEED,
+            b"devmgr image",
+            &[Role::Service, Role::BootModule],
+            DEVMGR,
+        );
+        assert_eq!(
+            verifier.object(&devmgr, Role::BootModule, DEVMGR).unwrap(),
+            b"devmgr image"
+        );
     }
+
+    /// The install path of the module the refusal tests load.
+    const DEVMGR: &[u8] = b"/services/devmgr";
 
     // Defect caught: a tampered, renamed, misused or unsigned object, or one
     // signed by a key the store does not trust, loaded rather than refused,
@@ -240,11 +256,16 @@ mod tests
     {
         let bytes = store_of(&ROOT_SEED);
         let mut verifier = Verifier::new(parse_store(&bytes).unwrap());
-        let object = signed(&ROOT_SEED, b"devmgr image", Kind::BootModule, b"devmgr");
+        let object = signed(
+            &ROOT_SEED,
+            b"devmgr image",
+            &[Role::Service, Role::BootModule],
+            DEVMGR,
+        );
         let mut tampered = object.clone();
         tampered[0] ^= 1;
-        let mut refused = |object: &[u8], kind: Kind, name: &[u8]| match verifier
-            .object(object, kind, name)
+        let mut refused = |object: &[u8], role: Role, name: &[u8]| match verifier
+            .object(object, role, name)
         {
             Err(BootError::SignatureRefused { object, refusal }) =>
             {
@@ -254,34 +275,45 @@ mod tests
             other => panic!("expected a refusal, got {other:?}"),
         };
         assert_eq!(
-            refused(&tampered, Kind::BootModule, b"devmgr"),
+            refused(&tampered, Role::BootModule, DEVMGR),
             Refusal::Failed(RecordFailure::BodyHash)
         );
         assert_eq!(
-            refused(&object, Kind::BootModule, b"vfsd"),
+            refused(&object, Role::BootModule, b"/services/vfsd"),
             Refusal::Failed(RecordFailure::Name)
         );
         assert_eq!(
-            refused(&object, Kind::Init, b"devmgr"),
-            Refusal::Failed(RecordFailure::Kind)
+            refused(&object, Role::Init, DEVMGR),
+            Refusal::Failed(RecordFailure::Role)
+        );
+        // An installed service the bundle list may not name.
+        let service = signed(&ROOT_SEED, b"devmgr image", &[Role::Service], DEVMGR);
+        assert_eq!(
+            refused(&service, Role::BootModule, DEVMGR),
+            Refusal::Failed(RecordFailure::Role)
         );
         assert!(matches!(
-            refused(b"devmgr image", Kind::BootModule, b"devmgr"),
+            refused(b"devmgr image", Role::BootModule, DEVMGR),
             Refusal::Parse(_)
         ));
-        let stranger = signed(&STRANGER_SEED, b"devmgr image", Kind::BootModule, b"devmgr");
+        let stranger = signed(
+            &STRANGER_SEED,
+            b"devmgr image",
+            &[Role::Service, Role::BootModule],
+            DEVMGR,
+        );
         assert_eq!(
-            refused(&stranger, Kind::BootModule, b"devmgr"),
+            refused(&stranger, Role::BootModule, DEVMGR),
             Refusal::Untrusted
         );
         let message = format!(
             "{}",
             Verifier::new(parse_store(&bytes).unwrap())
-                .object(&tampered, Kind::BootModule, b"devmgr")
+                .object(&tampered, Role::BootModule, DEVMGR)
                 .unwrap_err()
         );
         assert!(
-            message.contains("devmgr") && message.contains("BodyHash"),
+            message.contains("/services/devmgr") && message.contains("BodyHash"),
             "{message}"
         );
     }

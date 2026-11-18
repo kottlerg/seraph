@@ -61,7 +61,7 @@ pub const CRASH_SERVICE_PRESENT: u64 = 16;
 pub const THREAD_LIMIT: u64 = 17;
 /// A create refused because its object did not verify: it does not parse
 /// as a signed object, no record chains to the trust store, or the record
-/// that does fails a check, its name, kind (against the creator's
+/// that does fails a check, its name, roles (against the creator's
 /// signature policy), architecture or body hash among them
 /// (docs/signing.md § Signature Policy in procmgr). Nothing was created.
 pub const SIGNATURE_REFUSED: u64 = 18;

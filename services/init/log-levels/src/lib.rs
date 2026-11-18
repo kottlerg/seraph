@@ -4,8 +4,8 @@
 // services/init/log-levels/src/lib.rs
 
 //! The log-level configuration init reads at boot: the parser of the
-//! `log-levels` boot module, which names the level of each service init
-//! spawns (`services/init/docs/bootstrap.md` § Log levels).
+//! `/config/init/log-levels.conf` boot module, which names the level of each
+//! service init spawns (`services/init/docs/bootstrap.md` § Log levels).
 //!
 //! The module is text, one setting per line, `<service> = <level>`: a
 //! [`Service`] name and a level `log::parse_level` accepts. A `#` starts a
@@ -155,7 +155,7 @@ pub fn parse(text: &[u8], mut on_error: impl FnMut(&[u8], LineError)) -> Levels
     levels
 }
 
-/// Parse the `log-levels` boot module `module`: the configuration its body
+/// Parse the `/config/init/log-levels.conf` boot module `module`: the configuration its body
 /// holds, as [`parse`] reads it. The bootloader verified the module, so its
 /// trailer is split off with the parse checks alone (docs/signing.md
 /// § Verifier Discipline).
@@ -234,10 +234,10 @@ mod tests
             attrs: objsig::Attributes {
                 body_len: u64::try_from(body.len()).unwrap(),
                 security_version: 1,
-                kind: objsig::Kind::BootModule,
+                roles: objsig::RoleSet::of(&[objsig::Role::BootModule]),
                 arch: objsig::Arch::X86_64,
                 body_hash: [0; 64],
-                name: b"log-levels",
+                name: b"/config/init/log-levels.conf",
             },
             certificate: None,
             signature: [0; 64],

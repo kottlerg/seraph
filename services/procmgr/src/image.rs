@@ -351,8 +351,8 @@ fn copy_cache_page(
 }
 
 /// Verify `object` against procmgr's trust store as the image a creator
-/// expects: signed under `name`, as a kind in `kinds` (the creator's
-/// signature policy), for this architecture. The certificate cache is copied
+/// expects: signed under `name`, with a role set that meets `roles` (the
+/// creator's signature policy), for this architecture. The certificate cache is copied
 /// out under its lock and written back after, so creates verify at once; the
 /// cache is a memo of certificate checks, so an update one create's
 /// write-back loses costs a later create one signature check and changes no
@@ -364,11 +364,11 @@ pub fn verify<'a>(
     ctx: &crate::ProcmgrCtx,
     object: &'a [u8],
     name: &[u8],
-    kinds: objsig::KindSet,
+    roles: objsig::RoleSet,
 ) -> Result<objsig::Verified<'a, 'static>, objsig::Refusal>
 {
     let expect = objsig::Expectation {
-        kinds,
+        roles,
         name,
         arch: crate::arch::current::SIGNED_ARCH,
     };

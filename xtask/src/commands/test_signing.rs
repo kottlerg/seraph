@@ -12,14 +12,14 @@
 //!
 //! - `kernel`: the kernel with a body byte flipped; the bootloader refuses
 //!   it (`Failed(BodyHash)`).
-//! - `bundle`: the `virtio-blk` entry of the bundle with a body byte
-//!   flipped; the bootloader refuses it (`Failed(BodyHash)`).
+//! - `bundle`: the `/services/drivers/virtio-blk` entry of the bundle with a
+//!   body byte flipped; the bootloader refuses it (`Failed(BodyHash)`).
 //! - `revoked`: a bootloader built under the build's trust store with the
 //!   signing key revoked; it refuses the kernel (`Failed(Revoked)`).
 //! - `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr`
-//!   signed as data, and `/services/crashd` signed by a key no anchor
-//!   trusts; procmgr refuses each (`Failed(BodyHash)`, `Failed(Kind)`,
-//!   `Untrusted`) and svcmgr reports the refused launch. The kernel and
+//!   signed with the data role alone, and `/services/crashd` signed by a key
+//!   no anchor trusts; procmgr refuses each (`Failed(BodyHash)`,
+//!   `Failed(Role)`, `Untrusted`) and svcmgr reports the refused launch. The kernel and
 //!   `/programs/terminal` each carry a record of that untrusted key before
 //!   their own, which the bootloader and procmgr skip, and the boot reaches
 //!   the terminal's READY line.
@@ -32,8 +32,9 @@
 //! the layout they had.
 //!
 //! Requires a populated sysroot from `cargo xtask build` whose staged bundle
-//! may be any harness's: the command composes the default-init bundle into
-//! its own directory for the boots and leaves the staged one in place.
+//! may be any harness's: the command signs the sysroot for the default-init
+//! harness, composes its bundle into its own directory for the boots, and
+//! leaves the staged one in place.
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -43,7 +44,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use objsig::Kind;
+use objsig::{Role, RoleSet};
 
 use crate::arch::Arch;
 use crate::bundle::Harness;
@@ -94,12 +95,12 @@ const ROOTFS_TIMEOUT: Duration = Duration::from_mins(6);
 const KERNEL: &str = "esp/EFI/seraph/kernel";
 const BUNDLE: &str = "esp/EFI/seraph/bootstrap.bundle";
 const TAMPERED: &str = "services/timed";
-const WRONG_KIND: &str = "services/pwrmgr";
+const WRONG_ROLE: &str = "services/pwrmgr";
 const UNTRUSTED: &str = "services/crashd";
 const EXTRA_RECORD: &str = "programs/terminal";
 
 /// The bundle entry the `bundle` case tampers with.
-const BUNDLE_ENTRY: &str = "virtio-blk";
+const BUNDLE_ENTRY: &str = "/services/drivers/virtio-blk";
 
 /// One boot: the files its images carry in place of the sysroot's, the lines
 /// it owes, and its deadline.
@@ -174,15 +175,17 @@ pub fn run(ctx: &Context, args: &TestSigningArgs) -> Result<()>
     Ok(())
 }
 
-/// Compose the default-init bundle, copy it to `dir`, and put the staged
-/// bundle back; returns the copy's path.
+/// Sign the sysroot for the default-init harness, compose its bundle, copy
+/// it to `dir`, and put the staged bundle back; returns the copy's path. The
+/// next pack signs the sysroot for the staged bundle's harness again.
 fn init_bundle(ctx: &Context, arch: Arch, dir: &Path) -> Result<PathBuf>
 {
     let staged_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
     let staged = fs::read(&staged_path)
         .with_context(|| format!("reading the staged {}", staged_path.display()))?;
     let copy = dir.join("bootstrap.bundle");
-    let composed = crate::bundle::compose(ctx, arch, Harness::Init)
+    let composed = crate::signing::sign_for_harness(ctx, arch, Harness::Init)
+        .and_then(|()| crate::bundle::compose(ctx, arch, Harness::Init))
         .context("composing the default-init bundle")
         .and_then(|()| {
             fs::copy(&staged_path, &copy)
@@ -290,34 +293,34 @@ fn rootfs_case(
 ) -> Result<Case>
 {
     let untrusted = untrusted_signer(ctx, arch)?;
-    let foreign_record = |relative: &str, object: &[u8], kind: Kind| -> Result<Vec<u8>> {
+    let foreign_record = |relative: &str, object: &[u8], role: Role| -> Result<Vec<u8>> {
         let body = crate::signing::body_of(object)?;
-        let theirs = untrusted.sign(body, kind, &install_name(relative))?;
+        let theirs = untrusted.sign(body, RoleSet::of(&[role]), &install_name(relative))?;
         prepend_records(object, &theirs)
     };
     let tampered = flip_body_byte(&read_sysroot(ctx, TAMPERED)?)?;
-    let pwrmgr = read_sysroot(ctx, WRONG_KIND)?;
+    let pwrmgr = read_sysroot(ctx, WRONG_ROLE)?;
     let as_data = signer.sign(
         crate::signing::body_of(&pwrmgr)?,
-        Kind::Data,
-        &install_name(WRONG_KIND),
+        RoleSet::of(&[Role::Data]),
+        &install_name(WRONG_ROLE),
     )?;
     let crashd = read_sysroot(ctx, UNTRUSTED)?;
     let foreign = untrusted.sign(
         crate::signing::body_of(&crashd)?,
-        Kind::Service,
+        RoleSet::of(&[Role::Service]),
         &install_name(UNTRUSTED),
     )?;
-    let kernel = foreign_record("kernel", &read_sysroot(ctx, KERNEL)?, Kind::Kernel)?;
+    let kernel = foreign_record("kernel", &read_sysroot(ctx, KERNEL)?, Role::Kernel)?;
     let terminal = foreign_record(
         EXTRA_RECORD,
         &read_sysroot(ctx, EXTRA_RECORD)?,
-        Kind::Program,
+        Role::Program,
     )?;
     let mut expect = Vec::new();
     for (path, refusal) in [
         (TAMPERED, "Failed(BodyHash)"),
-        (WRONG_KIND, "Failed(Kind)"),
+        (WRONG_ROLE, "Failed(Role)"),
         (UNTRUSTED, "Untrusted"),
     ]
     {
@@ -334,7 +337,7 @@ fn rootfs_case(
             sub(BUNDLE, bundle.to_path_buf()),
             sub(KERNEL, stage(dir, "kernel.two-records", &kernel)?),
             sub(TAMPERED, stage(dir, "timed.tampered", &tampered)?),
-            sub(WRONG_KIND, stage(dir, "pwrmgr.data", &as_data)?),
+            sub(WRONG_ROLE, stage(dir, "pwrmgr.data", &as_data)?),
             sub(UNTRUSTED, stage(dir, "crashd.untrusted", &foreign)?),
             sub(EXTRA_RECORD, stage(dir, "terminal.two-records", &terminal)?),
         ],
@@ -756,7 +759,9 @@ mod tests
     {
         let root = crate::signing::testing::scratch("test-signing");
         let signer = crate::signing::testing::signer(&root.join("keys"), Arch::X86_64);
-        let object = signer.sign(body, Kind::Service, "/services/x").unwrap();
+        let object = signer
+            .sign(body, RoleSet::of(&[Role::Service]), "/services/x")
+            .unwrap();
         let _ = fs::remove_dir_all(&root);
         object
     }

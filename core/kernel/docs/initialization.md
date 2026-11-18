@@ -534,27 +534,28 @@ Phase 7.
    region and returning its buddy block's tail can each split one extent), one descriptor per
    AcpiReclaimable memory-map entry, MMIO aperture, boot module and reclaim range, and
    FIXED_BOOT_DESCRIPTORS more (`cap::init_info_descriptor_bound`), in the fewest pages that hold
-   them, one contiguous zeroed extent. A boot whose bound passes INIT_INFO_DESCRIPTOR_CAPACITY, the
-   8,079 slots of the protocol's INIT_INFO_MAX_PAGES = 64 ceiling, halts with "FATAL: Phase 7:
+   them past the header and a boot-module name table of one entry per module, one contiguous zeroed
+   extent. A boot whose bound passes INIT_INFO_DESCRIPTOR_CAPACITY, the 7,484 slots of the
+   protocol's INIT_INFO_MAX_PAGES = 64 ceiling past a full name table, halts with "FATAL: Phase 7:
    boot descriptors exceed the InitInfo region ceiling". Then drain the remaining buddy RAM as
    address-sorted, maximal contiguous extents (`BuddyAllocator::drain_coalesced`), seal the buddy,
    and install SEED_MEMORY over the front seed_reserve_bytes() of the largest drained extent
    (`cap::drain_and_install_seed`). The drain writes each extent into a slot of the region's
-   descriptor array, the 32-byte slots past the header, extent i in slot i; more extents than slots
-   halt the boot with "FATAL: Phase 7: drained RAM extents exceed the InitInfo descriptor
-   capacity", the one check the in-place mint of step 3a relies on. Every capability Phases 7 and 8
-   mint then has its descriptor written into that array, in place, so no copy of it exists, and a
-   boot whose capabilities outnumber the slots halts by name in Phase 7 or 8 ("cap: boot
-   capabilities exceed the InitInfo descriptor capacity"). Phase 9's capabilities reach init
+   descriptor array, the 32-byte slots past the header and the name table, extent i in slot i; more
+   extents than slots halt the boot with "FATAL: Phase 7: drained RAM extents exceed the InitInfo
+   descriptor capacity", the one check the in-place mint of step 3a relies on. Every capability
+   Phases 7 and 8 mint then has its descriptor written into that array, in place, so no copy of it
+   exists, and a boot whose capabilities outnumber the slots halts by name in Phase 7 or 8 ("cap:
+   boot capabilities exceed the InitInfo descriptor capacity"). Phase 9's capabilities reach init
    through InitInfo header fields instead. seed_reserve_bytes() is the boot footprint, sized with
-   the region (about 250 KiB on the 512 MiB QEMU boots): the root CSpace slab, init's
-   address-space and thread slabs (the thread slab sized from the boot CPU's save area, so it grows
-   with a wider vector length), and one 128-byte body for each descriptor slot and for each Memory
-   capability Phase 9 mints (init segments, InitInfo pages, init stack pages), plus alignment
-   slack. Every drained extent exposed to userspace (each drained extent, and the seed extent's
-   tail past the reserve) is zeroed through the direct map before step 3 mints it: free RAM still
-   holds what firmware and the bootloader left there, the UEFI stack among it, and the buddy's
-   free-list headers. The "Phase 7: drained" line reports the time the zeroing took
+   the region (about 250 KiB on the 512 MiB QEMU boots): the root CSpace slab, init's address-space
+   and thread slabs (the thread slab sized from the boot CPU's save area, so it grows with a wider
+   vector length), and one 128-byte body for each descriptor slot and for each Memory capability
+   Phase 9 mints (init segments, InitInfo pages, init stack pages), plus alignment slack. Every
+   drained extent exposed to userspace (each drained extent, and the seed extent's tail past the
+   reserve) is zeroed through the direct map before step 3 mints it: free RAM still holds what
+   firmware and the bootloader left there, the UEFI stack among it, and the buddy's free-list
+   headers. The "Phase 7: drained" line reports the time the zeroing took
 2. Boot-retype the root CSpace from SEED_MEMORY (`boot_retype_cspace`, `root_cspace_init_pages()`
    pages: one wrapper page plus a slot-page pool holding at least every capability body the boot
    mints (`boot_body_bound`), ROOT_CSPACE_BOOT_EXTRA_SLOTS = 4 (slot 0 and init's AddressSpace,
@@ -598,9 +599,9 @@ Phase 7.
       its `CapDescriptor` (`CapType::EntropyControl`, `aux0 = aux1 = 0`)
    h. Memory capabilities for the boot module images, via
       `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry), which
-      also writes each module's name entry, and the entry count, into the
-      `InitInfo` header's module-name table in place in the region step 1
-      reserved
+      also writes each module's name entry into the `InitInfo` module-name
+      table, which follows the header at `MODULE_NAMES_OFFSET`, in place in
+      the region step 1 reserved, and the entry count into the header
    i. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
       for its segments, InitInfo pages, and stack pages are added in Phase 9)
 

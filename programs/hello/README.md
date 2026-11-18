@@ -39,7 +39,7 @@ hello from seraph userspace
 The `hello-tester` crate installs at `/tests/programs/hello`, per the
 [per-program tester protocol](../../docs/testing.md#per-program-tester-protocol). It spawns
 `/programs/hello` with a piped stdout, reads the stream to EOF, and waits for the child. Then,
-being a program itself, it spawns the service-kind `/tests/crasher`, which procmgr refuses, since
+being a program itself, it spawns the service `/tests/crasher`, which procmgr refuses, since
 a program may start programs only
 ([docs/signing.md](../../docs/signing.md) § Signature Policy in procmgr).
 

@@ -100,7 +100,7 @@ subcommands! {
         /// and regenerate `disk.img` without invoking cargo. The mirror is
         /// authoritative over `config/`+`data/` (deletions in `rootfs/` are
         /// pruned); use `--repack-only` to pack a hand-staged sysroot as it
-        /// stands. Every pack re-signs the kernel and the ELF images in place.
+        /// stands. Every pack re-signs the sysroot's signed objects in place.
         /// Requires an arch-tagged sysroot from a prior `cargo xtask build`.
         Mkdisk(MkdiskArgs),
 
@@ -166,7 +166,7 @@ subcommands! {
         /// Check that each signature verifier refuses what it is owed to: boot
         /// the current sysroot four times from disk images carrying a tampered
         /// kernel, a tampered bundle entry, a bootloader revoking the signing
-        /// key, and tampered, wrong-kind and foreign-signed rootfs images, and
+        /// key, and tampered, wrong-role and foreign-signed rootfs images, and
         /// assert each refusal line. Builds that bootloader; leaves the
         /// sysroot as it was and packs the disk images again (see
         /// xtask/README.md).
@@ -671,7 +671,7 @@ args! {
         pub arch: Arch,
 
         /// Repack `disk.img` from the sysroot as it stands, skipping the
-        /// `rootfs/` re-mirror; the kernel and the ELF images are still
+        /// `rootfs/` re-mirror; the sysroot's signed objects are still
         /// re-signed in place, as every pack signs them. Use after editing the
         /// staged sysroot directly (e.g. adding a test recipe or removing a
         /// default one): a normal re-mirror is authoritative and would restore

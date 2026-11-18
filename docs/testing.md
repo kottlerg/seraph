@@ -509,13 +509,13 @@ sysroot itself is never changed:
 
 1. `kernel`: the kernel with a body byte flipped. The bootloader refuses it,
    `Failed(BodyHash)`.
-2. `bundle`: the bundle's `virtio-blk` entry with a body byte flipped. The bootloader refuses
-   it, `Failed(BodyHash)`.
+2. `bundle`: the bundle's `/services/drivers/virtio-blk` entry with a body byte flipped. The
+   bootloader refuses it, `Failed(BodyHash)`.
 3. `revoked`: a bootloader built under the build's trust store with the signing key revoked. It
    refuses the kernel, `Failed(Revoked)`.
-4. `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr` signed as data,
-   and `/services/crashd` signed by a key no anchor holds. procmgr refuses each
-   (`Failed(BodyHash)`, `Failed(Kind)`, `Untrusted`) and svcmgr reports each refused launch.
+4. `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr` signed with the data
+   role alone, and `/services/crashd` signed by a key no anchor holds. procmgr refuses each
+   (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr reports each refused launch.
    The kernel and `/programs/terminal` each carry a record of that key before their own, which
    the bootloader and procmgr skip, and the boot reaches the terminal's READY line.
 

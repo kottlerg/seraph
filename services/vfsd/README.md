@@ -59,8 +59,9 @@ vfsd/
   and `GET_SWAP_PARTITION` on its un-badged service endpoint, with
   multi-threaded recv so independent requests proceed while one waits on
   a driver spawn; no service-endpoint request waits on another's IPC (a
-  `GET_SWAP_PARTITION` waits at most for the swap lock, held across one
-  call to the block driver, which never calls vfsd), so the thread count
+  `GET_SWAP_PARTITION` waits at most for the discovery lock and the swap
+  lock, held across a discovery of new disks and one call to the block
+  driver; neither devmgr nor a block driver calls vfsd), so the thread count
   is a concurrency knob, not a correctness bound. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts), gated on the
   `MOUNT_AUTHORITY` badge bit; root, `/esp`, and `/data` are
@@ -128,8 +129,9 @@ vfsd/
 - **GPT enumeration + mount discovery** — at startup, queries devmgr
   for every block device (`QUERY_DEVICE` on the `block` class SEND at instance ordinals 0,
   1, …, passing a `WITHDRAWN` one, until another reply is not
-  `SUCCESS`), and again from the first ordinal not yet queried for a
-  `MOUNT` whose role no held disk carries, and parses each disk's GPT
+  `SUCCESS`), and again from the first ordinal not yet queried before
+  each runtime role lookup (a `MOUNT`, the first `GET_SWAP_PARTITION`),
+  and parses each disk's GPT
   partition table through one scratch memory cap reused across the reads (replaced from memmgr
   before the next disk when a failed read left it lost), keeping every
   used entry of each header's `num_parts`-entry array (a disk whose GPT

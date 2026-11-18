@@ -91,12 +91,15 @@ the new filesystem's namespace endpoint addressing its root. A mount
 on `/` once root is already mounted, on a path that is already a mount
 point, or on a path with a component the namespace protocol cannot name, is
 rejected (`TABLE_FULL`) before any partition is registered or driver
-spawned. A role no held disk carries is looked up again after vfsd queries
-devmgr for the block devices it served since vfsd's last query (from the
-first instance ordinal not yet queried), so a disk added or inserted again
-after startup is found; until devmgr serves it, the request replies
-`NO_MOUNT`. A mount that fails after the spawn (the `FS_MOUNT` probe, an
-install a concurrent `MOUNT` beat, an install past the tree's
+spawned. Before the role lookup vfsd queries devmgr for the block devices
+it served since vfsd's last query (from the first instance ordinal not yet
+queried) and holds them, so the role resolves across every disk devmgr
+serves, under the priority and tie rules of
+[docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a disk
+added or inserted again after startup is found, and its partition wins or
+ties against those of the disks held before it. A mount that
+fails after the spawn (the `FS_MOUNT` probe, an install a concurrent
+`MOUNT` beat, an install past the tree's
 `MAX_MOUNTS` or one that cannot allocate its tree nodes, or a disk removed
 during the mount) revokes the partition cap vfsd registered and the new
 driver's service endpoint, which stops the driver, and deletes the

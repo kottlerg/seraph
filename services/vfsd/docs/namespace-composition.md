@@ -185,9 +185,9 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   block request ([docs/storage.md](../../../docs/storage.md#failure-and-revocation-invariants)
   § Failure and Revocation Invariants).
 - **A change of the class.** devmgr signals the watch when it serves a block driver and when it
-  withdraws one. The watch thread probes every held disk. A `MOUNT` that discovers new disks
-  probes each once it is held, since devmgr can withdraw one after discovery asked about it and
-  before the watch thread can see it held.
+  withdraws one. The watch thread probes every held disk. A discovery of new disks (before a
+  runtime role lookup) probes each once it is held, since devmgr can withdraw one after discovery
+  asked about it and before the watch thread can see it held.
 - **The probe** asks devmgr about the disk's instance ordinal (`QUERY_DEVICE` on the `block`
   class); `WITHDRAWN` means the disk is gone for good, since devmgr never serves an ordinal
   again. The probe does not call the disk's own cap: devmgr takes a removed device's driver out of
@@ -212,9 +212,9 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   ([vfsd.svc](../../../rootfs/config/svcmgr/services/vfsd.svc)), so svcmgr shuts the system down
   ([docs/supervision.md](../../../docs/supervision.md)).
 
-A disk inserted again is a new driver at a new ordinal. vfsd mounts none of its partitions on its
-own: a `MOUNT` whose role is found on no held disk queries devmgr for the disks served since the
-last query and looks again
+A disk added or inserted again is a new driver at a new ordinal. vfsd mounts none of its
+partitions on its own: each runtime role lookup first queries devmgr for the disks served since
+the last query and holds them, so a `MOUNT` resolves its role across every disk devmgr serves
 ([`vfs-ipc-interface.md`](vfs-ipc-interface.md#label-10-mount) § Label 10).
 
 ---

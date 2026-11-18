@@ -1680,6 +1680,19 @@ pub fn split_mmio(span: &Span<u64>, at: u64) -> Result<(u64, u64), SplitError>
     syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
 }
 
+/// Merge the `Mmio` caps of `lower` and `upper`, two adjacent spans of an
+/// aperture table, into one cap over their joined range (`SYS_MMIO_MERGE`),
+/// for a range given back to the table. `None` when the kernel refuses
+/// them: caps that are not derivation siblings (pieces of two aperture caps
+/// with different derivation parents), a cap with a derivation of its own,
+/// or a joined cap the `CSpace` cannot back. Neither cap is changed then, and the table keeps
+/// both.
+#[must_use]
+pub fn merge_mmio(lower: &Span<u64>, upper: &Span<u64>) -> Option<u64>
+{
+    syscall::mmio_merge(lower.slot, upper.slot).ok()
+}
+
 // ── Interrupt range allocator ───────────────────────────────────────────────
 
 /// `SYS_IRQ_SPLIT`'s error for a split point outside the cap's range.

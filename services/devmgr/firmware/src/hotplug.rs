@@ -559,9 +559,9 @@ fn lowest_free(
 
 /// The ranges of `slot`'s windows that devmgr still holds: the part of each
 /// span of `spans` (its aperture table's caps) inside each open window, its
-/// ends rounded inward to pages. A span is not merged with its neighbours, so
-/// each range lies inside one cap and a BAR placed in it ([`assign`]) is
-/// carved from that cap. Appended to `out`.
+/// ends rounded inward to pages. Each range lies inside one cap, so a BAR
+/// placed in it ([`assign`]) is carved from that cap; two neighbours the
+/// kernel did not merge are two ranges. Appended to `out`.
 ///
 /// # Errors
 /// The allocation error when `out` cannot grow.
@@ -603,13 +603,24 @@ pub fn bar_spans(device: &PciDevice) -> impl Iterator<Item = (u64, u64)> + '_
         .take(device.bar_count)
         .filter(|&((&phys, _), &mmio)| mmio && phys != 0)
         .map(|((&phys, &size), _)| {
-            let base = phys & !(PAGE - 1);
-            let end = phys
-                .saturating_add(size)
-                .checked_next_multiple_of(PAGE)
-                .unwrap_or(u64::MAX);
+            let (base, end) = bar_page_span(phys, size);
             (base, end.saturating_sub(base))
         })
+}
+
+/// The whole pages `(base, end)` a BAR at `phys` of `size` bytes lies in:
+/// the range devmgr carves and holds its caps in, and within which a BAR cap
+/// given back to the held BAR pages is merged with its neighbours.
+#[must_use]
+pub const fn bar_page_span(phys: u64, size: u64) -> (u64, u64)
+{
+    let base = phys & !(PAGE - 1);
+    let end = match phys.saturating_add(size).checked_next_multiple_of(PAGE)
+    {
+        Some(end) => end,
+        None => u64::MAX,
+    };
+    (base, end)
 }
 
 /// Write the BARs of `placed` into the function at `bus:dev.func`, its
@@ -1083,10 +1094,11 @@ const fn indicator(control: u16, capabilities: u32, value: u16) -> u16
 
 /// Return held BAR pages: move each span of `held` (the held BAR pages)
 /// that `inside` holds for, given its `(base, end)`, to `free` (the
-/// apertures), whole, one at a time. A span is moved as the cap it is, so
-/// nothing is split, and only from `held`, so a page is returned once: a
-/// span returned already, or carved by a bind and not given back, is not
-/// there. Returns the number of spans moved.
+/// apertures), whole, one at a time, and merge it there with each adjacent
+/// span through `merge` ([`SpanTable::move_merged`]). A span is moved as the
+/// cap it is, so nothing is split, and only from `held`, so a page is
+/// returned once: a span returned already, or carved by a bind and not given
+/// back, is not there. Returns the number of spans moved.
 ///
 /// # Errors
 /// [`CarveError::NoMemory`], with the spans moved before, when `free`
@@ -1095,6 +1107,7 @@ pub fn return_bars<S: Copy>(
     held: &mut SpanTable<S>,
     free: &mut SpanTable<S>,
     inside: impl Fn(u64, u64) -> bool,
+    mut merge: impl FnMut(&Span<S>, &Span<S>) -> Option<S>,
 ) -> Result<usize, (usize, CarveError)>
 {
     let mut moved = 0usize;
@@ -1105,9 +1118,14 @@ pub fn return_bars<S: Copy>(
         .find(|&(base, end)| inside(base, end))
     {
         // Moved whole, the span splits nothing.
-        held.move_to(free, base, end.saturating_sub(base), 1, |_, _| {
-            Err(SplitError::Failed)
-        })
+        held.move_merged(
+            free,
+            base,
+            end.saturating_sub(base),
+            1,
+            |_, _| Err(SplitError::Failed),
+            &mut merge,
+        )
         .map_err(|e| (moved, e))?;
         moved = moved.saturating_add(1);
     }
@@ -1153,9 +1171,10 @@ pub struct Removal
 /// driver's device); then turn off each one's memory decode (`quiesce`), so
 /// it no longer answers at its BARs; then move every span of the held BAR
 /// pages inside a BAR span of one of them ([`bar_spans`]) to the apertures
-/// `free` ([`return_bars`]); then mark each record removed. The slot's
-/// port is on the bus above it and is not one of them. The caller powers the
-/// slot off once this returns.
+/// `free`, merged there with each adjacent span through `merge`
+/// ([`return_bars`]); then mark each record removed. The slot's port is on
+/// the bus above it and is not one of them. The caller powers the slot off
+/// once this returns.
 pub fn remove<S: Copy>(
     slot: &Slot,
     records: &mut PciRecords,
@@ -1163,6 +1182,7 @@ pub fn remove<S: Copy>(
     free: &mut SpanTable<S>,
     mut withdraw: impl FnMut(Address, &mut SpanTable<S>),
     mut quiesce: impl FnMut(Address),
+    merge: impl FnMut(&Span<S>, &Span<S>) -> Option<S>,
 ) -> Removal
 {
     let behind = |records: &PciRecords, index: usize| {
@@ -1189,13 +1209,18 @@ pub fn remove<S: Copy>(
             quiesce(address(&device));
         }
     }
-    let returned = return_bars(held, free, |base, end| {
-        (0..count).any(|index| {
-            behind(records, index).is_some_and(|d| {
-                bar_spans(&d).any(|(b, len)| b <= base && end <= b.saturating_add(len))
+    let returned = return_bars(
+        held,
+        free,
+        |base, end| {
+            (0..count).any(|index| {
+                behind(records, index).is_some_and(|d| {
+                    bar_spans(&d).any(|(b, len)| b <= base && end <= b.saturating_add(len))
+                })
             })
-        })
-    });
+        },
+        merge,
+    );
     let mut functions = 0usize;
     for index in 0..count
     {
@@ -1950,6 +1975,13 @@ mod tests
         Ok(((b, at), (at, e)))
     }
 
+    /// A model of `SYS_MMIO_MERGE` over [`split_model`]'s caps: two
+    /// adjacent caps join into one.
+    fn merge_model(lower: &Span<(u64, u64)>, upper: &Span<(u64, u64)>) -> Option<(u64, u64)>
+    {
+        (lower.slot.1 == upper.slot.0).then_some((lower.slot.0, upper.slot.1))
+    }
+
     fn covered(table: &SpanTable<(u64, u64)>) -> Vec<(u64, u64)>
     {
         table.spans().iter().map(|s| (s.base, s.end)).collect()
@@ -2059,7 +2091,7 @@ mod tests
         // Held at placement: the BAR's pages move out of the apertures.
         let spans: Vec<(u64, u64)> = bar_spans(&device).collect();
         apertures
-            .move_all(&mut held, &spans, PAGE, split_model)
+            .move_all(&mut held, &spans, PAGE, split_model, merge_model)
             .unwrap();
         assert_eq!(covered(&held), [(bar, bar + 0x10_0000)]);
         // The mirror: a region grant of a page under the BAR finds no
@@ -2752,7 +2784,8 @@ mod tests
         space.write16(1, 0, 0, COMMAND, COMMAND_MEMORY | COMMAND_BUS_MASTER);
         let mut held = SpanTable::new();
         let spans: Vec<(u64, u64)> = bar_spans(&edu).collect();
-        free.move_all(&mut held, &spans, PAGE, split_model).unwrap();
+        free.move_all(&mut held, &spans, PAGE, split_model, merge_model)
+            .unwrap();
         let mut functions = Vec::new();
         scan(&space, 0, 0, 3, &mut functions).unwrap();
         let mut records = PciRecords::new(functions).unwrap();
@@ -2830,6 +2863,7 @@ mod tests
                 events.borrow_mut().push(("quiesce", at));
                 assert!(quiesce(&space, (at.1, at.2, at.3)));
             },
+            merge_model,
         );
         // The port is not behind its own slot; the edu is, withdrawn before it
         // is quiesced.
@@ -2863,6 +2897,7 @@ mod tests
             &mut free,
             |_, _| panic!("a removed function is withdrawn again"),
             |_| panic!("a removed function is quiesced again"),
+            |_, _| panic!("nothing returned, nothing merged"),
         );
         assert_eq!(
             again,
@@ -2872,6 +2907,112 @@ mod tests
             }
         );
         assert_eq!(covered(&free), before);
+    }
+
+    /// The removal fixture's `edu` bound and removed: its bind carved the
+    /// driver's cap on the BAR's first half and its MSI-X table's page from
+    /// the second, leaving the BAR's held pages in two pieces; the withdrawal
+    /// gives both caps back to the held BAR pages, merged inside the BAR's
+    /// page span through `merge`, and the removal returns what is held to the
+    /// apertures through `merge`. Returns the configuration space, the slot,
+    /// and the apertures after the removal.
+    fn removed_after_a_bind(
+        merge: impl Fn(&Span<(u64, u64)>, &Span<(u64, u64)>) -> Option<(u64, u64)> + Copy,
+    ) -> (Space, Slot, SpanTable<(u64, u64)>)
+    {
+        let (space, slot, mut records, mut held, mut free) = removal_fixture();
+        let window = slot.memory.unwrap();
+        let bar = bar_page_span(window.base, 0x10_0000);
+        let cap = held.carve_span(bar.0, 0x8_0000, PAGE, split_model).unwrap();
+        let table = held
+            .carve_span(bar.0 + 0xC_0000, PAGE, PAGE, split_model)
+            .unwrap();
+        assert_eq!(
+            covered(&held),
+            [
+                (bar.0 + 0x8_0000, bar.0 + 0xC_0000),
+                (bar.0 + 0xC_1000, bar.1)
+            ]
+        );
+        let removal = remove(
+            &slot,
+            &mut records,
+            &mut held,
+            &mut free,
+            |_, held| {
+                for c in [cap, table]
+                {
+                    assert!(
+                        held.insert_merged(c.slot, c.base, c.end - c.base, bar, merge)
+                            .unwrap()
+                    );
+                }
+            },
+            |at| {
+                quiesce(&space, (at.1, at.2, at.3));
+            },
+            merge,
+        );
+        assert_eq!(removal.functions, 1);
+        removal.returned.unwrap();
+        assert_eq!(covered(&held), []);
+        each_page_once(window, &[&free], &[]);
+        (space, slot, free)
+    }
+
+    /// A function with QEMU's `edu` header and one 32-bit non-prefetchable
+    /// BAR 0, unassigned, of the size the writable bits `mask` give.
+    fn add_card(space: &Space, bdf: (u8, u8, u8), mask: u32)
+    {
+        add_edu(space, bdf);
+        space.funcs.borrow_mut().get_mut(&bdf).unwrap().bar_masks[0] = mask;
+    }
+
+    #[test]
+    fn a_card_added_after_a_removal_spans_the_pieces_the_removal_returned()
+    {
+        let (space, slot, mut free) = removed_after_a_bind(merge_model);
+        let window = slot.memory.unwrap();
+        // The BAR's pieces merged back into one held span, returned whole, and
+        // merged with the window's rest: the window is one span again.
+        assert_eq!(covered(&free), [(window.base, window.end)]);
+        // A card whose 2 MiB BAR takes the whole window, across the BAR the
+        // removal returned and the rest, is placed and held.
+        add_card(&space, (1, 0, 0), 0xFFE0_0000);
+        let mut ranges = Vec::new();
+        free_ranges(free.spans(), &slot, &mut ranges).unwrap();
+        let Found::Ready(card) = place(&space, &slot, (1, 0, 0), &ranges)
+        else
+        {
+            panic!("a BAR the free window holds was not placed");
+        };
+        assert_eq!(card.bar_phys[0], window.base);
+        let spans: Vec<(u64, u64)> = bar_spans(&card).collect();
+        assert_eq!(spans, [(window.base, window.end - window.base)]);
+        let mut held = SpanTable::new();
+        free.move_all(&mut held, &spans, PAGE, split_model, merge_model)
+            .unwrap();
+        assert_eq!(covered(&held), [(window.base, window.end)]);
+        assert_eq!(covered(&free), []);
+    }
+
+    #[test]
+    fn pieces_the_kernel_does_not_merge_place_no_bar_across_them()
+    {
+        // Every merge refused, as for caps that are not derivation siblings:
+        // the window comes back in the pieces it was carved into, and a BAR
+        // larger than each does not fit, although the window is free.
+        let (space, slot, free) = removed_after_a_bind(|_, _| None);
+        let window = slot.memory.unwrap();
+        assert_eq!(covered(&free).len(), 5);
+        add_card(&space, (1, 0, 0), 0xFFE0_0000);
+        let mut ranges = Vec::new();
+        free_ranges(free.spans(), &slot, &mut ranges).unwrap();
+        assert!(matches!(
+            place(&space, &slot, (1, 0, 0), &ranges),
+            Found::Unplaced(_, Unplaced::NoRoom(0))
+        ));
+        each_page_once(window, &[&free], &[]);
     }
 
     #[test]
@@ -2895,6 +3036,7 @@ mod tests
             |at| {
                 quiesce(&space, (at.1, at.2, at.3));
             },
+            merge_model,
         );
         assert_eq!(asked, 1);
         assert_eq!(removal.functions, 1);
@@ -2942,6 +3084,7 @@ mod tests
             |at| {
                 quiesce(&space, (at.1, at.2, at.3));
             },
+            merge_model,
         );
         assert_eq!(removal.functions, 1);
         // The mapping's commit is refused, and the device, gone, has none.

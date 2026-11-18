@@ -1171,7 +1171,11 @@ fn carve_bars(
 ) -> Option<()>
 {
     let mut carve_one = |b: usize, bytes: u64| {
-        let (Some(&index), Some(&bar_phys)) = (pci_dev.bar_pci_idx.get(b), pci_dev.bar_phys.get(b))
+        let (Some(&index), Some(&bar_phys), Some(&bar_size)) = (
+            pci_dev.bar_pci_idx.get(b),
+            pci_dev.bar_phys.get(b),
+            pci_dev.bar_size.get(b),
+        )
         else
         {
             return None;
@@ -1205,7 +1209,10 @@ fn carve_bars(
                 bytes,
                 offset,
             });
-            dev.push_bar(span);
+            dev.push_bar(BarCap {
+                span,
+                bar: firmware::hotplug::bar_page_span(bar_phys, bar_size),
+            });
         }
         Some(())
     };
@@ -1655,17 +1662,17 @@ fn give_msix(
         Ok(minted) => minted,
         Err(e) =>
         {
-            return_bar(&mut carve.caps.slot_bars, table.span);
+            return_bar(&mut carve.caps.slot_bars, table.bar);
             return Err(e);
         }
     };
     if !dev.config.enable_msix(msix, &table, &messages)
     {
         delete_messages(carve.irq_range.remap.as_deref(), &messages);
-        return_bar(&mut carve.caps.slot_bars, table.span);
+        return_bar(&mut carve.caps.slot_bars, table.bar);
         return Err(not_given(widened));
     }
-    dev.push_bar(table.span);
+    dev.push_bar(table.bar);
     dev.remap = carve.irq_range.remap();
     for (vector, m) in (0..=u8::MAX).zip(&messages)
     {
@@ -1683,8 +1690,9 @@ fn give_msix(
 struct MsixTable
 {
     cap: u64,
-    /// The cap with the range it covers, under which it is given back.
-    span: Span<u64>,
+    /// The cap with the range it covers and its BAR's pages, under which it
+    /// is given back.
+    bar: BarCap,
     /// Pages the cap spans.
     pages: u64,
     /// The table's byte offset from the cap's first page.
@@ -1742,7 +1750,10 @@ fn msix_table(
     };
     Some(MsixTable {
         cap: carved.slot,
-        span: carved,
+        bar: BarCap {
+            span: carved,
+            bar: firmware::hotplug::bar_page_span(bar_phys, bar_size),
+        },
         pages: bytes.div_ceil(PAGE_SIZE),
         offset,
     })
@@ -1934,10 +1945,10 @@ pub struct PciDeviceCaps
     /// the bind and the registry as a few words.
     resources: Vec<Resource>,
     /// Each cap devmgr carved on the function's BARs, its `Mmio` resources'
-    /// and its MSI-X table's, with the range it covers, which
-    /// [`Self::release`] gives back to the held BAR pages; room for one more
-    /// than [`MAX_BOUND_RESOURCES`] reserved at [`Self::empty`].
-    bars: Vec<Span<u64>>,
+    /// and its MSI-X table's, with the range it covers and its BAR's pages,
+    /// which [`Self::release`] gives back to the held BAR pages; room for one
+    /// more than [`MAX_BOUND_RESOURCES`] reserved at [`Self::empty`].
+    bars: Vec<BarCap>,
     /// The device's DMA capability, kept by devmgr, and its mappings
     /// ([`dma::DmaGrant`]); `None` for a driver that declares no DMA.
     pub dma: Option<dma::DmaGrant>,
@@ -1991,15 +2002,14 @@ impl PciDeviceCaps
         let _ = push_bound(&mut self.resources, resource);
     }
 
-    /// Record a cap carved on the function's BARs with the range it covers
-    /// (`span`), to be given back at [`Self::release`]: at most one per
-    /// delivered range and one for the MSI-X table, which the room reserved
-    /// at [`Self::empty`] holds.
-    fn push_bar(&mut self, span: Span<u64>)
+    /// Record a cap carved on the function's BARs (`bar`), to be given back
+    /// at [`Self::release`]: at most one per delivered range and one for the
+    /// MSI-X table, which the room reserved at [`Self::empty`] holds.
+    fn push_bar(&mut self, bar: BarCap)
     {
         if self.bars.len() < self.bars.capacity()
         {
-            self.bars.push(span);
+            self.bars.push(bar);
         }
     }
 
@@ -2068,16 +2078,16 @@ impl PciDeviceCaps
                 // there is deleted.
                 Resource::Mmio { cap, .. } =>
                 {
-                    if !self.bars.iter().any(|s| s.slot == *cap)
+                    if !self.bars.iter().any(|b| b.span.slot == *cap)
                     {
                         let _ = syscall::cap_delete(*cap);
                     }
                 }
             }
         }
-        for &span in &self.bars
+        for &bar in &self.bars
         {
-            return_bar(held, span);
+            return_bar(held, bar);
         }
         if let Some(dma) = &self.dma
         {
@@ -2214,18 +2224,41 @@ pub fn withdraw_device(dev_caps: &PciDeviceCaps, child: spawn::HeldChild, ipc_bu
     }
 }
 
-/// Give the cap devmgr carved on a function's BARs, covering `span`, back to
-/// the held BAR pages `held` (`caps::DevmgrCaps::slot_bars`): every copy
-/// derived from it (the driver's, and their mappings) is revoked first, so
-/// the pages are devmgr's alone again, and a bind carves them, or a hotplug
-/// removal returns them to the apertures, once more. Deleted, logged, when a
-/// copy cannot be revoked or the table cannot grow; its pages are then lost
-/// for the boot.
-pub fn return_bar(held: &mut SpanTable<u64>, span: Span<u64>)
+/// A cap devmgr carved on a function's BARs: the cap with the range it
+/// covers, and the page span of the BAR it lies in
+/// (`firmware::hotplug::bar_page_span`), inside which it is merged with the
+/// held BAR pages beside it when it is given back ([`return_bar`]).
+#[derive(Clone, Copy)]
+pub struct BarCap
 {
+    /// The cap with the range it covers.
+    pub span: Span<u64>,
+    /// The BAR's pages, `(base, end)`.
+    pub bar: (u64, u64),
+}
+
+/// Give the cap devmgr carved on a function's BARs, `bar`, back to the held
+/// BAR pages `held` (`caps::DevmgrCaps::slot_bars`): every copy derived from
+/// it (the driver's, and their mappings) is revoked first, so the pages are
+/// devmgr's alone again, and a bind carves them, or a hotplug removal returns
+/// them to the apertures, once more. It is merged with each adjacent held
+/// span inside its BAR's pages ([`crate::merge_mmio`]), so the BAR's pages
+/// a bind split come back as one span, and no span reaches past the BAR,
+/// since a removal returns only a span inside a removed function's BAR
+/// (`firmware::hotplug::remove`). Deleted, logged, when a copy cannot be
+/// revoked or the table cannot grow; its pages are then lost for the boot.
+pub fn return_bar(held: &mut SpanTable<u64>, bar: BarCap)
+{
+    let BarCap { span, bar } = bar;
     let kept = syscall::cap_revoke_all(span.slot).is_ok()
         && matches!(
-            held.insert(span.slot, span.base, span.end.saturating_sub(span.base)),
+            held.insert_merged(
+                span.slot,
+                span.base,
+                span.end.saturating_sub(span.base),
+                bar,
+                crate::merge_mmio,
+            ),
             Ok(true)
         );
     if !kept

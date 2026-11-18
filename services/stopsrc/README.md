@@ -19,7 +19,7 @@ from bootstrap slot 0, touches its stack, logs `serving`, and serves, on any bad
 |---|---|
 | `PROBE` (1) | `SUCCESS`, word 0 a per-instance random nonce, word 1 the job's state (`JOB_NONE` 0, `JOB_RUNNING` 1, `JOB_STOPPED` 2), word 2 the running job's key or 0 |
 | `START_JOB` (2) | Start a job of `data[0]` pages: `SUCCESS` with word 0 the job's key once the fixture's budget subtree holds that many pages beyond its own node; `JOB_FAILED` when the child is not created or does not hold them within 10 s, and is destroyed; `BUSY` while a job runs |
-| `EXIT` (3) | `SUCCESS`, then the fixture destroys its job and exits with status 0, which `restart = always` restarts |
+| `EXIT` (3) | `SUCCESS`, then the fixture exits with status 0, leaving a running job to procmgr, which destroys it with the fixture since svcmgr creates the fixture contained; `restart = always` restarts it |
 | any other | `UNKNOWN_OPCODE` |
 
 and, on a badge carrying `stop_labels::STOP_AUTHORITY`, the shared stop labels in place of its
@@ -36,10 +36,11 @@ the fixture's own binary run as `stopsrc job <pages>`: it touches that many page
 sleeps until it is destroyed.
 
 svctest's `svcmgr_stop_service` phase reads that svcmgr lists the fixture as a source of the
-program class, and that the stop labels answer on the SEND svcmgr hands out and refuse on the
-`:deny` one. Its `oom_policy` phase has the fixture exit, so the instance svcmgr restarts starts
-after oomd, and start a job before memhog fills memory: oomd stops the job before memhog, and the
-fixture reports it stopped ([services/svctest/README.md](../svctest/README.md)). A fixture that
+program class, that the stop labels answer on the SEND svcmgr hands out and refuse on the
+`:deny` one, and that a job the fixture started is gone once the fixture has exited. Its
+`oom_policy` phase has the fixture exit, so the instance svcmgr restarts starts after oomd, and
+start a job before memhog fills memory: oomd stops the job before memhog, and the fixture reports
+it stopped ([services/svctest/README.md](../svctest/README.md)). A fixture that
 lacks its endpoint or nonce logs an error and exits.
 
 ---

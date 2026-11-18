@@ -185,7 +185,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[12]` | `devmgr.class.input-deny` | drivers deny phase: an `input` class SEND without the driver's verb bits |
 | `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits; `logd_sinks` phase: the class it waits on for the killed framebuffer driver's withdrawal |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
-| `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; svctest declares itself undebuggable at startup |
+| `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `oom_policy` phase, no-stop case: `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -292,7 +292,12 @@ the table. The whole `LIST_STOP_SOURCES` walk must list exactly
 [stopsrc](../stopsrc/README.md), with the program class, when `stopsrc.svc` is staged, and nothing
 otherwise; through the SEND it carries, the fixture's `LIST_CANDIDATES` must reply `SUCCESS` and
 `STOP_CANDIDATE` of a key it never gave `NO_CANDIDATE`, and through the fixture's `:deny` SEND,
-which `QUERY_ENDPOINT` resolves, both must reply `UNAUTHORIZED`. With `crasher-worker.svc` staged,
+which `QUERY_ENDPOINT` resolves, both must reply `UNAUTHORIZED`. With `stopsrc.svc` staged, the
+phase also checks that svcmgr creates the source contained: through `caps[15]`, `LIST_PROCESSES`
+must list one process under `/tests/stopsrc` before `START_JOB` and a second, the job, after it;
+once the fixture has exited (`EXIT`, which leaves the job running) and its next instance answers
+`PROBE` with a new nonce, the job's badge must leave the list within 2 s. With
+`crasher-worker.svc` staged,
 `STOP_CANDIDATE` of its listed key must reply `SUCCESS`, the fixture must then answer
 `PROBE_INSTANCE` with a new instance's nonce, the restart its `on_failure` policy makes of the
 `EXIT_KILLED` death, and the same key must then reply `NO_CANDIDATE`.

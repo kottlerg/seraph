@@ -953,6 +953,7 @@ production value is raised.
 | `NORMAL_WAIT`, `LOG_WAIT`, `CHILD_WAIT`, `NO_STOP_MARGIN_MS` | `services/svctest/src/phases/oom.rs` | 60 s / 10 s / 30 s / 2000 ms | test fixture | none | correct as is | None |
 | `JOB_PAGES` | `services/svctest/src/phases/oom.rs` | 64 pages of `stopsrc`'s job | test fixture | none | correct as is | None |
 | `UNLISTED_SLOTS` | `services/svctest/src/phases/svcmgr.rs` | 32 svcmgr table slots whose unlisted keys the stop phase tries | test fixture | none | correct as is | None |
+| `CONTAIN_JOB_PAGES`, `CONTAIN_WAIT_MS` | `services/svctest/src/phases/svcmgr.rs` | 1 page of the job the stop phase has `stopsrc` start; 2000 ms for that job to leave procmgr's list once its source has restarted | test fixture; test wait bound | none | correct as is | None |
 | `JOB_READY_MS`, `JOB_POLL_MS`, `STACK_TOUCH_BYTES` | `services/stopsrc/src/main.rs` | 10 s for a job to hold its pages, read every 20 ms; 16 KiB of stack touched at start | test fixture | 16 KiB of stack | correct as is | None |
 | svctest poll counts | `services/svctest/src/phases/*.rs` | 256 to 5000 | test fixture | none | correct as is | None |
 | debug-echo `RX_WAIT_MS`, `MAX_MESSAGE_BYTES` | `services/debug-echo/src/main.rs` | 20 ms; 512, derived from `MSG_DATA_WORDS_MAX * 8` | test fixture | none | correct as is | None |

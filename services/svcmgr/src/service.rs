@@ -198,7 +198,8 @@ pub struct RestartRecipe
     /// The `reserve = yes` service: each instance is created in the system
     /// reserve (`svcmgr_defs::create_flags`).
     pub reserve: bool,
-    /// The `stop_source = <class>` service's class: while it runs, a
+    /// The `stop_source = <class>` service's class: each instance is created
+    /// contained (`svcmgr_defs::create_flags`), and while it runs, a
     /// stop-authority holder finds it, with a stop-badged SEND on its service
     /// endpoint, through `svcmgr_labels::LIST_STOP_SOURCES` (`crate::stop`).
     pub stop_source: Option<svcmgr_defs::stop::StopClass>,

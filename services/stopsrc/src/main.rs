@@ -141,10 +141,8 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
                 {
                     // SAFETY: ipc_buf is the registered IPC buffer page.
                     let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(src::SUCCESS), ipc_buf) };
-                    if let Some(mut child) = job.child.take()
-                    {
-                        let _ = child.kill();
-                    }
+                    // The job is left running: svcmgr creates the fixture
+                    // contained, so procmgr destroys it with this instance.
                     std::os::seraph::log!("exiting on request");
                     std::process::exit(0);
                 }

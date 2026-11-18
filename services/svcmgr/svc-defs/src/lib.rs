@@ -69,16 +69,20 @@ pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
 /// [`CREATE_RESERVE`](ipc::procmgr_labels::CREATE_RESERVE) for a recipe that
 /// sets `reserve = yes` ([`Definition::reserve`]), so the service's budget
 /// node is in the system reserve, which procmgr grants svcmgr since svcmgr's
-/// own node is a reserve node; and
+/// own node is a reserve node;
 /// [`CREATE_NODE_HANDLE`](ipc::procmgr_labels::CREATE_NODE_HANDLE) for one
 /// that sets `oom_stop = yes` ([`Definition::oom_stop`]), whose usage svcmgr
-/// reads through the handle for `stop_labels::LIST_CANDIDATES`.
+/// reads through the handle for `stop_labels::LIST_CANDIDATES`; and
+/// [`CREATE_CONTAIN`](ipc::procmgr_labels::CREATE_CONTAIN) for one that sets
+/// `stop_source` ([`Definition::stop_source`]), so no process the source
+/// started outlives it: a candidate it lists ends with it, and a restarted
+/// source starts with none.
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "each argument is the recipe key that asks for one flag"
 )]
-pub const fn create_flags(reserve: bool, oom_stop: bool) -> u64
+pub const fn create_flags(reserve: bool, oom_stop: bool, stop_source: bool) -> u64
 {
     let mut flags = 0;
     if reserve
@@ -88,6 +92,10 @@ pub const fn create_flags(reserve: bool, oom_stop: bool) -> u64
     if oom_stop
     {
         flags |= ipc::procmgr_labels::CREATE_NODE_HANDLE;
+    }
+    if stop_source
+    {
+        flags |= ipc::procmgr_labels::CREATE_CONTAIN;
     }
     flags
 }
@@ -338,7 +346,9 @@ pub struct Definition
     /// `stop_source = <class>` makes the service a stop source of that class:
     /// while it runs, svcmgr lists it to a stop-authority holder
     /// (`svcmgr_labels::LIST_STOP_SOURCES`) with the class and a SEND on its
-    /// service endpoint badged with `stop_labels::STOP_AUTHORITY`. A core role
+    /// service endpoint badged with `stop_labels::STOP_AUTHORITY`. Each
+    /// instance is created contained (`procmgr_labels::CREATE_CONTAIN`,
+    /// [`create_flags`]), so what it started ends with it. A core role
     /// ([`stop::core_role`]). The parser requires `provides` with every entry
     /// badged and a supervised service. `None` for every other service.
     pub stop_source: Option<stop::StopClass>,
@@ -532,18 +542,19 @@ mod tests
     #[test]
     fn each_recipe_key_asks_for_its_own_create_flag()
     {
-        use ipc::procmgr_labels::{CREATE_NODE_HANDLE, CREATE_RESERVE};
-        assert_eq!(create_flags(false, false), 0);
-        assert_eq!(create_flags(true, false), CREATE_RESERVE);
-        assert_eq!(create_flags(false, true), CREATE_NODE_HANDLE);
+        use ipc::procmgr_labels::{CREATE_CONTAIN, CREATE_NODE_HANDLE, CREATE_RESERVE};
+        assert_eq!(create_flags(false, false, false), 0);
+        assert_eq!(create_flags(true, false, false), CREATE_RESERVE);
+        assert_eq!(create_flags(false, true, false), CREATE_NODE_HANDLE);
+        assert_eq!(create_flags(false, false, true), CREATE_CONTAIN);
         assert_eq!(
-            create_flags(true, true),
-            CREATE_RESERVE | CREATE_NODE_HANDLE
+            create_flags(true, true, true),
+            CREATE_RESERVE | CREATE_NODE_HANDLE | CREATE_CONTAIN
         );
         // Never a flag procmgr refuses from svcmgr: the charge-node flag, with
         // which procmgr refuses CREATE_RESERVE.
         assert_eq!(
-            create_flags(true, true) & ipc::procmgr_labels::CREATE_CHARGE_NODE,
+            create_flags(true, true, true) & ipc::procmgr_labels::CREATE_CHARGE_NODE,
             0
         );
     }

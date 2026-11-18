@@ -103,7 +103,7 @@ out of every interface.
   `stop_source = program` (§ Stop Sources). The last two are core roles, so svcmgr never offers
   sessiond to oomd. A reserve service, it touches what it uses at start and allocates nothing on
   its list and stop paths, so it answers oomd while the free pool is spent. svcmgr creates every
-  `stop_source` service contained (§ procmgr Mechanism): sessiond's death ends every session, and
+  `stop_source` service contained (§ Stop Sources): sessiond's death ends every session, and
   no session outlives its supervisor.
 - **Opening a session.** An interface asks sessiond to open a session and hands it the caps the
   leader's standard streams take (the terminal's pipe caps; later a PTY's subordinate end, or a
@@ -236,10 +236,11 @@ the one class, and sessiond its one source.
   `MSG_CAP_SLOTS_MAX` caps, so the list is paged.
 - **Class.** A source's class is read from its recipe, never from the source: a source that
   declared its own class could claim the service class and delay its own stop. The key is a core
-  role. A source is reached on its service endpoint, so the `.svc` parser rejects the key on a
-  recipe without `provides`; on one with a bare `provides` entry, whose unbadged SEND any holder
-  could badge with the stop bit; and with `restart = never`, since svcmgr lists only a source it
-  supervises.
+  role, and svcmgr creates every `stop_source` service contained (§ procmgr Mechanism), so no
+  process a source started outlives it and each instance starts with no candidate. A source is
+  reached on its service endpoint, so the `.svc` parser rejects the key on a recipe without
+  `provides`; on one with a bare `provides` entry, whose unbadged SEND any holder could badge with
+  the stop bit; and with `restart = never`, since svcmgr lists only a source it supervises.
 - **Protocol.** Every source serves the same two labels, from one shared label module: a paged list
   of its candidates, each with a key, a rank, a name and the pages of its subtree; and the stop of
   one candidate, named by its key. A key names one candidate and no other while the source runs;

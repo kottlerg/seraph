@@ -541,7 +541,13 @@ impl Job
 
 /// Call `label` with `data[0] = word` on the `stopsrc` fixture: the reply's
 /// first three data words. Fails `phase` on a reply other than `SUCCESS`.
-fn src_call(fixture: u64, label: u64, word: u64, phase: &str, what: &str) -> (u64, u64, u64)
+pub(super) fn src_call(
+    fixture: u64,
+    label: u64,
+    word: u64,
+    phase: &str,
+    what: &str,
+) -> (u64, u64, u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let msg = ipc::IpcMessage::builder(label).word(0, word).build();

@@ -698,7 +698,8 @@ oomd stops it, and passes otherwise. The CI svctest cell drops crashd, so the he
 that phase (a child's page fault crashd holds until oomd's stop frees memory) runs in the burn-in
 svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
 `stop_source = program`) is co-staged beside `memhog` in both cells: svctest's
-`svcmgr_stop_service` phase reads that svcmgr lists it as the one stop source, and its `oom_policy`
+`svcmgr_stop_service` phase reads that svcmgr lists it as the one stop source and that a job it
+started ends with it, and its `oom_policy`
 phase has it start a job that oomd stops before memhog; both phases pass without it.
 
 **Test isolation.** The functional harness boots run a controlled substrate:

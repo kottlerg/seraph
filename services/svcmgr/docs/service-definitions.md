@@ -68,7 +68,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth`. Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
-| `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
+| `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
 | `oom_stop` | no | `yes` or `no` (default `no`). Opts the service in to being stopped by a stop-authority holder. Refused, as a parser error, on a recipe the eligibility rule refuses. See [`oom_stop`](#oom_stop). |
 | `reserve` | no | `yes` or `no` (default `no`). Creates the service inside memmgr's system reserve. A core role: the eligibility rule never stops it. See [`reserve`](#reserve). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
@@ -449,6 +449,12 @@ source is reached on its service endpoint; on one with a bare `provides` entry, 
 publishes an unbadged SEND, from which any holder could derive a SEND badged with the stop bit, so
 every entry carries `:auth` or `:deny`; and with `restart = never`, since svcmgr lists only a
 source it supervises.
+
+svcmgr creates each instance of a source contained, on its launch and on every restart
+(`procmgr_labels::CREATE_CONTAIN`,
+[procmgr IPC Interface § Process Tree](../../procmgr/docs/ipc-interface.md#process-tree)): when the
+instance ends, procmgr destroys what is left of its subtree, so no process the source started
+outlives it, a candidate it listed is gone with it, and its next instance starts with none.
 
 ```
 binary      = /tests/stopsrc

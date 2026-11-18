@@ -3753,7 +3753,9 @@ pub mod stopsrc_labels
     /// destroyed), and [`BUSY`] while a job runs.
     pub const START_JOB: u64 = 2;
     /// Reply [`SUCCESS`], then exit with status 0, which the recipe's
-    /// `restart = always` restarts: a new instance of the source starts.
+    /// `restart = always` restarts: a new instance of the source starts. A
+    /// running job is left to procmgr, which destroys it with the fixture,
+    /// since svcmgr creates a stop source contained.
     pub const EXIT: u64 = 3;
     /// [`PROBE`]: no job has run in this instance.
     pub const JOB_NONE: u64 = 0;

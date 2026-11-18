@@ -387,6 +387,20 @@ pub(crate) fn badge_named(authority: u64, name: &[u8]) -> Option<u64>
     find_listed(authority, |_, listed| listed == name).map(|(badge, _)| badge)
 }
 
+/// Walk `LIST_PROCESSES` for every live process named `name`; their badges.
+pub(crate) fn badges_named(authority: u64, name: &[u8]) -> Vec<u64>
+{
+    let badges = core::cell::RefCell::new(Vec::new());
+    let _ = find_listed(authority, |badge, listed| {
+        if listed == name
+        {
+            badges.borrow_mut().push(badge);
+        }
+        false
+    });
+    badges.into_inner()
+}
+
 /// Walk `LIST_PROCESSES` for the first entry `matches` accepts; its badge
 /// and name.
 fn find_listed(authority: u64, matches: impl Fn(u64, &[u8]) -> bool) -> Option<(u64, Vec<u8>)>

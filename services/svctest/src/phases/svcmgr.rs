@@ -200,6 +200,19 @@ pub(super) struct Listed
 /// boot.
 pub(super) const STOPSRC_RECIPE: &str = "/config/svcmgr/services/stopsrc.svc";
 
+/// The name procmgr lists the `stopsrc` fixture's processes under, its
+/// instance and its job alike: the path both are created from.
+const STOPSRC_PATH: &[u8] = b"/tests/stopsrc";
+
+/// The pages of the job [`check_source_contained`] has `stopsrc` start: one,
+/// since only its process is looked for.
+const CONTAIN_JOB_PAGES: u64 = 1;
+
+/// How long [`check_source_contained`] waits, once `stopsrc`'s next instance
+/// answers, for procmgr to stop listing the job of the instance that exited.
+/// A test wait bound.
+const CONTAIN_WAIT_MS: u64 = 2000;
+
 /// Call `label` with `data[0] = word` through `cap`, delete any cap the reply
 /// carries, and return the reply label; `what` names the call in a failure.
 fn call_label(cap: u64, label: u64, word: u64, what: &str) -> u64
@@ -407,6 +420,62 @@ fn check_stop_sources(stop_cap: u64, phase: &str)
     }
 }
 
+/// The containment of a stop source (services/svcmgr/docs/service-definitions.md
+/// § `stop_source`): svcmgr creates `stopsrc` contained, so the job an
+/// instance started ends with that instance. Through the debug authority
+/// `authority`, `LIST_PROCESSES` lists one process under `stopsrc`'s path,
+/// then a second once `START_JOB` has the instance start a job; once the
+/// instance has exited (`EXIT`) and its restarted successor answers, the
+/// job's badge leaves the list within [`CONTAIN_WAIT_MS`]. Created
+/// uncontained, the job would be re-parented and listed on.
+fn check_source_contained(authority: u64, phase: &str)
+{
+    use super::crash::badges_named;
+    use super::oom::src_call;
+    use ipc::stopsrc_labels as src;
+    assert_ne!(
+        authority, 0,
+        "{phase}: no debug-authority cap in slot 15 (debug_authority = yes)"
+    );
+    let fixture = provided_endpoint(src::NAME, phase);
+    let alone = badges_named(authority, STOPSRC_PATH);
+    let (first, _, _) = src_call(fixture, src::PROBE, 0, phase, "stopsrc PROBE");
+    let _ = src_call(
+        fixture,
+        src::START_JOB,
+        CONTAIN_JOB_PAGES,
+        phase,
+        "stopsrc START_JOB",
+    );
+    let jobs: Vec<u64> = badges_named(authority, STOPSRC_PATH)
+        .into_iter()
+        .filter(|badge| !alone.contains(badge))
+        .collect();
+    let [job] = jobs[..]
+    else
+    {
+        panic!("{phase}: LIST_PROCESSES lists stopsrc's instance {alone:#x?} and jobs {jobs:#x?}");
+    };
+    assert_eq!(
+        alone.len(),
+        1,
+        "{phase}: LIST_PROCESSES lists {alone:#x?} under stopsrc's path before its job"
+    );
+    let _ = src_call(fixture, src::EXIT, 0, phase, "stopsrc EXIT");
+    let (next, _, _) = src_call(fixture, src::PROBE, 0, phase, "stopsrc PROBE after EXIT");
+    assert_ne!(next, first, "{phase}: stopsrc did not restart");
+    let start = std::time::Instant::now();
+    while badges_named(authority, STOPSRC_PATH).contains(&job)
+    {
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(CONTAIN_WAIT_MS),
+            "{phase}: stopsrc's job {job:#x} outlived the instance that started it"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = syscall::cap_delete(fixture);
+}
+
 /// End to end: the stop authority (services/svcmgr/docs/ipc-interface.md
 /// § Stop authority). `STOP_CANDIDATE`, `LIST_CANDIDATES` and
 /// `LIST_STOP_SOURCES` through the per-process SEND, which carries no verb
@@ -430,7 +499,8 @@ fn check_stop_sources(stop_cap: u64, phase: &str)
 /// carries reaches the fixture's stop labels: its list replies `SUCCESS`,
 /// and a stop of a key it never gave replies `NO_CANDIDATE`. The fixture's
 /// own `:deny` SEND, which any process can query, gets `UNAUTHORIZED` for
-/// both.
+/// both, and the job an instance of it started ends with that instance
+/// ([`check_source_contained`]).
 ///
 /// With `crasher-worker` staged, `STOP_CANDIDATE` of its listed key replies
 /// `SUCCESS`, and the restart probe then answers with a new instance's nonce:
@@ -497,6 +567,10 @@ fn svcmgr_stop_service_phase(caps: &Caps)
     }
 
     check_stop_sources(stop_cap, phase);
+    if recipe_staged(STOPSRC_RECIPE, phase)
+    {
+        check_source_contained(caps.debug_authority, phase);
+    }
     if !staged
     {
         std::os::seraph::log!(

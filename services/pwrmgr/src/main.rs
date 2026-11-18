@@ -100,10 +100,27 @@ fn main() -> !
                 }
             }
         }
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let msg = match unsafe { ipc::ipc_recv(bootstrap.service_ep, ipc_buf) }
+        // A wake on the endpoint is readiness that can lapse before the
+        // receive (its caller stopped or destroyed in between). With the wait
+        // set the receive does not block, so the wait, where svcmgr's death
+        // is seen, stays pwrmgr's one blocking point.
+        let received = if wait_set == 0
+        {
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            unsafe { ipc::ipc_recv(bootstrap.service_ep, ipc_buf) }
+        }
+        else
+        {
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            unsafe { ipc::ipc_try_recv(bootstrap.service_ep, ipc_buf) }
+        };
+        let msg = match received
         {
             Ok(msg) => msg,
+            Err(e) if wait_set != 0 && e == syscall_abi::SyscallError::WouldBlock as i64 =>
+            {
+                continue;
+            }
             Err(e) =>
             {
                 guard.on_failure(e);

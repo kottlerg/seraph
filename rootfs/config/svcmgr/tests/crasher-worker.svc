@@ -12,8 +12,9 @@
 # shows that svcmgr routed the death and restarted the service
 # (`restart = on_failure`). `critical = no`: the system continues if the
 # restart budget is spent. `oom_stop = yes` makes it one of the staged
-# fixtures (with memhog) a stop-authority holder may stop: svctest's svcmgr_stop_service phase lists
-# it, stops it, and reads the restarted instance's nonce.
+# fixtures (with memhog) a stop-authority holder may stop: svctest's
+# svcmgr_stop_service phase lists it, stops it, and reads the restarted
+# instance's nonce.
 binary    = /tests/crasher
 argv      = crasher worker-fault
 restart   = on_failure

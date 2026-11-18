@@ -23,6 +23,7 @@
 //! procmgr call to a worker thread keeps main's reply path intact.
 
 use std::collections::VecDeque;
+use std::os::seraph::process::ArgvEnvCap;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::worker;
@@ -75,6 +76,10 @@ pub struct CreateFromFileOrder
     /// Stays the caller's: the worker derives the relay it sends under
     /// `CREATE_DEATH_RELAY` from it and binds the child's main thread to it.
     pub death_queue: u64,
+    /// The child's argv and env (`crate::driver`'s `driver_argv_env`),
+    /// which the worker's `CREATE_FROM_FILE` carries; `None` creates it
+    /// unnamed.
+    pub argv_env: Option<ArgvEnvCap>,
     /// The bootstrap caps to deliver once the child REQUESTs.
     pub bootstrap: BootstrapOrder,
 }

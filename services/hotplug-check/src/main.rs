@@ -3,17 +3,23 @@
 
 // services/hotplug-check/src/main.rs
 
-//! Hotplug fixture: waits for devmgr to serve the `test-dma` fixture on an `edu`
-//! device the host hot-adds behind a PCI Express root port and checks that
-//! the device's DMA and its MSI work; then, once the host has removed the
-//! device, that devmgr withdrew its driver, and once the host has added it
-//! again, that the new device is served at the next ordinal, works, and
-//! holds none of its predecessor's IOMMU faults. So `cargo xtask
-//! test-hotplug` proves devmgr's native hotplug add and removal paths from
-//! the slot to a bound driver and back.
+//! Hotplug fixture, in two modes. The device mode (no argument) waits for
+//! devmgr to serve the `test-dma` fixture on an `edu` device the host
+//! hot-adds behind a PCI Express root port and checks that the device's DMA
+//! and its MSI work; then, once the host has removed the device, that devmgr
+//! withdrew its driver, and once the host has added it again, that the new
+//! device is served at the next ordinal, works, and holds none of its
+//! predecessor's IOMMU faults. So `cargo xtask test-hotplug` proves devmgr's
+//! native hotplug add and removal paths from the slot to a bound driver and
+//! back. The disk mode (`disk`, [`disk`]) follows a disk the host hot-adds,
+//! removes and adds again through vfsd's mounts, and the loss of the root
+//! filesystem's driver.
 //!
 //! The checks, and the markers it logs, are specified in
 //! `services/hotplug-check/README.md`.
+
+mod arch;
+mod disk;
 
 use driver_binding::resources::InterruptKind;
 use ipc::ClassCallError;
@@ -33,13 +39,13 @@ const REMOVE_MARKER: &str = "READY for the removal";
 /// `xtask/src/commands/test_hotplug.rs`.
 const READD_MARKER: &str = "WITHDRAWN at ordinal 0; READY for the re-added device";
 
-/// Logged when every check passed. Kept in sync with
+/// Logged when every check passed, in either mode. Kept in sync with
 /// `xtask/src/commands/test_hotplug.rs`.
-const PASS_MARKER: &str = "PASS";
+pub(crate) const PASS_MARKER: &str = "PASS";
 
-/// Logged, with the reason, when a check failed. Kept in sync with
-/// `xtask/src/commands/test_hotplug.rs`.
-const FAIL_MARKER: &str = "FAIL";
+/// Logged, with the reason, when a check failed, in either mode. Kept in
+/// sync with `xtask/src/commands/test_hotplug.rs`.
+pub(crate) const FAIL_MARKER: &str = "FAIL";
 
 /// How long the fixture waits for devmgr to serve the hot-added device's
 /// driver, in milliseconds: past the host's hot-add, the poller's period,
@@ -56,6 +62,11 @@ fn main()
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
+    if std::env::args().nth(1).as_deref() == Some("disk")
+    {
+        disk::run(info, ipc_buf);
+        return;
+    }
     match check(info.creator_endpoint, ipc_buf)
     {
         Ok((first, again)) => std::os::seraph::log!(

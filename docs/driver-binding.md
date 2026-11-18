@@ -167,7 +167,7 @@ A table belongs to the bundle only when it describes a device the root mount nee
 bundle is the bootstrap closure ([boot-media.md](boot-media.md) § The Bootstrap Closure); any other
 table is installed on the root filesystem and read by devmgr from there. `qemu-virt.platform`
 describes the RTC and the hotplug grant, neither of which the root mount needs. That is design
-intent, not yet implemented ([#I_CLOSURE](https://github.com/kottlerg/seraph/issues/I_CLOSURE)):
+intent, not yet implemented ([#1267](https://github.com/kottlerg/seraph/issues/1267)):
 devmgr reads tables from its boot modules alone, and the bundle carries every table of the
 architecture.
 

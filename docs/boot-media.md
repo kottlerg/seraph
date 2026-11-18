@@ -52,7 +52,7 @@ Design intent, not yet implemented:
   [#1078](https://github.com/kottlerg/seraph/issues/1078)).
 - The bundle carries more than the bootstrap closure: the serial and framebuffer drivers and,
   on riscv64, the platform description table, none of which the root mount needs
-  ([#I_CLOSURE](https://github.com/kottlerg/seraph/issues/I_CLOSURE)).
+  ([#1267](https://github.com/kottlerg/seraph/issues/1267)).
 
 ---
 

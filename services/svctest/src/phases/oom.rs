@@ -6,13 +6,16 @@
 //! The out-of-memory policy end to end (services/oomd/docs/operation.md): the
 //! `memhog` fixture fills memmgr's pool up to the system reserve, and oomd
 //! stops it once the level has read `CRITICAL` for its grace, or, with
-//! `OOMD_STOP=no` or no oomd, nothing stops it.
+//! `OOMD_STOP=no` or no oomd, nothing stops it. With the `stopsrc` fixture
+//! staged, oomd first stops the job that stop source lists, since the program
+//! class is stopped before the service class.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ipc::memhog_labels as hog;
+use ipc::stopsrc_labels as src;
 use std::os::seraph::MemoryPressure;
 
 use crate::bootstrap::Caps;
@@ -30,7 +33,8 @@ const CRASHD_RECIPE: &str = "/config/svcmgr/services/crashd.svc";
 
 /// How long the phase waits for the level to read `NORMAL`: before the
 /// fill, for what earlier phases left, and after it, for oomd's grace, its
-/// stop, and memmgr's reclaim of the fixture's memory. A test wait bound.
+/// stop (with `stopsrc`'s job stopped first, a cooldown later), and
+/// memmgr's reclaim of the fixture's memory. A test wait bound.
 const NORMAL_WAIT: Duration = Duration::from_secs(60);
 
 /// How long the phase waits for oomd's and crashd's lines to reach logd's
@@ -53,6 +57,13 @@ const STACK_TOUCH_BYTES: usize = 16 * 1024;
 
 /// The prefix of oomd's line for a stop of the fixture.
 const STOP_LINE: &[u8] = b"stopped memhog: ";
+
+/// The prefix of oomd's line for a stop of `stopsrc`'s job.
+const JOB_STOP_LINE: &[u8] = b"stopped stopsrc-job: ";
+
+/// The pages of the job the stop case has `stopsrc` start: few, so its stop
+/// leaves the level `CRITICAL` while memhog tops its fill up.
+const JOB_PAGES: u64 = 64;
 
 /// The prefix of oomd's line for a stop of the fixture it advises.
 const ADVICE_LINE: &[u8] = b"would stop memhog: ";
@@ -125,7 +136,11 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 /// fixture fills the pool up to the reserve; the level falls back to
 /// `NORMAL`; the fixture's next instance answers with a new nonce and no
 /// pages held; and oomd's log holds one new line for the stop, after the
-/// level had read `CRITICAL` for at least its grace. With crashd holding
+/// level had read `CRITICAL` for at least its grace. With `stopsrc.svc`
+/// staged, the phase first has that stop source exit, so the instance svcmgr
+/// restarts started after oomd, and start a job of [`JOB_PAGES`]: oomd stops
+/// the job at its first act, before memhog at a later one, and the fixture
+/// reports the job stopped. With crashd holding
 /// faults, a child (`/programs/crashme oom-touch`) writes a demand page
 /// while the pool is full: crashd holds the fault, and resumes it once the
 /// stop frees memory, so the child exits 0 and crashd logs one more resumed
@@ -135,7 +150,8 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 /// `CRITICAL` past oomd's grace and cooldown with the same instance of the
 /// fixture running and no stop line logged, and, with oomd, at least one line
 /// naming the fixture it would stop; svctest then stops the fixture itself,
-/// through its stop authority, and the level falls back to `NORMAL`.
+/// through its stop authority, by the key svcmgr listed it under before the
+/// fill, and the level falls back to `NORMAL`.
 ///
 /// Between the fill and the fall of the level the phase allocates nothing and
 /// touches no new stack page: a fault of its own would be declined or held.
@@ -178,6 +194,8 @@ fn oom_policy_phase(caps: &Caps)
 /// The stop case of [`oom_policy_phase`].
 fn stop_case(fixture: u64, config: oomd_policy::Config, before: Lines, phase: &str)
 {
+    let job = super::svcmgr::recipe_staged(super::svcmgr::STOPSRC_RECIPE, phase)
+        .then(|| Job::start(phase));
     let mut toucher = crashd_holds(phase).then(|| Toucher::start(phase));
     touch_stack();
     let pages = hog_call(fixture, phase);
@@ -194,8 +212,14 @@ fn stop_case(fixture: u64, config: oomd_policy::Config, before: Lines, phase: &s
     // oomd logs its line after the stop, and crashd its line after the
     // resume, so either can land after the level has fallen.
     let after = Lines::await_where(before.query, |now| {
-        now.stops > before.stops && (held_ms.is_none() || now.resumed > before.resumed)
+        now.stops > before.stops
+            && (held_ms.is_none() || now.resumed > before.resumed)
+            && (job.is_none() || now.job_stops > before.job_stops)
     });
+    if let Some(job) = &job
+    {
+        job.finish(&before, &after, phase);
+    }
     let stops = after.stops.saturating_sub(before.stops);
     assert_eq!(
         stops, 1,
@@ -207,6 +231,14 @@ fn stop_case(fixture: u64, config: oomd_policy::Config, before: Lines, phase: &s
         "{phase}: oomd advised in its stop mode"
     );
     let critical_ms = after.last_stop_critical_ms.unwrap_or(0);
+    let job_line = if job.is_some()
+    {
+        "; stopsrc's job stopped first"
+    }
+    else
+    {
+        ""
+    };
     assert!(
         critical_ms >= config.grace_ms,
         "{phase}: oomd stopped memhog after {critical_ms} ms critical, inside its {} ms grace",
@@ -220,14 +252,14 @@ fn stop_case(fixture: u64, config: oomd_policy::Config, before: Lines, phase: &s
         );
         std::os::seraph::log!(
             "oom phase passed (memhog hogged {pages} pages; oomd stopped it after {critical_ms} \
-             ms critical; oom-touch's write held {held_ms} ms and resumed)"
+             ms critical{job_line}; oom-touch's write held {held_ms} ms and resumed)"
         );
     }
     else
     {
         std::os::seraph::log!(
             "oom phase passed (memhog hogged {pages} pages; oomd stopped it after {critical_ms} \
-             ms critical; crashd holds no fault, no held write)"
+             ms critical{job_line}; crashd holds no fault, no held write)"
         );
     }
 }
@@ -254,6 +286,10 @@ fn no_stop_case(
         stop_cap, 0,
         "{phase}: no stop-authority cap (stop_authority = yes)"
     );
+    let key = super::svcmgr::list_candidates(stop_cap, phase)
+        .iter()
+        .find(|c| c.name == "memhog")
+        .map_or(0, |c| c.key);
     touch_stack();
     let pages = hog_call(fixture, phase);
     let _ = syscall::thread_sleep(watch_ms);
@@ -261,7 +297,7 @@ fn no_stop_case(
     let (same, held) = probe(fixture, phase, "PROBE past the grace");
     // The fixture's next instance is idle, so the level the fixture held
     // falls once it is stopped below.
-    let label = super::svcmgr::stop_service(stop_cap, b"memhog");
+    let label = super::svcmgr::stop_candidate(stop_cap, key);
     let _ = await_level(MemoryPressure::Normal, phase, "after svctest's stop");
     assert_eq!(
         level,
@@ -278,8 +314,8 @@ fn no_stop_case(
     );
     assert_eq!(
         label,
-        ipc::svcmgr_errors::SUCCESS,
-        "{phase}: STOP_SERVICE(memhog) replied {label:#x}"
+        ipc::stop_labels::SUCCESS,
+        "{phase}: STOP_CANDIDATE(memhog) replied {label:#x}"
     );
     let after = Lines::await_where(before.query, |now| {
         config.is_none() || now.advice > before.advice
@@ -366,6 +402,11 @@ struct Lines
     query: u64,
     /// oomd's stops of the fixture.
     stops: usize,
+    /// oomd's stops of `stopsrc`'s job.
+    job_stops: usize,
+    /// Whether the newest stop of the job was logged before the newest stop
+    /// of the fixture.
+    job_first: bool,
     /// oomd's advice to stop the fixture.
     advice: usize,
     /// crashd's resumed held faults.
@@ -403,13 +444,25 @@ impl Lines
                 .count()
         };
         // Newest first: the first stop line is the last logged.
+        let newest = |needle: &[u8]| {
+            history
+                .iter()
+                .position(|(_, bytes)| contains(bytes, needle))
+        };
         let last_stop_critical_ms = history
             .iter()
             .find(|(_, bytes)| contains(bytes, STOP_LINE))
             .and_then(|(_, bytes)| critical_ms(bytes));
+        // Newest first: the line logged first sits further down.
+        let job_first = matches!(
+            (newest(JOB_STOP_LINE), newest(STOP_LINE)),
+            (Some(job), Some(hog)) if job > hog
+        );
         Self {
             query,
             stops: count(STOP_LINE),
+            job_stops: count(JOB_STOP_LINE),
+            job_first,
             advice: count(ADVICE_LINE),
             resumed: count(RESUMED_LINE),
             last_stop_critical_ms,
@@ -430,6 +483,78 @@ fn critical_ms(line: &[u8]) -> Option<u64>
 fn contains(haystack: &[u8], needle: &[u8]) -> bool
 {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The job the stop case has the `stopsrc` fixture start: the SEND on the
+/// fixture's provided name, and the job's key.
+struct Job
+{
+    fixture: u64,
+    key: u64,
+}
+
+impl Job
+{
+    /// Have the fixture exit, wait for its restarted instance's new nonce,
+    /// then have that instance start a job of [`JOB_PAGES`]. svcmgr starts
+    /// the new instance after oomd, so oomd finds the source only by its walk
+    /// at the act.
+    fn start(phase: &str) -> Self
+    {
+        let fixture = super::svcmgr::provided_endpoint(src::NAME, phase);
+        let (first, _, _) = src_call(fixture, src::PROBE, 0, phase, "stopsrc PROBE");
+        let _ = src_call(fixture, src::EXIT, 0, phase, "stopsrc EXIT");
+        let (next, state, _) = src_call(fixture, src::PROBE, 0, phase, "stopsrc PROBE after EXIT");
+        assert!(
+            next != first && state == src::JOB_NONE,
+            "{phase}: stopsrc did not restart (nonce {first:#x} then {next:#x}, job {state})"
+        );
+        let (key, _, _) = src_call(
+            fixture,
+            src::START_JOB,
+            JOB_PAGES,
+            phase,
+            "stopsrc START_JOB",
+        );
+        Self { fixture, key }
+    }
+
+    /// Check that oomd logged one stop of the job, before its stop of memhog,
+    /// and that the fixture reports the job stopped.
+    fn finish(&self, before: &Lines, after: &Lines, phase: &str)
+    {
+        let stops = after.job_stops.saturating_sub(before.job_stops);
+        assert!(
+            stops == 1 && after.job_first,
+            "{phase}: oomd logged {stops} stops of stopsrc's job, first: {}",
+            after.job_first
+        );
+        let (_, state, key) = src_call(self.fixture, src::PROBE, 0, phase, "stopsrc PROBE");
+        assert!(
+            state == src::JOB_STOPPED && key == 0,
+            "{phase}: stopsrc's job {} reads state {state}, key {key}",
+            self.key
+        );
+        let _ = syscall::cap_delete(self.fixture);
+    }
+}
+
+/// Call `label` with `data[0] = word` on the `stopsrc` fixture: the reply's
+/// first three data words. Fails `phase` on a reply other than `SUCCESS`.
+fn src_call(fixture: u64, label: u64, word: u64, phase: &str, what: &str) -> (u64, u64, u64)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let msg = ipc::IpcMessage::builder(label).word(0, word).build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(fixture, &msg, ipc_buf) }
+        .unwrap_or_else(|e| panic!("{phase}: {what} call failed: {e:?}"));
+    assert_eq!(
+        reply.label,
+        src::SUCCESS,
+        "{phase}: {what} reply {:#x}",
+        reply.label
+    );
+    (reply.word(0), reply.word(1), reply.word(2))
 }
 
 /// A `/programs/crashme oom-touch` child, between its `ready` and its

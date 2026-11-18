@@ -24,7 +24,10 @@ so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields `GR
 
 svcmgr is also the stop authority: a service whose recipe sets `stop_authority = yes` receives a
 `STOP_AUTHORITY` SEND on svcmgr's endpoint, through which it lists the services svcmgr would stop,
-with each one's memory usage, and has svcmgr stop one (`STOP_SERVICE`, `LIST_STOPPABLE`). svcmgr
+with each one's memory usage, and has svcmgr stop one, through the shared stop labels
+(`LIST_CANDIDATES`, `STOP_CANDIDATE`), and through which it learns the other stop sources, the
+services whose recipes set `stop_source`, each with a stop-badged SEND on its endpoint
+(`LIST_STOP_SOURCES`). svcmgr
 stops only a service it launched whose recipe opts in with `oom_stop = yes` and that is neither
 `critical`, nor `restart = never`, nor in a core role, and routes the stop through the service's
 restart policy ([docs/ipc-interface.md](docs/ipc-interface.md) § Stop authority;
@@ -59,8 +62,9 @@ svcmgr/
 │   │                              # configure_namespace_caps, start_process),
 │   │                              # restart's apply_namespace_policy,
 │   │                              # death handling, DeathOutcome
-│   ├── stop.rs                    # STOP_SERVICE / LIST_STOPPABLE, the stop
-│   │                              # authority's handlers
+│   ├── stop.rs                    # STOP_CANDIDATE / LIST_CANDIDATES /
+│   │                              # LIST_STOP_SOURCES, the stop authority's
+│   │                              # handlers
 │   ├── definitions/
 │   │   ├── mod.rs                 # On-disk definitions; re-exports svc-defs
 │   │   ├── launch.rs              # First-launch path
@@ -84,7 +88,8 @@ svcmgr/
 └── docs/
     ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
     │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT,
-    │                              # STOP_SERVICE / LIST_STOPPABLE
+    │                              # STOP_CANDIDATE / LIST_CANDIDATES /
+    │                              # LIST_STOP_SOURCES
     ├── restart-protocol.md        # Death detection, restart sequencing,
     │                              # shared spawn primitives, criticality
     │                              # semantics

@@ -599,8 +599,9 @@ fn dispatch_ipc(
         {
             handle_query_endpoint(&msg, &mut state.registry, ipc_buf);
         }
-        svcmgr_labels::STOP_SERVICE => stop::handle_stop_service(&msg, state, ctx),
-        svcmgr_labels::LIST_STOPPABLE => stop::handle_list_stoppable(&msg, state, ctx),
+        ipc::stop_labels::STOP_CANDIDATE => stop::handle_stop_candidate(&msg, state, ctx),
+        ipc::stop_labels::LIST_CANDIDATES => stop::handle_list_candidates(&msg, state, ctx),
+        svcmgr_labels::LIST_STOP_SOURCES => stop::handle_list_stop_sources(&msg, state, ctx),
         _ =>
         {
             let reply = IpcMessage::new(ipc::svcmgr_errors::UNKNOWN_OPCODE);

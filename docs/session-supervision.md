@@ -32,13 +32,12 @@ cap-native coordination of a session's members (signals, a foreground job, suspe
 
 ## Implementation Status
 
-Design intent; not yet implemented. Every section below but § Today states design intent, each
-part under the Issue that builds it:
+§ Today, and § Stop Sources but for sessiond's candidates, state the system as built. Every other
+section below states design intent, not yet implemented, each part under the Issue that builds it:
 
 | Part | Issue |
 |---|---|
 | procmgr's parent link, re-parenting, containment, subtree destroy, child list and destroy, end post, end queue (§ procmgr Mechanism) | #1233 |
-| svcmgr's `stop_source` key and stop-source list, the shared stop labels, oomd's program class (§ Stop Sources) | #1233 |
 | sessiond in operator mode, session nodes, the terminal opening its session through sessiond (§ sessiond, § Attribution) | #1233 |
 | Sessions over a PTY, several terminals, hangup (§ Session Kinds) | #1235 |
 | Remote login through sessiond (§ Session Kinds) | #1236 |
@@ -66,7 +65,10 @@ program:
   says.
 - svcmgr's stop authority reaches only services whose recipe opts in, as
   [`.svc` Service Definitions § `oom_stop`](../services/svcmgr/docs/service-definitions.md#oom_stop)
-  says. oomd, its holder, stops such a service when memory stays critical
+  says, and lists the other stop sources (§ Stop Sources). No recipe of the default image sets
+  `stop_source`, so no program is a candidate: the `stopsrc` test fixture is the one source
+  ([services/stopsrc/README.md](../services/stopsrc/README.md)). oomd, its holder, stops a
+  candidate a source lists, a program before any service, when memory stays critical
   ([services/oomd/README.md](../services/oomd/README.md)).
 
 ---
@@ -220,19 +222,23 @@ the one class, and sessiond its one source.
   whose recipe sets the key, svcmgr returns a SEND derived from the original of that service's
   endpoint, which it holds for the service's life
   ([Supervision § Restart Authority](supervision.md#restart-authority)), badged with the stop
-  verb bit, and the class the recipe names. The endpoint persists across the source's restarts, so
-  a cap oomd keeps reaches the next instance. A message carries at most `MSG_CAP_SLOTS_MAX` caps,
-  so the list is paged.
+  verb bit, and the class the recipe names. oomd keeps no source between acts: it asks for the list
+  at each act, so a source that started, restarted or ended since is found as it is, and deletes
+  the SENDs it received once the act is done. The endpoint persists across the source's restarts,
+  so a SEND that is still held reaches the next instance. A message carries at most
+  `MSG_CAP_SLOTS_MAX` caps, so the list is paged.
 - **Class.** A source's class is read from its recipe, never from the source: a source that
   declared its own class could claim the service class and delay its own stop. The key is a core
   role. A source is reached on its service endpoint, so the `.svc` parser rejects the key on a
-  recipe without `provides`.
+  recipe without `provides`; on one with a bare `provides` entry, whose unbadged SEND any holder
+  could badge with the stop bit; and with `restart = never`, since svcmgr lists only a source it
+  supervises.
 - **Protocol.** Every source serves the same two labels, from one shared label module: a paged list
   of its candidates, each with a key, a rank, a name and the pages of its subtree; and the stop of
   one candidate, named by its key. A key names one candidate and no other while the source runs;
   the stop of a candidate that is gone is refused and changes nothing. The source stops through the
-  handles it holds, and oomd holds no process handle. svcmgr's `LIST_STOPPABLE` and
-  `STOP_SERVICE` move to the shared labels, a service's key naming its table slot and instance.
+  handles it holds, and oomd holds no process handle. svcmgr serves the shared labels for the
+  service class, a service's key naming its table slot and instance.
 - **sessiond's candidates.** Each job, ranked job, with the subtree pages procmgr's child list
   gives; and each session, ranked session, with its node's subtree pages. The stop of a job
   destroys that child of the leader with its subtree, and the shell, its creator, sees it end

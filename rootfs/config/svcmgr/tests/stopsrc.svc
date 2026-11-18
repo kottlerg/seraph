@@ -1,0 +1,23 @@
+# /tests/stopsrc — a stop source of the program class, svctest's fixture for
+# svcmgr's list of stop sources and oomd's program class.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# Co-staged with svctest (services-surface harness) in CI and stageable
+# by hand: copy this file into /config/svcmgr/services/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+#
+# stopsrc serves `ipc::stopsrc_labels` on the endpoint of the name it
+# provides: on request it starts one job, a child of its own binary holding
+# memory, which it lists to oomd as a candidate of the program class and
+# destroys on a stop (services/stopsrc/README.md). `stop_source = program`
+# makes svcmgr list it to a stop-authority holder with a stop-badged SEND on
+# that endpoint; the name is provided `:deny`, so no holder of it can stop
+# the job. `restart = always`: the fixture's EXIT label starts a new instance.
+# `universal`: it spawns its job from /tests/stopsrc, the path its image is
+# signed under, which a namespace rooted below / cannot name.
+binary      = /tests/stopsrc
+restart     = always
+critical    = no
+namespace   = universal
+provides    = stopsrc.ctl:deny
+stop_source = program

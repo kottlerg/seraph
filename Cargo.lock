@@ -556,6 +556,9 @@ dependencies = [
 [[package]]
 name = "oomd-policy"
 version = "0.1.4"
+dependencies = [
+ "ipc",
+]
 
 [[package]]
 name = "pipefault"
@@ -754,6 +757,15 @@ version = "0.1.4"
 [[package]]
 name = "stdiotest-tester"
 version = "0.1.4"
+
+[[package]]
+name = "stopsrc"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
 
 [[package]]
 name = "svc-grammar"

@@ -87,8 +87,8 @@ services/svctest/
         │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
         ├── pwrmgr.rs          # Shutdown cap-deny check, terminal shutdown, `reboot` role
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
-        ├── oom.rs             # Out-of-memory policy: memhog filled until oomd stops it, a held
-        │                      #   write resumed
+        ├── oom.rs             # Out-of-memory policy: memhog filled until oomd stops it, a
+        │                      #   stop source's job stopped first, a held write resumed
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
         │                      #   fall-through, remount, a mapped page across the unmount
@@ -184,7 +184,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
 | `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; svctest declares itself undebuggable at startup |
-| `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_SERVICE` and `LIST_STOPPABLE`; `oom_policy` phase, no-stop case: `STOP_SERVICE` of memhog |
+| `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `oom_policy` phase, no-stop case: `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the seven `devmgr.class.*` names among them. `caps[2]` carries
@@ -270,29 +270,38 @@ and requires a different nonce from the instance svcmgr restarts
 
 The `svcmgr_stop_service` phase checks the stop authority
 ([svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) § Stop authority). Through the
-per-process `service_registry_cap` both `STOP_SERVICE` and `LIST_STOPPABLE` must reply
-`UNAUTHORIZED`. Through `caps[16]`, `STOP_SERVICE` must reply `NOT_STOPPABLE` for an unknown
-name, for svctest itself (`restart = never`), vfsd (started by init), logd (`critical = yes`),
-pwrmgr (the shutdown actuator, a core role) and timed (no `oom_stop`). The whole
-`LIST_STOPPABLE` walk must list exactly the staged fixtures whose recipes set `oom_stop = yes`
-(`crasher-worker` and `memhog`), each with a non-zero usage, and nothing when neither is staged.
-With `crasher-worker.svc` staged, `STOP_SERVICE` of it must reply `SUCCESS`, and the fixture must
-then answer `PROBE_INSTANCE` with a new instance's nonce, the restart its `on_failure` policy makes
-of the `EXIT_KILLED` death.
+per-process `service_registry_cap`, `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`
+must reply `UNAUTHORIZED`. Through `caps[16]`, the whole `LIST_CANDIDATES` walk must list exactly
+the staged fixtures whose recipes set `oom_stop = yes` (`crasher-worker` and `memhog`), each with
+a non-zero usage and the service rank, and nothing when neither is staged; `STOP_CANDIDATE` must
+reply `NO_CANDIDATE` for the first instance's key of every svcmgr table slot below 32 it does not
+list, which covers svctest itself (`restart = never`), the services init started, logd
+(`critical = yes`), pwrmgr and `stopsrc` (core roles), timed (no `oom_stop`) and the slots past
+the table. The whole `LIST_STOP_SOURCES` walk must list exactly
+[stopsrc](../stopsrc/README.md), with the program class, when `stopsrc.svc` is staged, and nothing
+otherwise; through the SEND it carries, the fixture's `LIST_CANDIDATES` must reply `SUCCESS` and
+`STOP_CANDIDATE` of a key it never gave `NO_CANDIDATE`, and through the fixture's `:deny` SEND,
+which `QUERY_ENDPOINT` resolves, both must reply `UNAUTHORIZED`. With `crasher-worker.svc` staged,
+`STOP_CANDIDATE` of its listed key must reply `SUCCESS`, the fixture must then answer
+`PROBE_INSTANCE` with a new instance's nonce, the restart its `on_failure` policy makes of the
+`EXIT_KILLED` death, and the same key must then reply `NO_CANDIDATE`.
 
 The `oom_policy` phase (`phases/oom.rs`, registered after the svcmgr phases) runs when the
 `memhog.svc` recipe is staged beside `svctest.svc` and passes otherwise, logging that `memhog.svc`
 is not staged. It waits for the pressure level to read `NORMAL`, sends `PROBE` to
 [memhog](../memhog/README.md) (a nonce, 0 pages) and then `HOG`, which fills memory until the level
-reads `CRITICAL`. With oomd staged and `OOMD_STOP=yes`, it waits for the level to fall to
-`NORMAL` and checks that oomd logged exactly one `stopped memhog: ` line after at least its grace
-critical, and no advice line. When crashd is staged with a stall, a child (`/programs/crashme
-oom-touch`) writes a page during the fill and crashd logs it resumed. With `OOMD_STOP=no`, or
-without `oomd.svc` staged, it checks that memhog stays running and the level stays `CRITICAL` past
-the grace, the cooldown and 2000 ms, that oomd, if staged, logged at least one `would stop memhog: `
-line and no stop, and then stops memhog itself through `caps[16]`. In every case memhog's next
-instance answers `PROBE` with a new nonce and 0 pages
-([oomd](../oomd/README.md)).
+reads `CRITICAL`. With oomd staged and `OOMD_STOP=yes`, it waits for the level to fall to `NORMAL`
+and checks that oomd logged exactly one `stopped memhog: ` line after at least its grace critical,
+and no advice line. When `stopsrc.svc` is staged, the phase first sends the fixture `EXIT`, waits
+for its restarted instance's new nonce, so the source oomd finds started after oomd, and has it
+start a job of 64 pages; oomd must then log one `stopped stopsrc-job: ` line before its stop of
+memhog, and the fixture must report the job stopped. When crashd is staged with a stall, a child
+(`/programs/crashme oom-touch`) writes a page during the fill and crashd logs it resumed. With
+`OOMD_STOP=no`, or without `oomd.svc` staged, it checks that memhog stays running and the level
+stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd, if staged, logged at least one
+`would stop memhog: ` line and no stop, and then stops memhog itself through `caps[16]`, by the key
+svcmgr listed it under before the fill. In every case memhog's next instance answers `PROBE` with a
+new nonce and 0 pages ([oomd](../oomd/README.md)).
 
 ---
 

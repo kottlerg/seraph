@@ -72,7 +72,7 @@ pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
 /// own node is a reserve node; and
 /// [`CREATE_NODE_HANDLE`](ipc::procmgr_labels::CREATE_NODE_HANDLE) for one
 /// that sets `oom_stop = yes` ([`Definition::oom_stop`]), whose usage svcmgr
-/// reads through the handle for `svcmgr_labels::LIST_STOPPABLE`.
+/// reads through the handle for `stop_labels::LIST_CANDIDATES`.
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
@@ -319,10 +319,10 @@ pub struct Definition
     /// a scan.
     pub shutdown_actuator: Option<ProvidedName>,
     /// `oom_stop = yes` lets svcmgr stop the service when a stop-authority
-    /// holder asks (`svcmgr_labels::STOP_SERVICE`), routing the death
-    /// through [`Definition::restart`]; svcmgr asks procmgr for a handle to
-    /// its budget node, through which it reads the usage
-    /// `svcmgr_labels::LIST_STOPPABLE` reports. The parser rejects it on a
+    /// holder asks (`stop_labels::STOP_CANDIDATE` on svcmgr's endpoint),
+    /// routing the death through [`Definition::restart`]; svcmgr asks procmgr
+    /// for a handle to its budget node, through which it reads the usage
+    /// `stop_labels::LIST_CANDIDATES` reports. The parser rejects it on a
     /// recipe [`stop::stop_refusal`] would refuse: `critical = yes`,
     /// `restart = never`, or a core role ([`stop::core_role`]).
     pub oom_stop: bool,
@@ -335,6 +335,13 @@ pub struct Definition
     /// (`procmgr_labels::CREATE_RESERVE`, [`create_flags`]), on its launch
     /// and on every restart, so it may take the pages memmgr keeps in reserve.
     pub reserve: bool,
+    /// `stop_source = <class>` makes the service a stop source of that class:
+    /// while it runs, svcmgr lists it to a stop-authority holder
+    /// (`svcmgr_labels::LIST_STOP_SOURCES`) with the class and a SEND on its
+    /// service endpoint badged with `stop_labels::STOP_AUTHORITY`. A core role
+    /// ([`stop::core_role`]). The parser requires `provides` with every entry
+    /// badged and a supervised service. `None` for every other service.
+    pub stop_source: Option<stop::StopClass>,
     /// Priority level the service's initial thread is created at
     /// (`priority = ...`, range `1..=30`). `None` = unspecified: procmgr
     /// applies its default (`sched_policy::DEFAULT_SPAWN_PRIORITY` clamped

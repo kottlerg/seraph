@@ -110,7 +110,9 @@ jobs:
         # The svctest cell also co-stages memhog (memhog.svc), which svctest's
         # oom_policy phase has fill memory until oomd stops it; the cell keeps
         # crashd, so the phase's child writes a page while memory is critical
-        # and crashd resumes it once the stop frees memory.
+        # and crashd resumes it once the stop frees memory. It also co-stages
+        # stopsrc (stopsrc.svc), a stop source of the program class, whose job
+        # oomd stops first and whose source svcmgr lists.
         # The usertest cell also stages crashd's test recipe over the default
         # one: its `CORE_DUMP` names crashme, whose tester checks the cores.
         run: |
@@ -118,6 +120,7 @@ jobs:
             svctest)
               cp sysroot/config/svcmgr/tests/svctest.svc \
                  sysroot/config/svcmgr/tests/memhog.svc \
+                 sysroot/config/svcmgr/tests/stopsrc.svc \
                  sysroot/config/svcmgr/services/
               cp sysroot/config/devmgr/tests/*.class \
                  sysroot/config/devmgr/classes/

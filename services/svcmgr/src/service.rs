@@ -85,7 +85,7 @@ pub struct ServiceEntry
     /// The node handle of the current instance's memmgr budget node, which
     /// svcmgr asks procmgr for when the recipe sets `oom_stop = yes`
     /// (`procmgr_labels::CREATE_NODE_HANDLE`) and reads the instance's usage
-    /// through for `svcmgr_labels::LIST_STOPPABLE`; memmgr refuses it once the
+    /// through for `stop_labels::LIST_CANDIDATES`; memmgr refuses it once the
     /// instance is gone. Released with the instance on restart. Zero for every
     /// other service.
     pub node_handle: u64,
@@ -198,6 +198,10 @@ pub struct RestartRecipe
     /// The `reserve = yes` service: each instance is created in the system
     /// reserve (`svcmgr_defs::create_flags`).
     pub reserve: bool,
+    /// The `stop_source = <class>` service's class: while it runs, a
+    /// stop-authority holder finds it, with a stop-badged SEND on its service
+    /// endpoint, through `svcmgr_labels::LIST_STOP_SOURCES` (`crate::stop`).
+    pub stop_source: Option<svcmgr_defs::stop::StopClass>,
     /// Recipe `priority = ...` value; `0` = unspecified (procmgr default).
     /// Replayed on every restart so a respawned child lands at the same
     /// level it got on first launch.

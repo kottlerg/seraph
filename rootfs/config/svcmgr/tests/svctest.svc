@@ -40,8 +40,8 @@
 # stages crashd, and the phase then checks only the refusal); the
 # logd_restart phase kills logd through an attach with it.
 # stop_authority = yes delivers svcmgr's STOP_AUTHORITY SEND in the slot
-# after that, which the svcmgr_stop_service phase stops and lists services
-# through.
+# after that, through which the svcmgr_stop_service phase stops and lists
+# services and lists the stop sources.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT
 # scan. To enable in a boot, copy this file into

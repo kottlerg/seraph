@@ -4,9 +4,10 @@
 // services/oomd/src/main.rs
 
 //! The out-of-memory policy service: when memmgr's pressure level has read
-//! `CRITICAL` for a grace period, oomd stops one service that opted in to
-//! being stopped, the one using the most memory, and at most one per
-//! cooldown (services/oomd/docs/operation.md).
+//! `CRITICAL` for a grace period, oomd stops one candidate of its stop
+//! sources, a session's program before any service that opted in to being
+//! stopped, and the one using the most memory within its class, at most one
+//! per cooldown (services/oomd/docs/operation.md).
 //!
 //! oomd waits on the runtime's memory-pressure Notification, with a timeout
 //! of the next act's deadline, and reads the level from memmgr's
@@ -15,8 +16,8 @@
 //! the stop sources list ([`source`]). It stops through the stop authority
 //! svcmgr delivers to its recipe (`stop_authority = yes`), and holds no process
 //! handle. Its recipe sets `reserve = yes`, and it touches its stack and heap
-//! at start and allocates nothing after, so it runs while the pool outside the
-//! reserve is spent.
+//! and funds its `CSpace` headroom for a walk's caps at start, and allocates
+//! nothing after, so it runs while the pool outside the reserve is spent.
 
 mod source;
 
@@ -69,6 +70,12 @@ fn main() -> !
     let _ = now_ms();
     touch_stack();
     touch_heap();
+    // A walk receives at most a page of sources' caps beside the one it
+    // keeps; with this much headroom no walk grows the CSpace.
+    if !std::os::seraph::fund_cspace_slot_budget(info.self_cspace, source::WALK_CAPS_MAX as u64)
+    {
+        std::os::seraph::log!(warn: "CSpace headroom for a walk not funded");
+    }
     let mode = match config.mode
     {
         Mode::Stop => "stopping",
@@ -79,8 +86,7 @@ fn main() -> !
         config.grace_ms,
         config.cooldown_ms
     );
-    let sources = [source::Source::svcmgr(stop)];
-    serve(config, pressure, &sources, ipc_buf)
+    serve(config, pressure, stop, ipc_buf)
 }
 
 /// oomd's configuration from its environment, each setting that is clamped
@@ -133,7 +139,7 @@ fn warn_ms(name: &str, setting: policy::Setting<u64>)
 /// Follow the level for good: take each reading into the ladder, log each
 /// change, act on each act it asks for, and wait for a change of the level
 /// or the next act's deadline.
-fn serve(config: Config, pressure: u64, sources: &[source::Source], ipc_buf: *mut u64) -> !
+fn serve(config: Config, pressure: u64, authority: u64, ipc_buf: *mut u64) -> !
 {
     let mut ladder = Ladder::new(config);
     // A change signalled before now is in the level read here.
@@ -148,7 +154,7 @@ fn serve(config: Config, pressure: u64, sources: &[source::Source], ipc_buf: *mu
         }
         if let Some(act) = step.act
         {
-            act_on(act, sources, ipc_buf);
+            act_on(act, authority, ipc_buf);
         }
         // 0 waits without bound; a deadline due within the millisecond
         // waits one.
@@ -198,13 +204,14 @@ fn log_transition(transition: Transition)
     }
 }
 
-/// Act on `act`: walk the stop sources, and stop the candidate stopped
-/// first, or with `OOMD_STOP=no` name it, while the level still reads
-/// `CRITICAL`. The stop is made before its line is logged, so a log write
-/// that waits does not delay it.
-fn act_on(act: Act, sources: &[source::Source], ipc_buf: *mut u64)
+/// Act on `act`: walk the stop sources svcmgr lists on the stop authority
+/// `stop`, and svcmgr's own candidates, and stop the candidate stopped first,
+/// or with `OOMD_STOP=no` name it, while the level still reads `CRITICAL`.
+/// The stop is made before its line is logged, so a log write that waits
+/// does not delay it. The cap of the candidate's source is released after.
+fn act_on(act: Act, stop: u64, ipc_buf: *mut u64)
 {
-    let Some((order, candidate)) = source::walk(sources, ipc_buf)
+    let Some((order, candidate)) = source::walk(stop, ipc_buf)
     else
     {
         if act.first
@@ -220,6 +227,7 @@ fn act_on(act: Act, sources: &[source::Source], ipc_buf: *mut u64)
     // no stop.
     if read_level() != Level::Critical
     {
+        candidate.release();
         return;
     }
     let name = candidate.name();
@@ -234,7 +242,7 @@ fn act_on(act: Act, sources: &[source::Source], ipc_buf: *mut u64)
                  (OOMD_STOP=no)"
             );
         }
-        Mode::Stop => match source::stop(sources, &candidate, ipc_buf)
+        Mode::Stop => match source::stop(&candidate, ipc_buf)
         {
             Ok(()) =>
             {
@@ -248,6 +256,7 @@ fn act_on(act: Act, sources: &[source::Source], ipc_buf: *mut u64)
             }
         },
     }
+    candidate.release();
 }
 
 /// memmgr's level; [`Level::Unknown`] when memmgr does not answer.

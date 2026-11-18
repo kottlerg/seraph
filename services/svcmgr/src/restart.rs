@@ -122,7 +122,7 @@ pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
     syscall::cap_derive_badge(
         ctx.service_ep,
         syscall::RIGHTS_EP_SEND,
-        ipc::svcmgr_labels::STOP_AUTHORITY,
+        ipc::stop_labels::STOP_AUTHORITY,
     )
     .unwrap_or(0)
 }

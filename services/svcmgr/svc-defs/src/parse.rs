@@ -15,7 +15,7 @@
 
 use namespace_protocol::rights as ns_rights;
 
-use super::stop::{StopFacts, StopRefusal, core_role, stop_refusal};
+use super::stop::{StopClass, StopFacts, StopRefusal, core_role, stop_refusal};
 use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy, blob_len};
 
 /// Badge stamped on an `:auth` provider SEND — the first verb bit
@@ -178,7 +178,9 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// `log_sink` with `seed`/`provides`, `debug_authority` or `stop_authority`,
 /// a `shutdown_actuator` that names no `:auth` `provides` entry of the recipe
 /// or sits on a `restart = never` service, `oom_stop = yes` on a recipe the
-/// stop rule refuses (`super::stop::stop_refusal`), `sched_max` below
+/// stop rule refuses (`super::stop::stop_refusal`), `stop_source` on a
+/// recipe without `provides`, with an unbadged `provides` entry, or with
+/// `restart = never`, `sched_max` below
 /// `priority`), a
 /// `binary` that is not a canonical install path of at most
 /// `procmgr_labels::CREATE_NAME_MAX` bytes, a subtree path over
@@ -224,6 +226,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut oom_stop: Option<bool> = None;
     let mut stop_authority: Option<bool> = None;
     let mut reserve: Option<bool> = None;
+    let mut stop_source: Option<StopClass> = None;
     let mut shutdown_name: Option<String> = None;
     let mut priority: Option<u8> = None;
     let mut sched_max: Option<u8> = None;
@@ -473,6 +476,17 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     "stop_authority must be yes or no",
                 )?;
             }
+            "stop_source" =>
+            {
+                if stop_source.is_some()
+                {
+                    return Err(ParseError::DuplicateKey(lineno, "stop_source"));
+                }
+                stop_source = Some(StopClass::parse(value).ok_or(ParseError::InvalidValue(
+                    lineno,
+                    "stop_source must be program",
+                ))?);
+            }
             "reserve" =>
             {
                 set_yes_no(
@@ -608,6 +622,11 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         None => None,
     };
 
+    if stop_source.is_some()
+    {
+        check_stop_source(restart, &provides)?;
+    }
+
     let reserve = reserve.unwrap_or(false);
     let oom_stop = oom_stop.unwrap_or(false);
     if oom_stop
@@ -624,6 +643,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 stop_authority,
                 reserve,
                 shutdown_actuator.is_some(),
+                stop_source.is_some(),
             ),
             oom_stop,
         };
@@ -662,9 +682,39 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         oom_stop,
         stop_authority,
         reserve,
+        stop_source,
         priority,
         sched_max,
     })
+}
+
+/// Check a `stop_source` recipe: a source is reached on its service endpoint,
+/// so it provides a name; every name it provides is badged (`:auth` or
+/// `:deny`), since a holder of an unbadged SEND could badge it with
+/// `ipc::stop_labels::STOP_AUTHORITY` and stop the source's candidates; and
+/// it is supervised (`restart` other than `never`), since svcmgr lists only
+/// a service it holds the endpoint of.
+fn check_stop_source(restart: RestartPolicy, provides: &[ProvidedName]) -> Result<(), ParseError>
+{
+    if provides.is_empty()
+    {
+        return Err(ParseError::InvalidValue(0, "stop_source needs provides"));
+    }
+    if provides.iter().any(|p| p.badge == 0)
+    {
+        return Err(ParseError::InvalidValue(
+            0,
+            "stop_source needs every provides entry badged (:auth or :deny)",
+        ));
+    }
+    if matches!(restart, RestartPolicy::Never)
+    {
+        return Err(ParseError::InvalidValue(
+            0,
+            "stop_source needs a supervised service (restart other than never)",
+        ));
+    }
+    Ok(())
 }
 
 /// Set a `yes | no` key's value `slot` from `value` on line `lineno`, or
@@ -706,8 +756,8 @@ const fn oom_stop_refusal(refusal: StopRefusal) -> &'static str
         StopRefusal::Critical => "oom_stop needs critical = no",
         StopRefusal::CoreRole =>
         {
-            "oom_stop is exclusive of log_sink, debug_authority, stop_authority, reserve and \
-             shutdown_actuator"
+            "oom_stop is exclusive of log_sink, debug_authority, stop_authority, reserve, \
+             shutdown_actuator and stop_source"
         }
         StopRefusal::NotLaunched | StopRefusal::NotOptedIn => "oom_stop refused by the stop rule",
     }
@@ -1090,6 +1140,73 @@ sched_max = 12\n";
         let always = "binary = /services/x\nrestart = always\ncritical = no\nnamespace = none\n\
                       oom_stop = yes\n";
         assert!(parse("x", always).expect("eligible, always").oom_stop);
+    }
+
+    #[test]
+    fn a_stop_source_names_the_program_class_once()
+    {
+        let def = supervised_with("provides = s.ctl:deny\nstop_source = program\n")
+            .expect("a program source");
+        assert_eq!(def.stop_source, Some(StopClass::Program));
+        assert_eq!(parse_with("").expect("default").stop_source, None);
+        for bad in ["service", "yes", ""]
+        {
+            assert!(
+                matches!(
+                    supervised_with(&format!("provides = s.ctl:deny\nstop_source = {bad}\n")),
+                    Err(ParseError::InvalidValue(_, _))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            supervised_with(
+                "provides = s.ctl:deny\nstop_source = program\nstop_source = program\n"
+            ),
+            Err(ParseError::DuplicateKey(_, "stop_source"))
+        ));
+    }
+
+    #[test]
+    fn a_stop_source_needs_badged_provides_and_supervision()
+    {
+        // No provides: nothing to reach the source on.
+        assert!(matches!(
+            supervised_with("stop_source = program\n"),
+            Err(ParseError::InvalidValue(0, _))
+        ));
+        // An unbadged entry, alone or beside badged ones: its holders could
+        // badge it with the stop bit.
+        for provides in ["s.ctl", "s.ctl:deny s.raw", "s.raw s.ctl:auth"]
+        {
+            assert!(
+                matches!(
+                    supervised_with(&format!("provides = {provides}\nstop_source = program\n")),
+                    Err(ParseError::InvalidValue(0, _))
+                ),
+                "{provides:?}"
+            );
+        }
+        assert_eq!(
+            supervised_with("provides = s.ctl:auth s.pub:deny\nstop_source = program\n")
+                .expect("every entry badged")
+                .stop_source,
+            Some(StopClass::Program)
+        );
+        // restart = never: BASE is one-shot, so svcmgr holds no endpoint of it.
+        assert!(matches!(
+            parse_with("provides = s.ctl:deny\nstop_source = program\n"),
+            Err(ParseError::InvalidValue(0, _))
+        ));
+    }
+
+    #[test]
+    fn a_stop_source_holds_a_core_role_so_oom_stop_is_refused()
+    {
+        assert!(matches!(
+            supervised_with("provides = s.ctl:deny\nstop_source = program\noom_stop = yes\n"),
+            Err(ParseError::InvalidValue(0, _))
+        ));
     }
 
     #[test]

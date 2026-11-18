@@ -13,5 +13,9 @@ publish.workspace = true
 test = true
 doctest = false
 
+[dependencies]
+# The stop protocol's class and rank codes (`ipc::stop_labels`).
+ipc = { path = "../../../shared/ipc" }
+
 [lints]
 workspace = true

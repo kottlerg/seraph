@@ -119,7 +119,7 @@ how the `on_failure` policy classes each range:
 | `0x2000` (`EXIT_KILLED`) | Killed | failure |
 
 A stop svcmgr makes for a stop-authority holder
-([ipc-interface.md § Label 5](ipc-interface.md#label-5-stop_service)) is not posted by the kernel:
+([ipc-interface.md § Label 5](ipc-interface.md#label-5-stop_candidate)) is not posted by the kernel:
 svcmgr destroys the instance through procmgr, then routes the death itself as `EXIT_KILLED`
 under the instance's tag, so it takes this decision tree as a crash does. A post of the destroyed
 instance that arrives after it names the old instance and is dropped.

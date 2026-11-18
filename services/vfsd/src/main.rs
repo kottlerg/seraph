@@ -1795,16 +1795,26 @@ fn do_mount_internal(
 
     // Reject a mount the synthetic root would refuse (root already mounted,
     // `path` already a mount point, or a component the namespace protocol
-    // cannot name) before registering a partition or spawning a driver for
-    // it.
-    let installable = rt
-        .root_backend
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .can_install(path);
+    // cannot name), and a second mount of a partition a mount holds, before
+    // registering a partition or spawning a driver for it.
+    let (installable, held) = {
+        let backend = rt
+            .root_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (
+            backend.can_install(path),
+            backend.holds_partition(location.disk, partition_lba),
+        )
+    };
     if !installable
     {
         std::os::seraph::log!(warn: "MOUNT: mount point taken or path not installable");
+        return Err(ipc::vfsd_errors::TABLE_FULL);
+    }
+    if held
+    {
+        std::os::seraph::log!(warn: "MOUNT: the partition is already mounted");
         return Err(ipc::vfsd_errors::TABLE_FULL);
     }
 
@@ -1933,8 +1943,18 @@ fn do_mount_internal(
             death_queue: fatfs.death_queue,
             partition,
             disk: location.disk,
+            first_lba: partition_lba,
         };
-        let observed = rt.watch.add(&backend, fatfs.death_queue);
+        // A concurrent MOUNT of the partition may have installed since the
+        // check before the spawn: one driver serves a partition.
+        let observed = if backend.holds_partition(location.disk, partition_lba)
+        {
+            false
+        }
+        else
+        {
+            rt.watch.add(&backend, fatfs.death_queue)
+        };
         let installed = if observed
         {
             backend.install(path, mount)
@@ -1952,14 +1972,14 @@ fn do_mount_internal(
     let Some(install_result) = install_result
     else
     {
-        // A concurrent MOUNT took the mount point after the `can_install`
-        // check, the tree holds its most mounts, or it could not grow, or the
-        // watch set refused the death queue. Revoking the endpoint invalidates
-        // `install_cap` and `caller_root_cap` (both derive from it) and
-        // stops the driver nothing would reach.
+        // A concurrent MOUNT took the mount point or the partition since the
+        // checks before the spawn, the tree holds its most mounts, or it could
+        // not grow, or the watch set refused the death queue. Revoking the
+        // endpoint invalidates `install_cap` and `caller_root_cap` (both
+        // derive from it) and stops the driver nothing would reach.
         std::os::seraph::log!(
-            warn: "MOUNT: synthetic-root install failed (mount point taken, mount limit, \
-             no memory, or driver not observed)"
+            warn: "MOUNT: synthetic-root install failed (mount point or partition taken, \
+             mount limit, no memory, or driver not observed)"
         );
         release_failed_mount(&fatfs, partition);
         return Err(ipc::vfsd_errors::TABLE_FULL);

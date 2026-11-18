@@ -97,7 +97,10 @@ queried) and holds them, so the role resolves across every disk devmgr
 serves, under the priority and tie rules of
 [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a disk
 added or inserted again after startup is found, and its partition wins or
-ties against those of the disks held before it. A mount that
+ties against those of the disks held before it. A partition is mounted
+once: a mount of a partition a mount holds, at another path, one whose
+removal is under way included, is rejected (`TABLE_FULL`) before any
+driver is spawned, so no two drivers serve one partition. A mount that
 fails after the spawn (the `FS_MOUNT` probe, an install a concurrent
 `MOUNT` beat, an install past the tree's
 `MAX_MOUNTS` or one that cannot allocate its tree nodes, or a disk removed
@@ -142,7 +145,8 @@ on any held disk matches the role GUID after the query for new disks,
 if duplicate-priority partitions are detected, or if the disk was
 removed during the mount, `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if
 the synthetic-root install fails: root already mounted, the path
-already a mount point (one whose removal is under way included), a path
+already a mount point (one whose removal is under way included), the
+role's partition already mounted at another path (likewise), a path
 component the namespace protocol's name rule rejects, the tree already
 holding `MAX_MOUNTS` (1023) mounts
 ([`namespace-composition.md`](namespace-composition.md#synthetic-root-state)),

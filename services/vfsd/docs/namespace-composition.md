@@ -86,6 +86,7 @@ the mount's driver and to tear it down:
 | `death_queue` | `RECV` on the driver's death queue (below) |
 | `partition` | The partition cap virtio-blk returned on `REGISTER_PARTITION`; the driver holds a `cap_derive` (`SEND_GRANT`) of it, so `cap_revoke_all` on this cap cuts the driver off the partition |
 | `disk` | The index, in vfsd's disk list, of the disk that holds the partition |
+| `first_lba` | The partition's first LBA on that disk; with `disk`, it names the partition, so a `MOUNT` of a partition a record holds, mounted or being removed, is refused before its driver is spawned and one driver serves a partition |
 
 The death queue is an event queue of capacity 2 with 1 death-observer
 node, the main thread's binding. vfsd binds the driver's main thread to

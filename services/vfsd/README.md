@@ -61,7 +61,7 @@ vfsd/
   a driver spawn; no service-endpoint request waits on another's IPC (a
   `GET_SWAP_PARTITION` waits at most for the discovery lock and the swap
   lock, held across a discovery of new disks and one call to the block
-  driver; neither devmgr nor a block driver calls vfsd), so the thread count
+  driver; none of devmgr, memmgr and the block drivers calls vfsd), so the thread count
   is a concurrency knob, not a correctness bound. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts), gated on the
   `MOUNT_AUTHORITY` badge bit; root, `/esp`, and `/data` are

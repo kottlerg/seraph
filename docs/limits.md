@@ -663,7 +663,7 @@ Every entry here is `correct as is`; none is tracked.
 | `GptHeader.num_parts`, `entry_size` | `services/vfsd/gpt/src/lib.rs` | `u32` | hardware spec (UEFI GPT) | none | correct as is | None |
 | `BootstrapState.pending`, `ActiveState.queue` | `services/vfsd/src/worker_pool.rs` | heap `Vec` and `VecDeque`, one entry per in-flight fatfs spawn | per-instance (an allocation failure refuses the order and releases its caps) | none | correct as is | None |
 | `ACTIVE_WORKER_COUNT` | `services/vfsd/src/worker_pool.rs` | 2 | tuning (concurrency knob) | 2 thread stacks | correct as is | None (#254) |
-| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | tuning (concurrency knob; no service-endpoint request waits on another's IPC, and `GET_SWAP_PARTITION` only on the swap lock across one block-driver call) | 4 thread stacks | correct as is | None (#254) |
+| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | tuning (concurrency knob; no service-endpoint request waits on another's IPC, and `GET_SWAP_PARTITION` only on the discovery and swap locks, held across a discovery of new disks (devmgr, memmgr, block-driver GPT reads) and one block-driver call, none of which calls vfsd) | 4 thread stacks | correct as is | None (#254) |
 
 ### init and logd
 

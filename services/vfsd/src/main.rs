@@ -49,13 +49,14 @@ use worker_pool::WorkerPool;
 /// `DESTROY_PROCESS`, and the `NS_LOOKUP` walk for a fall-through cap)
 /// never calls the service endpoint, and neither does the discovery of new
 /// disks a `MOUNT` and the first `GET_SWAP_PARTITION` run before their role
-/// lookup: devmgr's `QUERY_DEVICE`, the GPT reads of each new disk, and the
+/// lookup: devmgr's `QUERY_DEVICE`, the GPT reads of each new disk, a
+/// scratch page from memmgr when a failed read lost the one held, and the
 /// forced unmount of a mount on a new disk found withdrawn, which blocks as
 /// an `UNMOUNT` does. A `GET_SWAP_PARTITION` handler also waits for the
 /// discovery lock, held across one discovery, and for the swap lock, which
 /// its holder keeps across the first request's discovery and one
-/// `REGISTER_PARTITION` call to the block driver; neither devmgr nor a
-/// block driver calls vfsd.
+/// `REGISTER_PARTITION` call to the block driver; none of devmgr, memmgr
+/// and the block drivers calls vfsd.
 const SERVICE_THREAD_COUNT: usize = 4;
 
 /// Bound on a fall-through call the namespace thread makes to the root

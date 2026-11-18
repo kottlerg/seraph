@@ -497,32 +497,31 @@ each key's 32-byte secret seed from the host's operating-system random source an
 A deterministic signature keeps a build reproducible under one key: two builds of the same sources
 with the same key produce the same image.
 
-**What is signed.** xtask signs each object once, in the sysroot, under the roles and the name of
-§ Signed Attributes: the kernel, and every ELF image it installs under `services/`, `programs/` and
+**What is signed.** xtask signs each object once, in the sysroot, under the roles and the name of §
+Signed Attributes: the kernel, and every ELF image it installs under `services/`, `programs/` and
 `tests/` ([build-system.md](build-system.md) § Build Output: the Sysroot). An image under a
 `drivers/` directory is a driver, one under a `programs/` directory a program, and every other a
-service; an image the bundle list names carries boot module beside that role. The kernel is
-signed `kernel` and `/services/init` `init`, each with its one role. `/tests/ktest` is signed
-`init` with the init role only in an image packed with the ktest harness in its `init` slot, and in
-every other image as the service its location makes it, so an image that does not boot the harness
-carries no second object that boots as init. The bundle's data entries (the platform tables and the
-log-level configuration) are installed files signed with the boot-module role, and their readers
-take the body through the parse-only split (§ Verifier Discipline). A platform table devmgr reads
-from the root filesystem is signed with the data role, and devmgr verifies it before it parses it
-(design intent, not yet implemented: [#1267](https://github.com/kottlerg/seraph/issues/1267),
-[#1071](https://github.com/kottlerg/seraph/issues/1071)). The bundle is
-composed by copying installed files and signs nothing, so each entry is its installed file byte
-for byte ([boot-media.md](boot-media.md) § The ESP). The sysroot's objects are signed in place
-each time a disk image is packed. The refusal test's pack alone writes objects as it is given
-them, in place of the sysroot's files in the images and never in the sysroot, so no later pack
-signs a tampered body. Signing replaces a trailer the object already carries, and is
-deterministic, so re-signing an unchanged image writes the same bytes. The files under `config/`
+service; an image the bundle list names carries boot module beside that role. The kernel is signed
+`kernel` and `/services/init` `init`, each with its one role. `/tests/ktest` is signed `init` with
+the init role only in an image packed with the ktest harness in its `init` slot, and in every other
+image as the service its location makes it, so an image that does not boot the harness carries no
+second object that boots as init. The bundle's data entries (the platform tables and the log-level
+configuration) are installed files signed with the boot-module role, and their readers take the body
+through the parse-only split (§ Verifier Discipline). A platform table devmgr reads from the root
+filesystem is signed with the data role, and devmgr verifies it before it parses it (design intent,
+not yet implemented: [#1267](https://github.com/kottlerg/seraph/issues/1267) builds that
+verification, and [#1071](https://github.com/kottlerg/seraph/issues/1071) reuses it for the other
+policy-bearing files). The bundle is composed by copying installed files and signs nothing, so each
+entry is its installed file byte for byte ([boot-media.md](boot-media.md) § The ESP). The sysroot's
+objects are signed in place each time a disk image is packed. The refusal test's pack alone writes
+objects as it is given them, in place of the sysroot's files in the images and never in the sysroot,
+so no later pack signs a tampered body. Signing replaces a trailer the object already carries, and
+is deterministic, so re-signing an unchanged image writes the same bytes. The files under `config/`
 and `data/` carry no trailer, since their readers take each file whole and configuration is not
-signed (§ Threat Model), and neither does the bootloader, which Secure Boot covers (§ Secure
-Boot). Role 7 is reserved for a data file whose reader verifies it. The security version is one
-integer in the tree (`SECURITY_VERSION` in `xtask/src/signing/mod.rs`), raised by a security fix
-that MUST make older images unbootable; every record carries it, and the store's floor is at least
-it.
+signed (§ Threat Model), and neither does the bootloader, which Secure Boot covers (§ Secure Boot).
+Role 7 is reserved for a data file whose reader verifies it. The security version is one integer in
+the tree (`SECURITY_VERSION` in `xtask/src/signing/mod.rs`), raised by a security fix that MUST make
+older images unbootable; every record carries it, and the store's floor is at least it.
 
 **The trust store** is built from public key files: by default the builder's local root. A build
 option (`SERAPH_TRUST_STORE`) names a deployer's store, which is merged with the default or, as

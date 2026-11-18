@@ -3,17 +3,18 @@
 
 // services/devmgr/src/hotplug.rs
 
-//! PCI Express native hotplug: the slots devmgr manages under a
-//! native-control grant, the poller thread that watches their Slot Status,
-//! and the add and removal jobs the control thread runs for each arrival and
-//! departure, as [hotplug.md](../docs/hotplug.md) specifies. The register logic, the BAR
+//! PCI Express hotplug: the slots devmgr manages under a native-control
+//! grant and the poller thread that watches their Slot Status, the slots
+//! whose firmware drives hotplug and acpid's events for them, and the add and
+//! removal jobs the control thread runs for each arrival and departure, as
+//! [hotplug.md](../docs/hotplug.md) specifies. The register logic, the BAR
 //! assignment and the poller's decisions are the host-tested
 //! `firmware::hotplug`; this module maps the configuration pages and runs
 //! them.
 
 use std::sync::mpsc;
 
-use firmware::acpid::{Address, Bridges, address};
+use firmware::acpid::{Address, Bridges, Osc, address};
 use firmware::hotplug::{
     self as hp, Action, Admission, LINK_ACTIVE, LINK_STATUS, SLOT_CONTROL, SLOT_STATUS,
     SLOTCTL_EVENT_ENABLES, SLOTSTA_COMMAND_COMPLETED, SLOTSTA_LATCHES, Slot, SlotState,
@@ -25,9 +26,11 @@ use firmware::scan::{ConfigSpace, MAX_BARS, PciDevice};
 use std::os::seraph::thread::BuilderExt;
 use syscall_abi::PAGE_SIZE;
 
+use crate::acpi::Reply;
 use crate::bind::{self, ConfigRegs};
 use crate::decls::{self, Binary, BootImage};
 use crate::{Registry, caps, settle};
+use ipc::devmgr_errors as errors;
 
 /// The step of the poller's waits for a Slot Control command and for a
 /// link, in milliseconds.
@@ -42,8 +45,12 @@ enum Grant
     Waiting,
     /// devmgr manages the slot: the poller watches it.
     Managed,
-    /// The grant was refused, or the slot could not be handed to the
-    /// poller; devmgr never touches the slot.
+    /// The host bridge's `_OSC` withholds native hotplug control, or failed,
+    /// and the platform table grants none: the firmware drives the slot, and
+    /// acpid posts its jobs from the firmware's `Notify`.
+    Firmware,
+    /// The slot could not be handed to the poller, or its BAR pages could not
+    /// be held; devmgr never touches the slot.
     Unmanaged,
 }
 
@@ -54,18 +61,54 @@ struct Candidate
     grant: Grant,
 }
 
-/// A job the poller posts to the control thread, which runs the jobs in the
-/// order they were posted, one at a time.
-#[derive(Clone, Copy)]
+/// A job the poller or acpid posts to the control thread, which runs the
+/// jobs in the order they were posted, one at a time.
 enum Job
 {
     /// The card in slot `.0` (its index among the candidates) was powered
-    /// up: record and bind the functions behind it ([`add`]).
-    Added(usize),
+    /// up, or the firmware reports it present: record and bind the functions
+    /// behind it ([`add`]).
+    Added(usize, Owner),
     /// The card in slot `.0` is leaving: withdraw and remove the functions
-    /// behind it ([`remove`]), then tell the poller, which powers the slot
-    /// off.
-    Removed(usize),
+    /// behind it ([`remove`]), then complete the job as its owner says.
+    Removed(usize, Owner),
+}
+
+/// A hotplug event acpid posts for a slot the firmware drives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Event
+{
+    /// The firmware reports a card in the slot (a device check).
+    Added,
+    /// The firmware asks for the slot's card to be ejected (an eject
+    /// request).
+    Removed,
+}
+
+/// Who posted a job, which is who drives the slot, and so how the job
+/// completes.
+enum Owner
+{
+    /// The poller, for a slot devmgr manages: a removal completes by telling
+    /// the poller, which powers the slot off.
+    Native,
+    /// acpid, for a slot the firmware drives: the job completes with the
+    /// reply sent here, after which acpid runs a removal's `_EJ0`.
+    Acpi(mpsc::SyncSender<Reply>),
+}
+
+impl Owner
+{
+    /// Complete an acpid job with `reply`; a native job has none.
+    fn reply(&self, reply: Reply)
+    {
+        if let Self::Acpi(to) = self
+        {
+            // The worker waits for its reply; one that is gone leaves
+            // nothing to tell.
+            let _ = to.send(reply);
+        }
+    }
 }
 
 /// A managed slot as the poller holds it.
@@ -97,7 +140,8 @@ pub struct Hotplug
     /// removal job completed; `None` until the first slot is managed and the
     /// poller started.
     poller: Option<Poller>,
-    /// The jobs' channel, which the poller posts on.
+    /// The jobs' channel, which the poller and [`Hotplug::post_acpi`] post
+    /// on.
     posted: mpsc::Sender<Job>,
     jobs: mpsc::Receiver<Job>,
     /// The boot driver modules a hot-added function can be bound from, kept
@@ -227,12 +271,13 @@ impl Hotplug
         }
     }
 
-    /// Manage each slot whose grant has come: the `_OSC` result of its host
-    /// bridge among `bridges` grants native hotplug control, or the platform
-    /// table does ([`hp::native_control`]). A slot whose host bridge's `_OSC`
-    /// result withholds it, with no platform grant, is never managed,
-    /// logged. A slot neither grants nor withholds waits. The record of each
-    /// managed slot's port is held in `records` ([`hp::hold_port`]).
+    /// Settle each slot whose grant has come. A slot whose host bridge's
+    /// `_OSC` result among `bridges` grants native hotplug control, or whose
+    /// platform table does ([`hp::native_control`]), is managed, the record
+    /// of its port held in `records` ([`hp::hold_port`]). A slot whose host
+    /// bridge's `_OSC` result withholds it, or failed, with no platform grant,
+    /// is left to the firmware ([`Grant::Firmware`]), logged. A slot neither
+    /// grants nor withholds waits.
     pub fn grant(
         &mut self,
         bridges: &Bridges,
@@ -252,7 +297,7 @@ impl Hotplug
                 continue;
             }
             let slot = candidate.slot;
-            let (s, b, d, f) = slot.port;
+            let (s, b, _, _) = slot.port;
             let osc = hp::host_bridge(bridges, s, b).and_then(|bridge| bridge.osc);
             let grant = if hp::native_control(osc, self.platform_grant)
             {
@@ -268,30 +313,7 @@ impl Hotplug
             }
             else if let Some(osc) = osc
             {
-                if osc.evaluated
-                {
-                    std::os::seraph::log!(
-                        "hotplug: slot {}:{}:{}.{}: not managed: _OSC control {:#x} withholds \
-                         native hotplug",
-                        s,
-                        b,
-                        d,
-                        f,
-                        osc.control
-                    );
-                }
-                else
-                {
-                    std::os::seraph::log!(
-                        "hotplug: slot {}:{}:{}.{}: not managed: _OSC failed, status {:#x}",
-                        s,
-                        b,
-                        d,
-                        f,
-                        osc.status
-                    );
-                }
-                Grant::Unmanaged
+                firmware(slot, osc, records, caps)
             }
             else
             {
@@ -302,6 +324,33 @@ impl Hotplug
                 candidate.grant = grant;
             }
         }
+    }
+
+    /// Post acpid's job of `event` at the slot of the port `port`, whose
+    /// reply goes on `reply` when it ends ([`Hotplug::run`]). A port that is
+    /// no slot of the boot scan is answered `NO_DEVICE` here, logged.
+    pub fn post_acpi(&self, event: Event, port: Address, reply: mpsc::SyncSender<Reply>)
+    {
+        let Some(index) = self.candidates.iter().position(|c| c.slot.port == port)
+        else
+        {
+            let (s, b, d, f) = port;
+            std::os::seraph::log!(
+                warn: "hotplug: acpid's event of port {}:{}:{}.{}: no hotplug slot there",
+                s, b, d, f
+            );
+            let _ = reply.send(Reply::status(errors::NO_DEVICE));
+            return;
+        };
+        let owner = Owner::Acpi(reply);
+        let job = match event
+        {
+            Event::Added => Job::Added(index, owner),
+            Event::Removed => Job::Removed(index, owner),
+        };
+        // The control thread runs the jobs next, after this; a send that
+        // fails drops the job's reply, which the worker answers.
+        let _ = self.posted.send(job);
     }
 
     /// Hand slot `index` to the poller, starting the poller with the first,
@@ -376,9 +425,9 @@ impl Hotplug
         Grant::Managed
     }
 
-    /// Run every job the poller posted, in the order it posted them, each to
-    /// its end before the next: one slot's removal job posted while its add
-    /// job waits runs after it, and withdraws what it bound.
+    /// Run every job the poller and acpid posted, in the order they were
+    /// posted, each to its end before the next: one slot's removal job posted
+    /// while its add job waits runs after it, and withdraws what it bound.
     ///
     /// An add job records the functions behind the slot ([`add`]), then
     /// binds them in a settle batch of their own, the hotplug batch
@@ -388,6 +437,12 @@ impl Hotplug
     /// a function no boot image binds is only recorded, and that directory's
     /// pass binds it. A removal job withdraws and removes them ([`remove`]),
     /// then posts the slot to the poller, which powers it off.
+    ///
+    /// acpid's job runs only on a slot the firmware drives, and is refused,
+    /// logged, on any other. Its add job records nothing while live records
+    /// lie behind the slot, as a device check of a card already recorded
+    /// does. Each acpid job ends with its reply: the functions recorded or
+    /// removed.
     pub fn run(
         &self,
         registry: &Registry,
@@ -399,52 +454,179 @@ impl Hotplug
     {
         while let Ok(job) = self.jobs.try_recv()
         {
-            let index = match job
+            let (index, owner, removal) = match job
             {
-                Job::Added(index) => index,
-                Job::Removed(index) =>
-                {
-                    if let Some(slot) = self.candidates.get(index).map(|c| c.slot)
-                    {
-                        remove(&slot, registry, records, carve.caps, ipc_buf);
-                    }
-                    // The slot is powered off whatever the job found, so the
-                    // poller never holds it removing.
-                    let sent = self.poller.as_ref().map(|p| p.removed.send(index));
-                    if !matches!(sent, Some(Ok(())))
-                    {
-                        std::os::seraph::log!(
-                            warn: "hotplug: no poller to power off a removed slot"
-                        );
-                    }
-                    continue;
-                }
+                Job::Added(index, owner) => (index, owner, false),
+                Job::Removed(index, owner) => (index, owner, true),
             };
-            let Some(slot) = self.candidates.get(index).map(|c| c.slot)
+            let Some(candidate) = self.candidates.get(index)
             else
             {
+                owner.reply(Reply::status(errors::NO_DEVICE));
                 continue;
             };
-            if add(&slot, records, carve.caps) == 0
+            let (slot, grant) = (candidate.slot, candidate.grant);
+            let (s, b, d, f) = slot.port;
+            if matches!(owner, Owner::Acpi(_)) && grant != Grant::Firmware
             {
+                std::os::seraph::log!(
+                    warn: "hotplug: slot {}:{}:{}.{}: acpid's {} refused: the firmware does not \
+                           drive the slot ({})",
+                    s, b, d, f,
+                    if removal { "eject request" } else { "device check" },
+                    match grant
+                    {
+                        Grant::Waiting => "no grant yet",
+                        Grant::Managed => "devmgr manages it",
+                        Grant::Firmware | Grant::Unmanaged => "not managed",
+                    }
+                );
+                owner.reply(Reply::status(errors::REFUSED));
                 continue;
             }
-            let (dir, dir_path) = {
-                let state = registry.lock();
-                (state.drivers_dir_cap, state.drivers_dir_path)
-            };
-            crate::spawn_hotplug_drivers(
-                records,
-                carve,
-                &self.images,
-                dir,
-                dir_path.as_bytes(),
-                watch,
-                registry,
-                ipc_buf,
-            );
+            if removal
+            {
+                if matches!(owner, Owner::Acpi(_))
+                {
+                    std::os::seraph::log!(
+                        "hotplug: slot {}:{}:{}.{}: removing its functions (the firmware's eject \
+                         request)",
+                        s,
+                        b,
+                        d,
+                        f
+                    );
+                }
+                let removed = remove(&slot, registry, records, carve.caps, ipc_buf);
+                match owner
+                {
+                    Owner::Native =>
+                    {
+                        // The slot is powered off whatever the job found, so
+                        // the poller never holds it removing.
+                        let sent = self.poller.as_ref().map(|p| p.removed.send(index));
+                        if !matches!(sent, Some(Ok(())))
+                        {
+                            std::os::seraph::log!(
+                                warn: "hotplug: no poller to power off a removed slot"
+                            );
+                        }
+                    }
+                    Owner::Acpi(_) =>
+                    {
+                        owner.reply(Reply::success(
+                            &[u64::try_from(removed).unwrap_or(u64::MAX)],
+                        ));
+                    }
+                }
+                continue;
+            }
+            if matches!(owner, Owner::Acpi(_))
+            {
+                if records.live_pci().any(|r| slot.holds(address(r)))
+                {
+                    std::os::seraph::log!(
+                        "hotplug: slot {}:{}:{}.{}: the firmware reports a card, whose functions \
+                         are recorded; nothing added",
+                        s,
+                        b,
+                        d,
+                        f
+                    );
+                    owner.reply(Reply::success(&[0]));
+                    continue;
+                }
+                std::os::seraph::log!(
+                    "hotplug: slot {}:{}:{}.{}: card added (the firmware's device check)",
+                    s,
+                    b,
+                    d,
+                    f
+                );
+            }
+            let added = add(&slot, records, carve.caps);
+            if added > 0
+            {
+                bind_added(&self.images, registry, records, carve, watch, ipc_buf);
+            }
+            owner.reply(Reply::success(&[u64::try_from(added).unwrap_or(u64::MAX)]));
         }
     }
+}
+
+/// Bind the functions an add job recorded in a settle batch of their own,
+/// the hotplug batch ([`crate::spawn_hotplug_drivers`]): from the kept boot
+/// images `images` first, then, once the drivers directory is installed,
+/// from it; before `SET_DRIVERS_DIR` that directory's pass binds what no
+/// boot image bound.
+fn bind_added(
+    images: &[BootImage],
+    registry: &Registry,
+    records: &mut bind::Records,
+    carve: &mut bind::Carve,
+    watch: &mut settle::DriverWatch,
+    ipc_buf: *mut u64,
+)
+{
+    let (dir, dir_path) = {
+        let state = registry.lock();
+        (state.drivers_dir_cap, state.drivers_dir_path)
+    };
+    crate::spawn_hotplug_drivers(
+        records,
+        carve,
+        images,
+        dir,
+        dir_path.as_bytes(),
+        watch,
+        registry,
+        ipc_buf,
+    );
+}
+
+/// Leave `slot` to the firmware, its host bridge's `_OSC` result `osc`
+/// withholding native hotplug control or failed: hold the BAR pages of the
+/// functions behind it ([`hold_behind`]), as for a managed slot, so no
+/// placement of a later add job lands on them, and log the grant.
+/// [`Grant::Unmanaged`], logged, when the pages cannot be held. The poller
+/// never watches the slot, and devmgr writes none of the port's registers.
+fn firmware(slot: Slot, osc: Osc, records: &bind::Records, caps: &mut caps::DevmgrCaps) -> Grant
+{
+    let (s, b, d, f) = slot.port;
+    if hold_behind(&slot, records, caps).is_none()
+    {
+        std::os::seraph::log!(
+            warn: "hotplug: slot {}:{}:{}.{}: the BAR pages of the functions behind it could not \
+                   be held; not managed",
+            s, b, d, f
+        );
+        return Grant::Unmanaged;
+    }
+    if osc.evaluated
+    {
+        std::os::seraph::log!(
+            "hotplug: slot {}:{}:{}.{}: firmware hotplug: _OSC control {:#x} withholds native \
+             hotplug; acpid posts its events",
+            s,
+            b,
+            d,
+            f,
+            osc.control
+        );
+    }
+    else
+    {
+        std::os::seraph::log!(
+            "hotplug: slot {}:{}:{}.{}: firmware hotplug: _OSC failed, status {:#x}; acpid posts \
+             its events",
+            s,
+            b,
+            d,
+            f,
+            osc.status
+        );
+    }
+    Grant::Firmware
 }
 
 /// Start the poller thread, which owns the managed slots it is sent; its
@@ -610,13 +792,13 @@ fn poll(slot: &mut Polled, aspace: u64, posted: &mpsc::Sender<Job>, job_note: u6
                     f,
                     hp::removal_cause(current, status, link_down)
                 );
-                post(Job::Removed(slot.index));
+                post(Job::Removed(slot.index, Owner::Native));
                 state
             }
             Action::PowerUp if power_up(regs, &s) =>
             {
                 std::os::seraph::log!("hotplug: slot {}:{}:{}.{}: card added", seg, b, d, f);
-                post(Job::Added(slot.index));
+                post(Job::Added(slot.index, Owner::Native));
                 SlotState::Occupied
             }
             Action::PowerUp =>
@@ -1083,14 +1265,15 @@ fn release(caps: &mut caps::DevmgrCaps, spans: &[(u64, u64)])
 /// apertures, whole; mark the records removed; and return each removed
 /// record's instance to its driver's instance limit
 /// ([`bind::Records::release_removed`]). A driver that does not answer
-/// cannot delay it: a withdrawal asks the driver nothing.
+/// cannot delay it: a withdrawal asks the driver nothing. Returns the number
+/// of records removed.
 fn remove(
     slot: &Slot,
     registry: &Registry,
     records: &mut bind::Records,
     caps: &mut caps::DevmgrCaps,
     ipc_buf: *mut u64,
-)
+) -> usize
 {
     let (s, b, d, f) = slot.port;
     let mut held = core::mem::take(&mut caps.slot_bars);
@@ -1139,6 +1322,7 @@ fn remove(
         withdrawn,
         returned
     );
+    removal.functions
 }
 
 /// Run `access` on the function at `at` (segment, bus, device, function),

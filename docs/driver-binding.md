@@ -18,9 +18,8 @@ enumerates every kind of device record of § Device Records (PCI, the ACPI names
 the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
 against the records (§ Matching), binds each matched PCI, platform, and IOMMU record through one
 path that delivers the resource list (§ Binding), and withdraws a bound driver in the order
-§ Binding gives. PCI Express native hotplug's add and removal paths are implemented; the ACPI
-hotplug source is design intent, not yet implemented (§ Hotplug,
-[#1096](https://github.com/kottlerg/seraph/issues/1096)).
+§ Binding gives. Both hotplug sources are implemented: PCI Express native hotplug, and the
+firmware's ACPI PCI hotplug, whose events acpid posts to devmgr (§ Hotplug).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
 `MINT_CLASS_SEND`, the class files, and the boot-only mark.
@@ -74,8 +73,8 @@ devmgr evaluates no AML. AML is firmware code whose methods reach I/O ports, mem
 configuration space, so it runs in acpid, a restartable service that holds only the register
 blocks the FADT declares and the regions devmgr grants it, one at a time, against the policy of
 [services/acpid/README.md](../services/acpid/README.md) (§ Region grants). devmgr consumes
-acpid's results: the `_OSC` grant and the `_PRT` routes, and the hotplug events (design intent;
-not yet implemented, #1096). The ACPI namespace enumerator itself still reads only `Device`
+acpid's results: the `_OSC` grant and the `_PRT` routes, and the hotplug events of the slots the
+firmware drives. The ACPI namespace enumerator itself still reads only `Device`
 objects whose identifying and resource objects are static `Name` objects, and skips one that
 defines any of them as a `Method`. It does not evaluate `_STA`: a `Device` whose `_STA` is a
 `Name` with bit 0 clear is not reported, and one whose `_STA` is a `Method` is reported. The
@@ -98,6 +97,24 @@ does not take keeps an unbound record, as any other function does. devmgr marks 
 Express hotplug slot's port bound the same way once it manages the slot, since its poller writes the
 port's slot registers ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)
 § Grant).
+
+A platform record is a resource container when its `_HID` and each of its `_CID`s is one of the
+IDs below and it carries no other key. The firmware describes its own registers with such a
+record, not a device a driver drives (on QEMU q35, the PCI and CPU hotplug blocks at ports
+0xCC0-0xCE3, which its AML reads), so the record is the firmware's: no bind pass binds it, and
+devmgr does not refuse acpid a region for overlapping it. Any other refusal still holds, another
+record's resource the region overlaps among them
+([services/acpid/docs/devmgr.md](../services/acpid/docs/devmgr.md) § Region grants). A record
+with any other key, a container `_CID` beside a device's `_HID` among them, is a device's.
+
+| ID | Meaning | Definition |
+|---|---|---|
+| `PNP0A05` | Generic container device | ACPI 6.5 § 5.6.7 (Device Class-Specific Objects) and § 9.6 (Generic Container Device) |
+| `PNP0A06` | Generic container device, extended I/O bus | ACPI 6.5 § 5.6.7 and § 9.6 |
+| `ACPI0004` | Module device | ACPI 6.5 § 5.6.7 and § 9.10 (Module Device) |
+| `PNP0C02` | Motherboard resources: ranges the platform reserves | Not an ACPI-defined ID: the Plug and Play ID list, whose IDs ACPI 6.5 § 6.1.5 admits as `_HID` values |
+
+The list is `firmware::binding::CONTAINER_IDS`.
 
 A record carries the device's resources, typed:
 
@@ -423,8 +440,9 @@ its ordinal. Either change signals the class's watches
 specified in [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md): devmgr
 appends and binds a function added to a PCI Express slot it controls natively, under the host
 bridge's `_OSC` or the platform description table's `pcie_native_hotplug` grant, and withdraws
-the driver of a function removed from one before it powers the slot off. The ACPI hotplug source
-is design intent; not yet implemented ([#1096](https://github.com/kottlerg/seraph/issues/1096)).
+the driver of a function removed from one before it powers the slot off. On a slot the firmware
+drives, it does the same on the device checks and eject requests acpid posts from the firmware's
+`Notify`, and withdraws before acpid ejects the card.
 
 ---
 

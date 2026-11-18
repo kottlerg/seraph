@@ -58,13 +58,27 @@
 //! returns `Ok`, or, if its dispatch overlaps the writes, a torn one. So the
 //! cell is a tripwire for that race, not a deterministic witness.
 //!
+//! The sweep forces each order only on a host that runs the helper's CPU and
+//! the controller's together after [`GO`]: a host that runs the helper's
+//! CPU late lets every start commit first, and one that runs the
+//! controller's late lets every configure win. So after the [`CYCLES`] fixed
+//! rounds, while one outcome has not occurred, held rounds run, up to
+//! [`super::MAX_EXTRA_ROUNDS`], with no delay on either side: for a missing
+//! `Ok` the controller starts the thread only once the helper has published
+//! that it is entering its configure ([`HELPER_ENTERED`]), and for a missing
+//! `InvalidArgument` the helper configures only once the controller has
+//! published that it is entering its start ([`STARTER_ENTERED`]), so the two
+//! calls still overlap, with the side that must lead known to be running.
+//! The host must run the leading side from its publish into its commit
+//! before the other's in one held round. The log counts the held rounds run.
+//!
 //! Needs **≥ 2 CPUs**.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     cap_create_thread, cap_delete, system_info, thread_configure, thread_exit, thread_set_affinity,
-    thread_sleep, thread_start, thread_yield,
+    thread_start, thread_yield,
 };
 use syscall_abi::{EXIT_VOLUNTARY, SyscallError, SystemInfoType};
 
@@ -74,7 +88,8 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// This cell's log name.
 const CELL: &str = "stress::configure_start_race";
 
-/// Rounds; each races one configure against one start of a fresh thread.
+/// Fixed rounds; each races one configure against one start of a fresh
+/// thread.
 const CYCLES: u32 = 200;
 
 /// CPUs needed: one each for the controller and the helper.
@@ -95,7 +110,8 @@ const B_STACK: usize = 2;
 const STACK_BYTES: u64 = ChildStack::BYTES as u64;
 
 /// Bound on each of a round's waits on the helper, in microseconds: for it
-/// to report itself ready, and for its configure to return.
+/// to report itself ready, to enter a held round's configure, and for its
+/// configure to return.
 ///
 /// Applied through [`crate::scaled_bound`], which stretches it past
 /// [`crate::UNSCALED_CPUS`] CPUs.
@@ -105,9 +121,6 @@ const ROUND_WAIT_US: u64 = 1_000_000;
 /// Applied through [`crate::scaled_polls`], which stretches it past
 /// [`crate::UNSCALED_CPUS`] CPUs.
 const EXIT_POLLS: u32 = 2000;
-
-/// Polls a bounded wait spins busily before it polls in 1 ms sleeps.
-const BUSY_POLLS: u32 = 100_000;
 
 /// The helper's configure results, as it reports them in [`OUTCOME`].
 const OUTCOME_CONFIGURED: u32 = 1;
@@ -130,6 +143,13 @@ static ARMED: AtomicU32 = AtomicU32::new(0);
 static READY: AtomicU32 = AtomicU32::new(0);
 static GO: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
+/// The held round (from 1) in which the controller's start leads: the helper
+/// configures only once the controller has stored [`STARTER_ENTERED`].
+static START_LEADS: AtomicU32 = AtomicU32::new(0);
+/// The round whose configure the helper is entering, and the round whose
+/// start the controller is entering, each stored just before its call.
+static HELPER_ENTERED: AtomicU32 = AtomicU32::new(0);
+static STARTER_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// The armed round's thread, a handle in ktest's `CSpace`.
 static TARGET: AtomicU64 = AtomicU64::new(0);
 /// The helper's configure result for the round it last finished.
@@ -154,6 +174,23 @@ struct Tally
     configured: u32,
     /// Rounds whose configure was refused (the old frame ran).
     refused: u32,
+    /// Held rounds run after the fixed rounds.
+    extra_rounds: u32,
+}
+
+/// Which side of a round's race, if either, waits for the other's publish.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing
+{
+    /// A fixed round: each side spins its share of the round's delay
+    /// ([`skews`]).
+    Raced,
+    /// A held round for a missing `Ok`: the controller starts the thread
+    /// once the helper has published that it is entering its configure.
+    ConfigureLeads,
+    /// A held round for a missing `InvalidArgument`: the helper configures
+    /// once the controller has published that it is entering its start.
+    StartLeads,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -194,6 +231,10 @@ fn report(tally: &Tally) -> TestResult
         "ktest: stress::configure_start_race refused=",
         u64::from(tally.refused),
     );
+    crate::log_u64(
+        "ktest: stress::configure_start_race extra_rounds=",
+        u64::from(tally.extra_rounds),
+    );
     if tally.refused == 0
     {
         return Err(
@@ -217,7 +258,18 @@ fn report(tally: &Tally) -> TestResult
 /// next test even after a failed round).
 fn with_helper(ctx: &TestContext, target_cpu: u32) -> Result<Tally, &'static str>
 {
-    for counter in [&QUIT, &HELPER_EXITED, &ARMED, &READY, &GO, &DONE, &OUTCOME]
+    for counter in [
+        &QUIT,
+        &HELPER_EXITED,
+        &ARMED,
+        &READY,
+        &GO,
+        &DONE,
+        &START_LEADS,
+        &HELPER_ENTERED,
+        &STARTER_ENTERED,
+        &OUTCOME,
+    ]
     {
         counter.store(0, Ordering::Release);
     }
@@ -285,33 +337,56 @@ fn start_helper(ctx: &TestContext, slot: &mut Option<u64>) -> Result<u64, &'stat
     Ok(th)
 }
 
-/// Run [`CYCLES`] rounds, stopping at the first that fails, and count each
-/// outcome.
+/// Run the [`CYCLES`] fixed rounds and then, while one outcome has not
+/// occurred, held rounds for it until it has or [`super::MAX_EXTRA_ROUNDS`]
+/// have run, stopping at the first round that fails; count each outcome.
 fn rounds(ctx: &TestContext, target_cpu: u32, tally: &mut Tally) -> TestResult
 {
     for seq in 1..=CYCLES
     {
-        if round(ctx, seq, target_cpu)? == OUTCOME_CONFIGURED
+        count(round(ctx, seq, target_cpu, Timing::Raced)?, tally);
+    }
+    while (tally.configured == 0 || tally.refused == 0)
+        && tally.extra_rounds < super::MAX_EXTRA_ROUNDS
+    {
+        tally.extra_rounds = tally.extra_rounds.saturating_add(1);
+        let seq = CYCLES.saturating_add(tally.extra_rounds);
+        let timing = if tally.configured == 0
         {
-            tally.configured = tally.configured.saturating_add(1);
+            Timing::ConfigureLeads
         }
         else
         {
-            tally.refused = tally.refused.saturating_add(1);
-        }
+            Timing::StartLeads
+        };
+        count(round(ctx, seq, target_cpu, timing)?, tally);
     }
     Ok(())
 }
 
-/// One round: race a configure against a start of a fresh thread and check
-/// the outcome; delete the thread on every path. Returns the configure's
-/// outcome, [`OUTCOME_CONFIGURED`] or [`OUTCOME_REFUSED`].
-fn round(ctx: &TestContext, seq: u32, target_cpu: u32) -> Result<u32, &'static str>
+/// Count a round's outcome.
+fn count(outcome: u32, tally: &mut Tally)
+{
+    if outcome == OUTCOME_CONFIGURED
+    {
+        tally.configured = tally.configured.saturating_add(1);
+    }
+    else
+    {
+        tally.refused = tally.refused.saturating_add(1);
+    }
+}
+
+/// One round: race a configure against a start of a fresh thread (`timing`
+/// says how) and check the outcome; delete the thread on every path. Returns
+/// the configure's outcome, [`OUTCOME_CONFIGURED`] or [`OUTCOME_REFUSED`].
+fn round(ctx: &TestContext, seq: u32, target_cpu: u32, timing: Timing)
+-> Result<u32, &'static str>
 {
     RAN_A.store(0, Ordering::Release);
     RAN_B.store(0, Ordering::Release);
     let mut slot = None;
-    let raced = create_target(ctx, seq, target_cpu, &mut slot).and_then(|th| race(th, seq));
+    let raced = create_target(ctx, seq, target_cpu, &mut slot).and_then(|th| race(th, seq, timing));
     let released = match slot
     {
         Some(th) =>
@@ -357,21 +432,24 @@ fn create_target(
     Ok(th)
 }
 
-/// Arm the round, wait for the helper, release it, spin this side's delay,
-/// start the thread, then wait for the helper's configure and the thread's
-/// exit and check the outcome.
-fn race(th: u64, seq: u32) -> Result<u32, &'static str>
+/// Arm the round, wait for the helper, release it, lead into the start
+/// ([`lead_in`]), start the thread, then wait for the helper's configure and
+/// the thread's exit and check the outcome.
+fn race(th: u64, seq: u32, timing: Timing) -> Result<u32, &'static str>
 {
     TARGET.store(th, Ordering::Release);
-    ARMED.store(seq, Ordering::Release);
-    if !await_within(crate::scaled_bound(ROUND_WAIT_US), || {
-        READY.load(Ordering::Acquire) == seq
-    })?
+    if timing == Timing::StartLeads
     {
-        return Err("stress::configure_start_race: the helper never became ready");
+        START_LEADS.store(seq, Ordering::Release);
     }
+    ARMED.store(seq, Ordering::Release);
+    super::require_within(
+        crate::scaled_bound(ROUND_WAIT_US),
+        "stress::configure_start_race: the helper never became ready",
+        || READY.load(Ordering::Acquire) == seq,
+    )?;
     GO.store(seq, Ordering::Release);
-    spin(skews(seq).0);
+    lead_in(seq, timing)?;
     thread_start(th).map_err(|e| {
         log_error("ktest: stress::configure_start_race thread_start error=", e);
         "stress::configure_start_race: the start failed"
@@ -380,12 +458,11 @@ fn race(th: u64, seq: u32) -> Result<u32, &'static str>
     // helper may still be inside its configure; one the yield passes over
     // runs at the controller's next sleep.
     thread_yield().map_err(|_| "stress::configure_start_race: yield failed")?;
-    if !await_within(crate::scaled_bound(ROUND_WAIT_US), || {
-        DONE.load(Ordering::Acquire) == seq
-    })?
-    {
-        return Err("stress::configure_start_race: the helper's configure never returned");
-    }
+    super::require_within(
+        crate::scaled_bound(ROUND_WAIT_US),
+        "stress::configure_start_race: the helper's configure never returned",
+        || DONE.load(Ordering::Acquire) == seq,
+    )?;
     let outcome = OUTCOME.load(Ordering::Acquire);
     if outcome == OUTCOME_BAD
     {
@@ -397,6 +474,35 @@ fn race(th: u64, seq: u32) -> Result<u32, &'static str>
     await_exit(th)?;
     check_ran(seq, outcome)?;
     Ok(outcome)
+}
+
+/// The controller's side of round `seq` between the release and its start:
+/// in a fixed round, spin its share of the delay; in a held round whose
+/// configure leads, wait, bounded by [`ROUND_WAIT_US`], until the helper has
+/// published that it is entering its configure ([`HELPER_ENTERED`]); in one
+/// whose start leads, publish that the start is being entered
+/// ([`STARTER_ENTERED`]).
+fn lead_in(seq: u32, timing: Timing) -> TestResult
+{
+    match timing
+    {
+        Timing::Raced =>
+        {
+            spin(skews(seq).0);
+            Ok(())
+        }
+        Timing::ConfigureLeads => super::require_within(
+            crate::scaled_bound(ROUND_WAIT_US),
+            "stress::configure_start_race: the helper did not reach its configure in a held \
+             round",
+            || HELPER_ENTERED.load(Ordering::Acquire) == seq,
+        ),
+        Timing::StartLeads =>
+        {
+            STARTER_ENTERED.store(seq, Ordering::Release);
+            Ok(())
+        }
+    }
 }
 
 /// Wait, bounded, for the raced thread to reach `Exited`, and require it to
@@ -498,43 +604,11 @@ fn spin(n: u32)
     }
 }
 
-/// Poll `done` until it holds, for at most `bound_us` microseconds on the
-/// `ElapsedUs` clock. The first [`BUSY_POLLS`] polls are busy; later ones
-/// sleep 1 ms. Returns whether `done` held in time; a clock read that
-/// fails, at the start or at a poll, is the wait's own failure, so a clock
-/// the wait cannot read never leaves it unbounded.
-fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> Result<bool, &'static str>
-{
-    let start = elapsed_us()?;
-    let mut polls = 0u32;
-    while !done()
-    {
-        if elapsed_us()?.saturating_sub(start) > bound_us
-        {
-            return Ok(false);
-        }
-        if polls < BUSY_POLLS
-        {
-            polls = polls.saturating_add(1);
-            core::hint::spin_loop();
-        }
-        else
-        {
-            let _ = thread_sleep(1);
-        }
-    }
-    Ok(true)
-}
-
-/// Microseconds since boot; the clock every bounded wait is measured on.
-fn elapsed_us() -> Result<u64, &'static str>
-{
-    system_info(SystemInfoType::ElapsedUs as u64)
-        .map_err(|_| "stress::configure_start_race: system_info(ElapsedUs) failed")
-}
-
 /// Helper: for each round the controller arms, report ready, spin until
-/// released, spin this side's delay, configure the round's thread to
+/// released, lead into its configure (spin this side's delay in a fixed
+/// round; in a held round whose start leads, spin until the controller has
+/// published its start, [`STARTER_ENTERED`]), publish that it is entering
+/// its configure ([`HELPER_ENTERED`]), configure the round's thread to
 /// [`entry_b`], and report the result; exit once told to quit.
 extern "C" fn helper_entry(_arg: u64) -> !
 {
@@ -543,11 +617,21 @@ extern "C" fn helper_entry(_arg: u64) -> !
     {
         seen = seq;
         READY.store(seq, Ordering::Release);
-        if !await_go(seq)
+        if !await_round(&GO, seq)
         {
             break;
         }
-        spin(skews(seq).1);
+        if seq <= CYCLES
+        {
+            spin(skews(seq).1);
+        }
+        else if START_LEADS.load(Ordering::Acquire) == seq && !await_round(&STARTER_ENTERED, seq)
+        {
+            break;
+        }
+        // A held round's controller whose configure leads starts only after
+        // this.
+        HELPER_ENTERED.store(seq, Ordering::Release);
         // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
         // stack is this child's own, on which no other live thread runs (`ChildStack`'s
         // rule, as noted where the stack is chosen).
@@ -585,11 +669,12 @@ fn next_round(seen: u32) -> Option<u32>
     }
 }
 
-/// Spin until the controller releases round `seq` (returning `true`) or sets
-/// [`QUIT`] (returning `false`: it failed after arming the round).
-fn await_go(seq: u32) -> bool
+/// Spin until the controller stores round `seq` in `flag` ([`GO`], or
+/// [`STARTER_ENTERED`]), returning `true`, or sets [`QUIT`], returning
+/// `false`: it failed after arming the round.
+fn await_round(flag: &AtomicU32, seq: u32) -> bool
 {
-    while GO.load(Ordering::Acquire) != seq
+    while flag.load(Ordering::Acquire) != seq
     {
         if QUIT.load(Ordering::Acquire) != 0
         {

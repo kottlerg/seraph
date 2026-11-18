@@ -35,6 +35,16 @@
 //! notification, lets the injector write [`TRAILING_WRITES`] more times into
 //! the freed identity, and parks it.
 //!
+//! A write completes during a delete only when the injector's CPU runs
+//! across the delete, which a host that runs the guest's CPUs late may do in
+//! few rounds or none. So after the [`CYCLES`] fixed rounds, while no round
+//! has armed the race, held rounds run, up to [`super::MAX_EXTRA_ROUNDS`]:
+//! after the leading writes the controller watches the write count, busily,
+//! until it has advanced twice (bounded by [`HELD_WRITE_WAIT_US`]), and then
+//! deletes at once, with no delay, so the delete starts while the injector is
+//! known to be running. The host must keep the injector's CPU running for the
+//! delete's span in one held round. The log counts the held rounds run.
+//!
 //! Required: the kernel survives every round, every round's first write
 //! signals its notification, no signal reaches the notification after the
 //! delete returned (a delivery the delete waited out signalled before it
@@ -67,7 +77,7 @@ use syscall_abi::SystemInfoType;
 use crate::unit::hw::{msg_authority, msg_of};
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Rounds to run.
+/// Fixed rounds to run.
 const CYCLES: u32 = 200;
 const MIN_CPUS: u64 = 2;
 const CONTROLLER_CPU: u32 = 0;
@@ -78,6 +88,9 @@ const LEADING_WRITES: u64 = 8;
 const TRAILING_WRITES: u64 = 16;
 /// Wait for a round's first signal, in ms, through [`crate::scaled_bound`].
 const PROBE_TIMEOUT_MS: u64 = 1000;
+/// Bound on a held round's watch for two more writes before its delete, in
+/// microseconds, through [`crate::scaled_bound`].
+const HELD_WRITE_WAIT_US: u64 = 1_000_000;
 /// Polls (1 ms each) for the injector's progress and exit, through
 /// [`crate::scaled_polls`].
 const WAIT_POLLS: u32 = 10_000;
@@ -100,6 +113,16 @@ static PARKED: AtomicU32 = AtomicU32::new(0);
 static QUIT: AtomicU32 = AtomicU32::new(0);
 
 static mut INJECTOR_STACK: ChildStack = ChildStack::ZERO;
+
+/// How a round places its delete in the write sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing
+{
+    /// A fixed round: the delete follows a varying spin.
+    Raced,
+    /// A held round: the delete follows two writes seen advance.
+    Held,
+}
 
 pub fn run(ctx: &TestContext) -> TestResult
 {
@@ -246,12 +269,7 @@ fn race(ctx: &TestContext, authority: u64) -> TestResult
         .map_err(|_| "stress::msg_inject_delete_race: start injector failed");
     let running = started.is_ok();
     let mut mapped = None;
-    let raced = started.and_then(|()| {
-        (1..=CYCLES).try_fold(0u32, |armed, round| {
-            round_once(ctx, authority, round, &mut mapped)
-                .map(|hit| armed.saturating_add(u32::from(hit)))
-        })
-    });
+    let raced = started.and_then(|()| rounds(ctx, authority, &mut mapped));
     WRITE_VA.store(0, Ordering::Release);
     QUIT.store(1, Ordering::Release);
     // An injector that never started is deleted without the wait.
@@ -265,9 +283,13 @@ fn race(ctx: &TestContext, authority: u64) -> TestResult
     };
     cap_delete(injector).ok();
     unmap_file(ctx, &mut mapped);
-    let armed = raced?;
+    let (armed, extra_rounds) = raced?;
     exited?;
     crate::log_u64("stress::msg_inject_delete_race: armed=", u64::from(armed));
+    crate::log_u64(
+        "stress::msg_inject_delete_race: extra_rounds=",
+        u64::from(extra_rounds),
+    );
     crate::log_u64(
         "stress::msg_inject_delete_race: writes=",
         WRITES.load(Ordering::Acquire),
@@ -277,6 +299,32 @@ fn race(ctx: &TestContext, authority: u64) -> TestResult
         return Err("stress::msg_inject_delete_race: no write completed during a delete");
     }
     Ok(())
+}
+
+/// Run the [`CYCLES`] fixed rounds, then held rounds while none has armed
+/// the race, up to [`super::MAX_EXTRA_ROUNDS`]. Returns the rounds that armed
+/// it and the held rounds run.
+fn rounds(
+    ctx: &TestContext,
+    authority: u64,
+    mapped: &mut Option<Mapped>,
+) -> Result<(u32, u32), &'static str>
+{
+    let mut armed = 0u32;
+    for round in 1..=CYCLES
+    {
+        let hit = round_once(ctx, authority, round, Timing::Raced, mapped)?;
+        armed = armed.saturating_add(u32::from(hit));
+    }
+    let mut extra = 0u32;
+    while armed == 0 && extra < super::MAX_EXTRA_ROUNDS
+    {
+        extra = extra.saturating_add(1);
+        let round = CYCLES.saturating_add(extra);
+        let hit = round_once(ctx, authority, round, Timing::Held, mapped)?;
+        armed = armed.saturating_add(u32::from(hit));
+    }
+    Ok((armed, extra))
 }
 
 /// Wait (bounded) until the injector has made `count` writes in all.
@@ -314,12 +362,13 @@ fn park() -> TestResult
 }
 
 /// One round: mint, bind and probe a target, then delete its capability while
-/// the injector writes its identity. Returns whether a write completed while
-/// the delete ran.
+/// the injector writes its identity, placed as `timing` says. Returns whether
+/// a write completed while the delete ran.
 fn round_once(
     ctx: &TestContext,
     authority: u64,
     round: u32,
+    timing: Timing,
     mapped: &mut Option<Mapped>,
 ) -> Result<bool, &'static str>
 {
@@ -328,7 +377,7 @@ fn round_once(
     let result = (|| -> Result<bool, &'static str> {
         let target =
             irq_msg_alloc(authority).map_err(|_| "stress::msg_inject_delete_race: mint failed")?;
-        let raced = race_delete(ctx, target, sig, round, mapped);
+        let raced = race_delete(ctx, target, sig, (round, timing), mapped);
         // A failed step can leave the target live; its delete here is a
         // no-op once the race deleted it, since nothing is created after.
         cap_delete(target).ok();
@@ -344,7 +393,7 @@ fn race_delete(
     ctx: &TestContext,
     target: u64,
     sig: u64,
-    round: u32,
+    (round, timing): (u32, Timing),
     mapped: &mut Option<Mapped>,
 ) -> Result<bool, &'static str>
 {
@@ -369,12 +418,7 @@ fn race_delete(
             .load(Ordering::Acquire)
             .saturating_add(LEADING_WRITES),
     )?;
-    // 0 to 4095 spins (a multiplicative hash of the round), so the delete
-    // lands at varying points in the write sequence.
-    for _ in 0..(round.wrapping_mul(2_654_435_761) >> 20)
-    {
-        core::hint::spin_loop();
-    }
+    lead_in(round, timing)?;
     let before = WRITES.load(Ordering::Acquire);
     cap_delete(target).map_err(|_| "stress::msg_inject_delete_race: delete failed")?;
     let after = WRITES.load(Ordering::Acquire);
@@ -390,6 +434,34 @@ fn race_delete(
     // A write counted after `before` and before `after`, other than one that
     // was already under way at `before`, began and ended inside the delete.
     Ok(after > before.saturating_add(1))
+}
+
+/// The controller's delay before a round's delete: in a fixed round, 0 to
+/// 4095 spins (a multiplicative hash of `round`), so the delete lands at
+/// varying points in the write sequence; in a held round, a busy watch until
+/// the injector has made two more writes, bounded by [`HELD_WRITE_WAIT_US`].
+fn lead_in(round: u32, timing: Timing) -> TestResult
+{
+    match timing
+    {
+        Timing::Raced =>
+        {
+            for _ in 0..(round.wrapping_mul(2_654_435_761) >> 20)
+            {
+                core::hint::spin_loop();
+            }
+            Ok(())
+        }
+        Timing::Held =>
+        {
+            let target = WRITES.load(Ordering::Acquire).saturating_add(2);
+            super::require_within(
+                crate::scaled_bound(HELD_WRITE_WAIT_US),
+                "stress::msg_inject_delete_race: the injector stopped writing in a held round",
+                || WRITES.load(Ordering::Acquire) >= target,
+            )
+        }
+    }
 }
 
 /// Injector: while [`WRITE_VA`] is nonzero, write [`IDENTITY`] to it and count

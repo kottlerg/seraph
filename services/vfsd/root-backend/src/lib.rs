@@ -44,6 +44,11 @@
 //! shadowing skip it, so its name falls through to the root filesystem
 //! as an absent one does. The root mount is never removed.
 //!
+//! The tree holds at most [`MAX_MOUNTS`] mounts, the root mount and
+//! those being removed included: vfsd observes each mount's driver on one
+//! wait set of `syscall_abi::WAIT_SET_MAX_MEMBERS` members, one of which is
+//! its device-class watch.
+//!
 //! The tree grows on the heap, one node per installed path component
 //! that does not yet exist, and nodes are never freed: a removed mount
 //! leaves its node vacant, and a later install reuses it, so a node's
@@ -72,6 +77,12 @@ use namespace_protocol::{
 /// [`VfsdRootBackend::install`] refuses to grow the pool to that many
 /// nodes.
 const NONE: u32 = u32::MAX;
+
+/// The most mounts the tree holds at once, counting the root mount and
+/// every mount whose removal has begun and not finished: one wait-set member
+/// each in vfsd's watch set beside its device-class watch
+/// (`services/vfsd/docs/namespace-composition.md` § Mount record).
+pub const MAX_MOUNTS: usize = 1023;
 
 /// The record of one mount: what vfsd holds to reach its driver and to
 /// tear it down. The tree stores the record and makes no syscall on it;
@@ -185,6 +196,9 @@ pub struct VfsdRootBackend
     root: TreeNode,
     /// Every other node; pool index `i` (from 1) is `nodes[i - 1]`.
     nodes: Vec<TreeNode>,
+    /// Nodes holding a mount, mounted or being removed; at most
+    /// [`MAX_MOUNTS`].
+    mounts: usize,
 }
 
 /// Outcome of a successful [`VfsdRootBackend::install`] call.
@@ -240,6 +254,7 @@ impl VfsdRootBackend
                 fallthrough_cap: 0,
             },
             nodes: Vec::new(),
+            mounts: 0,
         }
     }
 
@@ -266,8 +281,8 @@ impl VfsdRootBackend
     /// Returns `None`, leaving the tree unchanged, on a component that
     /// fails [`validate_name`], an attempt to mount on a node that holds
     /// a mount (one being removed included), a re-install of the root
-    /// mount (see [`Self::can_install`]), or a failure to allocate the
-    /// new nodes.
+    /// mount (see [`Self::can_install`]), a tree that already holds
+    /// [`MAX_MOUNTS`] mounts, or a failure to allocate the new nodes.
     pub fn install(&mut self, path: &[u8], mount: Mount) -> Option<InstallResult>
     {
         // Validate the whole path, and allocate every node and name the
@@ -279,6 +294,7 @@ impl VfsdRootBackend
             self.root.fallthrough_cap = mount.cap;
             self.root.slot = Slot::Mounted(mount);
             self.root.live = self.root.live.saturating_add(1);
+            self.mounts = self.mounts.saturating_add(1);
             return Some(InstallResult {
                 new_intermediates: Vec::new(),
             });
@@ -345,6 +361,7 @@ impl VfsdRootBackend
             current = next;
         }
         self.adjust_live(current, u32::saturating_add);
+        self.mounts = self.mounts.saturating_add(1);
         // `retain` keeps the reserved capacity and does not allocate.
         new_intermediates.retain(|&idx| self.needs_fallthrough(idx));
         Some(InstallResult { new_intermediates })
@@ -407,8 +424,8 @@ impl VfsdRootBackend
     /// Finish removing the mount whose removal [`Self::begin_unmount`]
     /// began on the node at `idx`: clear its record, which is returned,
     /// and leave the node in the tree with its index, for a later install
-    /// to reuse. `None`, changing nothing, when no removal has begun on
-    /// the node.
+    /// to reuse; the mount no longer counts toward [`MAX_MOUNTS`]. `None`,
+    /// changing nothing, when no removal has begun on the node.
     pub fn remove_mount(&mut self, idx: u32) -> Option<Mount>
     {
         let node = self.node_mut(idx)?;
@@ -418,7 +435,29 @@ impl VfsdRootBackend
             return None;
         };
         node.slot = Slot::Empty;
+        self.mounts = self.mounts.saturating_sub(1);
         Some(mount)
+    }
+
+    /// The node holding the first mount lookups cross whose record
+    /// `matches`, the root first, then the other nodes in pool order; a
+    /// mount whose removal has begun is skipped. vfsd finds the mount a
+    /// death queue belongs to, and the mounts of a removed disk, with it.
+    #[must_use]
+    pub fn find_mounted(&self, matches: impl Fn(&Mount) -> bool) -> Option<u32>
+    {
+        core::iter::once(&self.root)
+            .chain(self.nodes.iter())
+            .position(|n| n.mounted().is_some_and(&matches))
+            .and_then(|i| u32::try_from(i).ok())
+    }
+
+    /// The record of the mount lookups cross on the node at `idx`; `None`
+    /// for a node holding none, one being removed included.
+    #[must_use]
+    pub fn mounted(&self, idx: u32) -> Option<Mount>
+    {
+        self.node(idx).and_then(TreeNode::mounted).copied()
     }
 
     /// Undo [`Self::begin_unmount`] on the node at `idx`: lookups cross the
@@ -456,10 +495,11 @@ impl VfsdRootBackend
     }
 
     /// Whether [`Self::install`] would accept `path` against the current
-    /// tree: the root is not yet mounted (for `/`), every component
-    /// passes [`validate_name`], the final node holds no mount (one being
-    /// removed included), and the pool can index every node the install
-    /// would create. The MOUNT path checks this before it registers a
+    /// tree: the tree holds fewer than [`MAX_MOUNTS`] mounts, the root is
+    /// not yet mounted (for `/`), every component passes
+    /// [`validate_name`], the final node holds no mount (one being removed
+    /// included), and the pool can index every node the install would
+    /// create. The MOUNT path checks this before it registers a
     /// partition or spawns a driver, so a mount `install` would reject
     /// acquires nothing; only an allocation failure in `install` itself
     /// remains to be handled after the spawn.
@@ -474,6 +514,10 @@ impl VfsdRootBackend
     /// when `install` must reject it.
     fn plan_install(&self, path: &[u8]) -> Option<usize>
     {
+        if self.mounts >= MAX_MOUNTS
+        {
+            return None;
+        }
         let mut components = path_components(path).peekable();
         if components.peek().is_none()
         {
@@ -839,6 +883,56 @@ mod tests
         let idx = b.find(path).expect("installed path has a node");
         assert_eq!(b.begin_unmount(idx), Ok(mount(cap)));
         idx
+    }
+
+    #[test]
+    fn find_mounted_names_the_node_of_the_matching_crossed_mount()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/", mount(CAP)).is_some());
+        assert!(b.install(b"/a/esp", mount(CAP + 1)).is_some());
+        assert!(b.install(b"/data", mount(CAP + 2)).is_some());
+        let esp = b.find(b"/a/esp").expect("installed path has a node");
+        let data = b.find(b"/data").expect("installed path has a node");
+        assert_eq!(b.find_mounted(|m| m.cap == CAP), Some(0));
+        assert_eq!(b.find_mounted(|m| m.cap == CAP + 1), Some(esp));
+        assert_eq!(b.mounted(esp), Some(mount(CAP + 1)));
+        // Several match: the root first, then pool order.
+        assert_eq!(b.find_mounted(|m| m.disk == 1), Some(0));
+        assert_eq!(b.find_mounted(|m| m.cap > CAP), Some(esp));
+        // A mount whose removal began is not found, and its node holds no
+        // crossed mount; the intermediate above it never held one.
+        assert_eq!(b.begin_unmount(data), Ok(mount(CAP + 2)));
+        assert_eq!(b.find_mounted(|m| m.cap == CAP + 2), None);
+        assert_eq!(b.mounted(data), None);
+        assert_eq!(b.mounted(b.find(b"/a").expect("intermediate")), None);
+        assert_eq!(b.find_mounted(|m| m.cap == CAP + 9), None);
+    }
+
+    #[test]
+    fn the_tree_refuses_a_mount_past_max_mounts_until_a_removal_finishes()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/", mount(CAP)).is_some());
+        for i in 1..MAX_MOUNTS
+        {
+            let path = alloc::format!("/m{i}");
+            assert!(
+                b.install(path.as_bytes(), mount(CAP)).is_some(),
+                "mount {i}"
+            );
+        }
+        assert!(!b.can_install(b"/over"));
+        assert!(b.install(b"/over", mount(CAP)).is_none());
+        // A mount being removed still holds its place.
+        let idx = b.find(b"/m1").expect("installed path has a node");
+        assert_eq!(b.begin_unmount(idx), Ok(mount(CAP)));
+        assert!(!b.can_install(b"/over"));
+        assert!(b.restore_mount(idx));
+        assert_eq!(b.begin_unmount(idx), Ok(mount(CAP)));
+        assert!(b.remove_mount(idx).is_some());
+        assert!(b.install(b"/over", mount(CAP)).is_some());
+        assert!(b.install(b"/over2", mount(CAP)).is_none());
     }
 
     #[test]

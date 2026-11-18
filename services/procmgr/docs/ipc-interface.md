@@ -1257,6 +1257,7 @@ Operation](../../crashd/docs/operation.md) § Bounds), as does the wait of a dum
 process that never declared. A process can declare itself only, so the declaration removes no core
 of another process. Its mark leaves out a core of the declarer alone, which holds nothing of another
 process.
+
 ---
 
 ## Relevant Design Documents

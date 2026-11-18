@@ -22,6 +22,7 @@ mod bind;
 mod caps;
 mod decls;
 mod dma;
+mod headroom;
 mod hotplug;
 mod intremap;
 mod iommu;
@@ -217,6 +218,7 @@ fn main() -> !
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
+        headroom::hold_and_report();
         run_jobs(
             &registry,
             &mut records,
@@ -320,13 +322,15 @@ fn enumerate_records(
 
 /// Start the registry's workers and let them receive: the
 /// [`REGISTRY_WORKERS`] threads of a [`recv_pool::RecvPool`] on the registry
-/// endpoint, each serving its requests with [`Registry::handle`]. Halts,
+/// endpoint, each serving its requests with [`Registry::handle`] once it has
+/// held devmgr's `CSpace` headroom ([`headroom::hold`]). Halts,
 /// logged, when none can be started; fewer serve, logged, when some cannot.
 fn start_registry_workers(registry: &Arc<Registry>)
 {
     let pool = {
         let shared = Arc::clone(registry);
         recv_pool::RecvPool::new(registry.endpoint, recv_diag, move |msg, buf| {
+            headroom::hold();
             shared.handle(msg, buf.as_ptr());
         })
     };

@@ -403,13 +403,12 @@ cell drops `crashd.svc` with `terminal.svc` and runs the second, while crasher's
 unreported. Both read the log the cell's boot saved and boot nothing
 ([xtask/README.md § test-crash-report](../xtask/README.md#cargo-xtask-test-crash-report)).
 
-The crash service cannot cover every process. init, memmgr, and procmgr are not created by
-procmgr, and the serial and framebuffer drivers, the debug port's virtio-console driver, and crashd
-declare themselves undebuggable, as svctest and the GDB stub, debug-authority holders, do in
-a boot that stages them; their faults leave only the kernel's `fault unhandled` and
-`USERSPACE FAULT` lines. A thread that never registered with procmgr is reported without registers
-or a stack walk
-([crashd Operation § Limits](../services/crashd/docs/operation.md#limits)).
+The crash service cannot cover every process. init, memmgr, and procmgr are not created by procmgr,
+and the debug port's virtio-console driver and crashd declare themselves undebuggable, as svctest
+and the GDB stub, debug-authority holders, do in a boot that stages them; their faults leave only
+the kernel's `fault unhandled` and `USERSPACE FAULT` lines. A thread that never registered with
+procmgr is reported without registers or a stack walk ([crashd Operation §
+Limits](../services/crashd/docs/operation.md#limits)).
 
 ### Log levels (`test-log-level`)
 
@@ -1353,8 +1352,9 @@ cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
 window (`run-parallel --display framebuffer`,
 [xtask/README.md](../xtask/README.md#cargo-xtask-run-parallel)), so the bootloader hands the
 kernel the adapter's GOP framebuffer, devmgr spawns the framebuffer driver, and svctest's drivers
-phase runs its framebuffer case ([services/svctest/README.md](../services/svctest/README.md))
-instead of logging `framebuffer case skipped`. The boot passes on svctest's pass marker with no
+and `logd_sinks` phases run their framebuffer cases
+([services/svctest/README.md](../services/svctest/README.md)) instead of logging
+`framebuffer case skipped`. The boot passes on svctest's pass marker with no
 such line: its `--fail-also 'framebuffer case skipped'` makes a boot that logs the skip a `FAIL`.
 svctest is staged as `build-test.yml` stages it, on a debug-profile sysroot, as the commands
 below spell out. Its budget, 360 s, is the larger of three times the slower of the two boots on
@@ -1662,12 +1662,13 @@ gdb -batch -ex 'target remote :1234' -ex 'hbreak kernel::panic' -ex continue \
 while the rest of the system runs on: breakpoints, single-step, registers and memory of each of
 its threads, then a detach that hands it back to the crash service. `cargo xtask run --debug-port
 <PORT> --debug-target <NAME>` stages the stub for the boot, naming the process by its `argv[0]`
-(for a service, the first word of its recipe's `argv`), and prints the GDB command line, which
+(for a service, the first word of its recipe's `argv`; for a driver devmgr binds, its bundle
+entry name or install path), and prints the GDB command line, which
 loads the process's sysroot binary for symbols; the stub reports the image's load bias
 (`qOffsets`), so GDB relocates them itself
 ([xtask/README.md](../xtask/README.md#cargo-xtask-run)). A process that declared itself
-undebuggable (the serial and framebuffer drivers, the debug port's virtio-console driver, and
-every debug-authority holder) refuses the attach, and a process procmgr did not create (init,
+undebuggable (the debug port's virtio-console driver and every debug-authority holder) refuses
+the attach, and a process procmgr did not create (init,
 memmgr, procmgr) is not listed.
 
 ```sh

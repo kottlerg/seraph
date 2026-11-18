@@ -1123,9 +1123,8 @@ pub enum AttachRefusal
     /// and procmgr, which procmgr did not create, are never in the table.
     Unknown,
     /// The target declared itself undebuggable
-    /// (`procmgr_labels::DECLARE_NO_DEBUG`; `NOT_ATTACHABLE`): the serial
-    /// and framebuffer drivers, the debug port's driver, and every
-    /// debug-authority holder, the caller among them.
+    /// (`procmgr_labels::DECLARE_NO_DEBUG`; `NOT_ATTACHABLE`): the debug
+    /// port's driver and every debug-authority holder, the caller among them.
     NotAttachable,
 }
 
@@ -1669,9 +1668,8 @@ mod tests
     #[test]
     fn an_attach_to_a_process_that_declared_no_debug_is_refused()
     {
-        // The serial and framebuffer drivers, the debug port's driver, and
-        // every debug-authority holder, the caller among them, declare
-        // themselves undebuggable.
+        // The debug port's driver and every debug-authority holder, the
+        // caller among them, declare themselves undebuggable.
         let mut table = ProcessTable::new();
         let mut marked = entry_with_badge(0x77);
         marked.thread_cap = 41;

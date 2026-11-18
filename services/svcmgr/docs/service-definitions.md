@@ -68,6 +68,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth`. Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
+| `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
 | `oom_stop` | no | `yes` or `no` (default `no`). Opts the service in to being stopped by a stop-authority holder. Refused, as a parser error, on a recipe the eligibility rule refuses. See [`oom_stop`](#oom_stop). |
 | `reserve` | no | `yes` or `no` (default `no`). Creates the service inside memmgr's system reserve. A core role: the eligibility rule never stops it. See [`reserve`](#reserve). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
@@ -156,7 +157,7 @@ The primary lever for confining a service to only what it needs.
 | Form | Effect |
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported` (see [Namespace Model](../../../docs/namespace-model.md#initial-capability-delivery)). Default tight choice for services with no filesystem dependency. |
-| `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority. The recipes that declare it are `svctest` (the namespace tester), `usertest`, and `terminal`, which resolve and spawn programs; the recipes of the init-bootstrapped substrate services declare `none`, since init, not svcmgr, spawned them. |
+| `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority. The recipes that declare it are `svctest` (the namespace tester), `usertest`, `terminal`, and the `stopsrc` test fixture, which resolve and spawn programs; the recipes of the init-bootstrapped substrate services declare `none`, since init, not svcmgr, spawned them. |
 | `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute, names a directory below the root, and is at most `ipc::MAX_PATH_LEN` (4096) bytes; longer is a parser error, and so is a path with no components (`subtree:/`, which no namespace server would attenuate; use `universal`). `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
@@ -413,12 +414,13 @@ debug_authority = yes
 ## `stop_authority`
 
 `yes` endows the service with svcmgr's stop authority: on its first launch and on every restart,
-svcmgr mints a SEND on its own service endpoint badged `svcmgr_labels::STOP_AUTHORITY` and delivers
+svcmgr mints a SEND on its own service endpoint badged `stop_labels::STOP_AUTHORITY` and delivers
 it in the bootstrap slot after the `seed` caps and, for a `debug_authority = yes` service, after
 the debug-authority slot. A derive that fails leaves the slot absent. The authority serves
-svcmgr's `STOP_SERVICE` and `LIST_STOPPABLE`
+svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`
 ([ipc-interface.md § Stop authority](ipc-interface.md#stop-authority)): the holder learns which
-services it may stop, with each one's memory usage, and has svcmgr stop one. svcmgr does the
+services it may stop, with each one's memory usage, and has svcmgr stop one, and it learns the
+[stop sources](#stop_source), each reached through a SEND svcmgr derives for it. svcmgr does the
 stopping, through the process handle it holds as the service's creator, so the holder never holds
 a kill authority, and stops only what the [`oom_stop`](#oom_stop) rule allows. This key is the only
 path that mints the cap.
@@ -427,11 +429,47 @@ path that mints the cap.
 holder has a core role, so no holder stops another or itself. A one-shot holder
 (`restart = never`) is allowed: svctest's recipe sets the key.
 
+## `stop_source`
+
+`program` makes the service a stop source of the program class
+([Session Supervision § Stop Sources](../../../docs/session-supervision.md#stop-sources)): a
+service that holds kill authority over a set of processes and offers a stop-authority holder the
+stop of them. It serves the shared stop labels (`ipc::stop_labels`) on its service endpoint, on a
+badge carrying `stop_labels::STOP_AUTHORITY`. While an instance runs, svcmgr lists it in
+`LIST_STOP_SOURCES` ([ipc-interface.md § Label 7](ipc-interface.md#label-7-list_stop_sources))
+with the class this key names and a SEND on that endpoint badged with the stop bit. The class is
+read from the recipe, never from the source, so a source cannot claim the service class to delay
+its own stop. `program` is the one value; any other is a parser error. No recipe of the default
+image sets the key; the `stopsrc` test fixture's does
+([services/stopsrc/README.md](../../stopsrc/README.md)).
+
+The key is a core role, so the [`oom_stop`](#oom_stop) rule never stops a source and
+`LIST_CANDIDATES` never lists one. The parser rejects it on a recipe without `provides`, since a
+source is reached on its service endpoint; on one with a bare `provides` entry, since a bare entry
+publishes an unbadged SEND, from which any holder could derive a SEND badged with the stop bit, so
+every entry carries `:auth` or `:deny`; and with `restart = never`, since svcmgr lists only a
+source it supervises.
+
+svcmgr creates each instance of a source contained, on its launch and on every restart
+(`procmgr_labels::CREATE_CONTAIN`,
+[procmgr IPC Interface § Process Tree](../../procmgr/docs/ipc-interface.md#process-tree)): when the
+instance ends, procmgr destroys what is left of its subtree, so no process the source started
+outlives it, a candidate it listed is gone with it, and its next instance starts with none.
+
+```
+binary      = /tests/stopsrc
+restart     = always
+critical    = no
+namespace   = universal
+provides    = stopsrc.ctl:deny
+stop_source = program
+```
+
 ## `oom_stop`
 
 `yes` opts the service in to being stopped by a [`stop_authority`](#stop_authority) holder, and
 makes svcmgr ask procmgr for a node handle to the service's memory budget node at each create
-(`CREATE_NODE_HANDLE`), through which `LIST_STOPPABLE` reads its usage. Opting in is not enough:
+(`CREATE_NODE_HANDLE`), through which `LIST_CANDIDATES` reads its usage. Opting in is not enough:
 svcmgr stops a service only when this rule, `svcmgr_defs::stop::stop_refusal`, allows it,
 refusing for the first row that applies:
 
@@ -440,7 +478,7 @@ refusing for the first row that applies:
 | 1 | was started by init (memmgr, procmgr, devmgr, vfsd), so svcmgr only binds it | not launched by svcmgr |
 | 2 | has `restart = never`, so svcmgr does not supervise it | one-shot |
 | 3 | has `critical = yes` | the system is not viable without it |
-| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `reserve` or `shutdown_actuator` | the system's log, crash reporting, stopping and shutdown rest on it |
+| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping and shutdown rest on it |
 | 5 | does not set `oom_stop = yes` | not opted in |
 
 Eligibility is read from the recipe's keys alone, never from the service's name. The parser
@@ -523,8 +561,8 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, `oom_stop` and `reserve` flags, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
-| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve` and `oom_stop` ask for, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, `oom_stop` and `reserve` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop` and `stop_source` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 svcmgr launches the **launching** entries in launch order, which
@@ -563,9 +601,9 @@ registration is released, and svcmgr routes vfsd's death as system death
 | Document | Content |
 |---|---|
 | [README.md](../README.md) | Component scope, responsibilities, restart policy |
-| [ipc-interface.md](ipc-interface.md) | handover endowment, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT`, `STOP_SERVICE` / `LIST_STOPPABLE` |
+| [ipc-interface.md](ipc-interface.md) | handover endowment, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT`, `STOP_CANDIDATE` / `LIST_CANDIDATES` / `LIST_STOP_SOURCES` |
 | [restart-protocol.md](restart-protocol.md) | Restart sequencing, shared spawn primitives, criticality semantics |
-| [shared/ipc/src/lib.rs](../../../shared/ipc/src/lib.rs) | `published_names` constants, `svcmgr_labels::*`, `svcmgr_errors::*` |
+| [shared/ipc/src/lib.rs](../../../shared/ipc/src/lib.rs) | `published_names` constants, `svcmgr_labels::*`, `svcmgr_errors::*`, `stop_labels::*` |
 
 ---
 

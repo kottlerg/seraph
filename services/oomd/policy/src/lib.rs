@@ -14,7 +14,8 @@
 //! sources offers, the one stopped first: the earliest class, then the lowest
 //! rank within it, then the most pages, a tie going to the candidate offered
 //! first, so to the earlier source and then its earlier entry
-//! (docs/session-supervision.md § Stop Sources). The state takes the time and
+//! (docs/session-supervision.md § Stop Sources); the program class goes
+//! before the service class. The state takes the time and
 //! the level as arguments and holds no capability, so it is host-tested.
 
 #![cfg_attr(not(test), no_std)]
@@ -336,8 +337,27 @@ fn since(at: Option<u64>, now: u64) -> u64
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Class
 {
+    /// The programs of sessions: the sources whose recipes set
+    /// `stop_source = program`.
+    Program,
     /// svcmgr's services whose recipes set `oom_stop = yes`.
     Service,
+}
+
+impl Class
+{
+    /// The class of a source svcmgr lists with class code `code`
+    /// (`svcmgr_labels::LIST_STOP_SOURCES`); `None` for a code oomd does not
+    /// know. svcmgr itself, the service class's source, is never listed.
+    #[must_use]
+    pub const fn from_code(code: u64) -> Option<Self>
+    {
+        match code
+        {
+            ipc::stop_labels::CLASS_PROGRAM => Some(Self::Program),
+            _ => None,
+        }
+    }
 }
 
 /// Where a candidate falls in the order oomd stops in.
@@ -347,7 +367,7 @@ pub struct Order
     /// Its source's class.
     pub class: Class,
     /// Its rank within its class, the lower first; one a source gives.
-    pub rank: u8,
+    pub rank: u64,
     /// The pages its memory budget node and that node's subtree hold.
     pub pages: u64,
 }
@@ -385,7 +405,10 @@ impl<T> Default for Best<T>
 impl<T> Best<T>
 {
     /// Keep `item`, at `order`, when it is stopped before the one kept.
-    pub fn offer(&mut self, order: Order, item: T)
+    /// Returns the item not kept: the one `item` displaced, or `item`
+    /// itself; `None` when nothing was kept before.
+    #[must_use]
+    pub fn offer(&mut self, order: Order, item: T) -> Option<T>
     {
         let first = match &self.best
         {
@@ -394,8 +417,19 @@ impl<T> Best<T>
         };
         if first
         {
-            self.best = Some((order, item));
+            self.best.replace((order, item)).map(|(_, old)| old)
         }
+        else
+        {
+            Some(item)
+        }
+    }
+
+    /// The candidate kept so far, if any was offered.
+    #[must_use]
+    pub const fn kept(&self) -> Option<&(Order, T)>
+    {
+        self.best.as_ref()
     }
 
     /// The candidate kept, if any was offered.
@@ -599,7 +633,7 @@ mod tests
         assert_eq!(rise.act.map(|a| a.critical_ms), Some(0));
     }
 
-    fn service(rank: u8, pages: u64) -> Order
+    fn service(rank: u64, pages: u64) -> Order
     {
         Order {
             class: Class::Service,
@@ -608,29 +642,102 @@ mod tests
         }
     }
 
+    fn program(rank: u64, pages: u64) -> Order
+    {
+        Order {
+            class: Class::Program,
+            rank,
+            pages,
+        }
+    }
+
+    /// Offer each of `offers` in turn, returning what the walk keeps and the
+    /// items it handed back, in the order it handed them back.
+    fn walk<'a>(offers: &[(Order, &'a str)]) -> (Option<(Order, &'a str)>, Vec<&'a str>)
+    {
+        let mut best = Best::default();
+        let mut returned = Vec::new();
+        for &(order, item) in offers
+        {
+            returned.extend(best.offer(order, item));
+        }
+        (best.take(), returned)
+    }
+
     #[test]
     fn the_most_pages_go_first_and_a_tie_goes_to_the_earlier_offer()
     {
+        let (kept, returned) = walk(&[
+            (service(0, 10), "a"),
+            (service(0, 30), "b"),
+            (service(0, 30), "c"),
+            (service(0, 20), "d"),
+        ]);
+        assert_eq!(kept, Some((service(0, 30), "b")));
         let mut best = Best::default();
-        best.offer(service(0, 10), "a");
-        best.offer(service(0, 30), "b");
-        best.offer(service(0, 30), "c");
-        best.offer(service(0, 20), "d");
-        assert_eq!(best.take(), Some((service(0, 30), "b")));
+        assert!(best.kept().is_none());
+        assert_eq!(best.offer(service(0, 1), "x"), None);
+        assert_eq!(best.kept(), Some(&(service(0, 1), "x")));
+        // Every item not kept comes back once: the displaced "a", then the
+        // refused "c" and "d".
+        assert_eq!(returned, ["a", "c", "d"]);
     }
 
     #[test]
     fn a_lower_rank_goes_first_whatever_its_pages()
     {
-        let mut best = Best::default();
-        best.offer(service(1, 1000), "big");
-        best.offer(service(0, 1), "small");
-        assert_eq!(best.take().map(|(_, name)| name), Some("small"));
+        let (kept, returned) = walk(&[(service(1, 1000), "big"), (service(0, 1), "small")]);
+        assert_eq!(kept.map(|(_, name)| name), Some("small"));
+        assert_eq!(returned, ["big"]);
+    }
+
+    #[test]
+    fn programs_go_before_services_whatever_their_pages()
+    {
+        // svcmgr's services offered first, as from an earlier source, still
+        // yield to a program of a later one.
+        let (kept, _) = walk(&[
+            (service(0, 100_000), "memhog"),
+            (program(ipc::stop_labels::RANK_SESSION, 2), "session"),
+            (program(ipc::stop_labels::RANK_JOB, 1), "job"),
+            (service(0, 1), "small service"),
+        ]);
+        assert_eq!(kept.map(|(_, name)| name), Some("job"));
+    }
+
+    #[test]
+    fn jobs_go_before_sessions_and_the_largest_job_first()
+    {
+        let job = ipc::stop_labels::RANK_JOB;
+        let session = ipc::stop_labels::RANK_SESSION;
+        let (kept, _) = walk(&[
+            (program(session, 5000), "session"),
+            (program(job, 10), "small job"),
+            (program(job, 300), "large job"),
+            (program(job, 300), "tied job"),
+        ]);
+        assert_eq!(kept, Some((program(job, 300), "large job")));
+        // With no job, the session goes before any service.
+        let (kept, _) = walk(&[(service(0, 9000), "svc"), (program(session, 1), "session")]);
+        assert_eq!(kept.map(|(_, name)| name), Some("session"));
+    }
+
+    #[test]
+    fn the_program_class_code_names_the_program_class_and_no_other_code_a_class()
+    {
+        assert_eq!(
+            Class::from_code(ipc::stop_labels::CLASS_PROGRAM),
+            Some(Class::Program)
+        );
+        for code in [0, 2, u64::MAX]
+        {
+            assert_eq!(Class::from_code(code), None, "{code}");
+        }
     }
 
     #[test]
     fn a_walk_that_offers_nothing_picks_nothing()
     {
-        assert_eq!(Best::<()>::default().take(), None);
+        assert_eq!(walk(&[]), (None, Vec::new()));
     }
 }

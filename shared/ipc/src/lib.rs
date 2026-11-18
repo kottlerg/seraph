@@ -80,6 +80,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //   on every call; PROCESS_ABI_VERSION at process startup gives
 //   coarse-grained coverage in lockstep with workspace-inherited versioning):
 //     PROCMGR_LABELS_VERSION
+//     STOP_LABELS_VERSION
 //     PWRMGR_LABELS_VERSION
 //     RTC_LABELS_VERSION
 //     TIMED_LABELS_VERSION
@@ -1704,7 +1705,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 13;
+pub const SVCMGR_LABELS_VERSION: u32 = 14;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -1830,7 +1831,8 @@ pub mod svcmgr_labels
     /// endpoint (init, and procmgr's per-child source), which is what keeps
     /// the bit theirs: every other SEND on the endpoint is already badged (a
     /// badge is set once) without it — devmgr's with [`PUBLISH_AUTHORITY`],
-    /// each stop-authority holder's with [`STOP_AUTHORITY`], the published
+    /// each stop-authority holder's with
+    /// [`crate::stop_labels::STOP_AUTHORITY`], the published
     /// `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each per-process
     /// `service_registry_cap` with a process badge, which
     /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) keeps clear of verb bits.
@@ -1838,7 +1840,8 @@ pub mod svcmgr_labels
     /// Badge on the SEND svcmgr publishes on its own endpoint under the
     /// `svcmgr` name: a fixed value with no verb bit, so a consumer can
     /// `QUERY_ENDPOINT` through it but cannot re-badge it to mint
-    /// [`HANDOVER_AUTHORITY`], [`PUBLISH_AUTHORITY`] or [`STOP_AUTHORITY`].
+    /// [`HANDOVER_AUTHORITY`], [`PUBLISH_AUTHORITY`] or
+    /// [`crate::stop_labels::STOP_AUTHORITY`].
     pub const PUBLISHED_SEND_BADGE: u64 = 1;
     const _: () = core::assert!(PUBLISHED_SEND_BADGE & crate::VERB_BIT_MASK == 0);
     /// Publish a named endpoint into the discovery registry.
@@ -1894,132 +1897,285 @@ pub mod svcmgr_labels
     /// reserves it — see GitHub issue #76.
     pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
 
-    /// Stop a supervised service on behalf of the out-of-memory policy: svcmgr
-    /// destroys its process through the handle it holds as its creator and
-    /// routes the death through the service's restart policy as
-    /// `EXIT_KILLED`. Served only on a badge carrying [`STOP_AUTHORITY`]
-    /// (`svcmgr_errors::UNAUTHORIZED` otherwise).
+    /// List the stop sources: the running services whose recipes set
+    /// `stop_source`, each with its class and a SEND on its service endpoint
+    /// badged with [`crate::stop_labels::STOP_AUTHORITY`], through which the
+    /// holder lists and stops that source's candidates. Served only on a badge
+    /// carrying that bit (`svcmgr_errors::UNAUTHORIZED` otherwise).
     ///
-    /// Label bits 16..31 carry `name_len`; data words from 0 carry the
-    /// service name as for [`QUERY_ENDPOINT`] ([`pack_name`]). svcmgr stops
-    /// only a service it launched whose recipe sets `oom_stop = yes` and
-    /// meets the eligibility rule; the reply is `SUCCESS` once the process
-    /// is destroyed, `INVALID_NAME` for a malformed name,
-    /// `NOT_STOPPABLE` for a name no supervised service has or one the rule
-    /// refuses, `NOT_RUNNING` for an eligible service with no running
-    /// instance, and `UNAVAILABLE` when procmgr cannot be called or refuses
-    /// the destroy. A refusal changes nothing. Specified in
-    /// `services/svcmgr/docs/ipc-interface.md` § Label 5: `STOP_SERVICE`.
-    pub const STOP_SERVICE: u64 = 5;
+    /// `data[0]` is the cursor: 0 starts the walk, and each reply's `data[1]`
+    /// is the cursor that resumes it. The reply carries the page's count in
+    /// `data[0]`, the next cursor in `data[1]`, then per entry
+    /// [`STOP_SOURCE_WORDS`] words: the class
+    /// ([`crate::stop_labels::CLASS_PROGRAM`]), the service name's length,
+    /// and the name's bytes ([`pack_stop_source`]); `caps[i]` is entry
+    /// `i`'s SEND. At most [`LIST_STOP_SOURCES_PAGE`] entries, and a page
+    /// shorter than that ends the walk. Specified in
+    /// `services/svcmgr/docs/ipc-interface.md` § Label 7: `LIST_STOP_SOURCES`.
+    pub const LIST_STOP_SOURCES: u64 = 7;
 
-    /// List the services [`STOP_SERVICE`] would stop, with the memory each
-    /// uses, one page per call. Served only on a badge carrying
-    /// [`STOP_AUTHORITY`]. `data[0]` is the cursor: 0 starts the walk, and
-    /// each reply's `data[1]` is the cursor that resumes it. The reply
-    /// carries the page's count in `data[0]`, the next cursor in `data[1]`,
-    /// then per entry [`LIST_STOPPABLE_WORDS_PER_ENTRY`] words: the pages the
-    /// service's budget node and its subtree hold, its name's length, and the
-    /// name's bytes ([`pack_stoppable_entry`]); at most [`LIST_STOPPABLE_PAGE`]
-    /// entries, and a page shorter than that ends the walk. `UNAVAILABLE`
-    /// when memmgr or procmgr, through which the usage is read, cannot be
-    /// called. Specified in `services/svcmgr/docs/ipc-interface.md`
-    /// § Label 6: `LIST_STOPPABLE`.
-    pub const LIST_STOPPABLE: u64 = 6;
-
-    /// Data words one [`LIST_STOPPABLE`] entry takes: the usage in pages, the
+    /// Data words one [`LIST_STOP_SOURCES`] entry takes: the class, the
     /// name's length, and the name in [`NAME_MAX`] bytes.
-    pub const LIST_STOPPABLE_WORDS_PER_ENTRY: usize = 2 + NAME_WORDS;
+    pub const STOP_SOURCE_WORDS: usize = 2 + NAME_WORDS;
 
-    /// Data words of a [`LIST_STOPPABLE`] reply before its first entry: the
-    /// count and the next cursor.
-    pub const LIST_STOPPABLE_HEADER_WORDS: usize = 2;
+    /// Data words of a [`LIST_STOP_SOURCES`] reply before its first entry:
+    /// the count and the next cursor.
+    pub const STOP_SOURCES_HEADER_WORDS: usize = 2;
 
-    /// Entries one [`LIST_STOPPABLE`] reply carries at most: as many as fit
-    /// the data words after the header.
-    pub const LIST_STOPPABLE_PAGE: usize =
-        (super::MSG_DATA_WORDS_MAX - LIST_STOPPABLE_HEADER_WORDS) / LIST_STOPPABLE_WORDS_PER_ENTRY;
+    /// Entries one [`LIST_STOP_SOURCES`] reply carries at most: one per cap
+    /// a message carries.
+    pub const LIST_STOP_SOURCES_PAGE: usize = super::MSG_CAP_SLOTS_MAX;
 
-    const _: () = core::assert!(LIST_STOPPABLE_PAGE >= 1);
+    const _: () = core::assert!(
+        STOP_SOURCES_HEADER_WORDS + LIST_STOP_SOURCES_PAGE * STOP_SOURCE_WORDS
+            <= super::MSG_DATA_WORDS_MAX
+    );
 
-    /// Write entry `index` of a [`LIST_STOPPABLE`] reply into `words` (the
-    /// reply's data words, whose header the caller sets): the usage in pages,
-    /// the name's length, and the name's bytes as [`pack_name`] packs them,
+    /// Write entry `index` of a [`LIST_STOP_SOURCES`] reply into `words` (the
+    /// reply's data words, whose header the caller sets): the class, the
+    /// name's length, and the name's bytes as [`pack_name`] packs them,
     /// zero-padded. Returns `false`, writing nothing, when `name` is empty or
     /// longer than [`NAME_MAX`], or the entry does not fit `words`.
-    pub fn pack_stoppable_entry(words: &mut [u64], index: usize, pages: u64, name: &[u8]) -> bool
+    pub fn pack_stop_source(words: &mut [u64], index: usize, class: u64, name: &[u8]) -> bool
     {
         let mut packed = [0; NAME_WORDS];
         if name.is_empty() || pack_name(name, &mut packed).is_none()
         {
             return false;
         }
-        let Some([pages_word, len_word, name_words @ ..]) =
-            stoppable_entry_base(index).and_then(|base| {
-                words
-                    .get_mut(base..)?
-                    .get_mut(..LIST_STOPPABLE_WORDS_PER_ENTRY)
-            })
+        let Some([class_word, len_word, name_words @ ..]) = stop_source_base(index)
+            .and_then(|base| words.get_mut(base..)?.get_mut(..STOP_SOURCE_WORDS))
         else
         {
             return false;
         };
-        *pages_word = pages;
+        *class_word = class;
         *len_word = name.len() as u64;
         name_words.copy_from_slice(&packed);
         true
     }
 
-    /// Read entry `index` of a [`LIST_STOPPABLE`] reply's data words
-    /// `words`: the usage in pages, and the name, zero-padded to
-    /// [`NAME_MAX`], with its length. `None` when `index` is past the
-    /// reply's count or its words, or the entry's length is 0 or past
-    /// [`NAME_MAX`]; the reply is wire input, so nothing is read past either
-    /// bound.
+    /// Read entry `index` of a [`LIST_STOP_SOURCES`] reply's data words
+    /// `words`: the class, and the name, zero-padded to [`NAME_MAX`], with its
+    /// length. `None` when `index` is past the reply's count or its words, or
+    /// the entry's length is 0 or past [`NAME_MAX`]; the reply is wire input,
+    /// so nothing is read past either bound.
     #[must_use]
-    pub fn unpack_stoppable_entry(
-        words: &[u64],
-        index: usize,
-    ) -> Option<(u64, [u8; NAME_MAX], usize)>
+    pub fn unpack_stop_source(words: &[u64], index: usize) -> Option<(u64, [u8; NAME_MAX], usize)>
     {
         let count = usize::try_from(*words.first()?).ok()?;
         if index >= count
         {
             return None;
         }
-        let [pages, len_word, name_words @ ..] = words
-            .get(stoppable_entry_base(index)?..)?
-            .get(..LIST_STOPPABLE_WORDS_PER_ENTRY)?
+        let [class, len_word, name_words @ ..] = words
+            .get(stop_source_base(index)?..)?
+            .get(..STOP_SOURCE_WORDS)?
         else
         {
             return None;
         };
         let len = usize::try_from(*len_word).ok()?;
         let name = unpack_name(name_words, len)?;
-        Some((*pages, name, len))
+        Some((*class, name, len))
     }
 
-    /// The first data word of entry `index` of a [`LIST_STOPPABLE`] reply,
-    /// past the header; `None` when it does not fit a `usize`.
-    fn stoppable_entry_base(index: usize) -> Option<usize>
+    /// The first data word of entry `index` of a [`LIST_STOP_SOURCES`]
+    /// reply, past the header; `None` when it does not fit a `usize`.
+    fn stop_source_base(index: usize) -> Option<usize>
     {
         index
-            .checked_mul(LIST_STOPPABLE_WORDS_PER_ENTRY)?
-            .checked_add(LIST_STOPPABLE_HEADER_WORDS)
+            .checked_mul(STOP_SOURCE_WORDS)?
+            .checked_add(STOP_SOURCES_HEADER_WORDS)
     }
 
-    /// Verb-bit authorising [`STOP_SERVICE`] and [`LIST_STOPPABLE`]. svcmgr
-    /// alone mints it, on a SEND on its own service endpoint it delivers to a
-    /// service whose recipe sets `stop_authority = yes`, in the bootstrap slot
-    /// after the seeds and the debug-authority cap, fresh on every launch and
-    /// restart. The SEND carries no other verb bit, so it cannot publish or
-    /// hand over.
+    const _: () = core::assert!(
+        crate::stop_labels::STOP_AUTHORITY != PUBLISH_AUTHORITY
+            && crate::stop_labels::STOP_AUTHORITY != HANDOVER_AUTHORITY
+    );
+}
+
+/// Wire-protocol version of [`stop_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
+pub const STOP_LABELS_VERSION: u32 = 1;
+/// The stop protocol every stop source serves, one module for every source
+/// (docs/session-supervision.md § Stop Sources): a paged list of the
+/// candidates the source would stop, and the stop of one, named by its key.
+/// svcmgr serves it on its own endpoint for the service class; every other
+/// source is a service whose recipe sets `stop_source`, which serves it on
+/// the endpoint its recipe provides, and svcmgr hands the holder of its stop
+/// authority a SEND on that endpoint badged with [`STOP_AUTHORITY`]
+/// (`svcmgr_labels::LIST_STOP_SOURCES`).
+///
+/// A source serves both labels only on a badge carrying [`STOP_AUTHORITY`],
+/// and its own labels avoid [`STOP_CANDIDATE`] and [`LIST_CANDIDATES`]. A
+/// key names one candidate and no other while the source runs.
+pub mod stop_labels
+{
+    // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
+    // defines functions, imports the prelude the crate root imports.
+    #[cfg(feature = "rustc-dep-of-std")]
+    use core::prelude::rust_2024::*;
+
+    use super::svcmgr_labels::{NAME_MAX, NAME_WORDS, pack_name, unpack_name};
+
+    /// Verb bit authorising [`STOP_CANDIDATE`] and [`LIST_CANDIDATES`] on a
+    /// source's endpoint, and on svcmgr's also `svcmgr_labels::LIST_STOP_SOURCES`.
+    /// svcmgr alone mints it: on a SEND on its own service endpoint it
+    /// delivers to a service whose recipe sets `stop_authority = yes`, in the
+    /// bootstrap slot after the seeds and the debug-authority cap, fresh on
+    /// every launch and restart; and on each SEND a `LIST_STOP_SOURCES` reply
+    /// carries, derived from the source's endpoint. A source's recipe provides
+    /// only badged names, so no holder of a name can mint it. The SEND carries
+    /// no other verb bit.
     pub const STOP_AUTHORITY: u64 = 1u64 << 61;
 
-    const _: () = core::assert!(
-        STOP_AUTHORITY & crate::VERB_BIT_MASK != 0
-            && STOP_AUTHORITY != PUBLISH_AUTHORITY
-            && STOP_AUTHORITY != HANDOVER_AUTHORITY
-    );
+    const _: () = core::assert!(STOP_AUTHORITY & crate::VERB_BIT_MASK != 0);
+
+    /// Stop the candidate whose key is `data[0]`, through the authority the
+    /// source holds over it. The reply is [`SUCCESS`] once it is stopped,
+    /// [`NO_CANDIDATE`] when the key names no current candidate (it is gone,
+    /// or never was one), [`UNAVAILABLE`] when the source cannot stop it now,
+    /// and [`UNAUTHORIZED`] on a badge without [`STOP_AUTHORITY`]. A refusal
+    /// changes nothing.
+    pub const STOP_CANDIDATE: u64 = 5;
+
+    /// List the candidates the source would stop, one page per call.
+    /// `data[0]` is the cursor: 0 starts the walk, and each reply's `data[1]`
+    /// is the cursor that resumes it, greater than the one asked. The reply
+    /// carries the page's count in `data[0]`, the next cursor in `data[1]`,
+    /// then per entry [`CANDIDATE_WORDS`] words: the key, the rank, the pages
+    /// its memory budget subtree holds, its name's length, and the name's
+    /// bytes ([`pack_candidate`]); at most [`LIST_CANDIDATES_PAGE`] entries,
+    /// and a page shorter than that ends the walk. [`UNAVAILABLE`] when the
+    /// source cannot read its candidates now, [`UNAUTHORIZED`] on a badge
+    /// without [`STOP_AUTHORITY`].
+    pub const LIST_CANDIDATES: u64 = 6;
+
+    /// Data words one [`LIST_CANDIDATES`] entry takes: the key, the rank, the
+    /// pages, the name's length, and the name in [`NAME_MAX`] bytes.
+    pub const CANDIDATE_WORDS: usize = 4 + NAME_WORDS;
+
+    /// Data words of a [`LIST_CANDIDATES`] reply before its first entry: the
+    /// count and the next cursor.
+    pub const HEADER_WORDS: usize = 2;
+
+    /// Entries one [`LIST_CANDIDATES`] reply carries at most: as many as fit
+    /// the data words after the header.
+    pub const LIST_CANDIDATES_PAGE: usize =
+        (super::MSG_DATA_WORDS_MAX - HEADER_WORDS) / CANDIDATE_WORDS;
+
+    const _: () = core::assert!(LIST_CANDIDATES_PAGE >= 1);
+
+    /// The class code `svcmgr_labels::LIST_STOP_SOURCES` gives a source whose
+    /// recipe sets `stop_source = program`: the programs of sessions. svcmgr
+    /// is the service class's one source and is never listed.
+    pub const CLASS_PROGRAM: u64 = 1;
+
+    /// The rank of every candidate of the service class.
+    pub const RANK_SERVICE: u64 = 0;
+    /// The program class's rank of a job: a child of a session's leader with
+    /// every process below it.
+    pub const RANK_JOB: u64 = 0;
+    /// The program class's rank of a whole session, stopped after its jobs.
+    pub const RANK_SESSION: u64 = 1;
+
+    /// The reply label of a handled request.
+    pub const SUCCESS: u64 = 0;
+    /// The caller's badge lacks [`STOP_AUTHORITY`].
+    pub const UNAUTHORIZED: u64 = 1;
+    /// [`STOP_CANDIDATE`]: the key names no current candidate; nothing
+    /// changed.
+    pub const NO_CANDIDATE: u64 = 2;
+    /// The source cannot list or stop now (a service it calls is down, or
+    /// the stop failed); nothing changed.
+    pub const UNAVAILABLE: u64 = 3;
+
+    /// One entry of a [`LIST_CANDIDATES`] reply.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Candidate
+    {
+        /// The key [`STOP_CANDIDATE`] names it by.
+        pub key: u64,
+        /// Its rank within its source's class, the lower stopped first.
+        pub rank: u64,
+        /// The pages its memory budget subtree holds.
+        pub pages: u64,
+        /// Its name, zero-padded to [`NAME_MAX`].
+        pub name: [u8; NAME_MAX],
+        /// The name's length in bytes.
+        pub len: usize,
+    }
+
+    /// Write entry `index` of a [`LIST_CANDIDATES`] reply into `words` (the
+    /// reply's data words, whose header the caller sets). Returns `false`,
+    /// writing nothing, when `name` is empty or longer than [`NAME_MAX`], or
+    /// the entry does not fit `words`.
+    pub fn pack_candidate(
+        words: &mut [u64],
+        index: usize,
+        key: u64,
+        rank: u64,
+        pages: u64,
+        name: &[u8],
+    ) -> bool
+    {
+        let mut packed = [0; NAME_WORDS];
+        if name.is_empty() || pack_name(name, &mut packed).is_none()
+        {
+            return false;
+        }
+        let Some([key_word, rank_word, pages_word, len_word, name_words @ ..]) =
+            entry_base(index).and_then(|base| words.get_mut(base..)?.get_mut(..CANDIDATE_WORDS))
+        else
+        {
+            return false;
+        };
+        *key_word = key;
+        *rank_word = rank;
+        *pages_word = pages;
+        *len_word = name.len() as u64;
+        name_words.copy_from_slice(&packed);
+        true
+    }
+
+    /// Read entry `index` of a [`LIST_CANDIDATES`] reply's data words
+    /// `words`. `None` when `index` is past the reply's count or its words,
+    /// or the entry's name length is 0 or past [`NAME_MAX`]; the reply is wire
+    /// input, so nothing is read past either bound.
+    #[must_use]
+    pub fn unpack_candidate(words: &[u64], index: usize) -> Option<Candidate>
+    {
+        let count = usize::try_from(*words.first()?).ok()?;
+        if index >= count
+        {
+            return None;
+        }
+        let [key, rank, pages, len_word, name_words @ ..] =
+            words.get(entry_base(index)?..)?.get(..CANDIDATE_WORDS)?
+        else
+        {
+            return None;
+        };
+        let len = usize::try_from(*len_word).ok()?;
+        let name = unpack_name(name_words, len)?;
+        Some(Candidate {
+            key: *key,
+            rank: *rank,
+            pages: *pages,
+            name,
+            len,
+        })
+    }
+
+    /// The first data word of entry `index` of a [`LIST_CANDIDATES`] reply,
+    /// past the header; `None` when it does not fit a `usize`.
+    fn entry_base(index: usize) -> Option<usize>
+    {
+        index
+            .checked_mul(CANDIDATE_WORDS)?
+            .checked_add(HEADER_WORDS)
+    }
 }
 
 /// Well-known names published into svcmgr's discovery registry.
@@ -3562,6 +3718,63 @@ pub mod memhog_labels
     /// The reply label of a [`HOG`] whose level did not settle at
     /// `CRITICAL`, or that could not read the level.
     pub const NOT_CRITICAL: u64 = 2;
+}
+
+/// The `stopsrc` fixture's service labels (services/stopsrc/README.md): a
+/// supervised stop source of the program class, staged only with svctest,
+/// that runs one job child holding memory on request and lists it as its
+/// candidate, so svctest's phases drive svcmgr's list of sources and oomd's
+/// program class end to end.
+///
+/// The fixture serves them on the endpoint of the name its recipe provides,
+/// [`NAME`], on any badge, and serves [`crate::stop_labels`] there on a badge
+/// carrying [`crate::stop_labels::STOP_AUTHORITY`]; its labels avoid the stop
+/// labels' values.
+pub mod stopsrc_labels
+{
+    /// The name the fixture's recipe provides, badged `:deny`
+    /// (`rootfs/config/svcmgr/tests/stopsrc.svc`).
+    pub const NAME: &[u8] = b"stopsrc.ctl";
+    /// The name the fixture lists its job under.
+    pub const JOB_NAME: &[u8] = b"stopsrc-job";
+    /// Reply [`SUCCESS`] with data word 0 the instance's nonce, a random
+    /// value the process draws once at startup, data word 1 the job's state
+    /// ([`JOB_NONE`], [`JOB_RUNNING`] or [`JOB_STOPPED`]), and data word 2
+    /// the key the job is listed under, 0 with none.
+    pub const PROBE: u64 = 1;
+    /// Start a job: a child process of the fixture that touches `data[0]`
+    /// pages of heap and waits. Reply [`SUCCESS`] with data word 0 the job's
+    /// key once the fixture's subtree holds the pages, [`JOB_FAILED`] when
+    /// the child is not created or does not hold them within 10 s (it is
+    /// destroyed), and [`BUSY`] while a job runs.
+    pub const START_JOB: u64 = 2;
+    /// Reply [`SUCCESS`], then exit with status 0, which the recipe's
+    /// `restart = always` restarts: a new instance of the source starts. A
+    /// running job is left to procmgr, which destroys it with the fixture,
+    /// since svcmgr creates a stop source contained.
+    pub const EXIT: u64 = 3;
+    /// [`PROBE`]: no job has run in this instance.
+    pub const JOB_NONE: u64 = 0;
+    /// [`PROBE`]: the job runs, and the fixture lists it.
+    pub const JOB_RUNNING: u64 = 1;
+    /// [`PROBE`]: a `STOP_CANDIDATE` of the job's key destroyed it.
+    pub const JOB_STOPPED: u64 = 2;
+    /// The reply label of a handled request.
+    pub const SUCCESS: u64 = 0;
+    /// The reply label of a request with an unknown label.
+    pub const UNKNOWN_OPCODE: u64 = 1;
+    /// [`START_JOB`]: the job was not started.
+    pub const JOB_FAILED: u64 = 2;
+    /// [`START_JOB`]: a job runs already.
+    pub const BUSY: u64 = 3;
+    const _: () = core::assert!(
+        PROBE != crate::stop_labels::STOP_CANDIDATE
+            && PROBE != crate::stop_labels::LIST_CANDIDATES
+            && START_JOB != crate::stop_labels::STOP_CANDIDATE
+            && START_JOB != crate::stop_labels::LIST_CANDIDATES
+            && EXIT != crate::stop_labels::STOP_CANDIDATE
+            && EXIT != crate::stop_labels::LIST_CANDIDATES
+    );
 }
 
 /// The `test-dma` fixture driver's service label
@@ -5395,27 +5608,15 @@ pub mod svcmgr_errors
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
     /// `PUBLISH_ENDPOINT` request, [`svcmgr_labels::HANDOVER_AUTHORITY`] on
-    /// a `HANDOVER_COMPLETE`, or [`svcmgr_labels::STOP_AUTHORITY`] on a
-    /// `STOP_SERVICE` or `LIST_STOPPABLE`, or the handover has already run.
+    /// a `HANDOVER_COMPLETE`, or [`crate::stop_labels::STOP_AUTHORITY`] on
+    /// a `LIST_STOP_SOURCES`, or the handover has already run. The stop labels
+    /// svcmgr serves reply in [`crate::stop_labels`]'s codes.
     pub const UNAUTHORIZED: u64 = 8;
     /// Client-side: the underlying `ipc_call` returned `Err` (no reply
     /// from svcmgr, transport-level failure), for a client that reports it
     /// in the svcmgr status space. Never emitted by svcmgr itself; no
     /// in-tree client synthesises it.
     pub const IPC_FAILED: u64 = 9;
-    /// `svcmgr_labels::STOP_SERVICE`: no supervised service has the name,
-    /// or the eligibility rule refuses it (not launched by svcmgr,
-    /// `restart = never`, `critical = yes`, a core role, or no
-    /// `oom_stop = yes`).
-    pub const NOT_STOPPABLE: u64 = 10;
-    /// `svcmgr_labels::STOP_SERVICE`: the service is eligible but has no
-    /// running instance (it is down, or its death had not been routed, which
-    /// svcmgr then routes).
-    pub const NOT_RUNNING: u64 = 11;
-    /// `svcmgr_labels::STOP_SERVICE` or `svcmgr_labels::LIST_STOPPABLE`:
-    /// memmgr or procmgr, which the request calls, is down, or procmgr
-    /// refused the destroy; nothing changed.
-    pub const UNAVAILABLE: u64 = 12;
     /// Unknown opcode on svcmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }
@@ -6534,76 +6735,134 @@ mod tests
     }
 
     #[test]
-    fn a_stoppable_list_page_round_trips_names_of_every_length()
+    fn a_candidate_list_page_round_trips_every_field_and_name_length()
     {
-        use svcmgr_labels::{
-            LIST_STOPPABLE_PAGE, NAME_MAX, pack_stoppable_entry, unpack_stoppable_entry,
-        };
+        use stop_labels::{LIST_CANDIDATES_PAGE, pack_candidate, unpack_candidate};
+        use svcmgr_labels::NAME_MAX;
         let long = [b'x'; NAME_MAX];
         let names: [&[u8]; 3] = [b"memhog", &long, b"a"];
         let mut words = [0u64; MSG_DATA_WORDS_MAX];
         for (i, name) in names.iter().enumerate()
         {
-            assert!(pack_stoppable_entry(&mut words, i, 0x100 + i as u64, name));
+            let i64 = i as u64;
+            assert!(pack_candidate(
+                &mut words,
+                i,
+                u64::MAX - i64,
+                i64,
+                0x100 + i64,
+                name
+            ));
         }
         words[0] = names.len() as u64;
         for (i, name) in names.iter().enumerate()
         {
-            let (pages, out, len) = unpack_stoppable_entry(&words, i).unwrap();
-            assert_eq!((pages, &out[..len]), (0x100 + i as u64, *name));
-            assert!(out[len..].iter().all(|&b| b == 0));
+            let entry = unpack_candidate(&words, i).unwrap();
+            let i64 = i as u64;
+            assert_eq!(
+                (entry.key, entry.rank, entry.pages, &entry.name[..entry.len]),
+                (u64::MAX - i64, i64, 0x100 + i64, *name)
+            );
+            assert!(entry.name[entry.len..].iter().all(|&b| b == 0));
         }
-        assert!(unpack_stoppable_entry(&words, names.len()).is_none());
+        assert!(unpack_candidate(&words, names.len()).is_none());
         // A full page fits the message, and the entry past it does not.
-        assert!(pack_stoppable_entry(
+        assert!(pack_candidate(
             &mut words,
-            LIST_STOPPABLE_PAGE - 1,
+            LIST_CANDIDATES_PAGE - 1,
+            1,
+            0,
             1,
             b"a"
         ));
-        assert!(!pack_stoppable_entry(
+        assert!(!pack_candidate(
             &mut words,
-            LIST_STOPPABLE_PAGE,
+            LIST_CANDIDATES_PAGE,
+            1,
+            0,
             1,
             b"a"
         ));
     }
 
     #[test]
-    fn a_stoppable_list_entry_refuses_names_outside_one_to_name_max()
+    fn a_candidate_entry_refuses_names_outside_one_to_name_max()
     {
-        use svcmgr_labels::{NAME_MAX, pack_stoppable_entry, unpack_stoppable_entry};
+        use stop_labels::{HEADER_WORDS, pack_candidate, unpack_candidate};
+        use svcmgr_labels::NAME_MAX;
         let mut words = [0u64; MSG_DATA_WORDS_MAX];
-        assert!(!pack_stoppable_entry(&mut words, 0, 7, b""));
-        assert!(!pack_stoppable_entry(
+        assert!(!pack_candidate(&mut words, 0, 1, 0, 7, b""));
+        assert!(!pack_candidate(
             &mut words,
+            0,
+            1,
             0,
             7,
             &[b'n'; NAME_MAX + 1]
         ));
         assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
-        assert!(pack_stoppable_entry(&mut words, 0, 7, b"svc"));
+        assert!(pack_candidate(&mut words, 0, 1, 0, 7, b"job"));
         words[0] = 1;
         // A length the reply claims past NAME_MAX, or zero, is wire input
         // refused, not read.
-        words[3] = NAME_MAX as u64 + 1;
-        assert!(unpack_stoppable_entry(&words, 0).is_none());
-        words[3] = 0;
-        assert!(unpack_stoppable_entry(&words, 0).is_none());
+        words[HEADER_WORDS + 3] = NAME_MAX as u64 + 1;
+        assert!(unpack_candidate(&words, 0).is_none());
+        words[HEADER_WORDS + 3] = 0;
+        assert!(unpack_candidate(&words, 0).is_none());
     }
 
     #[test]
-    fn a_stoppable_list_index_whose_offset_overflows_is_refused()
+    fn a_candidate_index_whose_offset_overflows_is_refused()
     {
-        use svcmgr_labels::{
-            LIST_STOPPABLE_WORDS_PER_ENTRY, pack_stoppable_entry, unpack_stoppable_entry,
-        };
-        let index = usize::MAX / LIST_STOPPABLE_WORDS_PER_ENTRY + 1;
+        use stop_labels::{CANDIDATE_WORDS, pack_candidate, unpack_candidate};
+        let index = usize::MAX / CANDIDATE_WORDS + 1;
         let mut words = [0u64; MSG_DATA_WORDS_MAX];
-        assert!(!pack_stoppable_entry(&mut words, index, 7, b"a"));
+        assert!(!pack_candidate(&mut words, index, 1, 0, 7, b"a"));
         assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
         words[0] = u64::MAX;
-        assert!(unpack_stoppable_entry(&words, index).is_none());
+        assert!(unpack_candidate(&words, index).is_none());
+    }
+
+    #[test]
+    fn a_stop_source_page_round_trips_and_holds_one_entry_per_cap()
+    {
+        use svcmgr_labels::{
+            LIST_STOP_SOURCES_PAGE, NAME_MAX, STOP_SOURCE_WORDS, pack_stop_source,
+            unpack_stop_source,
+        };
+        assert_eq!(LIST_STOP_SOURCES_PAGE, MSG_CAP_SLOTS_MAX);
+        let long = [b'y'; NAME_MAX];
+        let names: [&[u8]; 2] = [b"sessiond", &long];
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        for (i, name) in names.iter().enumerate()
+        {
+            assert!(pack_stop_source(&mut words, i, 1 + i as u64, name));
+        }
+        words[0] = names.len() as u64;
+        for (i, name) in names.iter().enumerate()
+        {
+            let (class, out, len) = unpack_stop_source(&words, i).unwrap();
+            assert_eq!((class, &out[..len]), (1 + i as u64, *name));
+        }
+        assert!(unpack_stop_source(&words, names.len()).is_none());
+        assert!(!pack_stop_source(&mut words, 0, 1, b""));
+        assert!(pack_stop_source(
+            &mut words,
+            LIST_STOP_SOURCES_PAGE - 1,
+            1,
+            b"a"
+        ));
+        // A claimed length past NAME_MAX is refused, and an index whose
+        // offset overflows writes and reads nothing.
+        words[0] = 1;
+        words[3] = NAME_MAX as u64 + 1;
+        assert!(unpack_stop_source(&words, 0).is_none());
+        let index = usize::MAX / STOP_SOURCE_WORDS + 1;
+        let mut empty = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_stop_source(&mut empty, index, 1, b"a"));
+        assert_eq!(empty, [0; MSG_DATA_WORDS_MAX]);
+        empty[0] = u64::MAX;
+        assert!(unpack_stop_source(&empty, index).is_none());
     }
 
     #[test]

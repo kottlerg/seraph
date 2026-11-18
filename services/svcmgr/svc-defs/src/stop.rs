@@ -3,8 +3,10 @@
 
 // services/svcmgr/svc-defs/src/stop.rs
 
-//! The eligibility rule of `svcmgr_labels::STOP_SERVICE`: which supervised
-//! services svcmgr stops for a stop-authority holder.
+//! The eligibility rule of svcmgr's stop of a service
+//! (`stop_labels::STOP_CANDIDATE` on svcmgr's endpoint): which supervised
+//! services svcmgr stops for a stop-authority holder; and the classes a
+//! `stop_source` recipe names.
 //!
 //! One decision table, [`stop_refusal`], read from the facts svcmgr holds on
 //! a service ([`StopFacts`]). svcmgr applies it to each request, and the
@@ -30,8 +32,8 @@ pub struct StopFacts
     /// The recipe's `critical = yes`.
     pub critical: bool,
     /// The recipe gives the service a core role: `log_sink`,
-    /// `debug_authority`, `stop_authority`, `reserve`, or
-    /// `shutdown_actuator` (see [`core_role`]).
+    /// `debug_authority`, `stop_authority`, `reserve`, `shutdown_actuator`,
+    /// or `stop_source` (see [`core_role`]).
     pub core_role: bool,
     /// The recipe's `oom_stop = yes`.
     pub oom_stop: bool,
@@ -68,8 +70,8 @@ impl StopRefusal
             Self::Critical => "critical = yes",
             Self::CoreRole =>
             {
-                "holds a core role (log_sink, debug_authority, stop_authority, reserve or \
-                 shutdown_actuator)"
+                "holds a core role (log_sink, debug_authority, stop_authority, reserve, \
+                 shutdown_actuator or stop_source)"
             }
             Self::NotOptedIn => "oom_stop is not yes",
         }
@@ -79,7 +81,8 @@ impl StopRefusal
 /// Whether a recipe's keys give its service a core role, which the
 /// eligibility rule never stops: the system log sink, the holders of
 /// procmgr's debug authority and of the stop authority, a service in the
-/// system reserve, and the shutdown actuator.
+/// system reserve, the shutdown actuator, and a stop source, which holds kill
+/// authority over processes of its own.
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
@@ -91,9 +94,45 @@ pub const fn core_role(
     stop_authority: bool,
     reserve: bool,
     shutdown_actuator: bool,
+    stop_source: bool,
 ) -> bool
 {
-    log_sink || debug_authority || stop_authority || reserve || shutdown_actuator
+    log_sink || debug_authority || stop_authority || reserve || shutdown_actuator || stop_source
+}
+
+/// The class a `stop_source = <class>` recipe names: the class svcmgr gives
+/// the source in `svcmgr_labels::LIST_STOP_SOURCES`, read from the recipe and
+/// never from the source. Specified in
+/// `services/svcmgr/docs/service-definitions.md` § `stop_source`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopClass
+{
+    /// `program`: the programs of sessions.
+    Program,
+}
+
+impl StopClass
+{
+    /// The class a recipe value names; `None` for any other value.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self>
+    {
+        match value
+        {
+            "program" => Some(Self::Program),
+            _ => None,
+        }
+    }
+
+    /// The class's code on the wire (`ipc::stop_labels`).
+    #[must_use]
+    pub const fn code(self) -> u64
+    {
+        match self
+        {
+            Self::Program => ipc::stop_labels::CLASS_PROGRAM,
+        }
+    }
 }
 
 /// The eligibility rule: `None` when svcmgr may stop the service `facts`
@@ -251,11 +290,23 @@ mod tests
     #[test]
     fn each_core_role_key_alone_is_a_core_role()
     {
-        assert!(!core_role(false, false, false, false, false));
-        assert!(core_role(true, false, false, false, false));
-        assert!(core_role(false, true, false, false, false));
-        assert!(core_role(false, false, true, false, false));
-        assert!(core_role(false, false, false, true, false));
-        assert!(core_role(false, false, false, false, true));
+        assert!(!core_role(false, false, false, false, false, false));
+        assert!(core_role(true, false, false, false, false, false));
+        assert!(core_role(false, true, false, false, false, false));
+        assert!(core_role(false, false, true, false, false, false));
+        assert!(core_role(false, false, false, true, false, false));
+        assert!(core_role(false, false, false, false, true, false));
+        assert!(core_role(false, false, false, false, false, true));
+    }
+
+    #[test]
+    fn program_is_the_one_class_a_recipe_names()
+    {
+        assert_eq!(StopClass::parse("program"), Some(StopClass::Program));
+        assert_eq!(StopClass::Program.code(), ipc::stop_labels::CLASS_PROGRAM);
+        for other in ["service", "Program", "", "program "]
+        {
+            assert_eq!(StopClass::parse(other), None, "{other:?}");
+        }
     }
 }

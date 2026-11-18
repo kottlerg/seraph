@@ -10,8 +10,9 @@
 //! service is permanently down (continue, or graceful shutdown). On restart
 //! svcmgr re-creates the process via procmgr, replays the recipe's
 //! argv/env/cwd/seed surfaces, its scheduling fields (`priority`,
-//! `sched_max`), its create flags (`reserve`, and the node handle an
-//! `oom_stop` service is created with), its log-sink flag and its
+//! `sched_max`), its create flags (`reserve`, the node handle an
+//! `oom_stop` service is created with, and the containment of a
+//! `stop_source` service), its log-sink flag and its
 //! debug- and stop-authority caps, binds the new instance's death observers
 //! before it starts, and serves its bootstrap.
 //!
@@ -122,7 +123,7 @@ pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
     syscall::cap_derive_badge(
         ctx.service_ep,
         syscall::RIGHTS_EP_SEND,
-        ipc::svcmgr_labels::STOP_AUTHORITY,
+        ipc::stop_labels::STOP_AUTHORITY,
     )
     .unwrap_or(0)
 }
@@ -343,16 +344,23 @@ fn reply_node_handle(path: &str, label_bits: u64, reply_caps: &[u64]) -> u64
 /// The create label's fields beyond the opcode and `CREATE_ARGV_ENV` for a
 /// recipe: its scheduling fields (`priority` and `sched_max`, `0` for
 /// unspecified, when procmgr applies its defaults against svcmgr's band) and
-/// the create flags its `reserve` and `oom_stop` keys ask for
-/// (`svcmgr_defs::create_flags`). Shared by the launch and restart paths.
+/// the create flags its `reserve`, `oom_stop` and `stop_source` keys ask
+/// for (`svcmgr_defs::create_flags`). Shared by the launch and restart paths.
 #[expect(
     clippy::fn_params_excessive_bools,
-    reason = "`reserve` and `oom_stop` are the recipe's keys of those names"
+    reason = "`reserve`, `oom_stop` and `stop_source` are whether the recipe sets the keys \
+              of those names"
 )]
-pub(crate) fn create_label_bits(priority: u8, sched_max: u8, reserve: bool, oom_stop: bool) -> u64
+pub(crate) fn create_label_bits(
+    priority: u8,
+    sched_max: u8,
+    reserve: bool,
+    oom_stop: bool,
+    stop_source: bool,
+) -> u64
 {
     procmgr_labels::create_sched_bits(priority, sched_max)
-        | svcmgr_defs::create_flags(reserve, oom_stop)
+        | svcmgr_defs::create_flags(reserve, oom_stop, stop_source)
 }
 
 /// Send `START_PROCESS` via the badged process handle. Shared by the
@@ -771,7 +779,13 @@ fn create_process(
         env_count,
     };
     let label_bits = recipe.map_or(0, |r| {
-        create_label_bits(r.priority, r.sched_max, r.reserve, r.oom_stop)
+        create_label_bits(
+            r.priority,
+            r.sched_max,
+            r.reserve,
+            r.oom_stop,
+            r.stop_source.is_some(),
+        )
     });
     let created = walk_and_create_from_file(
         path_str,

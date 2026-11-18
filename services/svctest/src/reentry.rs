@@ -13,9 +13,9 @@
 //! `Child` kill and drop teardown, procmgr's teardown of a child whose create
 //! reply it cannot deliver, procmgr's death forward to logd, procmgr's post
 //! of a process's end to its end queue and, once, to its death relay, the fs
-//! release handler's cookie matching, fatfs's release of the open of a killed client
-//! and of one whose open reply it cannot deliver, memmgr's hold on a dead
-//! child's frame that a live kernel object still occupies, memmgr's hold
+//! release handler's cookie matching, fatfs's release of the open of a
+//! killed client and of one whose open reply it cannot deliver, memmgr's hold
+//! on a dead child's frame that a live kernel object still occupies, memmgr's hold
 //! of a child to the memory max its creator set, its commitment of a heap's
 //! growth, and what a mapped cache page reads across a forced unmount. The
 //! `reboot` role is the one not spawned by a phase: svcmgr launches it from

@@ -352,8 +352,8 @@ name hardware it has not been granted access to.
 Every Mmio capability references an object of its own: a copy or derivation of one
 (`SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`) references a fresh object over
 the same range, and the object records each `SYS_MMIO_MAP` mapping made through the
-capability. When the capability goes — deleted, consumed by a split, or revoked through an
-ancestor — its object is freed and every mapping made through it is unmapped, with TLB
+capability. When the capability goes — deleted, consumed by a split or a merge, or revoked through
+an ancestor — its object is freed and every mapping made through it is unmapped, with TLB
 shootdown, before the deleting or revoking call returns, unless a concurrent syscall still
 holds the object (any syscall naming the capability pins it), in which case all of its
 mappings are unmapped when that syscall releases it. A page the address space has since
@@ -368,8 +368,8 @@ holders donate (and the lineage count's encoding, 2^31 - 1 live copies, past whi
 Any holder of an ancestor capability, in any process, can withdraw a mapping this way, so
 the soundness obligation sits on the mapper: the userspace `mmio_map` wrapper is `unsafe`, and
 its contract has the caller reach the mapping only through raw-pointer accesses,
-never through a Rust reference, which is why the `cap_delete`, `cap_revoke`, and `mmio_split`
-wrappers stay safe functions ([shared/syscall/README.md](../shared/syscall/README.md)).
+never through a Rust reference, which is why the `cap_delete`, `cap_revoke`, `mmio_split`, and
+`mmio_merge` wrappers stay safe functions ([shared/syscall/README.md](../shared/syscall/README.md)).
 
 ### Thread
 
@@ -841,8 +841,8 @@ capability. There is no ambient kernel pool from which a process can
 draw kernel-object memory; a process can only create kernel objects
 against Memory caps it holds with `Retype` rights. The exceptions are
 the objects a syscall creates with no Memory cap to name: range-split
-children, Mmio, IoPort, and Interrupt copies, spilled Mmio mapping records,
-and per-thread port-binding tables. The `CSpace` the call inserts into or
+children, the joined Mmio of a merge, Mmio, IoPort, and Interrupt copies, spilled Mmio
+mapping records, and per-thread port-binding tables. The `CSpace` the call inserts into or
 resolves through, or a bound thread's own `CSpace` for its port-binding
 table, funds them from the pages donated to it, as it funds its slots (see
 [Address-space and CSpace growth budgets](#address-space-and-cspace-growth-budgets)).

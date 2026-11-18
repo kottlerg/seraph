@@ -319,8 +319,8 @@ creates on its mint source, and a create there would make a top-level reserve no
 which is what svcmgr's own node is. svctest's test phases set both flags, `CREATE_RESERVE` only to
 see procmgr refuse it; in the default image no process has a max of its own, and no default
 per-process max exists. svcmgr sets
-`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, crashd's in the default image,
-and starts every other service outside the reserve
+`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, oomd's, sessiond's, crashd's and
+logd's in the default image, and starts every other service outside the reserve
 ([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
 § `reserve`).
 

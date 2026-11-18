@@ -727,7 +727,8 @@ bounded faults complete long before `svctest`'s terminal marker, so the
 kernel fault dump never clobbers it. The `memhog` fixture (`memhog.svc`,
 `restart = on_failure`, `oom_stop = yes`) is co-staged with `svctest` in that cell and in the
 burn-in svctest cell: svctest's `oom_policy` phase runs when it is staged, has it fill memory until
-oomd stops it, and passes otherwise. The CI svctest cell drops crashd, so the held-write path of
+oomd stops it, and passes otherwise, and its `logd_reserve` phase has it fill memory while logd is
+killed and restarted. The CI svctest cell drops crashd, so the held-write path of
 that phase (a child's page fault crashd holds until oomd's stop frees memory) runs in the burn-in
 svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
 `stop_source = program`) is co-staged beside `memhog` in both cells: svctest's

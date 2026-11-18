@@ -140,6 +140,20 @@ after the restart included (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   ([docs/supervision.md](../../docs/supervision.md)); a debug-authority
   holder can attach to it.
 
+* **Reserve service.** logd's recipe sets `reserve = yes`, so its budget node is a
+  system-reserve node: oomd, crashd and sessiond, which end a memory-pressure episode, write
+  their lines through logd with a synchronous call, and a fault of logd's heap or stacks while
+  the free pool is at the reserve is backed from the reserve, as is the create of its next
+  instance after a crash (see
+  [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)
+  § `reserve`). What logd takes from the reserve is what its table grows by while memory is
+  critical: each live sender's history ring filling to `PER_SLOT_HISTORY` entries of at most
+  about 1.5 KiB and its partial line to `LINE_BUF_SIZE`, and a slot for each process created
+  meanwhile, which only a reserve creator can create. The retired slots are capped
+  (`RETIRED_SLOTS`), and retiring a slot moves it. No constant bounds the growth, since it
+  grows with the live sender count ([docs/limits.md](../../docs/limits.md) § init and logd;
+  [#1287](https://github.com/kottlerg/seraph/issues/1287)).
+
 * **No core.** logd declares itself on the core path to procmgr
   (`procmgr_labels::DECLARE_NO_CORE`) at startup, before it spawns a
   thread: a core dump stops every thread of its process but the faulting

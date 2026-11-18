@@ -12,7 +12,7 @@
 
 use ipc::fs_errors;
 
-use super::ramdisk::{self, DATA_LBA, RUN_PAGES, RamDisk, SharedDisk, lock};
+use super::ramdisk::{self, DATA_LBA, Fault, RUN_PAGES, RamDisk, SharedDisk, lock};
 use super::{CHUNK, OwnFatfs, slot_cluster};
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{fs_close, fs_create, fs_open_live, fs_release_memory, fs_write_inline};
@@ -50,7 +50,10 @@ fn content_byte(at: usize, shift: usize) -> u8
 ///    is about the file's pages over `RUN_PAGES`; together they cover every
 ///    sector of the file.
 /// 2. A read at an offset other than the open's next one fills one page.
-/// 3. An open whose cursor stands deep in the chain reads the file's new
+/// 3. A run read whose reply loses the run buffer's cap is served by its
+///    page's own fill, ends run fills, and leaves writes working: they use
+///    a scratch page of their own.
+/// 4. An open whose cursor stands deep in the chain reads the file's new
 ///    bytes after the volume's FAT entries changed under it: the cursor was
 ///    retired, not resumed.
 pub fn fs_run_fill_phase(_: &Caps)
@@ -59,11 +62,12 @@ pub fn fs_run_fill_phase(_: &Caps)
     write_scanned_file(&disk);
     let (reads, longest) = sequential_scan(&disk);
     off_sequence_read(&disk);
+    lost_run_cap_ends_runs_only(&disk);
     cursor_retired_by_fat_change(&disk);
     std::os::seraph::log!(
         "fs_run_fill passed: {reads} data reads for a {FILE_PAGES}-page scan, the longest \
-         {longest} sectors; a read off the sequence filled one page; a cursor did not \
-         outlive a FAT change"
+         {longest} sectors; a read off the sequence filled one page; a run read that lost \
+         its cap ended run fills and no write; a cursor did not outlive a FAT change"
     );
 }
 
@@ -155,7 +159,60 @@ fn off_sequence_read(disk: &SharedDisk)
     close_all(fs, open, &[liveness, file]);
 }
 
-/// Case 3: an open read to page 20 keeps its cursor there while the file is
+/// Case 3: the block server keeps the cap of the scan's first run read, as a
+/// reply that loses it does. The scan still returns the file, every later
+/// data read fills one page, and a write of the file still succeeds.
+fn lost_run_cap_ends_runs_only(disk: &SharedDisk)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let _ = lock(disk).take_reads();
+    let fs = OwnFatfs::start(disk);
+    let (file, _, _) = ns_lookup(fs.root, NAME, 0xFFFF, ipc_buf)
+        .unwrap_or_else(|e| panic!("fs_run_fill: lookup of the file: {e}"));
+    // The page holding the file's first sectors also holds the root
+    // directory's last ones, which the lookup filled, so the scan's first
+    // miss, and its first run read, is the page after it.
+    let first_page = file_sectors(disk)
+        .first()
+        .map(|&lba| lba.saturating_sub(lba % SECTORS_PER_PAGE))
+        .expect("fs_run_fill: the file has no cluster");
+    let run_at = first_page
+        .checked_add(SECTORS_PER_PAGE)
+        .expect("fs_run_fill: run sector");
+    {
+        let mut disk = lock(disk);
+        let _ = disk.take_reads();
+        disk.arm(run_at, 0, Fault::LoseCap);
+    }
+    let (open, liveness) = fs_open_live(file, 0, ipc_buf).expect("fs_run_fill: FS_OPEN");
+    let mut cookie = 1;
+    let end = scan(open, 0, FILE_PAGES * PAGE, 0, &mut cookie);
+    assert_eq!(
+        end,
+        FILE_PAGES * PAGE,
+        "fs_run_fill: the scan's end after the lost cap"
+    );
+    assert!(
+        lock(disk).unfired().is_empty(),
+        "fs_run_fill: no read started at sector {run_at}, the scan's first miss"
+    );
+    let reads = data_reads(disk);
+    assert!(
+        reads.len() >= FILE_PAGES.saturating_sub(1),
+        "fs_run_fill: {} data reads after the lost cap, fewer than the file's pages: {reads:?}",
+        reads.len()
+    );
+    assert!(
+        reads.iter().all(|&(_, count)| count <= SECTORS_PER_PAGE),
+        "fs_run_fill: a run fill after the run buffer's cap was lost: {reads:?}"
+    );
+    let head: Vec<u8> = (0..64).map(|i| content_byte(i, 0)).collect();
+    fs_write_inline(file, 0, &head, ipc_buf)
+        .expect("fs_run_fill: FS_WRITE after the run buffer's cap was lost");
+    close_all(fs, open, &[liveness, file]);
+}
+
+/// Case 4: an open read to page 20 keeps its cursor there while the file is
 /// truncated, rewritten with its first sector first, `OTHER.BIN` takes the
 /// clusters after, and the rest of the file follows: the file's first cluster
 /// is as before and its links past the first are not, so only the chain epoch

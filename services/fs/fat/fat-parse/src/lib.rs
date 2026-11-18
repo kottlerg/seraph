@@ -627,8 +627,8 @@ pub fn file_position(
 /// of a file ([`run_pages`]). Each block request pays a fixed cost (the
 /// device's DMA mapping and unmapping through devmgr, the interrupt, and the
 /// IPC round trips) that a run pays once for all its pages; the pages past the
-/// first are copied out of a transfer buffer of this many pages, which each
-/// mount holds for its lifetime. A tuning bound: a longer scan takes more
+/// first are copied out of a run buffer of this many pages, which each mount
+/// holds for its lifetime. A tuning bound: a longer scan takes more
 /// fills.
 pub const RUN_PAGES: u64 = 16;
 

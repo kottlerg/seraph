@@ -130,13 +130,15 @@ const RESULT_BAD: u32 = 3;
 
 /// Peer → controller handshake: the cycle the peer is about to park in, and
 /// the cycle whose result it has published in [`RESULT`]. Cycles count from
-/// 1; a peer exits after publishing cycle [`CYCLES`].
+/// 1 and run past [`CYCLES`] into held rounds; a peer exits after the
+/// controller has consumed the cycle it stored in [`END`].
 static PARKING: AtomicU32 = AtomicU32::new(0);
 static FINISHED: AtomicU32 = AtomicU32::new(0);
 static RESULT: AtomicU32 = AtomicU32::new(0);
 /// Controller → peer: the last cycle whose result the controller consumed. A
 /// peer starts cycle `n + 1` only after `ACKED == n`, and exits only after
-/// `ACKED == CYCLES`, so it never runs ahead of the race it is part of.
+/// `ACKED` reaches the cycle in [`END`], so it never runs ahead of the race
+/// it is part of.
 static ACKED: AtomicU32 = AtomicU32::new(0);
 /// Controller → peer: the phase's last cycle, stored before that cycle's
 /// [`ACKED`]; `u32::MAX` while the phase runs on. The peer exits once the

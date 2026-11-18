@@ -10,11 +10,12 @@
 //! memory access for the page that holds it (`ACPI_REGION_GRANT`), on first
 //! use; acpid binds the `IoPort` to the evaluation thread or maps the
 //! `Mmio`, and keeps the grant. A refused span is kept too, so it is asked
-//! for once. A configuration-space access is one
-//! `ACPI_PCI_CONFIG` call. Each `Notify` of a hotplug event is kept, once
-//! per object and event ([`hotplug::keep`]), for the evaluation thread to
-//! act on once the evaluation ends ([`Platform::take_notes`]). acpid holds no Global Lock, since devmgr
-//! refuses the FACS, so the evaluator's acquisition fails.
+//! for once. A configuration-space access is one `ACPI_PCI_CONFIG` call.
+//! Each `Notify` of a hotplug event is kept, once per object and event
+//! ([`hotplug::keep`]), for the evaluation thread to act on once the
+//! evaluation ends ([`Platform::take_hotplug_notes`]). acpid holds no
+//! Global Lock, since devmgr refuses the FACS, so the evaluator's
+//! acquisition fails.
 
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use aml::host::{Host, HostError, PciAddress, Span, Width};
 use ipc::devmgr_labels;
 use std::os::seraph::reserve_pages;
 
-use acpid::hotplug::{self, Kept, Note};
+use acpid::hotplug::{self, HotplugNote, Kept};
 
 use crate::arch;
 use crate::devmgr::{CallError, Devmgr};
@@ -53,7 +54,7 @@ pub struct Platform<'a>
     held: Vec<Held>,
     refused: Vec<(u64, Span)>,
     start: Instant,
-    notes: Vec<Note>,
+    hotplug_notes: Vec<HotplugNote>,
 }
 
 impl<'a> Platform<'a>
@@ -69,7 +70,7 @@ impl<'a> Platform<'a>
             held: Vec::new(),
             refused: Vec::new(),
             start: Instant::now(),
-            notes: Vec::new(),
+            hotplug_notes: Vec::new(),
         }
     }
 
@@ -79,10 +80,10 @@ impl<'a> Platform<'a>
         self.devmgr
     }
 
-    /// The `Notify` calls kept since the last take, in their order.
-    pub fn take_notes(&mut self) -> Vec<Note>
+    /// The hotplug `Notify` calls kept since the last take, in their order.
+    pub fn take_hotplug_notes(&mut self) -> Vec<HotplugNote>
     {
-        core::mem::take(&mut self.notes)
+        core::mem::take(&mut self.hotplug_notes)
     }
 
     /// The held grant of `space` that covers `[addr, addr + width)`,
@@ -356,7 +357,7 @@ impl Host for Platform<'_>
 
     fn notify(&mut self, path: &[Seg], value: u64) -> Result<(), HostError>
     {
-        match hotplug::keep(&mut self.notes, path, value)
+        match hotplug::keep(&mut self.hotplug_notes, path, value)
         {
             Kept::Kept | Kept::Repeat =>
             {}

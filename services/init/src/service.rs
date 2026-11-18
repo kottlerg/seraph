@@ -1098,8 +1098,7 @@ pub struct VfsdSpawnCaps
 /// (`MOUNT_AUTHORITY`) caps on the block drivers. init asks devmgr for it
 /// with a `CLASS_AUTHORITY` SEND it derives from `registry_ep`, its own
 /// badge-0 registry source, and deletes that SEND, so vfsd holds the class
-/// SEND alone and no registry authority bit. Not boot-only here: the
-/// `block` class file sets that.
+/// SEND alone and no registry authority bit.
 fn request_block_class(registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let minter = syscall::cap_derive_badge(
@@ -1110,13 +1109,7 @@ fn request_block_class(registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
     .ok()?;
     // SAFETY: ipc_buf is the registered IPC buffer.
     let block_class = unsafe {
-        ipc::mint_class_send(
-            minter,
-            b"block",
-            ipc::blk_labels::MOUNT_AUTHORITY,
-            0,
-            ipc_buf,
-        )
+        ipc::mint_class_send(minter, b"block", ipc::blk_labels::MOUNT_AUTHORITY, ipc_buf)
     };
     let _ = syscall::cap_delete(minter);
     if block_class.is_err()

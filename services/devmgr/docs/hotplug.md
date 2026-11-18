@@ -201,8 +201,10 @@ runs a drivers-directory pass over the directory cap it keeps, against the recor
 the appended ones among them, under the bounds of the `SET_DRIVERS_DIR` pass, as its own settle
 batch, the hotplug batch ([docs/driver-binding.md](../../../docs/driver-binding.md#hotplug) §
 Hotplug). Before `SET_DRIVERS_DIR` the record is only appended, and the directory's pass binds it. A
-hot-added function takes the next ordinal of its class, and a bound driver signals the class's
-watches.
+hot-added function therefore binds from `/services/drivers/` at the auxiliary tier whatever its
+class, a disk included: a boot-bundle copy of a driver runs only for the bootstrap
+([docs/driver-binding.md](../../../docs/driver-binding.md#declaration-bounds) § Declaration Bounds).
+It takes the next ordinal of its class, and a bound driver signals the class's watches.
 
 A hot-added function's `INTx` route is computed through the bridges of the records
 (`PciRecords::append`). On x86-64 no firmware programmed its Interrupt Line and devmgr reads no

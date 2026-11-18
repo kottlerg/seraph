@@ -637,21 +637,21 @@ devmgr's PCI Express hotplug
 ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)), native and through acpid
 from the firmware's, runs only when a device arrives in or leaves a hotplug slot, which no boot of
 a fixed device set makes. `cargo xtask test-hotplug [--arch]` (both arches) makes one arrive,
-leave, and arrive again, in one boot per hotplug control:
+leave, and arrive again, then makes a disk arrive, in one boot per hotplug control:
 
 1. Stage the [`hotplug-check`](../services/hotplug-check/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and the `test-dma` class file from
    `/config/devmgr/tests/` into `/config/devmgr/classes/`, and repack the disk images in the
    layout they have.
-2. Boot the current sysroot with an empty `pcie-root-port` and a QMP control socket, on x86_64
+2. Boot the current sysroot with two empty `pcie-root-port`s and a QMP control socket, on x86_64
    first under the machine's default, the firmware's ACPI PCI hotplug, whose `_OSC` withholds
    native hotplug control, then under native control (QEMU's ACPI PCI hotplug off, so `_OSC`
    grants it); on riscv64 under native control alone, which the `qemu-virt.platform` key grants.
-   Steps 3 to 7 run in each boot.
-3. Wait for devmgr's grant line for the slot, `firmware hotplug: _OSC control` under the
+   Steps 3 to 8 run in each boot.
+3. Wait for devmgr's grant line for a slot, `firmware hotplug: _OSC control` under the
    firmware's control and `managed (native control by` under native control (the other one fails
    the boot), and the fixture's `READY for the hot-added device` line.
-4. Hot-add QEMU's `edu` device behind the port (QMP `device_add`), and wait for the fixture's
+4. Hot-add QEMU's `edu` device behind the first port (QMP `device_add`), and wait for the fixture's
    `READY for the removal` line: it waits on the `test-dma` class's watch for the `test-dma` driver
    devmgr binds to the added function, then requires the driver's DMA probe to pass and its
    interrupt probe to report an MSI vector delivered.
@@ -668,7 +668,14 @@ leave, and arrive again, in one boot per hotplug control:
 6. Hot-add the device again and wait for the fixture's verdict: the new driver is served at
    ordinal 1, its probes pass, and its IOMMU fault count equals the first device's, so no fault is
    carried across the removal.
-7. Kill QEMU, remove the staged files, and repack the images in that layout again, whatever the
+7. Hot-add a `virtio-blk-pci` disk over a zero-filled 1 MiB raw image behind the second port (QMP
+   `blockdev-add`, then `device_add` with `disable-legacy=on` and `iommu_platform=on`, behind the
+   IOMMU as a boot disk is), and require, in any order, devmgr's `virtio-blk: binds PCI` line,
+   its `virtio-blk: boot tier not granted from the drivers directory` line, and the driver's
+   `ready, entering service loop` line: the disk is bound from the drivers directory's
+   virtio-blk at the auxiliary tier, as every device unbound after the boot pass is
+   ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding) § Binding).
+8. Kill QEMU, remove the staged files, and repack the images in that layout again, whatever the
    outcome.
 
 The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
@@ -1193,7 +1200,7 @@ the cells of every surface a non-inert line of its own diff is on.
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, and `call_test_dma`) | no-iommu, and hotplug |
-| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug port (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, and `EDU_DMA_MASK`) and QMP's `device_add` and `device_del` (`device_add`, `device_add_message`, `device_del`, and `device_deleted`) | hotplug |
+| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, and `device_deleted`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
@@ -1243,8 +1250,8 @@ D="$D|X86_IOMMU_DEVICE|X86_MACHINE_SPLIT_IRQCHIP|EDU_DEVICE"
 D="$D|test_dma_labels|dma_confinement_phase|msi_(delivery|forge|churn|release)_phase|call_test_dma"
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
-D="$D|hotplug_port_args|HOTPLUG_PORT_(DEVICE|ID)|X86_NATIVE_HOTPLUG_GLOBAL|HotplugControl"
-D="$D|EDU_DMA_MASK|device_add(_message)?|device_del(eted)?"
+D="$D|hotplug_port_args|HOTPLUG_(DISK_)?PORT_(DEVICE|ID)|X86_NATIVE_HOTPLUG_GLOBAL|HotplugControl"
+D="$D|EDU_DMA_MASK|device_add(_message)?|device_del(eted)?|blockdev_add_raw(_message)?|Property"
 D="$D|gdb_target(_tick|_worker_step)?|handle_list_processes|handle_detach_process"
 D="$D|restore_crash_bindings|watch_debugger|check_debuggers"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
@@ -1396,13 +1403,14 @@ cargo xtask test-gdb --arch <arch>
 
 **Hotplug cell.** The boots of `cargo xtask test-hotplug` (PCI Express hotplug (`test-hotplug`)
 above) on each architecture, two on x86_64 (the firmware's ACPI PCI hotplug, then native control)
-and one on riscv64, at 4 vCPUs, in which devmgr takes an empty root port's events, binds the
-`test-dma` fixture to the `edu` device the host hot-adds behind it, withdraws it when the host
-removes the device, and binds it again when the host adds it again. The command stages and unstages
-its own files on the current sysroot, a debug-profile build. It bounds each boot to its markers by
-five minutes, the fixture's probes by three minutes after each hot-add, and the removal by one
-minute from `device_del`; it has no `run-parallel` budget. The boots are the hotplug device cell
-(Device surfaces above).
+and one on riscv64, at 4 vCPUs, in which devmgr takes two empty root ports' events, binds the
+`test-dma` fixture to the `edu` device the host hot-adds behind one, withdraws it when the host
+removes the device, binds it again when the host adds it again, and binds the drivers directory's
+virtio-blk to the disk the host then hot-adds behind the other. The command stages and unstages its
+own files on the current sysroot, a debug-profile build. It bounds each boot to its markers by five
+minutes, the fixture's probes and the disk's bind by three minutes after each hot-add, and the
+removal by one minute from `device_del`; it has no `run-parallel` budget. The boots are the
+hotplug device cell (Device surfaces above).
 
 ```sh
 # Hotplug cell, per architecture (clean between architectures):

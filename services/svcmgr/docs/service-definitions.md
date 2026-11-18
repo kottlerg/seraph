@@ -539,18 +539,17 @@ differently attenuated SEND on that class under its own stem: `serial-deny.class
 |---|---|---|
 | `class` | no | The class name (default the file stem) |
 | `verbs` | yes | Space-separated bit positions, each in `ipc::VERB_BIT_MASK` (58 to 63), none repeated: the verb bits a `QUERY_DEVICE` reply through the class SEND carries |
-| `boot_only` | no | `yes` or `no` (default `no`): the class's drivers come from the boot bundle only, and devmgr refuses a drivers-directory declaration of the class |
 
 The shipped classes:
 
-| Class | `verbs` | `boot_only` |
-|---|---|---|
-| `block` | 63 (`blk_labels::MOUNT_AUTHORITY`) | `yes` |
-| `serial` | 63 62 (serial `WRITE`, `READ`) | `no` |
-| `framebuffer` | 63 (framebuffer `WRITE`) | `no` |
-| `rtc` | 63 (rtc `READ`) | `no` |
-| `input` | 63 (input `READ`) | `no` |
-| `debug-port` | 63 62 (serial `WRITE`, `READ`) | `no` |
+| Class | `verbs` |
+|---|---|
+| `block` | 63 (`blk_labels::MOUNT_AUTHORITY`) |
+| `serial` | 63 62 (serial `WRITE`, `READ`) |
+| `framebuffer` | 63 (framebuffer `WRITE`) |
+| `rtc` | 63 (rtc `READ`) |
+| `input` | 63 (input `READ`) |
+| `debug-port` | 63 62 (serial `WRITE`, `READ`) |
 
 init requests the `block` class SEND itself, for vfsd's root mount.
 

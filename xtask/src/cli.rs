@@ -186,12 +186,14 @@ subcommands! {
         /// QMP's SHUTDOWN event gives reason `guest-shutdown`, and QEMU exits on
         /// its own (see xtask/README.md).
         TestPowerbutton(TestPowerbuttonArgs),
-        /// Check PCI Express native hotplug: stage the `hotplug-check` fixture
-        /// and the `test-dma` class, boot the current sysroot with an empty root
-        /// port (on `x86_64` once under the machine's default, where devmgr must
-        /// leave the slot alone, then with native control), hot-add QEMU's `edu`
-        /// device behind it over QMP, check the fixture's verdict, and unstage
-        /// both again (see xtask/README.md).
+        /// Check PCI Express hotplug: stage the `hotplug-check` fixture and the
+        /// `test-dma` class, boot the current sysroot with two empty root ports
+        /// (on `x86_64` once under the machine's default, the firmware's ACPI PCI
+        /// hotplug through acpid, then with native control), hot-add, remove and
+        /// hot-add again QEMU's `edu` device behind one over QMP, check the
+        /// fixture's verdict, then hot-add a `virtio-blk-pci` disk behind the
+        /// other and check that devmgr binds it from the drivers directory's
+        /// driver, and unstage both again (see xtask/README.md).
         TestHotplug(TestHotplugArgs),
 
         /// Check the GDB stub: stage it and its `gdb-target` process, boot the

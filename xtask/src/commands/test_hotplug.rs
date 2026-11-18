@@ -10,13 +10,18 @@
 //!
 //! Stages the `hotplug-check` fixture's recipe and the `test-dma` class into the
 //! boot set, repacks the disk images in the layout they have, and boots the
-//! current sysroot with an empty `pcie-root-port` and a QMP socket. Once devmgr
-//! logs the slot's grant and the fixture logs [`READY_MARKER`], the host
-//! hot-adds QEMU's `edu` device behind the port (QMP `device_add`). Once the
-//! fixture logs [`REMOVE_MARKER`], the host removes it (QMP `device_del`)
-//! and waits for QEMU's `DEVICE_DELETED`; devmgr's removal lines must come in
-//! their order. Once the fixture logs [`READD_MARKER`], the host adds the
-//! device again and waits for the fixture's verdict.
+//! current sysroot with two empty `pcie-root-port`s and a QMP socket. Once
+//! devmgr logs the first slot's grant and the fixture logs [`READY_MARKER`],
+//! the host hot-adds QEMU's `edu` device behind that port (QMP
+//! `device_add`). Once the fixture logs [`REMOVE_MARKER`], the host removes
+//! it (QMP `device_del`) and waits for QEMU's `DEVICE_DELETED`; devmgr's
+//! removal lines must come in their order. Once the fixture logs
+//! [`READD_MARKER`], the host adds the device again and waits for the
+//! fixture's verdict. Once the fixture passes, the host hot-adds a
+//! `virtio-blk-pci` disk behind the second port: devmgr must bind it from
+//! the drivers directory's virtio-blk, at the auxiliary tier, as it binds
+//! every device unbound after the boot pass, and the driver must come up
+//! ([`disk_bound`]).
 //!
 //! Each boot runs that cycle under one hotplug control. Under native control
 //! devmgr manages the slot ([`MANAGED_MARKER`]): `device_del` presses the
@@ -48,11 +53,11 @@ use crate::disk::DiskLayout;
 use crate::error::{Context as _, Result, bail};
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    EDU_DMA_MASK, GdbMode, HOTPLUG_PORT_ID, HotplugControl, Iommu, QemuDisplay, QemuLaunchSpec,
-    RiscvMmu, RiscvZkr, SecondDisk, X86Paging, X86ShadowStack, build_qemu_argv,
-    prepare_riscv_firmware, validate_sysroot_for_launch,
+    EDU_DMA_MASK, GdbMode, HOTPLUG_DISK_PORT_ID, HOTPLUG_PORT_ID, HotplugControl, Iommu,
+    QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging, X86ShadowStack,
+    build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
-use crate::qmp;
+use crate::qmp::{self, Property};
 use crate::util::{require_tool, step};
 
 /// The fixture's recipe, as `cargo xtask build` installs it under
@@ -121,6 +126,36 @@ const FIRMWARE_MARKER: &str = "firmware hotplug: _OSC control";
 /// The id `device_add` gives the hot-added `edu`.
 const DEVICE_ID: &str = "hotplug-edu";
 
+/// Whether the boot attaches the IOMMU: attached, as every launch's
+/// default, so the hot-added disk is put behind it as the launchers put a
+/// boot `virtio-pci` device (`iommu_platform=on`).
+const IOMMU: Iommu = Iommu::Attached;
+
+/// The id `device_add` gives the hot-added disk.
+const DISK_ID: &str = "hotplug-disk";
+
+/// The block node of the hot-added disk's image, which its `drive`
+/// property names.
+const DISK_NODE: &str = "hotplug-disk-node";
+
+/// The size of the hot-added disk's raw image, zero-filled: the disk is only
+/// bound, never read.
+const DISK_BYTES: u64 = 1 << 20;
+
+/// devmgr's line once it binds a virtio-blk function: after the disk's
+/// hot-add, the disk's. Kept in sync with `services/devmgr/src/bind.rs`.
+const DISK_BIND_MARKER: &str = "[devmgr] virtio-blk: binds PCI";
+
+/// devmgr's line when it binds virtio-blk from the drivers directory, whose
+/// declaration asks for the boot tier: the driver runs at the auxiliary
+/// tier. After the disk's hot-add, it shows the disk bound from the drivers
+/// directory. Kept in sync with `services/devmgr/src/bind.rs`.
+const DISK_DIRECTORY_MARKER: &str = "virtio-blk: boot tier not granted from the drivers directory";
+
+/// The virtio-blk driver's line once it serves its disk. Kept in sync with
+/// `services/drivers/virtio/blk/src/main.rs`.
+const DISK_READY_MARKER: &str = "[virtio-blk] ready, entering service loop";
+
 /// Budget for a boot to reach its markers.
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -163,7 +198,8 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
     booted?;
     step(
         "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
-         driver and powered the slot off or ejected it, and it was bound again)",
+         driver and powered the slot off or ejected it, and it was bound again; a hot-added \
+         disk was bound from the drivers directory)",
     );
     Ok(())
 }
@@ -232,6 +268,10 @@ fn boot(
         .with_context(|| format!("creating {}", sock_dir.display()))?;
     let sock_path = sock_dir.join("hotplug-test-qmp.sock");
     let _ = std::fs::remove_file(&sock_path);
+    let disk_image = sock_dir.join("hotplug-disk.img");
+    std::fs::File::create(&disk_image)
+        .and_then(|f| f.set_len(DISK_BYTES))
+        .with_context(|| format!("creating {}", disk_image.display()))?;
     let disk_path = ctx.disk_image();
     let data_image = layout.second_image(ctx);
     let spec = QemuLaunchSpec {
@@ -256,7 +296,7 @@ fn boot(
         riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
-        iommu: Iommu::Attached,
+        iommu: IOMMU,
         debug_port: None,
         test_devices: false,
         hotplug_port: Some(control),
@@ -265,7 +305,7 @@ fn boot(
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
 
     step(&format!(
-        "hotplug test: booting with an empty root port, hotplug control {control:?}"
+        "hotplug test: booting with two empty root ports, hotplug control {control:?}"
     ));
     let mut child = Command::new(&qemu_binary)
         .args(&qemu_args)
@@ -274,18 +314,20 @@ fn boot(
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
-    let result = watch(&mut child, &sock_path, control);
+    let result = watch(&mut child, &sock_path, &disk_image, control);
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&disk_image);
     result
 }
 
 /// Read the serial stream of `child` and run the check of a boot under
 /// `control`: devmgr takes the slot's grant (managed, or left to the
 /// firmware), the host hot-adds `edu` once the fixture is ready, removes it,
-/// adds it again, and the fixture passes.
-fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()>
+/// adds it again, and the fixture passes; then a disk over the image `disk`
+/// hot-added behind the second port is bound ([`disk_bound`]).
+fn watch(child: &mut Child, socket: &Path, disk: &Path, control: HotplugControl) -> Result<()>
 {
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     // Serial lines on a worker thread, so each wait has a deadline; the
@@ -342,7 +384,7 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
             "edu",
             DEVICE_ID,
             HOTPLUG_PORT_ID,
-            &[("dma_mask", EDU_DMA_MASK)],
+            &[("dma_mask", Property::Number(EDU_DMA_MASK))],
         )
     };
     add()?;
@@ -374,6 +416,49 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
     if !verdict.contains(PASS_MARKER)
     {
         bail!("the fixture failed: {verdict}");
+    }
+    step("hotplug test: the fixture passed; hot-adding a virtio-blk disk");
+    add_disk(socket, disk)?;
+    lines.start = Instant::now();
+    disk_bound(&lines)
+}
+
+/// Hot-add the disk behind the second port: a raw block node over the image
+/// `disk` (QMP `blockdev-add`), then a `virtio-blk-pci` on it, behind the
+/// IOMMU when the boot attaches one, as the launchers put a boot disk.
+fn add_disk(socket: &Path, disk: &Path) -> Result<()>
+{
+    qmp::blockdev_add_raw(socket, DISK_NODE, disk)?;
+    qmp::device_add(
+        socket,
+        "virtio-blk-pci",
+        DISK_ID,
+        HOTPLUG_DISK_PORT_ID,
+        &[
+            ("drive", Property::Text(DISK_NODE)),
+            ("disable-legacy", Property::Text("on")),
+            ("iommu_platform", Property::Flag(IOMMU == Iommu::Attached)),
+        ],
+    )
+}
+
+/// Read the lines of the hot-added disk's bind, in any order: devmgr binds
+/// virtio-blk to it ([`DISK_BIND_MARKER`]), from the drivers directory, at the
+/// auxiliary tier ([`DISK_DIRECTORY_MARKER`]), and the driver serves the disk
+/// ([`DISK_READY_MARKER`]).
+fn disk_bound(lines: &Lines) -> Result<()>
+{
+    let markers = [DISK_BIND_MARKER, DISK_DIRECTORY_MARKER, DISK_READY_MARKER];
+    let mut seen = [false; 3];
+    while !seen.iter().all(|&s| s)
+    {
+        let line = lines.until(VERDICT_TIMEOUT, "the hot-added disk's bind", |l| {
+            markers.iter().any(|m| l.contains(m))
+        })?;
+        for (s, m) in seen.iter_mut().zip(markers)
+        {
+            *s |= line.contains(m);
+        }
     }
     Ok(())
 }

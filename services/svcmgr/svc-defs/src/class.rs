@@ -29,9 +29,6 @@ pub struct ClassDefinition
     /// The verb bits a `QUERY_DEVICE` reply through the class SEND carries,
     /// a non-empty subset of `ipc::VERB_BIT_MASK`.
     pub verbs: u64,
-    /// The class's drivers come from the boot bundle only
-    /// (`ipc::devmgr_labels::CLASS_BOOT_ONLY`).
-    pub boot_only: bool,
 }
 
 /// The directory svcmgr reads the class files from.
@@ -75,15 +72,14 @@ fn valid_class_name(name: &str) -> bool
 ///
 /// Keys: `verbs` (required), the bit positions of the verb bits, separated
 /// by spaces, each in `ipc::VERB_BIT_MASK` (58 to 63) and none repeated;
-/// `boot_only`, `yes` or `no` (default `no`); `class`, the class the file
-/// configures (default the stem).
+/// `class`, the class the file configures (default the stem).
 ///
 /// # Errors
 /// A [`ParseError`] naming the offending line: a stem (line 0) or `class`
 /// that is not 1 to `ipc::devmgr_labels::MAX_CLASS_NAME_BYTES` lowercase
 /// ASCII letters, digits, `-`, and `_`, a missing `=`, an unknown or repeated
-/// key, a missing or empty `verbs`, a bit position outside the mask or
-/// repeated, or a `boot_only` other than `yes` or `no`.
+/// key, a missing or empty `verbs`, or a bit position outside the mask or
+/// repeated.
 pub fn parse_class(stem: &str, contents: &str) -> Result<ClassDefinition, ParseError>
 {
     if !valid_class_name(stem)
@@ -94,7 +90,6 @@ pub fn parse_class(stem: &str, contents: &str) -> Result<ClassDefinition, ParseE
         ));
     }
     let mut verbs: Option<u64> = None;
-    let mut boot_only: Option<bool> = None;
     let mut class: Option<&str> = None;
     for entry in svc_grammar::entries(contents)
     {
@@ -112,25 +107,6 @@ pub fn parse_class(stem: &str, contents: &str) -> Result<ClassDefinition, ParseE
                     return Err(ParseError::DuplicateKey(lineno, "verbs"));
                 }
                 verbs = Some(parse_verbs(lineno, value)?);
-            }
-            ("boot_only", value) =>
-            {
-                if boot_only.is_some()
-                {
-                    return Err(ParseError::DuplicateKey(lineno, "boot_only"));
-                }
-                boot_only = Some(match value
-                {
-                    "yes" => true,
-                    "no" => false,
-                    _ =>
-                    {
-                        return Err(ParseError::InvalidValue(
-                            lineno,
-                            "boot_only must be yes or no",
-                        ));
-                    }
-                });
             }
             ("class", value) =>
             {
@@ -154,7 +130,6 @@ pub fn parse_class(stem: &str, contents: &str) -> Result<ClassDefinition, ParseE
         stem: owned(stem)?,
         name: owned(class.unwrap_or(stem))?,
         verbs: verbs.ok_or(ParseError::MissingKey("verbs"))?,
-        boot_only: boot_only.unwrap_or(false),
     })
 }
 
@@ -215,12 +190,9 @@ mod tests
                 stem: String::from("serial"),
                 name: String::from("serial"),
                 verbs: (1 << 63) | (1 << 62),
-                boot_only: false,
             }
         );
-        let block = parse_class("block", "verbs=63\nboot_only = yes").unwrap();
-        assert!(block.boot_only);
-        assert_eq!(block.verbs, 1 << 63);
+        assert_eq!(parse_class("block", "verbs=63").unwrap().verbs, 1 << 63);
         assert_eq!(
             parse_class("debug-port", "verbs = 58").unwrap().verbs,
             1 << 58
@@ -231,7 +203,7 @@ mod tests
     fn verbs_are_required_and_bounded()
     {
         assert!(matches!(
-            parse_class("rtc", "boot_only = no"),
+            parse_class("rtc", "class = rtc"),
             Err(ParseError::MissingKey("verbs"))
         ));
         for bad in [
@@ -257,13 +229,10 @@ mod tests
             parse_class("rtc", "verbs = 63\nverbs = 62"),
             Err(ParseError::DuplicateKey(2, "verbs"))
         ));
+        // No class is boot-bundle only: the key is not one.
         assert!(matches!(
-            parse_class("rtc", "verbs = 63\nboot_only = yes\nboot_only = no"),
-            Err(ParseError::DuplicateKey(3, "boot_only"))
-        ));
-        assert!(matches!(
-            parse_class("rtc", "verbs = 63\nboot_only = maybe"),
-            Err(ParseError::InvalidValue(2, _))
+            parse_class("block", "verbs = 63\nboot_only = yes"),
+            Err(ParseError::UnknownKey(2, _))
         ));
         assert!(matches!(
             parse_class("rtc", "verbs = 63\nmode = fast"),
@@ -285,7 +254,6 @@ mod tests
                 stem: String::from("serial-deny"),
                 name: String::from("serial"),
                 verbs: 1 << 58,
-                boot_only: false,
             }
         );
         assert!(matches!(

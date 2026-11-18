@@ -59,8 +59,9 @@ that class's watch; `cap[1]` is deleted after the handover release.
 ### `stream_labels::STREAM_BYTES` (10)
 
 Per-line byte stream. Sender packs the chunk byte length into bits
-16-31 of the label (`label | (len << 16)`) and the chunk's log level into
-bits 32-34 (§ Levels). Inline bytes
+16-31 of the label (`label | (len << 16)`), the chunk's log level into
+bits 32-34 (§ Levels), and, once it has registered a display name, bit 35
+(`SENDER_NAMED`, § `stream_labels::STREAM_REGISTER_NAME`). Inline bytes
 arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
@@ -79,7 +80,10 @@ Lines exceeding `LINE_BUF_SIZE` (256 bytes) flush without a
 trailing `\n` to keep the per-line attribution visible. Senders
 that have not yet called `STREAM_REGISTER_NAME` render as `[?]`.
 
-Reply: `label = 0` (success), empty payload. Sender unblocks.
+Reply: `label = 0` (success), empty payload, or `NAME_UNKNOWN` (2) for a
+message carrying `SENDER_NAMED` from a sender whose name logd does not hold, of
+which nothing is consumed (§ `stream_labels::STREAM_REGISTER_NAME`). Sender
+unblocks.
 
 #### Levels
 
@@ -213,7 +217,10 @@ exactly. A key may repeat; a reader sees each occurrence, in order.
   retained, `RECORD_REJECTED` (1) for a payload that is longer than a record
   or than the message, or that `ipc::log_record` does not decode (a length
   that overruns the payload, a key outside the alphabet, bytes left over):
-  such a payload is neither rendered nor retained. The payload is empty.
+  such a payload is neither rendered nor retained. logd answers
+  `NAME_UNKNOWN` (2) to a record that decodes and carries `SENDER_NAMED`
+  (bit 35) from a sender whose name it does not hold, and neither renders nor
+  retains it (§ `stream_labels::STREAM_REGISTER_NAME`). The payload is empty.
   Sender unblocks.
 
 ### `stream_labels::STREAM_REGISTER_NAME` (11)
@@ -229,6 +236,43 @@ two processes intentionally pick the same string. logd allows
 that.
 
 Reply: `label = 0`. Sender unblocks.
+
+A sender registers its name once, at startup, but logd's table can lose it: a
+restarted logd serves a fresh table ([`handover-protocol.md`](handover-protocol.md),
+the restart paragraph), and a name the handover does not deliver never reaches it
+([`handover-protocol.md`](handover-protocol.md) § Failure modes). The sender
+therefore keeps its name and states that it has one, and logd asks for it again:
+
+- **Sender.** `shared/log` keeps the first `SLOT_NAME_MAX` (48) bytes of the name
+  a process registers on its own log cap (`std::os::seraph::log::register_name`)
+  and sets `SENDER_NAMED` (bit 35 of the label) on every `STREAM_BYTES` and
+  `STREAM_RECORD` it sends on that cap from then on.
+- **logd.** A `STREAM_BYTES` or `STREAM_RECORD` that carries `SENDER_NAMED`, from a
+  badge whose live slot holds no name, or that has no live slot and is not among the
+  recent evictions (§ Wait-set), is answered `NAME_UNKNOWN` (2), and logd consumes
+  none of it: no byte joins the partial line, nothing is rendered or retained. A
+  record that does not decode is answered `RECORD_REJECTED` first, and an evicted
+  sender's message is dropped and answered as consumed, as without the bit. logd
+  never answers `NAME_UNKNOWN` to a message without the bit.
+- **Recovery.** On `NAME_UNKNOWN` the sender sends `STREAM_REGISTER_NAME` with its
+  kept name, then the refused message once more with the bit clear, which logd
+  accepts whatever its table holds. The message is refused at most once, so it costs
+  at most three calls, the two after the first only when logd answered, each under
+  the sender's log-call bound ([shared/log](../../../shared/log/README.md)), and it
+  is rendered under the name the registration restored. A registration that fails
+  leaves that one message rendered as `[?]`; the sender's next message is refused
+  and tries again.
+
+Every line of a named sender, its first after a logd restart included, is thus
+rendered under its name. A sender that sends nothing after the restart has no slot
+in the new table until it does, so its death writes no `reclaim:` line
+(§ Death-notification cascade); a sender whose registration after a refusal failed
+has a slot without a name until its next message, and a `reclaim:` line for it
+reads `name=?`. A name init-logd stored with a collision suffix
+(`.2`, `.3`, …) is registered again as the sender gave it. init-logd, the first receiver, ignores
+the bit and answers no message `NAME_UNKNOWN`.
+A sender that registered no name, or that calls the wire helpers with another
+cap, sends no bit and is never refused.
 
 ### `log_labels::HANDOVER_PULL` (13)
 

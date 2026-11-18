@@ -1637,7 +1637,10 @@ pub mod log {
     /// per-slot buffer are truncated. A name another sender holds is
     /// stored with a `.2` / `.3` / … suffix by init-logd, before the
     /// handover, and as given by logd
-    /// (`ipc::stream_labels::STREAM_REGISTER_NAME`).
+    /// (`ipc::stream_labels::STREAM_REGISTER_NAME`). The process keeps
+    /// the name and registers it again whenever logd answers a log call
+    /// that it holds none, as a restarted logd does, so one registration
+    /// names every later line (`::log::register_name`).
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn register_name(name: &[u8]) {
         let buf = current_ipc_buf();

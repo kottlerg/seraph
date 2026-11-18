@@ -245,6 +245,24 @@ impl SlotTable
         Some(self.get_or_create_with_seq(badge))
     }
 
+    /// Whether a message from `badge` that says its sender registered a
+    /// display name (`ipc::stream_labels::SENDER_NAMED`) finds no name for
+    /// it: the badge's live slot holds none, or the badge has no live slot and
+    /// is not among the recent evictions, so its message would create an
+    /// unnamed one. A restarted logd's fresh table holds no sender's name
+    /// (`services/logd/docs/ipc-interface.md`
+    /// § `stream_labels::STREAM_REGISTER_NAME`). An evicted sender's badge
+    /// finds its name, so its message is dropped as [`Self::sender_slot`]
+    /// says, not refused.
+    pub fn name_lost(&self, badge: u64) -> bool
+    {
+        match self.slots.get(&badge)
+        {
+            Some(slot) => slot.name.is_empty(),
+            None => !self.evicted.contains(&badge),
+        }
+    }
+
     /// Take the next entry sequence from `seq`, the table's counter as
     /// [`Self::get_or_create_with_seq`] lends it. A `u64` counting one per
     /// retained entry does not wrap.

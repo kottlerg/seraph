@@ -16,9 +16,11 @@ svcmgr holds the master-log endpoint source for the system's life, so a
 restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
 targets; only the one-time init-logd history pull
 ([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on restart, and the
-restarted logd serves a fresh table. That table holds no sender's display name: each sender
-registers its name once, at startup, so its lines render as `[?]` after a restart until it
-registers again (#1213).
+restarted logd serves a fresh table. That table holds no sender's display name, so logd refuses a
+sender's first message that says the sender registered one (`SENDER_NAMED`), and the sender
+registers it again and resends the message: every line renders under its sender's name, the first
+after the restart included (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
+§ `stream_labels::STREAM_REGISTER_NAME`).
 
 ## Role
 

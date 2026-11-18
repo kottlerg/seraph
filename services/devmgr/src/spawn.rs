@@ -211,19 +211,22 @@ pub fn destroy_held(child: HeldChild, ipc_buf: *mut u64)
 /// procmgr's teardown of the child, by this destroy or by its own reap of a
 /// dead child, precedes the release: procmgr replies to the destroy only
 /// once the child is torn down and its reclaim parked, by whichever of its
-/// threads tore it down (services/procmgr/README.md § Concurrency).
-pub fn destroy_and_release(child: HeldChild, ipc_buf: *mut u64)
+/// threads tore it down (services/procmgr/README.md § Concurrency). Returns
+/// whether procmgr released the held pages; `false` is logged.
+pub fn destroy_and_release(child: HeldChild, ipc_buf: *mut u64) -> bool
 {
     send_destroy(child.process_handle, ipc_buf);
     let release_msg = IpcMessage::new(procmgr_labels::RELEASE_HOLD);
     // SAFETY: ipc_buf is the registered IPC buffer.
     let released = unsafe { ipc::ipc_call(child.release_token, &release_msg, ipc_buf) };
-    if !matches!(released, Ok(r) if r.label == 0)
+    let released = matches!(released, Ok(r) if r.label == 0);
+    if !released
     {
         std::os::seraph::log!(warn: "driver memory hold not released");
     }
     let _ = syscall::cap_delete(child.process_handle);
     let _ = syscall::cap_delete(child.release_token);
+    released
 }
 
 /// Send `DESTROY_PROCESS` on `process_handle`; procmgr replies success

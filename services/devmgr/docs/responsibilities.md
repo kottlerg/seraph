@@ -45,7 +45,9 @@ devmgr's responsibilities are:
   the devices of the platform description table whose `oem_table_id` equals
   the XSDT's OEM table ID (§ Platform Description Tables there). devmgr merges
   the records by resource identity and delivers each driver the record's
-  resource list: each `Mmio` carved from the apertures, each `IoPort` from its
+  resource list: each `Mmio` carved as
+  [docs/driver-binding.md](../../../docs/driver-binding.md#binding) § Binding
+  step 1 says, each `IoPort` from its
   port capability, and the wired line carved exclusive, shared with no other
   device (the serial driver acknowledges a delivery only when its client reads
   ([services/drivers/serial/README.md](../../drivers/serial/README.md#interrupts)
@@ -321,7 +323,12 @@ devmgr's responsibilities are:
   devmgr's release. devmgr binds no driver to a PCI device whose
   configuration page it cannot carve or map, since it could not clear that
   function's Bus Master Enable. Then the driver's service endpoint is revoked
-  and deleted and its BAR, DMA, configuration-page, and IRQ caps released. A
+  and deleted and its BAR, DMA, configuration-page, and IRQ caps released: each
+  BAR cap (an `Mmio` resource's, and the MSI-X table's) goes back to devmgr's
+  held BAR pages over the range it covers, from which a later bind carves it
+  again, and is deleted, logged, only when a copy of it cannot be revoked or
+  the table cannot record it ([`docs/hotplug.md`](hotplug.md#removal)
+  § Removal). A
   withdrawn driver of a platform record has its copies of the record's caps
   revoked, the `Mmio`, `IoPort`, and wired-line caps devmgr carved and keeps,
   and is destroyed through its process handle while devmgr still keeps it (until
@@ -394,11 +401,12 @@ devmgr's responsibilities are:
   starts the drivers it binds in a settle batch of its own, and serves them once
   it settles, within `SETTLE_TIMEOUT`. A record is bound at most once a boot, so
   a second request over the same directory binds nothing; a limited driver's
-  bound devices are counted over the boot by driver name (`BoundCounts`), so
-  each pass binds it only to the devices its limit leaves. A request with no
-  directory cap or no path, before `SET_DRIVERS_DIR`, or while an earlier one is
-  not done gets `INVALID_REQUEST`. A `QUERY_DEVICE` whose answer would name no
-  driver waits until the pass and its settle end.
+  bound devices are counted across passes by driver name (`BoundCounts`), so
+  each pass binds it only to the devices its limit leaves, and a device's
+  hotplug removal returns its instance. A request with no directory cap or no
+  path, before `SET_DRIVERS_DIR`, or while an earlier one is not done gets
+  `INVALID_REQUEST`. A `QUERY_DEVICE` whose answer would name no driver waits
+  until the pass and its settle end.
 
   The [`test-dma`](../../drivers/test-dma/README.md) fixture is bound like any
   driver: its declaration matches QEMU's `edu` device (PCI `1234:11e8`, which
@@ -408,7 +416,7 @@ devmgr's responsibilities are:
   device's own caller: devmgr takes and logs the IOMMU driver's recorded faults
   (`iommu_labels::TAKE_FAULTS`), and replies `data[0]` = `DMA_CONFINED` (1)
   when an IOMMU confines the device, else 0, `data[1]` = DMA translation
-  faults taken for the device over the boot, `data[2]` = the latest's IOVA,
+  faults taken for the device since its DMA grant, `data[2]` = the latest's IOVA,
   page aligned, 0 with none (a VT-d interrupt-remapping fault, whose
   recorded address is a remapping table handle, is logged only);
   `UNAUTHORIZED` when the device is withdrawn or was never given DMA.
@@ -611,8 +619,11 @@ devmgr's responsibilities are:
   table's `pcie_native_hotplug`). A poller thread reads each managed slot's Slot Status every
   second, powers up a slot a card arrives in, and posts the arrival; the control thread places
   and programs the new functions' BARs in the slot's windows, appends their records, and binds
-  them in a hotplug batch (above). Removal and the ACPI hotplug source are design intent; not
-  yet implemented. See [`docs/hotplug.md`](hotplug.md).
+  them in a hotplug batch (above). When a card leaves, or its removal is asked for with the
+  attention button, the poller posts the removal; the control thread withdraws each driver behind
+  the slot as below, quiesces the functions, returns their BAR pages to the apertures and removes
+  their records, and the poller then powers the slot off. The ACPI hotplug source is design
+  intent; not yet implemented. See [`docs/hotplug.md`](hotplug.md).
 
 ---
 

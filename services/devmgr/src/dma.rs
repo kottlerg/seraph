@@ -160,8 +160,10 @@ impl DmaService
     /// firmware-reserved ranges its domain maps (`reserved`): register it in
     /// the table, so no mapping's IOVA overlaps a reserved range, and derive
     /// its DMA capability, a SEND on the DMA endpoint badged `device_badge`,
-    /// which the returned grant keeps. `None`, logged, when the tables cannot
-    /// grow or the derivation fails; nothing is registered then.
+    /// which the returned grant keeps; a confined device's faults are counted
+    /// for it from zero from then on (`Iommu::track_faults`). `None`,
+    /// logged, when the tables cannot grow or the derivation fails; nothing is
+    /// registered then.
     pub fn grant(
         &self,
         device_badge: u64,
@@ -200,10 +202,16 @@ impl DmaService
             self.shared.forget(device_badge);
             return None;
         };
+        let confined = confinement != Confinement::Unconfined;
+        if confined && let Some(iommu) = self.shared.iommu.get()
+        {
+            iommu.track_faults(requester_id);
+        }
         Some(DmaGrant {
             cap,
             device_badge,
-            confined: confinement != Confinement::Unconfined,
+            requester_id,
+            confined,
             shared: Arc::clone(&self.shared),
         })
     }
@@ -214,6 +222,9 @@ pub struct DmaGrant
 {
     cap: u64,
     device_badge: u64,
+    /// The device's requester ID, whose faults the IOMMU counts for it while
+    /// it is confined and not withdrawn.
+    requester_id: u64,
     confined: bool,
     shared: Arc<Shared>,
 }
@@ -293,7 +304,8 @@ impl DmaGrant
     /// Withdraw the device's DMA: revoke every copy of its DMA capability
     /// derived from devmgr's (the driver's), remove the device and its
     /// mappings from the table, so a request already queued is refused, and
-    /// block a confined device in the IOMMU (`BLOCK`). Returns the
+    /// block a confined device in the IOMMU (`BLOCK`), after which its faults
+    /// are no longer counted for it (`Iommu::untrack_faults`). Returns the
     /// [`Withdrawal`]: whether the IOMMU now blocks the device's DMA, which
     /// lets its driver's frames be released without the device confirmed
     /// quiet (`docs/device-management.md` § DMA-Safe Teardown),
@@ -330,6 +342,13 @@ impl DmaGrant
         if self.confined && !blocked
         {
             std::os::seraph::log!(warn: "device {} not blocked in the IOMMU", self.device_badge);
+        }
+        // After the block: a fault the device raises from now on, until it is
+        // stopped or its slot powered off, is charged to no record.
+        if self.confined
+            && let Some(iommu) = self.shared.iommu.get()
+        {
+            iommu.untrack_faults(self.requester_id);
         }
         Withdrawal {
             device_badge: self.device_badge,

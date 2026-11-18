@@ -8,9 +8,10 @@
 //! handshake, and issues the handful of commands the harnesses need:
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
 //! and `quit` (snapshot-resume test), `stop` + `pmemsave` (the ACPI table
-//! capture), `device_add` (the hotplug test), and `system_powerdown` (the
-//! power-button test); and waits for the `SHUTDOWN` event (the reboot and
-//! power-button tests).
+//! capture), `device_add` and `device_del` (the hotplug test), and
+//! `system_powerdown` (the power-button test); and waits for the
+//! `SHUTDOWN` event (the reboot and power-button tests) and the
+//! `DEVICE_DELETED` event (the hotplug test).
 //!
 //! Hand-rolled (no JSON dependency): the messages are fixed strings or
 //! `format!` templates, the free-form values (the migrate URI, the memory
@@ -260,16 +261,22 @@ pub fn powerdown(socket: &Path, timeout: Duration) -> Result<String>
 /// line.
 fn shutdown_reason(line: &str) -> Option<&str>
 {
-    let value = |key: &str| {
-        let (_, rest) = line.split_once(&format!("\"{key}\""))?;
-        let rest = rest
-            .trim_start()
-            .strip_prefix(':')?
-            .trim_start()
-            .strip_prefix('"')?;
-        rest.split_once('"').map(|(v, _)| v)
-    };
-    (value("event")? == "SHUTDOWN").then(|| value("reason").unwrap_or("unknown"))
+    (string_field(line, "event")? == "SHUTDOWN")
+        .then(|| string_field(line, "reason").unwrap_or("unknown"))
+}
+
+/// The string value of the first `"key"` of the QMP line `line`, read up to
+/// its closing quote (the values read hold no escaped quote); `None` when
+/// it has none.
+fn string_field<'a>(line: &'a str, key: &str) -> Option<&'a str>
+{
+    let (_, rest) = line.split_once(&format!("\"{key}\""))?;
+    let rest = rest
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start()
+        .strip_prefix('"')?;
+    rest.split_once('"').map(|(v, _)| v)
 }
 
 /// Hot-add the device `driver`, its id `id`, on the bus `bus` (a port's id),
@@ -305,6 +312,62 @@ fn device_add_message(driver: &str, id: &str, bus: &str, properties: &[(&str, u6
         let _ = write!(arguments, ",{}:{value}", json_string(name));
     }
     format!(r#"{{"execute":"device_add","arguments":{{{arguments}}}}}"#)
+}
+
+/// Ask QEMU to unplug the device `id` (`device_del`), then wait up to
+/// `timeout` for its `DEVICE_DELETED` event. A device behind a native
+/// hotplug port is unplugged only once the guest powers the slot off, so the
+/// command returns at once and the event comes after; the one connection
+/// sends the command and reads the event, so the event cannot be lost.
+pub fn device_del(socket: &Path, id: &str, timeout: Duration) -> Result<()>
+{
+    let mut client = Client::connect(socket)?;
+    client.send(&format!(
+        r#"{{"execute":"device_del","arguments":{{"id":{}}}}}"#,
+        json_string(id)
+    ))?;
+    let start = Instant::now();
+    let mut answered = false;
+    loop
+    {
+        let left = timeout
+            .checked_sub(start.elapsed())
+            .filter(|left| !left.is_zero())
+            .with_context(|| {
+                format!(
+                    "no DEVICE_DELETED event for {id} within {}s",
+                    timeout.as_secs()
+                )
+            })?;
+        client
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(left))
+            .context("setting QMP read timeout")?;
+        let line = read_line(&mut client.reader).context("waiting for the DEVICE_DELETED event")?;
+        if !answered && line.contains("\"error\"")
+        {
+            bail!("device_del {id}: QMP error: {}", line.trim());
+        }
+        answered |= line.contains("\"return\"");
+        if device_deleted(&line, id)
+        {
+            if !answered
+            {
+                bail!("device_del {id}: DEVICE_DELETED came before the command's answer");
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// Whether the QMP line `line` is the `DEVICE_DELETED` event of the device
+/// `id`; QEMU also sends the event for objects the device holds, which name
+/// no `device`.
+fn device_deleted(line: &str, id: &str) -> bool
+{
+    string_field(line, "event") == Some("DEVICE_DELETED")
+        && string_field(line, "device") == Some(id)
 }
 
 /// Ask QEMU to exit. The response read is best-effort: QEMU may close the
@@ -475,6 +538,22 @@ mod tests
             None
         );
         assert_eq!(shutdown_reason(r#"{"return": {}}"#), None);
+    }
+
+    #[test]
+    fn device_deleted_reads_the_event_of_the_named_device_only()
+    {
+        let deleted = r#"{"timestamp": {"seconds": 1, "microseconds": 2}, "event": "DEVICE_DELETED", "data": {"device": "hotplug-edu", "path": "/machine/peripheral/hotplug-edu"}}"#;
+        assert!(device_deleted(deleted, "hotplug-edu"));
+        assert!(!device_deleted(deleted, "hotplug"));
+        // An object the device held: no device named.
+        let held = r#"{"event": "DEVICE_DELETED", "data": {"path": "/machine/peripheral/hotplug-edu/bus master[0]"}}"#;
+        assert!(!device_deleted(held, "hotplug-edu"));
+        assert!(!device_deleted(r#"{"return": {}}"#, "hotplug-edu"));
+        assert!(!device_deleted(
+            r#"{"event": "SHUTDOWN", "data": {"device": "hotplug-edu"}}"#,
+            "hotplug-edu"
+        ));
     }
 
     #[test]

@@ -74,19 +74,20 @@ turn on the one thread that owns the namespace. A request is checked in order: t
 - `SLEEP`, with the state in `data[1]`, of which only S5 (soft-off) is served
   (`INVALID_REQUEST` for another): acpid evaluates `\_S5_` for `SLP_TYPa` (its first element,
   at most 7), runs `\_PTS(5)` when the tables define it (a fault is logged and the sleep goes
-  on), then, with the events armed (§ Events), disables every GPE and every fixed event but the
-  power button, S5's wake event, and clears every PM1 and GPE0 status, `WAK_STS` among them, as
-  ACPI 6.5 § 16.1.6 requires before `SLP_EN` is written. It then writes `PM1a_CNT` twice,
-  keeping its other bits: `SLP_TYPa` with `SLP_EN` clear, then with `SLP_EN` (bit 13) set,
-  and logs `SLEEP(5): PM1a_CNT ...` before the writes. When the writes return, acpid keeps
-  the events quiesced for 10 s (`SLEEP_GRACE`), the wait after which ACPICA takes an S5
-  write as not taken; when the platform still runs then, acpid enables the GPEs again, logs
-  `SLEEP(5): still running 10 s after the writes; GPEs enabled again`, and dispatches each
-  GPE that was enabled before the sleep and latched meanwhile. A GPE that had fired before the
-  sleep is left disabled for its queued method, which enables it again, and the power button
-  is left as the quiesce left it: a press taken before or during the sleep is delivered once, by
-  the `WAIT_EVENT` it is posted to, which enables the button again. So each event is handled
-  once.
+  on), then, with the events armed (§ Events), takes and hands on, as the event thread does,
+  each event that has fired and that the event thread has not taken yet, disables every GPE and
+  every fixed event but the power button, S5's wake event, and clears every PM1 and GPE0 status,
+  `WAK_STS` among them, as ACPI 6.5 § 16.1.6 requires before `SLP_EN` is written. It then
+  writes `PM1a_CNT` twice, keeping its other bits: `SLP_TYPa` with `SLP_EN` clear, then with
+  `SLP_EN` (bit 13) set, and logs `SLEEP(5): PM1a_CNT ...` before the writes. When the writes
+  return, acpid keeps the events quiesced for 10 s (`SLEEP_GRACE`), the wait after which ACPICA
+  takes an S5 write as not taken; when the platform still runs then, acpid enables the GPEs
+  again, logs `SLEEP(5): still running 10 s after the writes; GPEs enabled again`, and
+  dispatches each GPE that was enabled before the sleep and latched meanwhile. A GPE that had
+  fired before the sleep, or that the quiesce took, is left disabled for its queued method,
+  which enables it again, and the power button is left as the quiesce left it: a press taken
+  before or during the sleep is delivered once, by the `WAIT_EVENT` it is posted to, which
+  enables the button again. So each event is handled once.
 - `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG` port and logs
   `RESET: RESET_REG ...` before the write.
 - `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and

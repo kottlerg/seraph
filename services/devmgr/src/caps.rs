@@ -137,13 +137,17 @@ pub struct DevmgrCaps
     // out of them, keeping every remainder.
     pub apertures: SpanTable<u64>,
 
-    /// The pages of the BARs of the functions behind managed hotplug slots
-    /// that no bind has carved, moved out of [`Self::apertures`]: a
-    /// hot-added function's when its BARs are placed, a boot-scanned one's
-    /// when its slot is managed. A bind carves the function's BAR caps from here
-    /// ([`crate::carve_subrange`]); a region grant, which carves from the
-    /// apertures alone, never reaches them, and no placement in a slot's
-    /// windows, which takes only what the apertures hold, lands on them.
+    /// The held BAR pages: pages of PCI functions' BARs that no bind holds,
+    /// moved out of [`Self::apertures`] or given back to them. A hot-added
+    /// function's are moved here when its BARs are placed, a boot-scanned
+    /// one's behind a managed hotplug slot when its slot is managed, and the
+    /// BAR caps of a withdrawn driver's device, or of a bind that failed, are
+    /// given back here (`bind::PciDeviceCaps::release`). A bind carves a function's BAR caps
+    /// from here first ([`crate::carve_bar`]); a region grant, which carves
+    /// from the apertures alone, never reaches them, and no placement in a
+    /// slot's windows, which takes only what the apertures hold, lands on
+    /// them. A hotplug removal returns those of the removed functions to the
+    /// apertures (`firmware::hotplug::remove`).
     pub slot_bars: SpanTable<u64>,
 
     /// The `Mmio` cap of every scanned ECAM window, kept apart from the

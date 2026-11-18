@@ -632,31 +632,38 @@ the same report fails the command, as does every other fault.
 
 ### PCI Express hotplug (`test-hotplug`)
 
-devmgr's PCI Express native hotplug
-([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)) runs only when a device
-arrives in or leaves a slot devmgr manages, which no boot of a fixed device set makes.
-`cargo xtask test-hotplug [--arch]` (both arches) makes one arrive, leave, and arrive again:
+devmgr's PCI Express hotplug
+([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)), native and through acpid
+from the firmware's, runs only when a device arrives in or leaves a hotplug slot, which no boot of
+a fixed device set makes. `cargo xtask test-hotplug [--arch]` (both arches) makes one arrive,
+leave, and arrive again, in one boot per hotplug control:
 
 1. Stage the [`hotplug-check`](../services/hotplug-check/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and the `test-dma` class file from
    `/config/devmgr/tests/` into `/config/devmgr/classes/`, and repack the disk images in the
    layout they have.
-2. On x86_64, boot the current sysroot with an empty `pcie-root-port` under the machine's default,
-   whose `_OSC` withholds native hotplug control, and require devmgr's `not managed: _OSC control`
-   line for the slot, then kill QEMU.
-3. Boot it with the port under native control (on x86_64, QEMU's ACPI PCI hotplug off, so `_OSC`
-   grants it; on riscv64, the `qemu-virt.platform` key grants it) and a QMP control socket, and
-   wait for devmgr's `managed (native control by` line and the fixture's
-   `READY for the hot-added device` line.
+2. Boot the current sysroot with an empty `pcie-root-port` and a QMP control socket, on x86_64
+   first under the machine's default, the firmware's ACPI PCI hotplug, whose `_OSC` withholds
+   native hotplug control, then under native control (QEMU's ACPI PCI hotplug off, so `_OSC`
+   grants it); on riscv64 under native control alone, which the `qemu-virt.platform` key grants.
+   Steps 3 to 7 run in each boot.
+3. Wait for devmgr's grant line for the slot, `firmware hotplug: _OSC control` under the
+   firmware's control and `managed (native control by` under native control (the other one fails
+   the boot), and the fixture's `READY for the hot-added device` line.
 4. Hot-add QEMU's `edu` device behind the port (QMP `device_add`), and wait for the fixture's
    `READY for the removal` line: it waits on the `test-dma` class's watch for the `test-dma` driver
    devmgr binds to the added function, then requires the driver's DMA probe to pass and its
    interrupt probe to report an MSI vector delivered.
-5. Remove the device (QMP `device_del`, which presses the slot's attention button) and wait for
-   QEMU's `DEVICE_DELETED` event, which comes once devmgr powers the slot off; then require
-   devmgr's removal lines in their order (the removal started at the end of the abort window, the
-   driver's held memory released, one function removed and one driver withdrawn, the slot powered
-   off empty) and the fixture's line that devmgr answers `WITHDRAWN` at ordinal 0.
+5. Remove the device (QMP `device_del`) and wait for QEMU's `DEVICE_DELETED` event; then require
+   devmgr's removal lines in their order and the fixture's line that devmgr answers `WITHDRAWN` at
+   ordinal 0. Under native control `device_del` presses the slot's attention button and QEMU deletes
+   the device once devmgr powers the slot off: the lines are the removal started at the end of the
+   abort window, the driver's held memory released, one function removed and one driver withdrawn,
+   and the slot powered off empty. Under the firmware's, `device_del` makes the firmware's GPE
+   method notify an eject request, and QEMU deletes the device once acpid runs the slot's `_EJ0`,
+   which it runs only after devmgr's removal job has replied: the lines are the removal started on
+   the firmware's eject request, the driver's held memory released, and one function removed and
+   one driver withdrawn, and acpid's line that it ran `_EJ0` once devmgr removed one function.
 6. Hot-add the device again and wait for the fixture's verdict: the new driver is served at
    ordinal 1, its probes pass, and its IOMMU fault count equals the first device's, so no fault is
    carried across the removal.
@@ -1382,13 +1389,14 @@ cargo xtask test-gdb --arch <arch>
 ```
 
 **Hotplug cell.** The boots of `cargo xtask test-hotplug` (PCI Express hotplug (`test-hotplug`)
-above) on each architecture, two on x86_64 and one on riscv64, at 4 vCPUs, in which devmgr manages
-an empty root port, binds the `test-dma` fixture to the `edu` device the host hot-adds behind it,
-withdraws it when the host removes the device, and binds it again when the host adds it again. The
-command stages and unstages its own files on the current sysroot, a debug-profile build. It bounds
-each boot to its markers by five minutes, the fixture's probes by three minutes after each hot-add,
-and the removal by one minute from `device_del`; it has no `run-parallel` budget. The boots are the
-hotplug device cell (Device surfaces above).
+above) on each architecture, two on x86_64 (the firmware's ACPI PCI hotplug, then native control)
+and one on riscv64, at 4 vCPUs, in which devmgr takes an empty root port's events, binds the
+`test-dma` fixture to the `edu` device the host hot-adds behind it, withdraws it when the host
+removes the device, and binds it again when the host adds it again. The command stages and unstages
+its own files on the current sysroot, a debug-profile build. It bounds each boot to its markers by
+five minutes, the fixture's probes by three minutes after each hot-add, and the removal by one
+minute from `device_del`; it has no `run-parallel` budget. The boots are the hotplug device cell
+(Device surfaces above).
 
 ```sh
 # Hotplug cell, per architecture (clean between architectures):

@@ -226,7 +226,7 @@ fn main() -> !
             &mut catalog,
             ipc_buf,
         );
-        acpi.run(&records, &mut caps, &mut irq_range);
+        acpi.run(&records, &mut caps, &mut irq_range, &hotplug);
         hotplug.grant(acpi.bridges(), &mut records, &mut caps);
         hotplug.run(
             &registry,
@@ -1009,7 +1009,8 @@ impl Registry
             | ipc::devmgr_labels::ACPI_PCI_CONFIG
             | ipc::devmgr_labels::OSC_RESULT
             | ipc::devmgr_labels::BRIDGE_WINDOWS
-            | ipc::devmgr_labels::PRT_TABLE =>
+            | ipc::devmgr_labels::PRT_TABLE
+            | ipc::devmgr_labels::ACPI_HOTPLUG =>
             {
                 self.acpi_request(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf);
             }

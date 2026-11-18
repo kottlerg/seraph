@@ -403,7 +403,10 @@ pub(crate) fn badges_named(authority: u64, name: &[u8]) -> Vec<u64>
 
 /// Walk `LIST_PROCESSES` for the first entry `matches` accepts; its badge
 /// and name.
-fn find_listed(authority: u64, matches: impl Fn(u64, &[u8]) -> bool) -> Option<(u64, Vec<u8>)>
+pub(crate) fn find_listed(
+    authority: u64,
+    matches: impl Fn(u64, &[u8]) -> bool,
+) -> Option<(u64, Vec<u8>)>
 {
     let mut cursor = None;
     loop

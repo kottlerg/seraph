@@ -15,6 +15,7 @@
 //! serves (`crate::server`).
 
 use acpid::bridge::{self, Bridge, Osc};
+use acpid::hotplug::HotplugSlots;
 use acpid::{Failure, Why, walk};
 use aml::namespace::NodeId;
 use aml::{Data, Evaluator, Namespace};
@@ -45,11 +46,11 @@ pub fn run(devmgr: &Devmgr, aspace: u64, service: u64, ended: &Sender<&'static s
     });
     let mut platform = Platform::new(devmgr, aspace, thread);
     let mut ns = load(devmgr, aspace);
-    let mut bridges = Vec::new();
+    let mut hotplug_slots = HotplugSlots::default();
     if let Some((ns, tables)) = &mut ns
     {
         arch::current::enable_acpi(devmgr, thread, &power);
-        bridges = start(ns, *tables, devmgr, &mut platform);
+        hotplug_slots = start(ns, *tables, devmgr, &mut platform);
     }
     server::serve(
         service,
@@ -57,7 +58,7 @@ pub fn run(devmgr: &Devmgr, aspace: u64, service: u64, ended: &Sender<&'static s
         &mut platform,
         &power,
         events,
-        &bridges,
+        hotplug_slots,
         ended,
     );
 }
@@ -80,14 +81,14 @@ fn fixed_power_button(devmgr: &Devmgr, aspace: u64) -> bool
 
 /// Evaluate the loaded namespace `ns` of `tables` tables: the module-level
 /// code, the initialization walk, and each PCI host bridge's results, pushed
-/// to devmgr. Returns the host bridges, whose ports lead to the hotplug
-/// slots acpid serves (`crate::server`).
+/// to devmgr. Returns the hotplug slots acpid serves, behind the ports of
+/// the host bridges found ([`HotplugSlots`]).
 fn start(
     ns: &mut Namespace,
     tables: usize,
     devmgr: &Devmgr,
     platform: &mut Platform<'_>,
-) -> Vec<Bridge>
+) -> HotplugSlots
 {
     let mut ev = Evaluator::new(ns, platform);
     let module = ev.run_module_code();
@@ -129,7 +130,7 @@ fn start(
         walk.initialized,
         bridges.len()
     );
-    bridges
+    HotplugSlots::new(bridges)
 }
 
 /// Load the DSDT, then each SSDT devmgr serves, and parse their methods; the

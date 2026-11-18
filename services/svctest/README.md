@@ -96,7 +96,8 @@ services/svctest/
         │                      #   stop source's job stopped first, a held write resumed
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
-        │                      #   fall-through, remount, a mapped page across the unmount
+        │                      #   fall-through, remount, a mapped page across the unmount,
+        │                      #   a killed fs driver
         └── vfsd.rs            # `MOUNT` gate: deny, mounted-path and short-path rejections
 ```
 
@@ -174,7 +175,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
 | `caps[2]` | `devmgr.registry` | devmgr class-deny and shutdown-deny phases |
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
-| `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT` and the remounts |
+| `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
 | `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_restart`, `logd_sinks` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
@@ -444,7 +445,11 @@ unforced and a forced unmount of `/data`, and a `stale-map-child` maps a cache p
 `/data/test.txt`; while `/data` is unmounted they mount the data partition over
 `/config/svcmgr/tests`, the root filesystem's directory of svctest's own recipe, read
 `test.txt` there, and after unmounting it read `/config/svcmgr/tests/svctest.svc` through the
-fall-through again. They mount `/data` again and set svctest's cwd to it before they end.
+fall-through again. The `vfsd_driver_death` phase holds a file on `/data` open and kills the data
+mount's fs driver (found by its name `fatfs:/data`) through a debug attach: vfsd tears the mount
+down, `/data` falls through and is not found, the open file is stale, and a fresh `MOUNT` at
+`/data` succeeds on the same disk. They mount `/data` again and set svctest's cwd to it before
+they end.
 The sysroot placement of all of these is listed in [docs/testing.md § Sysroot
 layout](../../docs/testing.md#sysroot-layout).
 

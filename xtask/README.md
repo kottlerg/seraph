@@ -1299,7 +1299,7 @@ pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socke
    `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off`, so `_OSC` grants it; on riscv64
    the `qemu-virt.platform` key grants it): once devmgr logs the slot `managed (native control
    by` and the fixture logs `[hotplug-check] READY for the hot-added device`, it hot-adds QEMU's
-   `edu` device behind the port (QMP `device_add`, `dma_mask=0xffffffff` as the test devices'
+   `edu` device behind the first port (QMP `device_add`, `dma_mask=0xffffffff` as the test devices'
    `edu` has). Once the fixture logs `[hotplug-check] READY for the removal`, it removes the
    device (QMP `device_del`) and waits up to a minute for QEMU's `DEVICE_DELETED` event, then
    for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
@@ -1309,6 +1309,17 @@ pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socke
    once devmgr logs `[devmgr] virtio-blk: binds PCI` and `virtio-blk: boot tier not granted from
    the drivers directory` (the drivers directory's copy, at the auxiliary tier) and the driver
    logs `[virtio-blk] ready, entering service loop`.
+
+Then two storage boots on the split-data layout, under native control, with the disk-mode recipe
+(`hotplug-check-disk.svc`) staged alone:
+
+3. the data disk (`disk-data.img`) behind the first port from boot: the host removes it (QMP
+   `device_del`), requires devmgr's removal lines and vfsd's `disk N: removed; tearing down its
+   mounts`, adds it again (`device_add` of a `virtio-blk-pci` on the kept block node), then
+   requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`, svcmgr's `critical service
+   unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
+4. the boot disk behind the first port and the data disk on a slot of its own: the host removes
+   the boot disk and requires the same last three.
 
 It kills QEMU after each boot, then removes the staged files and repacks the images in that layout
 again, whatever the outcome. [docs/testing.md](../docs/testing.md) § PCI Express hotplug

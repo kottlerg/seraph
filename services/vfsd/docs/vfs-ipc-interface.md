@@ -163,11 +163,12 @@ vfsd stops resolving lookups across the mount, then sends the driver `FS_UNMOUNT
 ([fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md#label-19-fs_unmount) § Label 19),
 with `fs_labels::UNMOUNT_FORCE` when the request carries `UNMOUNT_FORCE`, bounded by a timeout.
 When the driver answers `BUSY` to an unforced request, the mount is kept: lookups cross it again
-and vfsd replies `BUSY` with the driver's count of live opens. Only opens count: a client whose
-cwd is under the mount, or that holds a node cap there, is not asked. Otherwise, whether the
-driver answered `SUCCESS`, anything else or nothing in time, vfsd tears the driver down: it
-revokes the partition cap, revokes and deletes the driver's service endpoint, waits a bounded
-time for the driver's death, destroys its process, and removes the mount's record
+and vfsd replies `BUSY` with the driver's count of live opens, unless the mount's disk was lost
+meanwhile, when vfsd unmounts the mount as the loss does and replies `NO_MOUNT`. Only opens
+count: a client whose cwd is under the mount, or that holds a node cap there, is not asked.
+Otherwise, whether the driver answered `SUCCESS`, anything else or nothing in time, vfsd tears
+the driver down: it revokes the partition cap, revokes and deletes the driver's service endpoint,
+waits a bounded time for the driver's death, destroys its process, and removes the mount's record
 ([`namespace-composition.md`](namespace-composition.md#unmount) § Unmount). The path then falls
 through to the root filesystem: lookups and listings serve its directory of the same name, or
 find the name absent when it has none.
@@ -197,7 +198,8 @@ opens; the mount is kept.
 **Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a badge without
 `MOUNT_AUTHORITY` and for `/`, `LABEL_VERSION_MISMATCH` when `data[0]` differs from vfsd's
 `VFSD_LABELS_VERSION`, `NOT_FOUND` for an invalid path length, `NO_MOUNT` when no mount is at
-the path or its unmount is already under way).
+the path or its unmount is already under way, and when the mount's disk was lost while the driver
+answered `BUSY`).
 
 ---
 

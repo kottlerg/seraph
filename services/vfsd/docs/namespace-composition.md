@@ -139,7 +139,8 @@ the mount at a path in this order:
 2. Send the driver `FS_UNMOUNT` on a SEND derived from the record's `endpoint`, bounded by a
    timeout, with `UNMOUNT_FORCE` when the request carries it. A `BUSY` answer to an unforced
    request ends the unmount: `restore_mount` puts the record back, and its death queue back in
-   the watch set, and vfsd replies `BUSY`.
+   the watch set, and vfsd replies `BUSY`. When the mount's disk was lost meanwhile, vfsd then
+   unmounts the mount as the loss does (§ Driver death and device loss) and replies `NO_MOUNT`.
 3. Otherwise, whether the driver answered `SUCCESS` (it has released every open and exits),
    anything else, or nothing in time, tear the driver down without relying on it: revoke and
    delete the record's `partition`, so the driver reaches the disk no more; revoke and delete
@@ -183,7 +184,9 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   block request ([docs/storage.md](../../../docs/storage.md#failure-and-revocation-invariants)
   § Failure and Revocation Invariants).
 - **A change of the class.** devmgr signals the watch when it serves a block driver and when it
-  withdraws one. The watch thread probes every held disk.
+  withdraws one. The watch thread probes every held disk. A `MOUNT` that discovers new disks
+  probes each once it is held, since devmgr can withdraw one after discovery asked about it and
+  before the watch thread can see it held.
 - **The probe** asks devmgr about the disk's instance ordinal (`QUERY_DEVICE` on the `block`
   class); `WITHDRAWN` means the disk is gone for good, since devmgr never serves an ordinal
   again. The probe does not call the disk's own cap: devmgr takes a removed device's driver out of
@@ -195,8 +198,11 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   records of its mounts name. Each mount on it is claimed and unmounted as a forced `UNMOUNT` is
   (§ Unmount): `FS_UNMOUNT` with `UNMOUNT_FORCE`, bounded, then the teardown, whether the driver
   answered or not. An idle driver, or one serving from its page cache, has touched no block since
-  the removal and has not exited; the class watch is what sees its disk go. A `MOUNT` whose
-  install lands after its disk's loss tears its mount down and replies `NO_MOUNT`.
+  the removal and has not exited; the class watch is what sees its disk go. A mount the claims
+  passed, because a `MOUNT` installed it or a refused `UNMOUNT` restored it after them, is torn
+  down the same way by that request, which checks the disk after the install or the restore and
+  replies `NO_MOUNT`; the disk is marked removed before the claims, so the claims or that check
+  see the mount.
 - **The root.** The death of the root mount's driver, or the loss of its disk, ends vfsd: it logs
   `FATAL: root filesystem lost` with the cause and exits with code 1, on the main thread, since
   the exit syscall ends only the thread that makes it and procmgr tears a process down at its main
@@ -355,9 +361,11 @@ vfsd holds two un-badged endpoints:
   in-memory walks of one node's children or ancestors, and the only
   blocking call is the optional fall-through call, bounded by
   `FALLTHROUGH_TIMEOUT_MS` (10 s): a root driver that stops answering
-  holds the dispatcher, and the lookups queued behind it, up at most that
-  long, and a lookup that crosses another mount never reaches it. The same endpoint is the
-  kernel-derivation parent for every system-root cap vfsd ever
+  holds the dispatcher up to that bound per fall-through call, so a
+  lookup queued behind such calls waits up to the bound for each of them,
+  and a lookup that crosses another mount never reaches the root driver
+  itself. The same endpoint is the kernel-derivation parent for every
+  system-root cap vfsd ever
   issues via `cap_derive_badge` (the synthetic root cap, plus a
   fresh cap per synthetic intermediate descent).
 

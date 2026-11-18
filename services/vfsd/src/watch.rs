@@ -180,11 +180,19 @@ fn class_changed(rt: &VfsdRuntime, ipc_buf: *mut u64)
         .len();
     for disk in 0..count
     {
-        if let Some(ordinal) = held_ordinal(rt, disk)
-            && partition::probe(rt.caps.block_class, ordinal, ipc_buf) == DiskState::Withdrawn
-        {
-            disk_lost(rt, disk, ipc_buf);
-        }
+        probe_disk(rt, disk, ipc_buf);
+    }
+}
+
+/// Ask devmgr whether it still serves the held disk at `disk`
+/// ([`partition::probe`]) and handle its loss when it withdrew it
+/// ([`disk_lost`]). A removed disk is not asked again.
+pub fn probe_disk(rt: &VfsdRuntime, disk: usize, ipc_buf: *mut u64)
+{
+    if let Some(ordinal) = held_ordinal(rt, disk)
+        && partition::probe(rt.caps.block_class, ordinal, ipc_buf) == DiskState::Withdrawn
+    {
+        disk_lost(rt, disk, ipc_buf);
     }
 }
 
@@ -226,11 +234,7 @@ fn driver_died(rt: &VfsdRuntime, queue: u64, ipc_buf: *mut u64)
     );
     crate::teardown_dead_mount(&mount, ipc_buf);
     crate::finish_unmount(rt, idx, ipc_buf);
-    if let Some(ordinal) = held_ordinal(rt, mount.disk)
-        && partition::probe(rt.caps.block_class, ordinal, ipc_buf) == DiskState::Withdrawn
-    {
-        disk_lost(rt, mount.disk, ipc_buf);
-    }
+    probe_disk(rt, mount.disk, ipc_buf);
 }
 
 /// In the hold `backend`, take the death `queue` holds when it belongs to a
@@ -279,6 +283,39 @@ fn disk_lost(rt: &VfsdRuntime, disk: usize, ipc_buf: *mut u64)
     {
         crate::force_unmount(rt, idx, &mount, ipc_buf);
     }
+}
+
+/// Tear down, as a forced unmount, the mount on the disk at `disk` whose
+/// death queue is `death_queue` when that disk is removed; returns whether
+/// it is.
+///
+/// For a mount that became one lookups cross outside the claims of
+/// [`disk_lost`]: one a `MOUNT` installed, or one a refused `UNMOUNT`
+/// restored, after those claims passed it. The disk is marked removed
+/// before the claims, so the claims or this check, which follows the
+/// install or the restore, see the mount; when both do, the first claim
+/// wins and the other finds nothing to claim.
+pub fn unmount_if_removed(
+    rt: &VfsdRuntime,
+    disk: usize,
+    death_queue: u64,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let removed = rt
+        .disks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(disk)
+        .is_none_or(|d| d.removed);
+    // The disk is matched too: once another remover ended the mount, a later
+    // mount's death queue may reuse the handle.
+    if removed
+        && let Some((idx, mount)) = claim(rt, |m| m.disk == disk && m.death_queue == death_queue)
+    {
+        crate::force_unmount(rt, idx, &mount, ipc_buf);
+    }
+    removed
 }
 
 /// Claim the first mount lookups cross whose record `matches` ([`begin_claim`]

@@ -288,8 +288,9 @@ The supported failure-handling primitives are:
   the loss of its disk, makes vfsd log `FATAL: root filesystem lost`
   and exit; vfsd is critical and never restarted, so svcmgr shuts the
   system down. vfsd's calls that fall through to the root filesystem
-  are bounded (10 s, answered `IoError`), so a root driver that stops
-  answering delays a lookup into another mount at most that long. The
+  are bounded (10 s each, answered `IoError`), so a root driver that
+  stops answering delays a lookup into another mount by that bound for
+  each fall-through call queued ahead of it, not indefinitely. The
   sequence is owned by
   [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md#driver-death-and-device-loss)
   § Driver death and device loss.

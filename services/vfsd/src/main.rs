@@ -562,8 +562,9 @@ fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRunti
 /// One thread is sufficient: every backend operation is an in-memory walk
 /// of one node's children, or of one node's ancestors; the only blocking
 /// call is the optional fall-through call to a root-fs cap, bounded by
-/// [`FALLTHROUGH_TIMEOUT_MS`], so a root fs driver that stops answering
-/// delays the walks queued behind it by at most the bound. A
+/// [`FALLTHROUGH_TIMEOUT_MS`] per call, so a root fs driver that stops
+/// answering delays a walk queued behind fall-through calls by up to the
+/// bound for each of them. A
 /// multi-threaded recv on `namespace_ep` would only buy concurrency
 /// between independent `NS_*` requests and is not load-bearing today.
 ///
@@ -1349,6 +1350,14 @@ fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) ->
             {
                 std::os::seraph::log!(error: "UNMOUNT: the refused unmount was not under way");
             }
+            // The claims of a disk found removed may have passed this mount
+            // while this request held it; its loss ends it as if those
+            // claims had found it.
+            if watch::unmount_if_removed(rt, mount.disk, mount.death_queue, ipc_buf)
+            {
+                std::os::seraph::log!(warn: "UNMOUNT: the disk was removed during the unmount");
+                return IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
+            }
             std::os::seraph::log!("UNMOUNT: refused, {open} file(s) open");
             return IpcMessage::builder(ipc::vfsd_errors::BUSY)
                 .word(0, open)
@@ -1698,17 +1707,19 @@ fn discover_new_disks(rt: &VfsdRuntime, ipc_buf: *mut u64)
     // after they are held.
     let mut discovery = rt.discovery.lock().unwrap_or_else(PoisonError::into_inner);
     let found = discovery.discover(ipc_buf);
-    hold_new_disks(rt, discovery, found);
+    hold_new_disks(rt, discovery, found, ipc_buf);
 }
 
 /// Append the disks `found`, which `discovery` just found, to the disk
-/// table, holding `discovery` until they are. When the table has no room,
-/// their caps are deleted and `discovery` queries them again on its next
-/// run.
+/// table, holding `discovery` until they are, then ask devmgr again
+/// whether it serves each one ([`watch::probe_disk`]). When the table has
+/// no room, their caps are deleted and `discovery` queries them again on
+/// its next run.
 fn hold_new_disks(
     rt: &VfsdRuntime,
     mut discovery: std::sync::MutexGuard<'_, partition::Discovery>,
     found: Vec<partition::Disk>,
+    ipc_buf: *mut u64,
 )
 {
     let Some(first) = found.first().map(|d| d.ordinal)
@@ -1717,6 +1728,7 @@ fn hold_new_disks(
         return;
     };
     let mut disks = rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
+    let start = disks.len();
     if disks.try_reserve(found.len()).is_err()
     {
         drop(disks);
@@ -1729,6 +1741,17 @@ fn hold_new_disks(
         return;
     }
     disks.extend(found);
+    let end = disks.len();
+    drop(disks);
+    drop(discovery);
+    // devmgr may have withdrawn a disk after discovery asked about it and
+    // before it was held, and the watch thread, probing the disks held then,
+    // passed it; asking again once it is held closes that window, as a later
+    // withdrawal signals a watch that finds it held.
+    for disk in start..end
+    {
+        watch::probe_disk(rt, disk, ipc_buf);
+    }
 }
 
 /// Shared implementation for both role-driven (`do_mount`) and
@@ -1942,22 +1965,11 @@ fn do_mount_internal(
 
     populate_fallthrough_caps(rt, ipc_buf, install_result.as_slice());
 
-    // The watch thread claims the mounts of a disk it finds removed; a mount
-    // installed after those claims is torn down here. The disk is marked
-    // removed before the claims, so this check or the claims see the mount.
-    let disk_removed = rt
-        .disks
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(location.disk)
-        .is_none_or(|d| d.removed);
-    if disk_removed
+    // The claims of a disk found removed may have passed this mount before
+    // its install.
+    if watch::unmount_if_removed(rt, location.disk, fatfs.death_queue, ipc_buf)
     {
         std::os::seraph::log!(warn: "MOUNT: the disk was removed during the mount");
-        if let Some((idx, mount)) = watch::claim(rt, |m| m.death_queue == fatfs.death_queue)
-        {
-            force_unmount(rt, idx, &mount, ipc_buf);
-        }
         log_cap_delete("caller cap (disk removed)", caller_root_cap.unwrap_or(0));
         return Err(ipc::vfsd_errors::NO_MOUNT);
     }

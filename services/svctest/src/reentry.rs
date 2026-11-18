@@ -39,6 +39,7 @@ pub fn dispatch(role: &str)
 {
     phases::namespace::reentry_main(role);
     phases::procmgr::reentry_main(role);
+    phases::process_tree::reentry_main(role);
     phases::fs_std::reentry_main(role);
     phases::fs_opens::reentry_main(role);
     phases::exit_code::reentry_main(role);

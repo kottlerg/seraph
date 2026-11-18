@@ -1002,9 +1002,8 @@ impl ProcessTable
         let idx = self.index_of_badge(badge)?;
         let entry = self.entries.remove(idx);
         let heir = entry.parent;
-        let doom = entry.contained
-            || entry.doomed
-            || self.find_by_badge(heir).is_some_and(|e| e.doomed);
+        let doom =
+            entry.contained || entry.doomed || self.find_by_badge(heir).is_some_and(|e| e.doomed);
         for child in self.entries.iter_mut().filter(|e| e.parent == badge)
         {
             child.parent = heir;
@@ -1052,7 +1051,10 @@ impl ProcessTable
     #[must_use]
     pub fn is_child(&self, parent: u64, child: u64) -> bool
     {
-        parent != 0 && self.find_by_badge(child).is_some_and(|e| e.parent == parent)
+        parent != 0
+            && self
+                .find_by_badge(child)
+                .is_some_and(|e| e.parent == parent)
     }
 
     /// Record `queue` (a slot in procmgr's `CSpace`) as the end queue of the
@@ -1156,13 +1158,15 @@ impl ProcessTable
         {
             return Some(Creator::UNBADGED);
         }
-        self.find_by_badge(badge).filter(|e| !e.doomed).map(|e| Creator {
-            band_max: e.band_max,
-            memmgr_badge: e.memmgr_badge,
-            reserve: e.reserve,
-            unbadged: false,
-            sign_kinds: e.sign_kinds,
-        })
+        self.find_by_badge(badge)
+            .filter(|e| !e.doomed)
+            .map(|e| Creator {
+                band_max: e.band_max,
+                memmgr_badge: e.memmgr_badge,
+                reserve: e.reserve,
+                unbadged: false,
+                sign_kinds: e.sign_kinds,
+            })
     }
 }
 
@@ -3294,7 +3298,13 @@ mod tests
     #[test]
     fn a_contained_end_dooms_what_is_left_of_its_subtree()
     {
-        let mut table = tree(&[(0x10, 0), (0x20, 0x10), (0x30, 0x20), (0x40, 0x30), (0x50, 0x10)]);
+        let mut table = tree(&[
+            (0x10, 0),
+            (0x20, 0x10),
+            (0x30, 0x20),
+            (0x40, 0x30),
+            (0x50, 0x10),
+        ]);
         table.find_mut_by_badge(0x20).expect("live").contained = true;
         table.find_mut_by_badge(0x30).expect("live").relay = 5;
         assert_eq!(table.reserve_badge(0x60, 0x40), Ok(()));
@@ -3310,8 +3320,17 @@ mod tests
             Err(InsertError::CreatorEnded)
         );
         // The doomed child lists under no one, and is taken as any doomed.
-        assert_eq!(table.children_after(0x10, None).map(|e| e.badge).collect::<Vec<_>>(), [0x50]);
-        while table.take_doomed(|_| panic!("no doomed child is re-parented")).is_some() {}
+        assert_eq!(
+            table
+                .children_after(0x10, None)
+                .map(|e| e.badge)
+                .collect::<Vec<_>>(),
+            [0x50]
+        );
+        while table
+            .take_doomed(|_| panic!("no doomed child is re-parented"))
+            .is_some()
+        {}
         assert_eq!(table.len(), 2);
     }
 
@@ -3334,7 +3353,13 @@ mod tests
     #[test]
     fn the_child_walk_pages_the_live_children_in_badge_order()
     {
-        let mut table = tree(&[(0x10, 0), (0x40, 0x10), (0x20, 0x10), (0x30, 0x20), (0x50, 0x10)]);
+        let mut table = tree(&[
+            (0x10, 0),
+            (0x40, 0x10),
+            (0x20, 0x10),
+            (0x30, 0x20),
+            (0x50, 0x10),
+        ]);
         assert!(table.doom_subtree(0x50));
         let all: Vec<u64> = table.children_after(0x10, None).map(|e| e.badge).collect();
         assert_eq!(all, [0x20, 0x40]);

@@ -68,22 +68,21 @@ pub struct FatfsDriver
     /// procmgr's process handle for the driver.
     pub process: u64,
     /// `RECV` on the driver's death queue ([`new_death_queue`]): the
-    /// driver's main thread is bound to it, and procmgr binds the relay
-    /// derived from it to the driver's address space, so its main thread's
-    /// exit and the first terminal fault in any of its threads post to it.
+    /// driver's main thread is bound to it, and procmgr posts the driver's
+    /// end to the relay derived from it, so its main thread's exit and its
+    /// end, a terminal fault in any of its threads among them, post to it.
     pub death_queue: u64,
 }
 
 /// Entries a driver's death queue holds. The main-thread binding posts once,
-/// on the main thread's exit or terminal fault, and procmgr's address-space
-/// binding of the relay posts once, on the first terminal fault in any of its
-/// threads (an address space posts its observers once), so a driver's death
-/// posts one or two entries, and the queue holds every post.
+/// on the main thread's exit or terminal fault, and procmgr posts the
+/// driver's end to the relay once, at its reap or destroy, so a driver's
+/// death posts one or two entries, and the queue holds every post.
 const DEATH_QUEUE_CAPACITY: u32 = 2;
 
-/// Death-observer nodes of a driver's death queue: the main-thread binding
-/// and procmgr's address-space binding.
-const DEATH_QUEUE_OBSERVERS: u32 = 2;
+/// Death-observer nodes of a driver's death queue: the main-thread binding.
+/// procmgr's post to the relay is a post, not a binding, and takes none.
+const DEATH_QUEUE_OBSERVERS: u32 = 1;
 
 /// Spawn a fatfs driver instance for a partition and return it.
 /// `module_cap` is non-zero only for the root mount; pass zero to use the
@@ -306,9 +305,9 @@ fn new_bootstrap_order(
     Some((bootstrap, badged_creator))
 }
 
-/// A driver's death queue: an event queue with room for every post its
-/// two bindings can make ([`DEATH_QUEUE_CAPACITY`]) and an observer node
-/// for each ([`DEATH_QUEUE_OBSERVERS`]). Returns the original, or `None`
+/// A driver's death queue: an event queue with room for every post the
+/// main-thread binding and the relay can take ([`DEATH_QUEUE_CAPACITY`]) and
+/// an observer node for the binding ([`DEATH_QUEUE_OBSERVERS`]). Returns the original, or `None`
 /// when the queue cannot be created.
 fn new_death_queue() -> Option<u64>
 {
@@ -322,8 +321,8 @@ fn new_death_queue() -> Option<u64>
 }
 
 /// A `POST`-only derivation of `death_queue`: the relay a create request
-/// carries under `CREATE_DEATH_RELAY` for procmgr to bind to the child's
-/// address space.
+/// carries under `CREATE_DEATH_RELAY`, to which procmgr posts the child's
+/// end.
 pub fn derive_death_relay(death_queue: u64) -> Option<u64>
 {
     syscall::cap_derive(death_queue, syscall::RIGHTS_EQ_POST).ok()

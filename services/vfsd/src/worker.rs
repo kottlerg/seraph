@@ -136,8 +136,8 @@ fn take_next_active_job(active: &ActiveState) -> ActiveJob
 /// bootstrap delivery the bootstrap worker performs in parallel.
 ///
 /// The child's main thread is bound to `order.death_queue` before it
-/// starts, and procmgr binds a relay derived from it to the child's address
-/// space (`CREATE_DEATH_RELAY`).
+/// starts, and procmgr posts the child's end to a relay derived from it
+/// (`CREATE_DEATH_RELAY`).
 ///
 /// Returns the child's process handle once the child holds its bootstrap
 /// caps. On every `None` return the bootstrap order is withdrawn

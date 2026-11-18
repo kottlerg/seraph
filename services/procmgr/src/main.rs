@@ -714,14 +714,15 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
             release_caps(req.caps());
             // Served on a process handle alone (`sender_refusal`): the badge
             // names the parent, `data[0]` the child.
-            let code = if process::destroy_child(badge, req.word(0), ctx.memmgr_ep, ipc_buf, &ctx.tables)
-            {
-                procmgr_errors::SUCCESS
-            }
-            else
-            {
-                procmgr_errors::INVALID_BADGE
-            };
+            let code =
+                if process::destroy_child(badge, req.word(0), ctx.memmgr_ep, ipc_buf, &ctx.tables)
+                {
+                    procmgr_errors::SUCCESS
+                }
+                else
+                {
+                    procmgr_errors::INVALID_BADGE
+                };
             reply_empty(ipc_buf, code);
             reap_checks(ctx);
         }

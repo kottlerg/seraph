@@ -905,7 +905,10 @@ pub mod procmgr_labels
         name: &mut [u8; super::svcmgr_labels::NAME_MAX],
     ) -> Option<(u64, usize)>
     {
-        unpack_named(entry_words(words, index, LIST_PROCESSES_WORDS_PER_ENTRY)?, name)
+        unpack_named(
+            entry_words(words, index, LIST_PROCESSES_WORDS_PER_ENTRY)?,
+            name,
+        )
     }
 
     /// Write entry `index` of a [`LIST_CHILDREN`] reply into `words` (the
@@ -921,8 +924,9 @@ pub mod procmgr_labels
         subtree_pages: u64,
     ) -> bool
     {
-        let Some((pages_word, named)) = entry_words_mut(words, index, LIST_CHILDREN_WORDS_PER_ENTRY)
-            .and_then(|entry| entry.split_last_mut())
+        let Some((pages_word, named)) =
+            entry_words_mut(words, index, LIST_CHILDREN_WORDS_PER_ENTRY)
+                .and_then(|entry| entry.split_last_mut())
         else
         {
             return false;
@@ -942,7 +946,8 @@ pub mod procmgr_labels
         name: &mut [u8; super::svcmgr_labels::NAME_MAX],
     ) -> Option<(u64, usize, u64)>
     {
-        let (pages, named) = entry_words(words, index, LIST_CHILDREN_WORDS_PER_ENTRY)?.split_last()?;
+        let (pages, named) =
+            entry_words(words, index, LIST_CHILDREN_WORDS_PER_ENTRY)?.split_last()?;
         let (badge, len) = unpack_named(named, name)?;
         Some((badge, len, *pages))
     }
@@ -1013,7 +1018,9 @@ pub mod procmgr_labels
     /// `words`, for writing; `None` when they do not fit.
     fn entry_words_mut(words: &mut [u64], index: usize, stride: usize) -> Option<&mut [u64]>
     {
-        words.get_mut(entry_base(index, stride)?..)?.get_mut(..stride)
+        words
+            .get_mut(entry_base(index, stride)?..)?
+            .get_mut(..stride)
     }
 
     /// The first data word of entry `index` of a list reply whose entries take

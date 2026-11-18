@@ -1983,7 +1983,11 @@ fn segment_prot(seg: &elf::LoadSegment) -> u64
 
 /// Derive caller-facing caps, wire the child's pager and crash binding, and
 /// record the process in the table, with the death relay
-/// (`parent_relay_cap`, `0` for none), which its entry then owns.
+/// (`parent_relay_cap`, `0` for none), which its entry then owns. procmgr
+/// posts the child's end to the relay itself at its reap or destroy
+/// ([`TeardownTail::finish`]) rather than binding it to the child's address
+/// space, so the relay receives one post whoever ends the child, and a
+/// re-parent takes it away.
 ///
 /// The entry is inserted last, under the table lock, so a request served on
 /// another worker never finds a child whose wiring is still in progress; the
@@ -2141,10 +2145,6 @@ fn finalize_creation(
         parent: sched.creator,
         contained: sched.contained,
         doomed: false,
-        // procmgr posts the child's end to the relay itself at its reap or
-        // destroy (`TeardownTail::finish`), so the relay is not bound to
-        // the child's address space: the post is then one, whoever ends the
-        // child, and a re-parent takes the relay away.
         relay: parent_relay_cap,
         end_queue: 0,
         end_correlator: 0,
@@ -2158,14 +2158,7 @@ fn finalize_creation(
         // finalize returns an error.
         let _ = syscall::cap_delete(thread_for_caller);
         let _ = syscall::cap_delete(process_handle);
-        return Err(match e
-        {
-            process_table::InsertError::CreatorEnded => procmgr_errors::INVALID_ARGUMENT,
-            process_table::InsertError::BadgeInUse | process_table::InsertError::OutOfMemory =>
-            {
-                procmgr_errors::OUT_OF_MEMORY
-            }
-        });
+        return Err(insert_refusal(e));
     }
 
     Ok(CreateResult {
@@ -2176,6 +2169,22 @@ fn finalize_creation(
         node_handle: 0,
         image_bias,
     })
+}
+
+/// The create reply code for a refused insert of a child's entry: the creator
+/// ended, or a destroy of it began, while the child was built, as for a create
+/// from a badge that names no live process; else the table could not grow (the
+/// badge was reserved, so no other entry holds it).
+fn insert_refusal(e: process_table::InsertError) -> u64
+{
+    match e
+    {
+        process_table::InsertError::CreatorEnded => procmgr_errors::INVALID_ARGUMENT,
+        process_table::InsertError::BadgeInUse | process_table::InsertError::OutOfMemory =>
+        {
+            procmgr_errors::OUT_OF_MEMORY
+        }
+    }
 }
 
 /// Bind a child's main thread's exception class to the crash endpoint
@@ -3358,7 +3367,9 @@ fn drain_doomed(memmgr_ep: u64, ipc_buf: *mut u64, tables: &Tables)
                 return;
             };
             let exit_reason = destroyed_exit_reason(&entry);
-            state.recent.record(entry.badge, exit_reason, crate::now_ns());
+            state
+                .recent
+                .record(entry.badge, exit_reason, crate::now_ns());
             teardown_entry(entry, exit_reason, &mut state.table)
         };
         tail.finish(memmgr_ep, ipc_buf);
@@ -3394,8 +3405,11 @@ pub fn destroy_created(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &T
 fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
 {
     let main_thread = syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
-    let terminal_fault =
-        syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT).ok();
+    let terminal_fault = syscall::cap_info(
+        entry.aspace_cap,
+        syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
+    )
+    .ok();
     resync_exit_reason(
         main_thread,
         syscall_abi::THREAD_STATE_EXITED,

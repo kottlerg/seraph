@@ -62,6 +62,7 @@ pub mod node_handle;
 pub mod pager;
 pub mod pipes;
 pub mod process_faults;
+pub mod process_tree;
 pub mod procmgr;
 pub mod pwrmgr;
 pub mod random;
@@ -108,6 +109,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_faults::phases());
     out.extend_from_slice(namespace::late());
     out.extend_from_slice(procmgr::command_phases());
+    out.extend_from_slice(process_tree::phases());
     out.extend_from_slice(startup::late());
     out.extend_from_slice(fs_ipc::relative_only());
     out.extend_from_slice(pwrmgr::deny_only());

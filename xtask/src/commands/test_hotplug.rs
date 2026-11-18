@@ -5,14 +5,20 @@
 
 //! PCI Express native hotplug test: a device hot-added behind a root port is
 //! found by devmgr, given its BARs, recorded, and bound, and its driver's DMA
-//! and MSI work.
+//! and MSI work; removed, its driver is withdrawn and the slot powered off;
+//! added again, it is bound anew and works.
 //!
 //! Stages the `hotplug-check` fixture's recipe and the `test-dma` class into the
 //! boot set, repacks the disk images in the layout they have, and boots the
 //! current sysroot with an empty `pcie-root-port` and a QMP socket. Once devmgr
 //! logs the slot managed ([`MANAGED_MARKER`]) and the fixture logs
 //! [`READY_MARKER`], the host hot-adds QEMU's `edu` device behind the port
-//! (QMP `device_add`) and waits for the fixture's verdict. On `x86_64` that boot
+//! (QMP `device_add`). Once the fixture logs [`REMOVE_MARKER`], the host
+//! removes it (QMP `device_del`, which presses the slot's attention button)
+//! and waits for QEMU's `DEVICE_DELETED`, which QEMU sends once devmgr powers
+//! the slot off; devmgr's removal lines must come in their order
+//! ([`REMOVAL_MARKERS`]). Once the fixture logs [`READD_MARKER`], the host
+//! adds the device again and waits for the fixture's verdict. On `x86_64` that boot
 //! turns QEMU's ACPI PCI hotplug off, so `_OSC` grants native control; a boot
 //! before it, with the machine's default, checks that devmgr leaves the slot
 //! alone when `_OSC` withholds it ([`REFUSED_MARKER`]). On riscv64 the
@@ -56,6 +62,26 @@ const CLASS: &str = "test-dma.class";
 /// with `services/hotplug-check/src/main.rs`.
 const READY_MARKER: &str = "[hotplug-check] READY for the hot-added device";
 
+/// The fixture's line once the hot-added device passed its probes. Kept in
+/// sync with `services/hotplug-check/src/main.rs`.
+const REMOVE_MARKER: &str = "[hotplug-check] READY for the removal";
+
+/// The fixture's line once devmgr withdrew the removed device's driver. Kept
+/// in sync with `services/hotplug-check/src/main.rs`.
+const READD_MARKER: &str = "[hotplug-check] WITHDRAWN at ordinal 0; READY for the re-added device";
+
+/// devmgr's lines of a removal, in the order they must come: the poller
+/// starts the removal at the end of the attention button's abort window, the
+/// driver's held memory is released once its device is withdrawn, the
+/// removal job ends, and the poller powers the slot off. Kept in sync with
+/// `services/devmgr/src/hotplug.rs` and `services/devmgr/src/bind.rs`.
+const REMOVAL_MARKERS: [&str; 4] = [
+    "removing its functions (its attention button's abort window elapsed)",
+    "driver withdrawn, its memory released",
+    "functions removed: 1, drivers withdrawn: 1,",
+    "powered off (empty)",
+];
+
 /// The fixture's line when every check passed.
 const PASS_MARKER: &str = "[hotplug-check] PASS";
 
@@ -79,6 +105,11 @@ const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Budget for the fixture's verdict after the hot-add: past the poller's
 /// period, the link wait, the add job, the driver's settle, and the probes.
 const VERDICT_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// Budget for a removal, from `device_del` to devmgr's last removal line:
+/// past the poller's period, the attention button's five-second abort
+/// window, and the withdrawal.
+const REMOVAL_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
 {
@@ -108,7 +139,10 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
         .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, layout))
         .context("restoring the disk images without the fixture")?;
     booted?;
-    step("hotplug test: PASS (the hot-added device was bound, its DMA and MSI work)");
+    step(
+        "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
+         driver and powered the slot off, and it was bound again)",
+    );
     Ok(())
 }
 
@@ -285,13 +319,33 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
         ready |= line.contains(READY_MARKER);
     }
     step("hotplug test: slot managed and the fixture ready; hot-adding edu");
-    qmp::device_add(
-        socket,
-        "edu",
-        DEVICE_ID,
-        HOTPLUG_PORT_ID,
-        &[("dma_mask", EDU_DMA_MASK)],
+    let add = || {
+        qmp::device_add(
+            socket,
+            "edu",
+            DEVICE_ID,
+            HOTPLUG_PORT_ID,
+            &[("dma_mask", EDU_DMA_MASK)],
+        )
+    };
+    add()?;
+    lines.start = Instant::now();
+    let line = lines.until(
+        VERDICT_TIMEOUT,
+        "the fixture's probes of the added device",
+        |l| l.contains(REMOVE_MARKER) || l.contains(FAIL_MARKER),
     )?;
+    if line.contains(FAIL_MARKER)
+    {
+        bail!("the fixture failed: {line}");
+    }
+    step("hotplug test: the added device works; removing it");
+    qmp::device_del(socket, DEVICE_ID, REMOVAL_TIMEOUT)?;
+    step("hotplug test: QEMU deleted the device");
+    lines.start = Instant::now();
+    removal(&lines)?;
+    step("hotplug test: devmgr withdrew the driver and powered the slot off; adding edu again");
+    add()?;
     lines.start = Instant::now();
     let verdict = lines.until(VERDICT_TIMEOUT, "the fixture's verdict", |l| {
         l.contains(PASS_MARKER) || l.contains(FAIL_MARKER)
@@ -299,6 +353,39 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
     if !verdict.contains(PASS_MARKER)
     {
         bail!("the fixture failed: {verdict}");
+    }
+    Ok(())
+}
+
+/// Read the lines of a removal: each of devmgr's [`REMOVAL_MARKERS`] once, in
+/// their order, and the fixture's [`READD_MARKER`], which may come among
+/// them, since the fixture sees the driver withdrawn as devmgr takes it out
+/// of its class.
+fn removal(lines: &Lines) -> Result<()>
+{
+    let mut next = 0usize;
+    let mut withdrawn = false;
+    while next < REMOVAL_MARKERS.len() || !withdrawn
+    {
+        let line = lines.until(REMOVAL_TIMEOUT, "the removal's lines", |l| {
+            l.contains(READD_MARKER)
+                || l.contains(FAIL_MARKER)
+                || REMOVAL_MARKERS.iter().any(|m| l.contains(m))
+        })?;
+        if line.contains(FAIL_MARKER)
+        {
+            bail!("the fixture failed: {line}");
+        }
+        if line.contains(READD_MARKER)
+        {
+            withdrawn = true;
+            continue;
+        }
+        match REMOVAL_MARKERS.iter().position(|m| line.contains(m))
+        {
+            Some(at) if at == next => next = next.saturating_add(1),
+            _ => bail!("removal line out of order or repeated: {line}"),
+        }
     }
     Ok(())
 }

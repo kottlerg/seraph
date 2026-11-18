@@ -4,9 +4,9 @@ How devmgr learns that a device was added to or removed from a running machine, 
 device's record and driver follow.
 
 Implementation status: partly implemented
-([#939](https://github.com/kottlerg/seraph/issues/939)). PCI Express native hotplug's add path is
-implemented. Its removal path (§ Removal) and the ACPI PCI hotplug source (§ Event Sources) are
-design intent; not yet implemented.
+([#939](https://github.com/kottlerg/seraph/issues/939)). PCI Express native hotplug's add and
+removal paths are implemented. The ACPI PCI hotplug source (§ Event Sources) is design intent;
+not yet implemented ([#1096](https://github.com/kottlerg/seraph/issues/1096)).
 
 ---
 
@@ -29,7 +29,7 @@ advertises Hot-Plug Capable while firmware keeps control (QEMU's default q35 roo
 control 0x1E) is driven by firmware's own hotplug, and a second agent on its Slot Control would
 contend with it. The platform key exists for a machine whose `_OSC` withholds native control
 while it offers no ACPI hotplug either (QEMU's riscv64 `virt`), so no other agent drives the
-slot. Both sources feed one add path (§ Add Job).
+slot. Both sources feed one add path (§ Add Job) and one removal path (§ Removal).
 
 ---
 
@@ -68,10 +68,11 @@ write to it ([acpid's devmgr.md](../../acpid/docs/devmgr.md) § Configuration ac
 Before the hand-over devmgr holds the BAR pages of the functions behind the slot
 (`hotplug::hold_behind`): what the apertures still hold of the page span of each MMIO BAR of each
 live record on the slot's buses (all of it for an unbound record, what its bind left for a bound
-one) moves out of the apertures into devmgr's held BAR pages (`DevmgrCaps::slot_bars`), from which
-a bind carves the function's BAR caps. Placement takes only what the apertures hold
-(§ Add Job), so no hot-added BAR lands on them. A slot whose pages cannot be held is not managed,
-logged, and the pages moved before the failure go back to the apertures.
+one) moves out of the apertures into devmgr's held BAR pages (`DevmgrCaps::slot_bars`), from which a
+bind carves the function's BAR caps. A withdrawal gives every BAR cap of its driver's device back to
+the held BAR pages (§ Removal), so the pages a bind carved come back there too. Placement takes only
+what the apertures hold (§ Add Job), so no hot-added BAR lands on them. A slot whose pages cannot be
+held is not managed, logged, and the pages moved before the failure go back to the apertures.
 
 ### Poller
 
@@ -89,10 +90,21 @@ Changed, Data Link Layer State Changed; all RW1C, so a poll loses no event), and
 
 | Slot | Slot Status | Action |
 |---|---|---|
-| empty | Presence Detect State set | power up, then post the arrival; the slot is occupied, or failed when the link does not come up |
-| occupied | presence lost, or Attention Button Pressed | the removal path (§ Removal); the slot is departed |
-| departed | presence, and Attention Button Pressed clear | the slot is occupied again |
-| failed | presence lost | the slot is empty again |
+| empty | Presence Detect State set | power up, then post the add job; the slot is occupied, or failed when the link does not come up |
+| occupied | presence lost or changed, or the link lost | post the removal job; the slot is removing |
+| occupied | Attention Button Pressed | blink the power indicator; the slot is pressed, for the abort window |
+| pressed | Attention Button Pressed again | the power indicator on; the removal is cancelled, and the slot is occupied |
+| pressed | presence lost or changed, or the link lost | post the removal job; the slot is removing |
+| pressed | the abort window ended | post the removal job; the slot is removing |
+| removing | Attention Button Pressed, or Presence Detect Changed, with a card present | nothing until the removal job completes; the slot is powered up after it (§ Removal) |
+| removing | anything else | nothing, until the removal job completes (§ Removal) |
+| off | Attention Button Pressed, or Presence Detect Changed, with a card present | power up, as for an empty slot |
+| off, failed | presence lost | the slot is empty |
+
+The link is lost when the port reports Data Link Layer Link Active, Data Link Layer State Changed
+is latched, and Link Active reads clear. A Slot Status of all ones, from a port that does not
+answer, changes nothing. The abort window is `ABORT_WINDOW_MS` (5000), `ABORT_POLLS` polls (PCI
+Express Base Specification r4.0 § 6.7.1.5).
 
 Power-up writes Slot Control with the slot's power on where it has a Power Controller and its
 power indicator on where it has one. Where the slot reports Command Completed, each Slot Control
@@ -101,12 +113,13 @@ reports Data Link Layer Link Active, the poller waits up to `SLOT_WAIT_MS` for t
 `LINK_SETTLE_MS` (100) before any configuration request goes below the port (PCI Express Base
 Specification r4.0 § 6.6.1); where it does not report it, it waits `SLOT_WAIT_MS`. A link that
 does not come up is logged, the slot powered off, and the slot held failed until the card is
-removed. An arrival is posted to the control thread over a channel, with a signal of its job
-notification.
+removed. A job, add or removal, is posted to the control thread over one channel, with a signal
+of its job notification; the control thread runs the jobs in the order they were posted, each to
+its end before the next.
 
 ### Add Job
 
-The control thread runs each posted arrival (`hotplug::Hotplug::run`). It reads function 0 of
+The control thread runs each posted add job (`hotplug::Hotplug::run`). It reads function 0 of
 device 0 on the slot's secondary bus, and functions 1 to 7 when function 0 is multi-function: a
 downstream port forwards configuration requests to device 0 only. For each function present
 (`firmware::hotplug::place`):
@@ -137,8 +150,8 @@ The aperture table is the one record of what is free. A page devmgr granted acpi
 ([acpid's devmgr.md](../../acpid/docs/devmgr.md) § Region grants), carved for itself or a driver,
 or holds for a function behind a managed slot is not in it, so no placement lands on it; a held
 page is in no aperture, so no region grant reaches it. A bind carves a hot-added function's BAR
-caps from the held pages. The removal path returns a removed function's held pages to the
-apertures.
+caps from the held pages. The removal job returns a removed function's held pages to the
+apertures (§ Removal).
 
 ### Binding
 
@@ -159,12 +172,73 @@ route).
 
 ### Removal
 
-Design intent; not yet implemented ([#939](https://github.com/kottlerg/seraph/issues/939)). The
-poller logs a removal or an attention-button press on an occupied slot once, and devmgr does nothing
-else: the records and drivers behind the slot stay. The removal path withdraws every live record on
-the slot's buses through the withdrawal order of
-[responsibilities.md](responsibilities.md#withdrawing-a-driver) § Withdrawing a Driver, honours the
-attention button's 5 s abort window, and powers the slot off only after the withdrawal returns.
+A removal is a slot's card leaving: pulled (presence lost or changed, so a card pulled and inserted,
+or swapped, within one poll is removed and then added again, or the link lost), or asked for with
+the attention button, whose press blinks the power indicator for the abort window; a second press
+within it cancels the removal, and the indicator is on again. The poller posts the slot's removal
+job, logged `removing its functions` with the cause, and holds the slot removing until the job
+completes, whatever Slot Status reads meanwhile: a card inserted, pressed or pulled then is acted on
+only after the completion. The slot keeps whether a card was inserted or the button pressed while it
+was removing, so that card is powered up after the completion without a further press, on a slot
+with no attention button as on one with it. A removal posted for a card changed in the slot, or in
+the poll of a second press within the abort window, which asks to keep the card, starts asked for
+the same way; one posted in the poll of a first press does not, since that press asks for the
+removal.
+
+The control thread runs the removal job (`firmware::hotplug::remove`), in this order:
+
+1. it withdraws the driver of each live record on the slot's buses
+   (`Registry::withdraw_at`): the driver is taken out of its class, its tombstone left and the
+   class's watchers signalled, and withdrawn through the order of
+   [responsibilities.md](responsibilities.md#withdrawing-a-driver) § Withdrawing a Driver. That
+   withdraws its DMA and has the IOMMU block the device, clears Bus Master Enable, revokes the
+   driver's copies of the device's BAR caps, disables its message-signaled vectors and clears
+   their remapping entries, resets and destroys the driver, and releases its held memory only once
+   the device is blocked or confirmed quiet. Each of its device's BAR caps (its `Mmio` resources'
+   and its MSI-X table's) is given back to the held BAR pages over the range it covers
+   (`PciDeviceCaps::release`), once every copy derived from it is revoked; a cap whose copies
+   cannot be revoked, or that the table cannot record, is deleted, logged, and its pages are lost
+   for the boot. A withdrawal asks the driver nothing, so a driver that does not answer cannot
+   delay it;
+2. it quiesces each of those functions (`firmware::hotplug::quiesce`): memory decode and Bus
+   Master Enable off, Interrupt Disable set, so a function with no driver answers at none of its
+   BARs either;
+3. it moves every held BAR span that lies inside a BAR's page span of one of them back to the
+   apertures, whole (`firmware::hotplug::return_bars`): a span moves as the cap it is, so nothing
+   is split, and only out of the held BAR pages, so a page is returned once;
+4. it marks their records removed (`PciRecords::remove`); the port's own record is on the bus
+   above and stays;
+5. it returns the instance of each removed record bound to a driver with an instance limit
+   (`BoundCounts::release_removed`), so a later pass can bind that driver to the device that
+   replaces it ([docs/driver-binding.md](../../../docs/driver-binding.md#matching) § Matching).
+   The instance returns only here, once the driver is withdrawn and the record removed, so a
+   driver never serves more devices than its limit.
+
+It logs `functions removed` with the number of records removed, drivers withdrawn and held spans
+returned, and posts the slot back to the poller, which powers it off in two Slot Control writes: the
+power controller off, then the power indicator off, logged `powered off`. QEMU unplugs the card on
+the write that leaves both off. The slot is then off while the card the removal removed is still
+present, until a press or a new insertion asks for it; it is empty when no card is present, or when
+a card was inserted or the button pressed while it was removing or by the power-off, so the next
+poll powers that card up (`firmware::hotplug::completed`). A slot is powered up again only from
+empty or off, so no add job for it runs before its previous occupant's DMA, IOMMU mappings and
+interrupt routes are gone. A removal job posted while the slot's add job waits runs after it, and
+withdraws what the add bound; a second removal job of a slot finds no live record and returns
+nothing.
+
+An IOMMU fault is counted for a requester ID only while a DMA grant of a live record tracks it
+(`firmware::dma::FaultCounts`): the grant tracks it from zero, the withdrawal stops counting it
+once the device is blocked, and a fault of an untracked requester ID is logged, not counted. A
+function added at a removed one's address starts with no faults.
+
+Returned BAR caps stay split: no syscall merges two adjacent `Mmio` caps
+([#1230](https://github.com/kottlerg/seraph/issues/1230) adds one), so a window's free
+range comes back as the spans it was carved into, each placeable on its own. A card added again
+with the same BARs is placed in the same spans; a BAR larger than the largest span left, or whose
+aligned base falls across two spans, no longer fits, logged as `the slot's windows have no room
+for it`, although the window is free. Each add at a new place splits a free span into at most
+three, so the apertures table grows by at most two spans per BAR placed, and never past one span
+per page of the windows.
 
 ---
 

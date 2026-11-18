@@ -18,9 +18,9 @@ enumerates every kind of device record of § Device Records (PCI, the ACPI names
 the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
 against the records (§ Matching), binds each matched PCI, platform, and IOMMU record through one
 path that delivers the resource list (§ Binding), and withdraws a bound driver in the order
-§ Binding gives. PCI Express native hotplug's add path is implemented; hotplug removal and the
-ACPI hotplug source are design intent, not yet implemented (§ Hotplug,
-[#939](https://github.com/kottlerg/seraph/issues/939)).
+§ Binding gives. PCI Express native hotplug's add and removal paths are implemented; the ACPI
+hotplug source is design intent, not yet implemented (§ Hotplug,
+[#1096](https://github.com/kottlerg/seraph/issues/1096)).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
 `MINT_CLASS_SEND`, the class files, and the boot-only mark.
@@ -163,7 +163,7 @@ describes, and a signature over the binary would cover its declaration with it.
 | Name | The driver's name in log lines |
 | Match entries | One or more keys of § Device Records: a PCI vendor and device, or a PCI class, subclass, and programming interface under a mask; an ACPI `_HID` or `_CID`; an SPCR interface type; a platform key; an IOMMU family key; the `boot-framebuffer` key |
 | Class | The name of the device class the driver serves (§ Device Classes) |
-| Instance limit | The most devices of its match the driver is bound to; absent means every one |
+| Instance limit | The most devices of its match the driver serves at once; absent means every one |
 | Interrupt need | None, optional, or required, and for a message-signaled capable driver the vector count it requests, given only beside DMA ([device-management.md](device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | DMA | Whether the device performs DMA: the driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD` and given a DMA capability ([device-management.md](device-management.md#dma-authorisation) § DMA Authorisation) |
 | DMA address width | Optional, valid only beside DMA: the address bits the device's DMA reaches, 12 to 64; absent means the device has no limit of its own. devmgr limits the device's IOVA space to the smaller of this and its unit's width (§ Declaration Bounds) |
@@ -250,9 +250,13 @@ and unbound, and a later declaration (a driver installed afterwards, through `BI
 hotplug pass) can still match it. A hotplug pass is a drivers-directory pass over the directory
 `SET_DRIVERS_DIR` installed, run against the records still unbound once a hotplug arrival has
 appended one ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding)
-§ Binding). A limited driver's bound devices are counted by driver name, within a pass and over the
-boot, so two declarations of one name share one count and a later pass binds the driver only to the
-devices its limit leaves.
+§ Binding). A limited driver's bound devices are counted by driver name, within a pass and across
+passes, so two declarations of one name share one count and a later pass binds the driver only to
+the devices its limit leaves. A PCI device's hotplug removal returns its instance once the removal
+has withdrawn the driver and removed the record, so the limit bounds the devices the driver serves
+at once, and a later pass can bind the driver to the device that replaces it. A withdrawal for any
+other cause, the driver's death among them, returns nothing: the record stays, and a record is
+bound at most once a boot.
 
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process
@@ -281,10 +285,11 @@ devmgr is its only consumer, over `ipc::iommu_labels`; it serves no device class
 at `BIND_DRIVERS`, and for a hot-added device:
 
 1. Carve one capability per resource of the record the declaration needs: each `Mmio` from
-   the apertures, or, for a BAR of a function behind a managed hotplug slot, from the BAR pages
-   devmgr holds for it
-   ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#add-job) § Add Job), and
-   each `IoPort` from devmgr's port capability, and keep the `Config` page.
+   the BAR pages devmgr holds where they cover it, else from the apertures, and each `IoPort`
+   from devmgr's port capability, and keep the `Config` page. devmgr holds the BAR pages of the
+   functions behind a managed hotplug slot
+   ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#add-job) § Add Job) and
+   every BAR capability a withdrawal or a failed bind gave back.
    The BARs of a PCI function devmgr may give MSI-X are carved less the pages holding its MSI-X
    table and Pending Bit Array, which devmgr keeps and delivers to no driver, so one BAR may be
    up to three `Mmio` capabilities, each naming its BAR and its offset in it
@@ -411,9 +416,9 @@ driver, which leaves a tombstone at its ordinal. Either change signals the class
 (§ Device Classes), so a consumer learns of it without probing. The event sources are
 specified in [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md): devmgr
 appends and binds a function added to a PCI Express slot it controls natively, under the host
-bridge's `_OSC` or the platform description table's `pcie_native_hotplug` grant. Removal and
-the ACPI hotplug source are design intent; not yet implemented
-([#939](https://github.com/kottlerg/seraph/issues/939)).
+bridge's `_OSC` or the platform description table's `pcie_native_hotplug` grant, and withdraws
+the driver of a function removed from one before it powers the slot off. The ACPI hotplug source
+is design intent; not yet implemented ([#1096](https://github.com/kottlerg/seraph/issues/1096)).
 
 ---
 

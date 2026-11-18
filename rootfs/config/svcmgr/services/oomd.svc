@@ -26,8 +26,8 @@
 #
 # `restart = on_failure`, `critical = no`: without oomd the system runs, with
 # no policy. crashd's recipe holds a fault declined for want of memory for
-# longer than the grace and the cooldown together, so a fault held while oomd
-# stops a service resumes.
+# longer than the grace and the cooldown together, so a fault held from the
+# level's rise resumes when one of oomd's first two stops frees memory.
 binary          = /services/oomd
 priority        = 20
 restart         = on_failure

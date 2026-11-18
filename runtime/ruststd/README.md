@@ -33,9 +33,11 @@ ruststd/
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
 │                               #   rustc-dep-of-std dep of overlaid std (not re-exported),
 │                               #   and the policy shared/death-set follows for services
-├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement rule
-│   └── src/lib.rs              #   of the byte heap (where a request lands in a free block,
-│                               #   what stays free); a rustc-dep-of-std dep of overlaid std
+├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement and
+│   └── src/lib.rs              #   release rules of the byte heap (where a request lands in a
+│                               #   free block, what stays free, which chunks of the committed
+│                               #   growth a free trims or discards); a rustc-dep-of-std dep
+│                               #   of overlaid std
 ├── pool-funding/               # `ruststd-pool-funding` crate: pure, host-tested funding
 │   └── src/lib.rs              #   policy of the page-table and `CSpace` growth pools (a
 │                               #   top-up's donations and outcome, the map retry after an
@@ -124,7 +126,11 @@ process the grow path registers one committed growth region directly above the h
 (`REGISTER_REGION` with `REGION_COMMIT`) on its first grow and extends it (`EXTEND_REGION`) on
 every later one, in 16-page multiples; memmgr charges each in full when it accepts it, so a
 refused grow is an allocation error, never a fault, and the heap holds no Memory caps
-([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Commit). A
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Commit).
+`dealloc` gives the region's unused pages back as the `ruststd-heap-fit` crate's `Growth` plans
+it: a free that leaves the heap's top free cuts the region (`SHRINK_REGION`), and a large free
+inside it discards its whole free chunks (`DISCARD_RANGE`), whose later touch memmgr backs
+zero-filled under the region's commitment; the floor is never given back. A
 process with no pager requests Memory caps from memmgr via
 `memmgr_labels::REQUEST_MEMORY_CAPS` on `ProcessInfo.memmgr_endpoint_cap`, mapping them at a
 contiguous VA above the heap's high-water mark with a single multi-page `mem_map` per returned

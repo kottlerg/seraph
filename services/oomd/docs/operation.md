@@ -54,9 +54,12 @@ nothing.
 
 The shipped recipe, `rootfs/config/svcmgr/services/oomd.svc`, sets the defaults. crashd's shipped
 recipe holds a fault declined for want of memory for 10 000 ms (`CRASHD_OOM_STALL_MS`), longer than
-the grace and the cooldown together, so a fault held from the level's rise outlasts the first stop
-and the cooldown that lets its memory come back
-([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold).
+the grace and the cooldown together, so a fault held from the level's rise outlasts the first two
+acts and the time after the second in which its stop's memory comes back. An act past the stall,
+due when the stops before it gave back too little to lift the level, finds the fault reported and
+declined: the stall bounds the hold, and does not grow with the ladder
+([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold, The stall and oomd's
+ladder).
 
 ---
 

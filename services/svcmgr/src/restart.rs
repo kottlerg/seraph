@@ -128,6 +128,19 @@ pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
     .unwrap_or(0)
 }
 
+/// Mint a receive-only derivation of the queue svcmgr's own death posts to,
+/// for the bootstrap round of the shutdown actuator, which observes svcmgr
+/// through it (docs/supervision.md § Observing svcmgr). `0` when svcmgr has
+/// no such queue or the derive fails, and the slot is then absent.
+pub(crate) fn mint_self_death_recv(ctx: &RestartCtx) -> u64
+{
+    if ctx.self_death_queue == 0
+    {
+        return 0;
+    }
+    syscall::cap_derive(ctx.self_death_queue, syscall::RIGHTS_EQ_RECV).unwrap_or(0)
+}
+
 /// The `CREATE_FROM_FILE` request labelled `label` for `file` (its file
 /// cap, its size, and the path walked to it, the name it is verified under),
 /// with creator endpoint `badged_creator` and the argv/env cap when present.
@@ -400,6 +413,11 @@ pub struct RestartCtx
     /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it, and a
     /// `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND|GRANT` cap.
     pub procmgr_death_auth_source: u64,
+    /// The queue svcmgr's own main thread and address space post their
+    /// death to (`observe_own_death` in `main.rs`), from which svcmgr mints
+    /// the shutdown actuator's receive-only derivation on every launch
+    /// ([`mint_self_death_recv`]). `0` when it could not be made.
+    pub self_death_queue: u64,
 }
 
 /// Handle a service death detected via event queue notification.
@@ -730,6 +748,12 @@ fn restart_boot_caps(
     if matches!(recipe, Some(r) if r.stop_authority)
     {
         restart_caps.push(mint_stop_authority(ctx));
+    }
+    // The shutdown actuator's receive-only derivation of svcmgr's own death
+    // queue rides the slot after those, so each instance observes svcmgr.
+    if matches!(recipe, Some(r) if r.observes_svcmgr)
+    {
+        restart_caps.push(mint_self_death_recv(ctx));
     }
 
     let provided_recv = if svc.provided_endpoint != 0

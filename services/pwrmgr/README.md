@@ -12,7 +12,7 @@ pwrmgr/
 ├── README.md
 └── src/
     ├── main.rs       # Entry, bootstrap, IPC dispatch loop, cap-gating
-    ├── caps.rs       # svcmgr bootstrap: the service endpoint and the two seeds
+    ├── caps.rs       # svcmgr bootstrap: the service endpoint, the two seeds, svcmgr's death queue
     └── arch/
         ├── mod.rs         # Arch dispatch: `arch::current` (Actuator, resolve,
         │                  # watch_events, shutdown, reboot)
@@ -73,11 +73,18 @@ issued, and a reboot about one second after.
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.
 
-pwrmgr observing svcmgr, which cannot observe its own death, and powering
-the platform off when svcmgr dies is design intent; not yet implemented
-(#262) (see
-[docs/supervision.md](../../docs/supervision.md#observing-svcmgr)
-§ Observing svcmgr).
+pwrmgr observes svcmgr, which cannot observe its own death
+([docs/supervision.md](../../docs/supervision.md#observing-svcmgr)
+§ Observing svcmgr). It waits on one wait set over its service endpoint and
+the receive-only derivation of svcmgr's death queue that svcmgr serves it
+(Cap flow below). An entry on the queue is svcmgr's death: pwrmgr drains the
+queue, logs `svcmgr died (exit reason <reason>); powering off` at error level,
+and powers the platform off as `SHUTDOWN` does. A power-off that does not take
+effect, or the absence of an actuator, is logged, and pwrmgr serves on. Without
+the queue, or when the wait set cannot be made, pwrmgr logs that svcmgr's
+death is unobserved and receives on its endpoint alone.
+`cargo xtask test-core-death` kills svcmgr and checks the power-off
+([docs/testing.md](../../docs/testing.md#core-death-test-core-death) § Core death).
 
 ---
 
@@ -109,7 +116,14 @@ the platform off when svcmgr dies is design intent; not yet implemented
    assert the gate rejects an unauthorised cap
    ([`provides`](../svcmgr/docs/service-definitions.md#provides);
    [svctest Capabilities](../svctest/README.md#capabilities)).
-4. svctest, at the end of `main()` after `ALL TESTS PASSED`, or from its
+4. svcmgr serves pwrmgr, the recognised shutdown actuator, a RECV-only
+   derivation of the event queue its own main thread and address space post
+   their death to, as bootstrap `cap[3]`, on its first launch and on every
+   restart
+   ([`shutdown_actuator`](../svcmgr/docs/service-definitions.md#shutdown_actuator)).
+   The queue is svcmgr's, so its death observers outlive every pwrmgr
+   instance, and the derivation keeps the queue alive past svcmgr's death.
+5. svctest, at the end of `main()` after `ALL TESTS PASSED`, or from its
    failure hooks after `SOME TESTS FAILED`, sends
    `pwrmgr_labels::SHUTDOWN` through the authorised cap, per
    [Cross-harness conventions](../../docs/testing.md#cross-harness-conventions)

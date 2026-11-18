@@ -47,17 +47,17 @@
 //! server receiving on the endpoint) — one phase racing a stop and one racing a
 //! Thread delete. A long-lived racer, pinned to CPU 2, takes the phase's action
 //! (stop the waiter, or delete its Thread capability) in each round it is armed
-//! for. The controller, pinned to CPU 0, runs [`CYCLES`] rounds per phase. Each
-//! round creates a fresh source and a waiter pinned to CPU 1 that loops waiting
-//! on it, counting each wait it enters and classifying each result; the
-//! controller waits until the waiter has entered a wait (bounded by
-//! [`ENTRY_WAIT_US`]; a round that times out is tallied), spins a varying
-//! settle so the race lands before, during, or after the park, arms the racer,
-//! spins a short varying delay of its own, and deletes the source's capability,
-//! so the racer's action and the source's teardown overlap in both orders. The
-//! source, the waiter, and the racer all use ktest's own `CSpace` and the
-//! controller's handles, so the source's delete and the racer's Thread delete
-//! each drop the object's last capability.
+//! for. The controller, pinned to CPU 0, runs [`CYCLES`] fixed rounds per phase
+//! (and the held rounds below). Each round creates a fresh source and a waiter
+//! pinned to CPU 1 that loops waiting on it, counting each wait it enters and
+//! classifying each result; the controller waits until the waiter has entered a
+//! wait (bounded by [`ENTRY_WAIT_US`]; a round that times out is tallied),
+//! spins a varying settle so the race lands before, during, or after the park,
+//! arms the racer, spins a short varying delay of its own, and deletes the
+//! source's capability, so the racer's action and the source's teardown overlap
+//! in both orders. The source, the waiter, and the racer all use ktest's own
+//! `CSpace` and the controller's handles, so the source's delete and the
+//! racer's Thread delete each drop the object's last capability.
 //!
 //! In a stop phase the controller then restarts the waiter (a waiter the
 //! stop found already exited — the teardown woke it first and its next wait
@@ -89,23 +89,36 @@
 //!
 //! ## What the host must give
 //!
-//! In a served-call phase's [`CYCLES`] fixed rounds a server receive is
-//! parked when the endpoint is deleted only if CPU 3 runs at once with
-//! CPU 0: the controller deletes within a few microseconds of arming the
-//! server. A host that runs fewer of the guest's CPUs at a time than the
-//! guest has (one 4-CPU guest on two cores, or the burn-in's two on four)
-//! does so in few rounds or none. So, after the fixed rounds, while the
-//! phase has fewer than [`MIN_PARKED`] parked receives, it runs held rounds,
-//! up to [`MAX_EXTRA_ROUNDS`] of them: the controller arms the racer and the
-//! server as in a fixed round, then waits, polling in 1 ms sleeps that leave
-//! its host core to the others and bounded by [`ACK_WAIT_US`], for the server
-//! to publish that it is entering its receive ([`SERVER_ENTERED`]), sleeps
-//! [`HOLD_MS`] more so the receive parks, and deletes the endpoint. The
-//! racer's action lands during the hold, on a caller the server is serving or
-//! about to dequeue. The host must run the server from its publish into its
-//! park within the hold in [`MIN_PARKED`] of the held rounds, not run CPUs at
-//! once throughout; a delete that no longer meets a parked receive leaves
-//! the count below the floor after every held round and fails.
+//! A fixed round's race needs the host to run the guest's CPUs at once. The
+//! racer acts within a few microseconds of the controller's arm only if CPU 2
+//! runs then; a racer whose CPU the host runs late acts after the source's
+//! teardown has woken the waiter and the waiter has exited, so its stop finds
+//! the waiter `Exited` and its Thread delete ends the waiter between waits.
+//! In a served-call phase a server receive is parked when the endpoint is
+//! deleted only if CPU 3 runs at once with CPU 0: the controller deletes
+//! within a few microseconds of arming the server. A host that runs fewer of
+//! the guest's CPUs at a time than the guest has (one 4-CPU guest on two
+//! cores, or the burn-in's two on four), or that runs other guests' CPUs on
+//! the cores this guest's use, does so in few rounds or none. So, after the
+//! fixed rounds, while the phase has no action landed on a waiter inside a
+//! wait, or, served, fewer than [`MIN_PARKED`] parked receives, it runs held
+//! rounds, up to [`MAX_EXTRA_ROUNDS`] of them. A held round's controller arms
+//! the racer (and the server) as in a fixed round and waits, bounded by
+//! [`ACK_WAIT_US`], for the racer to publish that it is taking its action
+//! ([`RACER_ENTERED`]). In any other phase it then deletes the source at
+//! once, its wait busy at first, so the action and the delete still meet
+//! within microseconds, in either order, with the racer known to be running.
+//! In a served-call phase it polls in 1 ms sleeps that leave its host core to
+//! the others, for the server's publish that it is entering its receive
+//! ([`SERVER_ENTERED`]) as well, sleeps [`HOLD_MS`] more so the receive
+//! parks, and deletes the endpoint; the racer's action, begun by then, lands
+//! on a caller the server is serving, is about to dequeue, or has not yet
+//! reached. The host must run the racer from its publish into its action
+//! before the woken waiter exits in one held round, and, served, the server
+//! from its publish into its park within the hold in [`MIN_PARKED`] of them,
+//! not run CPUs at once throughout; an action that no longer reaches a waiter
+//! inside a wait, or a delete that no longer meets a parked receive, leaves
+//! the floor unmet after every held round and fails.
 //!
 //! Required, per phase: every wait returned `Interrupted` or
 //! `InvalidCapability` (nothing is ever delivered); every racer action returned
@@ -123,8 +136,9 @@
 //! race armed. A served-call wait may also return the server's reply (tallied
 //! as served, never required), and in the served-call stop phase, with no
 //! restart, no `Interrupted` is required. A served-call phase also requires
-//! [`MIN_PARKED`] server receives parked on a deleted endpoint, its held
-//! rounds included, and logs the held rounds it ran.
+//! [`MIN_PARKED`] server receives parked on a deleted endpoint. Each
+//! requirement counts the phase's held rounds, and each phase logs the held
+//! rounds it ran.
 //!
 //! Needs **≥ 3 CPUs**; the served-call phases need a fourth (for the server)
 //! and are skipped below it.
@@ -154,12 +168,12 @@ const CYCLES: u32 = 200;
 /// it was deleted.
 const MIN_PARKED: u32 = 4;
 
-/// Bound on the held rounds a served-call phase runs after its fixed rounds
-/// while it has fewer than [`MIN_PARKED`] parked receives.
+/// Bound on the held rounds a phase runs after its fixed rounds while the
+/// race it requires has not armed ([`race_unarmed`]).
 const MAX_EXTRA_ROUNDS: u32 = 1000;
 
-/// A held round's sleep, in milliseconds, between the server's publish that
-/// it is entering its receive and the endpoint's delete.
+/// A served-call held round's sleep, in milliseconds, between the server's
+/// publish that it is entering its receive and the endpoint's delete.
 const HOLD_MS: u64 = 1;
 
 /// CPUs needed: one each for the controller, the waiter, and the racer.
@@ -190,8 +204,10 @@ const MEMBER_BADGE: u64 = 1;
 /// a wait, in microseconds.
 const ENTRY_WAIT_US: u64 = 100_000;
 
-/// Bound on the controller's waits for the racer to finish a round's action
-/// and to exit, in microseconds.
+/// Bound on the controller's waits for the racer to begin a held round's
+/// action, to finish each round's action, and to exit, and for the server to
+/// enter a held round's receive, to end each round's receives, and to exit,
+/// in microseconds.
 ///
 /// Applied through [`crate::scaled_bound`], which stretches it past
 /// [`crate::UNSCALED_CPUS`] CPUs.
@@ -230,6 +246,10 @@ static WAITER: AtomicU64 = AtomicU64::new(0);
 /// action it has finished, after [`RACER_RESULT`].
 static ARMED: AtomicU32 = AtomicU32::new(0);
 static RACER_DONE: AtomicU32 = AtomicU32::new(0);
+/// Racer → controller: the round whose action the racer is taking, stored
+/// just before it; a held round's controller deletes the source only after
+/// this ([`Timing::Held`]).
+static RACER_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// The result of the racer's last action: [`RESULT_OK`] or an error word.
 static RACER_RESULT: AtomicU64 = AtomicU64::new(RESULT_OK);
 /// Waits the phase's waiters entered, and waits whose result they tallied.
@@ -359,8 +379,9 @@ enum Timing
     /// After a varying spin of its own, racing the racer's action (and, on a
     /// served call, the server's receive).
     Raced,
-    /// Served call only: once the server has published its entry into its
-    /// receive, and [`HOLD_MS`] after that ([`hold_for_server`]).
+    /// Once the racer has published that it is taking its action and, on a
+    /// served call, the server its entry into its receive and [`HOLD_MS`]
+    /// has passed after that ([`hold`]).
     Held,
 }
 
@@ -402,7 +423,7 @@ struct Seen
     /// that were parked on the endpoint when it was deleted.
     served: u32,
     server_interrupted: u32,
-    /// Served-call phases: held rounds run after the fixed rounds.
+    /// Held rounds run after the fixed rounds.
     extra_rounds: u32,
 }
 
@@ -579,6 +600,7 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
         &RACER_EXITED,
         &ARMED,
         &RACER_DONE,
+        &RACER_ENTERED,
         &WAITS_ENTERED,
         &WAITS_DONE,
         &INTERRUPTED,
@@ -685,10 +707,10 @@ fn finish_racer() -> TestResult
     }
 }
 
-/// Run the phase's [`CYCLES`] fixed rounds and then, in a served-call phase
-/// with fewer than [`MIN_PARKED`] parked server receives, held rounds until
-/// it has them or has run [`MAX_EXTRA_ROUNDS`], stopping at the first round
-/// that fails. Returns the controller-side tallies.
+/// Run the phase's [`CYCLES`] fixed rounds and then, while the race the
+/// phase requires has not armed ([`race_unarmed`]), held rounds until it has
+/// or [`MAX_EXTRA_ROUNDS`] have run, stopping at the first round that fails.
+/// Returns the controller-side tallies.
 fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str>
 {
     let mut seen = Seen::default();
@@ -696,20 +718,29 @@ fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static st
     {
         run_round(ctx, kind, race, cycle, Timing::Raced, &mut seen)?;
     }
-    if kind != Kind::CallServed
-    {
-        return Ok(seen);
-    }
-    // The server's count is stable here: each round waited for its
-    // `SERVER_DONE`, which the server stores after the count.
-    while SERVER_INTERRUPTED.load(Ordering::Acquire) < MIN_PARKED
-        && seen.extra_rounds < MAX_EXTRA_ROUNDS
+    while race_unarmed(&seen, kind, race) && seen.extra_rounds < MAX_EXTRA_ROUNDS
     {
         let cycle = CYCLES.saturating_add(seen.extra_rounds);
         run_round(ctx, kind, race, cycle, Timing::Held, &mut seen)?;
         seen.extra_rounds = seen.extra_rounds.saturating_add(1);
     }
     Ok(seen)
+}
+
+/// Whether the phase still lacks what [`check`] requires of its race: an
+/// action that landed on a waiter inside a wait, and, in a served-call phase,
+/// [`MIN_PARKED`] server receives parked on a deleted endpoint. The server's
+/// count is stable between rounds: each round waited for its [`SERVER_DONE`],
+/// which the server stores after the count.
+fn race_unarmed(seen: &Seen, kind: Kind, race: Race) -> bool
+{
+    let landed_in_wait = match race
+    {
+        Race::Stop => seen.stopped_in_wait,
+        Race::ThreadDelete => seen.died_in_wait,
+    };
+    landed_in_wait == 0
+        || (kind == Kind::CallServed && SERVER_INTERRUPTED.load(Ordering::Acquire) < MIN_PARKED)
 }
 
 /// Run round `cycle` ([`round`]) and delete what remains of it.
@@ -763,7 +794,7 @@ fn round(
     }
     if timing == Timing::Held
     {
-        hold_for_server(cycle)?;
+        hold(kind, cycle)?;
     }
     else
     {
@@ -782,19 +813,43 @@ fn round(
     settle_round(kind, race, cycle, entered_before, done_before, parts, seen)
 }
 
-/// A held round's wait before the endpoint's delete: poll in 1 ms sleeps,
-/// which leave CPU 0's host core to the other CPUs, until the server
-/// publishes that it is entering round `cycle`'s receive (bounded by
-/// [`ACK_WAIT_US`]), then sleep [`HOLD_MS`] so the receive parks.
-fn hold_for_server(cycle: u32) -> TestResult
+/// A held round's wait before the source's delete, bounded by
+/// [`ACK_WAIT_US`]: until the racer publishes that it is taking round
+/// `cycle`'s action ([`RACER_ENTERED`]), busy at first, so the delete that
+/// follows meets the action within microseconds. In a served-call phase,
+/// instead, poll in 1 ms sleeps, which leave CPU 0's host core to the other
+/// CPUs, until the server has also published that it is entering the round's
+/// receive ([`SERVER_ENTERED`]), then sleep [`HOLD_MS`] so the receive parks.
+fn hold(kind: Kind, cycle: u32) -> TestResult
 {
     let round = cycle.saturating_add(1);
+    let acting = || RACER_ENTERED.load(Ordering::Acquire) == round;
+    if kind != Kind::CallServed
+    {
+        return if await_within(crate::scaled_bound(ACK_WAIT_US), acting)?
+        {
+            Ok(())
+        }
+        else
+        {
+            Err("stress::stop_source_delete: the racer did not reach its action")
+        };
+    }
     let start = elapsed_us()?;
-    while SERVER_ENTERED.load(Ordering::Acquire) != round
+    while SERVER_ENTERED.load(Ordering::Acquire) != round || !acting()
     {
         if elapsed_us()?.saturating_sub(start) > crate::scaled_bound(ACK_WAIT_US)
         {
-            return Err("stress::stop_source_delete: the server did not reach its receive");
+            return Err(
+                if acting()
+                {
+                    "stress::stop_source_delete: the server did not reach its receive"
+                }
+                else
+                {
+                    "stress::stop_source_delete: the racer did not reach its action"
+                },
+            );
         }
         let _ = thread_sleep(1);
     }
@@ -1206,9 +1261,10 @@ extern "C" fn waiter_entry(arg: u64) -> !
 
 /// Racer: until told to quit, act on the waiter of each round it is armed
 /// for: spin a varying short delay, so its action lands before, with, or
-/// after the controller's delete of the source, then stop the waiter or
-/// delete its Thread capability, publish the result, and acknowledge the
-/// round. Between rounds it spins on its own CPU.
+/// after the controller's delete of the source, publish that it is taking
+/// the action ([`RACER_ENTERED`]), then stop the waiter or delete its Thread
+/// capability, publish the result, and acknowledge the round. Between rounds
+/// it spins on its own CPU.
 extern "C" fn racer_entry(arg: u64) -> !
 {
     let race = Race::decode(arg);
@@ -1227,6 +1283,8 @@ extern "C" fn racer_entry(arg: u64) -> !
         {
             core::hint::spin_loop();
         }
+        // A held round's controller deletes the source only after this.
+        RACER_ENTERED.store(armed, Ordering::Release);
         let result = match race
         {
             Race::Stop => thread_stop(waiter),

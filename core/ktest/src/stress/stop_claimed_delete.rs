@@ -48,43 +48,68 @@
 //!
 //! ## How this exercises it
 //!
-//! Four phases: for each source kind, a notification and then an event
-//! queue, one phase in which the controller is the only stopper and one in
-//! which a second stopper races it. A long-lived sender, pinned to CPU 2,
-//! serves each wait the round's waiter enters: it spins a varying delay,
-//! then delivers to the round's source, which it reads from a shared handle
-//! whenever the round is flagged live. The controller, pinned to CPU 0, runs
-//! [`CYCLES`] rounds per phase. Each round creates a fresh source, publishes
-//! its handle, and spawns a waiter pinned to CPU 1 that loops waiting on
-//! that source, counting each wait it enters and each result; the controller
-//! waits until the waiter has entered a wait (bounded by [`ENTRY_WAIT_US`];
-//! a round that times out is tallied), spins a varying delay, and stops the
-//! waiter, so the stop lands before, during, or after the sender's claim of
-//! the park. In a double-stop phase it first arms a long-lived second
-//! stopper, pinned to CPU 3, which spins a varying short delay and stops the
-//! waiter too (`Ok`, or `InvalidState` for a waiter the other stop reached
-//! first; the controller's own stop accepts the same), so two stops race one
-//! `Blocked` waiter and the second can commit between the first's claim and
-//! its tail. Once every stop has returned, the controller clears the live
-//! flag, waits until the sender is past its last delivery, deletes the
-//! source's capability, and deletes the stopped waiter's Thread capability:
-//! the step that walked the freed source before the fixes. The waiter, the
-//! sender, and the second stopper run in ktest's own `CSpace` and use the
-//! controller's handles, so each delete is the object's last reference.
+//! Four phases: for each source kind, a notification and then an event queue,
+//! one phase in which the controller is the only stopper and one in which a
+//! second stopper races it. A long-lived sender, pinned to CPU 2, serves each
+//! wait the round's waiter enters: it spins a varying delay, then delivers to
+//! the round's source, which it reads from a shared handle whenever the round
+//! is flagged live. The controller, pinned to CPU 0, runs [`CYCLES`] fixed
+//! rounds per phase (and the held rounds below). Each round creates a fresh
+//! source, publishes its handle, and spawns a waiter pinned to CPU 1 that loops
+//! waiting on that source, counting each wait it enters and each result; the
+//! controller waits until the waiter has entered a wait (bounded by
+//! [`ENTRY_WAIT_US`]; a round that times out is tallied), spins a varying
+//! delay, and stops the waiter, so the stop lands before, during, or after the
+//! sender's claim of the park. In a double-stop phase it first arms a
+//! long-lived second stopper, pinned to CPU 3, which spins a varying short
+//! delay and stops the waiter too (`Ok`, or `InvalidState` for a waiter the
+//! other stop reached first; the controller's own stop accepts the same), so
+//! two stops race one `Blocked` waiter and the second can commit between the
+//! first's claim and its tail. Once every stop has returned, the controller
+//! clears the live flag, waits until the sender is past its last delivery,
+//! deletes the source's capability, and deletes the stopped waiter's Thread
+//! capability: the step that walked the freed source before the fixes. The
+//! waiter, the sender, and the second stopper run in ktest's own `CSpace` and
+//! use the controller's handles, so each delete is the object's last reference.
 //!
 //! Required, per phase: every wait returned the delivery or `Interrupted`;
 //! every delivery succeeded (the controller waits the sender out of its
-//! delivery before deleting the source, so none fails legitimately); the
-//! waiter consumed deliveries across the rounds; some stop landed on a
-//! waiter inside a wait (the race armed); and, in a double-stop phase, the
-//! second stopper's stop returned `Ok` in some round (it committed rather
-//! than finding the waiter stopped: the two-stop race armed). Userspace
-//! cannot tell a cancelled park from one a delivery had already claimed, nor
-//! which stop's cancel claimed it, so the claimed-then-stopped and the
-//! claimed-then-stopped-again interleavings are reached statistically across
-//! the rounds; the kernel's debug assertions (a freed object's lock or
-//! magic, `commit_blocked`'s parking-while-linked check, the spurious-resume
-//! tripwires) are the tripwires for the binding outliving its source.
+//! delivery before deleting the source, so none fails legitimately); the waiter
+//! consumed deliveries across the rounds; some stop landed on a waiter inside a
+//! wait (the race armed); and, in a double-stop phase, the second stopper's
+//! stop returned `Ok` in some round (it committed rather than finding the
+//! waiter stopped: the two-stop race armed). Userspace cannot tell a cancelled
+//! park from one a delivery had already claimed, nor which stop's cancel
+//! claimed it, so the claimed-then-stopped and the claimed-then-stopped-again
+//! interleavings are reached statistically across the rounds, and each
+//! requirement counts the held rounds; the kernel's debug assertions (a freed
+//! object's lock or magic, `commit_blocked`'s parking-while-linked check, the
+//! spurious-resume tripwires) are the tripwires for the binding outliving its
+//! source.
+//!
+//! ## What the host must give
+//!
+//! A fixed round's delivery reaches the waiter only if the sender's CPU runs
+//! between the waiter's entry into a wait and the controller's stop, a few
+//! microseconds later, and the second stopper's stop commits only if its CPU
+//! runs at once with the controller's: the controller stops the waiter right
+//! after arming it, and a stop of a waiter already `Stopped` answers
+//! `InvalidState`. A host that runs fewer of the guest's CPUs at a time than
+//! the guest has, or that runs other guests' CPUs on the cores this guest's
+//! use, does so in few rounds or none. So, after the fixed rounds, while the
+//! waiters have consumed no delivery or, in a double-stop phase, no second
+//! stop has committed, the phase runs held rounds, up to
+//! [`MAX_EXTRA_ROUNDS`] of them, logged as `extra_rounds`: the controller
+//! stops the waiter only once it has consumed a delivery in the round and, in
+//! a double-stop phase, once the second stopper has published that it is
+//! taking its stop ([`STOPPER_ENTERED`]), each wait bounded by
+//! [`ACK_WAIT_US`] and busy at first, so the two stops still meet within
+//! microseconds with the second stopper known to be running. The host must
+//! run the sender and the waiter through one delivery, and the second stopper
+//! from its publish into its commit before the controller's stop in one held
+//! round, not run CPUs at once throughout; a delivery or a second stop that
+//! no longer commits leaves the requirement unmet after every held round and
+//! fails.
 //!
 //! Needs **≥ 4 CPUs**.
 
@@ -103,8 +128,13 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// This cell's log name.
 const CELL: &str = "stress::stop_claimed_delete";
 
-/// Rounds per phase; each creates and deletes one source and one waiter.
+/// Fixed rounds per phase; each creates and deletes one source and one
+/// waiter.
 const CYCLES: u32 = 1000;
+
+/// Bound on the held rounds a phase runs after its fixed rounds while the
+/// race it requires has not armed ([`race_unarmed`]).
+const MAX_EXTRA_ROUNDS: u32 = 1000;
 
 /// CPUs needed: one each for the controller, the waiter, the sender, and
 /// the second stopper.
@@ -139,8 +169,9 @@ const VALUE: u64 = 1 << 0;
 const ENTRY_WAIT_US: u64 = 100_000;
 
 /// Bound on the controller's waits for the sender to acknowledge a pause,
-/// for the second stopper to finish a round's stop, and for either helper
-/// to exit, in microseconds.
+/// for the waiter to consume a held round's delivery, for the second stopper
+/// to begin a held round's stop and to finish each round's stop, and for
+/// either helper to exit, in microseconds.
 ///
 /// Applied through [`crate::scaled_bound`], which stretches it past
 /// [`crate::UNSCALED_CPUS`] CPUs.
@@ -174,6 +205,10 @@ static WAITER: AtomicU64 = AtomicU64::new(0);
 /// finished, after which the controller may delete the waiter.
 static STOP_ARMED: AtomicU32 = AtomicU32::new(0);
 static STOPPER_DONE: AtomicU32 = AtomicU32::new(0);
+/// Second stopper → controller: the round whose waiter it is stopping,
+/// stored just before its stop; a held round's controller stops the waiter
+/// only after this ([`Timing::Held`]).
+static STOPPER_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// Waits the phase's waiters entered, and waits whose result they tallied;
 /// a stopped waiter adds one to the difference if it was stopped inside a
 /// wait, and zero if it was stopped between waits.
@@ -212,6 +247,21 @@ enum Stops
 {
     Single,
     Double,
+}
+
+/// When a round's controller stops the waiter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing
+{
+    /// After a varying spin of its own once the waiter has entered a wait,
+    /// and, in a double-stop phase, at once after arming the second stopper.
+    Raced,
+    /// Once the waiter has consumed a delivery in the round, so the sender is
+    /// known to be serving its waits, and, in a double-stop phase, once the
+    /// second stopper has published that it is taking its stop
+    /// ([`STOPPER_ENTERED`]), so the two stops meet with it known to be
+    /// running.
+    Held,
 }
 
 static PHASE_ARGS: spawn::ArgBlock<Kind, 1> = spawn::ArgBlock::new(Kind::Notification);
@@ -264,6 +314,8 @@ struct Seen
     sends: u32,
     /// The second stopper's stops that returned `Ok`.
     second_stops_ok: u32,
+    /// Held rounds run after the fixed rounds.
+    extra_rounds: u32,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -331,6 +383,7 @@ fn log_seen(seen: &Seen)
         (" stops_lost=", seen.stops_lost),
         (" sends=", seen.sends),
         (" second_stops_ok=", seen.second_stops_ok),
+        (" extra_rounds=", seen.extra_rounds),
     ]
     {
         crate::tally::log_cell_u64(CELL, label, u64::from(value));
@@ -373,8 +426,8 @@ fn check(seen: &Seen, stops: Stops) -> TestResult
     Ok(())
 }
 
-/// One phase: start the helpers, run [`CYCLES`] rounds, end the helpers, and
-/// delete them whatever the outcome. Returns what the phase saw.
+/// One phase: start the helpers, run its rounds ([`rounds`]), end the
+/// helpers, and delete them whatever the outcome. Returns what the phase saw.
 fn phase(ctx: &TestContext, kind: Kind, stops: Stops) -> Result<Seen, &'static str>
 {
     for counter in [
@@ -384,6 +437,7 @@ fn phase(ctx: &TestContext, kind: Kind, stops: Stops) -> Result<Seen, &'static s
         &STOPPER_EXITED,
         &STOP_ARMED,
         &STOPPER_DONE,
+        &STOPPER_ENTERED,
         &WAITS_ENTERED,
         &WAITS_DONE,
         &DELIVERED,
@@ -491,26 +545,49 @@ fn release_helpers(helpers: &Helpers) -> TestResult
     }
 }
 
-/// Run the phase's [`CYCLES`] rounds, stopping at the first that fails.
+/// Run the phase's [`CYCLES`] fixed rounds and then, while the race the
+/// phase requires has not armed ([`race_unarmed`]), held rounds until it has
+/// or [`MAX_EXTRA_ROUNDS`] have run, stopping at the first round that fails.
 /// Returns the controller-side tallies.
 fn rounds(ctx: &TestContext, phase: Phase) -> Result<Seen, &'static str>
 {
     let mut seen = Seen::default();
     for cycle in 0..CYCLES
     {
-        round(ctx, phase, cycle, &mut seen)?;
+        round(ctx, phase, cycle, Timing::Raced, &mut seen)?;
+    }
+    while race_unarmed(phase.stops) && seen.extra_rounds < MAX_EXTRA_ROUNDS
+    {
+        let cycle = CYCLES.saturating_add(seen.extra_rounds);
+        round(ctx, phase, cycle, Timing::Held, &mut seen)?;
+        seen.extra_rounds = seen.extra_rounds.saturating_add(1);
     }
     Ok(seen)
 }
 
-/// One round: arm the race and stop the waiter, then take the round down:
-/// clear the live flag, wait out the sender's last delivery, and delete the
-/// source and then the stopped waiter. Everything the round created is
-/// deleted on every path.
-fn round(ctx: &TestContext, phase: Phase, cycle: u32, seen: &mut Seen) -> TestResult
+/// Whether the phase still lacks what [`check`] requires of its race beyond
+/// a stop inside a wait (the controller stops a waiter it has seen enter a
+/// wait, so a host that runs the waiter's CPU late makes that likelier, not
+/// rarer): a delivery the waiter consumed and, in a double-stop phase, a
+/// committed stop by the second stopper. Both counts are stable between rounds: the
+/// waiter is stopped and drained off its CPU, and each double-stop round
+/// waited for the second stopper's `STOPPER_DONE`, which it stores after its
+/// count.
+fn race_unarmed(stops: Stops) -> bool
+{
+    DELIVERED.load(Ordering::Acquire) == 0
+        || (stops == Stops::Double && SECOND_STOPS_OK.load(Ordering::Acquire) == 0)
+}
+
+/// One round: arm the race and stop the waiter (`timing` says when), then
+/// take the round down: clear the live flag, wait out the sender's last
+/// delivery, and delete the source and then the stopped waiter. Everything
+/// the round created is deleted on every path.
+fn round(ctx: &TestContext, phase: Phase, cycle: u32, timing: Timing, seen: &mut Seen)
+-> TestResult
 {
     let mut parts = RoundParts::default();
-    let result = arm_and_stop(ctx, phase, cycle, &mut parts, seen);
+    let result = arm_and_stop(ctx, phase, cycle, timing, &mut parts, seen);
     LIVE.store(0, Ordering::SeqCst);
     let paused = await_within(crate::scaled_bound(ACK_WAIT_US), || {
         SENDER_BUSY.load(Ordering::SeqCst) == 0
@@ -527,19 +604,22 @@ fn round(ctx: &TestContext, phase: Phase, cycle: u32, seen: &mut Seen) -> TestRe
 }
 
 /// Create the round's source, go live, start a waiter on it, wait until it
-/// has entered a wait, spin a varying delay, and stop it; then classify where
-/// the stop landed from the waiter's counts, stable once it is stopped and
-/// drained off its CPU.
+/// has entered a wait, spin a varying delay (in a held round, instead wait,
+/// bounded by [`ACK_WAIT_US`], until it has consumed a delivery), and stop
+/// it; then classify where the stop landed from the waiter's counts, stable
+/// once it is stopped and drained off its CPU.
 fn arm_and_stop(
     ctx: &TestContext,
     phase: Phase,
     cycle: u32,
+    timing: Timing,
     parts: &mut RoundParts,
     seen: &mut Seen,
 ) -> TestResult
 {
     let entered_before = WAITS_ENTERED.load(Ordering::Acquire);
     let done_before = WAITS_DONE.load(Ordering::Acquire);
+    let delivered_before = DELIVERED.load(Ordering::Acquire);
     let source = *parts.source.insert(create_source(ctx, phase.kind)?);
     SOURCE.store(source, Ordering::Release);
     LIVE.store(1, Ordering::SeqCst);
@@ -558,13 +638,27 @@ fn arm_and_stop(
     {
         seen.starved = seen.starved.saturating_add(1);
     }
-    // 0 to 4095 spins (a multiplicative hash of the round), so the stop
-    // lands at varying points of the waiter's and sender's exchange.
-    for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
+    if timing == Timing::Held
     {
-        core::hint::spin_loop();
+        if !await_within(crate::scaled_bound(ACK_WAIT_US), || {
+            DELIVERED.load(Ordering::Acquire) != delivered_before
+        })?
+        {
+            return Err(
+                "stress::stop_claimed_delete: the waiter consumed no delivery in a held round",
+            );
+        }
     }
-    stop(waiter, phase.stops, cycle, seen)?;
+    else
+    {
+        // 0 to 4095 spins (a multiplicative hash of the round), so the stop
+        // lands at varying points of the waiter's and sender's exchange.
+        for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
+        {
+            core::hint::spin_loop();
+        }
+    }
+    stop(waiter, phase.stops, cycle, timing, seen)?;
     let entered = WAITS_ENTERED
         .load(Ordering::Acquire)
         .wrapping_sub(entered_before);
@@ -580,11 +674,13 @@ fn arm_and_stop(
 
 /// Stop the waiter. With the controller as the only stopper its stop must
 /// return `Ok`. With a second stopper, arm it first, so its stop races this
-/// one; this one may then return `InvalidState` (the second stopper's
+/// one, and, in a held round, wait, bounded by [`ACK_WAIT_US`], until it
+/// publishes that it is taking its stop ([`STOPPER_ENTERED`]), busy at
+/// first; this one may then return `InvalidState` (the second stopper's
 /// reached the waiter first), and the second stopper's stop is waited out,
 /// bounded by [`ACK_WAIT_US`], so the waiter is stopped and off its CPU,
 /// and its handle is free to delete, whichever stop committed.
-fn stop(waiter: u64, stops: Stops, cycle: u32, seen: &mut Seen) -> TestResult
+fn stop(waiter: u64, stops: Stops, cycle: u32, timing: Timing, seen: &mut Seen) -> TestResult
 {
     if stops == Stops::Single
     {
@@ -596,6 +692,13 @@ fn stop(waiter: u64, stops: Stops, cycle: u32, seen: &mut Seen) -> TestResult
     WAITER.store(waiter, Ordering::Release);
     let armed_round = cycle.saturating_add(1);
     STOP_ARMED.store(armed_round, Ordering::Release);
+    if timing == Timing::Held
+        && !await_within(crate::scaled_bound(ACK_WAIT_US), || {
+            STOPPER_ENTERED.load(Ordering::Acquire) == armed_round
+        })?
+    {
+        return Err("stress::stop_claimed_delete: the second stopper did not reach its stop");
+    }
     let own = thread_stop(waiter);
     let acked = await_within(crate::scaled_bound(ACK_WAIT_US), || {
         STOPPER_DONE.load(Ordering::Acquire) == armed_round
@@ -830,7 +933,8 @@ fn serve(kind: Kind, entered: u32)
 
 /// Second stopper: until told to quit, stop the waiter of each round it is
 /// armed for: spin a varying short delay, so its stop lands before, with,
-/// or after the controller's, then stop the waiter (`Ok` is counted;
+/// or after the controller's, publish that it is taking its stop
+/// ([`STOPPER_ENTERED`]), then stop the waiter (`Ok` is counted;
 /// `InvalidState`, a waiter the controller's stop reached first, accepted;
 /// anything else recorded as bad) and acknowledge the round. Between rounds
 /// it spins on its own CPU.
@@ -851,6 +955,8 @@ extern "C" fn stopper_entry(_arg: u64) -> !
         {
             core::hint::spin_loop();
         }
+        // A held round's controller makes its own stop only after this.
+        STOPPER_ENTERED.store(armed, Ordering::Release);
         match thread_stop(waiter)
         {
             Ok(()) =>

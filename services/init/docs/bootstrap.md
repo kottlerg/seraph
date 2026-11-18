@@ -234,8 +234,9 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     added, gating `QUERY_SHUTDOWN_DEVICE`; pwrmgr is the only recipe
     seeding it.
   - `devmgr.bind` — the same SEND with `BIND_AUTHORITY` added, gating `BIND_DRIVERS`; seed-only,
-    and the one name a seed receives as `SEND|GRANT`, since `BIND_DRIVERS` moves a directory cap
-    and the kernel requires `GRANT` for a cap transfer. svctest is the only recipe seeding it.
+    and seeded as `SEND|GRANT`, as only it and each `:grant` name (`sessiond.operator`) are,
+    since `BIND_DRIVERS` moves a directory cap and the kernel requires `GRANT` for a cap
+    transfer. svctest is the only recipe seeding it.
   - `devmgr.class.<stem>` — one class SEND per class file of
     `/config/devmgr/classes/`, minted by devmgr on `MINT_CLASS_SEND` and
     published seed-only ([svcmgr service definitions § Device class
@@ -270,8 +271,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   All four `devmgr.*` names, the three `vfsd.*` names, and `logd.query` are seed-only: svcmgr's
   `QUERY_ENDPOINT` refuses them, so each badge reaches only the recipes that seed the name
   ([svcmgr IPC interface § Label 4](../../svcmgr/docs/ipc-interface.md#label-4-query_endpoint)).
-  `QUERY_ENDPOINT` never yields `GRANT` for any name; a seed is `SEND` except `devmgr.bind`'s
-  `SEND|GRANT`.
+  `QUERY_ENDPOINT` never yields `GRANT` for any name; a seed is `SEND` except those of
+  `devmgr.bind` and of each `:grant` name (`sessiond.operator`), which are `SEND|GRANT`.
 
   `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`, and `timed` are published by
   svcmgr's provider path on each provider's launch (see

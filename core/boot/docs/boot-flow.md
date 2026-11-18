@@ -116,10 +116,14 @@ the bundle bodies are already 4096-byte aligned within the bundle allocation. At
 `MAX_BOOT_MODULES - 1` entries are modules; a larger bundle fails here by name. Past its signature,
 the bootloader does not inspect module content; what each module does and in what order init spawns
 them is init's concern ([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)).
-Typical modules: procmgr, memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs, and
-iommu-vtd on x86-64 or iommu-riscv on riscv64, and the text platform description tables of the
-architecture's machines (`platform-qemu-virt` on riscv64) that devmgr reads (the authoritative lists
-are `xtask/src/bundle.rs::MODULES`, `ARCH_MODULES` and `ARCH_TABLES`).
+Each module is named by its install path: typically `/services/procmgr`, `/services/memmgr`,
+`/services/devmgr`, `/services/vfsd`, `/services/drivers/virtio-blk`, `/services/drivers/serial`,
+`/services/drivers/framebuffer`, `/services/fs/fatfs`, and `/services/drivers/iommu-vtd` on x86-64
+or `/services/drivers/iommu-riscv` on riscv64, the log-level configuration
+`/config/init/log-levels.conf`, and the text platform description tables of the architecture's
+machines (`/config/devmgr/platform/qemu-virt.platform` on riscv64) that devmgr reads (the
+authoritative lists are `xtask/src/bundle.rs::MODULES`, `ARCH_MODULES`, `ARCH_TABLES` and
+`LOG_LEVELS`).
 
 Last, the bootloader copies the trust store into a page allocation of its own, the slack
 after it zeroed, and describes it as the boot module `trust-store` (`TRUST_STORE_MODULE`),
@@ -296,7 +300,7 @@ Pointer and resource-address fields hold physical addresses; `init_image` carrie
 unbiased link virtual addresses, and the only kernel virtual addresses are the
 KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel scrubs from
 this donated page after consuming them. The `version` field is set to
-`BOOT_PROTOCOL_VERSION` (currently `22`). Fields are populated as follows:
+`BOOT_PROTOCOL_VERSION` (currently `23`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|
@@ -306,7 +310,7 @@ this donated page after consuming them. The `version` field is set to
 | `kernel_virtual_base` | KASLR-biased kernel image virtual base (link base + slide from step 5d) |
 | `kernel_size` | Total span of kernel ELF LOAD segments from step 3 |
 | `init_image` | Pre-parsed init ELF segments and entry point from step 4 |
-| `modules` | Name, physical base, and size of each non-`init` bundle entry from step 4, at most `MAX_BOOT_MODULES - 1` (`MAX_BOOT_MODULES` is 85, the entries one page holds; a larger bundle fails step 4 by name), then the `trust-store` module step 4 allocated; never empty |
+| `modules` | Name, physical base, and size of each non-`init` bundle entry from step 4, at most `MAX_BOOT_MODULES - 1` (`MAX_BOOT_MODULES` is 85; a larger bundle fails step 4 by name), in an array step 6 allocates at the bundle's size, then the `trust-store` module step 4 allocated; never empty |
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |

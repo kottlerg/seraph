@@ -219,7 +219,7 @@ a page-rounded allocation (the kernel's `mint_module_memory_caps`,
 which rounds `size` up to the next page boundary for the Memory cap)
 does not need to copy or relocate bytes. Init receives a `Memory`
 cap for each module in its initial `CSpace`, resolved by name through
-`InitInfo::module_names`
+the `InitInfo` module-name table
 ([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cspace-at-_start))
 and is responsible for validating and starting each service.
 
@@ -234,7 +234,7 @@ binary needs no change. `BootInfo.modules.count` is the bundle's
 non-`init` entry count plus one, the `trust-store` module, which is
 always last; the kernel iterates the modules without assuming a fixed
 count or ordering, and init looks
-modules up by name via `InitInfo::module_names` rather than by
+modules up by name in the `InitInfo` module-name table rather than by
 ordinal ([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cspace-at-_start)).
 
 ---

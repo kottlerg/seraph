@@ -167,7 +167,9 @@ pub fn watch_loop(rt: &'static VfsdRuntime) -> !
 
 /// devmgr signalled a change of the `block` class: a driver served or
 /// withdrawn. Probe every held disk and handle each one withdrawn. A new
-/// driver changes nothing here: a `MOUNT` finds its disk.
+/// driver changes nothing here: the discovery before the next role lookup
+/// holds its disk (`find_partition`), since a discovery reads the disk's
+/// GPT, a call on its driver the watch thread never makes.
 fn class_changed(rt: &VfsdRuntime, ipc_buf: *mut u64)
 {
     // Clear the bits before the probes, so a change during them signals

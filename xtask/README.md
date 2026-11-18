@@ -1321,9 +1321,12 @@ Then two storage boots on the split-data layout, under native control, with the 
 
 3. the data disk (`disk-data.img`) behind the first port from boot: the host removes it (QMP
    `device_del`), requires devmgr's removal lines and vfsd's `disk N: removed; tearing down its
-   mounts`, adds it again (`device_add` of a `virtio-blk-pci` on the kept block node), then
-   requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`, svcmgr's `critical service
-   unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
+   mounts`, adds it again (`device_add` of a `virtio-blk-pci` on the kept block node); once the
+   fixture logs `MOUNTED /data on the re-added disk`, it adds a raw block node over a copy of
+   `disk-data.img` taken before the boot (`target/xtask/hotplug-tie-disk.img`, removed after
+   the boot) and a `virtio-blk-pci` on it behind the second port, with the data disk's
+   properties; it then requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`,
+   svcmgr's `critical service unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
 4. the boot disk behind the first port and the data disk on a slot of its own: the host removes
    the boot disk and requires the same last three.
 

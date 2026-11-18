@@ -1,6 +1,7 @@
 # /tests/hotplug-check, disk mode — the fixture of test-hotplug's storage
 # boots: a disk hot-added, removed and added again behind the root port,
-# and the loss of the root filesystem's driver.
+# a copy of it added behind the second port, and the loss of the root
+# filesystem's driver.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
 # `cargo xtask test-hotplug` stages it into /config/svcmgr/services/ for

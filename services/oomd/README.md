@@ -81,8 +81,9 @@ stopsrc's 64-page one. memhog fills the pool up to the reserve; oomd stops the c
 grace, then stopsrc's job, then the session or sessions, then memhog, a cooldown apart; the
 session's relay gives the leader's end. The level falls to `NORMAL`, memhog's next instance is idle,
 and oomd has logged one stop of each. In a boot that stages crashd with a stall, a child of svctest
-writes a page while the pool is full, its start deferred until sessiond lists no candidate, so
-crashd's hold covers only memhog's stop, and crashd resumes it once the stop frees memory. With
+writes the pages of a demand region while the pool is full, its start deferred until sessiond lists
+no candidate, so crashd's hold of the write memmgr declines covers only memhog's stop, and crashd
+resumes it once the stop frees memory. With
 `OOMD_STOP=no`, or without oomd's recipe, the phase checks that nothing stops memhog
 ([services/svctest/README.md](../svctest/README.md)).
 

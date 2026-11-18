@@ -100,27 +100,10 @@ fn main() -> !
                 }
             }
         }
-        // A wake on the endpoint is readiness that can lapse before the
-        // receive (its caller stopped or destroyed in between). With the wait
-        // set the receive does not block, so the wait, where svcmgr's death
-        // is seen, stays pwrmgr's one blocking point.
-        let received = if wait_set == 0
+        let msg = match receive(bootstrap.service_ep, wait_set, ipc_buf)
         {
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            unsafe { ipc::ipc_recv(bootstrap.service_ep, ipc_buf) }
-        }
-        else
-        {
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            unsafe { ipc::ipc_try_recv(bootstrap.service_ep, ipc_buf) }
-        };
-        let msg = match received
-        {
-            Ok(msg) => msg,
-            Err(e) if wait_set != 0 && e == syscall_abi::SyscallError::WouldBlock as i64 =>
-            {
-                continue;
-            }
+            Ok(Some(msg)) => msg,
+            Ok(None) => continue,
             Err(e) =>
             {
                 guard.on_failure(e);
@@ -164,6 +147,27 @@ fn main() -> !
             }
             _ => reject(pwrmgr_errors::UNKNOWN_OPCODE, ipc_buf),
         }
+    }
+}
+
+/// Receive a request on `service_ep`. With a wait set pwrmgr has been woken
+/// for the endpoint, and a wake is readiness that can lapse before the
+/// receive (its caller stopped or destroyed in between): the receive does not
+/// block, and `Ok(None)` is nothing to take, so the wait, where svcmgr's death
+/// is seen, stays pwrmgr's one blocking point.
+fn receive(service_ep: u64, wait_set: u64, ipc_buf: *mut u64) -> Result<Option<IpcMessage>, i64>
+{
+    if wait_set == 0
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        return unsafe { ipc::ipc_recv(service_ep, ipc_buf) }.map(Some);
+    }
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    match unsafe { ipc::ipc_try_recv(service_ep, ipc_buf) }
+    {
+        Ok(msg) => Ok(Some(msg)),
+        Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => Ok(None),
+        Err(e) => Err(e),
     }
 }
 

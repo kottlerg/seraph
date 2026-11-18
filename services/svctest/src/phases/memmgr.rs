@@ -49,6 +49,10 @@ pub fn phases() -> &'static [Phase]
             run: cspace_slot_budget_phase,
         },
         Phase {
+            name: "cspace_headroom",
+            run: cspace_headroom_phase,
+        },
+        Phase {
             name: "object_slab_release",
             run: object_slab_release_phase,
         },
@@ -549,6 +553,77 @@ pub fn cspace_slot_budget_phase(_: &Caps)
         "CSpace headroom {after} after funding falls short of {want}"
     );
     std::os::seraph::log!("CSpace headroom funded {before} -> {after} (asked {want})");
+}
+
+/// The low-water mark the [`cspace_headroom_phase`] holds svctest's `CSpace`
+/// above.
+const HEADROOM_LOW_WATER: u64 = 64;
+
+/// Headroom each top-up of the [`cspace_headroom_phase`] funds.
+const HEADROOM_TOPUP_SLOTS: u64 = 256;
+
+/// `std::os::seraph::CSpaceHeadroom` holds a `CSpace` past what it holds
+/// when the phase starts, the seed procmgr gave svctest and every top-up
+/// since: holding before each, svctest derives copies of an endpoint cap until
+/// it holds two top-ups' worth more than its headroom at the start allowed,
+/// and every derivation must succeed with no failed top-up to report. Without
+/// the hold the derivations fail once that headroom is spent. Deletes every
+/// copy.
+pub fn cspace_headroom_phase(_: &Caps)
+{
+    static HEADROOM: std::os::seraph::CSpaceHeadroom =
+        std::os::seraph::CSpaceHeadroom::new(HEADROOM_LOW_WATER, HEADROOM_TOPUP_SLOTS);
+
+    let info = startup_info();
+    let cspace = info.self_cspace;
+    let capacity = |what: &str| {
+        syscall::cap_info(cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+            .unwrap_or_else(|e| panic!("cap_info(CAP_INFO_CSPACE_CAPACITY) {what} failed: {e}"))
+    };
+    let before = capacity("before");
+    let start_headroom = std::os::seraph::cspace_slot_headroom(cspace);
+    let copies = HEADROOM_TOPUP_SLOTS
+        .checked_mul(2)
+        .and_then(|extra| start_headroom.checked_add(extra))
+        .expect("cspace headroom target overflowed");
+    let mut held = Vec::new();
+    held.try_reserve_exact(usize::try_from(copies).expect("copy count fits usize"))
+        .expect("no memory for the copies' list");
+    for i in 0..copies
+    {
+        HEADROOM.hold(cspace);
+        match syscall::cap_derive(info.memmgr_endpoint, syscall::RIGHTS_EP_SEND)
+        {
+            Ok(copy) => held.push(copy),
+            Err(e) =>
+            {
+                let headroom = std::os::seraph::cspace_slot_headroom(cspace);
+                for copy in held
+                {
+                    let _ = syscall::cap_delete(copy);
+                }
+                panic!(
+                    "derivation {i} of {copies} failed ({e}) at headroom {headroom}, from \
+                     {start_headroom} at the start"
+                );
+            }
+        }
+    }
+    let after = capacity("after");
+    let reported = HEADROOM.failure_to_report();
+    for copy in held
+    {
+        let _ = syscall::cap_delete(copy);
+    }
+    assert!(!reported, "a CSpaceHeadroom top-up was refused");
+    assert!(
+        after > before,
+        "the CSpace held {copies} more slots without growing past {before}"
+    );
+    std::os::seraph::log!(
+        "CSpace held past its start: {copies} copies from headroom {start_headroom}, capacity \
+         {before} -> {after}"
+    );
 }
 
 /// One stray-cap flood case: a message memmgr refuses or answers with no

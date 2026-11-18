@@ -275,7 +275,7 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
     step(
         "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
          driver and powered the slot off or ejected it, and it was bound again; a hot-added \
-         disk was bound from the drivers directory; the data disk's mount was torn down at its \
+         disk was bound from the drivers directory on its wired line; the data disk's mount was torn down at its \
          removal and the disk mounted again when added back; the loss of the root driver and of \
          the boot disk shut the system down)",
     );

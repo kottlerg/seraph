@@ -1560,7 +1560,15 @@ mod tests
         // Windows alone: no table to route by.
         assert_eq!(bridges.line(PrtMode::PicMode, &leaf), None);
         assert_eq!(
-            bridges.push_prt(0, 0, PrtMode::PicMode, &pic, PIC, functions.iter(), programmed),
+            bridges.push_prt(
+                0,
+                0,
+                PrtMode::PicMode,
+                &pic,
+                PIC,
+                functions.iter(),
+                programmed
+            ),
             Some(Push::Kept)
         );
         assert_eq!(bridges.line(PrtMode::PicMode, &leaf), Some(11));

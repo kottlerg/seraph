@@ -35,6 +35,10 @@
 //! 8. [`unmount`] after every phase that uses `/data` or the cwd: it
 //!    unmounts the data partition, killing every cap on it, before it
 //!    mounts it again and sets the cwd to it again.
+//! 9. [`logd_restart`] after every phase that reads logd's slots or
+//!    history before it ([`procmgr::logd_forward`], [`log_client`]): it
+//!    kills logd, whose next instance holds a fresh table, and runs the
+//!    [`procmgr::logd_forward`] check again against it.
 
 use crate::runner::Phase;
 
@@ -51,6 +55,7 @@ pub mod fs_std;
 pub mod heap_commit;
 pub mod layout;
 pub mod log_client;
+pub mod logd_restart;
 pub mod memmgr;
 pub mod namespace;
 pub mod node_handle;
@@ -109,6 +114,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(svcmgr::phases());
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(log_client::phases());
+    out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());

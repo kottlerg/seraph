@@ -18,9 +18,11 @@
 //!   creates): the stub is staged naming the target, as `run --debug-target`
 //!   stages it (`crate::debug_stub`), and attaches to it during the boot; the
 //!   host connects over the debug port, moves the main thread, and detaches,
-//!   which gives the target its crash bindings back. logd restarts, so it is
-//!   killed again, through the stub's attach to each new instance, until
-//!   svcmgr's restart budget is spent.
+//!   which gives the target its crash bindings back. logd is killed at the
+//!   stub's first attach, which can fall before logd asks svcmgr for its
+//!   bootstrap round, and as it restarts, it is killed again, through the
+//!   stub's attach to each new instance, until svcmgr's restart budget is
+//!   spent.
 //! - **QEMU's own gdbstub** (memmgr and procmgr, which init creates with raw
 //!   syscalls, so no debugger can attach to them): once the default boot is
 //!   up, the host sets a hardware breakpoint on a function of the target's
@@ -124,11 +126,11 @@ enum KillPoint
     /// calls devmgr and vfsd during its launches, where a call to a server
     /// that died after svcmgr's check of it waits for good (#1185).
     SystemUp,
-    /// As [`KillPoint::SystemUp`], then again after each restart svcmgr
-    /// makes, until its restart budget is spent and the death is permanent.
-    /// Not at the stub's first attach: a service that dies before it asks
-    /// svcmgr for its bootstrap round leaves svcmgr waiting for the request
-    /// (#1297).
+    /// As [`KillPoint::Attach`], then again after each restart svcmgr makes,
+    /// until its restart budget is spent and the death is permanent. The
+    /// first kill can fall before the target asks svcmgr for its bootstrap
+    /// round, a death svcmgr routes as any other
+    /// (`services/svcmgr/docs/restart-protocol.md` § Death detection).
     RestartsSpent,
 }
 
@@ -490,13 +492,11 @@ fn kill_through_stub(
     // for the target at its start; a stub that found none looks again here.
     stub.request(b"qSupported")?;
     stub.set_answer_timeout(ANSWER_TIMEOUT)?;
-    if matches!(point, KillPoint::SystemUp | KillPoint::RestartsSpent)
+    if point == KillPoint::SystemUp
     {
         // The attach holds every thread of the target, and the boot waits on
-        // devmgr, vfsd and logd (svcmgr waits for logd's bootstrap request,
-        // and a logd killed before it sends one leaves svcmgr waiting, #1297):
-        // released until the system is up, the target is held again by the
-        // next `qSupported`, which finds the stub detached.
+        // devmgr and vfsd: released until the system is up, the target is
+        // held again by the next `qSupported`, which finds the stub detached.
         stub.expect_ok(b"D")?;
         let awaited: Vec<&str> = [READY_MARKER, RECONCILED_MARKER]
             .into_iter()

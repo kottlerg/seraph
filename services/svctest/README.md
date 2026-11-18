@@ -317,6 +317,19 @@ nonce with `PROBE_INSTANCE`, sends `PROBE_FAULT_WORKER` so a worker thread of th
 and requires a different nonce from the instance svcmgr restarts
 ([crasher](../crasher/README.md)).
 
+The `svcmgr_boot_death` phase runs when the `crasher-boot.svc` recipe is staged beside
+`svctest.svc` and is skipped otherwise; staged, it fails if `crasher.boot` is not published
+within 10 s. It checks that svcmgr routes the death of a service that dies before its bootstrap
+request ([Restart Protocol § Death
+detection](../svcmgr/docs/restart-protocol.md#death-detection)). The fixture's instance that finds
+the token `/data/crasher-boot/die-early` removes it and faults before its request, and any other
+serves `PROBE_INSTANCE` and `PROBE_FAULT_WORKER` on `crasher.boot`. The data partition ships the
+token, so the first launch dies so: the phase requires an instance's nonce, which only an instance
+svcmgr started after routing that death answers, and the token gone. It then writes the token,
+sends `PROBE_FAULT_WORKER`, and requires a different nonce and the token gone: the restart after the
+worker's fault took the token and died before its request, and a later restart answered. It
+writes the token again at its end, so a later boot of the same image repeats the first-launch case.
+
 The `svcmgr_stop_service` phase checks the stop authority
 ([svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) § Stop authority). Through the
 per-process `service_registry_cap`, `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`

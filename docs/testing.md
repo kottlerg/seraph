@@ -171,6 +171,7 @@ rootfs/config/svcmgr/
 │   ├── usertest.svc
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
+│   ├── crasher-boot.svc      # death-before-bootstrap fixture; co-staged with svctest
 │   ├── memhog.svc            # out-of-memory policy fixture; co-staged with svctest
 │   ├── stopsrc.svc           # stop-source fixture; co-staged with svctest
 │   ├── crashd.svc            # crashd naming crashme, holding 3 s; co-staged with usertest
@@ -489,11 +490,13 @@ terminal. Two routes reach the thread:
   into the fault. svcmgr is killed at the attach, while the boot waits on it. devmgr and vfsd are
   released at the attach and held again once the terminal's READY line and svcmgr's
   reconciliation line have appeared: svcmgr's launches still call them, and a call to one that
-  died after svcmgr's check of it waits for good (#1185). logd restarts, so it is killed at the
-  same point, then again after each `service restarted: logd` line, through the stub's attach to
-  the new instance, four times in all: the fourth death finds svcmgr's restart budget (three per
-  60 s window) spent and is permanent. It is released at the attach too: a logd that dies before
-  it asks svcmgr for its bootstrap round leaves svcmgr waiting for the request (#1297). The stub's
+  died after svcmgr's check of it waits for good (#1185). logd is killed at the attach, as svcmgr
+  is, which can fall before logd asks svcmgr for its bootstrap round, a death svcmgr routes as any
+  other ([Restart Protocol § Death
+  detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). logd restarts, so it
+  is killed again after each `service restarted: logd` line, through the stub's attach to the new
+  instance, four times in all: the fourth death finds svcmgr's restart budget (three per 60 s
+  window) spent and is permanent. The stub's
   lines reach the serial line through logd once logd has taken the log over from init, so a stub
   holding logd cannot log its attach: for logd the host connects once svcmgr's
   `svcmgr: launching: logd` line has appeared, and the stub answers its first request once it
@@ -775,7 +778,10 @@ Non-shutdown fixtures may co-stage alongside one harness. `crasher`
 the services-surface CI cell so their restart paths are exercised there (svctest's
 `svcmgr_worker_fault_restart` phase runs when `crasher-worker.svc` is staged and is
 skipped otherwise, and its `svcmgr_stop_service` phase stops and restarts the fixture through
-svcmgr's stop authority when it is staged); its
+svcmgr's stop authority when it is staged), as is its boot-fault role (`crasher-boot.svc`,
+`restart = on_failure`), whose instance that finds the token `/data/crasher-boot/die-early`,
+which the data partition ships, removes it and dies before its bootstrap request (svctest's
+`svcmgr_boot_death` phase runs when it is staged and is skipped otherwise); its
 bounded faults complete long before `svctest`'s terminal marker, so the
 kernel fault dump never clobbers it. The `memhog` fixture (`memhog.svc`,
 `restart = on_failure`, `oom_stop = yes`) is co-staged with `svctest` in that cell and in the
@@ -1434,8 +1440,9 @@ owes some of the cells runs those boots, and the release host runs run all four.
 # Disk variations, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/memhog.svc \
-    sysroot/config/svcmgr/tests/stopsrc.svc sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/crasher-boot.svc \
+    sysroot/config/svcmgr/tests/memhog.svc sysroot/config/svcmgr/tests/stopsrc.svc \
+    sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
@@ -1471,8 +1478,9 @@ is the framebuffer device cell (Device surfaces above).
 # Framebuffer cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/memhog.svc \
-    sysroot/config/svcmgr/tests/stopsrc.svc sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/crasher-boot.svc \
+    sysroot/config/svcmgr/tests/memhog.svc sysroot/config/svcmgr/tests/stopsrc.svc \
+    sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only

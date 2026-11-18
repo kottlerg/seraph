@@ -12,6 +12,7 @@
 //! the [`Launched`] handles; for a supervised launch [`launch`] binds
 //! the service's death observers itself, before `START_PROCESS`.
 
+use ipc::bootstrap::ServeFailure;
 use ipc::procmgr_labels;
 use registry::{Resolver, Visibility};
 use svcmgr_defs::DeathTag;
@@ -20,9 +21,9 @@ use svcmgr_defs::class::class_publication;
 use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::registry_lookup_derived;
 use crate::restart::{
-    CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, create_label_bits,
-    destroy_partial_child, mint_debug_authority, mint_self_death_recv, mint_stop_authority,
-    start_process, walk_and_create_from_file,
+    CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, caps_death,
+    create_label_bits, destroy_partial_child, mint_debug_authority, mint_self_death_recv,
+    mint_stop_authority, start_process, walk_and_create_from_file,
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
@@ -39,6 +40,10 @@ pub struct Launched
     /// The node handle of the child's budget node for an `oom_stop = yes`
     /// service ([`CreatedProcess::node_handle`]); zero for every other.
     pub node_handle: u64,
+    /// The exit reason of a child that died during its bootstrap rounds, which
+    /// the caller routes as the service's death; `None` for a child that took
+    /// them.
+    pub died: Option<u64>,
 }
 
 /// Whether a launch is of the recognised shutdown actuator, which observes
@@ -83,6 +88,13 @@ pub(crate) fn assemble_boot_caps(provided_recv: u64, seeds: Vec<u64>) -> Vec<u64
     caps
 }
 
+/// The interval, in milliseconds, at which svcmgr's wait for a child's
+/// bootstrap request reads whether the child has died ([`serve_boot_slots`]).
+/// A tuning value that bounds no capacity: a request wakes the wait at once,
+/// so the interval is only how late a child that died before its request is
+/// seen.
+pub(crate) const BOOTSTRAP_POLL_MS: u64 = 50;
+
 /// Serve a child's bootstrap rounds from its positional `slots` (`0` marks
 /// an absent cap). A round carries at most `MSG_CAP_SLOTS_MAX` caps, so the
 /// slots are split over [`ipc::bootstrap::slot_rounds`] windows, one round
@@ -93,24 +105,39 @@ pub(crate) fn assemble_boot_caps(provided_recv: u64, seeds: Vec<u64>) -> Vec<u64
 /// in [service-definitions.md § `seed`](../../docs/service-definitions.md#seed)).
 /// Shared by the launch and restart paths.
 ///
+/// Each round's wait for the child's request is watched
+/// ([`ipc::bootstrap::serve_round_watched`]): every [`BOOTSTRAP_POLL_MS`]
+/// svcmgr reads the child's main thread through `thread_cap`
+/// ([`caps_death`]), so a child that dies before a request ends the serve
+/// instead of holding svcmgr's only thread, and with it every death svcmgr
+/// routes, for good. The read is svcmgr's own `cap_info`, which no other
+/// service answers. A live child that sends no request is still waited for.
+///
 /// # Errors
-/// The [`ipc::bootstrap::serve_round`] error code of the first round that
-/// fails; the caps of the rounds after it are still the caller's.
-pub(crate) fn serve_boot_slots(ctx: &RestartCtx, child_badge: u64, slots: &[u64])
--> Result<(), u64>
+/// The [`ServeFailure`] of the first round that fails: the child's death,
+/// or the round's refusal; the caps of the rounds after it are still the
+/// caller's.
+pub(crate) fn serve_boot_slots(
+    ctx: &RestartCtx,
+    child_badge: u64,
+    thread_cap: u64,
+    slots: &[u64],
+) -> Result<(), ServeFailure>
 {
     let rounds = ipc::bootstrap::slot_round_count(slots.len());
     for (k, packed) in ipc::bootstrap::slot_rounds(slots).enumerate()
     {
         // SAFETY: `ctx.ipc_buf` is the registered IPC buffer.
         unsafe {
-            ipc::bootstrap::serve_round(
+            ipc::bootstrap::serve_round_watched(
                 ctx.bootstrap_ep,
                 child_badge,
                 ctx.ipc_buf,
                 k.saturating_add(1) == rounds,
                 packed.caps(),
                 &[packed.presence()],
+                BOOTSTRAP_POLL_MS,
+                || caps_death(thread_cap, 0),
             )
         }?;
     }
@@ -361,7 +388,11 @@ fn assemble_provided_boot_caps(
 /// Spawn a service from its parsed `.svc` definition.
 ///
 /// Returns `Some(Launched)` on success, with the child running and
-/// its bootstrap rounds delivered. Returns `None` if any step fails;
+/// its bootstrap rounds delivered, or with the child dead during them
+/// ([`Launched::died`]): the rounds not served are released, the provided
+/// names are published as for a child that took them, since the endpoint
+/// outlives the instance, and the caller routes the death. Returns `None` if
+/// any step fails;
 /// in that case the child has been destroyed and any resolved seed caps
 /// and its node handle have been released; a create whose reply caps never reach svcmgr (see
 /// [`walk_and_create_from_file`]) leaves no child, since procmgr destroys
@@ -429,7 +460,8 @@ pub fn launch(
 /// The steps of [`launch`] after the create: namespace, death observers,
 /// bootstrap caps, `START_PROCESS` and the bootstrap rounds, then the
 /// publication of the provided names. `None` when a step fails, the child
-/// destroyed.
+/// destroyed; a child that died during its rounds is no failed step
+/// ([`Launched::died`]).
 fn launch_created(
     def: &Definition,
     created: &CreatedProcess,
@@ -484,19 +516,33 @@ fn launch_created(
         return None;
     }
 
-    if serve_boot_slots(ctx, created.child_badge, &boot_caps).is_err()
+    let died = match serve_boot_slots(ctx, created.child_badge, created.thread_cap, &boot_caps)
     {
-        std::os::seraph::log!(warn: "launch {}: bootstrap serve failed", def.name);
-        // The started child is blocked in its bootstrap request; destroy it
-        // rather than leave it waiting on a round that will not come.
-        delete_caps(&boot_caps);
-        if provided_endpoint != 0
+        Ok(()) => None,
+        Err(ServeFailure::ChildDied(exit_reason)) =>
         {
-            let _ = syscall::cap_delete(provided_endpoint);
+            // The caps of the rounds not served are still svcmgr's (deleting
+            // a transferred slot is a no-op). The dead child is the caller's
+            // to route, and no line is written here: the death's lines are
+            // the routing's, which holds the log sink's until a next instance
+            // runs.
+            delete_caps(&boot_caps);
+            Some(exit_reason)
         }
-        destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
-        return None;
-    }
+        Err(ServeFailure::Refused(_)) =>
+        {
+            std::os::seraph::log!(warn: "launch {}: bootstrap serve failed", def.name);
+            // The started child is blocked in its bootstrap request; destroy
+            // it rather than leave it waiting on a round that will not come.
+            delete_caps(&boot_caps);
+            if provided_endpoint != 0
+            {
+                let _ = syscall::cap_delete(provided_endpoint);
+            }
+            destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
+            return None;
+        }
+    };
 
     // Publish the provided name now that the endpoint exists, so consumers
     // launched after this provider resolve it.
@@ -507,6 +553,7 @@ fn launch_created(
         process_handle: created.process_handle,
         provided_endpoint,
         node_handle: created.node_handle,
+        died,
     })
 }
 

@@ -27,6 +27,7 @@ use crate::definitions::launch::{
 };
 use crate::definitions::{build_blob, cwd_rights};
 use crate::service::{POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
+use ipc::bootstrap::ServeFailure;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use std::os::seraph::process::ArgvEnvCap;
 use svcmgr_defs::DeathTag;
@@ -434,6 +435,11 @@ pub struct RestartCtx
 /// and the next instance, so its death routes back to the same
 /// `ServiceEntry` and a late post of this instance is dropped.
 ///
+/// A restarted instance that dies during its bootstrap rounds
+/// ([`Respawn::DiedInBootstrap`]) is a death of its own, decided here the
+/// same way, its restart charged to the same budget, so the budget bounds the
+/// repeats. Its late posts carry an instance already routed and are dropped.
+///
 /// Returns a [`DeathOutcome`] the caller routes:
 ///
 /// * `Restarted` — service is back up; supervision loop continues.
@@ -466,34 +472,64 @@ pub fn handle_death(
     {
         DeathLines::Written
     };
-    if lines == DeathLines::Written
+    // The routed death, and the deaths of the instances that died during
+    // their bootstrap since, with the reason of the last.
+    let routed_reason = exit_reason;
+    let mut exit_reason = exit_reason;
+    let mut bootstrap_deaths: u32 = 0;
+    loop
     {
-        log_death(svc, exit_reason);
+        if lines == DeathLines::Written
+        {
+            log_death(svc, exit_reason);
+        }
+
+        if !should_restart(svc, exit_reason, lines)
+        {
+            svc.active = false;
+            return permanent_death_outcome(svc, lines);
+        }
+
+        if lines == DeathLines::Written
+        {
+            let attempt = u64::from(svc.restart_count.saturating_add(1));
+            std::os::seraph::log!("restarting (attempt {attempt:#018x})");
+        }
+
+        let respawn = restart_process(svc, ctx, tag.slot, recipe, registry);
+        if respawn == Respawn::Failed
+        {
+            svc.active = false;
+            return permanent_death_outcome(svc, lines);
+        }
+        // A restart count cannot meaningfully exceed its type, so it
+        // saturates; an instance that started counts, whether or not it lived
+        // through its bootstrap.
+        svc.restart_count = svc.restart_count.saturating_add(1);
+        let Respawn::DiedInBootstrap(reason) = respawn
+        else
+        {
+            break;
+        };
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!("  the new instance died during its bootstrap");
+        }
+        bootstrap_deaths = bootstrap_deaths.saturating_add(1);
+        exit_reason = reason;
     }
 
-    if !should_restart(svc, exit_reason, lines)
-    {
-        svc.active = false;
-        return permanent_death_outcome(svc, lines);
-    }
-
-    let attempt = u64::from(svc.restart_count.saturating_add(1));
-    if lines == DeathLines::Written
-    {
-        std::os::seraph::log!("restarting (attempt {attempt:#018x})");
-    }
-
-    if !restart_process(svc, ctx, tag.slot, recipe, registry)
-    {
-        svc.active = false;
-        return permanent_death_outcome(svc, lines);
-    }
-
-    // A restart count cannot meaningfully exceed its type, so it saturates.
-    svc.restart_count = svc.restart_count.saturating_add(1);
     if lines == DeathLines::Held
     {
-        log_death(svc, exit_reason);
+        log_death(svc, routed_reason);
+        if bootstrap_deaths != 0
+        {
+            std::os::seraph::log!(
+                "  {bootstrap_deaths} later instance(s) died during their bootstrap; last \
+                 exit_reason={exit_reason:#018x}"
+            );
+        }
+        let attempt = u64::from(svc.restart_count);
         std::os::seraph::log!("restarting (attempt {attempt:#018x})");
     }
     std::os::seraph::log!("service restarted: {}", svc.name_str());
@@ -592,20 +628,37 @@ fn should_restart(svc: &mut ServiceEntry, exit_reason: u64, lines: DeathLines) -
     true
 }
 
+/// What [`restart_process`] made of a service's next instance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Respawn
+{
+    /// The instance runs and took its bootstrap rounds.
+    Started,
+    /// The instance started and died during its bootstrap rounds, with this
+    /// exit reason. The entry names it, and the next restart releases it as it
+    /// releases any dead instance.
+    DiedInBootstrap(u64),
+    /// A step failed: the new child, if one was created, is destroyed, and
+    /// the entry names no instance.
+    Failed,
+}
+
 /// Release the dead instance, create a new process via procmgr, bind its
 /// death observers (its main thread's, and its address space's through
 /// procmgr) under the slot's next instance, start it, and serve its bootstrap
 /// rounds. The observers are bound before `START_PROCESS`, so no death of the
-/// new instance precedes them. Returns `true` on success; on a failure after
-/// the create the new child is destroyed and the entry holds no instance
-/// (`process_handle` and `thread_cap` zero).
+/// new instance precedes them. Returns [`Respawn::Started`] on success, and
+/// [`Respawn::DiedInBootstrap`] when the instance dies before its rounds
+/// reach it ([`serve_boot_slots`]); on a failure after the create the new
+/// child is destroyed and the entry holds no instance (`process_handle` and
+/// `thread_cap` zero), [`Respawn::Failed`].
 fn restart_process(
     svc: &mut ServiceEntry,
     ctx: &RestartCtx,
     slot: u32,
     recipe: Option<&RestartRecipe>,
     registry: &mut registry::Registry,
-) -> bool
+) -> Respawn
 {
     // Reclaim the previous instance's kernel objects (thread/aspace/cspace/
     // ProcessInfo memory cap) before spawning a fresh one. CSpace teardown
@@ -648,7 +701,7 @@ fn restart_process(
     }) = create_process(svc, recipe, ctx)
     else
     {
-        return false;
+        return Respawn::Failed;
     };
 
     let instance = svc.instance.wrapping_add(1);
@@ -658,7 +711,7 @@ fn restart_process(
         std::os::seraph::log!(warn: "failed to bind the new instance's death observers");
         destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
         delete_caps(&[node_handle]);
-        return false;
+        return Respawn::Failed;
     }
     svc.process_handle = process_handle;
     svc.thread_cap = new_thread_cap;
@@ -672,7 +725,7 @@ fn restart_process(
         svc.process_handle = 0;
         svc.thread_cap = 0;
         svc.node_handle = 0;
-        false
+        Respawn::Failed
     };
 
     if !start_process(process_handle, ctx.ipc_buf)
@@ -686,19 +739,32 @@ fn restart_process(
         return fail(svc);
     };
 
-    if serve_boot_slots(ctx, child_badge, &boot_caps).is_err()
+    match serve_boot_slots(ctx, child_badge, new_thread_cap, &boot_caps)
     {
-        std::os::seraph::log!(warn: "bootstrap serve failed");
-        // serve_round MOVES caps on success; on failure they may or
-        // may not have been consumed. Best-effort delete is safe
-        // (delete of an already-transferred slot is a no-op). The
-        // started child is blocked in its bootstrap request; destroy it.
-        delete_caps(&boot_caps);
-        return fail(svc);
+        Ok(()) =>
+        {}
+        Err(ServeFailure::ChildDied(exit_reason)) =>
+        {
+            // The caps of the rounds not served are still svcmgr's (delete of
+            // an already-transferred slot is a no-op). The entry keeps the
+            // dead instance for the caller to route.
+            delete_caps(&boot_caps);
+            return Respawn::DiedInBootstrap(exit_reason);
+        }
+        Err(ServeFailure::Refused(_)) =>
+        {
+            std::os::seraph::log!(warn: "bootstrap serve failed");
+            // A round MOVES its caps on success; on failure they may or
+            // may not have been consumed. Best-effort delete is safe
+            // (delete of an already-transferred slot is a no-op). The
+            // started child is blocked in its bootstrap request; destroy it.
+            delete_caps(&boot_caps);
+            return fail(svc);
+        }
     }
 
     svc.bootstrap_badge = child_badge;
-    true
+    Respawn::Started
 }
 
 /// Assemble the restart bootstrap cap set for `svc`. Returns `None`, with

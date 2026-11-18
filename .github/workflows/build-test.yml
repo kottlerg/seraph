@@ -149,7 +149,9 @@ jobs:
         # the disk image as part of the compose step.
         #
         # The svctest cell also co-stages crasher (the restart-path
-        # fixture) and its worker-fault recipe (crasher-worker.svc):
+        # fixture), its worker-fault recipe (crasher-worker.svc) and its
+        # boot-fault recipe (crasher-boot.svc, whose first launch dies before
+        # its bootstrap request on the token the data partition ships):
         # crasher is non-shutdown, so it shares the boot with
         # svctest without racing pwrmgr shutdown; its bounded faults
         # finish long before svctest's terminal marker. This is the only
@@ -187,6 +189,7 @@ jobs:
                  sysroot/config/devmgr/classes/
               cp sysroot/config/svcmgr/tests/crasher.svc \
                  sysroot/config/svcmgr/tests/crasher-worker.svc \
+                 sysroot/config/svcmgr/tests/crasher-boot.svc \
                  sysroot/config/svcmgr/tests/memhog.svc \
                  sysroot/config/svcmgr/tests/stopsrc.svc \
                  sysroot/config/svcmgr/services/

@@ -3,14 +3,17 @@
 
 // shared/ipc/src/restart_probe_labels.rs
 
-//! The service labels of the `crasher` fixture's `worker-fault` role
+//! The service labels of the `crasher` fixture's `worker-fault` role, and of
+//! its `boot-fault` role once an instance lives through its bootstrap
 //! (services/crasher/README.md), through which svctest checks that svcmgr
-//! restarts a supervised service whose worker thread faults.
+//! restarts a supervised service whose worker thread faults, and one whose
+//! instance died before its bootstrap request.
 //!
-//! The fixture serves them on the endpoint of the name its recipe provides,
-//! [`NAME`]. Every request carries no data; no badge bit is checked.
+//! The fixture serves them on the endpoint of the name its recipe provides:
+//! [`NAME`] for `worker-fault`, `crasher.boot` for `boot-fault`. Every
+//! request carries no data; no badge bit is checked.
 
-/// The name the fixture's recipe provides
+/// The name the `worker-fault` recipe provides
 /// (`rootfs/config/svcmgr/tests/crasher-worker.svc`).
 pub const NAME: &[u8] = b"crasher.worker";
 /// Reply `SUCCESS` with data word 0 the instance's nonce: a random value

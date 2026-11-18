@@ -1302,6 +1302,17 @@ pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c`) and a QMP socket:
    for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
    then hot-adds the device again, and passes on the fixture's `[hotplug-check] PASS` line.
 
+Then two storage boots on the split-data layout, under native control, with the disk-mode recipe
+(`hotplug-check-disk.svc`) staged alone:
+
+3. the data disk (`disk-data.img`) behind the root port from boot: the host removes it (QMP
+   `device_del`), requires devmgr's removal lines and vfsd's `disk N: removed; tearing down its
+   mounts`, adds it again (`device_add` of a `virtio-blk-pci` on the kept block node), then
+   requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`, svcmgr's `critical service
+   unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
+4. the boot disk behind the port and the data disk on a slot of its own: the host removes the boot
+   disk and requires the same last three.
+
 It kills QEMU after each boot, then removes the staged files and repacks the images in that layout
 again, whatever the outcome. [docs/testing.md](../docs/testing.md) § PCI Express hotplug
 (`test-hotplug`) lists what the fixture checks.

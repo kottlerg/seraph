@@ -306,22 +306,150 @@ pub enum HotplugControl
     Native,
 }
 
+/// The hotplug root port a launch attaches ([`QemuLaunchSpec::hotplug_port`]):
+/// who controls its hotplug, and the disk placed behind it, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotplugPort<'a>
+{
+    pub control: HotplugControl,
+    pub disk: Option<PortDisk<'a>>,
+}
+
+impl HotplugPort<'_>
+{
+    /// An empty port under `control`, with no disk.
+    #[must_use]
+    pub const fn empty(control: HotplugControl) -> Self
+    {
+        Self {
+            control,
+            disk: None,
+        }
+    }
+}
+
+/// A disk a hotplug launch places behind its root port ([`HotplugPort`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortDisk<'a>
+{
+    /// The image at this path as the block node [`PORT_DISK_NODE`], its
+    /// `virtio-blk-pci` device, id [`PORT_DISK_ID`], behind the port from
+    /// boot. QEMU keeps a node made by `-blockdev` across the removal of its
+    /// device, so the host can remove the device and add it again
+    /// ([`port_disk_properties`]). Its device presents `block_size`-byte
+    /// blocks.
+    Data
+    {
+        path: &'a Path, block_size: u32
+    },
+    /// The boot disk itself: its `virtio-blk-pci` device, id
+    /// [`PORT_DISK_ID`], sits behind the port from boot, so the host can
+    /// remove it.
+    Boot,
+}
+
+/// The id of the `virtio-blk-pci` device behind the hotplug port, of the
+/// boot disk ([`PortDisk::Boot`]) or the data disk ([`PortDisk::Data`]).
+pub const PORT_DISK_ID: &str = "hotplug-disk";
+
+/// The block node of a [`PortDisk::Data`] image, which its device names as
+/// its drive.
+pub const PORT_DISK_NODE: &str = "hotplug-disk-node";
+
+/// The `device_add` properties of the `virtio-blk-pci` device a host adds
+/// again on a [`PortDisk::Data`] node: those [`blk_device`] gives every
+/// disk, `block_size`-byte blocks and behind the IOMMU when `iommu`
+/// attaches one.
+#[must_use]
+pub fn port_disk_properties(
+    block_size: u32,
+    iommu: Iommu,
+) -> Vec<(&'static str, crate::qmp::Property<'static>)>
+{
+    use crate::qmp::Property;
+    let mut properties = vec![
+        ("drive", Property::String(PORT_DISK_NODE)),
+        ("disable-legacy", Property::String("on")),
+        (
+            "logical_block_size",
+            Property::Number(u64::from(block_size)),
+        ),
+        (
+            "physical_block_size",
+            Property::Number(u64::from(block_size)),
+        ),
+    ];
+    if iommu == Iommu::Attached
+    {
+        properties.push(("iommu_platform", Property::Bool(true)));
+    }
+    properties
+}
+
 /// The arguments that attach the hotplug root port of `spec`, none when it
-/// asks for none: the port, and on q35 under native control the property
-/// that turns ACPI PCI hotplug off.
+/// asks for none: the port, on q35 under native control the property that
+/// turns ACPI PCI hotplug off, and the disk behind it: the boot disk's
+/// device, or the data image's node and device, each after the port it sits
+/// on.
 fn hotplug_port_args(spec: &QemuLaunchSpec) -> Vec<String>
 {
-    let Some(control) = spec.hotplug_port
+    let Some(port) = spec.hotplug_port
     else
     {
         return Vec::new();
     };
     let mut args = vec!["-device".to_string(), HOTPLUG_PORT_DEVICE.to_string()];
-    if spec.arch == Arch::X86_64 && control == HotplugControl::Native
+    if spec.arch == Arch::X86_64 && port.control == HotplugControl::Native
     {
         args.extend(["-global".to_string(), X86_NATIVE_HOTPLUG_GLOBAL.to_string()]);
     }
+    match port.disk
+    {
+        None =>
+        {}
+        Some(PortDisk::Boot) => args.extend([
+            "-device".to_string(),
+            format!(
+                "{},bus={HOTPLUG_PORT_ID},id={PORT_DISK_ID}",
+                blk_device("hd0", spec.disk_block_size, None, spec.iommu, DiskLine::Own)
+            ),
+        ]),
+        Some(PortDisk::Data { path, block_size }) =>
+        {
+            args.extend([
+                "-blockdev".to_string(),
+                format!(
+                    "driver=raw,node-name={PORT_DISK_NODE},file.driver=file,file.filename={}",
+                    path.display()
+                ),
+                "-device".to_string(),
+                format!(
+                    "{},bus={HOTPLUG_PORT_ID},id={PORT_DISK_ID}",
+                    blk_device(PORT_DISK_NODE, block_size, None, spec.iommu, DiskLine::Own)
+                ),
+            ]);
+        }
+    }
     args
+}
+
+/// The block size of the data disk behind the hotplug port of `spec`
+/// ([`PortDisk::Data`]), if it has one.
+fn port_disk_block_size(spec: &QemuLaunchSpec) -> Option<u32>
+{
+    match spec.hotplug_port?.disk?
+    {
+        PortDisk::Data { block_size, .. } => Some(block_size),
+        PortDisk::Boot => None,
+    }
+}
+
+/// Whether the boot disk's device sits behind the hotplug port of `spec`
+/// ([`PortDisk::Boot`]), which [`hotplug_port_args`] then places.
+fn boot_disk_behind_port(spec: &QemuLaunchSpec) -> bool
+{
+    spec.hotplug_port
+        .is_some_and(|port| port.disk == Some(PortDisk::Boot))
 }
 
 /// The RISC-V IOMMU as a PCI function, pinned at 00:01.0, the lowest slot
@@ -528,10 +656,10 @@ pub struct QemuLaunchSpec<'a>
     /// the `pci-testdev` functions svctest's devmgr phases drive through the
     /// test-only drivers ([`test_device_args`]).
     pub test_devices: bool,
-    /// When set, attach an empty PCI Express root port a device can be
-    /// hot-added behind (`test-hotplug`), its hotplug under this control
-    /// ([`hotplug_port_args`]).
-    pub hotplug_port: Option<HotplugControl>,
+    /// When set, attach a PCI Express root port a device can be hot-added
+    /// behind or removed from (`test-hotplug`), its hotplug under its
+    /// control, with the disk it places behind it ([`hotplug_port_args`]).
+    pub hotplug_port: Option<HotplugPort<'a>>,
 }
 
 /// The device arguments a launch passes before every other device: the
@@ -594,6 +722,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         bail!("--mem 0 is not a bootable guest memory size");
     }
     check_block_size(spec.disk_block_size)?;
+    port_disk_block_size(spec).map_or(Ok(()), check_block_size)?;
 
     let mut args: Vec<String> = vec![
         "-m".into(),
@@ -608,15 +737,22 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             "if=none,id=hd0,format=raw,file={}",
             spec.disk_path.display()
         ),
-        "-device".into(),
-        blk_device(
-            "hd0",
-            spec.disk_block_size,
-            spec.second_disk.as_ref().map(|_| FIRST_DISK_SLOT),
-            spec.iommu,
-            spec.second_disk.as_ref().map_or(DiskLine::Own, |s| s.line),
-        ),
     ]);
+    // A boot disk behind the hotplug port has its device placed after the
+    // port (`hotplug_port_args`).
+    if !boot_disk_behind_port(spec)
+    {
+        args.extend([
+            "-device".into(),
+            blk_device(
+                "hd0",
+                spec.disk_block_size,
+                spec.second_disk.as_ref().map(|_| FIRST_DISK_SLOT),
+                spec.iommu,
+                spec.second_disk.as_ref().map_or(DiskLine::Own, |s| s.line),
+            ),
+        ]);
+    }
 
     if let Some(second) = &spec.second_disk
     {
@@ -1904,18 +2040,86 @@ mod tests
             assert!(!devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
             assert!(!global(&argv));
 
-            spec.hotplug_port = Some(HotplugControl::Firmware);
+            spec.hotplug_port = Some(HotplugPort::empty(HotplugControl::Firmware));
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
             assert!(!global(&argv));
 
-            spec.hotplug_port = Some(HotplugControl::Native);
+            spec.hotplug_port = Some(HotplugPort::empty(HotplugControl::Native));
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
             assert_eq!(global(&argv), spec.arch == Arch::X86_64);
         }
         assert!(HOTPLUG_PORT_DEVICE.contains(&format!("id={HOTPLUG_PORT_ID},")));
         assert!(EDU_DEVICE.ends_with(&format!("dma_mask={EDU_DMA_MASK:#x}")));
+    }
+
+    #[test]
+    fn a_port_disk_sits_behind_the_port()
+    {
+        let path = Path::new("/w/spare.img");
+        for mut spec in [riscv_spec(4, 512), x86_spec(X86Paging::Four)]
+        {
+            spec.hotplug_port = Some(HotplugPort {
+                control: HotplugControl::Native,
+                disk: Some(PortDisk::Boot),
+            });
+            let argv = build_qemu_argv(&spec).unwrap();
+            let placed = devices(&argv);
+            let boot: Vec<usize> = placed
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.starts_with("virtio-blk-pci,drive=hd0,"))
+                .map(|(at, _)| at)
+                .collect();
+            let port = placed.iter().position(|d| *d == HOTPLUG_PORT_DEVICE);
+            assert_eq!(boot.len(), 1, "one boot disk device: {placed:?}");
+            assert!(port.is_some_and(|port| port < boot[0]), "{placed:?}");
+            assert!(
+                placed[boot[0]].ends_with(&format!(",bus={HOTPLUG_PORT_ID},id={PORT_DISK_ID}"))
+            );
+            assert!(!argv.iter().any(|a| a == "-blockdev"));
+
+            spec.hotplug_port = Some(HotplugPort {
+                control: HotplugControl::Native,
+                disk: Some(PortDisk::Data {
+                    path,
+                    block_size: 4096,
+                }),
+            });
+            let argv = build_qemu_argv(&spec).unwrap();
+            assert!(blk_device_arg(&argv, "hd0").is_some());
+            let data = blk_device_arg(&argv, PORT_DISK_NODE).unwrap();
+            assert!(data.contains(",logical_block_size=4096,"));
+            assert!(data.ends_with(&format!(",bus={HOTPLUG_PORT_ID},id={PORT_DISK_ID}")));
+            let node = argv
+                .windows(2)
+                .find(|w| w[0] == "-blockdev")
+                .map(|w| w[1].as_str());
+            assert_eq!(
+                node,
+                Some(
+                    format!(
+                        "driver=raw,node-name={PORT_DISK_NODE},file.driver=file,\
+                         file.filename=/w/spare.img"
+                    )
+                    .as_str()
+                )
+            );
+        }
+        let iommu_platform = |iommu| {
+            port_disk_properties(4096, iommu)
+                .iter()
+                .any(|(name, value)| {
+                    *name == "iommu_platform" && *value == crate::qmp::Property::Bool(true)
+                })
+        };
+        assert!(iommu_platform(Iommu::Attached));
+        assert!(!iommu_platform(Iommu::Absent));
+        assert!(
+            port_disk_properties(4096, Iommu::Absent)
+                .contains(&("drive", crate::qmp::Property::String(PORT_DISK_NODE)))
+        );
     }
 
     #[test]

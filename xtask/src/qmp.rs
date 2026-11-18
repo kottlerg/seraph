@@ -279,14 +279,27 @@ fn string_field<'a>(line: &'a str, key: &str) -> Option<&'a str>
     rest.split_once('"').map(|(v, _)| v)
 }
 
+/// The value of a device property `device_add` sets: a JSON number, string
+/// or boolean, as the property's type takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Property<'a>
+{
+    /// An integer or a size (`dma_mask`, `logical_block_size`).
+    Number(u64),
+    /// A string, an id or an enumeration (`drive`, `disable-legacy`).
+    String(&'a str),
+    /// A boolean (`iommu_platform`).
+    Bool(bool),
+}
+
 /// Hot-add the device `driver`, its id `id`, on the bus `bus` (a port's id),
-/// with the further properties `properties`, each a name and a JSON number.
+/// with the further properties `properties`, each a name and a value.
 pub fn device_add(
     socket: &Path,
     driver: &str,
     id: &str,
     bus: &str,
-    properties: &[(&str, u64)],
+    properties: &[(&str, Property<'_>)],
 ) -> Result<()>
 {
     let mut client = Client::connect(socket)?;
@@ -298,7 +311,12 @@ pub fn device_add(
 }
 
 /// The `device_add` command of [`device_add`].
-fn device_add_message(driver: &str, id: &str, bus: &str, properties: &[(&str, u64)]) -> String
+fn device_add_message(
+    driver: &str,
+    id: &str,
+    bus: &str,
+    properties: &[(&str, Property<'_>)],
+) -> String
 {
     let mut arguments = format!(
         r#""driver":{},"id":{},"bus":{}"#,
@@ -308,10 +326,39 @@ fn device_add_message(driver: &str, id: &str, bus: &str, properties: &[(&str, u6
     );
     for (name, value) in properties
     {
+        let value = match *value
+        {
+            Property::Number(n) => n.to_string(),
+            Property::String(s) => json_string(s),
+            Property::Bool(b) => b.to_string(),
+        };
         // Writing to a `String` cannot fail.
         let _ = write!(arguments, ",{}:{value}", json_string(name));
     }
     format!(r#"{{"execute":"device_add","arguments":{{{arguments}}}}}"#)
+}
+
+/// The `device_del` command of the device `id`.
+fn device_del_message(id: &str) -> String
+{
+    format!(
+        r#"{{"execute":"device_del","arguments":{{"id":{}}}}}"#,
+        json_string(id)
+    )
+}
+
+/// Ask QEMU to unplug the device `id` (`device_del`) and read its answer,
+/// without waiting for the device's `DEVICE_DELETED` event: a guest that
+/// loses its boot disk shuts down, and may power off before it powers the
+/// slot off.
+pub fn device_del_request(socket: &Path, id: &str) -> Result<()>
+{
+    let mut client = Client::connect(socket)?;
+    client.send(&device_del_message(id))?;
+    client
+        .read_result()
+        .with_context(|| format!("device_del {id}"))?;
+    Ok(())
 }
 
 /// Ask QEMU to unplug the device `id` (`device_del`), then wait up to
@@ -322,10 +369,7 @@ fn device_add_message(driver: &str, id: &str, bus: &str, properties: &[(&str, u6
 pub fn device_del(socket: &Path, id: &str, timeout: Duration) -> Result<()>
 {
     let mut client = Client::connect(socket)?;
-    client.send(&format!(
-        r#"{{"execute":"device_del","arguments":{{"id":{}}}}}"#,
-        json_string(id)
-    ))?;
+    client.send(&device_del_message(id))?;
     let start = Instant::now();
     let mut answered = false;
     loop
@@ -485,15 +529,42 @@ mod tests
     }
 
     #[test]
-    fn device_add_names_the_driver_id_bus_and_numeric_properties()
+    fn device_add_names_the_driver_id_bus_and_properties()
     {
         assert_eq!(
-            device_add_message("edu", "hp\"0", "port", &[("dma_mask", 0xFFFF_FFFF)]),
+            device_add_message(
+                "edu",
+                "hp\"0",
+                "port",
+                &[("dma_mask", Property::Number(0xFFFF_FFFF))]
+            ),
             r#"{"execute":"device_add","arguments":{"driver":"edu","id":"hp\"0","bus":"port","dma_mask":4294967295}}"#
         );
         assert_eq!(
             device_add_message("edu", "a", "b", &[]),
             r#"{"execute":"device_add","arguments":{"driver":"edu","id":"a","bus":"b"}}"#
+        );
+        assert_eq!(
+            device_add_message(
+                "virtio-blk-pci",
+                "d",
+                "p",
+                &[
+                    ("drive", Property::String("n\"1")),
+                    ("iommu_platform", Property::Bool(true)),
+                    ("logical_block_size", Property::Number(512)),
+                ]
+            ),
+            r#"{"execute":"device_add","arguments":{"driver":"virtio-blk-pci","id":"d","bus":"p","drive":"n\"1","iommu_platform":true,"logical_block_size":512}}"#
+        );
+    }
+
+    #[test]
+    fn device_del_names_the_device()
+    {
+        assert_eq!(
+            device_del_message("hp\"0"),
+            r#"{"execute":"device_del","arguments":{"id":"hp\"0"}}"#
         );
     }
 

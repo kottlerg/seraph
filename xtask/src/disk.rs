@@ -10,7 +10,10 @@
 //! partition. `disk.img` carries all four, or all but the data partition,
 //! which then sits alone on a second image; the logical block size, 512 or
 //! 4096 bytes, is chosen per authoring. The kernel and every ELF image the
-//! partitions carry are signed first ([`crate::signing::sign_sysroot`]).
+//! partitions carry are signed first ([`crate::signing::sign_sysroot`]). The
+//! refusal boots of `test-signing` pack through
+//! [`create_disk_image_substituting`], which writes bytes the harness staged
+//! in place of named sysroot files and leaves the sysroot as it was.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -156,20 +159,45 @@ struct Volume
 /// What an authored partition holds.
 enum Contents
 {
-    /// A FAT volume ([`crate::fat`]) holding a host directory's tree, or
-    /// nothing when the directory is absent.
-    Fat(PathBuf),
+    /// A FAT volume ([`crate::fat`]).
+    Fat(FatSource),
     /// No filesystem: the partition's bytes are left as the new image's
     /// zeros.
     Raw,
 }
 
-/// The host directories the three partitions are populated from.
+/// The tree a FAT volume holds: a host directory's, or nothing when the
+/// directory is absent, with each substitute's file in place of the one at its
+/// path.
+struct FatSource
+{
+    dir: PathBuf,
+    /// Paths relative to `dir`.
+    substitutes: Vec<Substitute>,
+}
+
+/// A file a pack writes in place of the one the sysroot holds
+/// ([`create_disk_image_substituting`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Substitute
+{
+    /// The file's path relative to the sysroot: under `esp/` on the ESP,
+    /// under `data/` on the data partition, and on the root partition
+    /// otherwise. The sysroot holds a file there.
+    pub path: PathBuf,
+    /// The host file whose bytes the partition holds in its place.
+    pub source: PathBuf,
+}
+
+/// The host directories the three partitions are populated from, and the
+/// files written in place of theirs.
 struct Sources
 {
     esp: PathBuf,
     root: PathBuf,
     data: PathBuf,
+    /// Paths relative to the sysroot.
+    substitutes: Vec<Substitute>,
 }
 
 /// Create the GPT disk image at `<project_root>/disk.img`, and, when the
@@ -200,6 +228,37 @@ struct Sources
 /// duplicated onto root; vfsd's fall-through still serves `/data` from
 /// root on images that choose to carry it there instead.
 pub fn create_disk_image(ctx: &BuildContext, arch: Arch, layout: DiskLayout) -> Result<()>
+{
+    pack(ctx, arch, layout, Vec::new())
+}
+
+/// [`create_disk_image`], with each of `substitutes` written in place of the
+/// sysroot file at its path. The sysroot is signed and left as every pack
+/// leaves it; only the images carry the substitutes, as written, so a test can
+/// boot an object no pack would sign (a tampered or foreign-signed image)
+/// without changing the sysroot a later pack signs.
+///
+/// # Errors
+/// Fails as [`create_disk_image`] does; when a substitute's path is not a
+/// relative path naming a file the sysroot holds, or its source cannot be
+/// read.
+pub fn create_disk_image_substituting(
+    ctx: &BuildContext,
+    arch: Arch,
+    layout: DiskLayout,
+    substitutes: &[Substitute],
+) -> Result<()>
+{
+    pack(ctx, arch, layout, substitutes.to_vec())
+}
+
+/// The pack of [`create_disk_image`] and [`create_disk_image_substituting`].
+fn pack(
+    ctx: &BuildContext,
+    arch: Arch,
+    layout: DiskLayout,
+    substitutes: Vec<Substitute>,
+) -> Result<()>
 {
     let image_path = ctx.disk_image();
     step(&format!(
@@ -232,6 +291,7 @@ pub fn create_disk_image(ctx: &BuildContext, arch: Arch, layout: DiskLayout) -> 
         esp: ctx.sysroot_esp(),
         root: ctx.sysroot.clone(),
         data: ctx.sysroot.join("data"),
+        substitutes,
     };
     let data_image = ctx.data_disk_image();
     author_images(&image_path, &data_image, arch, layout, &sources)?;
@@ -254,19 +314,26 @@ fn author_images(
     sources: &Sources,
 ) -> Result<()>
 {
+    let [on_esp, on_root, on_data] = split_substitutes(&sources.substitutes)?;
+    let fat = |dir: &Path, substitutes| {
+        Contents::Fat(FatSource {
+            dir: dir.to_path_buf(),
+            substitutes,
+        })
+    };
     let esp = Volume {
         name: "ESP",
         type_guid: gpt::EFI_SYSTEM_PARTITION,
         unique_guid: ESP_UNIQUE_GUID,
         bytes: ESP_PARTITION_SIZE,
-        contents: Contents::Fat(sources.esp.clone()),
+        contents: fat(&sources.esp, on_esp),
     };
     let root = Volume {
         name: "ROOT",
         type_guid: seraph_root_type(arch),
         unique_guid: ROOT_UNIQUE_GUID,
         bytes: ROOT_PARTITION_SIZE,
-        contents: Contents::Fat(sources.root.clone()),
+        contents: fat(&sources.root, on_root),
     };
     // The data tree is not also written to the root partition
     // (populate_dir skips top-level data/).
@@ -275,7 +342,7 @@ fn author_images(
         type_guid: role_guids::SERAPH_DATA,
         unique_guid: DATA_UNIQUE_GUID,
         bytes: DATA_PARTITION_SIZE,
-        contents: Contents::Fat(sources.data.clone()),
+        contents: fat(&sources.data, on_data),
     };
     let swap = Volume {
         name: "SWAP",
@@ -568,8 +635,9 @@ fn write_gpt(
 
 /// Write the FAT volume of the `bytes`-byte partition at byte `offset` of the image at
 /// `image_path`, its sectors `block_size` bytes and its serial number the first four bytes of
-/// `unique_guid`, holding the tree under `source_dir` ([`host_tree`]), or nothing when that
-/// directory is absent. The partition's bytes are the new image's zeros, as
+/// `unique_guid`, holding the tree under `source.dir` ([`host_tree`]), or nothing when that
+/// directory is absent, with each of `source.substitutes` in place of the file at its path
+/// ([`substitute`]). The partition's bytes are the new image's zeros, as
 /// [`fat::write_volume`] requires.
 fn write_fat_partition(
     image_path: &Path,
@@ -577,10 +645,11 @@ fn write_fat_partition(
     bytes: u64,
     block_size: BlockSize,
     unique_guid: &Guid,
-    source_dir: &Path,
+    source: &FatSource,
 ) -> Result<()>
 {
-    let tree = if source_dir.exists()
+    let source_dir = source.dir.as_path();
+    let mut tree = if source_dir.exists()
     {
         host_tree(source_dir, source_dir)?
     }
@@ -588,6 +657,17 @@ fn write_fat_partition(
     {
         Vec::new()
     };
+    for each in &source.substitutes
+    {
+        substitute(&mut tree, &each.path, &each.source).with_context(|| {
+            format!(
+                "substituting {} for {} of {}",
+                each.source.display(),
+                each.path.display(),
+                source_dir.display()
+            )
+        })?;
+    }
     let [a, b, c, d, ..] = *unique_guid;
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -613,6 +693,85 @@ fn write_fat_partition(
         )
     })?;
     file.sync_all().context("failed to sync the FAT volume")
+}
+
+/// `substitutes`, whose paths are relative to the sysroot, split by the volume each lands
+/// on, `[ESP, root, data]`, each path made relative to its volume's directory: the ESP's
+/// under `esp/`, the data partition's under `data/`, and the root partition's every
+/// other.
+///
+/// # Errors
+/// When a path is not relative, or holds a component other than a name.
+fn split_substitutes(substitutes: &[Substitute]) -> Result<[Vec<Substitute>; 3]>
+{
+    let mut volumes: [Vec<Substitute>; 3] = Default::default();
+    for each in substitutes
+    {
+        let mut names = Vec::new();
+        for component in each.path.components()
+        {
+            let std::path::Component::Normal(name) = component
+            else
+            {
+                crate::error::bail!(
+                    "the substitute path {} is not a path of names relative to the sysroot",
+                    each.path.display()
+                );
+            };
+            names.push(name);
+        }
+        let (volume, within) = match names.split_first()
+        {
+            Some((first, rest)) if *first == "esp" => (0, rest),
+            Some((first, rest)) if *first == "data" => (2, rest),
+            _ => (1, names.as_slice()),
+        };
+        if let Some(list) = volumes.get_mut(volume)
+        {
+            list.push(Substitute {
+                path: within.iter().collect(),
+                source: each.source.clone(),
+            });
+        }
+    }
+    Ok(volumes)
+}
+
+/// Put the host file `source` in place of the file at `path`, relative to the volume's
+/// root, in `tree`.
+///
+/// # Errors
+/// When `tree` holds no file at `path`, or the length of `source` cannot be read.
+fn substitute(tree: &mut [fat::Entry], path: &Path, source: &Path) -> Result<()>
+{
+    let mut level = tree;
+    let mut names = path.components().peekable();
+    while let Some(component) = names.next()
+    {
+        let entries = std::mem::take(&mut level);
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| component.as_os_str() == entry.name.as_str())
+        else
+        {
+            break;
+        };
+        let last = names.peek().is_none();
+        match &mut entry.kind
+        {
+            fat::Kind::Dir(children) if !last => level = children.as_mut_slice(),
+            fat::Kind::File { path: file, len } if last =>
+            {
+                *len = fs::metadata(source)
+                    .with_context(|| format!("failed to read the size of {}", source.display()))?
+                    .len();
+                source.clone_into(file);
+                return Ok(());
+            }
+            fat::Kind::Dir(_) | fat::Kind::File { .. } => break,
+        }
+    }
+    crate::error::bail!("the volume holds no file at {}", path.display())
 }
 
 /// The files and directories under `host_dir`, in name order, as a FAT volume holds them.
@@ -711,6 +870,7 @@ mod tests
                 esp: self.0.join("no-esp"),
                 root: self.0.join("no-root"),
                 data,
+                substitutes: Vec::new(),
             }
         }
     }
@@ -1042,6 +1202,111 @@ mod tests
                 data: DataPlacement::MainImage,
             };
             assert_eq!(single.second_image(&ctx), None);
+        }
+    }
+
+    // Defect caught: a substitute written to the wrong volume or path, the
+    // sysroot's file packed in its place, or a substitute for a file the
+    // sysroot does not hold packed as a new file, which would boot a layout no
+    // build makes.
+    #[test]
+    fn a_substitute_replaces_the_named_file_on_its_volume_alone()
+    {
+        use crate::fat::read::{Node, read_volume};
+
+        let scratch = Scratch::new("substitute");
+        let sysroot = scratch.0.join("sysroot");
+        let files = [
+            ("esp/EFI/seraph/kernel", b"kernel".as_slice()),
+            ("services/timed", b"timed"),
+            ("services/drivers/timed", b"driver"),
+            ("data/note", b"note"),
+        ];
+        for (path, bytes) in files
+        {
+            let full = sysroot.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, bytes).unwrap();
+        }
+        let staged = |name: &str, bytes: &[u8]| {
+            let path = scratch.0.join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+        let sources = |substitutes| Sources {
+            esp: sysroot.join("esp"),
+            root: sysroot.clone(),
+            data: sysroot.join("data"),
+            substitutes,
+        };
+        let main = scratch.0.join("disk.img");
+        let data_image = scratch.0.join("disk-data.img");
+        let substitutes = vec![
+            Substitute {
+                path: PathBuf::from("esp/EFI/seraph/kernel"),
+                source: staged("kernel.new", b"tampered kernel"),
+            },
+            Substitute {
+                path: PathBuf::from("services/timed"),
+                source: staged("timed.new", b"tampered timed"),
+            },
+            Substitute {
+                path: PathBuf::from("data/note"),
+                source: staged("note.new", b"tampered note"),
+            },
+        ];
+        author_images(
+            &main,
+            &data_image,
+            Arch::X86_64,
+            DiskLayout::default(),
+            &sources(substitutes),
+        )
+        .unwrap();
+
+        let mut image = File::open(&main).unwrap();
+        let file = |bytes: &[u8]| Some(Node::File(bytes.to_vec()));
+        let esp = read_volume(&mut image, IMAGE_MARGIN, 512);
+        assert_eq!(
+            esp.get("/EFI/seraph/kernel"),
+            file(b"tampered kernel").as_ref()
+        );
+        let root = read_volume(&mut image, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512);
+        assert_eq!(
+            root.get("/services/timed"),
+            file(b"tampered timed").as_ref()
+        );
+        assert_eq!(
+            root.get("/services/drivers/timed"),
+            file(b"driver").as_ref()
+        );
+        let data = read_volume(
+            &mut image,
+            IMAGE_MARGIN + ESP_PARTITION_SIZE + ROOT_PARTITION_SIZE,
+            512,
+        );
+        assert_eq!(data.get("/note"), file(b"tampered note").as_ref());
+        assert_eq!(fs::read(sysroot.join("services/timed")).unwrap(), b"timed");
+
+        for path in [
+            "services/absent",
+            "services/drivers",
+            "esp",
+            "/services/timed",
+        ]
+        {
+            let refused = vec![Substitute {
+                path: PathBuf::from(path),
+                source: staged("refused.new", b"x"),
+            }];
+            author_images(
+                &main,
+                &data_image,
+                Arch::X86_64,
+                DiskLayout::default(),
+                &sources(refused),
+            )
+            .expect_err(path);
         }
     }
 

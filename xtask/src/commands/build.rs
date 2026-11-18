@@ -628,8 +628,41 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         args.profile().dir_name()
     ));
 
+    // The trust store the bootloader is built with, at a fixed path of the
+    // build output (docs/signing.md § Signing).
+    let signer = crate::signing::Signer::for_bootloader(ctx, args.arch)?;
+    let store = crate::signing::write_boot_store(ctx, &signer)?;
+    step(&format!("Trust store: {}", store.display()));
+
+    let efi_boot_dir = ctx.sysroot_efi_boot();
+    let efi_seraph_dir = ctx.sysroot_efi_seraph();
+    fs::create_dir_all(&efi_boot_dir)
+        .with_context(|| format!("creating {}", efi_boot_dir.display()))?;
+    fs::create_dir_all(&efi_seraph_dir)
+        .with_context(|| format!("creating {}", efi_seraph_dir.display()))?;
+
+    let dst_boot = efi_seraph_dir.join("boot.efi");
+    compile_boot(ctx, args, &store, &dst_boot)?;
+    let dst_efi = efi_boot_dir.join(args.arch.boot_efi_filename());
+    copy_file(&dst_boot, &dst_efi)?;
+    step(&format!("Bootloader: {}", dst_boot.display()));
+    step(&format!("Bootloader: {}", dst_efi.display()));
+    Ok(())
+}
+
+/// Compile the bootloader for `args.arch` in `args`'s profile, embedding the
+/// trust store in the file `store`, and write its PE image to `out`; the
+/// clippy pass runs first unless `args.skip_lints`. `test-signing` builds a
+/// bootloader under a store of its own this way, outside the sysroot.
+///
+/// # Errors
+///
+/// When the store's path cannot be resolved or is not UTF-8, when the lint
+/// pass or the build fails, when the build's output is missing, or when it
+/// cannot be converted or copied to `out`.
+pub fn compile_boot(ctx: &BuildContext, args: &BuildArgs, store: &Path, out: &Path) -> Result<()>
+{
     let boot_triple = args.arch.boot_target_triple();
-    let efi_name = args.arch.boot_efi_filename();
 
     let mut flags = vec![
         "-p",
@@ -644,17 +677,12 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         flags.push("--release");
     }
 
-    // The trust store the bootloader is built with, at a fixed path of the
-    // build output, which `core/boot/src/signing.rs` embeds from the path
-    // `SERAPH_BOOT_TRUST_STORE` names (docs/signing.md § Signing). rustc
-    // tracks the file and the variable, so the bootloader rebuilds when the
-    // store changes, and only then: `write_boot_store` leaves an unchanged
-    // file untouched.
-    let signer = crate::signing::Signer::for_bootloader(ctx, args.arch)?;
-    let store = crate::signing::write_boot_store(ctx, &signer)?;
-    step(&format!("Trust store: {}", store.display()));
+    // `core/boot/src/signing.rs` embeds the store from the path
+    // `SERAPH_BOOT_TRUST_STORE` names. rustc tracks the file and the
+    // variable, so the bootloader rebuilds when the store changes, and only
+    // then: `write_boot_store` leaves an unchanged file untouched.
     let store =
-        std::path::absolute(&store).with_context(|| format!("resolving {}", store.display()))?;
+        std::path::absolute(store).with_context(|| format!("resolving {}", store.display()))?;
     let store = store
         .to_str()
         .with_context(|| format!("the trust store path {} is not UTF-8", store.display()))?;
@@ -674,13 +702,6 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     cmd.envs(env);
     run_cmd(&mut cmd)?;
 
-    let efi_boot_dir = ctx.sysroot_efi_boot();
-    let efi_seraph_dir = ctx.sysroot_efi_seraph();
-    fs::create_dir_all(&efi_boot_dir)
-        .with_context(|| format!("creating {}", efi_boot_dir.display()))?;
-    fs::create_dir_all(&efi_seraph_dir)
-        .with_context(|| format!("creating {}", efi_seraph_dir.display()))?;
-
     if args.arch == Arch::Riscv64
     {
         // RISC-V: cargo produces an ELF; convert to a flat PE32+ binary via
@@ -692,26 +713,13 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         {
             bail!("expected ELF output not found: {}", elf_out.display());
         }
-
         let objcopy = find_llvm_objcopy()?;
-        let dst_boot = efi_seraph_dir.join("boot.efi");
         run_cmd(
             Command::new(&objcopy)
                 .args(["-O", "binary"])
                 .arg(&elf_out)
-                .arg(&dst_boot),
+                .arg(out),
         )?;
-        let dst_efi = efi_boot_dir.join(efi_name);
-        copy_file(&dst_boot, &dst_efi)?;
-
-        step(&format!(
-            "Bootloader: {} (ELF → flat binary)",
-            efi_seraph_dir.join("boot.efi").display()
-        ));
-        step(&format!(
-            "Bootloader: {} (ELF → flat binary)",
-            dst_efi.display()
-        ));
     }
     else
     {
@@ -723,19 +731,8 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         {
             bail!("expected EFI output not found: {}", cargo_out.display());
         }
-
-        let dst_boot = efi_seraph_dir.join("boot.efi");
-        copy_file(&cargo_out, &dst_boot)?;
-        let dst_efi = efi_boot_dir.join(efi_name);
-        copy_file(&dst_boot, &dst_efi)?;
-
-        step(&format!(
-            "Bootloader: {}",
-            efi_seraph_dir.join("boot.efi").display()
-        ));
-        step(&format!("Bootloader: {}", dst_efi.display()));
+        copy_file(&cargo_out, out)?;
     }
-
     Ok(())
 }
 

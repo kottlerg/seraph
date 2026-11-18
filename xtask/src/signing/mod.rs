@@ -28,11 +28,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use objsig::attrs::Attributes;
-use objsig::{Expectation, Kind, KindSet, ParseError, RecordSpec, TrustStore};
+use objsig::{Expectation, KeyId, Kind, KindSet, ParseError, RecordSpec, TrustStore};
 
 use crate::arch::Arch;
 use crate::context::Context as BuildContext;
-use crate::error::{Context, Result, bail, err};
+use crate::error::{Context, Result, bail, ensure, err};
 
 pub use identity::{Identity, os_random};
 pub use store::StoreMode;
@@ -233,6 +233,25 @@ impl Signer
         &self.store
     }
 
+    /// The key id of the signing key, which every record it makes names.
+    pub fn key_id(&self) -> KeyId
+    {
+        objsig::key_id(self.identity.public_key())
+    }
+
+    /// The build's trust store with the signing key's id among its revoked
+    /// key ids: a store that refuses every record this signer makes
+    /// (`RecordFailure::Revoked`), as a deployer's store revoking the key
+    /// would.
+    ///
+    /// # Errors
+    ///
+    /// When the build's store does not parse.
+    pub fn store_revoking_own_key(&self) -> Result<Vec<u8>>
+    {
+        store::with_revoked(&self.store, self.key_id())
+    }
+
     /// `object` signed as `kind` under `name`: its body, the object less
     /// any trailer it carries, followed by a trailer of one record of the
     /// signing key. The result is verified under the build's store, with
@@ -268,7 +287,7 @@ impl Signer
         let mut signed = vec![0u8; attrs.encoded_len().map_err(refused)?];
         attrs.encode(&mut signed).map_err(refused)?;
         let record = RecordSpec {
-            signer_key_id: objsig::key_id(self.identity.public_key()),
+            signer_key_id: self.key_id(),
             attrs,
             certificate: self.identity.certificate(),
             signature: self.identity.sign(&signed)?,
@@ -343,6 +362,45 @@ pub fn body_of(object: &[u8]) -> Result<&[u8]>
         Err(ParseError::TooShort | ParseError::Magic) => Ok(object),
         Err(e) => bail!("the object ends in a malformed signature trailer ({e:?})"),
     }
+}
+
+/// The signed object of `object`'s body whose trailer holds the records of
+/// `first` and then those of `object`: a verifier checks `first`'s records
+/// before `object`'s.
+///
+/// # Errors
+///
+/// When either is not a signed object, when their bodies differ, or when the
+/// records do not fit one trailer.
+pub fn prepend_records(object: &[u8], first: &[u8]) -> Result<Vec<u8>>
+{
+    let split = |bytes, which: &str| {
+        objsig::split(bytes).map_err(|e| err!("the {which} object does not parse ({e:?})"))
+    };
+    let own = split(object, "second")?;
+    let other = split(first, "first")?;
+    let body = own.body();
+    ensure!(
+        other.body() == body,
+        "the two objects are signed over different bodies"
+    );
+    let records: Vec<RecordSpec<'_>> = other
+        .records()
+        .chain(own.records())
+        .map(|record| record.spec())
+        .collect();
+    let refused = |e| err!("encoding the trailer of {} records ({e:?})", records.len());
+    let trailer = objsig::trailer_len(&records).map_err(refused)?;
+    let mut out = body.to_vec();
+    out.resize(
+        body.len()
+            .checked_add(trailer)
+            .context("a signed object longer than usize")?,
+        0,
+    );
+    let (_, tail) = out.split_at_mut(body.len());
+    objsig::encode_trailer(body, &records, tail).map_err(refused)?;
+    Ok(out)
 }
 
 /// The trailer format's architecture of `arch`.
@@ -731,6 +789,70 @@ mod tests
         signer
             .sign(b"\x7fELF image", Kind::Service, "/services/x")
             .unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a revoking store that does not revoke the signing key, or
+    // that drops an anchor or lowers the floor, so test-signing's
+    // revoked-signer boot would refuse nothing or refuse for another reason.
+    #[test]
+    fn the_store_revoking_the_signing_key_refuses_its_records_and_keeps_the_rest()
+    {
+        let root = scratch("revoking");
+        let signer = signer(&root.join("keys"), Arch::Riscv64);
+        let object = signer
+            .sign(b"\x7fELF image", Kind::Kernel, "kernel")
+            .unwrap();
+        let revoking = signer.store_revoking_own_key().unwrap();
+        let store = TrustStore::parse(&revoking).unwrap();
+        let built = TrustStore::parse(signer.store()).unwrap();
+        assert_eq!(store.revoked(), [signer.key_id()]);
+        assert!(store.anchors().eq(built.anchors()));
+        assert_eq!(store.security_floor(), built.security_floor());
+        let expect = Expectation {
+            kinds: KindSet::of(&[Kind::Kernel]),
+            name: b"kernel",
+            arch: SigArch::Riscv64,
+        };
+        assert_eq!(
+            objsig::verify(&object, &store, &expect).map(|_| ()),
+            Err(objsig::Refusal::Failed(objsig::RecordFailure::Revoked))
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: an object whose combined trailer loses a record or
+    // reorders them, or two objects of different bodies combined, so a record
+    // signs bytes the object does not carry.
+    #[test]
+    fn prepended_records_come_first_over_the_shared_body()
+    {
+        let root = scratch("prepend");
+        let ours = signer(&root.join("keys"), Arch::Riscv64);
+        let theirs = Signer::new(
+            &config(&root.join("other-keys")),
+            &work_tree(),
+            Arch::Riscv64,
+            &mut counter(50),
+        )
+        .unwrap();
+        let trusted = ours
+            .sign(b"\x7fELF image", Kind::Service, "/services/x")
+            .unwrap();
+        let untrusted = theirs.sign(&trusted, Kind::Service, "/services/x").unwrap();
+        let both = prepend_records(&trusted, &untrusted).unwrap();
+        let signed = objsig::split(&both).unwrap();
+        assert_eq!(signed.body(), b"\x7fELF image");
+        let signers: Vec<KeyId> = signed
+            .records()
+            .map(|record| record.signer_key_id)
+            .collect();
+        assert_eq!(signers, [theirs.key_id(), ours.key_id()]);
+        assert!(verifies(&ours, &both, Kind::Service, "/services/x"));
+        let other = theirs
+            .sign(b"\x7fELF other", Kind::Service, "/services/x")
+            .unwrap();
+        prepend_records(&trusted, &other).unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
 

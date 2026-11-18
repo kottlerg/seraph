@@ -12,7 +12,8 @@
 //! `services/logd/docs/handover-protocol.md` § Startup ordering and § Call
 //! shape; and why logd cannot use `seraph::log!`, and so routes its own
 //! diagnostics and panic output to the serial driver, in the README's
-//! § Role and `docs/console-model.md`. `main` follows that order: bootstrap
+//! § Role and `docs/console-model.md`. `main` follows that order: the
+//! core-path declaration (`procmgr_labels::DECLARE_NO_CORE`), bootstrap
 //! caps, the serial sink and panic sink, the dropped `log_send_cap`, the
 //! death EQ and its registration, the wait set, the receive pool's workers
 //! (spawned behind its gate, `services/logd/docs/ipc-interface.md`
@@ -134,6 +135,22 @@ fn main() -> !
         reason = "IPC buffer is registered by `_start`; reinterpret as `*mut u64`"
     )]
     let ipc_buf = startup.ipc_buffer.cast::<u64>();
+
+    // A core dump stops every thread of its process but the faulting one, and
+    // every process's log output, the crash service's line of the dump's
+    // outcome included, waits on logd's receive workers: declare this process
+    // on the core path before it spawns a thread, so the crash service reports
+    // a fault of logd and writes no core of it
+    // (`procmgr_labels::DECLARE_NO_CORE`). A refusal leaves a dump of logd to
+    // the policy, and the log calls the dump holds to their bound.
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe {
+        ipc::ipc_call(
+            startup.procmgr_endpoint,
+            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_CORE),
+            ipc_buf,
+        )
+    };
 
     let Some(caps) = bootstrap_caps(startup.creator_endpoint, ipc_buf)
     else

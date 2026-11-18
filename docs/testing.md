@@ -1167,18 +1167,16 @@ the shared surface is what every driver shares, the launchers' attachment of the
 every device included. Each surface is the files and directories its row lists, as a whole, and, in
 any other file, a changed line that names one of its listed items as a whole identifier or lies
 within one's definition; a protocol module of `shared/ipc`, and an item the row lists by its
-definition alone, is on a surface only by a changed line within that definition, and an item the row
-lists as a named file's alone only by a changed line of that file that names it or lies within its
-definition. In a file outside a surface's files and directories, a changed line that names a listed
-type only in an import or re-export, or in a signature or type annotation, is not on that surface by
-that name; it stays on one when it names another listed item or lies within a listed item's
-definition. A line that reads or writes one of the type's fields, calls one of its methods, or
-constructs or matches its value names it in another use and stays on the surface. The exemption
-reaches no listed function, constant, or protocol module: each stays on a surface as the sentences
-above define. The listed types are `InterruptObject`, `Iommu`, `SecondDisk`, `DiskLine`,
-`BlockSize`, `FramebufferInfo`, `InitFramebufferInfo`, `QemuDisplay`, `BatchDisplay`,
-`HotplugControl`, and `BootEntropy`. A PR owes the cells of every surface a non-inert line of its
-own diff is on.
+definition alone, is on a surface only by a changed line within that definition. In a file outside a
+surface's files and directories, a changed line that names a listed type only in an import or
+re-export, or in a signature or type annotation, is not on that surface by that name; it stays on
+one when it names another listed item or lies within a listed item's definition. A line that reads
+or writes one of the type's fields, calls one of its methods, or constructs or matches its value
+names it in another use and stays on the surface. The exemption reaches no listed function,
+constant, or protocol module: each stays on a surface as the sentences above define. The listed
+types are `InterruptObject`, `Iommu`, `SecondDisk`, `DiskLine`, `BlockSize`, `FramebufferInfo`,
+`InitFramebufferInfo`, `QemuDisplay`, `BatchDisplay`, `HotplugControl`, and `BootEntropy`. A PR owes
+the cells of every surface a non-inert line of its own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
@@ -1189,7 +1187,7 @@ own diff is on.
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, and `call_test_dma`) | no-iommu, and hotplug |
-| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug port (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, and `EDU_DMA_MASK`) and QMP's `device_add` and `device_del` (`device_add`, `device_add_message`, `device_del`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`); as items of `services/acpid/src/server.rs` alone, the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`start_hotplug`, `notes`, `ask`, `complete`, `secondary_bus`, `Pending`, `Ask`, and `Work::Hotplug`, with the arm of the evaluation thread's loop that matches it); the lines of `services/acpid/src/startup.rs` that hand the host bridges start-up finds to the evaluation thread, which routes each hotplug event through them; and, by definition alone, the host's keeping of a `Notify` in `services/acpid/src/platform.rs` (`notify` and `take_notes`) and the `ACPI_HOTPLUG` call in `services/acpid/src/devmgr.rs` (its `hotplug` method) | hotplug |
+| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug port (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, and `EDU_DMA_MASK`) and QMP's `device_add` and `device_del` (`device_add`, `device_add_message`, `device_del`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold; the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and, by definition alone, the host's `notify`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
@@ -1204,16 +1202,16 @@ the shared surface (the launchers' IOMMU attachment among it), virtio-blk, virti
 test-dma owe it. The cet cell runs the kernel on the CPU's CET shadow stacks, which neither the CI
 runners nor TCG offer, so the canonical cells boot every path the CET row lists only with shadow
 stacks off; the shared surface owes it too, since the IRQ entry and exit run on the shadow stack
-when it is on. A PR that adds a driver adds its row, with its directory and the cells that exercise
-its device, and a PR that adds a cell names the surfaces that owe it. `cargo xtask lint-docs` checks
-this list as it checks the two above, its directories (written with a trailing `/`) included, and
-resolves its items in xtask's own sources too. The screen works as the boundary one does: the first
-command lists the changed files on a surface as a whole, and the others print every candidate, which
-the PR owes the surface's cells for when a non-inert changed line names the item or lies within its
-definition (within it alone for a protocol module and for an item listed by definition alone, and in
-its file alone for an item listed as a named file's alone), read in that file's hunk, unless the
-line names a listed type only in an import, a re-export, a signature, or a type annotation, as the
-first paragraph of Device surfaces defines it.
+when it is on. A PR that adds a driver adds its row, with its directory and the cells that
+exercise its device, and a PR that adds a cell names the surfaces that owe it. `cargo xtask
+lint-docs` checks this list as it checks the two above, its directories (written with a trailing
+`/`) included, and resolves its items in xtask's own sources too. The screen works as the boundary
+one does: the first command lists the changed files on a surface as a whole, and the others print
+every candidate, which the PR owes the surface's cells for when a non-inert changed line names the
+item or lies within its definition (within it alone for a protocol module and for an item listed by
+definition alone), read in that file's hunk, unless the line names a listed type only in an import,
+a re-export, a signature, or a type annotation, as the first paragraph of Device surfaces defines
+it.
 
 ```sh
 git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
@@ -1240,7 +1238,9 @@ D="$D|test_dma_labels|dma_confinement_phase|msi_(delivery|forge|churn|release)_p
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
 D="$D|hotplug_port_args|HOTPLUG_PORT_(DEVICE|ID)|X86_NATIVE_HOTPLUG_GLOBAL|HotplugControl"
-D="$D|EDU_DMA_MASK|device_add(_message)?|device_del(eted)?|Work::Hotplug"
+D="$D|EDU_DMA_MASK|device_add(_message)?|device_del(eted)?|Hotplug(Slots|Job|Note)"
+D="$D|start_hotplug|route_hotplug_notes|ask_hotplug|end_hotplug_job|run_hotplug_methods"
+D="$D|Work::Hotplug|take_hotplug_notes|acpi_hotplug"
 D="$D|gdb_target(_tick|_worker_step)?|handle_list_processes|handle_detach_process"
 D="$D|restore_crash_bindings|watch_debugger|check_debuggers"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
@@ -1255,10 +1255,7 @@ git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
     grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
 git diff -W "$B" <head> -- core/kernel/src/arch/x86_64/ core/kernel/src/mm/stack_guard.rs |
     grep -E "^\+\+\+ |\b(switch|syscall_entry|page_fault_handler|hole|close)\b"
-git diff -W "$B" <head> -- services/acpid/src/server.rs services/acpid/src/platform.rs \
-    services/acpid/src/devmgr.rs services/acpid/src/startup.rs |
-    grep -E -e "^\+\+\+ |\b(start_hotplug|notes|ask|complete|secondary_bus|Pending|Ask)\b" \
-        -e "\b(notify|take_notes|hotplug|bridges)\b"
+git diff -W "$B" <head> -- services/acpid/src/platform.rs | grep -E "^\+\+\+ |\bnotify\b"
 ```
 
 **Repeat count.** Every owed run, local or release, runs once (`--runs 1`); nothing raises the

@@ -29,9 +29,8 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use acpid::bridge::Bridge;
 use acpid::events::{self, Fired, Handled, Handler, Layout, Start};
-use acpid::hotplug::{self, Event, Outcome};
+use acpid::hotplug::{self, Event, Held, HotplugJob, HotplugSlots, Outcome};
 use acpid::power::{self, Request};
 use aml::host::{Host, PciAddress, Width};
 use aml::namespace::NodeId;
@@ -66,31 +65,6 @@ enum Work
     /// devmgr's job of the hotplug event of the slot device `.0` ended:
     /// the functions it recorded or removed, or why the call failed.
     Hotplug(NodeId, Result<u64, CallError>),
-}
-
-/// A hotplug event the evaluation thread holds until devmgr's job of it
-/// ends: asked of the hotplug thread, or queued behind the asked event of
-/// its slot.
-struct Pending
-{
-    /// The slot's device, which the `Notify` named.
-    slot: NodeId,
-    /// The `Notify` value, which its `_OST` answers.
-    value: u64,
-    event: Event,
-    /// The port, as `devmgr_labels::pci_function` packs it.
-    port: u64,
-    /// Whether the hotplug thread was asked for its job.
-    asked: bool,
-}
-
-/// A job the hotplug thread asks devmgr for.
-struct Ask
-{
-    slot: NodeId,
-    event: Event,
-    /// The port, as `devmgr_labels::pci_function` packs it.
-    port: u64,
 }
 
 /// A thread whose end ends acpid: its drop, on return or in a panic's
@@ -180,22 +154,21 @@ struct Armed
 /// thread, and run the evaluation thread's work loop for acpid's lifetime:
 /// `ns` is the namespace start-up loaded, `None` when the DSDT could not
 /// be; `platform` the evaluator's host; `power` the sleep and reset
-/// registers; `events` what start-up acquired of the events; `bridges` the
-/// PCI host bridges start-up found; `ended` where each watched thread's end
-/// is sent.
+/// registers; `events` what start-up acquired of the events;
+/// `hotplug_slots` the hotplug slots behind the PCI host bridges start-up
+/// found; `ended` where each watched thread's end is sent.
 pub fn serve(
     service: u64,
     mut ns: Option<&mut Namespace>,
     platform: &mut Platform<'_>,
     power: &Power,
     events: Option<EventSource>,
-    bridges: &[Bridge],
+    mut hotplug_slots: HotplugSlots,
     ended: &Sender<&'static str>,
 ) -> !
 {
     let (work, jobs) = mpsc::channel();
     let asks = start_hotplug(platform.devmgr().clone(), &work, ended);
-    let mut pending: Vec<Pending> = Vec::new();
     let mailbox = Arc::new(Mailbox {
         mail: Mutex::new(Mail {
             waitable: false,
@@ -228,7 +201,7 @@ pub fn serve(
         // item's.
         if let Some(ns) = ns.as_deref_mut()
         {
-            notes(ns, platform, bridges, &mut pending, &asks);
+            route_hotplug_notes(ns, platform, &mut hotplug_slots, &asks);
         }
         // `work`, a sender, lives in this frame, so the receive does not
         // fail.
@@ -268,23 +241,14 @@ pub fn serve(
                     events::rearm_power_button(&mut *lock(&armed.regs), &armed.layout);
                 }
             }
-            Work::Hotplug(slot, answer) =>
-            {
-                let at = pending.iter().position(|p| p.slot == slot && p.asked);
-                if let Some(at) = at
-                {
-                    let job = pending.remove(at);
-                    if let Some(ns) = ns.as_deref_mut()
-                    {
-                        complete(ns, platform, &job, answer);
-                    }
-                    // The slot's next event, queued behind this one.
-                    if let Some(next) = pending.iter_mut().find(|p| p.slot == slot)
-                    {
-                        ask(next, &asks);
-                    }
-                }
-            }
+            Work::Hotplug(slot, answer) => end_hotplug_job(
+                ns.as_deref_mut(),
+                platform,
+                &mut hotplug_slots,
+                &asks,
+                slot,
+                answer,
+            ),
         }
     }
 }
@@ -293,24 +257,28 @@ pub fn serve(
 /// job of each event it is sent, one at a time, and posts each job's end to
 /// `work`; the channel it takes the events on. A thread that cannot start
 /// exits acpid, as a receiver's does, and svcmgr restarts it.
-fn start_hotplug(devmgr: Devmgr, work: &Sender<Work>, ended: &Sender<&'static str>) -> Sender<Ask>
+fn start_hotplug(
+    devmgr: Devmgr,
+    work: &Sender<Work>,
+    ended: &Sender<&'static str>,
+) -> Sender<HotplugJob>
 {
-    let (asks, asked) = mpsc::channel::<Ask>();
+    let (asks, asked) = mpsc::channel::<HotplugJob>();
     let (work, ended) = (work.clone(), ended.clone());
     let spawned = std::thread::Builder::new()
         .name("acpid-hotplug".into())
         .spawn(move || {
             let _watched = Watched::new("hotplug", ended);
             // The evaluation thread holds the sender for acpid's lifetime.
-            while let Ok(ask) = asked.recv()
+            while let Ok(job) = asked.recv()
             {
-                let event = match ask.event
+                let event = match job.event
                 {
                     Event::Check => devmgr_labels::HOTPLUG_ADDED,
                     Event::Eject => devmgr_labels::HOTPLUG_REMOVED,
                 };
-                let answer = devmgr.hotplug(event, ask.port);
-                if work.send(Work::Hotplug(ask.slot, answer)).is_err()
+                let answer = devmgr.acpi_hotplug(event, job.port);
+                if work.send(Work::Hotplug(job.slot, answer)).is_err()
                 {
                     return;
                 }
@@ -324,22 +292,21 @@ fn start_hotplug(devmgr: Devmgr, work: &Sender<Work>, ended: &Sender<&'static st
     asks
 }
 
-/// Act on the `Notify` calls `platform` kept: each Bus Check, Device Check
-/// or Eject Request of a device below a port of one of `bridges` is kept in
-/// `pending` until its job ends, and sent to the hotplug thread on `asks`
-/// unless an event of its slot was sent before it, behind which it waits.
-/// An event its slot holds already, the firmware's repeat of it, is
-/// dropped, so each slot holds at most one event of each kind. Any other
-/// `Notify` is logged and dropped.
-fn notes(
+/// Act on the hotplug `Notify` calls `platform` kept: each Bus Check,
+/// Device Check or Eject Request of a device below a port of one of the
+/// host bridges of `hotplug_slots` is held there until its job ends, and
+/// sent to the hotplug thread on `asks` unless an event of its slot was
+/// sent before it, behind which it waits. An event its slot holds already,
+/// the firmware's repeat of it, is dropped, so each slot holds at most one
+/// event of each kind. A `Notify` of no such device is logged and dropped.
+fn route_hotplug_notes(
     ns: &mut Namespace,
     platform: &mut Platform<'_>,
-    bridges: &[Bridge],
-    pending: &mut Vec<Pending>,
-    asks: &Sender<Ask>,
+    hotplug_slots: &mut HotplugSlots,
+    asks: &Sender<HotplugJob>,
 )
 {
-    for (target, value) in platform.take_notes()
+    for (target, value) in platform.take_hotplug_notes()
     {
         let at = path_text(&target);
         // The host keeps only hotplug events (`hotplug::keep`).
@@ -354,15 +321,19 @@ fn notes(
             std::os::seraph::log!(warn: "Notify({at}, {value:#x}) dropped: no such object");
             continue;
         };
-        if pending.iter().any(|p| p.slot == slot && p.event == event)
+        if hotplug_slots.holds(slot, event)
         {
             std::os::seraph::log!(debug: "Notify({at}, {value:#x}) dropped: its slot holds it");
             continue;
         }
-        let route = hotplug::route(&mut Evaluator::new(ns, platform), bridges, slot);
+        let route = hotplug::route(
+            &mut Evaluator::new(ns, platform),
+            hotplug_slots.bridges(),
+            slot,
+        );
         let port = match &route
         {
-            Ok(route) => hotplug::port(route, |f| secondary_bus(platform, f)),
+            Ok(route) => hotplug::port(route, |f| hotplug::secondary_bus(platform, f)),
             Err(why) =>
             {
                 std::os::seraph::log!(warn: "Notify({at}, {value:#x}) dropped: {why:?}");
@@ -379,79 +350,83 @@ fn notes(
         };
         std::os::seraph::log!(
             "hotplug: {} of {at} (port {}:{}:{}.{}); asking devmgr",
-            event_name(event),
+            event.name(),
             port.segment,
             port.bus,
             port.device,
             port.function
         );
-        if pending.try_reserve(1).is_err()
-        {
-            std::os::seraph::log!(warn: "Notify({at}, {value:#x}) dropped: no memory to hold it");
-            continue;
-        }
-        let queued = pending.iter().any(|p| p.slot == slot);
-        pending.push(Pending {
+        let job = HotplugJob {
             slot,
             value,
             event,
             port: devmgr_labels::pci_function(port.segment, port.bus, port.device, port.function),
-            asked: false,
-        });
-        if !queued && let Some(job) = pending.last_mut()
+        };
+        match hotplug_slots.hold(job)
         {
-            ask(job, asks);
+            Held::Ask(job) => ask_hotplug(asks, job),
+            Held::Queued =>
+            {}
+            Held::NoMemory =>
+            {
+                std::os::seraph::log!(warn: "Notify({at}, {value:#x}) dropped: no memory to hold it");
+            }
         }
     }
 }
 
-/// Send `job` to the hotplug thread on `asks`, marking it asked. The thread
-/// takes events for acpid's lifetime, so the send does not fail while acpid
-/// runs.
-fn ask(job: &mut Pending, asks: &Sender<Ask>)
+/// Send `job` to the hotplug thread on `asks`. The thread takes jobs for
+/// acpid's lifetime, and its end exits acpid, so a failed send, logged,
+/// comes only while acpid exits.
+fn ask_hotplug(asks: &Sender<HotplugJob>, job: HotplugJob)
 {
-    job.asked = asks
-        .send(Ask {
-            slot: job.slot,
-            event: job.event,
-            port: job.port,
-        })
-        .is_ok();
-}
-
-/// The Secondary Bus Number of the bridge `function`, read through
-/// `platform`.
-fn secondary_bus(platform: &mut Platform<'_>, function: PciAddress) -> Option<u8>
-{
-    platform
-        .pci_read(function, hotplug::SECONDARY_BUS, Width::Byte)
-        .ok()
-        .and_then(|bus| u8::try_from(bus).ok())
-}
-
-/// The event's name in a log line.
-const fn event_name(event: Event) -> &'static str
-{
-    match event
+    if asks.send(job).is_err()
     {
-        Event::Check => "device check",
-        Event::Eject => "eject request",
+        std::os::seraph::log!(warn: "hotplug job not asked: the hotplug thread ended");
     }
 }
 
-/// End the hotplug event `job` once devmgr's job ended with `answer`: for
-/// an Eject Request devmgr ran, the slot's `_EJ0`; then, when the slot has
-/// one, its `_OST` with the status of the outcome
-/// ([`hotplug::ost_status`]).
-fn complete(
+/// End the asked hotplug event of `slot` once devmgr's job of it ended
+/// with `answer`: run the slot's methods that end it
+/// ([`run_hotplug_methods`]) when `ns` holds the namespace, then send the
+/// slot's next held event to the hotplug thread on `asks`.
+fn end_hotplug_job(
+    ns: Option<&mut Namespace>,
+    platform: &mut Platform<'_>,
+    hotplug_slots: &mut HotplugSlots,
+    asks: &Sender<HotplugJob>,
+    slot: NodeId,
+    answer: Result<u64, CallError>,
+)
+{
+    let Some((job, next)) = hotplug_slots.end(slot)
+    else
+    {
+        return;
+    };
+    if let Some(ns) = ns
+    {
+        run_hotplug_methods(ns, platform, &job, answer);
+    }
+    if let Some(next) = next
+    {
+        ask_hotplug(asks, next);
+    }
+}
+
+/// Run the slot methods that end the hotplug event `job`, whose devmgr job
+/// ended with `answer`: for an Eject Request devmgr ran, the slot's
+/// `_EJ0`; then, when the slot has one, its `_OST` with the status of the
+/// outcome ([`hotplug::ost_status`]).
+fn run_hotplug_methods(
     ns: &mut Namespace,
     platform: &mut Platform<'_>,
-    job: &Pending,
+    job: &HotplugJob,
     answer: Result<u64, CallError>,
 )
 {
     let at = path(ns, job.slot);
-    let what = event_name(job.event);
+    let what = job.event.name();
     let mut ev = Evaluator::new(ns, platform);
     let outcome = match (answer, job.event)
     {

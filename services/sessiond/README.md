@@ -118,4 +118,4 @@ terminal's session end to end.
 
 ## Summarized By
 
-[docs/session-supervision.md](../../docs/session-supervision.md)
+[Session Supervision](../../docs/session-supervision.md)

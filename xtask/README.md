@@ -324,10 +324,11 @@ size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
 image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
 `run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-reboot`, `test-hotplug`,
-`test-kaslr`, `test-map-redo`, and `test-log-level` repack the images in the layout they find:
-`disk.img`'s block size, and the data partition on `disk-data.img` when that image is there. The
-seven test commands boot that layout, attaching `disk-data.img` as the second disk when it holds the
-data partition; `run` and `run-parallel` attach a second disk only as `--second-disk` names it.
+`test-kaslr`, `test-map-redo`, `test-log-level`, and `test-signing` repack the images in the
+layout they find: `disk.img`'s block size, and the data partition on `disk-data.img` when that
+image is there. The eight test commands boot that layout, attaching `disk-data.img` as the second
+disk when it holds the data partition; `run` and `run-parallel` attach a second disk only as
+`--second-disk` names it.
 
 `src/fat.rs` writes each FAT volume in one pass, with its variant chosen by its cluster count as
 the FAT specification's type rule chooses it: at 4 KiB clusters the ESP (64 MiB), root
@@ -1231,6 +1232,54 @@ seconds. The boot is one of the two of the debug-port device cell of the local a
 
 ---
 
+### `cargo xtask test-signing`
+
+Check that every signature verifier refuses an object that does not verify, with the refusal it
+owes, on either arch ([docs/signing.md](../docs/signing.md) § Which Stage Verifies What). The
+command composes the default-init bundle into `target/xtask/test-signing/<arch>/` and puts the
+staged bundle back, packs the disk images once so the sysroot is signed, writes each case's
+objects into that directory from the sysroot's signed ones, and boots the current sysroot four
+times, each from images packed with those objects in place of the sysroot's files
+(`disk::create_disk_image_substituting`):
+
+| Case | Objects in place of the sysroot's | Owed lines |
+|---|---|---|
+| `kernel` | the kernel with a body byte flipped | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(BodyHash)` |
+| `bundle` | the bundle with a body byte of its `virtio-blk` entry flipped | `SERAPH BOOT FATAL: signature verification refused: virtio-blk: Failed(BodyHash)` |
+| `revoked` | both bootloader images, built under the build's trust store with the signing key's id revoked | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(Revoked)` |
+| `rootfs` | `/services/timed` with a body byte flipped, `/services/pwrmgr` signed as data, `/services/crashd` signed by a key no anchor holds; the kernel and `/programs/terminal` each with a record of that key before their own | procmgr's `signature verification refused: <path>: <refusal>` (`Failed(BodyHash)`, `Failed(Kind)`, `Untrusted`) and svcmgr's `create: "<path>" refused: its signature did not verify` for each of the three, and `terminal: READY for injection` |
+
+The untrusted key is a local identity generated for the run in a directory under the host's
+temporary directory, outside the work tree, and removed again. A boot passes once every owed line
+has appeared, in any order; it fails at once on another refusal line or a fatal marker
+(`KERNEL EXCEPTION`, `FATAL:`, a panic, the watchdog), and fails at its deadline, three minutes
+for a boot the bootloader ends and six for `rootfs`, naming the lines still missing. A staged
+test harness's own verdict is not judged. The host kills QEMU. Every boot's serial log is saved
+as `target/xtask/test-signing/<arch>/<case>.log`, and the command reports every case before it
+fails. The images are packed again from the sysroot in the layout they had, whatever the outcome;
+no case changes a sysroot file, so a later pack cannot sign a tampered body.
+
+The command compiles the bootloader of the `revoked` case, so the host admits it as a build and
+then its boots as one boot of `--cpus` vCPUs (§ Host launch rules). The compile reuses the
+bootloader's cargo output directory, so the next `cargo xtask build` compiles the bootloader
+again.
+
+A pure runner; requires a populated sysroot of the profile `--release` names:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64] [--release]
+cargo xtask test-signing [--arch x86_64|riscv64] [--release] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--release` | `false` | Build the `revoked` case's bootloader in release mode, as the sysroot's was built |
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+---
+
 ### `cargo xtask test-hotplug`
 
 Check devmgr's PCI Express native hotplug add and removal paths, on either arch. Stages the
@@ -1777,10 +1826,12 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
-`crypto-vectors` and `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names
-them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-reboot`,
-`test-powerbutton`, `test-cet`, `test-kaslr`, `test-map-redo`, `test-log-level`,
-`test-debug-port`, `test-hotplug`, `test-gdb` and `capture-acpi` as boots.
+`crypto-vectors`, `compare-images` and `test-signing` as builds (`CliCommand::build_host` in
+`src/cli.rs` names them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`,
+`test-reboot`, `test-powerbutton`, `test-cet`, `test-kaslr`, `test-map-redo`, `test-log-level`,
+`test-debug-port`, `test-hotplug`, `test-gdb`, `test-signing` and `capture-acpi` as boots.
+`test-signing`, which compiles a bootloader before it boots, is admitted as a build when it starts
+and as a boot before its first boot.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

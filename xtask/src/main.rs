@@ -130,6 +130,7 @@ fn main()
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
         CliCommand::TestLogLevel(args) => commands::test_log_level::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
+        CliCommand::TestSigning(args) => commands::test_signing::run(&ctx, args),
         CliCommand::TestReboot(args) => commands::test_reboot::run(&ctx, args),
         CliCommand::TestPowerbutton(args) => commands::test_powerbutton::run(&ctx, args),
         CliCommand::TestHotplug(args) => commands::test_hotplug::run(&ctx, args),

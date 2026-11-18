@@ -14,6 +14,9 @@ ipc = { path = "../../shared/ipc" }
 # Pure handover decoding and diagnostic formatting, extracted so it is
 # host-testable.
 logd-codec = { path = "codec" }
+# The sender slots and their bounded history, extracted so they are
+# host-testable.
+logd-slot-table = { path = "slot-table" }
 # The worker pool that receives on the master log endpoint.
 recv-pool = { path = "../../shared/recv-pool" }
 syscall = { path = "../../shared/syscall" }

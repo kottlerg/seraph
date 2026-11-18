@@ -153,7 +153,7 @@ impl Devmgr
     /// `port` (`devmgr_labels::pci_function`) for `event`
     /// (`devmgr_labels::HOTPLUG_ADDED` or `HOTPLUG_REMOVED`). Returns once
     /// the job ended, with the functions it recorded or removed.
-    pub fn hotplug(&self, event: u64, port: u64) -> Result<u64, CallError>
+    pub fn acpi_hotplug(&self, event: u64, port: u64) -> Result<u64, CallError>
     {
         self.call(devmgr_labels::ACPI_HOTPLUG, &[event, port])
             .map(|reply| reply.word(0))

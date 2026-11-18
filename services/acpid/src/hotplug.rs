@@ -9,7 +9,7 @@
 //! once devmgr's job ends (services/acpid/README.md § Hotplug).
 
 use aml::encoding::Seg;
-use aml::host::PciAddress;
+use aml::host::{Host, PciAddress, Width};
 use aml::namespace::NodeId;
 use aml::{Data, Evaluator, Fault, Namespace};
 
@@ -58,11 +58,22 @@ impl Event
             _ => None,
         }
     }
+
+    /// The event's name in a log line.
+    #[must_use]
+    pub const fn name(self) -> &'static str
+    {
+        match self
+        {
+            Self::Check => "device check",
+            Self::Eject => "eject request",
+        }
+    }
 }
 
-/// A `Notify` the evaluated code made: the object's absolute path, root
-/// first, and the value.
-pub type Note = (Vec<Seg>, u64);
+/// A `Notify` of a hotplug event the evaluated code made: the object's
+/// absolute path, root first, and the value.
+pub type HotplugNote = (Vec<Seg>, u64);
 
 /// What [`keep`] did with a `Notify`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +95,7 @@ pub enum Kept
 /// holds at most one note per object and event, a bound the namespace's
 /// objects set, and no event the firmware reports once (a device check,
 /// whose QEMU register clears as the method reads it) is lost to a bound.
-pub fn keep(notes: &mut Vec<Note>, path: &[Seg], value: u64) -> Kept
+pub fn keep(notes: &mut Vec<HotplugNote>, path: &[Seg], value: u64) -> Kept
 {
     let Some(event) = Event::of(value)
     else
@@ -233,6 +244,118 @@ pub fn port(
         device,
         function,
     })
+}
+
+/// The Secondary Bus Number of the bridge `function` ([`SECONDARY_BUS`]),
+/// read through `host`; `None` when the read fails.
+pub fn secondary_bus(host: &mut impl Host, function: PciAddress) -> Option<u8>
+{
+    host.pci_read(function, SECONDARY_BUS, Width::Byte)
+        .ok()
+        .and_then(|bus| u8::try_from(bus).ok())
+}
+
+/// A hotplug event of a slot, held until devmgr's job of it ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotplugJob
+{
+    /// The slot's device, which the `Notify` named.
+    pub slot: NodeId,
+    /// The `Notify` value, which the slot's `_OST` answers.
+    pub value: u64,
+    /// The event the value reports.
+    pub event: Event,
+    /// The port above the slot, as `devmgr_labels::pci_function` packs it.
+    pub port: u64,
+}
+
+/// What [`HotplugSlots::hold`] did with an event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held
+{
+    /// Held, and no other event of its slot is: ask devmgr for its job now.
+    Ask(HotplugJob),
+    /// Held behind the event of its slot that devmgr was asked for.
+    Queued,
+    /// Not held: no memory was left to hold it.
+    NoMemory,
+}
+
+/// The firmware's hotplug slots as acpid serves them: the PCI host bridges
+/// whose ports lead to them, and the events held per slot, in `Notify`
+/// order. One event of a slot at a time is asked of devmgr; the slot's
+/// later events wait behind it. A slot holds at most one event of each
+/// kind, so the held events are bounded by the slots the namespace holds.
+#[derive(Debug, Default)]
+pub struct HotplugSlots
+{
+    bridges: Vec<Bridge>,
+    /// Each held event, and whether devmgr was asked for its job.
+    held: Vec<(HotplugJob, bool)>,
+}
+
+impl HotplugSlots
+{
+    /// The slots behind the ports of `bridges`, holding no event.
+    #[must_use]
+    pub const fn new(bridges: Vec<Bridge>) -> Self
+    {
+        Self {
+            bridges,
+            held: Vec::new(),
+        }
+    }
+
+    /// The host bridges whose ports lead to the slots.
+    #[must_use]
+    pub fn bridges(&self) -> &[Bridge]
+    {
+        &self.bridges
+    }
+
+    /// Whether `slot` holds an `event` already: the firmware's repeat of it.
+    #[must_use]
+    pub fn holds(&self, slot: NodeId, event: Event) -> bool
+    {
+        self.held
+            .iter()
+            .any(|(job, _)| job.slot == slot && job.event == event)
+    }
+
+    /// Hold `job`, which the caller has checked its slot does not hold
+    /// ([`HotplugSlots::holds`]). It is marked asked when no other event of
+    /// its slot is held, and the caller then asks devmgr for its job.
+    pub fn hold(&mut self, job: HotplugJob) -> Held
+    {
+        if self.held.try_reserve(1).is_err()
+        {
+            return Held::NoMemory;
+        }
+        let queued = self.held.iter().any(|(held, _)| held.slot == job.slot);
+        self.held.push((job, !queued));
+        if queued { Held::Queued } else { Held::Ask(job) }
+    }
+
+    /// End the asked event of `slot`, whose devmgr job ended: the event,
+    /// and the slot's next held event, marked asked, which the caller asks
+    /// devmgr for next. `None` when `slot` has no asked event.
+    pub fn end(&mut self, slot: NodeId) -> Option<(HotplugJob, Option<HotplugJob>)>
+    {
+        let at = self
+            .held
+            .iter()
+            .position(|(job, asked)| job.slot == slot && *asked)?;
+        let (ended, _) = self.held.remove(at);
+        let next = self
+            .held
+            .iter_mut()
+            .find(|(job, _)| job.slot == slot)
+            .map(|(job, asked)| {
+                *asked = true;
+                *job
+            });
+        Some((ended, next))
+    }
 }
 
 /// How devmgr's job of an event ended.
@@ -540,5 +663,38 @@ mod tests
             assert_eq!(keep(&mut many, &path, DEVICE_CHECK), Kept::Kept);
         }
         assert_eq!(many.len(), 256);
+    }
+
+    #[test]
+    fn a_slot_asks_one_event_at_a_time_in_notify_order()
+    {
+        let ns = Namespace::new().unwrap();
+        let (a, b) = (NodeId::ROOT, target(&ns, &[*b"_SB_"]).unwrap());
+        let job = |slot, value, event| HotplugJob {
+            slot,
+            value,
+            event,
+            port: 0x1c0,
+        };
+        let check = job(a, DEVICE_CHECK, Event::Check);
+        let eject = job(a, EJECT_REQUEST, Event::Eject);
+        let other = job(b, BUS_CHECK, Event::Check);
+        let mut slots = HotplugSlots::new(Vec::new());
+        assert_eq!(slots.bridges(), &[]);
+        assert_eq!(slots.hold(check), Held::Ask(check));
+        assert!(slots.holds(a, Event::Check));
+        assert!(!slots.holds(a, Event::Eject));
+        // A later event of the slot waits behind the asked one; another
+        // slot's is asked at once.
+        assert_eq!(slots.hold(eject), Held::Queued);
+        assert_eq!(slots.hold(other), Held::Ask(other));
+        // An end with no asked event of its slot ends nothing.
+        assert_eq!(HotplugSlots::default().end(a), None);
+        assert_eq!(slots.end(a), Some((check, Some(eject))));
+        assert!(!slots.holds(a, Event::Check));
+        assert_eq!(slots.end(a), Some((eject, None)));
+        assert_eq!(slots.end(a), None);
+        assert_eq!(slots.end(b), Some((other, None)));
+        assert_eq!(slots.end(b), None);
     }
 }

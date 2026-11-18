@@ -367,9 +367,10 @@ The phase first checks that crashd's stall outlasts what oomd takes from the wri
 stop: a cooldown with sessiond staged, else the grace and a cooldown for `stopsrc`'s job. With
 `OOMD_STOP=no`, or without `oomd.svc` staged, it checks that memhog stays running and the level
 stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd, if staged, logged at least
-one `would stop memhog: ` line and no stop, and then stops memhog itself through `caps[19]`, by
-the key svcmgr listed it under before the fill. In every case memhog's next instance answers
-`PROBE` with a new nonce and 0 pages ([oomd](../oomd/README.md)).
+one `would stop ` line, which names the operator session while one is open, and no stop, and then
+stops memhog itself through `caps[19]`, by the key svcmgr listed it under before the fill. In
+every case memhog's next instance answers `PROBE` with a new nonce and 0 pages
+([oomd](../oomd/README.md)).
 
 The `sessiond_operator` phase (`phases/sessiond.rs`, right after the svcmgr phases) runs when
 `sessiond.svc` is staged and `caps[15]` is set, and passes otherwise. Through the stop SEND svcmgr

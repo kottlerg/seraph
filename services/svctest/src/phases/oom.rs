@@ -78,8 +78,10 @@ const SESSION_STOP_LINE: &[u8] = b"stopped session ";
 /// than [`JOB_PAGES`] by far, so oomd stops it before `stopsrc`'s.
 const HOLD_PAGES: u64 = 512;
 
-/// The prefix of oomd's line for a stop of the fixture it advises.
-const ADVICE_LINE: &[u8] = b"would stop memhog: ";
+/// The prefix of oomd's line naming the candidate it would stop. In advice mode
+/// nothing is stopped, so each line names the first of oomd's stop order: the
+/// operator session while one is open.
+const ADVICE_LINE: &[u8] = b"would stop ";
 
 /// The part of crashd's line for a fault it holds.
 const HELD_LINE: &[u8] = b"held: memory critical";
@@ -182,7 +184,7 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 /// With `OOMD_STOP=no`, or no oomd (the no-stop case): the level stays
 /// `CRITICAL` past oomd's grace and cooldown with the same instance of the
 /// fixture running and no stop line logged, and, with oomd, at least one line
-/// naming the fixture it would stop; svctest then stops the fixture itself,
+/// naming a candidate it would stop; svctest then stops the fixture itself,
 /// through its stop authority, by the key svcmgr listed it under before the
 /// fill, and the level falls back to `NORMAL`.
 ///

@@ -379,7 +379,7 @@ devmgr's responsibilities are:
   The settle bound, `SETTLE_TIMEOUT` (`services/devmgr/src/settle.rs`), is
   twice `virtio_core::pci::RESET_TIMEOUT` (5 s), so 10 s, counted from the
   start of the settle, after the batch's last spawn. The VirtIO reset, which
-  a virtio-blk, virtio-input, or virtio-console driver polls for once, is the
+  a virtio-blk, virtio-input, virtio-rng, or virtio-console driver polls for once, is the
   longest bounded wait a driver's setup makes, so the settle never ends before
   a driver's own timeout has, and a margin of one further `RESET_TIMEOUT`
   covers the rest of the setup. The platform drivers (serial, framebuffer, and RTC) make
@@ -491,7 +491,7 @@ devmgr's responsibilities are:
     every other module by the declaration it carries, read from the module mapped read-only and
     bound in the boot pass (above). Every module cap is released once its pass ends.
   - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among
-    them the per-arch RTC, virtio-input, virtio-console, test-dma, and a copy
+    them the per-arch RTC, virtio-input, virtio-console, virtio-rng, test-dma, and a copy
     of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr
     delivers a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
     subtree cap via `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by
@@ -511,7 +511,7 @@ devmgr's responsibilities are:
     at-most-once per boot; failure, including an on-disk driver's death, or
     its overrun of the settle bound, before it reports ready, is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
-    the rtc, input, and debug-port classes, the same reply
+    the rtc, input, hwrng, and debug-port classes, the same reply
     as before `SET_DRIVERS_DIR` arrives, so a client that needs the class waits on a `WATCH_CLASS`
     watch. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).

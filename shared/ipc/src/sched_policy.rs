@@ -19,7 +19,7 @@
 //! | 28 | memmgr |
 //! | 27 | procmgr |
 //! | 26 | init-logd, serial, virtio-blk, devmgr's DMA thread |
-//! | 25 | framebuffer, rtc, virtio-input, virtio-console |
+//! | 25 | framebuffer, rtc, virtio-input, virtio-console, virtio-rng |
 //! | 24 | devmgr, every thread but its DMA thread |
 //! | 23 | vfsd, fs drivers (fatfs) |
 //! | 21 | svcmgr |
@@ -61,8 +61,8 @@ pub const INIT_LOGD_PRIORITY: u8 = 26;
 /// virtio-blk blocks on for every transfer.
 pub const BOOT_DRIVER_PRIORITY: u8 = 26;
 
-/// Non-boot-critical device drivers: framebuffer, RTC, virtio-input, and
-/// the debug port's virtio-console.
+/// Non-boot-critical device drivers: framebuffer, RTC, virtio-input, virtio-rng,
+/// and the debug port's virtio-console.
 pub const AUX_DRIVER_PRIORITY: u8 = 25;
 
 /// devmgr — device enumeration and driver supervision.

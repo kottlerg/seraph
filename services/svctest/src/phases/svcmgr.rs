@@ -774,6 +774,8 @@ const SEED_ONLY_NAMES: &[&[u8]] = &[
     b"devmgr.class.serial-deny",
     b"devmgr.class.input-deny",
     b"devmgr.class.framebuffer-deny",
+    b"devmgr.class.hwrng",
+    b"devmgr.class.hwrng-deny",
 ];
 
 /// The public names `svcmgr_seed_only_names_refused_phase` checks
@@ -786,7 +788,7 @@ const PUBLIC_NAMES: &[&[u8]] = &[
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show fifteen of the refused names are
+/// cap. svctest's own non-zero seeds show seventeen of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.acpi`,
 /// which only acpid seeds, are published by the same loop as
 /// `devmgr.registry` and `devmgr.bind`, `acpid.power`,
@@ -815,6 +817,8 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.input_deny_class, "devmgr.class.input-deny"),
         (caps.framebuffer_deny_class, "devmgr.class.framebuffer-deny"),
         (caps.vfsd_swap, "vfsd.swap"),
+        (caps.hwrng_class, "devmgr.class.hwrng"),
+        (caps.hwrng_deny_class, "devmgr.class.hwrng-deny"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");

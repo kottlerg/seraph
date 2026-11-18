@@ -318,6 +318,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hwrng-protocol"
+version = "0.1.4"
+dependencies = [
+ "syscall-abi",
+]
+
+[[package]]
 name = "init"
 version = "0.1.4"
 dependencies = [
@@ -812,6 +819,7 @@ dependencies = [
  "driver-binding",
  "elf",
  "fatfs-parse",
+ "hwrng-protocol",
  "ipc",
  "log",
  "logd-codec",
@@ -983,6 +991,18 @@ name = "virtio-input"
 version = "0.1.4"
 dependencies = [
  "driver-binding",
+ "ipc",
+ "syscall",
+ "syscall-abi",
+ "virtio-core",
+]
+
+[[package]]
+name = "virtio-rng"
+version = "0.1.4"
+dependencies = [
+ "driver-binding",
+ "hwrng-protocol",
  "ipc",
  "syscall",
  "syscall-abi",

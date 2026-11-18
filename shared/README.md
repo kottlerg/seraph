@@ -14,6 +14,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`elf/`](elf/README.md) | ELF64 parser — header validation, segment enumeration |
 | [`font/`](font/README.md) | Embedded 9×20 bitmap font shared by every framebuffer console |
 | [`gdb-rsp/`](gdb-rsp/README.md) | GDB remote serial protocol — packet framing, packet parse and encode, and the target descriptions a stub serves |
+| [`hwrng-protocol/`](hwrng-protocol/README.md) | Wire protocol of the `hwrng` device class: the `READ(n)` label, its reply bound, and the `READ_AUTHORITY` verb bit |
 | [`ipc/`](ipc/README.md) | IPC helpers — `IpcMessage` snapshot type, `ipc_call`/`recv`/`reply` wrappers, bootstrap protocol, and the `RecvGuard` receive-failure policy for blocking recv loops |
 | [`json/`](json/README.md) | Strict JSON value (RFC 8259): a bounded parser of untrusted text and compact and indented printers, for host tools |
 | [`log/`](log/README.md) | System log primitives — wire-format helpers and process-global cache for the badged log cap |

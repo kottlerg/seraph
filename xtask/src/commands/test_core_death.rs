@@ -124,8 +124,10 @@ enum KillPoint
     /// calls devmgr and vfsd during its launches, where a call to a server
     /// that died after svcmgr's check of it waits for good (#1185).
     SystemUp,
-    /// Once the stub holds the target, then again after each restart svcmgr
+    /// As [`KillPoint::SystemUp`], then again after each restart svcmgr
     /// makes, until its restart budget is spent and the death is permanent.
+    /// Not at the stub's first attach: a service that dies before it asks
+    /// svcmgr for its bootstrap round leaves svcmgr waiting for the request.
     RestartsSpent,
 }
 
@@ -487,11 +489,12 @@ fn kill_through_stub(
     // for the target at its start; a stub that found none looks again here.
     stub.request(b"qSupported")?;
     stub.set_answer_timeout(ANSWER_TIMEOUT)?;
-    if point == KillPoint::SystemUp
+    if matches!(point, KillPoint::SystemUp | KillPoint::RestartsSpent)
     {
         // The attach holds every thread of the target, and the boot waits on
-        // devmgr and vfsd: released until the system is up, the target is
-        // held again by the next `qSupported`, which finds the stub detached.
+        // devmgr, vfsd and logd (svcmgr waits for logd's bootstrap request):
+        // released until the system is up, the target is held again by the
+        // next `qSupported`, which finds the stub detached.
         stub.expect_ok(b"D")?;
         let awaited: Vec<&str> = [READY_MARKER, RECONCILED_MARKER]
             .into_iter()
@@ -720,9 +723,10 @@ mod tests
             assert!(matches!(route(target), Route::Hardware(_)), "{target:?}");
         }
         // svcmgr is killed held, since the boot waits on it; devmgr and vfsd
-        // once svcmgr no longer calls them unchecked. Defect caught too: the
-        // stub's attach to logd, the log sink, awaited by its marker, which
-        // logd itself carries, so a stub holding logd never shows it.
+        // once svcmgr no longer calls them unchecked, and logd once it has
+        // taken its bootstrap round. Defect caught too: the stub's attach to
+        // logd, the log sink, awaited by its marker, which logd itself
+        // carries, so a stub holding logd never shows it.
         for (target, name, point, contact) in [
             (
                 CoreDeathTarget::Svcmgr,

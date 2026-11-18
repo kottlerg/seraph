@@ -25,11 +25,13 @@ pub mod arena;
 pub mod budget;
 pub mod chunk;
 pub mod commit;
+pub mod compress;
 pub mod deferred;
 pub mod index;
 pub mod ledger;
 pub mod pool;
 pub mod pressure;
+pub mod store;
 
 pub use arena::{
     Arena, ArenaLayout, Commitment, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node,

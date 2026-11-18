@@ -64,7 +64,7 @@ direct console paths remain as fallbacks for the life of the system.
    acknowledgement ([logd handover protocol](../services/logd/docs/handover-protocol.md)
    § Startup ordering). The handover is unconditional, so if the serial driver never
    comes up, userspace serial output after the handover is dropped (real-logd keeps the lines in
-   its history ring). init-logd has no direct-framebuffer path; before the framebuffer driver is
+   its history). init-logd has no direct-framebuffer path; before the framebuffer driver is
    up, userspace output reaches only the UART.
 
 4. **Serial-driver-mediated path** — devmgr spawns the serial driver (`services/drivers/serial/`);

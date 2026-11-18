@@ -244,22 +244,26 @@ jobs:
           if [ "${{ matrix.tester }}" = "svctest" ]; then
             test_devices=--test-devices
           fi
+          # Runs one boot the budget bounds. A pass over half its budget has
+          # outgrown the worst pass the budget was derived from, a third of
+          # the budget or less, so the budget is due for re-derivation before
+          # a slower draw of the same boot reaches it; a warning annotation on
+          # the run says so and fails nothing.
+          budgeted() {
+            started=$SECONDS
+            "$@"
+            took=$((SECONDS - started))
+            if [ "$took" -gt $((budget / 2)) ]; then
+              echo "::warning title=run-parallel budget::$3 took ${took} s, over half of the cell's ${budget} s budget; re-derive the budgets (docs/build-system.md § Continuous Integration)."
+            fi
+          }
           # --save-logs keeps every run's log, a PASS included, for the
           # run-parallel-saved artifact below, so a cell's per-phase timings
           # can be compared across heads.
-          started=$SECONDS
-          cargo xtask run-parallel \
+          budgeted cargo xtask run-parallel \
             --arch ${{ matrix.arch }} \
             --parallel 1 --runs 1 --timeout "$budget" \
             --save-logs target/xtask/run-parallel-saved $test_devices
-          # A pass over half its budget has outgrown the worst pass the budget
-          # was derived from, a third of the budget or less, so the budget is
-          # due for re-derivation before a slower draw of the same boot reaches
-          # it; a warning annotation on the run says so and fails nothing.
-          took=$((SECONDS - started))
-          if [ "$took" -gt $((budget / 2)) ]; then
-            echo "::warning title=run-parallel budget::The boot took ${took} s, over half of the cell's ${budget} s budget; re-derive the budgets (docs/build-system.md § Continuous Integration)."
-          fi
           if [ "${{ matrix.tester }}" = "svctest" ]; then
             # No extra boot: the image staged no crashd, so the log must hold
             # no crash report.
@@ -278,7 +282,7 @@ jobs:
             # mapredo knob, so the bootloader redoes its first page-table and
             # memory-map attempt, and boots the ktest bundle to its pass
             # marker under the cell's budget; the knob is removed afterwards.
-            cargo xtask test-map-redo --arch ${{ matrix.arch }} --timeout "$budget"
+            budgeted cargo xtask test-map-redo --arch ${{ matrix.arch }} --timeout "$budget"
           fi
           if [ "${{ matrix.tester }}" = "usertest" ]; then
             # No extra boot: the crash reports of the crashme fixture, which the
@@ -291,7 +295,7 @@ jobs:
             # under the cell's budget, and checks that vfsd's and fatfs's debug
             # lines appear and devmgr's and procmgr's do not; the staged bundle
             # is put back afterwards.
-            cargo xtask test-log-level --arch ${{ matrix.arch }} --timeout "$budget"
+            budgeted cargo xtask test-log-level --arch ${{ matrix.arch }} --timeout "$budget"
             # Third boot: the terminal interactive test (keyboard input
             # through the terminal). It needs the QMP `test-terminal` runner
             # (host-side key injection) and so cannot ride run-parallel;

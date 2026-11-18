@@ -729,7 +729,8 @@ reserve nodes, and so is the node of a process created with procmgr's reserve cr
 (`CREATE_RESERVE`), which procmgr honours only from a reserve creator, as it does
 `CREATE_PHYS_ACCESS`. A process a reserve
 creator creates without the flag is outside the reserve, so svcmgr's services are outside it
-unless the recipe's `reserve = yes` has svcmgr pass the flag, as crashd's does
+unless the recipe's `reserve = yes` has svcmgr pass the flag, as oomd's, sessiond's, crashd's and
+logd's do
 ([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
 § `reserve`). The reserve is `pool_total / 64`
 ([docs/limits.md](../../../docs/limits.md) § memmgr).

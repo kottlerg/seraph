@@ -59,6 +59,19 @@
 //! never armed: if, in the first phase, no stop cancelled a wait or no wait
 //! received a delivery, or, in the second, the starter never won a restart.
 //!
+//! The starter wins a restart only when its CPU runs a start between the
+//! controller's stop and its restart, which nothing holds open, so a host
+//! that runs the guest's CPUs late may let it win in few rounds or none. So
+//! after the second phase's [`CYCLES`] fixed rounds, while the starter has
+//! won none, held rounds run, up to [`super::MAX_EXTRA_ROUNDS`]: the
+//! controller stops the waiter, waits until the starter has published that
+//! it is entering a start issued after that stop ([`STARTER_ENTERED`],
+//! bounded by [`STARTER_ENTRY_WAIT_US`]), and then restarts it at once, so
+//! the two restarts still race with the starter known to be running; the
+//! starter is not stopped in a held round. The host must run the starter from
+//! that publish into its commit before the controller's in one held round.
+//! The log counts the held rounds run.
+//!
 //! Needs **≥ 2 CPUs**; the second phase needs **≥ 4** and is skipped below.
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -76,7 +89,7 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// This cell's name in log lines.
 const CELL: &str = "stress::stop_owed_wake";
 
-/// Stop/start rounds per phase.
+/// Fixed stop/start rounds per phase.
 const CYCLES: u32 = 2000;
 
 /// Bound, in 1 ms sleeps, on the controller's polls for the starter to go
@@ -105,6 +118,13 @@ const RACE_MIN_CPUS: u64 = 4;
 /// and enter its next wait before the round's varying spin.
 const ENTRY_WAIT_US: u64 = 100_000;
 
+/// Bound on a held round's wait for the starter to publish a start issued
+/// after the controller's stop ([`STARTER_ENTERED`]), in microseconds.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
+const STARTER_ENTRY_WAIT_US: u64 = 1_000_000;
+
 /// Set by the controller once the rounds are done; every child exits.
 static QUIT: AtomicU32 = AtomicU32::new(0);
 /// Set by the controller for the second phase; the starter races it then.
@@ -116,6 +136,10 @@ static RACE: AtomicU32 = AtomicU32::new(0);
 static STARTER_BUSY: AtomicU32 = AtomicU32::new(0);
 /// Restarts the starter won.
 static STARTER_WINS: AtomicU32 = AtomicU32::new(0);
+/// Starts the starter has entered, counted just before each; a held round's
+/// controller restarts the waiter only once this has moved past its value
+/// after the round's stop.
+static STARTER_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// The starter's starts that returned `Interrupted` (it was stopped while
 /// its start waited for the waiter to settle).
 static STARTER_INTERRUPTED: AtomicU32 = AtomicU32::new(0);
@@ -163,6 +187,8 @@ struct Race
     starter_wins: u32,
     controller_losses: u32,
     starter_interrupted: u32,
+    /// Held rounds run after the second phase's fixed rounds.
+    extra_rounds: u32,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -179,6 +205,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         &RACE,
         &STARTER_BUSY,
         &STARTER_WINS,
+        &STARTER_ENTERED,
         &STARTER_INTERRUPTED,
         &EXITED,
         &WAITS_ENTERED,
@@ -276,6 +303,10 @@ fn check_race(race: &Race) -> TestResult
     crate::log_u64(
         "ktest: stress::stop_owed_wake starter_interrupted=",
         u64::from(race.starter_interrupted),
+    );
+    crate::log_u64(
+        "ktest: stress::stop_owed_wake extra_rounds=",
+        u64::from(race.extra_rounds),
     );
     if race.starter_wins == 0
     {
@@ -410,18 +441,22 @@ fn run_phases(waiter_th: u64, starter_th: u64, phases: Phases) -> Result<Armed, 
         Phases::AloneThenRacing =>
         {
             RACE.store(1, Ordering::SeqCst);
-            let raced = rounds(waiter_th, Some(starter_th));
+            let raced = rounds(waiter_th, Some(starter_th)).and_then(|fixed_losses| {
+                held_rounds(waiter_th)
+                    .map(|(held_losses, extra)| (fixed_losses.saturating_add(held_losses), extra))
+            });
             // A failed round may have left the starter stopped; it must run
             // to leave its last start and to exit on QUIT.
             let resumed = ensure_started(starter_th);
             let settled = await_starter_idle();
-            let controller_losses = raced?;
+            let (controller_losses, extra_rounds) = raced?;
             resumed?;
             settled?;
             Some(Race {
                 starter_wins: STARTER_WINS.load(Ordering::Acquire),
                 controller_losses,
                 starter_interrupted: STARTER_INTERRUPTED.load(Ordering::Acquire),
+                extra_rounds,
             })
         }
     };
@@ -474,6 +509,43 @@ fn rounds(waiter_th: u64, starter_th: Option<u64>) -> Result<u32, &'static str>
         }
     }
     Ok(lost)
+}
+
+/// After the second phase's fixed rounds, run held rounds while the starter
+/// has won no restart, up to [`super::MAX_EXTRA_ROUNDS`]: stop the waiter,
+/// wait, bounded by [`STARTER_ENTRY_WAIT_US`], until the starter has
+/// published that it is entering a start issued after the stop
+/// ([`STARTER_ENTERED`]), and restart the waiter at once. Returns how many of
+/// the waiter's restarts lost to the starter's, and how many held rounds ran.
+fn held_rounds(waiter_th: u64) -> Result<(u32, u32), &'static str>
+{
+    let mut lost = 0u32;
+    let mut extra = 0u32;
+    while STARTER_WINS.load(Ordering::Acquire) == 0 && extra < super::MAX_EXTRA_ROUNDS
+    {
+        extra = extra.saturating_add(1);
+        stop(
+            waiter_th,
+            "stress::stop_owed_wake: thread_stop of the waiter failed",
+        )?;
+        let entered = WAITS_ENTERED.load(Ordering::Acquire);
+        let starts = STARTER_ENTERED.load(Ordering::Acquire);
+        let issued = super::require_within(
+            crate::scaled_bound(STARTER_ENTRY_WAIT_US),
+            "stress::stop_owed_wake: the starter entered no start in a held round",
+            || STARTER_ENTERED.load(Ordering::Acquire) != starts,
+        );
+        // Restarted whatever the wait's outcome, so a failed round leaves
+        // no waiter stopped.
+        let restarted = restart_waiter(waiter_th);
+        issued?;
+        if restarted?
+        {
+            lost = lost.saturating_add(1);
+        }
+        await_waiter_entry(entered);
+    }
+    Ok((lost, extra))
 }
 
 /// Wait, for at most [`ENTRY_WAIT_US`], until the restarted waiter has entered
@@ -631,6 +703,8 @@ extern "C" fn starter_entry(arg: u64) -> !
             let _ = thread_sleep(1);
             continue;
         }
+        // A held round's controller restarts the waiter only after this.
+        STARTER_ENTERED.fetch_add(1, Ordering::AcqRel);
         match thread_start(waiter_th)
         {
             Ok(()) =>

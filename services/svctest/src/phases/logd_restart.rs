@@ -28,10 +28,17 @@
 //! The phase writes no log line between the kill and the new instance's
 //! service: a line written while no logd receives waits out its bound. The
 //! new instance's table holds no sender's name, and svctest registered its
-//! own once, at startup, so the phase registers it again before its next
-//! line; otherwise every later svctest line, the terminal marker included,
-//! would carry `[?]` (`services/logd/docs/handover-protocol.md`, the
-//! restart paragraph).
+//! own once, at startup. Its first line after the restart carries
+//! `SENDER_NAMED`, which the new instance refuses with `NAME_UNKNOWN` until
+//! the name is sent again, so the phase checks that the line is retained once,
+//! in a slot named `svctest`
+//! (`services/logd/docs/ipc-interface.md` § `stream_labels::STREAM_REGISTER_NAME`).
+//! A child then sends the new instance raw stream messages. It first registers
+//! an empty name, so its live slot holds none, as a slot a sender created
+//! before registering does; then a line without the bit, which no receiver
+//! refuses; then a line and a record with the bit, which must be refused and
+//! not retained; then, once it has registered a name, a line with the bit,
+//! which is accepted.
 
 use std::time::{Duration, Instant};
 
@@ -81,9 +88,171 @@ pub fn logd_restart_phase(caps: &Caps)
     kill(authority, killed);
     await_restart(caps.logd_query, authority, killed);
     let took = start.elapsed().as_millis();
-    std::os::seraph::log::register_name(b"svctest");
-    super::procmgr::logd_death_forward_phase(caps);
     std::os::seraph::log!("logd_restart: logd restarted in {took} ms");
+    check_first_line_named(caps.logd_query);
+    check_name_probe(caps.logd_query);
+    super::procmgr::logd_death_forward_phase(caps);
+}
+
+/// The start of svctest's first line after the restart.
+const FIRST_LINE: &[u8] = b"logd_restart: logd restarted in ";
+
+/// svctest's own display name, which it registered at startup.
+const SVCTEST_NAME: &[u8] = b"svctest";
+
+/// Check that svctest's first line after the restart ([`FIRST_LINE`]), sent
+/// with `SENDER_NAMED` to a table that held no name for svctest, is retained
+/// once, in the history of svctest's live slot, which holds svctest's name: the
+/// new instance refused the line until svctest's log client sent the name
+/// again, and retained it once resent.
+fn check_first_line_named(query: u64)
+{
+    use ipc::log_query::SLOT_LIVE;
+
+    let first_lines = |history: Vec<(u8, Vec<u8>)>| {
+        history
+            .iter()
+            .filter(|(_, bytes)| bytes.starts_with(FIRST_LINE))
+            .count()
+    };
+    let retained = first_lines(super::procmgr::logd_history(query, None));
+    assert_eq!(
+        retained, 1,
+        "logd_restart: the first line after the restart is retained {retained} times, not once"
+    );
+    let named: Vec<u64> = super::procmgr::logd_slots(query)
+        .into_iter()
+        .filter(|(_, state, _, name)| *state == SLOT_LIVE && name == SVCTEST_NAME)
+        .map(|(badge, _, _, _)| badge)
+        .collect();
+    let &[badge] = named.as_slice()
+    else
+    {
+        panic!(
+            "logd_restart: {} live slots named svctest, not one",
+            named.len()
+        );
+    };
+    assert_eq!(
+        first_lines(super::procmgr::logd_history(query, Some(badge))),
+        1,
+        "logd_restart: the first line after the restart is not in svctest's named slot"
+    );
+}
+
+/// Role token of [`name_probe_child_main`].
+const NAME_PROBE_ROLE: &str = "logd-name-probe-child";
+
+/// The name [`name_probe_child_main`] registers once its refused messages are
+/// sent.
+const NAME_PROBE_NAME: &[u8] = b"svctest-logd-name-probe";
+
+/// The probe child's exit code once every reply was the one expected; a
+/// failed check panics, so the exit code differs.
+const NAME_PROBE_EXIT_CODE: i32 = 0x2b;
+
+/// The probe child's line without `SENDER_NAMED`, which logd accepts.
+const PROBE_UNNAMED: &[u8] = b"name probe: a line without the named-sender bit\n";
+
+/// The probe child's line with `SENDER_NAMED` and no name registered, which
+/// logd refuses.
+const PROBE_REFUSED: &[u8] = b"name probe: a refused line\n";
+
+/// The probe child's line with `SENDER_NAMED` once its name is registered,
+/// which logd accepts.
+const PROBE_NAMED: &[u8] = b"name probe: a line after the registration\n";
+
+/// Child mode of the [`logd_restart_phase`]: send logd raw stream messages and
+/// require each reply (see the module documentation), then exit with
+/// [`NAME_PROBE_EXIT_CODE`].
+fn name_probe_child_main() -> !
+{
+    use ipc::stream_labels::{
+        LEVEL_INFO, LEVEL_SHIFT, NAME_UNKNOWN, SENDER_NAMED, STREAM_BYTES, STREAM_RECORD,
+        STREAM_REGISTER_NAME,
+    };
+
+    let cap = std::os::seraph::log::acquire();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let send = |id: u64, bytes: &[u8]| {
+        let label = id | ((bytes.len() as u64) << 16) | (LEVEL_INFO << LEVEL_SHIFT);
+        let msg = ipc::IpcMessage::builder(label).bytes(0, bytes).build();
+        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
+        unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }
+            .expect("logd name probe: log send failed")
+            .label
+    };
+    // svctest's `main` registered `svctest` for this child before the role
+    // dispatch: an empty name leaves its slot holding none.
+    assert_eq!(
+        send(STREAM_REGISTER_NAME, b""),
+        0,
+        "logd name probe: the empty name was not acknowledged"
+    );
+    assert_eq!(
+        send(STREAM_BYTES, PROBE_UNNAMED),
+        0,
+        "logd name probe: a line without the named-sender bit was not accepted"
+    );
+    assert_eq!(
+        send(STREAM_BYTES | SENDER_NAMED, PROBE_REFUSED),
+        NAME_UNKNOWN,
+        "logd name probe: a named line from a sender with no name held was not refused"
+    );
+    let record = log::build_record(format_args!("name probe: a refused record"), &[]);
+    assert_eq!(
+        send(STREAM_RECORD | SENDER_NAMED, record.as_bytes()),
+        NAME_UNKNOWN,
+        "logd name probe: a named record from a sender with no name held was not refused"
+    );
+    std::os::seraph::log::register_name(NAME_PROBE_NAME);
+    assert_eq!(
+        send(STREAM_BYTES | SENDER_NAMED, PROBE_NAMED),
+        0,
+        "logd name probe: a named line after the registration was not accepted"
+    );
+    std::process::exit(NAME_PROBE_EXIT_CODE)
+}
+
+/// Run [`name_probe_child_main`] and check its exit code, then that logd
+/// retained exactly its two accepted lines, newest first, under the badge of
+/// the slot named [`NAME_PROBE_NAME`].
+fn check_name_probe(query: u64)
+{
+    let status = std::process::Command::new("/tests/svctest")
+        .arg(NAME_PROBE_ROLE)
+        .status()
+        .expect("logd_restart: spawning the name probe failed");
+    assert_eq!(
+        status.code(),
+        Some(NAME_PROBE_EXIT_CODE),
+        "logd_restart: the name probe failed: {status}"
+    );
+    let badge = super::procmgr::logd_slots(query)
+        .into_iter()
+        .find(|(_, _, _, name)| name == NAME_PROBE_NAME)
+        .map(|(badge, _, _, _)| badge)
+        .expect("logd_restart: no slot holds the name probe's name");
+    let lines: Vec<Vec<u8>> = super::procmgr::logd_history(query, Some(badge))
+        .into_iter()
+        .map(|(_, bytes)| bytes)
+        .collect();
+    let line = |text: &[u8]| text.strip_suffix(b"\n").unwrap_or(text).to_vec();
+    assert_eq!(
+        lines,
+        [line(PROBE_NAMED), line(PROBE_UNNAMED)],
+        "logd_restart: logd retained other than the name probe's two accepted lines"
+    );
+    std::os::seraph::log!("logd_restart: named-sender refusals and resends checked");
+}
+
+/// Child-mode dispatch for this module's role ([`crate::reentry`]).
+pub fn reentry_main(role: &str)
+{
+    if role == NAME_PROBE_ROLE
+    {
+        name_probe_child_main();
+    }
 }
 
 /// Kill the process `process` (logd) through an attach, which must report it

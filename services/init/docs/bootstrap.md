@@ -378,11 +378,15 @@ needs no rebuild. memmgr is `no_std` and has no level.
   procmgr's is placed in the argv/env region that follows its `ProcessInfo`
   page (`process_abi::ARGV_ENV_REGION_OFFSET`), on a page init maps there
   in the raw bootstrap. devmgr's, vfsd's, and svcmgr's ride their create
-  requests with `procmgr_labels::CREATE_ARGV_ENV`: init writes the entry
-  into one page it allocated before `finalize_memmgr` and transfers a
-  map-only derivation of it, from which procmgr copies the entry into the
-  child's argv/env region, and deletes its own handle after the call. The
-  page is init's to the reap, which donates it.
+  requests with `procmgr_labels::CREATE_ARGV_ENV`, beside each service's
+  name as its one argv string, which every create request of the three
+  carries, a level set or not: procmgr lists the process under it
+  (`LIST_PROCESSES`), so a debugger finds it by name. init writes the argv
+  and the entry into one page it allocated before `finalize_memmgr` and
+  transfers a map-only derivation of it, from which procmgr copies them into
+  the child's argv/env region, and deletes its own handle after the call. A
+  page init could not allocate leaves the three unnamed, at info. The page
+  is init's to the reap, which donates it.
 - **Inheritance.** A process devmgr or vfsd spawns on the system's behalf (a
   driver, a fatfs instance) is created with its spawner's own level as its
   one env entry, read back with

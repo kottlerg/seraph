@@ -67,7 +67,30 @@
 //! stop's pair goes uncounted when the released child restarts its peer
 //! before the controller does); a controller delayed between its two
 //! restarts, however briefly, can count a sequential stop instead, so the
-//! witness is statistical, not exact. On the unfixed kernel the first
+//! witness is statistical, not exact.
+//!
+//! A mutual stop needs CPUs 1 and 2 run at once, each child entering its
+//! stop before the other's commits, which a host running fewer of the
+//! guest's CPUs at a time than it has, or running other guests' CPUs on its
+//! cores, does in few rounds or none. So after the [`CYCLES`] fixed rounds,
+//! while no round has counted both children stopped, the controller moves
+//! the children into held rounds ([`HELD`]; it restarts both until each has
+//! reached the held loop), up to [`super::MAX_EXTRA_ROUNDS`]. In held round
+//! `g` ([`ROUND`]) each child publishes its arrival ([`ARRIVED`]), spins
+//! until the other has arrived, stops it at once, publishes that its stop
+//! returned ([`STOPPED`]), and starts its peer only once the controller has
+//! released the round ([`RELEASE`]). The controller restarts each stopped
+//! child, in passes a 1 ms sleep apart, until both stops have returned,
+//! counting a pass whose two restarts both returned `Ok`, then releases the
+//! round and restarts any child still stopped until both have finished it
+//! ([`FINISHED`]); each wait is bounded by [`HELD_WAIT_US`]. Since no child
+//! starts its peer before the release, the controller alone ends the
+//! round's stops, and the released-child loss above cannot occur; a child
+//! the first restart of a pass releases can still stop the other before the
+//! second restart, so the count stays a floor that can include a sequential
+//! stop. The host need only run CPUs 1 and 2 together as the second child
+//! arrives, in one held round, not throughout. The log counts the held
+//! rounds run. On the unfixed kernel the first
 //! mutual stop wedges CPUs 1 and 2, the controller's next restart waits
 //! forever for a child to leave its CPU, and the boot ends in the harness
 //! watchdog.
@@ -88,7 +111,7 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// This cell's log name.
 const CELL: &str = "stress::mutual_stop";
 
-/// Controller rounds.
+/// Fixed controller rounds.
 const CYCLES: u32 = 200;
 
 /// The two children.
@@ -105,6 +128,14 @@ const CHILD_CPUS: [u32; CHILDREN] = [1, 2];
 /// microseconds. A child whose peer runs on marked `Stopped` waits for that
 /// peer's slice to expire, and the two may wait so in turn.
 const ROUND_WAIT_US: u64 = 50_000;
+
+/// Bound on each of a held round's waits, in microseconds: for both
+/// children to enter the held loop, for both stops to return, and for both
+/// children to finish the round.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
+const HELD_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the wait for both children to exit, in 1 ms polls.
 /// Applied through [`crate::scaled_polls`], which stretches it past
@@ -124,6 +155,20 @@ static QUIT: AtomicU32 = AtomicU32::new(0);
 static QUIESCED: AtomicU32 = AtomicU32::new(0);
 /// Children that have exited.
 static EXITED: AtomicU32 = AtomicU32::new(0);
+/// Set by the controller after the fixed rounds when they counted no mutual
+/// stop; each child moves to the held loop at its next loop top.
+static HELD: AtomicU32 = AtomicU32::new(0);
+/// Children that have entered the held loop.
+static HELD_READY: AtomicU32 = AtomicU32::new(0);
+/// Controller → children: the held round (from 1) to run, and the held round
+/// whose stops it has ended, after which each child starts its peer.
+static ROUND: AtomicU32 = AtomicU32::new(0);
+static RELEASE: AtomicU32 = AtomicU32::new(0);
+/// Per child: the held round it has arrived at, the held round whose stop
+/// of its peer returned, and the held round it has finished.
+static ARRIVED: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
+static STOPPED: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
+static FINISHED: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
 /// Per child: loops counted, stops of the peer that returned `Ok`, starts of
 /// the peer that returned `Ok`, and starts that returned `Interrupted`.
 static PROGRESS: [AtomicU32; CHILDREN] = [AtomicU32::new(0), AtomicU32::new(0)];
@@ -193,6 +238,27 @@ struct Tally
     both_restarted: u32,
     /// Rounds in which a child counted no loop within [`ROUND_WAIT_US`].
     starved: u32,
+    /// Held rounds run after the fixed rounds.
+    extra_rounds: u32,
+}
+
+/// Whether a restart pass whose two restarts both return `Ok` counts as the
+/// witness of a mutual stop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Witness
+{
+    Counted,
+    Uncounted,
+}
+
+/// A child's tallies, in the per-child statics.
+#[derive(Clone, Copy)]
+struct ChildTallies
+{
+    progress: &'static AtomicU32,
+    stops_ok: &'static AtomicU32,
+    starts_ok: &'static AtomicU32,
+    starts_interrupted: &'static AtomicU32,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -204,12 +270,24 @@ pub fn run(ctx: &TestContext) -> TestResult
         crate::log("ktest: stress::mutual_stop SKIP (need 3+ CPUs)");
         return Ok(());
     }
-    for counter in [&GO, &QUIT, &QUIESCED, &EXITED]
-        .into_iter()
-        .chain(PROGRESS.iter())
-        .chain(STOPS_OK.iter())
-        .chain(STARTS_OK.iter())
-        .chain(STARTS_INTERRUPTED.iter())
+    for counter in [
+        &GO,
+        &QUIT,
+        &QUIESCED,
+        &EXITED,
+        &HELD,
+        &HELD_READY,
+        &ROUND,
+        &RELEASE,
+    ]
+    .into_iter()
+    .chain(ARRIVED.iter())
+    .chain(STOPPED.iter())
+    .chain(FINISHED.iter())
+    .chain(PROGRESS.iter())
+    .chain(STOPS_OK.iter())
+    .chain(STARTS_OK.iter())
+    .chain(STARTS_INTERRUPTED.iter())
     {
         counter.store(0, Ordering::Release);
     }
@@ -312,6 +390,10 @@ fn log_tallies(tally: &Tally)
         "ktest: stress::mutual_stop starved=",
         u64::from(tally.starved),
     );
+    crate::log_u64(
+        "ktest: stress::mutual_stop extra_rounds=",
+        u64::from(tally.extra_rounds),
+    );
 }
 
 /// Create and start the children, run [`CYCLES`] rounds, end the children,
@@ -395,24 +477,16 @@ fn start(
     Ok(th)
 }
 
-/// Run [`CYCLES`] rounds: restart both children, wait for both to count
-/// another loop, and spin a varying delay. Records the loops counted by
-/// the end.
+/// Run [`CYCLES`] fixed rounds: restart both children, wait for both to
+/// count another loop, and spin a varying delay; then, if no round found
+/// both children stopped, held rounds ([`held_rounds`]). Records the loops
+/// counted by the end.
 fn rounds(th: [u64; CHILDREN], tally: &mut Tally) -> TestResult
 {
     for cycle in 0..CYCLES
     {
         let before = PROGRESS.each_ref().map(|p| p.load(Ordering::Acquire));
-        let mut restarted = 0usize;
-        for (&child, controller_starts_ok) in th.iter().zip(tally.controller_starts_ok.iter_mut())
-        {
-            if restart(child)?
-            {
-                *controller_starts_ok = controller_starts_ok.saturating_add(1);
-                restarted = restarted.saturating_add(1);
-            }
-        }
-        if restarted == CHILDREN
+        if restart_pass(th, tally)? == CHILDREN
         {
             tally.both_restarted = tally.both_restarted.saturating_add(1);
         }
@@ -423,8 +497,102 @@ fn rounds(th: [u64; CHILDREN], tally: &mut Tally) -> TestResult
             core::hint::spin_loop();
         }
     }
+    if tally.both_restarted == 0
+    {
+        held_rounds(th, tally)?;
+    }
     tally.progress_in_rounds = PROGRESS.each_ref().map(|p| p.load(Ordering::Acquire));
     Ok(())
+}
+
+/// Move both children into the held loop ([`HELD`]), restarting them until
+/// each has entered it, then run held rounds ([`held_round`]) until one has
+/// counted both children stopped or [`super::MAX_EXTRA_ROUNDS`] have run.
+fn held_rounds(th: [u64; CHILDREN], tally: &mut Tally) -> TestResult
+{
+    HELD.store(1, Ordering::Release);
+    restart_until(
+        th,
+        tally,
+        Witness::Uncounted,
+        "stress::mutual_stop: a child did not enter the held rounds",
+        || HELD_READY.load(Ordering::Acquire) as usize == CHILDREN,
+    )?;
+    while tally.both_restarted == 0 && tally.extra_rounds < super::MAX_EXTRA_ROUNDS
+    {
+        tally.extra_rounds = tally.extra_rounds.saturating_add(1);
+        held_round(th, tally.extra_rounds, tally)?;
+    }
+    Ok(())
+}
+
+/// Held round `round`: start it ([`ROUND`]), restart stopped children until
+/// both children's stops have returned ([`STOPPED`]), counting a pass that
+/// restarted both, then release it ([`RELEASE`]) and restart stopped
+/// children until both have finished it ([`FINISHED`]).
+fn held_round(th: [u64; CHILDREN], round: u32, tally: &mut Tally) -> TestResult
+{
+    ROUND.store(round, Ordering::Release);
+    restart_until(
+        th,
+        tally,
+        Witness::Counted,
+        "stress::mutual_stop: a child's stop did not return in a held round",
+        || STOPPED.iter().all(|s| s.load(Ordering::Acquire) == round),
+    )?;
+    RELEASE.store(round, Ordering::Release);
+    restart_until(
+        th,
+        tally,
+        Witness::Uncounted,
+        "stress::mutual_stop: a child did not finish a held round",
+        || FINISHED.iter().all(|f| f.load(Ordering::Acquire) == round),
+    )
+}
+
+/// Until `done` holds, restart both children in passes a 1 ms sleep apart;
+/// with [`Witness::Counted`], a pass whose two restarts both returned `Ok`
+/// counts in `tally.both_restarted`. Fails with `message` past
+/// [`HELD_WAIT_US`].
+fn restart_until(
+    th: [u64; CHILDREN],
+    tally: &mut Tally,
+    witness: Witness,
+    message: &'static str,
+    done: impl Fn() -> bool,
+) -> TestResult
+{
+    let bound = crate::scaled_bound(HELD_WAIT_US);
+    let start = elapsed_us()?;
+    while !done()
+    {
+        if elapsed_us()?.saturating_sub(start) > bound
+        {
+            return Err(message);
+        }
+        if restart_pass(th, tally)? == CHILDREN && witness == Witness::Counted
+        {
+            tally.both_restarted = tally.both_restarted.saturating_add(1);
+        }
+        thread_sleep(1).map_err(|_| "stress::mutual_stop: held round sleep failed")?;
+    }
+    Ok(())
+}
+
+/// Restart each child once, counting each `Ok` in
+/// `tally.controller_starts_ok`; returns how many restarts returned `Ok`.
+fn restart_pass(th: [u64; CHILDREN], tally: &mut Tally) -> Result<usize, &'static str>
+{
+    let mut restarted = 0usize;
+    for (&child, controller_starts_ok) in th.iter().zip(tally.controller_starts_ok.iter_mut())
+    {
+        if restart(child)?
+        {
+            *controller_starts_ok = controller_starts_ok.saturating_add(1);
+            restarted = restarted.saturating_add(1);
+        }
+    }
+    Ok(restarted)
 }
 
 /// Restart `child`; returns whether the start committed (`Ok`). A child
@@ -514,8 +682,9 @@ fn finish(th: [u64; CHILDREN], tally: &mut Tally) -> TestResult
     Ok(())
 }
 
-/// Child: once released, loop until told to quit: stop the peer, spin a
-/// varying delay, start the peer, count the loop.
+/// Child: once released, loop until told to quit or to hold: stop the peer,
+/// spin a varying delay, start the peer, count the loop; once told to hold,
+/// run the held rounds ([`held_loop`]) until told to quit.
 extern "C" fn child_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `start` published for this child.
@@ -535,8 +704,14 @@ extern "C" fn child_entry(arg: u64) -> !
         // The parent's bounded exit wait reports a child that never exits.
         thread_exit()
     };
+    let tallies = ChildTallies {
+        progress,
+        stops_ok,
+        starts_ok,
+        starts_interrupted,
+    };
     let mut loops = 0u32;
-    while QUIT.load(Ordering::Acquire) == 0
+    while QUIT.load(Ordering::Acquire) == 0 && HELD.load(Ordering::Acquire) == 0
     {
         loops = loops.wrapping_add(1);
         stop_peer(peer, stops_ok);
@@ -548,6 +723,10 @@ extern "C" fn child_entry(arg: u64) -> !
         start_peer(peer, starts_ok, starts_interrupted);
         progress.fetch_add(1, Ordering::AcqRel);
     }
+    if QUIT.load(Ordering::Acquire) == 0
+    {
+        held_loop(index, peer, tallies);
+    }
     QUIESCED.fetch_add(1, Ordering::AcqRel);
     while (QUIESCED.load(Ordering::Acquire) as usize) < CHILDREN
     {
@@ -555,6 +734,81 @@ extern "C" fn child_entry(arg: u64) -> !
     }
     EXITED.fetch_add(1, Ordering::AcqRel);
     thread_exit()
+}
+
+/// A child's held rounds, until told to quit: for each round the controller
+/// starts ([`ROUND`]), publish its arrival ([`ARRIVED`]), spin until the
+/// peer has arrived, stop the peer at once, publish that the stop returned
+/// ([`STOPPED`]), spin until the controller releases the round
+/// ([`RELEASE`]), start the peer, count the loop, and publish that the round
+/// is finished ([`FINISHED`]).
+fn held_loop(index: usize, peer: u64, tallies: ChildTallies)
+{
+    let (Some(arrived), Some(peer_arrived), Some(stopped), Some(finished)) = (
+        ARRIVED.get(index),
+        ARRIVED.get(index ^ 1),
+        STOPPED.get(index),
+        FINISHED.get(index),
+    )
+    else
+    {
+        // The controller's bounded wait reports a child that never enters.
+        return;
+    };
+    HELD_READY.fetch_add(1, Ordering::AcqRel);
+    let mut seen = 0u32;
+    while let Some(round) = next_held_round(seen)
+    {
+        seen = round;
+        arrived.store(round, Ordering::Release);
+        if !await_held(peer_arrived, round)
+        {
+            return;
+        }
+        stop_peer(peer, tallies.stops_ok);
+        stopped.store(round, Ordering::Release);
+        if !await_held(&RELEASE, round)
+        {
+            return;
+        }
+        start_peer(peer, tallies.starts_ok, tallies.starts_interrupted);
+        tallies.progress.fetch_add(1, Ordering::AcqRel);
+        finished.store(round, Ordering::Release);
+    }
+}
+
+/// Spin until the controller starts a held round after `seen` (returning it)
+/// or sets [`QUIT`] (returning `None`).
+fn next_held_round(seen: u32) -> Option<u32>
+{
+    loop
+    {
+        if QUIT.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        let round = ROUND.load(Ordering::Acquire);
+        if round != seen
+        {
+            return Some(round);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Spin until `flag` holds `round` (returning `true`) or the controller sets
+/// [`QUIT`] (returning `false`).
+fn await_held(flag: &AtomicU32, round: u32) -> bool
+{
+    while flag.load(Ordering::Acquire) != round
+    {
+        if QUIT.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
 }
 
 /// Stop the peer: `Ok` is tallied, `InvalidState` (the peer is already

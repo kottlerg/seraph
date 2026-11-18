@@ -105,6 +105,21 @@
 //! happens to fit inside that span on the host at hand. The delayed half
 //! moves the stopper later, through the controller's cancel and commit and,
 //! once [`OFFSET_SPAN`] spins outlast them, past the commit.
+//!
+//! The check does depend on the host running the stopper's CPU when the
+//! controller probes for the handshake: a stopper whose CPU is not run within
+//! [`SEEN_PROBES`] probes of its release enters its stop after the controller
+//! has committed, and a host that runs the guest's CPUs late can do that in
+//! every cycle. So after the [`CYCLES`] fixed cycles, while no second stop
+//! has committed, held cycles run, up to [`super::MAX_EXTRA_ROUNDS`]: each is
+//! a stop-first cycle with no offset in which the stopper publishes that it
+//! is taking its stop ([`STOPPER_ENTERED`]) just before it, and the
+//! controller, waiting for that publish (bounded by
+//! [`STOPPER_ENTRY_WAIT_US`]) rather than probing a fixed number of times,
+//! then stops and deletes at once. The host must run the stopper from that
+//! publish through its precheck before the controller's commit in one held
+//! cycle, not run the two CPUs at once throughout. The log counts the held
+//! cycles run.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -118,7 +133,7 @@ use syscall_abi::{RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND_GRANT, RIGHTS_THREAD_CONTROL
 use crate::tally::await_report;
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Number of stop-vs-free races to run. Tunable; 300 gives the cross-CPU
+/// Number of fixed stop-vs-free races to run. Tunable; 300 gives the cross-CPU
 /// window many chances to land on either side of the free.
 const CYCLES: u32 = 300;
 
@@ -171,6 +186,13 @@ const OFFSET_SPAN: u32 = 64;
 /// accepts.
 const SEEN_PROBES: u32 = 1 << 16;
 
+/// Bound on a held cycle's wait for the second stopper to publish that it
+/// is taking its stop ([`STOPPER_ENTERED`]), in microseconds.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
+const STOPPER_ENTRY_WAIT_US: u64 = 1_000_000;
+
 /// Controller → second stopper: the cycle, counted from 1, whose client it is
 /// to stop now. The stopper spins on it rather than blocking, so its release
 /// costs no wake latency.
@@ -179,6 +201,10 @@ static STOPPER_GO: AtomicU32 = AtomicU32::new(0);
 /// stopper has seen. The controller spins on it, so the handshake costs no
 /// wake latency either.
 static STOPPER_SEEN: AtomicU32 = AtomicU32::new(0);
+/// Second stopper → controller: the cycle, counted from 1, whose client it
+/// is stopping, stored just before its stop; a held cycle's controller
+/// stops only after this ([`Timing::Held`]).
+static STOPPER_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// Second stops that returned `Ok` in a stop-first cycle, where the client
 /// is reply-blocked until a stop cancels it (see the module's § Pass
 /// criterion).
@@ -197,13 +223,29 @@ struct StopperArgs
     done: u64,
     /// The cycle, counted from 1.
     round: u32,
+    /// Whether the cycle is a fixed or a held one.
+    timing: Timing,
 }
 
 static STOPPER_ARGS: spawn::ArgBlock<StopperArgs, 1> = spawn::ArgBlock::new(StopperArgs {
     target: 0,
     done: 0,
     round: 0,
+    timing: Timing::Raced,
 });
+
+/// When a cycle's two stops are released.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing
+{
+    /// At the cycle's offset ([`offset_spins`]), once the controller has
+    /// seen the stopper's handshake or [`SEEN_PROBES`] probes ran out.
+    Raced,
+    /// With no offset, once the stopper has published that it is taking its
+    /// stop ([`STOPPER_ENTERED`]), so the two stops meet with the stopper
+    /// known to be running; always a stop-first cycle.
+    Held,
+}
 
 /// The client's and the server's arguments, handed to `client_entry` and
 /// `server_entry` by address (cap handles in the child's own `CSpace`).
@@ -317,25 +359,55 @@ enum Stops
 }
 
 /// Run [`CYCLES`] races with the children placed per `place` and stopped by
-/// `stops`. Every cycle must arm its race ([`one_cycle`] fails one that does
-/// not).
+/// `stops`, and, with a second stopper, held cycles ([`held_cycles`]).
+/// Every cycle must arm its race ([`one_cycle`] fails one that does not).
 fn cycles(ctx: &TestContext, place: Placement, stops: Stops) -> TestResult
 {
-    STOPPER_GO.store(0, Ordering::Release);
-    STOPPER_SEEN.store(0, Ordering::Release);
-    SECOND_STOPS_OK.store(0, Ordering::Release);
-    SECOND_STOPS_DELAYED_OK.store(0, Ordering::Release);
+    for counter in [
+        &STOPPER_GO,
+        &STOPPER_SEEN,
+        &STOPPER_ENTERED,
+        &SECOND_STOPS_OK,
+        &SECOND_STOPS_DELAYED_OK,
+    ]
+    {
+        counter.store(0, Ordering::Release);
+    }
 
     for cycle in 0..CYCLES
     {
         let slot = super::rotation_slot(cycle, CYCLES, place.span);
-        one_cycle(ctx, place, stops, cycle, slot)?;
+        one_cycle(ctx, place, stops, (cycle, slot), Timing::Raced)?;
     }
     if stops == Stops::Double
     {
+        let extra = held_cycles(ctx, place)?;
+        crate::log_u64(
+            "ktest: stress::stop_reply_race extra_rounds=",
+            u64::from(extra),
+        );
         check_second_stops()?;
     }
     Ok(())
+}
+
+/// After the fixed cycles, run held cycles ([`Timing::Held`]) while no
+/// second stop has committed, up to [`super::MAX_EXTRA_ROUNDS`]; returns how
+/// many ran. Each is numbered past the fixed cycles with an even number, so
+/// it is a stop-first cycle, the only kind [`SECOND_STOPS_OK`] counts. The
+/// count is stable between cycles: each cycle with a second stopper waits for
+/// its `BIT_STOPPER_DONE`, which the stopper raises after its count.
+fn held_cycles(ctx: &TestContext, place: Placement) -> Result<u32, &'static str>
+{
+    let mut extra = 0u32;
+    while SECOND_STOPS_OK.load(Ordering::Acquire) == 0 && extra < super::MAX_EXTRA_ROUNDS
+    {
+        let cycle = CYCLES.saturating_add(extra.saturating_mul(2));
+        let slot = super::rotation_slot(cycle, CYCLES, place.span);
+        one_cycle(ctx, place, Stops::Double, (cycle, slot), Timing::Held)?;
+        extra = extra.saturating_add(1);
+    }
+    Ok(extra)
 }
 
 /// One cycle's objects and children; [`reap_cycle`] deletes whichever exist.
@@ -349,15 +421,22 @@ struct CycleParts
     server: Option<spawn::SpawnedChild>,
 }
 
-/// One cycle: create the endpoint and `done`, start the client, the second
-/// stopper (if any) and the server on the CPUs `place` gives `slot`, wait for
-/// the race to arm, race, and delete everything the cycle created on every
-/// path, so a failed cycle leaves no child running on its CPU or stack.
-fn one_cycle(ctx: &TestContext, place: Placement, stops: Stops, cycle: u32, slot: u32)
--> TestResult
+/// One cycle, for the cycle and slot pair `at`: create the endpoint and
+/// `done`, start the client, the second stopper (if any) and the server on
+/// the CPUs `place` gives the slot, wait for the race to arm, race (`timing`
+/// says when the stops are released), and delete everything the cycle
+/// created on every path, so a failed cycle leaves no child running on its
+/// CPU or stack.
+fn one_cycle(
+    ctx: &TestContext,
+    place: Placement,
+    stops: Stops,
+    at: (u32, u32),
+    timing: Timing,
+) -> TestResult
 {
     let mut parts = CycleParts::default();
-    let result = arm_and_race(ctx, place, stops, (cycle, slot), &mut parts);
+    let result = arm_and_race(ctx, place, stops, at, timing, &mut parts);
     let reaped = reap_cycle(&mut parts);
     result?;
     reaped
@@ -370,6 +449,7 @@ fn arm_and_race(
     place: Placement,
     stops: Stops,
     at: (u32, u32),
+    timing: Timing,
     parts: &mut CycleParts,
 ) -> TestResult
 {
@@ -397,6 +477,7 @@ fn arm_and_race(
                 target: client_th,
                 done,
                 round: cycle.saturating_add(1),
+                timing,
             },
             place.cpu(slot, 2)?,
             &mut parts.stopper,
@@ -446,7 +527,7 @@ fn arm_and_race(
         .server
         .as_mut()
         .ok_or("stress::stop_reply_race: the cycle holds no server")?;
-    race(cycle, client_th, server, stops)?;
+    race(cycle, client_th, server, stops, timing)?;
     if parts.stopper.is_some()
     {
         await_report(
@@ -570,15 +651,33 @@ fn check_second_stops() -> TestResult
 /// TCB. Client and server are pinned to different CPUs, so A's CAS and B's
 /// free execute on different cores; the issue order alternates by cycle
 /// parity to cover both interleavings. With [`Stops::Double`], the second
-/// stopper is released first and races A with a second cancel at the cycle's
-/// offset ([`controller_lead_in`]). B deletes the Thread cap through
-/// `server`, its guard.
-fn race(cycle: u32, client_th: u64, server: &mut spawn::SpawnedChild, stops: Stops) -> TestResult
+/// stopper is released first and races A with a second cancel: at the
+/// cycle's offset ([`controller_lead_in`]) in a fixed cycle, and in a held
+/// one once the stopper has published that it is taking its stop
+/// ([`STOPPER_ENTERED`]), bounded by [`STOPPER_ENTRY_WAIT_US`]. B deletes
+/// the Thread cap through `server`, its guard.
+fn race(
+    cycle: u32,
+    client_th: u64,
+    server: &mut spawn::SpawnedChild,
+    stops: Stops,
+    timing: Timing,
+) -> TestResult
 {
-    STOPPER_GO.store(cycle.saturating_add(1), Ordering::Release);
+    let round = cycle.saturating_add(1);
+    STOPPER_GO.store(round, Ordering::Release);
     if stops == Stops::Double
     {
-        controller_lead_in(cycle);
+        match timing
+        {
+            Timing::Raced => controller_lead_in(cycle),
+            Timing::Held => super::require_within(
+                crate::scaled_bound(STOPPER_ENTRY_WAIT_US),
+                "stress::stop_reply_race: the second stopper did not reach its stop in a held \
+                 cycle",
+                || STOPPER_ENTERED.load(Ordering::Acquire) == round,
+            )?,
+        }
     }
     // The stop's outcome depends on which teardown reached the client first
     // (`Ok`, or `InvalidState` once another stop committed or the client
@@ -754,6 +853,7 @@ fn spawn_stopper(
                 target,
                 done,
                 round: args.round,
+                timing: args.timing,
             },
         )
     };
@@ -818,8 +918,9 @@ extern "C" fn server_entry(arg: u64) -> !
 }
 
 /// Second stopper: spin until the controller releases this cycle, raise the
-/// handshake, spin the stopper's share of the cycle's offset, stop the
-/// client, record the stop's return, and report it on `done`.
+/// handshake, spin the stopper's share of the cycle's offset (none in a held
+/// cycle), publish that it is taking its stop ([`STOPPER_ENTERED`]), stop
+/// the client, record the stop's return, and report it on `done`.
 extern "C" fn stopper_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `spawn_stopper` published for this stopper.
@@ -827,18 +928,25 @@ extern "C" fn stopper_entry(arg: u64) -> !
         target,
         done,
         round,
+        timing,
     } = unsafe { spawn::child_args(arg) };
     while STOPPER_GO.load(Ordering::Acquire) != round
     {
         core::hint::spin_loop();
     }
     STOPPER_SEEN.store(round, Ordering::Release);
-    // `round` counts the cycle from 1.
-    let (stopper_spin, _) = offset_spins(round.saturating_sub(1));
+    let stopper_spin = match timing
+    {
+        // `round` counts the cycle from 1.
+        Timing::Raced => offset_spins(round.saturating_sub(1)).0,
+        Timing::Held => 0,
+    };
     for _ in 0..stopper_spin
     {
         core::hint::spin_loop();
     }
+    // A held cycle's controller makes its own stop only after this.
+    STOPPER_ENTERED.store(round, Ordering::Release);
     // Ok: this stop's unlocked state precheck read the client before any
     // `Stopped` commit landed (two stops past that precheck both commit
     // `Stopped` and both return Ok), or, in a delete-first cycle, read a

@@ -51,6 +51,17 @@
 //! result is reported in its place, since it sends the waiter on to the
 //! source the check no longer delivers to.
 //!
+//! A delivery is consumed during the rounds only when the sender's CPU runs
+//! between the waiter's entry into a wait and the controller's next stop,
+//! which a host that runs the guest's CPUs late may do in few rounds or none.
+//! So after a phase's [`CYCLES`] fixed rounds, while either source has had no
+//! delivery consumed, held rounds run, up to [`super::MAX_EXTRA_ROUNDS`]: the
+//! controller stops and restarts the waiter, waits for its entry as before,
+//! and then waits, bounded by [`DELIVERY_WAIT_US`], until both sources have
+//! had a delivery consumed before its next stop, so the host must run the
+//! sender through a delivery on each source in one held round, not run CPUs
+//! at once throughout. Each phase's log counts the held rounds run.
+//!
 //! Required, per phase: every wait returned its own source's bits or payload
 //! or `Interrupted`; every delivery by the sender succeeded; the waiter
 //! consumed deliveries on both sources during the rounds, and some stop
@@ -79,7 +90,7 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// This cell's log name.
 const CELL: &str = "stress::stop_repark";
 
-/// Stop/start rounds per phase.
+/// Fixed stop/start rounds per phase.
 const CYCLES: u32 = 1000;
 
 /// The two sources of a phase, and its two children (the waiter and the
@@ -114,6 +125,13 @@ const VALUES: [u64; SOURCES] = [1 << 0, 1 << 1];
 /// before polling in 1 ms sleeps.
 const ENTRY_WAIT_US: u64 = 100_000;
 const ENTRY_SPINS: u32 = 100_000;
+
+/// Bound on a held round's wait for the waiter to have consumed a delivery
+/// on both sources, in microseconds.
+///
+/// Applied through [`crate::scaled_bound`], which stretches it past
+/// [`crate::UNSCALED_CPUS`] CPUs.
+const DELIVERY_WAIT_US: u64 = 1_000_000;
 
 /// Bound on the controller's deliveries after the rounds, in 1 ms polls.
 /// Applied through [`crate::scaled_polls`], which stretches it past
@@ -192,6 +210,8 @@ struct Seen
     /// Rounds in which the waiter entered no wait within [`ENTRY_WAIT_US`]
     /// of its restart.
     starved: u32,
+    /// Held rounds run after the fixed rounds.
+    extra_rounds: u32,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -279,6 +299,10 @@ fn log_seen(seen: &Seen)
             seen.interrupted[1],
         ),
         ("ktest: stress::stop_repark starved=", seen.starved),
+        (
+            "ktest: stress::stop_repark extra_rounds=",
+            seen.extra_rounds,
+        ),
     ]
     {
         crate::log_u64(label, u64::from(value));
@@ -366,10 +390,12 @@ fn phase(ctx: &TestContext, kind: Kind) -> Result<Seen, &'static str>
         let waiter = parts.waiter.ok_or("stress::stop_repark: no waiter")?;
         let sources = sources_of(&parts)?;
         let ran = rounds(waiter);
+        let (starved, extra_rounds) = ran.as_ref().copied().unwrap_or((0, 0));
         let seen = Seen {
             delivered: DELIVERED.each_ref().map(|d| d.load(Ordering::Acquire)),
             interrupted: INTERRUPTED.each_ref().map(|i| i.load(Ordering::Acquire)),
-            starved: ran.as_ref().copied().unwrap_or(0),
+            starved,
+            extra_rounds,
         };
         let paused = pause_sender();
         let checked = final_check(kind, sources);
@@ -486,16 +512,14 @@ fn create_thread(
 }
 
 /// Stop and restart the waiter [`CYCLES`] times, waiting after each restart
-/// until it has entered a new wait. Returns the rounds that timed out.
-fn rounds(waiter: u64) -> Result<u32, &'static str>
+/// until it has entered a new wait, then run held rounds ([`held_rounds`]).
+/// Returns the rounds whose entry wait timed out, and the held rounds run.
+fn rounds(waiter: u64) -> Result<(u32, u32), &'static str>
 {
     let mut starved = 0u32;
     for cycle in 0..CYCLES
     {
-        thread_stop(waiter).map_err(|e| {
-            log_error("ktest: stress::stop_repark thread_stop error=", e);
-            "stress::stop_repark: thread_stop of the waiter failed"
-        })?;
+        stop_waiter(waiter)?;
         // Stopped and off its CPU: the waiter's count is stable until the
         // restart.
         let entered = WAITS_ENTERED.load(Ordering::Acquire);
@@ -505,10 +529,7 @@ fn rounds(waiter: u64) -> Result<u32, &'static str>
         {
             core::hint::spin_loop();
         }
-        thread_start(waiter).map_err(|e| {
-            log_error("ktest: stress::stop_repark thread_start error=", e);
-            "stress::stop_repark: thread_start of the waiter failed"
-        })?;
+        start_waiter(waiter)?;
         if !await_entry(entered)
         {
             starved = starved.saturating_add(1);
@@ -520,7 +541,55 @@ fn rounds(waiter: u64) -> Result<u32, &'static str>
             core::hint::spin_loop();
         }
     }
-    Ok(starved)
+    let extra = held_rounds(waiter, &mut starved)?;
+    Ok((starved, extra))
+}
+
+/// After the fixed rounds, while either source has had no delivery
+/// consumed, run held rounds, up to [`super::MAX_EXTRA_ROUNDS`]: stop and
+/// restart the waiter, wait for its entry (counting a timeout in
+/// `starved`), and wait, bounded by [`DELIVERY_WAIT_US`], until both
+/// sources have had a delivery consumed. Returns the held rounds run.
+fn held_rounds(waiter: u64, starved: &mut u32) -> Result<u32, &'static str>
+{
+    let unarmed = || DELIVERED.iter().any(|d| d.load(Ordering::Acquire) == 0);
+    let mut extra = 0u32;
+    while unarmed() && extra < super::MAX_EXTRA_ROUNDS
+    {
+        extra = extra.saturating_add(1);
+        stop_waiter(waiter)?;
+        let entered = WAITS_ENTERED.load(Ordering::Acquire);
+        start_waiter(waiter)?;
+        if !await_entry(entered)
+        {
+            *starved = starved.saturating_add(1);
+        }
+        super::require_within(
+            crate::scaled_bound(DELIVERY_WAIT_US),
+            "stress::stop_repark: the waiter consumed no delivery on a source in a held round",
+            || !unarmed(),
+        )?;
+    }
+    Ok(extra)
+}
+
+/// Stop the waiter, failing (and logging the error) if the stop fails.
+fn stop_waiter(waiter: u64) -> TestResult
+{
+    thread_stop(waiter).map_err(|e| {
+        log_error("ktest: stress::stop_repark thread_stop error=", e);
+        "stress::stop_repark: thread_stop of the waiter failed"
+    })
+}
+
+/// Restart the stopped waiter, failing (and logging the error) if the start
+/// fails.
+fn start_waiter(waiter: u64) -> TestResult
+{
+    thread_start(waiter).map_err(|e| {
+        log_error("ktest: stress::stop_repark thread_start error=", e);
+        "stress::stop_repark: thread_start of the waiter failed"
+    })
 }
 
 /// Wait, for at most [`ENTRY_WAIT_US`], until the restarted waiter has

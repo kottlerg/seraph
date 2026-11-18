@@ -57,7 +57,10 @@ mod timed_wait_reuse;
 mod timed_wait_source_delete;
 mod timed_waiter_thread_delete;
 
-use crate::{ChildStack, TestContext, run_integration_test};
+use syscall::{system_info, thread_sleep};
+use syscall_abi::SystemInfoType;
+
+use crate::{ChildStack, TestContext, TestResult, run_integration_test};
 
 /// Number of shared child stacks, and so the maximum children a stress cell
 /// runs on [`STRESS_STACKS`] stacks at once.
@@ -78,6 +81,66 @@ const MAX_STRESS_THREADS: usize = 64;
 // Only accessed by one stress test at a time (sequential execution).
 // Each test uses distinct indices.
 static mut STRESS_STACKS: [ChildStack; MAX_STRESS_THREADS] = [ChildStack::ZERO; MAX_STRESS_THREADS];
+
+/// Bound on the held rounds a cell runs after its fixed rounds while the
+/// race one of its checks requires has not armed: rounds in which the
+/// helper's action lands while the helper is known to be running, so the
+/// check needs the host to run the helper's CPU in time in one of them
+/// rather than in the fixed rounds (`core/ktest/README.md` § Tier S, the
+/// `MAX_EXTRA_ROUNDS` knob).
+const MAX_EXTRA_ROUNDS: u32 = 1000;
+
+/// Polls [`await_within`] makes busily before it polls in 1 ms sleeps.
+const BUSY_POLLS: u32 = 100_000;
+
+/// Poll `done` until it holds, for at most `bound_us` microseconds on the
+/// `ElapsedUs` clock. The first [`BUSY_POLLS`] polls are busy, so a helper
+/// already running is seen at once; later ones sleep 1 ms, so a helper that
+/// shares the caller's CPU can run. Returns whether `done` held in time; a
+/// clock read that fails, at the start or at a poll, is the wait's own
+/// failure, so a clock the wait cannot read never leaves it unbounded.
+fn await_within(bound_us: u64, mut done: impl FnMut() -> bool) -> Result<bool, &'static str>
+{
+    let start = elapsed_us()?;
+    let mut polls = 0u32;
+    while !done()
+    {
+        if elapsed_us()?.saturating_sub(start) > bound_us
+        {
+            return Ok(false);
+        }
+        if polls < BUSY_POLLS
+        {
+            polls = polls.saturating_add(1);
+            core::hint::spin_loop();
+        }
+        else
+        {
+            let _ = thread_sleep(1);
+        }
+    }
+    Ok(true)
+}
+
+/// Like [`await_within`], but a wait that times out fails with `message`.
+fn require_within(bound_us: u64, message: &'static str, done: impl FnMut() -> bool) -> TestResult
+{
+    if await_within(bound_us, done)?
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(message)
+    }
+}
+
+/// Microseconds since boot; the clock [`await_within`] is bounded on.
+fn elapsed_us() -> Result<u64, &'static str>
+{
+    system_info(SystemInfoType::ElapsedUs as u64)
+        .map_err(|_| "stress: system_info(ElapsedUs) failed")
+}
 
 /// The placement slot of `cycle`, out of `cycles`, for a cell that rotates
 /// its pinned children over `span` CPUs: with `cycles < span` the cycles'

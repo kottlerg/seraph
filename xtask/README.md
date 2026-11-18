@@ -24,7 +24,7 @@ xtask/
 │   ├── diag.rs                 # Diagnostics of the pull-request, record, and Issue checks
 │   ├── arch.rs                 # Supported architectures and per-arch constants
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
-│   ├── bundle.rs               # Bootloader bundle composition (MODULES table)
+│   ├── bundle.rs               # Bootloader bundle composition from the installed bundle lists
 │   ├── disk.rs                 # GPT disk-image construction from the sysroot
 │   ├── error.rs                # Error type with its context chain; Context, err!, bail!, ensure!
 │   ├── fat.rs                  # FAT16/FAT32 volume writer on fatfs-parse (mkdisk)
@@ -107,25 +107,26 @@ when the image has no such section. No other build has the check.
 
 Every object a build packs is signed once, in the sysroot, as [docs/signing.md](../docs/signing.md)
 § Signing specifies: each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every
-command that repacks), and each composition of the bundle before it, signs in place the kernel
-(`kernel`, the kernel role), every ELF image under `services/`, `programs/` and `tests/` (under
-its install path with the role of its location, and the boot-module role when the bundle list names
-it; `/services/init` as `init` with the init role, and `/tests/ktest` too when the bundle's `init`
-slot holds the ktest harness), and the bundle's data entries, installed under `/config/` (the
-boot-module role). A pack signs for the harness the staged bundle holds, which it reads from the
-bundle's `init` entry. The bundle composer copies the installed files and signs nothing; it
-verifies each entry as the bootloader will before it writes the bundle. Every signed object is
-verified under the build's trust store, with each of its roles, its name and the architecture its
-loaders expect, before it is written. Each
-command derives the store from the signing identity and the deployer's store its environment names.
-`cargo xtask build` passes the store's path to the bootloader's build in `SERAPH_BOOT_TRUST_STORE`
-(set by xtask, not by a user), and the bootloader embeds it. Every pack after that (the build's own,
-`compose-bundle`, `mkdisk` including `--repack-only`, and the harness commands that repack) reads
-the store out of both installed bootloader images (`esp/EFI/seraph/boot.efi` and
-`esp/EFI/BOOT/BOOTX64.EFI` or `BOOTRISCV64.EFI`) and refuses to sign when an image is missing, holds
-no marker or two, or embeds another store; the error names the image and tells to run
-`cargo xtask build` (docs/signing.md § Signing). Signing a pack's images takes about half a second
-(`src/signing/`).
+command that repacks) signs in place the kernel installed at `boot/kernel` (`kernel`, the kernel
+role), every ELF image under `services/`, `programs/` and `tests/` (under its install path with
+the role of its location, and the boot-module role when a bundle list names it as an entry;
+`/services/init` as `init` with the init role, and `/tests/ktest` too when the pack composes the
+ktest harness's bundle), and every other file a bundle list names, the data files installed under
+`/config/` (the boot-module role). A pack signs for the harness recorded in `sysroot/.harness`
+([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot), then composes the
+ESP (`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and composes the
+bundle by copying the installed files the harness's list in `config/bundle/` names
+(`src/bundle.rs`). The composition signs nothing and reads no key; it verifies the kernel and each
+bundle entry as the bootloader will before it writes them. Every signed object is verified under
+the build's trust store, with each of its roles, its name and the architecture its loaders expect,
+before it is written. Each command derives the store from the signing identity and the deployer's
+store its environment names. `cargo xtask build` passes the store's path to the bootloader's build
+in `SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader embeds it. Every pack
+after that (the build's own, `compose-bundle`, `mkdisk` including `--repack-only`, and the harness
+commands that repack) reads the store out of the installed bootloader, `boot/boot.efi`, and refuses
+to sign when it is missing, holds no marker or two, or embeds another store; the error names the
+image and tells to run `cargo xtask build` (docs/signing.md § Signing). Signing a pack's images
+takes about half a second (`src/signing/`).
 
 The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
 one, whose canonical path lies inside it, `target/` included. When the directory is absent or
@@ -289,22 +290,23 @@ binary install). Requires a populated, arch-tagged sysroot from a prior
 
 The mirror is authoritative over the rootfs-managed subtrees (`config/`,
 `data/`): files deleted from `rootfs/` are pruned from the sysroot, while
-build-owned trees (`esp/`, `services/`, `programs/`, `tests/`) and the
+build-owned trees (`boot/`, `esp/`, `services/`, `programs/`, `tests/`) and the
 synthesised `data/svctest/` fixtures are left untouched. To pack a
 hand-staged sysroot that diverges from `rootfs/` — e.g. a test recipe
 copied from `sysroot/config/svcmgr/tests/` into
 `sysroot/config/svcmgr/services/` — use `--repack-only`, which skips the
 re-mirror and packs the sysroot as it stands (a plain repack would
 prune the hand-added recipe). Every pack, `--repack-only` included, re-signs the kernel, the ELF
-images and the bundle's data entries of the sysroot in place ([§ Signing](#signing)), so a
-hand-staged image is packed with the local identity's signature, not its own. The mirror rules are
-owned by [rootfs/README.md](../rootfs/README.md).
+images and the other files a bundle list names in place ([§ Signing](#signing)), so a hand-staged
+image is packed with the local identity's signature, not its own. The mirror rules are owned by
+[rootfs/README.md](../rootfs/README.md).
 
-`mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
-fails if the bundle is missing. The bundle is composed by
-`cargo xtask build` (default-init) or by
-[`cargo xtask compose-bundle`](#cargo-xtask-compose-bundle) (any
-harness). `mkdisk` always removes the `\EFI\seraph\mapredo` test knob, which
+Every pack, `mkdisk`'s included, composes the ESP from the installed files: the bootloader and
+the kernel, and `sysroot/esp/EFI/seraph/bootstrap.bundle` for the harness recorded in
+`sysroot/.harness`, which `cargo xtask build` records as `init` and
+[`cargo xtask compose-bundle`](#cargo-xtask-compose-bundle) as the harness it is given. An edit
+to a bundle list in `rootfs/config/bundle/` therefore reaches the bundle at the next `mkdisk`.
+`mkdisk` always removes the `\EFI\seraph\mapredo` test knob, which
 only [`test-map-redo`](#cargo-xtask-test-map-redo) stages, for its own boot.
 
 `disk.img` carries four GPT partitions: the EFI System Partition
@@ -403,12 +405,12 @@ what `fsck.fat` printed, and when `fsck.fat` is not on `PATH`, naming the packag
 
 ### `cargo xtask compose-bundle`
 
-Install the bundle's data entries from the repository, sign the sysroot for the
-chosen harness, compose `sysroot/esp/EFI/seraph/bootstrap.bundle` by copying
-the installed files, and repack `disk.img`. Symmetric with `mkdisk`: both end
-with `create_disk_image`, the difference being which file they author.
-`compose-bundle` is the bundle authoring step; `mkdisk` never authors the
-bundle. The composer signs nothing ([§ Signing](#signing)).
+Choose the harness whose bundle the disk images boot: install the repository's data files, record
+the harness in `sysroot/.harness`, and repack `disk.img`, which signs the sysroot for that harness
+and composes the ESP, `sysroot/esp/EFI/seraph/bootstrap.bundle` included, by copying the installed
+files ([§ Signing](#signing)). Every later pack, `mkdisk`'s included, composes the same harness's
+bundle until another `compose-bundle` or a full `cargo xtask build`, which records `init`. The
+composer signs nothing.
 
 ```
 cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
@@ -417,24 +419,24 @@ cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
-| `--harness` | `init` | Which binary becomes the bundle's `init` entry: `init` for the regular userspace init, `ktest` for the kernel-test harness |
+| `--harness` | `init` | Whose bundle every pack composes: `init` for the regular userspace init, `ktest` for the kernel-test harness |
 
-`--harness init` produces an 11-entry bundle on x86-64 and a 12-entry bundle on
-riscv64 (`init` + the 8 boot modules listed in `xtask/src/bundle.rs::MODULES`, the IOMMU
-driver of the architecture's family from `ARCH_MODULES`, `iommu-vtd` on x86-64 and `iommu-riscv` on
-riscv64, on riscv64 the platform description table `/config/devmgr/platform/qemu-virt.platform` from
-`ARCH_TABLES`, and the log-level configuration `/config/init/log-levels.conf` (`LOG_LEVELS`),
-installed from the repository's `services/init/log-levels.conf`; every entry but `init` is named by
-its install path, and the bootloader and init address entries by name, so order is not significant).
+The bundle's entries are the installed files the harness's bundle list names, each by its install
+path: `/config/bundle/init.x86_64.list` or `init.riscv64.list` for `init`, and
+`/config/bundle/ktest.list` for `ktest`, installed from
+[`rootfs/config/bundle/`](../rootfs/config/bundle/). A list holds one `init <path>` line, naming the
+object of the bundle's `init` slot, and one install path per line for every other entry; `#` starts
+a comment. A harness has either one list for every architecture or one per architecture, never
+both. The bootloader and init address entries by name, so order is not significant. `init`'s
+bundle holds 11 entries on x86-64 and 12 on riscv64: `init`, the 8 boot modules, the IOMMU driver of
+the architecture's family (`iommu-vtd` on x86-64, `iommu-riscv` on riscv64), on riscv64 the platform
+description table `/config/devmgr/platform/qemu-virt.platform`, and the log-level configuration
+`/config/init/log-levels.conf`, installed from the repository's `services/init/log-levels.conf`.
 The configuration names the log level of each service init spawns
 ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels); an edit to it
-takes effect at the next `compose-bundle` or `build`, with no rebuild of a component. `--harness
-ktest` produces a single-entry bundle (`ktest` as the `init` entry, zero
-modules); ktest is monolithic and does not spawn userspace.
-
-Both `cargo xtask build` and `compose-bundle` are *authoring* steps —
-both deliberately overwrite the bundle. `mkdisk` is the
-refresh-from-sysroot path and never authors.
+takes effect at the next `compose-bundle`, `mkdisk` or `build`, with no rebuild of a component,
+and an edit to a list at the next `mkdisk` or `build`. `ktest`'s bundle holds the one entry
+`ktest` as its `init` entry and zero modules; ktest is monolithic and does not spawn userspace.
 
 Example — switch to ktest, run, then switch back to regular init:
 
@@ -452,8 +454,8 @@ tiers, bench iteration count) bake in as compile-time defaults in
 `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT` (CI-friendly:
 shutdown=Always, timeout=0, full filter, 1000 bench iters). To change
 them, edit the constant, run `cargo xtask build --component ktest`, then
-re-compose with `cargo xtask compose-bundle --harness ktest` (a
-single-component build does not re-compose the bundle); see
+repack with `cargo xtask mkdisk` (a single-component build does not
+repack); see
 [core/ktest/README.md](../core/ktest/README.md) § Compile-time options.
 
 ---
@@ -1111,15 +1113,16 @@ See [docs/testing.md](../docs/testing.md) for the harness model.
 
 ### `cargo xtask test-log-level`
 
-Check that the boot bundle's log-level configuration reaches the service it names and the
-processes that service spawns, and no other, on either arch
+Check that the boot bundle's log-level configuration reaches the service it names and the processes
+that service spawns, and no other, on either arch
 ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels). Saves the
-staged bundle, composes the default-init bundle with a configuration of its own,
-`vfsd = debug`, written to `target/xtask/test-log-level/log-levels.conf`, repacks the disk images
-in the layout they have, boots the current sysroot once, and always puts the saved bundle back
-and repacks again in that layout afterwards. It passes when the boot reaches its pass marker and
-its log holds a `[vfsd] DEBUG ` line and a `[fatfs] DEBUG ` line, fatfs logging at the level of
-vfsd, which spawns it, and no `[devmgr] DEBUG ` or `[procmgr] DEBUG ` line.
+installed configuration, `/config/init/log-levels.conf`, installs a configuration of its own in its
+place, `vfsd = debug`, repacks the disk images in the layout they have with the default-init bundle,
+which the pack composes from the installed files, boots the current sysroot once, and always puts
+the saved configuration back and repacks again in that layout, with the recorded harness's bundle,
+afterwards. It passes when the boot reaches its pass marker and its log holds a `[vfsd] DEBUG ` line
+and a `[fatfs] DEBUG ` line, fatfs logging at the level of vfsd, which spawns it, and no `[devmgr]
+DEBUG ` or `[procmgr] DEBUG ` line.
 
 A pure runner; requires a populated sysroot with the default-init bundle's binaries and a harness
 staged (CI runs it in the usertest cell, on that cell's usertest staging), and `--test-devices`
@@ -1241,17 +1244,17 @@ seconds. The boot is one of the two of the debug-port device cell of the local a
 
 Check that every signature verifier refuses an object that does not verify, with the refusal it
 owes, on either arch ([docs/signing.md](../docs/signing.md) § Which Stage Verifies What). The
-command composes the default-init bundle into `target/xtask/test-signing/<arch>/` and puts the
-staged bundle back, packs the disk images once so the sysroot is signed, writes each case's
-objects into that directory from the sysroot's signed ones, and boots the current sysroot four
-times, each from images packed with those objects in place of the sysroot's files
-(`disk::create_disk_image_substituting`):
+command packs the disk images once with the default-init bundle, so the sysroot is signed and the
+ESP holds that bundle, composed from the installed files; writes each case's objects into
+`target/xtask/test-signing/<arch>/` from the signed ones; and boots the current sysroot four
+times, each from images packed with the default-init bundle and those objects in place of the
+ESP's or the sysroot's files (`disk::create_disk_image_substituting`):
 
 | Case | Objects in place of the sysroot's | Owed lines |
 |---|---|---|
 | `kernel` | the kernel with a body byte flipped | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(BodyHash)` |
 | `bundle` | the bundle with a body byte of its `/services/drivers/virtio-blk` entry flipped | `SERAPH BOOT FATAL: signature verification refused: /services/drivers/virtio-blk: Failed(BodyHash)` |
-| `revoked` | both bootloader images, built under the build's trust store with the signing key's id revoked | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(Revoked)` |
+| `revoked` | both ESP copies of the bootloader, built under the build's trust store with the signing key's id revoked | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(Revoked)` |
 | `rootfs` | `/services/timed` with a body byte flipped, `/services/pwrmgr` signed with the data role alone, `/services/crashd` signed by a key no anchor holds; the kernel and `/programs/terminal` each with a record of that key before their own | procmgr's `signature verification refused: <path>: <refusal>` (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr's `create: "<path>" refused: its signature did not verify` for each of the three, and `terminal: READY for injection` |
 
 The untrusted key is a local identity generated for the run in a directory under the host's
@@ -1261,8 +1264,9 @@ EXCEPTION`, `FATAL:`, a panic, the watchdog, the entropy self-test), and fails a
 three minutes for a boot the bootloader ends and six for `rootfs`, naming the lines still missing. A
 staged test harness's own verdict is not judged. The host kills QEMU. Every boot's serial log is
 saved as `target/xtask/test-signing/<arch>/<case>.log`, and the command reports every case before it
-fails. The images are packed again from the sysroot in the layout they had, whatever the outcome; no
-case changes a sysroot file, so a later pack cannot sign a tampered body.
+fails. The images are packed again from the sysroot in the layout they had, with the recorded
+harness's bundle, whatever the outcome; no case changes a sysroot file, so a later pack cannot sign
+a tampered body.
 
 The command compiles the bootloader of the `revoked` case, so the host admits it as a build and
 then its boots as one boot of `--cpus` vCPUs (§ Host launch rules). The compile reuses the

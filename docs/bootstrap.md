@@ -28,8 +28,8 @@ procmgr ([signing.md](signing.md)), which verifies every image it creates agains
 parses it. The ESP is derived from the root filesystem: the bundle carries the bootstrap closure,
 what is needed to reach the root filesystem and begin loading from it, and every object on the
 ESP is a copy of an installed file, used during bootstrap alone
-([boot-media.md](boot-media.md); the installed kernel and bootloader, and a bundle composed by
-copying and trimmed to the closure, are design intent, not yet implemented).
+([boot-media.md](boot-media.md); a bundle trimmed to the closure is design intent, not yet
+implemented, [#1267](https://github.com/kottlerg/seraph/issues/1267)).
 
 Boot-time configuration on disk consists of only the two ESP files
 named above, the optional presence-only `\EFI\seraph\nokaslr` KASLR

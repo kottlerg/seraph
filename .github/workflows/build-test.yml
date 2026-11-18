@@ -277,11 +277,12 @@ jobs:
             # saved.
             cargo xtask test-crash-report --expect reports \
               --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
-            # Second boot: the log-level configuration test (#936). Composes the
-            # bundle with vfsd set to debug, boots the usertest staging above
-            # under the cell's budget, and checks that vfsd's and fatfs's debug
-            # lines appear and devmgr's and procmgr's do not; the staged bundle
-            # is put back afterwards.
+            # Second boot: the log-level configuration test (#936). Installs a
+            # configuration setting vfsd to debug and packs the default-init
+            # bundle, boots the usertest staging above under the cell's budget,
+            # and checks that vfsd's and fatfs's debug lines appear and
+            # devmgr's and procmgr's do not; the installed configuration and
+            # the recorded harness's bundle are put back afterwards.
             cargo xtask test-log-level --arch ${{ matrix.arch }} --timeout "$budget"
             # Third boot: the terminal interactive test (keyboard input
             # through the terminal). It needs the QMP `test-terminal` runner

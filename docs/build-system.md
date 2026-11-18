@@ -279,30 +279,37 @@ Build artifacts are staged in `sysroot/`, which is then packaged into the
 top-level `disk.img` GPT image consumed by QEMU (with the data partition on a
 second image, `disk-data.img`, under `mkdisk --split-data`). The sysroot is built for
 one architecture at a time; the active architecture is recorded in
-`sysroot/.arch`. Switching architectures requires a clean rebuild.
+`sysroot/.arch`. Switching architectures requires a clean rebuild. The harness
+whose bundle every pack composes, `init` or `ktest`, is recorded in
+`sysroot/.harness`: `cargo xtask build` records `init`, and
+`cargo xtask compose-bundle` the harness it is given.
 
 ```
 sysroot/
   .arch                   # "x86_64" or "riscv64"
-  esp/                    # EFI System Partition contents
+  .harness                # "init" or "ktest": the bundle every pack composes
+  boot/                   # The installed kernel and bootloader
+    kernel                # Microkernel, signed here
+    boot.efi              # Bootloader, embedding the trust store
+  esp/                    # EFI System Partition contents, composed by
+                          # every pack from installed files
     EFI/
       BOOT/               # UEFI fallback boot path
-        BOOTX64.EFI       # x86-64
-        BOOTRISCV64.EFI   # RISC-V
+        BOOTX64.EFI       # x86-64: a copy of boot/boot.efi
+        BOOTRISCV64.EFI   # RISC-V: a copy of boot/boot.efi
       seraph/             # Seraph vendor directory
-        boot.efi          # Bootloader (also copied to EFI/BOOT/BOOT<arch>.EFI)
-        kernel            # Microkernel
-        bootstrap.bundle  # Init + every boot module, packed by
-                          # `cargo xtask build` (or `compose-bundle`)
-                          # per `abi/boot-protocol::bundle`. Exactly
-                          # one of {init, ktest} appears as the
+        boot.efi          # A copy of boot/boot.efi
+        kernel            # A copy of boot/kernel
+        bootstrap.bundle  # The recorded harness's bundle, per
+                          # `abi/boot-protocol::bundle`: the installed
+                          # files its list in config/bundle/ names.
+                          # Exactly one of {init, ktest} appears as the
                           # bundle's `init` entry; ktest is monolithic
                           # so its bundle has zero module entries.
   services/               # Long-running userspace components sourced
                           # from services/ in the repo tree (init,
                           # procmgr, memmgr, devmgr, vfsd, svcmgr, logd,
-                          # pwrmgr, timed). The bundle composer reads
-                          # from this tree.
+                          # pwrmgr, timed).
   services/drivers/       # Device drivers sourced from
                           # services/drivers/<x>/ (the
                           # InstallDest::ServicesDrivers entries in
@@ -331,7 +338,8 @@ sysroot/
                           # which no drivers-directory pass at boot reads.
   tests/programs/         # Per-program tester binaries discovered by
                           # the usertest orchestrator.
-  config/                 # System configuration (from rootfs/)
+  config/                 # System configuration (from rootfs/), the
+                          # bundle lists in config/bundle/ among it
   data/                   # Data files used by fs / namespace tests
                           # (from rootfs/), plus deterministic svctest
                           # fixtures synthesised under data/svctest/,
@@ -341,16 +349,16 @@ sysroot/
 ```
 
 The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
-(the UEFI specification's fallback boot path). The kernel and boot-loaded
-services live alongside it under `EFI/seraph/`, the Seraph vendor directory
-within the EFI partition.
+(the UEFI specification's fallback boot path). The kernel and the bundle of
+boot-loaded services live alongside it under `EFI/seraph/`, the Seraph vendor
+directory within the EFI partition.
 
 `tests/` holds the test harnesses, per-program testers, and harness-only
 fixtures, but test-only artifacts also install under `services/drivers/`,
 `programs/`, `config/svcmgr/tests/`, `config/devmgr/tests/`, and `data/`;
 [testing.md § Sysroot layout](testing.md#sysroot-layout) lists them.
 
-Non-ESP, non-`data` directories (`services/`, `programs/`, `tests/`,
+Non-ESP, non-`data` directories (`boot/`, `services/`, `programs/`, `tests/`,
 `config/`, `crash/`) populate the GPT image's root partition, which userspace
 services mount via vfsd / fatfs after boot. `data/` populates a
 dedicated `SERAPH_DATA` partition instead of the root partition; vfsd
@@ -363,18 +371,21 @@ partition, except the discoverable `/data` mountpoint.
 
 The ESP is derived from the root partition ([boot-media.md](boot-media.md)): every object on it,
 the bootloader and the kernel included, is a byte copy of a file installed on the root partition,
-and composing it copies files and signs nothing. The bundle is composed so: each entry is a byte
-copy of its installed file, the data entries included, which the build installs under `/config/`
-from the repository (`ARCH_TABLES`, `LOG_LEVELS`). The rest is design intent, not yet
-implemented: the kernel and the bootloader are installed under `esp/` alone, and the bundle's
-entries are chosen by the lists in `xtask/src/bundle.rs`
-([#1264](https://github.com/kottlerg/seraph/issues/1264)).
+and composing it copies files, signs nothing and reads no key. Every pack composes it as its last
+step before it writes the images, so the ESP of every image equals the installed files. The
+bundle's entries are the installed files that the recorded harness's bundle list names
+(`config/bundle/<harness>.<arch>.list` where the architectures differ, `<harness>.list` where
+they do not, from [`rootfs/config/bundle/`](../rootfs/config/bundle/)), each by its install path;
+the list's `init` line names the object of the `init` slot. The data files a list names, the
+log-level configuration and the platform description tables, the build installs under `/config/`
+from the repository (`xtask/src/sysroot.rs`, `data_files`).
 
 The `esp/` and root-partition trees are populated from two sources:
 
 - Compiled binaries are installed by `cargo xtask build` to their
-  destinations (`esp/EFI/seraph/kernel` for the kernel; boot modules reach
-  the ESP only inside `bootstrap.bundle`),
+  destinations (`boot/kernel` for the kernel and `boot/boot.efi` for the
+  bootloader, which reach the ESP as copies; boot modules reach the ESP only
+  inside `bootstrap.bundle`),
   `services/<name>`, `services/drivers/<name>`,
   `services/fs/<name>`, or `programs/<name>` for std-userspace
   binaries, `tests/<name>` or `tests/programs/<name>` for harness
@@ -388,13 +399,13 @@ The `esp/` and root-partition trees are populated from two sources:
   synthesised `data/svctest/` fixtures are left untouched (see
   [`rootfs/README.md`](../rootfs/README.md)).
 
-Each packing of a disk image, and each composition of the bundle, signs the kernel, the ELF images
-under `services/`, `programs/` and `tests/` and the bundle's data entries in place, so each ends in
-a signature trailer
+Each packing of a disk image signs the kernel, the ELF images under `services/`, `programs/` and
+`tests/` and every other file a bundle list names in place, before it composes the ESP, so each
+ends in a signature trailer
 ([signing.md § Signed Object Format](signing.md#signed-object-format)); the bootloader verifies
 the kernel and each bundle entry, and procmgr every image it creates, and each loads only the body
 the verifier returns. In
-`bootstrap.bundle` every entry is its body plus a trailer, the data entries included
+`bootstrap.bundle` every entry is its body plus a trailer, the data files included
 ([xtask/README.md § Signing](../xtask/README.md#signing)).
 
 The disk image is assembled by xtask after the sysroot is populated. Cargo's

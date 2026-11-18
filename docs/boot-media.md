@@ -27,21 +27,19 @@ mount in [storage.md](storage.md).
 
 ## Implementation Status
 
-Partly implemented. Implemented: every service, driver, filesystem driver, program and test image,
-and each of the bundle's data entries (the log-level configuration and the platform description
-tables), is installed on the root filesystem at its install path and signed there once, with the
-set of roles it may be loaded in ([signing.md](signing.md) § Signing); every bundle entry other
-than `init` is named by its install path and is its installed file byte for byte, and the
-composition of the bundle copies files and signs nothing; the bootloader refuses an entry without
-the boot-module role; the bundle is used during bootstrap alone (§ Bootstrap-Only Boot Copies); the
-loss of the root filesystem's driver or of its disk is system death; and the ESP holds no secret.
+Partly implemented. Implemented: every shipped object, the kernel (`/boot/kernel`) and the
+bootloader (`/boot/boot.efi`) included, is installed on the root filesystem at its install path,
+and every signed one is signed there once, with the set of roles it may be loaded in
+([signing.md](signing.md) § Signing); every pack composes the ESP from the installed files, so
+each object on it is its installed file byte for byte, and the composition copies files, signs
+nothing and reads no key; the bundle's entries are chosen by a list per harness in configuration
+(`/config/bundle/`), and every entry other than `init` is named by its install path; the
+bootloader refuses an entry without the boot-module role; the bundle is used during bootstrap alone
+(§ Bootstrap-Only Boot Copies); the loss of the root filesystem's driver or of its disk is system
+death; and the ESP holds no secret.
 
 Design intent, not yet implemented:
 
-- The kernel and the bootloader have no installed copy: they exist only on the ESP
-  ([#1264](https://github.com/kottlerg/seraph/issues/1264)).
-- The bundle is chosen by lists in xtask (`xtask/src/bundle.rs`), not by a list in
-  configuration ([#1264](https://github.com/kottlerg/seraph/issues/1264)).
 - No step checks that the ESP's objects equal their installed files
   ([#1265](https://github.com/kottlerg/seraph/issues/1265)).
 - The bundle carries more than the bootstrap closure: the serial and framebuffer drivers and,

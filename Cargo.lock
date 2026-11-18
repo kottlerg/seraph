@@ -469,6 +469,7 @@ version = "0.1.4"
 dependencies = [
  "ipc",
  "logd-codec",
+ "logd-slot-table",
  "recv-pool",
  "syscall",
  "syscall-abi",
@@ -480,6 +481,14 @@ version = "0.1.4"
 dependencies = [
  "ipc",
  "syscall-abi",
+]
+
+[[package]]
+name = "logd-slot-table"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "logd-codec",
 ]
 
 [[package]]
@@ -1039,6 +1048,7 @@ dependencies = [
  "logd-codec",
  "objsig",
  "procmgr-process-table",
+ "svcmgr-defs",
  "syscall-abi",
  "vfsd-gpt",
 ]

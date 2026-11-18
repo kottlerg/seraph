@@ -1276,7 +1276,8 @@ process died resumes at the next badge above it.
 
 A process's name is the first string of the argv its creator passed (`CREATE_ARGV_ENV`), up to
 its NUL, truncated to `svcmgr_labels::NAME_MAX` (64) bytes, or empty for a process created
-without argv. For a service it is the first word of its recipe's `argv`. procmgr records it at
+without argv. For a service it is the first word of its recipe's `argv`; devmgr, vfsd and svcmgr,
+which init creates, carry their service name. procmgr records it at
 creation and never changes it. It is a label the creator chose, not an identity: two processes can
 share one, and a debugger that looks a process up by name takes the first match in badge order.
 The walk lists every live process procmgr created, those that declared themselves undebuggable

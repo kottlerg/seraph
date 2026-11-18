@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "logd-slot-table"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Pure logic: logd's sender slots, their history under its byte bound, and the
+# retired slots. Built against std, as logd is. Host-tested.
+
+[dependencies]
+# `log_query` views and codes, `log_record` spans: the stored form logd's
+# queries read.
+ipc = { path = "../../../shared/ipc" }
+# `LINE_BUF_SIZE`, `MAX_NAME_LEN`, the longest entry and the query rows.
+logd-codec = { path = "../codec" }
+
+[lints]
+workspace = true

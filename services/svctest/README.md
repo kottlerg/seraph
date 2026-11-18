@@ -94,7 +94,8 @@ services/svctest/
         ├── fs_faults/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
         │   ├── pressure.rs    # Own fatfs gives idle cache pages back at memory pressure Low
-        │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
+        │   ├── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
+        │   └── run_fill.rs    # Own fatfs fills sequential reads in runs; chain cursor retired
         ├── pwrmgr.rs          # Shutdown cap-deny check, terminal shutdown, `reboot` role
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
         ├── sessiond.rs        # sessiond's operator interface: badge gates, interface registration
@@ -354,14 +355,18 @@ session, whose relay gives the leader's end, and then memhog. When `stopsrc.svc`
 phase first sends the fixture `EXIT`, waits for its restarted instance's new nonce, so the source
 oomd finds started after oomd, and has it start a job of 64 pages; oomd must then log one `stopped
 stopsrc-job: ` line before its stop of memhog, and the fixture must report the job stopped. When
-crashd is staged with a stall, a child (`/programs/crashme oom-touch`) writes a page during the fill
-and crashd logs it resumed; with sessiond staged, the child's `go` waits until sessiond lists no
-candidate, so crashd's hold covers only memhog's stop. With `OOMD_STOP=no`, or without `oomd.svc`
-staged, it checks that memhog stays running and the level stays `CRITICAL` past the grace, the
-cooldown and 2000 ms, that oomd, if staged, logged at least one `would stop memhog: ` line and no
-stop, and then stops memhog itself through `caps[19]`, by the key svcmgr listed it under before the
-fill. In every case memhog's next instance answers `PROBE` with a new nonce and 0 pages
-([oomd](../oomd/README.md)).
+crashd is staged with a stall, a child (`/programs/crashme oom-touch 1024`) writes the pages of a
+demand region in turn during the fill, and crashd logs the write memmgr declines held, then resumed;
+with sessiond staged, the child's `go` waits until sessiond lists no candidate, so crashd's hold
+covers only memhog's stop. The pages oomd's last stop freed lie above the reserve until memhog's
+next top-up takes them back, and the child's writes spend them, so one write is always declined.
+The phase first checks that crashd's stall outlasts what oomd takes from the write to memhog's
+stop: a cooldown with sessiond staged, else the grace and a cooldown for `stopsrc`'s job. With
+`OOMD_STOP=no`, or without `oomd.svc` staged, it checks that memhog stays running and the level
+stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd, if staged, logged at least
+one `would stop memhog: ` line and no stop, and then stops memhog itself through `caps[19]`, by
+the key svcmgr listed it under before the fill. In every case memhog's next instance answers
+`PROBE` with a new nonce and 0 pages ([oomd](../oomd/README.md)).
 
 The `sessiond_operator` phase (`phases/sessiond.rs`, right after the svcmgr phases) runs when
 `sessiond.svc` is staged and `caps[15]` is set, and passes otherwise. Through the stop SEND svcmgr
@@ -495,7 +500,13 @@ its service endpoint as vfsd ends a driver it cannot use and must exit at its ne
 read the block server fails, drives memmgr's level to `Low` and back as `memmgr_pressure` does, and
 checks from the block server's log of reads that the driver gave back every idle cache page but the
 one svctest still maps and the few it keeps, the lost cap's page among them, with its children's
-charge falling to match and memmgr's pool total unchanged. The FS,
+charge falling to match and memmgr's pool total unchanged. The `fs_run_fill` phase after it starts
+fatfs the same way four times on one volume: from the block server's log of reads, a sequential
+`FS_READ_MEMORY` scan of a file fills runs of more than a page and at most `fat_parse::RUN_PAGES`
+pages, and a read off the sequence fills one page; a scan whose first run read loses its Memory
+cap fills one page at a time from there, and a write after it still succeeds; then an open whose
+chain cursor stands deep in the file reads the file's new bytes after a truncate and rewrite give
+the file the same first cluster and different later links. The FS,
 namespace, and procmgr phases read `/data/test.txt`; the FS phases also read the build-synthesised
 `/data/svctest/large.bin` and write their scratch files under `/data/svctest/`; `fsbench`, spawned
 by the `fs_crossover_bench` phase, reads the build-synthesised `/data/svctest/bench.bin`, which the

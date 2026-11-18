@@ -6,14 +6,18 @@
 //! A client of QEMU's own gdbstub (`-gdb unix:...`), which the host-driven
 //! tests use to act on a running guest at the hardware boundary, so the
 //! kernel carries no test code: `test-wedge` moves a CPU's program counter,
-//! and `test-cet` corrupts a kernel return address. It also holds the helpers
-//! those tests share: kernel symbol spans and the serial lines' hex fields.
+//! `test-cet` corrupts a kernel return address, and `test-core-death` moves
+//! a core service's thread. It also holds the helpers those tests share:
+//! kernel symbol spans and the serial lines' hex fields.
 //!
-//! Distinct from the GDB stub service (`services/gdbstub`), which debugs a
-//! userspace process over the debug port.
+//! The same client speaks to the GDB stub service (`services/gdbstub`), which
+//! debugs a userspace process over the debug port, a TCP port on the host
+//! ([`Stub::connect_tcp`]); `test-core-death` moves its target's thread
+//! through it.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -121,11 +125,48 @@ pub fn stop_thread(reply: &[u8]) -> Option<u64>
         .and_then(|id| u64::from_str_radix(id, 16).ok())
 }
 
-/// QEMU's gdbstub over its unix socket, in the protocol's acknowledged mode.
-/// Connecting stops the VM; detaching (`D`) resumes it.
+/// The connection to a gdbstub: QEMU's unix socket, or the debug port.
+enum Stream
+{
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Stream
+{
+    fn set_read_timeout(&self, timeout: Duration) -> std::io::Result<()>
+    {
+        match self
+        {
+            Self::Unix(s) => s.set_read_timeout(Some(timeout)),
+            Self::Tcp(s) => s.set_read_timeout(Some(timeout)),
+        }
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>
+    {
+        match self
+        {
+            Self::Unix(s) => s.read(buf),
+            Self::Tcp(s) => s.read(buf),
+        }
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()>
+    {
+        match self
+        {
+            Self::Unix(s) => s.write_all(buf),
+            Self::Tcp(s) => s.write_all(buf),
+        }
+    }
+}
+
+/// A gdbstub, in the protocol's acknowledged mode. Connecting to QEMU's
+/// stops the VM; detaching (`D`) resumes it.
 pub struct Stub
 {
-    stream: UnixStream,
+    stream: Stream,
     reader: PacketReader<PACKET_SIZE>,
 }
 
@@ -136,11 +177,34 @@ impl Stub
     {
         let stream = UnixStream::connect(path)
             .with_context(|| format!("connecting to the gdbstub at {}", path.display()))?;
-        stream.set_read_timeout(Some(answer_timeout))?;
+        Self::over(Stream::Unix(stream), answer_timeout)
+    }
+
+    /// Connect to a gdbstub served on the TCP address `addr` (the debug
+    /// port's), waiting at most `answer_timeout` for each later reply.
+    pub fn connect_tcp(addr: &str, answer_timeout: Duration) -> Result<Self>
+    {
+        let stream = TcpStream::connect(addr)
+            .with_context(|| format!("connecting to the gdbstub at {addr}"))?;
+        Self::over(Stream::Tcp(stream), answer_timeout)
+    }
+
+    fn over(stream: Stream, answer_timeout: Duration) -> Result<Self>
+    {
+        stream.set_read_timeout(answer_timeout)?;
         Ok(Self {
             stream,
             reader: PacketReader::new(),
         })
+    }
+
+    /// Wait at most `timeout` for each later reply: a continue's stop
+    /// reply comes only when the target stops.
+    pub fn set_answer_timeout(&mut self, timeout: Duration) -> Result<()>
+    {
+        self.stream
+            .set_read_timeout(timeout)
+            .context("setting the reply timeout")
     }
 
     /// Send `body` and return the reply's body, acknowledging it.

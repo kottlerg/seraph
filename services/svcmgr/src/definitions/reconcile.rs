@@ -266,7 +266,15 @@ pub fn reconcile_and_launch(
     let actuator = shutdown_actuator(&defs);
     for (i, def) in defs.iter().enumerate()
     {
-        let slot = handle_definition(def, pending, table, ctx, registry);
+        let role = if Some(i) == actuator
+        {
+            launch::Role::ShutdownActuator
+        }
+        else
+        {
+            launch::Role::Ordinary
+        };
+        let slot = handle_definition(def, role, pending, table, ctx, registry);
         if let Some(provided) = &def.shutdown_actuator
         {
             if Some(i) == actuator
@@ -372,9 +380,13 @@ fn record_shutdown_actuator(
 
 /// Route one parsed `Definition` to the bind-only or launch path. Returns
 /// the service-table slot of the supervised entry it recorded, or `None`
-/// for a one-shot launch or one that did not land.
+/// for a one-shot launch or one that did not land. `role` marks the
+/// recognised shutdown actuator: a supervised launch of it, and each restart,
+/// carries the receive-only derivation of svcmgr's own death queue
+/// (`launch::launch`).
 fn handle_definition(
     def: &Definition,
+    role: launch::Role,
     pending: &mut [PendingRegistration],
     table: &mut ServiceTable,
     ctx: &RestartCtx,
@@ -403,7 +415,7 @@ fn handle_definition(
     {
         // One-shot launch: no supervision binding, no `ServiceEntry`.
         // procmgr auto-reaps on exit.
-        let Some(launched) = launch::launch(def, ctx, registry, None)
+        let Some(launched) = launch::launch(def, ctx, registry, None, launch::Role::Ordinary)
         else
         {
             log!(warn: "svcmgr: launch failed: {}", def.name);
@@ -451,14 +463,15 @@ fn handle_definition(
     // Build the entry before launching, so a heap that cannot hold its name
     // and paths launches nothing rather than an instance svcmgr could not
     // supervise.
-    let (Some(mut entry), Some(recipe)) = (build_entry(def), recipe_from(def))
+    let (Some(mut entry), Some(mut recipe)) = (build_entry(def), recipe_from(def))
     else
     {
         log!(warn: "svcmgr: no memory for {}'s entry; not launched", def.name);
         return None;
     };
+    recipe.observes_svcmgr = role == launch::Role::ShutdownActuator;
 
-    let Some(launched) = launch::launch(def, ctx, registry, Some(tag))
+    let Some(launched) = launch::launch(def, ctx, registry, Some(tag), role)
     else
     {
         log!(warn: "svcmgr: launch failed: {}", def.name);
@@ -608,6 +621,7 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         stop_authority: def.stop_authority,
         reserve: def.reserve,
         stop_source: def.stop_source,
+        observes_svcmgr: false,
         priority: def.priority.unwrap_or(0),
         sched_max: def.sched_max.unwrap_or(0),
     })

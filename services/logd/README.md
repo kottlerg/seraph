@@ -87,16 +87,15 @@ after the restart included (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   § `stream_labels::STREAM_RECORD`).
 
-* **History buffer.** logd keeps a bounded per-sender ring of completed
-  entries, text lines and records (oldest entry dropped when full),
-  appended on every `STREAM_BYTES` line flush and every `STREAM_RECORD`
-  (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § History, which
-  states the stored form) and seeded at startup from init-logd's handover
-  `LINE` and `RECORD` chunks (see
-  [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). An
-  evicted slot is retired with its name and ring, a bounded number of them
-  kept (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Retired
-  slots).
+* **History buffer.** logd keeps a history of completed entries, text lines and records,
+  appended on every `STREAM_BYTES` line flush and every `STREAM_RECORD` (see
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § History, which states the stored form) and
+  seeded at startup from init-logd's handover `LINE` and `RECORD` chunks (see
+  [`docs/handover-protocol.md`](docs/handover-protocol.md) § `LINE`). The history of every
+  sender together is bounded by `HISTORY_BYTES` (256 KiB): an entry retained past it drops the
+  oldest entries logd-wide. A sender keeps at most its last `PER_SLOT_HISTORY` (16) entries. An
+  evicted slot is retired with its name and entries, a bounded number of them kept (see
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Retired slots).
 
 * **Query API.** `QUERY_SLOTS` reads the sender slots, live and retired,
   with each one's name and how it was evicted, and `QUERY_HISTORY` reads the
@@ -147,14 +146,12 @@ after the restart included (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   instance after a crash (see
   [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)
   § `reserve`). What logd takes from the reserve is what it grows by while memory is critical:
-  each live sender's history ring filling to `PER_SLOT_HISTORY` entries of at most about 1.5 KiB
-  and its partial line to `LINE_BUF_SIZE`, and a slot for each sender that sends its first line
-  meanwhile. After a restart while memory is critical that is every live sender, since the new
-  instance's table is empty, and the new instance's whole startup footprint is taken from the
-  reserve as well. The retired slots are capped
-  (`RETIRED_SLOTS`), and retiring a slot moves it. No constant bounds the growth, since it
-  grows with the live sender count ([docs/limits.md](../../docs/limits.md) § init and logd;
-  [#1287](https://github.com/kottlerg/seraph/issues/1287)).
+  its history, which `HISTORY_BYTES` (256 KiB) bounds whatever the number of senders, each live
+  sender's partial line filling to `LINE_BUF_SIZE`, and a slot of about 0.5 KiB for each sender
+  that sends its first line meanwhile. After a restart while memory is critical that is every live
+  sender, since the new instance's table is empty, and the new instance's whole startup footprint
+  is taken from the reserve as well; its history is bounded the same way
+  ([docs/limits.md](../../docs/limits.md) § init and logd).
 
 * **No core.** logd declares itself on the core path to procmgr
   (`procmgr_labels::DECLARE_NO_CORE`) at startup, before it spawns a
@@ -188,15 +185,16 @@ logd/
 ├── docs/
 │   ├── handover-protocol.md    # init-logd → logd wire format
 │   └── ipc-interface.md        # IPC labels logd handles
+├── slot-table/                 # logd-slot-table: SlotTable, the sender
+│                               # slots, their history under
+│                               # HISTORY_BYTES, and the retired slots
+│                               # (host-tested)
 └── src/
     ├── main.rs                 # entry, bootstrap, receive-pool
     │                           # handler, control loop, serial and
     │                           # framebuffer sinks and their writers,
     │                           # self_log
-    ├── handover.rs             # HANDOVER_PULL / HANDOVER_RELEASE caller
-    └── slot.rs                 # SlotTable: HashMap<badge, Slot>
-                                # with per-sender history ring, and
-                                # the retired slots
+    └── handover.rs             # HANDOVER_PULL / HANDOVER_RELEASE caller
 ```
 
 ## Bootstrap caps

@@ -22,7 +22,7 @@ use ipc::log_labels::{HANDOVER_PULL, HANDOVER_RELEASE};
 use ipc::log_record::Record;
 use logd_codec::handover::{self as wire, Chunk};
 
-use crate::slot::SlotTable;
+use logd_slot_table::SlotTable;
 
 /// Outcome of [`send_release`].
 enum Release

@@ -127,7 +127,8 @@ Every later start of an object is from its installed path, a further instance of
 booted included: vfsd starts `fatfs` from the bundle for the root mount alone and from
 `/services/fs/fatfs` for every later mount ([storage.md](storage.md) § First-mount structural
 constraint), and devmgr starts a driver from its bundle copy in its IOMMU and boot passes alone, and
-from the root filesystem in every later pass ([driver-binding.md](driver-binding.md) § Binding). A
+from the root filesystem in every later pass, a hot-added device's included
+([driver-binding.md](driver-binding.md) § Declaration Bounds, Source). A
 restart of a driver or a filesystem driver ([#1077](https://github.com/kottlerg/seraph/issues/1077),
 [#1078](https://github.com/kottlerg/seraph/issues/1078)) is a later start.
 

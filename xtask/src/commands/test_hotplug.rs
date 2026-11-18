@@ -578,7 +578,12 @@ fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32) -> Result<()>
     qmp::device_del(socket, PORT_DISK_ID, REMOVAL_TIMEOUT)?;
     step("hotplug test: QEMU deleted the disk");
     lines.start = Instant::now();
-    removal(lines, &NATIVE_REMOVAL, DISK_READD_MARKER, &[VFSD_REMOVED_MARKER])?;
+    removal(
+        lines,
+        &NATIVE_REMOVAL,
+        DISK_READD_MARKER,
+        &[VFSD_REMOVED_MARKER],
+    )?;
     step(
         "hotplug test: devmgr withdrew the driver and powered the slot off, vfsd tore the mount \
          down; adding the disk again",

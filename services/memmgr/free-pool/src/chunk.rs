@@ -601,16 +601,7 @@ pub fn release<S: SlotStore>(
                     stack = c;
                 }
             }
-            Node::Chunk(entry) =>
-            {
-                let mut run = entry.runs();
-                while let Node::Frame(frame) = arena.get(run).node
-                {
-                    let next = arena.get(run).next;
-                    retire(arena, run, frame);
-                    run = next;
-                }
-            }
+            Node::Chunk(entry) => retire_runs(arena, entry, &mut retire),
             // Not a table node: no table links to one, so leave it alone.
             Node::Free
             | Node::Run(_)
@@ -631,9 +622,118 @@ pub fn release<S: SlotStore>(
     }
 }
 
+/// Hand each run on the run list of `entry`, a resident or evicting chunk's,
+/// to `retire` with its slot, which `retire` takes over.
+fn retire_runs<S: SlotStore>(
+    arena: &mut Arena<S>,
+    entry: ChunkEntry,
+    retire: &mut impl FnMut(&mut Arena<S>, NodeIdx, FrameDesc),
+)
+{
+    let mut run = entry.runs();
+    while let Node::Frame(frame) = arena.get(run).node
+    {
+        let next = arena.get(run).next;
+        retire(arena, run, frame);
+        run = next;
+    }
+}
+
 /// The most directory levels a table has: the height of a table with a leaf
 /// for every `u64` chunk index.
 const MAX_HEIGHT: u32 = table_height(u64::MAX);
+
+/// Clear the chunks `first` to `end` (exclusive) of the table at `root` of
+/// `height` directory levels, for a range whose pages were discarded: free
+/// the leaf of each that has one, handing each run of it to `retire` as
+/// [`release`] does, and each directory node the clearing leaves with no
+/// child, setting `root` to [`NODE_NULL`] when the table empties. A cleared
+/// chunk reads [`ChunkEntry::UNBACKED`]. The walk descends from the root for
+/// each chunk it visits and skips the whole subtree below an absent child, so
+/// it visits only chunks that have a leaf and the first chunk of each absent
+/// subtree. Returns the leaves freed. Needs no slot, so it cannot fail.
+pub fn clear<S: SlotStore>(
+    arena: &mut Arena<S>,
+    root: &mut NodeIdx,
+    height: u32,
+    first: u64,
+    end: u64,
+    mut retire: impl FnMut(&mut Arena<S>, NodeIdx, FrameDesc),
+) -> u64
+{
+    let end = end.min(capacity(height));
+    let mut cleared: u64 = 0;
+    let mut index = first;
+    while index < end && *root != NODE_NULL
+    {
+        // The directory nodes on the path to the chunk `index`, from the
+        // root down, with the child each leads through.
+        let mut path = [(NODE_NULL, 0usize); MAX_HEIGHT as usize];
+        let mut depth: usize = 0;
+        let mut cur = *root;
+        let mut level = height;
+        while level > 0
+        {
+            let pos = digit(index, level);
+            if let Some(slot) = path.get_mut(depth)
+            {
+                *slot = (cur, pos);
+                depth = depth.saturating_add(1);
+            }
+            let below = child(arena, cur, pos);
+            if below == NODE_NULL
+            {
+                break;
+            }
+            cur = below;
+            level = level.saturating_sub(1);
+        }
+        if level > 0
+        {
+            // No chunk of the subtree the absent child stands for has an
+            // entry: go on at the first chunk past it.
+            let span = RADIX.saturating_pow(level.saturating_sub(1));
+            index = index
+                .checked_div(span)
+                .unwrap_or(0)
+                .saturating_add(1)
+                .saturating_mul(span);
+            continue;
+        }
+        if let Node::Chunk(entry) = arena.get(cur).node
+        {
+            retire_runs(arena, entry, &mut retire);
+        }
+        arena.free(cur);
+        cleared = cleared.saturating_add(1);
+        // Unlink the leaf, then free the directory nodes it emptied, from the
+        // deepest up: a node that keeps a child keeps every node above it.
+        let mut emptied = true;
+        while let Some(&(dir, pos)) = depth.checked_sub(1).and_then(|d| path.get(d))
+        {
+            set_child(arena, dir, pos, NODE_NULL);
+            let Node::ChunkDir(children) = arena.get(dir).node
+            else
+            {
+                emptied = false;
+                break;
+            };
+            if children.iter().any(|&c| c != NODE_NULL)
+            {
+                emptied = false;
+                break;
+            }
+            arena.free(dir);
+            depth = depth.saturating_sub(1);
+        }
+        if emptied
+        {
+            *root = NODE_NULL;
+        }
+        index = index.saturating_add(1);
+    }
+    cleared
+}
 
 /// Raise the table at `root` from `height` to `new_height` directory levels,
 /// for a region that grew: each new level is a directory node whose child 0 is
@@ -1158,5 +1258,111 @@ mod tests
                 assert_eq!(root, NODE_NULL, "keep {keep}");
             }
         }
+    }
+
+    #[test]
+    fn clear_drops_the_chunks_of_its_range_and_leaves_the_table_of_the_rest()
+    {
+        let backed = [0, 1, 7, 35, 36, 37, 71, 199];
+        let ranges = [
+            (0, 1),
+            (0, 200),
+            (1, 2),
+            (2, 7),
+            (7, 8),
+            (35, 38),
+            (36, 72),
+            (37, 199),
+            (72, 199),
+            (199, 500),
+            (500, 600),
+        ];
+        for (first, end) in ranges
+        {
+            let mut a = arena();
+            let free = a.free_count();
+            let height = table_height(200);
+            let mut root = table_with(&mut a, 200, &backed);
+            let mut dropped = Vec::new();
+            let cleared = clear(&mut a, &mut root, height, first, end, |a, idx, f| {
+                dropped.push(f.cap_slot);
+                a.free(idx);
+            });
+            let in_range = |i: &u64| (first..end).contains(i);
+            let kept: Vec<u64> = backed.iter().copied().filter(|i| !in_range(i)).collect();
+            let gone: Vec<u64> = backed.iter().copied().filter(in_range).collect();
+            dropped.sort_unstable();
+            assert_eq!(dropped, gone, "{first}..{end}");
+            assert_eq!(cleared, gone.len() as u64, "{first}..{end}");
+            for i in 0..200
+            {
+                assert_eq!(
+                    entry(&a, root, height, i).runs() != NODE_NULL,
+                    kept.contains(&i),
+                    "{first}..{end}: chunk {i}"
+                );
+            }
+            // What is left is the table of the kept entries, slot for slot:
+            // every directory node the clearing emptied is free.
+            assert_eq!(
+                free - a.free_count(),
+                slots_of(200, &kept),
+                "{first}..{end}"
+            );
+            if kept.is_empty()
+            {
+                assert_eq!(root, NODE_NULL, "{first}..{end}");
+            }
+        }
+        // A one-chunk table's root is its leaf.
+        let mut a = arena();
+        let free = a.free_count();
+        let mut root = table_with(&mut a, 1, &[0]);
+        assert_eq!(
+            clear(&mut a, &mut root, 0, 0, 1, |a, idx, _| a.free(idx)),
+            1
+        );
+        assert_eq!(root, NODE_NULL);
+        assert_eq!(a.free_count(), free);
+    }
+
+    #[test]
+    fn clear_skips_each_absent_subtree_whole()
+    {
+        // A sparse table of a region of 6^20 chunks: a walk chunk by chunk
+        // would not end, one that skips each absent subtree visits a few
+        // chunks per level.
+        let chunks = RADIX.pow(20);
+        let height = table_height(chunks);
+        let mut a = arena();
+        let free = a.free_count();
+        let backed = [3, RADIX.pow(9) + 1, chunks - 1];
+        let mut root = NODE_NULL;
+        for &i in &backed
+        {
+            let run = a
+                .alloc(
+                    Node::Frame(FrameDesc {
+                        cap_slot: i,
+                        page_count: 1,
+                        phys_base: 0,
+                        va: 0,
+                        region_id: NO_REGION_ID,
+                    }),
+                    NODE_NULL,
+                )
+                .unwrap();
+            let e = ChunkEntry::UNBACKED.back(0, 1, run).unwrap();
+            assert!(set_entry(&mut a, &mut root, height, i, e));
+        }
+        let mut dropped = Vec::new();
+        let cleared = clear(&mut a, &mut root, height, 1, u64::MAX, |a, idx, f| {
+            dropped.push(f.cap_slot);
+            a.free(idx);
+        });
+        assert_eq!(cleared, 3);
+        assert_eq!(dropped, backed);
+        assert_eq!(root, NODE_NULL);
+        assert_eq!(a.free_count(), free);
     }
 }

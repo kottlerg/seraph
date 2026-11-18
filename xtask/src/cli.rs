@@ -186,6 +186,15 @@ subcommands! {
         /// QMP's SHUTDOWN event gives reason `guest-shutdown`, and QEMU exits on
         /// its own (see xtask/README.md).
         TestPowerbutton(TestPowerbuttonArgs),
+
+        /// Check that the death of a core or critical service powers the
+        /// system off: boot once per target, kill it by a terminal fault made
+        /// from outside the guest (the GDB stub service for svcmgr, devmgr,
+        /// vfsd and logd, logd until its restart budget is spent; QEMU's
+        /// gdbstub and a hardware breakpoint for memmgr and procmgr), and pass
+        /// when QMP's SHUTDOWN event gives reason `guest-shutdown` and QEMU
+        /// exits on its own (see xtask/README.md).
+        TestCoreDeath(TestCoreDeathArgs),
         /// Check PCI Express hotplug: stage the `hotplug-check` fixture and the
         /// `test-dma` class, boot the current sysroot with two empty root ports
         /// (on `x86_64` once under the machine's default, the firmware's ACPI PCI
@@ -330,6 +339,7 @@ impl CliCommand
             | Self::TestDebugPort(_)
             | Self::TestReboot(_)
             | Self::TestPowerbutton(_)
+            | Self::TestCoreDeath(_)
             | Self::TestHotplug(_)
             | Self::TestGdb(_)
             | Self::TestWedge(_)
@@ -1014,6 +1024,72 @@ args! {
 args! {
     pub struct TestPowerbuttonArgs
     {
+        /// Number of vCPUs to expose to the guest (QEMU -smp).
+        #[arg(long, default_value = "4")]
+        pub cpus: u32,
+
+        /// Guest memory size in MiB (QEMU -m).
+        #[arg(long, default_value = "512")]
+        pub mem: u32,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+// ── TestCoreDeath ────────────────────────────────────────────────────────────
+
+value_enum! {
+    /// A service `test-core-death` kills.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CoreDeathTarget
+    {
+        /// memmgr's thread, in an allocation.
+        Memmgr,
+        /// A procmgr request worker, in a create.
+        Procmgr,
+        /// procmgr's reaper thread, in a reap.
+        ProcmgrReaper,
+        /// svcmgr's main thread.
+        Svcmgr,
+        /// devmgr's main thread.
+        Devmgr,
+        /// vfsd's main thread.
+        Vfsd,
+        /// logd's main thread, once per restart its budget allows and once
+        /// more.
+        Logd,
+    }
+}
+
+impl CoreDeathTarget
+{
+    /// Every target, in the order a run without `--target` kills them.
+    pub const ALL: [Self; 7] = [
+        Self::Memmgr,
+        Self::Procmgr,
+        Self::ProcmgrReaper,
+        Self::Svcmgr,
+        Self::Devmgr,
+        Self::Vfsd,
+        Self::Logd,
+    ];
+}
+
+args! {
+    pub struct TestCoreDeathArgs
+    {
+        /// Target architecture.
+        #[arg(long, default_value = "x86_64")]
+        pub arch: Arch,
+
+        /// The services to kill, one boot each (default: every one).
+        /// Repeatable, or comma-separated.
+        #[arg(long, value_delimiter = ',')]
+        pub target: Vec<CoreDeathTarget>,
+
         /// Number of vCPUs to expose to the guest (QEMU -smp).
         #[arg(long, default_value = "4")]
         pub cpus: u32,

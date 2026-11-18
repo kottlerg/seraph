@@ -3,8 +3,8 @@
 
 // runtime/ruststd/heap-fit/src/lib.rs
 
-//! Placement rule of the seraph std overlay's byte heap, as pure host-tested
-//! logic.
+//! Placement and release rules of the seraph std overlay's byte heap, as pure
+//! host-tested logic.
 //!
 //! The heap keeps its free space as an address-ordered list of free blocks,
 //! each at least `min_block` bytes so it can hold the list node. An
@@ -13,8 +13,14 @@
 //! list, so a block is placed only where each of them is empty or can hold a
 //! node: no byte of a block leaves the free list unless the allocation that
 //! `dealloc` later returns covers it. [`fit_bound`] sizes the free block that
-//! always places a request, which the heap's grow path maps. The free-list
-//! surgery stays with the caller. See
+//! always places a request, which the heap's grow path maps.
+//!
+//! A heap whose growth is a committed memmgr region gives freed pages of it
+//! back ([`Growth`]): it cuts the region's top when the free block at the top
+//! is large enough ([`Growth::trim`]), and discards the whole chunks of a
+//! large freed block's free block ([`Growth::discard`]); neither reaches the
+//! bytes of the block's own list node. The free-list surgery and the memmgr
+//! calls stay with the caller. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
@@ -98,6 +104,98 @@ pub fn fit_bound(want: usize, align: usize, min_block: usize) -> Option<usize>
         .checked_add(align)?
         .checked_add(want)?
         .checked_add(min_block)
+}
+
+/// A heap's committed growth region, `[base, end)`, whose length is a whole
+/// number of `chunk`-byte chunks counted from `base`: the unit memmgr cuts
+/// and discards the region in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Growth
+{
+    /// The region's base.
+    pub base: usize,
+    /// The region's end, the top of the heap.
+    pub end: usize,
+    /// Bytes of a chunk; nonzero.
+    pub chunk: usize,
+}
+
+impl Growth
+{
+    /// The new end of the region when its top free block starts at `block`
+    /// and holds its list node in its first `node` bytes: the end of the
+    /// chunk that holds the node's last byte, `pad` bytes above it, and at
+    /// least one chunk above the base, so the region keeps a nonzero length.
+    /// `None` when the cut would take fewer than `min` bytes, or none.
+    ///
+    /// The caller passes `pad` as a whole number of chunks, so the new end
+    /// is one too.
+    #[must_use]
+    pub fn trim(&self, block: usize, node: usize, pad: usize, min: usize) -> Option<usize>
+    {
+        let reached = block.checked_add(node)?.saturating_sub(self.base);
+        let keep = reached
+            .checked_next_multiple_of(self.chunk)?
+            .checked_add(pad)?
+            .max(self.chunk);
+        let top = self.base.checked_add(keep)?;
+        let cut = self.end.checked_sub(top)?;
+        (cut != 0 && cut >= min).then_some(top)
+    }
+
+    /// The chunks `[lo, hi)` of the region a free of `[freed, freed_end)`
+    /// lets the heap discard, when its bytes coalesced into the free block
+    /// `[block, block_end)`, whose list node takes its first `node` bytes:
+    /// each chunk of the region that lies wholly in the block past its node
+    /// and meets `[freed, freed_end + node)`, the bytes the free made free and
+    /// the list node of a block above it that the free merged. The chunks of
+    /// the block the free did not touch were whole free chunks before it, given
+    /// back then or never. `None` for no chunk, and for a free of fewer than
+    /// `min` bytes, which gives nothing back.
+    #[must_use]
+    pub fn discard(
+        &self,
+        block: usize,
+        block_end: usize,
+        freed: usize,
+        freed_end: usize,
+        node: usize,
+        min: usize,
+    ) -> Option<(usize, usize)>
+    {
+        if freed_end.checked_sub(freed)? < min
+        {
+            return None;
+        }
+        let len = self.end.checked_sub(self.base)?;
+        let past_node = block
+            .checked_add(node)?
+            .saturating_sub(self.base)
+            .checked_next_multiple_of(self.chunk)?;
+        let from_freed = round_down(freed.saturating_sub(self.base), self.chunk)?;
+        let lo = past_node.max(from_freed);
+        let block_top = block_end.min(self.end).checked_sub(self.base)?;
+        let in_block = if block_top == len
+        {
+            len
+        }
+        else
+        {
+            round_down(block_top, self.chunk)?
+        };
+        let to_freed = freed_end
+            .checked_add(node)?
+            .saturating_sub(self.base)
+            .checked_next_multiple_of(self.chunk)?;
+        let hi = in_block.min(to_freed);
+        (lo < hi).then_some((self.base.checked_add(lo)?, self.base.checked_add(hi)?))
+    }
+}
+
+/// `offset` rounded down to a multiple of `chunk`; `None` for a zero chunk.
+fn round_down(offset: usize, chunk: usize) -> Option<usize>
+{
+    offset.checked_sub(offset.checked_rem(chunk)?)
 }
 
 #[cfg(test)]
@@ -222,6 +320,137 @@ mod tests
                     if let Some(f) = f
                     {
                         assert_well_formed(f, start, size, want, align);
+                    }
+                }
+            }
+        }
+    }
+
+    const CHUNK: usize = 0x1_0000;
+    const BASE: usize = 0x40_0000;
+
+    /// A growth region of `chunks` chunks at [`BASE`].
+    fn growth(chunks: usize) -> Growth
+    {
+        Growth {
+            base: BASE,
+            end: BASE + chunks * CHUNK,
+            chunk: CHUNK,
+        }
+    }
+
+    #[test]
+    fn a_trim_keeps_the_chunk_of_the_node_and_the_pad_above_it()
+    {
+        let g = growth(10);
+        // The node ends inside chunk 3: chunks 0 to 3 and a pad of two stay.
+        assert_eq!(
+            g.trim(BASE + 3 * CHUNK + 0x100, MIN_BLOCK, 2 * CHUNK, 4 * CHUNK),
+            Some(BASE + 6 * CHUNK)
+        );
+        // A node that ends on a chunk boundary keeps no chunk above it.
+        assert_eq!(
+            g.trim(BASE + 3 * CHUNK - MIN_BLOCK, MIN_BLOCK, 0, CHUNK),
+            Some(BASE + 3 * CHUNK)
+        );
+        // A cut smaller than the minimum, or empty, is none.
+        assert_eq!(
+            g.trim(BASE + 3 * CHUNK + 0x100, MIN_BLOCK, 2 * CHUNK, 5 * CHUNK),
+            None
+        );
+        assert_eq!(g.trim(BASE + 9 * CHUNK, MIN_BLOCK, CHUNK, 0), None);
+        // A block that starts below the region, in the floor, keeps the pad,
+        // and at least one chunk.
+        assert_eq!(
+            g.trim(BASE - 0x1000, MIN_BLOCK, 2 * CHUNK, CHUNK),
+            Some(BASE + 2 * CHUNK)
+        );
+        assert_eq!(
+            g.trim(BASE - 0x1000, MIN_BLOCK, 0, CHUNK),
+            Some(BASE + CHUNK)
+        );
+        // A one-chunk region is never cut.
+        assert_eq!(growth(1).trim(BASE - 0x1000, MIN_BLOCK, 0, 0), None);
+    }
+
+    #[test]
+    fn a_discard_takes_the_whole_chunks_the_free_made_free_past_the_node()
+    {
+        let g = growth(16);
+        let min = 4 * CHUNK;
+        // A free of chunks 2 to 7 plus a little either side, merged with no
+        // neighbour: the chunk of its node and the chunk it ends in stay.
+        let (freed, freed_end) = (BASE + 2 * CHUNK - 0x40, BASE + 8 * CHUNK + 0x40);
+        assert_eq!(
+            g.discard(freed, freed_end, freed, freed_end, MIN_BLOCK, min),
+            Some((BASE + 2 * CHUNK, BASE + 8 * CHUNK))
+        );
+        // A small free gives nothing back, whatever its block.
+        assert_eq!(
+            g.discard(
+                BASE,
+                g.end,
+                BASE + 5 * CHUNK,
+                BASE + 6 * CHUNK,
+                MIN_BLOCK,
+                min
+            ),
+            None
+        );
+        // Merged into a block below it, the free gives back the chunk it
+        // shares with that block, but no chunk of the block it did not touch.
+        let (freed, freed_end) = (BASE + 6 * CHUNK + 0x40, BASE + 11 * CHUNK);
+        assert_eq!(
+            g.discard(BASE + 0x80, freed_end, freed, freed_end, MIN_BLOCK, min),
+            Some((BASE + 6 * CHUNK, BASE + 11 * CHUNK))
+        );
+        // Merged with a block above it, whose node sat at a chunk boundary,
+        // the free also gives back the chunk of that node.
+        let (freed, freed_end) = (BASE + CHUNK, BASE + 5 * CHUNK);
+        assert_eq!(
+            g.discard(freed, BASE + 9 * CHUNK, freed, freed_end, MIN_BLOCK, min),
+            Some((BASE + 2 * CHUNK, BASE + 6 * CHUNK))
+        );
+        // A block that reaches the region's top takes the last chunk.
+        let freed = BASE + 10 * CHUNK + 0x40;
+        assert_eq!(
+            g.discard(freed, g.end, freed, g.end, MIN_BLOCK, min),
+            Some((BASE + 11 * CHUNK, g.end))
+        );
+        // A free in the floor, below the region, gives nothing back.
+        let floor = BASE - 8 * CHUNK;
+        assert_eq!(g.discard(floor, BASE, floor, BASE, MIN_BLOCK, min), None);
+    }
+
+    #[test]
+    fn every_discard_lies_in_its_block_past_its_node_and_meets_the_free()
+    {
+        let g = growth(12);
+        let step = CHUNK / 2 + 8;
+        let starts = (BASE - 2 * CHUNK..g.end).step_by(step);
+        for block in starts
+        {
+            for block_end in (block + MIN_BLOCK..=g.end).step_by(step)
+            {
+                for freed in (block..block_end).step_by(3 * step)
+                {
+                    for freed_end in (freed + MIN_BLOCK..=block_end).step_by(3 * step)
+                    {
+                        let Some((lo, hi)) =
+                            g.discard(block, block_end, freed, freed_end, MIN_BLOCK, 0)
+                        else
+                        {
+                            continue;
+                        };
+                        let at = (block, block_end, freed, freed_end);
+                        assert!(lo >= block + MIN_BLOCK && hi <= block_end, "{at:x?}");
+                        assert!(lo >= g.base && hi <= g.end, "{at:x?}");
+                        assert!((lo - g.base).is_multiple_of(CHUNK), "{at:x?}");
+                        assert!(
+                            (hi - g.base).is_multiple_of(CHUNK) || hi == g.end,
+                            "{at:x?}"
+                        );
+                        assert!(lo < freed_end + MIN_BLOCK && hi > freed, "{at:x?}");
                     }
                 }
             }

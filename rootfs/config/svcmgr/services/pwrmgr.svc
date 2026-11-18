@@ -28,7 +28,9 @@
 # `shutdown_actuator = pwrmgr.shutdown` declares pwrmgr the system's
 # shutdown actuator: when a `critical = yes` service is permanently down,
 # svcmgr calls SHUTDOWN through a SEND it derives from pwrmgr's endpoint
-# with the `pwrmgr.shutdown` entry's SHUTDOWN_AUTHORITY badge.
+# with the `pwrmgr.shutdown` entry's SHUTDOWN_AUTHORITY badge, and serves
+# pwrmgr as cap[3] the RECV-only derivation of svcmgr's own death queue, on
+# which pwrmgr observes svcmgr's death and powers the platform off.
 # `critical = no`: a permanently-dead pwrmgr cannot power the system off,
 # so a graceful shutdown on its death is impossible; the honest terminal
 # state is logged-and-continue, matching timed.

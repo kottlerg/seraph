@@ -148,9 +148,69 @@ fn main() -> !
     );
     install_drivers_dir(&caps, &state.pending, ipc_buf);
 
+    let self_death_queue = observe_own_death(info);
+
     std::os::seraph::log!("endowed; waiting for handover");
 
-    event_loop(info, &caps, deaths, ipc_buf, &mut state);
+    event_loop(info, &caps, deaths, self_death_queue, ipc_buf, &mut state);
+}
+
+/// Entries the queue svcmgr's own death posts to holds: one from the
+/// main-thread observer and one from the address-space observer.
+const SELF_DEATH_CAPACITY: u32 = 2;
+
+/// Create the event queue svcmgr's own death posts to, and bind svcmgr's main
+/// thread and address space to it (docs/supervision.md § Observing svcmgr):
+/// the main thread's exit and the first terminal fault of any svcmgr thread
+/// each post an entry. Both binds need Control, which svcmgr holds on itself
+/// alone, so svcmgr makes them and hands the shutdown actuator only a
+/// receive-only derivation of the queue ([`restart::mint_self_death_recv`]).
+/// Returns the queue, or `0`, logged, when it cannot be created or neither
+/// observer binds; a queue with one observer bound is kept, its missing
+/// observer logged.
+fn observe_own_death(info: &StartupInfo) -> u64
+{
+    let Some(queue) = std::os::seraph::object_slab_retype(
+        std::os::seraph::event_queue_retype_bytes(
+            u64::from(SELF_DEATH_CAPACITY),
+            u64::from(SELF_DEATH_CAPACITY),
+        ),
+        |slab| {
+            syscall::event_queue_create_observed(slab, SELF_DEATH_CAPACITY, SELF_DEATH_CAPACITY)
+                .ok()
+        },
+    )
+    else
+    {
+        std::os::seraph::log!(error: "own death queue not created; svcmgr's death is unobserved");
+        return 0;
+    };
+    let thread = syscall::thread_bind_notification(info.self_thread, queue, 0).is_ok();
+    let aspace = syscall::aspace_bind_notification(info.self_aspace, queue, 0).is_ok();
+    match (thread, aspace)
+    {
+        (true, true) => queue,
+        (false, false) =>
+        {
+            std::os::seraph::log!(error: "own death observers not bound; svcmgr's death is unobserved");
+            let _ = syscall::cap_delete(queue);
+            0
+        }
+        (true, false) =>
+        {
+            std::os::seraph::log!(
+                error: "own address-space observer not bound; a worker fault of svcmgr is unobserved"
+            );
+            queue
+        }
+        (false, true) =>
+        {
+            std::os::seraph::log!(
+                error: "own main-thread observer not bound; svcmgr's main-thread exit is unobserved"
+            );
+            queue
+        }
+    }
 }
 
 /// Publish the well-known names svcmgr owns into its own discovery
@@ -465,6 +525,7 @@ fn event_loop(
     info: &StartupInfo,
     caps: &service::SvcmgrCaps,
     deaths: death_set::DeathSet,
+    self_death_queue: u64,
     ipc_buf: *mut u64,
     state: &mut SvcmgrState,
 ) -> !
@@ -477,6 +538,7 @@ fn event_loop(
         deaths,
         master_log_source: caps.master_log_source,
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
+        self_death_queue,
     };
 
     // One guard covers both spin shapes: a failing wait_set_wait, and a

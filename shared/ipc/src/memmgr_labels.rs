@@ -331,6 +331,30 @@ pub const NODE_RELEASE: u64 = 18;
 /// `services/memmgr/docs/ipc-interface.md` § Label 19: `CREATE_SUB_NODE`.
 pub const CREATE_SUB_NODE: u64 = 19;
 
+/// Bytes of one memmgr demand chunk, the unit a region's chunk table records
+/// and `SHRINK_REGION` and [`DISCARD_RANGE`] cut and discard a region in,
+/// counted from the region's base.
+pub const DEMAND_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// Discard pages of a demand region of the caller, attributed by
+/// `recv.badge`: memmgr unmaps them and takes back the frames that backed
+/// them, and the next touch of a page of them faults in a zero-filled page.
+/// A committed region keeps its commitment, so that touch is not declined
+/// for budget or RAM.
+///
+/// Wire format:
+/// * `data[0]` — `va` (a whole number of 64 KiB demand chunks above the
+///   region's base).
+/// * `data[1]` — `len_bytes` (nonzero; a whole number of chunks, or
+///   reaching the region's end).
+///
+/// Reply: `memmgr_errors::SUCCESS` (also for a range already discarded);
+/// `INVALID_ARGUMENT` (unknown badge, no region holding `va`, or a range
+/// that breaks the rule above or leaves the region); or `UNAUTHORIZED` (a
+/// node handle). Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 20: `DISCARD_RANGE`.
+pub const DISCARD_RANGE: u64 = 20;
+
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.
 pub const PRESSURE_NORMAL: u64 = 0;

@@ -108,9 +108,13 @@ jobs:
         # `sysroot/config/devmgr/tests/` into `classes/`, and its boots attach
         # the test devices (`--test-devices`, below) the test-only drivers bind.
         # The svctest cell also co-stages memhog (memhog.svc), which svctest's
-        # oom_policy phase has fill memory until oomd stops it; the cell keeps
-        # crashd, so the phase's child writes a page while memory is critical
-        # and crashd resumes it once the stop frees memory. It also co-stages
+        # oom_policy phase has fill memory until oomd stops it. The cell keeps
+        # crashd, which build-test.yml's svctest cells drop, so the phase's
+        # child writes the pages of a demand region once oomd has stopped every
+        # program, spending the pages the last stop freed; crashd holds the
+        # write memmgr declines and resumes it when oomd's stop of memhog, a
+        # cooldown later and inside crashd's stall, frees memory
+        # (services/crashd/docs/operation.md § Hold). It also co-stages
         # stopsrc (stopsrc.svc), a stop source of the program class, whose job
         # oomd stops first and whose source svcmgr lists.
         # The usertest cell also stages crashd's test recipe over the default

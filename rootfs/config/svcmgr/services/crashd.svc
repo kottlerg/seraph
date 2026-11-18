@@ -28,8 +28,9 @@
 #
 # `CRASHD_OOM_STALL_MS` holds a fault memmgr declined for want of memory for up
 # to 10000 ms (services/crashd/docs/operation.md § Hold): longer than oomd's
-# grace and cooldown together (services/oomd.svc), so a fault held while oomd
-# stops a service to free memory resumes rather than kills.
+# grace and cooldown together (services/oomd.svc), so a fault held from the
+# level's rise outlasts oomd's first two stops, and resumes when either frees
+# memory; a later stop finds it reported and declined.
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure

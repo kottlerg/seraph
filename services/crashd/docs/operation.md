@@ -79,9 +79,21 @@ how long crashd holds a page fault memmgr declined for want of memory before it 
 declines it. No entry, or `0`, holds none, and crashd handles every fault as
 [Per Fault](#per-fault) says. A value that is not decimal digits is logged as a warning and holds
 none; one past 600 000 ms (`STALL_MAX_MS`, ten minutes) is clamped to it, logged. The shipped
-recipe sets 10 000 ms, longer than oomd's grace and cooldown together; the usertest boot's sets
-3000 ms
+recipe sets 10 000 ms; the usertest boot's sets 3000 ms
 ([docs/testing.md](../../../docs/testing.md) § Crash reports).
+
+**The stall and oomd's ladder.** oomd stops one candidate once the level has read `CRITICAL` for
+its grace (2000 ms), and another each cooldown (5000 ms) while it still reads `CRITICAL`
+([services/oomd/docs/operation.md](../../oomd/docs/operation.md) § Ladder). The shipped stall is
+longer than the grace and the cooldown together, so a fault held from the level's rise outlasts
+oomd's first two acts, at 2000 ms and 7000 ms, and the 3000 ms after the second in which its
+stopped candidate's memory comes back; a fault held later in the episode outlasts the act that
+falls due next. When the stops within the stall give back too little to lift the level, the act
+that does falls after the stall: the hold times out, and crashd reports and declines the fault. The
+stall is not sized to the ladder, whose length is the number of candidates oomd stops before the
+one whose memory lifts the level, and which no fixed bound covers; it bounds how long a thread
+waits on the policy, and a stop that frees memory within it resumes the thread rather than ending
+it.
 
 With a stall set, crashd makes 16 hold endpoints at start (`SLOTS`), each the queue of one held
 fault, and a wait set of procmgr's crash endpoint and the Notification on which the runtime

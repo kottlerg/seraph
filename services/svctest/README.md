@@ -82,6 +82,9 @@ services/svctest/
         ├── heap_commit.rs     # Committed heap growth: max refusal as an allocation error, a grant
         │                      #   past the promised bound, no fault declined, committed region
         │                      #   register, extend, shrink; all-RAM-accounted identity
+        ├── discard.rs         # DISCARD_RANGE and SHRINK_REGION return frames; discarded pages
+        │                      #   refault zero-filled and, committed, cannot be declined;
+        │                      #   the std heap's discard and trim; all-RAM-accounted identity
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -351,14 +354,18 @@ session, whose relay gives the leader's end, and then memhog. When `stopsrc.svc`
 phase first sends the fixture `EXIT`, waits for its restarted instance's new nonce, so the source
 oomd finds started after oomd, and has it start a job of 64 pages; oomd must then log one `stopped
 stopsrc-job: ` line before its stop of memhog, and the fixture must report the job stopped. When
-crashd is staged with a stall, a child (`/programs/crashme oom-touch`) writes a page during the fill
-and crashd logs it resumed; with sessiond staged, the child's `go` waits until sessiond lists no
-candidate, so crashd's hold covers only memhog's stop. With `OOMD_STOP=no`, or without `oomd.svc`
-staged, it checks that memhog stays running and the level stays `CRITICAL` past the grace, the
-cooldown and 2000 ms, that oomd, if staged, logged at least one `would stop memhog: ` line and no
-stop, and then stops memhog itself through `caps[19]`, by the key svcmgr listed it under before the
-fill. In every case memhog's next instance answers `PROBE` with a new nonce and 0 pages
-([oomd](../oomd/README.md)).
+crashd is staged with a stall, a child (`/programs/crashme oom-touch 1024`) writes the pages of a
+demand region in turn during the fill, and crashd logs the write memmgr declines held, then resumed;
+with sessiond staged, the child's `go` waits until sessiond lists no candidate, so crashd's hold
+covers only memhog's stop. The pages oomd's last stop freed lie above the reserve until memhog's
+next top-up takes them back, and the child's writes spend them, so one write is always declined.
+The phase first checks that crashd's stall outlasts what oomd takes from the write to memhog's
+stop: a cooldown with sessiond staged, else the grace and a cooldown for `stopsrc`'s job. With
+`OOMD_STOP=no`, or without `oomd.svc` staged, it checks that memhog stays running and the level
+stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd, if staged, logged at least
+one `would stop memhog: ` line and no stop, and then stops memhog itself through `caps[19]`, by
+the key svcmgr listed it under before the fill. In every case memhog's next instance answers
+`PROBE` with a new nonce and 0 pages ([oomd](../oomd/README.md)).
 
 The `sessiond_operator` phase (`phases/sessiond.rs`, right after the svcmgr phases) runs when
 `sessiond.svc` is staged and `caps[15]` is set, and passes otherwise. Through the stop SEND svcmgr
@@ -408,6 +415,8 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `node-handle-child`         | `node_handle`  | `memmgr_node_handles` (max set by handle)   |
 | `heap-commit-limited`       | `heap_commit`  | `memmgr_heap_commit` (4096-page max)        |
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
+| `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
+| `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---

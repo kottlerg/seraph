@@ -78,6 +78,20 @@ pub const fn meta_bound(len: u64) -> u64
         .div_ceil(SLOTS_PER_PAGE)
 }
 
+/// The metadata-arena pages `chunks` chunks of a committed region can take
+/// at most once they hold no entry: [`META_SLOTS_PER_CHUNK`] for each, in
+/// pages of [`SLOTS_PER_PAGE`] slots. A discard that clears them gives the
+/// region's metadata bound back this much, at most up to [`meta_bound`] of
+/// its length, so their refaults draw on the bound as their first touches
+/// did.
+#[must_use]
+pub const fn meta_of_chunks(chunks: u64) -> u64
+{
+    chunks
+        .saturating_mul(META_SLOTS_PER_CHUNK)
+        .div_ceil(SLOTS_PER_PAGE)
+}
+
 /// What committing a region's growth from `old_len` to `new_len` bytes
 /// adds, each part in pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,5 +285,20 @@ mod tests
             .map(|l| chunks.div_ceil(6u64.pow(l)))
             .sum();
         assert!(dirs <= chunks + u64::from(table_height(chunks)));
+    }
+
+    #[test]
+    fn the_metadata_of_cleared_chunks_is_their_slots_in_pages()
+    {
+        assert_eq!(meta_of_chunks(0), 0);
+        assert_eq!(meta_of_chunks(1), 1);
+        let chunks = 1 << 12;
+        assert_eq!(
+            meta_of_chunks(chunks),
+            (chunks * (u64::from(DEMAND_CHUNK_PAGES) + 2)).div_ceil(SLOTS_PER_PAGE)
+        );
+        // The chunks of a region need no more than its bound less the
+        // directory levels the bound adds.
+        assert!(meta_of_chunks(chunks) <= meta_bound(chunks * CHUNK_BYTES));
     }
 }

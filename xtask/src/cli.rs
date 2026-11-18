@@ -110,10 +110,11 @@ subcommands! {
         /// xtask/README.md.
         CheckDisk(CheckDiskArgs),
 
-        /// Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from
-        /// `sysroot/services/` and repack `disk.img`. Use `--harness ktest`
-        /// to run the kernel test harness; the default is `--harness init`.
-        /// Requires a populated sysroot from a prior `cargo xtask build`.
+        /// Record the harness whose bundle every pack composes from the
+        /// installed files its bundle list names, and repack `disk.img`. Use
+        /// `--harness ktest` to run the kernel test harness; the default is
+        /// `--harness init`. Requires a populated sysroot from a prior `cargo
+        /// xtask build`.
         ComposeBundle(ComposeBundleArgs),
 
         /// Boot the terminal interactive test: launch QEMU with a QMP control
@@ -151,10 +152,11 @@ subcommands! {
         TestMapRedo(TestMapRedoArgs),
 
         /// Check that the log-level configuration reaches the services init
-        /// spawns: compose the bundle with vfsd set to debug, boot the current
-        /// sysroot once through `run-parallel`, assert that vfsd's and fatfs's
-        /// debug lines appear and devmgr's and procmgr's do not, and compose the
-        /// bundle back (see xtask/README.md).
+        /// spawns: install a configuration with vfsd set to debug and pack the
+        /// default-init bundle, boot the current sysroot once through
+        /// `run-parallel`, assert that vfsd's and fatfs's debug lines appear and
+        /// devmgr's and procmgr's do not, and restore the configuration and the
+        /// recorded harness's bundle (see xtask/README.md).
         TestLogLevel(TestLogLevelArgs),
 
         /// Check the debug port's transport: stage the `debug-echo` fixture,
@@ -1142,7 +1144,8 @@ args! {
         #[arg(long, default_value = "x86_64")]
         pub arch: Arch,
 
-        /// Which harness binary to use as the bundle's `init` entry.
+        /// Which harness's bundle list composes the bundle, and so which
+        /// object is its `init` entry.
         #[arg(long, default_value = "init")]
         pub harness: Harness,
     }

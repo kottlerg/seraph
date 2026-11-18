@@ -24,17 +24,17 @@
 //!   their own, which the bootloader and procmgr skip, and the boot reaches
 //!   the terminal's READY line.
 //!
+//! Every boot packs the default-init harness's bundle, which the pack composes
+//! from the installed files; the substitutes are written in the images alone.
 //! A boot passes when every line it is owed appears; it fails at once on any
 //! other refusal or a fatal marker, and at its deadline naming the lines
 //! missing ([`Judge`]). Every boot's serial log is saved under
 //! `target/xtask/test-signing/<arch>/`. The sysroot is left as it was, apart
 //! from the signing every pack does, and the disk images are packed again in
-//! the layout they had.
+//! the layout they had, with the recorded harness's bundle.
 //!
-//! Requires a populated sysroot from `cargo xtask build` whose staged bundle
-//! may be any harness's: the command signs the sysroot for the default-init
-//! harness, composes its bundle into its own directory for the boots, and
-//! leaves the staged one in place.
+//! Requires a populated sysroot from `cargo xtask build`, whose recorded
+//! harness may be any.
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
@@ -57,7 +57,7 @@ use crate::qemu::{
     GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
     X86ShadowStack, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
-use crate::signing::{Config, Signer, bootloader_images, os_random, prepend_records};
+use crate::signing::{Config, Signer, os_random, prepend_records};
 use crate::util::{require_tool, step};
 
 /// The terminal's line once it reads input. Kept in sync with
@@ -91,8 +91,11 @@ const BOOTLOADER_TIMEOUT: Duration = Duration::from_mins(3);
 /// Budget for the boot that reaches the terminal.
 const ROOTFS_TIMEOUT: Duration = Duration::from_mins(6);
 
-/// The sysroot-relative paths of the objects the cases replace.
-const KERNEL: &str = "esp/EFI/seraph/kernel";
+/// The sysroot-relative paths of the objects the cases read or replace: the
+/// installed kernel, its ESP copy, the bundle on the ESP, and installed
+/// services and programs.
+const KERNEL: &str = "boot/kernel";
+const ESP_KERNEL: &str = "esp/EFI/seraph/kernel";
 const BUNDLE: &str = "esp/EFI/seraph/bootstrap.bundle";
 const TAMPERED: &str = "services/timed";
 const WRONG_ROLE: &str = "services/pwrmgr";
@@ -133,11 +136,11 @@ pub fn run(ctx: &Context, args: &TestSigningArgs) -> Result<()>
     // Read before anything changes, so a failure cannot change what the
     // restore writes.
     let layout = crate::disk::current_layout(ctx)?;
-    let bundle = init_bundle(ctx, args.arch, &dir)?;
-    // A plain pack signs the sysroot, whose signed objects the cases derive
-    // theirs from.
-    crate::disk::create_disk_image(ctx, args.arch, layout)?;
-    let cases = prepare(ctx, args, &dir, &bundle);
+    // A pack of the default-init bundle signs the sysroot, whose signed
+    // objects the cases derive theirs from, and composes the bundle the
+    // `bundle` case tampers with.
+    let cases = crate::disk::create_disk_image_for(ctx, args.arch, layout, Harness::Init)
+        .and_then(|()| prepare(ctx, args, &dir));
     let results = cases.and_then(|cases| {
         // Held until the last boot's QEMU has exited.
         let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
@@ -175,43 +178,19 @@ pub fn run(ctx: &Context, args: &TestSigningArgs) -> Result<()>
     Ok(())
 }
 
-/// Sign the sysroot for the default-init harness, compose its bundle, copy
-/// it to `dir`, and put the staged bundle back; returns the copy's path. The
-/// next pack signs the sysroot for the staged bundle's harness again.
-fn init_bundle(ctx: &Context, arch: Arch, dir: &Path) -> Result<PathBuf>
-{
-    let staged_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
-    let staged = fs::read(&staged_path)
-        .with_context(|| format!("reading the staged {}", staged_path.display()))?;
-    let copy = dir.join("bootstrap.bundle");
-    let composed = crate::signing::sign_for_harness(ctx, arch, Harness::Init)
-        .and_then(|()| crate::bundle::compose(ctx, arch, Harness::Init))
-        .context("composing the default-init bundle")
-        .and_then(|()| {
-            fs::copy(&staged_path, &copy)
-                .with_context(|| format!("copying the bundle to {}", copy.display()))
-        });
-    fs::write(&staged_path, &staged)
-        .with_context(|| format!("restoring the staged {}", staged_path.display()))?;
-    composed?;
-    Ok(copy)
-}
-
-/// Build every case's objects under `dir`.
-fn prepare(ctx: &Context, args: &TestSigningArgs, dir: &Path, bundle: &Path) -> Result<Vec<Case>>
+/// Build every case's objects under `dir`, from the sysroot a pack of the
+/// default-init bundle signed and the bundle it composed.
+fn prepare(ctx: &Context, args: &TestSigningArgs, dir: &Path) -> Result<Vec<Case>>
 {
     let signer = Signer::open(ctx, args.arch)?;
     let kernel = read_sysroot(ctx, KERNEL)?;
-    let init_bundle = fs::read(bundle).with_context(|| format!("reading {}", bundle.display()))?;
+    let init_bundle = read_sysroot(ctx, BUNDLE)?;
     let kernel_case = Case {
         name: "kernel",
-        substitutes: vec![
-            sub(BUNDLE, bundle.to_path_buf()),
-            sub(
-                KERNEL,
-                stage(dir, "kernel.tampered", &flip_body_byte(&kernel)?)?,
-            ),
-        ],
+        substitutes: vec![sub(
+            ESP_KERNEL,
+            stage(dir, "kernel.tampered", &flip_body_byte(&kernel)?)?,
+        )],
         expect: vec![boot_refusal("kernel", "Failed(BodyHash)")],
         timeout: BOOTLOADER_TIMEOUT,
     };
@@ -231,18 +210,17 @@ fn prepare(ctx: &Context, args: &TestSigningArgs, dir: &Path, bundle: &Path) -> 
     Ok(vec![
         kernel_case,
         bundle_case,
-        revoked_case(ctx, args, dir, bundle, &signer)?,
-        rootfs_case(ctx, args.arch, dir, bundle, &signer)?,
+        revoked_case(ctx, args, dir, &signer)?,
+        rootfs_case(ctx, args.arch, dir, &signer)?,
     ])
 }
 
 /// The `revoked` case: a bootloader built under the build's store with
-/// `signer`'s key revoked, in place of both installed images.
+/// `signer`'s key revoked, in place of both ESP copies of the installed one.
 fn revoked_case(
     ctx: &Context,
     args: &TestSigningArgs,
     dir: &Path,
-    bundle: &Path,
     signer: &Signer,
 ) -> Result<Case>
 {
@@ -263,8 +241,8 @@ fn revoked_case(
     };
     step("signature test: building a bootloader under a store revoking the signing key");
     crate::commands::build::compile_boot(ctx, &build, &revoking, &boot)?;
-    let mut substitutes = vec![sub(BUNDLE, bundle.to_path_buf())];
-    for image in bootloader_images(ctx, args.arch)
+    let mut substitutes = Vec::new();
+    for image in crate::esp::bootloader_copies(ctx, args.arch)
     {
         let relative = image
             .strip_prefix(&ctx.sysroot)
@@ -284,13 +262,7 @@ fn revoked_case(
 
 /// The `rootfs` case: three services procmgr refuses, and the kernel and
 /// the terminal each with an untrusted record before their own.
-fn rootfs_case(
-    ctx: &Context,
-    arch: Arch,
-    dir: &Path,
-    bundle: &Path,
-    signer: &Signer,
-) -> Result<Case>
+fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result<Case>
 {
     let untrusted = untrusted_signer(ctx, arch)?;
     let foreign_record = |relative: &str, object: &[u8], role: Role| -> Result<Vec<u8>> {
@@ -334,8 +306,7 @@ fn rootfs_case(
     Ok(Case {
         name: "rootfs",
         substitutes: vec![
-            sub(BUNDLE, bundle.to_path_buf()),
-            sub(KERNEL, stage(dir, "kernel.two-records", &kernel)?),
+            sub(ESP_KERNEL, stage(dir, "kernel.two-records", &kernel)?),
             sub(TAMPERED, stage(dir, "timed.tampered", &tampered)?),
             sub(WRONG_ROLE, stage(dir, "pwrmgr.data", &as_data)?),
             sub(UNTRUSTED, stage(dir, "crashd.untrusted", &foreign)?),
@@ -536,7 +507,13 @@ fn boot_case(
     case: &Case,
 ) -> Result<()>
 {
-    crate::disk::create_disk_image_substituting(ctx, args.arch, layout, &case.substitutes)?;
+    crate::disk::create_disk_image_substituting(
+        ctx,
+        args.arch,
+        layout,
+        Harness::Init,
+        &case.substitutes,
+    )?;
     let log_path = dir.join(format!("{}.log", case.name));
     let mut log =
         fs::File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;

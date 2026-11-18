@@ -21,13 +21,13 @@ Commands:
   symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes. Runs in CI's validate job; see xtask/README.md
-  compose-bundle     Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from `sysroot/services/` and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
+  compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
   test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
   test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: compose the bundle with vfsd set to debug, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and compose the bundle back (see xtask/README.md)
+  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
   test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
   test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
@@ -69,13 +69,13 @@ Commands:
   symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes. Runs in CI's validate job; see xtask/README.md
-  compose-bundle     Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from `sysroot/services/` and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
+  compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
   test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
   test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: compose the bundle with vfsd set to debug, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and compose the bundle back (see xtask/README.md)
+  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
   test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
   test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
@@ -736,16 +736,16 @@ Usage: xtask check-disk
 Options:
   -h, --help  Print help
 === xtask compose-bundle -h
-Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from `sysroot/services/` and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
+Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
 
 Usage: xtask compose-bundle [OPTIONS]
 
 Options:
       --arch <ARCH>        Target architecture — must match the existing sysroot's arch tag [default: x86_64] [possible values: x86_64, riscv64]
-      --harness <HARNESS>  Which harness binary to use as the bundle's `init` entry [default: init] [possible values: init, ktest]
+      --harness <HARNESS>  Which harness's bundle list composes the bundle, and so which object is its `init` entry [default: init] [possible values: init, ktest]
   -h, --help               Print help (see more with '--help')
 === xtask compose-bundle --help
-Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from `sysroot/services/` and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
+Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
 
 Usage: xtask compose-bundle [OPTIONS]
 
@@ -760,11 +760,11 @@ Options:
           [default: x86_64]
 
       --harness <HARNESS>
-          Which harness binary to use as the bundle's `init` entry
+          Which harness's bundle list composes the bundle, and so which object is its `init` entry
 
           Possible values:
-          - init:  Regular userspace init at `sysroot/services/init`. Bundle includes every service module the system needs to bootstrap userspace
-          - ktest: `sysroot/tests/ktest` as the `"init"` entry. Bundle is a single entry; ktest is monolithic and does not spawn userspace modules
+          - init:  The userspace init, `/services/init`, with every module the system needs to bootstrap userspace (`init.<arch>.list`)
+          - ktest: The kernel-test harness, `/tests/ktest`, as the `"init"` entry alone: ktest is monolithic and spawns no module (`ktest.list`)
           
           [default: init]
 
@@ -1051,7 +1051,7 @@ Options:
   -h, --help
           Print help (see a summary with '-h')
 === xtask test-log-level -h
-Check that the log-level configuration reaches the services init spawns: compose the bundle with vfsd set to debug, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and compose the bundle back (see xtask/README.md)
+Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
 
 Usage: xtask test-log-level [OPTIONS]
 
@@ -1068,7 +1068,7 @@ Options:
       --grant <HOLDER>     Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
   -h, --help               Print help (see more with '--help')
 === xtask test-log-level --help
-Check that the log-level configuration reaches the services init spawns: compose the bundle with vfsd set to debug, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and compose the bundle back (see xtask/README.md)
+Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
 
 Usage: xtask test-log-level [OPTIONS]
 
@@ -2391,13 +2391,13 @@ Commands:
   symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes. Runs in CI's validate job; see xtask/README.md
-  compose-bundle     Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from `sysroot/services/` and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
+  compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
   test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
   test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: compose the bundle with vfsd set to debug, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and compose the bundle back (see xtask/README.md)
+  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
   test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
   test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)

@@ -55,6 +55,7 @@ mod debug_stub;
 mod diag;
 mod disk;
 mod error;
+mod esp;
 mod fat;
 mod firmware;
 mod fs_compat;

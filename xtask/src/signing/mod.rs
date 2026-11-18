@@ -8,11 +8,10 @@
 //!
 //! Every object is signed once, in the sysroot, under its install path and the
 //! roles it may be loaded in ([`sign_sysroot`]): the kernel, every ELF image
-//! under `services/`, `programs/` and `tests/`, and the bundle's data
-//! entries. [`crate::disk::create_disk_image`] signs the sysroot as it packs,
-//! and every command that composes a bundle signs it first
-//! ([`sign_for_harness`]), since [`crate::bundle`] copies installed files
-//! and signs nothing. A signed object is its body and a trailer of one record
+//! under `services/`, `programs/` and `tests/`, and every other file a
+//! bundle list names. [`crate::disk::create_disk_image`] signs the sysroot as
+//! it packs ([`sign_for_harness`]), before [`crate::esp`] composes the ESP,
+//! which copies installed files and signs nothing. A signed object is its body and a trailer of one record
 //! ([`Signer::sign`]), which [`objsig::verify`] accepts under the build's
 //! trust store before it is written, with each of its roles, its name and the
 //! architecture the bootloader and procmgr expect of it.
@@ -165,9 +164,9 @@ pub struct Signer
 impl Signer
 {
     /// The signer of a pack of `arch` in `ctx`: [`Self::for_bootloader`],
-    /// refused unless every bootloader image installed in the sysroot embeds
-    /// its trust store ([`check_installed_store`]), so no pack signs under a
-    /// store the bootloader it boots with does not hold.
+    /// refused unless the installed bootloader embeds its trust store
+    /// ([`check_installed_store`]), so no pack signs under a store the
+    /// bootloader it boots with, a copy of the installed one, does not hold.
     ///
     /// # Errors
     ///
@@ -175,7 +174,7 @@ impl Signer
     pub fn open(ctx: &BuildContext, arch: Arch) -> Result<Self>
     {
         let signer = Self::for_bootloader(ctx, arch)?;
-        check_installed_store(&bootloader_images(ctx, arch), signer.store())?;
+        check_installed_store(&ctx.installed_bootloader(), signer.store())?;
         Ok(signer)
     }
 
@@ -452,32 +451,25 @@ fn location_role(path: &Path) -> Role
 /// under (`boot_protocol::bundle::INIT_ENTRY_NAME`).
 pub const INIT_SLOT: &str = "init";
 
-/// The install path of init, signed `init` with the init role alone.
-const INIT_PATH: &str = "/services/init";
-
-/// The install path of ktest, signed `init` with the init role alone in an
-/// image packed with the ktest harness in its `init` slot.
-const KTEST_PATH: &str = "/tests/ktest";
-
 /// The name and the role set the ELF image installed at `install` is signed
-/// with in an image whose bundle's `init` slot holds `harness`, whose
-/// default bundle names the objects `boot_modules` holds: init's, and
-/// ktest's under the ktest harness, `init` with the init role alone; every
-/// other image's its install path, with its [`location_role`] and the
-/// boot-module role when the bundle names it (docs/signing.md § Signing).
+/// with, where `slots` holds the objects signed into the `init` slot and
+/// `boot_modules` the entries the bundle lists name: an object of `slots`,
+/// `init` with the init role alone; every other image, its install path with
+/// its [`location_role`], and the boot-module role when a list names it
+/// (docs/signing.md § Signing).
 fn image_signature(
     install: &str,
     relative: &Path,
-    harness: Harness,
-    boot_modules: &[&str],
+    slots: &[String],
+    boot_modules: &[String],
 ) -> (String, RoleSet)
 {
-    if install == INIT_PATH || (install == KTEST_PATH && harness == Harness::Ktest)
+    if slots.iter().any(|slot| slot == install)
     {
         return (INIT_SLOT.to_owned(), RoleSet::of(&[Role::Init]));
     }
     let role = location_role(relative);
-    let roles = if boot_modules.contains(&install)
+    let roles = if boot_modules.iter().any(|module| module == install)
     {
         RoleSet::of(&[role, Role::BootModule])
     }
@@ -505,18 +497,23 @@ fn install_name(path: &Path) -> Result<String>
     Ok(name)
 }
 
-/// Sign every object of the sysroot for a pack of `arch` whose bundle's
-/// `init` slot holds `harness`: the kernel, `kernel` with the kernel role
-/// alone; every ELF image under [`SIGNED_TREES`] as [`image_signature`]
-/// says; and each of the bundle's data entries the sysroot installs for
-/// `arch`, under its install path with the boot-module role
-/// (`crate::bundle::data_entries`). Returns how many objects were signed and
-/// how many of them changed.
+/// Sign every object of the sysroot for a pack of `arch` that composes the
+/// bundle of `harness`, as the installed bundle lists of `arch` say
+/// (`crate::bundle::read_list`): the installed kernel, `kernel` with the
+/// kernel role alone; every ELF image under [`SIGNED_TREES`] as
+/// [`image_signature`] says; and every other installed file a list names,
+/// `init` with the init role alone when it is the object of a signed
+/// `init` slot, under its install path with the boot-module role alone
+/// otherwise. The `init` slot objects signed are the init harness's, always,
+/// and `harness`'s. A file a list names that the sysroot does not install is
+/// left to the compose of a bundle that names it, which refuses it. Returns how
+/// many objects were signed and how many of them changed.
 ///
 /// # Errors
 ///
-/// On an I/O failure, when a data entry of `arch` is not installed, and the
-/// errors of [`Signer::sign_file`].
+/// On an I/O failure; the errors of `crate::bundle::read_list` and
+/// [`Signer::sign_file`]; when an object a list puts in the `init` slot is
+/// an entry of a list too, since an object is signed under one name.
 pub fn sign_sysroot(
     ctx: &BuildContext,
     signer: &Signer,
@@ -524,46 +521,66 @@ pub fn sign_sysroot(
     harness: Harness,
 ) -> Result<(usize, usize)>
 {
-    let boot_modules = crate::bundle::boot_modules(arch);
+    let boot_modules = crate::bundle::boot_modules(ctx, arch)?;
+    let mut slots = vec![crate::bundle::read_list(ctx, arch, Harness::Init)?.init];
+    let packed = crate::bundle::read_list(ctx, arch, harness)?.init;
+    if !slots.contains(&packed)
+    {
+        slots.push(packed);
+    }
+    if let Some(both) = slots.iter().find(|slot| boot_modules.contains(slot))
+    {
+        bail!(
+            "{both} is the object of an `init` slot and an entry of a bundle list: an object \
+             is signed under one name"
+        );
+    }
     let mut total = 0usize;
     let mut changed = 0usize;
     let mut count = |was_changed: bool| {
         total = total.saturating_add(1);
         changed = changed.saturating_add(usize::from(was_changed));
     };
-    let kernel = ctx.sysroot_efi_seraph().join("kernel");
+    let kernel = ctx.installed_kernel();
     if kernel.is_file()
     {
         count(signer.sign_file(&kernel, RoleSet::of(&[Role::Kernel]), "kernel")?);
     }
+    let mut done = std::collections::HashSet::new();
     for tree in SIGNED_TREES
     {
         for relative in elf_images(&ctx.sysroot, Path::new(tree))?
         {
             let install = install_name(&relative)?;
-            let (name, roles) = image_signature(&install, &relative, harness, &boot_modules);
+            let (name, roles) = image_signature(&install, &relative, &slots, &boot_modules);
             count(signer.sign_file(&ctx.sysroot.join(&relative), roles, &name)?);
+            done.insert(install);
         }
     }
-    for entry in crate::bundle::data_entries(arch)
+    for install in slots.iter().chain(&boot_modules)
     {
-        let path = ctx.sysroot.join(entry.relative());
-        if !path.is_file()
+        let path = ctx.sysroot.join(install.trim_start_matches('/'));
+        if done.contains(install) || !path.is_file()
         {
-            bail!(
-                "{} is not installed (run `cargo xtask build` first)",
-                path.display()
-            );
+            continue;
         }
-        count(signer.sign_file(&path, RoleSet::of(&[Role::BootModule]), entry.install)?);
+        let (name, role) = if slots.contains(install)
+        {
+            (INIT_SLOT, Role::Init)
+        }
+        else
+        {
+            (install.as_str(), Role::BootModule)
+        };
+        count(signer.sign_file(&path, RoleSet::of(&[role]), name)?);
     }
     Ok((total, changed))
 }
 
-/// Sign the sysroot for a pack of `arch` whose bundle's `init` slot holds
+/// Sign the sysroot for a pack of `arch` that composes the bundle of
 /// `harness` ([`sign_sysroot`]), with the signer of a pack
-/// ([`Signer::open`]): what a command does before it composes a bundle of
-/// `harness`, since the bundle copies the installed files as they are.
+/// ([`Signer::open`]): what a pack does before it composes the ESP, since
+/// the ESP copies the installed files as they are.
 ///
 /// # Errors
 ///
@@ -648,49 +665,61 @@ pub fn write_boot_store(ctx: &BuildContext, signer: &Signer) -> Result<PathBuf>
     Ok(path)
 }
 
-/// The bootloader images the sysroot installs for `arch`: the one
-/// `\EFI\seraph\boot.efi` names and the removable-media default the firmware
-/// boots.
-pub fn bootloader_images(ctx: &BuildContext, arch: Arch) -> [PathBuf; 2]
-{
-    [
-        ctx.sysroot_efi_seraph().join("boot.efi"),
-        ctx.sysroot_efi_boot().join(arch.boot_efi_filename()),
-    ]
-}
-
-/// Refuse unless each of `images` embeds `store`: the trust store read out of
-/// the image ([`objsig::embed::find`]) is the one the pack signs under.
+/// The trust store the installed bootloader (`/boot/boot.efi`) embeds: the
+/// one a boot of a pack verifies under, since the ESP's bootloader images are
+/// its copies.
 ///
 /// # Errors
 ///
-/// Naming the image and the rebuild that fixes it: when an image cannot be
+/// When the image cannot be read or embeds no store or more than one.
+pub fn installed_store(ctx: &BuildContext) -> Result<Vec<u8>>
+{
+    let image = ctx.installed_bootloader();
+    let bytes = fs::read(&image).with_context(|| {
+        format!(
+            "reading the installed bootloader {} (run `cargo xtask build`)",
+            image.display()
+        )
+    })?;
+    let store = objsig::embed::find(&bytes).map_err(|e| {
+        err!(
+            "the installed bootloader {} holds no trust store ({e:?}): run `cargo xtask build`",
+            image.display()
+        )
+    })?;
+    Ok(store.to_vec())
+}
+
+/// Refuse unless `image` embeds `store`: the trust store read out of the
+/// image ([`objsig::embed::find`]) is the one the pack signs under.
+///
+/// # Errors
+///
+/// Naming the image and the rebuild that fixes it: when the image cannot be
 /// read, embeds no store or more than one, embeds one that does not parse, or
 /// embeds another store.
-pub fn check_installed_store(images: &[PathBuf], store: &[u8]) -> Result<()>
+pub fn check_installed_store(image: &Path, store: &[u8]) -> Result<()>
 {
     const FIX: &str = "rebuild the bootloader with `cargo xtask build`";
-    for image in images
+    let bytes = fs::read(image).with_context(|| {
+        format!(
+            "reading the installed bootloader {}, whose trust store a pack signs under ({FIX})",
+            image.display()
+        )
+    })?;
+    let embedded = objsig::embed::find(&bytes).map_err(|e| {
+        err!(
+            "the installed bootloader {} holds no trust store a pack can read ({e:?}): {FIX}",
+            image.display()
+        )
+    })?;
+    if embedded != store
     {
-        let bytes = fs::read(image).with_context(|| {
-            format!(
-                "reading the installed bootloader {}, whose trust store a pack signs under                  ({FIX})",
-                image.display()
-            )
-        })?;
-        let embedded = objsig::embed::find(&bytes).map_err(|e| {
-            err!(
-                "the installed bootloader {} holds no trust store a pack can read ({e:?}): {FIX}",
-                image.display()
-            )
-        })?;
-        if embedded != store
-        {
-            bail!(
-                "the installed bootloader {} embeds another trust store than this build signs                  under, so it would refuse what the pack signs: {FIX}",
-                image.display()
-            );
-        }
+        bail!(
+            "the installed bootloader {} embeds another trust store than this build signs under, \
+             so it would refuse what the pack signs: {FIX}",
+            image.display()
+        );
     }
     Ok(())
 }
@@ -703,6 +732,21 @@ pub mod testing
 
     use super::{Config, Signer};
     use crate::arch::Arch;
+    use crate::context::Context as BuildContext;
+
+    /// Install the repository's bundle lists (`rootfs/config/bundle/`) in the
+    /// sysroot of `ctx`, as the rootfs mirror does.
+    pub fn install_lists(ctx: &BuildContext)
+    {
+        let from = work_tree().join("rootfs").join(crate::bundle::LIST_DIR);
+        let to = ctx.sysroot.join(crate::bundle::LIST_DIR);
+        std::fs::create_dir_all(&to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap()
+        {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
 
     /// The work tree the tests' identities lie outside of: the repository.
     pub fn work_tree() -> PathBuf
@@ -1009,7 +1053,7 @@ mod tests
     /// Each ELF image of the test sysroot of riscv64 under the init harness:
     /// its sysroot-relative path, its role set and its name.
     const SIGNED_IMAGES: [(&str, &[Role], &str); 9] = [
-        ("esp/EFI/seraph/kernel", &[Role::Kernel], "kernel"),
+        ("boot/kernel", &[Role::Kernel], "kernel"),
         ("services/init", &[Role::Init], "init"),
         (
             "services/devmgr",
@@ -1042,21 +1086,23 @@ mod tests
 
     // Defect caught: an object left unsigned, signed under a name or a role
     // set its loader does not expect (a bundle entry without the boot-module
-    // role, an object the bundle does not name with it, init under its path,
-    // ktest as init in an image that does not boot it), a data entry left
-    // unsigned, or a file outside the signed trees given a trailer.
+    // role, an object no list names with it, init under its path, ktest as
+    // init in an image that does not boot it), a data file a list names left
+    // unsigned, a file outside the signed trees given a trailer (the
+    // installed bootloader among them), or an object signed both into an
+    // `init` slot and as an entry.
     #[test]
     fn the_sysroot_objects_are_signed_under_their_names_and_roles()
     {
         let arch = Arch::Riscv64;
         let images = SIGNED_IMAGES;
-        let data = crate::bundle::data_entries(arch);
-        assert!(
-            data.iter()
-                .any(|entry| entry.install == "/config/init/log-levels.conf")
-        );
+        let data: Vec<&str> = [
+            "/config/devmgr/platform/qemu-virt.platform",
+            "/config/init/log-levels.conf",
+        ]
+        .into();
         // ELF files outside the signed trees, and a text file inside one.
-        let outside = ["config/x", "esp/EFI/seraph/boot.efi"];
+        let outside = ["config/x", "boot/boot.efi", "esp/EFI/seraph/kernel"];
         let text = "services/init.conf";
         let mut files: Vec<(&str, &[u8])> = images
             .iter()
@@ -1069,16 +1115,9 @@ mod tests
                 .map(|path| (*path, b"\x7fELF outside".as_slice())),
         );
         files.push((text, b"vfsd = debug\n"));
-        let relatives: Vec<String> = data
-            .iter()
-            .map(crate::bundle::DataEntry::relative)
-            .collect();
-        files.extend(
-            relatives
-                .iter()
-                .map(|path| (path.as_str(), b"data = 1\n".as_slice())),
-        );
+        files.extend(data.iter().map(|path| (&path[1..], b"data = 1\n".as_slice())));
         let (root, ctx) = sysroot_of("sysroot", &files);
+        testing::install_lists(&ctx);
         let signer = signer(&root.join("keys"), arch);
 
         let objects = images.len() + 1 + data.len();
@@ -1105,17 +1144,17 @@ mod tests
         let ktest = fs::read(ctx.sysroot.join("tests/ktest")).unwrap();
         assert!(verifies(&signer, &ktest, Role::Service, "/tests/ktest"));
         assert!(!verifies(&signer, &ktest, Role::Init, "init"));
-        for (entry, relative) in data.iter().zip(&relatives)
+        for install in &data
         {
-            let object = fs::read(ctx.sysroot.join(relative)).unwrap();
+            let object = fs::read(ctx.sysroot.join(&install[1..])).unwrap();
             let attrs = objsig::split(&object)
                 .unwrap()
                 .records()
                 .next()
                 .unwrap()
                 .attrs;
-            assert_eq!(attrs.roles, RoleSet::of(&[Role::BootModule]), "{relative}");
-            assert!(verifies(&signer, &object, Role::BootModule, entry.install));
+            assert_eq!(attrs.roles, RoleSet::of(&[Role::BootModule]), "{install}");
+            assert!(verifies(&signer, &object, Role::BootModule, install));
         }
         assert_eq!(fs::read(ctx.sysroot.join(text)).unwrap(), b"vfsd = debug\n");
         for path in outside
@@ -1139,8 +1178,19 @@ mod tests
         let ktest = fs::read(ctx.sysroot.join("tests/ktest")).unwrap();
         assert!(verifies(&signer, &ktest, Role::Init, "init"));
         assert_eq!(objsig::split(&ktest).unwrap().body(), b"\x7fELF ktest");
-        // A data entry the sysroot does not install fails the pack.
-        fs::remove_file(ctx.sysroot.join(&relatives[0])).unwrap();
+        // A file a list names that the sysroot does not install is not
+        // signed; the compose of a bundle that names it refuses it.
+        fs::remove_file(ctx.sysroot.join(&data[0][1..])).unwrap();
+        assert_eq!(
+            sign_sysroot(&ctx, &signer, arch, Harness::Ktest).unwrap(),
+            (objects - 1, 0)
+        );
+        // An object both in an `init` slot and an entry of a list is refused.
+        fs::write(
+            ctx.sysroot.join("config/bundle/ktest.list"),
+            "init /tests/ktest\n/services/init\n",
+        )
+        .unwrap();
         sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
@@ -1216,12 +1266,18 @@ mod tests
 
     // Defect caught: a pack that signs under a store the installed bootloader
     // does not hold (a store changed since the bootloader was built, a missing
-    // bootloader, or one built without a store), so the boot refuses every
-    // object.
+    // bootloader, or one built without a store), so the boot of its ESP copies
+    // refuses every object; or a compose that verifies under another store
+    // than the installed bootloader's.
     #[test]
-    fn a_pack_signs_only_under_the_store_every_installed_bootloader_embeds()
+    fn a_pack_signs_only_under_the_store_the_installed_bootloader_embeds()
     {
         let root = scratch("installed-store");
+        let ctx = BuildContext {
+            root: root.clone(),
+            sysroot: root.join("sysroot"),
+            target_dir: root.join("target"),
+        };
         let ours = signer(&root.join("keys"), Arch::Riscv64);
         let theirs = Signer::new(
             &config(&root.join("other-keys")),
@@ -1231,35 +1287,37 @@ mod tests
         )
         .unwrap();
         assert_ne!(ours.store(), theirs.store());
-        let primary = root.join("boot.efi");
-        let fallback = root.join("BOOTRISCV64.EFI");
-        let images = [primary.clone(), fallback.clone()];
+        let image = ctx.installed_bootloader();
+        fs::create_dir_all(image.parent().unwrap()).unwrap();
 
-        fs::write(&primary, bootloader_image(ours.store())).unwrap();
-        fs::write(&fallback, bootloader_image(ours.store())).unwrap();
-        check_installed_store(&images, ours.store()).unwrap();
+        fs::write(&image, bootloader_image(ours.store())).unwrap();
+        check_installed_store(&image, ours.store()).unwrap();
+        assert_eq!(installed_store(&ctx).unwrap(), ours.store());
 
-        fs::write(&fallback, bootloader_image(theirs.store())).unwrap();
+        fs::write(&image, bootloader_image(theirs.store())).unwrap();
         let refusal = format!(
             "{:#}",
-            check_installed_store(&images, ours.store()).unwrap_err()
+            check_installed_store(&image, ours.store()).unwrap_err()
         );
-        assert!(refusal.contains("BOOTRISCV64.EFI"), "{refusal}");
+        assert!(refusal.contains("boot.efi"), "{refusal}");
         assert!(refusal.contains("another trust store"), "{refusal}");
+        assert_eq!(installed_store(&ctx).unwrap(), theirs.store());
 
-        fs::write(&fallback, b"an image without a store").unwrap();
+        fs::write(&image, b"an image without a store").unwrap();
         let refusal = format!(
             "{:#}",
-            check_installed_store(&images, ours.store()).unwrap_err()
+            check_installed_store(&image, ours.store()).unwrap_err()
         );
         assert!(refusal.contains("NoMarker"), "{refusal}");
+        installed_store(&ctx).unwrap_err();
 
-        fs::remove_file(&fallback).unwrap();
+        fs::remove_file(&image).unwrap();
         let refusal = format!(
             "{:#}",
-            check_installed_store(&images, ours.store()).unwrap_err()
+            check_installed_store(&image, ours.store()).unwrap_err()
         );
         assert!(refusal.contains("cargo xtask build"), "{refusal}");
+        installed_store(&ctx).unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
 

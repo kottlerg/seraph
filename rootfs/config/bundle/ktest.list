@@ -1,0 +1,4 @@
+# The bundle of the ktest harness, on every architecture: ktest in the `init`
+# slot alone. ktest is monolithic and spawns no module (docs/boot-media.md
+# § The ESP).
+init /tests/ktest

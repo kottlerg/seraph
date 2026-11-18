@@ -7,9 +7,9 @@ work; then that devmgr withdraws the driver when the host removes the device, an
 added again is served anew, works, and is charged none of its predecessor's IOMMU faults. So
 `cargo xtask test-hotplug` follows an arrival from the slot to a bound driver, and a removal back to
 an empty slot, under each hotplug control. The disk mode (`hotplug-check disk`) proves vfsd's
-handling of a disk removed and added again behind a root port, and of the loss of its root
-filesystem's driver. It is gated and opt-in: its recipes live in `/config/svcmgr/tests/`, and only
-`test-hotplug` stages them, each for its own boots.
+handling of a disk removed and added again behind a root port, its role lookup across a disk added
+after start, and the loss of its root filesystem's driver. It is gated and opt-in: its recipes live
+in `/config/svcmgr/tests/`, and only `test-hotplug` stages them, each for its own boots.
 
 ---
 
@@ -82,7 +82,12 @@ so vfsd mounts `/data` at startup. It finds the root mount's driver by its proce
 3. the open file is stale: it fails with `StaleNetworkFileHandle`.
 
 It logs `TORN DOWN /data, its disk removed; READY for the re-added disk`, on which the host adds the
-disk again. It then mounts `/data` through a fresh `MOUNT` and reads the file back. It then stops
+disk again. It then mounts `/data` through a fresh `MOUNT`, reads the file back, and logs
+`MOUNTED /data on the re-added disk; READY for a copy of the disk`, on which the host adds a copy
+of the disk behind the second root port. It checks that vfsd resolves the data role across every
+disk devmgr serves: `MOUNT` at `/data` answers `TABLE_FULL` while the data disk alone holds the
+partition and `NO_MOUNT` (a tie at the highest priority) once devmgr serves the copy, and the file
+still reads. It then stops
 the root driver's threads through a debug attach, checks that a lookup falling through at `/`
 errors within 30 s while `/data` still reads, logs `PASS`, and kills the root driver; vfsd exits and
 svcmgr shuts the system down. In the second storage boot, whose boot disk sits behind the port, the

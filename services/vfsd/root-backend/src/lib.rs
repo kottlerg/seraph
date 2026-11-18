@@ -111,6 +111,10 @@ pub struct Mount
     /// The index, in vfsd's disk list, of the disk that holds the
     /// mounted partition.
     pub disk: usize,
+    /// The first LBA of the mounted partition on its disk. With `disk`, it
+    /// names the partition, which [`VfsdRootBackend::holds_partition`]
+    /// matches.
+    pub first_lba: u64,
 }
 
 /// Why [`VfsdRootBackend::begin_unmount`] refused a node.
@@ -450,6 +454,26 @@ impl VfsdRootBackend
             .chain(self.nodes.iter())
             .position(|n| n.mounted().is_some_and(&matches))
             .and_then(|i| u32::try_from(i).ok())
+    }
+
+    /// Whether a mount in the tree, mounted or being removed, is of the
+    /// partition at `first_lba` on the disk at index `disk`. vfsd refuses a
+    /// second mount of a partition with it, in the hold of the install, so
+    /// no two drivers serve one partition: a removal's driver may still
+    /// write until the removal finishes.
+    #[must_use]
+    pub fn holds_partition(&self, disk: usize, first_lba: u64) -> bool
+    {
+        core::iter::once(&self.root)
+            .chain(self.nodes.iter())
+            .any(|n| match &n.slot
+            {
+                Slot::Mounted(m) | Slot::Unmounting(m) =>
+                {
+                    m.disk == disk && m.first_lba == first_lba
+                }
+                Slot::Empty => false,
+            })
     }
 
     /// The record of the mount lookups cross on the node at `idx`; `None`
@@ -873,6 +897,7 @@ mod tests
             death_queue: cap + 300,
             partition: cap + 400,
             disk: 1,
+            first_lba: cap + 500,
         }
     }
 
@@ -907,6 +932,31 @@ mod tests
         assert_eq!(b.mounted(data), None);
         assert_eq!(b.mounted(b.find(b"/a").expect("intermediate")), None);
         assert_eq!(b.find_mounted(|m| m.cap == CAP + 9), None);
+    }
+
+    #[test]
+    fn a_partition_is_held_while_mounted_or_being_removed()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/", mount(CAP)).is_some());
+        let held = mount(CAP + 1);
+        assert!(!b.holds_partition(held.disk, held.first_lba));
+        assert!(b.install(b"/data", held).is_some());
+        let idx = b.find(b"/data").expect("installed path has a node");
+        // The root mount's partition is held too.
+        assert!(b.holds_partition(1, mount(CAP).first_lba));
+        assert!(b.holds_partition(held.disk, held.first_lba));
+        // Another LBA on the disk, or the LBA on another disk, is not.
+        assert!(!b.holds_partition(held.disk, held.first_lba + 1));
+        assert!(!b.holds_partition(held.disk + 1, held.first_lba));
+        // A mount being removed still holds it: its driver may still write.
+        assert_eq!(b.begin_unmount(idx), Ok(held));
+        assert!(b.holds_partition(held.disk, held.first_lba));
+        assert!(b.restore_mount(idx));
+        assert!(b.holds_partition(held.disk, held.first_lba));
+        assert_eq!(b.begin_unmount(idx), Ok(held));
+        assert!(b.remove_mount(idx).is_some());
+        assert!(!b.holds_partition(held.disk, held.first_lba));
     }
 
     #[test]

@@ -5,8 +5,7 @@ device's record and driver follow.
 
 Implementation status: implemented
 ([#939](https://github.com/kottlerg/seraph/issues/939),
-[#1096](https://github.com/kottlerg/seraph/issues/1096)), apart from the wired interrupt of a
-hot-added function on x86-64 (§ Binding).
+[#1096](https://github.com/kottlerg/seraph/issues/1096)).
 
 ---
 
@@ -207,11 +206,15 @@ class, a disk included: a boot-bundle copy of a driver runs only for the bootstr
 It takes the next ordinal of its class, and a bound driver signals the class's watches.
 
 A hot-added function's `INTx` route is computed through the bridges of the records
-(`PciRecords::append`). On x86-64 no firmware programmed its Interrupt Line and devmgr reads no
-`_PRT` route for it, so it has no wired line: it is given message-signaled vectors where its
-driver's declaration takes them, and a driver that requires an interrupt it cannot be given that
-way is refused, logged ([#1096](https://github.com/kottlerg/seraph/issues/1096) adds the
-route).
+(`PciRecords::append`). On x86-64 no firmware programmed its Interrupt Line, so devmgr gives
+it the line that the PIC-model `_PRT` table of its host bridge (`PRT_PIC_MODE`, which acpid reads
+before `_PIC(1)`) routes to the pin and root-bus device number its interrupt reaches the root bus
+with (`firmware::acpid::Bridges::line`). A boot function uses the PIC-model line the firmware
+programmed, so the hot-added one shares lines as a boot function at its place would. It has no
+wired line when devmgr holds no PIC-model table for the bridge or the table does not route the
+pin; it is then given message-signaled vectors where its driver's declaration takes them, and a
+driver that requires an interrupt it cannot be given that way is refused, logged. On riscv64 the
+line is the `virt` swizzle onto the APLIC sources 32 to 35.
 
 ### Removal
 

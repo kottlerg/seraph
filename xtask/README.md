@@ -36,7 +36,7 @@ xtask/
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
-│   ├── qemu_gdb.rs             # Client of QEMU's gdbstub for test-wedge and test-cet
+│   ├── qemu_gdb.rs             # GDB remote client: QEMU's gdbstub and the GDB stub service
 │   ├── regex/                  # Pattern matching: Pike VM over the syntax of § Pattern syntax
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── signing/                # Signing of packed images, the signing identity, the trust
@@ -53,7 +53,7 @@ xtask/
 │   │                           #   ktest_timing, symbolize, mkdisk, check_disk, compose_bundle,
 │   │                           #   clean,
 │   │                           #   test, crypto_vectors, compare_images, test_crash_report,
-│   │                           #   test_debug_port, test_hotplug,
+│   │                           #   test_core_death, test_debug_port, test_hotplug,
 │   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
 │   │                           #   test_reboot, test_terminal, test_vmgenid, test_wedge, lint_docs,
 │   │                           #   pr_check,
@@ -332,11 +332,11 @@ size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
 image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
 `run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-reboot`, `test-hotplug`,
-`test-kaslr`, `test-map-redo`, `test-log-level`, and `test-signing` repack the images in the
-layout they find: `disk.img`'s block size, and the data partition on `disk-data.img` when that
-image is there. The eight test commands boot that layout, attaching `disk-data.img` as the second
-disk when it holds the data partition; `run` and `run-parallel` attach a second disk only as
-`--second-disk` names it.
+`test-core-death`, `test-kaslr`, `test-map-redo`, `test-log-level`, and `test-signing` repack
+the images in the layout they find: `disk.img`'s block size, and the data partition on
+`disk-data.img` when that image is there. The nine test commands boot that layout, attaching
+`disk-data.img` as the second disk when it holds the data partition; `run` and `run-parallel`
+attach a second disk only as `--second-disk` names it.
 
 `src/fat.rs` writes each FAT volume in one pass, with its variant chosen by its cluster count as
 the FAT specification's type rule chooses it: at 4 KiB clusters the ESP (64 MiB), root
@@ -1204,6 +1204,39 @@ cargo xtask test-powerbutton [--cpus N] [--mem MIB]
 The QMP socket is `target/xtask/powerbutton-test.sock`. CI runs the command in each `x86_64`
 `usertest` cell.
 
+### `cargo xtask test-core-death`
+
+Check that the death of a core or critical service powers the system off, on either arch. Boots
+the current sysroot once per target, headless, with a QMP socket, and kills the target by moving
+one of its threads to program counter 0. svcmgr, devmgr, vfsd and logd are reached through the GDB
+stub service, which the command stages naming the target and boots with the debug port, as
+`run --debug-target` does, removing it again and repacking the disk images in the layout they had,
+whatever the outcome; logd is killed four times, once more than svcmgr's restart budget allows.
+memmgr and procmgr are reached through QEMU's own gdbstub, on a unix socket, with a hardware
+breakpoint on a function of the target's binary, hit by a `hello` the command types at the shell.
+It passes for a target when QMP's `SHUTDOWN` event, after the kill, gives reason
+`guest-shutdown`, and QEMU exits on its own within two minutes of the kill;
+[docs/testing.md](../docs/testing.md) § Core death (`test-core-death`) says when each target is
+killed and which path powers the system off. Every target is tried; the command fails naming each
+one that failed.
+
+A pure runner; requires a populated sysroot with the default boot set (terminal + shell):
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test-core-death [--arch x86_64|riscv64] [--target NAME[,NAME...]] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--target` | every one | The services to kill, one boot each: `memmgr`, `procmgr` (a request worker), `procmgr-reaper` (procmgr's reaper thread), `svcmgr`, `devmgr`, `vfsd`, `logd`; repeatable, or comma-separated |
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+Each boot to the kill is bounded by five minutes. The QMP and gdbstub sockets are
+`target/xtask/core-death-<pid>.qmp` and `.gdb`. CI runs the command in each `usertest` cell.
+
 ### `cargo xtask test-debug-port`
 
 Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
@@ -1859,8 +1892,9 @@ The worktrees of one checkout share one host. The commands that load it apply it
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
 `crypto-vectors`, `compare-images` and `test-signing` as builds (`CliCommand::build_host` in
 `src/cli.rs` names them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`,
-`test-reboot`, `test-powerbutton`, `test-cet`, `test-kaslr`, `test-map-redo`, `test-log-level`,
-`test-debug-port`, `test-hotplug`, `test-gdb`, `test-signing` and `capture-acpi` as boots.
+`test-reboot`, `test-powerbutton`, `test-core-death`, `test-cet`, `test-kaslr`, `test-map-redo`,
+`test-log-level`, `test-debug-port`, `test-hotplug`, `test-gdb`, `test-signing` and `capture-acpi`
+as boots.
 `test-signing`, which compiles a bootloader before it boots, is admitted as a build when it starts
 and as a boot before its first boot.
 

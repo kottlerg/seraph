@@ -40,7 +40,7 @@ svcmgr          supervises the substrate (memmgr, procmgr, devmgr, vfsd) and eve
    ├── devmgr   observes each driver's death and withdraws a dead driver; restarts none
    ├── vfsd     observes no fs driver's death; restarts none
    └── sessiond supervises each session's leader
-pwrmgr          observes svcmgr (design intent; not yet implemented, #262)
+pwrmgr          observes svcmgr; powers the system off on its death
 ```
 
 | Supervisor | Supervises | Observes death through | On death |
@@ -50,7 +50,7 @@ pwrmgr          observes svcmgr (design intent; not yet implemented, #262)
 | devmgr | drivers it spawns | a death observer bound on each driver's main thread, and one procmgr binds on its address space (`BIND_DEATH_OBSERVER`), which the first terminal fault of any of its threads posts | the driver is withdrawn and its DMA hold released once its device is quiesced; no restart (design intent; not yet implemented, #1077; the IOMMU driver, #1079) ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#relationship-to-drivers)) |
 | vfsd | fs drivers it spawns | a death queue per mount, bound on the driver's main thread, to whose relay (`CREATE_DEATH_RELAY`) procmgr posts the driver's end, whoever ends it, a terminal fault in any of its threads included | the mount is torn down and its path falls through to the root filesystem; the root mount's driver's death ends vfsd, so the system shuts down; no restart (design intent; not yet implemented, #1078) ([Storage § Failure and Revocation Invariants](storage.md#failure-and-revocation-invariants)) |
 | sessiond | each session's leader and, through containment, every process the leader starts | a death observer on the leader's main thread, and one procmgr binds on its address space | the session ends: procmgr destroys what is left of the leader's subtree ([Session Supervision](session-supervision.md#sessiond)) |
-| pwrmgr | svcmgr | an event queue svcmgr binds to its own death (§ Observing svcmgr) | power-off (design intent; not yet implemented, #262) |
+| pwrmgr | svcmgr | an event queue svcmgr binds to its own death (§ Observing svcmgr) | power-off |
 
 A `restart = never` service that svcmgr launches, rather than binds, is launched one-shot: svcmgr
 binds no death observer for it and keeps no record of it, so that service has no supervisor
@@ -112,13 +112,11 @@ a critical thread.
 The recipes of memmgr and procmgr are `restart = never`, `critical = yes`, so svcmgr routes either
 death to its graceful shutdown through the shutdown actuator, pwrmgr
 ([Restart Protocol § Decision tree](../services/svcmgr/docs/restart-protocol.md#decision-tree)).
-svcmgr cannot observe its own death. pwrmgr observing it and powering the system off is design
-intent; not yet implemented (#262) (§ Observing svcmgr): today svcmgr's death is observed only by
-procmgr, which reaps it, and the system runs on unsupervised. What svcmgr observes of memmgr and
-procmgr is the death of the main thread and the first terminal fault of any thread, through the
-Control-only address-space cap init endows for each (§ Supervision Hierarchy). A terminal fault in
-another of their threads (such as procmgr's reaper or request workers) is therefore the service's
-death and powers the system off.
+svcmgr cannot observe its own death; pwrmgr observes it and powers the system off (§ Observing
+svcmgr). What svcmgr observes of memmgr and procmgr is the death of the main thread and the first
+terminal fault of any thread, through the Control-only address-space cap init endows for each
+(§ Supervision Hierarchy). A terminal fault in another of their threads (such as procmgr's reaper or
+request workers) is therefore the service's death and powers the system off.
 
 devmgr and vfsd are `restart = never`, `critical = yes`, and are not in the core set: their restart
 is future work that no principle excludes, and no restart of either is designed yet. The death of
@@ -140,12 +138,20 @@ disk (devmgr withdraws the disk when its driver dies or the device is removed), 
 death svcmgr routes to the graceful shutdown above ([Storage § Failure and Revocation
 Invariants](storage.md#failure-and-revocation-invariants)).
 
-The path from a core or critical death to power-off MUST NOT depend on the service that died. svcmgr
-and pwrmgr are demand-paged on memmgr (memmgr and procmgr are pinned by construction, per
-[Fault Handling § Default System Pager](fault-handling.md#default-system-pager)), so whether a
-memmgr death reaches power-off is not established. A test that kills each core and critical service
-and checks the power-off on both architectures, with the fixes it needs, is design intent; not yet
-implemented (#262).
+The path from a core or critical death to power-off MUST NOT depend on the service that died.
+`cargo xtask test-core-death` kills memmgr, procmgr (a request worker, and its reaper thread),
+svcmgr, devmgr, vfsd and logd (until svcmgr's restart budget for it is spent), one boot each, by a
+terminal fault made from outside the guest, and checks that the system powers off, on both
+architectures ([Testing § Core death](testing.md#core-death-test-core-death)). It kills devmgr and
+vfsd once svcmgr has reconciled its recipes, after the window that #1185 leaves open above, and
+logd once the boot is up: a service that dies after its start and before it asks svcmgr for its
+bootstrap round leaves svcmgr waiting for the request for good (#1297). The path does not yet
+hold the requirement by construction: svcmgr, pwrmgr and, on x86-64, acpid are
+demand-paged on memmgr and grow their heaps through it (memmgr and procmgr are pinned by
+construction, per [Fault Handling § Default System Pager](fault-handling.md#default-system-pager)),
+so a fault on a page not yet resident, or a call to memmgr, on the path after memmgr's death waits
+for good. A power-off path that neither faults nor calls memmgr after a core death is design
+intent; not yet implemented (#1290).
 
 ---
 
@@ -214,15 +220,20 @@ vfsd keeps each fs driver's service endpoint original, from which it mints the m
 
 ## Observing svcmgr
 
-Design intent; not yet implemented (#262). The mechanism uses existing kernel surfaces.
+The mechanism uses existing kernel surfaces.
 
-svcmgr creates one event queue at startup and binds two death observers on it: one on its own main
-thread (`SYS_THREAD_BIND_NOTIFICATION`, through `ProcessInfo.self_thread_cap`), and one on its own
-address space (`SYS_ASPACE_BIND_NOTIFICATION`, through `ProcessInfo.self_aspace_cap`), which the
-first terminal fault of any svcmgr thread posts to. svcmgr keeps the queue's original and delivers a
-derivation carrying only the receive right to the shutdown actuator, pwrmgr, in the bootstrap round
-of each of its launches. pwrmgr waits on that queue beside its service endpoint; an entry on it is
-svcmgr's death, and pwrmgr powers the platform off.
+svcmgr creates one event queue at startup, with room for an entry from each observer, and binds two
+death observers on it: one on its own main thread (`SYS_THREAD_BIND_NOTIFICATION`, through
+`ProcessInfo.self_thread_cap`), and one on its own address space (`SYS_ASPACE_BIND_NOTIFICATION`,
+through `ProcessInfo.self_aspace_cap`), which the first terminal fault of any svcmgr thread posts
+to. svcmgr keeps the queue's original and delivers a derivation carrying only the receive right to
+the shutdown actuator, pwrmgr, in the bootstrap round of each of its launches
+([`shutdown_actuator`](../services/svcmgr/docs/service-definitions.md#shutdown_actuator)). pwrmgr
+waits on that queue beside its service endpoint, in one wait set; an entry on it is svcmgr's death,
+and pwrmgr logs it and powers the platform off as a `SHUTDOWN` request does
+([services/pwrmgr/README.md](../services/pwrmgr/README.md#responsibilities)). A queue svcmgr cannot
+create or bind, or a wait set pwrmgr cannot make, is logged at error level, and svcmgr's death then
+goes unobserved; svcmgr keeps the queue when one of its two binds holds.
 
 svcmgr binds itself because both binds need Control on the observed object ([Syscall Interface
 Specification](../core/kernel/docs/syscalls.md) § `SYS_THREAD_BIND_NOTIFICATION` (47) and §
@@ -242,9 +253,8 @@ down when svcmgr dies leaves svcmgr's death unobserved.
 
 Each item below is specified above or in the document it names, and is not yet implemented:
 
-- pwrmgr observes svcmgr and powers off on its death (§ Observing svcmgr): #262.
-- A test of each core and critical death, on a power-off path that does not depend on the dying
-  service (§ Core Set and System Death): #262.
+- A power-off path that neither faults nor calls memmgr after a core death (§ Core Set and System
+  Death): #1290.
 - devmgr restarts drivers, the driver of the root filesystem's disk apart: #1077. The IOMMU driver
   survives and restarts: #1079.
 - vfsd restarts fs drivers by revoke and re-resolve, the root filesystem's driver apart: #1078.

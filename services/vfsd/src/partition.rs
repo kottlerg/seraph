@@ -4,8 +4,9 @@
 // services/vfsd/src/partition.rs
 
 //! Disk and partition discovery: devmgr's `block` class queried at every
-//! instance ordinal, at startup from the first and on a later `MOUNT` from
-//! the first not yet seen, block-device I/O wrapped around the pure [`gpt`]
+//! instance ordinal, at startup from the first and before each later role
+//! lookup (a `MOUNT`, the first `GET_SWAP_PARTITION`) from the first not yet
+//! seen, block-device I/O wrapped around the pure [`gpt`]
 //! format parser on each disk found, and the probe that tells a held disk
 //! present from removed.
 //!
@@ -234,9 +235,8 @@ impl Discovery
             };
             self.next_ordinal = next;
         }
-        // A `MOUNT` that finds its role on no held disk runs a discovery,
-        // which usually finds none, so only a discovery that found a disk
-        // logs at info.
+        // Every runtime role lookup runs a discovery, which usually finds
+        // none, so only a discovery that found a disk logs at info.
         if disks.is_empty()
         {
             std::os::seraph::log!(debug: "disks found: 0");

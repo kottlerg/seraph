@@ -1281,6 +1281,7 @@ process.
 [Fault Handling](../../../docs/fault-handling.md),
 [Namespace Model](../../../docs/namespace-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Session Supervision](../../../docs/session-supervision.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [crashd Operation](../../crashd/docs/operation.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),

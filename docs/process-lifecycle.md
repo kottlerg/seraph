@@ -611,7 +611,7 @@ Handling](fault-handling.md#delivery-resume-and-kill)).
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
 [Capability Model](capability-model.md), [Fault Handling](fault-handling.md),
-[Supervision](supervision.md), [Testing](testing.md),
+[Session Supervision](session-supervision.md), [Supervision](supervision.md), [Testing](testing.md),
 [Userspace Memory Model](userspace-memory-model.md),
 [programs/pipefault/README.md](../programs/pipefault/README.md),
 [programs/relrofault/README.md](../programs/relrofault/README.md),

@@ -41,8 +41,8 @@ services/svctest/
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS,
         │                      # spawned IPC buffers in the arena; stack note parse
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
-        ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines
-        │                      #   and a death forward on the new instance
+        ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines,
+        │                      #   names restored by refusal, a death forward on the new instance
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
@@ -253,10 +253,17 @@ The `logd_restart` phase kills logd through `caps[15]`: it finds logd by name
 crashd when the boot stages it, else to procmgr's decliner, and svcmgr restarts logd. It writes no
 log line until it finds, through `caps[6]`, svcmgr's `service died: logd` and
 `service restarted: logd` lines in the new instance's history, which holds only lines written
-after the respawn, and fails when they do not arrive within 30 s. It then registers svctest's name
-again, which the new instance's table lacks (#1213), and runs the `logd_death_forward` check again,
-against the new instance's fresh table and the death queue it registered, and logs how long the
-restart took.
+after the respawn, and fails when they do not arrive within 30 s. It then logs how long the restart
+took, as svctest's first line to the new instance, whose table holds no name for svctest, and
+requires that line retained once, in a live slot named `svctest`: the line carried
+`SENDER_NAMED`, so the new instance refused it until svctest's log client registered the name
+again ([logd IPC interface](../logd/docs/ipc-interface.md)
+§ `stream_labels::STREAM_REGISTER_NAME`). A `logd-name-probe-child` then sends the new
+instance raw stream messages: it registers an empty name, so its live slot holds none, and requires
+a line without `SENDER_NAMED` accepted, a line and a record with it refused `NAME_UNKNOWN`, and,
+once it has registered a name, a line with it accepted; the phase requires logd's history of the
+child to hold the two accepted lines alone. Last, it runs the `logd_death_forward` check again,
+against the new instance's fresh table and the death queue it registered.
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
@@ -317,6 +324,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
 | `end-queue-child`           | `process_tree` | `process_tree_end_queue` (end queue)       |
 | `exit-fault-child`          | `process_tree` | `process_tree_end_posted_once` (one post)  |
+| `logd-name-probe-child`     | `logd_restart` | `logd_restart` (named-sender refusals)      |
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
 | `open-undeliverable-child`  | `fs_opens`     | `fs_reclaims_dead_opens` (failed reply)     |

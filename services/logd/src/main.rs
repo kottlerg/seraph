@@ -37,8 +37,8 @@ use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
 use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
 use ipc::stream_labels::{
-    LEVEL_INFO, RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD,
-    STREAM_REGISTER_NAME, level_of,
+    LEVEL_INFO, NAME_UNKNOWN, RECORD_ACCEPTED, RECORD_REJECTED, STREAM_BYTES, STREAM_RECORD,
+    STREAM_REGISTER_NAME, level_of, sender_named,
 };
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use logd_codec::hold::HeldLines;
@@ -788,8 +788,9 @@ fn serve_request(logd: &Logd, msg: &IpcMessage, buf: IpcBuf)
     let byte_len = ((msg.label >> 16) & 0xFFFF) as usize;
     if label_id == STREAM_BYTES
     {
-        consume_bytes(logd, msg.badge, msg, byte_len);
-        reply_ack(ipc_buf);
+        let status = consume_bytes(logd, msg.badge, msg, byte_len);
+        // SAFETY: ipc_buf is this worker's registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
     }
     else if label_id == STREAM_RECORD
     {
@@ -874,15 +875,25 @@ fn reply_ack(ipc_buf: *mut u64)
 /// Each line is completed, rendered, and retained under the state lock, and
 /// written once the lock is released; the bytes after it are taken under the
 /// lock again.
+///
+/// Returns the reply label: 0, or `NAME_UNKNOWN` for a message that carries
+/// `SENDER_NAMED` from a sender whose name logd does not hold
+/// ([`SlotTable::name_lost`]), of which nothing is consumed, so its sender
+/// registers the name and sends the message again
+/// (`services/logd/docs/ipc-interface.md` § `stream_labels::STREAM_REGISTER_NAME`).
 #[expect(
     clippy::significant_drop_tightening,
     reason = "the sender's `slot` and `seq` borrow through the guard to the end of the byte loop: \
               the hold serialises the slot's partial line, its history and the sequence counter"
 )]
-fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
+fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
 {
     const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
+    if sender_named(msg.label) && logd.lock().table.name_lost(badge)
+    {
+        return NAME_UNKNOWN;
+    }
     let bytes = msg.data_bytes();
     let n = byte_len.min(bytes.len()).min(STREAM_CHUNK_SIZE);
     let level = level_of(msg.label);
@@ -895,8 +906,9 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
             let Some((slot, seq)) = state.table.sender_slot(badge)
             else
             {
-                // An evicted sender's message (`SlotTable::sender_slot`).
-                return;
+                // An evicted sender's message (`SlotTable::sender_slot`):
+                // dropped, and answered as consumed.
+                return 0;
             };
             let mut done = false;
             while let Some((&b, tail)) = rest.split_first()
@@ -927,6 +939,7 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
             out.flush();
         }
     }
+    0
 }
 
 /// Render one `STREAM_RECORD` message's record as one line and retain it in
@@ -934,7 +947,9 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
 /// the line. The record does not touch the slot's partial text line. Returns
 /// the reply label: `RECORD_ACCEPTED`, or `RECORD_REJECTED` for a payload
 /// longer than a record or than the message, or one `ipc::log_record` refuses,
-/// which is neither rendered nor retained.
+/// which is neither rendered nor retained, or `NAME_UNKNOWN` for a record
+/// that carries `SENDER_NAMED` from a sender whose name logd does not hold,
+/// neither rendered nor retained either, as [`consume_bytes`] answers.
 #[expect(
     clippy::significant_drop_tightening,
     reason = "the sender's `slot` and `seq` borrow through the guard to the record's retention: \
@@ -956,6 +971,10 @@ fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) ->
     let mut out = LineBuf::new();
     {
         let mut state = logd.lock();
+        if sender_named(msg.label) && state.table.name_lost(badge)
+        {
+            return NAME_UNKNOWN;
+        }
         let Some((slot, seq)) = state.table.sender_slot(badge)
         else
         {

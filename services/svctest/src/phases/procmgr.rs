@@ -202,8 +202,19 @@ pub(crate) fn logd_query_call(cap: u64, msg: &ipc::IpcMessage) -> ipc::IpcMessag
 }
 
 /// Every slot named [`LOGD_RECLAIM_NAME`], live or retired, as (badge, state,
-/// exit reason), read across every `QUERY_SLOTS` page.
+/// exit reason).
 fn logd_named_slots(query: u64) -> Vec<(u64, u8, u64)>
+{
+    logd_slots(query)
+        .into_iter()
+        .filter(|(_, _, _, name)| name == LOGD_RECLAIM_NAME)
+        .map(|(badge, state, exit_reason, _)| (badge, state, exit_reason))
+        .collect()
+}
+
+/// Every slot, live or retired, as (badge, state, exit reason, name), read
+/// across every `QUERY_SLOTS` page.
+pub(crate) fn logd_slots(query: u64) -> Vec<(u64, u8, u64, Vec<u8>)>
 {
     use ipc::log_query::{QUERY_OK, reply_more, reply_status, slot_entry, slots_request};
 
@@ -221,10 +232,12 @@ fn logd_named_slots(query: u64) -> Vec<(u64, u8, u64)>
         let mut index = 0usize;
         while let Some(entry) = slot_entry(&reply, index)
         {
-            if entry.name() == LOGD_RECLAIM_NAME
-            {
-                found.push((entry.badge, entry.state, entry.exit_reason));
-            }
+            found.push((
+                entry.badge,
+                entry.state,
+                entry.exit_reason,
+                entry.name().to_vec(),
+            ));
             after = Some(entry.cursor());
             index = index
                 .checked_add(1)

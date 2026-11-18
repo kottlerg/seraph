@@ -1310,10 +1310,11 @@ pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socke
    for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
    then hot-adds the device again and waits for the fixture's `[hotplug-check] PASS` line. It
    then adds a raw block node over a zero-filled 1 MiB image (QMP `blockdev-add`) and hot-adds a
-   `virtio-blk-pci` on it behind the second port and the IOMMU (`iommu_platform=on`), and passes
-   once devmgr logs `[devmgr] virtio-blk: binds PCI` and `virtio-blk: boot tier not granted from
-   the drivers directory` (the drivers directory's copy, at the auxiliary tier) and the driver
-   logs `[virtio-blk] ready, entering service loop`.
+   `virtio-blk-pci` on it behind the second port and the IOMMU (`iommu_platform=on`) with no MSI-X
+   vectors (`vectors=0`), and passes once devmgr logs `[devmgr] virtio-blk: binds PCI`,
+   `virtio-blk: boot tier not granted from the drivers directory` (the drivers directory's copy,
+   at the auxiliary tier) and `[devmgr] virtio-blk: Wired interrupt, 1 vector(s)` (the line of the
+   disk's `INTx` pin) and the driver logs `[virtio-blk] ready, entering service loop`.
 
 Then two storage boots on the split-data layout, under native control, with the disk-mode recipe
 (`hotplug-check-disk.svc`) staged alone:

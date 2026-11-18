@@ -59,15 +59,23 @@ pub const ELF_MACHINE: u16 = elf::EM_X86_64;
 /// the ACPI DMAR and programmed by `iommu-vtd`.
 pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Vtd;
 
-/// GSI for a PCI function whose config-space IRQ line is unset, from the
-/// `INTx` pin and device number its interrupt reaches the root bus with.
-///
-/// Returns `None`: on x86-64 the firmware programs the IRQ line, and
-/// routing an unprogrammed `INTx` pin to a GSI needs the ACPI `_PRT`,
-/// which devmgr does not parse; there is no fixed swizzle to fall back to.
-pub fn intx_fallback_gsi(_pin: u8, _dev: u8) -> Option<u32>
+/// GSI for PCI function `function`, whose config-space IRQ line is unset (a
+/// function hot-added after the firmware ran): the line the PIC-model
+/// `_PRT` acpid pushed for its host bridge, which devmgr holds in
+/// `bridges`, routes the `INTx` pin and device number its interrupt
+/// reaches the root bus with to (`PciDevice::host_intx`;
+/// [`firmware::acpid::Bridges::line`]). That is the line the firmware writes
+/// into a boot function's Interrupt Line register, which devmgr gives a boot
+/// function, so the function shares lines as a boot function at its place
+/// would; the APIC-model routes name other GSIs on the same PIRQ wires.
+/// Returns `None` while devmgr holds no PIC-model table for the bridge, and
+/// for a pin the table does not route.
+pub fn intx_fallback_gsi(
+    function: &firmware::scan::PciDevice,
+    bridges: &firmware::acpid::Bridges,
+) -> Option<u32>
 {
-    None
+    bridges.line(firmware::acpid::PrtMode::PicMode, function)
 }
 
 /// Carve an `IoPort` cap over ports `base..base + count` out of devmgr's

@@ -6,8 +6,10 @@
 //! logd's restart end to end (`docs/supervision.md` § Restart Shapes).
 //!
 //! The phase kills logd through the debug authority svctest holds: it finds
-//! logd by name (`LIST_PROCESSES`), attaches to it (`ATTACH_PROCESS`), stops
-//! its main thread, points the thread's instruction pointer at an unmapped
+//! logd by name (`LIST_PROCESSES`), attaches to it (`ATTACH_PROCESS`), checks
+//! that the attach reports logd on the core path (`ATTACH_FLAG_NO_CORE`), so
+//! the crash service writes no core of it
+//! (`services/crashd/docs/operation.md` § Core Dump), stops its main thread, points the thread's instruction pointer at an unmapped
 //! address, and starts it. The thread faults there, and the fault takes the
 //! path any fault of logd takes: memmgr forwards it to the exception class,
 //! which procmgr bound to its crash endpoint, where crashd, when the boot
@@ -84,8 +86,8 @@ pub fn logd_restart_phase(caps: &Caps)
     std::os::seraph::log!("logd_restart: logd restarted in {took} ms");
 }
 
-/// Kill the process `process` (logd) through an attach: stop its main
-/// thread, set its instruction pointer to [`UNMAPPED_IP`], and start it, so
+/// Kill the process `process` (logd) through an attach, which must report it
+/// on the core path: stop its main thread, set its instruction pointer to [`UNMAPPED_IP`], and start it, so
 /// it takes a fault no handler resolves (see the module documentation).
 fn kill(authority: u64, process: u64)
 {
@@ -102,6 +104,11 @@ fn kill(authority: u64, process: u64)
         procmgr_errors::SUCCESS,
         "logd_restart: ATTACH_PROCESS of logd refused ({:#x})",
         reply.label
+    );
+    assert_ne!(
+        reply.word(procmgr_labels::ATTACH_WORD_FLAGS) & procmgr_labels::ATTACH_FLAG_NO_CORE,
+        0,
+        "logd_restart: logd is not on the core path (no DECLARE_NO_CORE)"
     );
     let threads = reply.caps().to_vec();
     let main = *threads

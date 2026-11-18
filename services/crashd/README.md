@@ -24,11 +24,11 @@ declines it.
 Before the decline, when the `CORE_DUMP` entry of its recipe's environment names the process,
 crashd writes an ELF core of it to `/crash` on the root filesystem, which host `gdb` reads, under
 a per-core and a directory byte budget; the recipe sets `CORE_DUMP=no`, so no core is written by
-default. The core's directory, names and contents are in
-[docs/core-format.md](docs/core-format.md). crashd writes no core of a process on the path a core
-is written through, vfsd, the FAT driver, the block driver, devmgr and the IOMMU driver, which
-declare themselves so to procmgr, and its recipe grants it `/crash` alone, without the right to
-read a core back.
+default. The core's directory, names and contents are in [docs/core-format.md](docs/core-format.md).
+crashd writes no core of a process a dump waits on, which declares itself so to procmgr: vfsd, the
+FAT driver, the block driver, devmgr and the IOMMU driver, through which the core is written, and
+logd, which the dump's outcome line waits on. Its recipe grants it `/crash` alone, without the right
+to read a core back.
 
 svcmgr starts crashd from `rootfs/config/svcmgr/services/crashd.svc`, which sets
 `debug_authority = yes`, and `reserve = yes`, which creates it inside memmgr's system reserve

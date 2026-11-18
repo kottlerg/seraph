@@ -176,8 +176,8 @@ pub struct ProcessEntry
     /// ([`attach_target`]).
     pub no_debug: bool,
     /// Set by the child's `DECLARE_NO_CORE` ([`ProcessTable::declare_no_core`]):
-    /// the child is on the path a core is written through, which
-    /// `ATTACH_PROCESS` reports ([`ProcessEntry::attach_flags`]).
+    /// the child is on the core path, the processes a core dump waits on,
+    /// which `ATTACH_PROCESS` reports ([`ProcessEntry::attach_flags`]).
     pub no_core: bool,
     /// Where the loader placed the child's image, which `ATTACH_PROCESS`
     /// reports.
@@ -792,9 +792,9 @@ impl ProcessTable
         })
     }
 
-    /// Mark the live entry whose badge matches as on the path a core is
-    /// written through (`DECLARE_NO_CORE`, sent on the child's own procmgr
-    /// cap). Returns `false` when the badge names no live entry.
+    /// Mark the live entry whose badge matches as on the core path, the
+    /// processes a core dump waits on (`DECLARE_NO_CORE`, sent on the
+    /// child's own procmgr cap). Returns `false` when the badge names no live entry.
     #[must_use]
     pub fn declare_no_core(&mut self, badge: u64) -> bool
     {

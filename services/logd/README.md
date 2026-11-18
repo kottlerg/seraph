@@ -131,6 +131,16 @@ registers again (#1213).
   ([docs/supervision.md](../../docs/supervision.md)); a debug-authority
   holder can attach to it.
 
+* **No core.** logd declares itself on the core path to procmgr
+  (`procmgr_labels::DECLARE_NO_CORE`) at startup, before it spawns a
+  thread: a core dump stops every thread of its process but the faulting
+  one, and every process's log output, the crash service's line of the
+  dump's outcome included, waits on logd's receive workers. The crash
+  service reports a fault of logd and writes no core of it, whatever its
+  `CORE_DUMP` setting names
+  ([services/crashd/docs/operation.md](../crashd/docs/operation.md)
+  § Core Dump).
+
 ## Out of scope (follow-up issues)
 
 * Log rotation, durable-disk persistence.
@@ -200,6 +210,7 @@ the two class SENDs for its lifetime (see
 | [services/procmgr/README.md](../procmgr/README.md) | `REGISTER_DEATH_EQ` handler and the per-teardown death forward, and the `QUERY_LIVE_PROCESSES` walk logd resyncs from |
 | [services/logd/docs/handover-protocol.md](docs/handover-protocol.md) | init-logd → logd wire format |
 | [services/logd/docs/ipc-interface.md](docs/ipc-interface.md) | IPC labels logd accepts, the query API (`QUERY_SLOTS`, `QUERY_HISTORY`) and its `LOG_QUERY_AUTHORITY`, the history's stored form and the retired slots, and the `reclaim:` line logd logs when it evicts a slot |
+| [services/crashd/docs/operation.md](../crashd/docs/operation.md) | The core dump, whose outcome line waits on logd, and so writes no core of logd, which declares itself on the core path |
 | [services/logd/codec/README.md](codec/README.md) | `logd-codec`: the handover wire contract logd decodes with, the `reclaim:` line, log record rendering, and the `BoundedStr` diagnostic formatter |
 
 ---

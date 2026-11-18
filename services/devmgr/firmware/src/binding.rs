@@ -16,7 +16,8 @@
 //! over. devmgr walks its records in record order, so a driver's instance
 //! limit counts its devices in that order, and a limited driver's devices are
 //! counted over the boot ([`BoundCounts`]), so a later pass binds it only to
-//! the devices its limit leaves. [`grants`] applies the source
+//! the devices its limit leaves; a PCI device's hotplug removal returns its
+//! instance. [`grants`] applies the source
 //! bounds to what a declaration asks for. The table knows no driver: it
 //! compares the keys a declaration carries against the keys a record carries.
 
@@ -344,12 +345,17 @@ impl<T> MatchTable<T>
 /// The devices each driver with an instance limit is bound to over the boot,
 /// by driver name, so the limit holds across bind passes: a pass's
 /// [`MatchTable`] starts each limited declaration at the count the earlier
-/// passes left. A driver with no limit is not tracked, so the table grows
-/// only with the limited drivers a boot considers.
+/// passes left. A PCI record's removal returns its instance
+/// ([`Self::release_removed`]), so a later pass may bind the driver to the
+/// device that replaces it. A driver with no limit is not tracked, so the
+/// table grows only with the limited drivers a boot considers.
 #[derive(Default)]
 pub struct BoundCounts
 {
     counts: Vec<(DriverName, u16)>,
+    /// The PCI records bound to a limited driver, each with the driver's
+    /// name: the instances a removal can return.
+    pci: Vec<(usize, DriverName)>,
 }
 
 impl BoundCounts
@@ -358,7 +364,10 @@ impl BoundCounts
     #[must_use]
     pub const fn new() -> Self
     {
-        Self { counts: Vec::new() }
+        Self {
+            counts: Vec::new(),
+            pci: Vec::new(),
+        }
     }
 
     /// The devices a driver named `decl.name` is bound to so far, tracking
@@ -392,6 +401,47 @@ impl BoundCounts
         {
             *bound = bound.saturating_add(1);
         }
+    }
+
+    /// [`Self::note`] for the PCI record at `record`, kept so that the
+    /// record's removal returns the instance ([`Self::release_removed`]).
+    ///
+    /// # Errors
+    /// Returns the allocation error when the driver is limited and the record
+    /// cannot be kept; the device is counted all the same, and its removal
+    /// then returns nothing.
+    pub fn note_pci(&mut self, name: &DriverName, record: usize) -> Result<(), TryReserveError>
+    {
+        if !self.counts.iter().any(|(n, _)| n == name)
+        {
+            return Ok(());
+        }
+        self.note(name);
+        self.pci.try_reserve(1)?;
+        self.pci.push((record, *name));
+        Ok(())
+    }
+
+    /// Return the instance of each kept PCI record that `removed` says is
+    /// removed, once: its driver's count drops by one and the record is no
+    /// longer kept. Returns how many were returned.
+    pub fn release_removed(&mut self, removed: impl Fn(usize) -> bool) -> usize
+    {
+        let mut released = 0usize;
+        let counts = &mut self.counts;
+        self.pci.retain(|(record, name)| {
+            if !removed(*record)
+            {
+                return true;
+            }
+            if let Some((_, bound)) = counts.iter_mut().find(|(n, _)| n == name)
+            {
+                *bound = bound.saturating_sub(1);
+            }
+            released = released.saturating_add(1);
+            false
+        });
+        released
     }
 }
 
@@ -738,6 +788,52 @@ mod tests
             )
             .unwrap();
         assert_eq!(later.choose(&pci(1, 2, 0)), Choice::Unmatched);
+    }
+
+    #[test]
+    fn a_removed_pci_record_returns_its_instance_once()
+    {
+        let limited = decl(
+            &[Match::PciId {
+                vendor: 1,
+                device: 2,
+            }],
+            Some(1),
+        );
+        let unlimited = named(
+            "u",
+            &[Match::PciId {
+                vendor: 3,
+                device: 4,
+            }],
+            None,
+        );
+        let mut counts = BoundCounts::new();
+        assert_eq!(counts.track(&limited).unwrap(), 0);
+        assert_eq!(counts.track(&unlimited).unwrap(), 0);
+        counts.note_pci(&limited.name, 7).unwrap();
+        counts.note_pci(&unlimited.name, 8).unwrap();
+        assert_eq!(counts.track(&limited).unwrap(), 1);
+        // Only the limited driver's record is kept.
+        assert_eq!(counts.pci.len(), 1);
+        // A record not removed returns nothing.
+        assert_eq!(counts.release_removed(|r| r == 8), 0);
+        assert_eq!(counts.track(&limited).unwrap(), 1);
+        // Its removal returns the instance, so a later pass binds the driver
+        // to the device that replaces it; a second call returns nothing.
+        assert_eq!(counts.release_removed(|r| r == 7), 1);
+        assert_eq!(counts.track(&limited).unwrap(), 0);
+        assert_eq!(counts.release_removed(|_| true), 0);
+        let mut table = MatchTable::new();
+        let index = table
+            .add(
+                limited,
+                Source::DriversDir,
+                (),
+                counts.track(&limited).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(table.choose(&pci(1, 2, 0)), Choice::Bind(index));
     }
 
     #[test]

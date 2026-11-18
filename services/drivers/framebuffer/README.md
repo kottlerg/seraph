@@ -65,11 +65,16 @@ badge carries the `WRITE` verb. Both labels below
 are gated by `WRITE_AUTHORITY`: a request whose badge lacks it is answered
 `UNAUTHORIZED` and has no effect.
 
-Before its bootstrap the driver declares itself undebuggable to procmgr
-(`procmgr_labels::DECLARE_NO_DEBUG`): logd mirrors every log line through it, with calls that have
-no bound, so a debug-authority holder that stopped it would hold every process's log output, its
-own included, for as long as the driver stayed stopped
-([crashd Operation](../../crashd/docs/operation.md) § Limits).
+The driver is debuggable, and a fault of it reaches the crash service like any driver's. logd
+mirrors every log line to it from its framebuffer sink's writer thread, the only logd thread that
+waits on the driver; a debug-authority holder that stops it holds the log stream for at most
+logd's `SINK_STALL_MS` once, after which logd queues and then drops and counts the lines meant
+for the framebuffer until the driver writes again, and keeps writing them to serial and retaining
+them in its history. Should logd fail to spawn that writer, each line's producer writes it, and a
+stopped driver then costs every line up to that bound
+([logd IPC Interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks).
+devmgr creates it with its bundle entry name, `framebuffer`, as its `argv[0]`, under which
+procmgr's `LIST_PROCESSES` names it to a debugger.
 
 ---
 

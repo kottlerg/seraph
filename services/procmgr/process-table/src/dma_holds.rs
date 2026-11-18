@@ -228,6 +228,12 @@ mod tests
             name: crate::ProcessName::EMPTY,
             sign_kinds: objsig::KindSet::EMPTY,
             debugger: 0,
+            parent: 0,
+            contained: false,
+            doomed: false,
+            relay: 0,
+            end_queue: 0,
+            end_correlator: 0,
         }
     }
 

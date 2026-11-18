@@ -199,6 +199,7 @@ fn main() -> !
         boot_modules,
         &mut caps,
         &mut irq_range,
+        acpi.bridges(),
         &mut watch,
         &mut catalog,
         &registry,
@@ -220,10 +221,13 @@ fn main() -> !
         run_jobs(
             &registry,
             &mut records,
-            &mut caps,
-            &mut irq_range,
+            &mut bind::Carve {
+                caps: &mut caps,
+                irq_range: &mut irq_range,
+                catalog: &mut catalog,
+                bridges: acpi.bridges(),
+            },
             &mut watch,
-            &mut catalog,
             ipc_buf,
         );
         acpi.run(&records, &mut caps, &mut irq_range, &hotplug);
@@ -235,6 +239,7 @@ fn main() -> !
                 caps: &mut caps,
                 irq_range: &mut irq_range,
                 catalog: &mut catalog,
+                bridges: acpi.bridges(),
             },
             &mut watch,
             ipc_buf,
@@ -360,10 +365,8 @@ const REGISTRY_WORKERS: usize = 4;
 fn run_jobs(
     registry: &Registry,
     records: &mut bind::Records,
-    caps: &mut caps::DevmgrCaps,
-    irq_range: &mut IrqRangeAllocator,
+    tables: &mut bind::Carve,
     watch: &mut settle::DriverWatch,
-    catalog: &mut DeviceCatalog,
     ipc_buf: *mut u64,
 )
 {
@@ -377,17 +380,12 @@ fn run_jobs(
             state.bind_dir_path,
         )
     };
-    let mut tables = bind::Carve {
-        caps,
-        irq_range,
-        catalog,
-    };
     if jobs.drivers_dir
     {
         spawn_dir_drivers(
             "on-disk batch",
             records,
-            &mut tables,
+            tables,
             drivers_dir_cap,
             drivers_dir_path.as_bytes(),
             watch,
@@ -402,7 +400,7 @@ fn run_jobs(
         spawn_dir_drivers(
             "on-demand batch",
             records,
-            &mut tables,
+            tables,
             bind_dir_cap,
             bind_dir_path.as_bytes(),
             watch,
@@ -2372,6 +2370,7 @@ fn spawn_boot_drivers(
     modules: Vec<(driver_binding::decl::DriverDecl, decls::Binary)>,
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
+    bridges: &firmware::acpid::Bridges,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
     registry: &Registry,
@@ -2397,6 +2396,7 @@ fn spawn_boot_drivers(
             caps,
             irq_range,
             catalog,
+            bridges,
         },
         &mut bind::Pass {
             batch: &batch,

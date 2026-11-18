@@ -638,6 +638,30 @@ impl Bridges
             .find(|b| (b.segment, b.bus) == (segment, bus))
     }
 
+    /// The line the table of `mode` devmgr holds routes `function`'s
+    /// interrupt pin to: the table of the bridge whose buses
+    /// ([`Bridge::buses`]) hold the function's bus, at the pin and device
+    /// number its interrupt reaches the root bus with
+    /// (`PciDevice::host_intx`). `None` for a function with no pin, one on
+    /// the buses of no bridge devmgr holds windows for, one whose bridge has
+    /// no table of `mode` held, and one whose pin that table does not route.
+    #[must_use]
+    pub fn line(&self, mode: PrtMode, function: &PciDevice) -> Option<u32>
+    {
+        let (pin, dev) = function.host_intx?;
+        let bridge = self.list.iter().find(|b| {
+            b.segment == function.segment
+                && b.buses()
+                    .is_some_and(|(first, last)| (first..=last).contains(&function.bus))
+        })?;
+        let held = match mode
+        {
+            PrtMode::Routes => bridge.routes.as_ref(),
+            PrtMode::PicMode => bridge.pic.as_ref(),
+        }?;
+        route(&held.value, pin, dev).map(u32::from)
+    }
+
     /// The bridge at `(segment, bus)`, made with nothing held when absent;
     /// `None` when a new bridge cannot be recorded.
     fn entry(&mut self, segment: u16, bus: u8) -> Option<&mut Bridge>
@@ -906,16 +930,11 @@ pub fn check_prt<'a>(
             continue;
         };
         let at = address(function);
-        let line = table
-            .get(usize::from(dev))
-            .and_then(|pins| pins.get(usize::from(pin).checked_sub(1)?))
-            .copied()
-            .filter(|&line| u64::from(line) != PRT_NO_ROUTE)
-            .ok_or(Disagreement::Unrouted {
-                function: at,
-                dev,
-                pin,
-            })?;
+        let line = route(table, pin, dev).ok_or(Disagreement::Unrouted {
+            function: at,
+            dev,
+            pin,
+        })?;
         if let Some(want) = expected(function)
             && u32::from(line) != want
         {
@@ -928,6 +947,17 @@ pub fn check_prt<'a>(
         covered = covered.saturating_add(1);
     }
     Ok(covered)
+}
+
+/// The line `table` routes pin `pin` (`INTA`..=`INTD`, 1..=4) of root-bus
+/// device `dev` to; `None` where it routes none.
+fn route(table: &PrtTable, pin: u8, dev: u8) -> Option<u16>
+{
+    table
+        .get(usize::from(dev))
+        .and_then(|pins| pins.get(usize::from(pin).checked_sub(1)?))
+        .copied()
+        .filter(|&line| u64::from(line) != PRT_NO_ROUTE)
 }
 
 #[cfg(test)]
@@ -1499,6 +1529,48 @@ mod tests
                 .map(|h| h.covered),
             Some(1)
         );
+    }
+
+    #[test]
+    fn a_function_takes_the_line_the_held_table_routes_its_root_bus_pin_and_device_to()
+    {
+        // The root port at device 4, its line programmed, and a function on
+        // bus 1 behind it, its line not: its INTB reaches the root bus as
+        // INTB of device 4.
+        let mut port = function((0, 0, 4, 0), 1);
+        port.irq_line = 10;
+        let mut leaf = function((0, 1, 0, 0), 2);
+        leaf.host_intx = Some((2, 4));
+        let functions = [port, leaf];
+        let mut unrouted = function((0, 1, 1, 0), 3);
+        unrouted.host_intx = Some((3, 4));
+        let mut elsewhere = function((1, 1, 0, 0), 2);
+        elsewhere.host_intx = Some((2, 4));
+        let no_pin = function((0, 1, 2, 0), 0);
+        let programmed = |f: &PciDevice| (f.irq_line != 0).then(|| u32::from(f.irq_line));
+        let pic = table(&[(4, 1, 10), (4, 2, 11)]);
+        let mut bridges = Bridges::new();
+        assert_eq!(bridges.line(PrtMode::PicMode, &leaf), None);
+
+        let windows = vec![window(WindowKind::Bus, 0, 0x100)];
+        assert_eq!(
+            bridges.push_windows(0, 0, windows, functions.iter(), &APERTURES),
+            Some(Push::Kept)
+        );
+        // Windows alone: no table to route by.
+        assert_eq!(bridges.line(PrtMode::PicMode, &leaf), None);
+        assert_eq!(
+            bridges.push_prt(0, 0, PrtMode::PicMode, &pic, PIC, functions.iter(), programmed),
+            Some(Push::Kept)
+        );
+        assert_eq!(bridges.line(PrtMode::PicMode, &leaf), Some(11));
+        assert_eq!(bridges.line(PrtMode::PicMode, &port), Some(10));
+        // No table of the other mode; a pin the table leaves unrouted; a
+        // segment no bridge holds; no pin at all.
+        assert_eq!(bridges.line(PrtMode::Routes, &leaf), None);
+        assert_eq!(bridges.line(PrtMode::PicMode, &unrouted), None);
+        assert_eq!(bridges.line(PrtMode::PicMode, &elsewhere), None);
+        assert_eq!(bridges.line(PrtMode::PicMode, &no_pin), None);
     }
 
     #[test]

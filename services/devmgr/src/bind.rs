@@ -219,12 +219,15 @@ pub struct Pass<'a>
 }
 
 /// What a bind carves from and records into: devmgr's held caps, its
-/// interrupt lines, and the device catalog.
+/// interrupt lines, and the device catalog; and what it routes a PCI
+/// function's wired line by, the host bridges' results acpid pushed
+/// ([`device_gsi`]).
 pub struct Carve<'a>
 {
     pub caps: &'a mut caps::DevmgrCaps,
     pub irq_range: &'a mut IrqRangeAllocator,
     pub catalog: &'a mut DeviceCatalog,
+    pub bridges: &'a firmware::acpid::Bridges,
 }
 
 /// The boot pass: bind the unbound records to the declarations of `modules`,
@@ -1320,7 +1323,8 @@ fn give_interrupt(
         {
             InterruptPlan::None => return Ok(None),
             InterruptPlan::Wired => (
-                give_wired(pci_dev, carve.irq_range, dev).then_some(InterruptKind::Wired),
+                give_wired(pci_dev, carve.irq_range, carve.bridges, dev)
+                    .then_some(InterruptKind::Wired),
                 1,
             ),
             InterruptPlan::Msi => (
@@ -1398,15 +1402,29 @@ fn not_given(widened: bool) -> NotGiven
 fn give_wired(
     pci_dev: &pci::PciDevice,
     irq_range: &mut IrqRangeAllocator,
+    bridges: &firmware::acpid::Bridges,
     dev: &mut PciDeviceCaps,
 ) -> bool
 {
-    let Some(cap) = acquire_single_irq_cap(pci_dev, irq_range)
+    let Some(gsi) = device_gsi(pci_dev, bridges)
+    else
+    {
+        std::os::seraph::log!(
+            warn: "PCI {}:{}:{}.{}: no wired line: its Interrupt Line is unset, and it has no \
+                   pin or no route devmgr holds names it",
+            pci_dev.segment,
+            pci_dev.bus,
+            pci_dev.dev,
+            pci_dev.func
+        );
+        return false;
+    };
+    let Some(cap) = acquire_single_irq_cap(gsi, irq_range)
     else
     {
         return false;
     };
-    let mode = device_gsi(pci_dev).map_or(0, |gsi| irq_range.line_mode(gsi));
+    let mode = irq_range.line_mode(gsi);
     dev.push(Resource::Interrupt {
         cap,
         kind: InterruptKind::Wired,
@@ -1730,16 +1748,12 @@ fn msix_table(
     })
 }
 
-/// A PCI device's own single-line `Interrupt` cap: a derivation of the held
-/// cap of its GSI's line ([`IrqRangeAllocator::line_cap`]), so a device whose
-/// line another device already holds gets one too. `None`, logged, when the
-/// device names no line or no cap can be had for it.
-fn acquire_single_irq_cap(
-    pci_dev: &pci::PciDevice,
-    irq_range: &mut IrqRangeAllocator,
-) -> Option<u64>
+/// A PCI device's own single-line `Interrupt` cap on its line `gsi`
+/// ([`device_gsi`]): a derivation of the held cap of the line
+/// ([`IrqRangeAllocator::line_cap`]), so a device whose line another device
+/// already holds gets one too. `None`, logged, when no cap can be had for it.
+fn acquire_single_irq_cap(gsi: u32, irq_range: &mut IrqRangeAllocator) -> Option<u64>
 {
-    let gsi = device_gsi(pci_dev)?;
     match irq_range.line_cap(gsi)
     {
         Ok(cap) =>
@@ -1770,15 +1784,16 @@ fn acquire_single_irq_cap(
 /// The GSI of a PCI device: the firmware-programmed config-space IRQ line
 /// when one is set, else the arch `INTx` routing fallback
 /// ([`arch::current::intx_fallback_gsi`]) of the pin and device number its
-/// interrupt reaches its root bus with (`PciDevice::host_intx`).
-pub fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
+/// interrupt reaches its root bus with (`PciDevice::host_intx`), which on
+/// x86-64 reads the route acpid pushed for its host bridge, held in
+/// `bridges`. `None` for a function no line can be found for.
+pub fn device_gsi(pci_dev: &pci::PciDevice, bridges: &firmware::acpid::Bridges) -> Option<u32>
 {
     if pci_dev.irq_line != 0 && pci_dev.irq_line != 0xFF
     {
         return Some(u32::from(pci_dev.irq_line));
     }
-    let (pin, dev) = pci_dev.host_intx?;
-    arch::current::intx_fallback_gsi(pin, dev)
+    arch::current::intx_fallback_gsi(pci_dev, bridges)
 }
 
 /// The `Mmio` cap of the configuration page of the function at `address`

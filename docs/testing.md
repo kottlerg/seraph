@@ -174,6 +174,7 @@ rootfs/config/svcmgr/
 │   ├── crashd.svc            # crashd naming crashme, holding 3 s; co-staged with usertest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 │   ├── hotplug-check.svc     # hotplug fixture; staged by test-hotplug
+│   ├── hotplug-check-disk.svc # hotplug fixture's disk mode; staged by test-hotplug
 │   ├── reboot.svc            # reboot fixture; staged by test-reboot
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
@@ -634,8 +635,11 @@ the same report fails the command, as does every other fault.
 devmgr's PCI Express hotplug
 ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)), native and through acpid
 from the firmware's, runs only when a device arrives in or leaves a hotplug slot, which no boot of
-a fixed device set makes. `cargo xtask test-hotplug [--arch]` (both arches) makes one arrive,
-leave, and arrive again, then makes a disk arrive, in one boot per hotplug control:
+a fixed device set makes, and vfsd's handling of a disk's loss and of its root filesystem's ([vfsd
+namespace composition](../services/vfsd/docs/namespace-composition.md#driver-death-and-device-loss)
+§ Driver death and device loss) runs only when a disk leaves. `cargo xtask test-hotplug [--arch]`
+(both arches) makes a device arrive, leave, and arrive again, then makes a disk arrive, in one boot
+per hotplug control, and then makes a disk leave and arrive again:
 
 1. Stage the [`hotplug-check`](../services/hotplug-check/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and the `test-dma` class file from
@@ -645,7 +649,7 @@ leave, and arrive again, then makes a disk arrive, in one boot per hotplug contr
    first under the machine's default, the firmware's ACPI PCI hotplug, whose `_OSC` withholds
    native hotplug control, then under native control (QEMU's ACPI PCI hotplug off, so `_OSC`
    grants it); on riscv64 under native control alone, which the `qemu-virt.platform` key grants.
-   Steps 3 to 8 run in each boot.
+   Steps 3 to 7 run in each of these boots.
 3. Wait for devmgr's grant line for a slot, `firmware hotplug: _OSC control` under the
    firmware's control and `managed (native control by` under native control (the other one fails
    the boot), and the fixture's `READY for the hot-added device` line.
@@ -673,11 +677,30 @@ leave, and arrive again, then makes a disk arrive, in one boot per hotplug contr
    `ready, entering service loop` line: the disk is bound from the drivers directory's
    virtio-blk at the auxiliary tier, as every device unbound after the boot pass is
    ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding) § Binding).
-8. Kill QEMU, remove the staged files, and repack the images in that layout again, whatever the
-   outcome.
+   Kill QEMU.
+8. For the storage boots, stage the fixture's disk-mode recipe (`hotplug-check-disk.svc`) alone
+   and repack the images in the split-data layout at the block size they have, so the data
+   partition is on `disk-data.img`. Boot under native control with that image's `virtio-blk-pci`
+   behind the first port, and wait for devmgr's `managed` line and the fixture's
+   `HOLDING a file open on /data` line: vfsd mounted `/data` on the disk at startup, and the
+   fixture holds a file open there and knows the root mount's driver by its name, `fatfs:/`.
+9. Remove the disk with its driver idle, and require devmgr's removal lines, vfsd's
+   `disk N: removed; tearing down its mounts` line, and the fixture's `TORN DOWN /data` line: the
+   mount is gone, the disk marked removed, the open file stale. Add the disk again on the same
+   block node and wait for the fixture's verdict: a fresh `MOUNT` mounts `/data` on it, and with
+   the root mount's driver stopped a lookup at `/` ends in an error within vfsd's bound while
+   `/data` still reads. The fixture then kills the root mount's driver; require vfsd's
+   `FATAL: root filesystem lost` line, svcmgr's `critical service unrecoverable: vfsd` line,
+   and QEMU's exit.
+10. Boot with the boot disk itself behind the first port and the data disk on a slot of its own,
+    wait for the slot managed and the fixture ready, remove the boot disk, and require the same
+    three.
+11. Kill QEMU, remove the staged files, and repack the images in their layout again, whatever the
+    outcome.
 
 The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
-shutdown. See [xtask/README.md § test-hotplug](../xtask/README.md#cargo-xtask-test-hotplug) for the
+shutdown, and the storage boots end in the shutdown svcmgr makes at vfsd's exit. See
+[xtask/README.md § test-hotplug](../xtask/README.md#cargo-xtask-test-hotplug) for the
 command. No canonical CI cell attaches a hotplug port, so the boots are the `hotplug` device cell
 of the local and release host runs (Coverage tiers below).
 
@@ -1194,7 +1217,7 @@ the cells of every surface a non-inert line of its own diff is on.
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, and `call_test_dma`) | no-iommu, and hotplug |
-| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
+| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
@@ -1245,7 +1268,9 @@ D="$D|test_dma_labels|dma_confinement_phase|msi_(delivery|forge|churn|release)_p
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
 D="$D|hotplug_port_args|HOTPLUG_(DISK_)?PORT_(DEVICE|ID)|X86_NATIVE_HOTPLUG_GLOBAL|HotplugControl"
-D="$D|EDU_DMA_MASK|device_add(_message)?|device_del(eted)?|blockdev_add_raw(_message)?|Property"
+D="$D|HotplugPort|PortDisk|PORT_DISK_(ID|NODE)|port_disk_(properties|block_size)"
+D="$D|boot_disk_behind_port|Property|blockdev_add_raw(_message)?"
+D="$D|EDU_DMA_MASK|device_add(_message)?|device_del(eted|_message|_request)?"
 D="$D|Hotplug(Slots|Job|Note|Server)|hotplug_slots|start_hotplug|route_hotplug_notes"
 D="$D|ask_hotplug|end_hotplug_job|run_hotplug_methods|Work::Hotplug|take_hotplug_notes"
 D="$D|acpi_hotplug"
@@ -1400,15 +1425,18 @@ cargo xtask test-gdb --arch <arch>
 ```
 
 **Hotplug cell.** The boots of `cargo xtask test-hotplug` (PCI Express hotplug (`test-hotplug`)
-above) on each architecture, two on x86_64 (the firmware's ACPI PCI hotplug, then native control)
-and one on riscv64, at 4 vCPUs, in which devmgr takes two empty root ports' events, binds the
-`test-dma` fixture to the `edu` device the host hot-adds behind one, withdraws it when the host
-removes the device, binds it again when the host adds it again, and binds the drivers directory's
-virtio-blk to the disk the host then hot-adds behind the other. The command stages and unstages its
-own files on the current sysroot, a debug-profile build. It bounds each boot to its markers by five
-minutes, the fixture's probes and the disk's bind by three minutes after each hot-add, and the
-removal by one minute from `device_del`; it has no `run-parallel` budget. The boots are the
-hotplug device cell (Device surfaces above).
+above) on each architecture, four on x86_64 and three on riscv64, at 4 vCPUs. In the device
+boots, two on x86_64 (the firmware's ACPI PCI hotplug, then native control) and one on riscv64,
+devmgr takes two empty root ports' events, binds the `test-dma` fixture to the `edu` device the
+host hot-adds behind one, withdraws it when the host removes the device, binds it again when the
+host adds it again, and binds the drivers directory's virtio-blk to the disk the host then
+hot-adds behind the other. In the two storage boots, vfsd tears down the mount of a disk removed
+behind a port and mounts it again when it is added again, and ends at the loss of its root
+filesystem's driver and of the boot disk. The command stages and unstages its own files on the
+current sysroot, a debug-profile build. It bounds each boot to its markers by five minutes, the
+fixture's probes and the disk's bind by three minutes after each hot-add, and the removal by one
+minute from `device_del`; it has no `run-parallel` budget. The boots are the hotplug device cell
+(Device surfaces above).
 
 ```sh
 # Hotplug cell, per architecture (clean between architectures):

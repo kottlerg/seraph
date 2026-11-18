@@ -299,7 +299,7 @@ pub fn device_add(
 }
 
 /// A property value [`device_add`] sets on the device it adds.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Property<'a>
 {
     /// A number, such as a DMA mask.
@@ -360,6 +360,29 @@ fn device_add_message(
     format!(r#"{{"execute":"device_add","arguments":{{{arguments}}}}}"#)
 }
 
+/// The `device_del` command of the device `id`.
+fn device_del_message(id: &str) -> String
+{
+    format!(
+        r#"{{"execute":"device_del","arguments":{{"id":{}}}}}"#,
+        json_string(id)
+    )
+}
+
+/// Ask QEMU to unplug the device `id` (`device_del`) and read its answer,
+/// without waiting for the device's `DEVICE_DELETED` event: a guest that
+/// loses its boot disk shuts down, and may power off before it powers the
+/// slot off.
+pub fn device_del_request(socket: &Path, id: &str) -> Result<()>
+{
+    let mut client = Client::connect(socket)?;
+    client.send(&device_del_message(id))?;
+    client
+        .read_result()
+        .with_context(|| format!("device_del {id}"))?;
+    Ok(())
+}
+
 /// Ask QEMU to unplug the device `id` (`device_del`), then wait up to
 /// `timeout` for its `DEVICE_DELETED` event. A device behind a native
 /// hotplug port is unplugged only once the guest powers the slot off, so the
@@ -368,10 +391,7 @@ fn device_add_message(
 pub fn device_del(socket: &Path, id: &str, timeout: Duration) -> Result<()>
 {
     let mut client = Client::connect(socket)?;
-    client.send(&format!(
-        r#"{{"execute":"device_del","arguments":{{"id":{}}}}}"#,
-        json_string(id)
-    ))?;
+    client.send(&device_del_message(id))?;
     let start = Instant::now();
     let mut answered = false;
     loop
@@ -557,6 +577,28 @@ mod tests
         assert_eq!(
             device_add_message("edu", "a", "b", &[]),
             r#"{"execute":"device_add","arguments":{"driver":"edu","id":"a","bus":"b"}}"#
+        );
+        assert_eq!(
+            device_add_message(
+                "virtio-blk-pci",
+                "d",
+                "p",
+                &[
+                    ("drive", Property::Text("n\"1")),
+                    ("iommu_platform", Property::Flag(true)),
+                    ("logical_block_size", Property::Number(512)),
+                ]
+            ),
+            r#"{"execute":"device_add","arguments":{"driver":"virtio-blk-pci","id":"d","bus":"p","drive":"n\"1","iommu_platform":true,"logical_block_size":512}}"#
+        );
+    }
+
+    #[test]
+    fn device_del_names_the_device()
+    {
+        assert_eq!(
+            device_del_message("hp\"0"),
+            r#"{"execute":"device_del","arguments":{"id":"hp\"0"}}"#
         );
     }
 

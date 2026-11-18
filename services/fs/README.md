@@ -45,8 +45,9 @@ those endpoints (delivery in
 how block device endpoints are established.
 
 A filesystem driver crash does not affect other mounted filesystems
-or the block device driver; vfsd does not observe the death or
-respawn the driver (see
+or the block device driver; vfsd observes the death and tears the
+mount down, and does not respawn the driver; the death of the root
+mount's driver ends vfsd and shuts the system down (see
 [`docs/storage.md`](../../docs/storage.md) § Failure and Revocation Invariants).
 
 ---

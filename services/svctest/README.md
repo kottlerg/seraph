@@ -299,9 +299,13 @@ timing, are what fail for a logd outside the reserve. It attaches to logd before
 memhog fill the pool, faults logd's main thread once the level reads `CRITICAL`, and waits for
 the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop mode, and
 svctest's own stop through `caps[19]`, 5 s after the fill, otherwise. It then requires, through
-`caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history, stamped no
-later than the last reading of the level that gave `CRITICAL`, and memhog's next instance to
-answer `PROBE` with a new nonce and no pages.
+`caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history stamped before
+svcmgr's `stop memhog` line, the first of each after the kill, and memhog's next instance to
+answer `PROBE` with a new nonce and no pages. svcmgr writes the stop line once procmgr has
+destroyed memhog, which frees the memory, and serves a stop and a restart on one event loop
+([Restart Protocol](../svcmgr/docs/restart-protocol.md) § Death detection), so a stop asked for
+while it restarts logd waits for the restart, and the order of the two lines is the order of the
+restart and the stop, however long the restart takes.
 
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`

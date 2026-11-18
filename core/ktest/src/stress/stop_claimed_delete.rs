@@ -566,9 +566,10 @@ fn rounds(ctx: &TestContext, phase: Phase) -> Result<Seen, &'static str>
 }
 
 /// Whether the phase still lacks what [`check`] requires of its race beyond
-/// a stop inside a wait, which every round gives a waiter that entered one:
-/// a delivery the waiter consumed and, in a double-stop phase, a committed
-/// stop by the second stopper. Both counts are stable between rounds: the
+/// a stop inside a wait (the controller stops a waiter it has seen enter a
+/// wait, so a host that runs the waiter's CPU late makes that likelier, not
+/// rarer): a delivery the waiter consumed and, in a double-stop phase, a
+/// committed stop by the second stopper. Both counts are stable between rounds: the
 /// waiter is stopped and drained off its CPU, and each double-stop round
 /// waited for the second stopper's `STOPPER_DONE`, which it stores after its
 /// count.

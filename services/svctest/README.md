@@ -148,11 +148,12 @@ svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`, `pwrmgr.
 `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
 vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`,
 `logd_restart`, and `logd_sinks` phases (`caps[6]`), the vfsd swap-partition phase (`caps[14]`), the
-`crash_endpoint`, `logd_restart`, and `logd_sinks` phases (`caps[17]`), and the
-`svcmgr_stop_service` phase (`caps[18]`), and the `oom_policy` phase's no-stop case (`caps[18]`),
-instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before the
-terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached; the panic hook's
-`SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
+`crash_endpoint`, `logd_restart`, `logd_sinks`, and `vfsd_driver_death` phases (`caps[17]`), the
+`svcmgr_stop_service` phase (`caps[18]`, and `caps[17]` with `stopsrc` staged), and the
+`oom_policy` phase's no-stop case (`caps[18]`), instead fail their assertions. The seed-only phase
+thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's
+own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero
+cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -189,7 +190,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
 | `caps[15]` | `devmgr.class.hwrng` | drivers hwrng read and drivers stray-cap phases: the `hwrng` class SEND |
 | `caps[16]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
-| `caps[17]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[17]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[18]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `oom_policy` phase, no-stop case: `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence

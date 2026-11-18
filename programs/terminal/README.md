@@ -130,7 +130,8 @@ stream. It runs as a boot in the `usertest` cell. See
 
 ## Summarized By
 
-[Console Model](../../docs/console-model.md), [Testing](../../docs/testing.md),
+[Console Model](../../docs/console-model.md),
+[Session Supervision](../../docs/session-supervision.md), [Testing](../../docs/testing.md),
 [programs/fb-charset/README.md](../fb-charset/README.md),
 [programs/shell/README.md](../shell/README.md),
 [services/drivers/framebuffer/README.md](../../services/drivers/framebuffer/README.md),

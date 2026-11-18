@@ -81,10 +81,9 @@ direct console paths remain as fallbacks for the life of the system.
    deletes init's UART Mmio capability), and by devmgr, whose I/O-port and MMIO caps it carves the
    driver's cap from.
 
-   real-logd is declared restartable (`restart = on_failure`; see
-   [services/logd/README.md](../services/logd/README.md)); a working logd restart is design intent;
-   not yet implemented ([#262](https://github.com/kottlerg/seraph/issues/262)). In the intended
-   model, svcmgr holds the master-log endpoint source for the system's life, so a restarted logd
+   real-logd is restartable (`restart = on_failure`; see
+   [services/logd/README.md](../services/logd/README.md)). svcmgr holds the master-log endpoint
+   source for the system's life, so a restarted logd
    re-attaches a fresh RECV to the same endpoint object every sender already targets; the log
    senders are uninterrupted across the restart and need no re-derivation of their `log_send_cap`. A
    restarted logd re-resolves the serial driver via `QUERY_DEVICE` on the serial class SEND (under a
@@ -92,11 +91,10 @@ direct console paths remain as fallbacks for the life of the system.
    `STREAM_BYTES` call waits at the kernel endpoint for at most its bound (`LOG_CALL_TIMEOUT_MS`,
    then `LOG_CALL_UNANSWERED_TIMEOUT_MS` once one of the process's calls has gone unanswered, per
    [shared/log](../shared/log/README.md)), and a line no logd takes within it is dropped; the kernel
-   panic console remains the guaranteed output path for any fault in that window. Today svcmgr's
-   death handler makes its own `log!` calls to the master-log endpoint before it respawns logd, so
-   the respawn is delayed by those bounds, not prevented, and procmgr rejects a restarted logd's
-   `REGISTER_DEATH_EQ` (first-wins), per [svcmgr restart
-   protocol](../services/svcmgr/docs/restart-protocol.md) § Supervision hierarchy.
+   panic console remains the guaranteed output path for any fault in that window. svcmgr writes no
+   line of logd's death before the respawn, so none of its own waits on those bounds, and procmgr
+   takes a restarted logd's `REGISTER_DEATH_EQ` in place of the dead instance's, per [svcmgr
+   restart protocol](../services/svcmgr/docs/restart-protocol.md) § Supervision hierarchy.
 
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace

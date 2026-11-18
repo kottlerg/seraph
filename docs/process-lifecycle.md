@@ -171,8 +171,7 @@ subsequent `SUBSTRATE` round carries one `(name, thread_cap, observer)`
 triple for a substrate service init bootstrapped (`memmgr`, `procmgr`,
 `devmgr`, `vfsd`), and a terminal `LOGD_SOURCES` round carries the
 master-log endpoint source and a badge-0 `SEND|GRANT` source on procmgr's
-endpoint, from which svcmgr launches real logd (restart: design intent; not
-yet implemented (#262), per
+endpoint, from which svcmgr launches and restarts real logd (per
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy). svcmgr — not init — then publishes the
 well-known names it owns into its own registry
@@ -612,7 +611,7 @@ Handling](fault-handling.md#delivery-resume-and-kill)).
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
 [Capability Model](capability-model.md), [Fault Handling](fault-handling.md),
-[Supervision](supervision.md), [Testing](testing.md),
+[Session Supervision](session-supervision.md), [Supervision](supervision.md), [Testing](testing.md),
 [Userspace Memory Model](userspace-memory-model.md),
 [programs/pipefault/README.md](../programs/pipefault/README.md),
 [programs/relrofault/README.md](../programs/relrofault/README.md),

@@ -10,13 +10,15 @@ been draining since boot, ingests init-logd's captured history (see
 [`docs/handover-protocol.md`](docs/handover-protocol.md)), subscribes to
 procmgr's death-notification cascade, and from then on is the single owner
 of every log line emitted by every userspace process.
-It is declared restartable (`restart = on_failure`); a working restart is design
-intent; not yet implemented ([#262](https://github.com/kottlerg/seraph/issues/262); see
-[`services/svcmgr/docs/restart-protocol.md`](../svcmgr/docs/restart-protocol.md)). In the
-intended model, svcmgr holds the master-log endpoint source for the system's life, so a
+It is restartable (`restart = on_failure`; see
+[`services/svcmgr/docs/restart-protocol.md`](../svcmgr/docs/restart-protocol.md)):
+svcmgr holds the master-log endpoint source for the system's life, so a
 restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
 targets; only the one-time init-logd history pull
-([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on restart.
+([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on restart, and the
+restarted logd serves a fresh table. That table holds no sender's display name: each sender
+registers its name once, at startup, so its lines render as `[?]` after a restart until it
+registers again (#1213).
 
 ## Role
 
@@ -118,11 +120,16 @@ targets; only the one-time init-logd history pull
   log calls would deadlock against it (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   § Death-queue resync).
 
-* **Undebuggable.** At startup logd declares itself undebuggable to procmgr
-  (`procmgr_labels::DECLARE_NO_DEBUG`): every process's log output, a
-  debug-authority holder's own included, waits on logd, so a holder that
-  stopped it would wait on itself (see
-  [crashd Operation](../crashd/docs/operation.md) § Limits).
+* **Debuggable.** The maintainer decided that logd does not declare itself
+  undebuggable to procmgr (`procmgr_labels::DECLARE_NO_DEBUG`): every
+  process's log output, a debug-authority holder's own included, waits on
+  logd, but every log call is bounded (`LOG_CALL_TIMEOUT_MS`, then `LOG_CALL_UNANSWERED_TIMEOUT_MS`,
+  [shared/log](../../shared/log/README.md)), so a holder that stops logd
+  waits on its own lines for at most that bound and drops them. A fault of
+  logd therefore reaches the crash service, whose report the receive workers
+  logd has left serve, and svcmgr restarts logd once the fault is declined
+  ([docs/supervision.md](../../docs/supervision.md)); a debug-authority
+  holder can attach to it.
 
 ## Out of scope (follow-up issues)
 
@@ -168,7 +175,7 @@ reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-lo
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, repeated after a further drain while init-logd defers it, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). Absent on a restart — there is no init-logd left to pull from, so logd skips the handover (restart: design intent; not yet implemented (#262)) |
+| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, repeated after a further drain while init-logd defers it, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). Absent on a restart — there is no init-logd left to pull from, so logd skips the handover |
 | 2 | Badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | The `serial` class SEND, derived from the `devmgr.class.serial` publication (to resolve the serial driver via `QUERY_DEVICE`) |
 | 4 | The `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (to resolve the framebuffer driver via `QUERY_DEVICE`) |

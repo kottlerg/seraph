@@ -117,4 +117,5 @@ path (the `$ ` prompt rendered via the terminal) is covered by
 
 ## Summarized By
 
+[Session Supervision](../../docs/session-supervision.md),
 [programs/stdiotest/README.md](../stdiotest/README.md)

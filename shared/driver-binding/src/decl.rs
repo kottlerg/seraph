@@ -31,7 +31,7 @@
 //! | `0x21` | Interrupt need | need (1 optional, 2 required), message-signaled vectors (0 to [`MAX_MSI_VECTORS`]) |
 //! | `0x22` | DMA | none |
 //! | `0x23` | Physical access | none |
-//! | `0x24` | Withdrawal reset | 1 `VirtIO` status, 2 PCI Express Function Level Reset |
+//! | `0x24` | Withdrawal reset | 1 `VirtIO` status of a device type with device-specific configuration, 2 PCI Express Function Level Reset, 3 `VirtIO` status of a device type with none |
 //! | `0x25` | Priority tier | 0 auxiliary, 1 boot |
 //! | `0x26` | DMA address width | one byte, [`MIN_DMA_WIDTH_BITS`] to [`MAX_DMA_WIDTH_BITS`]; only beside DMA |
 //!
@@ -306,6 +306,22 @@ impl Interrupt
     };
 }
 
+/// Whether a `VirtIO` device type has a device-specific configuration
+/// region (`VirtIO` 1.2 § 4.1.4.6), and so whether its driver's register
+/// layout includes one (`virtio_core::VirtioPciStartupInfo::register_layout`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtioDeviceConfig
+{
+    /// The device type has device-specific configuration, which its driver
+    /// reads (block, console, input): a device that presents no usable
+    /// region of it has no register layout.
+    Required,
+    /// The device type has none (the entropy device, `VirtIO` 1.2 § 5.4.4):
+    /// the layout neither requires the region nor reaches for it, and one
+    /// the device presents anyway is ignored.
+    Absent,
+}
+
 /// How devmgr stops the device when it withdraws the driver, beside the
 /// interrupt disable every PCI function gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,10 +329,32 @@ pub enum Reset
 {
     /// No reset.
     None,
-    /// The `VirtIO` `device_status` reset (`VirtIO` 1.2 § 4.1.4.3.2).
-    VirtioStatus,
+    /// The `VirtIO` `device_status` reset (`VirtIO` 1.2 § 4.1.4.3.2), of a
+    /// driver of the `VirtIO` register layout: devmgr gives such a driver
+    /// the layout, with the device-specific configuration region its device
+    /// type has or without it.
+    VirtioStatus
+    {
+        device_config: VirtioDeviceConfig
+    },
     /// A PCI Express Function Level Reset.
     PcieFlr,
+}
+
+impl Reset
+{
+    /// The device-configuration requirement of a driver that declares the
+    /// `VirtIO` status reset, the one declaration devmgr gives the `VirtIO`
+    /// register layout; `None` for any other reset.
+    #[must_use]
+    pub const fn virtio_device_config(self) -> Option<VirtioDeviceConfig>
+    {
+        match self
+        {
+            Self::VirtioStatus { device_config } => Some(device_config),
+            Self::None | Self::PcieFlr => None,
+        }
+    }
 }
 
 /// The priority tier the driver is created at.
@@ -615,8 +653,19 @@ impl Builder
                 d.dma_width = Some(bits);
             }
             (kind::PHYS_ACCESS, []) => d.phys_access = true,
-            (kind::RESET, &[1]) => d.reset = Reset::VirtioStatus,
+            (kind::RESET, &[1]) =>
+            {
+                d.reset = Reset::VirtioStatus {
+                    device_config: VirtioDeviceConfig::Required,
+                };
+            }
             (kind::RESET, &[2]) => d.reset = Reset::PcieFlr,
+            (kind::RESET, &[3]) =>
+            {
+                d.reset = Reset::VirtioStatus {
+                    device_config: VirtioDeviceConfig::Absent,
+                };
+            }
             (kind::TIER, &[0]) => d.tier = Tier::Auxiliary,
             (kind::TIER, &[1]) => d.tier = Tier::Boot,
             _ => return Err(bad),
@@ -840,8 +889,13 @@ pub const fn encode(decl: &Declaration<'_>) -> EncodedDesc
     {
         Reset::None =>
         {}
-        Reset::VirtioStatus => w.field(kind::RESET, &[1]),
+        Reset::VirtioStatus {
+            device_config: VirtioDeviceConfig::Required,
+        } => w.field(kind::RESET, &[1]),
         Reset::PcieFlr => w.field(kind::RESET, &[2]),
+        Reset::VirtioStatus {
+            device_config: VirtioDeviceConfig::Absent,
+        } => w.field(kind::RESET, &[3]),
     }
     if let Tier::Boot = decl.tier
     {
@@ -1152,7 +1206,8 @@ mod tests
             (kind::DMA, &[1]),
             (kind::PHYS_ACCESS, &[0]),
             (kind::RESET, &[0]),
-            (kind::RESET, &[3]),
+            (kind::RESET, &[4]),
+            (kind::RESET, &[1, 0]),
             (kind::TIER, &[2]),
             (kind::DMA_WIDTH, &[]),
             (kind::DMA_WIDTH, &[0]),
@@ -1203,6 +1258,49 @@ mod tests
             ])),
             Err(DeclError::Duplicate(kind::DMA_WIDTH))
         );
+    }
+
+    #[test]
+    fn each_withdrawal_reset_round_trips_and_keeps_its_wire_value()
+    {
+        let cases = [
+            (Reset::None, None),
+            (
+                Reset::VirtioStatus {
+                    device_config: VirtioDeviceConfig::Required,
+                },
+                Some(1),
+            ),
+            (Reset::PcieFlr, Some(2)),
+            (
+                Reset::VirtioStatus {
+                    device_config: VirtioDeviceConfig::Absent,
+                },
+                Some(3),
+            ),
+        ];
+        for (reset, wire) in cases
+        {
+            let desc = encode(&Declaration { reset, ..MINIMAL });
+            assert_eq!(decode(desc.as_bytes()).map(|d| d.reset), Ok(reset));
+            // The field is the last one MINIMAL encodes, so it ends the
+            // descriptor; with no reset there is none.
+            let bytes = desc.as_bytes();
+            match wire
+            {
+                Some(value) => assert_eq!(&bytes[bytes.len() - 3..], &[kind::RESET, 1, value]),
+                None => assert!(!bytes.contains(&kind::RESET)),
+            }
+        }
+        assert_eq!(
+            Reset::VirtioStatus {
+                device_config: VirtioDeviceConfig::Absent
+            }
+            .virtio_device_config(),
+            Some(VirtioDeviceConfig::Absent)
+        );
+        assert_eq!(Reset::PcieFlr.virtio_device_config(), None);
+        assert_eq!(Reset::None.virtio_device_config(), None);
     }
 
     #[test]

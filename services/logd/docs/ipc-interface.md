@@ -26,7 +26,7 @@ The shape mirrors the README's "Bootstrap caps" table:
 | Index | Cap |
 |---|---|
 | 0 | `RECV` on the master log endpoint |
-| 1 | `SEND` on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); a release init-logd defers is repeated after a further drain; if no attempt is delivered init-logd keeps serving), then `cap_delete` whatever the outcome; see [`handover-protocol.md`](handover-protocol.md)). Absent on a restart — no init-logd remains to pull from, so logd skips the history pull (restart: design intent; not yet implemented (#262)) |
+| 1 | `SEND` on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); a release init-logd defers is repeated after a further drain; if no attempt is delivered init-logd keeps serving), then `cap_delete` whatever the outcome; see [`handover-protocol.md`](handover-protocol.md)). Absent on a restart — no init-logd remains to pull from, so logd skips the history pull |
 | 2 | badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | the `serial` class `SEND`, derived from the `devmgr.class.serial` publication (resolves the serial driver via `QUERY_DEVICE`) |
 | 4 | the `framebuffer` class `SEND`, derived from the `devmgr.class.framebuffer` publication (resolves the framebuffer driver via `QUERY_DEVICE`) |
@@ -35,8 +35,7 @@ Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log
 source, so a restarted logd re-attaches its RECV to the same endpoint
 object every sender already targets. Only `cap[1]` differs across the two
 paths: present on the first launch (one-shot history pull from init-logd),
-absent on a restart (history pull skipped, fresh table served). A working
-logd restart is design intent; not yet implemented (#262), per svcmgr's
+absent on a restart (history pull skipped, fresh table served), per svcmgr's
 [`restart-protocol.md`](../../svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy.
 
@@ -53,7 +52,7 @@ that class's watch; `cap[1]` is deleted after the handover release.
 | logd's receive workers | `RECV` | each receives on the endpoint with `ipc_recv` (§ Receive pool) |
 | every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_RECORD`, `STREAM_REGISTER_NAME` |
 | a service that seeds `logd.query` | `SEND` badged `LOG_QUERY_AUTHORITY` | `QUERY_SLOTS`, `QUERY_HISTORY` (§ Queries) |
-| real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a restart (design intent; not yet implemented (#262)) |
+| real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a restart |
 
 ## Labels accepted
 
@@ -461,7 +460,8 @@ nothing binds it: once logd's
 procmgr's `LOGD_DEATH_EQ` static, every teardown procmgr runs (the reap of
 a death event, its death resync, and `DESTROY_PROCESS`) posts the death
 entry `(exit_reason, process badge)` to it. A process torn down before the
-registration posts nothing.
+registration posts nothing. A restarted logd's registration replaces the dead
+instance's queue, so its fresh table hears every death after it.
 
 logd's drain consumes each event as that death entry (`syscall::DeathEvent`,
 the full `u64` badge in the correlator word) and evicts the slot of exactly

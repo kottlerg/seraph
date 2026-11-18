@@ -382,7 +382,7 @@ fn listed_name(authority: u64, process: u64) -> Option<Vec<u8>>
 }
 
 /// Walk `LIST_PROCESSES` for the first live process named `name`; its badge.
-fn badge_named(authority: u64, name: &[u8]) -> Option<u64>
+pub(crate) fn badge_named(authority: u64, name: &[u8]) -> Option<u64>
 {
     find_listed(authority, |_, listed| listed == name).map(|(badge, _)| badge)
 }

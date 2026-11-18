@@ -44,8 +44,9 @@ The interrupt cap is optional: without it the driver still answers reads (RX the
 the client's bounded poll) but `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
 
 Before its bootstrap the driver declares itself undebuggable to procmgr
-(`procmgr_labels::DECLARE_NO_DEBUG`): logd writes every log line through it, so a debug-authority
-holder that stopped it would wait on its own log output
+(`procmgr_labels::DECLARE_NO_DEBUG`): logd writes every log line through it, with calls that have
+no bound, so a debug-authority holder that stopped it would hold every process's log output, its
+own included, for as long as the driver stayed stopped
 ([crashd Operation](../../crashd/docs/operation.md) § Limits).
 
 The bootstrap is the resource list (`driver_binding::resources`), decoded with

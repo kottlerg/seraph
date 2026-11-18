@@ -131,9 +131,10 @@ devmgr's responsibilities are:
   ([docs/pci-enumeration.md](pci-enumeration.md) § Per-Device Capability
   Creation):
 
-  - an `Mmio` cap per MMIO BAR: for a function that presents the VirtIO
-    register layout, each BAR the layout names, clipped to the pages its
-    regions reach, and for any other function every MMIO BAR, whole. For a
+  - an `Mmio` cap per MMIO BAR: for a driver that declares the VirtIO
+    status reset, and so is given the VirtIO register layout, each BAR the
+    layout names, clipped to the pages its regions reach, and for any other
+    driver every MMIO BAR, whole. For a
     function devmgr may give MSI-X the pages holding its MSI-X table and
     Pending Bit Array are cut out, so a BAR may be up to three caps, each
     naming its offset in its BAR; devmgr keeps the table's pages and writes
@@ -158,8 +159,8 @@ devmgr's responsibilities are:
   - for a DMA declaration, the device's DMA capability, after its grant
     attaches it to its IOMMU domain where a unit translates it (above); the
     driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD`;
-  - a catalog entry carrying the VirtIO startup info for a VirtIO function,
-    and no startup info otherwise.
+  - a catalog entry carrying the VirtIO startup info for a driver given the
+    VirtIO register layout, and no startup info otherwise.
 
   devmgr keeps the function's configuration page, which it carves at the bind
   and delegates to no driver, and writes the Command register through it:
@@ -210,8 +211,9 @@ devmgr's responsibilities are:
   the hotplug batch ([hotplug.md](hotplug.md#binding) § Binding).
   Each driver's devmgr query cap is a
   SEND, badged with its device badge, on its batch's private endpoint; the
-  IOMMU driver's badge, and those of PCI-bound drivers of functions that
-  present no VirtIO layout, name catalog entries that carry no startup info;
+  IOMMU driver's badge, and those of PCI-bound drivers given no VirtIO
+  register layout (any that declares no VirtIO status reset), name catalog
+  entries that carry no startup info;
   a platform record's badge names an entry too, the framebuffer's carrying its
   geometry and the CMOS RTC's its century index. Once a driver's bootstrap is
   served,

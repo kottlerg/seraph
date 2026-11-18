@@ -1105,6 +1105,7 @@ reply-then-death ordering is therefore enforced by the kernel.
 [Device Management](../../../docs/device-management.md),
 [Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Session Supervision](../../../docs/session-supervision.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [programs/capexhaust/README.md](../../../programs/capexhaust/README.md),
 [programs/demandpaged/README.md](../../../programs/demandpaged/README.md),

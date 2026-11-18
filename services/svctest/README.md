@@ -241,7 +241,8 @@ interface](../logd/docs/ipc-interface.md) § Queries); the `logd_death_forward` 
 child's retired slot and history through it, and requires `QUERY_DENIED` for a query on svctest's
 own log cap.
 The `logd_restart` phase kills logd through `caps[15]`: it finds logd by name
-(`LIST_PROCESSES`), attaches to it, stops its main thread, sets the thread's instruction pointer to
+(`LIST_PROCESSES`), attaches to it, requires the attach to report logd on the core path
+(`ATTACH_FLAG_NO_CORE`), stops its main thread, sets the thread's instruction pointer to
 0, and starts it, so the thread faults and the fault takes the path any fault of logd takes, to
 crashd when the boot stages it, else to procmgr's decliner, and svcmgr restarts logd. It writes no
 log line until it finds, through `caps[6]`, svcmgr's `service died: logd` and

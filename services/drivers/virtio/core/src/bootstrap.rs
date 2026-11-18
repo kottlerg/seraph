@@ -6,9 +6,12 @@
 //! A `VirtIO` PCI driver's reading of the resource list devmgr delivers it
 //! (`driver_binding::resources`; docs/driver-binding.md § Binding).
 //!
-//! For a function that presents the `VirtIO` register layout, devmgr delivers
-//! the BARs the layout's register regions name, in ascending BAR index (the
-//! order of [`RegisterLayout::bars`](crate::RegisterLayout::bars)), each as
+//! To a driver that declares the `VirtIO` status reset, devmgr delivers the
+//! BARs its register layout names (`register_layout` for the
+//! `VirtioDeviceConfig` it declares: a device region the device presents to
+//! a driver that declares `Absent` is not among them), in ascending BAR
+//! index (the order of [`RegisterLayout::bars`](crate::RegisterLayout::bars)),
+//! each as
 //! one `Mmio` resource from its start or, around the pages holding the
 //! function's MSI-X table and Pending Bit Array, which no driver is
 //! delivered, as several, each naming its PCI BAR and its offset in it; then

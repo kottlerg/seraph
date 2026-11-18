@@ -2360,6 +2360,233 @@ pub mod process {
         }
     }
 
+    /// The standard streams of a session's leader, made by the interface
+    /// that opens the session through sessiond
+    /// (`services/sessiond/docs/ipc-interface.md`): three pipes, the leader's
+    /// stdin, stdout and stderr, and the event queue procmgr posts the
+    /// leader's end to, its death relay.
+    ///
+    /// The interface hands sessiond [`Self::relay`] with `OPEN_SESSION` and
+    /// each stream's caps ([`Self::handoff`]) with `SESSION_STDIO`; sessiond
+    /// passes them on to procmgr for the leader it creates. The interface
+    /// keeps its ends ([`Self::take_stdin`], [`Self::take_stdout`],
+    /// [`Self::take_stderr`]) and learns the leader's end with [`Self::wait`].
+    ///
+    /// Each ring page is a grant of this process's, returned to memmgr once
+    /// both its end here is dropped and no leader can map it: after
+    /// [`Self::wait`] has returned, since procmgr posts the relay only once it
+    /// has torn the leader down, or after [`Self::refused`], when no leader
+    /// was made. Dropped with neither, the grants stay accounted to this
+    /// process until it exits, since a leader may still map the rings.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub struct SessionStdio {
+        relay: u64,
+        stdin: Option<crate::sys::process::ChildPipe>,
+        stdout: Option<crate::sys::process::ChildPipe>,
+        stderr: Option<crate::sys::process::ChildPipe>,
+        handoff: [Option<crate::sys::pipe::seraph::PipeCaps>; 3],
+        wakes: [(u64, u64); 3],
+        releases: [Option<crate::sync::Arc<crate::sys::pipe::seraph::RingRelease>>; 3],
+        peer_dead: crate::sync::Arc<crate::sync::atomic::AtomicBool>,
+        /// The leader's end, once [`Self::wait`] has read it.
+        ended: Option<u64>,
+    }
+
+    /// Entries the relay queue holds: procmgr's one post of the leader's end,
+    /// and one spare.
+    const RELAY_CAPACITY: u32 = 2;
+
+    impl SessionStdio {
+        /// Make the relay queue and the three pipes: the leader's stdin,
+        /// written here, and its stdout and stderr, read here.
+        ///
+        /// # Errors
+        /// The error of the object or pipe that could not be made; nothing
+        /// made before it is kept.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn new() -> crate::io::Result<Self> {
+            use crate::sys::pipe::seraph::{Pipe, Role};
+
+            let bytes = syscall_abi::event_queue_retype_bytes(u64::from(RELAY_CAPACITY), 0);
+            let relay = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
+                syscall::event_queue_create(slab, RELAY_CAPACITY).ok()
+            })
+            .ok_or_else(|| crate::io::Error::other("session: relay queue not made"))?;
+            let mut this = Self {
+                relay,
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                handoff: [None; 3],
+                wakes: [(0, 0); 3],
+                releases: [None, None, None],
+                peer_dead: crate::sync::Arc::new(crate::sync::atomic::AtomicBool::new(false)),
+                ended: None,
+            };
+            for (index, role) in [Role::Writer, Role::Reader, Role::Reader].into_iter().enumerate() {
+                // An error drops `this` while no release is armed, so each
+                // end made before it returns its ring when dropped: no
+                // leader has them.
+                let (mut pipe, caps) = Pipe::create_for_child(role)?;
+                pipe.set_peer_dead(this.peer_dead.clone());
+                if let Some(wake) = this.wakes.get_mut(index) {
+                    *wake = (pipe.data_notification_cap(), pipe.space_notification_cap());
+                }
+                if let Some(slot) = this.handoff.get_mut(index) {
+                    *slot = Some(caps);
+                }
+                let pipe = Some(crate::boxed::Box::new(pipe));
+                match index {
+                    0 => this.stdin = pipe,
+                    1 => this.stdout = pipe,
+                    _ => this.stderr = pipe,
+                }
+            }
+            // From here a leader may map the rings, so each ring returns only
+            // once its end is dropped and the peer is reported gone
+            // (`Self::wait` or `Self::refused`).
+            let ends = [&this.stdin, &this.stdout, &this.stderr];
+            for (release, end) in this.releases.iter_mut().zip(ends) {
+                *release = end.as_ref().and_then(|pipe| pipe.arm_ring_release());
+            }
+            Ok(this)
+        }
+
+        /// A POST cap on the relay queue, for `OPEN_SESSION`'s `caps[0]`.
+        ///
+        /// # Errors
+        /// When the kernel refuses the derivation.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn relay(&self) -> crate::io::Result<u64> {
+            syscall::cap_derive(self.relay, syscall::RIGHTS_EQ_POST)
+                .map_err(|_| crate::io::Error::other("session: relay POST not derived"))
+        }
+
+        /// The caps of the stream `direction` names
+        /// (`ipc::procmgr_labels::PIPE_DIR_STDIN`, `PIPE_DIR_STDOUT` or
+        /// `PIPE_DIR_STDERR`), for `SESSION_STDIO`'s `caps[0..3]`: the ring's
+        /// memory cap and its data and space notifications. `None` for
+        /// another direction, or once taken: the call that carries them moves
+        /// them.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn handoff(&mut self, direction: u64) -> Option<[u64; 3]> {
+            let caps = self.handoff.get_mut(usize::try_from(direction).ok()?)?.take()?;
+            Some([caps.memory, caps.data_notification, caps.space_notification])
+        }
+
+        /// The byte capacity of each ring, for `SESSION_STDIO`'s `data[3]`.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn ring_capacity(&self) -> u64 {
+            u64::from(crate::sys::pipe::seraph::RING_CAPACITY)
+        }
+
+        /// The end that writes the leader's stdin; `None` once taken.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn take_stdin(&mut self) -> Option<crate::process::ChildStdin> {
+            use crate::sys::FromInner;
+            self.stdin.take().map(crate::process::ChildStdin::from_inner)
+        }
+
+        /// The end that reads the leader's stdout; `None` once taken.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn take_stdout(&mut self) -> Option<crate::process::ChildStdout> {
+            use crate::sys::FromInner;
+            self.stdout.take().map(crate::process::ChildStdout::from_inner)
+        }
+
+        /// The end that reads the leader's stderr; `None` once taken.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn take_stderr(&mut self) -> Option<crate::process::ChildStderr> {
+            use crate::sys::FromInner;
+            self.stderr.take().map(crate::process::ChildStderr::from_inner)
+        }
+
+        /// Wait for procmgr's post of the leader's end to the relay, and
+        /// return it: the leader's exit status, its fault, or `EXIT_KILLED`
+        /// for a leader a destroy tore down. The ends here then read EOF once
+        /// drained and write `BrokenPipe`, and each ring returns to memmgr
+        /// once its end is dropped. A wait after the first returns the same
+        /// status at once.
+        ///
+        /// # Errors
+        /// When the relay cannot be read: the ends stay as they are.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn wait(&mut self) -> crate::io::Result<crate::process::ExitStatus> {
+            use crate::sys::FromInner;
+
+            let reason = match self.ended {
+                Some(reason) => reason,
+                None => self.receive_end()?,
+            };
+            Ok(crate::process::ExitStatus::from_inner(
+                crate::sys::process::ExitStatus::from_reason(reason),
+            ))
+        }
+
+        /// Receive the leader's end from the relay, then end the peer.
+        fn receive_end(&mut self) -> crate::io::Result<u64> {
+            use syscall_abi::SyscallError;
+
+            let reason = loop {
+                match syscall::event_recv(self.relay) {
+                    Ok(reason) => break reason,
+                    // A stop of this thread, or an upcall to it.
+                    Err(e) if e == SyscallError::Interrupted as i64 => {}
+                    Err(_) => return Err(crate::io::Error::other("session: relay unreadable")),
+                }
+            };
+            self.end_peer();
+            self.ended = Some(reason);
+            Ok(reason)
+        }
+
+        /// The session was refused, so no leader holds the rings: mark the
+        /// peer gone, so each ring returns to memmgr once its end is dropped.
+        /// Call it only on a definite refusal, one after which no leader
+        /// exists (sessiond's replies say which).
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn refused(mut self) {
+            self.end_peer();
+        }
+
+        /// Mark the peer gone, wake every end blocked on its ring, and report
+        /// the peer's end to each ring's release, sending the release of a
+        /// ring whose end is already dropped.
+        fn end_peer(&mut self) {
+            self.peer_dead.store(true, crate::sync::atomic::Ordering::Release);
+            for &(data, space) in &self.wakes {
+                let _ = syscall::notification_send(data, 1);
+                let _ = syscall::notification_send(space, 1);
+            }
+            for release in self.releases.iter_mut().filter_map(Option::take) {
+                if release.on_peer_death() {
+                    crate::sys::alloc::seraph::slab_release_fresh(release.region_id());
+                }
+            }
+        }
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl crate::fmt::Debug for SessionStdio {
+        fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+            f.debug_struct("SessionStdio").field("ended", &self.ended).finish_non_exhaustive()
+        }
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl Drop for SessionStdio {
+        fn drop(&mut self) {
+            // Caps no call moved: a moved one is a stale handle here, whose
+            // delete the per-slot generation refuses.
+            for caps in self.handoff.iter_mut().filter_map(Option::take) {
+                let _ = syscall::cap_delete(caps.memory);
+                let _ = syscall::cap_delete(caps.data_notification);
+                let _ = syscall::cap_delete(caps.space_notification);
+            }
+            let _ = syscall::cap_delete(self.relay);
+        }
+    }
+
     /// The spawning process's memmgr endpoint and address space.
     fn spawner_memmgr() -> crate::io::Result<(u64, u64)> {
         let info = super::try_startup_info().ok_or_else(|| {

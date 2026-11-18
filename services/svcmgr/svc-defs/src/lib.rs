@@ -377,11 +377,16 @@ pub struct Definition
 pub struct ProvidedName
 {
     pub name: String,
-    /// `1 << 63` for an `:auth` entry (carries the verb-authority bit),
-    /// `1` for a `:deny` entry (present but gate-failing), `0` for a bare
-    /// entry (unbadged — published via `cap_derive`, not
-    /// `cap_derive_badge`).
+    /// `1 << 63` for an `:auth` or `:grant` entry (carries the
+    /// verb-authority bit), `1` for a `:deny` entry (present but
+    /// gate-failing), `0` for a bare entry (unbadged — published via
+    /// `cap_derive`, not `cap_derive_badge`).
     pub badge: u64,
+    /// `true` for a `:grant` entry: svcmgr publishes its SEND with
+    /// `GRANT`, so a recipe seeding the name can move caps to the provider.
+    /// Such a name is seed-only, as every verb-bit name is, so
+    /// `QUERY_ENDPOINT` never yields `GRANT`.
+    pub grant: bool,
 }
 
 /// Directory svcmgr scans for service definitions. Absolute path

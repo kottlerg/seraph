@@ -1,24 +1,24 @@
 # /programs/terminal — userspace terminal (v0.0.1, #111).
 #
-# Autostarts on a normal boot. Relays the virtio-input keyboard to a child's
-# stdin and the child's stdout to the framebuffer + serial TX, with a minimal
-# line discipline (local echo, single-line backspace, CR->LF). Persistent and
-# non-bootstrap: critical = no, restart = never (svcmgr launches it one-shot and
-# does not supervise it; a post-login session model owns terminal lifecycle in a
-# later release). It is never in the ESP bundle and init never loads it.
+# Autostarts on a normal boot. Relays the virtio-input keyboard to the stdin of
+# an operator session's leader and the leader's stdout to the framebuffer +
+# serial TX, with a minimal line discipline (local echo, single-line
+# backspace, CR->LF). It is never in the ESP bundle and init never loads it.
 #
-# argv[1] is the child binary the terminal spawns: /programs/shell (#112).
-# namespace = universal + cwd = /data so the terminal can resolve and spawn the
-# child via procmgr (mirrors the program-spawning test harnesses); the shell
-# re-seeds its own cwd to the namespace root at startup. The seeds are the
-# input, framebuffer, and serial class SENDs, in that order, each queried
-# with QUERY_DEVICE.
+# The terminal is an interface of sessiond (docs/session-supervision.md): it
+# opens its session through the sessiond.operator SEND, and sessiond creates
+# the leader (the shell sessiond's recipe names), so the terminal holds no
+# process handle and needs no namespace. sessiond ends the terminal's sessions
+# when the terminal ends, whatever ends it, so svcmgr supervises it:
+# `restart = on_failure`, `critical = no`.
+#
+# The seeds are the input, framebuffer, and serial class SENDs, each queried
+# with QUERY_DEVICE, and the sessiond.operator SEND, in that order.
 binary    = /programs/terminal
 priority  = 10
 sched_max = 10
-argv      = terminal /programs/shell
-restart   = never
+argv      = terminal
+restart   = on_failure
 critical  = no
-namespace = universal
-cwd       = /data
-seed      = devmgr.class.input devmgr.class.framebuffer devmgr.class.serial
+namespace = none
+seed      = devmgr.class.input devmgr.class.framebuffer devmgr.class.serial sessiond.operator

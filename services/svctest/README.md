@@ -93,6 +93,8 @@ services/svctest/
         │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
         ├── pwrmgr.rs          # Shutdown cap-deny check, terminal shutdown, `reboot` role
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
+        ├── sessiond.rs        # sessiond's operator interface: badge gates, interface registration
+        │                      #   refusals, a session's shell, listed jobs, stopped whole
         ├── oom.rs             # Out-of-memory policy: memhog filled until oomd stops it, a
         │                      #   stop source's job stopped first, a held write resumed
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed
@@ -148,8 +150,9 @@ svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`, `pwrmgr.
 `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
 vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`,
 `logd_restart`, and `logd_sinks` phases (`caps[6]`), the vfsd swap-partition phase (`caps[14]`), the
-`crash_endpoint`, `logd_restart`, and `logd_sinks` phases (`caps[15]`), and the
-`svcmgr_stop_service` phase (`caps[16]`), and the `oom_policy` phase's no-stop case (`caps[16]`),
+`sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[17]`),
+the `crash_endpoint`, `logd_restart`, and `logd_sinks` phases (`caps[16]`), and the
+`svcmgr_stop_service` phase (`caps[17]`), and the `oom_policy` phase's no-stop case (`caps[17]`),
 instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before the
 terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached; the panic hook's
 `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
@@ -164,8 +167,8 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, four slots
 to a round (`caps[0]` to `caps[3]`, `caps[4]` to `caps[7]`, `caps[8]` to `caps[11]`,
-`caps[12]` to `caps[15]`, and `caps[16]`), the last two being the debug-authority cap the
-recipe's `debug_authority = yes` grants and the stop-authority cap its `stop_authority = yes`
+`caps[12]` to `caps[15]`, and `caps[16]` to `caps[17]`), the last two being the debug-authority cap
+the recipe's `debug_authority = yes` grants and the stop-authority cap its `stop_authority = yes`
 grants; [service-definitions.md §
 `seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's cap shape and the zero slot
 an unresolved name leaves. With no creator endpoint, every slot stays zero.
@@ -187,8 +190,9 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[12]` | `devmgr.class.input-deny` | drivers deny phase: an `input` class SEND without the driver's verb bits |
 | `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits; `logd_sinks` phase: the class it waits on for the killed framebuffer driver's withdrawal |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
-| `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
-| `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `oom_policy` phase, no-stop case: `STOP_CANDIDATE` of memhog |
+| `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose shell runs the large job |
+| `caps[16]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[17]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` phase, no-stop case: `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the seven `devmgr.class.*` names among them. `caps[2]` carries
@@ -197,7 +201,7 @@ that its name is published, the seven `devmgr.class.*` names among them. `caps[2
 `caps[3]`, neither of
 whose badges carries a class slot), `QUERY_SHUTDOWN_DEVICE`, and `BIND_DRIVERS`. `caps[3]` carries
 `REGISTRY_QUERY_AUTHORITY | BIND_AUTHORITY` as a `SEND|GRANT`, since `BIND_DRIVERS` moves a cap to
-devmgr; it is the one seed that arrives with GRANT, and the on-demand-bind phase sends
+devmgr; it is the one devmgr seed that arrives with GRANT, and the on-demand-bind phase sends
 `BIND_DRIVERS` on it. `caps[7]` and `caps[8]` are the `serial` and `input` class SENDs. The
 input-ordinal phase waits on a `WATCH_CLASS` watch (bounded by `DEVICE_WAIT_MS`) until devmgr
 serves an input driver, then requires a cap from `QUERY_DEVICE`
@@ -249,7 +253,7 @@ when either arrives empty.
 interface](../logd/docs/ipc-interface.md) § Queries); the `logd_death_forward` phase reads its dead
 child's retired slot and history through it, and requires `QUERY_DENIED` for a query on svctest's
 own log cap.
-The `logd_restart` phase kills logd through `caps[15]`: it finds logd by name
+The `logd_restart` phase kills logd through `caps[16]`: it finds logd by name
 (`LIST_PROCESSES`), attaches to it, requires the attach to report logd on the core path
 (`ATTACH_FLAG_NO_CORE`), stops its main thread, sets the thread's instruction pointer to
 0, and starts it, so the thread faults and the fault takes the path any fault of logd takes, to
@@ -284,18 +288,19 @@ and requires a different nonce from the instance svcmgr restarts
 The `svcmgr_stop_service` phase checks the stop authority
 ([svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) § Stop authority). Through the
 per-process `service_registry_cap`, `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`
-must reply `UNAUTHORIZED`. Through `caps[16]`, the whole `LIST_CANDIDATES` walk must list exactly
+must reply `UNAUTHORIZED`. Through `caps[17]`, the whole `LIST_CANDIDATES` walk must list exactly
 the staged fixtures whose recipes set `oom_stop = yes` (`crasher-worker` and `memhog`), each with
 a non-zero usage and the service rank, and nothing when neither is staged; `STOP_CANDIDATE` must
 reply `NO_CANDIDATE` for the first instance's key of every svcmgr table slot below 32 it does not
 list, which covers svctest itself (`restart = never`), the services init started, logd
 (`critical = yes`), pwrmgr and `stopsrc` (core roles), timed (no `oom_stop`) and the slots past
 the table. The whole `LIST_STOP_SOURCES` walk must list exactly
-[stopsrc](../stopsrc/README.md), with the program class, when `stopsrc.svc` is staged, and nothing
-otherwise; through the SEND it carries, the fixture's `LIST_CANDIDATES` must reply `SUCCESS` and
-`STOP_CANDIDATE` of a key it never gave `NO_CANDIDATE`, and through the fixture's `:deny` SEND,
+[sessiond](../sessiond/README.md) and [stopsrc](../stopsrc/README.md), each when its recipe is
+staged, both with the program class, and nothing when neither is staged; through the SEND it
+carries, the fixture's `LIST_CANDIDATES` must reply `SUCCESS` and `STOP_CANDIDATE` of a key it never
+gave `NO_CANDIDATE`, and through the fixture's `:deny` SEND,
 which `QUERY_ENDPOINT` resolves, both must reply `UNAUTHORIZED`. With `stopsrc.svc` staged, the
-phase also checks that svcmgr creates the source contained: through `caps[15]`, `LIST_PROCESSES`
+phase also checks that svcmgr creates the source contained: through `caps[16]`, `LIST_PROCESSES`
 must list one new process named `/tests/stopsrc`, the job's first argv word, after `START_JOB`;
 once the fixture has exited (`EXIT`, which leaves the job running) and its next instance answers
 `PROBE` with a new nonce, the job's badge must leave the list within 2 s. With
@@ -310,16 +315,34 @@ is not staged. It waits for the pressure level to read `NORMAL`, sends `PROBE` t
 [memhog](../memhog/README.md) (a nonce, 0 pages) and then `HOG`, which fills memory until the level
 reads `CRITICAL`. With oomd staged and `OOMD_STOP=yes`, it waits for the level to fall to `NORMAL`
 and checks that oomd logged exactly one `stopped memhog: ` line after at least its grace critical,
-and no advice line. When `stopsrc.svc` is staged, the phase first sends the fixture `EXIT`, waits
-for its restarted instance's new nonce, so the source oomd finds started after oomd, and has it
-start a job of 64 pages; oomd must then log one `stopped stopsrc-job: ` line before its stop of
-memhog, and the fixture must report the job stopped. When crashd is staged with a stall, a child
-(`/programs/crashme oom-touch`) writes a page during the fill and crashd logs it resumed. With
-`OOMD_STOP=no`, or without `oomd.svc` staged, it checks that memhog stays running and the level
-stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd, if staged, logged at least one
-`would stop memhog: ` line and no stop, and then stops memhog itself through `caps[16]`, by the key
-svcmgr listed it under before the fill. In every case memhog's next instance answers `PROBE` with a
-new nonce and 0 pages ([oomd](../oomd/README.md)).
+and no advice line. When `sessiond.svc` is staged and `caps[15]` is set, the phase also opens an
+operator session whose shell runs `crashme oom-hold 512`, a job larger than `stopsrc`'s; oomd must
+log one `stopped /programs/crashme: ` line before its stop of `stopsrc`'s job, then stop the
+session, whose relay gives the leader's end, and then memhog. When `stopsrc.svc` is staged, the
+phase first sends the fixture `EXIT`, waits for its restarted instance's new nonce, so the source
+oomd finds started after oomd, and has it start a job of 64 pages; oomd must then log one `stopped
+stopsrc-job: ` line before its stop of memhog, and the fixture must report the job stopped. When
+crashd is staged with a stall, a child (`/programs/crashme oom-touch`) writes a page during the fill
+and crashd logs it resumed; with sessiond staged, the child's `go` waits until sessiond lists no
+candidate, so crashd's hold covers only memhog's stop. With `OOMD_STOP=no`, or without `oomd.svc`
+staged, it checks that memhog stays running and the level stays `CRITICAL` past the grace, the
+cooldown and 2000 ms, that oomd, if staged, logged at least one `would stop memhog: ` line and no
+stop, and then stops memhog itself through `caps[17]`, by the key svcmgr listed it under before the
+fill. In every case memhog's next instance answers `PROBE` with a new nonce and 0 pages
+([oomd](../oomd/README.md)).
+
+The `sessiond_operator` phase (`phases/sessiond.rs`, right after the svcmgr phases) runs when
+`sessiond.svc` is staged and `caps[15]` is set, and passes otherwise. Through the stop SEND svcmgr
+hands svctest for sessiond, operator labels must reply `UNAUTHORIZED`, as must stop labels through
+the operator SEND. `OPEN_SESSION` under an unregistered nonce replies `UNKNOWN_INTERFACE`,
+`REGISTER_INTERFACE` of another version `VERSION_MISMATCH`, and a second one under one nonce
+`INVALID_ARGUMENT`. A cap of the wrong type or rights replies `INVALID_ARGUMENT`: a POST cap as
+`REGISTER_INTERFACE`'s end queue, a RECV cap as `OPEN_SESSION`'s relay, and a notification as
+`SESSION_STDIO`'s memory cap, which also ends the session, whose relay is then posted. A session
+runs the shell (`echo`), lists with `RANK_SESSION` under its key and its job (`crashme oom-hold 16`)
+with `RANK_JOB` under `/programs/crashme` with at least 16 pages; `STOP_CANDIDATE` of the job leaves
+the shell answering. The shell's exit gives status 0 on the relay and its key `NO_CANDIDATE` after;
+a second session stopped whole gives `EXIT_KILLED` ([sessiond](../sessiond/README.md)).
 
 ---
 
@@ -364,10 +387,12 @@ spawner tears them down), and an unmatched token falls through to the normal run
 
 Phases spawn these programs from `/programs/`: `hello` (procmgr, pipes), `stdiotest` (pipes,
 procmgr), `pipefault` (pipes), `stackoverflow` and `relrofault` (process faults), `capexhaust` (recv
-guard), `demandpaged` (pager), `fsbench` (FS IPC), and `crashme` (crash endpoint: svctest, its
-recipe granting `debug_authority`, registers as the crash service and takes a `crashme` child's
-forwarded page fault, and the faults of two `registry-*` children, whose attach lists their live
-registered threads and none that exited or was joined, and whose spawned thread's crash badge names
+guard), `demandpaged` (pager), `fsbench` (FS IPC), and `crashme` (`oom-hold <pages>`, run through a
+session's shell by the `sessiond_operator` and `oom_policy` phases: it touches that many heap pages,
+prints `holding <pages>` and waits to be destroyed; and the crash endpoint: svctest, its recipe
+granting `debug_authority`, registers as the crash service and takes a `crashme` child's forwarded
+page fault, and the faults of two `registry-*` children, whose attach lists their live registered
+threads and none that exited or was joined, and whose spawned thread's crash badge names
 it; on the first of those it acts as a debugger, finding the child with `LIST_PROCESSES` and having
 procmgr restore a registered thread it rebound, by `DETACH_PROCESS` and then by an attach's watch
 thread exiting; acts as the debugger of a `debugger-tag` child, whose thread registering with a

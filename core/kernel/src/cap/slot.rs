@@ -921,6 +921,7 @@ mod tests
     {
         assert_eq!(CapTag::Memory as u8, syscall::CAP_TAG_MEMORY);
         assert_eq!(CapTag::Notification as u8, syscall::CAP_TAG_NOTIFICATION);
+        assert_eq!(CapTag::EventQueue as u8, syscall::CAP_TAG_EVENT_QUEUE);
     }
 
     #[test]

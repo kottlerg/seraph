@@ -4,7 +4,7 @@
 // shared/objsig/src/cert.rs
 
 //! The certificate: a fixed 148-byte record by which a root lets a signing
-//! key sign objects of some kinds within a range of security versions
+//! key sign objects in some roles within a range of security versions
 //! ([docs/signing.md](../../../docs/signing.md) § Certificate Format).
 
 use crate::wire::{Reader, concat};
@@ -31,7 +31,7 @@ pub struct CertificateBody
     pub issuer_key_id: KeyId,
     /// The issuer's serial number of the certificate.
     pub serial: u64,
-    /// The kinds the signing key may sign; `certify` is always false.
+    /// The roles the signing key may sign; `certify` is always false.
     pub usage: Usage,
     /// The lowest security version the key may sign.
     pub min_security_version: u32,
@@ -152,7 +152,7 @@ impl Certificate
 mod tests
 {
     use super::*;
-    use crate::{Kind, KindSet};
+    use crate::{Role, RoleSet};
 
     fn sample() -> Certificate
     {
@@ -162,7 +162,7 @@ mod tests
                 issuer_key_id: [0x22; 16],
                 serial: 0x0102_0304_0506_0708,
                 usage: Usage {
-                    kinds: KindSet::of(&[Kind::Service, Kind::Driver]),
+                    roles: RoleSet::of(&[Role::Service, Role::Driver]),
                     certify: false,
                 },
                 min_security_version: 3,

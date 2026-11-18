@@ -43,10 +43,10 @@ use boot_protocol::{
     MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
     TRUST_STORE_MODULE, bundle,
 };
-use objsig::Kind;
+use objsig::Role;
 
-/// Maximum boot modules carried in [`BootInfo::modules`]: the ABI bound, the
-/// `BootModule` entries the one-page module array holds.
+/// Maximum boot modules carried in [`BootInfo::modules`]: the ABI bound. Step 6
+/// sizes the module array to the boot's own count ([`module_array_pages`]).
 const MAX_MODULES: usize = boot_protocol::MAX_BOOT_MODULES;
 
 /// Maximum modules the bundle supplies: one fewer than [`MAX_MODULES`], since
@@ -164,9 +164,12 @@ const MAX_RECLAIM_ENTRIES: usize = 12 + MAX_BUNDLE_MODULES + 1;
 // overflow halt in step 9 is unreachable.
 const _: () = assert!(MAX_RECLAIM_ENTRIES <= MAX_RECLAIM_RANGES);
 
-// The bundle entry name is copied straight into `BootModule.name` (step 4), so
-// the two widths are one ABI fact.
+// The bundle entry name is copied straight into `BootModule.name` (step 9), so
+// the two widths are one ABI fact, and each holds every name an object is
+// signed under whole, so the name the verifier checks is the name the entry
+// carries.
 const _: () = assert!(bundle::ENTRY_NAME_LEN == BOOT_MODULE_NAME_LEN);
+const _: () = assert!(BOOT_MODULE_NAME_LEN == objsig::NAME_MAX);
 
 // ── Forward-state groupings ───────────────────────────────────────────────────
 
@@ -201,16 +204,38 @@ struct InitLoad
     image: InitImage,
 }
 
-/// Boot-module load results: a fixed-capacity array of the bundle's
-/// [`BootModule`] descriptors, whose bodies are slices of the bundle
-/// allocation (see [`BundleLoad`]; there is no per-module read buffer), and
-/// the trust-store module, in a page allocation of its own, which step 9 lists
-/// after them.
+/// Boot-module load results: a fixed-capacity array of the bundle's modules,
+/// whose bodies are slices of the bundle allocation (see [`BundleLoad`];
+/// there is no per-module read buffer), and the trust-store module, in a page
+/// allocation of its own, which step 9 lists after them.
 struct ModulesLoad
 {
-    modules: [BootModule; MAX_BUNDLE_MODULES],
+    modules: [ModuleBody; MAX_BUNDLE_MODULES],
     count: usize,
     trust_store: BootModule,
+}
+
+/// One bundle module: its entry's index in the bundle's entry table and its
+/// body. Step 9 copies the entry's name into the module's [`BootModule`], so
+/// no name is held on the stack between steps 4 and 9.
+#[derive(Clone, Copy)]
+struct ModuleBody
+{
+    /// Index of the module's entry in the bundle's entry table.
+    entry: u32,
+    /// Physical base of the body inside the bundle allocation.
+    physical_base: u64,
+    /// The body's size in bytes, trailer included.
+    size: u64,
+}
+
+/// Pages of the module array that lists `listed` [`BootModule`] entries;
+/// a count too large to size saturates, which the allocation refuses.
+fn module_array_pages(listed: usize) -> usize
+{
+    listed
+        .saturating_mul(core::mem::size_of::<BootModule>())
+        .div_ceil(4096)
 }
 
 /// Bundle load result: a single UEFI allocation holding the whole
@@ -322,6 +347,9 @@ struct BootAllocations
 {
     boot_info_phys: u64,
     modules_phys: u64,
+    /// Pages of the [`BootModule`] array at `modules_phys`
+    /// ([`module_array_pages`] of the modules step 9 lists).
+    modules_pages: usize,
     mem_entries_phys: u64,
     /// Pages of the `MemoryMapEntry` array at `mem_entries_phys`, sized at
     /// step 6 to the reach of the map buffer for the firmware's descriptor
@@ -463,6 +491,8 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
         steps6_and_7_sized_to_the_map(
             &ctx,
             &module_regions(&bundle_load, &mods),
+            // The bundle's modules and the trust store.
+            mods.count.saturating_add(1),
             &kernel,
             &init,
             &cpus,
@@ -671,7 +701,7 @@ unsafe fn step3_load_kernel(
     // SAFETY: kernel_file is open and at position 0; kernel_buf is the correct size.
     unsafe { file_read(kernel_file, kernel_buf)? };
     // Verify before the ELF header is read: only the verified body is parsed.
-    let body = verifier.object(kernel_buf, Kind::Kernel, b"kernel")?;
+    let body = verifier.object(kernel_buf, Role::Kernel, b"kernel")?;
     // SAFETY: bs is valid; body is the complete ELF image.
     let info = unsafe { load_kernel(ctx.bs, body, arch::current::EXPECTED_ELF_MACHINE)? };
     // The read buffer is dead: load_kernel copied every segment and the
@@ -709,8 +739,8 @@ fn bundle_body(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]>
 }
 
 /// Walk the bundle header twice. The first walk verifies every entry through
-/// `verifier` under its entry name (`init` as init, every other entry as a boot
-/// module) and refuses an entry named [`TRUST_STORE_MODULE`]; the second, once
+/// `verifier` under its entry name (`init` as init, every other entry, which
+/// an install path names, as a boot module); the second, once
 /// every entry has passed, ELF-loads the body of the entry named
 /// [`bundle::INIT_ENTRY_NAME`] into a fresh set of segment pages and exposes
 /// every other entry, its trailer included, as a [`BootModule`] referencing the
@@ -758,8 +788,8 @@ unsafe fn step4_parse_bundle(
     );
 
     // Second walk: expose every entry but init, whole, as a module.
-    let mut modules = [BootModule {
-        name: [0u8; BOOT_MODULE_NAME_LEN],
+    let mut modules = [ModuleBody {
+        entry: 0,
         physical_base: 0,
         size: 0,
     }; MAX_BUNDLE_MODULES];
@@ -783,8 +813,8 @@ unsafe fn step4_parse_bundle(
         {
             return Err(BootError::InvalidBundle("bundle body past file end"));
         };
-        *slot = BootModule {
-            name: entry.name,
+        *slot = ModuleBody {
+            entry: i,
             // Bundle bodies are page-aligned (per `bundle::BODY_ALIGNMENT`),
             // so this physical base is a valid 4 KiB-aligned address inside
             // the bundle UEFI allocation.
@@ -827,12 +857,15 @@ fn parse_bundle_header(bytes: &[u8]) -> Result<bundle::BundleHeader, BootError>
 /// The first walk of [`step4_parse_bundle`]: verify each of the bundle's
 /// `entry_count` entries through `verifier` under its entry name, `init` as init
 /// and every other entry as a boot module, before any is parsed or exposed
-/// (docs/signing.md § Verifier Discipline). Returns init's verified body.
+/// (docs/signing.md § Verifier Discipline). Every entry but init is named by an
+/// install path, so none takes [`TRUST_STORE_MODULE`], the name the bootloader
+/// gives the module it adds. Returns init's verified body.
 ///
 /// # Errors
 /// [`BootError::SignatureRefused`] for the first entry the verifier refuses;
-/// [`BootError::InvalidBundle`] for an entry named [`TRUST_STORE_MODULE`], a
-/// second `init` entry or none, or an entry past the end of `bytes`.
+/// [`BootError::InvalidBundle`] for an entry other than init not named by an
+/// install path, a second `init` entry or none, or an entry past the end of
+/// `bytes`.
 fn verify_bundle<'a>(
     bytes: &'a [u8],
     entry_count: u32,
@@ -844,12 +877,6 @@ fn verify_bundle<'a>(
     {
         let (entry, object) = bundle_entry(bytes, i)?;
         let name = bundle::name_str(&entry.name);
-        if name == TRUST_STORE_MODULE
-        {
-            return Err(BootError::InvalidBundle(
-                "bundle has an entry named `trust-store`, a name the bootloader reserves",
-            ));
-        }
         if name == bundle::INIT_ENTRY_NAME
         {
             if init_body.is_some()
@@ -858,11 +885,17 @@ fn verify_bundle<'a>(
                     "bundle has multiple `init` entries",
                 ));
             }
-            init_body = Some(verifier.object(object, Kind::Init, name)?);
+            init_body = Some(verifier.object(object, Role::Init, name)?);
+        }
+        else if objsig::name_is_install_path(name)
+        {
+            verifier.object(object, Role::BootModule, name)?;
         }
         else
         {
-            verifier.object(object, Kind::BootModule, name)?;
+            return Err(BootError::InvalidBundle(
+                "bundle has an entry other than `init` not named by an install path",
+            ));
         }
     }
     init_body.ok_or(BootError::InvalidBundle("bundle missing `init` entry"))
@@ -1387,6 +1420,7 @@ unsafe fn knob_present(ctx: &UefiContext, path: &[u16], name: &'static str) -> b
 unsafe fn step6_allocate_and_build_page_tables(
     ctx: &UefiContext,
     module_regions: &[(u64, u64); 2],
+    listed_modules: usize,
     kernel: &KernelLoad,
     init: &InitLoad,
     cpus: &CpuTopology,
@@ -1405,9 +1439,10 @@ unsafe fn step6_allocate_and_build_page_tables(
     // BootInfo: one page — holds the BootInfo struct populated in step 9.
     // SAFETY: bs is valid.
     let boot_info_phys = unsafe { allocate_pages(ctx.bs, 1)? };
-    // Module array: one page — BootInfo.modules descriptor array.
+    // Module array: BootInfo.modules, one BootModule per listed module.
+    let modules_pages = module_array_pages(listed_modules);
     // SAFETY: bs is valid.
-    let modules_phys = unsafe { allocate_pages(ctx.bs, 1)? };
+    let modules_phys = unsafe { allocate_pages(ctx.bs, modules_pages)? };
     // MemoryMapEntry output array.
     // SAFETY: bs is valid.
     let mem_entries_phys = unsafe { allocate_pages(ctx.bs, mem_entries_pages)? };
@@ -1474,6 +1509,7 @@ unsafe fn step6_allocate_and_build_page_tables(
     let allocs = BootAllocations {
         boot_info_phys,
         modules_phys,
+        modules_pages,
         mem_entries_phys,
         mem_entries_pages,
         apertures_phys,
@@ -1630,7 +1666,7 @@ fn pages_to_bytes(pages: usize) -> u64
 }
 
 /// The identity-map regions of the fixed boot allocations: the `BootInfo`
-/// page, the boot-module array page, the memory-map entry pages, the handoff
+/// page, the boot-module array pages, the memory-map entry pages, the handoff
 /// stack above its guard page, the MMIO aperture array pages, the
 /// reclaim-array page (`BootInfo.reclaim_ranges`), and the CPU-id pages
 /// (`BootInfo.cpu_ids`). The AP trampoline page is mapped by the kernel, not
@@ -1639,7 +1675,7 @@ fn allocation_regions(allocs: &BootAllocations) -> [(u64, u64); 7]
 {
     [
         (allocs.boot_info_phys, 4096),
-        (allocs.modules_phys, 4096),
+        (allocs.modules_phys, pages_to_bytes(allocs.modules_pages)),
         (
             allocs.mem_entries_phys,
             pages_to_bytes(allocs.mem_entries_pages),
@@ -1777,9 +1813,15 @@ fn map_buffer_fits(buffer_bytes: usize, pages: usize) -> bool
 /// As [`step6_allocate_and_build_page_tables`], and `ctx.esp_root` must be a
 /// valid ESP root directory handle; nothing between the returned map and
 /// `ExitBootServices` may allocate.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "steps 6 and 7 pass step 6 every input it sizes its allocations from \
+              (step6_allocate_and_build_page_tables)"
+)]
 unsafe fn steps6_and_7_sized_to_the_map(
     ctx: &UefiContext,
     module_regions: &[(u64, u64); 2],
+    listed_modules: usize,
     kernel: &KernelLoad,
     init: &InitLoad,
     cpus: &CpuTopology,
@@ -1815,6 +1857,7 @@ unsafe fn steps6_and_7_sized_to_the_map(
             step6_allocate_and_build_page_tables(
                 ctx,
                 module_regions,
+                listed_modules,
                 kernel,
                 init,
                 cpus,
@@ -1901,7 +1944,7 @@ fn step6_and_7_spans(
     let pool_pages = pool.1 as usize;
     [
         (allocs.boot_info_phys, 1),
-        (allocs.modules_phys, 1),
+        (allocs.modules_phys, allocs.modules_pages),
         (allocs.mem_entries_phys, allocs.mem_entries_pages),
         (allocs.apertures_phys, allocs.apertures_pages),
         (allocs.seeds_phys, allocs.seeds_pages),
@@ -1968,11 +2011,13 @@ unsafe fn step8_exit_boot_services(
 ///
 /// # Errors
 /// [`BootError::ReclaimRangesOverflow`] when step 9 has more reclaim entries
-/// than `MAX_RECLAIM_ENTRIES` allows for.
+/// than `MAX_RECLAIM_ENTRIES` allows for; [`BootError::InvalidBundle`] when a
+/// module's bundle entry, which step 4 read, no longer reads.
 ///
 /// # Safety
-/// All physical allocations named in `allocs` must remain identity-mapped and
-/// writable. `uefi_map` must be the exited-boot memory map from step 7.
+/// All physical allocations named in `allocs` and `bundle` must remain
+/// identity-mapped, and those in `allocs` writable. `uefi_map` must be the
+/// exited-boot memory map from step 7.
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2000,23 +2045,42 @@ unsafe fn step9_populate_boot_info(
 {
     bprintln!("[--------] boot: step 9/10: populate BootInfo");
 
-    // Module descriptor array: the bundle's modules, then the trust store.
+    // Module descriptor array: the bundle's modules, each named by its
+    // entry's name, then the trust store.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "usize is 64-bit on every UEFI target Seraph supports, so the len cast is exact"
+    )]
+    // SAFETY: bundle.phys names the bundle's UEFI allocation of
+    // `pages * 4096 >= len` bytes, identity-mapped and live through the
+    // handoff (step 4's contract); nothing writes it.
+    let bundle_bytes =
+        unsafe { core::slice::from_raw_parts(bundle.phys as *const u8, bundle.len as usize) };
     let modules_ptr = allocs.modules_phys as *mut BootModule;
-    let listed = mods
-        .modules
-        .iter()
-        .take(mods.count)
-        .chain(core::iter::once(&mods.trust_store));
     let mut module_count: usize = 0;
-    for (i, &module) in listed.enumerate()
+    for (i, body) in mods.modules.iter().take(mods.count).enumerate()
     {
-        // SAFETY: modules_phys is a 4096-byte allocation; i ≤ count < MAX_MODULES (85)
-        // and 85 × 48-byte BootModule entries (4080 bytes) fit, so the offset stays inside it.
+        // Step 4 read this entry from the same bytes.
+        let entry = bundle::entry_at(bundle_bytes, body.entry)
+            .ok_or(BootError::InvalidBundle("bundle truncated"))?;
+        let module = BootModule {
+            name: entry.name,
+            physical_base: body.physical_base,
+            size: body.size,
+        };
+        // SAFETY: modules_phys is step 6's allocation of module_array_pages(count + 1)
+        // pages, and i < count, so the slot lies inside it.
         let slot = unsafe { modules_ptr.add(i) };
         // SAFETY: `slot` is an aligned BootModule slot of the owned, writable allocation.
         unsafe { core::ptr::write(slot, module) };
         module_count = i.saturating_add(1);
     }
+    // SAFETY: as above; module_count == count, the last slot of the
+    // count + 1 the allocation holds.
+    let slot = unsafe { modules_ptr.add(module_count) };
+    // SAFETY: `slot` is an aligned BootModule slot of the owned, writable allocation.
+    unsafe { core::ptr::write(slot, mods.trust_store) };
+    module_count = module_count.saturating_add(1);
 
     // Translate + sort the UEFI memory map.
     let entry_out = allocs.mem_entries_phys as *mut MemoryMapEntry;
@@ -2184,13 +2248,13 @@ unsafe fn step9_populate_boot_info(
         )
     };
     push_reclaim(allocs.boot_info_phys, 1, 0)?;
-    push_reclaim(allocs.modules_phys, 1, 0)?;
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the entry array is a few pages per thousand descriptors, far below u32::MAX \
-                  pages"
+        reason = "the module array is at most six pages (MAX_BOOT_MODULES entries), and the entry \
+                  array a few pages per thousand descriptors, far below u32::MAX pages"
     )]
     {
+        push_reclaim(allocs.modules_phys, allocs.modules_pages as u32, 0)?;
         push_reclaim(allocs.mem_entries_phys, allocs.mem_entries_pages as u32, 0)?;
     }
     #[expect(
@@ -2503,18 +2567,18 @@ mod tests
     use super::{
         BOOT_MODULE_NAME_LEN, BootAllocations, BootEntropy, BootError, BootModule, BundleLoad,
         ElfKind, HANDOFF_STACK_ALLOC_PAGES, KERNEL_STACK_PAGES, KaslrOverride, MAX_BUNDLE_MODULES,
-        MEM_MAP_ATTEMPTS, MapRedo, ModulesLoad, ReclaimRange, allocation_regions,
-        aperture_array_capacity, attempt_stands, bundle_body, choose_kaslr_layout,
-        entry_array_pages, framebuffer_aperture, handoff_stack_span, knob_redoes, map_buffer_fits,
-        memory_map, module_regions, push_reclaim_range, scrub, step6_and_7_spans, uefi,
-        verify_bundle,
+        MAX_MODULES, MEM_MAP_ATTEMPTS, MapRedo, ModuleBody, ModulesLoad, ReclaimRange,
+        allocation_regions, aperture_array_capacity, attempt_stands, bundle_body,
+        choose_kaslr_layout, entry_array_pages, framebuffer_aperture, handoff_stack_span,
+        knob_redoes, map_buffer_fits, memory_map, module_array_pages, module_regions,
+        push_reclaim_range, scrub, step6_and_7_spans, uefi, verify_bundle,
     };
     use crate::signing::Verifier;
     use crate::signing::testing::{ROOT_SEED, STRANGER_SEED, signed, store_of};
     use boot_protocol::{
         KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED, bundle,
     };
-    use objsig::{Kind, Refusal, TrustStore};
+    use objsig::{RecordFailure, Refusal, Role, TrustStore};
 
     /// A bundle of `(name, object)` entries, bodies at 4 KiB-aligned
     /// offsets, as xtask writes one.
@@ -2565,18 +2629,17 @@ mod tests
             pages: 3,
             len: 3 * 4096 - 5,
         };
-        let module = BootModule {
-            name: [0; BOOT_MODULE_NAME_LEN],
-            physical_base: 0,
-            size: 0,
-        };
         let mods = ModulesLoad {
-            modules: [module; MAX_BUNDLE_MODULES],
+            modules: [ModuleBody {
+                entry: 0,
+                physical_base: 0,
+                size: 0,
+            }; MAX_BUNDLE_MODULES],
             count: 0,
             trust_store: BootModule {
+                name: [0; BOOT_MODULE_NAME_LEN],
                 physical_base: 0x40_0000,
                 size: 4096 + 300,
-                ..module
             },
         };
         assert_eq!(
@@ -2586,24 +2649,40 @@ mod tests
     }
 
     // Defect caught: a bundle entry parsed or exposed without passing the
-    // verifier, init parsed from more than its verified body, or an entry
-    // taking the name of the module the bootloader adds.
+    // verifier, init parsed from more than its verified body, an entry other
+    // than init not named by an install path (the name of the module the
+    // bootloader adds among them), or a name cut short of its signed length.
     #[test]
     fn every_bundle_entry_is_verified_under_its_name_and_role()
     {
-        let init = signed(&ROOT_SEED, b"init image", Kind::Init, b"init");
-        let devmgr = signed(&ROOT_SEED, b"devmgr image", Kind::BootModule, b"devmgr");
+        const DEVMGR: &str = "/services/devmgr";
+        const TABLE: &str = "/config/devmgr/platform/qemu-virt.platform";
+        let init = signed(&ROOT_SEED, b"init image", &[Role::Init], b"init");
+        let devmgr = signed(
+            &ROOT_SEED,
+            b"devmgr image",
+            &[Role::Service, Role::BootModule],
+            DEVMGR.as_bytes(),
+        );
         let table = signed(
             &ROOT_SEED,
             b"oem_table_id = X\n",
-            Kind::BootModule,
-            b"table",
+            &[Role::BootModule],
+            TABLE.as_bytes(),
+        );
+        let longest = std::format!("/{}", "x".repeat(objsig::NAME_MAX - 1));
+        let long = signed(
+            &ROOT_SEED,
+            b"long image",
+            &[Role::Program, Role::BootModule],
+            longest.as_bytes(),
         );
         assert_eq!(
             verified(&[
                 ("init", init.clone()),
-                ("devmgr", devmgr.clone()),
-                ("table", table)
+                (DEVMGR, devmgr.clone()),
+                (TABLE, table),
+                (&longest, long),
             ])
             .unwrap(),
             b"init image"
@@ -2618,34 +2697,66 @@ mod tests
             other => panic!("expected a refusal, got {other:?}"),
         };
         // A module after init is verified before init is returned.
-        let untrusted = signed(&STRANGER_SEED, b"vfsd image", Kind::BootModule, b"vfsd");
+        let untrusted = signed(
+            &STRANGER_SEED,
+            b"vfsd image",
+            &[Role::Service, Role::BootModule],
+            b"/services/vfsd",
+        );
         assert_eq!(
-            refusal(&[("init", init.clone()), ("vfsd", untrusted)]),
-            ("vfsd".into(), Refusal::Untrusted)
+            refusal(&[("init", init.clone()), ("/services/vfsd", untrusted)]),
+            ("/services/vfsd".into(), Refusal::Untrusted)
         );
         // A module renamed in the header, and init signed as a module.
-        assert!(matches!(
-            refusal(&[("init", init.clone()), ("vfsd", devmgr.clone())]),
-            (name, Refusal::Failed(_)) if name == "vfsd"
-        ));
-        let module_as_init = signed(&ROOT_SEED, b"init image", Kind::BootModule, b"init");
-        assert!(matches!(
+        assert_eq!(
+            refusal(&[("init", init.clone()), ("/services/vfsd", devmgr.clone())]),
+            (
+                "/services/vfsd".into(),
+                Refusal::Failed(RecordFailure::Name)
+            )
+        );
+        let module_as_init = signed(&ROOT_SEED, b"init image", &[Role::BootModule], b"init");
+        assert_eq!(
             refusal(&[("init", module_as_init)]),
-            (name, Refusal::Failed(_)) if name == "init"
-        ));
+            ("init".into(), Refusal::Failed(RecordFailure::Role))
+        );
+        // A service the bundle carries though it was not signed to boot.
+        let service = signed(
+            &ROOT_SEED,
+            b"vfsd image",
+            &[Role::Service],
+            b"/services/vfsd",
+        );
+        assert_eq!(
+            refusal(&[("init", init.clone()), ("/services/vfsd", service)]),
+            (
+                "/services/vfsd".into(),
+                Refusal::Failed(RecordFailure::Role)
+            )
+        );
         // An unsigned data entry.
         assert!(matches!(
-            refusal(&[("init", init.clone()), ("log-levels", b"vfsd = debug\n".to_vec())]),
-            (name, Refusal::Parse(_)) if name == "log-levels"
+            refusal(&[
+                ("init", init.clone()),
+                ("/config/init/log-levels.conf", b"vfsd = debug\n".to_vec())
+            ]),
+            (name, Refusal::Parse(_)) if name == "/config/init/log-levels.conf"
         ));
 
-        let store = signed(&ROOT_SEED, b"store", Kind::BootModule, b"trust-store");
+        // Names no entry but init may carry: the module the bootloader adds,
+        // a bare component, the kernel's slot.
+        for name in ["trust-store", "devmgr", "kernel"]
+        {
+            assert!(
+                matches!(
+                    verified(&[("init", init.clone()), (name, devmgr.clone())]),
+                    Err(BootError::InvalidBundle(_))
+                ),
+                "{name}"
+            );
+        }
         assert!(matches!(
-            verified(&[("init", init.clone()), ("trust-store", store)]),
-            Err(BootError::InvalidBundle(_))
-        ));
-        assert!(matches!(
-            verified(&[("devmgr", devmgr)]),
+            verified(&[(DEVMGR, devmgr)]),
             Err(BootError::InvalidBundle("bundle missing `init` entry"))
         ));
         assert!(matches!(
@@ -2748,6 +2859,7 @@ mod tests
         BootAllocations {
             boot_info_phys: 0x1_0000,
             modules_phys: 0x2_0000,
+            modules_pages: 2,
             mem_entries_phys: 0x3_0000,
             mem_entries_pages: 3,
             apertures_phys: 0x4_0000,
@@ -2780,7 +2892,7 @@ mod tests
         let spans = step6_and_7_spans(&allocs, pool, map_buffer);
         let expected = [
             (0x1_0000, 1),
-            (0x2_0000, 1),
+            (0x2_0000, 2),
             (0x3_0000, 3),
             (0x4_0000, 3),
             (0x9_0000, 1),
@@ -2879,7 +2991,7 @@ mod tests
         let regions = allocation_regions(&allocs);
         for region in [
             (0x1_0000, 4096),
-            (0x2_0000, 4096),
+            (0x2_0000, 2 * 4096),
             (0x3_0000, 3 * 4096),
             (0x4_0000, 3 * 4096),
             (0x5_1000, (KERNEL_STACK_PAGES as u64) * 4096),
@@ -2892,6 +3004,27 @@ mod tests
                 "{region:x?} is not identity-mapped"
             );
         }
+    }
+
+    // Defect caught: a module array sized short of the modules step 9 lists,
+    // so the last entries are written past its pages, or one past what the
+    // largest boot needs.
+    #[test]
+    fn the_module_array_holds_every_listed_module()
+    {
+        let entry = core::mem::size_of::<BootModule>();
+        for listed in 1..=MAX_MODULES
+        {
+            let pages = module_array_pages(listed);
+            assert!(pages * 4096 >= listed * entry, "{listed} in {pages} pages");
+            assert!(
+                (pages - 1) * 4096 < listed * entry,
+                "{listed} in {pages} pages"
+            );
+        }
+        assert_eq!(module_array_pages(15), 1);
+        assert_eq!(module_array_pages(16), 2);
+        assert_eq!(module_array_pages(MAX_MODULES), 6);
     }
 
     // Defect caught: a push past the reclaim array's page, or one that records

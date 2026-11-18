@@ -45,10 +45,12 @@ pub struct BootModule
     pub name: Box<[u8]>,
 }
 
-/// Data words one module's bundle entry name takes in a MODULE round: 32 bytes,
+/// Data words one module's name takes in a MODULE round: its
+/// `BOOT_MODULE_NAME_LEN` bytes (the install path its signature names),
 /// packed little-endian, NUL-padded. Matches init's MODULE round
-/// (`services/init/src/service.rs`).
-const MODULE_NAME_WORDS: usize = 4;
+/// (`services/init/src/service.rs`), which carries one module a round, as the
+/// name fills half the round's data words.
+const MODULE_NAME_WORDS: usize = boot_protocol::BOOT_MODULE_NAME_LEN / 8;
 
 /// Round kind discriminator on post-R1 bootstrap rounds. Mirrors
 /// `init/src/service.rs::kind`.
@@ -255,8 +257,9 @@ impl DevmgrCaps
 //     data[2..] = kind-specific payload:
 //       APERTURE / ACPI_REGION → (base, size) pairs per cap
 //       MODULE → n = data[1] size words (the module's size in bytes), then
-//         MODULE_NAME_WORDS words per module, the module's bundle entry name
-//         (little-endian, NUL-padded); each cap is one boot module, untagged
+//         MODULE_NAME_WORDS words per module, the module's name, its install
+//         path (little-endian, NUL-padded); each cap is one boot module,
+//         untagged
 //       SVCMGR_BUNDLE → no payload; one or two caps (publish, optional
 //         arch shutdown); the terminal round
 //   RAM_EXTENT: zero caps; data[1] = count of (base, size) pairs,
@@ -412,7 +415,7 @@ fn absorb_ram_extent_round(
 /// Unpack one module-cap round: each cap is one boot module, untagged, and
 /// `data[2 + i]` is the size in bytes of the module of cap `i`, and with
 /// `n = data[1]` modules, words `2 + n + MODULE_NAME_WORDS * i` onward are its
-/// bundle entry name, the bytes up to the first NUL. The `.min(4)` is
+/// name, the bytes up to the first NUL or all of them. The `.min(4)` is
 /// `MSG_CAP_SLOTS_MAX`, the caps one round carries. A module whose size or name
 /// the round does not carry, whose name is empty, or that the list cannot grow
 /// to hold, is logged and its cap released: a retained module cap pins init's

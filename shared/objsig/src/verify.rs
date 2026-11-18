@@ -13,15 +13,16 @@ use crate::attrs::{Attributes, HASH_LEN};
 use crate::cert::Certificate;
 use crate::store::{Anchor, TrustStore};
 use crate::trailer::{Record, split};
-use crate::{Arch, KindSet, ParseError, PublicKey, key_id};
+use crate::{Arch, ParseError, PublicKey, RoleSet, key_id};
 
 /// What the caller expects of the object it loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Expectation<'a>
 {
-    /// The kinds the caller accepts.
-    pub kinds: KindSet,
-    /// The bundle entry name or install path the caller is loading.
+    /// The roles the caller accepts: the record's set must hold one of
+    /// them.
+    pub roles: RoleSet,
+    /// The slot name or install path the caller is loading.
     pub name: &'a [u8],
     /// The architecture the caller runs.
     pub arch: Arch,
@@ -64,11 +65,12 @@ pub enum RecordFailure
     SignerMismatch,
     /// The anchor's key id or the signing key's is revoked.
     Revoked,
-    /// The signing key may not sign the signed kind: the anchor's usage, or
-    /// with a certificate the certificate's and the anchor's, lack it.
+    /// The signing key may not sign every role of the signed set: the
+    /// anchor's usage, or with a certificate the certificate's and the
+    /// anchor's, lack one.
     KeyUsage,
-    /// The caller does not accept the signed kind.
-    Kind,
+    /// The signed set holds no role the caller accepts.
+    Role,
     /// The signed name is not the caller's.
     Name,
     /// The signed architecture is not the caller's.
@@ -174,12 +176,12 @@ fn check<'s>(
 {
     let fail = Miss::Failed;
     let attrs = &record.attrs;
-    let (anchor, signing_key, kinds) = match &record.certificate
+    let (anchor, signing_key, usable) = match &record.certificate
     {
         None =>
         {
             let anchor = store.anchor(&record.signer_key_id).ok_or(Miss::Untrusted)?;
-            (anchor, anchor.key, anchor.usage.kinds)
+            (anchor, anchor.key, anchor.usage.roles)
         }
         Some(certificate) =>
         {
@@ -196,7 +198,7 @@ fn check<'s>(
             (
                 anchor,
                 cert.subject_key,
-                cert.usage.kinds.intersection(anchor.usage.kinds),
+                cert.usage.roles.intersection(anchor.usage.roles),
             )
         }
     };
@@ -206,13 +208,13 @@ fn check<'s>(
     {
         return Err(fail(RecordFailure::Revoked));
     }
-    if !kinds.contains(attrs.kind)
+    if !attrs.roles.is_subset(usable)
     {
         return Err(fail(RecordFailure::KeyUsage));
     }
-    if !expect.kinds.contains(attrs.kind)
+    if !attrs.roles.meets(expect.roles)
     {
-        return Err(fail(RecordFailure::Kind));
+        return Err(fail(RecordFailure::Role));
     }
     if attrs.name != expect.name
     {
@@ -325,14 +327,14 @@ mod tests
     use super::*;
     use crate::testutil::{ROOT, attrs, certify, keys, object, record, store};
     use crate::trailer::RecordSpec;
-    use crate::{Kind, Usage};
+    use crate::{Role, Usage};
     use crypto_testkit::rng::Rng;
 
     const BODY: &[u8] = b"\x7fELF the body of a service image, any bytes at all";
     const NAME: &[u8] = b"/services/svcmgr";
 
     const EXPECT: Expectation<'static> = Expectation {
-        kinds: KindSet::of(&[Kind::Service]),
+        roles: RoleSet::of(&[Role::Service]),
         name: NAME,
         arch: Arch::X86_64,
     };
@@ -349,7 +351,7 @@ mod tests
         record(
             &keys().root,
             None,
-            attrs(BODY, Kind::Service, NAME, security_version),
+            attrs(BODY, &[Role::Service], NAME, security_version),
         )
     }
 
@@ -361,21 +363,25 @@ mod tests
         let cert = certify(
             &k.root,
             &k.signer,
-            KindSet::of(&[Kind::Service, Kind::Driver]),
+            RoleSet::of(&[Role::Service, Role::Driver]),
             2,
             5,
         );
         record(
             &k.signer,
             Some(cert),
-            attrs(BODY, Kind::Service, NAME, security_version),
+            attrs(BODY, &[Role::Service], NAME, security_version),
         )
     }
 
     /// A service record signed by a root no store trusts.
     fn stranger() -> RecordSpec<'static>
     {
-        record(&keys().stranger, None, attrs(BODY, Kind::Service, NAME, 3))
+        record(
+            &keys().stranger,
+            None,
+            attrs(BODY, &[Role::Service], NAME, 3),
+        )
     }
 
     fn run(
@@ -421,7 +427,7 @@ mod tests
     {
         let root = root_store();
         assert_eq!(run(&root, &[stranger(), direct(3)], &EXPECT), Ok(()));
-        let wrong_name = record(&keys().root, None, attrs(BODY, Kind::Service, b"/x", 3));
+        let wrong_name = record(&keys().root, None, attrs(BODY, &[Role::Service], b"/x", 3));
         assert_eq!(
             run(&root, &[wrong_name, stranger(), certified(3)], &EXPECT),
             Ok(())
@@ -431,7 +437,7 @@ mod tests
         let second = record(
             &keys().second_root,
             None,
-            attrs(BODY, Kind::Service, NAME, 3),
+            attrs(BODY, &[Role::Service], NAME, 3),
         );
         let store_view = TrustStore::parse(&both).unwrap();
         let bytes = object(BODY, &[second]);
@@ -447,8 +453,12 @@ mod tests
             Err(Refusal::Untrusted)
         );
         let k = keys();
-        let cert = certify(&k.stranger, &k.signer, KindSet::ALL, 0, 9);
-        let by_stranger = record(&k.signer, Some(cert), attrs(BODY, Kind::Service, NAME, 3));
+        let cert = certify(&k.stranger, &k.signer, RoleSet::ALL, 0, 9);
+        let by_stranger = record(
+            &k.signer,
+            Some(cert),
+            attrs(BODY, &[Role::Service], NAME, 3),
+        );
         assert_eq!(
             run(&root_store(), &[stranger(), by_stranger], &EXPECT),
             Err(Refusal::Untrusted)
@@ -459,15 +469,15 @@ mod tests
     fn reports_the_first_trusted_failure()
     {
         let store = root_store();
-        let wrong_name = record(&keys().root, None, attrs(BODY, Kind::Service, b"/x", 3));
-        let wrong_kind = record(&keys().root, None, attrs(BODY, Kind::Driver, NAME, 3));
+        let wrong_name = record(&keys().root, None, attrs(BODY, &[Role::Service], b"/x", 3));
+        let wrong_role = record(&keys().root, None, attrs(BODY, &[Role::Driver], NAME, 3));
         assert_eq!(
-            run(&store, &[stranger(), wrong_name, wrong_kind], &EXPECT),
+            run(&store, &[stranger(), wrong_name, wrong_role], &EXPECT),
             failed(RecordFailure::Name)
         );
         assert_eq!(
-            run(&store, &[wrong_kind, stranger(), wrong_name], &EXPECT),
-            failed(RecordFailure::Kind)
+            run(&store, &[wrong_role, stranger(), wrong_name], &EXPECT),
+            failed(RecordFailure::Role)
         );
     }
 
@@ -475,7 +485,7 @@ mod tests
     fn refuses_a_certificate_of_a_root_without_certify()
     {
         let usage = Usage {
-            kinds: KindSet::ALL,
+            roles: RoleSet::ALL,
             certify: false,
         };
         let store_bytes = store(0, &[(&keys().root, usage)], &[]);
@@ -519,11 +529,11 @@ mod tests
     }
 
     #[test]
-    fn refuses_a_kind_the_key_may_not_sign()
+    fn refuses_a_role_the_key_may_not_sign()
     {
         let k = keys();
         let programs_only = Usage {
-            kinds: KindSet::of(&[Kind::Program]),
+            roles: RoleSet::of(&[Role::Program]),
             certify: true,
         };
         let narrow = store(0, &[(&k.root, programs_only)], &[]);
@@ -537,11 +547,11 @@ mod tests
             failed(RecordFailure::KeyUsage)
         );
         // The issuer allows services, but the certificate does not.
-        let drivers = certify(&k.root, &k.signer, KindSet::of(&[Kind::Driver]), 0, 9);
+        let drivers = certify(&k.root, &k.signer, RoleSet::of(&[Role::Driver]), 0, 9);
         let spec = record(
             &k.signer,
             Some(drivers),
-            attrs(BODY, Kind::Service, NAME, 3),
+            attrs(BODY, &[Role::Service], NAME, 3),
         );
         assert_eq!(
             run(&root_store(), &[spec], &EXPECT),
@@ -554,12 +564,12 @@ mod tests
     {
         let store = root_store();
         let drivers = Expectation {
-            kinds: KindSet::of(&[Kind::Driver, Kind::Program]),
+            roles: RoleSet::of(&[Role::Driver, Role::Program]),
             ..EXPECT
         };
         assert_eq!(
             run(&store, &[direct(3)], &drivers),
-            failed(RecordFailure::Kind)
+            failed(RecordFailure::Role)
         );
         let other_name = Expectation {
             name: b"/services/svcmgr2",
@@ -579,11 +589,82 @@ mod tests
         );
     }
 
+    /// A record of several roles needs every one in the key's usage: one
+    /// role the key may not sign refuses it, whichever role the caller
+    /// asks for.
+    #[test]
+    fn refuses_a_set_one_role_of_which_the_key_may_not_sign()
+    {
+        let k = keys();
+        let both = &[Role::Service, Role::BootModule];
+        let services = Usage {
+            roles: RoleSet::of(&[Role::Service]),
+            certify: true,
+        };
+        let narrow = store(0, &[(&k.root, services)], &[]);
+        let spec = record(&k.root, None, attrs(BODY, both, NAME, 3));
+        assert_eq!(
+            run(&narrow, &[spec], &EXPECT),
+            failed(RecordFailure::KeyUsage)
+        );
+        assert_eq!(run(&root_store(), &[spec], &EXPECT), Ok(()));
+        // The certificate allows services and drivers, not boot modules.
+        let cert = certify(
+            &k.root,
+            &k.signer,
+            RoleSet::of(&[Role::Service, Role::Driver]),
+            0,
+            9,
+        );
+        let spec = record(&k.signer, Some(cert), attrs(BODY, both, NAME, 3));
+        assert_eq!(
+            run(&root_store(), &[spec], &EXPECT),
+            failed(RecordFailure::KeyUsage)
+        );
+    }
+
+    /// A record of several roles passes for a caller whose set meets its
+    /// own, in any one of them, and only for such a caller.
+    #[test]
+    fn accepts_a_caller_whose_set_meets_the_records()
+    {
+        let spec = record(
+            &keys().root,
+            None,
+            attrs(BODY, &[Role::Service, Role::BootModule], NAME, 3),
+        );
+        for accepted in [
+            &[Role::Service][..],
+            &[Role::BootModule],
+            &[Role::Driver, Role::Service],
+            &[Role::Service, Role::BootModule],
+        ]
+        {
+            let expect = Expectation {
+                roles: RoleSet::of(accepted),
+                ..EXPECT
+            };
+            assert_eq!(run(&root_store(), &[spec], &expect), Ok(()), "{accepted:?}");
+        }
+        for refused in [&[Role::Driver, Role::Program][..], &[Role::Init], &[]]
+        {
+            let expect = Expectation {
+                roles: RoleSet::of(refused),
+                ..EXPECT
+            };
+            assert_eq!(
+                run(&root_store(), &[spec], &expect),
+                failed(RecordFailure::Role),
+                "{refused:?}"
+            );
+        }
+    }
+
     #[test]
     fn refuses_a_record_of_another_body()
     {
         let k = keys();
-        let mut longer = attrs(BODY, Kind::Service, NAME, 3);
+        let mut longer = attrs(BODY, &[Role::Service], NAME, 3);
         longer.body_len += 1;
         assert_eq!(
             run(&root_store(), &[record(&k.root, None, longer)], &EXPECT),
@@ -591,7 +672,7 @@ mod tests
         );
         let mut other = BODY.to_vec();
         other[0] ^= 1;
-        let spec = record(&k.root, None, attrs(&other, Kind::Service, NAME, 3));
+        let spec = record(&k.root, None, attrs(&other, &[Role::Service], NAME, 3));
         assert_eq!(
             run(&root_store(), &[spec], &EXPECT),
             failed(RecordFailure::BodyHash)
@@ -636,9 +717,13 @@ mod tests
             failed(RecordFailure::CertificateSignature)
         );
         // A certificate the stranger signed that names the root as issuer.
-        let mut forged = certify(&k.stranger, &k.signer, KindSet::ALL, 0, 9);
+        let mut forged = certify(&k.stranger, &k.signer, RoleSet::ALL, 0, 9);
         forged.body.issuer_key_id = k.root.id();
-        let spec = record(&k.signer, Some(forged), attrs(BODY, Kind::Service, NAME, 3));
+        let spec = record(
+            &k.signer,
+            Some(forged),
+            attrs(BODY, &[Role::Service], NAME, 3),
+        );
         assert_eq!(
             run(&root_store(), &[spec], &EXPECT),
             failed(RecordFailure::CertificateSignature)
@@ -710,7 +795,7 @@ mod tests
         let k = keys();
         let issued: Vec<Certificate> = (9u32..)
             .take(CERTIFICATE_CACHE_LEN + 1)
-            .map(|max| certify(&k.root, &k.signer, KindSet::ALL, 0, max))
+            .map(|max| certify(&k.root, &k.signer, RoleSet::ALL, 0, max))
             .collect();
         let mut cache = CertificateCache::new();
         for cert in &issued

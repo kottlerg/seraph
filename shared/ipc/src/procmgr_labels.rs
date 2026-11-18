@@ -605,7 +605,8 @@ pub const REGISTER_CRASH_SERVICE: u64 = 19;
 /// `data[`[`ATTACH_WORD_PROCESS_BADGE`]`]` the target's process badge,
 /// `data[`[`ATTACH_WORD_NAMED_THREAD`]`]` the index of the thread the
 /// request's badge names, and `data[`[`ATTACH_WORD_FLAGS`]`]` the
-/// target's declarations ([`ATTACH_FLAG_NO_CORE`]), and with the caps of
+/// target's declarations and placement ([`ATTACH_FLAG_NO_CORE`],
+/// [`ATTACH_FLAG_RESERVE`]), and with the caps of
 /// threads `data[1]..` of the request, at most [`ATTACH_THREADS_PAGE`];
 /// `INVALID_BADGE` when no live process carries the badge (memmgr and
 /// procmgr, which procmgr did not create, among them); `NOT_ATTACHABLE`
@@ -626,12 +627,17 @@ pub const ATTACH_WORD_NAMED_THREAD: usize = 6;
 /// [`ATTACH_WORD_NAMED_THREAD`] value: the named thread is not listed.
 pub const ATTACH_NO_THREAD: u64 = u64::MAX;
 
-/// [`ATTACH_PROCESS`] reply word: the target's declarations, a set of
-/// `ATTACH_FLAG_*` bits.
+/// [`ATTACH_PROCESS`] reply word: the target's declarations and
+/// placement, a set of `ATTACH_FLAG_*` bits.
 pub const ATTACH_WORD_FLAGS: usize = 7;
 
 /// [`ATTACH_WORD_FLAGS`] bit: the target sent [`DECLARE_NO_CORE`].
 pub const ATTACH_FLAG_NO_CORE: u64 = 1;
+
+/// [`ATTACH_WORD_FLAGS`] bit: the target's memmgr budget node is a
+/// system-reserve node ([`CREATE_RESERVE`]), so its charges may take the
+/// free pages memmgr keeps in reserve.
+pub const ATTACH_FLAG_RESERVE: u64 = 1 << 1;
 
 /// The caller declares itself on the core path, the processes a core dump
 /// waits on, on its own procmgr cap (its process badge names it): procmgr

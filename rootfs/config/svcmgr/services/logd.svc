@@ -28,8 +28,9 @@
 # through logd with a synchronous call, so a service they call on that path
 # is a reserve service too (services/svcmgr/docs/service-definitions.md
 # § `reserve`): outside the reserve, a first touch of logd's heap while the
-# free pool is at the reserve is declined and kills it, and svcmgr cannot
-# create its next instance until memory is freed. A reserve holder has a core
+# free pool is at the reserve is declined and kills it, and svcmgr's one
+# create of its next instance is refused while the pool stays there, which,
+# logd being critical, shuts the system down. A reserve holder has a core
 # role, which `log_sink` gives logd already.
 binary    = /services/logd
 argv      = logd

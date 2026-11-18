@@ -146,10 +146,12 @@ after the restart included (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   the free pool is at the reserve is backed from the reserve, as is the create of its next
   instance after a crash (see
   [`services/svcmgr/docs/service-definitions.md`](../svcmgr/docs/service-definitions.md)
-  § `reserve`). What logd takes from the reserve is what its table grows by while memory is
-  critical: each live sender's history ring filling to `PER_SLOT_HISTORY` entries of at most
-  about 1.5 KiB and its partial line to `LINE_BUF_SIZE`, and a slot for each process created
-  meanwhile, which only a reserve creator can create. The retired slots are capped
+  § `reserve`). What logd takes from the reserve is what it grows by while memory is critical:
+  each live sender's history ring filling to `PER_SLOT_HISTORY` entries of at most about 1.5 KiB
+  and its partial line to `LINE_BUF_SIZE`, and a slot for each sender that sends its first line
+  meanwhile. After a restart while memory is critical that is every live sender, since the new
+  instance's table is empty, and the new instance's whole startup footprint is taken from the
+  reserve as well. The retired slots are capped
   (`RETIRED_SLOTS`), and retiring a slot moves it. No constant bounds the growth, since it
   grows with the live sender count ([docs/limits.md](../../docs/limits.md) § init and logd;
   [#1287](https://github.com/kottlerg/seraph/issues/1287)).

@@ -401,10 +401,12 @@ fn probe(fixture: u64, phase: &str, what: &str) -> (u64, u64)
 /// next instance must then answer with a new nonce and no pages.
 ///
 /// Returns the last `ElapsedUs` reading taken before a read of the level that
-/// gave `CRITICAL`: from the fill to that reading no process outside the
-/// system reserve could take a free page, since the fixture held the pool at
-/// the reserve throughout. `during` and the wait must allocate nothing and
-/// write no log line; the stack they use is touched before the fill.
+/// gave `CRITICAL`. From the fill to that reading the fixture holds the pool
+/// at the reserve, so a process outside the system reserve takes no free page,
+/// except the pages another process frees in the window, which the fixture
+/// takes back only at its next tick (`mem_fill::TICK_MS`). `during` and the
+/// wait must allocate nothing and write no log line; the stack they use is
+/// touched before the fill.
 pub(super) fn critical_window(
     caps: &Caps,
     phase: &str,

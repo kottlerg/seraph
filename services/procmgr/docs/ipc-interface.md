@@ -1055,7 +1055,7 @@ Reply `SUCCESS` with:
 | `data[4]` | The address of the target's `ProcessInfo` page |
 | `data[5]` | The target's process badge (`ATTACH_WORD_PROCESS_BADGE`) |
 | `data[6]` | The list index of the thread `data[0]` names (`ATTACH_WORD_NAMED_THREAD`): `0`, the main thread, for a process badge; the registered thread bound under a crash badge; `ATTACH_NO_THREAD` (`u64::MAX`) when that thread is no longer listed |
-| `data[7]` | The target's declarations (`ATTACH_WORD_FLAGS`): `ATTACH_FLAG_NO_CORE` (bit 0) once it sent `DECLARE_NO_CORE` (Label 26); other bits `0` |
+| `data[7]` | The target's declarations and placement (`ATTACH_WORD_FLAGS`): `ATTACH_FLAG_NO_CORE` (bit 0) once it sent `DECLARE_NO_CORE` (Label 26); `ATTACH_FLAG_RESERVE` (bit 1) when its budget node is a system-reserve node (Label 1, **Memory max and reserve**); other bits `0` |
 | caps | The Thread caps of threads `data[1]..`, each with `OBSERVE`, `CONTROL`, and `UPCALL`, at most `ATTACH_THREADS_PAGE` (`MSG_CAP_SLOTS_MAX`, 4); none past the count |
 
 The list is the main thread at index 0, then the registered threads in registration order. Before

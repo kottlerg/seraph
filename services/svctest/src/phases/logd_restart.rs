@@ -40,20 +40,25 @@
 //! not retained; then, once it has registered a name, a line with the bit,
 //! which is accepted.
 //!
-//! The `logd_reserve` phase before it kills logd in the same way while the
-//! `memhog` fixture holds memory at the system reserve, and requires the next
-//! instance to run and serve before the level falls
-//! (`services/svcmgr/docs/service-definitions.md` § `reserve`). While the
-//! level is `CRITICAL`, memmgr refuses every page to a budget node outside the
-//! reserve (`services/memmgr/docs/memory-pool.md` § Distribution policy), and
-//! the create of a new process and every first touch of its heap and stacks
-//! take fresh pages. So only a logd created in the reserve restarts in the
-//! window: the phase attaches to logd before the fill, faults it once the
-//! level reads `CRITICAL`, and, once the level has fallen, finds svcmgr's
+//! The `logd_reserve` phase before it requires logd's budget node to be a
+//! system-reserve node (`services/svcmgr/docs/service-definitions.md`
+//! § `reserve`), on the running instance and on the next: each attach must
+//! report `ATTACH_FLAG_RESERVE`, so the phase fails whenever logd's recipe
+//! leaves it outside the reserve. Between the two it kills logd in the same way
+//! while the `memhog` fixture holds memory at the system reserve, and requires
+//! the next instance to run and serve before the level falls. While the
+//! fixture holds the pool there, memmgr refuses every page to a budget node
+//! outside the reserve (`services/memmgr/docs/memory-pool.md` § Distribution
+//! policy), and the create of a new process and every first touch of its heap
+//! and stacks take fresh pages. The kill frees the old instance's frames,
+//! though, and the fixture takes back what others free only at its next tick
+//! (`mem_fill::TICK_MS`), so a create that falls in that gap is served from
+//! them whatever its node: the restart check shows that a logd in the reserve
+//! restarts while memory is critical, and the attach flags are what fail for a
+//! logd outside it. The phase attaches to logd before the fill, faults it once
+//! the level reads `CRITICAL`, and, once the level has fallen, finds svcmgr's
 //! restart line in the new instance's history stamped no later than the last
-//! reading of the level that gave `CRITICAL`. A logd outside the reserve is
-//! not restarted in the window: svcmgr's create of it fails, and logd being
-//! `critical = yes`, svcmgr shuts the system down.
+//! reading of the level that gave `CRITICAL`.
 
 use std::time::{Duration, Instant};
 
@@ -117,7 +122,8 @@ pub fn logd_reserve_phase(caps: &Caps)
     assert_ne!(caps.logd_query, 0, "{phase}: no logd.query seed");
     let killed = super::crash::badge_named(authority, LOGD_NAME)
         .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no logd"));
-    let threads = attach(authority, killed, phase);
+    let (threads, flags) = attach(authority, killed, phase);
+    require_reserve(flags, phase, "the running");
     let mut killed_us = 0;
     let critical_until = super::oom::critical_window(caps, phase, RESERVE_HOLD, || {
         killed_us = super::oom::elapsed_us();
@@ -134,6 +140,15 @@ pub fn logd_reserve_phase(caps: &Caps)
     .into_iter()
     .find_map(|(us, restart)| restart.then_some(us))
     .unwrap_or_else(|| panic!("{phase}: the next instance holds no restart line"));
+    let next = super::crash::badge_named(authority, LOGD_NAME)
+        .filter(|&badge| badge != killed)
+        .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no next logd"));
+    let (threads, flags) = attach(authority, next, phase);
+    for cap in threads
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    require_reserve(flags, phase, "the restarted");
     assert!(
         restarted_us <= critical_until,
         "{phase}: logd's next instance took svcmgr's restart line at {restarted_us} us, after the \
@@ -333,7 +348,7 @@ pub fn reentry_main(role: &str)
 /// a failure.
 pub(crate) fn kill(authority: u64, process: u64, what: &str)
 {
-    let threads = attach(authority, process, what);
+    let (threads, _) = attach(authority, process, what);
     fault_main(&threads, what);
     for cap in threads
     {
@@ -342,9 +357,10 @@ pub(crate) fn kill(authority: u64, process: u64, what: &str)
 }
 
 /// Attach to the process `process`, which must report it on the core path:
-/// its thread caps, its main thread's first, which the caller deletes. `what`
-/// names the phase and the process in a failure.
-fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
+/// its thread caps, its main thread's first, which the caller deletes, and the
+/// reply's `ATTACH_WORD_FLAGS`. `what` names the phase and the process in a
+/// failure.
+fn attach(authority: u64, process: u64, what: &str) -> (Vec<u64>, u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let attach = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
@@ -360,8 +376,9 @@ fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
         "{what}: ATTACH_PROCESS refused ({:#x})",
         reply.label
     );
+    let flags = reply.word(procmgr_labels::ATTACH_WORD_FLAGS);
     assert_ne!(
-        reply.word(procmgr_labels::ATTACH_WORD_FLAGS) & procmgr_labels::ATTACH_FLAG_NO_CORE,
+        flags & procmgr_labels::ATTACH_FLAG_NO_CORE,
         0,
         "{what}: the process is not on the core path (no DECLARE_NO_CORE)"
     );
@@ -370,7 +387,18 @@ fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
         !threads.is_empty(),
         "{what}: the attach returned no main thread"
     );
-    threads
+    (threads, flags)
+}
+
+/// Require the attach `flags` of the logd instance `which` names to report
+/// a system-reserve budget node (`ATTACH_FLAG_RESERVE`).
+fn require_reserve(flags: u64, phase: &str, which: &str)
+{
+    assert_ne!(
+        flags & procmgr_labels::ATTACH_FLAG_RESERVE,
+        0,
+        "{phase}: {which} logd's budget node is outside the system reserve (reserve = yes)"
+    );
 }
 
 /// Stop the main thread of an attached process, the first of `threads`, set

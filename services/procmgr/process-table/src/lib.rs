@@ -283,19 +283,16 @@ impl ProcessEntry
         self.badge
     }
 
-    /// The child's declarations, as the `ATTACH_PROCESS` reply's
-    /// `procmgr_labels::ATTACH_WORD_FLAGS` carries them.
+    /// The child's declarations and placement, as the `ATTACH_PROCESS`
+    /// reply's `procmgr_labels::ATTACH_WORD_FLAGS` carries them: its
+    /// `DECLARE_NO_CORE`, and whether its budget node is a reserve node.
     #[must_use]
     pub fn attach_flags(&self) -> u64
     {
-        if self.no_core
-        {
-            ipc::procmgr_labels::ATTACH_FLAG_NO_CORE
-        }
-        else
-        {
-            0
-        }
+        use ipc::procmgr_labels::{ATTACH_FLAG_NO_CORE, ATTACH_FLAG_RESERVE};
+        let no_core = if self.no_core { ATTACH_FLAG_NO_CORE } else { 0 };
+        let reserve = if self.reserve { ATTACH_FLAG_RESERVE } else { 0 };
+        no_core | reserve
     }
 
     /// Whether a thread of this child bound under `badge` is bound to the
@@ -2057,6 +2054,30 @@ mod tests
         assert!(table.declare_no_core(0x77));
         let (entry, _) = attach_target(&mut table, DEBUG_AUTHORITY, 0x77).unwrap();
         assert_eq!(entry.attach_flags(), ATTACH_FLAG_NO_CORE);
+        let (entry, _) = attach_target(&mut table, DEBUG_AUTHORITY, 0x78).unwrap();
+        assert_eq!(entry.attach_flags(), 0);
+    }
+
+    #[test]
+    fn the_attach_flags_report_a_reserve_node_beside_the_no_core_declaration()
+    {
+        use ipc::procmgr_labels::{ATTACH_FLAG_NO_CORE, ATTACH_FLAG_RESERVE, DEBUG_AUTHORITY};
+        let mut table = ProcessTable::new();
+        table
+            .insert(ProcessEntry {
+                reserve: true,
+                ..entry_with_badge(0x77)
+            })
+            .unwrap();
+        table.insert(entry_with_badge(0x78)).unwrap();
+        let (entry, _) = attach_target(&mut table, DEBUG_AUTHORITY, 0x77).unwrap();
+        assert_eq!(entry.attach_flags(), ATTACH_FLAG_RESERVE);
+        assert!(table.declare_no_core(0x77));
+        let (entry, _) = attach_target(&mut table, DEBUG_AUTHORITY, 0x77).unwrap();
+        assert_eq!(
+            entry.attach_flags(),
+            ATTACH_FLAG_NO_CORE | ATTACH_FLAG_RESERVE
+        );
         let (entry, _) = attach_target(&mut table, DEBUG_AUTHORITY, 0x78).unwrap();
         assert_eq!(entry.attach_flags(), 0);
     }

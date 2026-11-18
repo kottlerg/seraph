@@ -273,18 +273,24 @@ a line without `SENDER_NAMED` accepted, a line and a record with it refused `NAM
 once it has registered a name, a line with it accepted; the phase requires logd's history of the
 child to hold the two accepted lines alone. Last, it runs the `logd_death_forward` check again,
 against the new instance's fresh table and the death queue it registered.
+
 The `logd_reserve` phase, just before it, runs when `memhog.svc` is staged and passes otherwise.
-It kills logd in the same way while [memhog](../memhog/README.md) holds memory at the system
-reserve, and requires the next instance to run and serve before the level falls: logd's recipe
-sets `reserve = yes`, and outside the reserve the create of the next instance and every first
-touch of its heap and stacks are refused while the level reads `CRITICAL`
-([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md) § `reserve`). It
-attaches to logd before the fill, has memhog fill the pool, faults logd's main thread once the
-level reads `CRITICAL`, and waits for the level to fall: oomd's stop of memhog ends the window
-when oomd is staged in its stop mode, and svctest's own stop through `caps[17]`, 5 s after the
-fill, otherwise. It then requires, through `caps[6]`, svcmgr's `service restarted: logd` line in
-the new instance's history, stamped no later than the last reading of the level that gave
-`CRITICAL`, and memhog's next instance to answer `PROBE` with a new nonce and no pages.
+It requires logd's budget node to be a system-reserve node, as logd's recipe's `reserve = yes`
+makes it ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md) § `reserve`):
+the attach to the running instance and the attach to the next must each report
+`ATTACH_FLAG_RESERVE`. Between them it kills logd in the same way while
+[memhog](../memhog/README.md) holds memory at the system reserve, and requires the next instance
+to run and serve before the level falls. Outside the reserve the create of the next instance and
+every first touch of its heap and stacks are refused while memhog holds the pool, except from the
+frames the kill frees until memhog's next tick takes them back, so the attach flags, not the
+timing, are what fail for a logd outside the reserve. It attaches to logd before the fill, has
+memhog fill the pool, faults logd's main thread once the level reads `CRITICAL`, and waits for
+the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop mode, and
+svctest's own stop through `caps[17]`, 5 s after the fill, otherwise. It then requires, through
+`caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history, stamped no
+later than the last reading of the level that gave `CRITICAL`, and memhog's next instance to
+answer `PROBE` with a new nonce and no pages.
+
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`

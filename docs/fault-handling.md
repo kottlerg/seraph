@@ -847,13 +847,13 @@ format, the contract the host-side symbolizer reads, in
   every line to each through that sink's own writer thread, and no other thread of logd's, so none
   that serves the crash service's log calls, waits on either driver for longer than
   `SINK_STALL_MS` ([Console Model](console-model.md)). A fault of either reaches the crash
-  service, which reports it and writes its core. The maintainer decided
-  that logd does not declare itself undebuggable: the service's log calls to it are bounded
-  ([Console Model](console-model.md)), so a fault of logd reaches the crash service, whose report
-  the receive workers logd has left serve, and which writes no core of logd (below), and logd's
-  supervisor restarts it once the service declines the fault ([Supervision](supervision.md)). A
-  process created `CREATE_PINNED`, or whose pager binding failed, has no virtual-memory handler: its
-  page faults, which no pager forwards, kill it unreported.
+  service, which reports it, and writes its core when the service's `CORE_DUMP` names it. The
+  maintainer decided that logd does not declare itself undebuggable: the service's log calls to it
+  are bounded ([Console Model](console-model.md)), so a fault of logd reaches the crash service,
+  whose report the receive workers logd has left serve, and which writes no core of logd (below),
+  and logd's supervisor restarts it once the service declines the fault
+  ([Supervision](supervision.md)). A process created `CREATE_PINNED`, or whose pager binding failed,
+  has no virtual-memory handler: its page faults, which no pager forwards, kill it unreported.
 - **Debuggers.** A debugger binds a thread's exception class over the crash endpoint
   ([Debugging](#debugging)); the crash service then sees none of that thread's faults. An unbind
   leaves the class unbound, not bound to the crash endpoint again; procmgr binds it back on the

@@ -23,7 +23,9 @@
 # devmgr.class.test-dma and devmgr.class.test-fault reach the test-only
 # fixtures, and devmgr.class.{serial,input,framebuffer}-deny are SENDs on
 # those classes whose only verb bit (58) no such driver checks, which the
-# drivers deny phase sends the gated labels on. Their class files live in
+# drivers deny phase sends the gated labels on, and the logd_sinks phase
+# waits on framebuffer-deny for the killed framebuffer driver's
+# withdrawal. Their class files live in
 # /config/devmgr/tests/, which svcmgr does not scan, and are copied into
 # /config/devmgr/classes/ with this recipe; the fixtures' devices are
 # attached by `cargo xtask run --test-devices`.

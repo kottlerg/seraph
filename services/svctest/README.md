@@ -133,21 +133,21 @@ no `SHUTDOWN`, because the hooks get the pwrmgr cap only
 after the rounds return. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
 leaves the system idle, as on the pass path. A fault in svctest's own process (a stray access,
 a stack overflow) kills it without running either hook, so it logs neither marker.
-
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
 skip and return when their cap is zero; the devmgr class-deny phase (`caps[2]` and `caps[3]`), the
 bind-deny phase (`caps[2]`), the input-ordinal phase (`caps[8]`), the on-demand-bind phase
 (`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement and MSI delivery, forge, churn, and
 release phases (`caps[9]`), the drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny
-phase (`caps[11]` to `caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public
-`svcmgr`, `pwrmgr.deny` and `acpid.deny` names it resolves), the svcmgr second-seed-round phase
-(`caps[4]` and `caps[5]`), the vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the
-`logd_death_forward`, `logd_concurrent`, `logd_restart`, and `logd_sinks` phases (`caps[6]`), the
-vfsd swap-partition phase (`caps[14]`), the `crash_endpoint`, `logd_restart`, and `logd_sinks`
-phases (`caps[15]`), and the `svcmgr_stop_service` phase (`caps[16]`), and the `oom_policy` phase's
-no-stop case (`caps[16]`), instead fail their assertions. The seed-only phase thus fails the run on
-a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
-reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
+phase (`caps[11]` to `caps[13]`), the `logd_sinks` phase's framebuffer-killed case (`caps[13]`), the
+svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and
+`acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
+vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`,
+`logd_restart`, and `logd_sinks` phases (`caps[6]`), the vfsd swap-partition phase (`caps[14]`), the
+`crash_endpoint`, `logd_restart`, and `logd_sinks` phases (`caps[15]`), and the
+`svcmgr_stop_service` phase (`caps[16]`), and the `oom_policy` phase's no-stop case (`caps[16]`),
+instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before the
+terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached; the panic hook's
+`SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -180,7 +180,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[10]` | `devmgr.class.test-fault` | on-demand-bind phase: the `test-fault` class SEND |
 | `caps[11]` | `devmgr.class.serial-deny` | drivers deny phase: a `serial` class SEND without the driver's verb bits |
 | `caps[12]` | `devmgr.class.input-deny` | drivers deny phase: an `input` class SEND without the driver's verb bits |
-| `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits |
+| `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits; `logd_sinks` phase: the class it waits on for the killed framebuffer driver's withdrawal |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
 | `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; svctest declares itself undebuggable at startup |
 | `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_SERVICE` and `LIST_STOPPABLE`; `oom_policy` phase, no-stop case: `STOP_SERVICE` of memhog |

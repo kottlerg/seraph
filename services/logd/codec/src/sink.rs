@@ -32,8 +32,9 @@ pub const SINK_QUEUE_BYTES: usize = 16 * 1024;
 /// costs any of logd's threads but its own writer: the longest a line's
 /// producer waits on one sink for its line to be queued and written, after
 /// which a sink that has not written it is stalled ([`SinkQueue::stall`]);
-/// and the bound on each call logd makes to a driver outside its writer (its
-/// panic sink, and the inline write of a sink with no writer). Long enough
+/// the bound on the whole inline write of a line to a sink with no writer,
+/// its wait for its turn included; and the bound on each call of logd's
+/// panic sink. Long enough
 /// that a driver merely slowed by load completes the lines queued ahead within
 /// it; short enough that both sinks stopped together hold a sender's log call
 /// for less than half its own bound (`log::LOG_CALL_TIMEOUT_MS`, 5000).

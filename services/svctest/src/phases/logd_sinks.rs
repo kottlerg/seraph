@@ -33,10 +33,12 @@
 //!   the calls; the serial console shows every line, and logd's line
 //!   counting the framebuffer's drops once the driver is started again.
 //! - **Framebuffer killed.** The phase then makes the framebuffer driver's main
-//!   thread fault at an unmapped address, waits until the driver is gone, and
-//!   sends more than a queue's worth of lines again. Each must be answered
-//!   within the stall bound: a framebuffer writer still waiting in its call to
-//!   the dead driver would hold the first line's call for the whole bound.
+//!   thread fault at an unmapped address, waits until procmgr no longer lists
+//!   the driver and devmgr answers its ordinal `WITHDRAWN`, and sends more
+//!   than a queue's worth of lines again, under the same bounds as the
+//!   serial-stopped case. A call to the dead driver ends only when devmgr
+//!   revokes its endpoint, after the `WITHDRAWN` answer, so the first line
+//!   can still wait out the stall bound on a writer blocked in such a call.
 //!
 //! No driver restarts a killed one yet, so the case ends with the framebuffer
 //! sink resolving no driver; the serial driver is only stopped, since a kill
@@ -143,12 +145,13 @@ pub fn logd_sinks_phase(caps: &Caps)
 
     kill(authority, fb);
     await_gone(authority, fb);
+    await_withdrawn(caps.framebuffer_deny_class);
     let start_at = Instant::now();
     if let Err(e) = send_lines(
         "framebuffer killed",
         FLOOD_LINES,
         FLOOD_LINE_BYTES,
-        STALL_BOUND,
+        LOG_CALL_BOUND,
     )
     {
         panic!("{e}");
@@ -330,6 +333,36 @@ fn kill(authority: u64, process: u64)
     for cap in threads
     {
         let _ = syscall::cap_delete(cap);
+    }
+}
+
+/// Wait until devmgr answers the framebuffer class's ordinal 0, the killed
+/// driver's, `WITHDRAWN`, on `class`, a SEND on that class.
+fn await_withdrawn(class: u64)
+{
+    assert_ne!(
+        class, 0,
+        "logd_sinks: no devmgr.class.framebuffer-deny seed"
+    );
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let start_at = Instant::now();
+    loop
+    {
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+        match unsafe { ipc::query_device(class, 0, ipc_buf) }
+        {
+            Ok(copy) =>
+            {
+                let _ = syscall::cap_delete(copy);
+            }
+            Err(ipc::ClassCallError::Refused(ipc::devmgr_errors::WITHDRAWN)) => return,
+            Err(e) => panic!("logd_sinks: querying the framebuffer class ({e:?})"),
+        }
+        assert!(
+            start_at.elapsed() < DEATH_TIMEOUT,
+            "logd_sinks: devmgr has not withdrawn the killed framebuffer driver"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

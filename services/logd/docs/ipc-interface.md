@@ -496,11 +496,17 @@ logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
   every line stays in its sender's history (§ History) whatever its sinks do.
 - **Writer.** The writer takes the lines in order and writes each with `SERIAL_CHUNK`-byte calls
   that have no bound, so a line queued for a stopped driver is written once, when the driver
-  answers again. A call that fails (the driver died, or devmgr withdrew it) ends the line, and the
-  next line goes to the driver resolved then; a sink with no driver resolved drops its lines
-  uncounted. The writers are spawned beside the receive workers, before the handover pull; until a
-  sink's writer runs, or when it cannot be spawned, a producer writes the line itself, each call
-  bounded by `SINK_STALL_MS`, under a lock that keeps the line whole.
+  answers again. A call that fails ends the line, and the next line goes to the driver resolved
+  then; a sink with no driver resolved drops its lines uncounted. A call to a dead driver fails
+  only once devmgr withdraws the driver and revokes its endpoint
+  ([devmgr responsibilities](../../devmgr/docs/responsibilities.md)); until then the writer waits
+  in it and the sink stalls as for a stopped driver. The writers are spawned beside the receive
+  workers, before the handover pull.
+- **Inline.** Until a sink's writer runs, or when it cannot be spawned, a line's producer writes
+  the line itself, one producer at a time so a line stays whole. Its wait for its turn and its
+  calls end `SINK_STALL_MS` after it took the line, so no producer waits on the sink for longer;
+  a line not written whole by then is counted, and the count is written, as the writer's drop line
+  is, ahead of the next line an inline write starts, to that sink alone.
 - **Drops.** Where a sink dropped lines, its writer writes one warning-level logd line naming the
   count, `<n> lines dropped from the <sink> output: its driver took none within 1000 ms`, to its
   own driver ahead of the next line, or once its queue is empty, and queues the same line to the

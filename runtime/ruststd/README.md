@@ -464,15 +464,36 @@ passes it to the thread syscalls that inspect and modify the child
 
 ---
 
+## Session streams
+
+`std::os::seraph::process::SessionStdio` makes the standard streams of a session's leader for an
+interface that opens the session through sessiond
+([services/sessiond/docs/ipc-interface.md](../../services/sessiond/docs/ipc-interface.md)): three
+pipes, the leader's stdin, stdout and stderr, and an event queue procmgr posts the leader's end
+to, its death relay. `relay` gives the POST cap `OPEN_SESSION` carries, `handoff` each stream's
+ring memory cap and notifications, which `SESSION_STDIO` carries, and `ring_capacity` the size
+it states. The interface keeps its ends, a `ChildStdin`, a `ChildStdout` and a `ChildStderr`,
+through `take_stdin`, `take_stdout` and `take_stderr`.
+
+Each ring page is a grant of the interface's, which no process it created maps, so it is returned
+to memmgr once both the interface's end is dropped and no leader can map it: after `wait` has
+returned, since procmgr posts the relay only once it has torn the leader down, or after
+`refused`, which an interface calls on a refusal after which no leader exists. `wait` returns
+the leader's `ExitStatus` from the relay's entry, its exit reason, fault or `EXIT_KILLED`, then
+marks each end's peer gone, so a read drains to EOF and a write fails with `BrokenPipe`. Dropped
+with neither, the grants stay charged to the interface until it exits.
+
+---
+
 ## argv and env
 
 `Command::spawn` packs the child's argv and env into a Memory cap the spawner funds and
 `CREATE_FROM_FILE` transfers with `CREATE_ARGV_ENV`
 ([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#label-1-create_process)
 § Label 1, **argv and env**). `std::os::seraph::process::ArgvEnvCap` builds that cap and its
-header for any sender of a raw create request (svcmgr's launch and restart, svctest, and devmgr's
-and vfsd's driver spawns, which pass the child the spawner's own level as its one env entry,
-`std::os::seraph::log::inherited_level_entry`, `None` at info). After the
+header for any sender of a raw create request (svcmgr's launch and restart, sessiond's leaders,
+svctest, and devmgr's and vfsd's driver spawns, which pass the child the spawner's own level as
+its one env entry, `std::os::seraph::log::inherited_level_entry`, `None` at info). After the
 call the sender passes the reply label to `ArgvEnvCap::settle`, which withholds the run (it stays
 charged to the sender) on `ARGV_ENV_STILL_MAPPED`, when procmgr may still map its pages, and
 otherwise returns it to memmgr. `spawn` refuses with `ArgumentListTooLong` only when argv

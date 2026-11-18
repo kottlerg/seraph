@@ -3,7 +3,8 @@
 
 // programs/shell/src/main.rs
 
-//! Minimal interactive shell (#112). The child of `programs/terminal`.
+//! Minimal interactive shell (#112). The leader of an operator session
+//! sessiond opens for `programs/terminal`.
 //!
 //! Reads `\n`-terminated lines from stdin, runs a small set of built-ins
 //! (`help`, `exit`, `echo`, `pwd`, `cd`, `ls`, `cat`), and otherwise spawns

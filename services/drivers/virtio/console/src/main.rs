@@ -38,6 +38,11 @@ use virtio_core::{
 
 // ── Declaration ────────────────────────────────────────────────────────────
 
+/// The console device's device-specific configuration (`VirtIO` 1.2 § 5.3.4),
+/// which the driver reads: its declaration requires the region, and so does
+/// the register layout it maps.
+const DEVICE_CONFIG: virtio_core::VirtioDeviceConfig = virtio_core::VirtioDeviceConfig::Required;
+
 // What devmgr binds this driver to and how it starts it
 // (docs/driver-binding.md § Driver Declarations).
 driver_binding::driver_declaration!(driver_binding::decl::Declaration {
@@ -63,7 +68,9 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     dma: true,
     dma_width: None,
     phys_access: false,
-    reset: driver_binding::decl::Reset::VirtioStatus,
+    reset: driver_binding::decl::Reset::VirtioStatus {
+        device_config: DEVICE_CONFIG
+    },
     tier: driver_binding::decl::Tier::Auxiliary,
 });
 
@@ -790,7 +797,7 @@ fn main() -> !
     }
 
     let pci_info = query_device_info(caps.devmgr_ep, ipc_buf);
-    let Some(layout) = pci_info.register_layout()
+    let Some(layout) = pci_info.register_layout(DEVICE_CONFIG)
     else
     {
         fail("device presents no complete set of register regions");

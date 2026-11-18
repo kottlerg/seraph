@@ -18,6 +18,10 @@
 //! A job runs to its end whatever happens to acpid: a reply that fails
 //! deletes only the copy it carried, and a memory grant stays kept for a
 //! restarted acpid ([`firmware::acpid::Grants`]).
+//!
+//! An `ACPI_HOTPLUG` job is the one the control thread does not answer
+//! here: it is handed to the hotplug slots ([`crate::hotplug::Hotplug::post_acpi`]),
+//! whose add or removal job replies when it ends.
 
 use std::sync::mpsc;
 
@@ -31,6 +35,7 @@ use ipc::devmgr_errors as errors;
 use ipc::devmgr_labels as labels;
 
 use crate::caps::{DevmgrCaps, Firmware};
+use crate::hotplug::{Event, Hotplug};
 use crate::{IrqRangeAllocator, arch, bind, reply_status, tables};
 
 /// The data words of the longest reply, `QUERY_HOST_BRIDGE`'s.
@@ -83,6 +88,11 @@ pub enum Request
     },
     /// `QUERY_ACPI_RESOURCES` of `ACPI_SCI`.
     Sci,
+    /// `ACPI_HOTPLUG`: `event` at the slot of the port at `port`.
+    Hotplug
+    {
+        event: Event, port: Address
+    },
 }
 
 /// What the control thread hands back for a worker to reply with.
@@ -97,7 +107,7 @@ pub struct Reply
 impl Reply
 {
     /// A reply of `label` with no data and no cap.
-    fn status(label: u64) -> Self
+    pub(crate) fn status(label: u64) -> Self
     {
         Self {
             label,
@@ -108,7 +118,7 @@ impl Reply
     }
 
     /// A `SUCCESS` reply of `words`.
-    fn success(words: &[u64]) -> Self
+    pub(crate) fn success(words: &[u64]) -> Self
     {
         let mut reply = Self::status(errors::SUCCESS);
         for (slot, &word) in reply.words.iter_mut().zip(words)
@@ -238,8 +248,23 @@ pub fn decode(msg: &IpcMessage) -> Result<Request, u64>
             ordinal: msg.word(1),
         },
         labels::QUERY_ACPI_RESOURCES if msg.word(1) == labels::ACPI_SCI => Request::Sci,
+        labels::ACPI_HOTPLUG => hotplug_request(msg)?,
         _ => return Err(errors::UNKNOWN_OPCODE),
     })
+}
+
+/// `ACPI_HOTPLUG`, decoded; `Err(INVALID_REQUEST)` for an unknown event or
+/// a malformed address.
+fn hotplug_request(msg: &IpcMessage) -> Result<Request, u64>
+{
+    let event = match msg.word(1)
+    {
+        labels::HOTPLUG_ADDED => Event::Added,
+        labels::HOTPLUG_REMOVED => Event::Removed,
+        _ => return Err(errors::INVALID_REQUEST),
+    };
+    let port = unpack_function(msg.word(2)).ok_or(errors::INVALID_REQUEST)?;
+    Ok(Request::Hotplug { event, port })
 }
 
 /// The address `labels::pci_function` packed into `word`; `None` when a
@@ -447,18 +472,26 @@ impl AcpiService
     }
 
     /// Run every job posted, each to its end, handing its reply back. A
-    /// reply the worker can no longer take has its cap deleted.
+    /// reply the worker can no longer take has its cap deleted. An
+    /// `ACPI_HOTPLUG` job is posted to `hotplug` instead, whose job replies
+    /// ([`Hotplug::post_acpi`]).
     pub fn run(
         &mut self,
         records: &bind::Records,
         caps: &mut DevmgrCaps,
         irq_range: &mut IrqRangeAllocator,
+        hotplug: &Hotplug,
     )
     {
-        while let Ok(job) = self.jobs.try_recv()
+        while let Ok(Job { request, reply }) = self.jobs.try_recv()
         {
-            let reply = self.answer(job.request, records, caps, irq_range);
-            if let Err(mpsc::SendError(reply)) = job.reply.send(reply)
+            if let Request::Hotplug { event, port } = request
+            {
+                hotplug.post_acpi(event, port, reply);
+                continue;
+            }
+            let answer = self.answer(request, records, caps, irq_range);
+            if let Err(mpsc::SendError(reply)) = reply.send(answer)
                 && let Some(cap) = reply.cap
             {
                 let _ = syscall::cap_delete(cap);
@@ -538,6 +571,8 @@ impl AcpiService
             }
             Request::HostBridge { ordinal } => self.host_bridge(ordinal),
             Request::Sci => self.sci(irq_range),
+            // `run` posts it to the hotplug slots.
+            Request::Hotplug { .. } => Reply::status(errors::INVALID_REQUEST),
         }
     }
 

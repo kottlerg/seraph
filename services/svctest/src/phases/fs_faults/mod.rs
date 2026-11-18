@@ -32,6 +32,7 @@
 
 mod pressure;
 mod ramdisk;
+mod run_fill;
 
 use std::sync::Arc;
 
@@ -53,6 +54,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "fs_pressure_release",
             run: pressure::fs_pressure_release_phase,
+        },
+        Phase {
+            name: "fs_run_fill",
+            run: run_fill::fs_run_fill_phase,
         },
         Phase {
             name: "fs_block_faults",

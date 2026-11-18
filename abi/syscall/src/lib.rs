@@ -620,11 +620,15 @@ pub const SYS_THREAD_READ_EXT_REGS: u64 = 68;
 /// [`RIGHTS_EP_RECEIVE`] on the same endpoint. See
 /// `core/kernel/docs/syscalls.md` § `SYS_ENDPOINT_BADGE` (69).
 pub const SYS_ENDPOINT_BADGE: u64 = 69;
+/// Merge two sibling `Mmio` caps over adjacent ranges into one cap over the
+/// joined range, consuming both. See `core/kernel/docs/syscalls.md`
+/// § `SYS_MMIO_MERGE` (70).
+pub const SYS_MMIO_MERGE: u64 = 70;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_ENDPOINT_BADGE + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_MMIO_MERGE + 1;
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.

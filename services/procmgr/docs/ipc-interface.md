@@ -23,21 +23,23 @@ Label numbers, error codes, and query states are defined in
 [`shared/ipc/src/lib.rs`](../../../shared/ipc/src/lib.rs) (`procmgr_labels`,
 `procmgr_errors`, `procmgr_process_state`).
 
-`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`, and
-`BIND_DEATH_OBSERVER` are sent on a **process handle** (the badged endpoint a create call returns),
-and `RELEASE_HOLD` on a **release token** (the third cap a `CREATE_DMA_HOLD` create returns);
-procmgr identifies the target process by the badge `ipc_recv` delivers. A process handle is badged
-with the child's process badge and `procmgr_labels::PROCESS_HANDLE_TAG` (bit 59, a bit of
-`ipc::VERB_BIT_MASK`, which no process badge carries), which tells it from the child's own procmgr
-cap (`ProcessInfo.procmgr_endpoint_cap`), badged with the process badge alone. procmgr clears the
-tag before it serves a request, so a handle names its child to every label, and refuses
-`DECLARE_NO_DEBUG`, `DECLARE_NO_CORE` and `REGISTER_THREAD`, which name their sender, on a badge
-carrying it with `INVALID_BADGE`, deleting the caps the request carried: only the child itself
-sends them (§ Label 21, § Label 22, § Label 26). `BIND_DEATH_OBSERVER` is served on a process
-handle only (§ Label 25). Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
-§ `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
-§ `QUERY_LIVE_PROCESSES` below, labels 19–24 and 26 in § Crash Endpoint and Debug Authority, and
-label 25 in § Label 25: `BIND_DEATH_OBSERVER`.
+`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`,
+`BIND_DEATH_OBSERVER`, `LIST_CHILDREN` and `DESTROY_CHILD` are sent on a **process handle** (the
+badged endpoint a create call returns), and `RELEASE_HOLD` on a **release token** (the third cap a
+`CREATE_DMA_HOLD` create returns); procmgr identifies the target process by the badge `ipc_recv`
+delivers. A process handle is badged with the child's process badge and
+`procmgr_labels::PROCESS_HANDLE_TAG` (bit 59, a bit of `ipc::VERB_BIT_MASK`, which no process badge
+carries), which tells it from the child's own procmgr cap (`ProcessInfo.procmgr_endpoint_cap`),
+badged with the process badge alone. procmgr clears the tag before it serves a request, so a handle
+names its child to every label, and refuses `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`, `REGISTER_THREAD`
+and `REGISTER_END_QUEUE`, which name their sender, on a badge carrying it with `INVALID_BADGE`,
+deleting the caps the request carried: only the process itself sends them (§ Label 21, § Label 22, §
+Label 26, § Label 29). `BIND_DEATH_OBSERVER`, `LIST_CHILDREN` and `DESTROY_CHILD` are served on a
+process handle only, and refused on any other cap with `UNAUTHORIZED` (§ Label 25, § Process Tree).
+Labels 14–18 are specified in § `REGISTER_DEATH_EQ`, § `REGISTER_INIT_TEARDOWN`, §
+`INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and § `QUERY_LIVE_PROCESSES` below, labels 19–24 and 26
+in § Crash Endpoint and Debug Authority, label 25 in § Label 25: `BIND_DEATH_OBSERVER`, and labels
+27–29 in § Process Tree.
 Labels 4–7 and 10 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see § Capability Transfer).
 
@@ -93,8 +95,8 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 1 |
-| label bits `[16..35]` | Create flags and scheduling fields (see **Pinned flag**, **Death relay**, **Scheduling fields**, **argv and env**, **Physical-address flag**, and **Memory max and reserve** below) |
-| label bits `[35..64]` | Reserved, zero |
+| label bits `[16..36]` | Create flags and scheduling fields (see **Pinned flag**, **Death relay**, **Containment**, **Scheduling fields**, **argv and env**, **Physical-address flag**, and **Memory max and reserve** below) |
+| label bits `[36..64]` | Reserved, zero |
 | data[0] | The object's exact length in bytes, at byte 0 of cap[0] (§ Image Verification) |
 | data[1..5] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, `args_bytes`, `args_count`, `env_bytes`, `env_count`, one `u64` each |
 | data[1], or data[5] with `CREATE_ARGV_ENV` | When `CREATE_MEMORY_MAX` is set: the child's memory max in pages (**Memory max and reserve** below) |
@@ -112,7 +114,7 @@ handover page, with the child's argv and env in the pages after it (see
 **argv and env** below). procmgr deletes its copies of cap[0], cap[1], and
 the argv/env cap whether creation succeeds or fails, and the charge node's handle when memmgr did
 not take it (**Memory max and reserve** below), and deletes any cap the
-layout does not name; the death-relay cap it binds or deletes as **Death
+layout does not name; the death-relay cap it keeps or deletes as **Death
 relay** below says. A
 failed creation releases everything procmgr acquired for the child, including
 the child's memmgr record: procmgr sends memmgr `PROCESS_DIED` for it, so the
@@ -153,7 +155,7 @@ holds a handle to it.
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[35..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process, `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below) |
+| 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[36..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded or before procmgr's reply delivers it, or a destroy marked the child itself (`DESTROY_CHILD`, or a destroy of a subtree it is in) before procmgr's reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below) |
 | 11 | `MAP_FAILED` | The module cap, a copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | The module cap lacks the map right, or a rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
@@ -214,15 +216,28 @@ names a pager the child does not have; a child whose binding failed, or whose pa
 procmgr could not map to advertise it, reads zero and keeps its memory eager.
 
 **Death relay.** The label's bit 17 (`CREATE_DEATH_RELAY`, in the window shared with
-`CREATE_FROM_FILE`) marks a request whose last cap is a POST-only `EventQueue` cap, the relay. It
-is the last cap, so the creator-endpoint slot stays at cap[1], and a cap of its own, as the
-argv/env cap is: a request needs one cap past cap[0] for each of `CREATE_DEATH_RELAY`,
-`CREATE_ARGV_ENV` and `CREATE_CHARGE_NODE` it sets, and one that sets more than its caps can
-supply is refused with `INVALID_ARGUMENT`. Once the child is recorded, procmgr binds the relay as
-an `AddressSpace` death observer (correlator 0) on the child, using one of the relay queue's
-observer nodes, so the first terminal fault in any of the child's threads posts the fault class to
-the spawner's own death queue, once (a later fault posts nothing), then deletes its copy; a failed
-creation deletes it unbound.
+`CREATE_FROM_FILE`) marks a request whose last cap is a POST-only `EventQueue` cap, the relay. It is
+the last cap, so the creator-endpoint slot stays at cap[1], and a cap of its own, as the argv/env
+cap is: a request needs one cap past cap[0] for each of `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` and
+`CREATE_CHARGE_NODE` it sets, and one that sets more than its caps can supply is refused with
+`INVALID_ARGUMENT`. procmgr keeps the relay in the child's entry for the child's life and posts the
+child's end to it once, as the entry `(reason, 0)`, whoever ends the child: at the reap of a child
+that exited or took a terminal fault in any of its threads, the exit reason or the fault class
+procmgr reaped it by, and at the teardown of a destroyed child, a subtree's or a containment's
+included (§ Process Tree), the reason § Label 9 states for a destroyed process, `EXIT_KILLED` unless
+the child had exited or faulted already. Each is the reason `QUERY_PROCESS` then reports. procmgr
+posts after the teardown and memmgr's reclaim, then deletes its copy. The post is procmgr's, not a
+kernel binding: one party posts, once, whatever number of the child's threads exit or fault before
+the teardown, and the relay takes none of its queue's observer nodes. The relay reports the ends of
+its creator's own children only: when the creator ends and the child is re-parented, procmgr deletes
+the relay unposted. A failed creation deletes it unposted, one a destroy marked included: until
+procmgr's reply delivers the child's handle, the create owns the child's entry, and a destroy that
+marks the child leaves it to the create, which is then refused with `INVALID_ARGUMENT`
+(§ Process Tree).
+
+**Containment.** The label's bit 35 (`CREATE_CONTAIN`, in the window shared with
+`CREATE_FROM_FILE`) creates the child contained: when it ends, by an exit, a fault or a destroy,
+procmgr destroys what is left of its subtree instead of re-parenting its children (§ Process Tree).
 
 **DMA hold flag.** The label's bit 28 (`CREATE_DMA_HOLD`, in the window shared
 with `CREATE_FROM_FILE`) holds back the child's memory reclaim. Once the child
@@ -440,16 +455,22 @@ to a new child.
 
 ### Label 8: `DESTROY_PROCESS`
 
-Destroy a process. Sent on the process handle with no data words or caps.
-procmgr removes the process entry, revokes and deletes the child's `Thread`,
-`CSpace`, `AddressSpace`, `ProcessInfo` Memory cap, and TLS Memory cap, deletes
-any namespace caps never consumed by `START_PROCESS`, and sends memmgr
-`PROCESS_DIED` for the child's memmgr badge, unless the child was created with
-`CREATE_DMA_HOLD` and started, whose reclaim waits for `RELEASE_HOLD`
-(§ Label 3).
+Destroy a process together with every process below it (§ Process Tree). Sent on the process handle
+with no data words or caps. procmgr marks the subtree first, in one hold of its table lock, and
+from then on refuses a create from any process of it. For each process of the subtree it then
+removes the process entry, revokes and deletes the process's `Thread`, `CSpace`, `AddressSpace`,
+`ProcessInfo` Memory cap, and TLS Memory cap, deletes any namespace caps never consumed by
+`START_PROCESS`, sends memmgr `PROCESS_DIED` for its memmgr badge, unless it was created with
+`CREATE_DMA_HOLD` and started, whose reclaim waits for `RELEASE_HOLD` (§ Label 3), and posts its
+end to its death relay (§ Label 1, **Death relay**) and its end queue (§ Label 29). A process
+that has already ended, by an exit of its main thread or a terminal fault of any of its threads,
+and that procmgr has not reaped yet, is reaped instead, in the same hold of the table lock, with
+the reason it ended with: its children are re-parented, or destroyed when it was created contained,
+as at its reap (§ Process Tree), so whether the destroy or the reaper comes first changes nothing.
 
-**Reply:** label 0 (success), always. An unknown or already-destroyed badge is
-a no-op.
+**Reply:** label 0 (success), always, once the subtree is torn down, apart from a child whose
+create procmgr has not answered yet, which that create tears down when procmgr refuses it
+(§ Process Tree). An unknown or already-destroyed badge is a no-op.
 
 ### Label 9: `QUERY_PROCESS`
 
@@ -536,16 +557,16 @@ the caller walks its own namespace cap to the binary node and transfers the
 resulting file cap. procmgr opens it (`FS_OPEN`), copies the signed object out with
 `FS_READ_MEMORY` against its own open and verifies it (§ Image Verification), and never holds a
 namespace cap of its own. Loading, the
-**Pinned flag**, the **Death relay**, **Memory max and reserve**, the **Scheduling fields**, and
-**argv and env** are as for `CREATE_PROCESS`.
+**Pinned flag**, the **Death relay**, **Containment**, **Memory max and reserve**, the **Scheduling
+fields**, and **argv and env** are as for `CREATE_PROCESS`.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 13 |
-| label bits `[16..35]` | As for `CREATE_PROCESS` |
-| label bits `[35..64]` | Reserved, zero |
+| label bits `[16..36]` | As for `CREATE_PROCESS` |
+| label bits `[36..64]` | Reserved, zero |
 | data[0] | `file_size` in bytes, from the caller's `NS_LOOKUP` size hint: the signed object's length (§ Image Verification) |
 | data[1..5] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, as for `CREATE_PROCESS` |
 | data[1], or data[5] with `CREATE_ARGV_ENV` | When `CREATE_MEMORY_MAX` is set: the child's memory max in pages, as for `CREATE_PROCESS` |
@@ -559,7 +580,7 @@ namespace cap of its own. Loading, the
 procmgr deletes the file cap once it has opened it, `FS_CLOSE`s and deletes its open once the object
 is copied, whether the copy succeeds or fails, and deletes its copies of the creator endpoint, the
 argv/env cap and the charge node's handle memmgr did not take, and any cap the layout does not name;
-a request refused before the open deletes the file cap unopened. The death-relay cap is bound or
+a request refused before the open deletes the file cap unopened. The death-relay cap is kept or
 deleted as for `CREATE_PROCESS` (§ Label 1, **Death relay**), the file cap standing in for cap[0].
 
 The file cap's server is the caller's to choose, so procmgr bounds each call it makes on the file
@@ -582,7 +603,7 @@ included, as for `CREATE_PROCESS`.
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[35..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process, `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
+| 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[36..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, a destroy that marked the child itself before the reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | A copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
@@ -635,6 +656,107 @@ and to the main thread's observers; a later one posts only to the main thread's 
 
 ---
 
+## Process Tree
+
+procmgr records each process's **parent**: the process whose request created it, named by the
+badge of the procmgr cap the create came on (the creator's own cap or the creator's handle on
+it), or none for a child of the un-badged creator (init, or svcmgr's mint source). A create
+reserves its child's badge with the creator recorded beside it, and the child's entry takes the
+parent from that reservation when it is recorded. Every recorded parent names a live process. The
+parent link is the session model's process tree
+([docs/session-supervision.md](../../../docs/session-supervision.md#procmgr-mechanism)
+§ procmgr Mechanism): a supervisor that destroys a process destroys everything it started.
+
+- **Re-parenting.** When a process ends, by an exit or a terminal fault, each of its children, and
+  each create it has in progress, takes the dead process's parent as its parent, which by the
+  invariant is its nearest live ancestor, or none. A re-parented child loses its death relay
+  (§ Label 1, **Death relay**). A child's memmgr budget node stays where it was made, so its pages
+  still count in every ancestor's subtree usage.
+- **Containment.** When a process created with `CREATE_CONTAIN` ends, by an exit, a fault or a
+  destroy, procmgr destroys what is left of its subtree instead of re-parenting its children, as
+  it does when the process's new parent is itself being destroyed. Re-parenting therefore never
+  moves a process out of the subtree of a live contained ancestor.
+- **Subtree destroy.** `DESTROY_PROCESS` (§ Label 8) and `DESTROY_CHILD` (§ Label 28) mark the
+  process and every process below it, and every create one of them has in progress, in one hold of
+  procmgr's table lock, then tear each marked process down, one per hold. From the mark on, procmgr
+  refuses a create from a marked process with `INVALID_ARGUMENT`, as from a badge that names no live
+  process, and a marked create's child is destroyed when it is built, its create refused the same
+  way, so no process escapes the destroy by creating a child during it. A child built but whose
+  create procmgr has not answered yet is its create's until the reply delivers its handle: procmgr
+  makes that reply under its table lock, so a destroy marks the child either before it, when the
+  create is refused the same way and the child destroyed without posting to the creator's relay, or
+  after it, when the destroy tears the child down as any other. The destroy's reply can thus precede
+  the teardown of a child no one had yet received, which never ran. `LIST_CHILDREN` lists no marked
+  process, and `START_PROCESS` refuses one with `INVALID_BADGE`. Each destroyed process posts its
+  end to its relay and end queue. A destroy of a process that has already ended, before procmgr
+  reaped it, is that end's reap (§ Label 8).
+
+### Label 27: `LIST_CHILDREN`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::LIST_CHILDREN` (27) |
+| sent on | the process's handle; any other cap is refused with `UNAUTHORIZED` |
+| `data[0]` | `0` to start the walk, `1` to resume after the badge in `data[1]` |
+| `data[1]` | The cursor badge when `data[0]` is `1` |
+| caps | none; procmgr deletes any cap the message carried |
+
+Reply `SUCCESS` with `data[0]` = the page's count, then, for each child of the process above the
+cursor in ascending badge order, `LIST_CHILDREN_WORDS_PER_ENTRY` (11) words: a `LIST_PROCESSES`
+entry (its badge and its name, § Label 23), then the pages charged to its memmgr budget node and
+every node below it (`procmgr_labels::pack_child_entry`, `unpack_child_entry`). A child is a
+process whose parent the process is, by creation or by re-parenting, and no destroy has marked. A
+page holds at most `LIST_CHILDREN_PAGE` (`(MSG_DATA_WORDS_MAX - 1) / 11` = 5) entries; a page
+shorter than that ends the walk, as for `LIST_PROCESSES`. procmgr reads each child's subtree pages
+after it releases its table lock, as `data[2]` of a memmgr `QUERY_MEMORY_USAGE` over a copy of
+the memmgr SEND it holds for the child, which carries the child's memmgr badge
+([memmgr IPC Interface](../../memmgr/docs/ipc-interface.md)); a child memmgr no longer knows, or a
+failed query, reports `0`. Refusals: `INVALID_BADGE` when the handle names no live process;
+`INVALID_ARGUMENT` for a `data[0]` other than 0 or 1.
+
+### Label 28: `DESTROY_CHILD`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::DESTROY_CHILD` (28) |
+| sent on | the parent's handle; any other cap is refused with `UNAUTHORIZED` |
+| `data[0]` | The badge of one child of the process, as `LIST_CHILDREN` lists it |
+| caps | none; procmgr deletes any cap the message carried |
+
+Destroy the named child together with every process below it, as `DESTROY_PROCESS` destroys a
+process (§ Label 8), a child that has already ended included. The check that the badge names a child
+and the mark of its subtree are one hold of the table lock, so a re-parenting cannot move the child
+out from under the check. The handle is the authority: its holder may already destroy the parent
+with every process below it, and the badge only names one of its children. Replies `SUCCESS` once
+the subtree is torn down, as `DESTROY_PROCESS` does; `INVALID_BADGE` when `data[0]` names no live
+child of the process, a grandchild or a child a destroy has marked among them.
+
+### Label 29: `REGISTER_END_QUEUE`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::REGISTER_END_QUEUE` (29) |
+| caller's cap badge | The sender's own process badge (its `ProcessInfo.procmgr_endpoint_cap`); a process handle is refused (§ Messages) |
+| `data[0]` | The correlator every post to the queue carries |
+| cap[0] | A cap on an `EventQueue` carrying `POST`, the end queue |
+
+The sender registers an end queue on itself. procmgr posts the process's end to it once, as the
+entry `(reason, correlator)`, with the reason and at the point it posts to a death relay
+(§ Label 1, **Death relay**): the exit reason or fault class at the reap, or the destroyed
+process's reason after a destroy, whoever caused it. procmgr learns of every end, since it reaps
+each process through its own death observers and makes each destroy, so the holder of the queue's
+receive right learns of the end whoever caused it. A process registers one queue for its life:
+procmgr refuses a second with `END_QUEUE_PRESENT`, so no process replaces the queue another
+holder watches its end through. procmgr does not check the cap's type or rights: a cap that is no
+`POST` cap on an event queue is kept as the queue, and the post to it fails. procmgr deletes caps
+past cap[0], the queue of a refused request, and its copy of the queue once it has posted.
+Replies `SUCCESS`; `INVALID_ARGUMENT` without a cap; `INVALID_BADGE` when the badge names no live
+process or the request came on a process handle; `END_QUEUE_PRESENT` (19) when the process
+registered a queue before. Telling another holder of one's own end confers no authority over
+anything.
+
+---
+
 ## Capability Transfer
 
 Capability transfer uses the IPC message's cap slot array (up to 4 caps per
@@ -649,9 +771,9 @@ process creation and does not return it.
 Every cap a request transfers lands in procmgr's CSpace, whether or not the
 request's layout names it. procmgr deletes the caps a layout does not name
 (caps past the last named position, and every cap of a label that names none:
-`START_PROCESS`, `RELEASE_HOLD`, `DESTROY_PROCESS`, `QUERY_PROCESS`,
-`INIT_TEARDOWN_DONE`, and unknown opcodes), and every cap of a refused request, a refused
-`REGISTER_THREAD`'s thread cap among them, except the init-reap
+`START_PROCESS`, `RELEASE_HOLD`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `LIST_CHILDREN`,
+`DESTROY_CHILD`, `INIT_TEARDOWN_DONE`, and unknown opcodes), and every cap of a refused request, a
+refused `REGISTER_THREAD`'s thread cap among them, except the init-reap
 refusals of an un-badged sender that keep caps init may still be running on
 (§ `REGISTER_INIT_TEARDOWN`). A padded or refused request from any badged sender
 therefore cannot grow procmgr's CSpace. Replies to the calls procmgr makes on a
@@ -663,8 +785,8 @@ subsequent per-process operations), a derived copy of the child's `Thread`
 capability (Control, Observe, and Upcall rights, `RIGHTS_THREAD`), and, for a
 `CREATE_DMA_HOLD` child, its release token to the caller. procmgr retains the
 original caps for process lifecycle management, and hands out no cap on the
-child's address space: a creator observes its terminal faults through
-`BIND_DEATH_OBSERVER` (§ Label 25).
+child's address space: a creator observes the child's end through its death relay (§ Label 1,
+**Death relay**), and its first terminal fault through `BIND_DEATH_OBSERVER` (§ Label 25).
 
 ---
 
@@ -1012,12 +1134,14 @@ declaration, its runtime having sent no registration, or its registration having
 the registry's bound or for procmgr's heap, keeps a binding: the one it copied, or procmgr's under
 the process badge when that was a debugger's (Label 22).
 The senders are the processes a stop of which would hold a debug-authority holder, which waits on
-them for its log output or its own progress: the serial and framebuffer drivers, which logd calls
-with no bound for every line, the debug port's virtio-console driver, through which the GDB stub
+them for its own progress: the debug port's virtio-console driver, through which the GDB stub
 reaches its host for every packet, and every debug-authority holder, so none attaches to itself.
 logd does not declare: every log call to it is bounded, so a holder that stops it waits on its own
-log output for at most that bound. Replies `SUCCESS`, or `INVALID_BADGE` when
-the badge names no live process or the request came on a process handle.
+log output for at most that bound. Nor do the serial and framebuffer drivers: no thread of logd's
+but a sink's own writer waits on either for longer than `SINK_STALL_MS`
+([logd IPC interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks). Replies
+`SUCCESS`, or `INVALID_BADGE` when the badge names no live process or the request came on a
+process handle.
 
 Any process may declare itself, on its own cap alone: the badge names the sender, and the process
 handle its creator holds carries `procmgr_labels::PROCESS_HANDLE_TAG`, on which procmgr refuses the

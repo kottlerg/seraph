@@ -75,12 +75,13 @@ const REFUSAL_MARKERS: [&str; 2] = ["signature verification refused", "signature
 /// `run-parallel`'s default fail pattern. A test harness's own verdict is
 /// not one: a staged harness may fail its tests of the services this command
 /// refuses.
-const DEATH_MARKERS: [&str; 5] = [
+const DEATH_MARKERS: [&str; 6] = [
     "KERNEL EXCEPTION",
     "FATAL:",
     "PANIC at ",
     "PANIC: ",
     "=== WATCHDOG",
+    "entropy: SELFTEST FAIL",
 ];
 
 /// Budget for a boot the bootloader ends.
@@ -724,6 +725,28 @@ mod tests
             assert!(
                 matches!(Judge::new(&owed(&[&fatal])).line(line), Verdict::Fail(_)),
                 "{line}"
+            );
+        }
+    }
+
+    // Defect caught: a death marker of the default fail pattern missing from
+    // the list (or one the pattern lacks), so a fatal boot is not judged one.
+    #[test]
+    fn death_markers_agree_with_the_default_fail_pattern()
+    {
+        let fail = crate::regex::Regex::new(crate::cli::DEFAULT_FAIL_REGEX).unwrap();
+        for marker in DEATH_MARKERS
+        {
+            assert!(fail.is_match(marker), "{marker}");
+        }
+        // `PANIC( at |: )` stands for two markers, which the list holds.
+        let plain = crate::cli::DEFAULT_FAIL_REGEX.replace("PANIC( at |: )", "PANIC at ");
+        assert!(DEATH_MARKERS.contains(&"PANIC: "));
+        for alternative in plain.split('|')
+        {
+            assert!(
+                alternative.starts_with("SOME TESTS") || DEATH_MARKERS.contains(&alternative),
+                "{alternative}"
             );
         }
     }

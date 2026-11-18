@@ -16,9 +16,11 @@ svcmgr holds the master-log endpoint source for the system's life, so a
 restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
 targets; only the one-time init-logd history pull
 ([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on restart, and the
-restarted logd serves a fresh table. That table holds no sender's display name: each sender
-registers its name once, at startup, so its lines render as `[?]` after a restart until it
-registers again (#1213).
+restarted logd serves a fresh table. That table holds no sender's display name, so logd refuses a
+sender's first message that says the sender registered one (`SENDER_NAMED`), and the sender
+registers it again and resends the message: every line renders under its sender's name, the first
+after the restart included (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
+§ `stream_labels::STREAM_REGISTER_NAME`).
 
 ## Role
 
@@ -51,13 +53,18 @@ registers again (#1213).
   output routes to the serial driver through a
   `std::os::seraph::set_panic_sink` sink rather than the log endpoint,
   and logd deletes its procmgr-seeded `ProcessInfo.log_send_cap` at
-  startup so no path can self-IPC. The emit path never calls devmgr: while no driver is
-  resolved, serial output is dropped while history still accrues; early-boot
-  output is covered by init-logd's direct-UART fallback. logd holds its
-  own diagnostics until init-logd, which writes the UART directly, has
-  acknowledged the handover release, so the two never write a line at
-  once (see [`docs/handover-protocol.md`](docs/handover-protocol.md)
-  § Startup ordering). See
+  startup so no path can self-IPC. Each line reaches the driver through the serial sink, a bounded
+  queue drained by one writer thread, the only logd thread that waits on the driver: a line's
+  producer waits for its write for at most `SINK_STALL_MS`, and past that the sink is stalled and
+  its lines queued, then dropped and counted, until the driver writes again, so a driver that is
+  stopped by a debugger or dead does not hold the log stream; a sink whose writer could not be
+  spawned is written by each line's producer, and a stopped driver then costs every line up to that
+  bound (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Output sinks). The panic sink calls
+  the driver directly, each call bounded by the same bound. The emit path never calls devmgr: while
+  no driver is resolved, serial output is dropped while history still accrues; early-boot output is
+  covered by init-logd's direct-UART fallback. logd holds its own diagnostics until init-logd, which
+  writes the UART directly, has acknowledged the handover release, so the two never write a line at
+  once (see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering). See
   [docs/console-model.md](../../docs/console-model.md).
 
 * **Driver-mediated framebuffer mirror.** logd also mirrors each line
@@ -65,7 +72,9 @@ registers again (#1213).
   devmgr's `QUERY_DEVICE` on the `framebuffer` class SEND, under a `WATCH_CLASS` watch handled as
   the serial driver's, and written with `FB_WRITE_BYTES`,
   so the steady-state userspace log stream reaches the screen as well as
-  the UART (matching the early-kernel console). The mirror soft-degrades
+  the UART (matching the early-kernel console). The mirror is a sink of its own, with its own
+  queue and writer, so a framebuffer driver that does not answer holds neither the log stream nor
+  the serial output beyond `SINK_STALL_MS`. The mirror soft-degrades
   to a no-op when no framebuffer driver is present (headless boot),
   leaving serial the authoritative channel; the emit path never queries devmgr.
   See [docs/console-model.md](../../docs/console-model.md).
@@ -165,8 +174,9 @@ logd/
 │   └── ipc-interface.md        # IPC labels logd handles
 └── src/
     ├── main.rs                 # entry, bootstrap, receive-pool
-    │                           # handler, control loop, driver-mediated
-    │                           # serial + framebuffer emit, self_log
+    │                           # handler, control loop, serial and
+    │                           # framebuffer sinks and their writers,
+    │                           # self_log
     ├── handover.rs             # HANDOVER_PULL / HANDOVER_RELEASE caller
     └── slot.rs                 # SlotTable: HashMap<badge, Slot>
                                 # with per-sender history ring, and

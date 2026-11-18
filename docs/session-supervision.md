@@ -32,12 +32,12 @@ cap-native coordination of a session's members (signals, a foreground job, suspe
 
 ## Implementation Status
 
-§ Today, and § Stop Sources but for sessiond's candidates, state the system as built. Every other
-section below states design intent, not yet implemented, each part under the Issue that builds it:
+§ procmgr Mechanism, § Today, and § Stop Sources but for sessiond's candidates, state the system as
+built. Every other section below states design intent, not yet implemented, each part under the
+Issue that builds it:
 
 | Part | Issue |
 |---|---|
-| procmgr's parent link, re-parenting, containment, subtree destroy, child list and destroy, end post, end queue (§ procmgr Mechanism) | #1233 |
 | sessiond in operator mode, session nodes, the terminal opening its session through sessiond (§ sessiond, § Attribution) | #1233 |
 | Sessions over a PTY, several terminals, hangup (§ Session Kinds) | #1235 |
 | Remote login through sessiond (§ Session Kinds) | #1236 |
@@ -57,8 +57,9 @@ program:
   exits ([programs/terminal/README.md](../programs/terminal/README.md)).
 - The shell starts each external command the same way and is the only holder of that program's
   process handle ([programs/shell/README.md](../programs/shell/README.md)).
-- procmgr records no process's creator. Destroying a process destroys it alone, and a process
-  that ends leaves the processes it started running.
+- procmgr records each process's parent, destroys a process together with every process below
+  it, and re-parents the children of a process that ends (§ procmgr Mechanism). No session
+  supervisor uses it yet: a program's only supervisor is still the shell that started it.
 - memmgr charges each process under its creator's budget node, so a program's pages count in the
   shell's subtree and in the terminal's, as **Memory max and reserve** of
   [procmgr IPC Interface § Label 1](../services/procmgr/docs/ipc-interface.md#label-1-create_process)
@@ -155,7 +156,7 @@ account record are `docs/identity-and-authority.md`'s (#152).
 ## procmgr Mechanism
 
 What procmgr records and guarantees. The labels and their wire format are
-[procmgr's IPC Interface](../services/procmgr/docs/ipc-interface.md)'s once built.
+[procmgr's IPC Interface § Process Tree](../services/procmgr/docs/ipc-interface.md#process-tree)'s.
 
 - **Parent link.** procmgr records each process's parent: the process whose request created it,
   or none for a child of the un-badged creator (init, or svcmgr's mint source).
@@ -168,7 +169,8 @@ What procmgr records and guarantees. The labels and their wire format are
 - **Subtree destroy.** `DESTROY_PROCESS` destroys the process together with every process below
   it. Once a destroy begins, procmgr refuses a create from any process of that subtree, so none
   escapes it by starting a child during the teardown. A supervisor stopping a service or a program
-  thereby stops everything it started.
+  thereby stops everything it started. A destroy of a process that has already ended, before
+  procmgr reaped it, is that end's reap, so its children are re-parented whichever comes first.
 - **Children.** On a process handle, procmgr lists the process's children, each with its badge,
   its name and the pages of its subtree, and destroys one child, named by its badge, with its
   subtree. procmgr reads a child's subtree pages from memmgr with `QUERY_MEMORY_USAGE` over the
@@ -176,18 +178,23 @@ What procmgr records and guarantees. The labels and their wire format are
   new label. The handle is the authority: its holder may already destroy the process with every
   process below it, and the badge only names one of its children.
 - **End post.** procmgr keeps the death relay a create request carries (`CREATE_DEATH_RELAY`) for
-  the child's life, and the child's end reaches the relay once: a terminal fault through the
-  relay's binding, as today; an exit as procmgr posts the exit reason at the reap; a destroy, a
-  containment's included, as procmgr posts `EXIT_KILLED` after the teardown. A creator thereby
-  learns of a destroy it did not make (the shell, waiting on a job sessiond stopped), and an
-  interface whose queue is a leader's relay learns that its session ended. procmgr deletes its
-  copy of the relay once it has posted, and when the child is re-parented.
+  the child's life and posts the child's end to it once, whoever ends the child: a terminal fault in
+  any thread as the fault class, and an exit as the exit reason, at the reap; a destroy, a
+  containment's included, as `EXIT_KILLED` after the teardown, or as the exit or fault a process
+  that ended before its destroy was reaped took. procmgr posts it rather than binding the relay to
+  the child's address space, so the post is one whatever number of the child's threads end, and a
+  re-parent can take the relay away. A creator thereby learns of a destroy it did not make (the
+  shell, waiting on a job sessiond stopped), and an interface whose queue is a leader's relay learns
+  that its session ended. procmgr deletes its copy of the relay once it has posted, and when the
+  child is re-parented. A create procmgr refuses posts nothing, one a destroy reached between the
+  child's insert and procmgr's reply included: until that reply delivers the child, the create, not
+  the destroy, tears the child down, and procmgr deletes the relay unposted.
 - **End queue.** A process may register one end queue on itself, through the procmgr SEND it
   holds, which names it. procmgr posts the process's end to it once, as to a death relay: the
-  fault class, the exit reason at the reap, or `EXIT_KILLED` after a destroy. procmgr learns of
-  every end, since it reaps each process through its own observer and makes each destroy, so the
-  holder of the queue's receive right learns of the end whoever caused it. Telling another holder
-  of one's own end confers no authority over anything.
+  fault class or the exit reason at the reap, or the destroyed process's reason after a destroy.
+  procmgr learns of every end, since it reaps each process through its own observer and makes each
+  destroy, so the holder of the queue's receive right learns of the end whoever caused it. Telling
+  another holder of one's own end confers no authority over anything.
 
 ---
 

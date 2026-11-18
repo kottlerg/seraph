@@ -731,6 +731,10 @@ pub fn run_all(ctx: &TestContext)
     );
 
     // ── Hardware access syscalls ──────────────────────────────────────────────
+    // The merge tests run first: each splits a copy of a boot `Mmio` cap,
+    // which the split tests below consume.
+    run_test!("hw::mmio_merge_joins", hw::mmio_merge_joins(ctx));
+    run_test!("hw::mmio_merge_refusals", hw::mmio_merge_refusals(ctx));
     run_test!("hw::mmio_map", hw::mmio_map(ctx));
     run_test!(
         "hw::mmio_map_below_floor_err",

@@ -18,6 +18,7 @@
 //! - `SYS_IRQ_ROUTE` (63): route a wired line at its controller.
 //! - `SYS_IRQ_REMAP` (64): switch the kernel's interrupt formats to an
 //!   IOMMU's interrupt remapping.
+//! - `SYS_MMIO_MERGE` (70): merge two adjacent sibling `Mmio` caps into one.
 //!
 //! # Adding new hardware syscalls
 //! 1. Define the `SYS_*` number in `abi/syscall/src/lib.rs`.
@@ -574,10 +575,10 @@ pub fn sys_irq_remap(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// The `Mmio` object records the mapping, holding a reference on the address
 /// space, before any page is mapped; freeing the object (its capability
-/// deleted, consumed by a split, or revoked through an ancestor) unmaps it,
-/// with TLB shootdown (docs/capability-model.md § Mmio). A record past the
-/// object's `MMIO_INLINE_MAPPINGS` inline ones is a spill chunk from the
-/// caller's `CSpace` arena; the map returns `OutOfMemory` when that arena
+/// deleted, consumed by a split or a merge, or revoked through an ancestor)
+/// unmaps it, with TLB shootdown (docs/capability-model.md § Mmio). A record
+/// past the object's `MMIO_INLINE_MAPPINGS` inline ones is a spill chunk from
+/// the caller's `CSpace` arena; the map returns `OutOfMemory` when that arena
 /// cannot fund one.
 ///
 /// Intermediate page-table pages come from the target AS's PT growth pool;
@@ -1058,6 +1059,258 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Err(SyscallError::NotSupported)
 }
 
+// ── SYS_MMIO_MERGE ──────────────────────────────────────────────────────────
+
+/// `SYS_MMIO_MERGE` (70): merge two sibling `Mmio` caps over adjacent ranges
+/// into one cap over the joined range, consuming both.
+///
+/// Inverse of [`sys_mmio_split`]. Arguments, return, preconditions, and
+/// errors: `core/kernel/docs/syscalls.md` § `SYS_MMIO_MERGE` (70).
+#[cfg(not(test))]
+pub fn sys_mmio_merge(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::object::MmioObject;
+    use crate::cap::slot::MmioRights;
+    use crate::syscall::current_tcb;
+
+    let lower_handle = tf.arg(0);
+    let upper_handle = tf.arg(1);
+    // arg2 is reserved; ignore.
+
+    if syscall::cap_handle_index(lower_handle) == syscall::cap_handle_index(upper_handle)
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+
+    // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
+    // CPU's current thread.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*tcb).cspace };
+    if caller_cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+
+    // The pins keep both objects live until the merge has consumed their
+    // slots; dropping them at return frees each object, which unmaps every
+    // mapping made through it (`MmioObject::withdraw_mappings`).
+    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    let lower = unsafe { super::lookup_cap(caller_cspace, lower_handle, MmioRights::MAP) }?;
+    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    let upper = unsafe { super::lookup_cap(caller_cspace, upper_handle, MmioRights::MAP) }?;
+    let lower_obj = lower.object.ok_or(SyscallError::InvalidCapability)?;
+    let upper_obj = upper.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed Mmio by lookup_cap; the pin keeps the object live,
+    // and an Mmio object's range and flags never change after it is made.
+    let lo = unsafe { &*(lower_obj.as_ptr().cast::<MmioObject>()) };
+    // SAFETY: as for lo.
+    let up = unsafe { &*(upper_obj.as_ptr().cast::<MmioObject>()) };
+
+    if lower.rights != upper.rights || lo.flags != up.flags
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    let size =
+        joined_size(lo.base, lo.size, up.base, up.size).ok_or(SyscallError::InvalidArgument)?;
+
+    // The joined object is funded by the caller's CSpace, which receives it,
+    // as a split funds its children (core/kernel/docs/capability-internals.md
+    // § Body Arena).
+    // SAFETY: caller_cspace is the running thread's own CSpace, live while
+    // the thread runs.
+    let funder = unsafe { crate::cap::object::arena_of(caller_cspace) }?;
+    let joined = funder.alloc_body(MmioObject::new_root(lo.base, size, lo.flags))?;
+
+    // SAFETY: caller_cspace validated non-null; both handles resolved to
+    // these objects through lookup_cap, pinned above; joined is a fresh
+    // arena-backed MmioObject with refcount 1, inserted nowhere.
+    unsafe {
+        commit_mmio_merge(
+            caller_cspace,
+            MergedPair {
+                lower_handle,
+                upper_handle,
+                lower_obj,
+                upper_obj,
+                rights: lower.rights,
+            },
+            joined,
+        )
+    }
+}
+
+/// The two caps of an `Mmio` merge as looked up before `DERIVATION_LOCK` was
+/// taken, and the rights the joined cap takes.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+struct MergedPair
+{
+    lower_handle: u64,
+    upper_handle: u64,
+    lower_obj: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
+    upper_obj: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
+    rights: crate::cap::slot::Rights,
+}
+
+/// The locked part of `SYS_MMIO_MERGE`: in one `DERIVATION_LOCK` hold,
+/// revalidate both caps, check that they are derivation siblings with no
+/// derivation child, insert `joined` and link it under their parent, and
+/// unlink and free both slots; then release the references the slots held.
+/// Returns the joined cap's handle, minted under the insert's own
+/// `cspace.lock` hold. On any error nothing has changed and `joined` is
+/// deallocated.
+///
+/// # Safety
+/// `caller_cspace` must be the calling thread's valid non-null `CSpace`;
+/// `pair`'s handles must have resolved, through `lookup_cap` in that
+/// `CSpace`, to `pair`'s objects, which the caller keeps pinned. `joined`
+/// must be a freshly-allocated arena-backed `MmioObject` with refcount 1,
+/// not yet inserted anywhere. Syscall context with no lock held.
+#[cfg(not(test))]
+unsafe fn commit_mmio_merge(
+    caller_cspace: *mut crate::cap::cspace::CSpace,
+    pair: MergedPair,
+    joined: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
+) -> Result<u64, SyscallError>
+{
+    use crate::cap::derivation::{DERIVATION_LOCK, link_child, unlink_node};
+    use crate::cap::object::{dealloc_object, release_ref};
+    use crate::cap::slot::{CapTag, SlotId};
+
+    let fail = |e: SyscallError| -> Result<u64, SyscallError> {
+        DERIVATION_LOCK.write_unlock();
+        // SAFETY: joined is fresh (refcount 1) and was never inserted
+        // anywhere (caller contract); the lock is released.
+        unsafe { dealloc_object(joined) };
+        Err(e)
+    };
+
+    DERIVATION_LOCK.write_lock();
+    // Revalidate both unlocked-resolved caps under the lock
+    // (core/kernel/docs/capability-internals.md § Global Derivation Lock).
+    // SAFETY: caller_cspace valid (contract); DERIVATION_LOCK held.
+    let live = unsafe {
+        super::cap::revalidate_src_under_lock(caller_cspace, pair.lower_handle, pair.lower_obj)
+    }
+    .and_then(|()| {
+        // SAFETY: as above.
+        unsafe {
+            super::cap::revalidate_src_under_lock(caller_cspace, pair.upper_handle, pair.upper_obj)
+        }
+    });
+    if let Err(e) = live
+    {
+        return fail(e);
+    }
+
+    let lower_idx = syscall::cap_handle_index(pair.lower_handle);
+    let upper_idx = syscall::cap_handle_index(pair.upper_handle);
+    // DERIVATION_LOCK is held, so both slots, which revalidated in this hold,
+    // stay occupied and their links stable.
+    // SAFETY: caller_cspace valid (contract); DERIVATION_LOCK held.
+    let lower_slot = unsafe { (*caller_cspace).slot(lower_idx) };
+    // SAFETY: as above.
+    let upper_slot = unsafe { (*caller_cspace).slot(upper_idx) };
+    let (Some(lower_slot), Some(upper_slot)) = (lower_slot, upper_slot)
+    else
+    {
+        return fail(SyscallError::InvalidCapability);
+    };
+    let parent = lower_slot.deriv_parent;
+    if parent != upper_slot.deriv_parent
+    {
+        return fail(SyscallError::InvalidArgument);
+    }
+    // A derivation child would have to move under the joined cap or the
+    // parent: refused, so the merge stays one bounded edit of the tree.
+    if lower_slot.deriv_first_child.is_some() || upper_slot.deriv_first_child.is_some()
+    {
+        return fail(SyscallError::InvalidState);
+    }
+    let (Some(lower_nz), Some(upper_nz)) = (
+        core::num::NonZeroU32::new(lower_idx),
+        core::num::NonZeroU32::new(upper_idx),
+    )
+    else
+    {
+        return fail(SyscallError::InvalidCapability);
+    };
+
+    // SAFETY: caller_cspace valid (contract).
+    let cspace_id = unsafe { (*caller_cspace).id() };
+    // Insert the joined cap before either slot is freed, so a failed insert
+    // leaves both caps as they were; cspace.lock nests inside
+    // DERIVATION_LOCK (core/kernel/docs/scheduling-internals.md § Lock Hierarchy).
+    // SAFETY: caller_cspace valid (contract).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: as above; lock_raw/unlock_raw paired.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: as above; cspace.lock held; joined is fresh (contract).
+    let inserted =
+        unsafe { (*caller_cspace).insert_cap_slot_and_handle(CapTag::Mmio, pair.rights, joined) };
+    // Re-borrowed after the insert's `&mut` access to the CSpace.
+    // SAFETY: caller_cspace valid (contract).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
+    let (joined_slot, joined_handle) = match inserted
+    {
+        Ok(slot_and_handle) => slot_and_handle,
+        Err(e) => return fail(SyscallError::from(e)),
+    };
+    if let Some(parent) = parent
+    {
+        // SAFETY: DERIVATION_LOCK held; the joined slot was occupied by the
+        // insert above. A parent whose CSpace has since unregistered is a dead
+        // link (`truncate_dead_link`); the joined cap then stays a clean root,
+        // as a split child does.
+        let _ = unsafe { link_child(parent, SlotId::current(cspace_id, joined_slot)) };
+    }
+    // SAFETY: DERIVATION_LOCK held; both slots revalidated in this hold and
+    // are childless (checked above).
+    unsafe { unlink_node(SlotId::current(cspace_id, lower_nz)) };
+    // SAFETY: as above.
+    unsafe { unlink_node(SlotId::current(cspace_id, upper_nz)) };
+
+    // Freed in the same hold as the unlinks, so no derive re-links a child
+    // under a consumed cap between them.
+    // SAFETY: as for the insert; lock_raw/unlock_raw paired.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: caller_cspace valid; cspace.lock held; the index names a slot
+    // revalidated under DERIVATION_LOCK in this hold.
+    unsafe { (*caller_cspace).free_slot(lower_idx) };
+    // SAFETY: as above.
+    unsafe { (*caller_cspace).free_slot(upper_idx) };
+    // Re-borrowed after the frees' `&mut` access to the CSpace.
+    // SAFETY: caller_cspace valid (contract).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
+    DERIVATION_LOCK.write_unlock();
+
+    // Release the references the freed slots held; the caller's pins hold
+    // each object until the syscall returns, when its free unmaps every
+    // mapping made through it.
+    // SAFETY: lower_obj is the object the freed lower slot referenced, live
+    // (pinned); that reference is released exactly once, here; syscall
+    // context with no lock held.
+    unsafe { release_ref(pair.lower_obj) };
+    // SAFETY: as above, for the upper slot.
+    unsafe { release_ref(pair.upper_obj) };
+    Ok(joined_handle)
+}
+
+#[cfg(test)]
+pub fn sys_mmio_merge(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
 // ── SYS_IRQ_SPLIT ───────────────────────────────────────────────────────────
 
 /// `SYS_IRQ_SPLIT` (49): split an `Interrupt` range cap into two non-overlapping children.
@@ -1352,10 +1605,24 @@ fn split_range(start: u32, count: u32, split_at: u64) -> Option<RangeSplit>
     (lower > 0 && upper > 0).then_some(RangeSplit { at, lower, upper })
 }
 
+/// Size of the range `SYS_MMIO_MERGE` joins from `[lower_base, lower_base +
+/// lower_size)` and `[upper_base, upper_base + upper_size)`, or `None` when
+/// the upper range does not start where the lower one ends, or the joined
+/// range would pass the end of the address space.
+fn joined_size(lower_base: u64, lower_size: u64, upper_base: u64, upper_size: u64) -> Option<u64>
+{
+    if lower_base.checked_add(lower_size) != Some(upper_base)
+    {
+        return None;
+    }
+    upper_base.checked_add(upper_size)?;
+    lower_size.checked_add(upper_size)
+}
+
 #[cfg(test)]
 mod tests
 {
-    use super::split_range;
+    use super::{joined_size, split_range};
 
     /// The split as `(at, lower, upper)`, for comparison.
     fn split(start: u32, count: u32, split_at: u64) -> Option<(u32, u32, u32)>
@@ -1400,5 +1667,35 @@ mod tests
         assert_eq!(split(4, 4, 5), Some((5, 1, 3)));
         assert_eq!(split(4, 4, 0x1_0000_0005), None);
         assert_eq!(split(0, u32::MAX, u64::MAX), None);
+    }
+
+    // Defect guarded: ranges joined when they overlap, leave a gap, or are
+    // passed in the wrong order, which would mint a cap over a range neither
+    // caller cap covered, or one that does not start at the lower base.
+    #[test]
+    fn joined_size_joins_only_a_lower_range_and_the_one_that_follows_it()
+    {
+        assert_eq!(joined_size(0x1000, 0x2000, 0x3000, 0x1000), Some(0x3000));
+        // A gap of one page, an overlap of one page, and the reversed order.
+        assert_eq!(joined_size(0x1000, 0x2000, 0x4000, 0x1000), None);
+        assert_eq!(joined_size(0x1000, 0x2000, 0x2000, 0x1000), None);
+        assert_eq!(joined_size(0x3000, 0x1000, 0x1000, 0x2000), None);
+    }
+
+    // Defect guarded: an end computed with wrapping arithmetic, which would
+    // join a range ending at the top of the address space to one at zero, or
+    // mint a cap whose end wrapped.
+    #[test]
+    fn joined_size_refuses_a_range_that_passes_the_address_space()
+    {
+        // The lower range's end wraps to zero, where the upper one starts.
+        assert_eq!(joined_size(u64::MAX - 0xFFF, 0x1000, 0, 0x1000), None);
+        // The upper range runs past the end.
+        assert_eq!(joined_size(0, 0x1000, 0x1000, u64::MAX), None);
+        // Ending exactly at the last byte is representable.
+        assert_eq!(
+            joined_size(0, 0x1000, 0x1000, u64::MAX - 0x1000),
+            Some(u64::MAX)
+        );
     }
 }

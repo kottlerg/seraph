@@ -4,7 +4,12 @@ System log primitives for Seraph userspace. Three parts: no-allocation wire-form
 (`write_bytes`, `write_args`, `write_record`, `register_name`) over the labels in
 `ipc::stream_labels`, with the caller supplying its badged SEND cap, IPC buffer, and the line's
 level, and `build_record`, which stages a log record (`ipc::log_record`); a process-global cache
-(`install_badged_cap`, `ensure_badged_cap`) for the pre-installed badged log cap; and the
+(`install_badged_cap`, `ensure_badged_cap`) for the pre-installed badged log cap, beside which
+`register_name` keeps the name the process registers on that cap, so its stream messages there
+carry `ipc::stream_labels::SENDER_NAMED` and a log call sends the name again, then resends its
+message once, when the receiver answers `NAME_UNKNOWN`, as a restarted logd does
+([logd IPC interface](../../services/logd/docs/ipc-interface.md)
+§ `stream_labels::STREAM_REGISTER_NAME`); and the
 process-global level filter (`set_max_level`, `max_level`, `enabled`, `parse_level`,
 `LEVEL_ENV_KEY`), with `level_entry`, which writes the `SERAPH_LOG` entry `parse_level` reads back
 (`LEVEL_ENTRY_MAX` bytes at most). The only installer of either is std's `_start`, which installs

@@ -3,10 +3,10 @@
 How devmgr learns that a device was added to or removed from a running machine, and how the
 device's record and driver follow.
 
-Implementation status: partly implemented
-([#939](https://github.com/kottlerg/seraph/issues/939)). PCI Express native hotplug's add and
-removal paths are implemented. The ACPI PCI hotplug source (§ Event Sources) is design intent;
-not yet implemented ([#1096](https://github.com/kottlerg/seraph/issues/1096)).
+Implementation status: implemented
+([#939](https://github.com/kottlerg/seraph/issues/939),
+[#1096](https://github.com/kottlerg/seraph/issues/1096)), apart from the wired interrupt of a
+hot-added function on x86-64 (§ Binding).
 
 ---
 
@@ -18,22 +18,24 @@ controls the slot:
 | Source | Machine | Grant |
 |---|---|---|
 | PCI Express native hotplug, polled by devmgr (§ Native Hotplug) | riscv64 `virt`; x86-64 q35 with QEMU's ACPI PCI hotplug off | the host bridge's `_OSC` grants native hotplug control, or the machine's platform description table carries `pcie_native_hotplug = yes` |
-| ACPI PCI hotplug, through acpid (design intent; not yet implemented, [#1096](https://github.com/kottlerg/seraph/issues/1096)) | x86-64 q35 by default | `_OSC` withholds native control |
+| ACPI PCI hotplug, the firmware's, whose events acpid posts (§ ACPI Hotplug) | x86-64 q35 by default | `_OSC` withholds native control, or fails, and no platform table grants it |
 
 A slot is managed natively only under a grant: the `_OSC` result acpid reports for the slot's
 host bridge has the native hotplug bit (`OSC_NATIVE_HOTPLUG`, PCI Firmware Specification r3.2
 § 4.5.1), or the platform description table grants it
 ([docs/driver-binding.md](../../../docs/driver-binding.md#platform-description-tables)
-§ Platform Description Tables). Without either, devmgr never touches the slot: a slot that
-advertises Hot-Plug Capable while firmware keeps control (QEMU's default q35 root port, `_OSC`
-control 0x1E) is driven by firmware's own hotplug, and a second agent on its Slot Control would
-contend with it. The platform key exists for a machine whose `_OSC` withholds native control
-while it offers no ACPI hotplug either (QEMU's riscv64 `virt`), so no other agent drives the
-slot. Both sources feed one add path (§ Add Job) and one removal path (§ Removal).
+§ Platform Description Tables). Without either, the firmware drives the slot, and devmgr never
+writes its port: a slot that advertises Hot-Plug Capable while firmware keeps control (QEMU's
+default q35 root port, `_OSC` control 0x1E) is driven by the firmware's own hotplug, and a second
+agent on its Slot Control would contend with it. devmgr then acts on the slot only on the events
+acpid posts from the firmware's `Notify` (§ ACPI Hotplug). The platform key exists for a machine
+whose `_OSC` withholds native control while it offers no ACPI hotplug either (QEMU's riscv64
+`virt`), so no other agent drives the slot. Both sources feed one add path (§ Add Job) and one
+removal path (§ Removal).
 
 ---
 
-## Native Hotplug
+## Slots
 
 ### Slot Discovery
 
@@ -57,22 +59,29 @@ logged:
 On each turn of its control loop, after acpid's jobs, devmgr checks every slot still waiting: under
 a grant (§ Event Sources) it hands the slot to the poller, logged `managed (native control by _OSC)`
 or `by the platform table`; when the host bridge's `_OSC` result has arrived and withholds native
-control or reports a failed evaluation, with no platform grant, the slot is never managed, logged
-`not managed`. A slot whose `_OSC` result has not arrived waits. The slot's host bridge is the one
-whose `_CRS` bus window holds the port's bus, else the one whose root bus it is
-(`firmware::hotplug::host_bridge`). Once the slot is handed over, devmgr marks the port's record
-bound (`firmware::hotplug::hold_port`): the poller writes the port's Slot Control and Slot Status,
-past the configuration header, so no pass binds the port and acpid is refused every configuration
-write to it ([acpid's devmgr.md](../../acpid/docs/devmgr.md) § Configuration access).
+control or reports a failed evaluation, with no platform grant, it leaves the slot to the firmware,
+logged `firmware hotplug`, and runs the jobs acpid posts for it (§ ACPI Hotplug). A slot whose
+`_OSC` result has not arrived waits. The slot's host bridge is the one whose `_CRS` bus window holds
+the port's bus, else the one whose root bus it is (`firmware::hotplug::host_bridge`). Once the slot
+is handed over, devmgr marks the port's record bound (`firmware::hotplug::hold_port`): the poller
+writes the port's Slot Control and Slot Status, past the configuration header, so no pass binds the
+port and acpid is refused every configuration write to it ([acpid's
+devmgr.md](../../acpid/docs/devmgr.md) § Configuration access).
 
-Before the hand-over devmgr holds the BAR pages of the functions behind the slot
-(`hotplug::hold_behind`): what the apertures still hold of the page span of each MMIO BAR of each
-live record on the slot's buses (all of it for an unbound record, what its bind left for a bound
-one) moves out of the apertures into devmgr's held BAR pages (`DevmgrCaps::slot_bars`), from which a
-bind carves the function's BAR caps. A withdrawal gives every BAR cap of its driver's device back to
-the held BAR pages (§ Removal), so the pages a bind carved come back there too. Placement takes only
-what the apertures hold (§ Add Job), so no hot-added BAR lands on them. A slot whose pages cannot be
-held is not managed, logged, and the pages moved before the failure go back to the apertures.
+Before the hand-over, and before it leaves a slot to the firmware, devmgr holds the BAR pages of the
+functions behind the slot (`hotplug::hold_behind`): what the apertures still hold of the page span
+of each MMIO BAR of each live record on the slot's buses (all of it for an unbound record, what its
+bind left for a bound one) moves out of the apertures into devmgr's held BAR pages
+(`DevmgrCaps::slot_bars`), from which a bind carves the function's BAR caps. A withdrawal gives
+every BAR cap of its driver's device back to the held BAR pages (§ Removal), so the pages a bind
+carved come back there too. Placement takes only what the apertures hold (§ Add Job), so no
+hot-added BAR lands on them. A slot whose pages cannot be held is neither managed nor left to the
+firmware, logged `not managed`: devmgr acts on none of its events, and the pages moved before the
+failure go back to the apertures.
+
+---
+
+## Native Hotplug
 
 ### Poller
 
@@ -116,6 +125,38 @@ does not come up is logged, the slot powered off, and the slot held failed until
 removed. A job, add or removal, is posted to the control thread over one channel, with a signal
 of its job notification; the control thread runs the jobs in the order they were posted, each to
 its end before the next.
+
+---
+
+## ACPI Hotplug
+
+On a slot the firmware drives, QEMU's q35 ACPI PCI hotplug signals a change with GPE 1. acpid runs
+`\_GPE._E01`, which reads the firmware's hotplug registers and notifies each slot that changed:
+`Notify(slot, 1)` (Device Check) for a card inserted, `Notify(slot, 3)` (Eject Request) for one the
+operator asks to remove. acpid turns each into a job it posts to devmgr with `ACPI_HOTPLUG`, a
+Device Check or Bus Check as `HOTPLUG_ADDED` and an Eject Request as `HOTPLUG_REMOVED`, naming the
+port whose secondary bus the slot is on ([acpid's README](../../acpid/README.md#hotplug) § Hotplug).
+devmgr posts the job on the channel the poller posts on (`hotplug::Hotplug::post_acpi`), so the
+control thread runs it in order with the others, each to its end before the next:
+
+- a port that is no slot of the boot scan is answered `NO_DEVICE`, and a job for a slot the
+  firmware does not drive (managed, waiting for its grant, or not managed) `REFUSED`, each logged;
+- an add job runs the add path (§ Add Job), logged `card added (the firmware's device check)`. One
+  for a slot behind which live records lie already, a repeat of the firmware's for a card already
+  recorded, records nothing, logged;
+- a removal job runs the removal path (§ Removal), logged `removing its functions (the firmware's
+  eject request)`.
+
+The job's reply carries the number of functions it recorded or removed. Once a removal's reply has
+arrived, acpid runs the slot's `_EJ0`, on which the firmware lets the card go (QEMU unplugs it and
+emits `DEVICE_DELETED`), so the driver is withdrawn and the records removed before the card leaves.
+acpid then runs the slot's `_OST`, where it has one, with the event and its outcome; QEMU's slots
+have none. The poller never watches such a slot, and devmgr writes none of its port's registers:
+the firmware powers it.
+
+---
+
+## Jobs
 
 ### Add Job
 
@@ -172,16 +213,17 @@ route).
 
 ### Removal
 
-A removal is a slot's card leaving: pulled (presence lost or changed, so a card pulled and inserted,
-or swapped, within one poll is removed and then added again, or the link lost), or asked for with
-the attention button, whose press blinks the power indicator for the abort window; a second press
-within it cancels the removal, and the indicator is on again. The poller posts the slot's removal
-job, logged `removing its functions` with the cause, and holds the slot removing until the job
-completes, whatever Slot Status reads meanwhile: a card inserted, pressed or pulled then is acted on
-only after the completion. The slot keeps whether a card was inserted or the button pressed while it
-was removing, so that card is powered up after the completion without a further press, on a slot
-with no attention button as on one with it. A removal posted for a card changed in the slot, or in
-the poll of a second press within the abort window, which asks to keep the card, starts asked for
+On a slot the firmware drives, a removal is the firmware's eject request (§ ACPI Hotplug). On a
+managed slot it is the card leaving: pulled (presence lost or changed, so a card pulled and
+inserted, or swapped, within one poll is removed and then added again, or the link lost), or asked
+for with the attention button, whose press blinks the power indicator for the abort window; a second
+press within it cancels the removal, and the indicator is on again. The poller posts the slot's
+removal job, logged `removing its functions` with the cause, and holds the slot removing until the
+job completes, whatever Slot Status reads meanwhile: a card inserted, pressed or pulled then is
+acted on only after the completion. The slot keeps whether a card was inserted or the button pressed
+while it was removing, so that card is powered up after the completion without a further press, on a
+slot with no attention button as on one with it. A removal posted for a card changed in the slot, or
+in the poll of a second press within the abort window, which asks to keep the card, starts asked for
 the same way; one posted in the poll of a first press does not, since that press asks for the
 removal.
 
@@ -215,30 +257,30 @@ The control thread runs the removal job (`firmware::hotplug::remove`), in this o
    driver never serves more devices than its limit.
 
 It logs `functions removed` with the number of records removed, drivers withdrawn and held spans
-returned, and posts the slot back to the poller, which powers it off in two Slot Control writes: the
-power controller off, then the power indicator off, logged `powered off`. QEMU unplugs the card on
-the write that leaves both off. The slot is then off while the card the removal removed is still
-present, until a press or a new insertion asks for it; it is empty when no card is present, or when
-a card was inserted or the button pressed while it was removing or by the power-off, so the next
-poll powers that card up (`firmware::hotplug::completed`). A slot is powered up again only from
-empty or off, so no add job for it runs before its previous occupant's DMA, IOMMU mappings and
-interrupt routes are gone. A removal job posted while the slot's add job waits runs after it, and
-withdraws what the add bound; a second removal job of a slot finds no live record and returns
-nothing.
+returned. acpid's job then ends with its reply (§ ACPI Hotplug); the poller's posts the slot back to
+the poller, which powers it off in two Slot Control writes: the power controller off, then the power
+indicator off, logged `powered off`. QEMU unplugs the card on the write that leaves both off. The
+slot is then off while the card the removal removed is still present, until a press or a new
+insertion asks for it; it is empty when no card is present, or when a card was inserted or the
+button pressed while it was removing or by the power-off, so the next poll powers that card up
+(`firmware::hotplug::completed`). A slot is powered up again only from empty or off, so no add job
+for it runs before its previous occupant's DMA, IOMMU mappings and interrupt routes are gone. A
+removal job posted while the slot's add job waits runs after it, and withdraws what the add bound; a
+second removal job of a slot finds no live record and returns nothing.
 
 An IOMMU fault is counted for a requester ID only while a DMA grant of a live record tracks it
 (`firmware::dma::FaultCounts`): the grant tracks it from zero, the withdrawal stops counting it
 once the device is blocked, and a fault of an untracked requester ID is logged, not counted. A
 function added at a removed one's address starts with no faults.
 
-Returned BAR caps stay split: no syscall merges two adjacent `Mmio` caps
-([#1230](https://github.com/kottlerg/seraph/issues/1230) adds one), so a window's free
-range comes back as the spans it was carved into, each placeable on its own. A card added again
-with the same BARs is placed in the same spans; a BAR larger than the largest span left, or whose
-aligned base falls across two spans, no longer fits, logged as `the slot's windows have no room
-for it`, although the window is free. Each add at a new place splits a free span into at most
-three, so the apertures table grows by at most two spans per BAR placed, and never past one span
-per page of the windows.
+Returned BAR caps stay split: devmgr does not merge two adjacent `Mmio` caps, although
+`SYS_MMIO_MERGE` can ([#1230](https://github.com/kottlerg/seraph/issues/1230) has devmgr use it), so
+a window's free range comes back as the spans it was carved into, each placeable on its own. A card
+added again with the same BARs is placed in the same spans; a BAR larger than the largest span left,
+or whose aligned base falls across two spans, no longer fits, logged as `the slot's windows have no
+room for it`, although the window is free. Each add at a new place splits a free span into at most
+three, so the apertures table grows by at most two spans per BAR placed, and never past one span per
+page of the windows.
 
 ---
 

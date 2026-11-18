@@ -698,21 +698,46 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         procmgr_labels::DESTROY_PROCESS =>
         {
             release_caps(req.caps());
-            // Badge from ipc_recv identifies which process to destroy. Its
-            // exit is recorded like a reaped death's, so a `QUERY_PROCESS`
-            // racing a death drain the destroy overtook still answers
-            // `EXITED`.
-            let _ = process::destroy_process(
-                badge,
-                ctx.memmgr_ep,
-                ipc_buf,
-                &ctx.tables,
-                process::ExitRecord::Record,
-            );
+            // Badge from ipc_recv identifies which process to destroy, with
+            // every process below it. Each exit is recorded like a reaped
+            // death's, so a `QUERY_PROCESS` racing a death drain the destroy
+            // overtook still answers `EXITED`.
+            let _ = process::destroy_process(badge, ctx.memmgr_ep, ipc_buf, &ctx.tables);
             reply_empty(ipc_buf, procmgr_errors::SUCCESS);
-            // The destroyed process may have been the crash service or an
+            // A destroyed process may have been the crash service or an
             // attached debugger.
             reap_checks(ctx);
+        }
+
+        procmgr_labels::DESTROY_CHILD =>
+        {
+            release_caps(req.caps());
+            // Served on a process handle alone (`sender_refusal`): the badge
+            // names the parent, `data[0]` the child.
+            let code =
+                if process::destroy_child(badge, req.word(0), ctx.memmgr_ep, ipc_buf, &ctx.tables)
+                {
+                    procmgr_errors::SUCCESS
+                }
+                else
+                {
+                    procmgr_errors::INVALID_BADGE
+                };
+            reply_empty(ipc_buf, code);
+            reap_checks(ctx);
+        }
+
+        procmgr_labels::LIST_CHILDREN =>
+        {
+            release_caps(req.caps());
+            handle_list_children(&req, ipc_buf, ctx);
+        }
+
+        procmgr_labels::REGISTER_END_QUEUE =>
+        {
+            // A registration makes no syscall but the reply, under the table
+            // lock.
+            handle_register_end_queue(&req, ipc_buf, &mut ctx.tables.lock().table);
         }
 
         procmgr_labels::RELEASE_HOLD =>
@@ -1318,6 +1343,136 @@ fn handle_bind_death_observer(req: &IpcMessage, ipc_buf: *mut u64, table: &proce
     reply_empty(ipc_buf, code);
 }
 
+/// Handle `LIST_CHILDREN` — reply with one page of the children of the
+/// process the handle names, each with its name and its subtree's pages
+/// (`services/procmgr/docs/ipc-interface.md` § Label 27: `LIST_CHILDREN`).
+/// `dispatch_ipc` has refused it on any cap but a process handle.
+///
+/// The page is read under the table lock: each child's badge, its name, and a
+/// copy of procmgr's memmgr SEND for it, badged with the child's memmgr
+/// badge. After the release each copy's `QUERY_MEMORY_USAGE` reads the
+/// child's subtree pages, `data[2]` of the reply, and the copy is deleted:
+/// the call to memmgr waits on no lock, and a child torn down meanwhile
+/// leaves its copy valid, which memmgr then answers for an unknown badge,
+/// listed as `0`. `INVALID_BADGE` when the handle names no live process;
+/// `INVALID_ARGUMENT` for a `data[0]` other than 0 or 1.
+fn handle_list_children(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+{
+    let after = match req.word(0)
+    {
+        0 => None,
+        1 => Some(req.word(1)),
+        _ =>
+        {
+            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+            return;
+        }
+    };
+    let mut page =
+        [(0u64, process_table::ProcessName::EMPTY, 0u64); procmgr_labels::LIST_CHILDREN_PAGE];
+    let mut count = 0usize;
+    {
+        let state = ctx.tables.lock();
+        if state.table.find_by_badge(req.badge).is_none()
+        {
+            drop(state);
+            reply_empty(ipc_buf, procmgr_errors::INVALID_BADGE);
+            return;
+        }
+        for (slot, child) in page
+            .iter_mut()
+            .zip(state.table.children_after(req.badge, after))
+        {
+            let usage = if child.memmgr_send_cap == 0
+            {
+                0
+            }
+            else
+            {
+                syscall::cap_derive(child.memmgr_send_cap, syscall::RIGHTS_EP_SEND).unwrap_or(0)
+            };
+            *slot = (child.badge(), child.name, usage);
+            // `count` counts the slots of `page`, so it cannot overflow.
+            count = count.saturating_add(1);
+        }
+    }
+    let mut words = [0u64; syscall_abi::MSG_DATA_WORDS_MAX];
+    for (index, (badge, name, usage)) in page.iter().take(count).enumerate()
+    {
+        let pages = subtree_pages(*usage, ipc_buf);
+        if *usage != 0
+        {
+            let _ = syscall::cap_delete(*usage);
+        }
+        // `LIST_CHILDREN_PAGE` entries fit the data words after the count.
+        let _ = procmgr_labels::pack_child_entry(&mut words, index, *badge, name.as_bytes(), pages);
+    }
+    words[0] = count as u64;
+    let used = count
+        .saturating_mul(procmgr_labels::LIST_CHILDREN_WORDS_PER_ENTRY)
+        .saturating_add(1);
+    let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS);
+    for (i, &w) in words.get(..used).unwrap_or_default().iter().enumerate()
+    {
+        reply = reply.word(i, w);
+    }
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) };
+}
+
+/// The pages charged to the budget node, and every node below it, of the
+/// process whose memmgr badge `usage` (a SEND on memmgr's endpoint) carries:
+/// `data[2]` of its `QUERY_MEMORY_USAGE` reply; `0` for no cap, a refusal
+/// (memmgr no longer knows the badge), or a failed call.
+fn subtree_pages(usage: u64, ipc_buf: *mut u64) -> u64
+{
+    if usage == 0
+    {
+        return 0;
+    }
+    let msg = IpcMessage::new(memmgr_labels::QUERY_MEMORY_USAGE);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    match unsafe { ipc::ipc_call(usage, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == memmgr_errors::SUCCESS => reply.word(2),
+        _ => 0,
+    }
+}
+
+/// Handle `REGISTER_END_QUEUE` — record `caps[0]` as the sender's end
+/// queue, posted `data[0]` as the correlator with its end
+/// (`services/procmgr/docs/ipc-interface.md` § Label 29:
+/// `REGISTER_END_QUEUE`). `dispatch_ipc` has refused it on a process
+/// handle, so the badge is the sender's own. Replies `SUCCESS`;
+/// `INVALID_ARGUMENT` without a queue cap; `INVALID_BADGE` when the badge
+/// names no live process (the un-badged creator's); `END_QUEUE_PRESENT` when
+/// the sender registered one before. Caps past `caps[0]`, and the queue of a
+/// refused request, are deleted.
+fn handle_register_end_queue(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+{
+    let caps = req.caps();
+    let queue = caps.first().copied().unwrap_or(0);
+    release_caps(caps.get(1..).unwrap_or(&[]));
+    let code = if queue == 0
+    {
+        procmgr_errors::INVALID_ARGUMENT
+    }
+    else
+    {
+        match table.register_end_queue(req.badge, queue, req.word(0))
+        {
+            Ok(()) => procmgr_errors::SUCCESS,
+            Err(process_table::EndQueueRefusal::NotFound) => procmgr_errors::INVALID_BADGE,
+            Err(process_table::EndQueueRefusal::Present) => procmgr_errors::END_QUEUE_PRESENT,
+        }
+    };
+    if code != procmgr_errors::SUCCESS && queue != 0
+    {
+        let _ = syscall::cap_delete(queue);
+    }
+    reply_empty(ipc_buf, code);
+}
+
 /// Handle `QUERY_LIVE_PROCESSES` — reply with one page of live process
 /// badges, in ascending order, after the cursor the request names
 /// (`services/procmgr/docs/ipc-interface.md` § `QUERY_LIVE_PROCESSES`).
@@ -1737,6 +1892,8 @@ fn resolve_create_sched(
         band_max,
         budget,
         sign_kinds: creator.sign_kinds,
+        creator: req.badge,
+        contained: label & procmgr_labels::CREATE_CONTAIN != 0,
     })
 }
 
@@ -1747,8 +1904,11 @@ enum HoldRefusal
     /// The heap cannot reserve the room the child's parked record takes
     /// (`ArmError::OutOfMemory`).
     NoRoom,
-    /// No live entry holds the child's badge (`ArmError::NotFound`), which
-    /// the child's insertion just before rules out unless the table lost it.
+    /// No live entry holds the child's badge (`ArmError::NotFound`). The
+    /// child's insertion just before rules it out: until the create is
+    /// answered only the create's own refusal takes the entry
+    /// (`ProcessEntry::unanswered`), a destroy that marks it meanwhile
+    /// included, so this arm is reached only if the table lost the entry.
     NotFound,
     /// The release token could not be derived; the hold is armed, and the
     /// child's destroy settles it.
@@ -1812,13 +1972,7 @@ fn refuse_unarmed_create(
     {
         let _ = syscall::cap_delete(result.node_handle);
     }
-    let _ = process::destroy_process(
-        result.badge,
-        ctx.memmgr_ep,
-        ipc_buf,
-        &ctx.tables,
-        process::ExitRecord::Omit,
-    );
+    process::destroy_created(result.badge, ctx.memmgr_ep, ipc_buf, &ctx.tables);
     reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
 }
 
@@ -1852,7 +2006,15 @@ fn arm_and_reply_create(
 }
 
 /// Reply with a successful process creation result, or destroy the child
-/// when the reply cannot deliver it.
+/// when the reply cannot deliver it or a destroy has marked it.
+///
+/// The reply is made under the table lock, through
+/// `ProcessTable::answer_create`, so a destroy marks the child either
+/// before the reply, which is then not made and the create is refused with
+/// `INVALID_ARGUMENT`, as for a create a destroy marked before its insert,
+/// or after it, once the creator holds the child. Until the answer the
+/// destroy leaves the entry to this create, so a refused create deletes the
+/// death relay unposted. `ipc_reply` does not block on the caller.
 ///
 /// Reply caps: `[process_handle, thread, release_token?, node_handle?]`, the
 /// token only for a `CREATE_DMA_HOLD` child and the node handle only for a
@@ -1884,10 +2046,16 @@ fn reply_create_result(
         msg = msg.cap(result.node_handle);
     }
     let msg = msg.build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
+    let answer = tables.lock().table.answer_create(result.badge, || {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_ok()
+    });
+    if answer != process_table::CreateAnswer::Answered
     {
-        std::os::seraph::log!(warn: "create reply undeliverable; destroying the child");
+        if answer == process_table::CreateAnswer::Undelivered
+        {
+            std::os::seraph::log!(warn: "create reply undeliverable; destroying the child");
+        }
         let _ = syscall::cap_delete(result.thread_for_caller);
         let _ = syscall::cap_delete(result.process_handle);
         if let Some(token) = release_token
@@ -1899,13 +2067,11 @@ fn reply_create_result(
             let _ = syscall::cap_delete(result.node_handle);
         }
         // No handle to this child survives, so nothing can query its exit.
-        let _ = process::destroy_process(
-            result.badge,
-            memmgr_ep,
-            ipc_buf,
-            tables,
-            process::ExitRecord::Omit,
-        );
+        process::destroy_created(result.badge, memmgr_ep, ipc_buf, tables);
+        if answer == process_table::CreateAnswer::Refused
+        {
+            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        }
     }
 }
 
@@ -1936,8 +2102,9 @@ enum ObjectSource
 /// its object is copied (a file's opened, read and closed first), the creator
 /// endpoint once the child holds its own copy, the argv/env cap once its
 /// blobs are copied, the charge node's handle goes to memmgr with the
-/// registration, and the relay is consumed by `finalize_creation` on
-/// success; every cap of a refused request is deleted here. Stdio pipe
+/// registration, and the relay is kept in the child's table entry by
+/// `finalize_creation` on success; every cap of a refused request is
+/// deleted here. Stdio pipe
 /// wiring is installed by separate `CONFIGURE_PIPE` IPCs on the returned
 /// `process_handle` between create and `START_PROCESS`.
 fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: ObjectSource)
@@ -2007,9 +2174,9 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
         }
         Err(code) =>
         {
-            // `finalize_creation` consumes (binds and deletes) the relay
-            // only once the child's table entry exists, which every error
-            // return precedes; procmgr's copy is dropped here.
+            // `finalize_creation` moves the relay into the child's table
+            // entry only once that entry exists, which every error return
+            // precedes; procmgr's copy is dropped here.
             release_caps(&[caps.relay]);
             reply_empty(ipc_buf, code);
         }

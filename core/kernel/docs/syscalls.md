@@ -219,9 +219,10 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  67  SYS_THREAD_LIST_PAGES
                                  68  SYS_THREAD_READ_EXT_REGS
                                  69  SYS_ENDPOINT_BADGE
+                                 70  SYS_MMIO_MERGE
 ```
 
-**Implementation status.** Every number 0–69 has a handler; unallocated numbers
+**Implementation status.** Every number 0–70 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -229,11 +230,11 @@ return `UnknownSyscall`.
 ## Error Codes
 
 A syscall that inserts a capability into a CSpace (every `SYS_CAP_CREATE_*`, `SYS_CAP_COPY`,
-`SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_MOVE`, and the split syscalls) leaves the
-destination's IPC receive reserve (`CSPACE_IPC_RECV_RESERVE` free slots) untouched. Its
-"slot-page pool exhausted" `OutOfMemory`, and its structural-ceiling `QuotaExceeded`, therefore
-arise while that many slots are still free; only IPC capability transfer takes them
-([capability-internals.md](capability-internals.md) § IPC Receive Reserve).
+`SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_CAP_MOVE`, the split syscalls, and
+`SYS_MMIO_MERGE`) leaves the destination's IPC receive reserve (`CSPACE_IPC_RECV_RESERVE` free
+slots) untouched. Its "slot-page pool exhausted" `OutOfMemory`, and its structural-ceiling
+`QuotaExceeded`, therefore arise while that many slots are still free; only IPC capability
+transfer takes them ([capability-internals.md](capability-internals.md) § IPC Receive Reserve).
 
 All syscalls return one of these error codes on failure. The value is negative in
 `rax`/`a0`. Zero and positive values are success.
@@ -1044,8 +1045,8 @@ reference (see [capability-model.md](../../../docs/capability-model.md) § Revoc
 such a teardown can fail to complete as `SYS_CAP_DELETE` describes for a thread left
 on a halted CPU. While the revoke is in flight, `SYS_CAP_DELETE`, `SYS_CAP_MOVE`,
 `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_MEMORY_SPLIT`,
-`SYS_MEMORY_MERGE`, and the range splits on the target slot (and IPC transfer of it)
-are refused with `InvalidState`. A `SYS_CAP_MOVE` or IPC transfer in flight pins its
+`SYS_MEMORY_MERGE`, the range splits, and `SYS_MMIO_MERGE` on the target slot (and IPC transfer
+of it) are refused with `InvalidState`. A `SYS_CAP_MOVE` or IPC transfer in flight pins its
 source and destination slots the same way (see
 [capability-internals.md](capability-internals.md) § Revocation Algorithm).
 
@@ -1458,8 +1459,8 @@ attribute unconditionally. Each page records the same rights as its most, so no
 
 The `mmio_cap`'s object records the mapping, holding a reference on the address space, before any
 page is mapped. When the object is freed, because `mmio_cap` (or the copy it is) was deleted,
-consumed by a split, or revoked through an ancestor, every recorded mapping is unmapped with TLB
-shootdown, except a page the address space has since remapped to other memory (see
+consumed by a split or a merge, or revoked through an ancestor, every recorded mapping is unmapped
+with TLB shootdown, except a page the address space has since remapped to other memory (see
 [capability-model.md](../../../docs/capability-model.md) § Mmio). One object records
 `MMIO_INLINE_MAPPINGS` (4) mappings inline and each further one in a spill chunk funded by the
 caller's `CSpace` (see [capability-internals.md](capability-internals.md) § Mmio Mappings); mapping
@@ -1569,6 +1570,58 @@ mismatch, not contiguous, tail not virgin, not siblings, or another slot names e
 object),
 `InvalidCapability`,
 `InvalidState` (per above), `InsufficientRights` (either cap lacks Map).
+
+---
+
+### `SYS_MMIO_MERGE` (70)
+
+Merge two MMIO region capabilities over adjacent ranges into one capability over the joined
+range: the inverse of `SYS_MMIO_SPLIT`. Both capabilities are consumed, which frees their
+objects and unmaps every mapping made through either as § `SYS_MMIO_MAP` describes.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `lower_cap` | MMIO region capability over the lower range (Map rights); consumed |
+| 1 | `upper_cap` | MMIO region capability over the upper range (Map rights); consumed |
+| 2 | — | Reserved |
+
+**Return:** `rax`/`a0`: capability descriptor for the joined region
+`[lower.base, upper.base + upper.size)` on success; `SyscallError` on failure.
+
+The two capabilities must be distinct slots of the caller's CSpace, carry identical rights and
+flags, cover adjacent ranges in argument order (`lower.base + lower.size == upper.base`), and be
+derivation siblings: the same derivation parent, or no parent for both. Neither may have a
+derivation child: a capability derived or copied from one is refused rather than moved, so the
+merge is one bounded edit of the derivation tree, and a holder revokes what it delegated before
+merging. Merging a chain of adjacent siblings takes one call per neighbour.
+
+The joined capability references a fresh object, a lineage root funded by the caller's CSpace as
+a split child is (see [capability-internals.md](capability-internals.md) § Copies and Lineages),
+and carries the two capabilities' rights. It is inserted in the caller's CSpace and linked under
+their derivation parent, a root when they had none, in the same derivation-lock hold that unlinks
+and frees both: every ancestor's revoke reach covers the joined capability exactly as it covered
+the two, and no other thread observes the joined capability beside either of them. Both objects
+are freed, so every `SYS_MMIO_MAP` mapping made through either is unmapped, with TLB shootdown,
+before the call returns (unless a concurrent syscall pins an object, then when that syscall
+releases it). A caller that needs the region mapped maps it again through the joined capability.
+A call that fails changes neither capability.
+
+Both capabilities are revalidated under the derivation lock before the joined capability is
+inserted (see [capability-internals.md](capability-internals.md) § Global Derivation Lock): a
+capability a concurrent delete freed meanwhile fails with `InvalidCapability`, and one with a
+`SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer in flight with `InvalidState`.
+
+**Capability requirements:** `lower_cap` (Map), `upper_cap` (Map); rights must match.
+
+**Errors:** `InvalidArgument` (the same slot twice, rights or flags differ, the ranges are not
+adjacent in argument order, or the capabilities are not derivation siblings),
+`InvalidCapability`, `InsufficientRights` (either cap lacks Map), `InvalidState` (either cap
+has a derivation child, or per above), `OutOfMemory` (the caller's `CSpace` pool cannot back the
+joined capability's body or slot; see [capability-internals.md](capability-internals.md) § Body
+Arena), `QuotaExceeded` (caller's CSpace directory structurally full; the joined capability's
+slot is taken before the two are freed).
 
 ---
 

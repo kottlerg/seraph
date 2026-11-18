@@ -24,7 +24,10 @@ how both render a log record and the parser that reads its fields back from the 
 receivers keep per sender (`LINE_BUF_SIZE`, `MAX_NAME_LEN`), `BoundedStr`, the
 fixed-capacity, UTF-8-safe formatter logd uses for its own diagnostics, and `HeldLines`, the
 bounded hold on those diagnostics until init-logd acknowledges the handover release (see
-[`docs/handover-protocol.md`](../docs/handover-protocol.md) § Startup ordering). It issues no
+[`docs/handover-protocol.md`](../docs/handover-protocol.md) § Startup ordering). It holds
+real-logd's output-sink queue and its rule (`SinkQueue`, `SINK_QUEUE_BYTES`, `SINK_STALL_MS`:
+when a line's producer waits, when a sink is stalled, and where its dropped lines are counted; see
+[`docs/ipc-interface.md`](../docs/ipc-interface.md) § Output sinks). It issues no
 syscall and no IPC, so both ends keep the IPC calls and the logic stays host-reachable, per
 [coding-standards.md § D](../../../docs/coding-standards.md#d-testing-invariants).
 
@@ -55,6 +58,8 @@ services/logd/codec/
     │                           # parser
     ├── resync.rs               # Death-queue resync: candidates, live-page
     │                           # decoder, eviction set, WalkGate
+    ├── sink.rs                 # SinkQueue: an output sink's line queue,
+    │                           # stall mark, and drop count
     └── bounded_str.rs          # BoundedStr: UTF-8-safe bounded formatter
 ```
 

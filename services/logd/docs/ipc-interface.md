@@ -59,17 +59,19 @@ that class's watch; `cap[1]` is deleted after the handover release.
 ### `stream_labels::STREAM_BYTES` (10)
 
 Per-line byte stream. Sender packs the chunk byte length into bits
-16-31 of the label (`label | (len << 16)`) and the chunk's log level into
-bits 32-34 (§ Levels). Inline bytes
+16-31 of the label (`label | (len << 16)`), the chunk's log level into
+bits 32-34 (§ Levels), and, once it has registered a display name, bit 35
+(`SENDER_NAMED`, § `stream_labels::STREAM_REGISTER_NAME`). Inline bytes
 arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
 line: under the state lock the line is rendered as
 `[sec.usfrac] [name] <line>\r\n` and appended to the slot's history
 ring with its level, and once the lock is released the rendered line
-is emitted to the serial driver
+is written to the serial driver
 (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
-(`FB_WRITE_BYTES`) when one is present.
+(`FB_WRITE_BYTES`) when one is present, each through its sink
+(§ Output sinks).
 
 The history ring holds `PER_SLOT_HISTORY` (16) completed entries per slot, text lines and
 records (§ History; [`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest
@@ -79,7 +81,10 @@ Lines exceeding `LINE_BUF_SIZE` (256 bytes) flush without a
 trailing `\n` to keep the per-line attribution visible. Senders
 that have not yet called `STREAM_REGISTER_NAME` render as `[?]`.
 
-Reply: `label = 0` (success), empty payload. Sender unblocks.
+Reply: `label = 0` (success), empty payload, or `NAME_UNKNOWN` (2) for a
+message carrying `SENDER_NAMED` from a sender whose name logd does not hold, of
+which nothing is consumed (§ `stream_labels::STREAM_REGISTER_NAME`). Sender
+unblocks.
 
 #### Levels
 
@@ -213,7 +218,10 @@ exactly. A key may repeat; a reader sees each occurrence, in order.
   retained, `RECORD_REJECTED` (1) for a payload that is longer than a record
   or than the message, or that `ipc::log_record` does not decode (a length
   that overruns the payload, a key outside the alphabet, bytes left over):
-  such a payload is neither rendered nor retained. The payload is empty.
+  such a payload is neither rendered nor retained. logd answers
+  `NAME_UNKNOWN` (2) to a record that decodes and carries `SENDER_NAMED`
+  (bit 35) from a sender whose name it does not hold, and neither renders nor
+  retains it (§ `stream_labels::STREAM_REGISTER_NAME`). The payload is empty.
   Sender unblocks.
 
 ### `stream_labels::STREAM_REGISTER_NAME` (11)
@@ -229,6 +237,43 @@ two processes intentionally pick the same string. logd allows
 that.
 
 Reply: `label = 0`. Sender unblocks.
+
+A sender registers its name once, at startup, but logd's table can lose it: a
+restarted logd serves a fresh table ([`handover-protocol.md`](handover-protocol.md),
+the restart paragraph), and a name the handover does not deliver never reaches it
+([`handover-protocol.md`](handover-protocol.md) § Failure modes). The sender
+therefore keeps its name and states that it has one, and logd asks for it again:
+
+- **Sender.** `shared/log` keeps the first `SLOT_NAME_MAX` (48) bytes of the name
+  a process registers on its own log cap (`std::os::seraph::log::register_name`)
+  and sets `SENDER_NAMED` (bit 35 of the label) on every `STREAM_BYTES` and
+  `STREAM_RECORD` it sends on that cap from then on.
+- **logd.** A `STREAM_BYTES` or `STREAM_RECORD` that carries `SENDER_NAMED`, from a
+  badge whose live slot holds no name, or that has no live slot and is not among the
+  recent evictions (§ Wait-set), is answered `NAME_UNKNOWN` (2), and logd consumes
+  none of it: no byte joins the partial line, nothing is rendered or retained. A
+  record that does not decode is answered `RECORD_REJECTED` first, and an evicted
+  sender's message is dropped and answered as consumed, as without the bit. logd
+  never answers `NAME_UNKNOWN` to a message without the bit.
+- **Recovery.** On `NAME_UNKNOWN` the sender sends `STREAM_REGISTER_NAME` with its
+  kept name, then the refused message once more with the bit clear, which logd
+  accepts whatever its table holds. The message is refused at most once, so it costs
+  at most three calls, the two after the first only when logd answered, each under
+  the sender's log-call bound ([shared/log](../../../shared/log/README.md)), and it
+  is rendered under the name the registration restored. A registration that fails
+  leaves that one message rendered as `[?]`; the sender's next message is refused
+  and tries again.
+
+Every line of a named sender, its first after a logd restart included, is thus
+rendered under its name. A sender that sends nothing after the restart has no slot
+in the new table until it does, so its death writes no `reclaim:` line
+(§ Death-notification cascade); a sender whose registration after a refusal failed
+has a slot without a name until its next message, and a `reclaim:` line for it
+reads `name=?`. A name init-logd stored with a collision suffix
+(`.2`, `.3`, …) is registered again as the sender gave it. init-logd, the first receiver, ignores
+the bit and answers no message `NAME_UNKNOWN`.
+A sender that registered no name, or that calls the wire helpers with another
+cap, sends no bit and is never refused.
 
 ### `log_labels::HANDOVER_PULL` (13)
 
@@ -410,22 +455,64 @@ again.
 - **State.** The badge table, the retired slots, the recently evicted badges (§ Wait-set), the
   history rings, and the death drain's count are under one lock. A worker takes it to complete,
   render, and retain a line or a record, to record a name, or to answer a query, and releases it
-  before it writes the line to the drivers. No thread holds it across an IPC call.
-- **Output.** A rendered line is written whole: the serial driver's calls for one line are made
-  under one output lock and the framebuffer driver's under another, so a line longer than one call
-  (a record) is not split by another worker's. Each output lock is held across its driver's calls,
-  which is safe because neither driver calls logd; resolving a driver through devmgr, which logs,
-  happens before either lock is taken, by one thread at a time. The panic sink takes no lock.
+  before it hands the line to the sinks. No thread holds it across an IPC call.
+- **Output.** A worker hands a rendered line whole to each sink's queue and waits for the sink's
+  writer to write it, for at most `SINK_STALL_MS` per sink (§ Output sinks); no worker calls a
+  driver once the writers run.
 - **Order.** A line is retained, and its `seq` taken (§ History), under the state lock, and is
-  written after it, so the lines of different workers reach the serial driver in the order the
-  workers take the output lock, which can differ from their `seq` order. A worker replies only once
-  the line a message completed is retained and written, so the lines of one sender thread whose
-  calls are answered keep their order, in `seq` and on the drivers. A log call is bounded
-  ([shared/log/README.md](../../../shared/log/README.md)), and one that times out after a worker
-  received it ends that worker's binding, not its service of the message: the sender's next call,
-  served by another worker, can be retained and written first, so it takes the smaller `seq` and
-  reaches the drivers first, and the bytes of a timed-out `STREAM_BYTES` chunk can join the slot's
-  partial line after those of a later chunk. Two threads of one process share a slot (§ Levels).
+  queued after it, so the lines of different workers reach the drivers in the order the workers
+  queue them, which can differ from their `seq` order. A worker replies only once the line a message
+  completed is retained and queued, and written or its sink's bound passed, so the lines of one
+  sender thread whose calls are answered keep their order, in `seq` and on the drivers. A log call
+  is bounded ([shared/log/README.md](../../../shared/log/README.md)), and one that times out after a
+  worker received it ends that worker's binding, not its service of the message: the sender's next
+  call, served by another worker, can be retained and written first, so it takes the smaller `seq`
+  and reaches the drivers first, and the bytes of a timed-out `STREAM_BYTES` chunk can join the
+  slot's partial line after those of a later chunk. Two threads of one process share a slot (§
+  Levels).
+
+## Output sinks
+
+logd writes every rendered line to two output drivers, the serial driver and, when one is
+resolved, the framebuffer driver; each is a sink with its own queue and writer thread
+(`services/logd/src/main.rs` `Sink`, the queue and its rule in
+[`codec/src/sink.rs`](../codec/src/sink.rs)). The rule bounds what a driver that is slow,
+stopped by a debugger, or dead costs logd: its own writer waits on it, and no other thread of
+logd's waits on it for longer than `SINK_STALL_MS` (1000 ms,
+[docs/limits.md](../../../docs/limits.md) § init and logd).
+
+- **Queue.** Each sink queues whole lines in a static ring of `SINK_QUEUE_BYTES` (16 KiB), so its
+  memory is fixed at startup. A line is queued whole or not at all.
+- **Producers.** A receive worker, the main thread, and the resync helper hand each line to both
+  sinks' queues, then wait for each writer to write it, for at most `SINK_STALL_MS` per sink from
+  the hand-off; the two waits overlap. While the driver answers, the line is therefore on it when
+  the producer goes on, and a sender's log call returns with its line written, as with a
+  synchronous write. A producer that finds the queue full waits, within the same bound, for the
+  writer to free space.
+- **Stall.** A producer whose bound passes before its line is written, or before the queue has
+  room for it, stalls the sink. While a sink is stalled, producers wait for nothing: a line is
+  queued when it fits and dropped, counted, when it does not. The writer's next completed write
+  ends the stall. A stopped driver thus holds the log stream for `SINK_STALL_MS` once, and
+  every line stays in its sender's history (§ History) whatever its sinks do.
+- **Writer.** The writer takes the lines in order and writes each with `SERIAL_CHUNK`-byte calls
+  that have no bound, so a line queued for a stopped driver is written once, when the driver
+  answers again. A call that fails ends the line, and the next line goes to the driver resolved
+  then; a sink with no driver resolved drops its lines uncounted. A call to a dead driver fails
+  only once devmgr withdraws the driver and revokes its endpoint
+  ([devmgr responsibilities](../../devmgr/docs/responsibilities.md)); until then the writer waits
+  in it and the sink stalls as for a stopped driver. The writers are spawned beside the receive
+  workers, before the handover pull.
+- **Inline.** Until a sink's writer runs, or when it cannot be spawned, a line's producer writes
+  the line itself, one producer at a time so a line stays whole. Its wait for its turn and its
+  calls end `SINK_STALL_MS` after it took the line, so no producer waits on the sink for longer;
+  a line not written whole by then is counted, and the count is written, as the writer's drop line
+  is, ahead of the next line an inline write starts, to that sink alone.
+- **Drops.** Where a sink dropped lines, its writer writes one warning-level logd line naming the
+  count, `<n> lines dropped from the <sink> output: its driver took none within 1000 ms`, to its
+  own driver ahead of the next line, or once its queue is empty, and queues the same line to the
+  other sink.
+- **Panic sink.** logd's own panic and allocation-failure output goes to the serial driver
+  directly, outside the queue and with no lock taken, each call bounded by `SINK_STALL_MS`.
 
 ## Wait-set
 
@@ -458,7 +545,8 @@ auto-reap path). logd's death `EventQueue` has no death-observer nodes and
 nothing binds it: once logd's
 [`REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md) has stored it in
 procmgr's `LOGD_DEATH_EQ` static, every teardown procmgr runs (the reap of
-a death event, its death resync, and `DESTROY_PROCESS`) posts the death
+a death event, its death resync, and a destroy, `DESTROY_PROCESS` or
+`DESTROY_CHILD`, for each process of the subtree it destroys) posts the death
 entry `(exit_reason, process badge)` to it. A process torn down before the
 registration posts nothing. A restarted logd's registration replaces the dead
 instance's queue, so its fresh table hears every death after it.

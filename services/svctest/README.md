@@ -41,14 +41,19 @@ services/svctest/
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS,
         │                      # spawned IPC buffers in the arena; stack note parse
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
-        ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines
-        │                      #   and a death forward on the new instance
+        ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines,
+        │                      #   names restored by refusal, a death forward on the new instance
+        ├── logd_sinks.rs      # logd's sinks: serial and framebuffer drivers attachable; lines
+        │                      #   answered with either stopped, and with the framebuffer killed
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
         │                      # large-module create; death queues; logd death
         │                      # forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
+        ├── process_tree.rs    # procmgr's process tree: subtree destroy, re-parenting,
+        │                      #   destroy after an end, containment, child list and
+        │                      #   destroy, end post, end queue
         ├── crash.rs           # procmgr's crash endpoint: registration, handover, take-back
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
@@ -131,24 +136,21 @@ no `SHUTDOWN`, because the hooks get the pwrmgr cap only
 after the rounds return. A `SHUTDOWN` that pwrmgr answers, or whose call fails, is logged and
 leaves the system idle, as on the pass path. A fault in svctest's own process (a stray access,
 a stack overflow) kills it without running either hook, so it logs neither marker.
-
 The `ns` phase (`caps[0]`) and the pwrmgr cap-deny phase (the queried `pwrmgr.deny` cap) log the
 skip and return when their cap is zero; the devmgr class-deny phase (`caps[2]` and `caps[3]`), the
 bind-deny phase (`caps[2]`), the input-ordinal phase (`caps[8]`), the on-demand-bind phase
 (`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement and MSI delivery, forge, churn, and
-release phases (`caps[9]`), the
-drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny phase (`caps[11]` to
-`caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`,
-`pwrmgr.deny` and `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]`
-and `caps[5]`), the
-vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`,
-`logd_concurrent`, and `logd_restart` phases (`caps[6]`), the vfsd swap-partition phase
-(`caps[14]`), the `crash_endpoint` and `logd_restart` phases (`caps[15]`), and the
-`svcmgr_stop_service` phase (`caps[16]`), and the `oom_policy` phase's no-stop case
-(`caps[16]`), instead fail their assertions. The seed-only phase thus
-fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
-zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
-and the run ends idle.
+release phases (`caps[9]`), the drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny
+phase (`caps[11]` to `caps[13]`), the `logd_sinks` phase's framebuffer-killed case (`caps[13]`), the
+svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and
+`acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
+vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`,
+`logd_restart`, and `logd_sinks` phases (`caps[6]`), the vfsd swap-partition phase (`caps[14]`), the
+`crash_endpoint`, `logd_restart`, and `logd_sinks` phases (`caps[15]`), and the
+`svcmgr_stop_service` phase (`caps[16]`), and the `oom_policy` phase's no-stop case (`caps[16]`),
+instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before the
+terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached; the panic hook's
+`SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -174,16 +176,16 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT` and the remounts |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_restart` phases: read logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_restart`, `logd_sinks` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
 | `caps[10]` | `devmgr.class.test-fault` | on-demand-bind phase: the `test-fault` class SEND |
 | `caps[11]` | `devmgr.class.serial-deny` | drivers deny phase: a `serial` class SEND without the driver's verb bits |
 | `caps[12]` | `devmgr.class.input-deny` | drivers deny phase: an `input` class SEND without the driver's verb bits |
-| `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits |
+| `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits; `logd_sinks` phase: the class it waits on for the killed framebuffer driver's withdrawal |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
-| `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; svctest declares itself undebuggable at startup |
+| `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; svctest declares itself undebuggable at startup |
 | `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `oom_policy` phase, no-stop case: `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -217,7 +219,9 @@ with none of the driver's verb bits. That phase requires an `UNAUTHORIZED` reply
 `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY`, and `INPUT_READ_EVENTS` (at once, without blocking
 for a key), and to `FB_WRITE_BYTES` and `FB_SET_ATTRS` when a framebuffer driver runs; on a headless
 boot, CI's, devmgr runs none and the framebuffer case logs a skip, which the framebuffer device cell
-([docs/testing.md](../../docs/testing.md#coverage-tiers) § Coverage tiers) fails on. The input case
+([docs/testing.md](../../docs/testing.md#coverage-tiers) § Coverage tiers) fails on. The
+`logd_sinks` phase's framebuffer cases log the same skip on such a boot
+([`logd_sinks.rs`](src/phases/logd_sinks.rs) states its cases). The input case
 also logs a skip when `terminal.svc` is staged: the input driver serves one request at a time and
 the terminal keeps a blocking read pending, so the deny would wait behind it for a keypress.
 `caps[4]` and `caps[5]` are SENDs on vfsd's service endpoint, badged `MOUNT_AUTHORITY` and the
@@ -250,10 +254,17 @@ The `logd_restart` phase kills logd through `caps[15]`: it finds logd by name
 crashd when the boot stages it, else to procmgr's decliner, and svcmgr restarts logd. It writes no
 log line until it finds, through `caps[6]`, svcmgr's `service died: logd` and
 `service restarted: logd` lines in the new instance's history, which holds only lines written
-after the respawn, and fails when they do not arrive within 30 s. It then registers svctest's name
-again, which the new instance's table lacks (#1213), and runs the `logd_death_forward` check again,
-against the new instance's fresh table and the death queue it registered, and logs how long the
-restart took.
+after the respawn, and fails when they do not arrive within 30 s. It then logs how long the restart
+took, as svctest's first line to the new instance, whose table holds no name for svctest, and
+requires that line retained once, in a live slot named `svctest`: the line carried
+`SENDER_NAMED`, so the new instance refused it until svctest's log client registered the name
+again ([logd IPC interface](../logd/docs/ipc-interface.md)
+§ `stream_labels::STREAM_REGISTER_NAME`). A `logd-name-probe-child` then sends the new
+instance raw stream messages: it registers an empty name, so its live slot holds none, and requires
+a line without `SENDER_NAMED` accepted, a line and a record with it refused `NAME_UNKNOWN`, and,
+once it has registered a name, a line with it accepted; the phase requires logd's history of the
+child to hold the two accepted lines alone. Last, it runs the `logd_death_forward` check again,
+against the new instance's fresh table and the death queue it registered.
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
@@ -321,6 +332,9 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
+| `end-queue-child`           | `process_tree` | `process_tree_end_queue` (end queue)       |
+| `exit-fault-child`          | `process_tree` | `process_tree_end_posted_once` (one post)  |
+| `logd-name-probe-child`     | `logd_restart` | `logd_restart` (named-sender refusals)      |
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
 | `open-undeliverable-child`  | `fs_opens`     | `fs_reclaims_dead_opens` (failed reply)     |

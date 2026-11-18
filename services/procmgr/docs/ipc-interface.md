@@ -76,11 +76,11 @@ creates the child only from an object that verifies under that name
   therefore bounds an object's size, and its node must have room for the copy beside the child's
   own pages while it is created.
 - **Verify, then parse.** procmgr verifies the copy against the trust store the bootloader handed
-  it, expecting the requested name, this build's architecture, and a kind in the creator's
+  it, expecting the requested name, this build's architecture, and a role in the creator's
   signature policy, and parses and loads only the body the verifier returned. A refusal replies
   `SIGNATURE_REFUSED` (18) and logs one warning naming the name and the verifier's reason; the
   create releases everything it took, as any failed create does. A child takes its creator's
-  policy, narrowed to programs when its own object is a program.
+  policy, narrowed to programs when its own object's role set holds program.
 - **Release.** The copy's frames return to memmgr (`RELEASE_MEMORY_CAPS`) once the segments are
   copied into the child's own frames, whether the create succeeds or fails.
 
@@ -160,7 +160,7 @@ holds a handle to it.
 | 11 | `MAP_FAILED` | The module cap, a copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | The module cap lacks the map right, or a rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
-| 18 | `SIGNATURE_REFUSED` | The object does not verify under the name, as a kind in the creator's signature policy, for this architecture (§ Image Verification) |
+| 18 | `SIGNATURE_REFUSED` | The object does not verify under the name, in a role of the creator's signature policy, for this architecture (§ Image Verification) |
 
 **argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
 `CREATE_FROM_FILE`) marks a request that carries the child's argv and env in a Memory cap the caller

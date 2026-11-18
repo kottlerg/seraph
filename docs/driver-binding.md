@@ -157,11 +157,12 @@ A table holds at most `MAX_TABLE_BYTES` = 8192 bytes, `MAX_PLATFORM_DEVICES` = 1
 device; a table past a bound is rejected whole and logged.
 
 Tables live in the tree at `services/devmgr/platform/<machine>.platform`. `xtask/src/bundle.rs`
-(`ARCH_TABLES`) bundles them per architecture as boot modules (riscv64:
-`platform-qemu-virt`, from `services/devmgr/platform/qemu-virt.platform`; x86-64: none), init
-forwards them to devmgr with the driver modules, and devmgr tells one from a driver image by
-its content. devmgr uses the table whose `oem_table_id` equals the XSDT's OEM table ID. With no
-such table there are no platform-table records, and devmgr logs that once.
+(`ARCH_TABLES`) installs them per architecture under `/config/devmgr/platform/` and bundles them as
+boot modules named by that install path (riscv64: `/config/devmgr/platform/qemu-virt.platform`, from
+`services/devmgr/platform/qemu-virt.platform`; x86-64: none), init forwards them to devmgr with the
+driver modules, and devmgr tells one from a driver image by its content. devmgr uses the table whose
+`oem_table_id` equals the XSDT's OEM table ID. With no such table there are no platform-table
+records, and devmgr logs that once.
 
 A table belongs to the bundle only when it describes a device the root mount needs, since the bundle
 is the bootstrap closure ([boot-media.md](boot-media.md) § The Bootstrap Closure); any other table
@@ -208,12 +209,12 @@ devmgr implements once, for every driver that declares them.
 devmgr collects declarations from two places:
 
 - **Boot modules.** init forwards to devmgr, untagged, a copy of every boot module outside the
-  bootstrap set (init, procmgr, memmgr, devmgr, vfsd, `fatfs`, which init delivers to vfsd
-  until filesystem drivers declare themselves, `log-levels`, the log-level configuration init
-  reads itself, and `trust-store`, which init hands to procmgr), and devmgr tells them apart by
+  bootstrap set (init, procmgr, memmgr, devmgr, vfsd, `fatfs`, which init delivers to vfsd until
+  filesystem drivers declare themselves, `/config/init/log-levels.conf`, the log-level configuration
+  init reads itself, and `trust-store`, which init hands to procmgr), and devmgr tells them apart by
   content: an ELF image is a driver, whose `.note.seraph.driver` note devmgr decodes; valid UTF-8
-  text is a platform description table (§ Platform Description Tables). A driver image whose note
-  is missing or does not decode, a table that is rejected, and any other module are logged and
+  text is a platform description table (§ Platform Description Tables). A driver image whose note is
+  missing or does not decode, a table that is rejected, and any other module are logged and
   released.
 - **The drivers directory.** On `SET_DRIVERS_DIR` devmgr lists `/services/drivers/`
   (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`) and

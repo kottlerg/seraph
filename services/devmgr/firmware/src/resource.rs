@@ -10,9 +10,12 @@
 //! `SYS_IRQ_SPLIT`) that consumes a cap and returns its lower and upper
 //! children. [`SpanTable`] records which cap covers which range and carves a
 //! sub-range out of the covering cap, keeping both remainders in the table, so
-//! no carve gives up authority over the rest of the range. The split itself is
-//! passed in by the caller, which keeps this module free of syscalls and
-//! host-testable.
+//! no carve gives up authority over the rest of the range. A range given back
+//! to a table can be merged with the spans beside it (`SYS_MMIO_MERGE`, which
+//! consumes two adjacent caps and returns one over their joined range), so
+//! what a carve split comes back as one span. The split and the merge
+//! themselves are passed in by the caller, which keeps this module free of
+//! syscalls and host-testable.
 
 extern crate alloc;
 
@@ -168,14 +171,16 @@ impl<S: Copy> SpanTable<S>
     /// The first failed range's [`CarveError`] ([`CarveError::NoMemory`]
     /// when the tables cannot grow by what the moves need, none made). Each
     /// range moved before it is moved back first, so both tables cover what
-    /// they covered before: a range moved back is recorded as a cap of its
-    /// own, since the splits that carved it are not undone.
+    /// they covered before: a range moved back is merged with the spans
+    /// beside it here through `merge` ([`Self::move_merged`]), and one whose
+    /// merge is refused is recorded as a cap of its own.
     pub fn move_all(
         &mut self,
         to: &mut Self,
         ranges: &[(u64, u64)],
         granule: u64,
         mut split: impl FnMut(&Span<S>, u64) -> Result<(S, S), SplitError>,
+        mut merge: impl FnMut(&Span<S>, &Span<S>) -> Option<S>,
     ) -> Result<(), CarveError>
     {
         // Each move adds at most one span here (a lower remainder) and one to
@@ -202,14 +207,125 @@ impl<S: Copy> SpanTable<S>
                     {
                         continue;
                     };
-                    let _ = to.move_to(self, base, end.saturating_sub(base), 1, |_, _| {
-                        Err(SplitError::Failed)
-                    });
+                    let _ = to.move_merged(
+                        self,
+                        base,
+                        end.saturating_sub(base),
+                        1,
+                        |_, _| Err(SplitError::Failed),
+                        &mut merge,
+                    );
                 }
                 return Err(e);
             }
         }
         Ok(())
+    }
+
+    /// [`Self::insert`], then merge the recorded span with each adjacent
+    /// span, the one above it and the one below, whose joined range lies
+    /// inside `within` (`(base, end)`), through `merge`
+    /// ([`Self::merge_pair`]). Returns whether the span was recorded.
+    ///
+    /// # Errors
+    /// [`Self::insert`]'s; nothing is recorded or merged then.
+    pub fn insert_merged(
+        &mut self,
+        slot: S,
+        base: u64,
+        size: u64,
+        within: (u64, u64),
+        mut merge: impl FnMut(&Span<S>, &Span<S>) -> Option<S>,
+    ) -> Result<bool, TryReserveError>
+    {
+        if !self.insert(slot, base, size)?
+        {
+            return Ok(false);
+        }
+        let at = self.spans.partition_point(|s| s.base < base);
+        self.merge_around(at, within, &mut merge);
+        Ok(true)
+    }
+
+    /// [`Self::move_to`], the moved span then merged in `to` with each
+    /// adjacent span there through `merge`, with no bound on the joined range
+    /// ([`Self::merge_pair`]): how a range goes back to a table of free
+    /// ranges. Returns the moved range, `(base, end)`, which the span that
+    /// covers it in `to` may reach past.
+    ///
+    /// # Errors
+    /// [`Self::move_to`]'s; nothing is moved or merged then.
+    pub fn move_merged(
+        &mut self,
+        to: &mut Self,
+        base: u64,
+        size: u64,
+        granule: u64,
+        split: impl FnMut(&Span<S>, u64) -> Result<(S, S), SplitError>,
+        mut merge: impl FnMut(&Span<S>, &Span<S>) -> Option<S>,
+    ) -> Result<(u64, u64), CarveError>
+    {
+        let (moved, end) = self.move_to(to, base, size, granule, split)?;
+        let at = to.spans.partition_point(|s| s.base < moved);
+        to.merge_around(at, (0, u64::MAX), &mut merge);
+        Ok((moved, end))
+    }
+
+    /// Merge the span at `at` with the span above it, then with the span
+    /// below it ([`Self::merge_pair`]).
+    fn merge_around(
+        &mut self,
+        at: usize,
+        within: (u64, u64),
+        merge: &mut impl FnMut(&Span<S>, &Span<S>) -> Option<S>,
+    )
+    {
+        self.merge_pair(at, within, merge);
+        if let Some(below) = at.checked_sub(1)
+        {
+            self.merge_pair(below, within, merge);
+        }
+    }
+
+    /// Merge the spans at `lower` and `lower + 1` into one span over their
+    /// joined range, when the first ends where the second starts, the joined
+    /// range lies inside `within` (`(base, end)`), and `merge(lower, upper)`
+    /// returns one cap over it, both caps then consumed. `merge` returns
+    /// `None` when it does not join them (the kernel refuses two caps that
+    /// are not derivation siblings, for one), both caps then unchanged, and
+    /// the two spans stay apart. Returns whether they were merged.
+    fn merge_pair(
+        &mut self,
+        lower: usize,
+        within: (u64, u64),
+        merge: &mut impl FnMut(&Span<S>, &Span<S>) -> Option<S>,
+    ) -> bool
+    {
+        let upper = lower.saturating_add(1);
+        let (Some(&low), Some(&high)) = (self.spans.get(lower), self.spans.get(upper))
+        else
+        {
+            return false;
+        };
+        if low.end != high.base || low.base < within.0 || high.end > within.1
+        {
+            return false;
+        }
+        let Some(slot) = merge(&low, &high)
+        else
+        {
+            return false;
+        };
+        if let Some(joined) = self.spans.get_mut(lower)
+        {
+            *joined = Span {
+                slot,
+                base: low.base,
+                end: high.end,
+            };
+        }
+        self.spans.remove(upper);
+        true
     }
 
     /// [`Self::carve`], returning the carved cap with the range it covers,
@@ -320,6 +436,61 @@ mod tests
             return Err(SplitError::OutOfRange);
         }
         Ok(((b, at), (at, e)))
+    }
+
+    /// A model of the kernel's range merge over [`split_model`]'s caps: two
+    /// adjacent caps join; a pair that is not adjacent is refused.
+    fn merge_model(lower: &Span<(u64, u64)>, upper: &Span<(u64, u64)>) -> Option<(u64, u64)>
+    {
+        (lower.slot.1 == upper.slot.0).then_some((lower.slot.0, upper.slot.1))
+    }
+
+    /// A cap of the lineage model: its range and its derivation parent.
+    type Cap = (u64, u64, u8);
+
+    /// A model of `SYS_MMIO_SPLIT` over [`Cap`]: both children keep the
+    /// split cap's derivation parent.
+    fn split_cap(span: &Span<Cap>, at: u64) -> Result<(Cap, Cap), SplitError>
+    {
+        let (b, e, parent) = span.slot;
+        if at <= b || at >= e
+        {
+            return Err(SplitError::OutOfRange);
+        }
+        Ok(((b, at, parent), (at, e, parent)))
+    }
+
+    /// A model of `SYS_MMIO_MERGE` over [`Cap`]: two derivation siblings
+    /// over adjacent ranges, in argument order, join under their parent; any
+    /// other pair is refused, both caps unchanged.
+    fn merge_cap(lower: &Span<Cap>, upper: &Span<Cap>) -> Option<Cap>
+    {
+        let ((lb, le, lp), (ub, ue, up)) = (lower.slot, upper.slot);
+        (le == ub && lp == up).then_some((lb, ue, lp))
+    }
+
+    /// The spans of a lineage-model table as `(base, end, parent)`, each
+    /// checked to be the cap it records.
+    fn caps(t: &SpanTable<Cap>) -> Vec<Cap>
+    {
+        t.spans()
+            .iter()
+            .map(|s| {
+                assert_eq!((s.slot.0, s.slot.1), (s.base, s.end));
+                s.slot
+            })
+            .collect()
+    }
+
+    /// A lineage-model table of the caps `(base, end, parent)`.
+    fn cap_table(caps: &[Cap]) -> SpanTable<Cap>
+    {
+        let mut t = SpanTable::new();
+        for &(b, e, p) in caps
+        {
+            assert!(t.insert((b, e, p), b, e - b).unwrap());
+        }
+        t
     }
 
     fn table(ranges: &[(u64, u64)]) -> SpanTable<(u64, u64)>
@@ -545,7 +716,8 @@ mod tests
                 &mut held,
                 &[(0x8010_0000, 0x10_0000), (0x8000_0000, 0x100)],
                 0x1000,
-                split_model
+                split_model,
+                |_, _| panic!("a move that succeeds merges nothing")
             ),
             Ok(())
         );
@@ -560,8 +732,9 @@ mod tests
         assert_eq!(left, [(0x8000_1000, 0x8010_0000)]);
 
         // A range no span covers fails the whole move: the ranges moved
-        // before it are moved back, and both tables cover what they covered.
-        let before_held = held.spans().len();
+        // before it are moved back and merged with the spans beside them, so
+        // both tables hold what they held.
+        let before_held = held.spans().to_vec();
         assert_eq!(
             apertures.move_all(
                 &mut held,
@@ -571,17 +744,130 @@ mod tests
                     (0x9000_0000, 0x1000)
                 ],
                 0x1000,
-                split_model
+                split_model,
+                merge_model
             ),
             Err(CarveError::NotCovered)
         );
-        assert_eq!(held.spans().len(), before_held);
+        assert_eq!(held.spans(), before_held);
         assert_consistent(&apertures);
-        let mut covered: Vec<(u64, u64)> =
-            apertures.spans().iter().map(|s| (s.base, s.end)).collect();
-        covered.dedup();
-        assert_eq!(covered.first().map(|r| r.0), Some(0x8000_1000));
-        assert_eq!(covered.last().map(|r| r.1), Some(0x8010_0000));
-        assert!(covered.windows(2).all(|w| w[0].1 == w[1].0));
+        let covered: Vec<(u64, u64)> = apertures.spans().iter().map(|s| (s.base, s.end)).collect();
+        assert_eq!(covered, [(0x8000_1000, 0x8010_0000)]);
+
+        // With every merge refused, the ranges moved back are caps of their
+        // own, and the apertures still cover what they covered.
+        assert_eq!(
+            apertures.move_all(
+                &mut held,
+                &[(0x8000_4000, 0x1000), (0x9000_0000, 0x1000)],
+                0x1000,
+                split_model,
+                |_, _| None
+            ),
+            Err(CarveError::NotCovered)
+        );
+        assert_consistent(&apertures);
+        let covered: Vec<(u64, u64)> = apertures.spans().iter().map(|s| (s.base, s.end)).collect();
+        assert_eq!(
+            covered,
+            [
+                (0x8000_1000, 0x8000_4000),
+                (0x8000_4000, 0x8000_5000),
+                (0x8000_5000, 0x8010_0000)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_span_given_back_merges_with_both_neighbours_back_into_one_cap()
+    {
+        let mut t = cap_table(&[(0, 0x1_0000, 1)]);
+        let carved = t.carve_span(0x4000, 0x4000, 0x1000, split_cap).unwrap();
+        assert_eq!(caps(&t), [(0, 0x4000, 1), (0x8000, 0x1_0000, 1)]);
+        assert_eq!(
+            t.insert_merged(carved.slot, carved.base, 0x4000, (0, u64::MAX), merge_cap),
+            Ok(true)
+        );
+        assert_eq!(caps(&t), [(0, 0x1_0000, 1)]);
+    }
+
+    #[test]
+    fn a_merge_stays_inside_its_bound()
+    {
+        // A BAR's page span [0x4000, 0x1_0000), its MSI-X table's page carved
+        // apart from the rest; the page below the BAR is another function's.
+        let mut t = cap_table(&[(0, 0x1_0000, 1)]);
+        let table = t.carve_span(0x8000, 0x1000, 0x1000, split_cap).unwrap();
+        let bar = t.carve_span(0x4000, 0x4000, 0x1000, split_cap).unwrap();
+        let bound = (0x4000, 0x1_0000);
+        t.insert_merged(table.slot, table.base, 0x1000, bound, merge_cap)
+            .unwrap();
+        t.insert_merged(bar.slot, bar.base, 0x4000, bound, merge_cap)
+            .unwrap();
+        assert_eq!(caps(&t), [(0, 0x4000, 1), (0x4000, 0x1_0000, 1)]);
+    }
+
+    #[test]
+    fn a_refused_merge_keeps_both_caps_and_a_gap_asks_for_none()
+    {
+        // Two apertures from different parents meet at 0x4000: the merge
+        // across them is refused, the one inside the first is made.
+        let mut t = cap_table(&[(0, 0x4000, 1), (0x4000, 0x8000, 2)]);
+        let carved = t.carve_span(0x2000, 0x2000, 0x1000, split_cap).unwrap();
+        t.insert_merged(carved.slot, carved.base, 0x2000, (0, u64::MAX), merge_cap)
+            .unwrap();
+        assert_eq!(caps(&t), [(0, 0x4000, 1), (0x4000, 0x8000, 2)]);
+
+        // A span with no neighbour touching it asks for no merge.
+        let mut t = cap_table(&[(0, 0x1000, 1), (0x3000, 0x4000, 1)]);
+        t.insert_merged(
+            (0x1800, 0x2000, 1),
+            0x1800,
+            0x800,
+            (0, u64::MAX),
+            |_, _| -> Option<Cap> { panic!("spans that do not touch are not merged") },
+        )
+        .unwrap();
+        assert_eq!(
+            caps(&t),
+            [(0, 0x1000, 1), (0x1800, 0x2000, 1), (0x3000, 0x4000, 1)]
+        );
+        // An empty range is not recorded, and nothing is merged.
+        assert_eq!(
+            t.insert_merged((0x1000, 0x1000, 1), 0x1000, 0, (0, u64::MAX), |_, _| {
+                panic!("an empty range is not merged")
+            }),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn a_span_moved_back_merges_with_the_free_spans_beside_it()
+    {
+        let mut free = cap_table(&[(0, 0x10_0000, 1)]);
+        let mut held = SpanTable::new();
+        free.move_all(
+            &mut held,
+            &[(0x4_0000, 0x4_0000)],
+            0x1000,
+            split_cap,
+            |_, _| -> Option<Cap> { panic!("a move that succeeds merges nothing") },
+        )
+        .unwrap();
+        assert_eq!(caps(&free), [(0, 0x4_0000, 1), (0x8_0000, 0x10_0000, 1)]);
+        // Moved back whole, it splits nothing and joins both free neighbours.
+        assert_eq!(
+            held.move_merged(
+                &mut free,
+                0x4_0000,
+                0x4_0000,
+                1,
+                |_, _| Err(SplitError::Failed),
+                merge_cap
+            ),
+            Ok((0x4_0000, 0x8_0000))
+        );
+        assert_eq!(caps(&held), []);
+        assert_eq!(caps(&free), [(0, 0x10_0000, 1)]);
     }
 }

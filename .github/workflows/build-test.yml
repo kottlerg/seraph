@@ -309,7 +309,7 @@ jobs:
             # bootloader under a store revoking the signing key in the cell's
             # profile, then boots four images carrying a tampered kernel, a
             # tampered bundle entry, that bootloader, and tampered,
-            # wrong-kind and foreign-signed rootfs images, and checks each
+            # wrong-role and foreign-signed rootfs images, and checks each
             # verifier's refusal line; host-side, so it cannot ride
             # run-parallel. Packs the default interactive boot again after.
             if [ "${{ matrix.profile }}" = "release" ]; then

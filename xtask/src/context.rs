@@ -108,7 +108,7 @@ impl Context
 
     /// Path to `sysroot/services/` — canonical home for bootloader-loaded
     /// userspace components (init, ktest, procmgr, memmgr, devmgr, vfsd,
-    /// virtio-blk, fatfs). The bundle composer reads from here; the kernel
+    /// virtio-blk, fatfs). The bundle composer copies them from here; the kernel
     /// and bootloader binaries stay loose on the ESP and have no home here.
     pub fn sysroot_services(&self) -> PathBuf
     {

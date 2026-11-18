@@ -384,9 +384,9 @@ is specified in [`vfs-ipc-interface.md`](vfs-ipc-interface.md).
 
 vfsd is also the owner of fs-process lifecycle: `MOUNT` spawns the
 fatfs driver via `worker_pool` (or, on the very first mount, from the
-boot module). Each create names its binary for procmgr's verification:
-`fatfs` for the boot module, `/services/fs/fatfs` for the on-disk
-file. Each driver's `argv[0]` is `fatfs:` and its mount path
+boot module). Each create names its binary for procmgr's verification
+by its install path, `/services/fs/fatfs`, the boot module's name and the
+on-disk file's alike. Each driver's `argv[0]` is `fatfs:` and its mount path
 (`fatfs:/`, `fatfs:/data`), the name procmgr's `LIST_PROCESSES` reports
 for it. The first-mount `CREATE_PROCESS` is permanent and structural —
 `/services/fs/fatfs` is unreachable until root mounts, so moving spawn

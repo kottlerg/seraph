@@ -21,7 +21,7 @@ use std::process::{Command, Stdio};
 
 const EXPECTED_LINE: &str = "hello from seraph userspace";
 
-/// A service-kind image a program may not start: the restart-path fixture,
+/// A service image a program may not start: the restart-path fixture,
 /// which only crashes if it does start.
 const SERVICE_IMAGE: &str = "/tests/crasher";
 
@@ -54,7 +54,7 @@ fn main()
         std::process::exit(2);
     }
 
-    // Defect guarded: a program starting an image of a kind its creator's
+    // Defect guarded: a program starting an image in a role its creator's
     // signature policy does not admit, a service here.
     match Command::new(SERVICE_IMAGE).spawn()
     {

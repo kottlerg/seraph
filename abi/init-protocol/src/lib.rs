@@ -6,8 +6,8 @@
 //! Init entry protocol — kernel-to-init handover contract.
 //!
 //! This crate defines the binary interface between the kernel (Phase 7/9) and
-//! the init process. The kernel populates an [`InitInfo`] structure in a
-//! read-only page mapped into init's address space at a kernel-chosen virtual
+//! the init process. The kernel populates an [`InitInfo`] region in
+//! read-only pages mapped into init's address space at a kernel-chosen virtual
 //! address (`choose_init_layout` in the kernel) and passes that address as
 //! init's sole entry argument (`rdi` on x86-64, `a0` on RISC-V).
 //!
@@ -40,7 +40,7 @@
 ///     `Memory` caps (RSDP, ACPI reclaimable regions, DTB).
 /// v6: Added `init_stack_memory_*` / `init_info_memory_*` slot ranges for
 ///     init self-reclaim.
-/// v7: Added a fixed-size [`InitInfo::module_names`] table so init can
+/// v7: Added a fixed-size `InitInfo::module_names` table so init can
 ///     map bundle-entry names (carried by the bootloader through
 ///     `BootModule.name`) to the kernel's `CSpace` slot index of each
 ///     module's `Memory` cap. The table lives in the `InitInfo` header so
@@ -61,7 +61,7 @@
 ///     per-arch RTC drivers off the bundle and on the rootfs); the
 ///     headroom accommodates upcoming non-RTC additions such as the
 ///     keyboard driver. Pure constant bump; the
-///     [`InitInfo::module_names`] array grows in size but the field
+///     `InitInfo::module_names` array grows in size but the field
 ///     layout is otherwise unchanged.
 /// v10: Added [`InitInfo::system_ram_bytes`] and
 ///     [`InitInfo::kernel_reserved_bytes`] — immutable post-boot
@@ -85,7 +85,7 @@
 ///     byte-identical; the semantic change is that the handle's high bits are
 ///     now meaningful and the kernel validates them on every use.
 /// v14: [`INIT_MAX_NAMED_MODULES`] rose from 12 to 85, one per boot module a
-///     `BootInfo` can list; [`InitInfo::module_names`] grows with it, so every
+///     `BootInfo` can list; `InitInfo::module_names` grows with it, so every
 ///     field after it moves.
 /// v15: the kernel sizes the [`InitInfo`] region from the boot's own
 ///     descriptor counts and maps all of it; [`InitInfo::init_info_memory_count`]
@@ -109,19 +109,26 @@
 ///     [`CapDescriptor`] alone (no [`InitInfo`] field). Field layout
 ///     unchanged; an init built against v17 would read the new descriptor's
 ///     type byte as no [`CapType`] at all.
-pub const INIT_PROTOCOL_VERSION: u32 = 18;
+/// v19: [`INIT_MODULE_NAME_LEN`] rose from 32 to 256, so
+///     [`InitModuleName`] grew from 40 to 264 bytes, and the boot-module
+///     name table left the header: `module_names` is gone, and the table's
+///     `module_name_count` entries follow the header, at byte
+///     `size_of::<InitInfo>()` of the region, with the [`CapDescriptor`]
+///     array after them at [`InitInfo::cap_descriptors_offset`]. Every
+///     field after `init_info_memory_count` moves. A module's name is the
+///     install path its signature names.
+pub const INIT_PROTOCOL_VERSION: u32 = 19;
 
 /// Length of [`InitModuleName::name`], matching
-/// `boot_protocol::BOOT_MODULE_NAME_LEN` so the kernel copies the bundle
-/// entry name straight through.
-pub const INIT_MODULE_NAME_LEN: usize = 32;
+/// `boot_protocol::BOOT_MODULE_NAME_LEN` (256, `objsig::NAME_MAX`) so the
+/// kernel copies the bundle entry name straight through.
+pub const INIT_MODULE_NAME_LEN: usize = 256;
 
-/// Maximum number of named boot-module entries the kernel can publish in
-/// [`InitInfo::module_names`]: one per boot module a `BootInfo` can list
-/// (`boot_protocol::MAX_BOOT_MODULES`, 85, the entries of the bootloader's
-/// one-page module array), so every module gets a name. This crate depends on
-/// nothing outside `core`, so the kernel, which sees both crates, asserts the
-/// two are equal. The table keeps the `InitInfo` header within its first page.
+/// Maximum number of named boot-module entries the kernel can publish in the
+/// region's name table ([`InitInfo::module_name_count`]): one per boot module
+/// a `BootInfo` can list (`boot_protocol::MAX_BOOT_MODULES`, 85), so every
+/// module gets a name. This crate depends on nothing outside `core`, so the
+/// kernel, which sees both crates, asserts the two are equal.
 pub const INIT_MAX_NAMED_MODULES: usize = 85;
 
 // ── Address space constants ──────────────────────────────────────────────────
@@ -138,13 +145,14 @@ pub const INIT_MAX_NAMED_MODULES: usize = 85;
 /// and no hardware count grows.
 pub const INIT_STACK_PAGES: usize = 4;
 
-/// Ceiling on the 4 KiB pages of the [`InitInfo`] region (the header, which
-/// includes the boot-module name table, followed by the [`CapDescriptor`]
-/// array): 64 pages hold 8,079 descriptors past the header.
+/// Ceiling on the 4 KiB pages of the [`InitInfo`] region (the header, the
+/// boot-module name table, then the [`CapDescriptor`] array): 64 pages hold
+/// 7,484 descriptors past the header and a full name table.
 ///
 /// The kernel sizes each boot's region from that boot's own counts, one
-/// descriptor per coalesced RAM extent, ACPI region, MMIO aperture, boot module
-/// and reclaim range plus a few fixed caps, and reports the page count in
+/// name per boot module, and one descriptor per coalesced RAM extent, ACPI
+/// region, MMIO aperture, boot module and reclaim range plus a few fixed caps,
+/// and reports the page count in
 /// [`InitInfo::init_info_memory_count`]. Each of those counts is bounded by the
 /// platform: coalesced RAM extents and ACPI regions by the firmware memory map,
 /// apertures by the map and the firmware tables, modules by
@@ -162,9 +170,13 @@ pub const INIT_INFO_MAX_PAGES: usize = 64;
 /// Kernel-to-init handover structure.
 ///
 /// Placed in one or more read-only pages at a kernel-chosen virtual address,
-/// delivered to init in its entry register. The fixed-size header is followed by
-/// a variable-length [`CapDescriptor`] array; the array starts at byte offset
-/// [`InitInfo::cap_descriptors_offset`] from the start of this struct.
+/// delivered to init in its entry register. The fixed-size header is followed
+/// by the boot-module name table, [`InitInfo::module_name_count`]
+/// [`InitModuleName`] entries starting at byte `size_of::<InitInfo>()`
+/// ([`MODULE_NAMES_OFFSET`]), and then by a variable-length
+/// [`CapDescriptor`] array, which starts at byte offset
+/// [`InitInfo::cap_descriptors_offset`]; both offsets are from the start of
+/// this struct.
 ///
 /// All slot fields refer to init's root `CSpace` (`CSpace` ID 0). Each slot
 /// field holds a capability handle and each slot-count field a count of
@@ -193,9 +205,9 @@ pub struct InitInfo
     /// identify what each capability slot represents without probing.
     pub cap_descriptors_offset: u32,
 
-    /// Number of valid [`InitModuleName`] entries in [`Self::module_names`].
-    /// Indices `0..module_name_count` are populated; the rest are
-    /// [`INIT_MODULE_NAME_EMPTY`].
+    /// Number of [`InitModuleName`] entries in the name table at
+    /// [`MODULE_NAMES_OFFSET`], one per boot module, at most
+    /// [`INIT_MAX_NAMED_MODULES`].
     pub module_name_count: u32,
 
     // ── Init's own resources ─────────────────────────────────────────────
@@ -285,8 +297,8 @@ pub struct InitInfo
     /// First slot of init's `InitInfo`-region `Memory` caps.
     ///
     /// Each cap covers one 4 KiB page of the kernel-allocated
-    /// `InitInfo` region (header — which includes the boot-module name
-    /// table — followed by the `CapDescriptor` array). Donated
+    /// `InitInfo` region (the header, the boot-module name table, then the
+    /// `CapDescriptor` array). Donated
     /// alongside the stack caps in init's reap-handoff.
     /// The cap range includes the page that contains this `InitInfo`
     /// struct itself — once init has read `InitInfo` at `_start`, the
@@ -296,13 +308,6 @@ pub struct InitInfo
     /// one per page of the region: the region's page count, which bounds the
     /// descriptor slice.
     pub init_info_memory_count: u64,
-
-    // ── Boot-module name table (added in protocol version 7) ────────────
-    /// Bundle-entry-name → `CSpace`-slot mapping for boot-module `Memory`
-    /// caps. Lives inside the `InitInfo` header so it sits entirely on
-    /// the first `InitInfo` page (the [`CapDescriptor`] array that
-    /// follows the header may span pages).
-    pub module_names: [InitModuleName; INIT_MAX_NAMED_MODULES],
 
     // ── Memory-accounting facts (added in protocol version 10) ─────────
     /// Total installed usable system RAM, in bytes. Immutable after boot.
@@ -325,23 +330,30 @@ pub struct InitInfo
     /// indicates no framebuffer is present and devmgr skips the
     /// framebuffer-driver spawn.
     ///
-    /// Last field by intent: `cap_descriptors_offset =
-    /// size_of::<InitInfo>()` puts the `CapDescriptor` array
-    /// immediately after this field, and [`InitFramebufferInfo`] is
+    /// Last field by intent: the name table starts immediately after this
+    /// field ([`MODULE_NAMES_OFFSET`]), and [`InitFramebufferInfo`] is
     /// `u64 + 4×u32 = 24 B` so the total stays 8-byte aligned (the
-    /// `u64` alignment the descriptor array needs). The compile-time
-    /// assert below pins both invariants.
+    /// `u64` alignment the table and the descriptor array need). The
+    /// compile-time asserts below pin both invariants.
     pub framebuffer: InitFramebufferInfo,
 }
 
-// Compile-time invariants for the `InitInfo` layout. The kernel writes
-// the `CapDescriptor` array at byte offset `cap_descriptors_offset =
-// size_of::<InitInfo>()` and the entries contain `u64` fields, so the
-// total size must be 8-byte aligned. The header must also fit within the
-// region's first page.
+/// Byte offset, from the start of the region, of the boot-module name table:
+/// right after the [`InitInfo`] header.
+pub const MODULE_NAMES_OFFSET: usize = core::mem::size_of::<InitInfo>();
+
+// Compile-time invariants for the `InitInfo` layout. The kernel writes the
+// name table at byte offset `size_of::<InitInfo>()` and the `CapDescriptor`
+// array right after it; both hold `u64` fields, so the header's size and an
+// `InitModuleName`'s must be 8-byte aligned. The header must also fit within
+// the region's first page.
 const _: () = assert!(
     core::mem::size_of::<InitInfo>().is_multiple_of(8),
-    "InitInfo size must be 8-byte aligned so cap_descriptors_offset is 8-byte aligned",
+    "InitInfo size must be 8-byte aligned so the name table is 8-byte aligned",
+);
+const _: () = assert!(
+    core::mem::size_of::<InitModuleName>().is_multiple_of(8),
+    "InitModuleName size must be 8-byte aligned so cap_descriptors_offset is 8-byte aligned",
 );
 const _: () = assert!(
     core::mem::size_of::<InitInfo>() <= 4096,
@@ -353,7 +365,7 @@ const _: () = assert!(
 /// Describes a single capability in init's root `CSpace`.
 ///
 /// The kernel emits a variable-length array of these after the [`InitInfo`]
-/// header. Each entry identifies the slot index, capability type, and
+/// header and the boot-module name table. Each entry identifies the slot index, capability type, and
 /// type-specific metadata so init can identify what each capability represents
 /// without probing.
 #[repr(C)]
@@ -387,29 +399,23 @@ pub struct CapDescriptor
     pub aux1: u64,
 }
 
-/// Named boot-module entry published in [`InitInfo::module_names`].
+/// Named boot-module entry of the region's name table
+/// ([`MODULE_NAMES_OFFSET`], [`InitInfo::module_name_count`] entries).
 ///
-/// Maps a bundle-entry name (carried through
-/// `boot_protocol::BootModule::name`) to the `CSpace` slot index of
-/// the module's `Memory` capability. The table sits in the `InitInfo`
-/// header so it always lives on the first `InitInfo` page and does not
-/// interact with the variable-length [`CapDescriptor`] array, which
-/// may span pages once `INIT_MAX_NAMED_MODULES` modules are minted.
+/// Maps a module's name (carried through `boot_protocol::BootModule::name`:
+/// the install path its signature names, or `trust-store`) to the `CSpace`
+/// slot index of the module's `Memory` capability. The table may span
+/// pages.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InitModuleName
 {
     /// Capability handle of the module's `Memory` cap.
     pub slot: u64,
-    /// Bundle entry name, NUL-padded to [`INIT_MODULE_NAME_LEN`] bytes.
+    /// Module name, NUL-padded to [`INIT_MODULE_NAME_LEN`] bytes; a name of
+    /// the full length has no NUL.
     pub name: [u8; INIT_MODULE_NAME_LEN],
 }
-
-/// Empty / NUL-padded slot for an unused [`InitModuleName`] entry.
-pub const INIT_MODULE_NAME_EMPTY: InitModuleName = InitModuleName {
-    slot: 0,
-    name: [0u8; INIT_MODULE_NAME_LEN],
-};
 
 /// Pixel layout for a linear framebuffer. Discriminants are stable across
 /// the kernel-to-init boundary; values match `boot_protocol::PixelFormat`.
@@ -500,21 +506,53 @@ pub fn module_name_str(name: &[u8; INIT_MODULE_NAME_LEN]) -> &[u8]
     name.split(|&b| b == 0).next().unwrap_or(name)
 }
 
-/// Locate a boot-module `Memory` cap by its bundle-entry name.
+/// Locate a boot-module `Memory` cap by its name in `names`, the region's
+/// name table.
 ///
 /// Returns the capability handle from the first matching
-/// [`InitModuleName`] in [`InitInfo::module_names`], or `None` if no
-/// entry carries the requested name.
+/// [`InitModuleName`], or `None` if no entry carries the requested name.
 #[must_use]
-pub fn find_module_slot(info: &InitInfo, name: &[u8]) -> Option<u64>
+pub fn find_module_slot(names: &[InitModuleName], name: &[u8]) -> Option<u64>
 {
-    let count = info.module_name_count as usize;
-    for entry in info.module_names.iter().take(count)
+    names
+        .iter()
+        .find(|entry| module_name_str(&entry.name) == name)
+        .map(|entry| entry.slot)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // ABI contract: the kernel writes these into the region and init reads
+    // them back by offset, so their sizes are part of INIT_PROTOCOL_VERSION.
+    #[test]
+    fn init_protocol_struct_sizes_are_stable()
     {
-        if module_name_str(&entry.name) == name
-        {
-            return Some(entry.slot);
-        }
+        assert_eq!(core::mem::size_of::<InitInfo>(), 216);
+        assert_eq!(core::mem::size_of::<InitModuleName>(), 264);
+        assert_eq!(core::mem::size_of::<CapDescriptor>(), 32);
     }
-    None
+
+    #[test]
+    fn a_module_is_found_by_its_whole_name()
+    {
+        let entry = |slot, name: &[u8]| {
+            let mut padded = [0u8; INIT_MODULE_NAME_LEN];
+            padded[..name.len()].copy_from_slice(name);
+            InitModuleName { slot, name: padded }
+        };
+        let longest = [b'/'; INIT_MODULE_NAME_LEN];
+        let names = [
+            entry(3, b"/services/memmgr"),
+            entry(5, b"trust-store"),
+            entry(7, &longest),
+        ];
+        assert_eq!(find_module_slot(&names, b"/services/memmgr"), Some(3));
+        assert_eq!(find_module_slot(&names, b"trust-store"), Some(5));
+        assert_eq!(find_module_slot(&names, &longest), Some(7));
+        assert_eq!(find_module_slot(&names, b"/services/mem"), None);
+        assert_eq!(find_module_slot(&names, b"memmgr"), None);
+    }
 }

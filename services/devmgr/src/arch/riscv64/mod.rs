@@ -73,14 +73,20 @@ pub const ELF_MACHINE: u16 = elf::EM_RISCV;
 /// `iommu-riscv`.
 pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Riscv;
 
-/// GSI for a PCI function whose config-space IRQ line is unset, from the
-/// `INTx` pin and device number its interrupt reaches the root bus with
-/// (`PciDevice::host_intx`: its own on the root bus, swizzled at each bridge
-/// behind it): the QEMU `virt` PCI host's swizzle onto APLIC sources
-/// 32..=35 (firmware leaves the IRQ line 0 there). Returns `None` for a pin
+/// GSI for PCI function `function`, whose config-space IRQ line is unset,
+/// from the `INTx` pin and device number its interrupt reaches the root bus
+/// with (`PciDevice::host_intx`: its own on the root bus, swizzled at each
+/// bridge behind it): the QEMU `virt` PCI host's swizzle onto APLIC sources
+/// 32..=35 (firmware leaves the IRQ line 0 there). acpid's `_PRT` routes in
+/// `bridges` are not read: devmgr checks them against this swizzle
+/// ([`prt_rule`]). Returns `None` for a function with no pin or a pin
 /// outside `INTA`..=`INTD` (1..=4).
-pub fn intx_fallback_gsi(pin: u8, dev: u8) -> Option<u32>
+pub fn intx_fallback_gsi(
+    function: &firmware::scan::PciDevice,
+    _bridges: &firmware::acpid::Bridges,
+) -> Option<u32>
 {
+    let (pin, dev) = function.host_intx?;
     if (1..=4).contains(&pin)
     {
         let swizzled = u32::from(pin)

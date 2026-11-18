@@ -480,35 +480,51 @@ fn root_cspace_init_pages() -> u64
 #[cfg(not(test))]
 pub(crate) const INIT_ASPACE_PAGES: u64 = 18;
 
-/// Most descriptors an `InitInfo` block can hold: the
-/// [`init_protocol::INIT_INFO_MAX_PAGES`] (64) pages of the protocol's ceiling
-/// past the header, one [`CapDescriptor`] slot each, 8,079. Phase 7 sizes
-/// each boot's block from its own counts ([`init_info_descriptor_bound`]), so
-/// this binds only a boot whose counts pass it, which halts by name at the
-/// reservation; no platform comes near it (see the ceiling's rustdoc).
-pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize =
-    descriptors_in_pages(init_protocol::INIT_INFO_MAX_PAGES);
+/// Most descriptors an `InitInfo` block can hold whatever the boot's module
+/// count: the [`init_protocol::INIT_INFO_MAX_PAGES`] (64) pages of the
+/// protocol's ceiling past the header and a name table of
+/// [`init_protocol::INIT_MAX_NAMED_MODULES`] (85) entries, one
+/// [`CapDescriptor`] slot each, 7,484. Phase 7 sizes each boot's block from
+/// its own counts ([`init_info_descriptor_bound`]), so this binds only a boot
+/// whose counts pass it, which halts by name at the reservation; no platform
+/// comes near it (see the ceiling's rustdoc).
+pub const INIT_INFO_DESCRIPTOR_CAPACITY: usize = descriptors_in_pages(
+    init_protocol::INIT_INFO_MAX_PAGES,
+    init_protocol::INIT_MAX_NAMED_MODULES,
+);
 
-/// Descriptors an `InitInfo` region of `pages` pages holds past its header.
-const fn descriptors_in_pages(pages: usize) -> usize
+/// Bytes of an `InitInfo` region before its descriptor array: the header
+/// and a boot-module name table of `modules` entries.
+const fn init_info_prefix(modules: usize) -> usize
+{
+    // Saturates: a count past the address space needs more pages than the
+    // protocol's ceiling, which `reserve_init_backing` refuses before it.
+    modules
+        .saturating_mul(core::mem::size_of::<init_protocol::InitModuleName>())
+        .saturating_add(core::mem::size_of::<init_protocol::InitInfo>())
+}
+
+/// Descriptors an `InitInfo` region of `pages` pages holds past its header
+/// and a name table of `modules` entries.
+const fn descriptors_in_pages(pages: usize, modules: usize) -> usize
 {
     // Saturates: a region past the address space holds as many descriptors
-    // as the largest one, and none smaller than its header holds any.
+    // as the largest one, and none smaller than its prefix holds any.
     pages
         .saturating_mul(crate::mm::PAGE_SIZE)
-        .saturating_sub(core::mem::size_of::<init_protocol::InitInfo>())
+        .saturating_sub(init_info_prefix(modules))
         / DESCRIPTOR_BYTES
 }
 
-/// Pages of the `InitInfo` region that holds the header and `descriptors`
-/// descriptors.
-const fn init_info_pages(descriptors: usize) -> usize
+/// Pages of the `InitInfo` region that holds the header, a name table of
+/// `modules` entries and `descriptors` descriptors.
+const fn init_info_pages(descriptors: usize, modules: usize) -> usize
 {
     // Saturates: a count past the address space needs more pages than the
     // protocol's ceiling, which `reserve_init_backing` refuses before it.
     descriptors
         .saturating_mul(DESCRIPTOR_BYTES)
-        .saturating_add(core::mem::size_of::<init_protocol::InitInfo>())
+        .saturating_add(init_info_prefix(modules))
         .div_ceil(crate::mm::PAGE_SIZE)
 }
 
@@ -557,7 +573,12 @@ static DESCRIPTOR_CAPACITY: core::sync::atomic::AtomicUsize =
 /// Host-test stand-in for the reserved block's capacity: a four-page
 /// region's, enough for the test maps.
 #[cfg(test)]
-const TEST_DESCRIPTOR_CAPACITY: usize = descriptors_in_pages(4);
+const TEST_DESCRIPTOR_CAPACITY: usize = descriptors_in_pages(4, 0);
+
+/// Host-test stand-in for the reserved name table's capacity, enough for the
+/// test maps.
+#[cfg(test)]
+const TEST_MODULE_NAME_CAPACITY: usize = 4;
 
 /// Descriptors the reserved `InitInfo` block holds ([`DESCRIPTOR_CAPACITY`]).
 fn descriptor_capacity() -> usize
@@ -585,11 +606,15 @@ static INIT_INFO_BLOCK_PAGES: core::sync::atomic::AtomicUsize =
 const _: () = assert!(init_protocol::INIT_MODULE_NAME_LEN == boot_protocol::BOOT_MODULE_NAME_LEN);
 const _: () = assert!(init_protocol::INIT_MAX_NAMED_MODULES == boot_protocol::MAX_BOOT_MODULES);
 
-// The descriptor array starts right after the header, at an offset its
-// element alignment divides.
+// The name table starts right after the header and the descriptor array right
+// after the table, each at an offset its element alignment divides.
 const _: () = assert!(
     core::mem::size_of::<init_protocol::InitInfo>()
-        .is_multiple_of(core::mem::align_of::<CapDescriptor>())
+        .is_multiple_of(core::mem::align_of::<init_protocol::InitModuleName>())
+        && core::mem::size_of::<init_protocol::InitInfo>()
+            .is_multiple_of(core::mem::align_of::<CapDescriptor>())
+        && core::mem::size_of::<init_protocol::InitModuleName>()
+            .is_multiple_of(core::mem::align_of::<CapDescriptor>())
 );
 
 /// Most boot-minted capability bodies: one per descriptor the reserved
@@ -927,8 +952,10 @@ impl DescriptorCounts
 /// The block is sized for this boot: once the stack pages are out, the
 /// buddy's coalesced extents are counted without draining
 /// ([`crate::mm::buddy::BuddyAllocator::coalesced_extent_count`]), and the
-/// block taken holds that count plus two (taking it and returning its tail
-/// can each split one extent) together with the descriptors `counts` bounds.
+/// block taken holds the header, a name table of one entry per boot module,
+/// and that count plus two (taking it and returning its tail can each split
+/// one extent) together with the descriptors `counts` bounds. A boot listing
+/// more modules than the protocol names halts by name.
 /// The block is one contiguous extent, so the descriptor array that spans its
 /// pages lives in a single backing allocation; the pages of its power-of-two
 /// buddy block past the region go back to the buddy, which the drain then
@@ -946,6 +973,15 @@ fn reserve_init_backing(counts: &DescriptorCounts)
             slot.store(page, core::sync::atomic::Ordering::Relaxed);
         }
 
+        if counts.modules > init_protocol::INIT_MAX_NAMED_MODULES
+        {
+            crate::kprintln!(
+                "Phase 7: {} boot modules; the InitInfo name table holds {}",
+                counts.modules,
+                init_protocol::INIT_MAX_NAMED_MODULES
+            );
+            crate::fatal("Phase 7: more boot modules than INIT_MAX_NAMED_MODULES");
+        }
         // Saturates: a saturated bound passes the ceiling check below.
         let bound = counts.bound(alloc.coalesced_extent_count().saturating_add(2));
         if bound > INIT_INFO_DESCRIPTOR_CAPACITY
@@ -958,9 +994,10 @@ fn reserve_init_backing(counts: &DescriptorCounts)
             );
             crate::fatal("Phase 7: boot descriptors exceed the InitInfo region ceiling");
         }
-        // At most INIT_INFO_MAX_PAGES (checked above), so the block's page
-        // count and byte sizes below are small.
-        let pages = init_info_pages(bound);
+        // At most INIT_INFO_MAX_PAGES (checked above: the capacity is the
+        // ceiling's with a full name table), so the block's page count and
+        // byte sizes below are small.
+        let pages = init_info_pages(bound, counts.modules);
         let block_pages = pages.next_power_of_two();
         let order = block_pages.trailing_zeros() as usize;
         let info = alloc
@@ -979,9 +1016,10 @@ fn reserve_init_backing(counts: &DescriptorCounts)
         INIT_INFO_BLOCK_PHYS.store(info, core::sync::atomic::Ordering::Relaxed);
         INIT_INFO_BLOCK_PAGES.store(pages, core::sync::atomic::Ordering::Relaxed);
         DESCRIPTOR_CAPACITY.store(
-            descriptors_in_pages(pages),
+            descriptors_in_pages(pages, counts.modules),
             core::sync::atomic::Ordering::Relaxed,
         );
+        MODULE_NAME_CAPACITY.store(counts.modules, core::sync::atomic::Ordering::Relaxed);
         let block = phys_to_virt(info) as *mut u8;
         // SAFETY: the region's pages were just taken from the buddy, so
         // nothing else references them, and the direct map covers all RAM
@@ -1001,14 +1039,28 @@ fn reserve_init_backing(counts: &DescriptorCounts)
             block.cast::<init_protocol::InitInfo>(),
             core::sync::atomic::Ordering::Relaxed,
         );
-        // SAFETY: the header fits the region's first page, so the array start
+        // SAFETY: the header fits the region's first page, so the table start
         // lies inside the region.
-        let array = unsafe { block.add(core::mem::size_of::<init_protocol::InitInfo>()) };
+        let names = unsafe { block.add(core::mem::size_of::<init_protocol::InitInfo>()) };
         #[expect(
             clippy::cast_ptr_alignment,
-            reason = "the region is page-aligned and the header's size is a multiple of the \
-                      descriptor alignment (asserted at INIT_INFO_DESCRIPTOR_CAPACITY), so the \
-                      array start is aligned"
+            reason = "the region is page-aligned and the header's size is a multiple of the name \
+                      entry's alignment (asserted below INIT_INFO_BLOCK_PAGES), so the table \
+                      start is aligned"
+        )]
+        MODULE_NAME_TABLE.store(
+            names.cast::<init_protocol::InitModuleName>(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        // SAFETY: the region holds its prefix and at least the fixed
+        // descriptors past it (`init_info_pages` above), so the array start
+        // lies inside the region.
+        let array = unsafe { block.add(init_info_prefix(counts.modules)) };
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "the region is page-aligned and the header's and a name entry's sizes are \
+                      multiples of the descriptor alignment (asserted below \
+                      INIT_INFO_BLOCK_PAGES), so the array start is aligned"
         )]
         DESCRIPTOR_ARRAY.store(
             array.cast::<CapDescriptor>(),
@@ -1017,23 +1069,27 @@ fn reserve_init_backing(counts: &DescriptorCounts)
     });
 }
 
-/// Physical base and page count of the pre-reserved `InitInfo` region.
-/// Single consumption: returns them and clears the base.
+/// Physical base and page count of the pre-reserved `InitInfo` region, and
+/// the byte offset of its descriptor array, past the header and the name
+/// table. Single consumption: returns them and clears the base.
 #[cfg(not(test))]
-pub(crate) fn take_init_info_block() -> (u64, usize)
+pub(crate) fn take_init_info_block() -> (u64, usize, usize)
 {
-    // The block goes to init now, so the descriptor array and the header are
-    // retired with it: a later `descriptor_array()` or `init_info_header()`
-    // halts, naming their lifetime (the Phase 7 reservation to this Phase 9
-    // hand-off), instead of writing into them. Phase 9 writes the header's
-    // fields through the block address returned here.
+    // The block goes to init now, so the descriptor array, the name table and
+    // the header are retired with it: a later `descriptor_array()`,
+    // `module_name_table()` or `init_info_header()` halts, naming their
+    // lifetime (the Phase 7 reservation to this Phase 9 hand-off), instead of
+    // writing into them. Phase 9 writes the header's fields through the block
+    // address returned here.
     DESCRIPTOR_ARRAY.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+    MODULE_NAME_TABLE.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     INIT_INFO_HEADER.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     let phys = INIT_INFO_BLOCK_PHYS.swap(0, core::sync::atomic::Ordering::Relaxed);
     debug_assert!(phys != 0, "InitInfo block consumed before it was reserved");
     (
         phys,
         INIT_INFO_BLOCK_PAGES.load(core::sync::atomic::Ordering::Relaxed),
+        init_info_prefix(MODULE_NAME_CAPACITY.load(core::sync::atomic::Ordering::Relaxed)),
     )
 }
 
@@ -1582,12 +1638,27 @@ static DESCRIPTOR_ARRAY: core::sync::atomic::AtomicPtr<CapDescriptor> =
 
 /// The `InitInfo` header at the start of the reserved `InitInfo` block, set
 /// with [`DESCRIPTOR_ARRAY`] and nulled with it. Phase 7 writes the
-/// boot-module name table into it in place (`mint_module_memory_caps`) and
-/// Phase 9 the header's other fields, so no copy of the header, or of its
-/// 3400 B name table, is built on the boot stack.
+/// name table's count into it in place (`mint_module_memory_caps`) and
+/// Phase 9 the header's other fields, so no copy of the header is built on
+/// the boot stack.
 #[cfg(not(test))]
 static INIT_INFO_HEADER: core::sync::atomic::AtomicPtr<init_protocol::InitInfo> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// The boot-module name table right after the header of the reserved
+/// `InitInfo` block, [`MODULE_NAME_CAPACITY`] entries, set with
+/// [`DESCRIPTOR_ARRAY`] and nulled with it. Phase 7 writes one entry per
+/// boot module into it in place (`mint_module_memory_caps`), so no copy of
+/// the table is built on the boot stack.
+#[cfg(not(test))]
+static MODULE_NAME_TABLE: core::sync::atomic::AtomicPtr<init_protocol::InitModuleName> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Entries of the name table Phase 7 reserved, one per boot module, set once
+/// by `reserve_init_backing`.
+#[cfg(not(test))]
+static MODULE_NAME_CAPACITY: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 std::thread_local! {
@@ -1598,6 +1669,19 @@ std::thread_local! {
     static TEST_INIT_INFO_HEADER: core::cell::UnsafeCell<
         core::mem::MaybeUninit<init_protocol::InitInfo>,
     > = const { core::cell::UnsafeCell::new(core::mem::MaybeUninit::zeroed()) };
+
+    /// Host-test stand-in for the `InitInfo` name table, one per test thread
+    /// for the reason [`TEST_INIT_INFO_HEADER`] gives.
+    static TEST_MODULE_NAMES: core::cell::UnsafeCell<
+        [init_protocol::InitModuleName; TEST_MODULE_NAME_CAPACITY],
+    > = const {
+        core::cell::UnsafeCell::new(
+            [init_protocol::InitModuleName {
+                slot: 0,
+                name: [0; init_protocol::INIT_MODULE_NAME_LEN],
+            }; TEST_MODULE_NAME_CAPACITY],
+        )
+    };
 
     /// Host-test stand-in for the `InitInfo` descriptor array, one per test
     /// thread for the reason [`TEST_INIT_INFO_HEADER`] gives.
@@ -1638,6 +1722,34 @@ fn init_info_header() -> *mut init_protocol::InitInfo
     {
         // The thread's own header, live for the rest of the test thread.
         TEST_INIT_INFO_HEADER.with(|h| h.get().cast::<init_protocol::InitInfo>())
+    }
+}
+
+/// The name table's first entry and its entry count.
+fn module_name_table() -> (*mut init_protocol::InitModuleName, usize)
+{
+    #[cfg(not(test))]
+    {
+        let p = MODULE_NAME_TABLE.load(core::sync::atomic::Ordering::Relaxed);
+        if p.is_null()
+        {
+            crate::fatal(
+                "cap: InitInfo name table used before Phase 7 reserves it or after Phase 9 hands \
+                 it to init",
+            );
+        }
+        (
+            p,
+            MODULE_NAME_CAPACITY.load(core::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    #[cfg(test)]
+    {
+        // The thread's own table, live for the rest of the test thread.
+        (
+            TEST_MODULE_NAMES.with(|t| t.get().cast::<init_protocol::InitModuleName>()),
+            TEST_MODULE_NAME_CAPACITY,
+        )
     }
 }
 
@@ -2421,14 +2533,14 @@ fn populate_cspace(
 /// Each boot module (raw ELF image for an early service) gets a full-rights,
 /// reclaimable Memory cap (`owns_memory = true`, full byte ledger), per
 /// `docs/capability-model.md` § Memory; loaders map the ELF source read-only.
-/// The kernel additionally publishes a name → slot mapping in
-/// [`init_protocol::InitInfo::module_names`] so init can match modules by
-/// their bundle entry identifier instead of relying on ordinal position.
+/// The kernel additionally publishes a name → slot mapping in the
+/// `InitInfo` region's name table ([`init_protocol::InitModuleName`]) so
+/// init can match modules by name instead of relying on ordinal position.
 ///
 /// Appends a [`CapDescriptor`] entry for each module, and writes its name
-/// entry and the table's `module_name_count` in place into the reserved
-/// `InitInfo` header ([`init_info_header`]); Phase 9 leaves both as written
-/// here.
+/// entry in place into the reserved name table ([`module_name_table`]) and
+/// the table's `module_name_count` into the header ([`init_info_header`]);
+/// Phase 9 leaves both as written here.
 fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
     use boot_protocol::BootModule;
@@ -2441,11 +2553,12 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
     }
 
     let header = init_info_header();
-    // SAFETY: the header is the reserved block's zeroed first bytes (or the
-    // zeroed test stand-in), a valid `InitInfo` (`init_info_header`);
-    // single-threaded boot, and no other reference to the header is live
-    // until this function returns.
-    let names = unsafe { &mut (*header).module_names };
+    let (table, capacity) = module_name_table();
+    // SAFETY: the table is `capacity` entries of the reserved block past its
+    // header (or the test stand-in), zeroed, and every bit pattern of an
+    // `InitModuleName` is valid; single-threaded boot, and no other
+    // reference to the table is live until this function returns.
+    let names = unsafe { core::slice::from_raw_parts_mut(table, capacity) };
     let mut name_count: u32 = 0;
 
     // SAFETY: boot_info.modules was validated by the bootloader; entries pointer
@@ -2530,21 +2643,25 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
                 aux1: module.size,
             },
         );
-        // Publish a name → slot entry in the InitInfo header table so
-        // init can resolve modules by name without scanning descriptors.
+        // Publish a name → slot entry in the InitInfo name table so init
+        // can resolve modules by name without scanning descriptors. Phase 7
+        // reserved one entry per module, at most INIT_MAX_NAMED_MODULES.
         let Some(name) = names.get_mut(name_count as usize)
         else
         {
-            crate::fatal("Phase 7: more boot modules than INIT_MAX_NAMED_MODULES");
+            crate::fatal("Phase 7: more boot modules than the InitInfo name table holds");
         };
         *name = init_protocol::InitModuleName {
             slot: u64::from(slot),
             name: module.name,
         };
-        // Below INIT_MAX_NAMED_MODULES (the table's length, checked above).
+        // Below the table's length (checked above), at most
+        // INIT_MAX_NAMED_MODULES.
         name_count = name_count.saturating_add(1);
     }
-    // SAFETY: as for `names` above, whose borrow has ended.
+    // SAFETY: the header is the reserved block's zeroed first bytes (or the
+    // zeroed test stand-in), a valid `InitInfo` (`init_info_header`);
+    // single-threaded boot, and no other reference to the header is live.
     unsafe { (*header).module_name_count = name_count };
 
     layout.total_populated = cspace.populated_count();
@@ -2583,8 +2700,8 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// the descriptor table to discover the caps. There is no dedicated
 /// `reclaim_memory_base` / `reclaim_memory_count` pair on [`CSpaceLayout`]
 /// because reclaim caps carry no per-index meaning — unlike boot
-/// modules, which init resolves by name through
-/// [`init_protocol::InitInfo::module_names`],
+/// modules, which init resolves by name through the `InitInfo` name table
+/// ([`init_protocol::InitModuleName`]),
 /// reclaim caps are a homogeneous pool and userspace inspects each
 /// `CapDescriptor.aux0`/`aux1` to learn the underlying physical range.
 fn mint_reclaim_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
@@ -3243,24 +3360,26 @@ mod tests
         padded
     }
 
-    // Defect guarded: a boot module's name entry, or the entry count, not
-    // written into the InitInfo header, where init resolves every boot module
-    // by name; or an entry naming a slot that holds no Memory cap.
+    // Defect guarded: a boot module's name entry not written into the
+    // InitInfo name table, or the entry count into the header, where init
+    // resolves every boot module by name; a name cut short of the whole
+    // install path; or an entry naming a slot that holds no Memory cap.
     #[test]
-    fn each_boot_module_is_published_by_name_in_the_init_info_header()
+    fn each_boot_module_is_published_by_name_in_the_init_info_name_table()
     {
         let modules = [
             boot_protocol::BootModule {
-                name: module_name(b"procmgr"),
+                name: module_name(b"/services/procmgr"),
                 physical_base: 0x2000_0000,
                 size: 0x1800,
             },
             boot_protocol::BootModule {
-                name: module_name(b"memmgr"),
+                name: [b'm'; boot_protocol::BOOT_MODULE_NAME_LEN],
                 physical_base: 0x2001_0000,
                 size: 0x3000,
             },
         ];
+        let longest = [b'm'; boot_protocol::BOOT_MODULE_NAME_LEN];
         // SAFETY: every `BootInfo` field is an integer, a raw pointer, an
         // array of those, or a `repr(u32)` enum with a 0 variant, so the
         // all-zero bit pattern is a valid value.
@@ -3284,15 +3403,20 @@ mod tests
         // SAFETY: the test stand-in header, which nothing else writes.
         let header = unsafe { &*init_info_header() };
         assert_eq!(header.module_name_count, 2);
-        let procmgr = init_protocol::find_module_slot(header, b"procmgr").unwrap();
-        let memmgr = init_protocol::find_module_slot(header, b"memmgr").unwrap();
-        assert_ne!(procmgr, memmgr);
-        for slot in [procmgr, memmgr]
+        let (table, _) = module_name_table();
+        // SAFETY: the test stand-in table, whose first module_name_count
+        // entries were written above, and which nothing else writes.
+        let names =
+            unsafe { core::slice::from_raw_parts(table, header.module_name_count as usize) };
+        let procmgr = init_protocol::find_module_slot(names, b"/services/procmgr").unwrap();
+        let longest = init_protocol::find_module_slot(names, &longest).unwrap();
+        assert_ne!(procmgr, longest);
+        for slot in [procmgr, longest]
         {
             let tag = cspace.slot(slot as u32).map(|s| s.tag);
             assert_eq!(tag, Some(slot::CapTag::Memory), "slot {slot}");
         }
-        assert_eq!(init_protocol::find_module_slot(header, b"vfsd"), None);
+        assert_eq!(init_protocol::find_module_slot(names, b"procmgr"), None);
     }
 
     // ── reclaim passes ────────────────────────────────────────────────────────
@@ -3465,7 +3589,8 @@ mod tests
     {
         let bound = init_info_descriptor_bound(usize::MAX, 1, 1, 1, 1);
         assert_eq!(bound, usize::MAX);
-        assert!(init_info_pages(bound) > init_protocol::INIT_INFO_MAX_PAGES);
+        assert!(init_info_pages(bound, 0) > init_protocol::INIT_INFO_MAX_PAGES);
+        assert!(init_info_pages(0, usize::MAX) > init_protocol::INIT_INFO_MAX_PAGES);
     }
 
     // Defect caught: a `populate_cspace` capability with a descriptor that
@@ -3598,36 +3723,58 @@ mod tests
     }
 
     // Defect caught: an InitInfo region sized for fewer descriptors than the
-    // bound counts, so Phase 7's drain or a later push overruns it, or one a
-    // page larger than the bound needs, or a ceiling capacity that the
-    // protocol's page limit does not hold.
+    // bound counts, or without room for the name table, so Phase 7's drain,
+    // a later push or a name write overruns it, or one a page larger than the
+    // bound needs, or a ceiling capacity that the protocol's page limit does
+    // not hold with a full name table.
     #[test]
     fn the_init_info_region_is_the_fewest_pages_that_hold_the_bound()
     {
-        for bound in [
-            1,
-            50,
-            168,
-            169,
-            170,
-            500,
-            4096,
-            INIT_INFO_DESCRIPTOR_CAPACITY,
-        ]
+        for modules in [0, 1, 15, init_protocol::INIT_MAX_NAMED_MODULES]
         {
-            let pages = init_info_pages(bound);
-            assert!(
-                descriptors_in_pages(pages) >= bound,
-                "{bound} in {pages} pages"
-            );
-            assert!(pages == 1 || descriptors_in_pages(pages - 1) < bound);
+            for bound in [
+                1,
+                50,
+                168,
+                169,
+                170,
+                500,
+                4096,
+                INIT_INFO_DESCRIPTOR_CAPACITY,
+            ]
+            {
+                let pages = init_info_pages(bound, modules);
+                assert!(
+                    descriptors_in_pages(pages, modules) >= bound,
+                    "{bound} beside {modules} names in {pages} pages"
+                );
+                assert!(pages == 1 || descriptors_in_pages(pages - 1, modules) < bound);
+                assert!(
+                    init_info_prefix(modules) + bound * DESCRIPTOR_BYTES
+                        <= pages * crate::mm::PAGE_SIZE
+                );
+                assert!(pages <= init_protocol::INIT_INFO_MAX_PAGES);
+            }
         }
+        assert_eq!(INIT_INFO_DESCRIPTOR_CAPACITY, 7484);
         assert_eq!(
-            init_info_pages(INIT_INFO_DESCRIPTOR_CAPACITY),
+            init_info_pages(
+                INIT_INFO_DESCRIPTOR_CAPACITY,
+                init_protocol::INIT_MAX_NAMED_MODULES
+            ),
             init_protocol::INIT_INFO_MAX_PAGES
         );
         assert!(
-            init_info_pages(INIT_INFO_DESCRIPTOR_CAPACITY + 1) > init_protocol::INIT_INFO_MAX_PAGES
+            init_info_pages(
+                INIT_INFO_DESCRIPTOR_CAPACITY + 1,
+                init_protocol::INIT_MAX_NAMED_MODULES
+            ) > init_protocol::INIT_INFO_MAX_PAGES
+        );
+        // The descriptor array starts past the header and the name table.
+        assert_eq!(
+            init_info_prefix(2),
+            core::mem::size_of::<init_protocol::InitInfo>()
+                + 2 * core::mem::size_of::<init_protocol::InitModuleName>()
         );
         // Every count the bound takes adds one descriptor each.
         let base = init_info_descriptor_bound(0, 0, 0, 0, 0);

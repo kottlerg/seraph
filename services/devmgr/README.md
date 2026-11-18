@@ -44,6 +44,7 @@ devmgr/
 │   ├── decls.rs                    # Driver declarations read from boot modules and the drivers
 │   │                               #   directory
 │   ├── dma.rs                      # DMA endpoint and its thread: per-device DMA caps, map/unmap
+│   ├── headroom.rs                 # devmgr's own CSpace held above its low-water mark
 │   ├── hotplug.rs                  # PCI Express hotplug: managed slots, poller, acpid's jobs,
 │   │                               #   add and removal jobs
 │   ├── intremap.rs                 # VT-d interrupt remapping: enable, per-source remapping entries
@@ -57,7 +58,8 @@ devmgr/
 │   ├── spawn.rs                    # Driver-process spawn helpers (bound, IOMMU)
 │   └── tables.rs                   # Firmware-table mapping: ECAM discovery, ACPI table lookup
 └── docs/
-    ├── responsibilities.md         # Responsibilities, bootstrap capabilities, driver authority
+    ├── responsibilities.md         # Responsibilities, bootstrap capabilities, CSpace headroom,
+    │                               #   driver authority
     ├── pci-enumeration.md          # PCI enumeration via ECAM MMIO
     └── hotplug.md                  # Hotplug event sources, native and ACPI slots, add, removal
 ```
@@ -81,7 +83,7 @@ relationship to driver processes are specified in
 
 | Document | Content |
 |---|---|
-| [docs/responsibilities.md](docs/responsibilities.md) | Responsibilities, bootstrap capabilities, authority over drivers |
+| [docs/responsibilities.md](docs/responsibilities.md) | Responsibilities, bootstrap capabilities, CSpace headroom, authority over drivers |
 | [docs/pci-enumeration.md](docs/pci-enumeration.md) | PCI enumeration via ECAM MMIO |
 | [docs/hotplug.md](docs/hotplug.md) | Hotplug event sources, native and ACPI hotplug slots, the add and removal paths |
 | [docs/device-management.md](../../docs/device-management.md) | Full device management design, DMA safety, security boundary |

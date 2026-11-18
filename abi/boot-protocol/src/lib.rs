@@ -164,7 +164,11 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     A bundle module's `size` is its whole signed object, signature
 ///     trailer included; the trust store's is the store's own length. No
 ///     layout change.
-pub const BOOT_PROTOCOL_VERSION: u32 = 22;
+/// v23: [`BOOT_MODULE_NAME_LEN`] rose from 32 to 256 (`objsig::NAME_MAX`),
+///     so [`BootModule`] grew from 48 to 272 bytes and the module array
+///     spans the pages its entries need. A bundle module's name is the
+///     install path its signature names. [`MAX_BOOT_MODULES`] stays 85.
+pub const BOOT_PROTOCOL_VERSION: u32 = 23;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -247,20 +251,21 @@ unsafe impl Sync for MemoryMapSlice {}
 
 // ── Boot modules ─────────────────────────────────────────────────────────────
 
-/// Maximum length of a [`BootModule::name`] (NUL-padded; the NUL terminator
-/// is part of the array, so usable name length is up to 32 bytes with no
-/// terminator implied beyond the array bound).
+/// Length of a [`BootModule::name`], NUL-padded: a name of the full length
+/// has no NUL. `objsig::NAME_MAX`, the longest name an object is signed
+/// under, so every install path fits whole.
 ///
-/// Matches [`bundle::BundleEntryHeader::name`] so the bootloader can copy
-/// the bundle entry's name verbatim into `BootModule.name`.
-pub const BOOT_MODULE_NAME_LEN: usize = 32;
+/// Matches [`bundle::ENTRY_NAME_LEN`] so the bootloader can copy the bundle
+/// entry's name verbatim into `BootModule.name`.
+pub const BOOT_MODULE_NAME_LEN: usize = 256;
 
-/// Maximum number of boot modules a `BootInfo` lists (`modules.count`): the
-/// [`BootModule`] entries the one page the bootloader allocates for the array
-/// holds. The bundle's modules number one fewer, since the
-/// [`TRUST_STORE_MODULE`] takes a slot. A bundle with more is refused by
-/// name, by the bootloader and the kernel alike.
-pub const MAX_BOOT_MODULES: usize = 4096 / core::mem::size_of::<BootModule>();
+/// Maximum number of boot modules a `BootInfo` lists (`modules.count`), a
+/// static-footprint budget: the bootloader sizes the module array to the
+/// boot's own count, at most this many [`BootModule`] entries (six pages).
+/// The bundle's modules number one fewer, since the [`TRUST_STORE_MODULE`]
+/// takes a slot. A bundle with more is refused by name, by the bootloader and
+/// the kernel alike.
+pub const MAX_BOOT_MODULES: usize = 85;
 
 /// Name of the boot module that holds the trust store the bootloader verified
 /// the kernel and the bundle against (docs/signing.md § Trust Store). The
@@ -275,14 +280,14 @@ pub const TRUST_STORE_MODULE: &[u8] = b"trust-store";
 /// devmgr, drivers, etc.) or a data entry (a platform description table, the
 /// log-level configuration), each a signed object the bootloader verified
 /// (docs/signing.md). The one other is the [`TRUST_STORE_MODULE`]. `name`
-/// carries the module's identifier so init can match modules by identity
-/// instead of position in the array.
+/// carries the module's name, the install path its signature names, so init
+/// can match modules by identity instead of position in the array.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BootModule
 {
-    /// Identifier copied verbatim from the bundle entry header, NUL-padded
-    /// to [`BOOT_MODULE_NAME_LEN`] bytes, or [`TRUST_STORE_MODULE`]. The
+    /// Name copied verbatim from the bundle entry header, NUL-padded to
+    /// [`BOOT_MODULE_NAME_LEN`] bytes, or [`TRUST_STORE_MODULE`]. The
     /// bundle's entry named `"init"` is consumed by the bootloader as the
     /// userspace init image and does not appear here; every other entry is
     /// exposed as a `BootModule`.
@@ -1231,6 +1236,7 @@ mod tests
         assert_eq!(FramebufferInfo::SIZE, 24);
         assert_eq!(core::mem::size_of::<AplicDomain>(), 24);
         assert_eq!(core::mem::size_of::<ImsicLayout>(), 16);
+        assert_eq!(core::mem::size_of::<BootModule>(), 272);
     }
 
     /// QEMU `virt`'s supervisor-level IMSIC layout with `aia=aplic-imsic`

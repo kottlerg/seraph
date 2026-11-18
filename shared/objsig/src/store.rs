@@ -39,7 +39,7 @@ pub struct Anchor<'a>
     pub key: PublicKey,
     /// The key id of [`Self::key`], computed.
     pub key_id: KeyId,
-    /// The kinds the root may sign directly, and whether it may certify.
+    /// The roles the root may sign directly, and whether it may certify.
     pub usage: Usage,
     /// Whether the root was generated on the build machine (`LOCAL`).
     pub local: bool,
@@ -299,10 +299,10 @@ mod tests
     use std::vec::Vec;
 
     use super::*;
-    use crate::{Kind, KindSet};
+    use crate::{Role, RoleSet};
 
     const ROOT: Usage = Usage {
-        kinds: KindSet::ALL,
+        roles: RoleSet::ALL,
         certify: true,
     };
 
@@ -327,7 +327,7 @@ mod tests
             AnchorSpec {
                 key: b,
                 usage: Usage {
-                    kinds: KindSet::of(&[Kind::Program]),
+                    roles: RoleSet::of(&[Role::Program]),
                     certify: false,
                 },
                 local: false,

@@ -362,7 +362,7 @@ mod tests
 
     use super::*;
     use crate::cert::CertificateBody;
-    use crate::{Arch, Kind, KindSet, Usage};
+    use crate::{Arch, Role, RoleSet, Usage};
 
     const BODY: &[u8] = b"\x7fELF and the rest of an image";
 
@@ -371,7 +371,7 @@ mod tests
         Attributes {
             body_len: 31,
             security_version: 2,
-            kind: Kind::Kernel,
+            roles: RoleSet::of(&[Role::Kernel]),
             arch: Arch::X86_64,
             body_hash: [0x44; 64],
             name,
@@ -386,7 +386,7 @@ mod tests
                 issuer_key_id: [0x66; 16],
                 serial: 1,
                 usage: Usage {
-                    kinds: KindSet::ALL,
+                    roles: RoleSet::ALL,
                     certify: false,
                 },
                 min_security_version: 0,
@@ -559,7 +559,7 @@ mod tests
             ParseError::RecordBlock,
         );
         refuse(&|b| b[at + 24] = 0, ParseError::AttributesDomain);
-        refuse(&|b| b[at + 24 + 28] = 9, ParseError::Kind);
+        refuse(&|b| b[at + 24 + 28] = 9, ParseError::Roles);
         refuse(&|b| b[at + 24 + 29] = 9, ParseError::Arch);
         refuse(&|b| b[at + 126] = 0, ParseError::CertificateDomain);
         refuse(&|b| b[at + 126 + 75] = 0x80, ParseError::CertificateCertify);

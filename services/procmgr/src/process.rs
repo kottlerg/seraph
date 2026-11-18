@@ -564,9 +564,9 @@ pub struct ChildSched
     /// membership, and max.
     pub budget: process_table::ChildBudget,
     /// The signature policy: the creator's until the child's image is
-    /// verified, the kinds the image may be; then the child's own
-    /// (`process_table::sign_policy::child_kinds`), which its entry keeps.
-    pub sign_kinds: objsig::KindSet,
+    /// verified, the roles the image may hold; then the child's own
+    /// (`process_table::sign_policy::child_roles`), which its entry keeps.
+    pub sign_roles: objsig::RoleSet,
     /// The badge the create request came on, the child's parent in the
     /// process tree: a live process, or `0` for the un-badged creator.
     pub creator: u64,
@@ -2139,7 +2139,7 @@ fn finalize_creation(
         image,
         threads: process_table::ThreadRegistry::new(),
         name: info_caps.name,
-        sign_kinds: sched.sign_kinds,
+        sign_roles: sched.sign_roles,
         debugger: 0,
         // The insert takes the parent from the badge's reservation.
         parent: sched.creator,

@@ -111,8 +111,11 @@ the bridge's windows are held is refused, as acpid pushes the windows first:
 A push that disagrees is refused with `REFUSED` and logged with the check it failed. The
 refusal is fail-closed: devmgr holds nothing from it, and the bridge has no windows or routes
 from acpid for the boot unless a later push passes. A consumer then finds them not held
-(`QUERY_HOST_BRIDGE`). devmgr's own interrupt routing and resource placement read neither. Each
-check counts the boot functions it covered.
+(`QUERY_HOST_BRIDGE`). On x86-64 devmgr's interrupt routing reads the held `PRT_PIC_MODE` table
+for a function whose Interrupt Line is unset, a hot-added one
+([services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#binding) § Binding); it reads
+no other table, and its resource placement reads neither. Each check counts the boot functions
+it covered.
 
 devmgr keeps the first windows and the first table of each mode that pass, and the first
 `_OSC` result, for the boot. A later push equal to the held one is accepted; one that differs

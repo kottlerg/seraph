@@ -3,23 +3,24 @@
 
 // services/init/src/log_levels.rs
 
-//! The log levels of the services init spawns: read from the `log-levels`
-//! boot module ([`read`]) and handed to each service as the `SERAPH_LOG`
-//! entry of its environment, procmgr's in the argv/env region init maps for
-//! it (`bootstrap::bootstrap_procmgr`), devmgr's, vfsd's and svcmgr's in
-//! their create requests ([`SpawnEnv`]). `services/init/docs/bootstrap.md`
-//! § Log levels specifies the configuration and its delivery.
-
+//! The log levels of the services init spawns: read from the
+//! `/config/init/log-levels.conf` boot module ([`read`]) and handed to each
+//! service as the `SERAPH_LOG` entry of its environment, procmgr's in the
+//! argv/env region init maps for it (`bootstrap::bootstrap_procmgr`),
+//! devmgr's, vfsd's and svcmgr's in their create requests ([`SpawnEnv`]).
+//! `services/init/docs/bootstrap.md` § Log levels specifies the configuration
+//! and its delivery.
 use init_log_levels::{Levels, Service};
 use init_protocol::InitInfo;
 
 use crate::logging::{log, log_parts};
 use crate::{MemoryAlloc, TEMP_MAP_BASE};
 
-/// Name of the boot module that holds the configuration.
-pub(crate) const MODULE_NAME: &[u8] = b"log-levels";
+/// Name of the boot module that holds the configuration: the install path
+/// its signature names.
+pub(crate) const MODULE_NAME: &[u8] = b"/config/init/log-levels.conf";
 
-/// Read the levels the `log-levels` boot module sets: the configuration its
+/// Read the levels the [`MODULE_NAME`] boot module sets: the configuration its
 /// body holds, after the trailer the bootloader verified
 /// (`init_log_levels::parse_module`). A missing or unreadable module, or one
 /// whose trailer does not parse, sets none, so every service logs at its

@@ -15,8 +15,9 @@ init/
 ├── Cargo.toml                  # Workspace member; no_std binary
 ├── clippy.toml                 # Clippy settings; frame threshold of init's 16 KiB stack
 ├── README.md
-├── log-levels.conf             # Log level of each service init spawns; packed into the
-│                               # boot bundle as `log-levels` (docs/bootstrap.md § Log levels)
+├── log-levels.conf             # Log level of each service init spawns; installed at, and
+│                               # bundled as, /config/init/log-levels.conf
+│                               # (docs/bootstrap.md § Log levels)
 ├── docs/
 │   └── bootstrap.md            # Authoritative stage enumeration;
 │                               # init's side of the capability flow

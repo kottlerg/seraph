@@ -325,18 +325,55 @@ std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n o
   decides, failing with the refillable `OutOfMemory`.
 
 A process calls it before a known burst of capability acquisitions; fatfs funds its page cache
-this way. A long-lived service calls it when the headroom drops below a low-water mark, as
-procmgr does ([services/procmgr/README.md](../../services/procmgr/README.md) § CSpace
+this way.
+
+A long-lived service whose capabilities grow with its load (a few per client, device, or child it
+serves) holds its headroom above a low-water mark instead, through a `static`
+`std::os::seraph::CSpaceHeadroom`:
+
+```rust
+static HEADROOM: CSpaceHeadroom = CSpaceHeadroom::new(LOW_WATER, TOPUP_SLOTS);
+
+HEADROOM.hold(self_cspace);           // before each operation that allocates slots
+if HEADROOM.failure_to_report() {     // once per run of refused top-ups
+    log!(warn: "...");
+}
+```
+
+- **`hold`** tops the pool up, through `fund_cspace_slot_budget` for `TOPUP_SLOTS`, when the
+  headroom is below `LOW_WATER` plus a page's slots or the growth budget below a page
+  (`syscall_abi::cspace_topup_pages`). One thread at a time reads and funds the pool; a thread
+  that finds another doing so goes on at once, so the mark is sized to cover every allocation
+  the process's threads make while one tops up. A refused top-up is retried at the next hold.
+  The body arena takes its pages from the same growth budget and lowers the capacity by a page's
+  slots for each, so the page beyond the mark covers the first arena page an operation takes,
+  and a service whose operations take more (many splits or range-capability copies) counts
+  those pages in its mark, a page's slots each.
+- **`failure_to_report`** answers `true` once per run of refused top-ups, to the first caller
+  that asks, whichever thread's top-up was refused; a hold that finds the pool covered or tops it
+  up ends the run. `hold` logs nothing, since a thread serving logd, or a driver logd writes
+  through, must not log while logd waits on its reply, so the service reports from a thread that
+  may log.
+
+The one-at-a-time and failure-run state is the `ruststd-pool-funding` crate's `LowWaterHold`,
+host-tested there. procmgr ([services/procmgr/README.md](../../services/procmgr/README.md)
+§ CSpace headroom) and devmgr
+([services/devmgr/docs/responsibilities.md](../../services/devmgr/docs/responsibilities.md)
+§ CSpace headroom) hold their `CSpace`s this way, each with its own marks. memmgr holds its own
+with the same test but funds it from its own pool, since a top-up through
+`fund_cspace_slot_budget` would ask memmgr itself
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § CSpace
 headroom).
 
 `std::thread::spawn` holds the headroom for the threads it creates itself. Before each spawn,
 when the headroom is below `SPAWN_CSPACE_LOW_WATER` (32 slots, about a spawn's worth of caps
 with margin) plus a page's slots, or the growth budget below a page
 (`syscall_abi::cspace_topup_pages`), it calls `fund_cspace_slot_budget` for
-`SPAWN_CSPACE_TOPUP_SLOTS` (128), so a process's live thread count is bound by the RAM memmgr
-grants rather than by the `CSpace` its creator seeded, and a process that spawns no thread funds
-nothing. A failed top-up does not fail the spawn, which then fails only if a capability
-allocation it makes finds the headroom spent.
+`SPAWN_CSPACE_TOPUP_SLOTS` (128). Each spawn makes the test itself, not one thread at a time as
+`CSpaceHeadroom` does, since the mark covers one spawn, not a burst of them. So a process's live
+thread count is bound by the RAM memmgr grants rather than by the `CSpace` its creator seeded,
+and a process that spawns no thread funds nothing. A failed top-up does not fail the spawn, which
+then fails only if a capability allocation it makes finds the headroom spent.
 
 ### Bootstrap-cross-boundary VAs
 

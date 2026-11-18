@@ -9,8 +9,9 @@
 //! sysroot/data/) that vfsd auto-mounts at /data, and a raw Seraph swap
 //! partition. `disk.img` carries all four, or all but the data partition,
 //! which then sits alone on a second image; the logical block size, 512 or
-//! 4096 bytes, is chosen per authoring. The kernel and every ELF image the
-//! partitions carry are signed first ([`crate::signing::sign_sysroot`]). The
+//! 4096 bytes, is chosen per authoring. The kernel, every ELF image the
+//! partitions carry and the bundle's data entries are signed first, for the
+//! harness the staged bundle boots ([`crate::signing::sign_sysroot`]). The
 //! refusal boots of `test-signing` pack through
 //! [`create_disk_image_substituting`], which writes bytes the harness staged
 //! in place of named sysroot files and leaves the sysroot as it was.
@@ -26,7 +27,7 @@ use crate::arch::Arch;
 use crate::context::Context as BuildContext;
 use crate::fat;
 use crate::gpt::{self, Guid, guid};
-use crate::signing::{Signer, sign_sysroot};
+use crate::signing::sign_for_harness;
 use crate::util::step;
 
 /// ESP partition size. Holds the kernel, the boot bundle (init + modules),
@@ -283,9 +284,9 @@ fn pack(
 
     // Every pack signs what it packs, so no path writes an unsigned image:
     // `build`, `mkdisk`, `compose-bundle` and every harness that repacks.
-    let signer = Signer::open(ctx, arch)?;
-    let (images, changed) = sign_sysroot(ctx, &signer)?;
-    step(&format!("Signed {images} images ({changed} changed)"));
+    // The signing follows the staged bundle's harness, so ktest is signed
+    // `init` only in an image whose bundle boots it.
+    sign_for_harness(ctx, arch, crate::bundle::staged_harness(ctx)?)?;
 
     let sources = Sources {
         esp: ctx.sysroot_esp(),

@@ -21,10 +21,12 @@
 //! `DEVICE_DELETED`; devmgr's removal lines must come in their order. Once
 //! the fixture logs [`READD_MARKER`], the host adds the device again and
 //! waits for the fixture's verdict. Once the fixture passes, the host
-//! hot-adds a `virtio-blk-pci` disk behind the second port: devmgr must bind
-//! it from the drivers directory's virtio-blk, at the auxiliary tier, as it
-//! binds every device unbound after the boot pass, and the driver must come
-//! up ([`disk_bound`]).
+//! hot-adds a `virtio-blk-pci` disk with no MSI-X vectors behind the second
+//! port: devmgr must bind it from the drivers directory's virtio-blk, at the
+//! auxiliary tier, as it binds every device unbound after the boot pass,
+//! give its driver the wired line its `INTx` pin is routed to, which the
+//! firmware never programmed into it, and the driver must come up
+//! ([`disk_bound`]).
 //!
 //! Each device boot runs that cycle under one hotplug control. Under native
 //! control devmgr manages the slot ([`MANAGED_MARKER`]): `device_del`
@@ -207,6 +209,13 @@ const DISK_DIRECTORY_MARKER: &str = "virtio-blk: boot tier not granted from the 
 /// `services/drivers/virtio/blk/src/main.rs`.
 const DISK_READY_MARKER: &str = "[virtio-blk] ready, entering service loop";
 
+/// devmgr's line when it gives virtio-blk a wired line: after the hot-add
+/// of the disk, which has no MSI-X vectors ([`add_disk`]), the line its
+/// `INTx` pin is routed to (on `x86_64` by the `_PRT` acpid pushed, on
+/// riscv64 by the `virt` host's swizzle). Kept in sync with
+/// `services/devmgr/src/bind.rs`.
+const DISK_WIRED_MARKER: &str = "[devmgr] virtio-blk: Wired interrupt, 1 vector(s)";
+
 /// Budget for a boot to reach its markers.
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -266,7 +275,7 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
     step(
         "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
          driver and powered the slot off or ejected it, and it was bound again; a hot-added \
-         disk was bound from the drivers directory; the data disk's mount was torn down at its \
+         disk was bound from the drivers directory on its wired line; the data disk's mount was torn down at its \
          removal and the disk mounted again when added back; the loss of the root driver and of \
          the boot disk shut the system down)",
     );
@@ -527,7 +536,10 @@ fn device_check(
 
 /// Hot-add the disk behind the second port: a raw block node over the image
 /// `disk` (QMP `blockdev-add`), then a `virtio-blk-pci` on it, behind the
-/// IOMMU when the boot attaches one, as the launchers put a boot disk.
+/// IOMMU when the boot attaches one, as the launchers put a boot disk, with
+/// no MSI-X vectors (`vectors=0`): virtio-pci has no MSI capability, so its
+/// driver is given the wired line of its `INTx` pin. The storage boot's
+/// disk added again ([`port_disk_properties`]) keeps its vectors.
 fn add_disk(socket: &Path, disk: &Path) -> Result<()>
 {
     qmp::blockdev_add_raw(socket, DISK_NODE, disk)?;
@@ -540,18 +552,26 @@ fn add_disk(socket: &Path, disk: &Path) -> Result<()>
             ("drive", Property::Text(DISK_NODE)),
             ("disable-legacy", Property::Text("on")),
             ("iommu_platform", Property::Flag(IOMMU == Iommu::Attached)),
+            ("vectors", Property::Number(0)),
         ],
     )
 }
 
 /// Read the lines of the hot-added disk's bind, in any order: devmgr binds
 /// virtio-blk to it ([`DISK_BIND_MARKER`]), from the drivers directory, at the
-/// auxiliary tier ([`DISK_DIRECTORY_MARKER`]), and the driver serves the disk
-/// ([`DISK_READY_MARKER`]).
+/// auxiliary tier ([`DISK_DIRECTORY_MARKER`]), and on the wired line of its
+/// `INTx` pin ([`DISK_WIRED_MARKER`]), and the driver serves the disk
+/// ([`DISK_READY_MARKER`]). They are read from the lines after the hot-add,
+/// which the boot disk's bind precedes.
 fn disk_bound(lines: &Lines) -> Result<()>
 {
-    let markers = [DISK_BIND_MARKER, DISK_DIRECTORY_MARKER, DISK_READY_MARKER];
-    let mut seen = [false; 3];
+    let markers = [
+        DISK_BIND_MARKER,
+        DISK_DIRECTORY_MARKER,
+        DISK_WIRED_MARKER,
+        DISK_READY_MARKER,
+    ];
+    let mut seen = [false; 4];
     while !seen.iter().all(|&s| s)
     {
         let line = lines.until(VERDICT_TIMEOUT, "the hot-added disk's bind", |l| {

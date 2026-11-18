@@ -14,7 +14,7 @@
 use crate::idle_loop;
 use crate::log_levels::{ArgvEnv, SpawnEnv};
 use crate::logging::{log, log_parts};
-use crate::walk;
+use crate::{module_name, walk};
 use init_log_levels::Service;
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels, svcmgr_labels};
@@ -528,24 +528,38 @@ fn serve_extent_rounds(
 /// through, never forwarded to devmgr: the bootstrap services, the root
 /// filesystem driver, init's log-level configuration, and the trust store,
 /// which procmgr alone receives.
-const BOOTSTRAP_MODULES: [&[u8]; 8] = [
-    b"init",
-    b"procmgr",
-    b"memmgr",
-    b"devmgr",
-    b"vfsd",
-    b"fatfs",
+const BOOTSTRAP_MODULES: [&[u8]; 7] = [
+    module_name::PROCMGR,
+    module_name::MEMMGR,
+    module_name::DEVMGR,
+    module_name::VFSD,
+    module_name::FATFS,
     crate::log_levels::MODULE_NAME,
     boot_protocol::TRUST_STORE_MODULE,
 ];
 
-/// Module caps one `kind::MODULE` round carries (`MSG_CAP_SLOTS_MAX`).
-const MODULES_PER_ROUND: usize = 4;
-
-/// Data words one module's bundle entry name takes in a `kind::MODULE`
-/// round: its `INIT_MODULE_NAME_LEN` bytes, NUL-padded, packed
-/// little-endian. devmgr's `caps.rs` reads the same layout.
+/// Data words one module's name takes in a `kind::MODULE` round: its
+/// `INIT_MODULE_NAME_LEN` bytes, NUL-padded, packed little-endian. devmgr's
+/// `caps.rs` reads the same layout.
 const MODULE_NAME_WORDS: usize = init_protocol::INIT_MODULE_NAME_LEN / 8;
+
+/// Module caps one `kind::MODULE` round carries: as many as the round's data
+/// words hold a size and a name for, after the kind and the count, at most
+/// `MSG_CAP_SLOTS_MAX`. One, since a name takes 32 words.
+const MODULES_PER_ROUND: usize = {
+    let fit = (syscall_abi::MSG_DATA_WORDS_MAX - 2) / (1 + MODULE_NAME_WORDS);
+    if fit < syscall_abi::MSG_CAP_SLOTS_MAX
+    {
+        fit
+    }
+    else
+    {
+        syscall_abi::MSG_CAP_SLOTS_MAX
+    }
+};
+
+// A round carries at least one module, or the modules are never served.
+const _: () = assert!(MODULES_PER_ROUND >= 1);
 
 /// Serve devmgr a copy of every boot module outside [`BOOTSTRAP_MODULES`],
 /// untagged, in `kind::MODULE` rounds of up to [`MODULES_PER_ROUND`] caps:
@@ -553,8 +567,8 @@ const MODULE_NAME_WORDS: usize = init_protocol::INIT_MODULE_NAME_LEN / 8;
 /// tells apart by their content. Each round's data words carry each module's
 /// size in bytes, from its `CapDescriptor`: the cap covers whole pages, and
 /// the bytes past the module's end are not the module's; then each module's
-/// bundle entry name, [`MODULE_NAME_WORDS`] words, under which devmgr has
-/// procmgr verify the drivers it creates from it. A module whose
+/// name, its install path, [`MODULE_NAME_WORDS`] words, under which devmgr
+/// has procmgr verify the drivers it creates from it. A module whose
 /// copy cannot be derived, or whose descriptor is missing, is skipped,
 /// logged, as `serve_region_rounds` skips a region: returning would leave
 /// devmgr blocked in `request_round` without the terminal round. Returns
@@ -566,10 +580,7 @@ fn serve_module_rounds(
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let count = (info.module_name_count as usize).min(init_protocol::INIT_MAX_NAMED_MODULES);
-    // `count` is at most the array length (`INIT_MAX_NAMED_MODULES`).
-    let names = info.module_names.get(..count).unwrap_or_default();
-    let mut forwarded = names.iter().filter(|entry| {
+    let mut forwarded = crate::module_names(info).iter().filter(|entry| {
         let name = init_protocol::module_name_str(&entry.name);
         !BOOTSTRAP_MODULES.contains(&name)
     });
@@ -787,7 +798,7 @@ pub fn create_devmgr_with_caps(
     ipc_buf: *mut u64,
 ) -> Option<SubstrateCaps>
 {
-    let devmgr_memory_cap = crate::find_module_by_name(info, b"devmgr")?;
+    let devmgr_memory_cap = crate::find_module_by_name(info, module_name::DEVMGR)?;
     let devmgr_len = module_len(info, devmgr_memory_cap)?;
     let devmgr_module_copy = module_spawn_copy(devmgr_memory_cap)?;
 
@@ -810,7 +821,7 @@ pub fn create_devmgr_with_caps(
                 ipc::sched_policy::DEVMGR_PRIORITY,
                 ipc::sched_policy::DEVMGR_BAND_MAX,
             ),
-        (devmgr_module_copy, devmgr_len, b"devmgr"),
+        (devmgr_module_copy, devmgr_len, module_name::DEVMGR),
         badged_creator,
         argv_env,
         ipc_buf,
@@ -1129,7 +1140,7 @@ pub fn create_vfsd_with_caps(
     ipc_buf: *mut u64,
 ) -> Option<SubstrateCaps>
 {
-    let vfsd_memory_cap = crate::find_module_by_name(info, b"vfsd")?;
+    let vfsd_memory_cap = crate::find_module_by_name(info, module_name::VFSD)?;
     let vfsd_len = module_len(info, vfsd_memory_cap)?;
     let vfsd_module_copy = module_spawn_copy(vfsd_memory_cap)?;
 
@@ -1144,7 +1155,7 @@ pub fn create_vfsd_with_caps(
             ipc::sched_policy::VFSD_PRIORITY,
             ipc::sched_policy::VFSD_PRIORITY,
         ),
-        (vfsd_module_copy, vfsd_len, b"vfsd"),
+        (vfsd_module_copy, vfsd_len, module_name::VFSD),
         badged_creator,
         argv_env,
         ipc_buf,
@@ -1187,7 +1198,7 @@ pub fn create_vfsd_with_caps(
     // cap list, not a zero handle, which the kernel would refuse along with
     // the whole round; vfsd then rejects the round (it needs the module to
     // mount root) instead of failing on a reply error.
-    let fatfs = crate::find_module_by_name(info, b"fatfs");
+    let fatfs = crate::find_module_by_name(info, module_name::FATFS);
     let fatfs_len = fatfs.and_then(|slot| module_len(info, slot)).unwrap_or(0);
     let fatfs_cap = match fatfs
     {

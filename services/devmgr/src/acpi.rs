@@ -551,6 +551,10 @@ impl AcpiService
                 {
                     return Reply::status(errors::INVALID_REQUEST);
                 };
+                // Checked against the line a function has from its records
+                // alone (its Interrupt Line, or the riscv64 swizzle), never
+                // one routed by a table acpid pushed: no bridge's tables.
+                let unrouted = firmware::acpid::Bridges::new();
                 let pushed = self.bridges.push_prt(
                     segment,
                     bus,
@@ -558,7 +562,7 @@ impl AcpiService
                     &table,
                     rule,
                     records.live_pci(),
-                    bind::device_gsi,
+                    |f| bind::device_gsi(f, &unrouted),
                 );
                 let (what, covered): (_, fn(&firmware::acpid::Bridge) -> Option<u64>) = match mode
                 {

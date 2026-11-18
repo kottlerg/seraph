@@ -10,6 +10,10 @@
 //! sector and attempt, or every request failed at once ([`RamDisk::fail_all`]).
 //! The device keeps a log of the reads it served ([`RamDisk::take_reads`]).
 //!
+//! A request carries up to [`RUN_PAGES`] pages of Memory cap, the run fill
+//! fatfs issues for a sequential read, and the server maps and copies as many
+//! pages as the request's sectors span.
+//!
 //! The device can also go away: a request carrying [`GONE_BADGE`] revokes
 //! every capability derived from the block endpoint, fatfs's among them, and
 //! stops the server, as a device whose partition capabilities its owner
@@ -33,7 +37,7 @@ const ROOT_ENTRIES: u16 = 64;
 const ROOT_LBA: usize = FAT_LBA + FAT_SECTORS;
 const ROOT_SECTORS: usize = 4;
 /// First sector of the data region, cluster 2.
-const DATA_LBA: usize = ROOT_LBA + ROOT_SECTORS;
+pub const DATA_LBA: usize = ROOT_LBA + ROOT_SECTORS;
 /// Data clusters, one sector each: past the 4085 below which a volume is
 /// FAT12, which fatfs refuses.
 const CLUSTERS: usize = 4096;
@@ -41,8 +45,16 @@ const CLUSTERS: usize = 4096;
 const TOTAL_SECTORS: usize = DATA_LBA + CLUSTERS;
 /// What an unwritten sector reads as.
 const ZERO_SECTOR: [u8; SECTOR] = [0; SECTOR];
-/// Largest request fatfs issues: one cache page of sectors.
-const MAX_SECTORS_PER_REQUEST: usize = 8;
+/// Pages of the largest request fatfs issues, a run fill.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "RUN_PAGES is 16, far below usize::MAX on every target"
+)]
+pub const RUN_PAGES: usize = fat_parse::RUN_PAGES as usize;
+/// Sectors in one page.
+const SECTORS_PER_PAGE: usize = 4096 / SECTOR;
+/// Largest request fatfs issues, a run fill: `RUN_PAGES` pages of sectors.
+const MAX_SECTORS_PER_REQUEST: usize = RUN_PAGES * SECTORS_PER_PAGE;
 
 /// Badge of the phase's stop SEND on the block endpoint.
 pub const STOP_BADGE: u64 = 0x5_70B;
@@ -268,13 +280,14 @@ impl RamDisk
 
 /// Serve the block requests fatfs sends on `ep` until a message carrying
 /// [`STOP_BADGE`] or [`GONE_BADGE`]; the latter first revokes every
-/// capability derived from `ep`. Each request's Memory cap is mapped at a
-/// scratch page for the copy, unmapped, and moved back in the reply.
+/// capability derived from `ep`. Each request's Memory cap is mapped, for as
+/// many pages as the request spans (at most [`RUN_PAGES`]), at a scratch
+/// range for the copy, unmapped, and moved back in the reply.
 pub fn serve(ep: u64, disk: &SharedDisk)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let aspace = std::os::seraph::startup_info().self_aspace;
-    let va = std::os::seraph::reserve_pages(1)
+    let va = std::os::seraph::reserve_pages(RUN_PAGES as u64)
         .expect("fs_faults block server: reserve_pages failed")
         .va_start();
     loop
@@ -370,7 +383,7 @@ fn map_refusal_label(error: i64) -> u64
     }
 }
 
-/// Copy `count` sectors at `lba` between the disk and the page `*cap` names,
+/// Copy `count` sectors at `lba` between the disk and the pages `*cap` names,
 /// in `direction`, unless an armed fault says otherwise. Returns the reply
 /// label; `*cap` is 0 when the fault deleted the cap, so the reply carries
 /// none.
@@ -418,10 +431,14 @@ fn transfer(
         Direction::Read => syscall::MAP_WRITABLE,
         Direction::Write => syscall::MAP_READ,
     };
-    // SAFETY: `va` is the block server's own page reservation from the
-    // per-process arena, used only by this thread for one copy at a time: VA
-    // no Rust object or IPC page occupies.
-    if let Err(e) = unsafe { std::os::seraph::mem_map_funded(*cap, aspace, va, 0, 1, prot) }
+    let pages = count.div_ceil(SECTORS_PER_PAGE);
+    // SAFETY: `va` is the block server's own reservation of `RUN_PAGES`
+    // pages from the per-process arena, used only by this thread for one copy
+    // at a time: VA no Rust object or IPC page occupies; `pages` of them,
+    // at most `RUN_PAGES`, are mapped.
+    let mapped =
+        unsafe { std::os::seraph::mem_map_funded(*cap, aspace, va, 0, pages as u64, prot) };
+    if let Err(e) = mapped
     {
         return map_refusal_label(e);
     }
@@ -446,16 +463,16 @@ fn transfer(
                     .sectors
                     .entry(sector_lba)
                     .or_insert_with(|| Box::new(ZERO_SECTOR));
-                // SAFETY: `va` maps one page for this copy, and sector `i` of
-                // at most `MAX_SECTORS_PER_REQUEST`, one page's worth, lies
-                // inside it; `sector` is a distinct heap buffer.
+                // SAFETY: `va` maps `pages` pages for this copy, and sector `i`
+                // of `count`, which `pages` holds, lies inside them;
+                // `sector` is a distinct heap buffer.
                 unsafe { core::ptr::copy_nonoverlapping(page, sector.as_mut_ptr(), SECTOR) };
             }
             Direction::Read =>
             {
                 let sector = disk.sector(sector_lba);
-                // SAFETY: `va` maps one page for this copy, and sector `i`
-                // lies inside it, as for the write arm; `sector` is the
+                // SAFETY: `va` maps `pages` pages for this copy, and sector
+                // `i` lies inside them, as for the write arm; `sector` is the
                 // disk's own buffer or the static `ZERO_SECTOR`, either way
                 // distinct from the mapped page.
                 unsafe { core::ptr::copy_nonoverlapping(sector.as_ptr(), page, SECTOR) };
@@ -463,9 +480,9 @@ fn transfer(
         }
     }
     drop(disk);
-    // SAFETY: the same reserved page, accessed above only through a raw
-    // copy; no Rust reference into it is live.
-    let _ = unsafe { syscall::mem_unmap(aspace, va, 1) };
+    // SAFETY: the same `pages` reserved pages, accessed above only through
+    // a raw copy; no Rust reference into them is live.
+    let _ = unsafe { syscall::mem_unmap(aspace, va, pages as u64) };
     if fault.is_some()
     {
         blk_errors::DEVICE_STATUS_IOERR

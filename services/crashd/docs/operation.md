@@ -214,8 +214,9 @@ A process the policy does not name gets no line.
 Handling one fault, its reading and its block's logging, is bounded by a watchdog, 2 s per fault
 (`FAULT_BOUND`, checked every 100 ms, `WATCHDOG_TICK`). The attach request can wait on procmgr, and
 procmgr can be waiting on the faulting process (an fs driver serving a `CREATE_FROM_FILE` read); a
-log write can wait on a driver logd writes through before that driver has declared itself
-undebuggable. When the bound passes, the watchdog posts the receiving thread an upcall
+log write can wait on a driver logd writes through, for up to logd's `SINK_STALL_MS` per sink
+([logd IPC interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks). When the
+bound passes, the watchdog posts the receiving thread an upcall
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Asynchronous Upcalls), which cancels
 the blocking request it waits in (`Interrupted`) and is then served by the watchdog. It posts
 another each tick until crashd ends that step, so a request a runtime call sends after the first

@@ -629,6 +629,8 @@ fn carve_platform_device(
     carve: &mut Carve,
 ) -> Option<PlatformDeviceCaps>
 {
+    // As for a PCI record's carves (`carve_pci_device`).
+    crate::headroom::hold();
     let Some(mut dev) = PlatformDeviceCaps::empty()
     else
     {
@@ -995,6 +997,9 @@ fn carve_pci_device(
     carve: &mut Carve,
 ) -> Option<PciDeviceCaps>
 {
+    // The carves and the spawn that follows take the most slots and arena
+    // bodies devmgr holds at once (`crate::headroom`).
+    crate::headroom::hold();
     let Ok(virtio) = virtio_layout(name, pci_dev, decl)
     else
     {

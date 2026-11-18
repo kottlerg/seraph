@@ -96,8 +96,8 @@ and teardown go through procmgr. See
 **svcmgr**
 Service supervisor and discovery registry. Detects crashes and restarts
 services via procmgr. memmgr, procmgr, and svcmgr form the core set, which
-never restarts: the death of memmgr or procmgr powers the system off, and
-so would svcmgr's (design intent; not yet implemented (#262)). The
+never restarts: the death of memmgr or procmgr powers the system off
+through svcmgr, and svcmgr's through pwrmgr, which observes it. The
 supervision hierarchy and the restart model are specified in
 [`supervision.md`](supervision.md). See
 [`services/svcmgr/README.md`](../services/svcmgr/README.md).

@@ -67,8 +67,9 @@ Allocation Contract").
   back for a DMA-capable driver until devmgr has confirmed the driver's device
   stopped its DMA (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   § Label 4).
-- **Mid-life reclamation** — on `RELEASE_MEMORY_CAPS` (or `UNREGISTER_REGION`
-  for a demand-paged region) from a live process, return the named grant to the
+- **Mid-life reclamation** — on `RELEASE_MEMORY_CAPS` (or `UNREGISTER_REGION`,
+  `SHRINK_REGION` or `DISCARD_RANGE` for a demand-paged region) from a live
+  process, return the named grant to the
   free pool so a per-unit-of-work retype loop holds a bounded footprint without
   waiting for process death. Best-fit best-effort selection (reuse a freed run
   of the requested size rather than re-split a larger one) plus a coalesce after
@@ -142,6 +143,8 @@ The full memmgr IPC specification is in
   `REGION_COMMIT` makes it a committed region
 - `EXTEND_REGION` / `SHRINK_REGION` — grow a committed region in place, or lower its top to a
   64 KiB chunk multiple
+- `DISCARD_RANGE` — take back the frames of whole 64 KiB chunks of a region, committed or not;
+  a later touch faults in a zero-filled page, and a committed region keeps its commitment
 - `QUERY_MEMORY_USAGE` — read the caller's own budget usage, its max, and its subtree's usage
 - `REGISTER_PRESSURE(bits, notification_cap)` — register the Notification memmgr signals on a
   change of the memory-pressure level; a second replaces the first, and the std runtime
@@ -177,7 +180,7 @@ The remaining constants are tuning values that bound no capacity:
 
 | Constant | Value | Role |
 |---|---|---|
-| `DEMAND_CHUNK_PAGES` | 16 | Pages one demand fault backs on an unfragmented pool; on a fragmented one, as many as the largest free run holds |
+| `DEMAND_CHUNK_PAGES` | 16 | Pages one demand fault backs on an unfragmented pool; on a fragmented one, as many as the largest free run holds. Also the unit `SHRINK_REGION` and `DISCARD_RANGE` take, which clients read as `memmgr_labels::DEMAND_CHUNK_BYTES` |
 | `SCRUB_WINDOW_PAGES` | 512 pages | Pages one pass maps to zero a run before hand-out ([`docs/memory-pool.md`](docs/memory-pool.md) § Frame contents) |
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_PAGES` | 256 slots, 16 pages | `CSpace` self-funding mark and step |
 | `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | 4 pages, 4 rounds | Page-table funding step and retries per map, for memmgr's own maps and a demand fault's map into a process |

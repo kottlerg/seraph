@@ -38,7 +38,10 @@
 //! `ruststd-heap-fit` crate) places it in the first free block that holds
 //! it: the block's bytes below and above the request stay on the free list,
 //! so `dealloc`, which returns exactly the request's bytes, leaves no byte
-//! of the heap outside both the free list and a live block.
+//! of the heap outside both the free list and a live block. `dealloc` then
+//! gives memmgr back the pages of the committed growth region the free left
+//! unused, as `heap_fit::Growth` plans it: a trim of the region's top, or a
+//! discard of whole chunks of a large freed block (`Heap::give_back`).
 
 use crate::alloc::Layout;
 use crate::cell::UnsafeCell;
@@ -49,8 +52,8 @@ use crate::ptr::{NonNull, null_mut};
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use ipc::memmgr_labels::{
-    EXTEND_REGION, QUERY_POOL_STATUS, REGION_COMMIT, REGISTER_PRESSURE, REGISTER_REGION,
-    RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS,
+    DEMAND_CHUNK_BYTES, DISCARD_RANGE, EXTEND_REGION, QUERY_POOL_STATUS, REGION_COMMIT,
+    REGISTER_PRESSURE, REGISTER_REGION, RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS, SHRINK_REGION,
 };
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
@@ -73,8 +76,29 @@ const HEAP_INITIAL_PAGES: u64 = 512;
 /// multiple of this many 4 KiB pages, at least one, to amortise the memmgr IPC
 /// round-trip over many small follow-up allocations. 16 pages = 64 KiB, one
 /// memmgr demand chunk, so the growth region of a demand-paged heap stays a
-/// whole number of chunks.
-const GROW_MIN_PAGES: u64 = 16;
+/// whole number of chunks, which memmgr cuts and discards it in.
+const GROW_MIN_PAGES: u64 = DEMAND_CHUNK_BYTES / PAGE_SIZE;
+
+/// Bytes of one memmgr demand chunk, the unit the heap gives its committed
+/// growth region back in ([`Heap::give_back`]).
+const CHUNK: usize = DEMAND_CHUNK_BYTES as usize;
+
+/// Bytes of free chunks a trim keeps at the top of the committed growth
+/// region, above the chunk of the top free block's node, so the allocations
+/// after a trim do not extend the region again at once. A tuning value that
+/// bounds no capacity (docs/limits.md).
+const TRIM_PAD: usize = 2 * CHUNK;
+
+/// Bytes the top free block must reach past what a trim keeps before the heap
+/// cuts the committed growth region, so a trim's `SHRINK_REGION` call frees
+/// at least this much. A tuning value that bounds no capacity.
+const TRIM_MIN: usize = 4 * CHUNK;
+
+/// Bytes a freed block must hold before its free block's chunks are discarded
+/// (`DISCARD_RANGE`): a smaller free calls memmgr for nothing, and its pages
+/// return when the block they lie in is trimmed or meets a larger free. A
+/// tuning value that bounds no capacity.
+const DISCARD_MIN: usize = 4 * CHUNK;
 
 // ── Spin mutex ──────────────────────────────────────────────────────────────
 
@@ -238,9 +262,13 @@ impl Heap {
         }
     }
 
+    /// Add `[ptr, ptr + size)` to the free list, merged with a free block
+    /// directly above or below it, and return the free block that then holds
+    /// it, as its start and size.
+    ///
     /// # Safety
     /// `ptr..ptr+size` must be a freed allocation previously returned by `alloc`.
-    unsafe fn insert(&mut self, ptr: usize, size: usize) {
+    unsafe fn insert(&mut self, ptr: usize, size: usize) -> (usize, usize) {
         let mut cur = self.head;
         let mut prev: Option<NonNull<FreeNode>> = None;
         while let Some(c) = cur {
@@ -266,7 +294,14 @@ impl Heap {
         unsafe { Self::try_coalesce(inserted) };
         if let Some(p) = prev {
             unsafe { Self::try_coalesce(p) };
+            // SAFETY: `p` is a node of this heap's free list.
+            let (start, size) = (p.as_ptr() as usize, unsafe { (*p.as_ptr()).size });
+            if start + size > ptr {
+                return (start, size);
+            }
         }
+        // SAFETY: `inserted` is a node of this heap's free list.
+        (ptr, unsafe { (*inserted.as_ptr()).size })
     }
 
     /// # Safety
@@ -466,6 +501,82 @@ impl Heap {
         unsafe { self.insert(base, bytes as usize) };
         self.mapped_end = base + bytes as usize;
         true
+    }
+
+    /// Give memmgr back the pages of the committed growth region that the
+    /// free of `[freed, freed + freed_len)` left in the free block `block`
+    /// (its start and size, as [`Self::insert`] returned it), as
+    /// `heap_fit::Growth` plans it: when the block is the heap's top, cut the
+    /// region (`SHRINK_REGION`) to [`TRIM_PAD`] above the chunk of the
+    /// block's node, once that frees [`TRIM_MIN`]; otherwise, when the free
+    /// held [`DISCARD_MIN`], discard (`DISCARD_RANGE`) the whole chunks it
+    /// made free past the block's node. The pages of the floor, an
+    /// uncommitted region, are never given back: a later touch of a discarded
+    /// floor page could be declined, where the committed region's commitment
+    /// keeps a discarded page's refault from being declined
+    /// (docs/userspace-memory-model.md § Byte Heap).
+    ///
+    /// Called with the heap lock held, which the call to memmgr keeps: a
+    /// thread that took the lock while memmgr clears the pages could allocate
+    /// from them, and memmgr would clear what it wrote. As with `grow`, the
+    /// IPC under the lock allocates nothing. A refused or failed call changes
+    /// nothing in the heap, and a repeat of an interrupted one is safe
+    /// ([`ipc_call_until_answered`]).
+    fn give_back(&mut self, block: (usize, usize), freed: usize, freed_len: usize) {
+        if self.growth_len == 0 {
+            return;
+        }
+        let (start, size) = block;
+        let growth = heap_fit::Growth {
+            base: self.growth_base as usize,
+            end: self.mapped_end,
+            chunk: CHUNK,
+        };
+        let trim = if start + size == self.mapped_end {
+            growth.trim(start, NODE_SIZE, TRIM_PAD, TRIM_MIN)
+        } else {
+            None
+        };
+        if let Some(top) = trim {
+            let new_len = (top - growth.base) as u64;
+            let msg = ipc::IpcMessage::builder(SHRINK_REGION)
+                .word(0, self.growth_base)
+                .word(1, new_len)
+                .build();
+            if self.memmgr_success(&msg) {
+                // SAFETY: `start` is the free list's last node, whose block
+                // ends at `mapped_end` and keeps its bytes below `top`, which
+                // lies above its node.
+                unsafe { (*(start as *mut FreeNode)).size = top - start };
+                self.mapped_end = top;
+                self.growth_len = new_len;
+            }
+            return;
+        }
+        if let Some((lo, hi)) =
+            growth.discard(start, start + size, freed, freed + freed_len, NODE_SIZE, DISCARD_MIN)
+        {
+            let msg = ipc::IpcMessage::builder(DISCARD_RANGE)
+                .word(0, lo as u64)
+                .word(1, (hi - lo) as u64)
+                .build();
+            let _ = self.memmgr_success(&msg);
+        }
+    }
+
+    /// Whether memmgr answered `msg` with success, on the calling thread's
+    /// IPC buffer; `false` for a thread with none.
+    fn memmgr_success(&self, msg: &ipc::IpcMessage) -> bool {
+        let ipc_buf = current_ipc_buf();
+        if ipc_buf.is_null() {
+            return false;
+        }
+        // SAFETY: ipc_buf is the current thread's kernel-registered,
+        // page-aligned IPC buffer.
+        matches!(
+            unsafe { ipc_call_until_answered(self.memmgr_ep, msg, ipc_buf) },
+            Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
+        )
     }
 
     /// Request and map exactly `pages` pages starting at `start_va`,
@@ -1491,6 +1602,15 @@ pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     pool_funding::top_up(short, donate)
 }
 
+/// Whether `self_cspace`'s general headroom is below `low_water` slots plus a
+/// page's slots, or its growth budget below a page
+/// (`syscall_abi::cspace_topup_pages`): the test a low-water hold makes
+/// before it funds.
+pub fn cspace_below_low_water(self_cspace: u64, low_water: u64) -> bool {
+    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+    syscall_abi::cspace_topup_pages(cspace_general_headroom(self_cspace), budget, low_water) != 0
+}
+
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-
 /// failure and panic terminator.
 pub fn abort_thread() -> ! {
@@ -1546,7 +1666,9 @@ pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
     ptr
 }
 
-/// Return the block at `ptr`, allocated with `layout`, to the byte heap.
+/// Return the block at `ptr`, allocated with `layout`, to the byte heap, and
+/// give memmgr back the committed growth region's pages the free leaves
+/// unused (`Heap::give_back`), which can call memmgr.
 ///
 /// # Safety
 /// `ptr` is a block [`alloc`] (or [`alloc_zeroed`] or [`realloc`]) returned
@@ -1565,7 +1687,8 @@ pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
     let size = block_size(layout);
     let mut heap = HEAP.lock();
     // SAFETY: the caller guarantees ptr/layout match a prior alloc.
-    unsafe { heap.insert(ptr as usize, size) };
+    let block = unsafe { heap.insert(ptr as usize, size) };
+    heap.give_back(block, ptr as usize, size);
 }
 
 /// Move the block at `ptr`, allocated with `old_layout`, to a new block of

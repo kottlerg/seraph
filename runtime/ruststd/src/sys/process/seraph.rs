@@ -1294,6 +1294,13 @@ fn destroy_child(process_handle: u64) -> bool {
 pub struct ExitStatus(u64);
 
 impl ExitStatus {
+    /// The status of a process whose end is the exit reason `reason`
+    /// (docs/process-lifecycle.md § Exit reason), as a death relay delivers
+    /// it: `std::os::seraph::process::SessionStdio::wait` reads one.
+    pub fn from_reason(reason: u64) -> Self {
+        Self(reason)
+    }
+
     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
         if self.0 == 0 {
             Ok(())

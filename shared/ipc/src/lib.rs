@@ -63,6 +63,8 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     MEMMGR_LABELS_VERSION — memmgr_labels::REGISTER_PROCESS   (procmgr ↔ memmgr)
 //     SVCMGR_LABELS_VERSION — every svcmgr handover endowment `CAPS` round,
 //                             in `data[1]` after the round kind (init ↔ svcmgr)
+//     SESSIOND_LABELS_VERSION — sessiond_labels::REGISTER_INTERFACE, in
+//                             `data[1]` (interface ↔ sessiond)
 //
 //   Checked on every request (`data[0]`):
 //     DEVMGR_LABELS_VERSION     — every devmgr_labels request
@@ -142,7 +144,7 @@ pub mod sched_policy;
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 13;
+pub const MEMMGR_LABELS_VERSION: u32 = 14;
 pub mod memmgr_labels;
 
 mod memmgr_grant;
@@ -164,6 +166,11 @@ pub mod svcmgr_labels;
 /// the label modules describes, which also lists its runtime check, if any.
 pub const STOP_LABELS_VERSION: u32 = 1;
 pub mod stop_labels;
+
+/// Wire-protocol version of [`sessiond_labels`]; bumped as the block comment
+/// above the label modules describes, which also lists its runtime check, if any.
+pub const SESSIOND_LABELS_VERSION: u32 = 1;
+pub mod sessiond_labels;
 
 pub mod published_names;
 

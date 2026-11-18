@@ -526,6 +526,7 @@ fn serve_list_round(
 )]
 pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn
 {
+    crate::headroom::hold();
     // Release the source ELF cap on every exit before the create call
     // consumes it. Disarmed once the ipc_call returns, which transfers the
     // cap to procmgr.

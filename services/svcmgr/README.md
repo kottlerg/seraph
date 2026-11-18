@@ -19,8 +19,8 @@ endows it with at handover, and from each provider's launch. Consumers resolve a
 their `.svc` `seed = ...` line at launch time, and the public names (`svcmgr`, `pwrmgr.deny`,
 `acpid.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority is seed-only,
 so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields `GRANT`; a seed is
-`SEND` except `devmgr.bind`, which is `SEND|GRANT`. The endowment and registry wire format are in
-[docs/ipc-interface.md](docs/ipc-interface.md).
+`SEND` except `devmgr.bind` and each `:grant` name (`sessiond.operator`), which are `SEND|GRANT`.
+The endowment and registry wire format are in [docs/ipc-interface.md](docs/ipc-interface.md).
 
 svcmgr is also the stop authority: a service whose recipe sets `stop_authority = yes` receives a
 `STOP_AUTHORITY` SEND on svcmgr's endpoint, through which it lists the services svcmgr would stop,
@@ -35,8 +35,10 @@ restart policy ([docs/ipc-interface.md](docs/ipc-interface.md) § Stop authority
 
 svcmgr supervises the top-level services and is itself in the core set with
 memmgr and procmgr: none of the three restarts, and the death of memmgr or
-procmgr powers the system off. Powering off on svcmgr's own death, observed by
-pwrmgr, is design intent; not yet implemented (#262). svcmgr holds no
+procmgr powers the system off, and so does svcmgr's own: svcmgr binds death
+observers on its own main thread and address space to a queue whose
+receive-only derivation it serves the shutdown actuator, pwrmgr, which powers
+the system off on an entry. svcmgr holds no
 process-creation capabilities; every launch and restart goes through procmgr
 ([docs/supervision.md](../../docs/supervision.md)).
 

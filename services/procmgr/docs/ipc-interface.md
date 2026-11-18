@@ -319,8 +319,8 @@ creates on its mint source, and a create there would make a top-level reserve no
 which is what svcmgr's own node is. svctest's test phases set both flags, `CREATE_RESERVE` only to
 see procmgr refuse it; in the default image no process has a max of its own, and no default
 per-process max exists. svcmgr sets
-`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, crashd's in the default image,
-and starts every other service outside the reserve
+`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, oomd's, sessiond's, crashd's and
+logd's in the default image, and starts every other service outside the reserve
 ([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
 § `reserve`).
 
@@ -1055,7 +1055,7 @@ Reply `SUCCESS` with:
 | `data[4]` | The address of the target's `ProcessInfo` page |
 | `data[5]` | The target's process badge (`ATTACH_WORD_PROCESS_BADGE`) |
 | `data[6]` | The list index of the thread `data[0]` names (`ATTACH_WORD_NAMED_THREAD`): `0`, the main thread, for a process badge; the registered thread bound under a crash badge; `ATTACH_NO_THREAD` (`u64::MAX`) when that thread is no longer listed |
-| `data[7]` | The target's declarations (`ATTACH_WORD_FLAGS`): `ATTACH_FLAG_NO_CORE` (bit 0) once it sent `DECLARE_NO_CORE` (Label 26); other bits `0` |
+| `data[7]` | The target's declarations and placement (`ATTACH_WORD_FLAGS`): `ATTACH_FLAG_NO_CORE` (bit 0) once it sent `DECLARE_NO_CORE` (Label 26); `ATTACH_FLAG_RESERVE` (bit 1) when its budget node is a system-reserve node (Label 1, **Memory max and reserve**); other bits `0` |
 | caps | The Thread caps of threads `data[1]..`, each with `OBSERVE`, `CONTROL`, and `UPCALL`, at most `ATTACH_THREADS_PAGE` (`MSG_CAP_SLOTS_MAX`, 4); none past the count |
 
 The list is the main thread at index 0, then the registered threads in registration order. Before
@@ -1276,7 +1276,8 @@ process died resumes at the next badge above it.
 
 A process's name is the first string of the argv its creator passed (`CREATE_ARGV_ENV`), up to
 its NUL, truncated to `svcmgr_labels::NAME_MAX` (64) bytes, or empty for a process created
-without argv. For a service it is the first word of its recipe's `argv`. procmgr records it at
+without argv. For a service it is the first word of its recipe's `argv`; devmgr, vfsd and svcmgr,
+which init creates, carry their service name. procmgr records it at
 creation and never changes it. It is a label the creator chose, not an identity: two processes can
 share one, and a debugger that looks a process up by name takes the first match in badge order.
 The walk lists every live process procmgr created, those that declared themselves undebuggable

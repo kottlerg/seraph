@@ -200,6 +200,10 @@ pub(super) struct Listed
 /// boot.
 pub(super) const STOPSRC_RECIPE: &str = "/config/svcmgr/services/stopsrc.svc";
 
+/// sessiond's recipe, a stop source (`stop_source = program`); present in
+/// every image that stages the operator session's service.
+pub(super) const SESSIOND_RECIPE: &str = "/config/svcmgr/services/sessiond.svc";
+
 /// The name procmgr lists `stopsrc`'s job under: the first word of its argv,
 /// the path the fixture creates it from. The fixture's own instance, which
 /// svcmgr creates with no argv, is listed with an empty name.
@@ -365,10 +369,10 @@ fn service_key(slot: u64, instance: u64) -> u64
 }
 
 /// The stop sources of [`svcmgr_stop_service_phase`]: `LIST_STOP_SOURCES`
-/// through svcmgr's stop authority `stop_cap` lists `stopsrc` alone, with
-/// the program class, when its recipe is staged, and nothing otherwise; the
-/// SEND it carries reaches the fixture's stop labels, and the fixture's own
-/// `:deny` SEND does not.
+/// through svcmgr's stop authority `stop_cap` lists `sessiond` and
+/// `stopsrc`, each with the program class, each when its recipe is staged,
+/// and nothing else; the SEND each carries reaches the source's stop labels,
+/// and the fixture's own `:deny` SEND does not.
 fn check_stop_sources(stop_cap: u64, phase: &str)
 {
     use ipc::stop_labels::{
@@ -376,30 +380,33 @@ fn check_stop_sources(stop_cap: u64, phase: &str)
     };
     let sources = list_stop_sources(stop_cap, phase);
     let stopsrc = recipe_staged(STOPSRC_RECIPE, phase);
-    let shown: Vec<(&str, u64)> = sources.iter().map(|(n, c, _)| (n.as_str(), *c)).collect();
-    let want: &[(&str, u64)] = if stopsrc
+    let mut shown: Vec<(&str, u64)> = sources.iter().map(|(n, c, _)| (n.as_str(), *c)).collect();
+    shown.sort_unstable();
+    let mut want: Vec<(&str, u64)> = Vec::with_capacity(2);
+    if recipe_staged(SESSIOND_RECIPE, phase)
     {
-        &[("stopsrc", CLASS_PROGRAM)]
+        want.push(("sessiond", CLASS_PROGRAM));
     }
-    else
+    if stopsrc
     {
-        &[]
-    };
+        want.push(("stopsrc", CLASS_PROGRAM));
+    }
     assert_eq!(
         shown, want,
-        "{phase}: LIST_STOP_SOURCES must list the staged stop_source fixtures alone"
+        "{phase}: LIST_STOP_SOURCES must list sessiond and the staged stop_source fixtures alone"
     );
-    for &(_, _, send) in &sources
+    for (name, _, send) in &sources
     {
+        let send = *send;
         let label = call_label(send, LIST_CANDIDATES, 0, phase);
         assert_eq!(
             label, SUCCESS,
-            "{phase}: LIST_CANDIDATES through stopsrc's stop SEND replied {label:#x}"
+            "{phase}: LIST_CANDIDATES through {name}'s stop SEND replied {label:#x}"
         );
         let label = stop_candidate(send, u64::MAX);
         assert_eq!(
             label, NO_CANDIDATE,
-            "{phase}: STOP_CANDIDATE of a key stopsrc never gave replied {label:#x}"
+            "{phase}: STOP_CANDIDATE of a key {name} never gave replied {label:#x}"
         );
         let _ = syscall::cap_delete(send);
     }
@@ -437,7 +444,7 @@ fn check_source_contained(authority: u64, phase: &str)
     use ipc::stopsrc_labels as src;
     assert_ne!(
         authority, 0,
-        "{phase}: no debug-authority cap in slot 15 (debug_authority = yes)"
+        "{phase}: no debug-authority cap in slot 18 (debug_authority = yes)"
     );
     let fixture = provided_endpoint(src::NAME, phase);
     let before = badges_named(authority, STOPSRC_PATH);
@@ -514,7 +521,7 @@ fn svcmgr_stop_service_phase(caps: &Caps)
     let stop_cap = caps.stop_authority;
     assert_ne!(
         stop_cap, 0,
-        "{phase}: no stop-authority cap in slot 16 (stop_authority = yes)"
+        "{phase}: no stop-authority cap in slot 19 (stop_authority = yes)"
     );
 
     for (label, want, what) in [
@@ -774,6 +781,8 @@ const SEED_ONLY_NAMES: &[&[u8]] = &[
     b"devmgr.class.serial-deny",
     b"devmgr.class.input-deny",
     b"devmgr.class.framebuffer-deny",
+    b"devmgr.class.hwrng",
+    b"devmgr.class.hwrng-deny",
 ];
 
 /// The public names `svcmgr_seed_only_names_refused_phase` checks
@@ -786,7 +795,7 @@ const PUBLIC_NAMES: &[&[u8]] = &[
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show fifteen of the refused names are
+/// cap. svctest's own non-zero seeds show seventeen of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.acpi`,
 /// which only acpid seeds, are published by the same loop as
 /// `devmgr.registry` and `devmgr.bind`, `acpid.power`,
@@ -815,6 +824,8 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.input_deny_class, "devmgr.class.input-deny"),
         (caps.framebuffer_deny_class, "devmgr.class.framebuffer-deny"),
         (caps.vfsd_swap, "vfsd.swap"),
+        (caps.hwrng_class, "devmgr.class.hwrng"),
+        (caps.hwrng_deny_class, "devmgr.class.hwrng-deny"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");

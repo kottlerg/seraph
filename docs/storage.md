@@ -146,9 +146,13 @@ or on-disk UUID. The model is:
   at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
   driver devmgr withdrew when it died), until another reply is not
   `SUCCESS`, holds the whole-disk cap of every block driver devmgr
-  serves, and parses each disk's GPT. A role lookup, at the root
-  self-mount, the auto-mounts, a runtime `MOUNT`, and the first
-  `GET_SWAP_PARTITION`, considers the partitions of every held disk; a
+  serves, and parses each disk's GPT. Before a runtime `MOUNT` and the
+  first `GET_SWAP_PARTITION` look their role up, vfsd queries again from
+  the first ordinal not yet queried and holds each disk devmgr served
+  since, a disk added or inserted again after startup among them. A role
+  lookup, at the root self-mount, the auto-mounts, a runtime `MOUNT`,
+  and the first `GET_SWAP_PARTITION`, so considers the partitions of
+  every disk devmgr serves, under the priority and tie rules below; a
   disk whose GPT cannot be read or validated contributes none. The
   partition's `REGISTER_PARTITION` goes
   to the block driver of the disk that holds it.
@@ -282,8 +286,8 @@ The supported failure-handling primitives are:
   is still served. A disk devmgr withdrew is marked removed, its
   partitions leave every role lookup, and each mount on it is torn
   down as a forced unmount, the driver idle or not. A disk inserted
-  again is a new device: no mount follows on its own, and a `MOUNT`
-  whose role no held disk carries finds it by asking devmgr again.
+  again is a new device: no mount follows on its own, and the next
+  role lookup finds it by asking devmgr first.
 - **Loss of the root.** The death of the root filesystem's driver, or
   the loss of its disk, makes vfsd log `FATAL: root filesystem lost`
   and exit; vfsd is critical and never restarted, so svcmgr shuts the

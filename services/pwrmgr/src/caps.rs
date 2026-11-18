@@ -17,6 +17,10 @@
 //! * `caps[2]` = `POWER_AUTHORITY`-badged SEND on acpid's service endpoint
 //!   (the `acpid.power` seed), through which the x86-64 arch module reaches
 //!   the ACPI sleep and reset registers and waits for the power button.
+//! * `caps[3]` = a receive-only derivation of the event queue svcmgr's own
+//!   death posts to, which svcmgr serves the shutdown actuator after its
+//!   seeds; an entry on it is svcmgr's death (docs/supervision.md § Observing
+//!   svcmgr).
 //!
 //! pwrmgr owns no hardware caps directly. The target's arch module
 //! ([`crate::arch::current`]) keeps the cap it uses and deletes the other.
@@ -32,6 +36,9 @@ pub struct Bootstrap
     pub devmgr_shutdown: u64,
     /// The `acpid.power` seed. Zero if absent.
     pub acpid_power: u64,
+    /// The receive-only derivation of svcmgr's own death queue. Zero if
+    /// absent.
+    pub svcmgr_death: u64,
 }
 
 /// Drain the provider bootstrap rounds from `creator_endpoint`.
@@ -45,12 +52,13 @@ pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Bootst
     // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
     // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`.
-    let [service_ep, devmgr_shutdown, acpid_power] =
-        unsafe { ipc::bootstrap::request_slots::<3>(creator, ipc_buf) }.ok()?;
+    let [service_ep, devmgr_shutdown, acpid_power, svcmgr_death] =
+        unsafe { ipc::bootstrap::request_slots::<4>(creator, ipc_buf) }.ok()?;
     Some(Bootstrap {
         service_ep,
         devmgr_shutdown,
         acpid_power,
+        svcmgr_death,
     })
 }
 

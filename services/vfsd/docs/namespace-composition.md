@@ -86,6 +86,7 @@ the mount's driver and to tear it down:
 | `death_queue` | `RECV` on the driver's death queue (below) |
 | `partition` | The partition cap virtio-blk returned on `REGISTER_PARTITION`; the driver holds a `cap_derive` (`SEND_GRANT`) of it, so `cap_revoke_all` on this cap cuts the driver off the partition |
 | `disk` | The index, in vfsd's disk list, of the disk that holds the partition |
+| `first_lba` | The partition's first LBA on that disk; with `disk`, it names the partition, so a `MOUNT` of a partition a record holds, mounted or being removed, is refused before its driver is spawned and one driver serves a partition |
 
 The death queue is an event queue of capacity 2 with 1 death-observer
 node, the main thread's binding. vfsd binds the driver's main thread to
@@ -185,9 +186,9 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   block request ([docs/storage.md](../../../docs/storage.md#failure-and-revocation-invariants)
   § Failure and Revocation Invariants).
 - **A change of the class.** devmgr signals the watch when it serves a block driver and when it
-  withdraws one. The watch thread probes every held disk. A `MOUNT` that discovers new disks
-  probes each once it is held, since devmgr can withdraw one after discovery asked about it and
-  before the watch thread can see it held.
+  withdraws one. The watch thread probes every held disk. A discovery of new disks (before a
+  runtime role lookup) probes each once it is held, since devmgr can withdraw one after discovery
+  asked about it and before the watch thread can see it held.
 - **The probe** asks devmgr about the disk's instance ordinal (`QUERY_DEVICE` on the `block`
   class); `WITHDRAWN` means the disk is gone for good, since devmgr never serves an ordinal
   again. The probe does not call the disk's own cap: devmgr takes a removed device's driver out of
@@ -212,9 +213,9 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   ([vfsd.svc](../../../rootfs/config/svcmgr/services/vfsd.svc)), so svcmgr shuts the system down
   ([docs/supervision.md](../../../docs/supervision.md)).
 
-A disk inserted again is a new driver at a new ordinal. vfsd mounts none of its partitions on its
-own: a `MOUNT` whose role is found on no held disk queries devmgr for the disks served since the
-last query and looks again
+A disk added or inserted again is a new driver at a new ordinal. vfsd mounts none of its
+partitions on its own: each runtime role lookup first queries devmgr for the disks served since
+the last query and holds them, so a `MOUNT` resolves its role across every disk devmgr serves
 ([`vfs-ipc-interface.md`](vfs-ipc-interface.md#label-10-mount) § Label 10).
 
 ---
@@ -352,11 +353,18 @@ vfsd holds two un-badged endpoints:
   dispatcher serves, and the `FS_MOUNT` probe) and what an `UNMOUNT`
   handler blocks on (the driver's `FS_UNMOUNT` and its death, each
   within a bound, procmgr's `DESTROY_PROCESS`, and the root-mount walk
-  for a fall-through cap) never calls the service endpoint, and a
-  `GET_SWAP_PARTITION` waits at most for the swap lock, which its
-  holder keeps across one `REGISTER_PARTITION` call to the block
-  driver, which never calls vfsd. A request past the last free handler
-  waits in the endpoint queue.
+  for a fall-through cap) never calls the service endpoint, and neither
+  does the discovery of new disks a `MOUNT` and the first
+  `GET_SWAP_PARTITION` run before their role lookup: devmgr's
+  `QUERY_DEVICE`, the GPT reads of each new disk on its block driver, a
+  scratch page from memmgr when a failed read lost the one held, and
+  the forced unmount of a mount on a new disk found withdrawn, which
+  blocks as an `UNMOUNT` does. A `GET_SWAP_PARTITION` also waits for
+  the discovery lock, held across one discovery, and for the swap lock,
+  which its holder keeps across the first request's discovery and one
+  `REGISTER_PARTITION` call to the block driver. Neither devmgr, nor
+  memmgr, nor a block driver calls vfsd. A request past the last free
+  handler waits in the endpoint queue.
 - **Namespace endpoint** — `NS_LOOKUP`, `NS_STAT`, `NS_READDIR`.
   Single dispatcher thread; the `NamespaceBackend` methods are
   in-memory walks of one node's children or ancestors, and the only

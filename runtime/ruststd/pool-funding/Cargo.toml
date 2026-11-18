@@ -12,7 +12,8 @@ publish.workspace = true
 # policy of the overlay (`runtime/ruststd/src/sys/alloc/seraph.rs`): how a
 # top-up of an address space's page-table pool or a `CSpace`'s slot-page pool
 # decides its donations and its outcome, and how a map into the process's own
-# address space retries after an exhausted pool. The pool reads, the donations
+# address space retries after an exhausted pool, and how the threads of a
+# process share a pool's low-water hold. The pool reads, the donations
 # and the map syscalls stay with the caller, so the only dep is the build-std
 # core facade, activated under the `rustc-dep-of-std` feature.
 [lib]

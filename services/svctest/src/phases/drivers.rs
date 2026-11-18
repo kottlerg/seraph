@@ -3,32 +3,38 @@
 
 // services/svctest/src/phases/drivers.rs
 
-//! Device-driver verb-bit gates: the serial, virtio-input, and framebuffer
-//! drivers refuse a label whose verb bit the caller's badge lacks.
+//! Device-driver verb-bit gates: the serial, virtio-input, framebuffer, and
+//! virtio-rng drivers refuse a label whose verb bit the caller's badge lacks.
 //!
 //! devmgr mints a client SEND on these endpoints with the verb bits of the
 //! class SEND it is asked through, and a holder cannot strip a bit from a
 //! badged cap, so the phase takes its no-authority SENDs through the
-//! test-only `devmgr.class.serial-deny`, `input-deny`, and
-//! `framebuffer-deny` class SENDs, whose verb mask holds only bit 58, which
+//! test-only `devmgr.class.serial-deny`, `input-deny`, `framebuffer-deny`,
+//! and `hwrng-deny` class SENDs, whose verb mask holds only bit 58, which
 //! none of these drivers checks. Every gated label sent on such a SEND must
 //! reply the driver's `UNAUTHORIZED` at once, without blocking for input or
-//! consuming a byte. The serial and input drivers are part of every boot's
-//! device set; the framebuffer case skips on a headless boot (CI's), where
+//! consuming a byte. The serial, input, and entropy drivers are part of every
+//! boot's device set; the framebuffer case skips on a headless boot (CI's), where
 //! devmgr runs no framebuffer driver. The input case also skips when the
 //! `terminal` recipe is staged: the input driver serves one request at a
 //! time, and the terminal keeps a blocking `INPUT_READ_EVENTS` pending, so
 //! svctest's call would wait behind it for a keypress.
 //!
-//! The stray-cap flood phase checks the serial and input drivers' cap
-//! hygiene: a cap a request carries that the driver does not keep is
+//! The stray-cap flood phase checks the serial, input, and entropy drivers'
+//! cap hygiene: a cap a request carries that the driver does not keep is
 //! deleted, not left in the driver's `CSpace`, and an accepted serial RX
 //! registration deletes the notification it replaces. It takes granted SENDs
-//! through the `devmgr.class.serial` and `devmgr.class.input` class SENDs.
-//! Under a staged terminal its input case skips, as the deny phase's does,
-//! and so do its serial cases that read the UART or rebind its interrupt,
-//! which would take the terminal's input.
+//! through the `devmgr.class.serial`, `devmgr.class.input`, and
+//! `devmgr.class.hwrng` class SENDs. Under a staged terminal its input case
+//! skips, as the deny phase's does, and so do its serial cases that read the
+//! UART or rebind its interrupt, which would take the terminal's input.
+//!
+//! The hwrng read phase reads the entropy driver through a granted SEND on
+//! the `devmgr.class.hwrng` class SEND: a `READ` of the most bytes one reply
+//! carries answers with at least one byte and no more than asked, two such
+//! reads differ, and a `READ` of no bytes answers with none.
 
+use hwrng_protocol::{MAX_READ_BYTES, errors as hwrng_errors};
 use syscall_abi::MSG_CAP_SLOTS_MAX;
 
 use crate::bootstrap::Caps;
@@ -45,12 +51,16 @@ pub fn phases() -> &'static [Phase]
             name: "drivers_stray_cap_flood",
             run: stray_cap_flood_phase,
         },
+        Phase {
+            name: "drivers_hwrng_read",
+            run: hwrng_read_phase,
+        },
     ]
 }
 
 /// A test wait bound, in milliseconds: how long svctest waits on a
-/// `WATCH_CLASS` watch for devmgr to serve the input or the `test-dma`
-/// driver (`ipc::await_device`) before it fails. Both are spawned from disk
+/// `WATCH_CLASS` watch for devmgr to serve the input, the entropy, or the
+/// `test-dma` driver (`ipc::await_device`) before it fails. Each is spawned from disk
 /// by the drivers-directory pass `SET_DRIVERS_DIR` posts, and a query devmgr
 /// receives after that waits for the pass's settle, so the watch only
 /// covers a query that reaches devmgr first. devmgr spawns the serial and
@@ -86,6 +96,21 @@ fn assert_denied(cap: u64, msg: &ipc::IpcMessage, unauthorized: u64, what: &str)
     assert!(reply.caps().is_empty(), "{what} deny must carry no cap");
 }
 
+/// The entropy driver's deny case, through the `hwrng-deny` class SEND
+/// `deny_class`: `READ` replies `UNAUTHORIZED`. A function of its own, so its
+/// message does not add to the deny phase's frame.
+fn hwrng_denied(deny_class: u64)
+{
+    let hwrng = granted_send(deny_class, "hwrng-deny", Some(DEVICE_WAIT_MS))
+        .expect("drivers deny: no hwrng driver");
+    // A granted READ would post a buffer to the device; the deny must not.
+    let read = ipc::IpcMessage::builder(hwrng_protocol::READ)
+        .word(0, 8)
+        .build();
+    assert_denied(hwrng, &read, hwrng_errors::UNAUTHORIZED, "hwrng READ");
+    let _ = syscall::cap_delete(hwrng);
+}
+
 fn verb_bit_deny_phase(caps: &Caps)
 {
     use crate::phases::devmgr::TEST_DEVICES_HINT;
@@ -94,6 +119,7 @@ fn verb_bit_deny_phase(caps: &Caps)
         (caps.serial_deny_class, "devmgr.class.serial-deny"),
         (caps.input_deny_class, "devmgr.class.input-deny"),
         (caps.framebuffer_deny_class, "devmgr.class.framebuffer-deny"),
+        (caps.hwrng_deny_class, "devmgr.class.hwrng-deny"),
     ]
     {
         assert!(
@@ -101,6 +127,8 @@ fn verb_bit_deny_phase(caps: &Caps)
             "drivers deny: no {shown} cap seeded: {TEST_DEVICES_HINT}"
         );
     }
+
+    hwrng_denied(caps.hwrng_deny_class);
 
     let serial = granted_send(caps.serial_deny_class, "serial-deny", None)
         .expect("drivers deny: no serial driver");
@@ -182,7 +210,7 @@ struct StrayCapCase
     what: &'static str,
 }
 
-/// A label neither driver serves.
+/// A label none of the flooded drivers serves.
 const UNKNOWN_LABEL: u64 = 0x7FFF;
 
 /// The serial driver's cases. A granted label keeps no cap but the
@@ -227,6 +255,29 @@ const SERIAL_CASES: [StrayCapCase; 5] = [
         expected: ipc::serial_errors::SUCCESS,
         uart: true,
         what: "SERIAL_REGISTER_RX_NOTIFY accepted",
+    },
+];
+
+/// The fewest bytes each of the hwrng read phase's two reads must answer:
+/// enough that two reads of a working source agreeing on them is negligible.
+const HWRNG_COMPARE_BYTES: usize = 16;
+
+/// The entropy driver's cases: no hwrng label keeps a cap. A `READ` with no
+/// data word asks for no bytes, so it posts nothing to the device.
+const HWRNG_CASES: [StrayCapCase; 2] = [
+    StrayCapCase {
+        label: UNKNOWN_LABEL,
+        first: FirstCap::Stray,
+        expected: hwrng_errors::UNKNOWN_OPCODE,
+        uart: false,
+        what: "hwrng unknown label",
+    },
+    StrayCapCase {
+        label: hwrng_protocol::READ,
+        first: FirstCap::Stray,
+        expected: hwrng_errors::SUCCESS,
+        uart: false,
+        what: "hwrng READ(0)",
     },
 ];
 
@@ -297,7 +348,7 @@ fn first_cap(driver: u64, first: FirstCap) -> u64
 /// (docs/ipc-design.md § Receive-Failure Policy). devmgr then withdraws it
 /// and revokes its service endpoint, so the call in flight returns an error
 /// and the `ipc_call` check below fails the phase (docs/device-management.md
-/// § Relationship to Other Services): the input case's outcome. The serial
+/// § Relationship to Other Services): the input and hwrng cases' outcome. The serial
 /// driver also carries logd's writes, which stall on it before then, and
 /// devmgr logs the withdrawal through logd, so the boot stalls instead, and
 /// its run timeout classifies it as a `HANG`.
@@ -346,10 +397,19 @@ fn flood(driver: u64, case: &StrayCapCase)
 fn stray_cap_flood_phase(caps: &Caps)
 {
     assert!(
-        caps.serial_class != 0 && caps.input_class != 0,
-        "drivers stray caps: no devmgr.class.serial or devmgr.class.input cap seeded"
+        caps.serial_class != 0 && caps.input_class != 0 && caps.hwrng_class != 0,
+        "drivers stray caps: no devmgr.class.serial, devmgr.class.input, or \
+         devmgr.class.hwrng cap seeded"
     );
     let staged = terminal_staged();
+
+    let hwrng = granted_send(caps.hwrng_class, "hwrng", Some(DEVICE_WAIT_MS))
+        .expect("drivers stray caps: no hwrng driver");
+    for case in &HWRNG_CASES
+    {
+        flood(hwrng, case);
+    }
+    let _ = syscall::cap_delete(hwrng);
 
     let serial = granted_send(caps.serial_class, "serial", None)
         .expect("drivers stray caps: no serial driver");
@@ -378,4 +438,72 @@ fn stray_cap_flood_phase(caps: &Caps)
         .expect("drivers stray caps: no input driver");
     flood(input, &INPUT_CASE);
     let _ = syscall::cap_delete(input);
+}
+
+/// One `READ` of `out.len()` bytes on the entropy driver's SEND `driver`:
+/// the bytes it answered with, into the front of `out`, and their count. A
+/// `NOT_READY` reply, which a device that produced nothing within the
+/// driver's wait bound earns, fails the phase: QEMU's device answers at once.
+fn hwrng_read(driver: u64, out: &mut [u8]) -> usize
+{
+    let asked = out.len();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let msg = ipc::IpcMessage::builder(hwrng_protocol::READ)
+        .word(0, asked as u64)
+        .build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(driver, &msg, ipc_buf) }
+        .unwrap_or_else(|_| panic!("hwrng READ({asked}): ipc_call failed"));
+    assert_eq!(
+        reply.label,
+        hwrng_errors::SUCCESS,
+        "hwrng READ({asked}) must succeed (got {:#x})",
+        reply.label
+    );
+    assert!(
+        reply.caps().is_empty(),
+        "hwrng READ({asked}) reply carried a cap"
+    );
+    let n = hwrng_protocol::decode_reply(reply.words(), out)
+        .unwrap_or_else(|| panic!("hwrng READ({asked}): reply does not decode"));
+    assert!(n <= asked, "hwrng READ({asked}) answered {n} bytes");
+    n
+}
+
+fn hwrng_read_phase(caps: &Caps)
+{
+    assert!(
+        caps.hwrng_class != 0,
+        "drivers hwrng read: no devmgr.class.hwrng cap seeded"
+    );
+    let driver = granted_send(caps.hwrng_class, "hwrng", Some(DEVICE_WAIT_MS))
+        .expect("drivers hwrng read: no hwrng driver");
+
+    let mut first = [0u8; MAX_READ_BYTES];
+    let n1 = hwrng_read(driver, &mut first);
+    let mut second = [0u8; MAX_READ_BYTES];
+    let n2 = hwrng_read(driver, &mut second);
+    // The contract allows a short answer; QEMU's device fills each buffer it
+    // is given, so a read this short is a driver that lost the device's bytes,
+    // and the comparison below needs enough bytes to mean anything.
+    let shorter = n1.min(n2);
+    assert!(
+        shorter >= HWRNG_COMPARE_BYTES,
+        "hwrng READ({MAX_READ_BYTES}) answered {n1} and {n2} bytes"
+    );
+    // Two reads of a working source agree on HWRNG_COMPARE_BYTES bytes with
+    // probability 2^-128; a driver handing out a stale or zeroed buffer
+    // repeats itself.
+    assert_ne!(
+        first.get(..shorter),
+        second.get(..shorter),
+        "two hwrng READs answered the same {shorter} bytes"
+    );
+    assert_eq!(
+        hwrng_read(driver, &mut []),
+        0,
+        "hwrng READ(0) must answer no bytes"
+    );
+    let _ = syscall::cap_delete(driver);
+    std::os::seraph::log!("drivers hwrng read phase passed ({n1} and {n2} bytes)");
 }

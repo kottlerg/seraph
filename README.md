@@ -68,9 +68,9 @@ cargo xtask clean [--all]                    # remove sysroot/ and disk images (
 Testing spans host-side `cargo xtask test`, in-tree QEMU harnesses
 (`ktest`, `svctest`, `usertest`), host-driven boot tests (`test-kaslr`,
 `test-map-redo`, `test-vmgenid`, `test-terminal`, `test-wedge`, `test-reboot`, `test-signing`,
-`test-cet`, `test-debug-port`, `test-hotplug`, `test-gdb`), and `test-crash-report`, a host-side
-check of a boot's serial log; the default boot is interactive and runs no harness.
-See [docs/testing.md](docs/testing.md) for the full model.
+`test-cet`, `test-debug-port`, `test-hotplug`, `test-gdb`, `test-core-death`), and
+`test-crash-report`, a host-side check of a boot's serial log; the default boot is interactive and
+runs no harness. See [docs/testing.md](docs/testing.md) for the full model.
 
 ---
 
@@ -89,7 +89,7 @@ Overall project design documents live in [`docs/`](docs/):
 - [Supervision](docs/supervision.md) — supervision hierarchy, core set and system death,
   restart shapes, late-launch rule
 - [Session Supervision](docs/session-supervision.md) — sessions as supervision units, sessiond
-  and its interfaces (design intent), stop sources and the order oomd stops in
+  and its interfaces, stop sources and the order oomd stops in
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
 - [Fault Handling](docs/fault-handling.md) — userspace fault-handler protocol (pager):

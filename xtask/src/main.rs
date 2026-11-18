@@ -134,6 +134,7 @@ fn main()
         CliCommand::TestSigning(args) => commands::test_signing::run(&ctx, args),
         CliCommand::TestReboot(args) => commands::test_reboot::run(&ctx, args),
         CliCommand::TestPowerbutton(args) => commands::test_powerbutton::run(&ctx, args),
+        CliCommand::TestCoreDeath(args) => commands::test_core_death::run(&ctx, args),
         CliCommand::TestHotplug(args) => commands::test_hotplug::run(&ctx, args),
         CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
         CliCommand::TestWedge(args) => commands::test_wedge::run(&ctx, args),

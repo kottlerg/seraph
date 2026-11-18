@@ -33,9 +33,11 @@ ruststd/
 │   └── src/                    #   growth policy and thread-reaper slot registry; a
 │                               #   rustc-dep-of-std dep of overlaid std (not re-exported),
 │                               #   and the policy shared/death-set follows for services
-├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement rule
-│   └── src/lib.rs              #   of the byte heap (where a request lands in a free block,
-│                               #   what stays free); a rustc-dep-of-std dep of overlaid std
+├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement and
+│   └── src/lib.rs              #   release rules of the byte heap (where a request lands in a
+│                               #   free block, what stays free, which chunks of the committed
+│                               #   growth a free trims or discards); a rustc-dep-of-std dep
+│                               #   of overlaid std
 ├── pool-funding/               # `ruststd-pool-funding` crate: pure, host-tested funding
 │   └── src/lib.rs              #   policy of the page-table and `CSpace` growth pools (a
 │                               #   top-up's donations and outcome, the map retry after an
@@ -124,7 +126,11 @@ process the grow path registers one committed growth region directly above the h
 (`REGISTER_REGION` with `REGION_COMMIT`) on its first grow and extends it (`EXTEND_REGION`) on
 every later one, in 16-page multiples; memmgr charges each in full when it accepts it, so a
 refused grow is an allocation error, never a fault, and the heap holds no Memory caps
-([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Commit). A
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Commit).
+`dealloc` gives the region's unused pages back as the `ruststd-heap-fit` crate's `Growth` plans
+it: a free that leaves the heap's top free cuts the region (`SHRINK_REGION`), and a large free
+inside it discards its whole free chunks (`DISCARD_RANGE`), whose later touch memmgr backs
+zero-filled under the region's commitment; the floor is never given back. A
 process with no pager requests Memory caps from memmgr via
 `memmgr_labels::REQUEST_MEMORY_CAPS` on `ProcessInfo.memmgr_endpoint_cap`, mapping them at a
 contiguous VA above the heap's high-water mark with a single multi-page `mem_map` per returned
@@ -325,18 +331,55 @@ std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n o
   decides, failing with the refillable `OutOfMemory`.
 
 A process calls it before a known burst of capability acquisitions; fatfs funds its page cache
-this way. A long-lived service calls it when the headroom drops below a low-water mark, as
-procmgr does ([services/procmgr/README.md](../../services/procmgr/README.md) § CSpace
+this way.
+
+A long-lived service whose capabilities grow with its load (a few per client, device, or child it
+serves) holds its headroom above a low-water mark instead, through a `static`
+`std::os::seraph::CSpaceHeadroom`:
+
+```rust
+static HEADROOM: CSpaceHeadroom = CSpaceHeadroom::new(LOW_WATER, TOPUP_SLOTS);
+
+HEADROOM.hold(self_cspace);           // before each operation that allocates slots
+if HEADROOM.failure_to_report() {     // once per run of refused top-ups
+    log!(warn: "...");
+}
+```
+
+- **`hold`** tops the pool up, through `fund_cspace_slot_budget` for `TOPUP_SLOTS`, when the
+  headroom is below `LOW_WATER` plus a page's slots or the growth budget below a page
+  (`syscall_abi::cspace_topup_pages`). One thread at a time reads and funds the pool; a thread
+  that finds another doing so goes on at once, so the mark is sized to cover every allocation
+  the process's threads make while one tops up. A refused top-up is retried at the next hold.
+  The body arena takes its pages from the same growth budget and lowers the capacity by a page's
+  slots for each, so the page beyond the mark covers the first arena page an operation takes,
+  and a service whose operations take more (many splits or range-capability copies) counts
+  those pages in its mark, a page's slots each.
+- **`failure_to_report`** answers `true` once per run of refused top-ups, to the first caller
+  that asks, whichever thread's top-up was refused; a hold that finds the pool covered or tops it
+  up ends the run. `hold` logs nothing, since a thread serving logd, or a driver logd writes
+  through, must not log while logd waits on its reply, so the service reports from a thread that
+  may log.
+
+The one-at-a-time and failure-run state is the `ruststd-pool-funding` crate's `LowWaterHold`,
+host-tested there. procmgr ([services/procmgr/README.md](../../services/procmgr/README.md)
+§ CSpace headroom) and devmgr
+([services/devmgr/docs/responsibilities.md](../../services/devmgr/docs/responsibilities.md)
+§ CSpace headroom) hold their `CSpace`s this way, each with its own marks. memmgr holds its own
+with the same test but funds it from its own pool, since a top-up through
+`fund_cspace_slot_budget` would ask memmgr itself
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § CSpace
 headroom).
 
 `std::thread::spawn` holds the headroom for the threads it creates itself. Before each spawn,
 when the headroom is below `SPAWN_CSPACE_LOW_WATER` (32 slots, about a spawn's worth of caps
 with margin) plus a page's slots, or the growth budget below a page
 (`syscall_abi::cspace_topup_pages`), it calls `fund_cspace_slot_budget` for
-`SPAWN_CSPACE_TOPUP_SLOTS` (128), so a process's live thread count is bound by the RAM memmgr
-grants rather than by the `CSpace` its creator seeded, and a process that spawns no thread funds
-nothing. A failed top-up does not fail the spawn, which then fails only if a capability
-allocation it makes finds the headroom spent.
+`SPAWN_CSPACE_TOPUP_SLOTS` (128). Each spawn makes the test itself, not one thread at a time as
+`CSpaceHeadroom` does, since the mark covers one spawn, not a burst of them. So a process's live
+thread count is bound by the RAM memmgr grants rather than by the `CSpace` its creator seeded,
+and a process that spawns no thread funds nothing. A failed top-up does not fail the spawn, which
+then fails only if a capability allocation it makes finds the headroom spent.
 
 ### Bootstrap-cross-boundary VAs
 
@@ -464,15 +507,36 @@ passes it to the thread syscalls that inspect and modify the child
 
 ---
 
+## Session streams
+
+`std::os::seraph::process::SessionStdio` makes the standard streams of a session's leader for an
+interface that opens the session through sessiond
+([services/sessiond/docs/ipc-interface.md](../../services/sessiond/docs/ipc-interface.md)): three
+pipes, the leader's stdin, stdout and stderr, and an event queue procmgr posts the leader's end
+to, its death relay. `relay` gives the POST cap `OPEN_SESSION` carries, `handoff` each stream's
+ring memory cap and notifications, which `SESSION_STDIO` carries, and `ring_capacity` the size
+it states. The interface keeps its ends, a `ChildStdin`, a `ChildStdout` and a `ChildStderr`,
+through `take_stdin`, `take_stdout` and `take_stderr`.
+
+Each ring page is a grant of the interface's, which no process it created maps, so it is returned
+to memmgr once both the interface's end is dropped and no leader can map it: after `wait` has
+returned, since procmgr posts the relay only once it has torn the leader down, or after
+`refused`, which an interface calls on a refusal after which no leader exists. `wait` returns
+the leader's `ExitStatus` from the relay's entry, its exit reason, fault or `EXIT_KILLED`, then
+marks each end's peer gone, so a read drains to EOF and a write fails with `BrokenPipe`. Dropped
+with neither, the grants stay charged to the interface until it exits.
+
+---
+
 ## argv and env
 
 `Command::spawn` packs the child's argv and env into a Memory cap the spawner funds and
 `CREATE_FROM_FILE` transfers with `CREATE_ARGV_ENV`
 ([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#label-1-create_process)
 § Label 1, **argv and env**). `std::os::seraph::process::ArgvEnvCap` builds that cap and its
-header for any sender of a raw create request (svcmgr's launch and restart, svctest, and devmgr's
-and vfsd's driver spawns, which pass the child the spawner's own level as its one env entry,
-`std::os::seraph::log::inherited_level_entry`, `None` at info). After the
+header for any sender of a raw create request (svcmgr's launch and restart, sessiond's leaders,
+svctest, and devmgr's and vfsd's driver spawns, which pass the child the spawner's own level as
+its one env entry, `std::os::seraph::log::inherited_level_entry`, `None` at info). After the
 call the sender passes the reply label to `ArgvEnvCap::settle`, which withholds the run (it stays
 charged to the sender) on `ARGV_ENV_STILL_MAPPED`, when procmgr may still map its pages, and
 otherwise returns it to memmgr. `spawn` refuses with `ArgumentListTooLong` only when argv

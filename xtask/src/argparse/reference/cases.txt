@@ -141,15 +141,15 @@ ok build debug=["kernel","procmgr","boot"]
 
 ["build","--debug","kernel,,procmgr"]
 ValueValidation
-error: invalid value '' for '--debug <DEBUG>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '' for '--debug <DEBUG>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug",""]
 ValueValidation
-error: invalid value '' for '--debug <DEBUG>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '' for '--debug <DEBUG>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug","kernel,"]
 ValueValidation
-error: invalid value '' for '--debug <DEBUG>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '' for '--debug <DEBUG>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["run-parallel","--parallel","1","--runs","1","--fail","$.^"]
 ok run-parallel parallel=["1"] runs=["1"] fail=["$.^"]
@@ -342,7 +342,7 @@ error: a value is required for '--component <COMPONENT>' but none was supplied
 
 ["build","--component","7"]
 ValueValidation
-error: invalid value '7' for '--component <COMPONENT>': no component named "7"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '7' for '--component <COMPONENT>': no component named "7"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--component","-1"]
 UnknownArgument
@@ -353,7 +353,7 @@ ok build component=["kernel"]
 
 ["build","--component",""]
 ValueValidation
-error: invalid value '' for '--component <COMPONENT>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '' for '--component <COMPONENT>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--component","--"]
 InvalidValue
@@ -361,7 +361,7 @@ error: a value is required for '--component <COMPONENT>' but none was supplied
 
 ["build","--component=--"]
 ValueValidation
-error: invalid value '--' for '--component <COMPONENT>': no component named "--"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '--' for '--component <COMPONENT>': no component named "--"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--component","--x"]
 UnknownArgument
@@ -369,11 +369,11 @@ error: unexpected argument '--x' found
 
 ["build","--component=--x"]
 ValueValidation
-error: invalid value '--x' for '--component <COMPONENT>': no component named "--x"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '--x' for '--component <COMPONENT>': no component named "--x"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--component","7","--component","7"]
 ValueValidation
-error: invalid value '7' for '--component <COMPONENT>': no component named "7"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '7' for '--component <COMPONENT>': no component named "7"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--component","kernel","--component","kernel"]
 ArgumentConflict
@@ -385,7 +385,7 @@ error: a value is required for '--debug <DEBUG>' but none was supplied
 
 ["build","--debug","7"]
 ValueValidation
-error: invalid value '7' for '--debug <DEBUG>': no component named "7"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '7' for '--debug <DEBUG>': no component named "7"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug","-1"]
 UnknownArgument
@@ -399,11 +399,11 @@ ok build debug=["kernel","procmgr"]
 
 ["build","--debug","a,b"]
 ValueValidation
-error: invalid value 'a' for '--debug <DEBUG>': no component named "a"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value 'a' for '--debug <DEBUG>': no component named "a"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug",","]
 ValueValidation
-error: invalid value '' for '--debug <DEBUG>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '' for '--debug <DEBUG>': no component named ""; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug","--"]
 InvalidValue
@@ -411,7 +411,7 @@ error: a value is required for '--debug <DEBUG>' but none was supplied
 
 ["build","--debug=--"]
 ValueValidation
-error: invalid value '--' for '--debug <DEBUG>': no component named "--"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '--' for '--debug <DEBUG>': no component named "--"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug","--x"]
 UnknownArgument
@@ -419,19 +419,19 @@ error: unexpected argument '--x' found
 
 ["build","--debug=--x"]
 ValueValidation
-error: invalid value '--x' for '--debug <DEBUG>': no component named "--x"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '--x' for '--debug <DEBUG>': no component named "--x"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug","debug,release"]
 ValueValidation
-error: invalid value 'debug' for '--debug <DEBUG>': no component named "debug"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value 'debug' for '--debug <DEBUG>': no component named "debug"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug","x86_64,riscv64"]
 ValueValidation
-error: invalid value 'x86_64' for '--debug <DEBUG>': no component named "x86_64"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value 'x86_64' for '--debug <DEBUG>': no component named "x86_64"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug","7","--debug","7"]
 ValueValidation
-error: invalid value '7' for '--debug <DEBUG>': no component named "7"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
+error: invalid value '7' for '--debug <DEBUG>': no component named "7"; expected boot, all, or one of: kernel, init, ktest, procmgr, memmgr, devmgr, vfsd, virtio-blk, virtio-input, virtio-rng, virtio-console, serial, framebuffer, cmos-rtc, goldfish-rtc, test-fault, test-dma, iommu-vtd, iommu-riscv, fatfs, crasher, memhog, stopsrc, gdbstub, debug-echo, hotplug-check, crashd, oomd, sessiond, svcmgr, pwrmgr, acpid, logd, timed, svctest, usertest, hello, hello-tester, fb-charset, terminal, shell, shell-tester, fsbench, stackoverflow, relrofault, capexhaust, pipefault, demandpaged, stdiotest, stdiotest-tester, threadstack, threadstack-tester, deadline, deadline-tester, debugger, debugger-tester, crashme, crashme-tester, pipestress, pipestress-tester, threadchurn, threadchurn-tester
 
 ["build","--debug","kernel","--debug","kernel"]
 ok build debug=["kernel","kernel"]
@@ -15398,6 +15398,523 @@ ok test-powerbutton timing grant=["7"]
 ["test-powerbutton","--cpus","7","--mem","7","--wait-host","7","--host-override","--alone","--timing","--grant","7"]
 ArgumentConflict
 error: the argument '--alone' cannot be used with '--timing'
+
+["test-core-death"]
+ok-all test-core-death arch=default["x86_64"] cpus=default["4"] mem=default["512"] host_override=default alone=default timing=default
+
+["test-core-death","-h"]
+help xtask test-core-death -h
+
+["test-core-death","--help"]
+help xtask test-core-death --help
+
+["test-core-death","bogus"]
+UnknownArgument
+error: unexpected argument 'bogus' found
+
+["test-core-death","--bogus"]
+UnknownArgument
+error: unexpected argument '--bogus' found
+
+["test-core-death","--","x"]
+UnknownArgument
+error: unexpected argument 'x' found
+
+["test-core-death","-h","bogus"]
+help xtask test-core-death -h
+
+["test-core-death","bogus","-h"]
+UnknownArgument
+error: unexpected argument 'bogus' found
+
+["test-core-death","--arch"]
+InvalidValue
+error: a value is required for '--arch <ARCH>' but none was supplied
+  [possible values: x86_64, riscv64]
+
+["test-core-death","--arch","7"]
+InvalidValue
+error: invalid value '7' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["test-core-death","--arch","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-core-death","--arch","x86_64"]
+ok test-core-death arch=["x86_64"]
+
+["test-core-death","--arch",""]
+InvalidValue
+error: a value is required for '--arch <ARCH>' but none was supplied
+  [possible values: x86_64, riscv64]
+
+["test-core-death","--arch","--"]
+InvalidValue
+error: a value is required for '--arch <ARCH>' but none was supplied
+  [possible values: x86_64, riscv64]
+
+["test-core-death","--arch=--"]
+InvalidValue
+error: invalid value '--' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["test-core-death","--arch","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-core-death","--arch=--x"]
+InvalidValue
+error: invalid value '--x' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["test-core-death","--arch","7","--arch","7"]
+InvalidValue
+error: invalid value '7' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["test-core-death","--arch","x86_64","--arch","x86_64"]
+ArgumentConflict
+error: the argument '--arch <ARCH>' cannot be used multiple times
+
+["test-core-death","--port=-1"]
+UnknownArgument
+error: unexpected argument '--port' found
+
+["test-core-death","--port=--"]
+UnknownArgument
+error: unexpected argument '--port' found
+
+["test-core-death","--port=--x"]
+UnknownArgument
+error: unexpected argument '--port' found
+
+["test-core-death","--cpus"]
+InvalidValue
+error: a value is required for '--cpus <CPUS>' but none was supplied
+
+["test-core-death","--cpus","7"]
+ok test-core-death cpus=["7"]
+
+["test-core-death","--cpus","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-core-death","--cpus=-1"]
+ValueValidation
+error: invalid value '-1' for '--cpus <CPUS>': -1 is not in 0..=4294967295
+
+["test-core-death","--cpus","4294967296"]
+ValueValidation
+error: invalid value '4294967296' for '--cpus <CPUS>': 4294967296 is not in 0..=4294967295
+
+["test-core-death","--cpus","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--cpus <CPUS>': number too large to fit in target type
+
+["test-core-death","--cpus","1.5"]
+ValueValidation
+error: invalid value '1.5' for '--cpus <CPUS>': invalid digit found in string
+
+["test-core-death","--cpus",""]
+ValueValidation
+error: invalid value '' for '--cpus <CPUS>': cannot parse integer from empty string
+
+["test-core-death","--cpus","--"]
+InvalidValue
+error: a value is required for '--cpus <CPUS>' but none was supplied
+
+["test-core-death","--cpus=--"]
+ValueValidation
+error: invalid value '--' for '--cpus <CPUS>': invalid digit found in string
+
+["test-core-death","--cpus","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-core-death","--cpus=--x"]
+ValueValidation
+error: invalid value '--x' for '--cpus <CPUS>': invalid digit found in string
+
+["test-core-death","--cpus","7","--cpus","7"]
+ArgumentConflict
+error: the argument '--cpus <CPUS>' cannot be used multiple times
+
+["test-core-death","--mem"]
+InvalidValue
+error: a value is required for '--mem <MEM>' but none was supplied
+
+["test-core-death","--mem","7"]
+ok test-core-death mem=["7"]
+
+["test-core-death","--mem","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-core-death","--mem=-1"]
+ValueValidation
+error: invalid value '-1' for '--mem <MEM>': -1 is not in 0..=4294967295
+
+["test-core-death","--mem","4294967296"]
+ValueValidation
+error: invalid value '4294967296' for '--mem <MEM>': 4294967296 is not in 0..=4294967295
+
+["test-core-death","--mem","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--mem <MEM>': number too large to fit in target type
+
+["test-core-death","--mem","1.5"]
+ValueValidation
+error: invalid value '1.5' for '--mem <MEM>': invalid digit found in string
+
+["test-core-death","--mem",""]
+ValueValidation
+error: invalid value '' for '--mem <MEM>': cannot parse integer from empty string
+
+["test-core-death","--mem","--"]
+InvalidValue
+error: a value is required for '--mem <MEM>' but none was supplied
+
+["test-core-death","--mem=--"]
+ValueValidation
+error: invalid value '--' for '--mem <MEM>': invalid digit found in string
+
+["test-core-death","--mem","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-core-death","--mem=--x"]
+ValueValidation
+error: invalid value '--x' for '--mem <MEM>': invalid digit found in string
+
+["test-core-death","--mem","7","--mem","7"]
+ArgumentConflict
+error: the argument '--mem <MEM>' cannot be used multiple times
+
+["test-core-death","--wait-host"]
+InvalidValue
+error: a value is required for '--wait-host <SECS>' but none was supplied
+
+["test-core-death","--wait-host","7"]
+ok test-core-death wait_host=["7"]
+
+["test-core-death","--wait-host","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-core-death","--wait-host=-1"]
+ValueValidation
+error: invalid value '-1' for '--wait-host <SECS>': invalid digit found in string
+
+["test-core-death","--wait-host","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--wait-host <SECS>': number too large to fit in target type
+
+["test-core-death","--wait-host",""]
+ValueValidation
+error: invalid value '' for '--wait-host <SECS>': cannot parse integer from empty string
+
+["test-core-death","--wait-host","--"]
+InvalidValue
+error: a value is required for '--wait-host <SECS>' but none was supplied
+
+["test-core-death","--wait-host=--"]
+ValueValidation
+error: invalid value '--' for '--wait-host <SECS>': invalid digit found in string
+
+["test-core-death","--wait-host","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-core-death","--wait-host=--x"]
+ValueValidation
+error: invalid value '--x' for '--wait-host <SECS>': invalid digit found in string
+
+["test-core-death","--wait-host","7","--wait-host","7"]
+ArgumentConflict
+error: the argument '--wait-host <SECS>' cannot be used multiple times
+
+["test-core-death","--host-override"]
+ok test-core-death host_override
+
+["test-core-death","--host-override","--host-override"]
+ArgumentConflict
+error: the argument '--host-override' cannot be used multiple times
+
+["test-core-death","--host-override","--host-override=true"]
+TooManyValues
+error: unexpected value 'true' for '--host-override' found; no more were expected
+
+["test-core-death","--host-override=false"]
+TooManyValues
+error: unexpected value 'false' for '--host-override' found; no more were expected
+
+["test-core-death","--alone"]
+ok test-core-death alone
+
+["test-core-death","--alone","--alone"]
+ArgumentConflict
+error: the argument '--alone' cannot be used multiple times
+
+["test-core-death","--alone","--alone=true"]
+TooManyValues
+error: unexpected value 'true' for '--alone' found; no more were expected
+
+["test-core-death","--alone=false"]
+TooManyValues
+error: unexpected value 'false' for '--alone' found; no more were expected
+
+["test-core-death","--timing"]
+ok test-core-death timing
+
+["test-core-death","--timing","--timing"]
+ArgumentConflict
+error: the argument '--timing' cannot be used multiple times
+
+["test-core-death","--timing","--timing=true"]
+TooManyValues
+error: unexpected value 'true' for '--timing' found; no more were expected
+
+["test-core-death","--timing=false"]
+TooManyValues
+error: unexpected value 'false' for '--timing' found; no more were expected
+
+["test-core-death","--grant"]
+InvalidValue
+error: a value is required for '--grant <HOLDER>' but none was supplied
+
+["test-core-death","--grant","7"]
+ok test-core-death grant=["7"]
+
+["test-core-death","--grant","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-core-death","--grant",""]
+ok test-core-death grant=[""]
+
+["test-core-death","--grant","--"]
+InvalidValue
+error: a value is required for '--grant <HOLDER>' but none was supplied
+
+["test-core-death","--grant=--"]
+ok test-core-death grant=["--"]
+
+["test-core-death","--grant","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-core-death","--grant=--x"]
+ok test-core-death grant=["--x"]
+
+["test-core-death","--grant","7","--grant","7"]
+ArgumentConflict
+error: the argument '--grant <HOLDER>' cannot be used multiple times
+
+["test-core-death","--arch","x86_64","--cpus","7"]
+ok test-core-death arch=["x86_64"] cpus=["7"]
+
+["test-core-death","--arch","x86_64","--mem","7"]
+ok test-core-death arch=["x86_64"] mem=["7"]
+
+["test-core-death","--arch","x86_64","--wait-host","7"]
+ok test-core-death arch=["x86_64"] wait_host=["7"]
+
+["test-core-death","--arch","x86_64","--host-override"]
+ok test-core-death arch=["x86_64"] host_override
+
+["test-core-death","--arch","x86_64","--alone"]
+ok test-core-death arch=["x86_64"] alone
+
+["test-core-death","--arch","x86_64","--timing"]
+ok test-core-death arch=["x86_64"] timing
+
+["test-core-death","--arch","x86_64","--grant","7"]
+ok test-core-death arch=["x86_64"] grant=["7"]
+
+["test-core-death","--cpus","7","--arch","x86_64"]
+ok test-core-death arch=["x86_64"] cpus=["7"]
+
+["test-core-death","--cpus","7","--mem","7"]
+ok test-core-death cpus=["7"] mem=["7"]
+
+["test-core-death","--cpus","7","--wait-host","7"]
+ok test-core-death cpus=["7"] wait_host=["7"]
+
+["test-core-death","--cpus","7","--host-override"]
+ok test-core-death cpus=["7"] host_override
+
+["test-core-death","--cpus","7","--alone"]
+ok test-core-death cpus=["7"] alone
+
+["test-core-death","--cpus","7","--timing"]
+ok test-core-death cpus=["7"] timing
+
+["test-core-death","--cpus","7","--grant","7"]
+ok test-core-death cpus=["7"] grant=["7"]
+
+["test-core-death","--mem","7","--arch","x86_64"]
+ok test-core-death arch=["x86_64"] mem=["7"]
+
+["test-core-death","--mem","7","--cpus","7"]
+ok test-core-death cpus=["7"] mem=["7"]
+
+["test-core-death","--mem","7","--wait-host","7"]
+ok test-core-death mem=["7"] wait_host=["7"]
+
+["test-core-death","--mem","7","--host-override"]
+ok test-core-death mem=["7"] host_override
+
+["test-core-death","--mem","7","--alone"]
+ok test-core-death mem=["7"] alone
+
+["test-core-death","--mem","7","--timing"]
+ok test-core-death mem=["7"] timing
+
+["test-core-death","--mem","7","--grant","7"]
+ok test-core-death mem=["7"] grant=["7"]
+
+["test-core-death","--wait-host","7","--arch","x86_64"]
+ok test-core-death arch=["x86_64"] wait_host=["7"]
+
+["test-core-death","--wait-host","7","--cpus","7"]
+ok test-core-death cpus=["7"] wait_host=["7"]
+
+["test-core-death","--wait-host","7","--mem","7"]
+ok test-core-death mem=["7"] wait_host=["7"]
+
+["test-core-death","--wait-host","7","--host-override"]
+ok test-core-death wait_host=["7"] host_override
+
+["test-core-death","--wait-host","7","--alone"]
+ok test-core-death wait_host=["7"] alone
+
+["test-core-death","--wait-host","7","--timing"]
+ok test-core-death wait_host=["7"] timing
+
+["test-core-death","--wait-host","7","--grant","7"]
+ok test-core-death wait_host=["7"] grant=["7"]
+
+["test-core-death","--host-override","--arch","x86_64"]
+ok test-core-death arch=["x86_64"] host_override
+
+["test-core-death","--host-override","--cpus","7"]
+ok test-core-death cpus=["7"] host_override
+
+["test-core-death","--host-override","--mem","7"]
+ok test-core-death mem=["7"] host_override
+
+["test-core-death","--host-override","--wait-host","7"]
+ok test-core-death wait_host=["7"] host_override
+
+["test-core-death","--host-override","--alone"]
+ok test-core-death host_override alone
+
+["test-core-death","--host-override","--timing"]
+ok test-core-death host_override timing
+
+["test-core-death","--host-override","--grant","7"]
+ok test-core-death host_override grant=["7"]
+
+["test-core-death","--alone","--arch","x86_64"]
+ok test-core-death arch=["x86_64"] alone
+
+["test-core-death","--alone","--cpus","7"]
+ok test-core-death cpus=["7"] alone
+
+["test-core-death","--alone","--mem","7"]
+ok test-core-death mem=["7"] alone
+
+["test-core-death","--alone","--wait-host","7"]
+ok test-core-death wait_host=["7"] alone
+
+["test-core-death","--alone","--host-override"]
+ok test-core-death host_override alone
+
+["test-core-death","--alone","--timing"]
+ArgumentConflict
+error: the argument '--alone' cannot be used with '--timing'
+
+["test-core-death","--alone","--grant","7"]
+ok test-core-death alone grant=["7"]
+
+["test-core-death","--timing","--arch","x86_64"]
+ok test-core-death arch=["x86_64"] timing
+
+["test-core-death","--timing","--cpus","7"]
+ok test-core-death cpus=["7"] timing
+
+["test-core-death","--timing","--mem","7"]
+ok test-core-death mem=["7"] timing
+
+["test-core-death","--timing","--wait-host","7"]
+ok test-core-death wait_host=["7"] timing
+
+["test-core-death","--timing","--host-override"]
+ok test-core-death host_override timing
+
+["test-core-death","--timing","--alone"]
+ArgumentConflict
+error: the argument '--timing' cannot be used with '--alone'
+
+["test-core-death","--timing","--grant","7"]
+ok test-core-death timing grant=["7"]
+
+["test-core-death","--grant","7","--arch","x86_64"]
+ok test-core-death arch=["x86_64"] grant=["7"]
+
+["test-core-death","--grant","7","--cpus","7"]
+ok test-core-death cpus=["7"] grant=["7"]
+
+["test-core-death","--grant","7","--mem","7"]
+ok test-core-death mem=["7"] grant=["7"]
+
+["test-core-death","--grant","7","--wait-host","7"]
+ok test-core-death wait_host=["7"] grant=["7"]
+
+["test-core-death","--grant","7","--host-override"]
+ok test-core-death host_override grant=["7"]
+
+["test-core-death","--grant","7","--alone"]
+ok test-core-death alone grant=["7"]
+
+["test-core-death","--grant","7","--timing"]
+ok test-core-death timing grant=["7"]
+
+["test-core-death","--target","memmgr"]
+ok test-core-death target=["memmgr"]
+
+["test-core-death","--target","procmgr-reaper"]
+ok test-core-death target=["procmgr-reaper"]
+
+["test-core-death","--target","logd,svcmgr"]
+ok test-core-death target=["logd","svcmgr"]
+
+["test-core-death","--target","devmgr","--target","vfsd"]
+ok test-core-death target=["devmgr","vfsd"]
+
+["test-core-death","--target","procmgr","--arch","riscv64"]
+ok test-core-death arch=["riscv64"] target=["procmgr"]
+
+["test-core-death","--target"]
+InvalidValue
+error: a value is required for '--target <TARGET>' but none was supplied
+  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+
+["test-core-death","--target","bogus"]
+InvalidValue
+error: invalid value 'bogus' for '--target <TARGET>'
+  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+
+["test-core-death","--target",""]
+InvalidValue
+error: a value is required for '--target <TARGET>' but none was supplied
+  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+
+["test-core-death","--target=memmgr,"]
+InvalidValue
+error: a value is required for '--target <TARGET>' but none was supplied
+  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
 
 ["test-kaslr"]
 ok-all test-kaslr arch=default["x86_64"] cpus=default["4"] mem=default["512"] riscv_mmu=default["sv48"] x86_paging=default["4"] host_override=default alone=default timing=default

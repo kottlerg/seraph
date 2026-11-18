@@ -729,7 +729,8 @@ reserve nodes, and so is the node of a process created with procmgr's reserve cr
 (`CREATE_RESERVE`), which procmgr honours only from a reserve creator, as it does
 `CREATE_PHYS_ACCESS`. A process a reserve
 creator creates without the flag is outside the reserve, so svcmgr's services are outside it
-unless the recipe's `reserve = yes` has svcmgr pass the flag, as crashd's does
+unless the recipe's `reserve = yes` has svcmgr pass the flag, as oomd's, sessiond's, crashd's and
+logd's do
 ([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
 § `reserve`). The reserve is `pool_total / 64`
 ([docs/limits.md](../../../docs/limits.md) § memmgr).
@@ -862,9 +863,24 @@ a regrowth up to the largest length the region has had adds none. `UNREGISTER_RE
 run and of what is left of its reservation, and its part of `promised`, what is left of its metadata
 bound with it.
 
+**Discard.** `DISCARD_RANGE` (§ Label 20) takes back the frames of whole chunks of a region, of
+any region, its length kept: memmgr unmaps the pages without reclaiming page tables and clears
+their chunks from the chunk table (`chunk::clear`), each run on them pooled or deferred. In an
+uncommitted region each run retires charged to the process's budget node, so it is uncharged as it
+rejoins the pool. A committed region keeps its commitment, whose charge carries its pages whether
+they hold a frame or not: its runs retire charged to no node, and `promised` rises by their pages,
+which hold no frame again, and by the metadata the cleared chunks gave back
+(`commit::meta_of_chunks`), what is left of the region's metadata bound rising by it, at most to
+the bound of its length. A refault of a discarded page is then admitted from `promised` as its first
+touch was, and is backed by a zero-filled run ([Frame contents](#frame-contents)). A discard frees
+RAM without raising the free pages outside `promised`; a cut does both. std's heap discards whole
+free chunks of a large freed block and cuts the free chunks at its top ([Userspace Memory Model §
+Byte Heap](../../../docs/userspace-memory-model.md#byte-heap)).
+
 **Retries.** A committed registration or growth whose reply does not reach the caller is undone,
 as a grant whose reply fails is rolled back, so a caller whose call was interrupted makes it again
-and is charged once. A cut repeated finds the region at its new length and succeeds.
+and is charged once. A cut repeated finds the region at its new length and succeeds, and a discard
+repeated finds no run in its range and succeeds.
 
 ---
 

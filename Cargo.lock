@@ -318,6 +318,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hwrng-protocol"
+version = "0.1.4"
+dependencies = [
+ "syscall-abi",
+]
+
+[[package]]
 name = "init"
 version = "0.1.4"
 dependencies = [
@@ -723,6 +730,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sessiond"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "sessiond-table",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "sessiond-table"
+version = "0.1.4"
+
+[[package]]
 name = "shell"
 version = "0.0.1"
 dependencies = [
@@ -812,6 +833,7 @@ dependencies = [
  "driver-binding",
  "elf",
  "fatfs-parse",
+ "hwrng-protocol",
  "ipc",
  "log",
  "logd-codec",
@@ -990,6 +1012,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-rng"
+version = "0.1.4"
+dependencies = [
+ "driver-binding",
+ "hwrng-protocol",
+ "ipc",
+ "syscall",
+ "syscall-abi",
+ "virtio-core",
+]
+
+[[package]]
 name = "xtask"
 version = "0.1.4"
 dependencies = [
@@ -1005,6 +1039,7 @@ dependencies = [
  "logd-codec",
  "objsig",
  "procmgr-process-table",
+ "svcmgr-defs",
  "syscall-abi",
  "vfsd-gpt",
 ]

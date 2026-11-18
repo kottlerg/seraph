@@ -192,6 +192,13 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::ServicesDrivers,
         arch_only: None,
     },
+    Spec {
+        name: "virtio-rng",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: None,
+    },
     // The debug port's driver: devmgr spawns it only for a virtio-console
     // device, which a launch attaches only with `--debug-port`.
     Spec {
@@ -334,6 +341,13 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "oomd",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Services,
+        arch_only: None,
+    },
+    Spec {
+        name: "sessiond",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::Services,

@@ -451,6 +451,7 @@ fn serve(ep: u64, shared: &Shared)
             }
         };
         guard.on_success();
+        crate::headroom::hold();
         match msg.label
         {
             devmgr_dma_labels::DMA_MAP => handle_map(&msg, shared, ipc_buf),

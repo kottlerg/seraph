@@ -47,12 +47,16 @@ use worker_pool::WorkerPool;
 /// driver's `FS_MOUNT` probe) and what an `UNMOUNT` handler blocks on (the
 /// driver's `FS_UNMOUNT` and its death, each within a bound, procmgr's
 /// `DESTROY_PROCESS`, and the `NS_LOOKUP` walk for a fall-through cap)
-/// never calls the service endpoint, and neither does what a `MOUNT` that
-/// finds its role on no held disk blocks on: devmgr's `QUERY_DEVICE` and the
-/// GPT reads of each new disk. A `GET_SWAP_PARTITION` handler waits
-/// only for the swap lock, which the holder keeps across one
-/// `REGISTER_PARTITION` call to the block driver, and the block driver
-/// never calls vfsd.
+/// never calls the service endpoint, and neither does the discovery of new
+/// disks a `MOUNT` and the first `GET_SWAP_PARTITION` run before their role
+/// lookup: devmgr's `QUERY_DEVICE`, the GPT reads of each new disk, a
+/// scratch page from memmgr when a failed read lost the one held, and the
+/// forced unmount of a mount on a new disk found withdrawn, which blocks as
+/// an `UNMOUNT` does. A `GET_SWAP_PARTITION` handler also waits for the
+/// discovery lock, held across one discovery, and for the swap lock, which
+/// its holder keeps across the first request's discovery and one
+/// `REGISTER_PARTITION` call to the block driver; none of devmgr, memmgr
+/// and the block drivers calls vfsd.
 const SERVICE_THREAD_COUNT: usize = 4;
 
 /// Bound on a fall-through call the namespace thread makes to the root
@@ -331,7 +335,8 @@ pub struct VfsdRuntime
     pub discovery: Mutex<partition::Discovery>,
     /// Every block device devmgr served vfsd, each with its whole-disk cap
     /// and its used GPT partition entries, in the order found: at startup,
-    /// then by each `MOUNT` that found its role on no held disk. A disk devmgr
+    /// then by the discovery before each runtime role lookup (`find_partition`
+    /// and the first `GET_SWAP_PARTITION`). A disk devmgr
     /// withdrew stays, marked removed, so a mount record's disk index keeps
     /// naming it. Held only across reads and updates of the table, never
     /// across IPC, and never together with `root_backend`.
@@ -409,15 +414,16 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   the same lock, after a driver's death or a disk's loss, and every
 ///   remover takes the mount's death queue out of the watch set in the
 ///   hold that begins the removal (the claim rule of `watch`).
-/// - `rt.discovery` — Mutex; held across a `MOUNT`'s discovery of new
-///   disks, so one runs at a time.
+/// - `rt.discovery` — Mutex; held across a discovery of new disks, a
+///   `MOUNT`'s or a `GET_SWAP_PARTITION`'s, so one runs at a time.
 /// - `rt.disks` — Mutex; held only across reads and updates of the disk
 ///   table, taken after `rt.discovery` when both are, and never together
 ///   with `rt.root_backend`.
 ///
 /// No `do_mount`- or `do_unmount`-touched state is shared without one of
-/// these locks. `GET_SWAP_PARTITION` holds `rt.swap` across a hand-out
-/// and takes only `rt.disks`, briefly, while it holds it.
+/// these locks. `GET_SWAP_PARTITION` holds `rt.swap` across a hand-out;
+/// the first one runs a discovery while it holds it, taking `rt.discovery`
+/// and then `rt.disks`, and nothing takes `rt.swap` while it holds either.
 fn service_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -972,8 +978,10 @@ impl swap::SwapOps for SwapIo<'_>
 {
     fn lookup(&mut self) -> Result<gpt::PartitionLocation, gpt::GptLookupError>
     {
-        // The role resolves across every held disk, as a mount role does
-        // (docs/storage.md § GPT Role-GUID Discovery).
+        // The role resolves across every disk devmgr serves, as a mount role
+        // does (docs/storage.md § GPT Role-GUID Discovery): the discovery
+        // first holds each disk served since the last one.
+        discover_new_disks(self.rt, self.ipc_buf);
         let disks = self.rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
         let disk_parts = disks.iter().map(|d| d.partitions.as_slice());
         let found = gpt::lookup_partition_by_type_guid(&role_guids::SERAPH_SWAP, disk_parts);
@@ -1020,8 +1028,9 @@ impl swap::SwapOps for SwapIo<'_>
 /// hand-out returned ([`swap::SwapPartition::hand_out`]).
 ///
 /// The dispatcher admits only a `SWAP_AUTHORITY` badge. The partition is
-/// looked up and registered on the first request, never at startup, so a
-/// disk with no swap partition changes nothing until a request, which then
+/// looked up and registered on the first request, never at startup, across
+/// every disk devmgr serves then ([`discover_new_disks`] first), so a disk
+/// with no swap partition changes nothing until a request, which then
 /// replies [`vfsd_errors::NO_MOUNT`]; so does a tie between swap partitions.
 /// A failed registration, revoke or derivation replies
 /// [`vfsd_errors::IO_ERROR`].
@@ -1107,7 +1116,7 @@ impl MountRole
 /// gate the return value.
 fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 {
-    match do_mount_internal(rt, ipc_buf, &role_guids::SERAPH_ROOT, b"/", Requery::No)
+    match do_mount_internal(rt, ipc_buf, &role_guids::SERAPH_ROOT, b"/", Discover::No)
     {
         Ok(caller_root_cap) =>
         {
@@ -1547,7 +1556,7 @@ fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mo
         std::os::seraph::log!(warn: "MOUNT: no partition for {mount_path}; skipping auto-mount");
         return;
     }
-    match do_mount_internal(rt, ipc_buf, type_guid, mount_path.as_bytes(), Requery::No)
+    match do_mount_internal(rt, ipc_buf, type_guid, mount_path.as_bytes(), Discover::No)
     {
         Ok(caller_cap) =>
         {
@@ -1595,8 +1604,8 @@ fn mount_path_is_root(path: &[u8]) -> bool
 /// Mount the partition `role` names at `path`.
 ///
 /// Looks the role's type GUID up across every held disk's GPT, after
-/// discovering the disks devmgr served since the last discovery when no
-/// held disk has it ([`find_partition`]), registers
+/// discovering the disks devmgr served since the last discovery
+/// ([`find_partition`]), registers
 /// the partition bound with the block driver of the disk that holds it,
 /// spawns a fatfs driver, and stores the mount's record in
 /// [`VfsdRootBackend`]: the driver's namespace endpoint (terminal mounts)
@@ -1614,37 +1623,40 @@ pub(crate) fn do_mount(
     path: &[u8],
 ) -> Result<u64, u64>
 {
-    do_mount_internal(rt, ipc_buf, role.type_guid(), path, Requery::Yes)
+    do_mount_internal(rt, ipc_buf, role.type_guid(), path, Discover::First)
 }
 
-/// Whether a mount whose role is found on no held disk discovers the disks
-/// devmgr served since the last discovery and looks again.
+/// Whether a mount's role lookup first discovers the disks devmgr served
+/// since the last discovery.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Requery
+enum Discover
 {
+    /// Look up over the held disks alone: the startup self-mount and the
+    /// auto-mounts after a root mount, which a discovery just preceded.
     No,
-    Yes,
+    /// Discover first ([`discover_new_disks`]): a runtime `MOUNT`.
+    First,
 }
 
 /// The partition `type_guid` names across every held disk's GPT, and the
-/// whole-disk cap of the disk that holds it. On [`Requery::Yes`] a role
-/// found on no disk is looked up again after [`discover_new_disks`], so a
-/// disk devmgr served after the last discovery, one inserted again among
-/// them, is found. Logs a failure and returns `vfsd_errors::NO_MOUNT`.
+/// whole-disk cap of the disk that holds it. On [`Discover::First`] the
+/// disks devmgr served since the last discovery are held first, so the role
+/// resolves across every disk devmgr serves, as at startup: a disk added or
+/// inserted again after startup is found, and its partition wins or ties by
+/// priority against those of the disks held before it. Logs a failure and
+/// returns `vfsd_errors::NO_MOUNT`.
 fn find_partition(
     rt: &VfsdRuntime,
     ipc_buf: *mut u64,
     type_guid: &[u8; 16],
-    requery: Requery,
+    discover: Discover,
 ) -> Result<(gpt::PartitionLocation, u64), u64>
 {
-    let mut found = lookup_role(rt, type_guid);
-    if requery == Requery::Yes && matches!(found, Err(gpt::GptLookupError::NotFound))
+    if discover == Discover::First
     {
         discover_new_disks(rt, ipc_buf);
-        found = lookup_role(rt, type_guid);
     }
-    match found
+    match lookup_role(rt, type_guid)
     {
         Ok(found) => Ok(found),
         Err(gpt::GptLookupError::NotFound) =>
@@ -1732,7 +1744,7 @@ fn hold_new_disks(
     if disks.try_reserve(found.len()).is_err()
     {
         drop(disks);
-        std::os::seraph::log!(warn: "MOUNT: no memory to hold {} new disk(s)", found.len());
+        std::os::seraph::log!(warn: "no memory to hold {} new disk(s)", found.len());
         discovery.rewind(first);
         for disk in found
         {
@@ -1772,10 +1784,10 @@ fn do_mount_internal(
     ipc_buf: *mut u64,
     type_guid: &[u8; 16],
     path: &[u8],
-    requery: Requery,
+    discover: Discover,
 ) -> Result<u64, u64>
 {
-    let (location, blk_ep) = find_partition(rt, ipc_buf, type_guid, requery)?;
+    let (location, blk_ep) = find_partition(rt, ipc_buf, type_guid, discover)?;
     let (partition_lba, partition_len) = (location.first_lba, location.length_lba);
     std::os::seraph::log!(
         debug: "MOUNT: partition on disk {} LBA={partition_lba:#018x} length={partition_len:#018x}",
@@ -1784,16 +1796,26 @@ fn do_mount_internal(
 
     // Reject a mount the synthetic root would refuse (root already mounted,
     // `path` already a mount point, or a component the namespace protocol
-    // cannot name) before registering a partition or spawning a driver for
-    // it.
-    let installable = rt
-        .root_backend
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .can_install(path);
+    // cannot name), and a second mount of a partition a mount holds, before
+    // registering a partition or spawning a driver for it.
+    let (installable, held) = {
+        let backend = rt
+            .root_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (
+            backend.can_install(path),
+            backend.holds_partition(location.disk, partition_lba),
+        )
+    };
     if !installable
     {
         std::os::seraph::log!(warn: "MOUNT: mount point taken or path not installable");
+        return Err(ipc::vfsd_errors::TABLE_FULL);
+    }
+    if held
+    {
+        std::os::seraph::log!(warn: "MOUNT: the partition is already mounted");
         return Err(ipc::vfsd_errors::TABLE_FULL);
     }
 
@@ -1922,8 +1944,18 @@ fn do_mount_internal(
             death_queue: fatfs.death_queue,
             partition,
             disk: location.disk,
+            first_lba: partition_lba,
         };
-        let observed = rt.watch.add(&backend, fatfs.death_queue);
+        // A concurrent MOUNT of the partition may have installed since the
+        // check before the spawn: one driver serves a partition.
+        let observed = if backend.holds_partition(location.disk, partition_lba)
+        {
+            false
+        }
+        else
+        {
+            rt.watch.add(&backend, fatfs.death_queue)
+        };
         let installed = if observed
         {
             backend.install(path, mount)
@@ -1941,14 +1973,14 @@ fn do_mount_internal(
     let Some(install_result) = install_result
     else
     {
-        // A concurrent MOUNT took the mount point after the `can_install`
-        // check, the tree holds its most mounts, or it could not grow, or the
-        // watch set refused the death queue. Revoking the endpoint invalidates
-        // `install_cap` and `caller_root_cap` (both derive from it) and
-        // stops the driver nothing would reach.
+        // A concurrent MOUNT took the mount point or the partition since the
+        // checks before the spawn, the tree holds its most mounts, or it could
+        // not grow, or the watch set refused the death queue. Revoking the
+        // endpoint invalidates `install_cap` and `caller_root_cap` (both
+        // derive from it) and stops the driver nothing would reach.
         std::os::seraph::log!(
-            warn: "MOUNT: synthetic-root install failed (mount point taken, mount limit, \
-             no memory, or driver not observed)"
+            warn: "MOUNT: synthetic-root install failed (mount point or partition taken, \
+             mount limit, no memory, or driver not observed)"
         );
         release_failed_mount(&fatfs, partition);
         return Err(ipc::vfsd_errors::TABLE_FULL);

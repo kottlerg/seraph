@@ -234,8 +234,9 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     added, gating `QUERY_SHUTDOWN_DEVICE`; pwrmgr is the only recipe
     seeding it.
   - `devmgr.bind` — the same SEND with `BIND_AUTHORITY` added, gating `BIND_DRIVERS`; seed-only,
-    and the one name a seed receives as `SEND|GRANT`, since `BIND_DRIVERS` moves a directory cap
-    and the kernel requires `GRANT` for a cap transfer. svctest is the only recipe seeding it.
+    and seeded as `SEND|GRANT`, as only it and each `:grant` name (`sessiond.operator`) are,
+    since `BIND_DRIVERS` moves a directory cap and the kernel requires `GRANT` for a cap
+    transfer. svctest is the only recipe seeding it.
   - `devmgr.class.<stem>` — one class SEND per class file of
     `/config/devmgr/classes/`, minted by devmgr on `MINT_CLASS_SEND` and
     published seed-only ([svcmgr service definitions § Device class
@@ -270,8 +271,8 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   All four `devmgr.*` names, the three `vfsd.*` names, and `logd.query` are seed-only: svcmgr's
   `QUERY_ENDPOINT` refuses them, so each badge reaches only the recipes that seed the name
   ([svcmgr IPC interface § Label 4](../../svcmgr/docs/ipc-interface.md#label-4-query_endpoint)).
-  `QUERY_ENDPOINT` never yields `GRANT` for any name; a seed is `SEND` except `devmgr.bind`'s
-  `SEND|GRANT`.
+  `QUERY_ENDPOINT` never yields `GRANT` for any name; a seed is `SEND` except those of
+  `devmgr.bind` and of each `:grant` name (`sessiond.operator`), which are `SEND|GRANT`.
 
   `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`, and `timed` are published by
   svcmgr's provider path on each provider's launch (see
@@ -377,11 +378,15 @@ edit needs no rebuild. memmgr is `no_std` and has no level.
   procmgr's is placed in the argv/env region that follows its `ProcessInfo`
   page (`process_abi::ARGV_ENV_REGION_OFFSET`), on a page init maps there
   in the raw bootstrap. devmgr's, vfsd's, and svcmgr's ride their create
-  requests with `procmgr_labels::CREATE_ARGV_ENV`: init writes the entry
-  into one page it allocated before `finalize_memmgr` and transfers a
-  map-only derivation of it, from which procmgr copies the entry into the
-  child's argv/env region, and deletes its own handle after the call. The
-  page is init's to the reap, which donates it.
+  requests with `procmgr_labels::CREATE_ARGV_ENV`, beside each service's
+  name as its one argv string, which every create request of the three
+  carries, a level set or not: procmgr lists the process under it
+  (`LIST_PROCESSES`), so a debugger finds it by name. init writes the argv
+  and the entry into one page it allocated before `finalize_memmgr` and
+  transfers a map-only derivation of it, from which procmgr copies them into
+  the child's argv/env region, and deletes its own handle after the call. A
+  page init could not allocate leaves the three unnamed, at info. The page
+  is init's to the reap, which donates it.
 - **Inheritance.** A process devmgr or vfsd spawns on the system's behalf (a
   driver, a fatfs instance) is created with its spawner's own level as its
   one env entry, read back with

@@ -379,7 +379,7 @@ devmgr's responsibilities are:
   The settle bound, `SETTLE_TIMEOUT` (`services/devmgr/src/settle.rs`), is
   twice `virtio_core::pci::RESET_TIMEOUT` (5 s), so 10 s, counted from the
   start of the settle, after the batch's last spawn. The VirtIO reset, which
-  a virtio-blk, virtio-input, or virtio-console driver polls for once, is the
+  a virtio-blk, virtio-input, virtio-rng, or virtio-console driver polls for once, is the
   longest bounded wait a driver's setup makes, so the settle never ends before
   a driver's own timeout has, and a margin of one further `RESET_TIMEOUT`
   covers the rest of the setup. The platform drivers (serial, framebuffer, and RTC) make
@@ -391,8 +391,8 @@ devmgr's responsibilities are:
 
   A further batch runs for each `devmgr_labels::BIND_DRIVERS`, gated on
   `BIND_AUTHORITY`, which only svctest's seed-only `devmgr.bind` cap carries
-  (the one published name a seed receives as `SEND|GRANT`, since the request
-  moves a directory cap to devmgr). devmgr replies `SUCCESS` at once; its
+  (seeded as `SEND|GRANT`, as only it and each `:grant` name are, since the
+  request moves a directory cap to devmgr). devmgr replies `SUCCESS` at once; its
   control thread then runs a drivers-directory pass over the directory cap,
   named by the directory's absolute path the request carries as a name block
   from data word `DRIVERS_DIR_PATH_WORD`, under the same declaration bounds as
@@ -491,7 +491,7 @@ devmgr's responsibilities are:
     every other module by the declaration it carries, read from the module mapped read-only and
     bound in the boot pass (above). Every module cap is released once its pass ends.
   - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among
-    them the per-arch RTC, virtio-input, virtio-console, test-dma, and a copy
+    them the per-arch RTC, virtio-input, virtio-console, virtio-rng, test-dma, and a copy
     of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr
     delivers a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
     subtree cap via `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by
@@ -511,7 +511,7 @@ devmgr's responsibilities are:
     at-most-once per boot; failure, including an on-disk driver's death, or
     its overrun of the settle bound, before it reports ready, is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
-    the rtc, input, and debug-port classes, the same reply
+    the rtc, input, hwrng, and debug-port classes, the same reply
     as before `SET_DRIVERS_DIR` arrives, so a client that needs the class waits on a `WATCH_CLASS`
     watch. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
@@ -684,6 +684,35 @@ the RISC-V IOMMUs from the RIMT, carves the first page of each one's BAR 0,
 which lies in a PCI window the bootloader seeds already, and delivers each to
 the RISC-V IOMMU driver, keeping no copy of either (see
 [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
+
+---
+
+## CSpace headroom
+
+devmgr runs on the `CSpace` procmgr seeds every child with, and holds a few capabilities for each
+driver it binds, each device record's carves, each class watch, and each DMA mapping, so its
+slots grow with the drivers and classes it serves. The `CSpace`'s body arena, which holds the
+body of each `Mmio`, `IoPort`, and `Interrupt` split and copy, draws whole pages from the same
+growth budget the slot pages come from, and each page it takes lowers the capacity by a page's
+slots. devmgr holds its headroom above a low-water mark through `std::os::seraph::CSpaceHeadroom`,
+whose rule [runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § CSpace slot headroom
+states: below `CSPACE_LOW_WATER` plus a page's slots, or a growth budget below a page, it funds
+the slot-page pool from memmgr for `CSPACE_TOPUP_SLOTS`, twice the mark (`src/headroom.rs`).
+
+The mark is the most one record's bind takes, at the declaration bound of resources
+(`spawn::MAX_BOUND_RESOURCES`): devmgr's carved cap and the driver's copy of each resource, the
+spawn's other copies (the end round's endpoints, the badged creator, the argv and env, procmgr's
+create reply, the death observer's copy), and the arena pages the bodies of those caps take,
+counted as the slots of those pages, with the requests the registry's workers and the DMA thread
+serve meanwhile: about 450 slots. The page `CSpaceHeadroom` holds beyond the mark keeps the first
+of those arena pages funded.
+
+devmgr holds it before each turn of the control thread's loop (acpid's requests, hotplug jobs,
+withdrawals, and the bind passes they start), before each record's carves (PCI and platform),
+before each driver spawn (the IOMMU driver's included), before each registry request a worker
+serves, and before each DMA request. A failed top-up is retried at the next hold; the control
+thread logs a run of them once, since a registry worker or the DMA thread may be serving logd, or
+a driver logd writes through, and must not log.
 
 ---
 

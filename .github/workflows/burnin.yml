@@ -145,7 +145,8 @@ jobs:
         # cell's worst pass over the 20 2-way runs of burn-in run
         # 41666083117 (2026-11-03, master 1896b7f4's boot image); the worst
         # passes are beside the values. riscv64 debug svctest's worst pass
-        # carries the fsbench slowdown on 4-core TCG since #679 (#666).
+        # carries the fsbench slowdown on 4-core TCG since #679 (#666), as
+        # build-test.yml's budget for that cell does.
         run: |
           case "${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}" in
             riscv64-debug-svctest)    budget=600 ;;  # worst pass 191.1 s

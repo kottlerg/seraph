@@ -1251,13 +1251,13 @@ times, each from images packed with those objects in place of the sysroot's file
 
 The untrusted key is a local identity generated for the run in a directory under the host's
 temporary directory, outside the work tree, and removed again. A boot passes once every owed line
-has appeared, in any order; it fails at once on another refusal line or a fatal marker
-(`KERNEL EXCEPTION`, `FATAL:`, a panic, the watchdog), and fails at its deadline, three minutes
-for a boot the bootloader ends and six for `rootfs`, naming the lines still missing. A staged
-test harness's own verdict is not judged. The host kills QEMU. Every boot's serial log is saved
-as `target/xtask/test-signing/<arch>/<case>.log`, and the command reports every case before it
-fails. The images are packed again from the sysroot in the layout they had, whatever the outcome;
-no case changes a sysroot file, so a later pack cannot sign a tampered body.
+has appeared, in any order; it fails at once on another refusal line or a fatal marker (`KERNEL
+EXCEPTION`, `FATAL:`, a panic, the watchdog, the entropy self-test), and fails at its deadline,
+three minutes for a boot the bootloader ends and six for `rootfs`, naming the lines still missing. A
+staged test harness's own verdict is not judged. The host kills QEMU. Every boot's serial log is
+saved as `target/xtask/test-signing/<arch>/<case>.log`, and the command reports every case before it
+fails. The images are packed again from the sysroot in the layout they had, whatever the outcome; no
+case changes a sysroot file, so a later pack cannot sign a tampered body.
 
 The command compiles the bootloader of the `revoked` case, so the host admits it as a build and
 then its boots as one boot of `--cpus` vCPUs (§ Host launch rules). The compile reuses the

@@ -85,9 +85,13 @@ garbage first entry with non-zero size still becomes an `MmioAperture`
 seed, and for an APLIC, IMSIC or UART node the garbage first entry
 becomes the corresponding `kernel_mmio` base). The AIA walk also assumes
 `#interrupt-cells = 1` on each hart's `riscv,cpu-intc`, so each IMSIC
-`interrupts-extended` entry is two cells (§ AIA Controllers). Full cell-inheritance support belongs
-to `devmgr` (design intent, not yet implemented: devmgr's DTB reader
-likewise assumes `#address-cells = 2` and `#size-cells = 2`).
+`interrupts-extended` entry is two cells (§ AIA Controllers). The
+bootloader does not follow cell inheritance; `devmgr`'s DTB reader
+(`services/devmgr/firmware/src/dtb.rs`) does, for the `pci-host-ecam-generic`
+nodes it reads: it decodes each node's `reg` in its parent's `#address-cells`
+and `#size-cells` (one or two cells each, the specification defaults when the
+parent sets none) and skips a node under any other size. It reads no other node
+kind and translates no `ranges`.
 
 Walker limits: `MAX_DEPTH = 32` for node nesting, `MAX_REG_ENTRIES = 8`
 for `reg` tuples per node, `MAX_IRQ_ENTRIES = 4` for `interrupts`

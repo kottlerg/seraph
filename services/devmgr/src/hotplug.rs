@@ -5,8 +5,8 @@
 
 //! PCI Express native hotplug: the slots devmgr manages under a
 //! native-control grant, the poller thread that watches their Slot Status,
-//! and the add job the control thread runs for each arrival, as
-//! [hotplug.md](../docs/hotplug.md) specifies. The register logic, the BAR
+//! and the add and removal jobs the control thread runs for each arrival and
+//! departure, as [hotplug.md](../docs/hotplug.md) specifies. The register logic, the BAR
 //! assignment and the poller's decisions are the host-tested
 //! `firmware::hotplug`; this module maps the configuration pages and runs
 //! them.
@@ -19,6 +19,7 @@ use firmware::hotplug::{
     SLOTCTL_EVENT_ENABLES, SLOTSTA_COMMAND_COMPLETED, SLOTSTA_LATCHES, Slot, SlotState,
 };
 use firmware::pci_records::RecordState;
+use firmware::resource::SpanTable;
 use firmware::resource::SplitError;
 use firmware::scan::{ConfigSpace, MAX_BARS, PciDevice};
 use std::os::seraph::thread::BuilderExt;
@@ -52,10 +53,24 @@ struct Candidate
     grant: Grant,
 }
 
+/// A job the poller posts to the control thread, which runs the jobs in the
+/// order they were posted, one at a time.
+#[derive(Clone, Copy)]
+enum Job
+{
+    /// The card in slot `.0` (its index among the candidates) was powered
+    /// up: record and bind the functions behind it ([`add`]).
+    Added(usize),
+    /// The card in slot `.0` is leaving: withdraw and remove the functions
+    /// behind it ([`remove`]), then tell the poller, which powers the slot
+    /// off.
+    Removed(usize),
+}
+
 /// A managed slot as the poller holds it.
 struct Polled
 {
-    /// The slot's index among the candidates, which its arrivals carry.
+    /// The slot's index among the candidates, which its jobs carry.
     index: usize,
     slot: Slot,
     /// A derivation of the port's configuration page cap.
@@ -75,14 +90,25 @@ pub struct Hotplug
     /// devmgr's own address space, which the poller maps pages in.
     aspace: u64,
     /// The control thread's job notification, which the poller signals
-    /// with each arrival it posts.
+    /// with each job it posts.
     job_note: u64,
-    /// The poller's channel of slots to manage; `None` until the first slot is
-    /// managed and the poller started.
-    poller: Option<mpsc::Sender<Polled>>,
-    /// The arrivals' channel: the index of each slot the poller brought up.
-    posted: mpsc::Sender<usize>,
-    arrivals: mpsc::Receiver<usize>,
+    /// The poller's channels, of slots to manage and of the slots whose
+    /// removal job completed; `None` until the first slot is managed and the
+    /// poller started.
+    poller: Option<Poller>,
+    /// The jobs' channel, which the poller posts on.
+    posted: mpsc::Sender<Job>,
+    jobs: mpsc::Receiver<Job>,
+}
+
+/// The control thread's ends of the poller's channels.
+struct Poller
+{
+    /// The slots to manage.
+    slots: mpsc::Sender<Polled>,
+    /// The index of each slot whose removal job completed, which the poller
+    /// then powers off.
+    removed: mpsc::Sender<usize>,
 }
 
 impl Hotplug
@@ -165,7 +191,7 @@ impl Hotplug
                 grant: Grant::Waiting,
             });
         }
-        let (posted, arrivals) = mpsc::channel();
+        let (posted, jobs) = mpsc::channel();
         Self {
             candidates,
             platform_grant,
@@ -173,7 +199,7 @@ impl Hotplug
             job_note,
             poller: None,
             posted,
-            arrivals,
+            jobs,
         }
     }
 
@@ -300,7 +326,7 @@ impl Hotplug
             recorded: records.live_pci().any(|r| slot.holds(address(r))),
             state: SlotState::Empty,
         };
-        let sent = self.poller.as_ref().map(|poller| poller.send(polled));
+        let sent = self.poller.as_ref().map(|poller| poller.slots.send(polled));
         if !matches!(sent, Some(Ok(())))
         {
             let _ = syscall::cap_delete(page);
@@ -326,11 +352,16 @@ impl Hotplug
         Grant::Managed
     }
 
-    /// Run the add job of every arrival the poller posted: record the
-    /// functions behind the slot ([`add`]), then, once the drivers
-    /// directory is installed, bind them in a drivers-directory pass of their
-    /// own settle batch, the hotplug batch. Before `SET_DRIVERS_DIR` the
-    /// functions are only recorded, and its pass binds them.
+    /// Run every job the poller posted, in the order it posted them, each to
+    /// its end before the next: one slot's removal job posted while its add
+    /// job waits runs after it, and withdraws what it bound.
+    ///
+    /// An add job records the functions behind the slot ([`add`]), then,
+    /// once the drivers directory is installed, binds them in a
+    /// drivers-directory pass of their own settle batch, the hotplug batch.
+    /// Before `SET_DRIVERS_DIR` the functions are only recorded, and its pass
+    /// binds them. A removal job withdraws and removes them ([`remove`]),
+    /// then posts the slot to the poller, which powers it off.
     pub fn run(
         &self,
         registry: &Registry,
@@ -340,8 +371,29 @@ impl Hotplug
         ipc_buf: *mut u64,
     )
     {
-        while let Ok(index) = self.arrivals.try_recv()
+        while let Ok(job) = self.jobs.try_recv()
         {
+            let index = match job
+            {
+                Job::Added(index) => index,
+                Job::Removed(index) =>
+                {
+                    if let Some(slot) = self.candidates.get(index).map(|c| c.slot)
+                    {
+                        remove(&slot, registry, records, carve.caps, ipc_buf);
+                    }
+                    // The slot is powered off whatever the job found, so the
+                    // poller never holds it removing.
+                    let sent = self.poller.as_ref().map(|p| p.removed.send(index));
+                    if !matches!(sent, Some(Ok(())))
+                    {
+                        std::os::seraph::log!(
+                            warn: "hotplug: no poller to power off a removed slot"
+                        );
+                    }
+                    continue;
+                }
+            };
             let Some(slot) = self.candidates.get(index).map(|c| c.slot)
             else
             {
@@ -377,32 +429,34 @@ impl Hotplug
 }
 
 /// Start the poller thread, which owns the managed slots it is sent; its
-/// channel, or `None`, logged, when the thread cannot be started.
-fn start_poller(
-    posted: mpsc::Sender<usize>,
-    job_note: u64,
-    aspace: u64,
-) -> Option<mpsc::Sender<Polled>>
+/// channels, or `None`, logged, when the thread cannot be started.
+fn start_poller(posted: mpsc::Sender<Job>, job_note: u64, aspace: u64) -> Option<Poller>
 {
     let (sender, slots) = mpsc::channel::<Polled>();
+    let (removed, completions) = mpsc::channel::<usize>();
     let started = std::thread::Builder::new()
         .name("hotplug".into())
         .spawn_at_priority(ipc::sched_policy::DEVMGR_PRIORITY, move || {
-            poll_loop(&slots, &posted, job_note, aspace);
+            poll_loop(&slots, &completions, &posted, job_note, aspace);
         });
     if started.is_err()
     {
         std::os::seraph::log!(warn: "hotplug: poller thread not started; no slot is managed");
         return None;
     }
-    Some(sender)
+    Some(Poller {
+        slots: sender,
+        removed,
+    })
 }
 
-/// The poller: take over each slot as it arrives, then every
+/// The poller: take over each slot as it arrives, power off each slot whose
+/// removal job completed ([`power_off`]), then every
 /// [`hp::HOTPLUG_POLL_MS`] read and act on each managed slot's Slot Status.
 fn poll_loop(
     slots: &mpsc::Receiver<Polled>,
-    posted: &mpsc::Sender<usize>,
+    completions: &mpsc::Receiver<usize>,
+    posted: &mpsc::Sender<Job>,
     job_note: u64,
     aspace: u64,
 ) -> !
@@ -410,6 +464,13 @@ fn poll_loop(
     let mut managed: Vec<Polled> = Vec::new();
     loop
     {
+        while let Ok(index) = completions.try_recv()
+        {
+            if let Some(slot) = managed.iter_mut().find(|s| s.index == index)
+            {
+                power_off(slot, aspace);
+            }
+        }
         while let Ok(mut slot) = slots.try_recv()
         {
             if managed.try_reserve(1).is_err()
@@ -455,10 +516,7 @@ fn take_over(slot: &mut Polled, aspace: u64)
     let s = slot.slot;
     let state = with_port(slot, aspace, |regs| {
         let control = regs.read16(s.register(SLOT_CONTROL));
-        if control != u16::MAX && control & SLOTCTL_EVENT_ENABLES != 0
-        {
-            write_control(regs, &s, control & !SLOTCTL_EVENT_ENABLES);
-        }
+        set_control(regs, &s, control, control & !SLOTCTL_EVENT_ENABLES);
         let status = regs.read16(s.register(SLOT_STATUS));
         clear_latches(regs, &s, status);
         hp::initial(status, slot.recorded)
@@ -467,35 +525,79 @@ fn take_over(slot: &mut Polled, aspace: u64)
 }
 
 /// Read a managed slot's Slot Status, clear the latches it holds, and act
-/// on it ([`hp::next`]).
-fn poll(slot: &mut Polled, aspace: u64, posted: &mpsc::Sender<usize>, job_note: u64)
+/// on it ([`hp::next`]), reading Link Status as well when Data Link Layer
+/// State Changed is latched on a slot that reports its link.
+fn poll(slot: &mut Polled, aspace: u64, posted: &mpsc::Sender<Job>, job_note: u64)
 {
     let s = slot.slot;
     let (seg, b, d, f) = s.port;
     let current = slot.state;
+    let post = |job: Job| {
+        if posted.send(job).is_ok()
+        {
+            let _ = syscall::notification_send(job_note, 1);
+        }
+    };
     let state = with_port(slot, aspace, |regs| {
         let status = regs.read16(s.register(SLOT_STATUS));
         clear_latches(regs, &s, status);
-        let (state, action) = hp::next(current, status);
+        let link_down = s.link_reporting && hp::link_changed(status) && {
+            let link = regs.read16(s.register(LINK_STATUS));
+            link != u16::MAX && link & LINK_ACTIVE == 0
+        };
+        let (state, action) = hp::next(current, status, link_down);
+        let control = || regs.read16(s.register(SLOT_CONTROL));
         match action
         {
             Action::None => state,
-            Action::Removal =>
+            Action::Blink =>
             {
                 std::os::seraph::log!(
-                    warn: "hotplug: slot {}:{}:{}.{}: card removed or its button pressed; devmgr \
-                           does not remove functions, its records stay",
-                    seg, b, d, f
+                    "hotplug: slot {}:{}:{}.{}: attention button pressed; removal in {} ms \
+                     unless pressed again",
+                    seg,
+                    b,
+                    d,
+                    f,
+                    hp::ABORT_POLLS.saturating_mul(hp::HOTPLUG_POLL_MS)
                 );
+                set_control(regs, &s, control(), hp::blink(control(), s.capabilities));
+                state
+            }
+            Action::Cancel =>
+            {
+                std::os::seraph::log!(
+                    "hotplug: slot {}:{}:{}.{}: attention button pressed again; removal cancelled",
+                    seg,
+                    b,
+                    d,
+                    f
+                );
+                set_control(
+                    regs,
+                    &s,
+                    control(),
+                    hp::indicator_on(control(), s.capabilities),
+                );
+                state
+            }
+            Action::Remove =>
+            {
+                std::os::seraph::log!(
+                    "hotplug: slot {}:{}:{}.{}: removing its functions ({})",
+                    seg,
+                    b,
+                    d,
+                    f,
+                    hp::removal_cause(current, status, link_down)
+                );
+                post(Job::Removed(slot.index));
                 state
             }
             Action::PowerUp if power_up(regs, &s) =>
             {
                 std::os::seraph::log!("hotplug: slot {}:{}:{}.{}: card added", seg, b, d, f);
-                if posted.send(slot.index).is_ok()
-                {
-                    let _ = syscall::notification_send(job_note, 1);
-                }
+                post(Job::Added(slot.index));
                 SlotState::Occupied
             }
             Action::PowerUp =>
@@ -505,12 +607,8 @@ fn poll(slot: &mut Polled, aspace: u64, posted: &mpsc::Sender<usize>, job_note: 
                            slot powered off until the card is removed",
                     seg, b, d, f
                 );
-                let control = regs.read16(s.register(SLOT_CONTROL));
-                let off = hp::power_off(control, s.capabilities);
-                if control != u16::MAX && off != control
-                {
-                    write_control(regs, &s, off);
-                }
+                let control = control();
+                set_control(regs, &s, control, hp::power_off(control, s.capabilities));
                 SlotState::Failed
             }
         }
@@ -518,6 +616,59 @@ fn poll(slot: &mut Polled, aspace: u64, posted: &mpsc::Sender<usize>, job_note: 
     if let Some(state) = state
     {
         slot.state = state;
+    }
+}
+
+/// Power off a slot whose removal job completed: the power controller off,
+/// then the power indicator off, two Slot Control writes, so a slot that
+/// acts on the write leaving both off (QEMU's) does so once the controller
+/// is off. The slot is then off while the card the removal removed is
+/// present, else empty, a card inserted or asked for meanwhile powered up
+/// on the next poll ([`hp::completed`]), its latches cleared.
+fn power_off(slot: &mut Polled, aspace: u64)
+{
+    let s = slot.slot;
+    let (seg, b, d, f) = s.port;
+    let current = slot.state;
+    let state = with_port(slot, aspace, |regs| {
+        let control = regs.read16(s.register(SLOT_CONTROL));
+        let off = hp::power_controller_off(control, s.capabilities);
+        set_control(regs, &s, control, off);
+        set_control(regs, &s, off, hp::indicator_off(off, s.capabilities));
+        let status = regs.read16(s.register(SLOT_STATUS));
+        clear_latches(regs, &s, status);
+        (hp::completed(current, status), hp::present(status))
+    });
+    let (state, present) = state.unwrap_or_else(|| (hp::completed(current, u16::MAX), false));
+    std::os::seraph::log!(
+        "hotplug: slot {}:{}:{}.{}: powered off ({})",
+        seg,
+        b,
+        d,
+        f,
+        if state == SlotState::Off
+        {
+            "card still present"
+        }
+        else if present
+        {
+            "a card inserted or asked for meanwhile; powering it up"
+        }
+        else
+        {
+            "empty"
+        }
+    );
+    slot.state = state;
+}
+
+/// Write Slot Control `value` ([`write_control`]) when it differs from
+/// `control`, the value read, and the port answered.
+fn set_control(regs: &ConfigRegs, slot: &Slot, control: u16, value: u16)
+{
+    if control != u16::MAX && value != control
+    {
+        write_control(regs, slot, value);
     }
 }
 
@@ -539,11 +690,12 @@ fn clear_latches(regs: &ConfigRegs, slot: &Slot, status: u16)
 fn power_up(regs: &ConfigRegs, slot: &Slot) -> bool
 {
     let control = regs.read16(slot.register(SLOT_CONTROL));
-    let on = hp::power_on(control, slot.capabilities);
-    if control != u16::MAX && on != control
-    {
-        write_control(regs, slot, on);
-    }
+    set_control(
+        regs,
+        slot,
+        control,
+        hp::power_on(control, slot.capabilities),
+    );
     let up = if slot.link_reporting
     {
         let link = || {
@@ -903,6 +1055,71 @@ fn release(caps: &mut caps::DevmgrCaps, spans: &[(u64, u64)])
     {
         std::os::seraph::log!(warn: "hotplug: no memory to return held BAR pages; they stay held");
     }
+}
+
+/// The removal job of `slot` ([`hp::remove`]): withdraw the driver of each
+/// live record behind it ([`Registry::withdraw_at`]), its device's BAR caps
+/// given back to the held BAR pages; quiesce each function
+/// ([`hp::quiesce`]); return the held BAR pages inside their BARs to the
+/// apertures, whole; mark the records removed; and return each removed
+/// record's instance to its driver's instance limit
+/// ([`bind::Records::release_removed`]). A driver that does not answer
+/// cannot delay it: a withdrawal asks the driver nothing.
+fn remove(
+    slot: &Slot,
+    registry: &Registry,
+    records: &mut bind::Records,
+    caps: &mut caps::DevmgrCaps,
+    ipc_buf: *mut u64,
+)
+{
+    let (s, b, d, f) = slot.port;
+    let mut held = core::mem::take(&mut caps.slot_bars);
+    let mut free = core::mem::take(&mut caps.apertures);
+    let mut withdrawn = 0usize;
+    let removal = hp::remove(
+        slot,
+        &mut records.pci,
+        &mut held,
+        &mut free,
+        |at, held: &mut SpanTable<u64>| {
+            if registry.withdraw_at(at, held, ipc_buf)
+            {
+                withdrawn = withdrawn.saturating_add(1);
+            }
+        },
+        |at| {
+            let (_, bus, dev, func) = at;
+            let _ = with_function(caps, at, |cfg| hp::quiesce(cfg, (bus, dev, func)));
+        },
+    );
+    caps.slot_bars = held;
+    caps.apertures = free;
+    records.release_removed();
+    let returned = match removal.returned
+    {
+        Ok(returned) => returned,
+        Err((returned, error)) =>
+        {
+            std::os::seraph::log!(
+                warn: "hotplug: slot {}:{}:{}.{}: held BAR pages not all returned ({:?}); the \
+                       rest stay held",
+                s, b, d, f, error
+            );
+            returned
+        }
+    };
+    std::os::seraph::log!(
+        "hotplug: slot {}:{}:{}.{}: functions removed: {}, drivers withdrawn: {}, held BAR spans \
+         returned: {}",
+        s,
+        b,
+        d,
+        f,
+        removal.functions,
+        withdrawn,
+        returned
+    );
 }
 
 /// Run `access` on the function at `at` (segment, bus, device, function),

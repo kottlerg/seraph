@@ -212,8 +212,12 @@ impl<S: Copy> SpanTable<S>
         Ok(())
     }
 
-    /// [`Self::carve`], returning the carved cap with the range it covers.
-    fn carve_span(
+    /// [`Self::carve`], returning the carved cap with the range it covers,
+    /// which a caller that gives the cap back later records it under.
+    ///
+    /// # Errors
+    /// [`Self::carve`]'s.
+    pub fn carve_span(
         &mut self,
         base: u64,
         size: u64,

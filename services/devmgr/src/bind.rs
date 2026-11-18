@@ -38,7 +38,7 @@ use firmware::lines::{HoldError, LineError};
 use firmware::pci::{BarSpan, InterruptPlan, MessagesRefused, Msi, Msix};
 use firmware::pci_records::{PciRecords, RecordState};
 use firmware::records::{PlatformRecord, PlatformRecords};
-use firmware::resource::{CarveError, Span, SplitError};
+use firmware::resource::{CarveError, Span, SpanTable, SplitError};
 use firmware::roster::Roster;
 use syscall_abi::PAGE_SIZE;
 
@@ -56,7 +56,7 @@ use crate::{
 /// Every device record a bind pass walks, in record order: the PCI records
 /// ([`PciRecords`]), then the platform records ([`crate::platform`]), each
 /// with its state, and how many devices each driver with an instance limit
-/// has been started for over the boot.
+/// has been started for over the boot, less the removed ones.
 pub struct Records
 {
     pub pci: PciRecords,
@@ -94,6 +94,17 @@ impl Records
             .devices()
             .len()
             .saturating_add(self.platform_states.len())
+    }
+
+    /// Return to its driver's instance limit each limited driver's PCI
+    /// record now removed ([`BoundCounts::release_removed`]), so a later
+    /// pass may bind the driver to the device that replaces it; returns how
+    /// many were returned.
+    pub fn release_removed(&mut self) -> usize
+    {
+        let pci = &self.pci;
+        self.bound_counts
+            .release_removed(|index| pci.state(index) == Some(RecordState::Removed))
     }
 
     /// The PCI functions of every record not removed, in record order.
@@ -469,8 +480,13 @@ fn bind_pci_records(
                     records.mark_bound(at);
                     table.note_bound(index);
                     if let Some(candidate) = table.candidates().get(index)
+                        && bound_counts.note_pci(&candidate.decl.name, at).is_err()
                     {
-                        bound_counts.note(&candidate.decl.name);
+                        std::os::seraph::log!(
+                            warn: "{}: no memory to keep its instance; its device's removal \
+                                   does not return it",
+                            candidate.decl.name.as_str()
+                        );
                     }
                 }
             }
@@ -575,7 +591,7 @@ fn bind_platform(
                     process_handle: child.process_handle,
                 },
             };
-            crate::record_spawned(pass.roster, spawned, ipc_buf);
+            crate::record_spawned(pass.roster, spawned, &mut carve.caps.slot_bars, ipc_buf);
         }
         spawn::DriverSpawn::Unbootstrapped(child) =>
         {
@@ -887,7 +903,7 @@ fn bind_pci(
     else
     {
         std::os::seraph::log!(warn: "{}: no service endpoint; not bound", name);
-        dev_caps.release();
+        dev_caps.release(&mut carve.caps.slot_bars);
         return false;
     };
     let Some(source) = candidate.binary.source_copy()
@@ -895,7 +911,7 @@ fn bind_pci(
     {
         std::os::seraph::log!(warn: "{}: binary cap not copied; not bound", name);
         let _ = syscall::cap_delete(service_ep);
-        dev_caps.release();
+        dev_caps.release(&mut carve.caps.slot_bars);
         return false;
     };
     let config = spawn::BoundSpawnConfig {
@@ -935,18 +951,18 @@ fn bind_pci(
                     process_handle: child.process_handle,
                 },
             };
-            crate::record_spawned(pass.roster, spawned, ipc_buf);
+            crate::record_spawned(pass.roster, spawned, &mut carve.caps.slot_bars, ipc_buf);
         }
         spawn::DriverSpawn::Unbootstrapped(child) =>
         {
             withdraw_device(&dev_caps, child, ipc_buf);
             let _ = syscall::cap_delete(service_ep);
-            dev_caps.release();
+            dev_caps.release(&mut carve.caps.slot_bars);
         }
         spawn::DriverSpawn::Failed =>
         {
             let _ = syscall::cap_delete(service_ep);
-            dev_caps.release();
+            dev_caps.release(&mut carve.caps.slot_bars);
             return false;
         }
     }
@@ -979,64 +995,59 @@ fn carve_pci_device(
     {
         return None;
     };
-    let (msi, msix) =
-        firmware::pci::deliverable_messages(pci_dev.msi, pci_dev.msix, virtio.as_ref());
-    let spans = msix.map(|m| m.withheld());
-    let withheld = spans.as_ref().map_or(&[][..], |w| w.as_slice());
-    let Some(mut dev) = PciDeviceCaps::empty(carve.caps.self_aspace)
+    let address = (pci_dev.segment, pci_dev.bus, pci_dev.dev, pci_dev.func);
+    let Some(mut dev) = PciDeviceCaps::empty(carve.caps.self_aspace, address)
     else
     {
         std::os::seraph::log!(warn: "{}: no memory for the device's resources; not bound", name);
         return None;
     };
-    if carve_bars(
-        name,
-        pci_dev,
-        virtio.as_ref(),
-        withheld,
-        carve.caps,
-        &mut dev,
-    )
-    .is_none()
+    if fill_pci_device(name, pci_dev, decl, virtio.as_ref(), carve, &mut dev).is_none()
     {
-        dev.release();
+        dev.release(&mut carve.caps.slot_bars);
         return None;
     }
-    let Some(config) = carve_function_config(name, pci_dev, carve.caps)
-    else
-    {
-        dev.release();
-        return None;
-    };
-    dev.config = config;
-    let Some(badge) = catalog_entry(pci_dev, virtio.as_ref(), carve.catalog)
+    Some(dev)
+}
+
+/// The carving of [`carve_pci_device`] into `dev`, from the BARs to the
+/// Command register, with the `VirtIO` register layout `virtio` the driver
+/// is given; `None`, logged under `name`, on any failure, leaving to the
+/// caller the release of what `dev` holds.
+fn fill_pci_device(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    decl: &DriverDecl,
+    virtio: Option<&virtio_core::RegisterLayout>,
+    carve: &mut Carve,
+    dev: &mut PciDeviceCaps,
+) -> Option<()>
+{
+    let (msi, msix) = firmware::pci::deliverable_messages(pci_dev.msi, pci_dev.msix, virtio);
+    let spans = msix.map(|m| m.withheld());
+    let withheld = spans.as_ref().map_or(&[][..], |w| w.as_slice());
+    carve_bars(name, pci_dev, virtio, withheld, carve.caps, dev)?;
+    dev.config = carve_function_config(name, pci_dev, carve.caps)?;
+    let Some(badge) = catalog_entry(pci_dev, virtio, carve.catalog)
     else
     {
         std::os::seraph::log!(warn: "{}: catalog entry not added; not bound", name);
-        dev.release();
         return None;
     };
     dev.device_badge = badge;
     if decl.dma
     {
-        let Some(grant) = grant_dma(name, pci_dev, decl.dma_width, carve.caps, badge)
-        else
-        {
-            dev.release();
-            return None;
-        };
-        dev.dma = Some(grant);
+        dev.dma = Some(grant_dma(name, pci_dev, decl.dma_width, carve.caps, badge)?);
     }
     // After the DMA grant: on riscv64 a message-signaled target's interrupt
     // file enters the device's IOMMU domain before its vectors are enabled.
-    let Ok(given) = give_interrupt(name, pci_dev, (msi, msix), decl, carve, &mut dev)
+    let Ok(given) = give_interrupt(name, pci_dev, (msi, msix), decl, carve, dev)
     else
     {
         std::os::seraph::log!(
             warn: "{}: interrupt files mapped for vectors not given; not bound",
             name
         );
-        dev.release();
         return None;
     };
     if given.is_none() && decl.interrupt.need == InterruptNeed::Required
@@ -1045,7 +1056,6 @@ fn carve_pci_device(
             warn: "{}: no interrupt for the device, which the driver requires; not bound",
             name
         );
-        dev.release();
         return None;
     }
     dev.reset = match decl.reset
@@ -1055,10 +1065,9 @@ fn carve_pci_device(
         Reset::VirtioStatus { .. } =>
         {
             // The layout is `Some`: a VirtIO status reset without one was
-            // refused above.
-            let reset = virtio
-                .as_ref()
-                .and_then(|l| DeviceReset::for_device(l, dev.resources(), dev.config.aspace));
+            // refused before the carve ([`virtio_layout`]).
+            let reset =
+                virtio.and_then(|l| DeviceReset::for_device(l, dev.resources(), dev.config.aspace));
             if reset.is_none()
             {
                 std::os::seraph::log!(
@@ -1074,10 +1083,9 @@ fn carve_pci_device(
         .prepare_for_bind(decl.dma, given == Some(InterruptKind::Wired))
     {
         std::os::seraph::log!(warn: "{}: configuration page not mapped; not bound", name);
-        dev.release();
         return None;
     }
-    Some(dev)
+    Some(())
 }
 
 /// The `VirtIO` register layout the driver `decl` is given of the PCI
@@ -1175,7 +1183,7 @@ fn carve_bars(
                 phys,
                 bytes
             );
-            let Some(cap) = crate::carve_subrange(caps, phys, bytes)
+            let Some(span) = crate::carve_bar(caps, phys, bytes)
             else
             {
                 std::os::seraph::log!(
@@ -1186,12 +1194,13 @@ fn carve_bars(
                 return None;
             };
             dev.push(Resource::Mmio {
-                cap,
+                cap: span.slot,
                 bar: Some(index),
                 phys,
                 bytes,
                 offset,
             });
+            dev.push_bar(span);
         }
         Some(())
     };
@@ -1626,17 +1635,17 @@ fn give_msix(
         Ok(minted) => minted,
         Err(e) =>
         {
-            let _ = syscall::cap_delete(table.cap);
+            return_bar(&mut carve.caps.slot_bars, table.span);
             return Err(e);
         }
     };
     if !dev.config.enable_msix(msix, &table, &messages)
     {
         delete_messages(carve.irq_range.remap.as_deref(), &messages);
-        let _ = syscall::cap_delete(table.cap);
+        return_bar(&mut carve.caps.slot_bars, table.span);
         return Err(not_given(widened));
     }
-    dev.msix_table = table.cap;
+    dev.push_bar(table.span);
     dev.remap = carve.irq_range.remap();
     for (vector, m) in (0..=u8::MAX).zip(&messages)
     {
@@ -1654,6 +1663,8 @@ fn give_msix(
 struct MsixTable
 {
     cap: u64,
+    /// The cap with the range it covers, under which it is given back.
+    span: Span<u64>,
     /// Pages the cap spans.
     pages: u64,
     /// The table's byte offset from the cap's first page.
@@ -1697,9 +1708,9 @@ fn msix_table(
     // `table_end() <= bar_size` bounds `span.start`, so the subtraction does
     // not saturate.
     let bytes = span.end.min(bar_size).saturating_sub(span.start);
-    let Some(cap) = bar_phys
+    let Some(carved) = bar_phys
         .checked_add(span.start)
-        .and_then(|at| crate::carve_subrange(caps, at, bytes))
+        .and_then(|at| crate::carve_bar(caps, at, bytes))
     else
     {
         std::os::seraph::log!(
@@ -1710,7 +1721,8 @@ fn msix_table(
         return None;
     };
     Some(MsixTable {
-        cap,
+        cap: carved.slot,
+        span: carved,
         pages: bytes.div_ceil(PAGE_SIZE),
         offset,
     })
@@ -1894,16 +1906,21 @@ enum StopReset
 
 /// The caps devmgr keeps for a PCI function it bound a driver to: the
 /// resources it delivered (each the cap the driver's copy derives from),
-/// the device's DMA grant for a DMA declaration, the function's
-/// configuration page, the pages of its MSI-X table for a function given
-/// MSI-X, the device's reset, its badge and requester ID, and the release
-/// token of a driver procmgr holds the memory of.
+/// the range each of its BAR caps covers, the device's DMA grant for a DMA
+/// declaration, the function's configuration page, the pages of its MSI-X
+/// table for a function given MSI-X, the device's reset, its address and
+/// badge, and the release token of a driver procmgr holds the memory of.
 pub struct PciDeviceCaps
 {
     /// Room for [`MAX_BOUND_RESOURCES`] reserved on the heap at
     /// [`Self::empty`], so a push never allocates and the caps move through
     /// the bind and the registry as a few words.
     resources: Vec<Resource>,
+    /// Each cap devmgr carved on the function's BARs, its `Mmio` resources'
+    /// and its MSI-X table's, with the range it covers, which
+    /// [`Self::release`] gives back to the held BAR pages; room for one more
+    /// than [`MAX_BOUND_RESOURCES`] reserved at [`Self::empty`].
+    bars: Vec<Span<u64>>,
     /// The device's DMA capability, kept by devmgr, and its mappings
     /// ([`dma::DmaGrant`]); `None` for a driver that declares no DMA.
     pub dma: Option<dma::DmaGrant>,
@@ -1911,11 +1928,9 @@ pub struct PciDeviceCaps
     /// which it clears Bus Master Enable and sets Interrupt Disable before it
     /// takes the device.
     config: FunctionConfig,
-    /// devmgr's cap on the pages holding the function's MSI-X table
-    /// ([`msix_table`]), kept by devmgr alone; 0 for a function not given
-    /// MSI-X.
-    msix_table: u64,
     reset: StopReset,
+    /// The function's address: segment, bus, device, function.
+    pub address: (u16, u8, u8, u8),
     pub device_badge: u64,
     /// The release token of the driver devmgr started for the device
     /// ([`spawn::HeldChild`]), on which alone procmgr releases the driver's
@@ -1932,14 +1947,18 @@ impl PciDeviceCaps
 {
     /// Nothing carved yet; `None` when the room for the resources cannot be
     /// reserved.
-    fn empty(aspace: u64) -> Option<Self>
+    fn empty(aspace: u64, address: (u16, u8, u8, u8)) -> Option<Self>
     {
+        let mut bars = Vec::new();
+        bars.try_reserve_exact(MAX_BOUND_RESOURCES.saturating_add(1))
+            .ok()?;
         Some(Self {
             resources: bound_resources()?,
+            bars,
             dma: None,
             config: FunctionConfig { cap: 0, aspace },
-            msix_table: 0,
             reset: StopReset::None,
+            address,
             device_badge: 0,
             release_token: 0,
             remap: None,
@@ -1953,6 +1972,18 @@ impl PciDeviceCaps
     fn push(&mut self, resource: Resource)
     {
         let _ = push_bound(&mut self.resources, resource);
+    }
+
+    /// Record a cap carved on the function's BARs with the range it covers
+    /// (`span`), to be given back at [`Self::release`]: at most one per
+    /// delivered range and one for the MSI-X table, which the room reserved
+    /// at [`Self::empty`] holds.
+    fn push_bar(&mut self, span: Span<u64>)
+    {
+        if self.bars.len() < self.bars.capacity()
+        {
+            self.bars.push(span);
+        }
     }
 
     /// The delivered resources, in delivery order: the BARs, then the
@@ -1989,8 +2020,11 @@ impl PciDeviceCaps
     /// targets once they are freed and minted for another device, and each
     /// target's remapping entry is cleared before its cap is deleted
     /// ([`release_message`]), so a message the device writes all the same
-    /// is blocked.
-    pub fn release(&self)
+    /// is blocked. The caps on its BARs, its `Mmio` resources' and its MSI-X
+    /// table's, are given back to the held BAR pages `held`
+    /// ([`return_bar`]), so its pages stay devmgr's: a later bind carves
+    /// them again, and a hotplug removal returns them to the apertures.
+    pub fn release(&self, held: &mut SpanTable<u64>)
     {
         if self.config.cap != 0 && self.has_messages()
         {
@@ -2009,16 +2043,24 @@ impl PciDeviceCaps
                     kind: InterruptKind::Wired,
                     ..
                 }
-                | Resource::Mmio { .. }
                 | Resource::IoPort { .. } =>
                 {
                     let _ = syscall::cap_delete(resource.cap());
                 }
+                // Given back with the other BAR caps below; one not recorded
+                // there is deleted.
+                Resource::Mmio { cap, .. } =>
+                {
+                    if !self.bars.iter().any(|s| s.slot == *cap)
+                    {
+                        let _ = syscall::cap_delete(*cap);
+                    }
+                }
             }
         }
-        if self.msix_table != 0
+        for &span in &self.bars
         {
-            let _ = syscall::cap_delete(self.msix_table);
+            return_bar(held, span);
         }
         if let Some(dma) = &self.dma
         {
@@ -2137,7 +2179,13 @@ pub fn withdraw_device(dev_caps: &PciDeviceCaps, child: spawn::HeldChild, ipc_bu
     }
     else if quiet
     {
-        spawn::destroy_and_release(child, ipc_buf);
+        if spawn::destroy_and_release(child, ipc_buf)
+        {
+            std::os::seraph::log!(
+                "device {}: driver withdrawn, its memory released",
+                dev_caps.device_badge
+            );
+        }
     }
     else
     {
@@ -2146,6 +2194,31 @@ pub fn withdraw_device(dev_caps: &PciDeviceCaps, child: spawn::HeldChild, ipc_bu
             dev_caps.device_badge
         );
         spawn::destroy_held(child, ipc_buf);
+    }
+}
+
+/// Give the cap devmgr carved on a function's BARs, covering `span`, back to
+/// the held BAR pages `held` (`caps::DevmgrCaps::slot_bars`): every copy
+/// derived from it (the driver's, and their mappings) is revoked first, so
+/// the pages are devmgr's alone again, and a bind carves them, or a hotplug
+/// removal returns them to the apertures, once more. Deleted, logged, when a
+/// copy cannot be revoked or the table cannot grow; its pages are then lost
+/// for the boot.
+pub fn return_bar(held: &mut SpanTable<u64>, span: Span<u64>)
+{
+    let kept = syscall::cap_revoke_all(span.slot).is_ok()
+        && matches!(
+            held.insert(span.slot, span.base, span.end.saturating_sub(span.base)),
+            Ok(true)
+        );
+    if !kept
+    {
+        let _ = syscall::cap_delete(span.slot);
+        std::os::seraph::log!(
+            warn: "BAR pages {:#x}..{:#x} not given back; lost for the boot",
+            span.base,
+            span.end
+        );
     }
 }
 

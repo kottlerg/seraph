@@ -338,7 +338,7 @@ master-log source and publishes it seed-only as `logd.query`
 ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `seed`),
 so only a recipe that seeds the name holds it. No sender's badge carries a verb
 bit: procmgr redraws a process badge that does
-([`log_badges`](../../../shared/ipc/src/lib.rs)), and `LOG_BADGE_INIT` and
+([`log_badges`](../../../shared/ipc/src/log_badges.rs)), and `LOG_BADGE_INIT` and
 `LOG_BADGE_PROCMGR` carry none. A query on any other badge is refused with
 `QUERY_DENIED`.
 

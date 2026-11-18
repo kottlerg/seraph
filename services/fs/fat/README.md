@@ -63,8 +63,9 @@ Per-label rights gating (`WRITE` for the write / truncate labels,
 [`namespace-protocol::gate`](../../../shared/namespace-protocol/src/gate.rs), as
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
 § Rights gate specifies. The exact wire shapes are defined in
-[`shared/ipc/src/lib.rs`](../../../shared/ipc/src/lib.rs) and documented
-in [`../docs/fs-driver-protocol.md`](../docs/fs-driver-protocol.md).
+[`shared/ipc/src/fs_labels.rs`](../../../shared/ipc/src/fs_labels.rs) and
+[`fs_errors.rs`](../../../shared/ipc/src/fs_errors.rs), and documented in
+[`../docs/fs-driver-protocol.md`](../docs/fs-driver-protocol.md).
 
 Cap-monotonic attenuation: `FS_CREATE` / `FS_MKDIR` mint a child cap
 with rights `caller_parent ∩ kind_max` where `kind_max` is

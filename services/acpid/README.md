@@ -181,8 +181,8 @@ event to devmgr with `ACPI_HOTPLUG`, as `HOTPLUG_ADDED` or `HOTPLUG_REMOVED`. A 
 thread makes the call, one event at a time, so the evaluation thread serves power requests and
 GPEs while devmgr runs the job; a slot's next event waits until its previous one ends. devmgr
 replies once its job has ended, with the functions it recorded or removed
-(`shared/ipc/src/lib.rs`, `devmgr_labels::ACPI_HOTPLUG`). The evaluation thread then completes
-the event:
+(`shared/ipc/src/devmgr_labels.rs`, `devmgr_labels::ACPI_HOTPLUG`). The evaluation thread then
+completes the event:
 
 - an eject request devmgr ran is ejected: acpid runs the slot's `_EJ0(1)`, on which the firmware
   lets the card go, logged `ejected (_EJ0) once devmgr removed` with the count. devmgr has by then
@@ -233,7 +233,8 @@ boot. The checks are [docs/devmgr.md](docs/devmgr.md) § Pushes.
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability authority; how acpid's capabilities derive from devmgr's |
 | [docs/limits.md](../../docs/limits.md) | The evaluator's bounds and acpid's own |
 | [shared/aml/README.md](../../shared/aml/README.md) | The parser, namespace and evaluator acpid runs |
-| [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | The `devmgr_labels` acpid calls, the `acpid_labels` it serves, and their wire contract |
+| [shared/ipc/src/devmgr_labels.rs](../../shared/ipc/src/devmgr_labels.rs) | The `devmgr_labels` acpid calls and their wire contract |
+| [shared/ipc/src/acpid_labels.rs](../../shared/ipc/src/acpid_labels.rs) | The `acpid_labels` it serves and their wire contract |
 | [services/pwrmgr/README.md](../pwrmgr/README.md) | The holder of `acpid.power`; powers off and resets x86-64 through acpid, and waits for its power button |
 | [services/devmgr/README.md](../devmgr/README.md) | The hardware authority that grants acpid's regions and keeps its results |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher and supervisor; mints the `devmgr.acpi` seed and publishes `acpid.power` and `acpid.deny` |

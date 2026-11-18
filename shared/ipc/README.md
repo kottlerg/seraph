@@ -27,11 +27,25 @@ shared/ipc/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── lib.rs                  # IpcMessage, call/recv/reply wrappers, labels, errors, decoders
+    ├── lib.rs                  # IpcMessage, call/recv/reply wrappers, version constants, modules
     ├── bootstrap.rs            # Creator-to-child bootstrap rounds; multi-round slot codec
+    ├── log_query.rs            # Wire format of logd's QUERY_SLOTS and QUERY_HISTORY labels
     ├── log_record.rs           # Log record codec: RecordWriter, Record, key alphabet
-    └── recv_guard.rs           # RecvGuard backoff and EXIT_RECV_WEDGE policy
+    ├── recv_guard.rs           # RecvGuard backoff and EXIT_RECV_WEDGE policy
+    ├── <protocol>_labels.rs    # One file per label module (procmgr_labels.rs, ...)
+    ├── <protocol>_errors.rs    # One file per error-code module (procmgr_errors.rs, ...)
+    ├── sched_policy.rs ...     # One file per table module: sched_policy, published_names,
+    │                           #   log_badges, keysym, memmgr_bootstrap, device_info_kind,
+    │                           #   procmgr_process_state
+    ├── devmgr_client.rs        # report_driver_ready, query_device, watch_class, ...
+    ├── devmgr_dma_client.rs    # dma_map, dma_unmap, dma_faults
+    └── memmgr_grant.rs         # memmgr_grant_layout reply decoder
 ```
+
+A label, error or table module is declared in `lib.rs` as `pub mod <name>;` and lives in
+`src/<name>.rs`; the three client files are private modules whose items `lib.rs` re-exports at
+the crate root. A change to one protocol's labels edits its own file (and, for a version bump, its
+constant in `lib.rs`).
 
 ---
 

@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// shared/ipc/src/fs_errors.rs
+
+//! Error replies from filesystem drivers (FAT, …).
+
+/// Request handled.
+pub const SUCCESS: u64 = 0;
+/// File not found, or filesystem failed to validate on mount.
+pub const NOT_FOUND: u64 = 1;
+/// I/O error, or out of memory.
+pub const IO_ERROR: u64 = 2;
+/// Out of file-handle slots.
+pub const TOO_MANY_OPEN: u64 = 3;
+/// File badge is invalid or expired.
+pub const INVALID_BADGE: u64 = 4;
+/// Reserved; not emitted by the current fs driver (the fat driver's
+/// cooperative-release watchdog revokes without replying this code).
+pub const RELEASE_TIMEOUT: u64 = 5;
+/// `FS_READ_MEMORY` cookie is invalid (zero — collides with the
+/// `OutstandingPage::None` sentinel in fs driver tracking), or an
+/// `FS_WRITE_MEMORY` byte range does not fit its source page (zero
+/// count, or offset plus count past the page).
+pub const BAD_MEMORY_OFFSET: u64 = 6;
+/// Caller's node-cap badge lacks a rights bit required by the
+/// requested operation (see `namespace-protocol::rights`).
+pub const PERMISSION_DENIED: u64 = 7;
+/// Caller's compiled `FS_LABELS_VERSION` does not match the receiver's.
+/// `FS_MOUNT` is the handshake entry point and carries the caller's
+/// version as `data[0]`; mismatch here means the caller was built
+/// against a different revision of `shared/ipc`.
+pub const LABEL_VERSION_MISMATCH: u64 = 8;
+/// Mutation refused: the target name already exists in the parent
+/// directory (`FS_CREATE`, `FS_MKDIR`, `FS_RENAME` destination).
+pub const EXISTS: u64 = 9;
+/// Mutation refused: the volume has no free cluster, the parent
+/// directory has no room for a new entry (FAT16 fixed root full;
+/// FAT32 cluster-chain extension failed), or a write would end past
+/// the largest file size the filesystem records.
+pub const NO_SPACE: u64 = 10;
+/// `FS_REMOVE` refused: the target directory is non-empty.
+pub const NOT_EMPTY: u64 = 11;
+/// Operation refused because the target is a directory (e.g.
+/// `FS_WRITE` on a directory cap) or because the operation is
+/// permitted only on files.
+pub const IS_A_DIRECTORY: u64 = 12;
+/// `FS_UNMOUNT` without `UNMOUNT_FORCE` refused: live opens remain;
+/// `data[0]` carries their count.
+pub const BUSY: u64 = 13;
+/// Unknown opcode on fs-driver endpoint.
+pub const UNKNOWN_OPCODE: u64 = 0xFF;

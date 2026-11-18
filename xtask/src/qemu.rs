@@ -276,14 +276,14 @@ fn test_device_args() -> Vec<String>
         .collect()
 }
 
-/// The id of the PCI Express root port a hotplug launch attaches
+/// The id of the first PCI Express root port a hotplug launch attaches
 /// ([`QemuLaunchSpec::hotplug_port`]), which `device_add` names as the bus of
-/// the device it hot-adds.
+/// the device it hot-adds, and the bus of a [`PortDisk`].
 pub const HOTPLUG_PORT_ID: &str = "hotplug-port";
 
-/// The PCI Express root port a hotplug launch attaches, empty at boot: its
-/// own chassis and slot number, pinned at slot `0x1c`, clear of every device
-/// a launch places.
+/// The first PCI Express root port a hotplug launch attaches, empty at boot
+/// unless a [`PortDisk`] sits behind it: its own chassis and slot number,
+/// pinned at slot `0x1c`, clear of every device a launch places.
 const HOTPLUG_PORT_DEVICE: &str = "pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c";
 
 /// The id of the second PCI Express root port a hotplug launch attaches,
@@ -301,7 +301,7 @@ const HOTPLUG_DISK_PORT_DEVICE: &str =
 /// firmware's `_OSC` grants the operating system native hotplug control.
 const X86_NATIVE_HOTPLUG_GLOBAL: &str = "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off";
 
-/// Who controls the hotplug of the root port a launch attaches
+/// Who controls the hotplug of the root ports a launch attaches
 /// ([`QemuLaunchSpec::hotplug_port`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotplugControl
@@ -317,8 +317,9 @@ pub enum HotplugControl
     Native,
 }
 
-/// The hotplug root port a launch attaches ([`QemuLaunchSpec::hotplug_port`]):
-/// who controls its hotplug, and the disk placed behind it, if any.
+/// The hotplug root ports a launch attaches
+/// ([`QemuLaunchSpec::hotplug_port`]): who controls their hotplug, and the
+/// disk placed behind the first, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HotplugPort<'a>
 {
@@ -328,7 +329,7 @@ pub struct HotplugPort<'a>
 
 impl HotplugPort<'_>
 {
-    /// An empty port under `control`, with no disk.
+    /// Empty ports under `control`, with no disk.
     #[must_use]
     pub const fn empty(control: HotplugControl) -> Self
     {
@@ -339,7 +340,8 @@ impl HotplugPort<'_>
     }
 }
 
-/// A disk a hotplug launch places behind its root port ([`HotplugPort`]).
+/// A disk a hotplug launch places behind its first root port
+/// ([`HotplugPort`], [`HOTPLUG_PORT_ID`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortDisk<'a>
 {
@@ -359,7 +361,7 @@ pub enum PortDisk<'a>
     Boot,
 }
 
-/// The id of the `virtio-blk-pci` device behind the hotplug port, of the
+/// The id of the `virtio-blk-pci` device behind the first hotplug port, of the
 /// boot disk ([`PortDisk::Boot`]) or the data disk ([`PortDisk::Data`]).
 pub const PORT_DISK_ID: &str = "hotplug-disk";
 
@@ -449,7 +451,7 @@ fn hotplug_port_args(spec: &QemuLaunchSpec) -> Vec<String>
     args
 }
 
-/// The block size of the data disk behind the hotplug port of `spec`
+/// The block size of the data disk behind the first hotplug port of `spec`
 /// ([`PortDisk::Data`]), if it has one.
 fn port_disk_block_size(spec: &QemuLaunchSpec) -> Option<u32>
 {
@@ -460,7 +462,7 @@ fn port_disk_block_size(spec: &QemuLaunchSpec) -> Option<u32>
     }
 }
 
-/// Whether the boot disk's device sits behind the hotplug port of `spec`
+/// Whether the boot disk's device sits behind the first hotplug port of `spec`
 /// ([`PortDisk::Boot`]), which [`hotplug_port_args`] then places.
 fn boot_disk_behind_port(spec: &QemuLaunchSpec) -> bool
 {

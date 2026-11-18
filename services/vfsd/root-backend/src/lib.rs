@@ -468,7 +468,10 @@ impl VfsdRootBackend
             .chain(self.nodes.iter())
             .any(|n| match &n.slot
             {
-                Slot::Mounted(m) | Slot::Unmounting(m) => m.disk == disk && m.first_lba == first_lba,
+                Slot::Mounted(m) | Slot::Unmounting(m) =>
+                {
+                    m.disk == disk && m.first_lba == first_lba
+                }
                 Slot::Empty => false,
             })
     }

@@ -68,8 +68,9 @@ it.
 The driver owns one DMA page, the request buffer, and the rings of the requestq (virtqueue 0), the
 device's only queue (VirtIO 1.2 § 5.4.2). It maps both for the device once at setup, through its
 DMA capability, and programs the device only with the device addresses devmgr returns, never with a
-physical address ([docs/device-management.md](../../../../docs/device-management.md#dma-authorisation)
-§ DMA Authorisation). The queue is one descriptor long, so at most one buffer is ever posted.
+physical address
+([docs/device-management.md](../../../../docs/device-management.md#dma-authorisation) § DMA
+Authorisation). The queue is one descriptor long, so at most one buffer is ever posted.
 
 A `READ` of `n` bytes posts the first `min(n, MAX_READ_BYTES)` bytes of the page as one
 device-writable descriptor and notifies the device, then waits for the used ring to return it. The

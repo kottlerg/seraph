@@ -970,3 +970,138 @@ pub const INIT_REAP_PROBE_HELD: u64 = 2;
 /// value, or carrying a `VERB_BIT_MASK` bit (this value carries all of
 /// them), so the two never collide.
 pub const INIT_REAP_CORRELATOR: u64 = u64::MAX;
+
+#[cfg(test)]
+mod tests
+{
+    use crate::{IpcMessage, MSG_DATA_WORDS_MAX, procmgr_labels, svcmgr_labels};
+
+    #[test]
+    fn a_create_name_block_follows_every_other_create_word()
+    {
+        use procmgr_labels::{
+            CREATE_ARGV_ENV, CREATE_FROM_FILE, CREATE_MEMORY_MAX, CREATE_PROCESS, create_name_word,
+        };
+        assert_eq!(create_name_word(CREATE_PROCESS), 1);
+        assert_eq!(create_name_word(CREATE_FROM_FILE | CREATE_MEMORY_MAX), 2);
+        assert_eq!(create_name_word(CREATE_PROCESS | CREATE_ARGV_ENV), 5);
+        assert_eq!(
+            create_name_word(CREATE_FROM_FILE | CREATE_ARGV_ENV | CREATE_MEMORY_MAX),
+            6
+        );
+    }
+
+    #[test]
+    fn a_create_name_round_trips_at_every_length()
+    {
+        use procmgr_labels::{
+            CREATE_ARGV_ENV, CREATE_FROM_FILE, CREATE_MEMORY_MAX, CREATE_NAME_MAX, create_name,
+            with_create_name,
+        };
+        let label = CREATE_FROM_FILE | CREATE_ARGV_ENV | CREATE_MEMORY_MAX;
+        let mut name = [0u8; CREATE_NAME_MAX];
+        for (i, byte) in name.iter_mut().enumerate()
+        {
+            *byte = b'a' + (i % 26) as u8;
+        }
+        for len in [1, 7, 8, 9, 16, 17, CREATE_NAME_MAX]
+        {
+            let builder = IpcMessage::builder(label).word(0, 4096).word(5, 9);
+            let msg = with_create_name(builder, label, &name[..len])
+                .unwrap()
+                .build();
+            assert_eq!(create_name(&msg), Some(&name[..len]), "length {len}");
+            // The words before the block are untouched.
+            assert_eq!((msg.word(0), msg.word(5)), (4096, 9));
+        }
+    }
+
+    #[test]
+    fn a_create_name_block_that_is_missing_empty_long_or_short_is_refused()
+    {
+        use procmgr_labels::{
+            CREATE_FROM_FILE, CREATE_NAME_MAX, CREATE_PROCESS, create_name, with_create_name,
+        };
+        let long = [b'x'; CREATE_NAME_MAX + 1];
+        let builder = || IpcMessage::builder(CREATE_PROCESS).word(0, 4096);
+        assert!(with_create_name(builder(), CREATE_PROCESS, b"").is_none());
+        assert!(with_create_name(builder(), CREATE_PROCESS, &long).is_none());
+        // No length word delivered.
+        assert_eq!(create_name(&builder().build()), None);
+        // A zero or over-long length word.
+        assert_eq!(create_name(&builder().word(1, 0).build()), None);
+        let over = builder()
+            .word(1, CREATE_NAME_MAX as u64 + 1)
+            .bytes(2, &long);
+        assert_eq!(create_name(&over.build()), None);
+        // A length the delivered words do not cover.
+        let short = IpcMessage::builder(CREATE_FROM_FILE)
+            .word(0, 1)
+            .word(1, 9)
+            .bytes(2, b"/abcdefg");
+        assert_eq!(create_name(&short.build()), None);
+    }
+
+    #[test]
+    fn a_process_list_page_round_trips_names_of_every_length()
+    {
+        use procmgr_labels::{LIST_PROCESSES_PAGE, pack_list_entry, unpack_list_entry};
+        let long = [b'x'; svcmgr_labels::NAME_MAX];
+        let names: [&[u8]; 4] = [b"svctest", &long, b"", b"seven77"];
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        for (i, name) in names.iter().enumerate()
+        {
+            assert!(pack_list_entry(&mut words, i, 0x100 + i as u64, name));
+        }
+        words[0] = names.len() as u64;
+        for (i, name) in names.iter().enumerate()
+        {
+            let mut out = [0u8; svcmgr_labels::NAME_MAX];
+            let (badge, len) = unpack_list_entry(&words, i, &mut out).unwrap();
+            assert_eq!((badge, &out[..len]), (0x100 + i as u64, *name));
+        }
+        assert!(
+            unpack_list_entry(&words, names.len(), &mut [0; svcmgr_labels::NAME_MAX]).is_none()
+        );
+        // A full page fits the message, and the entry past it does not.
+        assert!(pack_list_entry(
+            &mut words,
+            LIST_PROCESSES_PAGE - 1,
+            1,
+            b"a"
+        ));
+        assert!(!pack_list_entry(&mut words, LIST_PROCESSES_PAGE, 1, b"a"));
+    }
+
+    #[test]
+    fn a_process_list_entry_truncates_a_long_name_and_refuses_a_long_length()
+    {
+        use procmgr_labels::{pack_list_entry, unpack_list_entry};
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        let long = [b'n'; svcmgr_labels::NAME_MAX + 9];
+        assert!(pack_list_entry(&mut words, 0, 7, &long));
+        words[0] = 1;
+        let mut out = [0u8; svcmgr_labels::NAME_MAX];
+        assert_eq!(
+            unpack_list_entry(&words, 0, &mut out),
+            Some((7, svcmgr_labels::NAME_MAX))
+        );
+        words[2] = svcmgr_labels::NAME_MAX as u64 + 1;
+        assert!(unpack_list_entry(&words, 0, &mut out).is_none());
+    }
+
+    // The defect caught: an entry index whose word offset overflows `usize`,
+    // which wrapped to a small offset and wrote or read another entry.
+    #[test]
+    fn a_process_list_index_whose_offset_overflows_is_refused()
+    {
+        use procmgr_labels::{LIST_PROCESSES_WORDS_PER_ENTRY, pack_list_entry, unpack_list_entry};
+        let index = usize::MAX / LIST_PROCESSES_WORDS_PER_ENTRY + 1;
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_list_entry(&mut words, index, 7, b"a"));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        words[0] = u64::MAX;
+        let mut out = [0u8; svcmgr_labels::NAME_MAX];
+        assert!(unpack_list_entry(&words, index, &mut out).is_none());
+    }
+}

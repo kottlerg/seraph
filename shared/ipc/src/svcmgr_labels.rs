@@ -289,3 +289,79 @@ const _: () = core::assert!(
     crate::stop_labels::STOP_AUTHORITY != PUBLISH_AUTHORITY
         && crate::stop_labels::STOP_AUTHORITY != HANDOVER_AUTHORITY
 );
+
+#[cfg(test)]
+mod tests
+{
+    use crate::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, svcmgr_labels};
+
+    #[test]
+    fn a_stop_source_page_round_trips_and_holds_one_entry_per_cap()
+    {
+        use svcmgr_labels::{
+            LIST_STOP_SOURCES_PAGE, NAME_MAX, STOP_SOURCE_WORDS, pack_stop_source,
+            unpack_stop_source,
+        };
+        assert_eq!(LIST_STOP_SOURCES_PAGE, MSG_CAP_SLOTS_MAX);
+        let long = [b'y'; NAME_MAX];
+        let names: [&[u8]; 2] = [b"sessiond", &long];
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        for (i, name) in names.iter().enumerate()
+        {
+            assert!(pack_stop_source(&mut words, i, 1 + i as u64, name));
+        }
+        words[0] = names.len() as u64;
+        for (i, name) in names.iter().enumerate()
+        {
+            let (class, out, len) = unpack_stop_source(&words, i).unwrap();
+            assert_eq!((class, &out[..len]), (1 + i as u64, *name));
+        }
+        assert!(unpack_stop_source(&words, names.len()).is_none());
+        assert!(!pack_stop_source(&mut words, 0, 1, b""));
+        assert!(pack_stop_source(
+            &mut words,
+            LIST_STOP_SOURCES_PAGE - 1,
+            1,
+            b"a"
+        ));
+        // A claimed length past NAME_MAX is refused, and an index whose
+        // offset overflows writes and reads nothing.
+        words[0] = 1;
+        words[3] = NAME_MAX as u64 + 1;
+        assert!(unpack_stop_source(&words, 0).is_none());
+        let index = usize::MAX / STOP_SOURCE_WORDS + 1;
+        let mut empty = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_stop_source(&mut empty, index, 1, b"a"));
+        assert_eq!(empty, [0; MSG_DATA_WORDS_MAX]);
+        empty[0] = u64::MAX;
+        assert!(unpack_stop_source(&empty, index).is_none());
+    }
+
+    #[test]
+    fn svcmgr_name_round_trips_at_every_length_to_name_max()
+    {
+        use svcmgr_labels::{NAME_MAX, NAME_WORDS, pack_name, unpack_name};
+        let source: [u8; NAME_MAX] = core::array::from_fn(|i| b'a' + (i % 26) as u8);
+        for len in 1..=NAME_MAX
+        {
+            let mut words = [u64::MAX; NAME_WORDS];
+            assert_eq!(pack_name(&source[..len], &mut words), Some(len.div_ceil(8)));
+            let back = unpack_name(&words, len).expect("packed name unpacks");
+            assert_eq!(&back[..len], &source[..len]);
+            assert!(back[len..].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn svcmgr_name_codec_refuses_lengths_outside_one_to_name_max()
+    {
+        use svcmgr_labels::{NAME_MAX, NAME_WORDS, pack_name, unpack_name};
+        let mut words = [u64::MAX; NAME_WORDS];
+        assert_eq!(pack_name(&[b'a'; NAME_MAX + 1], &mut words), None);
+        assert_eq!(words, [0; NAME_WORDS]);
+        assert_eq!(unpack_name(&words, 0), None);
+        assert_eq!(unpack_name(&words, NAME_MAX + 1), None);
+        // A length whose words the message does not carry.
+        assert_eq!(unpack_name(&words[..1], 9), None);
+    }
+}

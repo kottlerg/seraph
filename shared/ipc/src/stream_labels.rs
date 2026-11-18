@@ -115,3 +115,50 @@ pub const RECORD_ACCEPTED: u64 = 0;
 /// length is over the limit or disagrees with the label, or
 /// `log_record::Record::decode` refuses it).
 pub const RECORD_REJECTED: u64 = 1;
+
+#[cfg(test)]
+mod tests
+{
+    use crate::stream_labels;
+
+    #[test]
+    fn a_stream_label_level_reads_back_and_an_absent_one_reads_as_info()
+    {
+        use stream_labels::{
+            LEVEL_ERROR, LEVEL_INFO, LEVEL_MASK, LEVEL_SHIFT, LEVEL_TRACE, LEVEL_WARN,
+            STREAM_BYTES, level_of,
+        };
+        let label = |level: u64| STREAM_BYTES | (40 << 16) | (level << LEVEL_SHIFT);
+        assert_eq!(level_of(label(LEVEL_WARN)), LEVEL_WARN);
+        assert_eq!(level_of(label(LEVEL_ERROR)), LEVEL_ERROR);
+        assert_eq!(level_of(label(LEVEL_TRACE)), LEVEL_TRACE);
+        // A sender that sets no level (the pre-level encoding) logs at info.
+        assert_eq!(level_of(STREAM_BYTES | (40 << 16)), LEVEL_INFO);
+        // The unassigned codes read as info too.
+        assert_eq!(level_of(label(6)), LEVEL_INFO);
+        assert_eq!(level_of(label(LEVEL_MASK)), LEVEL_INFO);
+        // The level field leaves the id and the length intact.
+        assert_eq!(label(LEVEL_TRACE) & 0xFFFF, STREAM_BYTES);
+        assert_eq!((label(LEVEL_TRACE) >> 16) & 0xFFFF, 40);
+    }
+
+    // Defect caught: a named-sender bit inside the id, length, or level field,
+    // which would change a line's label, length, or level, or a full field
+    // that reads as the bit.
+    #[test]
+    fn the_named_sender_bit_lies_outside_every_other_label_field()
+    {
+        use stream_labels::{
+            LEVEL_MASK, LEVEL_SHIFT, LEVEL_WARN, SENDER_NAMED, STREAM_RECORD, level_of,
+            sender_named,
+        };
+        let full = 0xFFFF | (0xFFFF << 16) | (LEVEL_MASK << LEVEL_SHIFT);
+        assert!(!sender_named(full));
+        assert_eq!(full & SENDER_NAMED, 0);
+        let label = STREAM_RECORD | (37 << 16) | (LEVEL_WARN << LEVEL_SHIFT) | SENDER_NAMED;
+        assert!(sender_named(label));
+        assert_eq!(label & 0xFFFF, STREAM_RECORD);
+        assert_eq!((label >> 16) & 0xFFFF, 37);
+        assert_eq!(level_of(label), LEVEL_WARN);
+    }
+}

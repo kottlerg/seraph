@@ -344,4 +344,28 @@ mod tests
         let null = IpcMessage::builder(devmgr_errors::SUCCESS).cap(0).build();
         assert_eq!(class_call_cap(&null), Err(ClassCallError::NoCap));
     }
+
+    #[test]
+    fn a_class_name_reads_back_from_its_words()
+    {
+        let msg = IpcMessage::builder(devmgr_labels::MINT_CLASS_SEND)
+            .word(0, 17)
+            .word(1, 1 << 63)
+            .word(2, 11)
+            .bytes(3, b"debug-port!")
+            .build();
+        assert_eq!(class_name_of(&msg, 2), Some(&b"debug-port!"[..]));
+        let short = IpcMessage::builder(0).word(1, 4).bytes(2, b"rtc").build();
+        assert_eq!(class_name_of(&short, 1), Some(&b"rtc\0"[..]));
+        let long = IpcMessage::builder(0).word(1, 9).bytes(2, b"rtc").build();
+        assert_eq!(class_name_of(&long, 1), None);
+        let empty = IpcMessage::builder(0).word(1, 0).build();
+        assert_eq!(class_name_of(&empty, 1), None);
+        let over = IpcMessage::builder(0)
+            .word(1, devmgr_labels::MAX_CLASS_NAME_BYTES as u64 + 1)
+            .bytes(2, &[b'a'; 40])
+            .build();
+        assert_eq!(class_name_of(&over, 1), None);
+        assert_eq!(class_name_of(&empty, 5), None);
+    }
 }

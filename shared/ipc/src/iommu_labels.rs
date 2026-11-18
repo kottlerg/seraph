@@ -155,3 +155,24 @@ pub const fn requester_id(segment: u16, bus: u8, device: u8, function: u8) -> u6
         | (((device & 0x1f) as u64) << 3)
         | ((function & 0x7) as u64)
 }
+
+#[cfg(test)]
+mod tests
+{
+    use crate::{MSG_DATA_WORDS_MAX, iommu_labels};
+
+    #[test]
+    fn a_requester_id_packs_segment_bus_device_and_function()
+    {
+        assert_eq!(iommu_labels::requester_id(0, 0, 3, 0), 0x18);
+        assert_eq!(iommu_labels::requester_id(1, 2, 0x1f, 7), 0x1_02ff);
+        // Out-of-range device and function bits are masked off.
+        assert_eq!(iommu_labels::requester_id(0, 0, 0x20, 8), 0);
+    }
+
+    #[test]
+    fn a_fault_reply_fits_its_count_and_two_words_per_fault()
+    {
+        const { assert!(2 * iommu_labels::MAX_FAULTS_PER_REPLY < MSG_DATA_WORDS_MAX) };
+    }
+}

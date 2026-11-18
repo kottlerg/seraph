@@ -669,3 +669,53 @@ pub mod class_badge
             .map(|s| (s, verbs))
     }
 }
+
+#[cfg(test)]
+mod tests
+{
+    use crate::{VERB_BIT_MASK, blk_labels, devmgr_labels, serial_labels};
+
+    #[test]
+    fn a_class_badge_round_trips_and_carries_no_authority_bit()
+    {
+        use devmgr_labels::class_badge::{MAX_SLOTS, decode, encode};
+        let verbs = serial_labels::WRITE_AUTHORITY | serial_labels::READ_AUTHORITY;
+        for slot in [0, 1, 63, MAX_SLOTS - 1]
+        {
+            let badge = encode(slot, verbs).unwrap();
+            assert_eq!(badge & VERB_BIT_MASK, 0, "slot {slot}");
+            assert_eq!(decode(badge), Some((slot, verbs)));
+        }
+        assert_eq!(
+            decode(encode(5, VERB_BIT_MASK).unwrap()),
+            Some((5, VERB_BIT_MASK))
+        );
+    }
+
+    #[test]
+    fn a_class_badge_refuses_what_it_cannot_name()
+    {
+        use devmgr_labels::class_badge::{MAX_SLOTS, decode, encode};
+        assert_eq!(encode(MAX_SLOTS, blk_labels::MOUNT_AUTHORITY), None);
+        assert_eq!(encode(0, 0), None);
+        assert_eq!(encode(0, 1), None);
+        // No registry SEND of an authority bit reads as a class badge.
+        for badge in [
+            0,
+            devmgr_labels::REGISTRY_QUERY_AUTHORITY,
+            devmgr_labels::REGISTRY_QUERY_AUTHORITY | devmgr_labels::BIND_AUTHORITY,
+            devmgr_labels::CLASS_AUTHORITY,
+            devmgr_labels::DRIVERS_DIR_AUTHORITY,
+        ]
+        {
+            assert_eq!(decode(badge), None, "badge {badge:#x}");
+        }
+        // A slot without verbs, verbs without a slot, and a class badge with
+        // an authority bit added are refused.
+        assert_eq!(decode(1), None);
+        let good = encode(2, blk_labels::MOUNT_AUTHORITY).unwrap();
+        assert_eq!(decode(good & !devmgr_labels::class_badge::SLOT_MASK), None);
+        assert_eq!(decode(good | devmgr_labels::REGISTRY_QUERY_AUTHORITY), None);
+        assert_eq!(decode(good | (1 << 30)), None);
+    }
+}

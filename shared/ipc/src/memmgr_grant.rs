@@ -37,3 +37,70 @@ pub fn memmgr_grant_layout(reply: &IpcMessage) -> Option<(&[u64], &[u64])>
     let (counts, rest) = rest.split_at_checked(count)?;
     Some((counts, rest.get(..count)?))
 }
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+    use crate::{IpcMessage, memmgr_errors};
+
+    /// A `REQUEST_MEMORY_CAPS` reply with `label`, data `words`, and one
+    /// transferred cap per entry of `caps`.
+    fn grant_reply(label: u64, words: &[u64], caps: &[u64]) -> IpcMessage
+    {
+        let mut b = IpcMessage::builder(label).words(0, words);
+        for &c in caps
+        {
+            b = b.cap(c);
+        }
+        b.build()
+    }
+
+    #[test]
+    fn grant_layout_splits_page_counts_and_region_ids_per_cap()
+    {
+        let reply = grant_reply(0, &[2, 3, 5, 7, 8], &[11, 12]);
+        let (pages, ids) = memmgr_grant_layout(&reply).expect("well-formed reply");
+        assert_eq!(pages, &[3, 5]);
+        assert_eq!(ids, &[7, 8]);
+    }
+
+    #[test]
+    fn grant_layout_refuses_an_error_label()
+    {
+        let reply = grant_reply(
+            memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
+            &[1, 1, 0x1000],
+            &[11],
+        );
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_reply_without_data_words()
+    {
+        assert_eq!(memmgr_grant_layout(&grant_reply(0, &[], &[11])), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_zero_count()
+    {
+        assert_eq!(memmgr_grant_layout(&grant_reply(0, &[0], &[])), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_a_count_other_than_the_caps_transferred()
+    {
+        // Declaring more caps than arrived would put the id words at an
+        // offset the transferred count does not establish.
+        let reply = grant_reply(0, &[2, 1, 1, 0x1000, 0x2000], &[11]);
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
+
+    #[test]
+    fn grant_layout_refuses_words_too_few_for_the_count()
+    {
+        let reply = grant_reply(0, &[2, 1, 1, 0x1000], &[11, 12]);
+        assert_eq!(memmgr_grant_layout(&reply), None);
+    }
+}

@@ -180,3 +180,98 @@ fn entry_base(index: usize) -> Option<usize>
         .checked_mul(CANDIDATE_WORDS)?
         .checked_add(HEADER_WORDS)
 }
+
+#[cfg(test)]
+mod tests
+{
+    use crate::{MSG_DATA_WORDS_MAX, stop_labels, svcmgr_labels};
+
+    #[test]
+    fn a_candidate_list_page_round_trips_every_field_and_name_length()
+    {
+        use stop_labels::{LIST_CANDIDATES_PAGE, pack_candidate, unpack_candidate};
+        use svcmgr_labels::NAME_MAX;
+        let long = [b'x'; NAME_MAX];
+        let names: [&[u8]; 3] = [b"memhog", &long, b"a"];
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        for (i, name) in names.iter().enumerate()
+        {
+            let i64 = i as u64;
+            assert!(pack_candidate(
+                &mut words,
+                i,
+                u64::MAX - i64,
+                i64,
+                0x100 + i64,
+                name
+            ));
+        }
+        words[0] = names.len() as u64;
+        for (i, name) in names.iter().enumerate()
+        {
+            let entry = unpack_candidate(&words, i).unwrap();
+            let i64 = i as u64;
+            assert_eq!(
+                (entry.key, entry.rank, entry.pages, &entry.name[..entry.len]),
+                (u64::MAX - i64, i64, 0x100 + i64, *name)
+            );
+            assert!(entry.name[entry.len..].iter().all(|&b| b == 0));
+        }
+        assert!(unpack_candidate(&words, names.len()).is_none());
+        // A full page fits the message, and the entry past it does not.
+        assert!(pack_candidate(
+            &mut words,
+            LIST_CANDIDATES_PAGE - 1,
+            1,
+            0,
+            1,
+            b"a"
+        ));
+        assert!(!pack_candidate(
+            &mut words,
+            LIST_CANDIDATES_PAGE,
+            1,
+            0,
+            1,
+            b"a"
+        ));
+    }
+
+    #[test]
+    fn a_candidate_entry_refuses_names_outside_one_to_name_max()
+    {
+        use stop_labels::{HEADER_WORDS, pack_candidate, unpack_candidate};
+        use svcmgr_labels::NAME_MAX;
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_candidate(&mut words, 0, 1, 0, 7, b""));
+        assert!(!pack_candidate(
+            &mut words,
+            0,
+            1,
+            0,
+            7,
+            &[b'n'; NAME_MAX + 1]
+        ));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        assert!(pack_candidate(&mut words, 0, 1, 0, 7, b"job"));
+        words[0] = 1;
+        // A length the reply claims past NAME_MAX, or zero, is wire input
+        // refused, not read.
+        words[HEADER_WORDS + 3] = NAME_MAX as u64 + 1;
+        assert!(unpack_candidate(&words, 0).is_none());
+        words[HEADER_WORDS + 3] = 0;
+        assert!(unpack_candidate(&words, 0).is_none());
+    }
+
+    #[test]
+    fn a_candidate_index_whose_offset_overflows_is_refused()
+    {
+        use stop_labels::{CANDIDATE_WORDS, pack_candidate, unpack_candidate};
+        let index = usize::MAX / CANDIDATE_WORDS + 1;
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_candidate(&mut words, index, 1, 0, 7, b"a"));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        words[0] = u64::MAX;
+        assert!(unpack_candidate(&words, index).is_none());
+    }
+}

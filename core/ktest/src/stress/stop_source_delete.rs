@@ -102,8 +102,8 @@
 //! the cores this guest's use, does so in few rounds or none. So, after the
 //! fixed rounds, while the phase has no action landed on a waiter inside a
 //! wait, or, served, fewer than [`MIN_PARKED`] parked receives, it runs held
-//! rounds, up to [`MAX_EXTRA_ROUNDS`] of them. A held round's controller arms
-//! the racer (and the server) as in a fixed round and waits, bounded by
+//! rounds, up to [`super::MAX_EXTRA_ROUNDS`] of them. A held round's controller
+//! arms the racer (and the server) as in a fixed round and waits, bounded by
 //! [`ACK_WAIT_US`], for the racer to publish that it is taking its action
 //! ([`RACER_ENTERED`]). In any other phase it then deletes the source at
 //! once, its wait busy at first, so the action and the delete still meet
@@ -167,10 +167,6 @@ const CYCLES: u32 = 200;
 /// Server receives a served-call phase requires parked on the endpoint when
 /// it was deleted.
 const MIN_PARKED: u32 = 4;
-
-/// Bound on the held rounds a phase runs after its fixed rounds while the
-/// race it requires has not armed ([`race_unarmed`]).
-const MAX_EXTRA_ROUNDS: u32 = 1000;
 
 /// A served-call held round's sleep, in milliseconds, between the server's
 /// publish that it is entering its receive and the endpoint's delete.
@@ -709,8 +705,8 @@ fn finish_racer() -> TestResult
 
 /// Run the phase's [`CYCLES`] fixed rounds and then, while the race the
 /// phase requires has not armed ([`race_unarmed`]), held rounds until it has
-/// or [`MAX_EXTRA_ROUNDS`] have run, stopping at the first round that fails.
-/// Returns the controller-side tallies.
+/// or [`super::MAX_EXTRA_ROUNDS`] have run, stopping at the first round that
+/// fails. Returns the controller-side tallies.
 fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str>
 {
     let mut seen = Seen::default();
@@ -718,7 +714,7 @@ fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static st
     {
         run_round(ctx, kind, race, cycle, Timing::Raced, &mut seen)?;
     }
-    while race_unarmed(&seen, kind, race) && seen.extra_rounds < MAX_EXTRA_ROUNDS
+    while race_unarmed(&seen, kind, race) && seen.extra_rounds < super::MAX_EXTRA_ROUNDS
     {
         let cycle = CYCLES.saturating_add(seen.extra_rounds);
         run_round(ctx, kind, race, cycle, Timing::Held, &mut seen)?;

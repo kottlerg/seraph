@@ -521,10 +521,23 @@ the free pages memmgr keeps in reserve
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Messages, **Memory max and
 reserve**). procmgr honours the flag because svcmgr's own node is a reserve node. Without the key
 a service svcmgr launches is outside the reserve. The key acts on svcmgr's creates only: a service
-init starts is placed by init. A reserve service has a core role, so no stop-authority holder
-stops it. The crash service's recipe sets it, so crashd can report and dump a fault memmgr
-declined for want of memory while the free pool is spent
-([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold).
+init starts is placed by init, and init's children (devmgr, vfsd and svcmgr) are reserve nodes
+without it. A reserve service has a core role, so no stop-authority holder stops it.
+
+A service is a reserve service when it acts to end a memory-pressure episode, or when a reserve
+service calls it on that path: outside the reserve, a first touch of its heap or stack while the
+free pool is at the reserve is declined and kills it, and svcmgr's create of its next instance is
+refused while the pool stays there. svcmgr makes that create once, so the service stays down, and a
+`critical = yes` one shuts the system down
+([Restart Protocol § Decision tree](restart-protocol.md#decision-tree)).
+Four recipes of the default image set the key. oomd's lists and stops
+services ([services/oomd/docs/operation.md](../../oomd/docs/operation.md)), sessiond's lists and
+stops sessions and jobs ([docs/session-supervision.md](../../../docs/session-supervision.md)),
+crashd's reports, holds and dumps a fault memmgr declined for want of memory
+([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold), and logd's
+receives the lines each of the three writes with a synchronous call
+([services/logd/README.md](../../logd/README.md)). With logd in the reserve, every
+`critical = yes` service is a reserve node.
 
 ## Device class files
 

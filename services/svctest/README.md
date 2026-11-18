@@ -43,7 +43,8 @@ services/svctest/
         │                      # spawned IPC buffers in the arena; stack note parse
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines,
-        │                      #   names restored by refusal, a death forward on the new instance
+        │                      #   names restored by refusal, a death forward on the new instance;
+        │                      #   and restarted while memory is critical (logd in the reserve)
         ├── logd_sinks.rs      # logd's sinks: serial and framebuffer drivers attachable; lines
         │                      #   answered with either stopped, and with the framebuffer killed
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
@@ -149,10 +150,11 @@ phase (`caps[11]` to `caps[13]`), the `logd_sinks` phase's framebuffer-killed ca
 svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and
 `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
 vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`,
-`logd_restart`, and `logd_sinks` phases (`caps[6]`), the vfsd swap-partition phase (`caps[14]`), the
-`sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[17]`),
-the `crash_endpoint`, `logd_restart`, and `logd_sinks` phases (`caps[16]`), and the
-`svcmgr_stop_service` phase (`caps[17]`), and the `oom_policy` phase's no-stop case (`caps[17]`),
+`logd_reserve`, `logd_restart`, and `logd_sinks` phases (`caps[6]`), the vfsd swap-partition phase
+(`caps[14]`), the `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]`
+and `caps[17]`), the `crash_endpoint`, `logd_reserve`, `logd_restart`, and `logd_sinks` phases
+(`caps[16]`), and the `svcmgr_stop_service` phase (`caps[17]`), and the no-stop cases of the
+`oom_policy` and `logd_reserve` phases (`caps[17]`),
 instead fail their assertions. The seed-only phase thus fails the run on a zero `caps[1]` before the
 terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not reached; the panic hook's
 `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
@@ -181,7 +183,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_restart`, `logd_sinks` phases: read logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
@@ -191,8 +193,8 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits; `logd_sinks` phase: the class it waits on for the killed framebuffer driver's withdrawal |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
 | `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose shell runs the large job |
-| `caps[16]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
-| `caps[17]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` phase, no-stop case: `STOP_CANDIDATE` of memhog |
+| `caps[16]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[17]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the seven `devmgr.class.*` names among them. `caps[2]` carries
@@ -271,6 +273,24 @@ a line without `SENDER_NAMED` accepted, a line and a record with it refused `NAM
 once it has registered a name, a line with it accepted; the phase requires logd's history of the
 child to hold the two accepted lines alone. Last, it runs the `logd_death_forward` check again,
 against the new instance's fresh table and the death queue it registered.
+
+The `logd_reserve` phase, just before it, runs when `memhog.svc` is staged and passes otherwise.
+It requires logd's budget node to be a system-reserve node, as logd's recipe's `reserve = yes`
+makes it ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md) § `reserve`):
+the attach to the running instance and the attach to the next must each report
+`ATTACH_FLAG_RESERVE`. Between them it kills logd in the same way while
+[memhog](../memhog/README.md) holds memory at the system reserve, and requires the next instance
+to run and serve before the level falls. Outside the reserve the create of the next instance and
+every first touch of its heap and stacks are refused while memhog holds the pool, except from the
+frames the kill frees until memhog's next tick takes them back, so the attach flags, not the
+timing, are what fail for a logd outside the reserve. It attaches to logd before the fill, has
+memhog fill the pool, faults logd's main thread once the level reads `CRITICAL`, and waits for
+the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop mode, and
+svctest's own stop through `caps[17]`, 5 s after the fill, otherwise. It then requires, through
+`caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history, stamped no
+later than the last reading of the level that gave `CRITICAL`, and memhog's next instance to
+answer `PROBE` with a new nonce and no pages.
+
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`

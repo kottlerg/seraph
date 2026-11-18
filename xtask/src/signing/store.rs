@@ -97,6 +97,33 @@ pub fn build(identity: &[u8], deployer: Option<(&[u8], StoreMode)>, floor: u32) 
     encode(security_floor, &anchors, &revoked)
 }
 
+/// `store` with `id` among its revoked key ids, its anchors and floor
+/// unchanged.
+///
+/// # Errors
+///
+/// When `store` does not parse.
+pub fn with_revoked(store: &[u8], id: KeyId) -> Result<Vec<u8>>
+{
+    let parsed =
+        TrustStore::parse(store).map_err(|e| err!("the trust store does not parse ({e:?})"))?;
+    // The parsed anchors come in key-id order, the order encode requires.
+    let anchors: Vec<AnchorSpec<'_>> = parsed
+        .anchors()
+        .map(|anchor| AnchorSpec {
+            key: anchor.key,
+            usage: anchor.usage,
+            local: anchor.local,
+            label: anchor.label,
+        })
+        .collect();
+    let mut revoked = parsed.revoked().to_vec();
+    revoked.push(id);
+    revoked.sort_unstable();
+    revoked.dedup();
+    encode(parsed.security_floor(), &anchors, &revoked)
+}
+
 /// Encode a store of `anchors`, which are sorted by key id, and `revoked`.
 ///
 /// # Errors

@@ -46,6 +46,10 @@ image it creates against that store before it parses it (§ Verifier Discipline)
 creator's signature policy and the name the creator gives (§ Signature Policy in procmgr). The
 override that § Signature Policy in procmgr describes is design intent, not yet implemented: no
 creator can hold it, so procmgr creates no process from an image that does not verify.
+`cargo xtask test-signing` boots each refusal on both architectures: a tampered kernel, a tampered
+bundle entry and a revoked signing key in the bootloader, and a tampered service, one signed under
+the wrong kind and one signed by an untrusted key in procmgr, beside a kernel and a program whose
+untrusted record both verifiers skip ([testing.md](testing.md) § Gating, Signature refusals).
 
 ---
 
@@ -473,7 +477,9 @@ under `services/`, `programs/` and `tests/` in the sysroot ([build-system.md](bu
 `drivers/` directory is a driver, one under a `programs/` directory a program, and every other a
 service. The kernel and the sysroot's images are signed in place each time a disk image is packed,
 and each bundle entry as the bundle is composed, from the body of its source, so an image the
-sysroot holds signed as a service enters the bundle signed as a boot module. Signing replaces a
+sysroot holds signed as a service enters the bundle signed as a boot module. The refusal test's
+pack alone writes objects as it is given them, in place of the sysroot's files in the images and
+never in the sysroot, so no later pack signs a tampered body. Signing replaces a
 trailer the object already carries, and is deterministic, so re-signing an unchanged image writes
 the same bytes. The bundle's data entries (the platform tables and the log-level configuration) are
 signed as boot modules like its executables, and their readers take the body through the parse-only

@@ -264,9 +264,11 @@ therefore keeps its name and states that it has one, and logd asks for it again:
   and tries again.
 
 Every line of a named sender, its first after a logd restart included, is thus
-rendered under its name. A sender that sends nothing after the restart has no name
-in the new table until it does, so a `reclaim:` line for it reads `name=?`
-(§ Death-notification cascade). A name init-logd stored with a collision suffix
+rendered under its name. A sender that sends nothing after the restart has no slot
+in the new table until it does, so its death writes no `reclaim:` line
+(§ Death-notification cascade); a sender whose registration after a refusal failed
+has a slot without a name until its next message, and a `reclaim:` line for it
+reads `name=?`. A name init-logd stored with a collision suffix
 (`.2`, `.3`, …) is registered again as the sender gave it. init-logd, the first receiver, ignores
 the bit and answers no message `NAME_UNKNOWN`.
 A sender that registered no name, or that calls the wire helpers with another

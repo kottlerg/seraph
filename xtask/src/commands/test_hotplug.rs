@@ -7,7 +7,8 @@
 //! devmgr, given its BARs, recorded, and bound, and its driver's DMA and MSI
 //! work; removed, its driver is withdrawn and the slot powered off or
 //! ejected; added again, it is bound anew and works. A disk behind the port
-//! is torn down at its removal and mounted again through vfsd; and the loss
+//! is torn down at its removal and mounted again through vfsd, and a copy of
+//! it added after start enters vfsd's role lookup; and the loss
 //! of the root filesystem's driver, or of the boot disk, ends vfsd and shuts
 //! the system down.
 //!
@@ -49,7 +50,12 @@
 //! fixture holds a file open there ([`DISK_REMOVE_MARKER`]), the host
 //! removes the disk and requires devmgr's removal lines and vfsd's
 //! [`VFSD_REMOVED_MARKER`]; once the fixture logs [`DISK_READD_MARKER`], it
-//! adds the disk again on the same block node. The fixture then stops and
+//! adds the disk again on the same block node. Once the fixture mounted it
+//! again ([`DISK_TIE_MARKER`]), the host adds a copy of the image, taken
+//! before the boot, behind the second port ([`add_tie_disk`]): its data
+//! partition ties the data disk's, so the fixture's `MOUNT` of the data
+//! role, `TABLE_FULL` while `/data` stands, must turn `NO_MOUNT` once
+//! devmgr serves the copy. The fixture then stops and
 //! kills the root mount's driver, and the host requires its verdict, vfsd's
 //! [`ROOT_LOST_MARKER`], svcmgr's [`SHUTDOWN_MARKER`], and QEMU's exit. The
 //! second boots with the boot disk itself behind that port (`PortDisk::Boot`)
@@ -121,6 +127,17 @@ const DISK_REMOVE_MARKER: &str =
 /// down. Kept in sync with `services/hotplug-check/src/disk.rs`.
 const DISK_READD_MARKER: &str =
     "[hotplug-check] TORN DOWN /data, its disk removed; READY for the re-added disk";
+
+/// The disk-mode fixture's line once it mounted `/data` on the re-added
+/// disk. Kept in sync with `services/hotplug-check/src/disk.rs`.
+const DISK_TIE_MARKER: &str =
+    "[hotplug-check] MOUNTED /data on the re-added disk; READY for a copy of the disk";
+
+/// The id `device_add` gives the storage boot's copy of the data disk.
+const TIE_DISK_ID: &str = "hotplug-tie-disk";
+
+/// The block node of the storage boot's copy of the data disk.
+const TIE_DISK_NODE: &str = "hotplug-tie-disk-node";
 
 /// devmgr's lines of a native removal, in the order they must come: the
 /// poller starts the removal at the end of the attention button's abort
@@ -275,9 +292,10 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
     step(
         "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
          driver and powered the slot off or ejected it, and it was bound again; a hot-added \
-         disk was bound from the drivers directory on its wired line; the data disk's mount was torn down at its \
-         removal and the disk mounted again when added back; the loss of the root driver and of \
-         the boot disk shut the system down)",
+         disk was bound from the drivers directory on its wired line; the data disk's mount was \
+         torn down at its removal and the disk mounted again when added back, and a copy of it \
+         added after start entered vfsd's role lookup; the loss of the root driver and of the \
+         boot disk shut the system down)",
     );
     Ok(())
 }
@@ -348,6 +366,16 @@ fn storage_boots(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
 {
     let data_image = ctx.data_disk_image();
     let block_size = crate::disk::logical_block_size(&data_image)?;
+    // Copied before the boot writes the data disk: its GPT, and so the data
+    // partition's type GUID and priority, are the data disk's.
+    let tie_image = ctx.target_dir.join("xtask").join("hotplug-tie-disk.img");
+    std::fs::copy(&data_image, &tie_image).with_context(|| {
+        format!(
+            "copying {} to {}",
+            data_image.display(),
+            tie_image.display()
+        )
+    })?;
     let port = HotplugPort {
         control: HotplugControl::Native,
         disk: Some(PortDisk::Data {
@@ -355,9 +383,11 @@ fn storage_boots(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
             block_size,
         }),
     };
-    boot(ctx, args, None, port, |lines, socket| {
-        disk_check(lines, socket, block_size)
-    })?;
+    let checked = boot(ctx, args, None, port, |lines, socket| {
+        disk_check(lines, socket, block_size, &tie_image)
+    });
+    let _ = std::fs::remove_file(&tie_image);
+    checked?;
     let port = HotplugPort {
         control: HotplugControl::Native,
         disk: Some(PortDisk::Boot),
@@ -589,9 +619,11 @@ fn disk_bound(lines: &Lines) -> Result<()>
 /// the slot is managed and the fixture holds a file open on the disk, the
 /// host removes it, and adds it again, a `virtio-blk-pci` of
 /// `block_size`-byte blocks on the same node, once vfsd has torn its mount
-/// down; the fixture passes, kills the root mount's driver, and the system
-/// shuts down ([`root_lost`]).
-fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32) -> Result<()>
+/// down; once the fixture mounted it again, the host adds `tie_image`, a
+/// copy of the disk, behind the second port ([`add_tie_disk`]); the fixture
+/// passes, kills the root mount's driver, and the system shuts down
+/// ([`root_lost`]).
+fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32, tie_image: &Path) -> Result<()>
 {
     granted_and_ready(lines, HotplugControl::Native, DISK_REMOVE_MARKER)?;
     step("hotplug test: slot managed and a file open on its disk; removing the data disk");
@@ -616,10 +648,44 @@ fn disk_check(lines: &mut Lines, socket: &Path, block_size: u32) -> Result<()>
         &port_disk_properties(block_size, IOMMU),
     )?;
     lines.start = Instant::now();
+    let mounted = lines.until(VERDICT_TIMEOUT, "the re-added disk's mount", |l| {
+        l.contains(DISK_TIE_MARKER) || l.contains(FAIL_MARKER)
+    })?;
+    if !mounted.contains(DISK_TIE_MARKER)
+    {
+        bail!("the fixture failed: {mounted}");
+    }
+    step("hotplug test: the disk was mounted again; adding a copy of it behind the second port");
+    add_tie_disk(socket, tie_image, block_size)?;
+    lines.start = Instant::now();
     verdict(lines)?;
-    step("hotplug test: the disk was mounted again; the root driver is killed");
+    step(
+        "hotplug test: vfsd resolved the data role across the added copy (a tie); the root \
+         driver is killed",
+    );
     lines.start = Instant::now();
     root_lost(lines)
+}
+
+/// Hot-add `image`, a copy of the data disk, behind the second port: a raw
+/// block node over it (QMP `blockdev-add`), then a `virtio-blk-pci` on it
+/// with the properties of the data disk's device added again, on that node.
+/// Its data partition ties the data disk's at the highest priority, so vfsd,
+/// resolving the role across every disk devmgr serves, answers the fixture's
+/// `MOUNT` `NO_MOUNT` once devmgr serves it.
+fn add_tie_disk(socket: &Path, image: &Path, block_size: u32) -> Result<()>
+{
+    qmp::blockdev_add_raw(socket, TIE_DISK_NODE, image)?;
+    let mut properties = port_disk_properties(block_size, IOMMU);
+    properties.retain(|&(name, _)| name != "drive");
+    properties.push(("drive", Property::Text(TIE_DISK_NODE)));
+    qmp::device_add(
+        socket,
+        "virtio-blk-pci",
+        TIE_DISK_ID,
+        HOTPLUG_DISK_PORT_ID,
+        &properties,
+    )
 }
 
 /// The check of the storage boot with the boot disk behind the port: once

@@ -77,23 +77,23 @@ const LIMITED_KEEP_CORRUPT: i32 = 4;
 /// Pages the hog leaves uncommitted, for the other processes of the boot to
 /// allocate while it runs; its commitment ends when it has at most this many
 /// left to commit.
-const HOG_MARGIN_PAGES: u64 = 1024;
+pub(crate) const HOG_MARGIN_PAGES: u64 = 1024;
 /// Reservations the hog may attempt before it gives up, over all its
 /// commitments down to the margin: each failure halves the next attempt, and
 /// each success commits at least half of what is left above the margin.
-const HOG_MAX_ROUNDS: usize = 256;
+pub(crate) const HOG_MAX_ROUNDS: usize = 256;
 /// Grants past what is left the hog may ask before it gives up: each one
 /// memmgr admits means another process freed pages after the hog read what
 /// was left, and the hog gives it back before it asks again.
 const HOG_REFUSAL_ATTEMPTS: usize = 8;
 /// Bytes of the hog's ballast: the size of the heap's floor, so the ballast
 /// holds at least what the floor has free.
-const HOG_BALLAST_BYTES: usize = 2 << 20;
+pub(crate) const HOG_BALLAST_BYTES: usize = 2 << 20;
 /// Exit code: a `QUERY_POOL_STATUS` call to memmgr failed or was refused.
-const HOG_STATUS_FAILED: i32 = 2;
+pub(crate) const HOG_STATUS_FAILED: i32 = 2;
 /// Exit code: the hog did not commit down to [`HOG_MARGIN_PAGES`] in
 /// [`HOG_MAX_ROUNDS`] attempts.
-const HOG_NOT_COMMITTED: i32 = 3;
+pub(crate) const HOG_NOT_COMMITTED: i32 = 3;
 /// Exit code: a grant of one page past what is left was admitted in each of
 /// [`HOG_REFUSAL_ATTEMPTS`] attempts, or refused other than with
 /// `OUT_OF_MEMORY_BEST_EFFORT`.
@@ -102,21 +102,22 @@ const HOG_GRANT_NOT_REFUSED: i32 = 4;
 /// did not show a refusal of pages the pool holds.
 const HOG_NO_FREE_PAGES: i32 = 5;
 /// Exit code: the allocation of the ballast failed.
-const HOG_BALLAST_FAILED: i32 = 6;
+pub(crate) const HOG_BALLAST_FAILED: i32 = 6;
 /// Exit code: memmgr refused the release of a grant it admitted past what
 /// was left, or its grant reply had no valid layout.
 const HOG_RELEASE_FAILED: i32 = 7;
 
-/// Pages of one memmgr demand chunk, the unit `SHRINK_REGION` cuts in.
-const CHUNK_PAGES: u64 = 16;
+/// Pages of one memmgr demand chunk, the unit `SHRINK_REGION` and
+/// `DISCARD_RANGE` take.
+pub(crate) const CHUNK_PAGES: u64 = memmgr_labels::DEMAND_CHUNK_BYTES / PAGE_SIZE;
 /// Pages the phase's own committed region is registered with: two chunks.
 const REGION_PAGES: u64 = 2 * CHUNK_PAGES;
 
 /// Sample windows the phase retries: memmgr's totals are system-wide, and
 /// other processes can move them inside one.
-const POOL_WINDOWS: u32 = 8;
+pub(crate) const POOL_WINDOWS: u32 = 8;
 /// Status queries per window after the children's destroy. A test wait bound.
-const POOL_POLLS: u32 = 256;
+pub(crate) const POOL_POLLS: u32 = 256;
 /// How long the phase waits for memmgr to reclaim a child that has exited. A
 /// test wait bound: procmgr's teardown of the hog and memmgr's reclaim of
 /// what it committed, most of RAM.
@@ -151,7 +152,7 @@ fn heap_commit_phase(caps: &Caps)
 /// memmgr's `QUERY_POOL_STATUS` free total, promised total and reserve
 /// (`data[3]`, `data[8]` and `data[6]`), in pages; `None` when the call
 /// fails or is refused. Allocates nothing.
-fn pool_totals() -> Option<(u64, u64, u64)>
+pub(crate) fn pool_totals() -> Option<(u64, u64, u64)>
 {
     let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
@@ -174,7 +175,7 @@ fn pool_totals() -> Option<(u64, u64, u64)>
 
 /// memmgr's free and promised totals in pages, once its deferred list has
 /// settled ([`budget::settled_pool_free`]).
-fn settled_totals() -> (u64, u64)
+pub(crate) fn settled_totals() -> (u64, u64)
 {
     let _ = budget::settled_pool_free();
     let (free, promised, _) = pool_totals().expect("QUERY_POOL_STATUS failed");
@@ -183,7 +184,7 @@ fn settled_totals() -> (u64, u64)
 
 /// Whether memmgr's free and promised totals read `level` within
 /// [`POOL_POLLS`] polls, each after a recheck of memmgr's deferred list.
-fn totals_settle_to(level: (u64, u64)) -> bool
+pub(crate) fn totals_settle_to(level: (u64, u64)) -> bool
 {
     for _ in 0..POOL_POLLS
     {
@@ -200,7 +201,7 @@ fn totals_settle_to(level: (u64, u64)) -> bool
 
 /// What memmgr charges svctest's descendants, in pages: the subtree count of
 /// svctest's budget node less its own (`QUERY_MEMORY_USAGE`).
-fn children_charge() -> u64
+pub(crate) fn children_charge() -> u64
 {
     let (own, _, subtree) = budget::memory_usage().expect("QUERY_MEMORY_USAGE failed");
     subtree.saturating_sub(own)
@@ -214,7 +215,7 @@ fn children_charge() -> u64
 /// memmgr's `PROCESS_DIED`, which frees the child's budget node, its regions
 /// and its commitment. Panics when the charge is still held after
 /// [`RECLAIM_TIMEOUT`].
-fn children_reclaimed(level: u64, what: &str)
+pub(crate) fn children_reclaimed(level: u64, what: &str)
 {
     let start = Instant::now();
     loop
@@ -235,7 +236,7 @@ fn children_reclaimed(level: u64, what: &str)
 }
 
 /// memmgr's reply label to `msg`.
-fn memmgr_label(msg: &IpcMessage, what: &str) -> u64
+pub(crate) fn memmgr_label(msg: &IpcMessage, what: &str) -> u64
 {
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
     unsafe {
@@ -250,7 +251,7 @@ fn memmgr_label(msg: &IpcMessage, what: &str) -> u64
 }
 
 /// Send `label` with `[va, len]` to memmgr and assert it replies `want`.
-fn expect_region_reply(label: u64, va: u64, len: u64, want: u64, what: &str)
+pub(crate) fn expect_region_reply(label: u64, va: u64, len: u64, want: u64, what: &str)
 {
     let msg = IpcMessage::builder(label).word(0, va).word(1, len).build();
     let got = memmgr_label(&msg, what);
@@ -258,7 +259,7 @@ fn expect_region_reply(label: u64, va: u64, len: u64, want: u64, what: &str)
 }
 
 /// svctest's own usage (`QUERY_MEMORY_USAGE` `data[0]`), in pages.
-fn own_usage() -> u64
+pub(crate) fn own_usage() -> u64
 {
     budget::memory_usage().expect("QUERY_MEMORY_USAGE failed").0
 }
@@ -489,7 +490,7 @@ fn run_hog()
 // ── The children ─────────────────────────────────────────────────────────────
 
 /// Bytes of `pages` pages, as a reservation length.
-fn page_bytes(pages: u64) -> usize
+pub(crate) fn page_bytes(pages: u64) -> usize
 {
     usize::try_from(pages.saturating_mul(PAGE_SIZE)).unwrap_or(usize::MAX)
 }
@@ -521,7 +522,7 @@ fn limited_child_main() -> !
 
 /// What memmgr can still promise a node outside the reserve, in pages: its
 /// free pages less `promised` and the reserve.
-fn uncommitted_available() -> u64
+pub(crate) fn uncommitted_available() -> u64
 {
     let Some((free, promised, reserve)) = pool_totals()
     else
@@ -578,7 +579,7 @@ fn hog_main() -> !
 /// [`HOG_MARGIN_PAGES`], spending reservation attempts from `rounds`, and
 /// return what is then left; exit with [`HOG_NOT_COMMITTED`] when `rounds`
 /// runs out first.
-fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
+pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
 {
     let mut ask = u64::MAX;
     while *rounds > 0
@@ -686,7 +687,7 @@ fn memmgr_label_or_exit(msg: &IpcMessage) -> u64
 
 /// Write one byte of every page of the blocks in `held`, each a committed
 /// reservation the hog has not touched.
-fn touch_committed(held: &mut [Vec<u8>])
+pub(crate) fn touch_committed(held: &mut [Vec<u8>])
 {
     let page = page_bytes(1);
     for block in held

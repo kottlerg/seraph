@@ -47,9 +47,11 @@
 //! on each (bounded by [`FINAL_POLLS`]): a lost wake or a stranded waiter
 //! makes no progress on one of them. A failed final check logs the rounds'
 //! tallies and probes the waiter ([`probe_waiter`]) before the children end,
-//! so the log names where it was stranded; and a wait that returned a wrong
-//! result is reported in its place, since it sends the waiter on to the
-//! source the check no longer delivers to.
+//! so the log names where it was stranded. When a held round or the final
+//! check fails, a wait that returned a wrong result is reported in its place,
+//! since such a wait consumes a delivery without counting it and sends the
+//! waiter on to the other source, so the round or the check waits for a count
+//! that does not come.
 //!
 //! A delivery is consumed during the rounds only when the sender's CPU runs
 //! between the waiter's entry into a wait and the controller's next stop,
@@ -405,15 +407,16 @@ fn phase(ctx: &TestContext, kind: Kind) -> Result<Seen, &'static str>
             probe_waiter(waiter);
         }
         let ended = finish(kind, sources);
-        ran?;
-        paused?;
-        if checked.is_err()
+        if ran.is_err() || checked.is_err()
         {
-            // A wait that returned a wrong result sends the waiter on to the
-            // source the check no longer delivers to, so the check fails
-            // after it; name the wrong result instead.
+            // A wait that returned a wrong result consumes a delivery without
+            // counting it and sends the waiter on to the other source, so a
+            // held round or the final check fails after it; name the wrong
+            // result instead.
             check_bad_waits()?;
         }
+        ran?;
+        paused?;
         checked?;
         ended?;
         Ok(seen)

@@ -36,6 +36,10 @@ use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallErro
 // default 8 (32 KiB).
 process_abi::stack_pages!(12);
 
+// Wire contract: the chunk table's chunk is the unit `SHRINK_REGION` and
+// `DISCARD_RANGE` take, which clients read as `DEMAND_CHUNK_BYTES`.
+const _: () = assert!(CHUNK_BYTES == memmgr_labels::DEMAND_CHUNK_BYTES);
+
 // ── Bespoke runtime ─────────────────────────────────────────────────────────
 //
 // memmgr cannot share `std::sys::seraph::_start`: that path bootstraps a heap
@@ -2123,6 +2127,45 @@ fn handle_shrink_region(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
+/// Discard the pages `[va, va + len)` (`data[0]`, `data[1]`) of a demand
+/// region of the calling process (services/memmgr/docs/ipc-interface.md
+/// § Label 20): unmap them from the client address space, keeping their page
+/// tables, then clear their chunks from the region's chunk table, taking each
+/// run back, pooled or deferred; a committed region keeps its commitment and
+/// promises the pages again (`free_pool::Ledger::discard_range`). The next
+/// fault on a page of them backs it with a zeroed run. A repeat finds nothing
+/// to take and succeeds, so an interrupted call is safe to repeat.
+fn handle_discard_range(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let va = req.word(0);
+    let len = req.word(1);
+    let l = ledger_mut();
+    // Check the range before the unmap, so a refused call unmaps nothing.
+    let Some(rec) = l
+        .find(req.badge)
+        .filter(|&rec| l.discard_region(rec, va, len).is_ok())
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let aspace_cap = l.aspace_cap(rec);
+    // Clear the pages' PTEs before their runs can reach another owner, as
+    // [`handle_shrink_region`] does, keeping the page tables: a refault maps
+    // into them again, and a committed region's reservation covers each table
+    // once. A run the unmap left mapped fails the quiescence check and waits
+    // on the deferred list.
+    // SAFETY: `aspace_cap` is a client address space procmgr delegated
+    // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
+    // memmgr runs on.
+    let _ = unsafe { syscall::mem_unmap(aspace_cap, va, len / PAGE_SIZE) };
+    recheck_deferred(l);
+    // The range was checked above, so the discard cannot be refused.
+    let _ = l.discard_range(rec, va, len, quiescent);
+    coalesce(l);
+    reply_label(ipc_buf, memmgr_errors::SUCCESS);
+}
+
 /// Unregister a demand-paged region for the calling process, reclaiming every
 /// frame memmgr mapped inside it.
 ///
@@ -3451,6 +3494,10 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         memmgr_labels::SHRINK_REGION =>
         {
             handle_shrink_region(req, ipc_buf);
+        }
+        memmgr_labels::DISCARD_RANGE =>
+        {
+            handle_discard_range(req, ipc_buf);
         }
         memmgr_labels::NODE_SET_MAX =>
         {

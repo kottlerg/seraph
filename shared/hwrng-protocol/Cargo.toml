@@ -1,0 +1,19 @@
+[package]
+name = "hwrng-protocol"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std: the `hwrng` device class protocol, the one artefact a hardware-RNG
+# driver and the consumers of its class both compile against: the label, the
+# verb bit, the error codes, and the reply codec. Host unit tests cover the
+# codec.
+[lib]
+test = true
+doctest = false
+
+[dependencies]
+syscall-abi = { path = "../../abi/syscall" }
+
+[lints]
+workspace = true

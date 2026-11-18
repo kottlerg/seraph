@@ -51,7 +51,9 @@ use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_WRI
 /// Pages backed per demand fault: memmgr maps a contiguous chunk of up to this
 /// many pages (clamped to the region) on each fault rather than a single page.
 /// A fault-around tuning value that bounds no capacity: a page outside the
-/// chunk faults again and is backed by the next chunk.
+/// chunk faults again and is backed by the next chunk. It is also the unit
+/// `SHRINK_REGION` and `DISCARD_RANGE` take, which clients read as
+/// `memmgr_labels::DEMAND_CHUNK_BYTES` and memmgr asserts equal.
 pub const DEMAND_CHUNK_PAGES: u32 = 16;
 
 /// Bytes of one demand chunk.

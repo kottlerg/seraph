@@ -589,6 +589,7 @@ init
  │    ├── driver/virtio-blk        (MMIO + IRQ caps; block class)
  │    ├── driver/virtio-input      (MMIO + opt. IRQ; input class; on-disk)
  │    ├── driver/virtio-console    (MMIO + opt. IRQ; debug-port class; on-disk)
+ │    ├── driver/virtio-rng        (MMIO + opt. IRQ; DMA; hwrng class; on-disk)
  │    ├── driver/serial            (UART hw + IRQ caps; serial class)
  │    ├── driver/framebuffer       (MMIO cap; framebuffer class)
  │    └── driver/{cmos-rtc,goldfish-rtc} (RTC hw cap; rtc class)
@@ -668,17 +669,18 @@ devmgr loads driver binaries from one of two places:
   ([driver-binding.md](driver-binding.md) § Declaration Bounds).
 - **On-disk rootfs** — non-essentials (the per-arch RTC, bound to its platform record, the
   [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's
-  virtio-console driver, and the test-only `test-dma`) live at `/services/drivers/` and are loaded
-  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-fault` binary lives in
-  `/tests/drivers/`, which no boot-time pass reads; devmgr binds it only on
-  `devmgr_labels::BIND_DRIVERS` (gated on `BIND_AUTHORITY`, which only svctest's seed-only
+  virtio-console driver, the virtio-rng driver, and the test-only `test-dma`) live at
+  `/services/drivers/` and are loaded via `procmgr_labels::CREATE_FROM_FILE`. The test-only
+  `test-fault` binary lives in `/tests/drivers/`, which no boot-time pass reads; devmgr binds it
+  only on `devmgr_labels::BIND_DRIVERS` (gated on `BIND_AUTHORITY`, which only svctest's seed-only
   `devmgr.bind` cap carries), so a boot without svctest binds none. Every binary there carries its
   declaration in the ELF note section `.note.seraph.driver`; devmgr reads the declaration of each
   entry once `SET_DRIVERS_DIR` arrives and binds the PCI devices still unbound: virtio-input,
-  virtio-console, and test-dma, none of which is on the read-the-disk critical path, ship only there
-  and are bound there. A device whose declaration takes its interrupt as optional and for which
-  devmgr can give no wired line (for instance, its line lies outside the Interrupt range devmgr
-  holds) is delivered a resource list with no `Interrupt` resource, and its driver polls its queue.
+  virtio-console, virtio-rng, and test-dma, none of which is on the read-the-disk critical path,
+  ship only there and are bound there. A device whose declaration takes its interrupt as optional
+  and for which devmgr can give no wired line (for instance, its line lies outside the Interrupt
+  range devmgr holds) is delivered a resource list with no `Interrupt` resource, and its driver
+  polls its queue.
   Post-handover, svcmgr walks its universal root to `/services/drivers/` and hands devmgr that
   subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from
   the devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ | READDIR` rights only
@@ -693,7 +695,7 @@ devmgr loads driver binaries from one of two places:
   find no driver waits until the settle has ended. The spawn is at-most-once per boot; on failure
   (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did not report
   ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
-  `QUERY_DEVICE` calls on the rtc, input, and debug-port classes and clients
+  `QUERY_DEVICE` calls on the rtc, input, hwrng, and debug-port classes and clients
   ([timed](../services/timed/README.md) degrades to its no-RTC path; the terminal, today's only
   input class consumer, keeps waiting). Before `SET_DRIVERS_DIR` arrives the reply is the same
   `NO_DEVICE`, so a client that cannot proceed without the device waits on a `WATCH_CLASS` watch

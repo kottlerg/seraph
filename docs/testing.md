@@ -171,6 +171,8 @@ rootfs/config/svcmgr/
 │   ├── usertest.svc
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
+│   ├── memhog.svc            # out-of-memory policy fixture; co-staged with svctest
+│   ├── stopsrc.svc           # stop-source fixture; co-staged with svctest
 │   ├── crashd.svc            # crashd naming crashme, holding 3 s; co-staged with usertest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 │   ├── hotplug-check.svc     # hotplug fixture; staged by test-hotplug
@@ -724,7 +726,11 @@ kernel fault dump never clobbers it. The `memhog` fixture (`memhog.svc`,
 burn-in svctest cell: svctest's `oom_policy` phase runs when it is staged, has it fill memory until
 oomd stops it, and passes otherwise. The CI svctest cell drops crashd, so the held-write path of
 that phase (a child's page fault crashd holds until oomd's stop frees memory) runs in the burn-in
-svctest cell, which keeps crashd.
+svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
+`stop_source = program`) is co-staged beside `memhog` in both cells: svctest's
+`svcmgr_stop_service` phase reads that svcmgr lists it as the one stop source and that a job it
+started ends with it, and its `oom_policy`
+phase has it start a job that oomd stops before memhog; both phases pass without it.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the
@@ -794,7 +800,7 @@ its own device surface, and variants belong to the tiers below.
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` co-staged in the svctest cell, no host-driven `test-*` boots) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` and `stopsrc` co-staged in the svctest cell, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, and the CET cell) once, whatever the release's PRs touched (see Release host runs below) |
 
@@ -1360,7 +1366,7 @@ owes some of the cells runs those boots, and the release host runs run all four.
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
     sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/memhog.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/stopsrc.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
@@ -1397,7 +1403,7 @@ is the framebuffer device cell (Device surfaces above).
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
     sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/tests/memhog.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/stopsrc.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only

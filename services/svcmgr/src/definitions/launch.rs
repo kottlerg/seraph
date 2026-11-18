@@ -369,6 +369,7 @@ pub fn launch(
             def.sched_max.unwrap_or(0),
             def.reserve,
             def.oom_stop,
+            def.stop_source.is_some(),
         ),
         ctx.procmgr_ep,
         ctx.bootstrap_ep,

@@ -1,19 +1,22 @@
 # oomd — the out-of-memory policy service.
 #
 # When memmgr's pressure level has read CRITICAL for OOMD_GRACE_MS, oomd stops
-# the stoppable service using the most memory, at most one per
-# OOMD_COOLDOWN_MS, and svcmgr restarts it under its restart policy
-# (services/oomd/docs/operation.md). A service is stoppable only when its
-# recipe sets `oom_stop = yes` and svcmgr's eligibility rule admits it; no
-# recipe of the default image sets it, so by default oomd stops nothing.
-# `OOMD_STOP=no` makes oomd name the service it would stop and stop none.
+# one candidate of its stop sources, at most one per OOMD_COOLDOWN_MS: a
+# program a `stop_source` service lists before any service, and within that
+# the one using the most memory (services/oomd/docs/operation.md). svcmgr
+# restarts a stopped service under its restart policy. A service is stoppable
+# only when its recipe sets `oom_stop = yes` and svcmgr's eligibility rule
+# admits it; no recipe of the default image sets `oom_stop` or `stop_source`,
+# so by default oomd stops nothing. `OOMD_STOP=no` makes oomd name the
+# candidate it would stop and stop none.
 # Removing this recipe from the image removes the policy: memory then runs out
 # for whichever process asks next, and the reserve keeps the core alive.
 #
 # `stop_authority = yes` makes svcmgr mint a SEND on its own endpoint badged
 # with STOP_AUTHORITY and deliver it in the bootstrap slot after the seeds
 # and the debug-authority cap (cap[0] here, with neither): oomd lists and
-# stops services through it, and holds no process handle.
+# stops services through it, learns the other stop sources through it, and
+# holds no process handle.
 #
 # `reserve = yes` makes oomd's budget node a system-reserve node, so it runs
 # while the free pool outside the reserve is spent; it touches its stack and

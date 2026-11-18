@@ -585,7 +585,8 @@ fn release_registration(pending: &PendingRegistration)
 
 /// Clone the launch surfaces the restart path replays from a parsed
 /// definition: argv/env/cwd/seed byte-for-byte, the log-sink,
-/// debug-authority, `oom_stop`, stop-authority and reserve flags, and the
+/// debug-authority, `oom_stop`, stop-authority and reserve flags, the
+/// `stop_source` class, and the
 /// scheduling fields. The name, binary, policy and namespace live on the
 /// `ServiceEntry` instead ([`build_entry`]). `None` when the heap cannot hold
 /// the copies.
@@ -606,6 +607,7 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         oom_stop: def.oom_stop,
         stop_authority: def.stop_authority,
         reserve: def.reserve,
+        stop_source: def.stop_source,
         priority: def.priority.unwrap_or(0),
         sched_max: def.sched_max.unwrap_or(0),
     })

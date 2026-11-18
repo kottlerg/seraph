@@ -57,7 +57,7 @@ no change to the encoding.
 | slot 6 | `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.swap`; absent if its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `13`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `14`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -158,7 +158,8 @@ to teardown), then runs
    * **parked AND defined** — bind death-notification, record the
      recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
      log-sink, debug-authority, stop-authority, `oom_stop` and `reserve`
-     flags, and scheduling fields in the parallel `RestartRecipe` table.
+     flags, `stop_source` class, and scheduling fields in the parallel
+     `RestartRecipe` table.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).
    * **parked without definition** — log `registered without
      definition: <name>; refusing to bind`.
@@ -241,64 +242,74 @@ any name published through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 | `INSUFFICIENT_CAPS` | — | Stored cap could not be derived (publisher gone); entry evicted |
 | `INVALID_NAME` | — | `name_len` is 0 or exceeds `svcmgr_labels::NAME_MAX` (64), or the message carries fewer name words than `name_len` needs |
 
-### Label 5: `STOP_SERVICE`
+### Label 5: `STOP_CANDIDATE`
 
-Stop a supervised service for a [stop-authority](#stop-authority) holder. svcmgr stops the service
-only when the eligibility rule allows it
-([service-definitions.md § `oom_stop`](service-definitions.md#oom_stop)) and an instance runs. It
-destroys the process through the procmgr process handle it holds as the service's creator
-(`procmgr_labels::DESTROY_PROCESS`), so the authority to kill a process never leaves svcmgr, replies
-`SUCCESS`, and then routes the death as `EXIT_KILLED` (`0x2000`) through the service's restart
-policy and budget ([Restart policy](#restart-policy)), as it routes a death the kernel posts: an
-`on_failure` or `always` service restarts while its budget lasts, and a death past it leaves the
-service permanently down. The reply precedes the restart, so the holder does not wait on it. A
-death post of the destroyed instance that arrives later names the old instance and is dropped.
+Stop a supervised service for a [stop-authority](#stop-authority) holder: the shared stop label
+`stop_labels::STOP_CANDIDATE`, which svcmgr serves as the service class's stop source
+([Session Supervision § Stop Sources](../../../docs/session-supervision.md#stop-sources)). The
+service is named by the key [`LIST_CANDIDATES`](#label-6-list_candidates) lists it under: the
+`DeathTag` correlator `(instance << 32) | slot` of its table slot and the instance that runs
+([Death notification](#death-notification)), so a key names one instance and no other. svcmgr
+stops the service only when the eligibility rule allows it
+([service-definitions.md § `oom_stop`](service-definitions.md#oom_stop)) and the instance the key
+names runs. It destroys the process through the procmgr process handle it holds as the service's
+creator (`procmgr_labels::DESTROY_PROCESS`), so the authority to kill a process never leaves
+svcmgr, replies `SUCCESS`, and then routes the death as `EXIT_KILLED` (`0x2000`) through the
+service's restart policy and budget ([Restart policy](#restart-policy)), as it routes a death the
+kernel posts: an `on_failure` or `always` service restarts while its budget lasts, and a death
+past it leaves the service permanently down. The reply precedes the restart, so the holder does
+not wait on it. A death post of the destroyed instance that arrives later names the old instance
+and is dropped, and the restarted instance has a new key.
 
 Each refusal is logged with its reason and changes nothing. A request delivers no cap, and svcmgr
-deletes any it carries.
+deletes any it carries. The reply labels are the stop labels' codes, not `svcmgr_errors`.
 
 **Request:**
 
 | Field | Value |
 |---|---|
-| label | `5 \| (name_len << 16)` |
-| words 0.. | `name` bytes: the service's recipe name |
+| label | `5` |
+| data[0] | The key: `(instance << 32) \| slot` |
 | badge | MUST carry [`STOP_AUTHORITY`](#stop-authority); rejected with `UNAUTHORIZED` otherwise. |
 
 **Reply**, the first that applies, in this order:
 
 | label value | Meaning |
 |---|---|
-| `UNAUTHORIZED` | Caller's badge lacks `STOP_AUTHORITY` |
-| `INVALID_NAME` | `name_len` is 0 or exceeds `svcmgr_labels::NAME_MAX` (64), or the message carries fewer name words than `name_len` needs |
-| `NOT_STOPPABLE` (10) | No supervised service has the name (an unknown name, or a `restart = never` service, which svcmgr does not supervise), or the eligibility rule refuses the service |
-| `NOT_RUNNING` (11) | The service is eligible but no instance runs: it is restarting, or permanently down. A death the kernel shows that svcmgr has not yet routed is routed after the reply |
-| `UNAVAILABLE` (12) | memmgr or procmgr is dead, so a destroy would not be answered, or procmgr did not destroy the process |
+| `UNAUTHORIZED` (1) | Caller's badge lacks `STOP_AUTHORITY` |
+| `NO_CANDIDATE` (2) | The slot holds no service, the eligibility rule refuses the service (a `restart = never` service among them, which svcmgr does not supervise), no instance runs (it is restarting, or permanently down; a death the kernel shows that svcmgr has not yet routed is routed after the reply), or the key's instance is not the one that runs |
+| `UNAVAILABLE` (3) | memmgr or procmgr is dead, so a destroy would not be answered, or procmgr did not destroy the process |
 | `0` (`SUCCESS`) | The instance is destroyed; its death is routed after the reply |
 
-### Label 6: `LIST_STOPPABLE`
+### Label 6: `LIST_CANDIDATES`
 
-List, one page per call, the services a [`STOP_SERVICE`](#label-5-stop_service) would stop now,
-each with the pages its memory budget node and that node's subtree hold. A service is listed when
-the eligibility rule allows it, an instance runs, and svcmgr holds a node handle to its budget node:
-svcmgr asks procmgr for one (`CREATE_NODE_HANDLE`) at each create of an `oom_stop = yes` service,
-and reads the usage through it (memmgr `NODE_QUERY_USAGE`'s `data[2]`;
+List, one page per call, the services a [`STOP_CANDIDATE`](#label-5-stop_candidate) would stop
+now: the shared stop label `stop_labels::LIST_CANDIDATES`, each entry with its key, its rank,
+the pages its memory budget node and that node's subtree hold, and its name. A service is listed
+when the eligibility rule allows it, an instance runs, and svcmgr holds a node handle to its budget
+node: svcmgr asks procmgr for one (`CREATE_NODE_HANDLE`) at each create of an `oom_stop = yes`
+service, and reads the usage through it (memmgr `NODE_QUERY_USAGE`'s `data[2]`;
 [memmgr IPC Interface § Node Handles](../../memmgr/docs/ipc-interface.md#node-handles)). A service
-whose usage memmgr does not give is logged and left out of the page.
+whose usage memmgr does not give is logged and left out of the page. Every service has the rank
+`stop_labels::RANK_SERVICE` (0).
 
 The walk is in svcmgr's table order, from a slot cursor: the first call passes `0`, and each next
-call passes the reply's `data[1]`. A page holds at most `svcmgr_labels::LIST_STOPPABLE_PAGE` (6)
+call passes the reply's `data[1]`. A page holds at most `stop_labels::LIST_CANDIDATES_PAGE` (5)
 entries, and a page of fewer ends the walk. svcmgr never reuses a slot, so a cursor names the same
 place for svcmgr's lifetime; a service that starts or stops between two calls is listed by the
 state at the call that reaches its slot. A request delivers no cap, and svcmgr deletes any it
 carries.
+
+Every stop source serves this label with this layout, and a source of the program class lists its
+jobs at `stop_labels::RANK_JOB` (0) and its sessions at `stop_labels::RANK_SESSION` (1); its
+cursor is its own.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label | `6` |
-| data[0] | Slot cursor: `0`, or the `data[1]` of the previous reply |
+| data[0] | Cursor: `0`, or the `data[1]` of the previous reply |
 | badge | MUST carry [`STOP_AUTHORITY`](#stop-authority); rejected with `UNAUTHORIZED` otherwise. |
 
 **Reply:**
@@ -306,18 +317,64 @@ carries.
 | label value | Meaning |
 |---|---|
 | `0` (`SUCCESS`) | One page, laid out below |
-| `UNAUTHORIZED` | Caller's badge lacks `STOP_AUTHORITY` |
-| `UNAVAILABLE` (12) | memmgr or procmgr is dead, so no usage can be read |
+| `UNAUTHORIZED` (1) | Caller's badge lacks `STOP_AUTHORITY` |
+| `UNAVAILABLE` (3) | memmgr or procmgr is dead, so no usage can be read |
 
 | Field | Value |
 |---|---|
-| data[0] | Entries in this page, `0..=LIST_STOPPABLE_PAGE` |
+| data[0] | Entries in this page, `0..=LIST_CANDIDATES_PAGE` |
+| data[1] | The cursor the next call passes, greater than the one asked; svcmgr's is the table's length when the walk reached its end |
+| data[2 + 12·i] | Entry `i`: the key [`STOP_CANDIDATE`](#label-5-stop_candidate) names it by |
+| data[3 + 12·i] | Entry `i`: the rank within its source's class, the lower stopped first |
+| data[4 + 12·i] | Entry `i`: the pages its budget node and subtree hold |
+| data[5 + 12·i] | Entry `i`: the name's length in bytes, `1..=NAME_MAX` |
+| data[6 + 12·i ..= 13 + 12·i] | Entry `i`: the name's bytes, packed as `svcmgr_labels::pack_name` packs them |
+
+`stop_labels::pack_candidate` and `unpack_candidate` write and read an entry.
+
+### Label 7: `LIST_STOP_SOURCES`
+
+List, one page per call, the stop sources other than svcmgr: the running services whose recipes
+set [`stop_source`](service-definitions.md#stop_source), each with its class and a SEND on its
+service endpoint badged with [`STOP_AUTHORITY`](#stop-authority), on which the source serves
+[`STOP_CANDIDATE`](#label-5-stop_candidate) and [`LIST_CANDIDATES`](#label-6-list_candidates)
+([Session Supervision § Stop Sources](../../../docs/session-supervision.md#stop-sources)). svcmgr
+derives each SEND (`cap_derive_badge`) from the original of the endpoint it holds for the
+service's life, the one it provides the service's names from; the endpoint persists across the
+source's restarts. The class is the recipe's, never the source's own claim. A service is listed
+while an instance runs; one whose SEND svcmgr cannot derive is logged and left out of the page.
+
+The walk is in svcmgr's table order, from a slot cursor, as
+[`LIST_CANDIDATES`](#label-6-list_candidates)' is. A page holds at most
+`svcmgr_labels::LIST_STOP_SOURCES_PAGE` (4) entries, one per cap a message carries
+(`MSG_CAP_SLOTS_MAX`), and a page of fewer ends the walk. The reply moves each SEND out of
+svcmgr's CSpace into the caller's; a reply that does not deliver deletes them. A request delivers
+no cap, and svcmgr deletes any it carries.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | `7` |
+| data[0] | Slot cursor: `0`, or the `data[1]` of the previous reply |
+| badge | MUST carry [`STOP_AUTHORITY`](#stop-authority); rejected with `UNAUTHORIZED` otherwise. |
+
+**Reply:**
+
+| label value | Caps | Meaning |
+|---|---|---|
+| `0` (`SUCCESS`) | `[send_0, …, send_(n-1)]` | One page of `n` entries, laid out below; `caps[i]` is entry `i`'s SEND |
+| `UNAUTHORIZED` | — | Caller's badge lacks `STOP_AUTHORITY` |
+
+| Field | Value |
+|---|---|
+| data[0] | Entries in this page, `0..=LIST_STOP_SOURCES_PAGE` |
 | data[1] | The cursor the next call passes; the table's length when the walk reached its end |
-| data[2 + 10·i] | Entry `i`: the pages its budget node and subtree hold |
+| data[2 + 10·i] | Entry `i`: the class, `stop_labels::CLASS_PROGRAM` (1) for `stop_source = program` |
 | data[3 + 10·i] | Entry `i`: the name's length in bytes |
 | data[4 + 10·i ..= 11 + 10·i] | Entry `i`: the name's bytes, packed as `svcmgr_labels::pack_name` packs them |
 
-`svcmgr_labels::pack_stoppable_entry` and `unpack_stoppable_entry` write and read an entry.
+`svcmgr_labels::pack_stop_source` and `unpack_stop_source` write and read an entry.
 
 ---
 
@@ -348,9 +405,10 @@ See [`docs/capability-model.md`](../../../docs/capability-model.md)
 
 ## Stop authority
 
-`svcmgr_labels::STOP_AUTHORITY` (bit 61) is the verb bit that gates
-[`STOP_SERVICE`](#label-5-stop_service) and [`LIST_STOPPABLE`](#label-6-list_stoppable). svcmgr
-mints a SEND on its own service endpoint with that badge for a service whose recipe sets
+`stop_labels::STOP_AUTHORITY` (bit 61) is the verb bit that gates the stop labels,
+[`STOP_CANDIDATE`](#label-5-stop_candidate) and [`LIST_CANDIDATES`](#label-6-list_candidates),
+and [`LIST_STOP_SOURCES`](#label-7-list_stop_sources). svcmgr mints a SEND on its own service
+endpoint with that badge for a service whose recipe sets
 [`stop_authority = yes`](service-definitions.md#stop_authority), at each launch and restart, and
 delivers it in the service's bootstrap rounds, in the slot after the seeds and the debug-authority
 slot. The cap reaches no process by any other path: the name is never published, the per-process
@@ -359,6 +417,12 @@ process badges it mints clear of verb bits
 ([Capability Model](../../../docs/capability-model.md#verb-bit-authority-pattern)). A holder learns
 which services it may stop and stops one; it never holds a process handle or any other kill
 authority, and a service the eligibility rule refuses stays out of its reach.
+
+The same bit on a SEND to a stop source's endpoint authorises that source's stop labels. svcmgr
+mints such a SEND only in a [`LIST_STOP_SOURCES`](#label-7-list_stop_sources) reply, to a holder
+of its own stop authority. The parser accepts `stop_source` only on a recipe whose every provided
+name is badged ([service-definitions.md § `stop_source`](service-definitions.md#stop_source)), so
+no holder of a source's provided name holds the bit.
 
 ---
 
@@ -385,7 +449,7 @@ Exit reason encoding:
 | `0` | clean exit (`SYS_THREAD_EXIT`) |
 | `1..=0x0FFF` | voluntary exit code |
 | `0x1000..=0x1FFF` (`EXIT_FAULT_BASE + vector`) | fault (exception vector / scause + base) |
-| `0x2000` (`EXIT_KILLED`) | killed, by procmgr or by svcmgr's [`STOP_SERVICE`](#label-5-stop_service) |
+| `0x2000` (`EXIT_KILLED`) | killed, by procmgr or by svcmgr's [`STOP_CANDIDATE`](#label-5-stop_candidate) |
 
 The full space is defined in
 [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason).

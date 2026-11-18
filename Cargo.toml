@@ -24,6 +24,7 @@ members = [
     "services/oomd",
     "services/oomd/policy",
     "services/memhog",
+    "services/stopsrc",
     "services/devmgr",
     "services/devmgr/firmware",
     "services/logd",

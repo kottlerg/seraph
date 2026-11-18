@@ -806,9 +806,10 @@ fault the pager declined for want of memory, which it may hold until memory is f
 time passes, then resume or decline. It ends the thread by declining the fault
 (`FAULT_REPLY_KILL`), so the thread dies with the same exit reason and the same death flow
 ([Process Lifecycle § Process Death](process-lifecycle.md#process-death)). It holds such a fault
-only when its recipe sets a stall, which the shipped recipe does not; a held fault waits queued on
-one of a fixed number of the service's endpoints ([`FAULT_REPLY_REDIRECT`](#reply)), so no thread
-of the service blocks on it and the service goes on reporting other faults
+only when its recipe sets a stall, which the shipped recipe does (10 000 ms); a held fault waits
+queued on one of a fixed number of the service's endpoints
+([`FAULT_REPLY_REDIRECT`](#reply)), so no thread of the service blocks on it and the service goes
+on reporting other faults
 ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The service, its report,
 and its limits are in [services/crashd/README.md](../services/crashd/README.md) and
 [crashd Operation](../services/crashd/docs/operation.md); the report's

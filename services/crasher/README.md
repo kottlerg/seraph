@@ -24,10 +24,10 @@ endpoint from bootstrap slot 0, logs `worker-fault: serving`, and serves
 fault after `FAULT_DELAY_MS` (200 ms), logging `worker-fault: worker thread faulting`. procmgr
 tears the process down, and svcmgr restarts it through its address-space observer; svctest's
 `svcmgr_worker_fault_restart` phase, which runs when this recipe is staged, reads a new nonce from
-the restarted instance. `oom_stop = yes` makes it the one service of that boot a stop-authority
-holder may stop: svctest's `svcmgr_stop_service` phase lists it, has svcmgr stop it, and reads the
-restarted instance's nonce the same way. A role that
-lacks its endpoint or nonce, or cannot start the worker, logs `FATAL: worker-fault: ...`.
+the restarted instance. `oom_stop = yes` makes it a service of that boot a stop-authority holder may
+stop, as the `memhog` fixture does ([memhog](../memhog/README.md)): svctest's `svcmgr_stop_service`
+phase lists it, has svcmgr stop it, and reads the restarted instance's nonce the same way. A role
+that lacks its endpoint or nonce, or cannot start the worker, logs `FATAL: worker-fault: ...`.
 
 ---
 

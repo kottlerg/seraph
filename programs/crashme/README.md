@@ -11,7 +11,8 @@ The fixture's per-program tester, `crashme-tester`, runs it once in each of the 
 `worker`, and `registry-declare` modes, then twice in the `oom-touch` mode beside the `oom-fill`
 mode, and the `usertest` orchestrator discovers and runs that
 tester. svctest's `crash_endpoint` phase also spawns it, in the `vm`, `exception`,
-`registry-main`, `registry-worker`, and `debugger-tag` modes
+`registry-main`, `registry-worker`, and `debugger-tag` modes, and its `oom_policy` phase in the
+`oom-touch` mode
 ([services/svctest/README.md § Fixtures](../../services/svctest/README.md#fixtures)). The fixture
 installs at `/programs/crashme` and the tester at `/tests/programs/crashme`, per [docs/testing.md §
 Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).

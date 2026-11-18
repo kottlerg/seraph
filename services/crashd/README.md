@@ -16,9 +16,9 @@ in the format [docs/block-format.md](docs/block-format.md) defines. It then decl
 with no handler ([docs/fault-handling.md](../../docs/fault-handling.md) § Crash Reports).
 
 A page fault memmgr declined for want of memory crashd may hold instead, when its recipe sets a
-stall (`CRASHD_OOM_STALL_MS`; the shipped recipe sets none): the fault waits queued on one of 16
-endpoints crashd made at start, no thread of crashd waiting on it, until memmgr's pressure level
-falls below `CRITICAL`, when crashd resumes it, or the stall passes, when crashd reports and
+stall (`CRASHD_OOM_STALL_MS`; the shipped recipe sets 10 000 ms): the fault waits queued on one
+of 16 endpoints crashd made at start, no thread of crashd waiting on it, until memmgr's pressure
+level falls below `CRITICAL`, when crashd resumes it, or the stall passes, when crashd reports and
 declines it.
 
 Before the decline, when the `CORE_DUMP` entry of its recipe's environment names the process,

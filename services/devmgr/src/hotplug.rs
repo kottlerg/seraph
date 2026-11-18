@@ -1133,7 +1133,13 @@ fn admit(
     let spans = spans.get(..count).unwrap_or(&[]);
     if let Err(e) =
         caps.apertures
-            .move_all(&mut caps.slot_bars, spans, PAGE_SIZE, crate::split_mmio)
+            .move_all(
+                &mut caps.slot_bars,
+                spans,
+                PAGE_SIZE,
+                crate::split_mmio,
+                crate::merge_mmio,
+            )
     {
         std::os::seraph::log!(
             warn: "hotplug: {}:{}:0.{} {:04x}:{:04x}: BAR pages not held ({:?}); not recorded, no \
@@ -1214,25 +1220,47 @@ fn hold_behind(
         }
     }
     caps.apertures
-        .move_all(&mut caps.slot_bars, &held, PAGE_SIZE, crate::split_mmio)
+        .move_all(
+            &mut caps.slot_bars,
+            &held,
+            PAGE_SIZE,
+            crate::split_mmio,
+            crate::merge_mmio,
+        )
         .ok()?;
     Some(held)
 }
 
 /// Return the held BAR pages `spans`, each a span [`hold_behind`] or
 /// [`add`] moved whole, from [`caps::DevmgrCaps::slot_bars`] to the
-/// apertures. Moved back whole, a span splits nothing; when the tables
-/// cannot grow, the spans stay held, logged, where only a bind reaches them.
+/// apertures, each merged there with the spans beside it
+/// ([`crate::merge_mmio`]). Moved back whole, a span splits nothing; one the
+/// apertures cannot grow to hold stays held, logged, where only a bind
+/// reaches it.
 fn release(caps: &mut caps::DevmgrCaps, spans: &[(u64, u64)])
 {
-    let returned = caps
-        .slot_bars
-        .move_all(&mut caps.apertures, spans, PAGE_SIZE, |_, _| {
-            Err(SplitError::Failed)
-        });
-    if returned.is_err()
+    let mut kept = 0usize;
+    for &(base, size) in spans
     {
-        std::os::seraph::log!(warn: "hotplug: no memory to return held BAR pages; they stay held");
+        let returned = caps.slot_bars.move_merged(
+            &mut caps.apertures,
+            base,
+            size,
+            PAGE_SIZE,
+            |_, _| Err(SplitError::Failed),
+            crate::merge_mmio,
+        );
+        if returned.is_err()
+        {
+            kept = kept.saturating_add(1);
+        }
+    }
+    if kept > 0
+    {
+        std::os::seraph::log!(
+            warn: "hotplug: {} held BAR spans not returned; they stay held",
+            kept
+        );
     }
 }
 
@@ -1240,7 +1268,8 @@ fn release(caps: &mut caps::DevmgrCaps, spans: &[(u64, u64)])
 /// live record behind it ([`Registry::withdraw_at`]), its device's BAR caps
 /// given back to the held BAR pages; quiesce each function
 /// ([`hp::quiesce`]); return the held BAR pages inside their BARs to the
-/// apertures, whole; mark the records removed; and return each removed
+/// apertures, whole, each merged there with the spans beside it
+/// ([`crate::merge_mmio`]); mark the records removed; and return each removed
 /// record's instance to its driver's instance limit
 /// ([`bind::Records::release_removed`]). A driver that does not answer
 /// cannot delay it: a withdrawal asks the driver nothing. Returns the number
@@ -1272,6 +1301,7 @@ fn remove(
             let (_, bus, dev, func) = at;
             let _ = with_function(caps, at, |cfg| hp::quiesce(cfg, (bus, dev, func)));
         },
+        crate::merge_mmio,
     );
     caps.slot_bars = held;
     caps.apertures = free;

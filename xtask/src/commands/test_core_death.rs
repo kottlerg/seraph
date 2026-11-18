@@ -104,8 +104,9 @@ const CODE_CHECK_BYTES: usize = 16;
 enum Route
 {
     /// The GDB stub service, attached to the process of this name; the main
-    /// thread is moved at the point the second field names.
-    Stub(&'static str, KillPoint),
+    /// thread is moved at the point the second field names, the host first
+    /// asking for it once the boot shows the line the third names.
+    Stub(&'static str, KillPoint, Contact),
     /// QEMU's gdbstub, with a hardware breakpoint on a function of the
     /// target's binary; the thread that runs it is moved.
     Hardware(Breakpoint),
@@ -123,10 +124,33 @@ enum KillPoint
     /// calls devmgr and vfsd during its launches, where a call to a server
     /// that died after svcmgr's check of it waits for good (#1185).
     SystemUp,
-    /// As [`KillPoint::SystemUp`], then again after each restart svcmgr
+    /// Once the stub holds the target, then again after each restart svcmgr
     /// makes, until its restart budget is spent and the death is permanent.
     RestartsSpent,
 }
+
+/// The line the boot shows before the host first asks the stub for its
+/// target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Contact
+{
+    /// The stub's attach marker, naming the target.
+    Attached,
+    /// svcmgr's line launching the target. The log sink's: the stub's lines
+    /// reach the serial line through it, so a stub that attaches once the
+    /// sink has taken the log over from init holds the process that would
+    /// carry its marker, and the marker is lost.
+    Launched,
+}
+
+/// The start of svcmgr's line as it launches a service. Kept in sync with
+/// `services/svcmgr/src/definitions/reconcile.rs`.
+const LAUNCHING_MARKER: &str = "svcmgr: launching: ";
+
+/// Budget for the stub's answer to the host's first request: the stub
+/// answers once its look for the target at its start has ended, which takes
+/// up to 60 s with no such process yet (`services/gdbstub/src/main.rs`).
+const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// The start of svcmgr's line once it has restarted a service. Kept in sync
 /// with `services/svcmgr/src/restart.rs`.
@@ -161,11 +185,13 @@ fn route(target: CoreDeathTarget) -> Route
     const PROCMGR_BIAS: &str = "init: procmgr image bias=";
     match target
     {
-        // memmgr's one thread, in an allocation of the spawn.
+        // memmgr's one thread, in the admission of an allocation the spawn
+        // charges. A function the release build keeps out of line, as it
+        // does not `memmgr::select`.
         CoreDeathTarget::Memmgr => Route::Hardware(Breakpoint {
             binary: "services/memmgr",
             bias_line: MEMMGR_BIAS,
-            function: "memmgr::select",
+            function: "memmgr::admit",
         }),
         // A request worker (the main thread is one), in the spawn's create.
         CoreDeathTarget::Procmgr => Route::Hardware(Breakpoint {
@@ -179,10 +205,10 @@ fn route(target: CoreDeathTarget) -> Route
             bias_line: PROCMGR_BIAS,
             function: "procmgr::process::reap_dead",
         }),
-        CoreDeathTarget::Svcmgr => Route::Stub("svcmgr", KillPoint::Attach),
-        CoreDeathTarget::Devmgr => Route::Stub("devmgr", KillPoint::SystemUp),
-        CoreDeathTarget::Vfsd => Route::Stub("vfsd", KillPoint::SystemUp),
-        CoreDeathTarget::Logd => Route::Stub("logd", KillPoint::RestartsSpent),
+        CoreDeathTarget::Svcmgr => Route::Stub("svcmgr", KillPoint::Attach, Contact::Attached),
+        CoreDeathTarget::Devmgr => Route::Stub("devmgr", KillPoint::SystemUp, Contact::Attached),
+        CoreDeathTarget::Vfsd => Route::Stub("vfsd", KillPoint::SystemUp, Contact::Attached),
+        CoreDeathTarget::Logd => Route::Stub("logd", KillPoint::RestartsSpent, Contact::Launched),
     }
 }
 
@@ -230,7 +256,7 @@ fn boot_once(ctx: &Context, args: &TestCoreDeathArgs, target: CoreDeathTarget) -
 {
     match route(target)
     {
-        route @ Route::Stub(name, _) =>
+        route @ Route::Stub(name, ..) =>
         {
             let layout = debug_stub::stage(ctx, args.arch, name)?;
             let result = boot(ctx, args, layout, route);
@@ -307,10 +333,10 @@ fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Rout
 
     let killed = match (route, function, debug_port, stdin)
     {
-        (Route::Stub(name, point), _, Some(port), stdin) =>
+        (Route::Stub(name, point, contact), _, Some(port), stdin) =>
         {
             let _stdin = stdin;
-            kill_through_stub(&mut guest, args.arch, port, name, point)
+            kill_through_stub(&mut guest, args.arch, port, name, point, contact)
         }
         (Route::Hardware(bp), Some(function), _, Some(stdin)) => guest
             .collect_until(READY_MARKER, BOOT_TIMEOUT)
@@ -443,14 +469,24 @@ fn kill_through_stub(
     port: u16,
     name: &str,
     point: KillPoint,
+    contact: Contact,
 ) -> Result<Instant>
 {
     let pc_reg = gdb_arch(arch).pc_regnum();
-    let seen = guest
-        .collect_until(&format!("{ATTACHED_MARKER} ({name})"), BOOT_TIMEOUT)
-        .context("the stub's attach")?;
-    let mut stub = Stub::connect_tcp(&format!("127.0.0.1:{port}"), ANSWER_TIMEOUT)?;
+    let seen = match contact
+    {
+        Contact::Attached => guest
+            .collect_until(&format!("{ATTACHED_MARKER} ({name})"), BOOT_TIMEOUT)
+            .context("the stub's attach")?,
+        Contact::Launched => guest
+            .collect_until(&format!("{LAUNCHING_MARKER}{name}"), BOOT_TIMEOUT)
+            .with_context(|| format!("{name}'s launch"))?,
+    };
+    let mut stub = Stub::connect_tcp(&format!("127.0.0.1:{port}"), FIRST_ANSWER_TIMEOUT)?;
+    // The bytes wait in the port until the stub reads them, after its look
+    // for the target at its start; a stub that found none looks again here.
     stub.request(b"qSupported")?;
+    stub.set_answer_timeout(ANSWER_TIMEOUT)?;
     if point == KillPoint::SystemUp
     {
         // The attach holds every thread of the target, and the boot waits on
@@ -684,15 +720,37 @@ mod tests
             assert!(matches!(route(target), Route::Hardware(_)), "{target:?}");
         }
         // svcmgr is killed held, since the boot waits on it; devmgr and vfsd
-        // once svcmgr no longer calls them unchecked.
-        for (target, name, point) in [
-            (CoreDeathTarget::Svcmgr, "svcmgr", KillPoint::Attach),
-            (CoreDeathTarget::Devmgr, "devmgr", KillPoint::SystemUp),
-            (CoreDeathTarget::Vfsd, "vfsd", KillPoint::SystemUp),
-            (CoreDeathTarget::Logd, "logd", KillPoint::RestartsSpent),
+        // once svcmgr no longer calls them unchecked. Defect caught too: the
+        // stub's attach to logd, the log sink, awaited by its marker, which
+        // logd itself carries, so a stub holding logd never shows it.
+        for (target, name, point, contact) in [
+            (
+                CoreDeathTarget::Svcmgr,
+                "svcmgr",
+                KillPoint::Attach,
+                Contact::Attached,
+            ),
+            (
+                CoreDeathTarget::Devmgr,
+                "devmgr",
+                KillPoint::SystemUp,
+                Contact::Attached,
+            ),
+            (
+                CoreDeathTarget::Vfsd,
+                "vfsd",
+                KillPoint::SystemUp,
+                Contact::Attached,
+            ),
+            (
+                CoreDeathTarget::Logd,
+                "logd",
+                KillPoint::RestartsSpent,
+                Contact::Launched,
+            ),
         ]
         {
-            assert_eq!(route(target), Route::Stub(name, point));
+            assert_eq!(route(target), Route::Stub(name, point, contact));
         }
         let Route::Hardware(reaper) = route(CoreDeathTarget::ProcmgrReaper)
         else

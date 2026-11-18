@@ -3377,22 +3377,13 @@ pub mod memhog_labels
     pub const PROBE: u64 = 1;
     /// Take what memmgr can still promise a process outside the system
     /// reserve, through the heap and then by one-page grants, until nothing
-    /// is left and the pressure level has read `CRITICAL` for [`SETTLE_MS`];
-    /// then reply [`SUCCESS`] with data word 0 the pages taken, and keep
-    /// taking back what other processes free, every [`TICK_MS`], until the
-    /// process dies. [`NOT_CRITICAL`] when the level does not settle within
-    /// [`FILL_TIMEOUT_MS`]; what was taken is kept. A repeat fills again from
-    /// what is held and replies the same way.
+    /// is left and the pressure level has read `CRITICAL` for 500 ms; then
+    /// reply [`SUCCESS`] with data word 0 the pages taken, and keep taking
+    /// back what other processes free, every 10 ms, until the process dies.
+    /// [`NOT_CRITICAL`] when the level does not settle within 30 s; what was
+    /// taken is kept. A repeat fills again from what is held and replies the
+    /// same way. The fill and its times are `shared/mem-fill`'s.
     pub const HOG: u64 = 2;
-    /// How long the level reads `CRITICAL`, with nothing left to take, before
-    /// a [`HOG`] replies: a file system gives back its cache when the level
-    /// rises, and the fixture takes that too.
-    pub const SETTLE_MS: u64 = 500;
-    /// How long a [`HOG`] tries to reach `CRITICAL`. A test wait bound.
-    pub const FILL_TIMEOUT_MS: u64 = 30_000;
-    /// How often the fixture takes back what other processes freed, once it
-    /// has hogged.
-    pub const TICK_MS: u64 = 10;
     /// The reply label of a handled request.
     pub const SUCCESS: u64 = 0;
     /// The reply label of a request with an unknown label.

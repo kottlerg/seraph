@@ -10,21 +10,18 @@ The recipe sets `restart = on_failure`, `critical = no`, `namespace = none`,
 `provides = memhog.ctl` and `oom_stop = yes`, with no `reserve`, so it is a service
 oomd may stop ([services/oomd/README.md](../oomd/README.md)), and a stop's `EXIT_KILLED` death
 restarts it. The fixture takes the provided name's service endpoint from bootstrap slot 0, allocates
-its ballast, touches its stack, logs `serving`, and serves `ipc::memhog_labels`:
+its fill's ballast, touches its stack, logs `serving`, and serves `ipc::memhog_labels`:
 
 | Label | Reply |
 |---|---|
 | `PROBE` (1) | `SUCCESS`, word 0 a per-instance random nonce, word 1 the pages it holds |
-| `HOG` (2) | `SUCCESS` with word 0 the pages it holds, once nothing is left to take and the level has read `CRITICAL` for `SETTLE_MS` (500 ms); `NOT_CRITICAL` when that does not happen within `FILL_TIMEOUT_MS` (30 s) |
+| `HOG` (2) | `SUCCESS` with word 0 the pages it holds, once nothing is left to take and the level has read `CRITICAL` for 500 ms; `NOT_CRITICAL` when that does not happen within 30 s, or memmgr does not answer |
 | any other | `UNKNOWN_OPCODE` |
 
-A fill reads what memmgr can still promise a process outside the reserve, from `QUERY_POOL_STATUS`
-(its free pages less `promised` and the reserve), and commits that much through the heap, halving
-an attempt memmgr refuses, until fewer than 16 pages are left, which it takes a page at a time by
-`REQUEST_MEMORY_CAPS` grants. It does so every `TICK_MS` (10 ms) until it replies, and after the
-reply between requests, so it takes back what another process frees and the level stays
-`CRITICAL` until the fixture is stopped. Its ballast, a 2 MiB heap allocation made at start, holds
-the heap's floor, an uncommitted demand region, so every block it commits lies above it.
+The fill is [`mem-fill`](../../shared/mem-fill/README.md)'s, shared with crashme's `oom-fill`
+mode: it commits what memmgr can still promise a process outside the reserve through the heap and
+takes the rest by one-page grants. Once hogging, the fixture tops up every 10 ms between requests,
+so it takes back what another process frees and the level stays `CRITICAL` until it is stopped.
 
 svctest's `oom_policy` phase, which runs when this recipe is staged, has it hog and reads that oomd
 stopped it, or with `OOMD_STOP=no` or no oomd that nothing did, and that its next instance answers
@@ -64,6 +61,7 @@ bootstrap round.
 |---|---|
 | [docs/testing.md](../../docs/testing.md) | How harnesses and fixtures are staged and co-staged |
 | [services/oomd/docs/operation.md](../oomd/docs/operation.md) | The ladder and the stop sources the fixture drives |
+| [shared/mem-fill/README.md](../../shared/mem-fill/README.md) | The fill |
 | [services/memmgr/docs/memory-pool.md](../memmgr/docs/memory-pool.md) | § Memory pressure, § Distribution policy |
 | [services/svcmgr/docs/service-definitions.md](../svcmgr/docs/service-definitions.md) | `provides`, `oom_stop` |
 

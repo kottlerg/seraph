@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "mem-fill"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# std, Seraph only: fills memmgr's pool up to the system reserve for the test
+# fixtures that drive the out-of-memory paths (memhog, crashme's oom-fill).
+# It calls memmgr through the runtime, so it has no host tests.
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+ipc = { path = "../ipc" }
+syscall-abi = { path = "../../abi/syscall" }
+
+[lints]
+workspace = true

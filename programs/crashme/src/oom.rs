@@ -15,19 +15,19 @@
 //! line of stdin writes the page: memmgr declines the fault, the crash service
 //! holds it, and the write either completes once the filler exits, printing
 //! how long it took, or the hold times out and the process dies of the fault.
-//! Neither allocates while the level is `CRITICAL`.
+//! Neither allocates while the level is `CRITICAL`. The fill is
+//! `mem_fill`'s, shared with the `memhog` fixture.
 
 use std::io::{BufRead, Write};
 use std::process::exit;
 use std::time::{Duration, Instant};
 
-use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
-use syscall_abi::PAGE_SIZE;
+use mem_fill::Fill;
 
 /// Exit code: a `QUERY_POOL_STATUS` call to memmgr failed or was refused.
 const FILL_STATUS_FAILED: i32 = 2;
 /// Exit code: the level did not read `CRITICAL`, with nothing left to
-/// commit, for [`FILL_SETTLE`] within [`FILL_TIMEOUT`].
+/// commit, for `mem_fill::SETTLE_MS` within `mem_fill::TIMEOUT_MS`.
 const FILL_NOT_CRITICAL: i32 = 3;
 /// Exit code: the ballast's allocation failed.
 const FILL_BALLAST_FAILED: i32 = 4;
@@ -36,26 +36,6 @@ const FILL_USAGE: i32 = 5;
 /// Exit code: `oom-touch` could not register its page or read its stdin.
 const TOUCH_SETUP_FAILED: i32 = 6;
 
-/// How long the level must read `CRITICAL`, with nothing left to commit,
-/// before the filler prints `full`: a file system gives back its cache when
-/// the level rises to `LOW` or `CRITICAL`, and the filler takes it.
-const FILL_SETTLE: Duration = Duration::from_millis(500);
-/// How long the filler tries to reach `CRITICAL`. A test wait bound.
-const FILL_TIMEOUT: Duration = Duration::from_secs(30);
-/// How often the filler takes back what other processes freed.
-const FILL_TICK: Duration = Duration::from_millis(10);
-/// Blocks the filler commits at most: each failure halves the next attempt,
-/// and each success commits at least half of what is left.
-const FILL_MAX_BLOCKS: usize = 256;
-/// Attempts of one top-up.
-const FILL_ROUNDS: usize = 64;
-/// Pages a heap commitment grows by at least (the runtime's heap grows in
-/// 16-page steps); less than this is taken by one-page grants.
-const COMMIT_MIN_PAGES: u64 = 16;
-/// Bytes of the filler's ballast: the size of the heap's floor, an
-/// uncommitted demand region whose untouched pages memmgr backs only while it
-/// has pages to spare, so every block the filler commits after lies above it.
-const BALLAST_BYTES: usize = 2 << 20;
 /// Bytes of stack each mode touches before the window, below its frame.
 const STACK_TOUCH_BYTES: usize = 16 * 1024;
 
@@ -71,44 +51,26 @@ pub fn fill(arg: Option<&str>) -> !
         println!("usage: crashme oom-fill <ms>");
         exit(FILL_USAGE);
     };
-    let mut ballast: Vec<u8> = Vec::new();
-    if ballast.try_reserve_exact(BALLAST_BYTES).is_err()
+    let Some(mut fill) = Fill::new()
+    else
     {
         exit(FILL_BALLAST_FAILED);
-    }
-    ballast.resize(BALLAST_BYTES, 1);
-    let mut held: Vec<Vec<u8>> = Vec::with_capacity(FILL_MAX_BLOCKS);
+    };
     touch_stack();
     say("filling");
-
-    let start = Instant::now();
-    let mut critical_since: Option<Instant> = None;
-    loop
+    match fill.to_critical()
     {
-        top_up(&mut held);
-        let full = available() == 0
-            && std::os::seraph::memory_pressure()
-                == Some(std::os::seraph::MemoryPressure::Critical);
-        match (full, critical_since)
-        {
-            (true, Some(since)) if since.elapsed() >= FILL_SETTLE => break,
-            (true, None) => critical_since = Some(Instant::now()),
-            (false, _) => critical_since = None,
-            (true, Some(_)) =>
-            {}
-        }
-        if start.elapsed() > FILL_TIMEOUT
-        {
-            exit(FILL_NOT_CRITICAL);
-        }
-        std::thread::sleep(FILL_TICK);
+        Ok(()) =>
+        {}
+        Err(mem_fill::Failed::Status) => exit(FILL_STATUS_FAILED),
+        Err(mem_fill::Failed::NotCritical) => exit(FILL_NOT_CRITICAL),
     }
     say("full");
     let until = Instant::now();
     while until.elapsed() < full_for
     {
-        top_up(&mut held);
-        std::thread::sleep(FILL_TICK);
+        fill.top_up();
+        std::thread::sleep(Duration::from_millis(mem_fill::TICK_MS));
     }
     // The exit gives memmgr back every commitment and grant.
     exit(0);
@@ -167,80 +129,4 @@ fn touch_stack()
 {
     let mut probe = [0u8; STACK_TOUCH_BYTES];
     std::hint::black_box(&mut probe);
-}
-
-/// What memmgr can still promise a process outside the reserve, in pages:
-/// its free pages less `promised` and the reserve (`QUERY_POOL_STATUS`'s
-/// `data[3]`, `data[8]` and `data[6]`). Allocates nothing.
-fn available() -> u64
-{
-    let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
-    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe {
-        ipc::ipc_call(
-            std::os::seraph::startup_info().memmgr_endpoint,
-            &req,
-            std::os::seraph::current_ipc_buf(),
-        )
-    };
-    match reply
-    {
-        Ok(r) if r.label == memmgr_errors::SUCCESS => (r.word(3) / PAGE_SIZE)
-            .saturating_sub(r.word(8) / PAGE_SIZE)
-            .saturating_sub(r.word(6) / PAGE_SIZE),
-        _ => exit(FILL_STATUS_FAILED),
-    }
-}
-
-/// Take what memmgr can still promise: commit it through the heap, halving
-/// an attempt memmgr refuses, while [`COMMIT_MIN_PAGES`] or more are left and
-/// `held` has room, then take what is left a page at a time by grants,
-/// whose caps the filler keeps until it exits.
-fn top_up(held: &mut Vec<Vec<u8>>)
-{
-    let mut ask = u64::MAX;
-    for _ in 0..FILL_ROUNDS
-    {
-        let left = available();
-        if left == 0
-        {
-            return;
-        }
-        ask = ask.min(left);
-        if ask >= COMMIT_MIN_PAGES && held.len() < held.capacity()
-        {
-            let bytes = usize::try_from(ask.saturating_mul(PAGE_SIZE)).unwrap_or(usize::MAX);
-            let mut block: Vec<u8> = Vec::new();
-            if block.try_reserve_exact(bytes).is_ok()
-            {
-                held.push(block);
-            }
-            else
-            {
-                ask /= 2;
-            }
-        }
-        else if !grant_one()
-        {
-            return;
-        }
-    }
-}
-
-/// Take one page by a `REQUEST_MEMORY_CAPS` grant, keeping its cap; `false`
-/// when memmgr refuses it.
-fn grant_one() -> bool
-{
-    let grant = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
-        .word(0, 1)
-        .build();
-    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe {
-        ipc::ipc_call(
-            std::os::seraph::startup_info().memmgr_endpoint,
-            &grant,
-            std::os::seraph::current_ipc_buf(),
-        )
-    };
-    reply.is_ok_and(|r| r.label == memmgr_errors::SUCCESS)
 }

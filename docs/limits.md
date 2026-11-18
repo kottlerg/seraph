@@ -934,8 +934,8 @@ production value is raised.
 | `GROWTH_CHILDREN` | `services/svctest/src/phases/procmgr.rs` | half procmgr's `FIRST_POOL_OBSERVERS` (32), imported | follows procmgr | none | correct as is | None |
 | `INLINE_CHUNK` | `services/svctest/src/phases/fs_ipc.rs` | 504 | ABI width | none | correct as is | Use the derived constant |
 | `SYSTEM_TIME_BEFORE_2100_SECS` | `services/svctest/src/phases/timed.rs` | 4 102 444 800 | mirror of the cmos century fallback | none | correct as is | None |
-| memhog `MAX_BLOCKS`, `TOP_UP_ROUNDS`, `COMMIT_MIN_PAGES`, `BALLAST_BYTES` | `services/memhog/src/main.rs` | 256 heap commitments, each failure halving the next; 64 attempts per top-up; 16 pages, below which it takes one-page grants; a 2 MiB ballast | test fixture | 2 MiB ballast and a 256-entry block list, at start | correct as is | None |
-| `SETTLE_MS`, `FILL_TIMEOUT_MS`, `TICK_MS` (`memhog_labels`) | `shared/ipc/src/lib.rs` | 500 ms / 30 s / 10 ms | test fixture | none | correct as is | None |
+| mem-fill `MAX_BLOCKS`, `TOP_UP_ROUNDS`, `COMMIT_MIN_PAGES`, `BALLAST_BYTES` | `shared/mem-fill/src/lib.rs` | 256 heap commitments, each failure halving the next; 64 attempts per top-up; 16 pages, below which it takes one-page grants; a 2 MiB ballast | test fixture (memhog and crashme's `oom-fill`) | 2 MiB ballast and a 256-entry block list per fill | correct as is | None |
+| mem-fill `SETTLE_MS`, `TIMEOUT_MS`, `TICK_MS` | `shared/mem-fill/src/lib.rs` | 500 ms / 30 s / 10 ms | test fixture | none | correct as is | None |
 | `NORMAL_WAIT`, `LOG_WAIT`, `CHILD_WAIT`, `NO_STOP_MARGIN_MS` | `services/svctest/src/phases/oom.rs` | 60 s / 10 s / 30 s / 2000 ms | test fixture | none | correct as is | None |
 | svctest poll counts | `services/svctest/src/phases/*.rs` | 256 to 5000 | test fixture | none | correct as is | None |
 | debug-echo `RX_WAIT_MS`, `MAX_MESSAGE_BYTES` | `services/debug-echo/src/main.rs` | 20 ms; 512, derived from `MSG_DATA_WORDS_MAX * 8` | test fixture | none | correct as is | None |

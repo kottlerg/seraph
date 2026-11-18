@@ -104,6 +104,7 @@ name = "crashme"
 version = "0.1.4"
 dependencies = [
  "ipc",
+ "mem-fill",
  "syscall",
  "syscall-abi",
 ]
@@ -474,10 +475,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mem-fill"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "syscall-abi",
+]
+
+[[package]]
 name = "memhog"
 version = "0.1.4"
 dependencies = [
  "ipc",
+ "mem-fill",
  "syscall",
  "syscall-abi",
 ]

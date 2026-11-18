@@ -74,7 +74,8 @@ given path. vfsd resolves the role byte to a type GUID (arch-conditional
 for the root role, arch-neutral for data; see
 [`services/vfsd/src/role_guids.rs`](../src/role_guids.rs)),
 looks the partition up across the parsed GPT tables of every disk it
-holds via [`gpt::lookup_partition_by_type_guid`](../gpt/src/lib.rs)
+holds and has not marked removed via
+[`gpt::lookup_partition_by_type_guid`](../gpt/src/lib.rs)
 (DPS-style priority tie-break on attribute bits 48-63, run across disks;
 a tie at the highest priority, on one disk or across disks, is rejected
 with `NO_MOUNT` (fatal only for the root self-mount); see
@@ -90,9 +91,14 @@ the new filesystem's namespace endpoint addressing its root. A mount
 on `/` once root is already mounted, on a path that is already a mount
 point, or on a path with a component the namespace protocol cannot name, is
 rejected (`TABLE_FULL`) before any partition is registered or driver
-spawned. A mount that fails after the spawn (the `FS_MOUNT` probe, an
-install a concurrent `MOUNT` beat, or an install that cannot allocate its
-tree nodes) revokes the partition cap vfsd registered and the new
+spawned. A role no held disk carries is looked up again after vfsd queries
+devmgr for the block devices it served since vfsd's last query (from the
+first instance ordinal not yet queried), so a disk added or inserted again
+after startup is found; until devmgr serves it, the request replies
+`NO_MOUNT`. A mount that fails after the spawn (the `FS_MOUNT` probe, an
+install a concurrent `MOUNT` beat, an install past the tree's
+`MAX_MOUNTS` or one that cannot allocate its tree nodes, or a disk removed
+during the mount) revokes the partition cap vfsd registered and the new
 driver's service endpoint, which stops the driver, and deletes the
 driver's process handle and death queue; the partition bound virtio-blk
 registered for it stays in virtio-blk's table, which has no unregister
@@ -129,11 +135,15 @@ the arch-neutral `SERAPH_DATA` GUID.
 **Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a
 badge without `MOUNT_AUTHORITY`, `NOT_FOUND` for an
 unknown role byte or invalid path length, `NO_MOUNT` if no partition
-on any held disk matches the role GUID or if duplicate-priority
-partitions are detected, `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if
+on any held disk matches the role GUID after the query for new disks,
+if duplicate-priority partitions are detected, or if the disk was
+removed during the mount, `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if
 the synthetic-root install fails: root already mounted, the path
-already a mount point, a path component the namespace protocol's name
-rule rejects, or no memory to grow the tree).
+already a mount point (one whose removal is under way included), a path
+component the namespace protocol's name rule rejects, the tree already
+holding `MAX_MOUNTS` (1023) mounts
+([`namespace-composition.md`](namespace-composition.md#synthetic-root-state)),
+or no memory to grow the tree).
 
 A mount path may have several components: each component above the mount point becomes a
 synthetic intermediate, through which lookups of the root filesystem's entries of the same

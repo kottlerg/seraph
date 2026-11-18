@@ -270,10 +270,29 @@ storage concern; see [`device-management.md`](device-management.md)
 
 The supported failure-handling primitives are:
 
-- **fs-driver crash.** Not handled: vfsd does not observe fs-driver
-  death and does not respawn a driver; the mount stays installed
-  against the dead endpoint. Other mounts and the block driver are
-  unaffected.
+- **fs-driver crash.** vfsd observes each driver's death on the
+  mount's death queue and tears the mount down without the driver: it
+  revokes the partition cap and the driver's endpoint, so every cap a
+  client held through the mount dies, removes the mount, and the path
+  falls through to the root filesystem, as after an unmount. No driver
+  is started again ([#1078](https://github.com/kottlerg/seraph/issues/1078)).
+  Other mounts and the block driver are unaffected.
+- **Device loss.** vfsd watches devmgr's `block` class and, on each
+  change and each driver death, asks devmgr whether each disk it holds
+  is still served. A disk devmgr withdrew is marked removed, its
+  partitions leave every role lookup, and each mount on it is torn
+  down as a forced unmount, the driver idle or not. A disk inserted
+  again is a new device: no mount follows on its own, and a `MOUNT`
+  whose role no held disk carries finds it by asking devmgr again.
+- **Loss of the root.** The death of the root filesystem's driver, or
+  the loss of its disk, makes vfsd log `FATAL: root filesystem lost`
+  and exit; vfsd is critical and never restarted, so svcmgr shuts the
+  system down. vfsd's calls that fall through to the root filesystem
+  are bounded (10 s, answered `IoError`), so a root driver that stops
+  answering delays a lookup into another mount at most that long. The
+  sequence is owned by
+  [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md#driver-death-and-device-loss)
+  § Driver death and device loss.
 - **Block device revocation.** An fs driver learns that its block
   device capability was revoked at its first block request afterwards:
   it answers that request as for any failed block access (`IO_ERROR`,

@@ -155,6 +155,7 @@ fn handle_create_from_file(
         file_size,
         badged_creator,
         death_queue,
+        argv_env,
         bootstrap,
     } = order;
     let badge = bootstrap.badge;
@@ -184,6 +185,7 @@ fn handle_create_from_file(
         file_size,
         badged_creator,
         relay,
+        argv_env,
         ipc_buf,
     )
     else
@@ -227,7 +229,8 @@ fn handle_create_from_file(
     }
 }
 
-/// Send `CREATE_FROM_FILE` for one fs driver and return procmgr's reply.
+/// Send `CREATE_FROM_FILE` for one fs driver, with its argv and env
+/// `argv_env` when it has them, and return procmgr's reply.
 /// `file_cap`, `badged_creator` and `relay` move to procmgr with the
 /// request; on `None` (the call failed) none of them is left in vfsd's
 /// `CSpace`.
@@ -237,10 +240,10 @@ fn call_create_from_file(
     file_size: u64,
     badged_creator: u64,
     relay: u64,
+    argv_env: Option<ArgvEnvCap>,
     ipc_buf: *mut u64,
 ) -> Option<IpcMessage>
 {
-    let argv_env = crate::driver::inherited_level_env();
     let create_msg = create_from_file_msg(
         file_cap,
         file_size,

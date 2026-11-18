@@ -25,6 +25,7 @@
 mod driver;
 mod partition;
 mod role_guids;
+mod watch;
 mod worker;
 mod worker_pool;
 
@@ -32,7 +33,7 @@ use std::os::seraph::startup_info;
 use std::sync::{Mutex, PoisonError};
 
 use ipc::{IpcMessage, blk_labels, ns_labels};
-use namespace_protocol::{GateError, compose_forward_lookup_rights, gate};
+use namespace_protocol::{GateError, NsError, compose_forward_lookup_rights, gate};
 use root_backend::{Mount, VfsdRootBackend};
 use worker_pool::WorkerPool;
 
@@ -46,11 +47,20 @@ use worker_pool::WorkerPool;
 /// driver's `FS_MOUNT` probe) and what an `UNMOUNT` handler blocks on (the
 /// driver's `FS_UNMOUNT` and its death, each within a bound, procmgr's
 /// `DESTROY_PROCESS`, and the `NS_LOOKUP` walk for a fall-through cap)
-/// never calls the service endpoint. A `GET_SWAP_PARTITION` handler waits
+/// never calls the service endpoint, and neither does what a `MOUNT` that
+/// finds its role on no held disk blocks on: devmgr's `QUERY_DEVICE` and the
+/// GPT reads of each new disk. A `GET_SWAP_PARTITION` handler waits
 /// only for the swap lock, which the holder keeps across one
 /// `REGISTER_PARTITION` call to the block driver, and the block driver
 /// never calls vfsd.
 const SERVICE_THREAD_COUNT: usize = 4;
+
+/// Bound on a fall-through call the namespace thread makes to the root
+/// filesystem. The thread serves every walk, so a root fs driver that stops
+/// answering would otherwise hold up every lookup, those into healthy mounts
+/// included; a call that has not returned within the bound is answered
+/// `NsError::IoError`.
+const FALLTHROUGH_TIMEOUT_MS: u32 = 10_000;
 
 /// Longest mount path a `MOUNT` or `UNMOUNT` request can name: the bytes
 /// the request's data words carry after its first two words. Set by the IPC
@@ -128,10 +138,10 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
 
 #[expect(
     clippy::too_many_lines,
-    reason = "vfsd's main is the in-order startup transcript — bootstrap caps, worker pool, GPT \
-              scratch alloc, disk discovery, namespace endpoint create, runtime leak, \
-              namespace-thread spawn, service-thread fanout, then the calling thread's own service \
-              loop. Each step depends on the prior step's locals; splitting introduces threading \
+    reason = "vfsd's main is the in-order startup transcript — bootstrap caps, worker pool, block \
+              class watch, GPT scratch alloc, disk discovery, namespace endpoint create, runtime \
+              leak, namespace- and watch-thread spawn, service-thread fanout, then the calling \
+              thread's own service loop. Each step depends on the prior step's locals; splitting introduces threading \
               those locals through helper arguments without buying any structural clarity"
 )]
 fn main() -> !
@@ -183,14 +193,23 @@ fn main() -> !
     };
     caps.bootstrap_ep = pool.bootstrap_ep();
 
+    // Watch the block class before the discovery, so a disk withdrawn after
+    // it signals the watch thread (`watch::WatchSet`).
+    let Some(watch) = watch::WatchSet::new(caps.block_class, ipc_buf)
+    else
+    {
+        std::os::seraph::log!(error: "FATAL: block class watch setup failed");
+        idle_loop();
+    };
+
     // Allocate a single scratch memory cap for GPT block reads. The
     // BLK_READ_INTO_MEMORY contract requires the caller to supply the DMA
     // target memory cap; vfsd reuses one scratch page across every disk's
     // GPT reads, replacing it before the next disk when a failed read left
-    // the slot empty (`partition::discover_disks`). vfsd never frees a
+    // the slot empty (`partition::Discovery::discover`). vfsd never frees a
     // scratch page or its VA reservation.
-    let Some((mut scratch_cap, mut scratch_va)) =
-        partition::alloc_scratch(caps.memmgr_ep, caps.self_aspace, ipc_buf)
+    let Some(mut discovery) =
+        partition::Discovery::new(caps.block_class, caps.memmgr_ep, caps.self_aspace, ipc_buf)
     else
     {
         std::os::seraph::log!(error: "FATAL: GPT scratch allocation failed");
@@ -200,14 +219,7 @@ fn main() -> !
     // Hold every block device devmgr serves and parse each one's GPT; role
     // lookups on MOUNT consider the partitions of all of them.
     std::os::seraph::log!("querying devmgr for block devices");
-    let disks = partition::discover_disks(
-        caps.block_class,
-        caps.memmgr_ep,
-        caps.self_aspace,
-        ipc_buf,
-        &mut scratch_cap,
-        &mut scratch_va,
-    );
+    let disks = discovery.discover(ipc_buf);
     if disks.is_empty()
     {
         std::os::seraph::log!(error: "no block device available");
@@ -250,7 +262,9 @@ fn main() -> !
     let boot_module_cap = caps.fatfs_module_cap;
     let runtime: &'static VfsdRuntime = Box::leak(Box::new(VfsdRuntime {
         caps,
-        disks,
+        discovery: Mutex::new(discovery),
+        disks: Mutex::new(disks),
+        watch,
         pool,
         boot_module_cap: Mutex::new(boot_module_cap),
         namespace_ep,
@@ -281,9 +295,9 @@ fn main() -> !
         std::os::seraph::log!(warn: "root unavailable; system-root requests will fail");
     }
 
-    // Spawn N-1 helper service threads; main becomes the Nth handler. Each
-    // thread runs the same recv/dispatch loop on the shared service endpoint.
-    for i in 1..SERVICE_THREAD_COUNT
+    // Spawn the service threads. Each runs the same recv/dispatch loop on
+    // the shared service endpoint.
+    for i in 0..SERVICE_THREAD_COUNT
     {
         let name = std::format!("vfsd-service-{i}");
         if std::thread::Builder::new()
@@ -296,8 +310,13 @@ fn main() -> !
         }
     }
 
-    std::os::seraph::log!("entering service loop");
-    service_loop(runtime);
+    // Main becomes the watch thread: it acts on driver deaths and disk
+    // removals, and ends vfsd at the loss of its root, an exit only the main
+    // thread can make the process's (`watch::root_lost`). A death or a class
+    // change from before the loop starts stays pending in the set, so the
+    // loop acts on it once it waits.
+    std::os::seraph::log!("entering the watch loop");
+    watch::watch_loop(runtime)
 }
 
 /// Live state shared by every service-handler thread. `Box::leak`ed at
@@ -306,9 +325,19 @@ fn main() -> !
 pub struct VfsdRuntime
 {
     pub caps: VfsdCaps,
-    /// Every block device devmgr serves, each with its whole-disk cap and
-    /// its used GPT partition entries, found once at startup.
-    pub disks: Vec<partition::Disk>,
+    /// Disk discovery's state: the next ordinal to query and the GPT scratch
+    /// page. Held across a whole discovery, so one runs at a time; taken
+    /// before `disks`, never after it.
+    pub discovery: Mutex<partition::Discovery>,
+    /// Every block device devmgr served vfsd, each with its whole-disk cap
+    /// and its used GPT partition entries, in the order found: at startup,
+    /// then by each `MOUNT` that found its role on no held disk. A disk devmgr
+    /// withdrew stays, marked removed, so a mount record's disk index keeps
+    /// naming it. Held only across reads and updates of the table, never
+    /// across IPC, and never together with `root_backend`.
+    pub disks: Mutex<Vec<partition::Disk>>,
+    /// The wait set the watch thread waits on (`watch::WatchSet`).
+    pub watch: watch::WatchSet,
     pub pool: WorkerPool,
     /// Boot-module fatfs cap consumed (and zeroed) by the very first MOUNT.
     /// Mutex-guarded because that MOUNT may land on any handler thread.
@@ -376,11 +405,19 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   (`do_unmount`) begins a removal under the same lock, and only the
 ///   request that began it ends it (`restore_mount` or `remove_mount`):
 ///   meanwhile a `MOUNT` at the path is refused and a second `UNMOUNT`
-///   finds the removal under way.
+///   finds the removal under way. The watch thread begins removals under
+///   the same lock, after a driver's death or a disk's loss, and every
+///   remover takes the mount's death queue out of the watch set in the
+///   hold that begins the removal (the claim rule of `watch`).
+/// - `rt.discovery` — Mutex; held across a `MOUNT`'s discovery of new
+///   disks, so one runs at a time.
+/// - `rt.disks` — Mutex; held only across reads and updates of the disk
+///   table, taken after `rt.discovery` when both are, and never together
+///   with `rt.root_backend`.
 ///
 /// No `do_mount`- or `do_unmount`-touched state is shared without one of
-/// these locks. `GET_SWAP_PARTITION` touches only `rt.swap`, under its own
-/// mutex, and takes no other lock while it holds it.
+/// these locks. `GET_SWAP_PARTITION` holds `rt.swap` across a hand-out
+/// and takes only `rt.disks`, briefly, while it holds it.
 fn service_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -524,8 +561,9 @@ fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRunti
 ///
 /// One thread is sufficient: every backend operation is an in-memory walk
 /// of one node's children, or of one node's ancestors; the only blocking
-/// call is the optional fall-through
-/// `ipc_call` to a root-fs cap, which yields like any other IPC. A
+/// call is the optional fall-through call to a root-fs cap, bounded by
+/// [`FALLTHROUGH_TIMEOUT_MS`], so a root fs driver that stops answering
+/// delays the walks queued behind it by at most the bound. A
 /// multi-threaded recv on `namespace_ep` would only buy concurrency
 /// between independent `NS_*` requests and is not load-bearing today.
 ///
@@ -610,7 +648,9 @@ fn namespace_loop(rt: &'static VfsdRuntime) -> !
 /// reply travels back unchanged: any cap it surfaces is the upstream
 /// fs's freshly-minted node cap, handed to the original caller
 /// directly. vfsd performs no cap derivation here, so no per-lookup
-/// cap leak in vfsd's `CSpace`.
+/// cap leak in vfsd's `CSpace`. A call that has not returned within
+/// [`FALLTHROUGH_TIMEOUT_MS`] is answered `NsError::IoError`; any other
+/// failed call goes to normal dispatch, which answers `NotFound`.
 fn try_forward_lookup_fallthrough(
     rt: &'static VfsdRuntime,
     recv: &IpcMessage,
@@ -680,8 +720,7 @@ fn try_forward_lookup_fallthrough(
         .bytes(1, name)
         .build();
 
-    // SAFETY: ipc_buf is the thread-registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(fallthrough, &forward, ipc_buf) })
+    let Some(reply) = fallthrough_call(fallthrough, &forward, ipc_buf)
     else
     {
         return false;
@@ -689,6 +728,28 @@ fn try_forward_lookup_fallthrough(
     // SAFETY: ipc_buf is the thread-registered IPC buffer.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
     true
+}
+
+/// Call the root filesystem through the fall-through cap `fallthrough`,
+/// bounded by [`FALLTHROUGH_TIMEOUT_MS`]. Returns the driver's reply, or an
+/// `NsError::IoError` reply, logged, when the bound expired first; `None`
+/// when the call failed otherwise.
+fn fallthrough_call(fallthrough: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Option<IpcMessage>
+{
+    // SAFETY: ipc_buf is the thread-registered IPC buffer.
+    match unsafe { ipc::ipc_call_timeout(fallthrough, msg, ipc_buf, FALLTHROUGH_TIMEOUT_MS) }
+    {
+        Ok(reply) => Some(reply),
+        Err(code) if code == syscall_abi::SyscallError::WouldBlock as i64 =>
+        {
+            std::os::seraph::log!(
+                warn: "root fs did not answer a fall-through call within \
+                 {FALLTHROUGH_TIMEOUT_MS} ms; answering IoError"
+            );
+            Some(IpcMessage::new(NsError::IoError.as_label()))
+        }
+        Err(_) => None,
+    }
 }
 
 /// If `recv` is an `NS_READDIR` on a synthetic tree node that carries a
@@ -714,7 +775,9 @@ fn try_forward_lookup_fallthrough(
 /// backend that did would need the probe to compose the caller's rights
 /// (as the lookup path does) before enumerating. Per client `NS_READDIR`
 /// this re-probes the fall-through dir from index 0, so a full listing is
-/// O(n²); acceptable for the small synthetic nodes (root, `/esp`).
+/// O(n²); acceptable for the small synthetic nodes (root, `/esp`). A probe
+/// call that has not returned within [`FALLTHROUGH_TIMEOUT_MS`] ends the
+/// enumeration with `NsError::IoError`.
 fn try_forward_readdir_fallthrough(
     rt: &'static VfsdRuntime,
     recv: &IpcMessage,
@@ -780,8 +843,7 @@ fn try_forward_readdir_fallthrough(
         let req = IpcMessage::builder(ns_labels::NS_READDIR)
             .word(0, u64::from(probe))
             .build();
-        // SAFETY: ipc_buf is the thread-registered IPC buffer.
-        let Ok(reply) = (unsafe { ipc::ipc_call(fallthrough, &req, ipc_buf) })
+        let Some(reply) = fallthrough_call(fallthrough, &req, ipc_buf)
         else
         {
             return false;
@@ -911,16 +973,20 @@ impl swap::SwapOps for SwapIo<'_>
     {
         // The role resolves across every held disk, as a mount role does
         // (docs/storage.md § GPT Role-GUID Discovery).
-        let disk_parts = self.rt.disks.iter().map(|d| d.partitions.as_slice());
-        gpt::lookup_partition_by_type_guid(&role_guids::SERAPH_SWAP, disk_parts)
+        let disks = self.rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
+        let disk_parts = disks.iter().map(|d| d.partitions.as_slice());
+        let found = gpt::lookup_partition_by_type_guid(&role_guids::SERAPH_SWAP, disk_parts);
+        drop(disks);
+        found
     }
 
     fn register(&mut self, location: &gpt::PartitionLocation) -> Option<u64>
     {
-        // The lookup ran over `rt.disks`, so its index is in range.
-        let disk = self.rt.disks.get(location.disk)?;
+        // The lookup ran over `rt.disks`, so its index is in range; a disk
+        // removed since holds no cap, and the registration fails.
+        let blk_ep = held_disk_cap(self.rt, location.disk)?;
         derive_and_register_partition(
-            disk.blk_ep,
+            blk_ep,
             location.first_lba,
             location.length_lba,
             self.ipc_buf,
@@ -1040,7 +1106,7 @@ impl MountRole
 /// gate the return value.
 fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 {
-    match do_mount_internal(rt, ipc_buf, &role_guids::SERAPH_ROOT, b"/")
+    match do_mount_internal(rt, ipc_buf, &role_guids::SERAPH_ROOT, b"/", Requery::No)
     {
         Ok(caller_root_cap) =>
         {
@@ -1233,7 +1299,10 @@ enum Force
 /// forced on [`Force::Yes`]), keeping the mount when it answers `BUSY`
 /// to an unforced request; otherwise tear the driver down
 /// ([`teardown_mount`]), whether it answered or not; remove the record,
-/// and give a node that stays an intermediate its fall-through cap.
+/// and give a node that stays an intermediate its fall-through cap
+/// ([`finish_unmount`]). The mount's death queue leaves the watch set in
+/// the hold that begins the removal, and returns to it in the hold that
+/// restores a refused one (the claim rule of `watch`).
 fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) -> IpcMessage
 {
     let begun = {
@@ -1244,7 +1313,7 @@ fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) ->
         backend
             .find(path)
             .ok_or(root_backend::UnmountError::NotMounted)
-            .and_then(|idx| backend.begin_unmount(idx).map(|mount| (idx, mount)))
+            .and_then(|idx| watch::begin_claim(rt, &mut backend, idx).map(|mount| (idx, mount)))
     };
     let (idx, mount) = match begun
     {
@@ -1267,11 +1336,15 @@ fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) ->
         {
             // Only this request began the node's unmount, and only it ends
             // the unmount, so the restore finds it under way.
-            let restored = rt
-                .root_backend
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .restore_mount(idx);
+            let restored = watch::restore_claim(
+                rt,
+                &mut rt
+                    .root_backend
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                idx,
+                mount.death_queue,
+            );
             if !restored
             {
                 std::os::seraph::log!(error: "UNMOUNT: the refused unmount was not under way");
@@ -1294,6 +1367,37 @@ fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) ->
     }
 
     teardown_mount(&mount, ipc_buf);
+    finish_unmount(rt, idx, ipc_buf);
+    std::os::seraph::log!("UNMOUNT: done");
+    IpcMessage::new(ipc::vfsd_errors::SUCCESS)
+}
+
+/// Unmount, with its files open or not, the mount at node `idx` whose
+/// removal the watch thread or a `MOUNT` began after its disk was lost
+/// (`watch::claim`): `FS_UNMOUNT` with `fs_labels::UNMOUNT_FORCE`, then the
+/// teardown and the record's removal, as [`do_unmount`] does with
+/// [`Force::Yes`].
+fn force_unmount(rt: &VfsdRuntime, idx: u32, mount: &Mount, ipc_buf: *mut u64)
+{
+    if !matches!(
+        driver_unmount(mount.endpoint, Force::Yes, ipc_buf),
+        DriverUnmount::Done
+    )
+    {
+        std::os::seraph::log!(
+            warn: "forced unmount: the driver did not unmount; tearing it down without it"
+        );
+    }
+    teardown_mount(mount, ipc_buf);
+    finish_unmount(rt, idx, ipc_buf);
+    std::os::seraph::log!("forced unmount: done");
+}
+
+/// End the removal begun on node `idx` once its driver is torn down: clear
+/// the record, and give a node that stays an intermediate its fall-through
+/// cap.
+fn finish_unmount(rt: &VfsdRuntime, idx: u32, ipc_buf: *mut u64)
+{
     let needs_fallthrough = {
         let mut backend = rt
             .root_backend
@@ -1301,7 +1405,7 @@ fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) ->
             .unwrap_or_else(PoisonError::into_inner);
         if backend.remove_mount(idx).is_none()
         {
-            std::os::seraph::log!(error: "UNMOUNT: the finished unmount was not under way");
+            std::os::seraph::log!(error: "unmount: the finished removal was not under way");
         }
         backend.needs_fallthrough(idx)
     };
@@ -1312,8 +1416,6 @@ fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) ->
     {
         populate_fallthrough_caps(rt, ipc_buf, &[idx]);
     }
-    std::os::seraph::log!("UNMOUNT: done");
-    IpcMessage::new(ipc::vfsd_errors::SUCCESS)
 }
 
 /// The driver's answer to `FS_UNMOUNT`.
@@ -1370,26 +1472,43 @@ fn driver_unmount(endpoint: u64, force: Force, ipc_buf: *mut u64) -> DriverUnmou
 /// partition cap, so it reaches the disk no more; revoke its service
 /// endpoint ([`driver::teardown_driver`]), which invalidates every cap a
 /// client holds on the mount; wait, bounded, for its death to post; then
-/// destroy its process, which a driver that did not exit needs and one
-/// that did takes as a no-op, and delete the process handle and death
-/// queue.
+/// destroy its process ([`destroy_driver`]), which a driver that did not
+/// exit needs and one that did takes as a no-op.
 fn teardown_mount(mount: &Mount, ipc_buf: *mut u64)
 {
     revoke_partition(mount.partition);
     driver::teardown_driver(mount.endpoint);
     match syscall::event_recv_timeout(mount.death_queue, DRIVER_DEATH_TIMEOUT_MS)
     {
-        Ok(reason) => std::os::seraph::log!(debug: "UNMOUNT: driver exited: reason={reason:#x}"),
+        Ok(reason) => std::os::seraph::log!(debug: "unmount: driver exited: reason={reason:#x}"),
         Err(code) => std::os::seraph::log!(
-            warn: "UNMOUNT: no driver death within {DRIVER_DEATH_TIMEOUT_MS} ms (code={code}); \
+            warn: "unmount: no driver death within {DRIVER_DEATH_TIMEOUT_MS} ms (code={code}); \
              destroying it"
         ),
     }
+    destroy_driver(mount, ipc_buf);
+}
+
+/// Tear down the driver of a mount whose removal began after its death:
+/// revoke its partition cap and its service endpoint, as
+/// [`teardown_mount`] does, and destroy what is left of its process; its
+/// death has posted, so nothing is waited for.
+fn teardown_dead_mount(mount: &Mount, ipc_buf: *mut u64)
+{
+    revoke_partition(mount.partition);
+    driver::teardown_driver(mount.endpoint);
+    destroy_driver(mount, ipc_buf);
+}
+
+/// Destroy a torn-down driver's process (`DESTROY_PROCESS`, a no-op for one
+/// that exited), and delete its process handle and death queue.
+fn destroy_driver(mount: &Mount, ipc_buf: *mut u64)
+{
     let destroy = IpcMessage::new(ipc::procmgr_labels::DESTROY_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.
     if let Err(code) = unsafe { ipc::ipc_call(mount.process, &destroy, ipc_buf) }
     {
-        std::os::seraph::log!(warn: "UNMOUNT: DESTROY_PROCESS failed: code={code}");
+        std::os::seraph::log!(warn: "unmount: DESTROY_PROCESS failed: code={code}");
     }
     log_cap_delete("driver process handle", mount.process);
     log_cap_delete("driver death queue", mount.death_queue);
@@ -1409,6 +1528,8 @@ fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mo
 {
     let present = rt
         .disks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .flat_map(|d| &d.partitions)
         .any(|p| &p.type_guid == type_guid);
@@ -1417,7 +1538,7 @@ fn auto_mount_role(rt: &VfsdRuntime, ipc_buf: *mut u64, type_guid: &[u8; 16], mo
         std::os::seraph::log!(warn: "MOUNT: no partition for {mount_path}; skipping auto-mount");
         return;
     }
-    match do_mount_internal(rt, ipc_buf, type_guid, mount_path.as_bytes())
+    match do_mount_internal(rt, ipc_buf, type_guid, mount_path.as_bytes(), Requery::No)
     {
         Ok(caller_cap) =>
         {
@@ -1464,7 +1585,9 @@ fn mount_path_is_root(path: &[u8]) -> bool
 
 /// Mount the partition `role` names at `path`.
 ///
-/// Looks the role's type GUID up across every held disk's GPT, registers
+/// Looks the role's type GUID up across every held disk's GPT, after
+/// discovering the disks devmgr served since the last discovery when no
+/// held disk has it ([`find_partition`]), registers
 /// the partition bound with the block driver of the disk that holds it,
 /// spawns a fatfs driver, and stores the mount's record in
 /// [`VfsdRootBackend`]: the driver's namespace endpoint (terminal mounts)
@@ -1482,7 +1605,130 @@ pub(crate) fn do_mount(
     path: &[u8],
 ) -> Result<u64, u64>
 {
-    do_mount_internal(rt, ipc_buf, role.type_guid(), path)
+    do_mount_internal(rt, ipc_buf, role.type_guid(), path, Requery::Yes)
+}
+
+/// Whether a mount whose role is found on no held disk discovers the disks
+/// devmgr served since the last discovery and looks again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Requery
+{
+    No,
+    Yes,
+}
+
+/// The partition `type_guid` names across every held disk's GPT, and the
+/// whole-disk cap of the disk that holds it. On [`Requery::Yes`] a role
+/// found on no disk is looked up again after [`discover_new_disks`], so a
+/// disk devmgr served after the last discovery, one inserted again among
+/// them, is found. Logs a failure and returns `vfsd_errors::NO_MOUNT`.
+fn find_partition(
+    rt: &VfsdRuntime,
+    ipc_buf: *mut u64,
+    type_guid: &[u8; 16],
+    requery: Requery,
+) -> Result<(gpt::PartitionLocation, u64), u64>
+{
+    let mut found = lookup_role(rt, type_guid);
+    if requery == Requery::Yes && matches!(found, Err(gpt::GptLookupError::NotFound))
+    {
+        discover_new_disks(rt, ipc_buf);
+        found = lookup_role(rt, type_guid);
+    }
+    match found
+    {
+        Ok(found) => Ok(found),
+        Err(gpt::GptLookupError::NotFound) =>
+        {
+            std::os::seraph::log!(warn: "MOUNT: partition role GUID not found on any disk");
+            Err(ipc::vfsd_errors::NO_MOUNT)
+        }
+        Err(gpt::GptLookupError::DuplicateTie) =>
+        {
+            // Non-fatal here; the caller decides (root self-mount treats
+            // the returned error as fatal, the /esp and /data auto-mounts
+            // skip and fall through).
+            std::os::seraph::log!(
+                warn: "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
+            );
+            Err(ipc::vfsd_errors::NO_MOUNT)
+        }
+    }
+}
+
+/// The role lookup over the held disks (docs/storage.md § GPT Role-GUID
+/// Discovery): a tie at the top priority is ambiguous whether the tied
+/// partitions share a disk or not, and a removed disk has no partitions.
+/// Returns the partition and its disk's whole-disk cap.
+fn lookup_role(
+    rt: &VfsdRuntime,
+    type_guid: &[u8; 16],
+) -> Result<(gpt::PartitionLocation, u64), gpt::GptLookupError>
+{
+    let disks = rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
+    let location = gpt::lookup_partition_by_type_guid(
+        type_guid,
+        disks.iter().map(|d| d.partitions.as_slice()),
+    )?;
+    // The lookup ran over `disks`, so its index is in range.
+    let blk_ep = disks.get(location.disk).map_or(0, |d| d.blk_ep);
+    drop(disks);
+    Ok((location, blk_ep))
+}
+
+/// The whole-disk cap of the held disk at `disk`; `None` once it is
+/// removed.
+fn held_disk_cap(rt: &VfsdRuntime, disk: usize) -> Option<u64>
+{
+    rt.disks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(disk)
+        .map(|d| d.blk_ep)
+        .filter(|&ep| ep != 0)
+}
+
+/// Query devmgr for the disks it served since the last discovery and hold
+/// each one ([`partition::Discovery::discover`]). Disks the table has no
+/// room for are released, and the next discovery queries them again.
+fn discover_new_disks(rt: &VfsdRuntime, ipc_buf: *mut u64)
+{
+    // The discovery lock is held until the new disks are in the table, so a
+    // concurrent MOUNT's discovery, which finds none of them, looks them up
+    // after they are held.
+    let mut discovery = rt.discovery.lock().unwrap_or_else(PoisonError::into_inner);
+    let found = discovery.discover(ipc_buf);
+    hold_new_disks(rt, discovery, found);
+}
+
+/// Append the disks `found`, which `discovery` just found, to the disk
+/// table, holding `discovery` until they are. When the table has no room,
+/// their caps are deleted and `discovery` queries them again on its next
+/// run.
+fn hold_new_disks(
+    rt: &VfsdRuntime,
+    mut discovery: std::sync::MutexGuard<'_, partition::Discovery>,
+    found: Vec<partition::Disk>,
+)
+{
+    let Some(first) = found.first().map(|d| d.ordinal)
+    else
+    {
+        return;
+    };
+    let mut disks = rt.disks.lock().unwrap_or_else(PoisonError::into_inner);
+    if disks.try_reserve(found.len()).is_err()
+    {
+        drop(disks);
+        std::os::seraph::log!(warn: "MOUNT: no memory to hold {} new disk(s)", found.len());
+        discovery.rewind(first);
+        for disk in found
+        {
+            log_cap_delete("unheld disk", disk.blk_ep);
+        }
+        return;
+    }
+    disks.extend(found);
 }
 
 /// Shared implementation for both role-driven (`do_mount`) and
@@ -1503,41 +1749,10 @@ fn do_mount_internal(
     ipc_buf: *mut u64,
     type_guid: &[u8; 16],
     path: &[u8],
+    requery: Requery,
 ) -> Result<u64, u64>
 {
-    // The role resolves across every held disk (docs/storage.md § GPT
-    // Role-GUID Discovery): a tie at the top priority is ambiguous whether
-    // the tied partitions share a disk or not.
-    let disk_parts = rt.disks.iter().map(|d| d.partitions.as_slice());
-    let location = match gpt::lookup_partition_by_type_guid(type_guid, disk_parts)
-    {
-        Ok(location) => location,
-        Err(gpt::GptLookupError::NotFound) =>
-        {
-            std::os::seraph::log!(warn: "MOUNT: partition role GUID not found on any disk");
-            return Err(ipc::vfsd_errors::NO_MOUNT);
-        }
-        Err(gpt::GptLookupError::DuplicateTie) =>
-        {
-            // Non-fatal here; the caller decides (root self-mount treats
-            // the returned error as fatal, the /esp and /data auto-mounts
-            // skip and fall through).
-            std::os::seraph::log!(
-                warn: "MOUNT: role GUID matched by multiple tied-priority partitions; not mounting"
-            );
-            return Err(ipc::vfsd_errors::NO_MOUNT);
-        }
-    };
-    let Some(disk) = rt.disks.get(location.disk)
-    else
-    {
-        // The lookup ran over `rt.disks`, so its index is in range.
-        std::os::seraph::log!(
-            warn: "MOUNT: role lookup named disk {} vfsd does not hold",
-            location.disk
-        );
-        return Err(ipc::vfsd_errors::NO_MOUNT);
-    };
+    let (location, blk_ep) = find_partition(rt, ipc_buf, type_guid, requery)?;
     let (partition_lba, partition_len) = (location.first_lba, location.length_lba);
     std::os::seraph::log!(
         debug: "MOUNT: partition on disk {} LBA={partition_lba:#018x} length={partition_len:#018x}",
@@ -1564,7 +1779,7 @@ fn do_mount_internal(
     // driver off the partition (`docs/namespace-composition.md` § Mount
     // record).
     let Some(partition) =
-        derive_and_register_partition(disk.blk_ep, partition_lba, partition_len, ipc_buf)
+        derive_and_register_partition(blk_ep, partition_lba, partition_len, ipc_buf)
     else
     {
         std::os::seraph::log!(warn: "MOUNT: partition cap registration failed");
@@ -1598,6 +1813,7 @@ fn do_mount_internal(
     let Some(fatfs) = driver::spawn_fatfs_driver(
         &rt.caps,
         &rt.pool,
+        path,
         partition_ep,
         module_cap_for_spawn,
         rt.system_root_cap,
@@ -1665,36 +1881,51 @@ fn do_mount_internal(
         driver_ep
     };
 
-    // Install the mount; capture the synthetic intermediates the install
-    // made visible so we can populate their fall-through caps after
-    // releasing the lock (the walk needs IPC and we must not block
-    // other namespace traffic on it).
+    // Install the mount, its death queue joining the watch set in the same
+    // hold (the claim rule of `watch`), so the watch thread sees the driver's
+    // death only once the mount is in the tree; capture the synthetic
+    // intermediates the install made visible so we can populate their
+    // fall-through caps after releasing the lock (the walk needs IPC and we
+    // must not block other namespace traffic on it).
     let install_result = {
         let mut backend = rt
             .root_backend
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        backend.install(
-            path,
-            Mount {
-                cap: install_cap,
-                endpoint: fatfs.endpoint,
-                process: fatfs.process,
-                death_queue: fatfs.death_queue,
-                partition,
-                disk: location.disk,
-            },
-        )
+        let mount = Mount {
+            cap: install_cap,
+            endpoint: fatfs.endpoint,
+            process: fatfs.process,
+            death_queue: fatfs.death_queue,
+            partition,
+            disk: location.disk,
+        };
+        let observed = rt.watch.add(&backend, fatfs.death_queue);
+        let installed = if observed
+        {
+            backend.install(path, mount)
+        }
+        else
+        {
+            None
+        };
+        if observed && installed.is_none()
+        {
+            rt.watch.remove(&backend, fatfs.death_queue);
+        }
+        installed
     };
     let Some(install_result) = install_result
     else
     {
         // A concurrent MOUNT took the mount point after the `can_install`
-        // check, or the tree could not grow. Revoking the endpoint invalidates
+        // check, the tree holds its most mounts, or it could not grow, or the
+        // watch set refused the death queue. Revoking the endpoint invalidates
         // `install_cap` and `caller_root_cap` (both derive from it) and
         // stops the driver nothing would reach.
         std::os::seraph::log!(
-            warn: "MOUNT: synthetic-root install failed (no memory or mount point taken)"
+            warn: "MOUNT: synthetic-root install failed (mount point taken, mount limit, \
+             no memory, or driver not observed)"
         );
         release_failed_mount(&fatfs, partition);
         return Err(ipc::vfsd_errors::TABLE_FULL);
@@ -1710,6 +1941,26 @@ fn do_mount_internal(
     // death queue and the partition cap for the life of the mount.
 
     populate_fallthrough_caps(rt, ipc_buf, install_result.as_slice());
+
+    // The watch thread claims the mounts of a disk it finds removed; a mount
+    // installed after those claims is torn down here. The disk is marked
+    // removed before the claims, so this check or the claims see the mount.
+    let disk_removed = rt
+        .disks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(location.disk)
+        .is_none_or(|d| d.removed);
+    if disk_removed
+    {
+        std::os::seraph::log!(warn: "MOUNT: the disk was removed during the mount");
+        if let Some((idx, mount)) = watch::claim(rt, |m| m.death_queue == fatfs.death_queue)
+        {
+            force_unmount(rt, idx, &mount, ipc_buf);
+        }
+        log_cap_delete("caller cap (disk removed)", caller_root_cap.unwrap_or(0));
+        return Err(ipc::vfsd_errors::NO_MOUNT);
+    }
 
     std::os::seraph::log!("MOUNT: registered");
     Ok(caller_root_cap.unwrap_or(0))

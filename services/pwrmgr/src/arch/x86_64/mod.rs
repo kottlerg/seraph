@@ -17,7 +17,10 @@
 //! caller, svcmgr's graceful shutdown among them. On any failure, including
 //! a request acpid carried out without the platform acting within
 //! [`crate::await_reset`]'s grace, a routine logs and returns, and the
-//! caller (`main`) replies `pwrmgr_errors::INVALID_REQUEST`.
+//! caller (`main`) replies `pwrmgr_errors::INVALID_REQUEST`. acpid
+//! answers a `SLEEP` only 10 s after its writes (its `SLEEP_GRACE`), so a
+//! power-off the platform does not act on fails about 11 s after it was
+//! issued, a reboot about one second after.
 //!
 //! The power button reaches pwrmgr through acpid too: a thread of its own
 //! ([`watch_events`]) waits in [`acpid_labels::WAIT_EVENT`] and powers

@@ -1,13 +1,14 @@
 # terminal
 
-Userspace terminal: relays a byte stream between hardware drivers and a child
-process's stdio, with a minimal line discipline. This is the durable terminal
+Userspace terminal: relays a byte stream between hardware drivers and the
+standard streams of an operator session's leader, with a minimal line
+discipline. This is the durable terminal
 abstraction; v0.0.1 (#111) ships an intentionally tiny feature surface that
 grows in later releases.
 
 The terminal owns its driver endpoint caps directly because no input/display
 broker exists yet. When a broker/compositor lands (a separate v0.2.0+ design
-issue), the terminal becomes a subscriber and the stdio contract to its child
+issue), the terminal becomes a subscriber and the stdio contract to the leader
 does not change.
 
 ---
@@ -19,7 +20,8 @@ terminal/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── main.rs            # Device resolution, child spawn/respawn, line discipline
+    ├── main.rs            # Device resolution, the session loop, line discipline
+    ├── session.rs         # sessiond client: registration, open, stream handover
     ├── input.rs           # Keyboard and serial RX producer threads
     └── output.rs          # Output sink: framebuffer (SGR-parsed) and serial mirror
 ```
@@ -51,25 +53,40 @@ terminal/
   - local echo of each typed character to the output,
   - single-line backspace (`BS` erases the last byte of the current line and
     emits `BS SP BS` to the display),
-  - CR→LF translation (Enter sends `\n` to the child).
-- **Child**: spawned with piped stdin/stdout/stderr over the `ProcessInfo`
-  stdio contract via `std::process::Command`. The child path defaults to
-  `/programs/shell` and is overridable through `argv[1]` (set in the recipe).
-  On child exit the terminal respawns it.
+  - CR→LF translation (Enter sends `\n` to the leader).
+- **Session**: the terminal is an interface of
+  [sessiond](../../services/sessiond/README.md)
+  ([docs/session-supervision.md](../../docs/session-supervision.md)). It
+  registers an end queue on itself with procmgr once, and registers with
+  sessiond under a random nonce, handing it the queue's receive right, so
+  sessiond ends the terminal's sessions whatever ends the terminal. For each
+  session it makes the leader's three pipes and death relay with
+  `std::os::seraph::process::SessionStdio`, opens the session through its
+  `sessiond.operator` seed, hands over the pipes, and starts it
+  ([sessiond IPC Interface](../../services/sessiond/docs/ipc-interface.md)).
+  sessiond creates the leader, the shell its own recipe names, so the terminal
+  holds no process handle and no namespace. When the relay gives the leader's
+  end, the terminal opens a new session. It registers again when a new
+  sessiond instance answers `UNKNOWN_INTERFACE`, waits for the pressure level
+  to change while sessiond answers `MEMORY_CRITICAL`, and asks again after a
+  second on any other refusal.
 - **Supervision**: a non-bootstrap svcmgr service
-  (`/config/svcmgr/services/terminal.svc`), `critical = no`, `restart = never`.
-  It autostarts on a normal `cargo xtask run`. It is never bundled into the ESP
-  and init never loads it.
+  (`/config/svcmgr/services/terminal.svc`), `critical = no`,
+  `restart = on_failure`, `namespace = none`, seeded with the input,
+  framebuffer and serial class SENDs and `sessiond.operator`. It autostarts on
+  a normal `cargo xtask run`. It is never bundled into the ESP and init never
+  loads it.
 
 ## Architecture
 
 One producer thread per input source feeds an `mpsc` channel: the keyboard
 thread blocks on the keysym stream and decodes key-downs to bytes; the serial
 thread wakes on the UART receive interrupt (`SERIAL_REGISTER_RX_NOTIFY`, with a
-bounded-timeout fallback) and forwards received bytes. Per-child relay threads
-forward the child's stdout/stderr down the same channel. The single consumer
-thread owns the output sink and the child's stdin, applies the line discipline,
-and respawns the child on exit. Sole ownership of the sink by one thread is why
+bounded-timeout fallback) and forwards received bytes. Per-session relay threads
+forward the leader's stdout/stderr down the same channel, and a watcher thread
+posts the leader's end, read from the session's relay. The single consumer
+thread owns the output sink and the leader's stdin, applies the line discipline,
+and opens a new session when the leader ends. Sole ownership of the sink by one thread is why
 no locking is needed; each thread issues driver IPC on its own per-thread IPC
 buffer (`std::os::seraph::current_ipc_buf`).
 
@@ -102,7 +119,7 @@ socket, waits for the `terminal: READY for injection` marker, then exercises
 both input sources in one boot: a keyboard round (key sequence injected through
 the real virtio-input driver over QMP) and a serial round (the same sequence
 written to the guest UART via QEMU's bidirectional `-serial stdio`). Each round
-asserts the echoed input and the relayed child output appear on the serial
+asserts the echoed input and the relayed leader output appear on the serial
 stream. It runs as a boot in the `usertest` cell. See
 [xtask/README.md](../../xtask/README.md#cargo-xtask-test-terminal) for the command and
 [docs/testing.md](../../docs/testing.md#interactive-input-test-terminal) for the test.
@@ -114,6 +131,8 @@ stream. It runs as a boot in the `usertest` cell. See
 | Document | Content |
 |---|---|
 | [docs/console-model.md](../../docs/console-model.md) | Console output ownership; the terminal as the production console path |
+| [docs/session-supervision.md](../../docs/session-supervision.md) | Sessions, sessiond, the terminal as an interface |
+| [services/sessiond/docs/ipc-interface.md](../../services/sessiond/docs/ipc-interface.md) | The labels the terminal opens its sessions with |
 | [docs/testing.md](../../docs/testing.md) | The `test-terminal` interactive input test |
 | [xtask/README.md](../../xtask/README.md) | `cargo xtask test-terminal` and the devices `run` attaches |
 | [serial driver](../../services/drivers/serial/README.md) | `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY` |

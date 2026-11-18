@@ -6,8 +6,9 @@
 # the one using the most memory (services/oomd/docs/operation.md). svcmgr
 # restarts a stopped service under its restart policy. A service is stoppable
 # only when its recipe sets `oom_stop = yes` and svcmgr's eligibility rule
-# admits it; no recipe of the default image sets `oom_stop` or `stop_source`,
-# so by default oomd stops nothing. `OOMD_STOP=no` makes oomd name the
+# admits it; no recipe of the default image sets `oom_stop`, and only
+# sessiond's sets `stop_source`, so by default oomd stops only a program or
+# session sessiond lists. `OOMD_STOP=no` makes oomd name the
 # candidate it would stop and stop none.
 # Removing this recipe from the image removes the policy: memory then runs out
 # for whichever process asks next, and the reserve keeps the core alive.

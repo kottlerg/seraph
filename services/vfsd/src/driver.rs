@@ -37,20 +37,15 @@ use ipc::{FS_LABELS_VERSION, IpcMessage, fs_labels, procmgr_labels};
 use crate::VfsdCaps;
 use crate::worker_pool::{BootstrapOrder, CreateFromFileOrder, WorkerPool, delete_bootstrap_caps};
 
-/// Where fatfs is installed, the path vfsd walks to start it from the root
-/// filesystem and the name its signed object is verified under.
+/// Where fatfs is installed: the path vfsd walks to start it from the root
+/// filesystem, and the name its signed object is verified under, whether
+/// vfsd starts it from that file or from the boot module init hands it, a
+/// byte copy of the same file.
 pub const FATFS_PATH: &str = "/services/fs/fatfs";
 
-/// The bundle entry name of the fatfs boot module init hands vfsd, under
-/// which procmgr verifies the module vfsd starts the root mount's fatfs from.
-pub const FATFS_MODULE_NAME: &[u8] = b"fatfs";
-
-// Both fatfs names fit a create request's name block, so a request built
-// with either carries its name.
-const _: () = assert!(
-    FATFS_PATH.len() <= procmgr_labels::CREATE_NAME_MAX
-        && FATFS_MODULE_NAME.len() <= procmgr_labels::CREATE_NAME_MAX
-);
+// The fatfs name fits a create request's name block, so a request built with
+// it carries its name.
+const _: () = assert!(FATFS_PATH.len() <= procmgr_labels::CREATE_NAME_MAX);
 
 /// A started fatfs driver instance: what the mount record keeps of it
 /// (`root_backend::Mount`, `docs/namespace-composition.md` § Mount record).
@@ -457,10 +452,10 @@ fn spawn_via_module(
             None => builder,
         }
     };
-    // `FATFS_MODULE_NAME` fits a name block (asserted at its definition); a request
+    // `FATFS_PATH` fits a name block (asserted at its definition); a request
     // without one would still carry every cap, for procmgr to refuse and
     // delete.
-    let create_msg = procmgr_labels::with_create_name(request(), label, FATFS_MODULE_NAME)
+    let create_msg = procmgr_labels::with_create_name(request(), label, FATFS_PATH.as_bytes())
         .unwrap_or_else(request)
         .cap(relay)
         .build();

@@ -1242,6 +1242,74 @@ pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     pal_alloc::fund_cspace_slot_budget(self_cspace, slots)
 }
 
+/// A `CSpace` held above a low-water mark of general slots by every thread of
+/// a process that serves a load whose capabilities grow with it: a service
+/// holding a few capabilities per client, device or child it serves.
+///
+/// A `CSpace` its creator seeded holds a fixed count of slots, and its growth
+/// pool grows only by donation ([`fund_cspace_slot_budget`]). A service that
+/// holds one of these as a `static` and calls [`hold`](Self::hold) before
+/// each operation that allocates slots keeps its headroom
+/// ([`cspace_slot_headroom`]) at or above `low_water`, with a page of growth
+/// budget beyond it for the body arena (`syscall_abi::cspace_topup_pages`):
+/// below either, the hold funds the pool for `topup_slots` from memmgr. The
+/// mark is sized to cover every allocation the process's threads can make
+/// while one of them tops up, since:
+///
+/// - one thread at a time reads and funds the pool; a thread that finds
+///   another doing so goes on at once, without waiting;
+/// - a refused top-up is retried at the next hold, and
+///   [`failure_to_report`](Self::failure_to_report) answers `true` once per
+///   run of refused top-ups, so the caller that may log does so once,
+///   whichever thread's top-up was refused.
+///
+/// Nothing is logged here: a thread that serves logd (or a driver logd
+/// writes through) must not log while logd waits on its reply, so the caller
+/// chooses which of its threads reports.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub struct CSpaceHeadroom {
+    low_water: u64,
+    topup_slots: u64,
+    state: pool_funding::LowWaterHold,
+}
+
+impl CSpaceHeadroom {
+    /// A hold of `low_water` general slots, funding `topup_slots` when the
+    /// headroom falls below it. `topup_slots` above `low_water` spaces the
+    /// top-ups apart; at or below it, every hold short of the mark tops up.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[rustc_const_stable(feature = "seraph_ext", since = "1.0.0")]
+    // The state's constructor is `ruststd-pool-funding`'s, a crate std
+    // depends on as `rustc_private`; it is a plain `const fn` of two atomics.
+    #[rustc_allow_const_fn_unstable(rustc_private)]
+    #[must_use]
+    pub const fn new(low_water: u64, topup_slots: u64) -> Self {
+        Self { low_water, topup_slots, state: pool_funding::LowWaterHold::new() }
+    }
+
+    /// Hold `self_cspace`, the calling process's own `CSpace`, above the
+    /// mark: unless another thread is holding it, top it up for
+    /// `topup_slots` when its headroom or its growth budget is short of the
+    /// mark. A refused top-up is recorded for
+    /// [`failure_to_report`](Self::failure_to_report).
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn hold(&self, self_cspace: u64) {
+        let _ = self.state.hold(
+            || pal_alloc::cspace_below_low_water(self_cspace, self.low_water),
+            || pal_alloc::fund_cspace_slot_budget(self_cspace, self.topup_slots),
+        );
+    }
+
+    /// Whether a run of refused top-ups is under way that no caller has
+    /// reported: `true` at most once per run, to the first caller that asks.
+    /// A hold that finds the pool covered or tops it up ends the run.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[must_use]
+    pub fn failure_to_report(&self) -> bool {
+        self.state.take_report()
+    }
+}
+
 // ── Page-reservation allocator ──────────────────────────────────────────────
 //
 // Re-exports from `crate::sys::reserve`. See that module for the per-process
@@ -2289,6 +2357,233 @@ pub mod process {
             }
             let _ = syscall::cap_delete(self.original);
             crate::sys::alloc::seraph::slab_release_fresh(self.region_id);
+        }
+    }
+
+    /// The standard streams of a session's leader, made by the interface
+    /// that opens the session through sessiond
+    /// (`services/sessiond/docs/ipc-interface.md`): three pipes, the leader's
+    /// stdin, stdout and stderr, and the event queue procmgr posts the
+    /// leader's end to, its death relay.
+    ///
+    /// The interface hands sessiond [`Self::relay`] with `OPEN_SESSION` and
+    /// each stream's caps ([`Self::handoff`]) with `SESSION_STDIO`; sessiond
+    /// passes them on to procmgr for the leader it creates. The interface
+    /// keeps its ends ([`Self::take_stdin`], [`Self::take_stdout`],
+    /// [`Self::take_stderr`]) and learns the leader's end with [`Self::wait`].
+    ///
+    /// Each ring page is a grant of this process's, returned to memmgr once
+    /// both its end here is dropped and no leader can map it: after
+    /// [`Self::wait`] has returned, since procmgr posts the relay only once it
+    /// has torn the leader down, or after [`Self::refused`], when no leader
+    /// was made. Dropped with neither, the grants stay accounted to this
+    /// process until it exits, since a leader may still map the rings.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub struct SessionStdio {
+        relay: u64,
+        stdin: Option<crate::sys::process::ChildPipe>,
+        stdout: Option<crate::sys::process::ChildPipe>,
+        stderr: Option<crate::sys::process::ChildPipe>,
+        handoff: [Option<crate::sys::pipe::seraph::PipeCaps>; 3],
+        wakes: [(u64, u64); 3],
+        releases: [Option<crate::sync::Arc<crate::sys::pipe::seraph::RingRelease>>; 3],
+        peer_dead: crate::sync::Arc<crate::sync::atomic::AtomicBool>,
+        /// The leader's end, once [`Self::wait`] has read it.
+        ended: Option<u64>,
+    }
+
+    /// Entries the relay queue holds: procmgr's one post of the leader's end,
+    /// and one spare.
+    const RELAY_CAPACITY: u32 = 2;
+
+    impl SessionStdio {
+        /// Make the relay queue and the three pipes: the leader's stdin,
+        /// written here, and its stdout and stderr, read here.
+        ///
+        /// # Errors
+        /// The error of the object or pipe that could not be made; nothing
+        /// made before it is kept.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn new() -> crate::io::Result<Self> {
+            use crate::sys::pipe::seraph::{Pipe, Role};
+
+            let bytes = syscall_abi::event_queue_retype_bytes(u64::from(RELAY_CAPACITY), 0);
+            let relay = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
+                syscall::event_queue_create(slab, RELAY_CAPACITY).ok()
+            })
+            .ok_or_else(|| crate::io::Error::other("session: relay queue not made"))?;
+            let mut this = Self {
+                relay,
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                handoff: [None; 3],
+                wakes: [(0, 0); 3],
+                releases: [None, None, None],
+                peer_dead: crate::sync::Arc::new(crate::sync::atomic::AtomicBool::new(false)),
+                ended: None,
+            };
+            for (index, role) in [Role::Writer, Role::Reader, Role::Reader].into_iter().enumerate() {
+                // An error drops `this` while no release is armed, so each
+                // end made before it returns its ring when dropped: no
+                // leader has them.
+                let (mut pipe, caps) = Pipe::create_for_child(role)?;
+                pipe.set_peer_dead(this.peer_dead.clone());
+                if let Some(wake) = this.wakes.get_mut(index) {
+                    *wake = (pipe.data_notification_cap(), pipe.space_notification_cap());
+                }
+                if let Some(slot) = this.handoff.get_mut(index) {
+                    *slot = Some(caps);
+                }
+                let pipe = Some(crate::boxed::Box::new(pipe));
+                match index {
+                    0 => this.stdin = pipe,
+                    1 => this.stdout = pipe,
+                    _ => this.stderr = pipe,
+                }
+            }
+            // From here a leader may map the rings, so each ring returns only
+            // once its end is dropped and the peer is reported gone
+            // (`Self::wait` or `Self::refused`).
+            let ends = [&this.stdin, &this.stdout, &this.stderr];
+            for (release, end) in this.releases.iter_mut().zip(ends) {
+                *release = end.as_ref().and_then(|pipe| pipe.arm_ring_release());
+            }
+            Ok(this)
+        }
+
+        /// A POST cap on the relay queue, for `OPEN_SESSION`'s `caps[0]`.
+        ///
+        /// # Errors
+        /// When the kernel refuses the derivation.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn relay(&self) -> crate::io::Result<u64> {
+            syscall::cap_derive(self.relay, syscall::RIGHTS_EQ_POST)
+                .map_err(|_| crate::io::Error::other("session: relay POST not derived"))
+        }
+
+        /// The caps of the stream `direction` names
+        /// (`ipc::procmgr_labels::PIPE_DIR_STDIN`, `PIPE_DIR_STDOUT` or
+        /// `PIPE_DIR_STDERR`), for `SESSION_STDIO`'s `caps[0..3]`: the ring's
+        /// memory cap and its data and space notifications. `None` for
+        /// another direction, or once taken: the call that carries them moves
+        /// them.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn handoff(&mut self, direction: u64) -> Option<[u64; 3]> {
+            let caps = self.handoff.get_mut(usize::try_from(direction).ok()?)?.take()?;
+            Some([caps.memory, caps.data_notification, caps.space_notification])
+        }
+
+        /// The byte capacity of each ring, for `SESSION_STDIO`'s `data[3]`.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn ring_capacity(&self) -> u64 {
+            u64::from(crate::sys::pipe::seraph::RING_CAPACITY)
+        }
+
+        /// The end that writes the leader's stdin; `None` once taken.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn take_stdin(&mut self) -> Option<crate::process::ChildStdin> {
+            use crate::sys::FromInner;
+            self.stdin.take().map(crate::process::ChildStdin::from_inner)
+        }
+
+        /// The end that reads the leader's stdout; `None` once taken.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn take_stdout(&mut self) -> Option<crate::process::ChildStdout> {
+            use crate::sys::FromInner;
+            self.stdout.take().map(crate::process::ChildStdout::from_inner)
+        }
+
+        /// The end that reads the leader's stderr; `None` once taken.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn take_stderr(&mut self) -> Option<crate::process::ChildStderr> {
+            use crate::sys::FromInner;
+            self.stderr.take().map(crate::process::ChildStderr::from_inner)
+        }
+
+        /// Wait for procmgr's post of the leader's end to the relay, and
+        /// return it: the leader's exit status, its fault, or `EXIT_KILLED`
+        /// for a leader a destroy tore down. The ends here then read EOF once
+        /// drained and write `BrokenPipe`, and each ring returns to memmgr
+        /// once its end is dropped. A wait after the first returns the same
+        /// status at once.
+        ///
+        /// # Errors
+        /// When the relay cannot be read: the ends stay as they are.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn wait(&mut self) -> crate::io::Result<crate::process::ExitStatus> {
+            use crate::sys::FromInner;
+
+            let reason = match self.ended {
+                Some(reason) => reason,
+                None => self.receive_end()?,
+            };
+            Ok(crate::process::ExitStatus::from_inner(
+                crate::sys::process::ExitStatus::from_reason(reason),
+            ))
+        }
+
+        /// Receive the leader's end from the relay, then end the peer.
+        fn receive_end(&mut self) -> crate::io::Result<u64> {
+            use syscall_abi::SyscallError;
+
+            let reason = loop {
+                match syscall::event_recv(self.relay) {
+                    Ok(reason) => break reason,
+                    // A stop of this thread, or an upcall to it.
+                    Err(e) if e == SyscallError::Interrupted as i64 => {}
+                    Err(_) => return Err(crate::io::Error::other("session: relay unreadable")),
+                }
+            };
+            self.end_peer();
+            self.ended = Some(reason);
+            Ok(reason)
+        }
+
+        /// The session was refused, so no leader holds the rings: mark the
+        /// peer gone, so each ring returns to memmgr once its end is dropped.
+        /// Call it only on a definite refusal, one after which no leader
+        /// exists (sessiond's replies say which).
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn refused(mut self) {
+            self.end_peer();
+        }
+
+        /// Mark the peer gone, wake every end blocked on its ring, and report
+        /// the peer's end to each ring's release, sending the release of a
+        /// ring whose end is already dropped.
+        fn end_peer(&mut self) {
+            self.peer_dead.store(true, crate::sync::atomic::Ordering::Release);
+            for &(data, space) in &self.wakes {
+                let _ = syscall::notification_send(data, 1);
+                let _ = syscall::notification_send(space, 1);
+            }
+            for release in self.releases.iter_mut().filter_map(Option::take) {
+                if release.on_peer_death() {
+                    crate::sys::alloc::seraph::slab_release_fresh(release.region_id());
+                }
+            }
+        }
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl crate::fmt::Debug for SessionStdio {
+        fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+            f.debug_struct("SessionStdio").field("ended", &self.ended).finish_non_exhaustive()
+        }
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl Drop for SessionStdio {
+        fn drop(&mut self) {
+            // Caps no call moved: a moved one is a stale handle here, whose
+            // delete the per-slot generation refuses.
+            for caps in self.handoff.iter_mut().filter_map(Option::take) {
+                let _ = syscall::cap_delete(caps.memory);
+                let _ = syscall::cap_delete(caps.data_notification);
+                let _ = syscall::cap_delete(caps.space_notification);
+            }
+            let _ = syscall::cap_delete(self.relay);
         }
     }
 

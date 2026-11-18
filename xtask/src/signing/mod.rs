@@ -6,12 +6,15 @@
 //! Signing of the objects a build packs, and the trust store the bootloader
 //! is built with (docs/signing.md § Signing).
 //!
-//! Every image is signed as it is packed: [`crate::disk::create_disk_image`]
-//! signs the kernel and every ELF image under `services/`, `programs/` and
-//! `tests/` in the sysroot ([`sign_sysroot`]), and [`crate::bundle`] signs
-//! each ELF entry of the bundle it composes. A signed object is its body and a
-//! trailer of one record ([`Signer::sign`]), which [`objsig::verify`] accepts
-//! under the build's trust store before it is written, with the kind, name and
+//! Every object is signed once, in the sysroot, under its install path and the
+//! roles it may be loaded in ([`sign_sysroot`]): the kernel, every ELF image
+//! under `services/`, `programs/` and `tests/`, and the bundle's data
+//! entries. [`crate::disk::create_disk_image`] signs the sysroot as it packs,
+//! and every command that composes a bundle signs it first
+//! ([`sign_for_harness`]), since [`crate::bundle`] copies installed files
+//! and signs nothing. A signed object is its body and a trailer of one record
+//! ([`Signer::sign`]), which [`objsig::verify`] accepts under the build's
+//! trust store before it is written, with each of its roles, its name and the
 //! architecture the bootloader and procmgr expect of it.
 //!
 //! - [`identity`]: the signing key, its certificate and the anchors it
@@ -28,9 +31,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use objsig::attrs::Attributes;
-use objsig::{Expectation, KeyId, Kind, KindSet, ParseError, RecordSpec, TrustStore};
+use objsig::{Expectation, KeyId, ParseError, RecordSpec, Role, RoleSet, TrustStore};
 
 use crate::arch::Arch;
+use crate::bundle::Harness;
 use crate::context::Context as BuildContext;
 use crate::error::{Context, Result, bail, ensure, err};
 
@@ -252,21 +256,24 @@ impl Signer
         store::with_revoked(&self.store, self.key_id())
     }
 
-    /// `object` signed as `kind` under `name`: its body, the object less
-    /// any trailer it carries, followed by a trailer of one record of the
-    /// signing key. The result is verified under the build's store, with
-    /// `kind`, `name` and the build's architecture expected, before it is
-    /// returned. Signing is deterministic, so an object already signed so
-    /// comes back unchanged.
+    /// `object` signed with the role set `roles` under `name`: its body, the
+    /// object less any trailer it carries, followed by a trailer of one
+    /// record of the signing key. The result is verified under the build's
+    /// store, with each of `roles`, `name` and the build's architecture
+    /// expected, before it is returned. Signing is deterministic, so an
+    /// object already signed so comes back unchanged.
     ///
     /// # Errors
     ///
     /// When `object` ends in a malformed trailer or its body in the trailer
     /// magic; when `name` is not in the canonical form of docs/signing.md
     /// § Signed Attributes (`objsig::name_is_canonical`), which a loader
-    /// checks the name it is given against; when the signature cannot be made; when the signed object does not verify
-    /// (a faulty external signer, or a store that does not trust the key).
-    pub fn sign(&self, object: &[u8], kind: Kind, name: &str) -> Result<Vec<u8>>
+    /// checks the name it is given against; when `roles` is not a set a
+    /// record may carry (empty, or kernel or init beside another role); when
+    /// the signature cannot be made; when the signed object does not verify
+    /// (a faulty external signer, or a store that does not trust the key for
+    /// one of the roles).
+    pub fn sign(&self, object: &[u8], roles: RoleSet, name: &str) -> Result<Vec<u8>>
     {
         if !objsig::name_is_canonical(name.as_bytes())
         {
@@ -279,7 +286,7 @@ impl Signer
         let attrs = Attributes {
             body_len: u64::try_from(body.len()).context("an object longer than u64")?,
             security_version: SECURITY_VERSION,
-            kind,
+            roles,
             arch: self.arch,
             body_hash: crypto::sha512(body),
             name: name.as_bytes(),
@@ -302,42 +309,44 @@ impl Signer
         );
         let (_, tail) = out.split_at_mut(body.len());
         objsig::encode_trailer(body, &[record], tail).map_err(refused)?;
-        self.check(&out, kind, name)?;
+        self.check(&out, roles, name)?;
         Ok(out)
     }
 
-    /// Verify the signed `object` as the loader of a `kind` named `name`
-    /// will.
-    fn check(&self, object: &[u8], kind: Kind, name: &str) -> Result<()>
+    /// Verify the signed `object` as the loader of each of `roles` will,
+    /// under the name `name`.
+    fn check(&self, object: &[u8], roles: RoleSet, name: &str) -> Result<()>
     {
         let store = TrustStore::parse(&self.store)
             .map_err(|e| err!("the build's trust store does not parse ({e:?})"))?;
-        let expect = Expectation {
-            kinds: KindSet::of(&[kind]),
-            name: name.as_bytes(),
-            arch: self.arch,
-        };
-        objsig::verify(object, &store, &expect)
-            .map(|_| ())
-            .map_err(|refusal| {
+        for role in Role::ALL.into_iter().filter(|&role| roles.contains(role))
+        {
+            let expect = Expectation {
+                roles: RoleSet::of(&[role]),
+                name: name.as_bytes(),
+                arch: self.arch,
+            };
+            objsig::verify(object, &store, &expect).map_err(|refusal| {
                 err!(
-                    "{name}, signed as {kind:?}, does not verify under the build's trust store \
-                     ({refusal:?})"
+                    "{name}, signed with the {role:?} role, does not verify under the build's \
+                     trust store ({refusal:?})"
                 )
-            })
+            })?;
+        }
+        Ok(())
     }
 
-    /// Sign the file at `path` in place as `kind` under `name`; returns
+    /// Sign the file at `path` in place with `roles` under `name`; returns
     /// whether its bytes changed.
     ///
     /// # Errors
     ///
     /// On an I/O failure and the errors of [`Self::sign`].
-    pub fn sign_file(&self, path: &Path, kind: Kind, name: &str) -> Result<bool>
+    pub fn sign_file(&self, path: &Path, roles: RoleSet, name: &str) -> Result<bool>
     {
         let object = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let signed = self
-            .sign(&object, kind, name)
+            .sign(&object, roles, name)
             .with_context(|| format!("signing {}", path.display()))?;
         if signed == object
         {
@@ -404,7 +413,7 @@ pub fn prepend_records(object: &[u8], first: &[u8]) -> Result<Vec<u8>>
 }
 
 /// The trailer format's architecture of `arch`.
-fn objsig_arch(arch: Arch) -> objsig::Arch
+pub fn objsig_arch(arch: Arch) -> objsig::Arch
 {
     match arch
     {
@@ -413,11 +422,11 @@ fn objsig_arch(arch: Arch) -> objsig::Arch
     }
 }
 
-/// The kind of the image installed at `path`, relative to the root of the
+/// The role of the image installed at `path`, relative to the root of the
 /// root filesystem: a driver under a `drivers/` directory, a program under a
 /// `programs/` directory, and a service otherwise (docs/signing.md
 /// § Signing).
-fn image_kind(path: &Path) -> Kind
+fn location_role(path: &Path) -> Role
 {
     let names: Vec<&std::ffi::OsStr> = path
         .parent()
@@ -427,16 +436,56 @@ fn image_kind(path: &Path) -> Kind
         .collect();
     if names.iter().any(|name| *name == "drivers")
     {
-        Kind::Driver
+        Role::Driver
     }
     else if names.iter().any(|name| *name == "programs")
     {
-        Kind::Program
+        Role::Program
     }
     else
     {
-        Kind::Service
+        Role::Service
     }
+}
+
+/// The name of the bundle's `init` slot, which the object in it is signed
+/// under (`boot_protocol::bundle::INIT_ENTRY_NAME`).
+pub const INIT_SLOT: &str = "init";
+
+/// The install path of init, signed `init` with the init role alone.
+const INIT_PATH: &str = "/services/init";
+
+/// The install path of ktest, signed `init` with the init role alone in an
+/// image packed with the ktest harness in its `init` slot.
+const KTEST_PATH: &str = "/tests/ktest";
+
+/// The name and the role set the ELF image installed at `install` is signed
+/// with in an image whose bundle's `init` slot holds `harness`, whose
+/// default bundle names the objects `boot_modules` holds: init's, and
+/// ktest's under the ktest harness, `init` with the init role alone; every
+/// other image's its install path, with its [`location_role`] and the
+/// boot-module role when the bundle names it (docs/signing.md § Signing).
+fn image_signature(
+    install: &str,
+    relative: &Path,
+    harness: Harness,
+    boot_modules: &[&str],
+) -> (String, RoleSet)
+{
+    if install == INIT_PATH || (install == KTEST_PATH && harness == Harness::Ktest)
+    {
+        return (INIT_SLOT.to_owned(), RoleSet::of(&[Role::Init]));
+    }
+    let role = location_role(relative);
+    let roles = if boot_modules.contains(&install)
+    {
+        RoleSet::of(&[role, Role::BootModule])
+    }
+    else
+    {
+        RoleSet::of(&[role])
+    };
+    (install.to_owned(), roles)
 }
 
 /// The install path of `path`, relative to the root of the root filesystem:
@@ -456,16 +505,26 @@ fn install_name(path: &Path) -> Result<String>
     Ok(name)
 }
 
-/// Sign the kernel, as kernel `kernel`, and every ELF image under
-/// [`SIGNED_TREES`] of the sysroot, under its install path and its
-/// [`image_kind`]; returns how many objects were signed and how many of
-/// them changed.
+/// Sign every object of the sysroot for a pack of `arch` whose bundle's
+/// `init` slot holds `harness`: the kernel, `kernel` with the kernel role
+/// alone; every ELF image under [`SIGNED_TREES`] as [`image_signature`]
+/// says; and each of the bundle's data entries the sysroot installs for
+/// `arch`, under its install path with the boot-module role
+/// (`crate::bundle::data_entries`). Returns how many objects were signed and
+/// how many of them changed.
 ///
 /// # Errors
 ///
-/// On an I/O failure and the errors of [`Signer::sign_file`].
-pub fn sign_sysroot(ctx: &BuildContext, signer: &Signer) -> Result<(usize, usize)>
+/// On an I/O failure, when a data entry of `arch` is not installed, and the
+/// errors of [`Signer::sign_file`].
+pub fn sign_sysroot(
+    ctx: &BuildContext,
+    signer: &Signer,
+    arch: Arch,
+    harness: Harness,
+) -> Result<(usize, usize)>
 {
+    let boot_modules = crate::bundle::boot_modules(arch);
     let mut total = 0usize;
     let mut changed = 0usize;
     let mut count = |was_changed: bool| {
@@ -475,17 +534,46 @@ pub fn sign_sysroot(ctx: &BuildContext, signer: &Signer) -> Result<(usize, usize
     let kernel = ctx.sysroot_efi_seraph().join("kernel");
     if kernel.is_file()
     {
-        count(signer.sign_file(&kernel, Kind::Kernel, "kernel")?);
+        count(signer.sign_file(&kernel, RoleSet::of(&[Role::Kernel]), "kernel")?);
     }
     for tree in SIGNED_TREES
     {
         for relative in elf_images(&ctx.sysroot, Path::new(tree))?
         {
-            let name = install_name(&relative)?;
-            count(signer.sign_file(&ctx.sysroot.join(&relative), image_kind(&relative), &name)?);
+            let install = install_name(&relative)?;
+            let (name, roles) = image_signature(&install, &relative, harness, &boot_modules);
+            count(signer.sign_file(&ctx.sysroot.join(&relative), roles, &name)?);
         }
     }
+    for entry in crate::bundle::data_entries(arch)
+    {
+        let path = ctx.sysroot.join(entry.relative());
+        if !path.is_file()
+        {
+            bail!(
+                "{} is not installed (run `cargo xtask build` first)",
+                path.display()
+            );
+        }
+        count(signer.sign_file(&path, RoleSet::of(&[Role::BootModule]), entry.install)?);
+    }
     Ok((total, changed))
+}
+
+/// Sign the sysroot for a pack of `arch` whose bundle's `init` slot holds
+/// `harness` ([`sign_sysroot`]), with the signer of a pack
+/// ([`Signer::open`]): what a command does before it composes a bundle of
+/// `harness`, since the bundle copies the installed files as they are.
+///
+/// # Errors
+///
+/// Those of [`Signer::open`] and [`sign_sysroot`].
+pub fn sign_for_harness(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<()>
+{
+    let signer = Signer::open(ctx, arch)?;
+    let (images, changed) = sign_sysroot(ctx, &signer, arch, harness)?;
+    crate::util::step(&format!("Signed {images} objects ({changed} changed)"));
+    Ok(())
 }
 
 /// The regular files under `root/dir` whose bytes begin with the ELF
@@ -680,33 +768,71 @@ mod tests
     use super::testing::{config, counter, scratch, signer, work_tree};
     use super::*;
 
-    /// `object` verified under `signer`'s store as `kind` named `name` for
-    /// riscv64.
-    fn verifies(signer: &Signer, object: &[u8], kind: Kind, name: &str) -> bool
+    /// `object` verified under `signer`'s store for a loader of `role`
+    /// named `name` on riscv64.
+    fn verifies(signer: &Signer, object: &[u8], role: Role, name: &str) -> bool
     {
         let store = TrustStore::parse(signer.store()).unwrap();
         let expect = Expectation {
-            kinds: KindSet::of(&[kind]),
+            roles: RoleSet::of(&[role]),
             name: name.as_bytes(),
             arch: SigArch::Riscv64,
         };
         objsig::verify(object, &store, &expect).is_ok()
     }
 
-    // Defect caught: a record whose attributes or signature the loader of its
-    // kind would refuse (a wrong body hash, kind, name or architecture), or a
-    // signed object whose body is not the image it was given.
-    #[test]
-    fn a_signed_object_verifies_as_its_kind_and_name_with_the_image_as_its_body()
+    /// The set of `roles`.
+    fn set(roles: &[Role]) -> RoleSet
     {
-        let root = scratch("kinds");
+        RoleSet::of(roles)
+    }
+
+    // Defect caught: a record whose attributes or signature the loader of one
+    // of its roles would refuse (a wrong body hash, role set, name or
+    // architecture), a role the set does not hold accepted, or a signed object
+    // whose body is not the image it was given.
+    #[test]
+    fn a_signed_object_verifies_in_each_of_its_roles_with_the_image_as_its_body()
+    {
+        let root = scratch("roles");
         let signer = signer(&root.join("keys"), Arch::Riscv64);
-        for kind in Kind::ALL
+        for role in Role::ALL
         {
-            let object = signer.sign(b"\x7fELF image", kind, "/services/x").unwrap();
-            assert!(verifies(&signer, &object, kind, "/services/x"), "{kind:?}");
+            let name = if matches!(role, Role::Kernel | Role::Init)
+            {
+                "init"
+            }
+            else
+            {
+                "/services/x"
+            };
+            let object = signer.sign(b"\x7fELF image", set(&[role]), name).unwrap();
+            assert!(verifies(&signer, &object, role, name), "{role:?}");
             assert_eq!(objsig::split(&object).unwrap().body(), b"\x7fELF image");
         }
+        let both = signer
+            .sign(
+                b"\x7fELF image",
+                set(&[Role::Driver, Role::BootModule]),
+                "/services/drivers/x",
+            )
+            .unwrap();
+        for role in Role::ALL
+        {
+            assert_eq!(
+                verifies(&signer, &both, role, "/services/drivers/x"),
+                matches!(role, Role::Driver | Role::BootModule),
+                "{role:?}"
+            );
+        }
+        // No record carries kernel or init beside another role.
+        signer
+            .sign(
+                b"\x7fELF image",
+                set(&[Role::Init, Role::BootModule]),
+                "init",
+            )
+            .unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -719,15 +845,19 @@ mod tests
         let root = scratch("again");
         let signer = signer(&root.join("keys"), Arch::Riscv64);
         let once = signer
-            .sign(b"\x7fELF image", Kind::Service, "/services/x")
+            .sign(b"\x7fELF image", set(&[Role::Service]), "/services/x")
             .unwrap();
         assert_eq!(
-            signer.sign(&once, Kind::Service, "/services/x").unwrap(),
+            signer
+                .sign(&once, set(&[Role::Service]), "/services/x")
+                .unwrap(),
             once
         );
-        let renamed = signer.sign(&once, Kind::BootModule, "x").unwrap();
+        let renamed = signer
+            .sign(&once, set(&[Role::BootModule]), "/services/y")
+            .unwrap();
         assert_eq!(objsig::split(&renamed).unwrap().body(), b"\x7fELF image");
-        assert!(verifies(&signer, &renamed, Kind::BootModule, "x"));
+        assert!(verifies(&signer, &renamed, Role::BootModule, "/services/y"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -749,7 +879,7 @@ mod tests
         ]
         {
             signer
-                .sign(b"\x7fELF image", Kind::Service, name)
+                .sign(b"\x7fELF image", set(&[Role::Service]), name)
                 .expect_err(name);
         }
         let _ = fs::remove_dir_all(&root);
@@ -763,14 +893,14 @@ mod tests
         let root = scratch("malformed");
         let signer = signer(&root.join("keys"), Arch::Riscv64);
         let mut object = signer
-            .sign(b"\x7fELF image", Kind::Service, "/services/x")
+            .sign(b"\x7fELF image", set(&[Role::Service]), "/services/x")
             .unwrap();
         // The footer's version field: 8 bytes of magic end the footer, after
         // the 2-byte version.
         let version = object.len() - 10;
         object[version] = 2;
         signer
-            .sign(&object, Kind::Service, "/services/x")
+            .sign(&object, set(&[Role::Service]), "/services/x")
             .unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
@@ -787,7 +917,7 @@ mod tests
         replaced.deployer_store = Some((other.join("trust.store"), StoreMode::Replace));
         let signer = Signer::new(&replaced, &work_tree(), Arch::Riscv64, &mut counter(1)).unwrap();
         signer
-            .sign(b"\x7fELF image", Kind::Service, "/services/x")
+            .sign(b"\x7fELF image", set(&[Role::Service]), "/services/x")
             .unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
@@ -801,7 +931,7 @@ mod tests
         let root = scratch("revoking");
         let signer = signer(&root.join("keys"), Arch::Riscv64);
         let object = signer
-            .sign(b"\x7fELF image", Kind::Kernel, "kernel")
+            .sign(b"\x7fELF image", set(&[Role::Kernel]), "kernel")
             .unwrap();
         let revoking = signer.store_revoking_own_key().unwrap();
         let store = TrustStore::parse(&revoking).unwrap();
@@ -810,7 +940,7 @@ mod tests
         assert!(store.anchors().eq(built.anchors()));
         assert_eq!(store.security_floor(), built.security_floor());
         let expect = Expectation {
-            kinds: KindSet::of(&[Kind::Kernel]),
+            roles: set(&[Role::Kernel]),
             name: b"kernel",
             arch: SigArch::Riscv64,
         };
@@ -837,9 +967,11 @@ mod tests
         )
         .unwrap();
         let trusted = ours
-            .sign(b"\x7fELF image", Kind::Service, "/services/x")
+            .sign(b"\x7fELF image", set(&[Role::Service]), "/services/x")
             .unwrap();
-        let untrusted = theirs.sign(&trusted, Kind::Service, "/services/x").unwrap();
+        let untrusted = theirs
+            .sign(&trusted, set(&[Role::Service]), "/services/x")
+            .unwrap();
         let both = prepend_records(&trusted, &untrusted).unwrap();
         let signed = objsig::split(&both).unwrap();
         assert_eq!(signed.body(), b"\x7fELF image");
@@ -848,70 +980,142 @@ mod tests
             .map(|record| record.signer_key_id)
             .collect();
         assert_eq!(signers, [theirs.key_id(), ours.key_id()]);
-        assert!(verifies(&ours, &both, Kind::Service, "/services/x"));
+        assert!(verifies(&ours, &both, Role::Service, "/services/x"));
         let other = theirs
-            .sign(b"\x7fELF other", Kind::Service, "/services/x")
+            .sign(b"\x7fELF other", set(&[Role::Service]), "/services/x")
             .unwrap();
         prepend_records(&trusted, &other).unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
 
-    // Defect caught: an image left unsigned, signed under a name or kind its
-    // loader does not expect, or a non-ELF file given a trailer.
-    #[test]
-    fn the_sysroot_images_are_signed_under_their_install_path_and_kind()
+    /// A sysroot in a fresh scratch directory holding `files`.
+    fn sysroot_of(tag: &str, files: &[(&str, &[u8])]) -> (PathBuf, BuildContext)
     {
-        let root = scratch("sysroot");
+        let root = scratch(tag);
         let ctx = BuildContext {
             root: root.clone(),
             sysroot: root.join("sysroot"),
             target_dir: root.join("target"),
         };
-        let images = [
-            ("esp/EFI/seraph/kernel", Kind::Kernel, "kernel"),
-            ("services/svcmgr", Kind::Service, "/services/svcmgr"),
-            ("services/fs/fatfs", Kind::Service, "/services/fs/fatfs"),
-            (
-                "services/drivers/virtio-blk",
-                Kind::Driver,
-                "/services/drivers/virtio-blk",
-            ),
-            ("programs/hello", Kind::Program, "/programs/hello"),
-            ("tests/ktest", Kind::Service, "/tests/ktest"),
-            (
-                "tests/programs/fixture",
-                Kind::Program,
-                "/tests/programs/fixture",
-            ),
-        ];
-        // ELF files outside the signed trees, and a text file inside one.
-        let outside = ["config/x", "esp/EFI/seraph/boot.efi"];
-        let text = "services/init/log-levels.conf";
-        let files = images
-            .iter()
-            .map(|(path, _, _)| (*path, b"\x7fELF image".as_slice()))
-            .chain(
-                outside
-                    .iter()
-                    .map(|path| (*path, b"\x7fELF outside".as_slice())),
-            )
-            .chain([(text, b"vfsd = debug\n".as_slice())]);
         for (path, bytes) in files
         {
             let full = ctx.sysroot.join(path);
             fs::create_dir_all(full.parent().unwrap()).unwrap();
             fs::write(&full, bytes).unwrap();
         }
-        let signer = signer(&root.join("keys"), Arch::Riscv64);
+        (root, ctx)
+    }
 
-        assert_eq!(
-            sign_sysroot(&ctx, &signer).unwrap(),
-            (images.len(), images.len())
+    /// Each ELF image of the test sysroot of riscv64 under the init harness:
+    /// its sysroot-relative path, its role set and its name.
+    const SIGNED_IMAGES: [(&str, &[Role], &str); 9] = [
+        ("esp/EFI/seraph/kernel", &[Role::Kernel], "kernel"),
+        ("services/init", &[Role::Init], "init"),
+        (
+            "services/devmgr",
+            &[Role::Service, Role::BootModule],
+            "/services/devmgr",
+        ),
+        ("services/svcmgr", &[Role::Service], "/services/svcmgr"),
+        (
+            "services/fs/fatfs",
+            &[Role::Service, Role::BootModule],
+            "/services/fs/fatfs",
+        ),
+        (
+            "services/drivers/virtio-blk",
+            &[Role::Driver, Role::BootModule],
+            "/services/drivers/virtio-blk",
+        ),
+        (
+            "services/drivers/iommu-riscv",
+            &[Role::Driver, Role::BootModule],
+            "/services/drivers/iommu-riscv",
+        ),
+        ("programs/hello", &[Role::Program], "/programs/hello"),
+        (
+            "tests/programs/fixture",
+            &[Role::Program],
+            "/tests/programs/fixture",
+        ),
+    ];
+
+    // Defect caught: an object left unsigned, signed under a name or a role
+    // set its loader does not expect (a bundle entry without the boot-module
+    // role, an object the bundle does not name with it, init under its path,
+    // ktest as init in an image that does not boot it), a data entry left
+    // unsigned, or a file outside the signed trees given a trailer.
+    #[test]
+    fn the_sysroot_objects_are_signed_under_their_names_and_roles()
+    {
+        let arch = Arch::Riscv64;
+        let images = SIGNED_IMAGES;
+        let data = crate::bundle::data_entries(arch);
+        assert!(
+            data.iter()
+                .any(|entry| entry.install == "/config/init/log-levels.conf")
         );
-        for (path, kind, name) in images
+        // ELF files outside the signed trees, and a text file inside one.
+        let outside = ["config/x", "esp/EFI/seraph/boot.efi"];
+        let text = "services/init.conf";
+        let mut files: Vec<(&str, &[u8])> = images
+            .iter()
+            .map(|(path, _, _)| (*path, b"\x7fELF image".as_slice()))
+            .collect();
+        files.push(("tests/ktest", b"\x7fELF ktest"));
+        files.extend(
+            outside
+                .iter()
+                .map(|path| (*path, b"\x7fELF outside".as_slice())),
+        );
+        files.push((text, b"vfsd = debug\n"));
+        let relatives: Vec<String> = data
+            .iter()
+            .map(crate::bundle::DataEntry::relative)
+            .collect();
+        files.extend(
+            relatives
+                .iter()
+                .map(|path| (path.as_str(), b"data = 1\n".as_slice())),
+        );
+        let (root, ctx) = sysroot_of("sysroot", &files);
+        let signer = signer(&root.join("keys"), arch);
+
+        let objects = images.len() + 1 + data.len();
+        assert_eq!(
+            sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap(),
+            (objects, objects)
+        );
+        for (path, roles, name) in images
         {
             let object = fs::read(ctx.sysroot.join(path)).unwrap();
-            assert!(verifies(&signer, &object, kind, name), "{path}");
+            let attrs = objsig::split(&object)
+                .unwrap()
+                .records()
+                .next()
+                .unwrap()
+                .attrs;
+            assert_eq!(attrs.roles, RoleSet::of(roles), "{path}");
+            assert_eq!(attrs.name, name.as_bytes(), "{path}");
+            for &role in roles
+            {
+                assert!(verifies(&signer, &object, role, name), "{path}");
+            }
+        }
+        let ktest = fs::read(ctx.sysroot.join("tests/ktest")).unwrap();
+        assert!(verifies(&signer, &ktest, Role::Service, "/tests/ktest"));
+        assert!(!verifies(&signer, &ktest, Role::Init, "init"));
+        for (entry, relative) in data.iter().zip(&relatives)
+        {
+            let object = fs::read(ctx.sysroot.join(relative)).unwrap();
+            let attrs = objsig::split(&object)
+                .unwrap()
+                .records()
+                .next()
+                .unwrap()
+                .attrs;
+            assert_eq!(attrs.roles, RoleSet::of(&[Role::BootModule]), "{relative}");
+            assert!(verifies(&signer, &object, Role::BootModule, entry.install));
         }
         assert_eq!(fs::read(ctx.sysroot.join(text)).unwrap(), b"vfsd = debug\n");
         for path in outside
@@ -922,7 +1126,22 @@ mod tests
             );
         }
         // A second pack of an unchanged sysroot changes no file.
-        assert_eq!(sign_sysroot(&ctx, &signer).unwrap(), (images.len(), 0));
+        assert_eq!(
+            sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap(),
+            (objects, 0)
+        );
+        // Under the ktest harness, ktest is signed init and nothing else
+        // changes.
+        assert_eq!(
+            sign_sysroot(&ctx, &signer, arch, Harness::Ktest).unwrap(),
+            (objects, 1)
+        );
+        let ktest = fs::read(ctx.sysroot.join("tests/ktest")).unwrap();
+        assert!(verifies(&signer, &ktest, Role::Init, "init"));
+        assert_eq!(objsig::split(&ktest).unwrap().body(), b"\x7fELF ktest");
+        // A data entry the sysroot does not install fails the pack.
+        fs::remove_file(ctx.sysroot.join(&relatives[0])).unwrap();
+        sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
 

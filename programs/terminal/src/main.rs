@@ -5,19 +5,23 @@
 
 //! Terminal abstraction, v0.0.1 (#111).
 //!
-//! Relays a byte stream between hardware drivers and a child process's stdio,
-//! with a tiny line discipline. Input arrives from two sources — the
-//! virtio-input keyboard (#110) and serial RX (#66) — and output renders on the
-//! framebuffer (#67) and mirrors to serial TX (#66). The child
-//! (`/programs/shell` by default, overridable via `argv[1]`) is spawned with
-//! piped stdio over the `ProcessInfo` stdio contract.
+//! Relays a byte stream between hardware drivers and the standard streams of
+//! an operator session's leader, with a tiny line discipline. Input arrives
+//! from two sources — the virtio-input keyboard (#110) and serial RX (#66) —
+//! and output renders on the framebuffer (#67) and mirrors to serial TX (#66).
+//! The terminal is an interface of sessiond (`session.rs`): it opens the
+//! session through the `sessiond.operator` SEND, handing over the leader's
+//! pipes and death relay, and sessiond creates the leader (the shell its
+//! recipe names), so the terminal holds no process handle and no namespace.
 //!
 //! Structure: one producer thread per input source (keyboard decodes key-downs
 //! to bytes; serial forwards received UART bytes) sends down a shared `mpsc`
-//! channel; per-child relay threads forward the child's stdout/stderr down the
-//! same channel; the single consumer thread (this `main`) owns the output sink
-//! and the child's stdin, applies the line discipline (local echo, single-line
-//! backspace, CR→LF), and respawns the child when it exits. The consumer's sole
+//! channel; per-session relay threads forward the leader's stdout/stderr down the
+//! same channel; a watcher thread per session posts the leader's end, read
+//! from its death relay; the single consumer thread (this `main`) owns the
+//! output sink and the leader's stdin, applies the line discipline (local
+//! echo, single-line backspace, CR→LF), and opens a new session when the
+//! leader ends. The consumer's sole
 //! ownership of the sink is why no locking is needed, and its source-agnostic
 //! discipline is why a new input source is just another producer.
 //!
@@ -26,30 +30,26 @@
 
 mod input;
 mod output;
+mod session;
 
 use std::io::Write;
-use std::os::seraph::process::CommandExt;
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::ChildStdin;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use output::Sink;
-
-/// Child spawned when the recipe passes no `argv[1]`. `terminal.svc` sets it
-/// explicitly; this is the fallback.
-const DEFAULT_CHILD: &str = "/programs/shell";
 
 /// Printed once all driver caps are held and the keyboard thread is running;
 /// the host test harness injects keys on seeing it. Kept in sync with
 /// `xtask/src/commands/test_terminal.rs`.
 const READY_MARKER: &str = "terminal: READY for injection";
 
-/// Channel message: a decoded input byte run, a child output byte run, or the
-/// child-exit edge (sent by the stdout relay on EOF).
+/// Channel message: a decoded input byte run, a leader output byte run, or the
+/// leader's end (sent by the session's watcher thread).
 pub(crate) enum Msg
 {
     Input(Vec<u8>),
     Output(Vec<u8>),
-    ChildExited,
+    SessionEnded,
 }
 
 fn main() -> !
@@ -62,11 +62,11 @@ fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some([input_class, fb_class, serial_class]) =
-        bootstrap_class_sends(info.creator_endpoint, ipc_buf)
+    let Some([input_class, fb_class, serial_class, operator]) =
+        bootstrap_seeds(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!(error: "terminal: a devmgr.class seed is missing; exiting");
+        std::os::seraph::log!(error: "terminal: a seed is missing; exiting");
         syscall::thread_exit();
     };
     let Some(input_cap) = await_device(input_class, "input", ipc_buf)
@@ -92,10 +92,6 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    let child_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_CHILD.to_string());
-
     let (tx, rx) = channel::<Msg>();
     let kbd_tx = tx.clone();
     std::thread::spawn(move || input::keyboard_loop(input_cap, &kbd_tx));
@@ -107,52 +103,44 @@ fn main() -> !
     let mut sink = Sink::new(fb_cap, serial_cap);
     std::os::seraph::log!("{READY_MARKER}");
 
-    run(&child_path, &rx, &tx, &mut sink)
+    let mut client = session::Client::new(operator);
+    run(&mut client, &rx, &tx, &mut sink)
 }
 
-/// Spawn the child, relay its stdio to the sink, feed it line-disciplined
-/// input, and respawn it when it exits. Never returns.
-fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) -> !
+/// Open a session, relay its leader's stdio to the sink, feed the leader
+/// line-disciplined input, and open a new session when the leader ends.
+/// Never returns.
+fn run(client: &mut session::Client, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) -> !
 {
     loop
     {
-        // Start each child with default colours: a previous child that exited
+        // Start each session with default colours: a previous leader that ended
         // mid-colour (e.g. crashed before its trailing `ESC[0m`) must not tint
-        // the next child or the shell prompt. Dedups to a no-op when already
+        // the next session or the shell prompt. Dedups to a no-op when already
         // default (the common first-spawn case).
         sink.write(b"\x1b[0m");
 
-        // The child session (shell) is the least-trusted process in the
-        // system: place it at level 5 with a matching band ceiling so
-        // neither it nor anything it spawns can climb above 5 — the
-        // terminal itself (level 10) always preempts it.
-        let mut child = match Command::new(child_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .priority(5)
-            .sched_max(5)
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) =>
-            {
-                std::os::seraph::log!(error: "terminal: spawn {child_path} failed: {e}");
-                syscall::thread_exit();
-            }
-        };
+        // sessiond creates the leader at level 5 with a band ceiling of 5,
+        // so the terminal (level 10) always preempts it.
+        let mut streams = client.open();
 
-        let mut stdin = child.stdin.take();
-        if let Some(out) = child.stdout.take()
+        let mut stdin = streams.take_stdin();
+        for out in [
+            streams.take_stdout().map(Pipe::Stdout),
+            streams.take_stderr().map(Pipe::Stderr),
+        ]
+        .into_iter()
+        .flatten()
         {
             let relay_tx = tx.clone();
-            std::thread::spawn(move || relay_stdout(out, &relay_tx));
+            std::thread::spawn(move || out.pump(&relay_tx));
         }
-        if let Some(err) = child.stderr.take()
-        {
-            let relay_tx = tx.clone();
-            std::thread::spawn(move || relay_stderr(err, &relay_tx));
-        }
+        let watch_tx = tx.clone();
+        let watcher = std::thread::spawn(move || {
+            let status = streams.wait();
+            let _ = watch_tx.send(Msg::SessionEnded);
+            status
+        });
 
         let mut line = Vec::new();
         loop
@@ -161,7 +149,7 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) 
             {
                 Ok(Msg::Input(bytes)) => discipline(&bytes, &mut line, sink, stdin.as_mut()),
                 Ok(Msg::Output(bytes)) => sink.write(&bytes),
-                Ok(Msg::ChildExited) => break,
+                Ok(Msg::SessionEnded) => break,
                 Err(_) =>
                 {
                     std::os::seraph::log!(error: "terminal: input channel closed; exiting");
@@ -171,13 +159,42 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) 
         }
 
         drop(stdin.take());
-        let _ = child.wait();
-        std::os::seraph::log!("terminal: child exited; respawning");
+        match watcher.join()
+        {
+            Ok(Ok(status)) =>
+            {
+                std::os::seraph::log!("terminal: session ended ({status}); opening another");
+            }
+            Ok(Err(_)) | Err(_) =>
+            {
+                std::os::seraph::log!(warn: "terminal: session end unread; opening another");
+            }
+        }
+    }
+}
+
+/// One of the leader's output streams.
+enum Pipe
+{
+    Stdout(std::process::ChildStdout),
+    Stderr(std::process::ChildStderr),
+}
+
+impl Pipe
+{
+    /// Forward the stream to the consumer until EOF.
+    fn pump(self, tx: &Sender<Msg>)
+    {
+        match self
+        {
+            Self::Stdout(out) => pump_stream(out, tx),
+            Self::Stderr(err) => pump_stream(err, tx),
+        }
     }
 }
 
 /// Apply the v0.0.1 line discipline to a run of input bytes: local echo to the
-/// sink, single-line backspace, and CR→LF translation to the child on Enter.
+/// sink, single-line backspace, and CR→LF translation to the leader on Enter.
 fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &mut Sink, mut stdin: Option<&mut ChildStdin>)
 {
     for &b in bytes
@@ -191,7 +208,7 @@ fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &mut Sink, mut stdin: Opti
                 if let Some(si) = stdin.as_deref_mut()
                     && (si.write_all(line).is_err() || si.flush().is_err())
                 {
-                    std::os::seraph::log!(warn: "terminal: write to child stdin failed");
+                    std::os::seraph::log!(warn: "terminal: write to the leader's stdin failed");
                 }
                 line.clear();
             }
@@ -211,7 +228,7 @@ fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &mut Sink, mut stdin: Opti
     }
 }
 
-/// Forward a child stream to the consumer as [`Msg::Output`] until EOF or a
+/// Forward a leader stream to the consumer as [`Msg::Output`] until EOF or a
 /// read/channel error.
 fn pump_stream<R: std::io::Read>(mut reader: R, tx: &Sender<Msg>)
 {
@@ -239,25 +256,10 @@ fn pump_stream<R: std::io::Read>(mut reader: R, tx: &Sender<Msg>)
     }
 }
 
-/// Relay the child's stdout, then post [`Msg::ChildExited`] on EOF so the
-/// consumer reaps and respawns the child.
-fn relay_stdout<R: std::io::Read>(reader: R, tx: &Sender<Msg>)
-{
-    pump_stream(reader, tx);
-    let _ = tx.send(Msg::ChildExited);
-}
-
-/// Relay the child's stderr. No exit signal — stdout's EOF drives respawn, so
-/// that a single channel message marks the child gone.
-fn relay_stderr<R: std::io::Read>(reader: R, tx: &Sender<Msg>)
-{
-    pump_stream(reader, tx);
-}
-
-/// Pull the bootstrap rounds; expect slots 0, 1 and 2 from the recipe's
-/// `seed = devmgr.class.input devmgr.class.framebuffer devmgr.class.serial`,
-/// in that order. `None` when any is absent.
-fn bootstrap_class_sends(creator_ep: u64, ipc_buf: *mut u64) -> Option<[u64; 3]>
+/// Pull the bootstrap rounds; expect slots 0 to 3 from the recipe's
+/// `seed = devmgr.class.input devmgr.class.framebuffer devmgr.class.serial
+/// sessiond.operator`, in that order. `None` when any is absent.
+fn bootstrap_seeds(creator_ep: u64, ipc_buf: *mut u64) -> Option<[u64; 4]>
 {
     if creator_ep == 0
     {
@@ -266,7 +268,7 @@ fn bootstrap_class_sends(creator_ep: u64, ipc_buf: *mut u64) -> Option<[u64; 3]>
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`.
-    let caps = unsafe { ipc::bootstrap::request_slots::<3>(creator_ep, ipc_buf) }.ok()?;
+    let caps = unsafe { ipc::bootstrap::request_slots::<4>(creator_ep, ipc_buf) }.ok()?;
     caps.iter().all(|&cap| cap != 0).then_some(caps)
 }
 

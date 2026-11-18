@@ -22,6 +22,7 @@ mod bind;
 mod caps;
 mod decls;
 mod dma;
+mod headroom;
 mod hotplug;
 mod intremap;
 mod iommu;
@@ -199,6 +200,7 @@ fn main() -> !
         boot_modules,
         &mut caps,
         &mut irq_range,
+        acpi.bridges(),
         &mut watch,
         &mut catalog,
         &registry,
@@ -217,13 +219,17 @@ fn main() -> !
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
+        headroom::hold_and_report();
         run_jobs(
             &registry,
             &mut records,
-            &mut caps,
-            &mut irq_range,
+            &mut bind::Carve {
+                caps: &mut caps,
+                irq_range: &mut irq_range,
+                catalog: &mut catalog,
+                bridges: acpi.bridges(),
+            },
             &mut watch,
-            &mut catalog,
             ipc_buf,
         );
         acpi.run(&records, &mut caps, &mut irq_range, &hotplug);
@@ -235,6 +241,7 @@ fn main() -> !
                 caps: &mut caps,
                 irq_range: &mut irq_range,
                 catalog: &mut catalog,
+                bridges: acpi.bridges(),
             },
             &mut watch,
             ipc_buf,
@@ -320,13 +327,15 @@ fn enumerate_records(
 
 /// Start the registry's workers and let them receive: the
 /// [`REGISTRY_WORKERS`] threads of a [`recv_pool::RecvPool`] on the registry
-/// endpoint, each serving its requests with [`Registry::handle`]. Halts,
+/// endpoint, each serving its requests with [`Registry::handle`] once it has
+/// held devmgr's `CSpace` headroom ([`headroom::hold`]). Halts,
 /// logged, when none can be started; fewer serve, logged, when some cannot.
 fn start_registry_workers(registry: &Arc<Registry>)
 {
     let pool = {
         let shared = Arc::clone(registry);
         recv_pool::RecvPool::new(registry.endpoint, recv_diag, move |msg, buf| {
+            headroom::hold();
             shared.handle(msg, buf.as_ptr());
         })
     };
@@ -360,10 +369,8 @@ const REGISTRY_WORKERS: usize = 4;
 fn run_jobs(
     registry: &Registry,
     records: &mut bind::Records,
-    caps: &mut caps::DevmgrCaps,
-    irq_range: &mut IrqRangeAllocator,
+    tables: &mut bind::Carve,
     watch: &mut settle::DriverWatch,
-    catalog: &mut DeviceCatalog,
     ipc_buf: *mut u64,
 )
 {
@@ -377,17 +384,12 @@ fn run_jobs(
             state.bind_dir_path,
         )
     };
-    let mut tables = bind::Carve {
-        caps,
-        irq_range,
-        catalog,
-    };
     if jobs.drivers_dir
     {
         spawn_dir_drivers(
             "on-disk batch",
             records,
-            &mut tables,
+            tables,
             drivers_dir_cap,
             drivers_dir_path.as_bytes(),
             watch,
@@ -402,7 +404,7 @@ fn run_jobs(
         spawn_dir_drivers(
             "on-demand batch",
             records,
-            &mut tables,
+            tables,
             bind_dir_cap,
             bind_dir_path.as_bytes(),
             watch,
@@ -1682,6 +1684,19 @@ pub fn split_mmio(span: &Span<u64>, at: u64) -> Result<(u64, u64), SplitError>
     syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
 }
 
+/// Merge the `Mmio` caps of `lower` and `upper`, two adjacent spans of an
+/// aperture table, into one cap over their joined range (`SYS_MMIO_MERGE`),
+/// for a range given back to the table. `None` when the kernel refuses
+/// them: caps that are not derivation siblings (pieces of two aperture caps
+/// with different derivation parents), a cap with a derivation of its own,
+/// or a joined cap the `CSpace` cannot back. Neither cap is changed then, and the table keeps
+/// both.
+#[must_use]
+pub fn merge_mmio(lower: &Span<u64>, upper: &Span<u64>) -> Option<u64>
+{
+    syscall::mmio_merge(lower.slot, upper.slot).ok()
+}
+
 // ── Interrupt range allocator ───────────────────────────────────────────────
 
 /// `SYS_IRQ_SPLIT`'s error for a split point outside the cap's range.
@@ -2372,6 +2387,7 @@ fn spawn_boot_drivers(
     modules: Vec<(driver_binding::decl::DriverDecl, decls::Binary)>,
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
+    bridges: &firmware::acpid::Bridges,
     watch: &mut settle::DriverWatch,
     catalog: &mut DeviceCatalog,
     registry: &Registry,
@@ -2397,6 +2413,7 @@ fn spawn_boot_drivers(
             caps,
             irq_range,
             catalog,
+            bridges,
         },
         &mut bind::Pass {
             batch: &batch,

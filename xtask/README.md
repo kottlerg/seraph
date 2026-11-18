@@ -105,13 +105,18 @@ when the image has no such section. No other build has the check.
 
 #### Signing
 
-Every image a build packs is signed, as [docs/signing.md](../docs/signing.md) § Signing specifies:
-each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every command that repacks)
-first signs the kernel and every ELF image under `services/`, `programs/` and `tests/` of the
-sysroot in place, and `compose-bundle` signs each executable entry of the bundle it composes: `init`
-as kind init, each module as a boot module. The bundle's data entries (the platform tables and
-`log-levels`) are signed as boot modules too. Every signed object is verified under the build's
-trust store, with the kind, name and architecture its loader expects, before it is written. Each
+Every object a build packs is signed once, in the sysroot, as [docs/signing.md](../docs/signing.md)
+§ Signing specifies: each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every
+command that repacks), and each composition of the bundle before it, signs in place the kernel
+(`kernel`, the kernel role), every ELF image under `services/`, `programs/` and `tests/` (under
+its install path with the role of its location, and the boot-module role when the bundle list names
+it; `/services/init` as `init` with the init role, and `/tests/ktest` too when the bundle's `init`
+slot holds the ktest harness), and the bundle's data entries, installed under `/config/` (the
+boot-module role). A pack signs for the harness the staged bundle holds, which it reads from the
+bundle's `init` entry. The bundle composer copies the installed files and signs nothing; it
+verifies each entry as the bootloader will before it writes the bundle. Every signed object is
+verified under the build's trust store, with each of its roles, its name and the architecture its
+loaders expect, before it is written. Each
 command derives the store from the signing identity and the deployer's store its environment names.
 `cargo xtask build` passes the store's path to the bootloader's build in `SERAPH_BOOT_TRUST_STORE`
 (set by xtask, not by a user), and the bootloader embeds it. Every pack after that (the build's own,
@@ -293,10 +298,10 @@ hand-staged sysroot that diverges from `rootfs/` — e.g. a test recipe
 copied from `sysroot/config/svcmgr/tests/` into
 `sysroot/config/svcmgr/services/` — use `--repack-only`, which skips the
 re-mirror and packs the sysroot as it stands (a plain repack would
-prune the hand-added recipe). Every pack, `--repack-only` included, re-signs the kernel and the
-ELF images of the sysroot in place ([§ Signing](#signing)), so a hand-staged image is packed
-with the local identity's signature, not its own. The mirror rules are owned by
-[rootfs/README.md](../rootfs/README.md).
+prune the hand-added recipe). Every pack, `--repack-only` included, re-signs the kernel, the ELF
+images and the bundle's data entries of the sysroot in place ([§ Signing](#signing)), so a
+hand-staged image is packed with the local identity's signature, not its own. The mirror rules are
+owned by [rootfs/README.md](../rootfs/README.md).
 
 `mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
 fails if the bundle is missing. The bundle is composed by
@@ -351,7 +356,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
-| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands, its images re-signed as every pack signs them — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
+| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands, its objects re-signed as every pack signs them — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; omit to remove the knob and re-enable KASLR |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
 | `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |
@@ -401,12 +406,12 @@ what `fsck.fat` printed, and when `fsck.fat` is not on `PATH`, naming the packag
 
 ### `cargo xtask compose-bundle`
 
-Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from canonical
-binaries under `sysroot/services/` and repack `disk.img`. Symmetric
-with `mkdisk`: both end with `create_disk_image`, the difference being
-which file they author. `compose-bundle` is the bundle authoring step;
-`mkdisk` never authors the bundle. `compose-bundle` signs the bundle's executable entries
-([§ Signing](#signing)).
+Install the bundle's data entries from the repository, sign the sysroot for the
+chosen harness, compose `sysroot/esp/EFI/seraph/bootstrap.bundle` by copying
+the installed files, and repack `disk.img`. Symmetric with `mkdisk`: both end
+with `create_disk_image`, the difference being which file they author.
+`compose-bundle` is the bundle authoring step; `mkdisk` never authors the
+bundle. The composer signs nothing ([§ Signing](#signing)).
 
 ```
 cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
@@ -419,15 +424,15 @@ cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
 
 `--harness init` produces an 11-entry bundle on x86-64 and a 12-entry bundle on
 riscv64 (`init` + the 8 boot modules listed in `xtask/src/bundle.rs::MODULES`, the IOMMU
-driver of the architecture's family from `ARCH_MODULES`, `iommu-vtd` on
-x86-64 and `iommu-riscv` on riscv64, on riscv64 the platform description table
-`platform-qemu-virt` from `ARCH_TABLES`, and the log-level configuration `log-levels`,
-packed from the repository's `services/init/log-levels.conf`; the bootloader and init address
-entries by name, so order is not significant). The configuration names the log level of each
-service init spawns ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md)
-§ Log levels); an edit to it takes effect at the next `compose-bundle` or `build`, with no
-rebuild of a component. `--harness ktest`
-produces a single-entry bundle (`ktest` as the `init` entry, zero
+driver of the architecture's family from `ARCH_MODULES`, `iommu-vtd` on x86-64 and `iommu-riscv` on
+riscv64, on riscv64 the platform description table `/config/devmgr/platform/qemu-virt.platform` from
+`ARCH_TABLES`, and the log-level configuration `/config/init/log-levels.conf` (`LOG_LEVELS`),
+installed from the repository's `services/init/log-levels.conf`; every entry but `init` is named by
+its install path, and the bootloader and init address entries by name, so order is not significant).
+The configuration names the log level of each service init spawns
+([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels); an edit to it
+takes effect at the next `compose-bundle` or `build`, with no rebuild of a component. `--harness
+ktest` produces a single-entry bundle (`ktest` as the `init` entry, zero
 modules); ktest is monolithic and does not spawn userspace.
 
 Both `cargo xtask build` and `compose-bundle` are *authoring* steps —
@@ -1248,9 +1253,9 @@ times, each from images packed with those objects in place of the sysroot's file
 | Case | Objects in place of the sysroot's | Owed lines |
 |---|---|---|
 | `kernel` | the kernel with a body byte flipped | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(BodyHash)` |
-| `bundle` | the bundle with a body byte of its `virtio-blk` entry flipped | `SERAPH BOOT FATAL: signature verification refused: virtio-blk: Failed(BodyHash)` |
+| `bundle` | the bundle with a body byte of its `/services/drivers/virtio-blk` entry flipped | `SERAPH BOOT FATAL: signature verification refused: /services/drivers/virtio-blk: Failed(BodyHash)` |
 | `revoked` | both bootloader images, built under the build's trust store with the signing key's id revoked | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(Revoked)` |
-| `rootfs` | `/services/timed` with a body byte flipped, `/services/pwrmgr` signed as data, `/services/crashd` signed by a key no anchor holds; the kernel and `/programs/terminal` each with a record of that key before their own | procmgr's `signature verification refused: <path>: <refusal>` (`Failed(BodyHash)`, `Failed(Kind)`, `Untrusted`) and svcmgr's `create: "<path>" refused: its signature did not verify` for each of the three, and `terminal: READY for injection` |
+| `rootfs` | `/services/timed` with a body byte flipped, `/services/pwrmgr` signed with the data role alone, `/services/crashd` signed by a key no anchor holds; the kernel and `/programs/terminal` each with a record of that key before their own | procmgr's `signature verification refused: <path>: <refusal>` (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr's `create: "<path>" refused: its signature did not verify` for each of the three, and `terminal: READY for injection` |
 
 The untrusted key is a local identity generated for the run in a directory under the host's
 temporary directory, outside the work tree, and removed again. A boot passes once every owed line
@@ -1308,10 +1313,11 @@ pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socke
    for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
    then hot-adds the device again and waits for the fixture's `[hotplug-check] PASS` line. It
    then adds a raw block node over a zero-filled 1 MiB image (QMP `blockdev-add`) and hot-adds a
-   `virtio-blk-pci` on it behind the second port and the IOMMU (`iommu_platform=on`), and passes
-   once devmgr logs `[devmgr] virtio-blk: binds PCI` and `virtio-blk: boot tier not granted from
-   the drivers directory` (the drivers directory's copy, at the auxiliary tier) and the driver
-   logs `[virtio-blk] ready, entering service loop`.
+   `virtio-blk-pci` on it behind the second port and the IOMMU (`iommu_platform=on`) with no MSI-X
+   vectors (`vectors=0`), and passes once devmgr logs `[devmgr] virtio-blk: binds PCI`,
+   `virtio-blk: boot tier not granted from the drivers directory` (the drivers directory's copy,
+   at the auxiliary tier) and `[devmgr] virtio-blk: Wired interrupt, 1 vector(s)` (the line of the
+   disk's `INTx` pin) and the driver logs `[virtio-blk] ready, entering service loop`.
 
 Then two storage boots on the split-data layout, under native control, with the disk-mode recipe
 (`hotplug-check-disk.svc`) staged alone:

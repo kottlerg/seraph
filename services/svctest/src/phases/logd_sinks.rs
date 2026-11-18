@@ -64,12 +64,12 @@ pub fn phases() -> &'static [Phase]
     }]
 }
 
-/// The serial driver's process name: its bundle entry name, which devmgr
-/// creates it with as its `argv[0]`.
-const SERIAL_NAME: &[u8] = b"serial";
+/// The serial driver's process name: its bundle entry name, its install
+/// path, which devmgr creates it with as its `argv[0]`.
+const SERIAL_NAME: &[u8] = b"/services/drivers/serial";
 
 /// The framebuffer driver's process name, as the serial driver's.
-const FRAMEBUFFER_NAME: &[u8] = b"framebuffer";
+const FRAMEBUFFER_NAME: &[u8] = b"/services/drivers/framebuffer";
 
 /// Lines sent while the serial driver is stopped: more than logd's four
 /// receive workers (`RECV_WORKERS`), each of which would hold one unanswered

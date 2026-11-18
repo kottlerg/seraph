@@ -73,8 +73,8 @@ for the framebuffer until the driver writes again, and keeps writing them to ser
 them in its history. Should logd fail to spawn that writer, each line's producer writes it, and a
 stopped driver then costs every line up to that bound
 ([logd IPC Interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks).
-devmgr creates it with its bundle entry name, `framebuffer`, as its `argv[0]`, under which
-procmgr's `LIST_PROCESSES` names it to a debugger.
+devmgr creates it with its bundle entry name, its install path `/services/drivers/framebuffer`, as
+its `argv[0]`, under which procmgr's `LIST_PROCESSES` names it to a debugger.
 
 ---
 

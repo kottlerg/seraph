@@ -42,10 +42,8 @@ fn is_named_memory_cap(info: &InitInfo, slot: u64) -> bool
         || (info.acpi_rsdp_memory_cap != 0 && slot == info.acpi_rsdp_memory_cap)
         || (info.dtb_memory_cap != 0 && slot == info.dtb_memory_cap)
         || in_range(info.acpi_region_memory_base, info.acpi_region_memory_count)
-        || info
-            .module_names
+        || crate::init_info::module_names(info)
             .iter()
-            .take(info.module_name_count as usize)
             .any(|m| m.slot == slot)
 }
 

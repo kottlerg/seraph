@@ -33,6 +33,9 @@
 # vfsd_swap_partition phase takes the swap partition through. svctest
 # holds it only while no swap service exists: the swap service's recipe
 # is to seed it, and two holders would revoke each other's partition cap.
+# sessiond.operator is the OPERATOR_AUTHORITY SEND on sessiond's service
+# endpoint, through which the sessiond_operator and oom_policy phases open
+# operator sessions as an interface.
 # devmgr.class.hwrng is the class SEND the drivers hwrng read phase and
 # the drivers stray-cap phase read the hardware RNG driver through, and
 # devmgr.class.hwrng-deny its twin whose only verb bit (58) no such
@@ -71,6 +74,6 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap devmgr.class.hwrng devmgr.class.hwrng-deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny
 debug_authority = yes
 stop_authority  = yes

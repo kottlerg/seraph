@@ -283,7 +283,7 @@ cargo xtask test-terminal
 
 This is the reusable foundation for interactive tests of the terminal, the
 shell (#112), and future consumers — they reuse the runner by swapping the
-terminal's child and the expected strings. It subsumes the keysym-decode
+terminal's session leader and the expected strings. It subsumes the keysym-decode
 coverage of the former standalone input smoke test: the echoed `help` proves
 lowercase keysym decode, and Return/Backspace prove the named-key decodes. In
 CI it runs as a further boot inside the `usertest` cell (after usertest's own
@@ -510,13 +510,13 @@ sysroot itself is never changed:
 
 1. `kernel`: the kernel with a body byte flipped. The bootloader refuses it,
    `Failed(BodyHash)`.
-2. `bundle`: the bundle's `virtio-blk` entry with a body byte flipped. The bootloader refuses
-   it, `Failed(BodyHash)`.
+2. `bundle`: the bundle's `/services/drivers/virtio-blk` entry with a body byte flipped. The
+   bootloader refuses it, `Failed(BodyHash)`.
 3. `revoked`: a bootloader built under the build's trust store with the signing key revoked. It
    refuses the kernel, `Failed(Revoked)`.
-4. `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr` signed as data,
-   and `/services/crashd` signed by a key no anchor holds. procmgr refuses each
-   (`Failed(BodyHash)`, `Failed(Kind)`, `Untrusted`) and svcmgr reports each refused launch.
+4. `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr` signed with the data
+   role alone, and `/services/crashd` signed by a key no anchor holds. procmgr refuses each
+   (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr reports each refused launch.
    The kernel and `/programs/terminal` each carry a record of that key before their own, which
    the bootloader and procmgr skip, and the boot reaches the terminal's READY line.
 
@@ -674,11 +674,14 @@ per hotplug control, and then makes a disk leave and arrive again:
    ordinal 1, its probes pass, and its IOMMU fault count equals the first device's, so no fault is
    carried across the removal.
 7. Hot-add a `virtio-blk-pci` disk over a zero-filled 1 MiB raw image behind the second port (QMP
-   `blockdev-add`, then `device_add` with `disable-legacy=on` and `iommu_platform=on`, behind the
-   IOMMU as a boot disk is), and require, in any order, devmgr's `virtio-blk: binds PCI` line,
-   its `virtio-blk: boot tier not granted from the drivers directory` line, and the driver's
-   `ready, entering service loop` line: the disk is bound from the drivers directory's
-   virtio-blk at the auxiliary tier, as every device unbound after the boot pass is
+   `blockdev-add`, then `device_add` with `disable-legacy=on`, `iommu_platform=on` and `vectors=0`,
+   behind the IOMMU as a boot disk is, and with no MSI-X vectors), and require, in any order,
+   devmgr's `virtio-blk: binds PCI` line, its `virtio-blk: boot tier not granted from the drivers
+   directory` line, its `virtio-blk: Wired interrupt, 1 vector(s)` line (the line of the disk's
+   `INTx` pin: on x86_64 the one acpid's PIC-model `_PRT` routes, on riscv64 the `virt`
+   swizzle's), and the driver's `ready, entering service loop` line: the disk is bound from the
+   drivers directory's virtio-blk at the auxiliary tier, as every device unbound after the boot
+   pass is, on the wired line the firmware never programmed into it
    ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding) § Binding).
    Kill QEMU.
 8. For the storage boots, stage the fixture's disk-mode recipe (`hotplug-check-disk.svc`) alone
@@ -729,9 +732,12 @@ oomd stops it, and passes otherwise. The CI svctest cell drops crashd, so the he
 that phase (a child's page fault crashd holds until oomd's stop frees memory) runs in the burn-in
 svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
 `stop_source = program`) is co-staged beside `memhog` in both cells: svctest's
-`svcmgr_stop_service` phase reads that svcmgr lists it as the one stop source and that a job it
-started ends with it, and its `oom_policy`
-phase has it start a job that oomd stops before memhog; both phases pass without it.
+`svcmgr_stop_service` phase reads that svcmgr lists it, beside sessiond when that recipe is staged,
+as a stop source of the program class and that a job it started ends with it, and its `oom_policy`
+phase has it start a job that oomd stops before memhog; both phases pass without it. With
+`sessiond.svc` staged, the `oom_policy` phase also opens an operator session whose shell runs
+`crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's `sessiond_operator` phase
+checks sessiond's operator interface; both pass without it.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the
@@ -1445,13 +1451,13 @@ boots, two on x86_64 (the firmware's ACPI PCI hotplug, then native control) and 
 devmgr takes two empty root ports' events, binds the `test-dma` fixture to the `edu` device the
 host hot-adds behind one, withdraws it when the host removes the device, binds it again when the
 host adds it again, and binds the drivers directory's virtio-blk to the disk the host then
-hot-adds behind the other. In the two storage boots, vfsd tears down the mount of a disk removed
-behind a port and mounts it again when it is added again, and ends at the loss of its root
-filesystem's driver and of the boot disk. The command stages and unstages its own files on the
-current sysroot, a debug-profile build. It bounds each boot to its markers by five minutes, the
-fixture's probes and the disk's bind by three minutes after each hot-add, and the removal by one
-minute from `device_del`; it has no `run-parallel` budget. The boots are the hotplug device cell
-(Device surfaces above).
+hot-adds behind the other, with no MSI-X vectors, on its wired interrupt line. In the two storage
+boots, vfsd tears down the mount of a disk removed behind a port and mounts it again when it is
+added again, and ends at the loss of its root filesystem's driver and of the boot disk. The
+command stages and unstages its own files on the current sysroot, a debug-profile build. It
+bounds each boot to its markers by five minutes, the fixture's probes and the disk's bind by
+three minutes after each hot-add, and the removal by one minute from `device_del`; it has no
+`run-parallel` budget. The boots are the hotplug device cell (Device surfaces above).
 
 ```sh
 # Hotplug cell, per architecture (clean between architectures):

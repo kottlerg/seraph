@@ -90,9 +90,9 @@ A `_PRT` entry whose source is a link device resolves to the line of that device
 The firmware hands an x86-64 machine over in the PIC model. In that model each `_PRT` entry
 names a PCI interrupt link device whose `_CRS` reads the PIRQ routing register the firmware
 programmed, and the firmware wrote the same line into each function's Interrupt Line register.
-acpid reads the `_PRT` in that model first, so that devmgr can check it against those registers,
-and only then selects the APIC model, whose entries name GSIs. RISC-V has one model, and acpid
-calls no `_PIC` there.
+acpid reads the `_PRT` in that model first, so that devmgr can check it against those registers
+and route a function whose register is unset by it, and only then selects the APIC model, whose
+entries name GSIs. RISC-V has one model, and acpid calls no `_PIC` there.
 
 ---
 

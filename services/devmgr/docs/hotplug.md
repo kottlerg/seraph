@@ -5,8 +5,7 @@ device's record and driver follow.
 
 Implementation status: implemented
 ([#939](https://github.com/kottlerg/seraph/issues/939),
-[#1096](https://github.com/kottlerg/seraph/issues/1096)), apart from the wired interrupt of a
-hot-added function on x86-64 (§ Binding).
+[#1096](https://github.com/kottlerg/seraph/issues/1096)).
 
 ---
 
@@ -207,11 +206,15 @@ class, a disk included: a boot-bundle copy of a driver runs only for the bootstr
 It takes the next ordinal of its class, and a bound driver signals the class's watches.
 
 A hot-added function's `INTx` route is computed through the bridges of the records
-(`PciRecords::append`). On x86-64 no firmware programmed its Interrupt Line and devmgr reads no
-`_PRT` route for it, so it has no wired line: it is given message-signaled vectors where its
-driver's declaration takes them, and a driver that requires an interrupt it cannot be given that
-way is refused, logged ([#1096](https://github.com/kottlerg/seraph/issues/1096) adds the
-route).
+(`PciRecords::append`). On x86-64 no firmware programmed its Interrupt Line, so devmgr gives
+it the line that the PIC-model `_PRT` table of its host bridge (`PRT_PIC_MODE`, which acpid reads
+before `_PIC(1)`) routes to the pin and root-bus device number its interrupt reaches the root bus
+with (`firmware::acpid::Bridges::line`). A boot function uses the PIC-model line the firmware
+programmed, so the hot-added one shares lines as a boot function at its place would. It has no
+wired line when devmgr holds no PIC-model table for the bridge or the table does not route the
+pin; it is then given message-signaled vectors where its driver's declaration takes them, and a
+driver that requires an interrupt it cannot be given that way is refused, logged. On riscv64 the
+line is the `virt` swizzle onto the APLIC sources 32 to 35.
 
 ### Removal
 
@@ -240,16 +243,18 @@ The control thread runs the removal job (`firmware::hotplug::remove`), in this o
    their remapping entries, resets and destroys the driver, and releases its held memory only once
    the device is blocked or confirmed quiet. Each of its device's BAR caps (its `Mmio` resources'
    and its MSI-X table's) is given back to the held BAR pages over the range it covers
-   (`PciDeviceCaps::release`), once every copy derived from it is revoked; a cap whose copies
-   cannot be revoked, or that the table cannot record, is deleted, logged, and its pages are lost
-   for the boot. A withdrawal asks the driver nothing, so a driver that does not answer cannot
+   (`PciDeviceCaps::release`), once every copy derived from it is revoked, and merged there with
+   each adjacent held span inside its BAR's pages (`bind::return_bar`); a cap whose copies cannot
+   be revoked, or that the table cannot record, is deleted, logged, and its pages are lost for the
+   boot. A withdrawal asks the driver nothing, so a driver that does not answer cannot
    delay it;
 2. it quiesces each of those functions (`firmware::hotplug::quiesce`): memory decode and Bus
    Master Enable off, Interrupt Disable set, so a function with no driver answers at none of its
    BARs either;
 3. it moves every held BAR span that lies inside a BAR's page span of one of them back to the
-   apertures, whole (`firmware::hotplug::return_bars`): a span moves as the cap it is, so nothing
-   is split, and only out of the held BAR pages, so a page is returned once;
+   apertures, whole (`firmware::hotplug::return_bars`), and merges it there with each adjacent
+   aperture span: a span moves as the cap it is, so nothing is split, and only out of the held BAR
+   pages, so a page is returned once;
 4. it marks their records removed (`PciRecords::remove`); the port's own record is on the bus
    above and stays;
 5. it returns the instance of each removed record bound to a driver with an instance limit
@@ -275,14 +280,20 @@ An IOMMU fault is counted for a requester ID only while a DMA grant of a live re
 once the device is blocked, and a fault of an untracked requester ID is logged, not counted. A
 function added at a removed one's address starts with no faults.
 
-Returned BAR caps stay split: devmgr does not merge two adjacent `Mmio` caps, although
-`SYS_MMIO_MERGE` can ([#1230](https://github.com/kottlerg/seraph/issues/1230) has devmgr use it), so
-a window's free range comes back as the spans it was carved into, each placeable on its own. A card
-added again with the same BARs is placed in the same spans; a BAR larger than the largest span left,
-or whose aligned base falls across two spans, no longer fits, logged as `the slot's windows have no
-room for it`, although the window is free. Each add at a new place splits a free span into at most
-three, so the apertures table grows by at most two spans per BAR placed, and never past one span per
-page of the windows.
+A span given back to a table is merged with each adjacent span of it through `SYS_MMIO_MERGE`
+(`firmware::resource::SpanTable`), so what a carve split comes back as one span. A BAR cap given
+back to the held BAR pages merges only inside its BAR's pages, so no held span reaches past one BAR
+and step 3 finds each whole; a span returned to the apertures, by a removal or by an add that
+records no function, merges with no bound. A window whose BARs are all removed is then one span
+again, as before its first add, and a card added after a removal is placed as in a window never
+used, a BAR across the spans the removal returned included. The kernel merges only two caps that
+are derivation siblings with no derivation of their own
+([syscalls.md](../../../core/kernel/docs/syscalls.md#sys_mmio_merge-70) § `SYS_MMIO_MERGE`). The
+pieces of one aperture cap are siblings; two spans it does not merge (pieces of aperture caps with
+different derivation parents, or a merge the `CSpace` cannot back) stay apart, each placeable on
+its own, and a BAR across them does not fit, logged as `the slot's windows have no room for it`.
+Each add at a new place splits a free span into at most three, so the apertures table grows by at
+most two spans per BAR placed, and never past one span per page of the windows.
 
 ---
 

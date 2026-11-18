@@ -521,6 +521,9 @@ pub const CAP_TAG_MEMORY: u8 = 1;
 /// `CapTag::Notification` discriminant.
 pub const CAP_TAG_NOTIFICATION: u8 = 4;
 
+/// `CapTag::EventQueue` discriminant.
+pub const CAP_TAG_EVENT_QUEUE: u8 = 5;
+
 // ── Syscall numbers (continued) ──────────────────────────────────────────────
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;

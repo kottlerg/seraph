@@ -120,7 +120,8 @@ service only when its recipe sets `oom_stop = yes` and the eligibility rule admi
 runs and its usage reads, and checks the rule and the instance again on the stop
 ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `oom_stop`). Every
 other source is a service whose recipe sets `stop_source`, of the program class, which ranks its
-jobs before its whole sessions. No recipe of the default image sets the key.
+jobs before its whole sessions. sessiond's recipe, the default image's, sets the key; the `stopsrc`
+test fixture's sets it too.
 
 **Discovery.** oomd keeps no source between acts: each act's walk asks svcmgr, on the stop
 authority, for the sources that run then (`LIST_STOP_SOURCES`; [svcmgr IPC
@@ -149,8 +150,8 @@ svcmgr's table. The order is host-tested in the policy crate.
 **Adding a source.** A source of the program class is one recipe that sets `stop_source` and
 serves the stop labels; it changes no oomd code. A new class is a class code in
 `ipc::stop_labels`, a value of the recipe key, and a `Class` in the policy crate placed where
-it is stopped; the ladder and the walk do not change. sessiond, the program class's source, is
-#1233's.
+it is stopped; the ladder and the walk do not change. sessiond is the default image's source of the
+program class ([services/sessiond/README.md](../../sessiond/README.md)).
 
 ---
 
@@ -183,8 +184,8 @@ and retried after 100 ms (`WAIT_RETRY_MS`).
 
 - oomd reaches only services that opt in and what a stop source lists. The processes svcmgr does
   not launch (memmgr, procmgr, devmgr, vfsd), the drivers devmgr starts, and fatfs are no source's
-  candidates; the programs a user starts become candidates once sessiond, the program class's
-  source, lists them (#1233).
+  candidates; the programs a user starts are candidates when sessiond, the program class's
+  source, lists them.
 - It stops the whole candidate: a service's memory is given back only by its death, and its
   supervisor restarts it under its restart policy and budget.
 - It asks no service to give memory back and evicts nothing: memmgr's `LOW` broadcast asks, and

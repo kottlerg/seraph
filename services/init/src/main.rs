@@ -19,7 +19,9 @@
 
 use core::panic::PanicInfo;
 
-use init_protocol::{CapDescriptor, CapType, INIT_INFO_MAX_PAGES, INIT_PROTOCOL_VERSION, InitInfo};
+use init_protocol::{
+    CapDescriptor, CapType, INIT_INFO_MAX_PAGES, INIT_PROTOCOL_VERSION, InitInfo, InitModuleName,
+};
 
 mod arch;
 mod bootstrap;
@@ -145,19 +147,45 @@ pub(crate) fn start_thread(thread_cap: u64) -> Result<(), i64>
 
 // ── Cap descriptor helpers ───────────────────────────────────────────────────
 
+/// The `CapDescriptor` array the kernel wrote into the `InitInfo` region.
 pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
 {
-    let offset = info.cap_descriptors_offset as usize;
-    let count = info.cap_descriptor_count as usize;
-    let desc_size = core::mem::size_of::<CapDescriptor>();
+    // SAFETY: the kernel writes `cap_descriptor_count` valid descriptors at
+    // `cap_descriptors_offset` of the region.
+    unsafe {
+        region_slice(
+            info,
+            info.cap_descriptors_offset as usize,
+            info.cap_descriptor_count as usize,
+        )
+    }
+}
 
+/// The boot-module name table the kernel wrote into the `InitInfo` region,
+/// one entry per boot module, right after the header.
+pub(crate) fn module_names(info: &InitInfo) -> &[InitModuleName]
+{
+    let count = (info.module_name_count as usize).min(init_protocol::INIT_MAX_NAMED_MODULES);
+    // SAFETY: the kernel writes `module_name_count` valid entries at
+    // `MODULE_NAMES_OFFSET` of the region.
+    unsafe { region_slice(info, init_protocol::MODULE_NAMES_OFFSET, count) }
+}
+
+/// The `count` values of `T` at byte `offset` of the `InitInfo` region
+/// `info` heads, or none when they would end past the region's mapped pages.
+///
+/// # Safety
+/// When they end within the region, the `count` values at `offset` must be
+/// valid `T`s the kernel wrote there, at an offset aligned for `T`.
+unsafe fn region_slice<T>(info: &InitInfo, offset: usize, count: usize) -> &[T]
+{
     // The region is the `init_info_memory_count` pages the kernel mapped, at
     // most INIT_INFO_MAX_PAGES (kernel-enforced).
     let pages = (info.init_info_memory_count as usize).min(INIT_INFO_MAX_PAGES);
     // `pages` is at most `INIT_INFO_MAX_PAGES`, so the product cannot overflow.
     let max_bytes = pages.saturating_mul(PAGE_SIZE as usize);
     let Some(end) = count
-        .checked_mul(desc_size)
+        .checked_mul(core::mem::size_of::<T>())
         .and_then(|table_bytes| offset.checked_add(table_bytes))
     else
     {
@@ -169,12 +197,13 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     }
 
     // The kernel maps the `InitInfo` region contiguously; the header lives at
-    // the start and `cap_descriptors_offset` indexes into the same region.
-    // Take the page address as a bare integer via `.addr()` (no provenance) and
-    // rebuild the pointer with `with_exposed_provenance` so the slice is not
-    // bounded by the narrower `&InitInfo` provenance — descriptors may span
-    // pages beyond the first one, and a pointer derived from the header's
-    // allocation would let the optimiser assume out-of-bounds reads.
+    // the start and `offset` indexes into the same region. Take the page
+    // address as a bare integer via `.addr()` (no provenance) and rebuild the
+    // pointer with `with_exposed_provenance` so the slice is not bounded by
+    // the narrower `&InitInfo` provenance — the name table and the
+    // descriptors may span pages beyond the first one, and a pointer derived
+    // from the header's allocation would let the optimiser assume
+    // out-of-bounds reads.
     let Some(base_addr) = core::ptr::from_ref::<InitInfo>(info)
         .addr()
         .checked_add(offset)
@@ -182,11 +211,23 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     {
         return &[];
     };
-    let ptr = core::ptr::with_exposed_provenance::<CapDescriptor>(base_addr);
-    // SAFETY: kernel has mapped `count * desc_size` valid CapDescriptor bytes
-    // starting at the InitInfo page + offset. The exposed-provenance pointer
-    // carries provenance broad enough to cover that span.
+    let ptr = core::ptr::with_exposed_provenance::<T>(base_addr);
+    // SAFETY: `count * size_of::<T>()` bytes from `offset` lie within the
+    // pages the kernel mapped (checked above), and hold valid, aligned `T`s
+    // (caller contract). The exposed-provenance pointer carries provenance
+    // broad enough to cover that span.
     unsafe { core::slice::from_raw_parts(ptr, count) }
+}
+
+/// The names of the boot modules init looks up: each module is named by the
+/// install path its signature names (docs/signing.md § Signed Attributes).
+pub(crate) mod module_name
+{
+    pub const MEMMGR: &[u8] = b"/services/memmgr";
+    pub const PROCMGR: &[u8] = b"/services/procmgr";
+    pub const DEVMGR: &[u8] = b"/services/devmgr";
+    pub const VFSD: &[u8] = b"/services/vfsd";
+    pub const FATFS: &[u8] = b"/services/fs/fatfs";
 }
 
 /// A map-only derivation of the `trust-store` boot module's cap and the
@@ -211,16 +252,15 @@ fn trust_store_for_procmgr(info: &InitInfo) -> Option<(u64, u64)>
     Some((cap, len))
 }
 
-/// Locate a boot-module `Memory` capability by the bundle-entry name
-/// the kernel published in [`InitInfo::module_names`] (init-protocol
-/// v7+).
+/// Locate a boot-module `Memory` capability by the name the kernel
+/// published in the region's name table ([`module_names`]).
 ///
 /// Returns the table entry's `CSpace` slot index, or `None` if no
 /// entry carries the requested name. This is init's only module-cap
 /// lookup; modules are addressed by name through the table.
 pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u64>
 {
-    init_protocol::find_module_slot(info, name)
+    init_protocol::find_module_slot(module_names(info), name)
 }
 
 pub(crate) fn find_cap_by_type(info: &InitInfo, wanted: CapType) -> Option<u64>
@@ -684,7 +724,7 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // The levels the `log-levels` boot module sets for the services init
+    // The levels the log-level configuration boot module sets for the services init
     // spawns (`log_levels`), read before the bootstrap loads reuse the
     // scratch span.
     // SAFETY: nothing has mapped TEMP_MAP_BASE yet, and no Rust object of
@@ -693,7 +733,7 @@ fn run(info_ptr: u64) -> !
 
     // ── Bootstrap memmgr (raw ELF load; first half of remaining memory caps) ──────
 
-    if find_module_by_name(info, b"memmgr").is_none()
+    if find_module_by_name(info, module_name::MEMMGR).is_none()
     {
         logging::log("FATAL: memmgr boot module missing from bundle");
         syscall::thread_exit();
@@ -942,7 +982,7 @@ fn run(info_ptr: u64) -> !
         ..service::ServiceThreadCaps::default()
     };
 
-    if find_module_by_name(info, b"devmgr").is_some()
+    if find_module_by_name(info, module_name::DEVMGR).is_some()
     {
         logging::log("requesting procmgr to create devmgr (with hw caps)");
         thread_caps.devmgr = service::create_devmgr_with_caps(
@@ -961,7 +1001,7 @@ fn run(info_ptr: u64) -> !
         logging::log("no devmgr module available");
     }
 
-    if find_module_by_name(info, b"vfsd").is_some()
+    if find_module_by_name(info, module_name::VFSD).is_some()
     {
         logging::log("requesting procmgr to create vfsd (with caps)");
         thread_caps.vfsd = service::create_vfsd_with_caps(

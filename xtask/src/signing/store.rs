@@ -152,7 +152,7 @@ pub fn hex(id: &KeyId) -> String
 #[cfg(test)]
 mod tests
 {
-    use objsig::{KindSet, PublicKey, Usage, key_id};
+    use objsig::{PublicKey, RoleSet, Usage, key_id};
 
     use super::*;
 
@@ -162,7 +162,7 @@ mod tests
         AnchorSpec {
             key,
             usage: Usage {
-                kinds: KindSet::ALL,
+                roles: RoleSet::ALL,
                 certify: true,
             },
             local: false,

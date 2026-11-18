@@ -344,6 +344,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "sessiond",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Services,
+        arch_only: None,
+    },
+    Spec {
         name: "svcmgr",
         install_name: None,
         profile: BuildProfile::StdUser,
@@ -618,10 +625,12 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         {
             build_boot(ctx, args)?;
             build_all_specs(ctx, args)?;
-            sysroot::install_rootfs(ctx)?;
+            sysroot::install_rootfs(ctx, args.arch)?;
             // `build` is an authoring step: always (re)compose the default-
-            // init bundle. Operators who want ktest run
+            // init bundle, after signing the sysroot for it, since the bundle
+            // copies the signed installed files. Operators who want ktest run
             // `cargo xtask compose-bundle --harness ktest` after `build`.
+            crate::signing::sign_for_harness(ctx, args.arch, crate::bundle::Harness::Init)?;
             crate::bundle::compose(ctx, args.arch, crate::bundle::Harness::Init)?;
             crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())?;
         }

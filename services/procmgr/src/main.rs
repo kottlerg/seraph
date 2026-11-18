@@ -574,45 +574,22 @@ const CSPACE_LOW_WATER: u64 = 256;
 /// Headroom a top-up funds: about 18 slot pages.
 const CSPACE_TOPUP_SLOTS: u64 = 1024;
 
-/// Whether the last top-up failed, so a streak of failures logs once; held
-/// by the one worker topping up, and passed over by any other meanwhile.
-static HEADROOM_WARNED: Mutex<bool> = Mutex::new(false);
+/// procmgr's own `CSpace` held above [`CSPACE_LOW_WATER`] general slots
+/// (services/procmgr/README.md § `CSpace` headroom).
+static HEADROOM: std::os::seraph::CSpaceHeadroom =
+    std::os::seraph::CSpaceHeadroom::new(CSPACE_LOW_WATER, CSPACE_TOPUP_SLOTS);
 
-/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, with
-/// a page of growth budget beyond them for its body arena, so
+/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, so
 /// its allocations never meet an exhausted `CSpace` and its receives keep the
-/// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). Each
-/// request runs it before it is served; a worker that finds another topping
-/// up goes on, since the low-water mark leaves room for every worker's
-/// request. A failed top-up is retried on the next request, and the log
-/// names only the first failure of a streak.
+/// IPC receive reserve. Each request runs it before it is served; a worker
+/// that finds another topping up goes on, since the low-water mark leaves
+/// room for every worker's request. A failed top-up is retried on the next
+/// request, and the log names only the first failure of a streak.
 fn hold_cspace_headroom(self_cspace: u64)
 {
-    // The top-up (a call to memmgr) and the failure's log line (a call to
-    // logd) are IPC calls made under this lock, which no other lock nests
-    // and no thread waits on (`try_lock`).
-    let Ok(mut warned) = HEADROOM_WARNED.try_lock()
-    else
+    HEADROOM.hold(self_cspace);
+    if HEADROOM.failure_to_report()
     {
-        return;
-    };
-    // The growth budget also funds the body arena (the bodies of procmgr's
-    // splits), so a page of it is held beyond the slots
-    // (`syscall_abi::cspace_topup_pages`).
-    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
-    let headroom = std::os::seraph::cspace_slot_headroom(self_cspace);
-    if syscall_abi::cspace_topup_pages(headroom, budget, CSPACE_LOW_WATER) == 0
-    {
-        *warned = false;
-        return;
-    }
-    if std::os::seraph::fund_cspace_slot_budget(self_cspace, CSPACE_TOPUP_SLOTS)
-    {
-        *warned = false;
-    }
-    else if !*warned
-    {
-        *warned = true;
         std::os::seraph::log!(warn: "CSpace headroom top-up failed; retrying each pass");
     }
 }
@@ -1832,7 +1809,7 @@ fn check_create_request<'a>(
 /// against the creator's spawn ceiling, and the child's memmgr registration
 /// (its budget node's parent, its max, reserve membership and class) against
 /// the creator's node and class; the child's signature policy starts as the
-/// creator's (`process_table::Creator::sign_kinds`). `None` means the request
+/// creator's (`process_table::Creator::sign_roles`). `None` means the request
 /// must be rejected with
 /// `INVALID_ARGUMENT`: still-reserved label bits are set, the badge names no
 /// creator (`process_table::ProcessTable::creator_of`), the requested band
@@ -1891,7 +1868,7 @@ fn resolve_create_sched(
         priority,
         band_max,
         budget,
-        sign_kinds: creator.sign_kinds,
+        sign_roles: creator.sign_roles,
         creator: req.badge,
         contained: label & procmgr_labels::CREATE_CONTAIN != 0,
     })
@@ -2205,7 +2182,7 @@ struct CreateRequest<'a>
 /// argv and env, read its object once into a buffer on its account
 /// ([`image::read_module`], [`image::read_file`]), verify the copy under the
 /// request's name and `sched`'s signature policy ([`image::verify`]), narrow
-/// the policy by the verified kind, and load the verified body
+/// the policy by the verified role set, and load the verified body
 /// (`process::create_process_from_bytes`). The buffer goes back to memmgr
 /// before the registration settles. Single exit: any failure, a refused
 /// signature among them, creates nothing and releases what it took.
@@ -2279,10 +2256,10 @@ fn create_child(
             ipc_buf,
         ),
     }?;
-    let verified = image::verify(ctx, buffer.bytes(), request.name, sched.sign_kinds)
+    let verified = image::verify(ctx, buffer.bytes(), request.name, sched.sign_roles)
         .map_err(|_| procmgr_errors::SIGNATURE_REFUSED)?;
-    sched.sign_kinds =
-        process_table::sign_policy::child_kinds(sched.sign_kinds, verified.attrs.kind);
+    sched.sign_roles =
+        process_table::sign_policy::child_roles(sched.sign_roles, verified.attrs.roles);
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,

@@ -37,7 +37,7 @@ pub fn run(ctx: &BuildContext, args: &MkdiskArgs) -> Result<()>
     sysroot::check_arch(ctx, args.arch)?;
     if !args.repack_only
     {
-        sysroot::install_rootfs(ctx)?;
+        sysroot::install_rootfs(ctx, args.arch)?;
     }
     if args.no_kaslr
     {

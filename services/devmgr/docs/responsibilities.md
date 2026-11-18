@@ -391,8 +391,8 @@ devmgr's responsibilities are:
 
   A further batch runs for each `devmgr_labels::BIND_DRIVERS`, gated on
   `BIND_AUTHORITY`, which only svctest's seed-only `devmgr.bind` cap carries
-  (the one published name a seed receives as `SEND|GRANT`, since the request
-  moves a directory cap to devmgr). devmgr replies `SUCCESS` at once; its
+  (seeded as `SEND|GRANT`, as only it and each `:grant` name are, since the
+  request moves a directory cap to devmgr). devmgr replies `SUCCESS` at once; its
   control thread then runs a drivers-directory pass over the directory cap,
   named by the directory's absolute path the request carries as a name block
   from data word `DRIVERS_DIR_PATH_WORD`, under the same declaration bounds as
@@ -640,12 +640,13 @@ base/size pairs; cap-less `RAM_EXTENT` rounds carry the base/size pair of every
 extent of RAM memmgr pools, against which devmgr checks the regions firmware reserves
 for a device
 ([docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming)
-§ IOMMU Discovery and Programming); `MODULE` rounds of up to four Memory caps (round data
-`[MODULE, n, size_0, ..., size_n-1, name_0 (4 words), ..., name_n-1 (4 words)]`, each module's
-size in bytes, since a module's cap covers whole pages and devmgr reads no byte past the
-module's end, then each module's bundle entry name: 32 bytes, little-endian, NUL-padded, which
+§ IOMMU Discovery and Programming); `MODULE` rounds of one Memory cap each (round data
+`[MODULE, 1, size, name (32 words)]`, the module's size in bytes, since a module's cap covers
+whole pages and devmgr reads no byte past the module's end, then the module's bundle entry
+name, its install path: `BOOT_MODULE_NAME_LEN` (256) bytes, little-endian, NUL-padded, which
 devmgr gives procmgr to verify the module's signature under) carry every boot module outside
-init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels, trust-store),
+init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, the log-level configuration,
+trust-store),
 untagged: the driver images and any platform description table; a cap-less
 `FRAMEBUFFER_INFO` round carries the framebuffer geometry (a zero base means no framebuffer); and
 the terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch shutdown-authority
@@ -683,6 +684,35 @@ the RISC-V IOMMUs from the RIMT, carves the first page of each one's BAR 0,
 which lies in a PCI window the bootloader seeds already, and delivers each to
 the RISC-V IOMMU driver, keeping no copy of either (see
 [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
+
+---
+
+## CSpace headroom
+
+devmgr runs on the `CSpace` procmgr seeds every child with, and holds a few capabilities for each
+driver it binds, each device record's carves, each class watch, and each DMA mapping, so its
+slots grow with the drivers and classes it serves. The `CSpace`'s body arena, which holds the
+body of each `Mmio`, `IoPort`, and `Interrupt` split and copy, draws whole pages from the same
+growth budget the slot pages come from, and each page it takes lowers the capacity by a page's
+slots. devmgr holds its headroom above a low-water mark through `std::os::seraph::CSpaceHeadroom`,
+whose rule [runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § CSpace slot headroom
+states: below `CSPACE_LOW_WATER` plus a page's slots, or a growth budget below a page, it funds
+the slot-page pool from memmgr for `CSPACE_TOPUP_SLOTS`, twice the mark (`src/headroom.rs`).
+
+The mark is the most one record's bind takes, at the declaration bound of resources
+(`spawn::MAX_BOUND_RESOURCES`): devmgr's carved cap and the driver's copy of each resource, the
+spawn's other copies (the end round's endpoints, the badged creator, the argv and env, procmgr's
+create reply, the death observer's copy), and the arena pages the bodies of those caps take,
+counted as the slots of those pages, with the requests the registry's workers and the DMA thread
+serve meanwhile: about 450 slots. The page `CSpaceHeadroom` holds beyond the mark keeps the first
+of those arena pages funded.
+
+devmgr holds it before each turn of the control thread's loop (acpid's requests, hotplug jobs,
+withdrawals, and the bind passes they start), before each record's carves (PCI and platform),
+before each driver spawn (the IOMMU driver's included), before each registry request a worker
+serves, and before each DMA request. A failed top-up is retried at the next hold; the control
+thread logs a run of them once, since a registry worker or the DMA thread may be serving logd, or
+a driver logd writes through, and must not log.
 
 ---
 

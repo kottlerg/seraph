@@ -392,7 +392,7 @@ waits on none of them. svctest's
 ([services/svctest/README.md](../../svctest/README.md)).
 
 svcmgr's own death is not routed here: svcmgr is in the core set, and
-pwrmgr observing it is design intent; not yet implemented (#262)
+pwrmgr observes it and powers the system off
 ([Supervision § Observing svcmgr](../../../docs/supervision.md#observing-svcmgr)).
 
 ---

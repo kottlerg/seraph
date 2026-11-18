@@ -775,8 +775,8 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
-    // The page that carries devmgr's, vfsd's and svcmgr's levels into their
-    // create requests, allocated while init's pool is still init's.
+    // The page that carries devmgr's, vfsd's and svcmgr's names and levels
+    // into their create requests, allocated while init's pool is still init's.
     let spawn_env = log_levels::SpawnEnv::new(levels, &mut alloc);
 
     // Now every alloc-from-init's-pool consumer has run. Reserve one

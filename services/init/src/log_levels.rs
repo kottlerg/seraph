@@ -7,7 +7,8 @@
 //! `/config/init/log-levels.conf` boot module ([`read`]) and handed to each
 //! service as the `SERAPH_LOG` entry of its environment, procmgr's in the
 //! argv/env region init maps for it (`bootstrap::bootstrap_procmgr`),
-//! devmgr's, vfsd's and svcmgr's in their create requests ([`SpawnEnv`]).
+//! devmgr's, vfsd's and svcmgr's in their create requests ([`SpawnEnv`]),
+//! beside each one's name as its argv.
 //! `services/init/docs/bootstrap.md` § Log levels specifies the configuration
 //! and its delivery.
 use init_log_levels::{Levels, Service};
@@ -98,10 +99,6 @@ pub(crate) unsafe fn read(info: &InitInfo) -> Levels
     levels
 }
 
-/// The services init spawns through procmgr whose level [`SpawnEnv`] hands
-/// them.
-const SPAWNED: [Service; 3] = [Service::Devmgr, Service::Vfsd, Service::Svcmgr];
-
 /// The argv and env of one create request (`procmgr_labels::CREATE_ARGV_ENV`):
 /// the map-only cap on the page that holds them, and their header's data
 /// words.
@@ -126,38 +123,32 @@ impl ArgvEnv
     }
 }
 
-/// The page that carries a spawned service's `SERAPH_LOG` entry into its
-/// create request. Allocated before `finalize_memmgr` only when the
-/// configuration sets the level of devmgr, vfsd or svcmgr; written before
-/// each such create and lent to procmgr through a map-only derivation, which
-/// procmgr copies into the child's argv/env region and deletes before it
-/// replies. The page is init's alone, so it reaches memmgr's pool through the
+/// The page that carries a spawned service's argv, its name, and its
+/// `SERAPH_LOG` entry, when the configuration sets its level, into its create
+/// request. Allocated before `finalize_memmgr`; written before each of
+/// devmgr's, vfsd's and svcmgr's creates and lent to procmgr through a
+/// map-only derivation, which procmgr copies into the child's argv/env region
+/// and deletes before it replies. The name is the one procmgr lists the
+/// process under (`procmgr_labels::LIST_PROCESSES`), by which a debugger
+/// finds it. The page is init's alone, so it reaches memmgr's pool through the
 /// reap donation ([`Self::page`]).
 pub(crate) struct SpawnEnv
 {
     levels: Levels,
-    /// The page's Memory cap; zero when no spawned service's level is set or
-    /// the page could not be allocated.
+    /// The page's Memory cap; zero when the page could not be allocated.
     page: u64,
 }
 
 impl SpawnEnv
 {
-    /// The env of the services init spawns under `levels`, allocating its page
-    /// from `alloc` when one of them has a level set.
+    /// The argv and env of the services init spawns under `levels`,
+    /// allocating their page from `alloc`.
     pub(crate) fn new(levels: Levels, alloc: &mut MemoryAlloc) -> Self
     {
-        let page = if SPAWNED.iter().any(|&s| levels.get(s).is_some())
-        {
-            alloc.alloc_page().unwrap_or_else(|| {
-                log("init: log-levels: page alloc failed; spawned services log at info");
-                0
-            })
-        }
-        else
-        {
+        let page = alloc.alloc_page().unwrap_or_else(|| {
+            log("init: spawn argv page alloc failed; spawned services unnamed, logging at info");
             0
-        };
+        });
         Self { levels, page }
     }
 
@@ -168,10 +159,11 @@ impl SpawnEnv
         (self.page != 0).then_some(self.page)
     }
 
-    /// The argv/env of `service`'s create request: its `SERAPH_LOG` entry,
-    /// written into the page. `None` when its level is not set, and, after a
-    /// log line, when the entry cannot be written or lent; the service is then
-    /// spawned without env and logs at info.
+    /// The argv/env of `service`'s create request: its name as its one argv
+    /// string and, when its level is set, its `SERAPH_LOG` entry, written
+    /// into the page. `None`, after a log line, when the page is absent or
+    /// cannot be written or lent; the service is then spawned without argv or
+    /// env, unnamed, and logs at info.
     ///
     /// # Safety
     /// `aspace` must be init's own address space, and the page at
@@ -179,7 +171,6 @@ impl SpawnEnv
     /// is mapped there for the write and unmapped again.
     pub(crate) unsafe fn argv_env(&self, service: Service, aspace: u64) -> Option<ArgvEnv>
     {
-        let level = self.levels.get(service)?;
         if self.page == 0
         {
             return None;
@@ -197,34 +188,47 @@ impl SpawnEnv
         }
         .is_err()
         {
-            log("init: log-levels: env page map failed; service spawned without env");
+            log("init: spawn argv page map failed; service spawned without argv or env");
             return None;
         }
-        // SAFETY: TEMP_MAP_BASE is mapped writable, one page, at least
-        // `LEVEL_ENTRY_MAX` bytes; nothing else refers to it.
+        let name = service.name();
+        // The longest name is a few bytes, so neither sum can overflow.
+        let args_bytes = name.len().saturating_add(1);
+        // SAFETY: TEMP_MAP_BASE is mapped writable, one page, which holds the
+        // longest name, its NUL and `LEVEL_ENTRY_MAX` bytes; nothing else
+        // refers to it.
         let out = unsafe {
-            core::slice::from_raw_parts_mut(TEMP_MAP_BASE as *mut u8, log::LEVEL_ENTRY_MAX)
+            core::slice::from_raw_parts_mut(
+                TEMP_MAP_BASE as *mut u8,
+                args_bytes.saturating_add(log::LEVEL_ENTRY_MAX),
+            )
         };
-        let written = log::level_entry(level, out);
-        // SAFETY: the env page's scratch mapping; `out` is not used past here.
-        let _ = unsafe { syscall::mem_unmap(aspace, TEMP_MAP_BASE, 1) };
-        let Some(env_bytes) = written
-        else
+        let (argv, env) = out.split_at_mut(args_bytes);
+        // `argv` is the name and its NUL, `args_bytes` long.
+        let (text, nul) = argv.split_at_mut(name.len());
+        text.copy_from_slice(name);
+        nul.fill(0);
+        let env_bytes = match self.levels.get(service)
         {
-            log("init: log-levels: level has no entry; service spawned without env");
-            return None;
+            Some(level) => log::level_entry(level, env).unwrap_or_else(|| {
+                log("init: log-levels: level has no entry; service logs at info");
+                0
+            }),
+            None => 0,
         };
+        // SAFETY: the page's scratch mapping; `out` is not used past here.
+        let _ = unsafe { syscall::mem_unmap(aspace, TEMP_MAP_BASE, 1) };
         let Ok(cap) = syscall::cap_derive(self.page, syscall::RIGHTS_MEM_MAP)
         else
         {
-            log("init: log-levels: env cap derive failed; service spawned without env");
+            log("init: spawn argv cap derive failed; service spawned without argv or env");
             return None;
         };
         let header = ipc::procmgr_labels::ArgvEnvHeader {
-            args_bytes: 0,
-            args_count: 0,
+            args_bytes: args_bytes as u64,
+            args_count: 1,
             env_bytes: env_bytes as u64,
-            env_count: 1,
+            env_count: u64::from(env_bytes != 0),
         };
         Some(ArgvEnv {
             cap,

@@ -203,6 +203,11 @@ pub struct RestartRecipe
     /// stop-authority holder finds it, with a stop-badged SEND on its service
     /// endpoint, through `svcmgr_labels::LIST_STOP_SOURCES` (`crate::stop`).
     pub stop_source: Option<svcmgr_defs::stop::StopClass>,
+    /// The recognised shutdown actuator: a receive-only derivation of
+    /// svcmgr's own death queue rides the slot after its seeds and authority
+    /// caps on every launch, so each instance observes svcmgr. See
+    /// `restart::mint_self_death_recv`.
+    pub observes_svcmgr: bool,
     /// Recipe `priority = ...` value; `0` = unspecified (procmgr default).
     /// Replayed on every restart so a respawned child lands at the same
     /// level it got on first launch.

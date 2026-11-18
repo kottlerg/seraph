@@ -17,6 +17,7 @@
 
 extern crate alloc;
 
+pub use driver_binding::decl::VirtioDeviceConfig;
 use syscall_abi::PAGE_SIZE;
 
 pub mod bootstrap;
@@ -215,33 +216,45 @@ impl VirtioPciStartupInfo
 
     /// Locate the device's register regions for the driver's register
     /// window: the distinct BARs they name and each region's place in the
-    /// window (see [`RegisterLayout`]).
+    /// window (see [`RegisterLayout`]). The regions are the common,
+    /// notification, and ISR regions, and the device-specific configuration
+    /// region when `device_config` is [`VirtioDeviceConfig::Required`]; with
+    /// [`VirtioDeviceConfig::Absent`] the layout leaves that region out,
+    /// whatever the device presents of it.
     ///
-    /// Returns `None` when a region is not one the transport can use
-    /// ([`structure_usable`]): absent (zero length), naming a BAR index
-    /// outside 0-5, a common region shorter than the [`COMMON_CFG_LEN`]
-    /// bytes of registers the transport addresses in it, or a common,
-    /// notification, or device region whose offsets would make a register
-    /// access misaligned. `VirtIO` 1.2 § 4.1.4 requires a modern PCI device
-    /// to present the common, notification, and ISR regions, and a device
-    /// type with device-specific configuration (block and input both have
-    /// one) to present that region too, each in a BAR of the device's choosing;
-    /// devmgr's scan keeps the first structure of each type that lies wholly
-    /// inside one of the device's MMIO BARs and passes [`structure_usable`],
-    /// so a region this refuses means the device presents none the driver
-    /// can use.
+    /// Returns `None` when a region of the layout is not one the transport
+    /// can use ([`structure_usable`]): absent (zero length), naming a BAR
+    /// index outside 0-5, a common region shorter than the
+    /// [`COMMON_CFG_LEN`] bytes of registers the transport addresses in it,
+    /// or a common, notification, or device region whose offsets would make
+    /// a register access misaligned. `VirtIO` 1.2 § 4.1.4 requires a modern
+    /// PCI device to present the common, notification, and ISR regions, and a
+    /// device type with device-specific configuration (block, console, and
+    /// input all have one) to present that region too, each in a BAR of the
+    /// device's choosing; a device type with none (the entropy device,
+    /// § 5.4.4) need not present it. devmgr's scan keeps the first structure
+    /// of each type that lies wholly inside one of the device's MMIO BARs and
+    /// passes [`structure_usable`], so a region this refuses means the
+    /// device presents none the driver can use.
     #[must_use]
-    pub fn register_layout(&self) -> Option<RegisterLayout>
+    pub fn register_layout(&self, device_config: VirtioDeviceConfig) -> Option<RegisterLayout>
     {
-        let regions = [
-            (VIRTIO_PCI_CAP_COMMON_CFG, &self.common_cfg),
-            (VIRTIO_PCI_CAP_NOTIFY_CFG, &self.notify_cfg),
-            (VIRTIO_PCI_CAP_ISR_CFG, &self.isr_cfg),
-            (VIRTIO_PCI_CAP_DEVICE_CFG, &self.device_cfg),
+        let all = [
+            (VIRTIO_PCI_CAP_COMMON_CFG, self.common_cfg),
+            (VIRTIO_PCI_CAP_NOTIFY_CFG, self.notify_cfg),
+            (VIRTIO_PCI_CAP_ISR_CFG, self.isr_cfg),
+            (VIRTIO_PCI_CAP_DEVICE_CFG, self.device_cfg),
         ];
+        let region_count = match device_config
+        {
+            VirtioDeviceConfig::Required => all.len(),
+            // The device region is the last.
+            VirtioDeviceConfig::Absent => all.len().saturating_sub(1),
+        };
+        let regions = all.get(..region_count)?;
         if !regions
             .iter()
-            .all(|&(ty, r)| structure_usable(ty, r, self.notify_off_multiplier))
+            .all(|(ty, r)| structure_usable(*ty, r, self.notify_off_multiplier))
         {
             return None;
         }
@@ -253,7 +266,7 @@ impl VirtioPciStartupInfo
         {
             let reach = regions
                 .iter()
-                .map(|&(_, r)| r)
+                .map(|(_, r)| r)
                 .filter(|r| r.bar == bar)
                 .map(VirtioCapLocation::end)
                 .max();
@@ -270,19 +283,24 @@ impl VirtioPciStartupInfo
         let mut layout = RegisterLayout {
             bars,
             bar_count,
-            regions: regions.map(|(_, r)| *r),
+            regions: all.map(|(_, r)| r),
+            region_count,
             common: 0,
             notify: 0,
             isr: 0,
             device: 0,
             notify_len: u64::from(self.notify_cfg.length),
-            device_len: u64::from(self.device_cfg.length),
+            device_len: 0,
             notify_off_multiplier: self.notify_off_multiplier,
         };
         layout.common = layout.region_offset(&self.common_cfg)?;
         layout.notify = layout.region_offset(&self.notify_cfg)?;
         layout.isr = layout.region_offset(&self.isr_cfg)?;
-        layout.device = layout.region_offset(&self.device_cfg)?;
+        if device_config == VirtioDeviceConfig::Required
+        {
+            layout.device = layout.region_offset(&self.device_cfg)?;
+            layout.device_len = u64::from(self.device_cfg.length);
+        }
         Some(layout)
     }
 }
@@ -293,7 +311,8 @@ const PCI_BAR_COUNT: u8 = 6;
 
 /// Most distinct BARs a `VirtIO` device's register regions name: one per
 /// region (common, notification, ISR, and device configuration, the four
-/// region types `VirtIO` 1.2 § 4.1.4 defines). A hardware-spec bound.
+/// region types `VirtIO` 1.2 § 4.1.4 defines; a layout without the device
+/// region names at most three). A hardware-spec bound.
 pub const MAX_VIRTIO_BARS: usize = 4;
 
 /// Most `Mmio` ranges devmgr delivers a `VirtIO` driver for the BARs its
@@ -329,8 +348,10 @@ pub struct BarRange
     pub bytes: u64,
 }
 
-/// Where a `VirtIO` device's four register regions sit, for a driver that
-/// maps every BAR they name into one register window.
+/// Where a `VirtIO` device's register regions sit, for a driver that maps
+/// every BAR they name into one register window: the common, notification,
+/// and ISR regions, and the device-specific configuration region when the
+/// layout was built with [`VirtioDeviceConfig::Required`].
 ///
 /// The window gives each BAR in [`bars`](Self::bars) order (ascending BAR
 /// index) [`BarAperture::pages`] pages, each BAR's following the previous
@@ -343,21 +364,26 @@ pub struct RegisterLayout
 {
     bars: [BarAperture; MAX_VIRTIO_BARS],
     bar_count: usize,
-    /// The common, notification, ISR, and device regions, in their BARs.
+    /// The common, notification, ISR, and device regions, in their BARs; the
+    /// first `region_count` are the layout's.
     regions: [VirtioCapLocation; 4],
+    /// 4 with the device region, 3 without it.
+    region_count: usize,
     /// Window offset of the common configuration region.
     pub common: u64,
     /// Window offset of the notification region.
     pub notify: u64,
     /// Window offset of the ISR status region.
     pub isr: u64,
-    /// Window offset of the device-specific configuration region.
+    /// Window offset of the device-specific configuration region; 0 for a
+    /// layout without it.
     pub device: u64,
     /// Length in bytes of the notification region; every queue's doorbell
     /// must lie inside it ([`pci::doorbell_fits`]).
     pub notify_len: u64,
     /// Length in bytes of the device-specific configuration region; every
-    /// read of it must lie inside it ([`pci::config_fits`]).
+    /// read of it must lie inside it ([`pci::config_fits`]). 0 for a layout
+    /// without the region, so no read of it fits.
     pub device_len: u64,
     /// Multiplier for queue-specific notification offsets.
     pub notify_off_multiplier: u32,
@@ -372,6 +398,16 @@ impl RegisterLayout
     {
         // `bar_count` never exceeds the array (`register_layout`).
         self.bars.get(..self.bar_count).unwrap_or_default()
+    }
+
+    /// The layout's register regions, each in its BAR: the common,
+    /// notification, and ISR regions, then the device region when the layout
+    /// has it.
+    #[must_use]
+    pub fn regions(&self) -> &[VirtioCapLocation]
+    {
+        // `region_count` is 3 or 4 (`register_layout`).
+        self.regions.get(..self.region_count).unwrap_or_default()
     }
 
     /// Pages the whole register window spans: the sum of the BARs' pages.
@@ -452,7 +488,7 @@ impl RegisterLayout
                         .is_some_and(|r_end| end <= r_end)
             })
         };
-        self.regions.iter().all(inside).then_some(placed)
+        self.regions().iter().all(inside).then_some(placed)
     }
 }
 
@@ -479,23 +515,22 @@ pub struct StatusRegister
     pub offset: u64,
 }
 
-impl VirtioPciStartupInfo
+impl RegisterLayout
 {
     /// The device-status byte's place ([`StatusRegister`]): in the common
     /// configuration region's BAR, at the region's offset plus
-    /// [`COMMON_DEVICE_STATUS`]. `None` when the device presents no complete
-    /// register layout ([`Self::register_layout`]), whose common region
-    /// always holds the byte ([`COMMON_CFG_LEN`]).
+    /// [`COMMON_DEVICE_STATUS`]. A layout's common region always holds the
+    /// byte ([`COMMON_CFG_LEN`]).
     #[must_use]
-    pub fn status_register(&self) -> Option<StatusRegister>
+    pub fn status_register(&self) -> StatusRegister
     {
-        self.register_layout()?;
-        let bar = self.common_cfg.bar;
-        Some(StatusRegister {
-            bar,
-            offset: u64::from(self.common_cfg.offset)
-                .checked_add(u64::from(COMMON_DEVICE_STATUS))?,
-        })
+        let [common, ..] = &self.regions;
+        StatusRegister {
+            bar: common.bar,
+            // A `u32` offset widened to `u64` plus a small constant: the sum
+            // cannot saturate.
+            offset: u64::from(common.offset).saturating_add(u64::from(COMMON_DEVICE_STATUS)),
+        }
     }
 }
 
@@ -590,20 +625,25 @@ mod tests
         // The common region of a VirtIO 1.x device: 0x38 bytes, holding `device_status`.
         let mut info = populated();
         info.common_cfg.length = 0x38;
-        let status = info.status_register().expect("complete layout");
-        assert_eq!(status.bar, 1);
-        assert_eq!(status.offset, 0x100 + u64::from(COMMON_DEVICE_STATUS));
+        for device_config in [VirtioDeviceConfig::Required, VirtioDeviceConfig::Absent]
+        {
+            let status = info
+                .register_layout(device_config)
+                .expect("complete layout")
+                .status_register();
+            assert_eq!(status.bar, 1);
+            assert_eq!(status.offset, 0x100 + u64::from(COMMON_DEVICE_STATUS));
+        }
     }
 
     #[test]
-    fn no_status_register_without_a_layout_or_room_for_the_byte()
+    fn no_layout_without_room_for_the_status_byte()
     {
+        // A common region too short to hold `device_status` gives no layout,
+        // so no status register.
         let mut info = populated();
         info.common_cfg.length = COMMON_DEVICE_STATUS;
-        assert_eq!(info.status_register(), None);
-        let mut info = populated();
-        info.isr_cfg.length = 0;
-        assert_eq!(info.status_register(), None);
+        assert!(info.register_layout(VirtioDeviceConfig::Absent).is_none());
     }
 
     #[test]
@@ -691,7 +731,7 @@ mod tests
         assert!(VirtioPciStartupInfo::from_bytes(&small).is_none());
     }
 
-    fn layout_of(regions: [VirtioCapLocation; 4]) -> Option<RegisterLayout>
+    fn info_of(regions: [VirtioCapLocation; 4]) -> VirtioPciStartupInfo
     {
         VirtioPciStartupInfo {
             common_cfg: regions[0],
@@ -701,7 +741,12 @@ mod tests
             notify_off_multiplier: 4,
             pad: 0,
         }
-        .register_layout()
+    }
+
+    /// The layout of a device type with device-specific configuration.
+    fn layout_of(regions: [VirtioCapLocation; 4]) -> Option<RegisterLayout>
+    {
+        info_of(regions).register_layout(VirtioDeviceConfig::Required)
     }
 
     #[test]
@@ -809,7 +854,7 @@ mod tests
                 notify_off_multiplier,
                 pad: 0,
             }
-            .register_layout()
+            .register_layout(VirtioDeviceConfig::Required)
         };
         // An odd region offset puts queue 0's doorbell at an odd address.
         assert!(with_multiplier(0x1001, 4).is_none());
@@ -860,6 +905,76 @@ mod tests
         assert!(layout_of(regions).is_some());
         regions[3].length = 0;
         assert!(layout_of(regions).is_none());
+    }
+
+    #[test]
+    fn a_device_type_without_device_configuration_needs_no_device_region()
+    {
+        // The entropy device presents no device-specific configuration
+        // (VirtIO 1.2 § 5.4.4): with the region absent it has a layout of
+        // three regions only when its driver states it has none.
+        let info = info_of([
+            cap(2, 0, 0x38),
+            cap(2, 0x800, 0x100),
+            cap(2, 0x900, 4),
+            cap(0, 0, 0),
+        ]);
+        assert!(info.register_layout(VirtioDeviceConfig::Required).is_none());
+        let layout = info
+            .register_layout(VirtioDeviceConfig::Absent)
+            .expect("the three regions every device presents");
+        assert_eq!(layout.regions().len(), 3);
+        assert_eq!(layout.bars(), &[BarAperture { bar: 2, pages: 1 }]);
+        assert_eq!(
+            (layout.common, layout.notify, layout.isr),
+            (0, 0x800, 0x900)
+        );
+        // No read of the absent region fits.
+        assert_eq!((layout.device, layout.device_len), (0, 0));
+        // BAR 2's range places alone: the absent region, whose zeroed
+        // location names BAR 0, needs no range.
+        assert!(layout.place(&[range(10, 2, 0, 0x1000)]).is_some());
+    }
+
+    #[test]
+    fn a_device_region_presented_to_a_driver_without_one_is_ignored()
+    {
+        // QEMU's `virtio-rng-pci` presents a device region though its device
+        // type has none. Without device configuration it is neither checked
+        // nor reached for: here it is misaligned, so a layout that includes
+        // it fails, and it lies in a BAR of its own, which the layout without
+        // it does not name.
+        let info = info_of([
+            cap(4, 0, 0x1000),
+            cap(4, 0x3000, 0x1000),
+            cap(4, 0x1000, 0x1000),
+            cap(5, 0x2, 0x1000),
+        ]);
+        assert!(info.register_layout(VirtioDeviceConfig::Required).is_none());
+        let layout = info
+            .register_layout(VirtioDeviceConfig::Absent)
+            .expect("the device region is ignored");
+        assert_eq!(layout.bars(), &[BarAperture { bar: 4, pages: 4 }]);
+        assert_eq!(layout.device_len, 0);
+        // With the region usable, the layout that requires it names its BAR
+        // too, and the one that does not still names BAR 4 alone.
+        let mut usable = info;
+        usable.device_cfg.offset = 0;
+        assert_eq!(
+            usable
+                .register_layout(VirtioDeviceConfig::Required)
+                .expect("every region usable")
+                .bars()
+                .len(),
+            2
+        );
+        assert_eq!(
+            usable
+                .register_layout(VirtioDeviceConfig::Absent)
+                .expect("the three regions")
+                .bars(),
+            &[BarAperture { bar: 4, pages: 4 }]
+        );
     }
 
     #[test]

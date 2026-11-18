@@ -75,10 +75,11 @@ pub fn split_address(addr: u64) -> (u32, u32)
 
 /// Modern PCI transport backed by MMIO-mapped BAR regions.
 ///
-/// The four register regions are reached through the driver's register
+/// The layout's register regions are reached through the driver's register
 /// window, which maps every BAR they name as a [`RegisterLayout`] lays it
 /// out; each region sits at its window offset, inside its own BAR's
-/// mapping.
+/// mapping. A layout without the device-specific configuration region gives
+/// the transport none: every read of it fails ([`config_fits`]).
 pub struct PciTransport
 {
     /// Virtual address of the register window.
@@ -632,7 +633,7 @@ mod tests
             notify_off_multiplier: 4,
             pad: 0,
         }
-        .register_layout()
+        .register_layout(crate::VirtioDeviceConfig::Required)
         .expect("every region present");
         assert_eq!(layout.notify_len, 0x100);
         // A host buffer stands in for the one-page register window; the
@@ -670,7 +671,7 @@ mod tests
             notify_off_multiplier: 4,
             pad: 0,
         }
-        .register_layout()
+        .register_layout(crate::VirtioDeviceConfig::Required)
         .expect("every region present");
         // A host buffer stands in for the register window: it keeps what is
         // written, as a device that takes the vector does.
@@ -725,7 +726,7 @@ mod tests
             notify_off_multiplier: 4,
             pad: 0,
         }
-        .register_layout()
+        .register_layout(crate::VirtioDeviceConfig::Required)
         .expect("every region present");
         // A host buffer stands in for the one-page register window, with
         // the device region's 12 bytes, and the word after them, filled.

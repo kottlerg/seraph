@@ -102,9 +102,11 @@ instance's tag, as any other death:
 - On the first launch the service is recorded as launched, and its provided names published, as
   for a child that took its rounds, since the endpoint outlives the instance; its death is routed
   before reconciliation launches the next recipe, so a dead log sink is restarted before svcmgr's
-  next lines. An unrecoverable outcome starts the graceful shutdown once reconciliation ends, when
-  the shutdown actuator is recorded. A one-shot service (`restart = never`) that dies so is
-  logged.
+  next lines. Until an instance of the log sink has taken all its rounds, each restart of it is
+  served the first launch's round, with the `HANDOVER_PULL` SEND, since init-logd still waits
+  for the handover (§ Supervision hierarchy). An unrecoverable outcome starts the graceful
+  shutdown once reconciliation ends, when the shutdown actuator is recorded. A one-shot service
+  (`restart = never`) that dies so is logged.
 - On a restart the dead new instance is a death of its own, decided by the same steps
   (§ Decision tree), its restart charged to the same budget, which bounds the repeats.
 
@@ -398,9 +400,13 @@ RECV on the persistent service endpoint so cached client caps survive the
 restart. `logd` is the log sink: svcmgr holds the master-log endpoint
 source for the system's life and mints each (re)launched logd a fresh RECV
 on that persistent endpoint, so log senders' caps survive the restart (per
-[service-definitions.md](service-definitions.md#log_sink)). The restarted
-logd skips the history pull, serves a fresh table (which holds no sender's
-display name: logd refuses a sender's next message with `NAME_UNKNOWN`, and
+[service-definitions.md](service-definitions.md#log_sink)). A logd
+restarted before any instance has taken all its bootstrap rounds (its
+first launch died before its request, as § Death detection describes) is
+minted the first launch's round, `HANDOVER_PULL` SEND included, since no
+instance has held the handover and init-logd still serves the endpoint.
+Any later restarted logd skips the history pull, serves a fresh table
+(which holds no sender's display name: logd refuses a sender's next message with `NAME_UNKNOWN`, and
 the sender registers its name again and resends, so its lines render under
 its name), and registers its death queue with procmgr, whose
 `REGISTER_DEATH_EQ` takes it in place of the dead instance's

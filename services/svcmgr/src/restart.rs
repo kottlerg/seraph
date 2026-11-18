@@ -26,7 +26,7 @@ use crate::definitions::launch::{
     serve_boot_slots,
 };
 use crate::definitions::{build_blob, cwd_rights};
-use crate::service::{POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
+use crate::service::{Bootstrap, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::bootstrap::ServeFailure;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use std::os::seraph::process::ArgvEnvCap;
@@ -764,6 +764,7 @@ fn restart_process(
     }
 
     svc.bootstrap_badge = child_badge;
+    svc.bootstrap = Bootstrap::Served;
     Respawn::Started
 }
 
@@ -772,11 +773,14 @@ fn restart_process(
 /// caller then destroys the new child.
 ///
 /// The log-sink service (real-logd) gets a freshly-minted round from the
-/// reserved log-sink sources, with no `HANDOVER_PULL` SEND — init-logd is long
-/// gone by any restart, so the restarted logd skips the history pull and takes
-/// over the log endpoint directly. Senders are unaffected: their SENDs target
-/// the endpoint object, and svcmgr's reserved source kept it alive across the
-/// crash.
+/// reserved log-sink sources. Once an instance has taken all its rounds
+/// (`ServiceEntry::bootstrap`) the round carries no `HANDOVER_PULL`
+/// SEND: that instance held the handover, so the restarted logd skips the
+/// history pull and takes over the log endpoint directly. Until then no
+/// instance has received the SEND and init-logd still serves the endpoint, so
+/// the round is the first launch's, with the SEND. Senders are unaffected:
+/// their SENDs target the endpoint object, and svcmgr's reserved source kept
+/// it alive across the crash.
 ///
 /// Otherwise the recipe's `seed = ...` names are re-resolved from the
 /// registry, in declaration order — byte-for-byte the positional set first
@@ -796,7 +800,12 @@ fn restart_boot_caps(
 {
     if matches!(recipe, Some(r) if r.log_sink)
     {
-        return Some(mint_logd_boot_caps(ctx, LaunchKind::Restart, registry));
+        let kind = match svc.bootstrap
+        {
+            Bootstrap::Served => LaunchKind::Restart,
+            Bootstrap::Pending => LaunchKind::First,
+        };
+        return Some(mint_logd_boot_caps(ctx, kind, registry));
     }
 
     let mut restart_caps: Vec<u64> = match recipe

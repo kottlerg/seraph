@@ -38,7 +38,8 @@ use svcmgr_endowment::SubstrateObserver;
 use crate::endowed_servers;
 use crate::restart::{DeathOutcome, RestartCtx, bind_fault_observer, handle_death};
 use crate::service::{
-    POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
+    Bootstrap, POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry,
+    try_string,
 };
 
 /// Entry in svcmgr's pending-registration table populated from init's
@@ -456,10 +457,7 @@ fn handle_definition(
         match launched.died
         {
             None => log!("svcmgr: launched ephemeral: {}", def.name),
-            Some(exit_reason) => log!(
-                warn: "svcmgr: {} died during its bootstrap (exit reason {exit_reason:#x})",
-                def.name
-            ),
+            Some(exit_reason) => log_boot_death(def, exit_reason),
         }
         let _ = syscall::cap_delete(launched.thread_cap);
         let _ = syscall::cap_delete(launched.process_handle);
@@ -522,10 +520,15 @@ fn handle_definition(
     entry.provided_endpoint = launched.provided_endpoint;
     entry.node_handle = launched.node_handle;
     entry.launched = true;
+    if launched.died.is_none()
+    {
+        entry.bootstrap = Bootstrap::Served;
+    }
     table.install(idx, entry, recipe)?;
     if let Some(exit_reason) = launched.died
         && let Some(entry) = table.services.get_mut(idx)
     {
+        log_boot_death(def, exit_reason);
         let recipe = table.recipes.get(idx).and_then(Option::as_ref);
         if handle_death(entry, exit_reason, ctx, tag, recipe, registry)
             == DeathOutcome::Unrecoverable
@@ -534,6 +537,19 @@ fn handle_definition(
         }
     }
     Some(idx)
+}
+
+/// Log the death of a service launched from `def` before its bootstrap
+/// request. The line reaches the serial line through whichever logger serves
+/// the log endpoint: a dead log sink's first launch leaves init-logd serving
+/// it. `cargo xtask test-core-death` matches the line's `died during its
+/// bootstrap`.
+fn log_boot_death(def: &Definition, exit_reason: u64)
+{
+    log!(
+        warn: "svcmgr: {} died during its bootstrap (exit reason {exit_reason:#x})",
+        def.name
+    );
 }
 
 /// Bind-only path: bind death-notification on a thread init already

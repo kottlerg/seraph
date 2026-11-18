@@ -38,11 +38,14 @@ which costs that sender two calls. Init-logd therefore sends such a slot again (
 [Name changes during the drain](#name-changes-during-the-drain)).
 
 On a logd **restart** (per
-[Restart Protocol](../../svcmgr/docs/restart-protocol.md#supervision-hierarchy)),
-svcmgr mints `cap[1] = 0`: init-logd exited after
-the first launch, so there is no handover source. The restarted logd skips
-the pull entirely (guarded on a non-zero `cap[1]`) and serves a fresh
-table on the same endpoint object — svcmgr holds the master-log source
+[Restart Protocol](../../svcmgr/docs/restart-protocol.md#supervision-hierarchy))
+after an instance has taken all its bootstrap rounds, svcmgr mints
+`cap[1] = 0`: that instance held the handover, so there is no handover
+source. A restart before that, of a first launch that died before its
+bootstrap request, is minted the first launch's round, `cap[1]` included,
+and runs the handover as the first launch would have. A restarted logd
+minted `cap[1] = 0` skips the pull entirely (guarded on a non-zero
+`cap[1]`) and serves a fresh table on the same endpoint object — svcmgr holds the master-log source
 for the system's life, so the restarted logd's RECV re-attaches to the
 object every sender already targets (see
 [`service-definitions.md` § `log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)).
@@ -79,9 +82,9 @@ them in order, with the time each was logged, once `handover::transfer` returns.
 bound is dropped and counted, and logd writes the count in one line after the held ones. Init-logd
 writes its last line, `handover complete; init-logd thread exiting`, before it acknowledges the
 release, and nothing after it. Two writes are not held: logd's panic sink, and a `FATAL` line on the
-way to a halt, which writes the held lines first. A restarted logd, with no init-logd, holds
-nothing. When no release reaches init-logd (§ Failure modes), logd writes the held lines when the
-attempts end, and its serial writes can then interleave with init-logd's.
+way to a halt, which writes the held lines first. A restarted logd with no handover source
+(`cap[1] = 0`) holds nothing. When no release reaches init-logd (§ Failure modes), logd writes the
+held lines when the attempts end, and its serial writes can then interleave with init-logd's.
 
 ## Call shape
 

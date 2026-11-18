@@ -15,12 +15,12 @@ It is restartable (`restart = on_failure`; see
 svcmgr holds the master-log endpoint source for the system's life, so a
 restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
 targets; only the one-time init-logd history pull
-([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on restart, and the
-restarted logd serves a fresh table. That table holds no sender's display name, so logd refuses a
-sender's first message that says the sender registered one (`SENDER_NAMED`), and the sender
-registers it again and resends the message: every line renders under its sender's name, the first
-after the restart included (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
-§ `stream_labels::STREAM_REGISTER_NAME`).
+([`docs/handover-protocol.md`](docs/handover-protocol.md)) is skipped on a restart once an
+instance has taken its bootstrap rounds, and such a restarted logd serves a fresh table. That
+table holds no sender's display name, so logd refuses a sender's first message that says the
+sender registered one (`SENDER_NAMED`), and the sender registers it again and resends the
+message: every line renders under its sender's name, the first after the restart included
+(see [`docs/ipc-interface.md`](docs/ipc-interface.md) § `stream_labels::STREAM_REGISTER_NAME`).
 
 ## Role
 
@@ -211,7 +211,7 @@ reads as `0`), minted from the reserved log-sink sources svcmgr holds (master-lo
 | Index | Cap |
 |---|---|
 | 0 | RECV on the master log endpoint |
-| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, repeated after a further drain while init-logd defers it, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). Absent on a restart — there is no init-logd left to pull from, so logd skips the handover |
+| 1 | SEND on the master log endpoint (single-use; carries the `HANDOVER_PULL` history drain, then the terminal `HANDOVER_RELEASE`, repeated after a further drain while init-logd defers it, then deleted; see [`docs/handover-protocol.md`](docs/handover-protocol.md)). Absent on a restart once an instance has taken all its bootstrap rounds — there is no init-logd left to pull from, so logd skips the handover; present on a restart before that, which runs the handover |
 | 2 | Badged `SEND\|GRANT` on procmgr's service endpoint carrying `DEATH_EQ_AUTHORITY` |
 | 3 | The `serial` class SEND, derived from the `devmgr.class.serial` publication (to resolve the serial driver via `QUERY_DEVICE`) |
 | 4 | The `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (to resolve the framebuffer driver via `QUERY_DEVICE`) |

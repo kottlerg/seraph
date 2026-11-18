@@ -493,7 +493,10 @@ terminal. Two routes reach the thread:
   died after svcmgr's check of it waits for good (#1185). logd is killed at the attach, as svcmgr
   is, which can fall before logd asks svcmgr for its bootstrap round, a death svcmgr routes as any
   other ([Restart Protocol § Death
-  detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). logd restarts, so it
+  detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). When svcmgr logs that
+  death (`svcmgr: logd died during its bootstrap`), the check also requires init-logd's
+  `handover complete; init-logd thread exiting` line before the second kill, since no instance
+  took the handover and the restarted one must. logd restarts, so it
   is killed again after each `service restarted: logd` line, through the stub's attach to the new
   instance, four times in all: the fourth death finds svcmgr's restart budget (three per 60 s
   window) spent and is permanent. The stub's

@@ -161,6 +161,15 @@ const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_mins(2);
 /// with `services/svcmgr/src/restart.rs`.
 const RESTARTED_MARKER: &str = "service restarted: ";
 
+/// The end of svcmgr's line when a service it launched from its recipe dies
+/// before its bootstrap request, after `svcmgr: <name>`. Kept in sync with
+/// `services/svcmgr/src/definitions/reconcile.rs`.
+const BOOT_DEATH_MARKER: &str = " died during its bootstrap";
+
+/// init-logd's last line, written once real-logd has pulled its history and
+/// released it. Kept in sync with `services/init/src/logging.rs`.
+const HANDOVER_MARKER: &str = "handover complete; init-logd thread exiting";
+
 /// The pause after a kill before the stub is asked to attach again, so its
 /// walk does not find the dying instance.
 const REAP_PAUSE: Duration = Duration::from_secs(2);
@@ -517,11 +526,30 @@ fn kill_through_stub(
         if kill > 1
         {
             // The restart's line is written by the new logd once it runs.
-            guest
+            let lines = guest
                 .collect_until(&format!("{RESTARTED_MARKER}{name}"), BOOT_TIMEOUT)
                 .with_context(|| {
                     format!("{name}'s restart after kill {}", kill.saturating_sub(1))
                 })?;
+            // A first kill that fell before the log sink's bootstrap request
+            // left init-logd serving the log endpoint: the restarted instance
+            // must take the handover from it, as the first launch would have.
+            let died_early = format!("svcmgr: {name}{BOOT_DEATH_MARKER}");
+            if kill == 2 && lines.iter().any(|l| l.contains(&died_early))
+            {
+                if !lines.iter().any(|l| l.contains(HANDOVER_MARKER))
+                {
+                    guest
+                        .collect_until(HANDOVER_MARKER, BOOT_TIMEOUT)
+                        .with_context(|| {
+                            format!("the handover to {name}'s restart after its first launch died")
+                        })?;
+                }
+                step(&format!(
+                    "core-death test: {name}'s first launch died before its bootstrap request; \
+                     its restart took the handover"
+                ));
+            }
             stub.request(b"qSupported")?;
         }
         // A target the stub does not hold (it exited, or the walk found

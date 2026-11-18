@@ -148,11 +148,13 @@ pub(crate) fn serve_boot_slots(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LaunchKind
 {
-    /// The reconciliation launch: init-logd is still alive to hand its
-    /// history over, so the round carries the `HANDOVER_PULL` SEND.
+    /// The reconciliation launch, and a respawn while no instance has taken
+    /// all its rounds (`ServiceEntry::bootstrap`): init-logd is
+    /// still alive to hand its history over, so the round carries the
+    /// `HANDOVER_PULL` SEND.
     First,
-    /// A respawn after death: there is no init-logd left to pull from, so
-    /// the `HANDOVER_PULL` slot is `0`.
+    /// A respawn after an instance took all its rounds: that instance held
+    /// the handover, so the `HANDOVER_PULL` slot is `0`.
     Restart,
 }
 
@@ -163,8 +165,8 @@ pub(crate) enum LaunchKind
 ///     fresh RECV reattaches each (re)launched logd to the same object that
 ///     every sender's `log_send_cap` targets);
 ///   * `[1]` a SEND on the same endpoint for the one-shot `HANDOVER_PULL`,
-///     present only for [`LaunchKind::First`] — a restart has no init-logd to
-///     pull from, so this is `0` and logd skips the history pull;
+///     present only for [`LaunchKind::First`] — a later restart has no
+///     init-logd to pull from, so this is `0` and logd skips the history pull;
 ///   * `[2]` a `DEATH_EQ_AUTHORITY` `SEND|GRANT` on procmgr (logd registers sender
 ///     death-notifications for slot reclaim) — `SEND|GRANT` because that
 ///     registration transfers a cap;

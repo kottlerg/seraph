@@ -32,7 +32,6 @@ use std::time::Duration;
 use acpid::events::{self, Fired, Handled, Handler, Layout, Start};
 use acpid::hotplug::{self, Event, Held, HotplugJob, HotplugSlots, Outcome};
 use acpid::power::{self, Request};
-use aml::host::{Host, PciAddress, Width};
 use aml::namespace::NodeId;
 use aml::{Evaluator, Namespace};
 use ipc::{IpcMessage, acpid_errors, acpid_labels, devmgr_errors, devmgr_labels};

@@ -132,7 +132,7 @@ exhausted, or a restart attempt failed).
 | Value | Behaviour once permanently down |
 |---|---|
 | `no` | Logged; service marked inactive. The system continues degraded. |
-| `yes` | svcmgr logs `critical service unrecoverable: <name>; initiating graceful shutdown` and issues [`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/lib.rs) through the [`shutdown_actuator`](#shutdown_actuator). See [restart-protocol.md](restart-protocol.md). |
+| `yes` | svcmgr logs `critical service unrecoverable: <name>; initiating graceful shutdown` and issues [`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/pwrmgr_labels.rs) through the [`shutdown_actuator`](#shutdown_actuator). See [restart-protocol.md](restart-protocol.md). |
 
 Because the two fields are independent, any combination is valid — e.g.
 `restart = always` + `critical = no` (the `crasher` fixture: respawned on
@@ -247,7 +247,7 @@ and second-seed-round phases fail the run on any unresolved seed (per [services/
 Run Sequence](../../svctest/README.md#run-sequence)).
 
 Well-known names are centralised in
-[`ipc::published_names`](../../../shared/ipc/src/lib.rs). Every name
+[`ipc::published_names`](../../../shared/ipc/src/published_names.rs). Every name
 resolves as a seed; only those marked in the Query column also resolve
 through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT`
 ([ipc-interface.md § Label 4](ipc-interface.md#label-4-query_endpoint)):
@@ -352,8 +352,8 @@ that powers the platform off. `<name>` is one entry of the recipe's own [`provid
 list and carries `:auth`. When a `critical = yes` service is permanently down, svcmgr derives a
 SEND stamped with that entry's badge, the authority bit the actuator's gate tests, from the
 actuator's own service endpoint, and calls
-[`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/lib.rs), the request label the actuator
-serves, through it. It does not resolve `<name>` from the discovery registry, which keeps a
+[`pwrmgr_labels::SHUTDOWN`](../../../shared/ipc/src/pwrmgr_labels.rs), the request label the
+actuator serves, through it. It does not resolve `<name>` from the discovery registry, which keeps a
 name's first publisher: the registry's entry for `<name>` may be another service's endpoint, or,
 when the recipe also lists `<name>:deny` first, the no-authority SEND. svcmgr knows the actuator
 only by this key; its code names no service.
@@ -603,7 +603,10 @@ registration is released, and svcmgr routes vfsd's death as system death
 | [README.md](../README.md) | Component scope, responsibilities, restart policy |
 | [ipc-interface.md](ipc-interface.md) | handover endowment, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT`, `STOP_CANDIDATE` / `LIST_CANDIDATES` / `LIST_STOP_SOURCES` |
 | [restart-protocol.md](restart-protocol.md) | Restart sequencing, shared spawn primitives, criticality semantics |
-| [shared/ipc/src/lib.rs](../../../shared/ipc/src/lib.rs) | `published_names` constants, `svcmgr_labels::*`, `svcmgr_errors::*`, `stop_labels::*` |
+| [shared/ipc/src/published_names.rs](../../../shared/ipc/src/published_names.rs) | `published_names` constants |
+| [shared/ipc/src/svcmgr_labels.rs](../../../shared/ipc/src/svcmgr_labels.rs) | `svcmgr_labels::*` |
+| [shared/ipc/src/svcmgr_errors.rs](../../../shared/ipc/src/svcmgr_errors.rs) | `svcmgr_errors::*` |
+| [shared/ipc/src/stop_labels.rs](../../../shared/ipc/src/stop_labels.rs) | `stop_labels::*` |
 
 ---
 

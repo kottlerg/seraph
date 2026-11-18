@@ -1,7 +1,7 @@
 # goldfish-rtc
 
 RISC-V Goldfish RTC driver. Serves
-[`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).
+[`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/rtc_labels.rs).
 
 The Goldfish RTC is a single-page MMIO device originally from the
 Android emulator, present on QEMU's `virt` RISC-V machine model at
@@ -63,7 +63,7 @@ endpoint only after the report, and withdraws it when the driver dies.
   `rtc_labels::READ_AUTHORITY` (devmgr stamps it on every SEND minted
   from `QUERY_DEVICE` on the `rtc` class); the driver replies
   `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a
-  [`rtc_errors`](../../../shared/ipc/src/lib.rs) status code; on
+  [`rtc_errors`](../../../shared/ipc/src/rtc_errors.rs) status code; on
   `SUCCESS`, `data[0]` is `u64` microseconds since the Unix epoch.
 
 ---

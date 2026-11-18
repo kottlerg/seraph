@@ -39,7 +39,7 @@ of its two seeds and deletes the other at startup:
   ([devmgr](../devmgr/docs/responsibilities.md#responsibilities)), which authorises forwarding
   `system_reset` through the kernel to M-mode firmware.
 
-It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
+It exposes a small IPC surface (`shared/ipc/src/pwrmgr_labels.rs`):
 
 - `SHUTDOWN` — power off the platform (ACPI S5 through acpid on x86-64, SBI SRST type 0
   on RISC-V).
@@ -182,7 +182,9 @@ There is no shared crate and no cross-reference between the two trees.
 | [docs/architecture.md](../../docs/architecture.md) | System-wide service inventory; pwrmgr's role |
 | [docs/supervision.md](../../docs/supervision.md) | Supervision hierarchy; pwrmgr as svcmgr's observer |
 | [docs/testing.md](../../docs/testing.md) | Cross-harness completion convention; harnesses request pwrmgr shutdown when they finish |
-| [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`, `devmgr_labels`) |
+| [shared/ipc/src/pwrmgr_labels.rs](../../shared/ipc/src/pwrmgr_labels.rs) | Authoritative IPC label definitions (`pwrmgr_labels`) |
+| [shared/ipc/src/pwrmgr_errors.rs](../../shared/ipc/src/pwrmgr_errors.rs) | Authoritative IPC error definitions (`pwrmgr_errors`) |
+| [shared/ipc/src/devmgr_labels.rs](../../shared/ipc/src/devmgr_labels.rs) | The `devmgr_labels` pwrmgr calls |
 | [services/acpid/README.md](../acpid/README.md) | Evaluates the firmware's AML; serves the x86-64 sleep, reset and power-button requests pwrmgr calls |
 | [services/devmgr/README.md](../devmgr/README.md) | Hardware authority; the `QUERY_SHUTDOWN_DEVICE` broker pwrmgr acquires its RISC-V cap through |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher + supervisor; the provider path that publishes `pwrmgr.shutdown` / `pwrmgr.deny` |

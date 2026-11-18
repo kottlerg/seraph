@@ -2,10 +2,10 @@
 
 Userspace wall-clock service. RTC-source agnostic: resolves the
 platform RTC via devmgr's
-[`devmgr_labels::QUERY_DEVICE`](../../shared/ipc/src/lib.rs) on the `rtc` class once
+[`devmgr_labels::QUERY_DEVICE`](../../shared/ipc/src/devmgr_labels.rs) on the `rtc` class once
 at startup, computes a fixed offset against the kernel's monotonic
 clock, then serves
-[`timed_labels::GET_WALL_TIME`](../../shared/ipc/src/lib.rs) from
+[`timed_labels::GET_WALL_TIME`](../../shared/ipc/src/timed_labels.rs) from
 `offset + kernel_elapsed_us()` on every request.
 
 `std::time::SystemTime::now()` resolves through this service (via
@@ -47,7 +47,7 @@ No other caps are needed; the class SEND is used once for the
 ## IPC Interface
 
 * **`timed_labels::GET_WALL_TIME`** — no payload. Reply label is a
-  [`timed_errors`](../../shared/ipc/src/lib.rs) status code; on
+  [`timed_errors`](../../shared/ipc/src/timed_errors.rs) status code; on
   `SUCCESS`, `data[0]` is `u64` microseconds since the Unix epoch.
 
   Resolution is microseconds. Computed as `offset + kernel_elapsed_us`

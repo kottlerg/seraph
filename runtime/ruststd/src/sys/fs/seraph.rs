@@ -2250,7 +2250,7 @@ pub fn mkdir(path: &Path) -> io::Result<()>
 }
 
 /// Rename an entry within a single directory. Cross-directory rename
-/// is not supported on the wire (see `shared/ipc/src/lib.rs`
+/// is not supported on the wire (see `shared/ipc/src/fs_labels.rs`
 /// `FS_RENAME` rustdoc) and is tracked separately; the PAL surfaces
 /// it as `InvalidInput`. The two names share the request's data area
 /// after the two length words, so a pair whose combined length does not

@@ -20,8 +20,9 @@ message label (`label & 0xFFFF`) select the operation; the create labels carry
 further fields in the upper bits. Data words and capability slots carry
 arguments. The reply label is `procmgr_errors::SUCCESS` (0) or an error code.
 Label numbers, error codes, and query states are defined in
-[`shared/ipc/src/lib.rs`](../../../shared/ipc/src/lib.rs) (`procmgr_labels`,
-`procmgr_errors`, `procmgr_process_state`).
+[`procmgr_labels`](../../../shared/ipc/src/procmgr_labels.rs),
+[`procmgr_errors`](../../../shared/ipc/src/procmgr_errors.rs), and
+[`procmgr_process_state`](../../../shared/ipc/src/procmgr_process_state.rs).
 
 `START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`,
 `BIND_DEATH_OBSERVER`, `LIST_CHILDREN` and `DESTROY_CHILD` are sent on a **process handle** (the

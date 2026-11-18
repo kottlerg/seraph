@@ -26,7 +26,8 @@ by acpid's recipe alone. `ACPI_AUTHORITY` gates every label acpid alone calls; d
 - each configuration-space access devmgr makes for it (§ Configuration access).
 
 Every capability is a derivation of one devmgr holds. The wire contract of each label is the
-`devmgr_labels` documentation in [shared/ipc/src/lib.rs](../../../shared/ipc/src/lib.rs).
+`devmgr_labels` documentation in
+[shared/ipc/src/devmgr_labels.rs](../../../shared/ipc/src/devmgr_labels.rs).
 
 ---
 

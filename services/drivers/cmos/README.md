@@ -1,7 +1,7 @@
 # cmos
 
 x86-64 CMOS / MC146818-compatible RTC driver. Serves
-[`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).
+[`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/rtc_labels.rs).
 
 Installed to `/services/drivers/cmos-rtc` on the rootfs. Bound by
 devmgr on x86-64 platforms to the platform device record the ACPI namespace gives `PNP0B00`,
@@ -64,7 +64,7 @@ report, and withdraws it when the driver dies.
   ([devmgr](../../devmgr/docs/responsibilities.md#responsibilities) stamps it
   on every SEND minted from `QUERY_DEVICE` on the `rtc` class); the driver replies
   `rtc_errors::UNAUTHORIZED` otherwise. Reply label is a
-  [`rtc_errors`](../../../shared/ipc/src/lib.rs) status code; on
+  [`rtc_errors`](../../../shared/ipc/src/rtc_errors.rs) status code; on
   `SUCCESS`, `data[0]` is `u64` microseconds since the Unix epoch.
 
 The driver does not maintain a wall-clock offset or compute drift;

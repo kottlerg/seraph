@@ -155,7 +155,7 @@ holds a handle to it.
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[36..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded, `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below) |
+| 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[36..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded or before procmgr's reply delivers it, `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below) |
 | 11 | `MAP_FAILED` | The module cap, a copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | The module cap lacks the map right, or a rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
@@ -216,21 +216,24 @@ names a pager the child does not have; a child whose binding failed, or whose pa
 procmgr could not map to advertise it, reads zero and keeps its memory eager.
 
 **Death relay.** The label's bit 17 (`CREATE_DEATH_RELAY`, in the window shared with
-`CREATE_FROM_FILE`) marks a request whose last cap is a POST-only `EventQueue` cap, the relay. It
-is the last cap, so the creator-endpoint slot stays at cap[1], and a cap of its own, as the
-argv/env cap is: a request needs one cap past cap[0] for each of `CREATE_DEATH_RELAY`,
-`CREATE_ARGV_ENV` and `CREATE_CHARGE_NODE` it sets, and one that sets more than its caps can
-supply is refused with `INVALID_ARGUMENT`. procmgr keeps the relay in the child's entry for the
-child's life and posts the child's end to it once, as the entry `(reason, 0)`, whoever ends the
-child: at the reap of a child that exited or took a terminal fault in any of its threads, the exit
-reason or the fault class procmgr reaped it by, and at the teardown of a destroyed child, a
-subtree's or a containment's included (§ Process Tree), the reason § Label 9 states for a destroyed
-process, `EXIT_KILLED` unless the child had exited or faulted already. Each is the reason
-`QUERY_PROCESS` then reports. procmgr posts after the teardown and memmgr's reclaim, then deletes
-its copy. The post is procmgr's, not a kernel binding: one party posts, once, whatever number of the
-child's threads exit or fault before the teardown, and the relay takes none of its queue's observer
-nodes. The relay reports the ends of its creator's own children only: when the creator ends and the
-child is re-parented, procmgr deletes the relay unposted. A failed creation deletes it unposted.
+`CREATE_FROM_FILE`) marks a request whose last cap is a POST-only `EventQueue` cap, the relay. It is
+the last cap, so the creator-endpoint slot stays at cap[1], and a cap of its own, as the argv/env
+cap is: a request needs one cap past cap[0] for each of `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` and
+`CREATE_CHARGE_NODE` it sets, and one that sets more than its caps can supply is refused with
+`INVALID_ARGUMENT`. procmgr keeps the relay in the child's entry for the child's life and posts the
+child's end to it once, as the entry `(reason, 0)`, whoever ends the child: at the reap of a child
+that exited or took a terminal fault in any of its threads, the exit reason or the fault class
+procmgr reaped it by, and at the teardown of a destroyed child, a subtree's or a containment's
+included (§ Process Tree), the reason § Label 9 states for a destroyed process, `EXIT_KILLED` unless
+the child had exited or faulted already. Each is the reason `QUERY_PROCESS` then reports. procmgr
+posts after the teardown and memmgr's reclaim, then deletes its copy. The post is procmgr's, not a
+kernel binding: one party posts, once, whatever number of the child's threads exit or fault before
+the teardown, and the relay takes none of its queue's observer nodes. The relay reports the ends of
+its creator's own children only: when the creator ends and the child is re-parented, procmgr deletes
+the relay unposted. A failed creation deletes it unposted, one a destroy marked included: until
+procmgr's reply delivers the child's handle, the create owns the child's entry, and a destroy that
+marks the child leaves it to the create, which is then refused with `INVALID_ARGUMENT`
+(§ Process Tree).
 
 **Containment.** The label's bit 35 (`CREATE_CONTAIN`, in the window shared with
 `CREATE_FROM_FILE`) creates the child contained: when it ends, by an exit, a fault or a destroy,
@@ -465,8 +468,9 @@ and that procmgr has not reaped yet, is reaped instead, in the same hold of the 
 the reason it ended with: its children are re-parented, or destroyed when it was created contained,
 as at its reap (§ Process Tree), so whether the destroy or the reaper comes first changes nothing.
 
-**Reply:** label 0 (success), always, once the subtree is torn down. An unknown or
-already-destroyed badge is a no-op.
+**Reply:** label 0 (success), always, once the subtree is torn down, apart from a child whose
+create procmgr has not answered yet, which that create tears down when procmgr refuses it
+(§ Process Tree). An unknown or already-destroyed badge is a no-op.
 
 ### Label 9: `QUERY_PROCESS`
 
@@ -599,7 +603,7 @@ included, as for `CREATE_PROCESS`.
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
 | 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[36..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on, `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
+| 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[36..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | A copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
@@ -674,13 +678,18 @@ parent link is the session model's process tree
   moves a process out of the subtree of a live contained ancestor.
 - **Subtree destroy.** `DESTROY_PROCESS` (§ Label 8) and `DESTROY_CHILD` (§ Label 28) mark the
   process and every process below it, and every create one of them has in progress, in one hold of
-  procmgr's table lock, then tear each marked process down, one per hold. From the mark on,
-  procmgr refuses a create from a marked process with `INVALID_ARGUMENT`, as from a badge that
-  names no live process, and a marked create's child is destroyed when it is built, its create
-  refused the same way, so no process escapes the destroy by creating a child during it.
-  `LIST_CHILDREN` lists no marked process, and `START_PROCESS` refuses one with `INVALID_BADGE`.
-  Each destroyed process posts its end to its relay and end queue. A destroy of a process that
-  has already ended, before procmgr reaped it, is that end's reap (§ Label 8).
+  procmgr's table lock, then tear each marked process down, one per hold. From the mark on, procmgr
+  refuses a create from a marked process with `INVALID_ARGUMENT`, as from a badge that names no live
+  process, and a marked create's child is destroyed when it is built, its create refused the same
+  way, so no process escapes the destroy by creating a child during it. A child built but whose
+  create procmgr has not answered yet is its create's until the reply delivers its handle: procmgr
+  makes that reply under its table lock, so a destroy marks the child either before it, when the
+  create is refused the same way and the child destroyed without posting to the creator's relay, or
+  after it, when the destroy tears the child down as any other. The destroy's reply can thus precede
+  the teardown of a child no one had yet received, which never ran. `LIST_CHILDREN` lists no marked
+  process, and `START_PROCESS` refuses one with `INVALID_BADGE`. Each destroyed process posts its
+  end to its relay and end queue. A destroy of a process that has already ended, before procmgr
+  reaped it, is that end's reap (§ Label 8).
 
 ### Label 27: `LIST_CHILDREN`
 
@@ -719,8 +728,8 @@ process (§ Label 8), a child that has already ended included. The check that th
 and the mark of its subtree are one hold of the table lock, so a re-parenting cannot move the child
 out from under the check. The handle is the authority: its holder may already destroy the parent
 with every process below it, and the badge only names one of its children. Replies `SUCCESS` once
-the subtree is torn down; `INVALID_BADGE` when `data[0]` names no live child of the process, a
-grandchild or a child a destroy has marked among them.
+the subtree is torn down, as `DESTROY_PROCESS` does; `INVALID_BADGE` when `data[0]` names no live
+child of the process, a grandchild or a child a destroy has marked among them.
 
 ### Label 29: `REGISTER_END_QUEUE`
 

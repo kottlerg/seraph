@@ -343,9 +343,10 @@ so its threads send no `REGISTER_THREAD` and start without waiting on one
 The shared state is behind these locks:
 
 - The table lock guards the process table and the recent-exits ring (`process::Tables`). Its holder
-  makes syscalls that do not block on another process, and no IPC call but the two below; every
-  other call, to memmgr for a child, to a file server, or to the crash decliner, is made after it
-  is released.
+  makes syscalls that do not block on another process, the create reply among them (an
+  `ipc_reply`, made under the lock so a destroy marks the child either before the reply or after
+  it), and no IPC call but the two below; every other call, to memmgr for a child, to a file
+  server, or to the crash decliner, is made after it is released.
 - The death-set lock guards the death queues and their wait set. A bind that grows the set funds
   the new queue or wait set from memmgr while it holds the lock; memmgr calls no procmgr label, so
   that call cannot wait on a lock procmgr holds.
@@ -381,7 +382,9 @@ A create reserves its badge under the table lock, with its creator beside it, wh
 concurrent create from drawing it, and builds the child (its kernel objects, its image, its death
 observers, its pager and crash bindings) with no lock held. It inserts the complete entry last,
 taking the parent from the reservation, so no other worker sees a half-built child, and an insert
-whose creator a destroy has marked meanwhile is refused. A destroy (`DESTROY_PROCESS`,
+whose creator a destroy has marked meanwhile is refused. The entry stays the create's until the
+create reply delivers the child: a destroy that marks it first leaves it, and the create refuses
+itself and destroys the child without posting to its relay. A destroy (`DESTROY_PROCESS`,
 `DESTROY_CHILD`) marks its whole subtree in one hold of the table lock, then tears the marked
 entries down one per hold; in that hold, a process that has already ended and is not reaped yet is
 reaped instead, as the reaper would. A teardown, by the reaper or by a destroy, takes the entry,

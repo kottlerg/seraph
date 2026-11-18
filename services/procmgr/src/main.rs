@@ -1904,8 +1904,11 @@ enum HoldRefusal
     /// The heap cannot reserve the room the child's parked record takes
     /// (`ArmError::OutOfMemory`).
     NoRoom,
-    /// No live entry holds the child's badge (`ArmError::NotFound`), which
-    /// the child's insertion just before rules out unless the table lost it.
+    /// No live entry holds the child's badge (`ArmError::NotFound`). The
+    /// child's insertion just before rules it out: until the create is
+    /// answered only the create's own refusal takes the entry
+    /// (`ProcessEntry::unanswered`), a destroy that marks it meanwhile
+    /// included, so this arm is reached only if the table lost the entry.
     NotFound,
     /// The release token could not be derived; the hold is armed, and the
     /// child's destroy settles it.
@@ -2003,7 +2006,15 @@ fn arm_and_reply_create(
 }
 
 /// Reply with a successful process creation result, or destroy the child
-/// when the reply cannot deliver it.
+/// when the reply cannot deliver it or a destroy has marked it.
+///
+/// The reply is made under the table lock, through
+/// `ProcessTable::answer_create`, so a destroy marks the child either
+/// before the reply, which is then not made and the create is refused with
+/// `INVALID_ARGUMENT`, as for a create a destroy marked before its insert,
+/// or after it, once the creator holds the child. Until the answer the
+/// destroy leaves the entry to this create, so a refused create deletes the
+/// death relay unposted. `ipc_reply` does not block on the caller.
 ///
 /// Reply caps: `[process_handle, thread, release_token?, node_handle?]`, the
 /// token only for a `CREATE_DMA_HOLD` child and the node handle only for a
@@ -2035,10 +2046,16 @@ fn reply_create_result(
         msg = msg.cap(result.node_handle);
     }
     let msg = msg.build();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
+    let answer = tables.lock().table.answer_create(result.badge, || {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_ok()
+    });
+    if answer != process_table::CreateAnswer::Answered
     {
-        std::os::seraph::log!(warn: "create reply undeliverable; destroying the child");
+        if answer == process_table::CreateAnswer::Undelivered
+        {
+            std::os::seraph::log!(warn: "create reply undeliverable; destroying the child");
+        }
         let _ = syscall::cap_delete(result.thread_for_caller);
         let _ = syscall::cap_delete(result.process_handle);
         if let Some(token) = release_token
@@ -2051,6 +2068,10 @@ fn reply_create_result(
         }
         // No handle to this child survives, so nothing can query its exit.
         process::destroy_created(result.badge, memmgr_ep, ipc_buf, tables);
+        if answer == process_table::CreateAnswer::Refused
+        {
+            reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        }
     }
 }
 

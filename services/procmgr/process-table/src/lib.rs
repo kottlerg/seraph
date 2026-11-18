@@ -222,6 +222,14 @@ pub struct ProcessEntry
     /// carried (`CREATE_DEATH_RELAY`), to which procmgr posts the child's
     /// end once; `0` with none, and once the child is re-parented.
     pub relay: u64,
+    /// Set from the insert until procmgr's reply to the create that made the
+    /// entry has delivered the child's handle ([`ProcessTable::answer_create`]).
+    /// Until then the create owns the entry's teardown, and the death relay
+    /// with it: a destroy that marks the entry does not take it
+    /// ([`ProcessTable::take_doomed`]), and the create refuses itself instead
+    /// and deletes the relay unposted ([`ProcessTable::take_refused`]), so a
+    /// failed creation never posts to its relay.
+    pub unanswered: bool,
     /// Slot in procmgr's `CSpace` of the end queue the child registered on
     /// itself (`REGISTER_END_QUEUE`, [`ProcessTable::register_end_queue`]),
     /// to which procmgr posts the child's end once; `0` with none.
@@ -515,6 +523,20 @@ pub enum InsertError
     /// The creator has ended, or a destroy of a subtree that holds it has
     /// begun: its child would escape that destroy.
     CreatorEnded,
+}
+
+/// How [`ProcessTable::answer_create`] ended a create whose child's entry was
+/// inserted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateAnswer
+{
+    /// The reply delivered the child's handle; the child is its creator's.
+    Answered,
+    /// A destroy marked the entry before the reply, which was not made: the
+    /// create is refused, as for a create a destroy marked before its insert.
+    Refused,
+    /// The reply could not be delivered: the create is refused.
+    Undelivered,
 }
 
 /// Why [`ProcessTable::register_end_queue`] registered nothing.
@@ -924,7 +946,9 @@ impl ProcessTable
     /// and an insert of such a create's child, so no process escapes the
     /// destroy by starting a child during the teardown. Returns `false` when
     /// no live entry holds `badge`. The entries stay in the table until
-    /// their teardown takes each ([`Self::take_doomed`]).
+    /// their teardown takes each ([`Self::take_doomed`]), or, for an entry
+    /// whose create is unanswered, until that create's refusal takes it
+    /// ([`Self::answer_create`], [`Self::take_refused`]).
     pub fn doom_subtree(&mut self, badge: u64) -> bool
     {
         let Some(root) = self.find_mut_by_badge(badge)
@@ -1025,6 +1049,29 @@ impl ProcessTable
         Some(entry)
     }
 
+    /// Answer the create that made the entry `badge`: unless a destroy has
+    /// marked the entry, call `reply`, which delivers the child's handle to its
+    /// creator and returns whether it did, and on delivery clear
+    /// [`ProcessEntry::unanswered`], so a destroy takes the entry from then on.
+    /// The reply is made under the caller's hold of the table, so no destroy
+    /// marks the entry between the check and the delivery: a destroy that
+    /// comes first leaves the create refused, one that comes after finds a
+    /// child its creator holds. An unknown badge is refused too.
+    pub fn answer_create(&mut self, badge: u64, reply: impl FnOnce() -> bool) -> CreateAnswer
+    {
+        let Some(entry) = self.find_mut_by_badge(badge).filter(|e| !e.doomed)
+        else
+        {
+            return CreateAnswer::Refused;
+        };
+        if !reply()
+        {
+            return CreateAnswer::Undelivered;
+        }
+        entry.unanswered = false;
+        CreateAnswer::Answered
+    }
+
     /// Take the entry `badge` of a child whose create procmgr refuses after it
     /// was inserted (a reply it cannot deliver, a hold it cannot arm), as
     /// [`Self::take_ended`] takes an ended one, and call `delete_relay` with
@@ -1048,9 +1095,16 @@ impl ProcessTable
     /// Take a doomed entry out of the table ([`Self::take_ended`]), the
     /// lowest-badged; `None` when none is doomed. A destroy takes the doomed
     /// entries one by one, each teardown in its own hold of the table lock.
+    /// An entry whose create is unanswered ([`ProcessEntry::unanswered`]) is
+    /// left to that create, which refuses itself once it finds the entry
+    /// doomed ([`Self::answer_create`]).
     pub fn take_doomed(&mut self, delete_relay: impl FnMut(u64)) -> Option<ProcessEntry>
     {
-        let badge = self.entries.iter().find(|e| e.doomed)?.badge;
+        let badge = self
+            .entries
+            .iter()
+            .find(|e| e.doomed && !e.unanswered)?
+            .badge;
         self.take_ended(badge, delete_relay)
     }
 
@@ -1860,6 +1914,7 @@ mod tests
             contained: false,
             doomed: false,
             relay: 0,
+            unanswered: false,
             end_queue: 0,
             end_correlator: 0,
         }
@@ -3289,6 +3344,76 @@ mod tests
         assert_eq!(taken, [0x10, 0x20, 0x30]);
         assert_eq!(table.len(), 3);
         assert_eq!(parent_of(&table, 0x40), 0x60);
+    }
+
+    // Defect guarded: a destroy that marked a child after its insert but
+    // before procmgr answered its create tore the child down and posted
+    // `EXIT_KILLED` to the creator's death relay, after which procmgr refused
+    // the create: a failed creation posted to its relay. The create owns an
+    // unanswered entry: the destroy leaves it, and the create refuses itself
+    // and drops the relay unposted.
+    #[test]
+    fn a_destroy_leaves_an_unanswered_create_to_refuse_itself()
+    {
+        let mut table = tree(&[(0x10, 0)]);
+        let mut child = child_of(0x20, 0x10);
+        child.unanswered = true;
+        child.relay = 44;
+        assert_eq!(table.insert(child), Ok(()));
+        assert!(table.doom_subtree(0x10));
+        let taken = table.take_doomed(|_| panic!("no relay is dropped by the destroy"));
+        assert_eq!(taken.map(|e| e.badge), Some(0x10));
+        assert!(
+            table.take_doomed(|_| ()).is_none(),
+            "the destroy took an entry whose create is unanswered"
+        );
+        let answer = table.answer_create(0x20, || panic!("a marked child's create is answered"));
+        assert_eq!(answer, CreateAnswer::Refused);
+        let mut dropped = Vec::new();
+        let refused = table
+            .take_refused(0x20, |relay| dropped.push(relay))
+            .expect("the refused child's entry");
+        assert_eq!(refused.relay, 0);
+        assert_eq!(dropped, [44]);
+    }
+
+    #[test]
+    fn an_answered_create_is_its_creators_child_for_a_destroy()
+    {
+        let mut table = tree(&[(0x10, 0)]);
+        let mut child = child_of(0x20, 0x10);
+        child.unanswered = true;
+        child.relay = 44;
+        assert_eq!(table.insert(child), Ok(()));
+        assert_eq!(table.answer_create(0x20, || true), CreateAnswer::Answered);
+        assert!(!table.find_by_badge(0x20).expect("live").unanswered);
+        assert!(table.doom_subtree(0x10));
+        let mut taken: Vec<u64> = Vec::new();
+        while let Some(entry) = table.take_doomed(|_| ())
+        {
+            taken.push(entry.badge);
+            // The answered child keeps its relay for the end post.
+            if entry.badge == 0x20
+            {
+                assert_eq!(entry.relay, 44);
+            }
+        }
+        assert_eq!(taken, [0x10, 0x20]);
+    }
+
+    #[test]
+    fn an_undelivered_answer_leaves_the_create_unanswered()
+    {
+        let mut table = tree(&[(0x10, 0)]);
+        let mut child = child_of(0x20, 0x10);
+        child.unanswered = true;
+        assert_eq!(table.insert(child), Ok(()));
+        assert_eq!(
+            table.answer_create(0x20, || false),
+            CreateAnswer::Undelivered
+        );
+        assert!(table.find_by_badge(0x20).expect("live").unanswered);
+        assert_eq!(table.answer_create(0x99, || true), CreateAnswer::Refused);
     }
 
     // Defect guarded: the teardown of a child whose create procmgr refused

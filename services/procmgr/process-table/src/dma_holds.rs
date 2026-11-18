@@ -232,6 +232,7 @@ mod tests
             contained: false,
             doomed: false,
             relay: 0,
+            unanswered: false,
             end_queue: 0,
             end_correlator: 0,
         }

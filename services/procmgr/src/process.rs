@@ -2146,6 +2146,8 @@ fn finalize_creation(
         contained: sched.contained,
         doomed: false,
         relay: parent_relay_cap,
+        // The create owns the entry until its reply delivers the handle.
+        unanswered: true,
         end_queue: 0,
         end_correlator: 0,
     });

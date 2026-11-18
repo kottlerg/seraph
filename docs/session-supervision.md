@@ -175,15 +175,17 @@ What procmgr records and guarantees. The labels and their wire format are
   new label. The handle is the authority: its holder may already destroy the process with every
   process below it, and the badge only names one of its children.
 - **End post.** procmgr keeps the death relay a create request carries (`CREATE_DEATH_RELAY`) for
-  the child's life and posts the child's end to it once, whoever ends the child: a terminal fault
-  in any thread as the fault class, and an exit as the exit reason, at the reap; a destroy, a
+  the child's life and posts the child's end to it once, whoever ends the child: a terminal fault in
+  any thread as the fault class, and an exit as the exit reason, at the reap; a destroy, a
   containment's included, as `EXIT_KILLED` after the teardown, or as the exit or fault a process
   that ended before its destroy was reaped took. procmgr posts it rather than binding the relay to
   the child's address space, so the post is one whatever number of the child's threads end, and a
   re-parent can take the relay away. A creator thereby learns of a destroy it did not make (the
-  shell, waiting on a job sessiond stopped), and an interface whose queue is a leader's relay
-  learns that its session ended. procmgr deletes its copy of the relay once it has posted, and when
-  the child is re-parented.
+  shell, waiting on a job sessiond stopped), and an interface whose queue is a leader's relay learns
+  that its session ended. procmgr deletes its copy of the relay once it has posted, and when the
+  child is re-parented. A create procmgr refuses posts nothing, one a destroy reached between the
+  child's insert and procmgr's reply included: until that reply delivers the child, the create, not
+  the destroy, tears the child down, and procmgr deletes the relay unposted.
 - **End queue.** A process may register one end queue on itself, through the procmgr SEND it
   holds, which names it. procmgr posts the process's end to it once, as to a death relay: the
   fault class or the exit reason at the reap, or the destroyed process's reason after a destroy.

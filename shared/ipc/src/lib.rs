@@ -535,7 +535,9 @@ pub mod procmgr_labels
     /// death relay and end queue. A process that has already ended and that
     /// procmgr has not reaped yet is reaped instead, its children re-parented
     /// as at its reap. Replies `SUCCESS` once the subtree is torn down, also
-    /// when the process was gone already.
+    /// when the process was gone already; a child whose create procmgr has
+    /// not answered yet is left to that create, which is refused and tears
+    /// the child down.
     /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 8:
     /// `DESTROY_PROCESS`.
     pub const DESTROY_PROCESS: u64 = 8;
@@ -590,7 +592,7 @@ pub mod procmgr_labels
     /// (`UNAUTHORIZED` on any other cap). The handle is the authority: its
     /// holder may destroy the parent with everything below it, and the badge
     /// only names one of its children. Replies `SUCCESS` once the subtree is
-    /// torn down; `INVALID_BADGE` when `data[0]` names no live child of the
+    /// torn down, as [`DESTROY_PROCESS`] does; `INVALID_BADGE` when `data[0]` names no live child of the
     /// process, or one a destroy has marked. Specified in `services/procmgr/docs/ipc-interface.md`
     /// § Label 28: `DESTROY_CHILD`.
     pub const DESTROY_CHILD: u64 = 28;

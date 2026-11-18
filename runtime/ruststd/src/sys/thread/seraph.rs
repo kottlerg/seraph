@@ -89,14 +89,14 @@ const SPAWN_CSPACE_TOPUP_SLOTS: u64 = 128;
 /// Keep the process's `CSpace` above [`SPAWN_CSPACE_LOW_WATER`] general
 /// slots, with a page of growth budget beyond them for its body arena, so a
 /// process's live thread count is bound by the RAM memmgr grants rather than
-/// by the `CSpace` its creator seeded. The check is the one memmgr's and
-/// procmgr's own low-water top-ups make (`syscall_abi::cspace_topup_pages`).
+/// by the `CSpace` its creator seeded. The test is the one every low-water
+/// hold makes (`std::os::seraph::CSpaceHeadroom`), made by each spawn itself
+/// rather than one thread at a time: the mark covers one spawn, so a spawn
+/// that ran on while another topped up could find it spent by a burst.
 /// Best-effort: a failed top-up leaves the spawn to fail at its own
 /// capability allocation if the headroom is truly spent.
 fn hold_cspace_headroom(self_cspace: u64) {
-    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
-    let headroom = crate::sys::alloc::seraph::cspace_general_headroom(self_cspace);
-    if syscall_abi::cspace_topup_pages(headroom, budget, SPAWN_CSPACE_LOW_WATER) != 0 {
+    if crate::sys::alloc::seraph::cspace_below_low_water(self_cspace, SPAWN_CSPACE_LOW_WATER) {
         let _ = crate::sys::alloc::seraph::fund_cspace_slot_budget(
             self_cspace,
             SPAWN_CSPACE_TOPUP_SLOTS,

@@ -24,6 +24,10 @@
 //!   [`map_with_top_ups`] does that: a map refused with `OutOfMemory` is topped
 //!   up and made again, up to [`MAP_TOP_UPS`] times.
 //!
+//! A pool held above a low-water mark by several threads is held through a
+//! [`LowWaterHold`]: one thread at a time reads and funds it, and a run of
+//! refused top-ups is reported once.
+//!
 //! The pool reads, the donations and the map syscalls stay with the caller.
 //! See [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
@@ -164,6 +168,129 @@ pub fn map_with_top_ups(
             }
             result => return result,
         }
+    }
+}
+
+/// What one [`LowWaterHold::hold`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held
+{
+    /// The pool was at or above its mark: nothing donated.
+    Enough,
+    /// The pool was below its mark and the top-up was made.
+    ToppedUp,
+    /// The pool was below its mark and the top-up was refused.
+    Failed,
+    /// Another thread was holding the pool: this caller neither read nor
+    /// funded it.
+    Busy,
+}
+
+/// The failure streak of a [`LowWaterHold`]: no failure since the last
+/// hold that found the pool covered or topped it up.
+const STREAK_NONE: u8 = 0;
+/// A failure streak no caller has reported yet.
+const STREAK_UNREPORTED: u8 = 1;
+/// A failure streak a caller has reported.
+const STREAK_REPORTED: u8 = 2;
+
+/// The shared state of a pool held above a low-water mark by every thread of
+/// a process: one thread at a time reads and funds the pool, and a run of
+/// refused top-ups is reported once.
+///
+/// A thread that finds another holding the pool goes on at once
+/// ([`Held::Busy`]): the mark is sized to cover the allocations every thread
+/// makes while one tops up, so none waits for the top-up. A refused top-up
+/// starts a failure streak, which the next hold that finds the pool covered
+/// or tops it up ends; [`LowWaterHold::take_report`] answers `true` once per
+/// streak, so the caller that can log does so once, whichever thread failed.
+/// The pool reads and the donations stay with the caller.
+pub struct LowWaterHold
+{
+    /// Set while a thread reads and funds the pool.
+    busy: core::sync::atomic::AtomicBool,
+    /// One of `STREAK_NONE`, `STREAK_UNREPORTED`, `STREAK_REPORTED`.
+    streak: core::sync::atomic::AtomicU8,
+}
+
+impl Default for LowWaterHold
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
+impl LowWaterHold
+{
+    /// A hold with no thread holding and no failure streak.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            busy: core::sync::atomic::AtomicBool::new(false),
+            streak: core::sync::atomic::AtomicU8::new(STREAK_NONE),
+        }
+    }
+
+    /// Hold the pool once: unless another thread is holding it, read through
+    /// `below_mark` whether it is below its mark and, when it is, top it up
+    /// through `fund`, which returns whether the top-up was made.
+    pub fn hold(&self, below_mark: impl FnOnce() -> bool, fund: impl FnOnce() -> bool) -> Held
+    {
+        use core::sync::atomic::Ordering;
+
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Held::Busy;
+        }
+        let held = if !below_mark()
+        {
+            Held::Enough
+        }
+        else if fund()
+        {
+            Held::ToppedUp
+        }
+        else
+        {
+            Held::Failed
+        };
+        if held == Held::Failed
+        {
+            // A streak already running, reported or not, stays as it is.
+            let _ = self.streak.compare_exchange(
+                STREAK_NONE,
+                STREAK_UNREPORTED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+        }
+        else
+        {
+            self.streak.store(STREAK_NONE, Ordering::Release);
+        }
+        self.busy.store(false, Ordering::Release);
+        held
+    }
+
+    /// Whether a failure streak is running that no caller has reported:
+    /// `true` at most once per streak, to the first caller that asks.
+    pub fn take_report(&self) -> bool
+    {
+        use core::sync::atomic::Ordering;
+
+        self.streak
+            .compare_exchange(
+                STREAK_UNREPORTED,
+                STREAK_REPORTED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
     }
 }
 
@@ -523,5 +650,114 @@ mod tests
             || panic!("topped up a map refused otherwise"),
         );
         assert_eq!(result, Err(INVALID));
+    }
+
+    #[test]
+    fn a_covered_pool_is_not_funded()
+    {
+        let pool = LowWaterHold::new();
+        let held = pool.hold(|| false, || panic!("funded a covered pool"));
+        assert_eq!(held, Held::Enough);
+        assert!(!pool.take_report());
+    }
+
+    #[test]
+    fn a_pool_below_its_mark_is_funded()
+    {
+        let pool = LowWaterHold::new();
+        let funded = Cell::new(0);
+        let held = pool.hold(
+            || true,
+            || {
+                funded.set(funded.get() + 1);
+                true
+            },
+        );
+        assert_eq!(held, Held::ToppedUp);
+        assert_eq!(funded.get(), 1);
+        assert!(!pool.take_report());
+    }
+
+    #[test]
+    fn a_thread_that_finds_another_holding_goes_on()
+    {
+        let pool = LowWaterHold::new();
+        let inner = Cell::new(None);
+        let outer = pool.hold(
+            || true,
+            || {
+                // Another thread's hold, made while this one funds.
+                inner.set(Some(pool.hold(
+                    || panic!("read the pool while another held it"),
+                    || panic!("funded the pool while another held it"),
+                )));
+                true
+            },
+        );
+        assert_eq!(outer, Held::ToppedUp);
+        assert_eq!(inner.get(), Some(Held::Busy));
+        // The hold is free again once the first thread is done.
+        assert_eq!(pool.hold(|| false, || true), Held::Enough);
+    }
+
+    #[test]
+    fn a_failure_streak_is_reported_once()
+    {
+        let pool = LowWaterHold::new();
+        assert_eq!(pool.hold(|| true, || false), Held::Failed);
+        assert_eq!(pool.hold(|| true, || false), Held::Failed);
+        assert!(pool.take_report(), "the streak was not reported");
+        assert!(!pool.take_report(), "the streak was reported twice");
+        assert_eq!(pool.hold(|| true, || false), Held::Failed);
+        assert!(
+            !pool.take_report(),
+            "a further failure reported the streak again"
+        );
+    }
+
+    #[test]
+    fn a_busy_hold_leaves_the_streak_as_it_is()
+    {
+        let pool = LowWaterHold::new();
+        assert_eq!(pool.hold(|| true, || false), Held::Failed);
+        let inner = Cell::new(None);
+        let _ = pool.hold(
+            || true,
+            || {
+                inner.set(Some(pool.hold(|| false, || true)));
+                false
+            },
+        );
+        assert_eq!(inner.get(), Some(Held::Busy));
+        assert!(pool.take_report(), "a busy hold ended the streak");
+    }
+
+    #[test]
+    fn a_covered_or_funded_pool_ends_the_streak()
+    {
+        for end in [Held::Enough, Held::ToppedUp]
+        {
+            let pool = LowWaterHold::new();
+            assert_eq!(pool.hold(|| true, || false), Held::Failed);
+            assert!(pool.take_report());
+            let held = pool.hold(|| end == Held::ToppedUp, || true);
+            assert_eq!(held, end);
+            assert!(!pool.take_report(), "{end:?} left the streak running");
+            // A new failure starts a new streak, reported again.
+            assert_eq!(pool.hold(|| true, || false), Held::Failed);
+            assert!(
+                pool.take_report(),
+                "the streak after {end:?} was not reported"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreported_streak_that_ends_is_not_reported()
+    {
+        let pool = LowWaterHold::new();
+        assert_eq!(pool.hold(|| true, || false), Held::Failed);
+        assert_eq!(pool.hold(|| false, || true), Held::Enough);
+        assert!(!pool.take_report(), "an ended streak was reported");
     }
 }

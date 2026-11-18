@@ -408,15 +408,14 @@ procmgr holds several capabilities per live child (its address space, CSpace, th
 memmgr caps), so spawning draws its own `CSpace`'s slots. A `CSpace` keeps its last
 `CSPACE_IPC_RECV_RESERVE` free slots for IPC capability transfer, and general allocations fail
 first ([docs/capability-model.md](../../docs/capability-model.md) § Address-space and CSpace
-growth budgets). Before it serves each request, a request worker compares its headroom
-(`std::os::seraph::cspace_slot_headroom`) and its growth budget (`CAP_INFO_CSPACE_BUDGET`)
-against `CSPACE_LOW_WATER` (256 slots) plus a page for its body arena
-(`syscall_abi::cspace_topup_pages`). Short of either, procmgr funds the slot-page pool to
-`CSPACE_TOPUP_SLOTS` (1024) through
-`std::os::seraph::fund_cspace_slot_budget`, which draws the pages from memmgr. One worker tops up
-at a time; a worker that finds another topping up serves its request without waiting, since the
-low-water mark leaves room for every worker's request. A failed top-up is logged once per streak
-of failures and retried on the next request.
+growth budgets). procmgr holds its headroom above a low-water mark through
+`std::os::seraph::CSpaceHeadroom`, whose rule
+[runtime/ruststd/README.md](../../runtime/ruststd/README.md) § CSpace slot headroom states: before
+it serves each request, a request worker holds it, and below `CSPACE_LOW_WATER` (256 slots) plus a
+page for its body arena procmgr funds the slot-page pool from memmgr for `CSPACE_TOPUP_SLOTS`
+(1024). The mark leaves room for every worker's request while one worker tops up. A failed top-up
+is retried on the next request, and the worker that finds a run of failures unreported logs it
+once.
 
 ---
 

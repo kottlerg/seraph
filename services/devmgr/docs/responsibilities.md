@@ -687,6 +687,35 @@ the RISC-V IOMMU driver, keeping no copy of either (see
 
 ---
 
+## CSpace headroom
+
+devmgr runs on the `CSpace` procmgr seeds every child with, and holds a few capabilities for each
+driver it binds, each device record's carves, each class watch, and each DMA mapping, so its
+slots grow with the drivers and classes it serves. The `CSpace`'s body arena, which holds the
+body of each `Mmio`, `IoPort`, and `Interrupt` split and copy, draws whole pages from the same
+growth budget the slot pages come from, and each page it takes lowers the capacity by a page's
+slots. devmgr holds its headroom above a low-water mark through `std::os::seraph::CSpaceHeadroom`,
+whose rule [runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § CSpace slot headroom
+states: below `CSPACE_LOW_WATER` plus a page's slots, or a growth budget below a page, it funds
+the slot-page pool from memmgr for `CSPACE_TOPUP_SLOTS`, twice the mark (`src/headroom.rs`).
+
+The mark is the most one record's bind takes, at the declaration bound of resources
+(`spawn::MAX_BOUND_RESOURCES`): devmgr's carved cap and the driver's copy of each resource, the
+spawn's other copies (the end round's endpoints, the badged creator, the argv and env, procmgr's
+create reply, the death observer's copy), and the arena pages the bodies of those caps take,
+counted as the slots of those pages, with the requests the registry's workers and the DMA thread
+serve meanwhile: about 450 slots. The page `CSpaceHeadroom` holds beyond the mark keeps the first
+of those arena pages funded.
+
+devmgr holds it before each turn of the control thread's loop (acpid's requests, hotplug jobs,
+withdrawals, and the bind passes they start), before each record's carves (PCI and platform),
+before each driver spawn (the IOMMU driver's included), before each registry request a worker
+serves, and before each DMA request. A failed top-up is retried at the next hold; the control
+thread logs a run of them once, since a registry worker or the DMA thread may be serving logd, or
+a driver logd writes through, and must not log.
+
+---
+
 ## Relationship to drivers
 
 devmgr is the sole authority for spawning device drivers. It observes each driver's death and

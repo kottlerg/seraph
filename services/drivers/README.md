@@ -104,11 +104,17 @@ services/drivers/
 │   │       ├── main.rs
 │   │       ├── input.rs            # Event virtqueue receive-buffer ring
 │   │       └── decode.rs           # Keycode → keysym tables + modifier state
-│   └── console/                    # VirtIO console driver: the debug port (binary + lib)
+│   ├── console/                    # VirtIO console driver: the debug port (binary + lib)
+│   │   ├── Cargo.toml
+│   │   ├── README.md               # Debug-port binding, serial protocol, queues
+│   │   └── src/
+│   │       ├── lib.rs              # Serial verb-bit gate, received-byte queue (host-tested)
+│   │       └── main.rs
+│   └── rng/                        # VirtIO entropy device driver: the hwrng class (binary + lib)
 │       ├── Cargo.toml
-│       ├── README.md               # Debug-port binding, serial protocol, queues
+│       ├── README.md               # hwrng binding, READ, requestq and DMA discipline
 │       └── src/
-│           ├── lib.rs              # Serial verb-bit gate, received-byte queue (host-tested)
+│           ├── lib.rs              # READ verb-bit gate, read length arithmetic (host-tested)
 │           └── main.rs
 └── docs/
     ├── driver-model.md             # Driver lifecycle and capability delegation
@@ -183,6 +189,7 @@ The full driver lifecycle is specified in
 | [`virtio/blk/`](virtio/blk/README.md) | Binary + library | VirtIO block device driver — exposes per-request DMA block-read IPC endpoint |
 | [`virtio/input/`](virtio/input/README.md) | Binary + library | VirtIO input (keyboard) device driver — decodes `EV_KEY` events into keysyms; answers `INPUT_READ_EVENTS` behind devmgr's `QUERY_DEVICE` on the `input` class |
 | [`virtio/console/`](virtio/console/README.md) | Binary + library | VirtIO console device driver — the debug port; serves the serial protocol behind devmgr's `QUERY_DEVICE` on the `debug-port` class |
+| [`virtio/rng/`](virtio/rng/README.md) | Binary + library | VirtIO entropy device driver — serves `hwrng_protocol::READ` behind devmgr's `QUERY_DEVICE` on the `hwrng` class; holds no kernel authority |
 | [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
 | [`framebuffer/`](framebuffer/README.md) | Binary + library | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
 | [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — bound by devmgr to the record whose `_HID` or a `_CID` is `PNP0B00`, `PNP0B01` or `PNP0B02`; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_DEVICE` on the `rtc` class |

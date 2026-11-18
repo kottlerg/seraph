@@ -800,17 +800,21 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             "virtio-keyboard-pci,disable-legacy=on,id=kbd0{}",
             spec.iommu.virtio_property()
         ),
-        // Boot-entropy source (KASLR, #252). The firmware's RNG driver binds
-        // this device and exposes EFI_RNG_PROTOCOL, which the bootloader draws
-        // from for the KASLR slide / direct-map base and the pool seed. On
-        // riscv64 it is the only such source (EDK2 hands the bootloader ACPI,
-        // not a DTB, so /chosen/rng-seed never reaches it); on x86-64 it backs
-        // OVMF's EFI_RNG_PROTOCOL alongside RDRAND. It stays outside the
-        // IOMMU: QEMU's transitional `virtio-rng-pci` cannot take
-        // `iommu_platform=on`, and only the firmware drives it, before any
-        // driver of the system runs.
+        // Entropy source, driven twice. The firmware's RNG driver binds it
+        // first and exposes EFI_RNG_PROTOCOL, which the bootloader draws from
+        // for the KASLR slide / direct-map base and the pool seed. On riscv64
+        // it is the only such source (EDK2 hands the bootloader ACPI, not a
+        // DTB, so /chosen/rng-seed never reaches it); on x86-64 OVMF binds it
+        // too, but its RDRAND driver answers the bootloader's draw. At run time devmgr binds
+        // the virtio-rng driver of the `hwrng` class to it. Modern-only
+        // (`disable-legacy=on`), since QEMU's transitional device cannot take
+        // `iommu_platform=on`, and behind the IOMMU like every device a
+        // driver of the system binds.
         "-device".into(),
-        "virtio-rng-pci".into(),
+        format!(
+            "virtio-rng-pci,disable-legacy=on{}",
+            spec.iommu.virtio_property()
+        ),
         "-serial".into(),
         "stdio".into(),
         "-no-reboot".into(),
@@ -1982,17 +1986,28 @@ mod tests
                 argv[first_device + 1] == RISCV_IOMMU_DEVICE,
                 iommu_device == RISCV_IOMMU_DEVICE
             );
-            // Both disks and the keyboard; the firmware-only RNG stays out.
+            // Both disks, the keyboard, and the RNG, which the firmware and
+            // the virtio-rng driver both reach through the IOMMU, modern-only.
             let devices = virtio(&argv);
             assert_eq!(devices.len(), 4);
             let behind = devices.iter().filter(|d| d.contains(",iommu_platform=on"));
-            assert_eq!(behind.count(), 3);
-            assert!(devices.iter().any(|d| d == "virtio-rng-pci"));
+            assert_eq!(behind.count(), 4);
+            assert!(
+                devices
+                    .iter()
+                    .any(|d| d == "virtio-rng-pci,disable-legacy=on,iommu_platform=on")
+            );
 
             spec.iommu = Iommu::Absent;
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(!argv.iter().any(|a| a.contains("iommu")));
-            assert_eq!(virtio(&argv).len(), 4);
+            let devices = virtio(&argv);
+            assert_eq!(devices.len(), 4);
+            assert!(
+                devices
+                    .iter()
+                    .any(|d| d == "virtio-rng-pci,disable-legacy=on")
+            );
         }
     }
 

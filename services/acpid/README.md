@@ -18,6 +18,7 @@ acpid/
     ├── lib.rs            # Host-tested library: `Failure`, `Why`
     ├── power.rs          # Power requests: decode, `\_S5_`, `\_PTS`, the `PM1a_CNT` values
     ├── events.rs         # The fixed power button and the GPEs: arm, scan, dispatch, re-enable
+    ├── hotplug.rs        # PCI hotplug: the `Notify` values, the slot's port, `_EJ0` and `_OST`
     ├── walk.rs           # The `_STA` / `_INI` initialization walk
     ├── bridge.rs         # Host bridges: `_HID`/`_CID`, `_SEG`, `_BBN`, `_OSC`, `_CRS`, `_PRT`
     ├── table.rs          # Where a served table sits in its region's mapping
@@ -27,7 +28,8 @@ acpid/
     ├── devmgr.rs         # The calls acpid makes on devmgr
     ├── platform.rs       # The evaluator's `Host`: region grants, configuration access
     ├── startup.rs        # The start-up sequence and the pushes
-    ├── server.rs         # The work loop, the receivers, the event thread, `WAIT_EVENT`
+    ├── server.rs         # The work loop, the receivers, the event and hotplug threads,
+    │                     # `WAIT_EVENT`
     └── arch/
         ├── mod.rs            # Arch dispatch: `arch::current`
         ├── x86_64/mod.rs     # ACPI mode, port I/O, the APIC model, PM1a_CNT, RESET_REG,
@@ -35,25 +37,25 @@ acpid/
         └── riscv64/mod.rs    # No I/O space, one interrupt model, no power registers or events
 ```
 
-The library (`lib.rs`, `walk.rs`, `bridge.rs`, `table.rs`, `power.rs`, `events.rs`) holds the
-evaluation logic and is host-tested over the QEMU tables `shared/aml/fixtures/` holds; the binary
-gives it a `Host` that reaches hardware only through devmgr.
+The library (`lib.rs`, `walk.rs`, `bridge.rs`, `table.rs`, `power.rs`, `events.rs`, `hotplug.rs`)
+holds the evaluation logic and is host-tested over the QEMU tables `shared/aml/fixtures/` holds; the
+binary gives it a `Host` that reaches hardware only through devmgr.
 
 ---
 
 ## Responsibilities
 
 acpid is a svcmgr service, launched on every boot of both architectures from
-`rootfs/config/svcmgr/services/acpid.svc` (`restart = on_failure`, `critical = no`). It is
-the only process that evaluates AML: devmgr evaluates none
-([docs/driver-binding.md](../../docs/driver-binding.md) § Device Records). It loads the DSDT
-and the SSDTs devmgr serves, switches an x86-64 platform into ACPI mode, runs the
-initialization walk, and evaluates each PCI host bridge's `_OSC`, `_CRS` and `_PRT`
-([docs/startup.md](docs/startup.md)). It pushes the results to devmgr, which keeps those that
-agree with its boot records and serves them per bridge with `QUERY_HOST_BRIDGE`
-([docs/devmgr.md](docs/devmgr.md) § Pushes). On x86-64 it then takes the SCI and handles the
-ACPI events: the fixed power button, which it reports to pwrmgr, and the general-purpose events
-(GPEs), whose `\_GPE` methods it runs (§ Events).
+`rootfs/config/svcmgr/services/acpid.svc` (`restart = on_failure`, `critical = no`). It is the only
+process that evaluates AML: devmgr evaluates none
+([docs/driver-binding.md](../../docs/driver-binding.md) § Device Records). It loads the DSDT and the
+SSDTs devmgr serves, switches an x86-64 platform into ACPI mode, runs the initialization walk, and
+evaluates each PCI host bridge's `_OSC`, `_CRS` and `_PRT` ([docs/startup.md](docs/startup.md)). It
+pushes the results to devmgr, which keeps those that agree with its boot records and serves them per
+bridge with `QUERY_HOST_BRIDGE` ([docs/devmgr.md](docs/devmgr.md) § Pushes). On x86-64 it then takes
+the SCI and handles the ACPI events: the fixed power button, which it reports to pwrmgr, and the
+general-purpose events (GPEs), whose `\_GPE` methods it runs (§ Events). It posts the firmware's PCI
+hotplug events to devmgr and completes each with the slot's `_EJ0` and `_OST` (§ Hotplug).
 
 acpid is a provider: its recipe's `provides = acpid.power:auth acpid.deny:deny` makes svcmgr
 create its service endpoint and publish two SENDs on it, the seed-only `acpid.power`, carrying
@@ -141,17 +143,56 @@ Once the start-up ends, acpid arms the events:
   on, and the GPEs handled. When the SCI cannot be taken, acpid disables every event and clears
   every status, those a dead acpid of the boot left enabled among them, and handles none.
 
-The event thread blocks on the SCI's notification alone. On each SCI it reads the PM1 and GPE
-status and enable registers, disables each event whose status and enable are both set, leaving
-its status set, hands it on and acknowledges the interrupt; it runs no AML and makes no IPC. The
-evaluation thread runs each GPE's method: for `_Exx` it clears the status first, for `_Lxx`
-after the method, and then enables the GPE again. A `Notify` the method makes is logged and
-dropped ([docs/startup.md](docs/startup.md) § The host). A power-button press is logged as
-`power button pressed` and posted for `WAIT_EVENT`; its status is cleared and the button
-enabled again once a `WAIT_EVENT` reply that carries it is delivered. pwrmgr waits in
-`WAIT_EVENT` and powers the platform off on a press
+The event thread blocks on the SCI's notification alone. On each SCI it reads the PM1 and GPE status
+and enable registers, disables each event whose status and enable are both set, leaving its status
+set, hands it on and acknowledges the interrupt; it runs no AML and makes no IPC. The evaluation
+thread runs each GPE's method: for `_Exx` it clears the status first, for `_Lxx` after the method,
+and then enables the GPE again. A `Notify` the method makes of a PCI hotplug slot is acted on after
+it (§ Hotplug); any other is logged and dropped ([docs/startup.md](docs/startup.md) § The host). A
+power-button press is logged as `power button pressed` and posted for `WAIT_EVENT`; its status is
+cleared and the button enabled again once a `WAIT_EVENT` reply that carries it is delivered. pwrmgr
+waits in `WAIT_EVENT` and powers the platform off on a press
 ([pwrmgr](../pwrmgr/README.md#responsibilities)). RISC-V platforms have no fixed events: QEMU
 `virt`'s FADT is hardware-reduced.
+
+---
+
+## Hotplug
+
+On x86-64 q35 with QEMU's ACPI PCI hotplug on, its default, the firmware drives the hotplug slots
+behind its root ports: `_OSC` withholds native hotplug control, and devmgr leaves each such slot to
+it ([devmgr's hotplug.md](../devmgr/docs/hotplug.md#acpi-hotplug) § ACPI Hotplug). The firmware's
+GPE method (`\_GPE._E01`) notifies the device of each slot that changed. acpid keeps the
+`Notify` calls of hotplug events a method makes, once per object and event
+([docs/limits.md](../../docs/limits.md)), and after the method acts on each:
+
+- a Bus Check (0) or a Device Check (1) is a device check, an Eject Request (3) an eject request;
+  any other value is logged and dropped;
+- the slot's port is resolved: the notified device has an `_ADR`, and its parent and each
+  device above it up to a host bridge acpid found are PCI-to-PCI bridges, each named by its
+  `_ADR`; the port is the parent, on the bus each bridge above it leads to, read from its
+  Secondary Bus Number through devmgr. A device on a root bus, or one no such route reaches, is
+  logged and dropped;
+- an event the slot already holds, the firmware's repeat of it, is dropped; the method notifies an
+  eject request again on every GPE until the card is ejected.
+
+acpid logs `hotplug: device check` or `eject request` with the slot's path and port, and posts the
+event to devmgr with `ACPI_HOTPLUG`, as `HOTPLUG_ADDED` or `HOTPLUG_REMOVED`. A dedicated hotplug
+thread makes the call, one event at a time, so the evaluation thread serves power requests and
+GPEs while devmgr runs the job; a slot's next event waits until its previous one ends. devmgr
+replies once its job has ended, with the functions it recorded or removed
+(`shared/ipc/src/lib.rs`, `devmgr_labels::ACPI_HOTPLUG`). The evaluation thread then completes
+the event:
+
+- an eject request devmgr ran is ejected: acpid runs the slot's `_EJ0(1)`, on which the firmware
+  lets the card go, logged `ejected (_EJ0) once devmgr removed` with the count. devmgr has by then
+  withdrawn the driver and removed the records;
+- where the slot has an `_OST`, acpid runs it with the `Notify` value and the outcome: success,
+  ejection not supported (0x80) for an eject request devmgr refused, or failure. QEMU's slots have
+  no `_OST`.
+
+An eject request devmgr refused, or whose call failed, is not ejected: the card stays, and a slot
+devmgr does not leave to the firmware is never ejected under it.
 
 ---
 
@@ -160,8 +201,9 @@ enabled again once a `WAIT_EVENT` reply that carries it is delivered. pwrmgr wai
 acpid holds no hardware capability of its own. Beside its service endpoint's `RECV`, its one
 capability, the `devmgr.acpi` seed, carries `ACPI_AUTHORITY`, under which devmgr serves it the
 FADT's register blocks and grants it, on first use, each `SystemIO` or `SystemMemory` operation
-region its AML reaches. devmgr refuses, logged, a range that a device record, a driver or the kernel
-holds (the interrupt controllers and, on x86-64, the legacy ports it drives), the
+region its AML reaches. devmgr refuses, logged, a range that a device record (a resource container's
+aside, [docs/driver-binding.md](../../docs/driver-binding.md) § Device Records), a driver or the
+kernel holds (the interrupt controllers and, on x86-64, the legacy ports it drives), the
 configuration-mechanism ports 0xCF8-0xCFF, the FACS, and memory outside the `Mmio` apertures it
 still holds, which leaves out RAM and ACPI NVS. Memory is granted a page at a time. A field access
 in a refused region fails and its method aborts. `PCI_Config` regions are reached one access at a

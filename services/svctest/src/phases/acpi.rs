@@ -200,6 +200,7 @@ fn authority_deny_phase(caps: &Caps)
         (ipc::devmgr_labels::OSC_RESULT, "OSC_RESULT"),
         (ipc::devmgr_labels::BRIDGE_WINDOWS, "BRIDGE_WINDOWS"),
         (ipc::devmgr_labels::PRT_TABLE, "PRT_TABLE"),
+        (ipc::devmgr_labels::ACPI_HOTPLUG, "ACPI_HOTPLUG"),
     ]
     {
         let req = ipc::IpcMessage::builder(label)

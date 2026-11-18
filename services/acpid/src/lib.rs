@@ -8,7 +8,8 @@
 //! routes ([`bridge`]), run by the [`aml`] evaluator over any [`aml::Host`], and
 //! where a served table sits in its region's mapping ([`table`]); the
 //! decoding and evaluation of the power requests acpid serves ([`power`]);
-//! and the fixed and general-purpose events it dispatches ([`events`]).
+//! the fixed and general-purpose events it dispatches ([`events`]); and the
+//! PCI hotplug events of the firmware's `Notify` ([`hotplug`]).
 //!
 //! The binary (`main.rs`) gives the evaluator a host that reaches the
 //! hardware through the grants devmgr makes, logs the failures this library
@@ -16,6 +17,7 @@
 
 pub mod bridge;
 pub mod events;
+pub mod hotplug;
 pub mod power;
 pub mod table;
 pub mod walk;

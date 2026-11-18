@@ -118,6 +118,7 @@ pub fn request_words(label: u64, count: u64) -> Option<usize>
             windows.checked_mul(3)?.checked_add(4)
         }
         labels::PRT_TABLE => Some(labels::PRT_TABLE_WORDS),
+        labels::ACPI_HOTPLUG => Some(3),
         _ => None,
     }
 }
@@ -193,7 +194,8 @@ pub fn platform_range(resource: CrsResource) -> Option<Range>
 pub enum Holder
 {
     /// A resource of a device record: a PCI BAR or a platform record's
-    /// `Mmio` or `IoPort`, whether or not a driver holds it yet.
+    /// `Mmio` or `IoPort`, whether or not a driver holds it yet, a resource
+    /// container's aside ([`HeldRange`]).
     Device,
     /// The configuration-mechanism ports ([`CONFIG_PORTS`]).
     ConfigMechanism,
@@ -205,6 +207,16 @@ pub enum Holder
     Kernel,
 }
 
+/// A memory or I/O range a device record not removed holds, and whether
+/// that record is a resource container ([`crate::binding::container`]),
+/// whose ranges are the firmware's own registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldRange
+{
+    pub range: Range,
+    pub container: bool,
+}
+
 /// Why a region is refused: the holder and the range of its it overlaps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Refusal
@@ -214,14 +226,16 @@ pub struct Refusal
 }
 
 /// Whether devmgr refuses acpid the region `want` ([`grant_range`]'s
-/// range): the first range of `devices` (each record's resources), then of
-/// `kernel` (the kernel's interrupt controllers and ports), then
-/// [`CONFIG_PORTS`], then `facs` that `want` overlaps.
+/// range): the first range of `devices` (each record's resources, a
+/// resource container's left out), then of `kernel` (the kernel's interrupt
+/// controllers and ports), then [`CONFIG_PORTS`], then `facs` that `want`
+/// overlaps. A container's range is granted only where no other holder
+/// refuses it, a device record that shares it among them.
 /// `None` lets the request go on to the carve, which refuses memory no
 /// aperture devmgr still holds covers.
 pub fn region_refusal(
     want: &Range,
-    devices: impl IntoIterator<Item = Range>,
+    devices: impl IntoIterator<Item = HeldRange>,
     kernel: &[Range],
     facs: Option<Range>,
 ) -> Option<Refusal>
@@ -231,6 +245,8 @@ pub fn region_refusal(
     };
     devices
         .into_iter()
+        .filter(|held| !held.container)
+        .map(|held| held.range)
         .find_map(refused(Holder::Device))
         .or_else(|| kernel.iter().copied().find_map(refused(Holder::Kernel)))
         .or_else(|| refused(Holder::ConfigMechanism)(CONFIG_PORTS))
@@ -918,6 +934,7 @@ pub fn check_prt<'a>(
 mod tests
 {
     use super::*;
+    use crate::binding::{RecordKeys, container};
     use crate::scan::MAX_BARS;
     use virtio_core::VirtioPciStartupInfo;
 
@@ -1038,7 +1055,12 @@ mod tests
             base: 0x3F8,
             count: 8,
         });
-        let devices = || pci_ranges(&nic).chain(serial);
+        let devices = || {
+            pci_ranges(&nic).chain(serial).map(|range| HeldRange {
+                range,
+                container: false,
+            })
+        };
         let kernel = [memory(0xFEE0_0000, 0xFEE0_1000), io(0x40, 0x44)];
         let facs = Some(memory(0x7FEB_1000, 0x7FEB_1040));
         let refused =
@@ -1071,6 +1093,51 @@ mod tests
         assert_eq!(refused(memory(0xFED0_0000, 0xFED0_1000)), None);
         let refusal = region_refusal(&io(0x6000, 0x6001), devices(), &kernel, facs);
         assert_eq!(refusal.map(|r| r.range), Some(io(0x6000, 0x6020)));
+    }
+
+    #[test]
+    fn a_resource_containers_range_is_granted_unless_another_holder_refuses_it()
+    {
+        let keys = |hid: &'static [u8], cids: &'static [&'static [u8]]| RecordKeys {
+            pci: None,
+            acpi_hid: Some(hid),
+            acpi_cids: cids,
+            spcr: None,
+            platform: None,
+            iommu_family: None,
+            boot_framebuffer: false,
+        };
+        let held = |range: Range, record: RecordKeys<'_>| HeldRange {
+            range,
+            container: container(&record),
+        };
+        // QEMU q35: the PCI hotplug block (\_SB.PCI0.PHPR) and the CPU
+        // hotplug block (\_SB.PCI0.PRES), both PNP0A06; a UART whose own
+        // ID sits beside a container _CID; a container over the PIT's ports
+        // and one over the configuration ports.
+        let devices = [
+            held(io(0xCC0, 0xCD8), keys(b"PNP0A06", &[])),
+            held(io(0xCD8, 0xCE4), keys(b"PNP0A06", &[])),
+            held(io(0x2F8, 0x300), keys(b"PNP0501", &[b"PNP0C02"])),
+            held(io(0x40, 0x44), keys(b"PNP0C02", &[])),
+            held(io(0xCF8, 0xD00), keys(b"PNP0C02", &[])),
+            held(io(0x7000, 0x7100), keys(b"PNP0C02", &[])),
+            held(io(0x7080, 0x7090), keys(b"PNP0B00", &[])),
+        ];
+        let kernel = [io(0x40, 0x44)];
+        let refused = |want: Range| region_refusal(&want, devices, &kernel, None).map(|r| r.holder);
+
+        // The firmware's own registers are granted.
+        assert_eq!(refused(io(0xCD0, 0xCD8)), None);
+        assert_eq!(refused(io(0xCD8, 0xCE4)), None);
+        // Mixed keys are a device's: refused through its record.
+        assert_eq!(refused(io(0x2F8, 0x300)), Some(Holder::Device));
+        // A container's range that another record also holds is refused
+        // through that record, and the fixed refusals still win.
+        assert_eq!(refused(io(0x7080, 0x7081)), Some(Holder::Device));
+        assert_eq!(refused(io(0x7000, 0x7010)), None);
+        assert_eq!(refused(io(0x40, 0x44)), Some(Holder::Kernel));
+        assert_eq!(refused(io(0xCF8, 0xD00)), Some(Holder::ConfigMechanism));
     }
 
     #[test]
@@ -1147,6 +1214,7 @@ mod tests
             Some(4 + 3 * labels::MAX_BRIDGE_WINDOWS)
         );
         assert_eq!(request_words(labels::PRT_TABLE, 0), Some(36));
+        assert_eq!(request_words(labels::ACPI_HOTPLUG, 0), Some(3));
         assert_eq!(request_words(labels::QUERY_HOST_BRIDGE, 0), None);
     }
 

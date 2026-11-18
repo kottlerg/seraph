@@ -599,10 +599,10 @@ devmgr's responsibilities are:
   a seed-only name pwrmgr alone seeds, which svcmgr's `QUERY_ENDPOINT`
   refuses.
 - **Serve acpid** — acpid, the service that evaluates AML, calls devmgr and devmgr never calls
-  acpid. Labels 24 to 29 (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`,
-  `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`) are gated on `ACPI_AUTHORITY`, which only the
-  seed-only `devmgr.acpi` cap carries, seeded by acpid's recipe alone
-  ([acpid and devmgr](../../acpid/docs/devmgr.md) § Capabilities).
+  acpid. Labels 24 to 29 and 31 (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`,
+  `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`, `ACPI_HOTPLUG`) are gated on
+  `ACPI_AUTHORITY`, which only the seed-only `devmgr.acpi` cap carries, seeded by acpid's
+  recipe alone ([acpid and devmgr](../../acpid/docs/devmgr.md) § Capabilities).
   - devmgr grants each operation region acpid's AML reaches against its policy, and makes
     each configuration-space access for it
     ([acpid and devmgr](../../acpid/docs/devmgr.md) § Region grants and § Configuration access).
@@ -622,8 +622,10 @@ devmgr's responsibilities are:
   them in a hotplug batch (above). When a card leaves, or its removal is asked for with the
   attention button, the poller posts the removal; the control thread withdraws each driver behind
   the slot as below, quiesces the functions, returns their BAR pages to the apertures and removes
-  their records, and the poller then powers the slot off. The ACPI hotplug source is design
-  intent; not yet implemented. See [`docs/hotplug.md`](hotplug.md).
+  their records, and the poller then powers the slot off. A slot whose firmware drives hotplug
+  (its `_OSC` withholds native control) is left to the firmware: devmgr holds the BAR pages
+  behind it, and runs the add or removal job for each `ACPI_HOTPLUG` event acpid posts. See
+  [`docs/hotplug.md`](hotplug.md).
 
 ---
 

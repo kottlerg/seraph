@@ -1,12 +1,13 @@
 # hotplug-check
 
-Test-tier fixture that proves devmgr's PCI Express native hotplug add and removal paths: it waits
-for devmgr to serve the `test-dma` fixture on an `edu` device the host hot-adds behind a root port
-and checks that the device's DMA and its MSI work; then that devmgr withdraws the driver when the
-host removes the device, and that the device added again is served anew, works, and is charged none
-of its predecessor's IOMMU faults. So `cargo xtask test-hotplug` follows an arrival from the slot to
-a bound driver, and a removal back to an empty slot. It is gated and opt-in: its recipe lives in
-`/config/svcmgr/tests/`, and only `test-hotplug` stages it, for its own boots.
+Test-tier fixture that proves devmgr's PCI Express hotplug add and removal paths, native and through
+acpid: it waits for devmgr to serve the `test-dma` fixture on an `edu` device the host hot-adds
+behind a root port and checks that the device's DMA and its MSI work; then that devmgr withdraws the
+driver when the host removes the device, and that the device added again is served anew, works, and
+is charged none of its predecessor's IOMMU faults. So `cargo xtask test-hotplug` follows an arrival
+from the slot to a bound driver, and a removal back to an empty slot, under each hotplug control. It
+is gated and opt-in: its recipe lives in `/config/svcmgr/tests/`, and only `test-hotplug` stages it,
+for its own boots.
 
 ---
 

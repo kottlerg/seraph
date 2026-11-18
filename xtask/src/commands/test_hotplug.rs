@@ -3,28 +3,34 @@
 
 // xtask/src/commands/test_hotplug.rs
 
-//! PCI Express native hotplug test: a device hot-added behind a root port is
-//! found by devmgr, given its BARs, recorded, and bound, and its driver's DMA
-//! and MSI work; removed, its driver is withdrawn and the slot powered off;
-//! added again, it is bound anew and works.
+//! PCI Express hotplug test: a device hot-added behind a root port is found by
+//! devmgr, given its BARs, recorded, and bound, and its driver's DMA and MSI
+//! work; removed, its driver is withdrawn and the slot powered off or
+//! ejected; added again, it is bound anew and works.
 //!
 //! Stages the `hotplug-check` fixture's recipe and the `test-dma` class into the
 //! boot set, repacks the disk images in the layout they have, and boots the
 //! current sysroot with an empty `pcie-root-port` and a QMP socket. Once devmgr
-//! logs the slot managed ([`MANAGED_MARKER`]) and the fixture logs
-//! [`READY_MARKER`], the host hot-adds QEMU's `edu` device behind the port
-//! (QMP `device_add`). Once the fixture logs [`REMOVE_MARKER`], the host
-//! removes it (QMP `device_del`, which presses the slot's attention button)
-//! and waits for QEMU's `DEVICE_DELETED`, which QEMU sends once devmgr powers
-//! the slot off; devmgr's removal lines must come in their order
-//! ([`REMOVAL_MARKERS`]). Once the fixture logs [`READD_MARKER`], the host
-//! adds the device again and waits for the fixture's verdict. On `x86_64` that boot
-//! turns QEMU's ACPI PCI hotplug off, so `_OSC` grants native control; a boot
-//! before it, with the machine's default, checks that devmgr leaves the slot
-//! alone when `_OSC` withholds it ([`REFUSED_MARKER`]). On riscv64 the
-//! platform description table grants it. The staged files are always
-//! removed and the images repacked in that layout afterwards. The host kills
-//! QEMU, as `test-debug-port` does.
+//! logs the slot's grant and the fixture logs [`READY_MARKER`], the host
+//! hot-adds QEMU's `edu` device behind the port (QMP `device_add`). Once the
+//! fixture logs [`REMOVE_MARKER`], the host removes it (QMP `device_del`)
+//! and waits for QEMU's `DEVICE_DELETED`; devmgr's removal lines must come in
+//! their order. Once the fixture logs [`READD_MARKER`], the host adds the
+//! device again and waits for the fixture's verdict.
+//!
+//! Each boot runs that cycle under one hotplug control. Under native control
+//! devmgr manages the slot ([`MANAGED_MARKER`]): `device_del` presses the
+//! slot's attention button, and QEMU deletes the device once devmgr powers the
+//! slot off ([`NATIVE_REMOVAL`]). Under the firmware's, q35's default on
+//! `x86_64`, `_OSC` withholds native control and devmgr leaves the slot to
+//! the firmware ([`FIRMWARE_MARKER`]): QEMU's GPE method notifies the slot's
+//! device, acpid posts devmgr's job, and `device_del` completes once acpid
+//! runs the slot's `_EJ0` after devmgr's removal ([`FIRMWARE_REMOVAL`],
+//! [`EJECT_MARKER`]). On `x86_64` both boots run, the firmware's first, the
+//! native one with QEMU's ACPI PCI hotplug off, so `_OSC` grants native
+//! control; on riscv64 the platform description table grants it. The staged
+//! files are always removed and the images repacked in that layout
+//! afterwards. The host kills QEMU, as `test-debug-port` does.
 //!
 //! A pure runner: requires a populated sysroot from `cargo xtask build`.
 
@@ -70,17 +76,32 @@ const REMOVE_MARKER: &str = "[hotplug-check] READY for the removal";
 /// in sync with `services/hotplug-check/src/main.rs`.
 const READD_MARKER: &str = "[hotplug-check] WITHDRAWN at ordinal 0; READY for the re-added device";
 
-/// devmgr's lines of a removal, in the order they must come: the poller
-/// starts the removal at the end of the attention button's abort window, the
-/// driver's held memory is released once its device is withdrawn, the
-/// removal job ends, and the poller powers the slot off. Kept in sync with
-/// `services/devmgr/src/hotplug.rs` and `services/devmgr/src/bind.rs`.
-const REMOVAL_MARKERS: [&str; 4] = [
+/// devmgr's lines of a native removal, in the order they must come: the
+/// poller starts the removal at the end of the attention button's abort
+/// window, the driver's held memory is released once its device is
+/// withdrawn, the removal job ends, and the poller powers the slot off. Kept
+/// in sync with `services/devmgr/src/hotplug.rs` and
+/// `services/devmgr/src/bind.rs`.
+const NATIVE_REMOVAL: [&str; 4] = [
     "removing its functions (its attention button's abort window elapsed)",
     "driver withdrawn, its memory released",
     "functions removed: 1, drivers withdrawn: 1,",
     "powered off (empty)",
 ];
+
+/// devmgr's lines of a removal the firmware asks for, in the order they must
+/// come: acpid's job starts the removal, the driver's held memory is released
+/// once its device is withdrawn, and the removal job ends. Kept in sync with
+/// `services/devmgr/src/hotplug.rs` and `services/devmgr/src/bind.rs`.
+const FIRMWARE_REMOVAL: [&str; 3] = [
+    "removing its functions (the firmware's eject request)",
+    "driver withdrawn, its memory released",
+    "functions removed: 1, drivers withdrawn: 1,",
+];
+
+/// acpid's line once it ran the slot's `_EJ0` after devmgr's removal job.
+/// Kept in sync with `services/acpid/src/server.rs`.
+const EJECT_MARKER: &str = "ejected (_EJ0) once devmgr removed 1 functions";
 
 /// The fixture's line when every check passed.
 const PASS_MARKER: &str = "[hotplug-check] PASS";
@@ -93,8 +114,9 @@ const FAIL_MARKER: &str = "[hotplug-check] FAIL";
 const MANAGED_MARKER: &str = "managed (native control by";
 
 /// devmgr's line for a slot whose host bridge's `_OSC` withholds native
-/// control. Kept in sync with `services/devmgr/src/hotplug.rs`.
-const REFUSED_MARKER: &str = "not managed: _OSC control";
+/// control, which it leaves to the firmware. Kept in sync with
+/// `services/devmgr/src/hotplug.rs`.
+const FIRMWARE_MARKER: &str = "firmware hotplug: _OSC control";
 
 /// The id `device_add` gives the hot-added `edu`.
 const DEVICE_ID: &str = "hotplug-edu";
@@ -108,7 +130,7 @@ const VERDICT_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Budget for a removal, from `device_del` to devmgr's last removal line:
 /// past the poller's period, the attention button's five-second abort
-/// window, and the withdrawal.
+/// window, and the withdrawal, or acpid's job and `_EJ0`.
 const REMOVAL_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
@@ -141,7 +163,7 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
     booted?;
     step(
         "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
-         driver and powered the slot off, and it was bound again)",
+         driver and powered the slot off or ejected it, and it was bound again)",
     );
     Ok(())
 }
@@ -175,8 +197,8 @@ fn unstage(staged: &[(PathBuf, PathBuf)]) -> Result<()>
     result
 }
 
-/// The boots of the test: on `x86_64` the machine's default first, which
-/// must leave the slot unmanaged, then native control; on riscv64 native
+/// The boots of the test: on `x86_64` the machine's default first, the
+/// firmware's hotplug through acpid, then native control; on riscv64 native
 /// control (the platform table's grant).
 fn boots(ctx: &Context, args: &TestHotplugArgs, layout: DiskLayout) -> Result<()>
 {
@@ -260,9 +282,9 @@ fn boot(
 }
 
 /// Read the serial stream of `child` and run the check of a boot under
-/// `control`: under the machine's default on `x86_64`, devmgr refuses the slot;
-/// under native control, devmgr manages it, the host hot-adds `edu` once
-/// the fixture is ready, and the fixture passes.
+/// `control`: devmgr takes the slot's grant (managed, or left to the
+/// firmware), the host hot-adds `edu` once the fixture is ready, removes it,
+/// adds it again, and the fixture passes.
 fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()>
 {
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
@@ -288,37 +310,32 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
         rx,
         start: Instant::now(),
     };
-    if control == HotplugControl::Firmware
+    // The grant devmgr must log for the slot, and the one it must not.
+    let (grant, wrong) = match control
     {
-        let line = lines.until(BOOT_TIMEOUT, "devmgr's refusal of the slot", |l| {
-            l.contains(MANAGED_MARKER) || l.contains(REFUSED_MARKER)
-        })?;
-        if !line.contains(REFUSED_MARKER)
-        {
-            bail!("devmgr managed the slot while _OSC withholds native control: {line}");
-        }
-        return Ok(());
-    }
-    let (mut managed, mut ready) = (false, false);
-    while !(managed && ready)
+        HotplugControl::Firmware => (FIRMWARE_MARKER, MANAGED_MARKER),
+        HotplugControl::Native => (MANAGED_MARKER, FIRMWARE_MARKER),
+    };
+    let (mut granted, mut ready) = (false, false);
+    while !(granted && ready)
     {
         let line = lines.until(
             BOOT_TIMEOUT,
-            "the slot managed and the fixture ready",
+            "the slot's grant and the fixture ready",
             |l| {
-                [MANAGED_MARKER, REFUSED_MARKER, READY_MARKER, FAIL_MARKER]
+                [grant, wrong, READY_MARKER, FAIL_MARKER]
                     .iter()
                     .any(|m| l.contains(m))
             },
         )?;
-        if line.contains(REFUSED_MARKER) || line.contains(FAIL_MARKER)
+        if line.contains(wrong) || line.contains(FAIL_MARKER)
         {
-            bail!("before the hot-add: {line}");
+            bail!("before the hot-add, under {control:?} control: {line}");
         }
-        managed |= line.contains(MANAGED_MARKER);
+        granted |= line.contains(grant);
         ready |= line.contains(READY_MARKER);
     }
-    step("hotplug test: slot managed and the fixture ready; hot-adding edu");
+    step("hotplug test: slot granted and the fixture ready; hot-adding edu");
     let add = || {
         qmp::device_add(
             socket,
@@ -343,8 +360,12 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
     qmp::device_del(socket, DEVICE_ID, REMOVAL_TIMEOUT)?;
     step("hotplug test: QEMU deleted the device");
     lines.start = Instant::now();
-    removal(&lines)?;
-    step("hotplug test: devmgr withdrew the driver and powered the slot off; adding edu again");
+    match control
+    {
+        HotplugControl::Firmware => removal(&lines, &FIRMWARE_REMOVAL, Some(EJECT_MARKER))?,
+        HotplugControl::Native => removal(&lines, &NATIVE_REMOVAL, None)?,
+    }
+    step("hotplug test: devmgr withdrew the driver and the slot let the card go; adding edu again");
     add()?;
     lines.start = Instant::now();
     let verdict = lines.until(VERDICT_TIMEOUT, "the fixture's verdict", |l| {
@@ -357,20 +378,23 @@ fn watch(child: &mut Child, socket: &Path, control: HotplugControl) -> Result<()
     Ok(())
 }
 
-/// Read the lines of a removal: each of devmgr's [`REMOVAL_MARKERS`] once, in
-/// their order, and the fixture's [`READD_MARKER`], which may come among
-/// them, since the fixture sees the driver withdrawn as devmgr takes it out
-/// of its class.
-fn removal(lines: &Lines) -> Result<()>
+/// Read the lines of a removal: each of devmgr's `markers` once, in their
+/// order; the fixture's [`READD_MARKER`], which may come among them, since
+/// the fixture sees the driver withdrawn as devmgr takes it out of its
+/// class; and `also`, when given, a line of another service that may come
+/// among them too.
+fn removal(lines: &Lines, markers: &[&str], also: Option<&str>) -> Result<()>
 {
     let mut next = 0usize;
     let mut withdrawn = false;
-    while next < REMOVAL_MARKERS.len() || !withdrawn
+    let mut seen = also.is_none();
+    while next < markers.len() || !withdrawn || !seen
     {
         let line = lines.until(REMOVAL_TIMEOUT, "the removal's lines", |l| {
             l.contains(READD_MARKER)
                 || l.contains(FAIL_MARKER)
-                || REMOVAL_MARKERS.iter().any(|m| l.contains(m))
+                || also.is_some_and(|m| l.contains(m))
+                || markers.iter().any(|m| l.contains(m))
         })?;
         if line.contains(FAIL_MARKER)
         {
@@ -381,7 +405,12 @@ fn removal(lines: &Lines) -> Result<()>
             withdrawn = true;
             continue;
         }
-        match REMOVAL_MARKERS.iter().position(|m| line.contains(m))
+        if also.is_some_and(|m| line.contains(m))
+        {
+            seen = true;
+            continue;
+        }
+        match markers.iter().position(|m| line.contains(m))
         {
             Some(at) if at == next => next = next.saturating_add(1),
             _ => bail!("removal line out of order or repeated: {line}"),

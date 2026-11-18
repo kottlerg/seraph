@@ -11,8 +11,9 @@
 //! use; acpid binds the `IoPort` to the evaluation thread or maps the
 //! `Mmio`, and keeps the grant. A refused span is kept too, so it is asked
 //! for once. A configuration-space access is one
-//! `ACPI_PCI_CONFIG` call. `Notify` is logged and dropped: no consumer of
-//! the notifications runs yet. acpid holds no Global Lock, since devmgr
+//! `ACPI_PCI_CONFIG` call. Each `Notify` is kept, up to [`MAX_NOTES`], for
+//! the evaluation thread to act on once the evaluation ends
+//! ([`Platform::take_notes`]). acpid holds no Global Lock, since devmgr
 //! refuses the FACS, so the evaluator's acquisition fails.
 
 use std::time::{Duration, Instant};
@@ -27,6 +28,16 @@ use crate::devmgr::{CallError, Devmgr};
 
 /// The page size of an `Mmio` grant.
 const PAGE_SIZE: u64 = 0x1000;
+
+/// The most `Notify` calls kept between two takes
+/// ([`Platform::take_notes`]); a later one is logged and dropped
+/// (`docs/limits.md`). A QEMU GPE method notifies one device per slot with a
+/// pending event, at most 32 per bus.
+pub const MAX_NOTES: usize = 32;
+
+/// A `Notify` the evaluated code made: the object's absolute path, root
+/// first, and the value.
+pub type Note = (Vec<Seg>, u64);
 
 /// A region devmgr granted, held for acpid's lifetime.
 struct Held
@@ -50,6 +61,7 @@ pub struct Platform<'a>
     held: Vec<Held>,
     refused: Vec<(u64, Span)>,
     start: Instant,
+    notes: Vec<Note>,
 }
 
 impl<'a> Platform<'a>
@@ -65,7 +77,20 @@ impl<'a> Platform<'a>
             held: Vec::new(),
             refused: Vec::new(),
             start: Instant::now(),
+            notes: Vec::new(),
         }
+    }
+
+    /// The calls to devmgr this host makes its accesses through.
+    pub const fn devmgr(&self) -> &'a Devmgr
+    {
+        self.devmgr
+    }
+
+    /// The `Notify` calls kept since the last take, in their order.
+    pub fn take_notes(&mut self) -> Vec<Note>
+    {
+        core::mem::take(&mut self.notes)
     }
 
     /// The held grant of `space` that covers `[addr, addr + width)`,
@@ -182,6 +207,16 @@ impl<'a> Platform<'a>
         }
         Ok(va)
     }
+}
+
+/// The ASL path of the absolute path `path`, root first (`\_SB_.PCI0`).
+pub fn path_text(path: &[Seg]) -> String
+{
+    let segs: Vec<String> = path
+        .iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    format!("\\{}", segs.join("."))
 }
 
 /// The name of region space `space` in a log line.
@@ -329,11 +364,16 @@ impl Host for Platform<'_>
 
     fn notify(&mut self, path: &[Seg], value: u64) -> Result<(), HostError>
     {
-        let path: Vec<String> = path
-            .iter()
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect();
-        std::os::seraph::log!(debug: "Notify(\\{}, {value:#x}) dropped", path.join("."));
+        if self.notes.len() >= MAX_NOTES || self.notes.try_reserve(1).is_err()
+        {
+            std::os::seraph::log!(
+                warn: "Notify({}, {value:#x}) dropped: {} wait already",
+                path_text(path),
+                self.notes.len()
+            );
+            return Ok(());
+        }
+        self.notes.push((path.to_vec(), value));
         Ok(())
     }
 

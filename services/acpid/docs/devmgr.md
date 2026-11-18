@@ -37,7 +37,9 @@ access, and for a `SystemMemory` region the page an access reaches, on the first
 page. devmgr refuses, and logs the refusal with the range it collides with:
 
 - a range overlapping a resource of any device record (a PCI BAR, a platform record's `Mmio` or
-  `IoPort`), whether or not a driver has been started for it;
+  `IoPort`), whether or not a driver has been started for it, apart from a resource container's,
+  the firmware's own registers
+  ([docs/driver-binding.md](../../../docs/driver-binding.md#device-records) § Device Records);
 - the register window of each interrupt controller the MADT describes, which the kernel
   programs (the local APIC, each I/O APIC, the APLIC, each hart's IMSIC interrupt file), and
   on x86-64 the legacy ports the kernel owns: the two 8259s and their edge/level control
@@ -114,16 +116,32 @@ check counts the boot functions it covered.
 devmgr keeps the first windows and the first table of each mode that pass, and the first
 `_OSC` result, for the boot. A later push equal to the held one is accepted; one that differs
 is logged and the held one stays, so a restarted acpid cannot change what devmgr acts on.
-devmgr acts on the held `_OSC` result for PCI Express native hotplug alone: it manages a slot
-below the bridge only when the control dword grants native hotplug control, or the platform
-description table does
-([services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#event-sources) § Event Sources).
+devmgr acts on the held `_OSC` result for PCI Express hotplug alone: it manages a slot below the
+bridge only when the control dword grants native hotplug control, or the platform description
+table does, and otherwise leaves the slot to the firmware, whose events acpid posts (§ Hotplug
+events; [services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#event-sources) § Event
+Sources).
 
 `QUERY_HOST_BRIDGE(ordinal)`, under `REGISTRY_QUERY_AUTHORITY`, serves what devmgr holds per
 bridge, in segment then bus order: the `_OSC` status and control, whether the routes and the
 windows are held, and the functions each check covered. Its production consumer is a service
 that drives a PCI Express port feature and must know whether `_OSC` granted it to the OS;
 svctest reads it on every boot.
+
+---
+
+## Hotplug events
+
+acpid posts each hotplug event of a slot the firmware drives with `ACPI_HOTPLUG`: the event,
+`HOTPLUG_ADDED` or `HOTPLUG_REMOVED`, and the port above the slot
+([README.md](../README.md#hotplug) § Hotplug). devmgr runs it as a job of that slot on its control
+thread, after the jobs posted before it, and replies when the job has ended, with the number of
+functions it recorded or removed; the registry worker that received the call waits for that reply.
+It replies `NO_DEVICE` to a port that is no hotplug slot of its boot scan, and `REFUSED` to a slot
+it does not leave to the firmware: one it manages, one whose grant has not come, and one it could
+not hold. A removal's reply comes once the drivers are withdrawn and the records removed, so the
+`_EJ0` acpid runs on it lets go of a card that nothing uses
+([services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#acpi-hotplug) § ACPI Hotplug).
 
 ---
 

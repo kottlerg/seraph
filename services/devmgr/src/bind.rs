@@ -131,23 +131,37 @@ impl Records
             .find(|&state| state != RecordState::Removed)
     }
 
-    /// Every memory and I/O range a record not removed holds, bound or not:
-    /// each PCI BAR, and each platform record's `Mmio` and `IoPort`.
-    pub fn resource_ranges(&self) -> impl Iterator<Item = firmware::acpid::Range> + '_
+    /// Every memory and I/O range a record not removed holds, bound or not,
+    /// each marked with whether its record is a resource container
+    /// ([`container`]): each PCI BAR, and each platform record's `Mmio` and
+    /// `IoPort`.
+    pub fn resource_ranges(&self) -> impl Iterator<Item = firmware::acpid::HeldRange> + '_
     {
-        let pci = self.live_pci().flat_map(firmware::acpid::pci_ranges);
+        let pci = self
+            .live_pci()
+            .flat_map(firmware::acpid::pci_ranges)
+            .map(|range| firmware::acpid::HeldRange {
+                range,
+                container: false,
+            });
         let platform = self
             .platform
             .records()
             .iter()
             .zip(&self.platform_states)
             .filter(|(_, state)| **state != RecordState::Removed)
-            .flat_map(|(record, _)| record.resources())
-            .filter_map(firmware::acpid::platform_range);
+            .flat_map(|(record, _)| {
+                let container = container(record);
+                record
+                    .resources()
+                    .filter_map(firmware::acpid::platform_range)
+                    .map(move |range| firmware::acpid::HeldRange { range, container })
+            });
         pci.chain(platform)
     }
 
-    /// The platform records a pass may bind, with their indices.
+    /// The platform records a pass may bind, with their indices: each
+    /// unbound one but a resource container ([`container`]).
     fn unbound_platform(&self) -> impl Iterator<Item = (usize, &PlatformRecord)>
     {
         self.platform
@@ -155,7 +169,7 @@ impl Records
             .iter()
             .zip(&self.platform_states)
             .enumerate()
-            .filter(|(_, (_, state))| **state == RecordState::Unbound)
+            .filter(|(_, (record, state))| **state == RecordState::Unbound && !container(record))
             .map(|(index, (record, _))| (index, record))
     }
 
@@ -388,7 +402,7 @@ fn bind_records(
             .platform
             .records()
             .get(index)
-            .filter(|_| *state == RecordState::Unbound)
+            .filter(|r| *state == RecordState::Unbound && !container(r))
         else
         {
             continue;
@@ -2832,4 +2846,12 @@ impl FunctionConfig
         }
         completed
     }
+}
+
+/// Whether `record` is a resource container, the firmware's
+/// (`firmware::binding::container`): no pass binds it, and its ranges are
+/// not among those devmgr refuses acpid.
+fn container(record: &PlatformRecord) -> bool
+{
+    record.with_keys(firmware::binding::container)
 }

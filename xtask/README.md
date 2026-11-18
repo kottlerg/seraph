@@ -1282,16 +1282,18 @@ cargo xtask test-signing [--arch x86_64|riscv64] [--release] [--cpus N] [--mem M
 
 ### `cargo xtask test-hotplug`
 
-Check devmgr's PCI Express native hotplug add and removal paths, on either arch. Stages the
-`hotplug-check` fixture's recipe
+Check devmgr's PCI Express hotplug add and removal paths, native and through acpid, on either arch.
+Stages the `hotplug-check` fixture's recipe
 ([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
 `config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
 `config/devmgr/tests/` into `config/devmgr/classes/`, and repacks the disk images in the layout they
 have. It boots the current sysroot headless, with an empty `pcie-root-port` (`-device
 pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c`) and a QMP socket:
 
-1. on x86_64 only, under the machine's default, whose `_OSC` withholds native hotplug control:
-   it passes when devmgr logs the slot `not managed: _OSC control`;
+1. on x86_64 only, under the machine's default, the firmware's ACPI PCI hotplug, whose `_OSC`
+   withholds native hotplug control: devmgr must log the slot `firmware hotplug: _OSC control`,
+   and the cycle of step 2 runs with the firmware's removal: devmgr's removal lines on its eject
+   request, then acpid's `ejected (_EJ0) once devmgr removed 1 functions`;
 2. under native control (on x86_64 with
    `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off`, so `_OSC` grants it; on riscv64
    the `qemu-virt.platform` key grants it): once devmgr logs the slot `managed (native control
@@ -1985,7 +1987,7 @@ test`, which rewrites every screen and outcome from the current table; the diff 
 | [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
 | [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md) | The debug port `--debug-port` attaches and `test-debug-port` drives |
 | [services/gdbstub/README.md](../services/gdbstub/README.md) | The GDB stub `--debug-target` stages and `test-gdb` drives |
-| [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md) | The PCI Express native hotplug `test-hotplug` drives |
+| [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md) | The PCI Express hotplug `test-hotplug` drives, native and through acpid |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` and `test` enforce; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
 | [targets/README.md](targets/README.md) | Custom target specs |

@@ -44,7 +44,8 @@ devmgr/
 │   ├── decls.rs                    # Driver declarations read from boot modules and the drivers
 │   │                               #   directory
 │   ├── dma.rs                      # DMA endpoint and its thread: per-device DMA caps, map/unmap
-│   ├── hotplug.rs                  # PCI Express native hotplug: managed slots, poller, add job
+│   ├── hotplug.rs                  # PCI Express hotplug: managed slots, poller, acpid's jobs,
+│   │                               #   add and removal jobs
 │   ├── intremap.rs                 # VT-d interrupt remapping: enable, per-source remapping entries
 │   ├── iommu.rs                    # IOMMU units, driver spawn, device attach, fail-closed client
 │   ├── pci.rs                      # ECAM configuration-space accessor for the PCI scan
@@ -58,7 +59,7 @@ devmgr/
 └── docs/
     ├── responsibilities.md         # Responsibilities, bootstrap capabilities, driver authority
     ├── pci-enumeration.md          # PCI enumeration via ECAM MMIO
-    └── hotplug.md                  # Hotplug event sources, native slots, add and removal
+    └── hotplug.md                  # Hotplug event sources, native and ACPI slots, add, removal
 ```
 
 ---
@@ -67,9 +68,10 @@ devmgr/
 
 devmgr parses firmware tables, enumerates PCI devices, binds and spawns drivers, exposes the device
 registry, brokers ACPI tables to acpid and the RISC-V shutdown cap to pwrmgr, and adds the functions
-a card brings to a PCI Express hotplug slot it controls natively, and withdraws and removes them
-when the card leaves; it is the sole authority for spawning device drivers. Each responsibility, the
-capabilities devmgr receives at bootstrap, and its relationship to driver processes are specified in
+a card brings to a PCI Express hotplug slot, one it controls natively or one whose firmware's events
+acpid posts, and withdraws and removes them when the card leaves; it is the sole authority for
+spawning device drivers. Each responsibility, the capabilities devmgr receives at bootstrap, and its
+relationship to driver processes are specified in
 [docs/responsibilities.md](docs/responsibilities.md); the system-scope design is
 [docs/device-management.md](../../docs/device-management.md).
 
@@ -81,7 +83,7 @@ capabilities devmgr receives at bootstrap, and its relationship to driver proces
 |---|---|
 | [docs/responsibilities.md](docs/responsibilities.md) | Responsibilities, bootstrap capabilities, authority over drivers |
 | [docs/pci-enumeration.md](docs/pci-enumeration.md) | PCI enumeration via ECAM MMIO |
-| [docs/hotplug.md](docs/hotplug.md) | Hotplug event sources, native slots, the add and removal paths |
+| [docs/hotplug.md](docs/hotplug.md) | Hotplug event sources, native and ACPI hotplug slots, the add and removal paths |
 | [docs/device-management.md](../../docs/device-management.md) | Full device management design, DMA safety, security boundary |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, delegation, revocation |
 | [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, service roles |

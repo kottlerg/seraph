@@ -45,10 +45,11 @@ pub fn run(devmgr: &Devmgr, aspace: u64, service: u64, ended: &Sender<&'static s
     });
     let mut platform = Platform::new(devmgr, aspace, thread);
     let mut ns = load(devmgr, aspace);
+    let mut bridges = Vec::new();
     if let Some((ns, tables)) = &mut ns
     {
         arch::current::enable_acpi(devmgr, thread, &power);
-        start(ns, *tables, devmgr, &mut platform);
+        bridges = start(ns, *tables, devmgr, &mut platform);
     }
     server::serve(
         service,
@@ -56,6 +57,7 @@ pub fn run(devmgr: &Devmgr, aspace: u64, service: u64, ended: &Sender<&'static s
         &mut platform,
         &power,
         events,
+        &bridges,
         ended,
     );
 }
@@ -78,8 +80,14 @@ fn fixed_power_button(devmgr: &Devmgr, aspace: u64) -> bool
 
 /// Evaluate the loaded namespace `ns` of `tables` tables: the module-level
 /// code, the initialization walk, and each PCI host bridge's results, pushed
-/// to devmgr.
-fn start(ns: &mut Namespace, tables: usize, devmgr: &Devmgr, platform: &mut Platform<'_>)
+/// to devmgr. Returns the host bridges, whose ports lead to the hotplug
+/// slots acpid serves (`crate::server`).
+fn start(
+    ns: &mut Namespace,
+    tables: usize,
+    devmgr: &Devmgr,
+    platform: &mut Platform<'_>,
+) -> Vec<Bridge>
 {
     let mut ev = Evaluator::new(ns, platform);
     let module = ev.run_module_code();
@@ -121,6 +129,7 @@ fn start(ns: &mut Namespace, tables: usize, devmgr: &Devmgr, platform: &mut Plat
         walk.initialized,
         bridges.len()
     );
+    bridges
 }
 
 /// Load the DSDT, then each SSDT devmgr serves, and parse their methods; the
@@ -385,7 +394,7 @@ fn log_failures(ev: &Evaluator<'_>, failures: &[Failure])
 }
 
 /// The ASL path of `node` (`\_SB_.PCI0`).
-fn path(ns: &Namespace, node: NodeId) -> String
+pub fn path(ns: &Namespace, node: NodeId) -> String
 {
     let segs = ns.path(node).unwrap_or_default();
     let segs: Vec<String> = segs

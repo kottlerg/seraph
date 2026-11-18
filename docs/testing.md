@@ -314,7 +314,7 @@ for the snapshot-detection design.
 Same boot requirements as `test-terminal` (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI it runs as
 an additional boot inside the x86_64 `usertest` cell, after `test-terminal`,
-`test-wedge` and `test-reboot`.
+`test-wedge`, `test-reboot` and `test-signing`.
 
 ### KASLR randomization (`test-kaslr`)
 
@@ -497,6 +497,32 @@ shutdown. See [xtask/README.md § test-debug-port](../xtask/README.md#cargo-xtas
 for the command. No canonical CI cell attaches the debug port, so the boot is the `debug-port`
 device cell of the local and release host runs (Coverage tiers below).
 
+### Signature refusals (`test-signing`)
+
+Every verifier of [signing.md](signing.md) § Which Stage Verifies What refuses an object that
+does not verify, and a refusal path no boot takes is not shown to work. `cargo xtask test-signing
+[--arch] [--release]` (both arches) boots the current sysroot four times from disk images that
+carry objects no build makes, written in place of the sysroot's files at pack time, so the
+sysroot itself is never changed:
+
+1. `kernel`: the kernel with a body byte flipped. The bootloader refuses it,
+   `Failed(BodyHash)`.
+2. `bundle`: the bundle's `virtio-blk` entry with a body byte flipped. The bootloader refuses
+   it, `Failed(BodyHash)`.
+3. `revoked`: a bootloader built under the build's trust store with the signing key revoked. It
+   refuses the kernel, `Failed(Revoked)`.
+4. `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr` signed as data,
+   and `/services/crashd` signed by a key no anchor holds. procmgr refuses each
+   (`Failed(BodyHash)`, `Failed(Kind)`, `Untrusted`) and svcmgr reports each refused launch.
+   The kernel and `/programs/terminal` each carry a record of that key before their own, which
+   the bootloader and procmgr skip, and the boot reaches the terminal's READY line.
+
+A boot passes when every line it owes appears, and fails on any other refusal or fatal line, or at
+its deadline. The images are packed again from the sysroot afterwards, whatever the outcome. See
+[xtask/README.md § test-signing](../xtask/README.md#cargo-xtask-test-signing) for the lines, the
+deadlines and the logs. CI runs it in each usertest cell after `test-reboot`, in the cell's
+profile.
+
 ### GDB stub (`test-gdb`)
 
 The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs a guest process
@@ -670,12 +696,13 @@ CI matrix cells follow these rules per boot. The `usertest` cell runs its
 boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
 the terminal interactive test (via `test-terminal`) after dropping
 `usertest.svc` and repacking to restore the default boot (terminal present),
-then the `test-wedge` boot pair, then the `test-reboot` boot, then on x86_64 the `test-vmgenid`
-save/restore boot pair and the `test-powerbutton` boot. The terminal and wedge test boots have
-*no* shutdown-invoking harness: `test-terminal` and `test-wedge` compute the verdict host-side and
-kill QEMU themselves. The `test-reboot` boot's fixture invokes `REBOOT`, the host reads the reset
-over QMP, and QEMU exits on its own. The `test-powerbutton` boot is powered off by its press:
-the host presses the button over QMP, reads the power-off there, and QEMU exits on its own.
+then the `test-wedge` boot pair, then the `test-reboot` boot, then the four `test-signing` boots,
+then on x86_64 the `test-vmgenid` save/restore boot pair and the `test-powerbutton` boot. The
+terminal and wedge test boots have *no* shutdown-invoking harness: `test-terminal` and
+`test-wedge` compute the verdict host-side and kill QEMU themselves. The `test-reboot` boot's
+fixture invokes `REBOOT`, the host reads the reset over QMP, and QEMU exits on its own. The
+`test-powerbutton` boot is powered off by its press: the host presses the button over QMP, reads
+the power-off there, and QEMU exits on its own.
 
 ---
 

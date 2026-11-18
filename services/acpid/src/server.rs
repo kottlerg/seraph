@@ -22,6 +22,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use acpid::events::{self, Fired, Handled, Handler, Layout, Start};
 use acpid::power::{self, Request};
@@ -30,6 +31,13 @@ use ipc::{IpcMessage, acpid_errors, acpid_labels};
 
 use crate::arch::current::{Events, Ports, Power};
 use crate::platform::Platform;
+
+/// How long a sleep keeps the events quiesced after its `PM1a_CNT` writes
+/// return before it takes the platform to be still running and enables
+/// the GPEs again ([`events::resume`]): ACPICA's wait before it takes an S4 or S5 write as not taken. A
+/// platform entering the state stops well within it, with only its wake
+/// events enabled.
+const SLEEP_GRACE: Duration = Duration::from_secs(10);
 
 /// The receiver threads on acpid's endpoint (`docs/limits.md`): one can
 /// hold a `WAIT_EVENT` while the other serves `SLEEP` and `RESET`.
@@ -124,6 +132,9 @@ struct Armed
     layout: Layout,
     regs: Arc<Mutex<Ports>>,
     handlers: Vec<Handler>,
+    /// The events [`events::arm`] enables, whose GPEs a sleep that returns
+    /// enables again ([`events::resume`]).
+    handled: Handled,
 }
 
 /// Arm the events, start the receivers on `service`, and run the evaluation
@@ -183,7 +194,11 @@ pub fn serve(
             {
                 let code = match request
                 {
-                    Request::Sleep(state) => sleep(state, ns.as_deref_mut(), platform, power),
+                    Request::Sleep(state) =>
+                    {
+                        let events = armed.as_ref().map(|armed| (armed, &*mailbox, &work));
+                        sleep(state, ns.as_deref_mut(), platform, power, events)
+                    }
                     Request::Reset => reset(power),
                     Request::WaitEvent => acpid_errors::INVALID_REQUEST,
                 };
@@ -217,8 +232,10 @@ fn lock(regs: &Mutex<Ports>) -> MutexGuard<'_, Ports>
 /// blocks to itself and registers the SCI, then set the enables
 /// ([`events::arm`]), hand on the events already pending, and let the
 /// event thread take the SCI. The GPEs handled are each `\_GPE` method of
-/// `ns`. `None`, logged, when the event thread cannot start; nothing is
-/// then enabled.
+/// `ns`. `None`, logged, when the event thread cannot start or take the
+/// SCI; every event is then disabled and its status cleared
+/// ([`events::clear`]), those a dead acpid of the boot left enabled among
+/// them.
 fn arm(
     source: EventSource,
     ns: Option<&Namespace>,
@@ -275,6 +292,7 @@ fn arm(
     if !taken
     {
         std::os::seraph::log!(warn: "the SCI is not taken; no events");
+        events::clear(&mut *lock(&regs), &layout);
         return None;
     }
     let fired = events::arm(&mut *lock(&regs), &layout, &handled);
@@ -295,6 +313,7 @@ fn arm(
         layout,
         regs,
         handlers,
+        handled,
     })
 }
 
@@ -533,9 +552,23 @@ pub fn refuse(service: u64) -> !
     }
 }
 
-/// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then the
-/// `PM1a_CNT` writes. The reply status when the platform keeps running.
-fn sleep(state: u8, ns: Option<&mut Namespace>, platform: &mut Platform<'_>, power: &Power) -> u64
+/// What a sleep needs of the armed events: the events, the mailbox and the
+/// work channel that what fired is handed on to.
+type SleepEvents<'a> = (&'a Armed, &'a Mailbox, &'a Sender<Work>);
+
+/// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then, with the
+/// events `armed`, [`events::quiesce`], then the `PM1a_CNT` writes. When
+/// the writes return, the events stay quiesced for [`SLEEP_GRACE`]; when the
+/// platform still runs then, the GPEs are enabled again
+/// ([`events::resume`]) and what latched is handed on, each event once. The
+/// reply status when the platform keeps running.
+fn sleep(
+    state: u8,
+    ns: Option<&mut Namespace>,
+    platform: &mut Platform<'_>,
+    power: &Power,
+    armed: Option<SleepEvents<'_>>,
+) -> u64
 {
     if !power.can_sleep()
     {
@@ -567,7 +600,27 @@ fn sleep(state: u8, ns: Option<&mut Namespace>, platform: &mut Platform<'_>, pow
     {
         std::os::seraph::log!(warn: "\\_PTS({state}) faulted: {fault:?}; sleeping anyway");
     }
-    if power.sleep(state, slp_typ)
+    let quiesced = armed.map(|(armed, ..)| events::quiesce(&mut *lock(&armed.regs), &armed.layout));
+    let entered = power.sleep(state, slp_typ);
+    if let (Some((armed, mailbox, work)), Some(quiesced)) = (armed, quiesced)
+    {
+        if entered
+        {
+            std::thread::sleep(SLEEP_GRACE);
+            std::os::seraph::log!(
+                warn: "SLEEP({state}): still running {} s after the writes; GPEs enabled again",
+                SLEEP_GRACE.as_secs()
+            );
+        }
+        let fired = events::resume(
+            &mut *lock(&armed.regs),
+            &armed.layout,
+            &armed.handled,
+            &quiesced,
+        );
+        deliver(&fired, mailbox, work);
+    }
+    if entered
     {
         acpid_errors::SUCCESS
     }

@@ -851,7 +851,10 @@ mod tests
         assert_eq!(info.notify_off_multiplier, 2);
         assert_eq!(at(info.device_cfg), (4, 0x2100, 8));
         // The structures kept make a layout the transport can use.
-        assert!(info.register_layout().is_some());
+        assert!(
+            info.register_layout(virtio_core::VirtioDeviceConfig::Required)
+                .is_some()
+        );
     }
 
     #[test]

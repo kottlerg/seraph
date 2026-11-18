@@ -302,14 +302,26 @@ jobs:
             # SHUTDOWN event; host-side over QMP, so it cannot ride
             # run-parallel. Restores the default interactive boot after.
             cargo xtask test-reboot --arch ${{ matrix.arch }}
+            # Sixth boot set: the signature refusal test (#124). Builds a
+            # bootloader under a store revoking the signing key in the cell's
+            # profile, then boots four images carrying a tampered kernel, a
+            # tampered bundle entry, that bootloader, and tampered,
+            # wrong-kind and foreign-signed rootfs images, and checks each
+            # verifier's refusal line; host-side, so it cannot ride
+            # run-parallel. Packs the default interactive boot again after.
+            if [ "${{ matrix.profile }}" = "release" ]; then
+              cargo xtask test-signing --arch ${{ matrix.arch }} --release
+            else
+              cargo xtask test-signing --arch ${{ matrix.arch }}
+            fi
             if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              # Sixth boot pair: the VMGENID snapshot-resume test (#395).
+              # Seventh boot pair: the VMGENID snapshot-resume test (#395).
               # x86_64 only (QEMU's riscv64 virt machine has no VMGENID);
               # host-side QMP migrate/restore, so it cannot ride
               # run-parallel. Reuses the default interactive boot the
               # test-reboot restore left.
               cargo xtask test-vmgenid
-              # Seventh boot: the power-button test. x86_64 only (QEMU's
+              # Eighth boot: the power-button test. x86_64 only (QEMU's
               # riscv64 virt machine has no fixed power button); presses the
               # ACPI power button over QMP once acpid has armed its events,
               # and pwrmgr must power off through acpid. Host-side over QMP,
@@ -327,6 +339,7 @@ jobs:
           path: |
             target/xtask/run-parallel/**/*.log
             target/xtask/run-parallel/**/*.crash.txt
+            target/xtask/test-signing/*/*.log
           if-no-files-found: ignore
 
       - name: Upload saved run logs

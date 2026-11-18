@@ -2211,13 +2211,16 @@ pub mod acpid_labels
 {
     /// Enter a sleep state: write `SLP_TYP` and then `SLP_TYP | SLP_EN` to
     /// `PM1a_CNT`, the `SLP_TYP` read from the state's `\_Sx_` package,
-    /// after `\_PTS` of the state when the tables define it.
+    /// after `\_PTS` of the state when the tables define it and after
+    /// acpid disables the events it armed but the power button and clears
+    /// every event status.
     ///
     /// Request: `data[0]` = the version; `data[1]` = the state, of which
     /// only [`STATE_S5`] (soft-off) is served. On the success path the
     /// platform powers off and no reply arrives; a
-    /// [`super::acpid_errors::SUCCESS`] reply means the write returned and
-    /// the platform still runs, and the caller decides how long to wait.
+    /// [`super::acpid_errors::SUCCESS`] reply means the platform still runs
+    /// 10 s after the writes, when acpid has enabled its GPEs again, and the
+    /// caller decides how long to wait.
     /// Replies [`super::acpid_errors::INVALID_REQUEST`] for another state and
     /// [`super::acpid_errors::NO_DEVICE`] when the platform has no
     /// `PM1a_CNT`, the tables no usable `\_S5_`, or no AML loaded (always
@@ -2241,7 +2244,7 @@ pub mod acpid_labels
     /// delivers it; one whose reply cannot be delivered (the caller died) is
     /// kept for the next `WAIT_EVENT`, and one acpid had not delivered when
     /// it died stays latched in the hardware and is delivered by the restarted
-    /// acpid. One caller waits at a time: a `WAIT_EVENT` that arrives while
+    /// acpid, unless a `SLEEP` that returned cleared its status first. One caller waits at a time: a `WAIT_EVENT` that arrives while
     /// another waits takes its place, and the earlier one is replied
     /// [`super::acpid_errors::SUPERSEDED`]. Replies
     /// [`super::acpid_errors::NO_DEVICE`] when acpid has no event to wait
@@ -2726,8 +2729,9 @@ pub mod devmgr_labels
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
     /// entry, or an entry that carries no startup info (the serial driver's,
     /// the goldfish RTC driver's, a CMOS RTC driver's when the FADT names no
-    /// century register, and that of a PCI function presenting no `VirtIO`
-    /// register layout), gets `INVALID_REQUEST`. A CMOS RTC driver's entry
+    /// century register, and that of a PCI function whose driver declares no
+    /// `VirtIO` status reset, and so is given no `VirtIO` register layout),
+    /// gets `INVALID_REQUEST`. A CMOS RTC driver's entry
     /// otherwise carries [`super::device_info_kind::RTC_CENTURY`]. The
     /// catalog only grows (the entry of a driver that failed to spawn or was
     /// withdrawn stays), so a badge is never recycled and its `u64` width

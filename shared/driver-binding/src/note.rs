@@ -93,12 +93,12 @@ macro_rules! driver_declaration {
 #[cfg(test)]
 mod tests
 {
-    use crate::decl::{Declaration, Interrupt, Match, Reset, Tier, decode};
+    use crate::decl::{Declaration, Interrupt, Match, Reset, Tier, VirtioDeviceConfig, decode};
 
     // The macro as a driver invokes it, in a module standing for a crate root.
     mod declared
     {
-        use crate::decl::{Declaration, Interrupt, Match, Reset, Tier};
+        use crate::decl::{Declaration, Interrupt, Match, Reset, Tier, VirtioDeviceConfig};
 
         crate::driver_declaration!(Declaration {
             name: "test-driver",
@@ -112,7 +112,9 @@ mod tests
             dma: true,
             dma_width: None,
             phys_access: false,
-            reset: Reset::VirtioStatus,
+            reset: Reset::VirtioStatus {
+                device_config: VirtioDeviceConfig::Absent,
+            },
             tier: Tier::Boot,
         });
 
@@ -148,7 +150,12 @@ mod tests
         let decl = decode(&note[20..20 + descsz]).expect("the emitted note decodes");
         assert_eq!(decl.name.as_str(), "test-driver");
         assert_eq!(decl.interrupt, Interrupt::REQUIRED);
-        assert_eq!(decl.reset, Reset::VirtioStatus);
+        assert_eq!(
+            decl.reset,
+            Reset::VirtioStatus {
+                device_config: VirtioDeviceConfig::Absent
+            }
+        );
         assert_eq!(decl.tier, Tier::Boot);
         assert!(decl.dma);
     }

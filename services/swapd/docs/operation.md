@@ -87,10 +87,13 @@ partition lost and logs it once: every fault on a chunk on disk is forwarded wit
 2, killing its process, and nothing more is written. It does not exit: a new instance would hold the
 same failed driver.
 
-A call to the block driver that fails has no reply, and the buffer it lent may be the driver's: the
-driver died, or a debugger stopped the calling thread. swapd then ends with a fault, as it does when
-a reply brings no buffer back, and the next instance takes the partition again from vfsd and
-registers again, keeping every chunk on disk.
+A call to the block driver that fails has no reply, and the buffer it lent may be the driver's.
+When the partition cap is gone, the driver died: devmgr revoked its endpoint, and with it the
+partition cap vfsd keeps and derives each hand-out from, so no instance can take the partition
+again. swapd then marks the partition lost as for `DEVICE_FAULT`. When the cap is still live, a
+debugger stopped the calling thread: swapd ends with a fault, as it does when a reply brings no
+buffer back, and the next instance takes the partition again from vfsd and registers again, keeping
+every chunk on disk.
 
 ---
 

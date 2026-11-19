@@ -156,13 +156,15 @@ pub enum Transfer
     /// The device failed this request; another may succeed.
     Failed,
     /// The block driver fails every request from now on (`DEVICE_FAULT`):
-    /// the partition is gone for this boot.
+    /// the partition is gone for this boot. swapd also loses it when a call
+    /// fails with the partition cap gone (services/swapd/docs/operation.md
+    /// § Disk Failure).
     Lost,
 }
 
 /// The meaning of a block request's reply `label`. A call that failed has
-/// no reply: swapd ends with a fault there (services/swapd/docs/operation.md
-/// § Disk Failure).
+/// no reply: swapd decides it from whether the partition cap is still live
+/// (services/swapd/docs/operation.md § Disk Failure).
 #[must_use]
 pub const fn transfer(label: u64) -> Transfer
 {

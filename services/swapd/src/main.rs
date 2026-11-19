@@ -71,7 +71,8 @@ struct Swap
 impl Swap
 {
     /// Whether the partition is lost: the block driver fails every request
-    /// (`DEVICE_FAULT`), so no slot is read or written again.
+    /// (`DEVICE_FAULT`) or is gone, its cap revoked, so no slot is read or
+    /// written again.
     fn lost(&self) -> bool
     {
         self.lost.load(Ordering::Acquire)
@@ -83,8 +84,8 @@ impl Swap
         if !self.lost.swap(true, Ordering::AcqRel)
         {
             std::os::seraph::log!(
-                error: "swap partition lost: the block driver fails every request; faults on \
-                        chunks on disk are forwarded, and nothing more is written"
+                error: "swap partition lost: the block driver fails every request or is gone; \
+                        faults on chunks on disk are forwarded, and nothing more is written"
             );
         }
     }
@@ -271,10 +272,13 @@ fn call(ep: u64, msg: &IpcMessage, what: &str) -> IpcMessage
 
 /// Move `extent` between the partition and the buffer `buf` with the block
 /// label `label`, the reply moving the buffer back into `buf`. Its outcome;
-/// `DEVICE_FAULT` loses the partition. A call that failed (the driver gone,
-/// or the thread stopped by a debugger while the buffer may be the
-/// driver's), or a reply without the buffer, ends swapd with a fault: the
-/// next instance takes the partition again and keeps every chunk on disk.
+/// `DEVICE_FAULT` loses the partition, and so does a call that failed with
+/// the partition cap gone: the block driver died, its endpoint revoked, and
+/// vfsd's kept cap with it, so no instance can take the partition again. Any
+/// other failed call (the thread stopped by a debugger, the buffer then
+/// perhaps the driver's), or a reply without the buffer, ends swapd with a
+/// fault: the next instance takes the partition again and keeps every chunk
+/// on disk.
 fn transfer(swap: &Swap, label: u64, extent: Extent, buf: &mut u64) -> Transfer
 {
     let msg = IpcMessage::builder(label)
@@ -282,7 +286,21 @@ fn transfer(swap: &Swap, label: u64, extent: Extent, buf: &mut u64) -> Transfer
         .word(1, extent.count)
         .cap(*buf)
         .build();
-    let reply = call(swap.partition, &msg, "a block request");
+    // SAFETY: `current_ipc_buf` is the calling thread's registered IPC buffer.
+    let reply =
+        match unsafe { ipc::ipc_call(swap.partition, &msg, std::os::seraph::current_ipc_buf()) }
+        {
+            Ok(reply) => reply,
+            Err(e) =>
+            {
+                if syscall::cap_info(swap.partition, syscall::CAP_INFO_TAG_RIGHTS).is_err()
+                {
+                    swap.lose();
+                    return Transfer::Lost;
+                }
+                fail(format_args!("a block request failed (err={e})"));
+            }
+        };
     *buf = *reply
         .caps()
         .first()
@@ -454,7 +472,8 @@ fn write_out(swap: &Swap, pressure: u64, mut buf: u64) -> !
                     {
                         unwritten_logged = true;
                         std::os::seraph::log!(
-                            warn: "a slot was not written; the write-out waits before each take                                    after a slot it could not write"
+                            warn: "a slot was not written; the write-out waits after each slot it cannot \
+                                   write"
                         );
                     }
                     let _ = syscall::notification_wait_timeout(pressure, wait);

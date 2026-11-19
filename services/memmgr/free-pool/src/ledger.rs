@@ -3866,13 +3866,14 @@ mod tests
         };
         let mut hand = ClockHand::default();
         let mut victims = [Victim::default(); 4];
+        let idle = COLD_SWEEPS;
         assert_eq!(
-            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS),
+            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, idle),
             0
         );
         // The second pass finds chunk 0 cold; chunk 2 stays warm.
         assert_eq!(
-            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS),
+            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, idle),
             1
         );
         assert_eq!(
@@ -3893,7 +3894,7 @@ mod tests
         let mut found = 0;
         for _ in 0..8
         {
-            found = l.sweep(&mut hand, 1, &mut harvest, &mut victims, COLD_SWEEPS);
+            found = l.sweep(&mut hand, 1, &mut harvest, &mut victims, idle);
             if !calls.borrow().is_empty()
             {
                 break;
@@ -3902,19 +3903,13 @@ mod tests
         assert_eq!(found, 1);
         assert_eq!(*calls.borrow(), [(7, BASE, 64)]);
         assert_eq!(
-            l.sweep(
-                &mut hand,
-                1000,
-                |_, _, _, _| false,
-                &mut victims,
-                COLD_SWEEPS
-            ),
+            l.sweep(&mut hand, 1000, |_, _, _, _| false, &mut victims, idle),
             0
         );
         // Evicting, the cold chunk is no longer reported.
         l.begin_evict(rec, open, BASE, 1).unwrap();
         assert_eq!(
-            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS),
+            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, idle),
             0
         );
     }

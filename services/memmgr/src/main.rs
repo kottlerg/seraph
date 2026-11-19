@@ -3644,6 +3644,7 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         }
     }
 }
+
 fn main(startup: &StartupInfo, sched_control: u64) -> !
 {
     // SAFETY: init maps `startup.ipc_buffer` as memmgr's own IPC page

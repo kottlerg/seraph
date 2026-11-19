@@ -7,18 +7,27 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# std: the death-queue set and main wait set of supervisor services (procmgr
-# and svcmgr). Makes the syscalls and funds the objects through
-# `std::os::seraph`, so its contents compile only for seraph; the growth
-# policy it follows is host-tested in `ruststd-death-queues`.
+# std: the death-queue set and main wait set of supervisor services (procmgr,
+# svcmgr and devmgr), and the overflow watch of a death-queue drain, which
+# logd's drain follows too. The set makes the syscalls and funds the objects
+# through `std::os::seraph`, so it compiles only for seraph; the growth
+# policy it follows is host-tested in `ruststd-death-queues`. The overflow
+# watch and drain are host-tested here, against a model of the kernel's
+# event-queue ring that the `model` feature also gives the services' host
+# tests.
 [lib]
-test = false
+test = true
 doctest = false
 
 [dependencies]
 death-queues = { path = "../../runtime/ruststd/death-queues", package = "ruststd-death-queues" }
 syscall = { path = "../syscall" }
 syscall-abi = { path = "../../abi/syscall" }
+
+[features]
+# The model of the kernel's event-queue ring (`death_set::model`), for the
+# host tests of the services' crates; no service build enables it.
+model = []
 
 [lints]
 workspace = true

@@ -17,5 +17,10 @@ ipc = { path = "../../../shared/ipc" }
 # `LINE_BUF_SIZE`, `MAX_NAME_LEN`, the longest entry and the query rows.
 logd-codec = { path = "../codec" }
 
+[dev-dependencies]
+# The overflow watch of logd's death drain and the model of the kernel's death
+# queue, for the death-resync test.
+death-set = { path = "../../../shared/death-set", features = ["model"] }
+
 [lints]
 workspace = true

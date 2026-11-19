@@ -71,10 +71,6 @@ use crate::util::{require_tool, step};
 /// `programs/terminal`.
 const READY_MARKER: &str = "terminal: READY for injection";
 
-/// The GDB stub's line once it holds its target. Kept in sync with
-/// `services/gdbstub/src/main.rs`.
-const ATTACHED_MARKER: &str = "[gdbstub] attached; serving the debug port";
-
 /// What the host types at the shell: a program whose spawn runs procmgr's
 /// create and memmgr's allocation, and whose exit runs procmgr's reap.
 const SERIAL_INPUT: &[u8] = b"hello\r";
@@ -489,11 +485,13 @@ fn kill_through_stub(
     contact: Contact,
 ) -> Result<Instant>
 {
-    let pc_reg = gdb_arch(arch).pc_regnum();
     let seen = match contact
     {
         Contact::Attached => guest
-            .collect_until(&format!("{ATTACHED_MARKER} ({name})"), BOOT_TIMEOUT)
+            .collect_until(
+                &format!("{} ({name})", debug_stub::ATTACHED_MARKER),
+                BOOT_TIMEOUT,
+            )
             .context("the stub's attach")?,
         Contact::Launched => guest
             .collect_until(&format!("{LAUNCHING_MARKER}{name}"), BOOT_TIMEOUT)
@@ -555,21 +553,8 @@ fn kill_through_stub(
             }
             stub.request(b"qSupported")?;
         }
-        // A target the stub does not hold (it exited, or the walk found
-        // none) is reported exited.
-        let halt = stub.request(b"?")?;
-        if !halt.starts_with(b"T") && !halt.starts_with(b"S")
-        {
-            bail!(
-                "the stub holds no {name} for kill {kill}: {}",
-                String::from_utf8_lossy(&halt)
-            );
-        }
-        // The main thread is the first of the stub's list.
-        stub.expect_ok(b"Hg1")?;
-        let pc = stub.read_register(pc_reg)?;
-        stub.expect_ok(format!("P{pc_reg:x}={}", le_hex(0)).as_bytes())?;
-        stub.expect_ok(b"D")?;
+        let pc = debug_stub::kill_held(&mut stub, arch, name)
+            .with_context(|| format!("kill {kill} of {kills}"))?;
         step(&format!(
             "core-death test: kill {kill} of {kills}: moved {name}'s main thread from {pc:#x} to 0"
         ));
@@ -592,7 +577,7 @@ fn kill_at_breakpoint(
     stdin: ChildStdin,
 ) -> Result<Instant>
 {
-    let pc_reg = gdb_arch(arch).pc_regnum();
+    let pc_reg = debug_stub::rsp_arch(arch).pc_regnum();
     let at = bias.wrapping_add(function.address);
     let kind = breakpoint_kind(arch);
     // Connecting stops the VM.
@@ -670,15 +655,6 @@ fn breakpoint_kind(arch: Arch) -> u32
     {
         Arch::X86_64 => 1,
         Arch::Riscv64 => 4,
-    }
-}
-
-fn gdb_arch(arch: Arch) -> gdb_rsp::target::Arch
-{
-    match arch
-    {
-        Arch::X86_64 => gdb_rsp::target::Arch::X86_64,
-        Arch::Riscv64 => gdb_rsp::target::Arch::Riscv64,
     }
 }
 

@@ -938,8 +938,11 @@ none. `run-parallel` writes the same report beside each log it keeps.
 ### `cargo xtask test-terminal`
 
 Boot the terminal interactive test, exercising keyboard input end-to-end
-through the live virtio-input driver and the autostarted `terminal`. Launches
-QEMU headless with a QMP control socket, waits for the guest to print
+through the live virtio-input driver and the autostarted `terminal`. Stages the
+GDB stub on the virtio-input driver (`/services/drivers/virtio-input`), as
+`run --debug-target` stages it, launches QEMU headless with a QMP control socket
+and the debug port, connects to the stub once it attaches and detaches, which
+releases the driver, waits for the guest to print
 `terminal: READY for injection` on the serial log, injects a known key
 sequence (`help`, a stray `x`, Backspace, Return) via QMP `input-send-event`,
 and asserts — host-side — that the terminal's local echo, the shell's `$ `
@@ -947,11 +950,18 @@ prompt, and the relayed `help` output (`shell built-ins:`) appear on the serial
 stream. After the keyboard round passes, the transcript is cleared and the same
 sequence is written to the guest UART over QEMU's bidirectional `-serial stdio`,
 with the same echo, prompt, and `shell built-ins:` assertions (the serial RX
-round, #291). Exits non-zero on an injection error or the 180 s timeout. This
+round, #291). It then kills the virtio-input driver through the stub, moving its
+main thread to program counter 0, waits for the terminal's
+`terminal: input driver at ordinal 1` line once devmgr has restarted it, and
+injects the key sequence again on a cleared transcript, with the echo and
+`shell built-ins:` assertions (the input restart round). The stub's recipe is
+removed and the disk images repacked in the layout they had afterwards. Exits
+non-zero on an injection or stub error or the 300 s timeout. This
 subsumes the former standalone keyboard smoke test: the echoed `help` proves
 keysym decode, and Return/Backspace prove the named-key decodes.
 
-A pure runner — it neither builds nor stages. `terminal.svc` is in the default
+A pure runner — it does not build, and stages only the GDB stub, which it
+removes again. `terminal.svc` is in the default
 boot set, so the terminal autostarts
 ([programs/terminal/README.md](../programs/terminal/README.md) § Scope); just build and repack:
 

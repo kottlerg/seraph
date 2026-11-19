@@ -841,7 +841,8 @@ ordinal, and its `WATCH_CLASS` watch is signalled at the withdrawal and again wh
 instance is served. A `QUERY_DEVICE` at the next ordinal (`first_device_from`) then waits for the
 restart's settle and names the new instance, or answers `NO_DEVICE` when the restart was refused or
 failed. A client re-registers with the new instance whatever it registered with the dead one. logd's
-sinks and entropyd re-resolve this way on their class watches.
+sinks, entropyd and the terminal re-resolve this way on their class watches; `ipc::refresh_device`
+is the look a client makes at its class on a signal.
 
 ### Root disk
 

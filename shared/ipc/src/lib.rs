@@ -242,9 +242,9 @@ pub mod test_dma_labels;
 mod devmgr_client;
 
 pub use devmgr_client::{
-    ClassCallError, ClassWatch, ReadyError, await_device, class_name_of, decline_restart,
-    first_device, first_device_from, mint_class_send, query_device, report_driver_ready,
-    watch_class,
+    ClassCallError, ClassWatch, ReadyError, Refresh, await_device, class_name_of, decline_restart,
+    first_device, first_device_from, mint_class_send, query_device, refresh_device,
+    report_driver_ready, watch_class,
 };
 
 pub mod device_info_kind;

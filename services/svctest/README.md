@@ -121,7 +121,8 @@ services/svctest/
         │                      #   refusals, a session's shell, listed jobs, stopped whole
         ├── oom.rs             # Out-of-memory policy: memhog filled until oomd stops it, a
         │                      #   stop source's job stopped first, a held write resumed
-        ├── timed.rs           # `SystemTime::now()` through svcmgr and timed
+        ├── timed.rs           # `SystemTime::now()` through svcmgr and timed; a timed started
+        │                      #   after the RTC driver's restart serves the wall clock
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
         │                      #   fall-through, remount, a mapped page across the unmount,
         │                      #   a killed fs driver
@@ -178,12 +179,13 @@ svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd and vfsd unmo
 `logd_sinks`, and `entropyd_contribution` phases (`caps[6]`), the vfsd swap-partition phase
 (`caps[14]`), the `memmgr_swap_client` phase (`caps[18]`), the `sessiond_operator` phase and the
 `oom_policy` phase's session case (`caps[15]` and `caps[20]`), the `crash_endpoint`, `logd_reserve`,
-`logd_restart`, `logd_sinks`, `memmgr_swap`, `memmgr_swap_client`, and `vfsd_driver_death` phases,
-and the drivers hwrng restart phase (`caps[19]`), the `svcmgr_stop_service` phase (`caps[20]`, and
-`caps[19]` with `stopsrc` staged), and the no-stop cases of the `oom_policy` and `logd_reserve`
-phases (`caps[20]`), instead fail their assertions. The seed-only phase thus fails the run on a zero
-`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
-reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
+`logd_restart`, `logd_sinks`, `memmgr_swap`, `memmgr_swap_client`, `vfsd_driver_death`, and
+`timed_rtc_restart` phases, and the drivers hwrng restart phase (`caps[19]`), the
+`svcmgr_stop_service` phase (`caps[20]`, and `caps[19]` with `stopsrc` staged), and the no-stop
+cases of the `oom_policy` and `logd_reserve` phases (`caps[20]`), instead fail their assertions. The
+seed-only phase thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so
+that phase's own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the
+same zero cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -222,7 +224,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
 | `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client` phase: memmgr's swap labels, as the swap service over a RAM slot store, with a want Notification of its own |
-| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -270,6 +272,11 @@ at least 16 and at most 504 bytes, the two answers to differ, and `READ(0)` to a
 The drivers hwrng restart phase kills the virtio-rng driver through `caps[19]`, requires its ordinal
 on `caps[16]` to answer `WITHDRAWN` and the class's next ordinal to answer with a new instance, and
 requires a `READ` through that instance to answer with bytes.
+The `timed_rtc_restart` phase kills the RTC driver (`cmos-rtc` on x86-64, `goldfish-rtc` on
+riscv64) through `caps[19]` and waits for devmgr's restart of it, then kills timed (its recipe's
+`argv = timed` names it), and requires `SystemTime::now()` to give a time between 2024 and 2100
+again within 30 s: the restarted timed resolves the RTC past the withdrawn ordinal
+([services/timed/README.md](../timed/README.md)).
 
 The `logd_sinks` phase's framebuffer-restarted case queries the framebuffer class's ordinal 1
 through `caps[13]`, finds, attaches to, and stops the instance devmgr restarted through `caps[19]`,

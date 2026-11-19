@@ -18,6 +18,12 @@
 //! publishes its result with a release store of [`DONE`], which the loop
 //! reads after an acquire load. Each side touches a slot's buffer only while
 //! the state gives the slot to it.
+//!
+//! A restore that the free pages do not admit evicts victims itself, in its
+//! turn, through the synchronous slot: an input window and an output buffer
+//! beside the worker's, and a hash table of its own, so it shares nothing
+//! with the worker (services/memmgr/docs/memory-pool.md § Eviction, Direct
+//! reclaim).
 
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicUsize, Ordering};
@@ -26,8 +32,8 @@ use free_pool::chunk::{ChunkEntry, ChunkState};
 use free_pool::compress::{HASH_ENTRIES, HashTable, PAGE_BYTES};
 use free_pool::store::{Decoder, encode_chunk, store_pages};
 use free_pool::{
-    CHUNK_BYTES, ClockHand, DEMAND_CHUNK_PAGES, DemandRegion, Fit, FrameDesc, FreeRun,
-    NO_REGION_ID, NodeIdx, PressureLevel, Victim, chunk_for, reserve_pages,
+    CHUNK_BYTES, COLD_SWEEPS, ClockHand, DEMAND_CHUNK_PAGES, DemandRegion, Fit, FrameDesc,
+    FreeRun, NO_REGION_ID, NodeIdx, PressureLevel, Victim, chunk_for, reserve_pages,
 };
 use syscall_abi::PAGE_SIZE;
 
@@ -40,18 +46,39 @@ use crate::{
 /// Job slots of the compression worker: evictions in flight at once.
 pub(crate) const JOB_SLOTS: usize = 2;
 
+/// The slot of a restore's synchronous eviction ([`evict_now`]): an input
+/// window and an output buffer after the worker's, never posted to it.
+const SYNC_SLOT: usize = JOB_SLOTS;
+
+/// Input windows and output buffers: one per job slot, and the synchronous
+/// slot's.
+const SLOTS: usize = JOB_SLOTS + 1;
+
+/// Victims a restore evicts at most in its turn before it is declined
+/// ([`admit_restore`]). A tuning value that bounds the turn's work: each
+/// victim kept frees at least one page, and a typical one most of a chunk.
+const MAX_SYNC_VICTIMS: usize = 4;
+
+/// Victims the clock's slices keep for a restore's direct reclaim.
+const VICTIM_CACHE: usize = 8;
+
+/// Sweeps without an access after which direct reclaim may take a chunk: one,
+/// so a chunk accessed, or restored, since the last sweep is never taken.
+const RECLAIM_IDLE_SWEEPS: u8 = 1;
+
 /// A chunk's pages, as a `u64` and as a `usize`.
 const CHUNK_PAGES: u64 = DEMAND_CHUNK_PAGES as u64;
 const CHUNK_RUNS: usize = DEMAND_CHUNK_PAGES as usize;
 
 /// Base of memmgr's eviction windows (the zone map in main.rs): the input
-/// window of each job slot, a chunk each, then the stream window.
+/// window of each job slot and of the synchronous slot, a chunk each, then
+/// the stream window.
 pub(crate) const EVICT_ZONE_VA: u64 = 0x0000_0001_0040_0000;
 
 /// The stream window, where the loop maps a chunk's store runs to write its
 /// stream into them or read it back for a restore. A chunk: a stream is
 /// stored only when it takes fewer pages than the chunk.
-const STREAM_VA: u64 = EVICT_ZONE_VA + JOB_SLOTS as u64 * CHUNK_BYTES;
+const STREAM_VA: u64 = EVICT_ZONE_VA + SLOTS as u64 * CHUNK_BYTES;
 
 /// Exclusive end of the eviction windows.
 pub(crate) const EVICT_ZONE_END: u64 = STREAM_VA + CHUNK_BYTES;
@@ -98,12 +125,17 @@ static BACKED: [AtomicU16; JOB_SLOTS] = [const { AtomicU16::new(0) }; JOB_SLOTS]
 /// Each done job's stream length, or [`NO_GAIN`].
 static RESULT: [AtomicUsize; JOB_SLOTS] = [const { AtomicUsize::new(NO_GAIN) }; JOB_SLOTS];
 
-/// Each job slot's output buffer: the worker's while the slot is posted, the
-/// loop's while it is done.
-static mut OUT: [[u8; OUT_BYTES]; JOB_SLOTS] = [[0; OUT_BYTES]; JOB_SLOTS];
+/// Each slot's output buffer: a job slot's is the worker's while the slot is
+/// posted and the loop's while it is done; the synchronous slot's is the
+/// loop's. Each side reaches only the buffer of the slot it holds
+/// ([`out_buf`]), never the array whole.
+static mut OUT: [[u8; OUT_BYTES]; SLOTS] = [[0; OUT_BYTES]; SLOTS];
 
 /// The compressor's hash table, the worker's alone.
 static mut TABLE: HashTable = [0; HASH_ENTRIES];
+
+/// The synchronous slot's hash table, the loop's alone.
+static mut SYNC_TABLE: HashTable = [0; HASH_ENTRIES];
 
 /// The worker's stack.
 #[repr(C, align(16))]
@@ -121,14 +153,15 @@ struct Job
 }
 
 /// The loop's state of eviction: each slot's job, the worker's Notification
-/// (0 while no worker runs), the clock's hand, and when the last slice ran.
-/// The loop's alone.
+/// (0 while no worker runs), the clock's hand, when the last slice ran, and
+/// the victims kept for direct reclaim. The loop's alone.
 struct Evictor
 {
     jobs: [Option<Job>; JOB_SLOTS],
     notify: u64,
     hand: ClockHand,
     last_slice_us: u64,
+    cache: [Option<Victim>; VICTIM_CACHE],
 }
 
 static mut EVICTOR: Evictor = Evictor {
@@ -136,6 +169,7 @@ static mut EVICTOR: Evictor = Evictor {
     notify: 0,
     hand: ClockHand::START,
     last_slice_us: 0,
+    cache: [None; VICTIM_CACHE],
 };
 
 #[expect(
@@ -150,17 +184,28 @@ fn evictor() -> &'static mut Evictor
     unsafe { &mut EVICTOR }
 }
 
-/// The input window of job slot `slot`.
+/// The output buffer of slot `slot`, below [`SLOTS`], reached alone.
+fn out_buf(slot: usize) -> *mut [u8; OUT_BYTES]
+{
+    debug_assert!(slot < SLOTS);
+    // A pointer to one element of `OUT`, made with no reference to the
+    // array, so the worker's buffer and the loop's never alias.
+    addr_of_mut!(OUT)
+        .cast::<[u8; OUT_BYTES]>()
+        .wrapping_add(slot.min(SLOTS - 1))
+}
+
+/// The input window of slot `slot`.
 const fn input_va(slot: usize) -> u64
 {
-    // `slot` is below `JOB_SLOTS`, so the window lies in the zone.
+    // `slot` is below `SLOTS`, so the window lies in the zone.
     EVICT_ZONE_VA.saturating_add((slot as u64).saturating_mul(CHUNK_BYTES))
 }
 
-/// The job slot index `slot` as the chunk entry's job slot.
+/// The slot index `slot` as the chunk entry's job slot.
 const fn job_id(slot: usize) -> u8
 {
-    // `slot` is below `JOB_SLOTS`.
+    // `slot` is below `SLOTS`.
     slot as u8
 }
 
@@ -251,38 +296,50 @@ extern "C" fn worker_entry(notify: u64) -> !
 fn compress_job(slot: usize)
 {
     let backed = BACKED.get(slot).map_or(0, |b| b.load(Ordering::Relaxed));
+    // SAFETY: the slot is posted, so its output buffer is the worker's alone
+    // until it marks the slot done, and the table is the worker's alone.
+    let (out, table) = unsafe { (&mut *out_buf(slot), &mut *addr_of_mut!(TABLE)) };
+    // SAFETY: the loop mapped each backed page of the chunk at its offset in
+    // the slot's input window before it posted the job, and unmaps it only
+    // once the job is done; nothing writes the pages meanwhile, since the
+    // process's mappings of them are gone.
+    let len = unsafe { compress(backed, input_va(slot), out, table) };
+    if let Some(r) = RESULT.get(slot)
+    {
+        r.store(len, Ordering::Relaxed);
+    }
+}
+
+/// Compress the chunk whose backed pages, as the mask `backed` names, are
+/// mapped at their offsets from `input`, into `out` with the hash table
+/// `table`. Returns the stream's length, or [`NO_GAIN`] when it does not
+/// take fewer pages than the backed pages.
+///
+/// # Safety
+/// Each backed page of the chunk is mapped readable at its offset from
+/// `input`, and nothing writes it until this returns.
+unsafe fn compress(backed: u16, input: u64, out: &mut [u8; OUT_BYTES], table: &mut HashTable)
+-> usize
+{
     // A stream gains only when it takes fewer pages than the chunk's backed
     // pages.
     let limit = (backed.count_ones() as usize)
         .saturating_sub(1)
         .saturating_mul(PAGE_BYTES)
         .min(OUT_BYTES);
-    let input = input_va(slot) as *const [u8; PAGE_BYTES];
-    // SAFETY: the slot is posted, so its output buffer is the worker's alone
-    // until it marks the slot done, and the table is the worker's alone.
-    let out = unsafe { &mut *addr_of_mut!(OUT) };
-    // SAFETY: as above.
-    let table = unsafe { &mut *addr_of_mut!(TABLE) };
-    let len = out
-        .get_mut(slot)
-        .and_then(|buf| buf.get_mut(..limit))
+    let input = input as *const [u8; PAGE_BYTES];
+    out.get_mut(..limit)
         .and_then(|buf| {
             encode_chunk(
                 backed,
-                // SAFETY: the loop mapped each backed page of the chunk at its
-                // offset in the slot's input window before it posted the job,
-                // and unmaps it only once the job is done; nothing writes the
-                // pages meanwhile, since the process's mappings of them are
-                // gone.
+                // SAFETY: the caller's contract: page `i` is mapped at its
+                // offset and nothing writes it.
                 |i| unsafe { &*input.wrapping_add(i as usize) },
                 buf,
                 table,
             )
-        });
-    if let Some(r) = RESULT.get(slot)
-    {
-        r.store(len.unwrap_or(NO_GAIN), Ordering::Relaxed);
-    }
+        })
+        .unwrap_or(NO_GAIN)
 }
 
 /// Whether a job is in flight, so the loop must wake to drain it.
@@ -291,24 +348,35 @@ pub(crate) fn in_flight() -> bool
     STATE.iter().any(|s| s.load(Ordering::Relaxed) != FREE)
 }
 
-/// Whether memmgr reclaims: the worker runs and the pressure level reads
-/// `LOW`. At `CRITICAL` the free pages above the reserve are gone, so a
-/// frame eviction frees goes to the next admission, which a process draining
-/// the pool makes first, and the victim's restore is then declined
-/// (services/memmgr/docs/memory-pool.md § Eviction, Selection).
+/// Whether memmgr reclaims in the background: the worker runs and the
+/// pressure level reads `LOW`. At `CRITICAL` the free pages above the
+/// reserve are gone, so a frame background eviction frees goes to the next
+/// admission, which a process draining the pool makes first; there only a
+/// restore evicts, for itself ([`admit_restore`];
+/// services/memmgr/docs/memory-pool.md § Eviction, Selection).
 pub(crate) fn reclaiming() -> bool
 {
     evictor().notify != 0 && current_pressure() == PressureLevel::Low
 }
 
+/// Whether the clock runs: the worker runs and the pressure level reads
+/// `LOW` or `CRITICAL`, so a restore at `CRITICAL` finds victims aged
+/// since the level fell.
+pub(crate) fn clocking() -> bool
+{
+    evictor().notify != 0 && current_pressure() != PressureLevel::Normal
+}
+
 /// One turn's eviction work, after the turn's message, if any: drain the done
-/// jobs, then, while memmgr reclaims and the interval since the last slice
-/// has passed, run a slice of the clock and post a job for each cold chunk it
-/// finds, as many as there are free slots.
+/// jobs, then, while the clock runs and the interval since the last slice has
+/// passed, run a slice of it. While memmgr reclaims, the slice finds the cold
+/// chunks and posts a job for each, as many as there are free slots;
+/// otherwise it finds the chunks idle for [`RECLAIM_IDLE_SWEEPS`]. The rest
+/// it finds are kept for direct reclaim ([`keep_victims`]).
 pub(crate) fn turn(l: &mut MemLedger)
 {
     drain(l);
-    if !reclaiming()
+    if !clocking()
     {
         return;
     }
@@ -319,30 +387,98 @@ pub(crate) fn turn(l: &mut MemLedger)
         return;
     }
     ev.last_slice_us = now;
-    let free = STATE
-        .iter()
-        .filter(|s| s.load(Ordering::Relaxed) == FREE)
-        .count();
-    if free == 0
+    let background = reclaiming();
+    let idle = if background
     {
-        return;
+        COLD_SWEEPS
     }
-    let mut victims = [Victim::default(); JOB_SLOTS];
+    else
+    {
+        RECLAIM_IDLE_SWEEPS
+    };
+    let mut victims = [Victim::default(); JOB_SLOTS + VICTIM_CACHE];
     let found = l.sweep(
         &mut ev.hand,
         SWEEP_SLICE_STEPS,
         |aspace, va, pages, bitmap| syscall::aspace_harvest(aspace, va, pages, bitmap).is_ok(),
-        victims.get_mut(..free).unwrap_or(&mut []),
+        &mut victims,
+        idle,
     );
-    for v in victims.iter().take(found)
+    let mut found = victims.get(..found).unwrap_or(&[]);
+    while background
+        && let Some((v, rest)) = found.split_first()
+        && let Some(slot) = STATE.iter().position(|s| s.load(Ordering::Relaxed) == FREE)
     {
-        let Some(slot) = STATE.iter().position(|s| s.load(Ordering::Relaxed) == FREE)
+        post(l, v, slot);
+        found = rest;
+    }
+    keep_victims(l, found);
+}
+
+/// Whether the victim `v` may still be evicted, as a chunk idle for `idle`
+/// sweeps of an eligible region of a process memmgr can unmap.
+fn still_victim(l: &MemLedger, v: &Victim, idle: u8) -> bool
+{
+    l.region_for(v.rec, v.page_base)
+        .is_some_and(|(reg, _)| reg == v.reg)
+        && l.evictable(v.rec, v.reg)
+        && l.aspace_cap(v.rec) != 0
+        && l.chunk_at(v.reg, v.page_base).is_idle(idle)
+}
+
+/// Keep `found` for direct reclaim: drop the kept victims that may no longer
+/// be evicted, then add each of `found` not kept already while there is
+/// room.
+fn keep_victims(l: &MemLedger, found: &[Victim])
+{
+    let cache = &mut evictor().cache;
+    for kept in cache.iter_mut()
+    {
+        if kept.is_some_and(|v| !still_victim(l, &v, RECLAIM_IDLE_SWEEPS))
+        {
+            *kept = None;
+        }
+    }
+    for v in found
+    {
+        if cache.contains(&Some(*v))
+        {
+            continue;
+        }
+        let Some(free) = cache.iter_mut().find(|k| k.is_none())
         else
         {
             break;
         };
-        post(l, v, slot);
+        *free = Some(*v);
     }
+}
+
+/// Take the kept victim of the greatest age that may still be evicted,
+/// dropping each that may not. `None` when none is left.
+fn take_victim(l: &MemLedger) -> Option<Victim>
+{
+    let cache = &mut evictor().cache;
+    let mut best: Option<(usize, u8)> = None;
+    for (i, kept) in cache.iter_mut().enumerate()
+    {
+        let Some(v) = *kept
+        else
+        {
+            continue;
+        };
+        if !still_victim(l, &v, RECLAIM_IDLE_SWEEPS)
+        {
+            *kept = None;
+            continue;
+        }
+        let age = l.chunk_at(v.reg, v.page_base).age();
+        if best.is_none_or(|(_, a)| age > a)
+        {
+            best = Some((i, age));
+        }
+    }
+    best.and_then(|(i, _)| cache.get_mut(i)).and_then(Option::take)
 }
 
 /// The runs of the resident or evicting chunk holding `page_base` in region
@@ -419,24 +555,77 @@ const fn remap_target(
     }
 }
 
-/// Evict the cold chunk `v` through job slot `slot`: unmap its runs from the
-/// process, mark it evicting, map its runs into the slot's input window, and
-/// post the job. A chunk no longer cold, or a step that fails, leaves the
-/// chunk resident and mapped.
+/// Evict the cold chunk `v` through job slot `slot`: unmap it and map it
+/// at the slot's input window ([`begin`]), then post the job.
 fn post(l: &mut MemLedger, v: &Victim, slot: usize)
 {
-    let Some((reg, region)) = l
-        .region_for(v.rec, v.page_base)
-        .filter(|(reg, _)| *reg == v.reg)
+    let Some(job) = begin(l, v, slot, COLD_SWEEPS)
     else
     {
         return;
     };
-    let entry = l.chunk_at(reg, v.page_base);
-    let aspace = l.aspace_cap(v.rec);
-    if !entry.is_cold() || aspace == 0
+    let backed = l.chunk_at(job.reg, job.page_base).backed();
+    if let Some(j) = evictor().jobs.get_mut(slot)
+    {
+        *j = Some(job);
+    }
+    if let (Some(b), Some(s)) = (BACKED.get(slot), STATE.get(slot))
+    {
+        b.store(backed, Ordering::Relaxed);
+        s.store(POSTED, Ordering::Release);
+    }
+    let _ = syscall::notification_send(evictor().notify, 1);
+}
+
+/// Evict the victim `v` now, in the loop's turn, through the synchronous
+/// slot (services/memmgr/docs/memory-pool.md § Eviction, Direct reclaim):
+/// unmap it and map it at the slot's input window ([`begin`]), compress it
+/// into the slot's buffer, unmap the window, and store the stream
+/// ([`store`]), which returns the chunk's runs to the pool. A stream that
+/// gains nothing, or a step that fails, maps the chunk back.
+fn evict_now(l: &mut MemLedger, v: &Victim)
+{
+    let Some(job) = begin(l, v, SYNC_SLOT, RECLAIM_IDLE_SWEEPS)
+    else
     {
         return;
+    };
+    let backed = l.chunk_at(job.reg, job.page_base).backed();
+    // SAFETY: the synchronous slot's buffer and table are the loop's alone;
+    // `begin` mapped each backed page of the chunk at its offset in the
+    // slot's input window, and the process's mappings of them are gone, so
+    // nothing writes them.
+    let len = unsafe {
+        compress(
+            backed,
+            input_va(SYNC_SLOT),
+            &mut *out_buf(SYNC_SLOT),
+            &mut *addr_of_mut!(SYNC_TABLE),
+        )
+    };
+    // SAFETY: the window is memmgr's own zone, mapped for this eviction alone.
+    let _ = unsafe { syscall::mem_unmap(self_aspace(), input_va(SYNC_SLOT), CHUNK_PAGES) };
+    if len == NO_GAIN || !store(l, &job, SYNC_SLOT, len)
+    {
+        cancel(l, &job);
+    }
+}
+
+/// Start evicting the victim `v` through slot `slot`: unmap its runs from
+/// the process, mark it evicting, and map its runs at the slot's input
+/// window. Returns its job. A chunk no longer idle for `idle` sweeps, or a
+/// step that fails, leaves the chunk resident and mapped, and returns
+/// `None`.
+fn begin(l: &mut MemLedger, v: &Victim, slot: usize, idle: u8) -> Option<Job>
+{
+    let (reg, region) = l
+        .region_for(v.rec, v.page_base)
+        .filter(|(reg, _)| *reg == v.reg)?;
+    let entry = l.chunk_at(reg, v.page_base);
+    let aspace = l.aspace_cap(v.rec);
+    if !entry.is_idle(idle) || aspace == 0
+    {
+        return None;
     }
     let (chunk_base, _) = chunk_for(&region, v.page_base);
     let (runs, n) = chunk_runs(l, reg, v.page_base);
@@ -447,7 +636,7 @@ fn post(l: &mut MemLedger, v: &Victim, slot: usize)
             .is_err()
     {
         let _ = map_runs(l, &target, runs);
-        return;
+        return None;
     }
     let window = input_va(slot);
     for run in runs
@@ -464,23 +653,14 @@ fn post(l: &mut MemLedger, v: &Victim, slot: usize)
             {
                 let _ = l.cancel_evict(v.rec, reg, v.page_base);
             }
-            return;
+            return None;
         }
     }
-    if let Some(job) = evictor().jobs.get_mut(slot)
-    {
-        *job = Some(Job {
-            rec: v.rec,
-            reg,
-            page_base: v.page_base,
-        });
-    }
-    if let (Some(b), Some(s)) = (BACKED.get(slot), STATE.get(slot))
-    {
-        b.store(entry.backed(), Ordering::Relaxed);
-        s.store(POSTED, Ordering::Release);
-    }
-    let _ = syscall::notification_send(evictor().notify, 1);
+    Some(Job {
+        rec: v.rec,
+        reg,
+        page_base: v.page_base,
+    })
 }
 
 /// Drain every done job: unmap its input window, then store the chunk's
@@ -539,7 +719,7 @@ fn cancel(l: &mut MemLedger, job: &Job)
     }
 }
 
-/// Store the stream of `len` bytes job slot `slot` holds for `job`'s chunk:
+/// Store the stream of `len` bytes slot `slot` holds for `job`'s chunk:
 /// take its store pages from the pool, write the stream into them through the
 /// stream window, and swap the chunk onto them
 /// ([`free_pool::Ledger::finish_evict`]), which returns the chunk's runs to
@@ -601,7 +781,7 @@ fn store(l: &mut MemLedger, job: &Job, slot: usize, len: usize) -> bool
     false
 }
 
-/// Write the first `len` bytes of job slot `slot`'s output buffer into the
+/// Write the first `len` bytes of slot `slot`'s output buffer into the
 /// store runs `runs`, in order, through the stream window.
 fn write_stream(l: &mut MemLedger, runs: &[FreeRun], slot: usize, len: usize) -> bool
 {
@@ -610,13 +790,11 @@ fn write_stream(l: &mut MemLedger, runs: &[FreeRun], slot: usize, len: usize) ->
     {
         return false;
     };
-    // SAFETY: the slot is done, so its output buffer is the loop's.
-    let out = unsafe { &*addr_of_mut!(OUT) };
+    // SAFETY: the slot is done, or is the synchronous slot, so its output
+    // buffer is the loop's.
+    let out = unsafe { &*out_buf(slot) };
     let room = usize::try_from(pages.saturating_mul(PAGE_SIZE)).unwrap_or(0);
-    let src = out
-        .get(slot)
-        .and_then(|b| b.get(..len))
-        .filter(|src| src.len() <= room);
+    let src = out.get(..len).filter(|src| src.len() <= room);
     if let Some(src) = src
     {
         // SAFETY: `map_stream` mapped `pages` pages read-write at the stream
@@ -710,7 +888,8 @@ fn give_back(l: &mut MemLedger, runs: &[FrameDesc])
 /// Restore the swapped chunk holding `page_base` in region `reg` of `rec`
 /// (services/memmgr/docs/memory-pool.md § Eviction, States): admitted when the
 /// free pages outside `promised` cover its backed pages and, for a node outside
-/// it, the system reserve; then runs covering exactly its backed pages, each
+/// it, the system reserve, once direct reclaim has made room when needed
+/// ([`admit_restore`]); then runs covering exactly its backed pages, each
 /// filled whole through the scrub window from the stream, mapped into the
 /// process, and the chunk resident on them, its store back in the pool. The
 /// chunk's pages are charged already.
@@ -730,12 +909,14 @@ fn restore(
     aspace: u64,
 ) -> Result<(), (FaultDecline, u64)>
 {
-    let entry = l.chunk_at(reg, page_base);
-    let backed = entry.backed();
+    let backed = l.chunk_at(reg, page_base).backed();
     if !admit_restore(l, rec, u64::from(backed.count_ones()))
     {
         return Err((FaultDecline::NoFreePage, 0));
     }
+    // Read after the admission, whose direct reclaim changes the chunk
+    // tables: the chunk itself stays swapped, since it is no victim.
+    let entry = l.chunk_at(reg, page_base);
     let (chunk_base, _) = chunk_for(region, page_base);
     let mut runs = [FrameDesc::default(); CHUNK_RUNS];
     let n = select_restore_runs(l, backed, chunk_base, &mut runs)?;
@@ -771,7 +952,11 @@ fn restore(
 
 /// Whether a restore of `pages` pages for `rec` is admitted: the free pages
 /// outside `promised` cover them and, for a budget node outside the reserve,
-/// the system reserve, after the turn's deferred recheck when they do not.
+/// the system reserve. When they do not, after the turn's deferred recheck,
+/// memmgr reclaims directly (services/memmgr/docs/memory-pool.md § Eviction,
+/// Direct reclaim): it evicts the kept victims of greatest age now, one by
+/// one ([`evict_now`]), until the restore is admitted or
+/// [`MAX_SYNC_VICTIMS`] have been tried.
 fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
 {
     let reserve = if l.budget(rec).is_some_and(|b| b.reserve())
@@ -790,6 +975,17 @@ fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
     if recheck_deferred(l) != 0
     {
         coalesce(l);
+    }
+    let mut tried: usize = 0;
+    while !fits(l) && tried < MAX_SYNC_VICTIMS
+    {
+        let Some(v) = take_victim(l)
+        else
+        {
+            return false;
+        };
+        evict_now(l, &v);
+        tried = tried.saturating_add(1);
     }
     fits(l)
 }

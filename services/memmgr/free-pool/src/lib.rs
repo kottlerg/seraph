@@ -40,7 +40,7 @@ pub use arena::{
 pub use budget::{
     BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, reserve_pages,
 };
-pub use chunk::{ChunkEntry, ChunkError, ChunkState};
+pub use chunk::{COLD_SWEEPS, ChunkEntry, ChunkError, ChunkState};
 pub use commit::{CommitNeed, PT_DONATION_PAGES};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};

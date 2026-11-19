@@ -169,7 +169,7 @@ impl ClockHand
     pub const START: Self = Self { badge: None, va: 0 };
 }
 
-/// A chunk a sweep found cold ([`ChunkEntry::is_cold`]) in an eligible
+/// A chunk a sweep found idle ([`ChunkEntry::is_idle`]) in an eligible
 /// region: the record and region slots, and the chunk's base.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Victim
@@ -179,14 +179,16 @@ pub struct Victim
     pub page_base: u64,
 }
 
-/// The state of one [`Ledger::sweep`]: the harvest, the victims written, and
-/// the steps left of its budget.
+/// The state of one [`Ledger::sweep`]: the harvest, the victims written, the
+/// steps left of its budget, and the sweeps without an access that make a
+/// victim.
 struct Sweep<'a, H>
 {
     harvest: H,
     victims: &'a mut [Victim],
     found: usize,
     left: u64,
+    idle_sweeps: u8,
 }
 
 /// What a teardown released from the chunks it freed ([`retire_entry`]).
@@ -2121,8 +2123,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// One slice of the eviction clock: from `hand`, sweep at most `budget`
     /// steps over the chunks of the eligible regions ([`Ledger::evictable`])
     /// of every process with a delegated address space, in record order and,
-    /// within a record, in address order, and write each chunk found cold into
-    /// `victims` until it is full. A step is a chunk swept, or a region or
+    /// within a record, in address order, and write each chunk found idle for
+    /// `idle_sweeps` sweeps ([`ChunkEntry::is_idle`]) into `victims` until it
+    /// is full. A step is a chunk swept, or a region or
     /// record passed; a span read is swept whole, so a slice passes `budget`
     /// by at most one span's chunks. Each span of up to [`SWEEP_SPAN_CHUNKS`] chunks from a
     /// chunk that has an entry is read with one call of `harvest(aspace, va,
@@ -2140,6 +2143,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         budget: u64,
         harvest: impl FnMut(u64, u64, u64, &mut [u8]) -> bool,
         victims: &mut [Victim],
+        idle_sweeps: u8,
     ) -> usize
     {
         let found = hand.badge.and_then(|b| self.find(b)).or_else(|| {
@@ -2157,6 +2161,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             victims,
             found: 0,
             left: budget,
+            idle_sweeps,
         };
         while s.left > 0
         {
@@ -2257,7 +2262,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 let mut table = node.table;
                 chunk::set_entry(&mut self.arena, &mut table, height, i, swept);
             }
-            if swept.is_cold()
+            if swept.is_idle(s.idle_sweeps)
                 && let Some(v) = s.victims.get_mut(s.found)
             {
                 *v = Victim {
@@ -2613,7 +2618,7 @@ mod tests
     use super::*;
     use crate::arena::test_store::VecStore;
     use crate::budget::{NO_MAX, reserve_pages};
-    use crate::chunk::ChunkState;
+    use crate::chunk::{COLD_SWEEPS, ChunkState};
 
     const UNMAPPED: u64 = u64::MAX;
 
@@ -3754,6 +3759,48 @@ mod tests
     }
 
     #[test]
+    fn a_sweep_reports_the_chunks_idle_for_the_sweeps_it_is_given()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        l.set_aspace_cap(rec, 7);
+        let open = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        for va in [BASE, BASE + CHUNK]
+        {
+            let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
+            l.back_chunk(rec, open, frame(cap, pages, phys, va)).unwrap();
+        }
+        // Every harvest sees page 0 of chunk 1 accessed.
+        let mut harvest = |_: u64, _: u64, _: u64, bitmap: &mut [u8]| {
+            bitmap[2] |= 1;
+            true
+        };
+        let mut hand = ClockHand::default();
+        let mut victims = [Victim::default(); 4];
+        // After one sweep chunk 0 is idle for one sweep, not for two, and the
+        // accessed chunk 1 for none.
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, 1), 1);
+        assert_eq!(victims[0].page_base, BASE);
+        assert_eq!(l.chunk_at(open, BASE).age(), 1);
+        assert_eq!(l.chunk_at(open, BASE + CHUNK).age(), 0);
+        assert!(!l.chunk_at(open, BASE).is_cold());
+        // A sweep for no sweeps reports every resident chunk, accessed or not;
+        // the second sweep makes chunk 0 cold.
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, 0), 2);
+        assert!(l.chunk_at(open, BASE).is_cold());
+        assert_eq!(
+            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS),
+            1
+        );
+        // A chunk that is not resident is never reported.
+        l.begin_evict(rec, open, BASE, 1).unwrap();
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, 0), 1);
+        assert_eq!(victims[0].page_base, BASE + CHUNK);
+    }
+
+    #[test]
     fn the_clock_sweeps_only_evictable_chunks_and_reports_the_cold_ones()
     {
         let mut l = roomy_ledger(10_000);
@@ -3818,9 +3865,9 @@ mod tests
         };
         let mut hand = ClockHand::default();
         let mut victims = [Victim::default(); 4];
-        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims), 0);
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS), 0);
         // The second pass finds chunk 0 cold; chunk 2 stays warm.
-        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims), 1);
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS), 1);
         assert_eq!(
             victims[0],
             Victim {
@@ -3839,7 +3886,7 @@ mod tests
         let mut found = 0;
         for _ in 0..8
         {
-            found = l.sweep(&mut hand, 1, &mut harvest, &mut victims);
+            found = l.sweep(&mut hand, 1, &mut harvest, &mut victims, COLD_SWEEPS);
             if !calls.borrow().is_empty()
             {
                 break;
@@ -3848,12 +3895,12 @@ mod tests
         assert_eq!(found, 1);
         assert_eq!(*calls.borrow(), [(7, BASE, 64)]);
         assert_eq!(
-            l.sweep(&mut hand, 1000, |_, _, _, _| false, &mut victims),
+            l.sweep(&mut hand, 1000, |_, _, _, _| false, &mut victims, COLD_SWEEPS),
             0
         );
         // Evicting, the cold chunk is no longer reported.
         l.begin_evict(rec, open, BASE, 1).unwrap();
-        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims), 0);
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS), 0);
     }
 
     #[test]

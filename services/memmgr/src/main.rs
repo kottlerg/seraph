@@ -138,8 +138,9 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 // windows, in address order, all below `MAIN_TLS_WINDOW.base`:
 //
 //   scrub window        [SCRUB_VA, + 2 MiB)                 a run being cleared
-//   eviction windows    [evict::EVICT_ZONE_VA, + 192 KiB)   a job's input, a
-//                                                            chunk's stream
+//   eviction windows    [evict::EVICT_ZONE_VA, + 256 KiB)   a job's input, a
+//                                                            restore's victim,
+//                                                            a chunk's stream
 //   phys-table scratch  [PHYS_TABLE_TEMP_VA, + 8 GiB)      one page, per-boot drawn
 //   process index       [PROCESS_INDEX_VA, PROCESS_INDEX_END)  bucket heads
 //   metadata arena      [drawn base, META_ARENA_LOW_END)    arena pages, then
@@ -3699,11 +3700,11 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
         // After the top-up, which draws on the free pool too, so the level a
         // registrant reads is the one the next receive starts from.
         signal_pressure();
-        // While memmgr reclaims or a compression job is in flight, a receive
+        // While the clock runs or a compression job is in flight, a receive
         // that waits a bounded time, so the loop drains completions and runs
         // the clock with no message arriving; else one that waits for a
         // message (services/memmgr/docs/memory-pool.md § Eviction).
-        let wait = if evict::in_flight() || evict::reclaiming()
+        let wait = if evict::in_flight() || evict::clocking()
         {
             evict::RECLAIM_WAIT_MS
         }

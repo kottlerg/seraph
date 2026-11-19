@@ -3557,13 +3557,10 @@ pub fn make_resident(
     // SAFETY: ipc_buf is the registered IPC buffer page.
     match unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }
     {
-        Ok(reply) if reply.label == memmgr_errors::SUCCESS =>
-        {
-            (
-                procmgr_errors::SUCCESS,
-                [reply.word(0), reply.word(1), reply.word(2)],
-            )
-        }
+        Ok(reply) if reply.label == memmgr_errors::SUCCESS => (
+            procmgr_errors::SUCCESS,
+            [reply.word(0), reply.word(1), reply.word(2)],
+        ),
         Ok(reply) if reply.label == memmgr_errors::INVALID_ARGUMENT =>
         {
             (procmgr_errors::INVALID_ARGUMENT, [0; 3])

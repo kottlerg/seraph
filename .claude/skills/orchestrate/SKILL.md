@@ -25,9 +25,11 @@ only if that does not cure it.
 
 1. **Start the orchestrator.** Spawn the `orchestrator` agent in this checkout (no worktree)
    with one line: the batch's goal as the maintainer gave it, or "resume from the record". Send
-   it its own agent id from the spawn result as its first message, since that id is the address
-   its workers report to.
-2. **Relay, unchanged.** What the orchestrator sends you is for the maintainer and is already
+   it its own agent id from the spawn result as its first message, since that id, once it
+   records it, is the address its workers report to. Keep the output file the spawn result
+   names: it is how you count and check the orchestrator (steps 3 and § A silent orchestrator).
+2. **Relay, unchanged.** The orchestrator reaches you by message only (`SendMessage` to
+   `main`), never by ending its turn. What it sends you is for the maintainer and is already
    limited to a merge, a block or question, a decision made on their behalf, a breach, or what
    they asked for. Show it as it is. Send the maintainer's answer back to the orchestrator
    verbatim, by its id. Never paraphrase a question or a decision in either direction, and
@@ -35,19 +37,26 @@ only if that does not cure it.
    orchestrator, and its answer comes back. The maintainer's words go no further than the
    orchestrator and its local record; nothing tracked or outward-facing quotes them
    (docs/documentation-standards.md § Tone and Language; docs/conventions.md § Style).
-3. **Replace the orchestrator at about 250,000 tokens.** Its notifications carry its token
-   count. At that size, or when it asks, send `park`; when it answers `parked` and hands back,
-   spawn a new one with "resume from the record" and give it its id. Stop the old one only if it
-   does not hand back. When it asks because a merge changed its own file, the request names the
-   changed files: the new one's line is "resume from the record; read from disk first: <the
-   files>", since the definition this session loaded is the old one. When the orchestrator
-   names this file after a merge, read it again yourself. A merge that changes `.claude/` needs
-   no new session (`.claude/agents/orchestrator.md` § Plan); this session continues.
-4. **Forward what orphans send you.** A worker spawned by an earlier orchestrator stays alive,
-   but its hand-back and task notifications arrive here. Forward a hand-back to the current
-   orchestrator verbatim: it is the worker's only copy of its report (a gate report, a question
-   that blocks it, a composition check's verdict, a stand-down line). Forward a notification
-   that carries no hand-back in one line: the worker and the notification's status.
+3. **Replace the orchestrator at about 250,000 tokens.** Its context size is the input of its
+   last turn, which the last `usage` entry of its output file records (`input_tokens`,
+   `cache_creation_input_tokens` and `cache_read_input_tokens` added up:
+   `tail -n 20 <file> | grep -o '"usage":{[^}]*}' | tail -1`), or the count a task
+   notification carries when one arrives. At that size, or when it asks, send `park`; when its
+   `parked` message arrives, spawn a new one with "resume from the record" and give it its id.
+   The old one stays idle and forwards you what still reaches it (step 4). Stop it only when no
+   `parked` comes and § A silent orchestrator shows it is gone. When it asks because a merge
+   changed its own file, the request names the changed files: the new one's line is "resume
+   from the record; read from disk first: <the files>", since the definition this session
+   loaded is the old one. When the orchestrator names this file after a merge, read it again
+   yourself. A merge that changes `.claude/` needs no new session
+   (`.claude/agents/orchestrator.md` § Plan); this session continues.
+4. **Forward what reaches you for the orchestrator.** A parked orchestrator sends you, verbatim,
+   any message that still reaches it, and a worker spawned by an earlier orchestrator stays
+   alive, with the harness's notifications of its stops arriving here. Forward a parked
+   orchestrator's message to the current orchestrator verbatim: it can be a worker's only copy of
+   its report (a gate report, a question that blocks it, a composition check's verdict, a
+   stand-down line). Forward a notification in one line: the worker and the notification's
+   status.
 5. **Do for the orchestrator what only the top session can**: stop an agent it names, schedule
    or cancel a tick it asks for, apply a `.claude/CLAUDE.md`, settings or hook patch on the
    maintainer's direct word in this conversation, and make a `release-review` workflow call it
@@ -56,6 +65,17 @@ only if that does not cure it.
 6. **Wake a drifted orchestrator.** A turn of the orchestrator that ran in a worker's worktree
    and deferred work sends "drift: wake me" as its last action (`.claude/agents/orchestrator.md`
    § Failure modes). On it, reply "resume" at once and show the maintainer nothing.
+
+## A silent orchestrator
+
+The harness sends you a task notification when the orchestrator stops only if no background
+child of its own is alive, and with workers alive that is almost never. Silence is therefore no
+sign: an orchestrator that has sent nothing may be working, waiting on a worker, or idle. Before
+you replace or stop one, check it. Read the tail of its output file: a recent entry, or a tool
+call with no result yet, means it is working. When the file shows a turn that ended, send it one
+line asking for its state; it answers by message. Treat it as gone only when a message to it is
+undeliverable, or when neither a reply nor a new entry in the file follows within ten minutes.
+Then spawn a new one with "resume from the record", as in step 3.
 
 ## What you do not do
 

@@ -59,11 +59,20 @@ work; do not act on the summary's account of a rule.
 
 ## Reporting
 
-Everything you send the orchestrator stays in its context for the rest of the batch. A message
-from you also wakes it for a turn, and that turn runs in your worktree, where the harness
-refuses it git on the main checkout, so it can verify no gate, merge or spawn. A hand-back
-starts its turn in the main checkout. So what you send has one of three shapes, each with its
-channel, and the detail lives in files: the PR body, the run records, the scratchpad.
+Everything you send the orchestrator stays in its context for the rest of the batch, and each
+message from you wakes it for a turn that can run in your worktree, where the harness refuses it
+git on the main checkout (`.claude/agents/orchestrator.md` § Failure modes). So what you send
+has one of three shapes, each with its channel, and the detail lives in files: the PR body, the
+run records, the scratchpad.
+
+Ending your turn reports nothing. The harness sends the orchestrator a task notification when you
+stop only if no background child of yours is alive (a CI watch, a `pr-reviewer` or
+`pr-auditor` agent, a background command), and that notification carries only your last text;
+with one alive, your stop reaches nobody. Every report the orchestrator must read therefore goes
+by `SendMessage` to its agent id: the one `cargo xtask orch orchestrator` prints, which the
+record keeps current when the orchestrator is replaced, or, when the command finds no batch, the
+one your prompt or a later orchestrator's message names. Never send to `main`, which is the
+supervisor above it.
 
 - **Status**: one line of at most 200 characters, recorded with
   `cargo xtask orch worker <name> --status "<line>"`, `<name>` being the record name your prompt
@@ -79,26 +88,23 @@ channel, and the detail lives in files: the PR body, the run records, the scratc
   instead. One status line is a message in any case: the results that end an exclusive grant
   (§ Host runs), since the orchestrator must act on them.
 - **Question**: the question, the options, your recommendation, in at most 150 words, with the
-  path of a file for anything longer. A question you can keep working past goes by `SendMessage`
-  to the orchestrator's agent id: the one your prompt names, or the one a later orchestrator's
-  message gives you, since the orchestrator is replaced during a batch. Never send to `main`,
-  which is the supervisor above it. A question that blocks you (a host request is one) goes by
-  hand-back alone.
+  path of a file for anything longer. A question you can keep working past goes as a message,
+  and you keep working. A question that blocks you (a host request is one) goes as a hand-back.
 - **Gate report**: the PR number and head, the result line of `cargo xtask pr-check <N> --gate`,
   the merge command, one line for each branch and the worktree (path and state), and what is
   left for you, if anything. The results, the findings and the Issue state are in the PR body
-  and the run records; do not repeat them. It goes by hand-back alone.
+  and the run records; do not repeat them. It goes as a hand-back.
 
 The plan after reading (the items you will fix and those you will not, the mechanism for
 anything non-trivial, the tests, each expansion) goes in a scratchpad file, with its path and a
 summary in the status line.
 
-A hand-back ends your turn, goes through the hand-back tool, and carries the whole report in its
-message, since nothing you wrote before it reaches the orchestrator. Send no message before it:
-the hand-back is the report. When the orchestrator that spawned you has been replaced, the
-hand-back reaches the supervisor, which forwards it to the current orchestrator verbatim.
-Standalone, your replies to the maintainer take the place of all of this, and there the verdict
-lines and results are shown in the reply.
+A hand-back is the message after which you stop and wait for the orchestrator. Send the whole
+report in one `SendMessage`, since nothing else you wrote reaches the orchestrator, and then end
+your turn with one line saying that it was sent: when the harness does send a notification of
+your stop, that line is what it adds to the orchestrator's context. Standalone, your replies to
+the maintainer take the place of all of this, and there the verdict lines and results are shown
+in the reply.
 
 Hand back in two cases only: a question the orchestrator must answer before you can go on (a
 host request is one), or the gate report. A pending CI run or review is not a reason, and
@@ -144,7 +150,9 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
 - Cut one branch from current `origin/master`, named per docs/conventions.md § Branch naming, as
   your first action after reading. One PR per commit-title scope; several scopes in one prompt
   mean several branches and PRs, each cut from `master`, never stacked. When the prompt names an
-  existing branch (a respawn), check it out from `origin/<branch>` and continue its PR.
+  existing branch (a respawn), continue its PR: in the existing worktree the prompt names, on the
+  branch it holds, running every command there by absolute path, or, when it names none, on a
+  checkout of `origin/<branch>`.
 - Touch only the files of your task. A change the rules force elsewhere is an expansion: state
   it in one line in the report and the PR body, and continue. Forced means a caller of a changed
   signature, every copy of a changed fact (docs/documentation-standards.md § Change propagation

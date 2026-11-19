@@ -30,7 +30,9 @@ memmgr/
 │                               # store's page codec and chunk stream
 │                               # (`compress.rs`, `store.rs`)
 ├── src/
-│   └── main.rs                 # _start() entry point, IPC dispatch loop
+│   ├── main.rs                 # _start() entry point, IPC dispatch loop
+│   └── evict.rs                # Eviction: the clock's slices, the compression
+│                               # worker, the store, restore
 └── docs/
     ├── memory-pool.md          # Pool, allocation, reclamation, coalescing
     └── ipc-interface.md        # memmgr IPC labels and wire shapes
@@ -111,10 +113,10 @@ Allocation Contract").
   (see [docs/fault-handling.md](../../docs/fault-handling.md) § Demand Paging
   and the Default System Pager); a failed allocation returns an out-of-memory
   error to the caller (see [`docs/memory-pool.md`](docs/memory-pool.md)
-  §"Failure Modes"). Under memory pressure memmgr is to evict cold pages it
-  mapped as pager into a compressed store it keeps in RAM, and restore them on
-  the next fault (design intent; not yet implemented: see
-  [`docs/memory-pool.md`](docs/memory-pool.md#eviction) § Eviction). Swap to
+  §"Failure Modes"). Under memory pressure memmgr evicts cold pages it mapped
+  as pager into a compressed store it keeps in RAM, and restores them on the
+  next fault (see [`docs/memory-pool.md`](docs/memory-pool.md#eviction)
+  § Eviction). Swap to
   disk is that store's second tier: a separate swap service writes store pages
   out and reads them back
   ([#43](https://github.com/kottlerg/seraph/issues/43)).
@@ -191,7 +193,7 @@ The remaining constants are tuning values that bound no capacity:
 | `DEFERRED_RECHECK_BATCH` | 64 runs | Deferred runs one recheck checks; a run not pooled goes to the back |
 | `DEFERRED_RECHECK_WINDOWS` | 256 windows | Mapping-count windows one recheck spends; the run that crosses the budget is still read whole |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
-| `SYSTEM_RESERVE_DIVISOR` | 64 | The system reserve is `pool_total / 64` free pages, which only a reserve budget node's charge may take; the pressure level is `CRITICAL` at or below it |
+| `SYSTEM_RESERVE_DIVISOR` | 64 | The system reserve is `pool_total / 64` free pages, which only a reserve budget node's charge may take; the pressure level is `CRITICAL` at or below the growth floor, the reserve and, while chunks are swapped, the restore headroom ([`docs/memory-pool.md`](docs/memory-pool.md) § Eviction) |
 | `PRESSURE_LOW_DIVISOR` | 16 | The pressure level is `LOW` below `pool_total / 16` free pages outside `promised` ([`docs/memory-pool.md`](docs/memory-pool.md) § Memory pressure) |
 | `PRESSURE_BAND_DIVISOR` | 128 | Hysteresis band of `pool_total / 128` pages, at least one, that the free pool clears before the level improves |
 

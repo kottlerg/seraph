@@ -923,6 +923,24 @@ fn entry_base(index: usize, stride: usize) -> Option<usize>
 /// `services/procmgr/docs/ipc-interface.md` § `DETACH_PROCESS`.
 pub const DETACH_PROCESS: u64 = 24;
 
+/// Make a range of a process's memory resident for a debugger: memmgr
+/// restores each chunk of the range it evicted into its compressed store,
+/// so a `SYS_THREAD_READ_MEM` that failed with `InvalidAddress` on such a
+/// page succeeds when the reader retries; a page no fault has backed stays
+/// not present. Served only on a badge carrying [`DEBUG_AUTHORITY`].
+/// `data[0]` is the target's process badge, `data[1]` the address and
+/// `data[2]` the length in bytes, nonzero. Replies `SUCCESS` with `data[0]`
+/// where memmgr stopped, which does a bounded part of the range per
+/// request: the range's end when it is all done, else the address to ask
+/// again from (`ipc::make_resident` asks until it is done);
+/// `UNAUTHORIZED` without the authority; `INVALID_BADGE` when no live
+/// process carries the badge; `INVALID_ARGUMENT` for a zero length or a
+/// range past the address space; `OUT_OF_MEMORY` when a chunk could not be
+/// restored. A process that declared itself undebuggable is served too,
+/// since the request reads and writes nothing of it.
+/// Specified in `services/procmgr/docs/ipc-interface.md` § `MAKE_RESIDENT`.
+pub const MAKE_RESIDENT: u64 = 30;
+
 /// Badge bit on procmgr service caps that authorises
 /// [`REGISTER_CRASH_SERVICE`], [`ATTACH_PROCESS`], [`LIST_PROCESSES`],
 /// and [`DETACH_PROCESS`]. svcmgr mints it for

@@ -1,9 +1,10 @@
 # mem-fill
 
-Fills memmgr's pool up to the system reserve, for the test fixtures that drive the out-of-memory
-paths: the [`memhog`](../../services/memhog/README.md) fixture, which oomd stops, and the
-`oom-fill` mode of [`crashme`](../../programs/crashme/README.md), beside whose `oom-touch` write
-crashd holds a fault.
+Fills memmgr's pool down to its growth floor, the system reserve and, while chunks are swapped, the
+restore headroom ([memmgr Memory Pool](../../services/memmgr/docs/memory-pool.md#eviction)
+§ Eviction), for the test fixtures that drive the out-of-memory paths: the
+[`memhog`](../../services/memhog/README.md) fixture, which oomd stops, and the `oom-fill` mode of
+[`crashme`](../../programs/crashme/README.md), beside whose `oom-touch` write crashd holds a fault.
 
 ---
 
@@ -15,7 +16,7 @@ region whose untouched pages memmgr backs only while it has pages to spare, so e
 commits lies above it.
 
 `top_up` reads what memmgr can still promise a process outside the reserve, from
-`QUERY_POOL_STATUS` (its free pages less `promised` and the reserve;
+`QUERY_POOL_STATUS` (its free pages less `promised` and the growth floor, `data[11]`;
 [memmgr Memory Pool](../../services/memmgr/docs/memory-pool.md) § Commit), and commits that much
 through the heap, halving an attempt memmgr refuses, until fewer than 16 pages are left or the block
 list is full; it takes the rest a page at a time by `REQUEST_MEMORY_CAPS` grants, whose caps stay

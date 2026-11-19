@@ -149,8 +149,8 @@ fn heap_commit_phase(caps: &Caps)
     std::os::seraph::log!("memmgr_heap_commit phase passed");
 }
 
-/// memmgr's `QUERY_POOL_STATUS` free total, promised total and reserve
-/// (`data[3]`, `data[8]` and `data[6]`), in pages; `None` when the call
+/// memmgr's `QUERY_POOL_STATUS` free total, promised total and growth floor
+/// (`data[3]`, `data[8]` and `data[11]`), in pages; `None` when the call
 /// fails or is refused. Allocates nothing.
 pub(crate) fn pool_totals() -> Option<(u64, u64, u64)>
 {
@@ -168,7 +168,7 @@ pub(crate) fn pool_totals() -> Option<(u64, u64, u64)>
         (
             reply.word(3) / PAGE_SIZE,
             reply.word(8) / PAGE_SIZE,
-            reply.word(6) / PAGE_SIZE,
+            reply.word(11) / PAGE_SIZE,
         )
     })
 }
@@ -521,15 +521,15 @@ fn limited_child_main() -> !
 }
 
 /// What memmgr can still promise a node outside the reserve, in pages: its
-/// free pages less `promised` and the reserve.
+/// free pages less `promised` and the growth floor.
 pub(crate) fn uncommitted_available() -> u64
 {
-    let Some((free, promised, reserve)) = pool_totals()
+    let Some((free, promised, floor)) = pool_totals()
     else
     {
         exit(HOG_STATUS_FAILED)
     };
-    free.saturating_sub(promised).saturating_sub(reserve)
+    free.saturating_sub(promised).saturating_sub(floor)
 }
 
 /// Child role: commit, through `try_reserve` on the heap, all but at most

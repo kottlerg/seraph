@@ -199,13 +199,13 @@ There is no fixed ceiling on `returned_cap_count` other than the IPC
 reply-side cap-slot limit (see [`docs/ipc-design.md`](../../../docs/ipc-design.md)).
 Best-effort replies may use the full reply-side capacity.
 
-memmgr admits the whole of `want_pages` against the caller's budget node
-before it selects a run, and charges the node each page it grants
-([`memory-pool.md`](memory-pool.md) § Distribution policy). A request over
-the max of the node or of an ancestor fails `LIMIT`, whatever part of it
-the pool could serve; one that would leave fewer free pages outside `promised`
-([`memory-pool.md`](memory-pool.md) § Commit) than the system reserve, from a
-caller outside it, or than none, fails as exhaustion, with code 1 or 2.
+memmgr admits the whole of `want_pages` against the caller's budget node before it selects a run,
+and charges the node each page it grants ([`memory-pool.md`](memory-pool.md) § Distribution policy).
+A request over the max of the node or of an ancestor fails `LIMIT`, whatever part of it the pool
+could serve; one that would leave fewer free pages outside `promised`
+([`memory-pool.md`](memory-pool.md) § Commit) than the growth floor (the system reserve and, while
+chunks are swapped, the restore headroom; `memory-pool.md` § Distribution policy), from a caller
+outside the reserve, or than none, fails as exhaustion, with code 1 or 2.
 
 **Reply (error):**
 
@@ -218,8 +218,8 @@ caller outside it, or than none, fails as exhaustion, with code 1 or 2.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant would take the system reserve from a caller outside it |
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant would take the system reserve from a caller outside it, or deriving the caller's copy failed |
+| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant would take the growth floor from a caller outside the system reserve |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant would take the growth floor from a caller outside the system reserve, or deriving the caller's copy failed |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), memmgr could not map a selected run to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
 | 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
 | 8 | `LIMIT` | `want_pages` would take the subtree of the caller's budget node, or of an ancestor, over its max |
@@ -508,9 +508,12 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[3] | `free_bytes` — subset of `pool_total_bytes` in free runs, lent to no process |
 | data[4] | `deferred_bytes` — subset of `pool_total_bytes` reclaimed but held out of the free runs while another process can still reach it |
 | data[5] | `largest_free_bytes` — the largest single free run, the most one `REQUIRE_CONTIGUOUS` grant can take; 0 when the pool is empty |
-| data[6] | `reserve_bytes` — the system reserve: the free pages a charge to a budget node outside the reserve may not take ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
-| data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL` ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
+| data[6] | `reserve_bytes` — the system reserve: the free pages only a charge to a reserve node may take ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
+| data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL`, at or below the growth floor ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
 | data[8] | `promised_bytes` — what the committed regions can still take from the free runs: their pages that hold no frame yet, and bounds on the page tables and metadata they can need ([`memory-pool.md`](memory-pool.md) § Commit) |
+| data[9] | `store_bytes` — subset of `pool_total_bytes` the compressed store holds: the stored pages of every evicted chunk ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
+| data[10] | `swapped_bytes` — the pages of every evicted chunk, which the store holds compressed and their processes' budget nodes stay charged for |
+| data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -528,15 +531,20 @@ baseline, and `data[4]` shows what is held instead. `largest_free_bytes`
 (`data[5]`) shows how fragmented the free runs are: below
 `DEMAND_CHUNK_PAGES` pages while `data[3]` is not zero, a demand fault is
 backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
-(`data[6]`) is `pool_total / 64` pages: a process outside the reserve has its
+(`data[6]`) is `pool_total / 64` pages. `growth_floor_bytes` (`data[11]`) is
+the reserve while nothing is swapped: a process outside the reserve has its
 grants refused, and its demand faults declined, once `data[3]` less
-`data[8]` less the request would fall below it. `pressure` (`data[7]`) is the
+`data[8]` less the request would fall below it, and the level is
+`PRESSURE_CRITICAL` at or below it. `pressure` (`data[7]`) is the
 level memmgr last signalled to the `REGISTER_PRESSURE` registrants, so a
 registrant woken by its bit reads here the level the bit announced, or a later
 one. `promised_bytes` (`data[8]`) is held for the committed regions' faults:
 every admission reads `data[3]` less it, so a free page it counts is refused to
-every other charge. `data[3]` to `data[8]` are appended after the identity
-terms; readers needing only the identity may ignore them.
+every other charge. `store_bytes` (`data[9]`) and `swapped_bytes`
+(`data[10]`) rise as memmgr evicts cold chunks under pressure and fall as
+faults restore them or their regions go; their ratio is the store's
+compression. `data[3]` to `data[11]` are appended after the identity terms;
+readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
 
@@ -557,7 +565,7 @@ Privilege: universal — attributed to the caller by `recv.badge`.
 | data[0] | `va_base` (page-aligned virtual address) |
 | data[1] | `len_bytes` (region length; page-multiple, nonzero) |
 | data[2] | `prot` (MAP_* protection bits; W^X enforced) |
-| data[3] | flags: bit 0 `REGION_COMMIT`; 0 for none |
+| data[3] | flags: bit 0 `REGION_COMMIT`, bit 1 `REGION_NO_EVICT`; 0 for none |
 
 **Reply (success):** `label` 0. No mapping is installed — backing happens
 lazily on fault, and only once procmgr has delegated this process's
@@ -582,11 +590,19 @@ caller whose call was interrupted makes it again
 ([`memory-pool.md`](memory-pool.md) § Commit). The std heap registers its
 growth region this way.
 
+**No-evict regions.** With `REGION_NO_EVICT`, memmgr never evicts a page of
+the region into its compressed store, so every page a fault backed stays
+mapped until the region is unregistered or the page discarded. Without it,
+memmgr may evict a cold chunk of an uncommitted region under memory pressure
+and restores it on the next fault on it, which only a debugger's
+`SYS_THREAD_READ_MEM` can tell apart ([`memory-pool.md`](memory-pool.md#eviction)
+§ Eviction).
+
 **Error codes:**
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A committed region's charge would leave fewer free pages outside `promised` than the system reserve, for a caller outside it, or than none |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A committed region's charge would leave fewer free pages outside `promised` than the growth floor, for a caller outside the system reserve, or than none |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) |
 | 4 | `INVALID_ARGUMENT` | Bad alignment, zero length, W^X violation, unknown prot or flag bit, unknown badge, or overlap |
 | 8 | `LIMIT` | A committed region's charge would take the subtree of the caller's budget node, or of an ancestor, over its max |
@@ -678,6 +694,8 @@ process's node, carries no caps and changes no state.
 | data[0] | `own_pages` — pages charged to the caller's node |
 | data[1] | `max_pages` — the node's max, `u64::MAX` for none |
 | data[2] | `subtree_pages` — pages charged to the node and to every node below it |
+| data[3] | `resident_pages` — the pages of `own_pages` not swapped |
+| data[4] | `swapped_pages` — the pages of `own_pages` memmgr evicted into its compressed store, which the node stays charged for ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
 
 The charge counts each grant, demand chunk of an uncommitted region and
 page-table donation memmgr accounts to the caller, each committed region's
@@ -758,7 +776,7 @@ length.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The growth's charge would leave fewer free pages outside `promised` than the system reserve, for a caller outside it, or than none |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The growth's charge would leave fewer free pages outside `promised` than the growth floor, for a caller outside the system reserve, or than none |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow for the chunk table's new levels |
 | 4 | `INVALID_ARGUMENT` | Unknown badge, no committed region based at `va_base`, a length unaligned, smaller, or past the address space, or growth that meets another region |
 | 8 | `LIMIT` | The growth's charge would take the subtree of the caller's budget node, or of an ancestor, over its max |
@@ -1009,6 +1027,47 @@ run changes nothing, so an interrupted call is safe to repeat.
 | 4 | `INVALID_ARGUMENT` | Unknown badge, no region holds `va`, or a range that breaks the rule above or leaves the region |
 | 5 | `UNAUTHORIZED` | The badge is a node handle |
 
+### Label 21: `MAKE_RESIDENT`
+
+Make a range of a process's demand regions resident for a debugger: memmgr
+restores each chunk of the range it evicted, and maps back each it is
+evicting, so a `SYS_THREAD_READ_MEM` that failed on a page of it succeeds
+when the reader retries. A page no fault has backed stays not present.
+Privilege: procmgr only, which sends it for a holder of its debug authority
+(`services/procmgr/docs/ipc-interface.md` § `MAKE_RESIDENT`).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 21 |
+| data[0] | the process's memmgr badge (from its `REGISTER_PROCESS` reply) |
+| data[1] | `va` |
+| data[2] | `len_bytes` (nonzero) |
+
+Each restore is admitted and made as a fault's on the chunk
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction), and counts as an
+access in the chunk's age. A process with no delegated address space has
+nothing evicted, and the request succeeds. memmgr walks only the chunks that
+have an entry, in address order, and stops after `MAKE_RESIDENT_CHUNKS` (4)
+chunks made resident or `MAKE_RESIDENT_VISITS` (64) chunks and regions
+visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 |
+| data[0] | where memmgr stopped: `va + len_bytes` when the whole range is done, else the address to send the request again from, with the rest of the range |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A chunk could not be restored: its restore was not admitted, or a map failed; the chunks before it are resident |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, zero length, or a range past the address space |
+| 5 | `UNAUTHORIZED` | The caller is not procmgr |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page fault the kernel cannot
@@ -1029,14 +1088,14 @@ it may take is free ([`memory-pool.md`](memory-pool.md#demand-faults) § Demand 
 committed region (§ Label 7) takes the pages `promised` holds for it, and is admitted without the
 budget and RAM tests that follow ([`memory-pool.md`](memory-pool.md#commit) § Commit). For an
 uncommitted region of a process whose budget node is outside the system reserve, neither the pages
-`promised` holds nor the reserve's pages are among them: the fault is declined with code 7 when no
-free page lies above the reserve, and with code 9 when the reserve refuses the page-table funding
-its map needs ([`memory-pool.md`](memory-pool.md#distribution-policy) § Distribution policy).
-Backing a chunk rather than a single page keeps cap-slot consumption to one cap per chunk on an
-unfragmented pool, so a deep demand stack cannot exhaust memmgr's CSpace; stacks grow contiguously,
-so a chunk's pages are consumed as the stack descends. The page tables the map needs come from the
-process address space's own page-table pool. When the kernel reports that pool exhausted, memmgr
-funds it from its free pool, accounted to the process, and maps the chunk again, at most four times
+`promised` holds nor the growth floor's pages are among them: the fault is declined with code 7 when
+no free page lies above the floor, and with code 9 when the floor refuses the page-table funding its
+map needs ([`memory-pool.md`](memory-pool.md#distribution-policy) § Distribution policy). Backing a
+chunk rather than a single page keeps cap-slot consumption to one cap per chunk on an unfragmented
+pool, so a deep demand stack cannot exhaust memmgr's CSpace; stacks grow contiguously, so a chunk's
+pages are consumed as the stack descends. The page tables the map needs come from the process
+address space's own page-table pool. When the kernel reports that pool exhausted, memmgr funds it
+from its free pool, accounted to the process, and maps the chunk again, at most four times
 ([`memory-pool.md`](memory-pool.md#client-page-table-funding) § Client page-table funding). So a
 fault in a region does not depend on the process having funded the pool beforehand. A non-VM fault
 replies `FAULT_REPLY_KILL`, and every other case — unknown process, address outside every region, a
@@ -1052,6 +1111,14 @@ of a user-mode access ([docs/fault-handling.md § Reply](../../../docs/fault-han
 Either way the fault takes the decline's outcome unless that handler resumes it, and memmgr waits on
 no handler it forwards to.
 
+A fault on a chunk memmgr is evicting maps the chunk's runs back and resumes; a
+fault on a chunk it evicted restores the whole chunk from its compressed store
+before it resumes, declined with code 7 when the free pages outside
+`promised` and, for a process outside it, the system reserve do not cover the
+chunk's backed pages, and with code 9 when a map fails or, with detail 0, the
+stored chunk does not decode; the chunk then stays evicted
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction).
+
 | Code | Decline |
 |---|---|
 | 1 | Not a `FAULT_KIND_VM` fault |
@@ -1060,7 +1127,7 @@ no handler it forwards to.
 | 4 | The region's protection refuses the access |
 | 5 | No delegated address space |
 | 6 | The metadata arena cannot grow for the slots recording the run takes: its descriptor, and the chunk's path in the region's chunk table |
-| 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, every free page outside `promised` is in the system reserve and the process's budget node is outside it, or none is outside `promised` (a fault in an uncommitted region), or the split of a run larger than the pages to back failed |
+| 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, every free page outside `promised` is in the growth floor and the process's budget node is outside the system reserve, or none is outside `promised` (a fault in an uncommitted region), or the split of a run larger than the pages to back failed |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 | 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Label 7); a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |

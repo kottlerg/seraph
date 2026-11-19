@@ -398,10 +398,10 @@ in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
-3000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The crashme
-tester fills memory up to the system reserve and has the fixture write a page it has not touched:
-once the filler gives the memory back within the stall, and the write completes after the hold;
-once the filler keeps it past the stall, and the fixture dies of the fault with no core written.
+3000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The crashme tester
+fills memory down to memmgr's growth floor and has the fixture write a page it has not touched: once
+the filler gives the memory back within the stall, and the write completes after the hold; once the
+filler keeps it past the stall, and the fixture dies of the fault with no core written.
 
 In CI the usertest cell keeps crashd and runs the first after its `run-parallel` boot; the svctest
 cell drops `crashd.svc` with `terminal.svc` and runs the second, while crasher's faults go
@@ -510,12 +510,12 @@ terminal. Two routes reach the thread:
   breakpoint on a function of the target's binary, at the image bias init logs for it plus the
   function's address in the binary's symbol table, read from the symbols store's file of its build
   id ([docs/build-system.md](build-system.md#symbols-store) § Symbols Store), and types `hello` at
-  the shell over the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's one thread,
-  in an allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the create),
-  and `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main thread, in the
-  reap). On each stop it checks that the program counter is the function's and the code there is the
-  binary's, since another process can run code at the same address, moves that CPU's program
-  counter, removes the breakpoint, and resumes the VM.
+  the shell over the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's receive
+  loop, in an allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the
+  create), and `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main
+  thread, in the reap). On each stop it checks that the program counter is the function's and the
+  code there is the binary's, since another process can run code at the same address, moves that
+  CPU's program counter, removes the breakpoint, and resumes the VM.
 
 A boot passes when, after the kill, QMP's `SHUTDOWN` event gives reason `guest-shutdown` and QEMU
 exits on its own within two minutes. The paths it covers are svcmgr's `critical service

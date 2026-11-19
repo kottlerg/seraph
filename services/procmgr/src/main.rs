@@ -797,7 +797,7 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         }
 
         // The debug-authority and thread-registry labels, and unknown opcodes.
-        _ => dispatch_debug(&req, ipc_buf, &ctx.tables),
+        _ => dispatch_debug(&req, ipc_buf, &ctx.tables, ctx.memmgr_ep),
     }
 }
 
@@ -866,18 +866,26 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 }
 
 /// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
-/// `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `DECLARE_NO_DEBUG`,
-/// `DECLARE_NO_CORE`, and `REGISTER_THREAD`, and answer any other opcode
-/// `UNKNOWN_OPCODE`, deleting the caps it carried. Every label but `REGISTER_CRASH_SERVICE`,
-/// which reads no table and calls the crash decliner, is served under the
-/// table lock: each makes syscalls, its reply among them, and a failed
-/// rebind's log line (services/procmgr/README.md § Concurrency).
-fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables)
+/// `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `MAKE_RESIDENT`,
+/// `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`, and `REGISTER_THREAD`, and answer
+/// any other opcode `UNKNOWN_OPCODE`, deleting the caps it carried. Every
+/// label but `REGISTER_CRASH_SERVICE`, which reads no table and calls the
+/// crash decliner, and `MAKE_RESIDENT`, which calls memmgr at `memmgr_ep`
+/// after the lock, is served under the table lock: each makes syscalls, its
+/// reply among them, and a failed rebind's log line
+/// (services/procmgr/README.md § Concurrency).
+fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables, memmgr_ep: u64)
 {
     let label = req.label & 0xFFFF;
     if label == procmgr_labels::REGISTER_CRASH_SERVICE
     {
         handle_register_crash_service(req, ipc_buf);
+        return;
+    }
+    if label == procmgr_labels::MAKE_RESIDENT
+    {
+        release_caps(req.caps());
+        handle_make_resident(req, ipc_buf, tables, memmgr_ep);
         return;
     }
     let table = &mut tables.lock().table;
@@ -1173,6 +1181,48 @@ fn handle_detach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
         Err(process_table::AttachRefusal::NotAttachable) => procmgr_errors::NOT_ATTACHABLE,
     };
     reply_empty(ipc_buf, code);
+}
+
+/// Handle `MAKE_RESIDENT` — have memmgr make the range `data[1]`, `data[2]`
+/// (an address and a length) of the process `data[0]` names resident, so a
+/// debugger whose `SYS_THREAD_READ_MEM` failed on a page of an evicted chunk
+/// reads it when it retries (`services/procmgr/docs/ipc-interface.md`
+/// § `MAKE_RESIDENT`). A process that declared itself undebuggable is served
+/// too: making its pages resident reads and writes nothing of it, and only
+/// does what its own next touch of them would. The target is found under the
+/// table lock, and memmgr is called after it, as for `RELEASE_HOLD`. A
+/// success carries memmgr's word 0: where it stopped, which the sender asks
+/// again from until it is the range's end.
+fn handle_make_resident(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    tables: &process::Tables,
+    memmgr_ep: u64,
+)
+{
+    if !process_table::debug_authorized(req.badge)
+    {
+        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        return;
+    }
+    let target = tables
+        .lock()
+        .table
+        .find_by_badge(req.word(0))
+        .map(|e| e.memmgr_badge);
+    let (code, reached) = match target
+    {
+        Some(badge) => process::make_resident(memmgr_ep, badge, req.word(1), req.word(2), ipc_buf),
+        None => (procmgr_errors::INVALID_BADGE, 0),
+    };
+    if code != procmgr_errors::SUCCESS
+    {
+        reply_empty(ipc_buf, code);
+        return;
+    }
+    let reply = IpcMessage::builder(code).word(0, reached).build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Times an attach sweeps and derives its page again when a registered

@@ -8,9 +8,9 @@ log.
 ## Role
 
 The fixture's per-program tester, `crashme-tester`, runs it once in each of the `vm`, `exception`,
-`worker`, and `registry-declare` modes, then twice in the `oom-touch` mode, with one page, beside
-the `oom-fill` mode, and the `usertest` orchestrator discovers and runs that tester. svctest's
-`crash_endpoint` phase also spawns it, in the `vm`, `exception`, `registry-main`,
+`worker`, and `registry-declare` modes, then twice in the `oom-touch` mode, with 1024 pages,
+beside the `oom-fill` mode, and the `usertest` orchestrator discovers and runs that tester.
+svctest's `crash_endpoint` phase also spawns it, in the `vm`, `exception`, `registry-main`,
 `registry-worker`, and `debugger-tag` modes, and its `oom_policy` phase in the `oom-touch` mode,
 with 1024 pages, and, through the shell of an operator session it opens, in the `oom-hold` mode
 ([services/svctest/README.md § Fixtures](../../services/svctest/README.md#fixtures)). The fixture
@@ -25,7 +25,7 @@ Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
 | `registry-main` | The illegal instruction on the main thread, with two parked threads registered and a detached one exited |
 | `registry-worker` | The illegal instruction on a spawned thread, after its registered sibling was joined |
 | `debugger-tag` | None: in steps svctest sets up as its debugger, each let go by a line on stdin, it checks that a thread it spawns while its main thread carries a debugger's binding, with no debugger watched, is bound back to the crash endpoint under a crash badge and its upcall class unbound at its registration, then that its `DECLARE_NO_DEBUG`, with a debugger attached and watched, unbinds the debugger's exception and upcall bindings of its main thread; it prints one line per step and exits 0 when both hold |
-| `oom-touch <pages>` | A write to each page of a demand region of `<pages>` pages it registered before, in turn, made on its second line of stdin while the `oom-fill` mode or the `memhog` fixture keeps memory critical: the writes spend whatever free pages lie above the system reserve, and memmgr declines the first past them for want of memory, which the crash service holds. It prints `ready` after the first line, and `touched held_ms=<ms>`, its longest write, and exits 0 when the writes complete; it dies of the fault when the hold times out |
+| `oom-touch <pages>` | A write to each page of a demand region of `<pages>` pages it registered before, in turn, made on its second line of stdin while the `oom-fill` mode or the `memhog` fixture keeps memory critical: the writes spend whatever free pages lie above the growth floor (the system reserve and, while pages are swapped, the restore headroom), and memmgr declines the first past them for want of memory, which the crash service holds. It prints `ready` after the first line, and `touched held_ms=<ms>`, its longest write, and exits 0 when the writes complete; it dies of the fault when the hold times out |
 | `oom-fill <ms>` | None: through [`mem-fill`](../../shared/mem-fill/README.md), shared with the `memhog` fixture, it commits what memmgr can still promise a process outside the system reserve, through its heap and then by one-page grants, until nothing is left and the pressure level has read `CRITICAL` for 500 ms, prints `full`, keeps taking what other processes free for `<ms>` milliseconds, and exits 0, which gives it all back |
 | `oom-hold <pages>` | None: it touches `<pages>` pages of heap, prints `holding <pages>`, and waits to be destroyed: a job of an operator session, which oomd stops before any service ([docs/session-supervision.md](../../docs/session-supervision.md)) |
 | `registry-declare` | None: with a registered thread parked, it sends `DECLARE_NO_DEBUG` and checks that the thread's crash binding, under a badge other than the main thread's, is unbound with the main thread's; it prints `registry-declare: PASS` and exits 0 when so |
@@ -45,11 +45,12 @@ fault: a non-clean exit whose reason is in the fault range, and left one new cor
 `registry-declare` passed, and when the crash service's hold of a fault declined for want of memory
 ([services/crashd/docs/operation.md](../../services/crashd/docs/operation.md) § Hold) behaved in its
 two cases. In the first, the filler keeps memory critical for 1000 ms after `full` while `oom-touch`
-writes its page: the write completes, held at least 500 ms. In the second, the filler keeps it
-critical for the usertest crash service's stall, 3000 ms, and 1500 ms more: the fixture dies of the
-fault, with a fault reason, at least 1000 ms after its write, and leaves no core, since memory was
-still critical. The usertest boot stages a crash service whose `CORE_DUMP` names `crashme`
-([docs/testing.md](../../docs/testing.md) § Gating), so each faulting death leaves an ELF core
+writes its pages: the writes complete, the held one taking at least 500 ms. In the second, the
+filler keeps it critical for the usertest crash service's stall, 3000 ms, and 1500 ms more: the
+fixture dies of the fault, with a fault reason, at least 1000 ms after it was told to write, and
+leaves no core, since memory was still critical. The usertest boot stages a crash service whose
+`CORE_DUMP` names `crashme` ([docs/testing.md](../../docs/testing.md) § Gating), so each faulting
+death leaves an ELF core
 ([services/crashd/docs/core-format.md](../../services/crashd/docs/core-format.md)). The tester reads
 it with a reader of its own, not crashd's code, and checks that it is an `ET_CORE` of the machine,
 that its first `NT_PRSTATUS` carries the fault's signal (`SIGSEGV` for `vm`, `SIGILL` for the

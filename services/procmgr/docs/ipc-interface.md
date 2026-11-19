@@ -22,25 +22,25 @@ arguments. The reply label is `procmgr_errors::SUCCESS` (0) or an error code.
 Label numbers, error codes, and query states are defined in
 [`procmgr_labels`](../../../shared/ipc/src/procmgr_labels.rs),
 [`procmgr_errors`](../../../shared/ipc/src/procmgr_errors.rs), and
-[`procmgr_process_state`](../../../shared/ipc/src/procmgr_process_state.rs).
-
-`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`,
-`BIND_DEATH_OBSERVER`, `LIST_CHILDREN` and `DESTROY_CHILD` are sent on a **process handle** (the
-badged endpoint a create call returns), and `RELEASE_HOLD` on a **release token** (the third cap a
-`CREATE_DMA_HOLD` create returns); procmgr identifies the target process by the badge `ipc_recv`
-delivers. A process handle is badged with the child's process badge and
-`procmgr_labels::PROCESS_HANDLE_TAG` (bit 59, a bit of `ipc::VERB_BIT_MASK`, which no process badge
-carries), which tells it from the child's own procmgr cap (`ProcessInfo.procmgr_endpoint_cap`),
-badged with the process badge alone. procmgr clears the tag before it serves a request, so a handle
-names its child to every label, and refuses `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`, `REGISTER_THREAD`
-and `REGISTER_END_QUEUE`, which name their sender, on a badge carrying it with `INVALID_BADGE`,
-deleting the caps the request carried: only the process itself sends them (§ Label 21, § Label 22, §
-Label 26, § Label 29). `BIND_DEATH_OBSERVER`, `LIST_CHILDREN` and `DESTROY_CHILD` are served on a
-process handle only, and refused on any other cap with `UNAUTHORIZED` (§ Label 25, § Process Tree).
+[`procmgr_process_state`](../../../shared/ipc/src/procmgr_process_state.rs). `START_PROCESS`,
+`DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`, `BIND_DEATH_OBSERVER`,
+`LIST_CHILDREN` and `DESTROY_CHILD` are sent on a **process handle** (the badged endpoint a create
+call returns), and `RELEASE_HOLD` on a **release token** (the third cap a `CREATE_DMA_HOLD` create
+returns); procmgr identifies the target process by the badge `ipc_recv` delivers. A process handle
+is badged with the child's process badge and `procmgr_labels::PROCESS_HANDLE_TAG` (bit 59, a bit of
+`ipc::VERB_BIT_MASK`, which no process badge carries), which tells it from the child's own procmgr
+cap (`ProcessInfo.procmgr_endpoint_cap`), badged with the process badge alone. procmgr clears the
+tag before it serves a request, so a handle names its child to every label, and refuses
+`DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`, `REGISTER_THREAD`, `REGISTER_END_QUEUE` and `READ_VERIFIED`,
+which name their sender, on a badge carrying it with `INVALID_BADGE`, deleting the caps the request
+carried: only the process itself sends them (§ Label 21, § Label 22, § Label 26, § Label 29, § Label
+31). `BIND_DEATH_OBSERVER`, `LIST_CHILDREN` and `DESTROY_CHILD` are served on a process handle only,
+and refused on any other cap with `UNAUTHORIZED` (§ Label 25, § Process Tree).
 Labels 14–18 are specified in § `REGISTER_DEATH_EQ`, § `REGISTER_INIT_TEARDOWN`, §
 `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and § `QUERY_LIVE_PROCESSES` below, labels 19–24 and 26
-in § Crash Endpoint and Debug Authority, label 25 in § Label 25: `BIND_DEATH_OBSERVER`, and labels
-27–29 in § Process Tree.
+in § Crash Endpoint and Debug Authority, label 25 in § Label 25: `BIND_DEATH_OBSERVER`, labels
+27–29 in § Process Tree, label 30 in § Label 30: `MAKE_RESIDENT`, and label 31 in § Label 31:
+`READ_VERIFIED`.
 Labels 4–7 and 10 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see § Capability Transfer).
 
@@ -1417,6 +1417,68 @@ authority; `INVALID_BADGE` when no live process carries the badge; then memmgr's
 for a zero length or a range past the address space, and `OUT_OF_MEMORY` when memmgr could not
 restore a chunk of the range or the call to it failed. svctest's `memmgr_swap` phase reads a page of
 an evicted chunk this way.
+
+### Label 31: `READ_VERIFIED`
+
+Read a signed data file for the sender and give it the verified body read-only
+([docs/signing.md](../../../docs/signing.md) § Verifier Discipline): the request a process makes
+before it parses a file it reads from the root filesystem as trusted input. Its client is
+`std::os::seraph::read_verified`.
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::READ_VERIFIED` (31) |
+| caller's cap | The sender's own procmgr cap (`ProcessInfo.procmgr_endpoint_cap`) |
+| `data[0]` | The file's length in bytes, from the caller's `NS_LOOKUP` size hint: 1 to `procmgr_labels::READ_VERIFIED_MAX` (32 KiB) |
+| from `data[1]` | The name block (`procmgr_labels::READ_VERIFIED_NAME_WORD`): the install path the file must be signed under, in the canonical form of § Image Verification |
+| cap[0] | File cap for the file |
+
+procmgr serves it as follows:
+
+1. **Checks.** A request with no file cap, a length of zero or past `READ_VERIFIED_MAX`, or no name
+   block or a name that is not a canonical install path is refused with `INVALID_ARGUMENT` before
+   procmgr opens the file. A request sent on a process handle, which names another process, is
+   refused with `INVALID_BADGE` (§ Messages), as is one whose badge names no live process. Every cap
+   past cap[0] is deleted at once.
+2. **The account.** Under the table lock procmgr derives a copy of the sender's memmgr SEND from its
+   table entry, so the copy is charged to the sender: its budget bounds it, and a teardown of the
+   sender that deletes the entry's slot meanwhile cannot hand the request another cap. A sender
+   procmgr registered with no memmgr SEND is refused with `OUT_OF_MEMORY`.
+3. **One copy.** With no lock held, procmgr opens the file (`FS_OPEN`), reads it once, `[0,
+   length)`, one `FS_READ_MEMORY` at a time, into one run of frames it requests on the sender's
+   account (`REQUIRE_CONTIGUOUS`) and maps in its own address space alone, and closes it, as
+   `CREATE_FROM_FILE` reads an image (§ Label 13, its bounds on every call on the file cap
+   included). The file cap is deleted on every path.
+4. **Verify.** procmgr verifies the copy against the trust store in the data role alone, under the
+   requested name, for this build's architecture. A refusal replies `SIGNATURE_REFUSED` and logs one
+   warning naming the name and the verifier's reason, as an image's does; the run returns to the
+   sender's account.
+5. **Hand over.** procmgr derives a Memory cap on the run carrying `RIGHTS_MEM_MAP` alone, unmaps
+   the run from its own address space and deletes its own cap, so no process but memmgr holds a cap
+   that can write it, and replies with the derived cap. A reply the sender cannot take (it is gone,
+   or its `CSpace` is full) leaves the cap with procmgr, which deletes it and releases the run to
+   the sender's account.
+
+**Reply (success):** `data[0]` the verified body's length, the body being the run's first
+`data[0]` bytes; `data[1]` the run's region id on the sender's account; `data[2]` its pages;
+cap[0] the map-only Memory cap. The sender maps it read-only and parses only the body. When it is
+done it unmaps the run, deletes the cap and names the region to memmgr's `RELEASE_MEMORY_CAPS` on
+its own memmgr cap; its death releases the run with its record.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account (a max too small for it among the causes), the sender has no memmgr SEND, or the map-only cap could not be derived |
+| 4 | `INVALID_BADGE` | Sent on a process handle, or no live process carries the badge |
+| 7 | `INVALID_ARGUMENT` | No file cap, a length of zero or past `READ_VERIFIED_MAX`, or no name block or a name not in the canonical form |
+| 10 | `IO_ERROR` | As for `CREATE_FROM_FILE` (§ Label 13) |
+| 11 | `MAP_FAILED` | The run could not be mapped in procmgr, or its mapping would not come down |
+| 18 | `SIGNATURE_REFUSED` | The copy does not verify in the data role under the name |
+
+svctest's `procmgr_read_verified` phase reads its data-role fixture back and checks the copy's
+charge, and the refusal of the fixture under another name, of a copy with a flipped byte, of an
+unsigned file, of a file past the bound and of a zero length.
 
 ---
 

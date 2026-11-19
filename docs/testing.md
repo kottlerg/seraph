@@ -145,7 +145,9 @@ Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases and by ea
 `/config/svcmgr/tests/` are the harness recipes, and under `/config/devmgr/tests/` the test
 device class files the svctest recipe stages (see [Gating](#gating)). Under `/data/` are
 `/data/test.txt`, a fixture shared by `svctest` and the `shell` tester, and the build-synthesised
-`svctest`-only fixtures `/data/svctest/large.bin` and `/data/svctest/bench.bin`.
+`svctest`-only fixtures `/data/svctest/large.bin`, `/data/svctest/bench.bin`, and
+`/data/svctest/signed/verified.dat`, the data-role fixture of procmgr's verified read, which every
+pack signs ([signing.md](signing.md) § Signing).
 
 ---
 

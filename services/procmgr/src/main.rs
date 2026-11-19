@@ -757,6 +757,11 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
             handle_create(&req, ipc_buf, ctx, ObjectSource::File);
         }
 
+        procmgr_labels::READ_VERIFIED =>
+        {
+            handle_read_verified(&req, ipc_buf, ctx);
+        }
+
         procmgr_labels::CONFIGURE_PIPE =>
         {
             // Maps the child's ProcessInfo page and copies caps into its
@@ -2198,6 +2203,114 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
     }
 }
 
+/// Handle `READ_VERIFIED`: read the data file `caps[0]` names once into one
+/// run of frames on the sender's memmgr account, verify the copy in the data
+/// role under the name the request gives, and give the sender the run
+/// read-only (docs/signing.md § Verifier Discipline). Wire layout:
+/// [`procmgr_labels::READ_VERIFIED`].
+///
+/// The sender's memmgr SEND is derived under the table lock, so a teardown of
+/// the sender that deletes its own slot meanwhile leaves this request a cap
+/// that names the same account, or one memmgr refuses, never another cap
+/// that took the slot. The read and the verification hold no lock. The file
+/// cap is deleted on every path (opened, read and closed first once the
+/// request is admitted), and every cap past it at once. A run the reply
+/// cannot deliver is released to the sender's account here.
+fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+{
+    let caps = req.caps();
+    let file_cap = caps.first().copied().unwrap_or(0);
+    release_caps(caps.get(1..).unwrap_or(&[]));
+    let read = process_table::sign_policy::data_read(req).filter(|_| file_cap != 0);
+    let Some(read) = read
+    else
+    {
+        release_caps(&[file_cap]);
+        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let memmgr = {
+        let state = ctx.tables.lock();
+        state
+            .table
+            .find_by_badge(req.badge)
+            .map(|entry| entry.memmgr_send_cap)
+            .map(|cap| {
+                if cap == 0
+                {
+                    None
+                }
+                else
+                {
+                    syscall::cap_derive(cap, syscall::RIGHTS_ALL).ok()
+                }
+            })
+    };
+    let memmgr = match memmgr
+    {
+        Some(Some(cap)) => process::CapGuard::new(cap),
+        Some(None) =>
+        {
+            release_caps(&[file_cap]);
+            reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+            return;
+        }
+        None =>
+        {
+            release_caps(&[file_cap]);
+            reply_empty(ipc_buf, procmgr_errors::INVALID_BADGE);
+            return;
+        }
+    };
+    let result = image::read_file(
+        ctx.self_aspace,
+        file_cap,
+        read.len,
+        memmgr.cap(),
+        ipc_buf,
+        image::Shape::Contiguous,
+    )
+    .and_then(|buffer| {
+        let body_len = image::verify(
+            ctx,
+            buffer.bytes(),
+            read.name,
+            process_table::sign_policy::DATA,
+        )
+        .map_err(|_| procmgr_errors::SIGNATURE_REFUSED)?
+        .body
+        .len();
+        let run = buffer.into_read_only()?;
+        Ok((body_len, run))
+    });
+    match result
+    {
+        Ok((body_len, run)) =>
+        {
+            let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+                .word(0, body_len as u64)
+                .word(1, run.region)
+                .word(2, run.pages)
+                .cap(run.cap)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+            {
+                // The cap stayed in procmgr's CSpace: the sender is gone or
+                // could not take it, so the run goes back to its account.
+                let _ = syscall::cap_delete(run.cap);
+                let msg = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
+                    .word(0, 1)
+                    .word(1, run.region)
+                    .build();
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_call(memmgr.cap(), &msg, ipc_buf) };
+            }
+        }
+        Err(code) => reply_empty(ipc_buf, code),
+    }
+}
+
 /// What [`create_child`] takes from a checked create request.
 struct CreateRequest<'a>
 {
@@ -2292,6 +2405,7 @@ fn create_child(
             request.len,
             mms.cap(),
             ipc_buf,
+            image::Shape::BestEffort,
         ),
     }?;
     let verified = image::verify(ctx, buffer.bytes(), request.name, sched.sign_roles)

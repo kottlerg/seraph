@@ -79,7 +79,8 @@ only if that does not cure it.
    - Answer the orchestrator with one line, `<name>: <agent id>`. Keep and relay nothing else of
      the result.
    - A respawn into a predecessor's worktree comes only after you have ended the predecessor's
-     task and confirmed it (step 6); the spawn line then names that worktree.
+     task and confirmed it (step 6), except for a worker of an earlier session, which ended with
+     that session; the spawn line then names that worktree.
 6. **Do for the orchestrator what only the top session can**: stop an agent it names and tell it
    once the stop is confirmed (a respawn into that agent's worktree waits for it), schedule
    or cancel a tick it asks for, apply a `.claude/CLAUDE.md`, settings or hook patch on the

@@ -22,7 +22,9 @@
 //! process registers with their crash badges ([`threads`]), and the
 //! registered crash service with its registration's generation
 //! ([`crash_registrant`]), the signature policy each creator's record
-//! carries ([`sign_policy`]), and the process tree: each entry's parent, the
+//! carries ([`sign_policy`]), the requests refused while procmgr's own
+//! `CSpace` is short of its headroom ([`headroom_refusal`]), and the process
+//! tree: each entry's parent, the
 //! marking of a subtree a destroy has begun on, and the re-parenting or
 //! containment at a process's end ([`ProcessTable::doom_subtree`],
 //! [`ProcessTable::take_ended`]). None of these
@@ -1569,6 +1571,35 @@ pub fn sender_refusal(opcode: u64, badge: u64) -> Option<u64>
     }
 }
 
+/// Whether procmgr's own `CSpace` held its headroom for the request being
+/// served (services/procmgr/README.md § `CSpace` headroom).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Headroom
+{
+    /// At or above the mark, or topped up to it.
+    Held,
+    /// Short of the mark, and the top-up was refused.
+    Short,
+}
+
+/// The error procmgr refuses `opcode` with, before it serves it, under
+/// [`Headroom::Short`]: `OUT_OF_MEMORY` for the create labels
+/// (`CREATE_PROCESS`, `CREATE_FROM_FILE`), each of whose children takes
+/// several capabilities procmgr keeps; `None` for every other label.
+/// `REGISTER_THREAD`, which keeps a Thread cap for each thread, is refused
+/// at its reservation instead, after its own checks
+/// ([`threads::ThreadRegistry::reserve_within`]); the rest keep no
+/// capability, or at most one per process or for the boot.
+#[must_use]
+pub fn headroom_refusal(opcode: u64) -> Option<u64>
+{
+    matches!(
+        opcode,
+        ipc::procmgr_labels::CREATE_PROCESS | ipc::procmgr_labels::CREATE_FROM_FILE
+    )
+    .then_some(ipc::procmgr_errors::OUT_OF_MEMORY)
+}
+
 /// Whether a request on procmgr's endpoint badged `caller_badge` carries
 /// `procmgr_labels::DEBUG_AUTHORITY`.
 #[must_use]
@@ -2371,6 +2402,29 @@ mod tests
         // Every other label is served on both.
         assert_eq!(sender_refusal(QUERY_PROCESS, handle), None);
         assert_eq!(sender_refusal(QUERY_PROCESS, own), None);
+    }
+
+    #[test]
+    fn headroom_refusal_refuses_only_the_create_labels()
+    {
+        use ipc::procmgr_errors::OUT_OF_MEMORY;
+        use ipc::procmgr_labels::{CREATE_FROM_FILE, CREATE_PROCESS};
+        for opcode in [CREATE_PROCESS, CREATE_FROM_FILE]
+        {
+            assert_eq!(
+                headroom_refusal(opcode),
+                Some(OUT_OF_MEMORY),
+                "opcode {opcode}"
+            );
+        }
+        // Every other label, `REGISTER_THREAD` (refused at its reservation)
+        // and the ones that keep one cap per process or for the boot among
+        // them, and an unknown opcode, is served.
+        let refused = [CREATE_PROCESS, CREATE_FROM_FILE];
+        for opcode in (0..=64).filter(|op| !refused.contains(op))
+        {
+            assert_eq!(headroom_refusal(opcode), None, "opcode {opcode}");
+        }
     }
 
     /// A table holding the sender `0x40` and another process `0x50`, each

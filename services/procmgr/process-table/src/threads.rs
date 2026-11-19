@@ -25,6 +25,8 @@ use alloc::vec::Vec;
 
 use ipc::procmgr_labels::REGISTERED_THREADS_MAX;
 
+use crate::Headroom;
+
 /// The tag every thread crash badge carries: bit 63, a verb bit
 /// (`ipc::VERB_BIT_MASK`) that no process badge carries
 /// ([`crate::badge_is_acceptable`]), so a thread's crash badge never equals a
@@ -232,10 +234,27 @@ impl ThreadRegistry
     /// [`RegisterRefusal::OutOfMemory`] when the heap cannot grow the registry.
     pub fn reserve(&mut self) -> Result<(), RegisterRefusal>
     {
+        self.reserve_within(Headroom::Held)
+    }
+
+    /// [`Self::reserve`] for a registration served under `headroom`: one
+    /// served while procmgr's own `CSpace` is short ([`Headroom::Short`]) is
+    /// refused as for the heap after the bound's check, since the registry
+    /// would keep its Thread cap.
+    ///
+    /// # Errors
+    /// As [`Self::reserve`], and [`RegisterRefusal::OutOfMemory`] below the
+    /// bound under [`Headroom::Short`].
+    pub fn reserve_within(&mut self, headroom: Headroom) -> Result<(), RegisterRefusal>
+    {
         self.requests = self.requests.saturating_add(1);
         if self.threads.len() >= REGISTERED_THREADS_MAX
         {
             return Err(RegisterRefusal::Limit);
+        }
+        if headroom == Headroom::Short
+        {
+            return Err(RegisterRefusal::OutOfMemory);
         }
         self.threads
             .try_reserve(1)
@@ -349,6 +368,27 @@ mod tests
         {
             assert_eq!(RegisteredThread::new(5, 0, origin).origin(), origin);
         }
+    }
+
+    #[test]
+    fn a_registration_short_of_headroom_is_refused_after_the_bound()
+    {
+        let mut reg = ThreadRegistry::new();
+        assert_eq!(
+            reg.reserve_within(Headroom::Short),
+            Err(RegisterRefusal::OutOfMemory)
+        );
+        assert_eq!(reg.len(), 0);
+        for i in 0..REGISTERED_THREADS_MAX as u64
+        {
+            assert_eq!(reg.reserve_within(Headroom::Held), Ok(()));
+            reg.push(thread(i + 1, 0));
+        }
+        // At the bound the bound's refusal comes first.
+        assert_eq!(
+            reg.reserve_within(Headroom::Short),
+            Err(RegisterRefusal::Limit)
+        );
     }
 
     #[test]

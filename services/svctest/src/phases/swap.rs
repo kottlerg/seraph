@@ -42,7 +42,9 @@
 //! After the hog's grants are released and the child has exited, the phase
 //! makes every process resident, and requires the store and the swapped total
 //! to be empty, the all-RAM-accounted identity to hold, and memmgr's free and
-//! deferred pages to total at least what they did at the start.
+//! deferred pages, with those charged to svctest itself, to total at least
+//! what they did at the start: the pages the hog's `CSpace` top-ups take stay
+//! svctest's.
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
@@ -162,9 +164,18 @@ const HOG_CSPACE_LOW_WATER: u64 = 64;
 const HOG_CSPACE_TOPUP_SLOTS: u64 = 1024;
 /// The hold of svctest's `CSpace` above [`HOG_CSPACE_LOW_WATER`] general
 /// slots (runtime/ruststd/README.md § `CSpace` slot headroom): the hog's caps
-/// outgrow the slots procmgr seeded.
+/// outgrow the slots procmgr seeded. Its top-ups stay with the `CSpace`, so
+/// the pages they take are svctest's own when the phase ends ([`phase_totals`]).
 static HOG_HEADROOM: std::os::seraph::CSpaceHeadroom =
     std::os::seraph::CSpaceHeadroom::new(HOG_CSPACE_LOW_WATER, HOG_CSPACE_TOPUP_SLOTS);
+/// Caps one grant's reply carries at most: one message's worth, the size of
+/// the IPC receive reserve.
+const GRANT_CAPS_MAX: u64 = syscall_abi::CSPACE_IPC_RECV_RESERVE;
+/// The label [`Hog::take`] records as its refusal when the hold of svctest's
+/// `CSpace` was refused and its general headroom, the refusal's first word,
+/// cannot hold a grant's caps: a grant then would take the receive reserve the
+/// next top-up's reply needs. memmgr replies no such label.
+const HOLD_REFUSED: u64 = u64::MAX - 1;
 /// Grant region ids one `RELEASE_MEMORY_CAPS` of the hog's release names.
 const RELEASE_BATCH: usize = 32;
 /// How often the hog looks at the level once it holds it.
@@ -360,7 +371,8 @@ pub(super) struct Hog
     /// Pages held.
     pages: u64,
     peaks: Peaks,
-    /// The label and first three words of memmgr's last refusal of a grant.
+    /// The label and first three words of memmgr's last refusal of a grant,
+    /// or [`HOLD_REFUSED`] and svctest's general headroom.
     refusal: (u64, [u64; 3]),
 }
 
@@ -382,14 +394,32 @@ impl Hog
     }
 
     /// Take a grant of `pages` pages, holding svctest's `CSpace` headroom
-    /// first ([`HOG_HEADROOM`]); whether memmgr granted it.
+    /// first ([`HOG_HEADROOM`]); whether memmgr granted it. A refused hold
+    /// refuses the grant while the general headroom cannot hold its caps.
     fn take(&mut self, pages: u64) -> bool
     {
-        HOG_HEADROOM.hold(startup_info().self_cspace);
+        let cspace = startup_info().self_cspace;
+        if !HOG_HEADROOM.hold(cspace)
+        {
+            let headroom = std::os::seraph::cspace_slot_headroom(cspace);
+            if headroom < GRANT_CAPS_MAX
+            {
+                self.refusal = (HOLD_REFUSED, [headroom, 0, 0]);
+                return false;
+            }
+        }
         let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
             .word(0, pages)
             .build();
         let reply = memmgr_call(&req, "REQUEST_MEMORY_CAPS");
+        assert_ne!(
+            reply.label,
+            syscall_abi::IPC_REPLY_TRANSFER_FAILED,
+            "{PHASE}: a grant's reply could not be received: svctest's CSpace has no slot for \
+             its caps, at a general headroom of {}, with {} caps held",
+            std::os::seraph::cspace_slot_headroom(cspace),
+            self.grants.len()
+        );
         if reply.label != memmgr_errors::SUCCESS
         {
             self.refusal = (reply.label, [reply.word(0), reply.word(1), reply.word(2)]);
@@ -535,7 +565,7 @@ impl Hog
                 "{PHASE}: a grant of a page refused with the level at {} (0 normal, 1 low, 2 \
                  critical) after {FILL_BOUND:?} of taking grants: {} pages available against a \
                  reserve of {} and a growth floor of {} pages, {} pages held in {} grants; the \
-                 refusal's label {:#x} and words {:?}",
+                 refusal's label {:#x} and words {:?} ({HOLD_REFUSED:#x}: the CSpace top-up)",
                 status.level,
                 status.available_pages(),
                 status.reserve_pages(),
@@ -1011,8 +1041,8 @@ fn swap_phase(caps: &Caps)
     let peaks = &hog.peaks;
     std::os::seraph::log!(
         "memmgr_swap phase passed (store peak {} pages, swapped peak {} pages, hogged {} pages, \
-         {from_headroom} chunks restored from the headroom at CRITICAL, free and deferred {} \
-         pages above the start)",
+         {from_headroom} chunks restored from the headroom at CRITICAL, free, deferred and \
+         svctest's own {} pages above the start)",
         peaks.store,
         peaks.swapped,
         peaks.hogged,
@@ -1021,8 +1051,8 @@ fn swap_phase(caps: &Caps)
 }
 
 /// Check the phase's baseline: the identity holds and the store and the
-/// swapped total are empty. Memmgr's free and deferred bytes together, once its
-/// deferred list has settled.
+/// swapped total are empty. The phase's totals ([`phase_totals`]) once
+/// memmgr's deferred list has settled.
 pub(super) fn baseline_totals() -> u64
 {
     let _ = crate::phases::memmgr::settled_deferred_bytes();
@@ -1040,7 +1070,21 @@ pub(super) fn baseline_totals() -> u64
         base.store,
         base.swapped
     );
-    base.free.saturating_add(base.deferred)
+    phase_totals(&base)
+}
+
+/// memmgr's free and deferred bytes with the bytes charged to svctest's own
+/// node: what the phase's pages total once they are all back. The pages the
+/// hog's `CSpace` top-ups take stay with svctest's `CSpace`
+/// ([`HOG_HEADROOM`]) and charged to svctest, so they count as back.
+fn phase_totals(status: &Pool) -> u64
+{
+    let (charged, _) = own_usage()
+        .unwrap_or_else(|| panic!("{PHASE}: QUERY_MEMORY_USAGE of svctest's own node failed"));
+    status
+        .free
+        .saturating_add(status.deferred)
+        .saturating_add(charged.saturating_mul(PAGE_SIZE))
 }
 
 /// The pages of the fixture's main region for a system reserve of `reserve`
@@ -1340,10 +1384,10 @@ fn require_no_evict(thread: u64, ready: &Ready)
 }
 
 /// Make every listed process resident, then wait until memmgr's store and
-/// swapped total are empty, the identity holds and, given a `baseline`, its
-/// free and deferred bytes total at least it: the phase's pages are all back,
-/// while another process may have returned pages of its own meanwhile.
-/// Returns memmgr's free and deferred bytes then.
+/// swapped total are empty, the identity holds and, given a `baseline`, the
+/// phase's totals ([`phase_totals`]) reach at least it: the phase's pages are
+/// all back, while another process may have returned pages of its own
+/// meanwhile. Returns the phase's totals then.
 pub(super) fn settle_resident(authority: u64, baseline: Option<u64>) -> u64
 {
     let top = syscall::user_va_top()
@@ -1361,7 +1405,7 @@ pub(super) fn settle_resident(authority: u64, baseline: Option<u64>) -> u64
     {
         crate::phases::memmgr::recheck_deferred();
         let status = pool();
-        let totals = status.free.saturating_add(status.deferred);
+        let totals = phase_totals(&status);
         if status.identity()
             && status.store == 0
             && status.swapped == 0
@@ -1372,8 +1416,8 @@ pub(super) fn settle_resident(authority: u64, baseline: Option<u64>) -> u64
         assert!(
             start.elapsed() < SETTLE_BOUND,
             "{PHASE}: {SETTLE_BOUND:?} after everything was made resident: identity {} (ram {} \
-             reserved {} total {}), store {} bytes, swapped {} bytes, free + deferred {totals} \
-             bytes against {baseline:?} at the start",
+             reserved {} total {}), store {} bytes, swapped {} bytes, free + deferred + \
+             svctest's own {totals} bytes against {baseline:?} at the start",
             status.identity(),
             status.system_ram,
             status.kernel_reserved,

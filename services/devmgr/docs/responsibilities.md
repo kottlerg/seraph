@@ -719,6 +719,16 @@ serves, and before each DMA request. A failed top-up is retried at the next hold
 thread logs a run of them once, since a registry worker or the DMA thread may be serving logd, or
 a driver logd writes through, and must not log.
 
+While the headroom is short of the mark and its top-up was refused, devmgr takes no capability
+it would keep, so the slots left and the IPC receive reserve the next top-up's reply needs stay
+free: a record's carves and a driver spawn fail, logged, and the record is not bound; the
+registry refuses `WATCH_CLASS`, whose watch keeps a Notification, with `OUT_OF_RESOURCES`; and
+the DMA thread refuses `DMA_MAP`, which keeps the mapped Memory cap, with `OUT_OF_RESOURCES`
+(`firmware::headroom`). Every other request keeps nothing past its reply, or a fixed number of
+directory caps that a repeat does not add to, and is served: `SET_DRIVERS_DIR` the drivers
+directory's and the platform tables' (`caps[1]`, which the drivers-directory job deletes), once
+per boot, and `BIND_DRIVERS` one while its pass is pending.
+
 ---
 
 ## Relationship to drivers

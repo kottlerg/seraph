@@ -181,10 +181,14 @@ reservation discharges the first by construction.
 A map into a retype-backed `AddressSpace` draws its intermediate page tables
 from that AS's page-table growth pool, and fails with `OutOfMemory` when the
 pool is exhausted. `fund_aspace_pt_budget(self_aspace, n)` tops the pool up: it
-acquires a memmgr-backed RETYPE Memory cap and augments the pool via
-`cap_create_aspace`, donating only the pool's shortfall against the worst case
-for `n` pages. It returns `false` only when a donation was refused (memmgr
-unreachable or refusing the grant, or the kernel refusing the donation).
+asks memmgr for the pool's shortfall against the worst case for `n` pages and
+augments the pool via `cap_create_aspace` with each run memmgr grants. A pool
+takes pages, not a run, so the request is best-effort, without
+`REQUIRE_CONTIGUOUS`: a free pool cut into short runs, as eviction leaves it,
+still funds it, and a grant short of the shortfall is followed by a request for
+the rest (`pool_funding::donate_runs`). It returns `false` only when a donation
+was refused (memmgr unreachable or refusing the grant, or the kernel refusing
+the donation).
 
 The pool is shared by every mapping of the process, the pager's included, so a
 top-up cannot be reserved for the span it was made for: another thread's mapping
@@ -319,12 +323,14 @@ std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n o
 
 - **`cspace_slot_headroom`** returns `CAP_INFO_CSPACE_CAPACITY` less `CAP_INFO_CSPACE_USED`
   and the reserve.
-- **`fund_cspace_slot_budget`** requests a memmgr-backed Memory cap through the object slab
-  when the headroom falls short of `n` plus a page's slots, or the growth budget
-  (`CAP_INFO_CSPACE_BUDGET`) below a page, and donates it with augment-mode `cap_create_cspace`,
-  sized by `syscall_abi::cspace_topup_pages`. The page beyond `n` is for the `CSpace`'s body
+- **`fund_cspace_slot_budget`** asks memmgr for pages when the headroom falls short of `n`
+  plus a page's slots, or the growth budget (`CAP_INFO_CSPACE_BUDGET`) below a page, and donates
+  each run memmgr grants with augment-mode `cap_create_cspace`, sized by
+  `syscall_abi::cspace_topup_pages`. The request is best-effort, as for the page-table pool
+  above, so a fragmented free pool funds it. The page beyond `n` is for the `CSpace`'s body
   arena, which a split or a range-capability copy draws on. It donates the shortfall it reads,
-  in at most `FUND_ROUNDS` (2) donations (the `ruststd-pool-funding` crate), and returns `false`
+  in at most `FUND_ROUNDS` (2) rounds of one donation or more, one for each run memmgr grants
+  (the `ruststd-pool-funding` crate), and returns `false`
   only when a donation was refused. The headroom is shared by every capability allocation of
   the process, so another thread's allocations can take the donated slots first; a headroom that
   reads short after donations that were made is no failure, and the caller's own allocation
@@ -340,7 +346,9 @@ serves) holds its headroom above a low-water mark instead, through a `static`
 ```rust
 static HEADROOM: CSpaceHeadroom = CSpaceHeadroom::new(LOW_WATER, TOPUP_SLOTS);
 
-HEADROOM.hold(self_cspace);           // before each operation that allocates slots
+if !HEADROOM.hold(self_cspace) {      // before each operation that allocates slots
+    // refused: take no more caps than cspace_slot_headroom covers
+}
 if HEADROOM.failure_to_report() {     // once per run of refused top-ups
     log!(warn: "...");
 }
@@ -351,6 +359,12 @@ if HEADROOM.failure_to_report() {     // once per run of refused top-ups
   (`syscall_abi::cspace_topup_pages`). One thread at a time reads and funds the pool; a thread
   that finds another doing so goes on at once, so the mark is sized to cover every allocation
   the process's threads make while one tops up. A refused top-up is retried at the next hold.
+  `hold` returns `false` when the headroom was short and its top-up was refused, and the result
+  must be used: a capability received by IPC takes a general slot while one is free and then a
+  slot of the IPC receive reserve, which the next top-up's own reply needs, so after `false` an
+  operation that receives capabilities goes on only while `cspace_slot_headroom` covers what it
+  receives, and otherwise fails as if refused for memory. A caller whose intake it does not yet
+  bound discards the result explicitly and says so where it does.
   The body arena takes its pages from the same growth budget and lowers the capacity by a page's
   slots for each, so the page beyond the mark covers the first arena page an operation takes,
   and a service whose operations take more (many splits or range-capability copies) counts

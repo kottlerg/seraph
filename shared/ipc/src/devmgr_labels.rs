@@ -71,9 +71,10 @@ pub const QUERY_DEVICE: u64 = 20;
 /// while the caller holds a copy of its Notification: once devmgr's own
 /// copy is the only reference left (the caller deleted its copies, or
 /// exited), devmgr drops the watch the next time it signals the class or
-/// finds the class full. `INVALID_REQUEST` when devmgr cannot create the
-/// Notification. The handler logs nothing, as [`QUERY_DEVICE`]'s does
-/// not.
+/// finds the class full. [`super::devmgr_errors::OUT_OF_RESOURCES`] when
+/// devmgr cannot create the Notification, or its `CSpace` is short of its
+/// slot headroom and a top-up was refused, since each watch keeps a slot.
+/// The handler logs nothing, as [`QUERY_DEVICE`]'s does not.
 pub const WATCH_CLASS: u64 = 23;
 /// The bit devmgr signals on a [`WATCH_CLASS`] Notification.
 pub const WATCH_CLASS_CHANGED: u64 = 1;

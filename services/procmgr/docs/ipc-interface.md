@@ -155,7 +155,7 @@ holds a handle to it.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[36..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded or before procmgr's reply delivers it, or a destroy marked the child itself (`DESTROY_CHILD`, or a destroy of a subtree it is in) before procmgr's reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below) |
 | 11 | `MAP_FAILED` | The module cap, a copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | The module cap lacks the map right, or a rights derivation failed during segment load |
@@ -603,7 +603,7 @@ included, as for `CREATE_PROCESS`.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | Memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[36..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, a destroy that marked the child itself before the reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | A copy frame or a segment could not be mapped |
@@ -1197,10 +1197,11 @@ half a registry's worth of requests.
 
 The registry holds at most `procmgr_labels::REGISTERED_THREADS_MAX` (16384) threads per process
 ([docs/limits.md](../../../docs/limits.md) § Shared IPC and protocol crates); past it a thread runs
-unregistered, so no spawn fails for the bound. A thread refused there, or for procmgr's heap, that
-carries a binding under the debugger tag, a watched debugger's included, is bound back to the crash
-endpoint under the process badge at the refusal, with a debugger's upcall binding unbound, since no
-attach lists an unregistered thread and no restore reaches it. procmgr does not compare a
+unregistered, so no spawn fails for the bound. A thread refused there, for procmgr's heap, or while
+procmgr's own `CSpace` is short of its headroom, that carries a binding under the debugger tag, a
+watched debugger's included, is bound back to the crash endpoint under the process badge at the
+refusal, with a debugger's upcall binding unbound, since no attach lists an unregistered thread and
+no restore reaches it. procmgr does not compare a
 registration against the threads it holds: a thread registered twice takes two entries, both
 counting toward the bound, and the runtime registers each thread once: it does not repeat a call
 that failed, since the kernel can cancel a call with `Interrupted` after procmgr received it and
@@ -1253,7 +1254,8 @@ request came on a process handle (§ Messages);
 the thread as the declaration unbinds the declarer's threads, and on which the runtime sends no
 further registration; `INVALID_ARGUMENT` without a Thread cap carrying `RIGHTS_THREAD`;
 `THREAD_LIMIT` at the bound, after any sweep due; `OUT_OF_MEMORY` when procmgr's heap cannot hold
-the entry. A refused request's caps are deleted.
+the entry, or when procmgr's own `CSpace` is short of its headroom and its top-up was refused
+([README.md](../README.md) § CSpace headroom). A refused request's caps are deleted.
 
 ### Label 23: `LIST_PROCESSES`
 

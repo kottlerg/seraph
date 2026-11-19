@@ -354,15 +354,20 @@ fn refresh_with(
 /// a [`devmgr_labels::WATCH_CLASS`] watch, then probe, and while the class
 /// serves none wait on the watch and probe again. `waiting` is called
 /// before each wait. Each wait ends after `wait_ms` milliseconds (`0`:
-/// never) with the last probe's error. A refused watch leaves one probe.
-/// The watch is deleted before the call returns. Logs nothing, so logd
-/// calls it too.
+/// never) with the last probe's error. A refused watch leaves one probe;
+/// when devmgr refused it for `OUT_OF_RESOURCES` and that probe finds no
+/// device, the call returns the watch's refusal rather than `NO_DEVICE`,
+/// which a client takes as terminal, since devmgr was short and the device
+/// may yet be served ([`unwatched_outcome`]). The watch is deleted before
+/// the call returns. Logs nothing, so logd calls it too.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
 ///
 /// # Errors
-/// [`first_device`]'s, or [`ClassCallError::Call`] with the wait's error.
+/// [`first_device`]'s, [`ClassCallError::Refused`] with
+/// `OUT_OF_RESOURCES` as above, or [`ClassCallError::Call`] with the wait's
+/// error.
 pub unsafe fn await_device(
     class_send: u64,
     wait_ms: u64,
@@ -371,7 +376,8 @@ pub unsafe fn await_device(
 ) -> Result<u64, ClassCallError>
 {
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-    let watch = unsafe { watch_class(class_send, ipc_buf) }.ok();
+    let watched = unsafe { watch_class(class_send, ipc_buf) };
+    let watch = watched.ok();
     let found = loop
     {
         // SAFETY: as above.
@@ -379,7 +385,7 @@ pub unsafe fn await_device(
         let Some(watch) = watch
         else
         {
-            break found;
+            break unwatched_outcome(found, watched.err());
         };
         if found != Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE))
         {
@@ -402,6 +408,27 @@ pub unsafe fn await_device(
         let _ = syscall::cap_delete(watch.note);
     }
     found
+}
+
+/// What [`await_device`] returns when it holds no watch: the probe's
+/// outcome `found`, except that a probe finding no device after devmgr
+/// refused the watch (`refusal`) with `OUT_OF_RESOURCES` returns that
+/// refusal, so the caller does not take a shortage of devmgr's for a class
+/// that serves no driver.
+fn unwatched_outcome(
+    found: Result<u64, ClassCallError>,
+    refusal: Option<ClassCallError>,
+) -> Result<u64, ClassCallError>
+{
+    let short = ClassCallError::Refused(devmgr_errors::OUT_OF_RESOURCES);
+    if found == Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE)) && refusal == Some(short)
+    {
+        Err(short)
+    }
+    else
+    {
+        found
+    }
 }
 
 /// Send [`devmgr_labels::MINT_CLASS_SEND`] on `registry`, a registry SEND
@@ -642,6 +669,22 @@ mod tests
             ),
             Err(ClassCallError::Call(-2))
         );
+    }
+
+    #[test]
+    fn an_unwatched_await_reports_a_short_devmgr_over_no_device()
+    {
+        let no_device = Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE));
+        let short = ClassCallError::Refused(devmgr_errors::OUT_OF_RESOURCES);
+        let full = ClassCallError::Refused(devmgr_errors::WATCHERS_FULL);
+        assert_eq!(unwatched_outcome(no_device, Some(short)), Err(short));
+        // Any other refusal of the watch leaves the probe's outcome.
+        assert_eq!(unwatched_outcome(no_device, Some(full)), no_device);
+        assert_eq!(unwatched_outcome(no_device, None), no_device);
+        // A probe that found a driver, or failed otherwise, stands.
+        assert_eq!(unwatched_outcome(Ok(9), Some(short)), Ok(9));
+        let withdrawn = Err(ClassCallError::Refused(devmgr_errors::WITHDRAWN));
+        assert_eq!(unwatched_outcome(withdrawn, Some(short)), withdrawn);
     }
 
     #[test]

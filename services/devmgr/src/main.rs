@@ -342,15 +342,14 @@ fn now_ns() -> u64
 
 /// Start the registry's workers and let them receive: the
 /// [`REGISTRY_WORKERS`] threads of a [`recv_pool::RecvPool`] on the registry
-/// endpoint, each serving its requests with [`Registry::handle`] once it has
-/// held devmgr's `CSpace` headroom ([`headroom::hold`]). Halts,
+/// endpoint, each serving its requests with [`Registry::handle`], which first
+/// holds devmgr's `CSpace` headroom ([`headroom::hold`]). Halts,
 /// logged, when none can be started; fewer serve, logged, when some cannot.
 fn start_registry_workers(registry: &Arc<Registry>)
 {
     let pool = {
         let shared = Arc::clone(registry);
         recv_pool::RecvPool::new(registry.endpoint, recv_diag, move |msg, buf| {
-            headroom::hold();
             shared.handle(msg, buf.as_ptr());
         })
     };
@@ -1053,9 +1052,13 @@ impl Registry
 impl Registry
 {
     /// Serve one registry request on a worker whose IPC buffer page is
-    /// `ipc_buf`, replying before it returns.
+    /// `ipc_buf`, replying before it returns. It first holds devmgr's
+    /// `CSpace` headroom ([`headroom::hold`]); when that is refused, a
+    /// request that would keep slots is refused
+    /// (`firmware::headroom::registry_refusal`).
     fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
+        let held = headroom::hold();
         let badge = msg.badge;
         // A client whose SEND carries GRANT (`devmgr.bind`, svcmgr, init) can
         // move caps here with any label. `SET_DRIVERS_DIR` takes `caps[0]`
@@ -1071,6 +1074,12 @@ impl Registry
         for &cap in msg.caps().iter().skip(kept)
         {
             let _ = syscall::cap_delete(cap);
+        }
+        // A refused label keeps no cap it was sent (`kept` is 0 for it).
+        if !held && let Some(code) = firmware::headroom::registry_refusal(msg.label)
+        {
+            reply_status(code, ipc_buf);
+            return;
         }
         match msg.label
         {
@@ -1280,7 +1289,7 @@ impl Registry
         )
         else
         {
-            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            reply_status(ipc::devmgr_errors::OUT_OF_RESOURCES, ipc_buf);
             return;
         };
         let Ok(copy) = syscall::cap_derive(note, syscall::RIGHTS_NTF_WAIT)

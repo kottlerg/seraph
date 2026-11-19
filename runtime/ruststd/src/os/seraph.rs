@@ -1266,10 +1266,10 @@ pub fn wait_memory_pressure(
 /// `region_pages`-page foreign-memory region (MMIO, DMA) into a
 /// retype-backed `AddressSpace`.
 ///
-/// Requests Memory backing from memmgr and retypes it onto the AS's PT pool
-/// via `cap_create_aspace` augment-mode, so a map of the region draws its
-/// intermediate page tables from this caller-funded, memmgr-accounted budget
-/// rather than the fixed kernel PT reserve. Only the pool's shortfall against
+/// Requests Memory backing from memmgr, in runs of any length, and retypes each
+/// run onto the AS's PT pool via `cap_create_aspace` augment-mode, so a map of
+/// the region draws its intermediate page tables from this caller-funded,
+/// memmgr-accounted budget rather than the fixed kernel PT reserve. Only the pool's shortfall against
 /// the region's worst case is donated.
 ///
 /// The pool is shared by every mapping of the process, the pager's included,
@@ -1382,7 +1382,8 @@ pub fn cspace_slot_headroom(self_cspace: u64) -> u64 {
 /// the `CSpace`'s arena, which draws whole pages from the same growth budget.
 /// This helper measures the headroom above the reserve and the budget and, when
 /// either is short (`syscall_abi::cspace_topup_pages`), requests Memory from
-/// memmgr and donates it to the pool via augment-mode `cap_create_cspace`.
+/// memmgr, in runs of any length, and donates each run to the pool via
+/// augment-mode `cap_create_cspace`.
 ///
 /// After a success, `slots` general allocations succeed and the arena can still
 /// take one more page, 31 bodies; a burst of `n` splits needs `slots` of at
@@ -1454,12 +1455,26 @@ impl CSpaceHeadroom {
     /// `topup_slots` when its headroom or its growth budget is short of the
     /// mark. A refused top-up is recorded for
     /// [`failure_to_report`](Self::failure_to_report).
+    ///
+    /// Returns `false` when the `CSpace` was short of the mark and the top-up
+    /// was refused, else `true` (a thread that found another holding counts
+    /// the mark as held, since the mark covers it). After `false`, the general
+    /// headroom ([`cspace_slot_headroom`]) is all the operation may take: a
+    /// capability received by IPC takes a general slot while one is free and
+    /// then a slot of the IPC receive reserve, and the next top-up's own
+    /// reply needs that reserve. So an operation that receives capabilities
+    /// goes on only while the headroom covers what it receives, and
+    /// otherwise fails as if refused for memory.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub fn hold(&self, self_cspace: u64) {
-        let _ = self.state.hold(
-            || pal_alloc::cspace_below_low_water(self_cspace, self.low_water),
-            || pal_alloc::fund_cspace_slot_budget(self_cspace, self.topup_slots),
-        );
+    #[must_use = "a refused top-up leaves the CSpace short of the mark: act on it, or say why the caller's capability intake is bounded"]
+    pub fn hold(&self, self_cspace: u64) -> bool {
+        !self
+            .state
+            .hold(
+                || pal_alloc::cspace_below_low_water(self_cspace, self.low_water),
+                || pal_alloc::fund_cspace_slot_budget(self_cspace, self.topup_slots),
+            )
+            .is_refused()
     }
 
     /// Whether a run of refused top-ups is under way that no caller has

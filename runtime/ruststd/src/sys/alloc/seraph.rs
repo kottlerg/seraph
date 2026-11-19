@@ -981,6 +981,85 @@ pub fn slab_request_pages(memmgr_ep: u64, min_pages: u64) -> Option<(u64, u64, u
     Some((caps[i], page_counts[i], region_ids[i]))
 }
 
+/// Donate `pages` pages of memmgr's pool to a growth pool of this process
+/// through `donate`, which carves the whole of the Memory cap `cap`, `n` pages
+/// long, into the pool: an augment-mode `cap_create_cspace` or
+/// `cap_create_aspace`, either of which takes any page count of one or more.
+///
+/// A growth pool takes pages, not a run, so the pages are requested
+/// best-effort, without `REQUIRE_CONTIGUOUS`: a pool whose free pages lie in
+/// runs shorter than `pages`, as eviction leaves them, still serves the
+/// top-up. A reply carries at most `MSG_CAP_SLOTS_MAX` runs, so the remainder
+/// is requested again until `pages` pages are donated
+/// (`pool_funding::donate_runs`). A donated run's cap is deleted: the pool holds
+/// its own reference on the grant's Memory object, and the run stays charged
+/// to the process until it dies. A run the kernel refused, and every run of
+/// its reply after it, is deleted and returned to memmgr's pool
+/// ([`release_reply_caps`]).
+///
+/// Returns whether every page was donated: `false` when memmgr is
+/// unreachable, refuses a request or grants nothing, or the kernel refuses a
+/// donation; the pages donated before stay in the pool. Allocates nothing.
+fn donate_pool_pages(pages: u64, donate: impl Fn(u64, u64) -> bool) -> bool {
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    let ipc_buf = current_ipc_buf();
+    if ep == 0 || ipc_buf.is_null() {
+        return false;
+    }
+    pool_funding::donate_runs(
+        pages,
+        |left| request_runs(ep, ipc_buf, left),
+        |run| {
+            let donated = donate(run.cap, run.pages);
+            if donated {
+                let _ = syscall::cap_delete(run.cap);
+            }
+            donated
+        },
+        |rest| {
+            let mut caps = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
+            let mut ids = [0u64; syscall_abi::MSG_CAP_SLOTS_MAX];
+            let mut n = 0;
+            for (run, (cap, id)) in rest.iter().zip(caps.iter_mut().zip(ids.iter_mut())) {
+                *cap = run.cap;
+                *id = run.region_id;
+                n += 1;
+            }
+            release_reply_caps(ep, ipc_buf, &caps[..n], &ids[..n], |_| false);
+        },
+    )
+}
+
+/// One best-effort `REQUEST_MEMORY_CAPS` of `pages` pages for
+/// [`donate_pool_pages`]: the runs memmgr granted, the first `count` of the
+/// array, or `None` when the call fails, memmgr refuses, or the reply's grant
+/// layout does not parse ([`ipc::memmgr_grant_layout`]). A request past the
+/// 32-bit page-count field asks for the most it holds. Every cap of a reply
+/// that is not returned is deleted and its run returned to memmgr's pool.
+fn request_runs(
+    ep: u64,
+    ipc_buf: *mut u64,
+    pages: u64,
+) -> Option<([pool_funding::GrantRun; syscall_abi::MSG_CAP_SLOTS_MAX], usize)> {
+    let want = u32::try_from(pages).unwrap_or(u32::MAX);
+    let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, u64::from(want)).build();
+    // An interrupted request is made again, as in `slab_request_pages`.
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    let caps = reply.caps();
+    let Some((counts, ids)) = ipc::memmgr_grant_layout(&reply) else {
+        release_reply_caps(ep, ipc_buf, caps, &[], |_| false);
+        return None;
+    };
+    let mut runs = [pool_funding::GrantRun::default(); syscall_abi::MSG_CAP_SLOTS_MAX];
+    let mut count = 0;
+    for (slot, ((&cap, &pages), &region_id)) in runs.iter_mut().zip(caps.iter().zip(counts).zip(ids)) {
+        *slot = pool_funding::GrantRun { cap, pages, region_id };
+        count += 1;
+    }
+    Some((runs, count))
+}
+
 /// Delete every cap a `REQUEST_MEMORY_CAPS` reply transferred except those
 /// `keep` selects by index, and return each deleted cap's run to memmgr's
 /// pool with one `RELEASE_MEMORY_CAPS` naming the region id `region_ids`
@@ -1430,14 +1509,14 @@ pub fn register_pressure() {
 /// `region_pages`-page foreign-frame region (MMIO, DMA) into a
 /// retype-backed `AddressSpace`.
 ///
-/// Requests a Memory cap from memmgr (via the object slab) and retypes it
-/// onto the AS's PT pool with `cap_create_aspace` in augment mode, so the
-/// kernel draws the region's intermediate page tables from this
+/// Requests Memory from memmgr in runs of any length ([`donate_pool_pages`])
+/// and retypes each onto the AS's PT pool with `cap_create_aspace` in augment
+/// mode, so the kernel draws the region's intermediate page tables from this
 /// caller-funded, memmgr-accounted budget rather than the fixed kernel PT
 /// reserve. The need is `pool_funding::pt_pages_for(region_pages)`, the
 /// worst case for a contiguous run, and only the pool's shortfall against
-/// it is donated, in at most `pool_funding::FUND_ROUNDS` donations
-/// (`pool_funding::top_up`).
+/// it is donated, in at most `pool_funding::FUND_ROUNDS` rounds of one
+/// donation or more (`pool_funding::top_up`).
 ///
 /// The pool is shared by every mapping of the process, the pager's
 /// included, so the top-up is not reserved for the region: another thread's
@@ -1466,10 +1545,7 @@ pub fn fund_aspace_pt_budget(self_aspace: u64, region_pages: u64) -> bool {
             / PAGE_SIZE
     };
     let donate = |pages: u64| {
-        object_slab_retype(pages * PAGE_SIZE, |frame| {
-            syscall::cap_create_aspace(frame, self_aspace, pages).ok()
-        })
-        .is_some()
+        donate_pool_pages(pages, |cap, n| syscall::cap_create_aspace(cap, self_aspace, n).is_ok())
     };
     let need = pool_funding::pt_pages_for(region_pages);
     pool_funding::top_up(|| need.saturating_sub(budget_pages()), donate)
@@ -1564,9 +1640,9 @@ pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
 /// Reads the `CSpace`'s headroom (`CAP_INFO_CSPACE_CAPACITY` less
 /// `CAP_INFO_CSPACE_USED` and the IPC receive reserve) and its growth budget
 /// (`CAP_INFO_CSPACE_BUDGET`) and, when either falls short of
-/// `syscall_abi::cspace_topup_pages`, requests Memory from memmgr (via the
-/// object slab) and donates it to the pool with augment-mode
-/// `cap_create_cspace`. After a success, `slots` general allocations succeed,
+/// `syscall_abi::cspace_topup_pages`, requests Memory from memmgr in runs of
+/// any length ([`donate_pool_pages`]) and donates each to the pool with
+/// augment-mode `cap_create_cspace`. After a success, `slots` general allocations succeed,
 /// and the body arena can still take one more page: up to 31 further bodies
 /// (split children, `Mmio`, `IoPort`, or `Interrupt` copies, spilled mapping
 /// records). A burst of `n` splits therefore needs `slots` of at least `n`
@@ -1580,12 +1656,13 @@ pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
 /// allocations can take the donated slots first, and the caller's own
 /// allocation then decides, failing with the refillable `OutOfMemory`. The
 /// donations follow `pool_funding::top_up`: the shortfall each round reads,
-/// in at most `pool_funding::FUND_ROUNDS` donations.
+/// in at most `pool_funding::FUND_ROUNDS` rounds of one donation or more.
 ///
 /// `slots == 0` still keeps the arena's page. Returns `false` only when a
 /// top-up was needed and could not be had: memmgr is unreachable or refuses
-/// the grant, or the kernel refuses the donation (the object slab's own cap
-/// needs one free general slot). A headroom that reads short after donations
+/// the grant, or the kernel refuses the donation. A granted run's cap takes a
+/// free slot, the IPC receive reserve's included, until it is donated, so a
+/// `CSpace` with no free slot cannot be topped up (#1328). A headroom that reads short after donations
 /// that were made is no failure, since another thread's allocations took it.
 pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     let short = || {
@@ -1594,10 +1671,7 @@ pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
         syscall_abi::cspace_topup_pages(cspace_general_headroom(self_cspace), budget, slots)
     };
     let donate = |pages: u64| {
-        object_slab_retype(pages * PAGE_SIZE, |frame| {
-            syscall::cap_create_cspace(frame, self_cspace, pages).ok()
-        })
-        .is_some()
+        donate_pool_pages(pages, |cap, n| syscall::cap_create_cspace(cap, self_cspace, n).is_ok())
     };
     pool_funding::top_up(short, donate)
 }

@@ -526,7 +526,7 @@ fn serve_list_round(
 )]
 pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn
 {
-    crate::headroom::hold();
+    let held = crate::headroom::hold();
     // Release the source ELF cap on every exit before the create call
     // consumes it. Disarmed once the ipc_call returns, which transfers the
     // cap to procmgr.
@@ -536,6 +536,11 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         CreateSource::File { file_cap, .. } => file_cap,
     };
     let mut source_guard = ModuleCapGuard::new(source_cap);
+    if !held
+    {
+        std::os::seraph::log!(warn: "driver spawn: CSpace short of its headroom");
+        return DriverSpawn::Failed;
+    }
 
     if config.resources.len() > MAX_BOUND_RESOURCES
     {

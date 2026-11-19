@@ -579,18 +579,33 @@ const CSPACE_TOPUP_SLOTS: u64 = 1024;
 static HEADROOM: std::os::seraph::CSpaceHeadroom =
     std::os::seraph::CSpaceHeadroom::new(CSPACE_LOW_WATER, CSPACE_TOPUP_SLOTS);
 
-/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, so
-/// its allocations never meet an exhausted `CSpace` and its receives keep the
-/// IPC receive reserve. Each request runs it before it is served; a worker
-/// that finds another topping up goes on, since the low-water mark leaves
-/// room for every worker's request. A failed top-up is retried on the next
-/// request, and the log names only the first failure of a streak.
-fn hold_cspace_headroom(self_cspace: u64)
+/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots.
+/// Each request runs it before it is served; a worker that finds another
+/// topping up goes on, since the low-water mark leaves room for every
+/// worker's request. A failed top-up is retried on the next request, and the
+/// log names only the first failure of a streak.
+///
+/// Returns [`process_table::Headroom::Short`] when the `CSpace` was short of
+/// the mark and its top-up was refused. A request that would keep
+/// capabilities in procmgr's `CSpace` in a number that grows with requests
+/// is then refused: a create before it is served
+/// ([`process_table::headroom_refusal`]), a thread registration at its
+/// reservation (`process::register_thread`), so the slots left, and the IPC
+/// receive reserve the next top-up's reply needs, are not taken.
+fn hold_cspace_headroom(self_cspace: u64) -> process_table::Headroom
 {
-    HEADROOM.hold(self_cspace);
+    let held = HEADROOM.hold(self_cspace);
     if HEADROOM.failure_to_report()
     {
         std::os::seraph::log!(warn: "CSpace headroom top-up failed; retrying each pass");
+    }
+    if held
+    {
+        process_table::Headroom::Held
+    }
+    else
+    {
+        process_table::Headroom::Short
     }
 }
 
@@ -622,7 +637,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 )]
 fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
-    hold_cspace_headroom(ctx.self_cspace);
+    let headroom = hold_cspace_headroom(ctx.self_cspace);
     // A crash service or a debugger watch that is a thread other than its
     // process's main thread posts no death when it exits, so every request
     // makes the checks before it is served, as the reaper does on a death.
@@ -637,6 +652,13 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     // registry, and `BIND_DEATH_OBSERVER` is refused on any other cap, so only the
     // creator chooses who observes the child.
     if let Some(code) = process_table::sender_refusal(label & 0xFFFF, req.badge)
+    {
+        release_caps(req.caps());
+        reply_empty(ipc_buf, code);
+        return;
+    }
+    if headroom == process_table::Headroom::Short
+        && let Some(code) = process_table::headroom_refusal(label & 0xFFFF)
     {
         release_caps(req.caps());
         reply_empty(ipc_buf, code);
@@ -802,7 +824,7 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         }
 
         // The debug-authority and thread-registry labels, and unknown opcodes.
-        _ => dispatch_debug(&req, ipc_buf, &ctx.tables, ctx.memmgr_ep),
+        _ => dispatch_debug(&req, ipc_buf, &ctx.tables, ctx.memmgr_ep, headroom),
     }
 }
 
@@ -878,8 +900,15 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 /// crash decliner, and `MAKE_RESIDENT`, which calls memmgr at `memmgr_ep`
 /// after the lock, is served under the table lock: each makes syscalls, its
 /// reply among them, and a failed rebind's log line
-/// (services/procmgr/README.md § Concurrency).
-fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables, memmgr_ep: u64)
+/// (services/procmgr/README.md § Concurrency). `headroom` is the request's
+/// hold of procmgr's `CSpace`, which `REGISTER_THREAD` reads.
+fn dispatch_debug(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    tables: &process::Tables,
+    memmgr_ep: u64,
+    headroom: process_table::Headroom,
+)
 {
     let label = req.label & 0xFFFF;
     if label == procmgr_labels::REGISTER_CRASH_SERVICE
@@ -915,7 +944,7 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables,
             release_caps(req.caps());
             handle_detach_process(req, ipc_buf, table);
         }
-        procmgr_labels::REGISTER_THREAD => handle_register_thread(req, ipc_buf, table),
+        procmgr_labels::REGISTER_THREAD => handle_register_thread(req, ipc_buf, table, headroom),
         procmgr_labels::DECLARE_NO_DEBUG =>
         {
             release_caps(req.caps());
@@ -948,15 +977,22 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables,
 /// Handle `REGISTER_THREAD` — keep the sending thread's cap in its process's
 /// registry (`process::register_thread`;
 /// `services/procmgr/docs/ipc-interface.md` § `REGISTER_THREAD`). Caps past
-/// `caps[0]`, and the cap of a refused request, are deleted.
-fn handle_register_thread(req: &IpcMessage, ipc_buf: *mut u64, table: &mut process::ProcessTable)
+/// `caps[0]`, and the cap of a refused request, are deleted. Under
+/// [`process_table::Headroom::Short`] the registration is refused
+/// `OUT_OF_MEMORY` at its reservation.
+fn handle_register_thread(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    table: &mut process::ProcessTable,
+    headroom: process_table::Headroom,
+)
 {
     let (thread, extra) = req
         .caps()
         .split_first()
         .map_or((0, &[][..]), |(&t, rest)| (t, rest));
     release_caps(extra);
-    let code = match process::register_thread(req.badge, thread, table)
+    let code = match process::register_thread(req.badge, thread, table, headroom)
     {
         Ok(()) => procmgr_errors::SUCCESS,
         Err(code) =>

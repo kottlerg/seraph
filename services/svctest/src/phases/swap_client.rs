@@ -42,9 +42,10 @@
 //!   detail 1, forwarded, and the fixture killed;
 //! * and once the fixture is gone, no chunk on disk, every slot free, and the
 //!   end of `memmgr_swap`: the store and the swapped total empty, the
-//!   identity holding, and memmgr's free and deferred pages at least what
-//!   they were at the start, less the pages of the swap slot map, which
-//!   memmgr keeps as its metadata once the takes grew it.
+//!   identity holding, and memmgr's free and deferred pages with svctest's
+//!   own charged pages at least what they were at the start, less the pages
+//!   of the swap slot map, which memmgr keeps as its metadata once the takes
+//!   grew it.
 
 use std::collections::HashMap;
 use std::os::seraph::{current_ipc_buf, startup_info};
@@ -756,8 +757,8 @@ fn swap_client_phase(caps: &Caps)
     let floor = baseline.saturating_sub(SLOT_MAP_PAGES.saturating_mul(PAGE_SIZE));
     let end = settle_resident(authority, Some(floor));
     std::os::seraph::log!(
-        "memmgr_swap_client phase passed ({} bytes sealed, chi-square {chi}, free and deferred {} \
-         pages above the start less the {SLOT_MAP_PAGES} slot-map pages)",
+        "memmgr_swap_client phase passed ({} bytes sealed, chi-square {chi}, free, deferred and \
+         svctest's own {} pages above the start less the {SLOT_MAP_PAGES} slot-map pages)",
         sealed.len(),
         end.saturating_sub(floor) / PAGE_SIZE
     );

@@ -443,19 +443,32 @@ impl Kernel for Sys
             return false;
         }
         let badge = control::thread_badge(slot);
-        let Ok(send) = syscall::cap_derive_badge(self.endpoint, syscall::RIGHTS_EP_SEND, badge)
-        else
+        let send = match syscall::cap_derive_badge(self.endpoint, syscall::RIGHTS_EP_SEND, badge)
         {
-            return false;
+            Ok(send) => send,
+            Err(e) =>
+            {
+                std::os::seraph::log!(
+                    warn: "thread {} left unbound: badge derive refused ({e:?})",
+                    slot.saturating_add(1)
+                );
+                return false;
+            }
         };
         let bound = syscall::thread_set_fault_handler(
             cap,
             send,
             syscall_abi::FAULT_CLASS_EXCEPTION | syscall_abi::FAULT_CLASS_UPCALL,
-        )
-        .is_ok();
+        );
         let _ = syscall::cap_delete(send);
-        bound
+        if let Err(e) = bound
+        {
+            std::os::seraph::log!(
+                warn: "thread {} left unbound: fault handler bind refused ({e:?})",
+                slot.saturating_add(1)
+            );
+        }
+        bound.is_ok()
     }
 
     fn unbind_upcall(&mut self, cap: u64)
@@ -938,7 +951,11 @@ impl Stub
                     self.ok(ipc_buf);
                 }
                 (_, Some(_)) | (ThreadOp::Resume, None) => self.ok(ipc_buf),
-                (ThreadOp::General, None) => self.error(ipc_buf, 1),
+                (ThreadOp::General, None) =>
+                {
+                    let code = self.log_refused_select(thread);
+                    self.error(ipc_buf, code);
+                }
             },
             Command::ThreadAlive(thread) => match self.select(thread)
             {
@@ -1032,6 +1049,29 @@ impl Stub
     fn select(&self, thread: ThreadId) -> Option<usize>
     {
         self.session.as_ref()?.select(thread)
+    }
+
+    /// Log why `Hg` of `thread` is refused, no session or the state of the
+    /// slot it names, and return the error number that answers it
+    /// ([`session::SlotState::refusal_code`]).
+    fn log_refused_select(&self, thread: ThreadId) -> u8
+    {
+        match &self.session
+        {
+            None =>
+            {
+                std::os::seraph::log!(warn: "Hg {thread:?} refused: no session");
+                1
+            }
+            Some(s) =>
+            {
+                let (state, slots) = s.slot_state(thread);
+                std::os::seraph::log!(
+                    warn: "Hg {thread:?} refused: slot {state:?} of {slots}"
+                );
+                state.refusal_code()
+            }
+        }
     }
 
     /// The slot of the thread register and memory commands act on.

@@ -3,8 +3,8 @@
 
 // xtask/src/debug_stub.rs
 
-//! Staging the GDB stub for one boot, and the GDB command line that
-//! connects to it.
+//! Staging the GDB stub for one boot, the GDB command line that connects to
+//! it, and the kill of the process it holds that the host tests make.
 //!
 //! The stub's recipe template lives at `config/svcmgr/debug/gdbstub.svc`,
 //! which svcmgr does not scan. Staging writes it into
@@ -21,6 +21,11 @@ use crate::error::{Context as _, Result, bail};
 use crate::arch::Arch;
 use crate::context::Context;
 use crate::disk::DiskLayout;
+use crate::qemu_gdb::{Stub, le_hex};
+
+/// The stub's line once it holds its target, followed by ` (<target>)`. Kept
+/// in sync with `services/gdbstub/src/main.rs`.
+pub const ATTACHED_MARKER: &str = "[gdbstub] attached; serving the debug port";
 
 /// The stub's recipe file name, in the template directory and once staged.
 const RECIPE: &str = "gdbstub.svc";
@@ -193,6 +198,39 @@ pub fn gdb_command(arch: Arch, port: u16, binary: Option<&Path>) -> String
     )
 }
 
+/// The GDB remote protocol's description of `arch`.
+pub fn rsp_arch(arch: Arch) -> gdb_rsp::target::Arch
+{
+    match arch
+    {
+        Arch::X86_64 => gdb_rsp::target::Arch::X86_64,
+        Arch::Riscv64 => gdb_rsp::target::Arch::Riscv64,
+    }
+}
+
+/// Kill `name`, the process the stub on `stub` holds, by a terminal fault
+/// made from outside the guest: move its main thread, the first of the
+/// stub's list, to program counter 0, an address no process maps, and
+/// detach, which resumes it there. Returns the program counter it moved the
+/// thread from. A stub that holds no process (it exited, or the stub's walk
+/// found none) answers `?` as exited, which fails the kill.
+pub fn kill_held(stub: &mut Stub, arch: Arch, name: &str) -> Result<u64>
+{
+    let pc_reg = rsp_arch(arch).pc_regnum();
+    let halt = stub.request(b"?")?;
+    if !halt.starts_with(b"T") && !halt.starts_with(b"S")
+    {
+        bail!(
+            "the stub holds no {name}: {}",
+            String::from_utf8_lossy(&halt)
+        );
+    }
+    stub.expect_ok(b"Hg1")?;
+    let pc = stub.read_register(pc_reg)?;
+    stub.expect_ok(format!("P{pc_reg:x}={}", le_hex(0)).as_bytes())?;
+    stub.expect_ok(b"D")?;
+    Ok(pc)
+}
 #[cfg(test)]
 mod tests
 {

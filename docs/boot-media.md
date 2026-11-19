@@ -134,7 +134,8 @@ from the root filesystem in every later pass, a hot-added device's included
 ([driver-binding.md](driver-binding.md) § Declaration Bounds, Source). A
 restart of a driver by devmgr ([devmgr responsibilities § Driver
 Restart](../services/devmgr/docs/responsibilities.md#driver-restart)) or of a filesystem driver
-([#1078](https://github.com/kottlerg/seraph/issues/1078)) is a later start.
+([namespace composition § Driver
+restart](../services/vfsd/docs/namespace-composition.md#driver-restart)) is a later start.
 
 Loss of what the root filesystem stands on is fatal: the root filesystem's driver and the driver
 of the disk under it are never restarted, and the root is not remounted in a running system. No
@@ -143,8 +144,8 @@ copy, kept in memory for the life of the system, that no update of the installed
 vfsd ends on the death of the root mount's driver or the loss of its disk, and its death is
 system death ([storage.md](storage.md) § Failure and Revocation Invariants;
 [supervision.md](supervision.md) § Core Set and System Death); devmgr's restart of a driver
-(vfsd declines it for the root disk's driver) and the restart of
-[#1078](https://github.com/kottlerg/seraph/issues/1078) exclude both drivers.
+(vfsd declines it for the root disk's driver) and vfsd's restart of a mount's driver
+(namespace composition § Driver restart) exclude both drivers.
 
 ---
 

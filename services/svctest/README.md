@@ -221,7 +221,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
 | `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client` phase: memmgr's swap labels, as the swap service over a RAM slot store |
-| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -570,8 +570,10 @@ unforced and a forced unmount of `/data`, and a `stale-map-child` maps a cache p
 `/config/svcmgr/tests`, the root filesystem's directory of svctest's own recipe, read
 `test.txt` there, and after unmounting it read `/config/svcmgr/tests/svctest.svc` through the
 fall-through again. The `vfsd_driver_death` phase holds a file on `/data` open and kills the data
-mount's fs driver (found by its name `fatfs:/data`) through a debug attach: vfsd tears the mount
-down, `/data` falls through and is not found, the open file is stale, and a fresh `MOUNT` at
+mount's fs driver (found by its name `fatfs:/data`) through a debug attach `RESTART_BURST` times;
+each time vfsd restarts the driver, a new `fatfs:/data` is listed, `/data/test.txt` reads again,
+`/data` is never not found, and the open file is stale. One more kill finds the restart budget
+spent: vfsd tears the mount down, `/data` falls through and is not found, and a fresh `MOUNT` at
 `/data` succeeds on the same disk. They mount `/data` again and set svctest's cwd to it before
 they end.
 The sysroot placement of all of these is listed in [docs/testing.md § Sysroot

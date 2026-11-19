@@ -7,9 +7,10 @@
 //! the symbolizer's tests, the crash-log tests and the frame-check tests.
 //!
 //! The writers emit exactly the fixture's shape: a little-endian ELF64
-//! relocatable file with `.text`, a symbol table and named extra sections,
-//! and DWARF 4 (32-bit format, 8-byte addresses) for one compile unit with
-//! one inlined call, every string inline (`DW_FORM_string`).
+//! relocatable file with `.text`, a GNU build-id note, a symbol table and
+//! named extra sections, and DWARF 4 (32-bit format, 8-byte addresses) for
+//! one compile unit with one inlined call, every string inline
+//! (`DW_FORM_string`); or, stripped, `.text` and the note alone.
 
 /// The fixture's ELF machine.
 #[derive(Clone, Copy)]
@@ -66,11 +67,18 @@ pub(crate) enum Debug
     SymbolsOnly,
 }
 
+/// The build id of every fixture image, the descriptor of its GNU build-id
+/// note: twenty bytes, as `--build-id=sha1` writes.
+pub(crate) const FIXTURE_BUILD_ID: [u8; 20] = *b"seraph-fixture-id-01";
+
 // ELF constants the writer uses.
 const ET_REL: u16 = 1;
 const SHT_PROGBITS: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
+const SHT_NOTE: u32 = 7;
+/// `NT_GNU_BUILD_ID`.
+const NT_GNU_BUILD_ID: u32 = 3;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
 /// `STB_GLOBAL << 4 | STT_FUNC`.
@@ -344,22 +352,94 @@ fn add_string(table: &mut Vec<u8>, name: &str) -> u32
     offset
 }
 
-/// An ELF image of `arch` whose functions sit at link addresses from
-/// `base`, with [`SYMBOLS`] in its symbol table and `debug` as its further
-/// sections: name, contents, and ELF section flags.
-pub(crate) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
+/// The GNU build-id note whose descriptor is `id`: its header (name size,
+/// descriptor size, type), the name `GNU`, and the descriptor.
+pub(crate) fn build_id_note(id: &[u8]) -> Vec<u8>
 {
-    let mut shstrtab = vec![0];
-    let mut sections = vec![Section {
-        name: add_string(&mut shstrtab, ".text"),
-        kind: SHT_PROGBITS,
-        flags: SHF_ALLOC | SHF_EXECINSTR,
-        data: vec![0; usize::try_from(TEXT_SIZE).unwrap()],
-        align: 16,
+    let mut note = Vec::new();
+    note.extend_from_slice(&4u32.to_le_bytes());
+    note.extend_from_slice(&u32::try_from(id.len()).unwrap().to_le_bytes());
+    note.extend_from_slice(&NT_GNU_BUILD_ID.to_le_bytes());
+    note.extend_from_slice(b"GNU\0");
+    note.extend_from_slice(id);
+    note
+}
+
+/// The sections every fixture image opens with: `.text`, zero-filled, and
+/// the build-id note of [`FIXTURE_BUILD_ID`]; their names go to `shstrtab`.
+fn text_and_note(shstrtab: &mut Vec<u8>) -> Vec<Section>
+{
+    vec![
+        Section {
+            name: add_string(shstrtab, ".text"),
+            kind: SHT_PROGBITS,
+            flags: SHF_ALLOC | SHF_EXECINSTR,
+            data: vec![0; usize::try_from(TEXT_SIZE).unwrap()],
+            align: 16,
+            link: 0,
+            info: 0,
+            entsize: 0,
+        },
+        Section {
+            name: add_string(shstrtab, ".note.gnu.build-id"),
+            kind: SHT_NOTE,
+            flags: SHF_ALLOC,
+            data: build_id_note(&FIXTURE_BUILD_ID),
+            align: 4,
+            link: 0,
+            info: 0,
+            entsize: 0,
+        },
+    ]
+}
+
+/// The section-name string table `shstrtab`, its own name added, as a
+/// section.
+fn shstrtab_section(mut shstrtab: Vec<u8>) -> Section
+{
+    let name = add_string(&mut shstrtab, ".shstrtab");
+    Section {
+        name,
+        kind: SHT_STRTAB,
+        flags: 0,
+        data: shstrtab,
+        align: 1,
         link: 0,
         info: 0,
         entsize: 0,
-    }];
+    }
+}
+
+/// The fixture image of `arch` stripped: `.text` and the build-id note,
+/// with no symbol table and no DWARF.
+pub(crate) fn stripped(arch: Architecture) -> Vec<u8>
+{
+    let mut shstrtab = vec![0];
+    let mut sections = text_and_note(&mut shstrtab);
+    sections.push(shstrtab_section(shstrtab));
+    write_file(arch, &sections)
+}
+
+/// `image`, a fixture image, with its build id `id` in place of
+/// [`FIXTURE_BUILD_ID`].
+pub(crate) fn with_build_id(mut image: Vec<u8>, id: &[u8; 20]) -> Vec<u8>
+{
+    let at = image
+        .windows(FIXTURE_BUILD_ID.len())
+        .position(|bytes| bytes == FIXTURE_BUILD_ID)
+        .expect("the fixture's build id");
+    image[at..at + id.len()].copy_from_slice(id);
+    image
+}
+
+/// An ELF image of `arch` whose functions sit at link addresses from
+/// `base`, with the build-id note of [`FIXTURE_BUILD_ID`], [`SYMBOLS`] in
+/// its symbol table and `debug` as its further sections: name, contents,
+/// and ELF section flags.
+pub(crate) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
+{
+    let mut shstrtab = vec![0];
+    let mut sections = text_and_note(&mut shstrtab);
     for (name, data, flags) in debug
     {
         sections.push(Section {
@@ -409,17 +489,7 @@ pub(crate) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)
         info: 0,
         entsize: 0,
     });
-    let shstrtab_name = add_string(&mut shstrtab, ".shstrtab");
-    sections.push(Section {
-        name: shstrtab_name,
-        kind: SHT_STRTAB,
-        flags: 0,
-        data: shstrtab,
-        align: 1,
-        link: 0,
-        info: 0,
-        entsize: 0,
-    });
+    sections.push(shstrtab_section(shstrtab));
     write_file(arch, &sections)
 }
 

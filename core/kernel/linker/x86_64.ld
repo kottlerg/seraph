@@ -46,6 +46,18 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
+    /*
+     * The build-id note the linker writes (--build-id, a link argument of the
+     * kernel triple): the key of the kernel's entry in the symbols store
+     * (docs/build-system.md § Symbols Store). Placed here, inside the
+     * read-only span, so the /DISCARD/ below, which drops every other note,
+     * does not reach it.
+     */
+    .note.gnu.build-id :
+    {
+        *(.note.gnu.build-id)
+    }
+
     .rela.dyn :
     {
         *(.rela.dyn)

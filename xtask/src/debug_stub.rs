@@ -112,10 +112,28 @@ pub fn unstage(ctx: &Context, arch: Arch, layout: DiskLayout) -> Result<()>
         .context("repacking the disk images without the gdbstub")
 }
 
-/// The sysroot binary a process named `target` runs, best effort: a staged
-/// recipe whose `argv` begins with the name gives its `binary`; otherwise
-/// `/programs/<target>` or `/services/<target>` when one exists.
+/// The ELF that holds the symbols of the sysroot binary a process named
+/// `target` runs, best effort: the symbols store's file of the binary's build
+/// id, the binary being the `binary` of a staged recipe whose `argv` begins
+/// with the name, or else `/programs/<target>` or `/services/<target>` when
+/// one exists.
 pub fn binary_for(ctx: &Context, target: &str) -> Option<PathBuf>
+{
+    let installed = installed_binary_for(ctx, target)?;
+    match crate::symbolize::store::Store::at(ctx.symbols_dir()).symbols_path(&installed)
+    {
+        Ok(symbols) => Some(symbols),
+        Err(err) =>
+        {
+            crate::util::step(&format!("no symbols for the GDB command: {err:#}"));
+            None
+        }
+    }
+}
+
+/// The sysroot binary a process named `target` runs, as [`binary_for`]
+/// finds it.
+fn installed_binary_for(ctx: &Context, target: &str) -> Option<PathBuf>
 {
     let dir = ctx.sysroot.join("config/svcmgr/services");
     if let Ok(entries) = std::fs::read_dir(&dir)

@@ -90,10 +90,11 @@ subcommands! {
 
         /// Resolve runtime addresses in a loaded ELF image (a binary, or the
         /// sysroot's kernel) to function, file, and line from its DWARF, or to the
-        /// nearest function symbol when no DWARF covers an address. Each output
-        /// line names the source it used. With `--log`, print every crash-report
-        /// block of a serial log with its addresses resolved against the
-        /// sysroot's binaries. See xtask/README.md.
+        /// nearest function symbol when no DWARF covers an address; a stripped
+        /// image's symbols are the symbols store's file of its build id. Each
+        /// output line names the source it used. With `--log`, print every
+        /// crash-report block of a serial log with its addresses resolved against
+        /// the sysroot's binaries. See xtask/README.md.
         Symbolize(SymbolizeArgs),
 
         /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
@@ -1563,7 +1564,8 @@ args! {
     pub struct SymbolizeArgs
     {
         /// The ELF image the addresses fall in (a sysroot binary, or its build
-        /// output under `target/`).
+        /// output under `target/`). A stripped image's symbols are read from
+        /// the symbols store's file of its build id.
         #[arg(long, value_name = "PATH", required_unless_present_any = ["kernel", "log"])]
         pub binary: Option<PathBuf>,
 
@@ -1596,6 +1598,13 @@ args! {
             conflicts_with_all = ["binary", "kernel", "bias", "addresses"]
         )]
         pub log: Option<PathBuf>,
+
+        /// The symbols store to read in place of the build's `symbols/`, such
+        /// as a release's symbols archive unpacked. With `--log`, the images
+        /// are the store's own files, named by its manifest, and the sysroot
+        /// is not read.
+        #[arg(long, value_name = "DIR")]
+        pub symbols: Option<PathBuf>,
     }
 }
 

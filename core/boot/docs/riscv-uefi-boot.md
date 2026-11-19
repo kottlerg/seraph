@@ -184,7 +184,7 @@ follow. Both set `os: "none"`, `llvm-target: "riscv64-unknown-none-elf"`,
 | Field | UEFI bootloader | Kernel |
 |---|---|---|
 | `features` | `"+m,+a,+c"` (RV64IMAC) | `"+m,+a,+c,+svinval,+svpbmt,+svnapot"` |
-| `pre-link-args` (`ld.lld`) | `--gc-sections -pie --no-dynamic-linker -z notext -z norelro -Bsymbolic` | `--gc-sections -pie --no-dynamic-linker -Bsymbolic -z max-page-size=4096` |
+| `pre-link-args` (`ld.lld`) | `--gc-sections --build-id=sha1 -pie --no-dynamic-linker -z notext -z norelro -Bsymbolic` | `--gc-sections --build-id=sha1 -pie --no-dynamic-linker -Bsymbolic -z max-page-size=4096` |
 | Linker script | `core/boot/linker/riscv64-uefi.ld`, passed by `core/boot/build.rs` | chosen by `core/kernel/build.rs` |
 
 Neither JSON names a linker script; each crate's `build.rs` passes its own
@@ -226,9 +226,10 @@ The intermediate ELF is not a usable UEFI image — UEFI does not
 understand ELF headers — but its symbols carry the same image-relative addresses as the flat
 binary's layout (the flat binary itself has no symbol table), so GDB / LLDB can set symbolic
 breakpoints from the ELF, offset by the runtime load bias, even though UEFI loads the flat
-binary. See [xtask/README.md](../../../xtask/README.md)
-for the authoritative command surface; the steps above are descriptive,
-not a manual recipe.
+binary. The build keeps the ELF in the symbols store, under the build id the flat binary carries
+in its data ([docs/build-system.md § Symbols Store](../../../docs/build-system.md#symbols-store)).
+See [xtask/README.md](../../../xtask/README.md) for the authoritative command surface; the steps
+above are descriptive, not a manual recipe.
 
 The bootloader's `RUSTFLAGS` ([docs/build-system.md § Custom
 Targets](../../../docs/build-system.md#custom-targets)) carry no jump-table flag. The relocation

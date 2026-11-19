@@ -65,6 +65,15 @@ SECTIONS
         *(.data.rel.ro .data.rel.ro.*)
     }
 
+    /* The build-id note the linker writes (--build-id, a link argument of the
+     * triple): the key of the bootloader's entry in the symbols store
+     * (docs/build-system.md § Symbols Store). Placed in the RW region, which
+     * the flat binary holds, so the /DISCARD/ below, which drops every other
+     * note, does not reach it. */
+    .note.gnu.build-id : ALIGN(4) {
+        KEEP(*(.note.gnu.build-id))
+    }
+
     /* Relocation metadata. The self-relocation loop only reads these, but they
      * share this RW .data PE region with the targets below (no separate RO
      * mapping). Bounded by __rela_dyn_start/__rela_dyn_end. */

@@ -205,6 +205,16 @@ compile, which reads it to force the inputs of its return mitigations
 ([transient-execution.md](../core/kernel/docs/transient-execution.md)
 § Forced return mitigations); the riscv64 kernel does not read it.
 
+Every custom triple links with `--build-id=sha1` among its `pre-link-args`, so
+every ELF image the build links carries a GNU build-id note
+(`.note.gnu.build-id`), the key of its symbols in the symbols store
+(§ Symbols Store below). The kernel's linker scripts and `riscv64-uefi.ld`
+discard every other `.note.*` section, so each places this one explicitly
+ahead of its `/DISCARD/`: the kernel's in its read-only span, the riscv64
+bootloader's in the data region its flat binary holds. The x86-64 bootloader,
+a PE image the built-in target links, carries in its place the `CodeView`
+record lld-link writes, which names its PDB by GUID and age.
+
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace
 triples) to rebuild the standard library from source. `cargo xtask build`
@@ -252,8 +262,11 @@ incrementally either way.
 ### Debuginfo is opt-in
 
 `debug = 0` means a plain `cargo xtask build` (or `--release`) emits no
-per-binary DWARF — every installed binary carries no debuginfo (symbol tables
-remain; no `strip` is configured). To debug specific components, opt them in:
+per-binary DWARF: the link output of every binary carries a symbol table and no
+debug information. The build installs every image but the kernel and the
+bootloader stripped of its symbol table, and keeps the link output in the
+symbols store, where GDB and the symbolizers read it (§ Symbols Store below).
+To debug specific components, opt them in:
 
 ```
 cargo xtask build --debug <component>[,<component>…]
@@ -262,14 +275,14 @@ cargo xtask build --debug <component>[,<component>…]
 This injects `--config profile.<active>.package."<pkg>".debug=2` plus
 `opt-level=1` for the named package(s) only, leaving every other binary
 without debuginfo. `<active>` is `dev` by default, `release` under `--release`.
+The DWARF of a named component reaches its store file; its installed image,
+unless it is the kernel's, carries none.
 The debugged crate drops to `opt-level = 1` (not `0`): opt-0 inflates stack
 frames and risks overflowing the tight kernel/thread stacks.
 
 Limits: under `--release`, fat LTO reoptimizes at the profile opt-level and
 partially overrides the per-package `opt-level=1`, so step fidelity is
-degraded — the normal debug flow uses the default (`dev`) profile. No `strip`
-is configured: debuginfo is already absent by default, and stripping would
-risk panic/fault backtrace symbolization.
+degraded — the normal debug flow uses the default (`dev`) profile.
 
 ---
 
@@ -412,6 +425,49 @@ The disk image is assembled by xtask after the sysroot is populated. Cargo's
 own `target/` directory contains intermediate compilation artifacts and is
 not part of the sysroot.
 
+### Symbols Store
+
+`cargo xtask build` installs every image procmgr loads, those under `services/`, `programs/` and
+`tests/`, stripped with `llvm-objcopy --strip-all`: no symbol table, no debug information, no
+`.comment`. procmgr reads an image whole through the filesystem to create a process, so a byte
+no loader maps costs every create of that image. The strip keeps the loadable segments, the
+section headers, and the notes: the `.note.seraph.*` notes the loaders find through the section
+headers, and the build-id note. The kernel and the bootloader, which the firmware and the
+bootloader load, are installed as linked.
+
+The link output of every image the build installs, the kernel's and the bootloader's included, is
+kept in `symbols/`, beside the sysroot:
+
+```
+symbols/
+  manifest            # "arch <arch>", then one line per installed image,
+                      # "<install path> <store file>", in path order
+  <build-id>.elf      # An image's link output, named by the hex
+                      # descriptor of its build-id note
+  <GUID><age>.pdb     # x86-64: the bootloader's PDB, named by the
+                      # CodeView record of /boot/boot.efi
+```
+
+The store holds the files of the images installed now: a rebuild of an image replaces its file.
+No pack reads it, and `cargo xtask clean` removes it with the sysroot.
+
+A host tool that resolves an address or a symbol of an installed image reads the image's own
+symbols when it carries them (the kernel's), and otherwise the store file of the image's build
+id, which it refuses unless that file's own build-id note is the image's: an image rebuilt since
+a boot, or the store of another build, gives no symbols rather than wrong ones. The tools are
+`cargo xtask symbolize`, the crash reports `run-parallel` writes, `test-core-death`, `test-gdb`,
+and the GDB command line `run --debug-target` prints
+([xtask/README.md](../xtask/README.md#cargo-xtask-symbolize) § `cargo xtask symbolize`).
+
+The riscv64 bootloader is a flat binary that `llvm-objcopy -O binary` makes from its ELF; the
+note is in its data, and the manifest names its ELF's store file as `/boot/boot.efi`'s. The
+x86-64 bootloader's PDB is kept under the name symbol servers give it, the GUID of its `CodeView`
+record in hex and then the record's age.
+
+A release publishes the store of each architecture's release build as one archive beside the
+disk image ([conventions.md](conventions.md#release-production) § Release Production);
+`cargo xtask symbolize --symbols <dir>` reads an unpacked archive.
+
 ---
 
 ## Convenience Commands
@@ -545,7 +601,7 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 | `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`, `memhog` and `stopsrc` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, checks the staged images' FAT volumes with `check-disk` (`fsck.fat -n`), and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes, which a pass taking more than half its budget flags with a warning annotation on the run; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run-parallel` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs and `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, `test-wedge`, `test-reboot`, `test-core-death` and `test-signing`, plus `test-vmgenid` and `test-powerbutton` on x86_64. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
-| `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
+| `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses each and the archive of its build's symbols store (§ Symbols Store) with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 
 The jobs that boot under QEMU (`validate` in `build-test.yml` and `burnin`
 in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner

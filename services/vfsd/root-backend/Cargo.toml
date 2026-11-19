@@ -9,6 +9,9 @@ publish.workspace = true
 
 [dependencies]
 namespace-protocol = { path = "../../../shared/namespace-protocol" }
+# The windowed restart budget the tree keeps for each mount whose driver vfsd
+# restarts.
+restart-budget = { path = "../../../shared/restart-budget" }
 
 [lints]
 workspace = true

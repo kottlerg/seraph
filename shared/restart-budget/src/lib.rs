@@ -8,7 +8,9 @@
 //! svcmgr keeps one per service
 //! (services/svcmgr/docs/restart-protocol.md § Decision tree), devmgr one
 //! per device record whose driver it restarts
-//! (services/devmgr/docs/responsibilities.md § Driver Restart).
+//! (services/devmgr/docs/responsibilities.md § Driver Restart), and vfsd one
+//! per mount below `/` whose fs driver it restarts
+//! (services/vfsd/docs/namespace-composition.md § Driver restart).
 //!
 //! A process may restart [`RESTART_BURST`] times within one
 //! [`RESTART_WINDOW_NS`] window. The window opens at the first restart after

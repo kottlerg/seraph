@@ -275,12 +275,22 @@ storage concern; see [`device-management.md`](device-management.md)
 The supported failure-handling primitives are:
 
 - **fs-driver crash.** vfsd observes each driver's death on the
-  mount's death queue and tears the mount down without the driver: it
-  revokes the partition cap and the driver's endpoint, so every cap a
-  client held through the mount dies, removes the mount, and the path
-  falls through to the root filesystem, as after an unmount. No driver
-  is started again ([#1078](https://github.com/kottlerg/seraph/issues/1078)).
-  Other mounts and the block driver are unaffected.
+  mount's death queue and restarts the driver of a mount below `/`,
+  revoke and re-resolve: it revokes every derivation of the dead
+  driver's endpoint, so every cap a client held through the mount
+  fails closed, and starts a new driver on the same partition from the
+  installed `/services/fs/fatfs`, never from the boot module. Until the
+  new driver serves, a lookup into the mount is answered `IoError` and
+  its path does not fall through; then clients resolve the path again
+  and reach the new driver. Restarts are bounded by a per-mount budget
+  (`RESTART_BURST`, 3, per `RESTART_WINDOW_NS`, 60 s;
+  [shared/restart-budget](../shared/restart-budget/README.md)); a death
+  that finds it spent, or a restart that cannot start the driver, tears
+  the mount down: vfsd revokes the partition cap and the driver's
+  endpoint, removes the mount, and the path falls through to the root
+  filesystem, as after an unmount. The sequence is owned by
+  [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md#driver-restart)
+  § Driver restart. Other mounts and the block driver are unaffected.
 - **Device loss.** vfsd watches devmgr's `block` class and, on each
   change and each driver death, asks devmgr whether each disk it holds
   is still served. A disk devmgr withdrew is marked removed, its

@@ -38,7 +38,7 @@ init            launches the bootstrap substrate, endows svcmgr, exits; supervis
 svcmgr          supervises the substrate (memmgr, procmgr, devmgr, vfsd) and every service it
    │            launches from a recipe (logd, timed, pwrmgr, crashd, ...)
    ├── devmgr   observes each driver's death, withdraws a dead driver, restarts a served one
-   ├── vfsd     observes no fs driver's death; restarts none
+   ├── vfsd     observes each fs driver's death, restarts the driver of a mount below /
    └── sessiond supervises each session's leader
 pwrmgr          observes svcmgr; powers the system off on its death
 ```
@@ -48,7 +48,7 @@ pwrmgr          observes svcmgr; powers the system off on its death
 | svcmgr | memmgr, procmgr, devmgr, vfsd (endowed by init) | two death observers: one on the main thread, through the thread cap each endowment round delivers, and one on the address space, which the first terminal fault of any thread posts (memmgr and procmgr through a Control-only address-space cap init endows; devmgr and vfsd through their process handles, which init endows and procmgr binds on svcmgr's behalf) | the service's recipe decides; every one of these is `restart = never`, `critical = yes`, so its death powers the system off |
 | svcmgr | each service it launches with a `restart` other than `never` | two death observers, bound before `START_PROCESS`: one on the main thread, through the thread cap procmgr's create reply returns, and one on the address space, which procmgr binds on the process handle (`BIND_DEATH_OBSERVER`) with a `POST` copy of a svcmgr death queue | the recipe's `restart` policy and budget, then `critical` ([Restart Protocol § Decision tree](../services/svcmgr/docs/restart-protocol.md#decision-tree)) |
 | devmgr | drivers it spawns | a death observer bound on each driver's main thread, and one procmgr binds on its address space (`BIND_DEATH_OBSERVER`), which the first terminal fault of any of its threads posts | the driver is withdrawn and its DMA hold released once its device is quiesced, and a served driver that died of a fault or a kill is restarted ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#driver-restart)); the IOMMU driver is not restarted (design intent; not yet implemented, #1079) ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#relationship-to-drivers)) |
-| vfsd | fs drivers it spawns | a death queue per mount, bound on the driver's main thread, to whose relay (`CREATE_DEATH_RELAY`) procmgr posts the driver's end, whoever ends it, a terminal fault in any of its threads included | the mount is torn down and its path falls through to the root filesystem; the root mount's driver's death ends vfsd, so the system shuts down; no restart (design intent; not yet implemented, #1078) ([Storage § Failure and Revocation Invariants](storage.md#failure-and-revocation-invariants)) |
+| vfsd | fs drivers it spawns | a death queue per mount, bound on the driver's main thread, to whose relay (`CREATE_DEATH_RELAY`) procmgr posts the driver's end, whoever ends it, a terminal fault in any of its threads included | the driver of a mount below `/` is restarted on the same partition, within a per-mount budget, and once the budget is spent the mount is torn down and its path falls through to the root filesystem; the root mount's driver's death ends vfsd, so the system shuts down ([Storage § Failure and Revocation Invariants](storage.md#failure-and-revocation-invariants); [vfsd namespace composition § Driver restart](../services/vfsd/docs/namespace-composition.md#driver-restart)) |
 | sessiond | each session's leader and, through containment, every process the leader starts | a death observer on the leader's main thread, and one procmgr binds on its address space | the session ends: procmgr destroys what is left of the leader's subtree ([Session Supervision](session-supervision.md#sessiond)) |
 | pwrmgr | svcmgr | an event queue svcmgr binds to its own death (§ Observing svcmgr) | power-off |
 
@@ -185,7 +185,7 @@ capabilities name, or its recipe states why its loss is critical.
 | logd | svcmgr | persistent endpoint (the master log endpoint), held by svcmgr ([Restart Protocol § Supervision hierarchy](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)) |
 | crashd | svcmgr | persistent endpoint (procmgr's crash endpoint), held by procmgr, which declines faults while no crash service is registered and hands the endpoint to the restarted crashd when it registers ([crashd Operation § Startup](../services/crashd/docs/operation.md#startup)) |
 | drivers | devmgr | revoke and re-resolve, at the class's next ordinal, within a per-record budget ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#driver-restart); [restart-budget](../shared/restart-budget/README.md)); the IOMMU driver is not restarted (design intent; not yet implemented, #1079); the driver of the root filesystem's disk never restarts (§ Core Set and System Death) |
-| fs drivers | vfsd | none today; revoke and re-resolve (design intent; not yet implemented, #1078); the root filesystem's driver never restarts (§ Core Set and System Death) |
+| fs drivers | vfsd | revoke and re-resolve, at the same mount path, within a per-mount budget ([vfsd namespace composition § Driver restart](../services/vfsd/docs/namespace-composition.md#driver-restart); [restart-budget](../shared/restart-budget/README.md)); the root filesystem's driver never restarts (§ Core Set and System Death) |
 
 ---
 
@@ -218,8 +218,11 @@ vfsd would first need that authority to reach svcmgr.
 
 devmgr holds the per-device capabilities it delegates to each driver and the release token of each
 driver's DMA hold ([Device Management § DMA-Safe Teardown](device-management.md#dma-safe-teardown)).
-vfsd keeps each fs driver's service endpoint original, from which it mints the mount's caps
-([Storage § Failure and Revocation Invariants](storage.md#failure-and-revocation-invariants)).
+vfsd keeps each fs driver's service endpoint original, from which it mints the mount's caps, the
+partition cap it registered for the mount, from which it derives each instance's, and the mount's
+restart budget; it starts each restarted driver from its installed path on the root filesystem,
+through vfsd's own system-root cap (vfsd
+[namespace composition § Driver restart](../services/vfsd/docs/namespace-composition.md#driver-restart)).
 
 ---
 
@@ -261,7 +264,6 @@ Each item below is specified above or in the document it names, and is not yet i
 - A power-off path that neither faults nor calls memmgr after a core death (§ Core Set and System
   Death): #1290.
 - The IOMMU driver survives and restarts: #1079.
-- vfsd restarts fs drivers by revoke and re-resolve, the root filesystem's driver apart: #1078.
 - procmgr tears down the processes a dead pager other than memmgr served: #226.
 - sessiond supervises every session, and oomd stops a session's programs before any service
   ([Session Supervision](session-supervision.md)).

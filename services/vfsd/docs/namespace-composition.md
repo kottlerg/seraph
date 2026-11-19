@@ -34,8 +34,8 @@ vfsd's heap. Each node carries:
 |---|---|
 | `name` / `name_len` | Path component captured at install time |
 | `parent` / `first_child` / `next_sibling` | Tree links |
-| `slot` | The node's mount, with its state (§ Mount record): none, mounted, or being removed |
-| `live` | Count of mounted mounts in the node's subtree, the node's own included; a node other than the root is *visible* exactly when it is non-zero |
+| `slot` | The node's mount, with its state (§ Mount record): none, mounted, restarting, or being removed |
+| `live` | Count of mounted and restarting mounts in the node's subtree, the node's own included; a node other than the root is *visible* exactly when it is non-zero |
 | `fallthrough_cap` | Badged SEND on the root mount's namespace endpoint addressing the directory at this node's path in the root filesystem; zero if no such fall-through is available |
 
 The synthetic root is `NodeId::ROOT` (pool index 0) and always
@@ -47,7 +47,7 @@ pool index is its `NodeId` for the life of vfsd. A node is a *terminal*
 when it holds a mounted mount, a *synthetic intermediate* when it holds
 none but is visible, and *vacant* otherwise.
 The tree holds at most `MAX_MOUNTS` (1023) mounts, the root mount and
-those being removed included: each is one member of the watch set beside
+those restarting or being removed included: each is one member of the watch set beside
 the class watch (§ Driver death and device loss). An install past that
 count, or one that cannot allocate its nodes, is refused and leaves the
 tree unchanged; no fixed count bounds the nodes. A component follows the
@@ -101,19 +101,24 @@ included
 two posts fill the queue's two entries. Both spawn paths,
 `CREATE_PROCESS` from the boot module and `CREATE_FROM_FILE`, set up
 both. While lookups cross the mount, the queue is a member of the watch
-set, and its death ends the mount (§ Driver death and device loss); an
-unmount waits on it for the driver's death (§ Unmount).
+set, and its death restarts the mount's driver or ends the mount (§ Driver
+restart); an unmount waits on it for the driver's death (§ Unmount).
 
-A record is in one of two states. While *mounted*, lookups cross it.
-Removing a mount below `/` takes two steps:
+A record is in one of three states. While *mounted*, lookups cross it.
+While *restarting*, its driver has died and vfsd is starting another
+(§ Driver restart): the node stays visible, so its name never falls
+through to the root filesystem, and a lookup that would cross it is
+answered `IoError`. Removing a mount below `/` takes two steps:
 `VfsdRootBackend::begin_unmount` moves the record to *being removed*,
 after which no lookup crosses it and no install may take the node, and
 `VfsdRootBackend::remove_mount` clears the record once the caller has
 torn the driver down, leaving the node vacant unless a mount below it
 keeps it visible as an intermediate.
 `VfsdRootBackend::restore_mount` instead moves a record being removed
-back to *mounted*, when the driver refuses the unmount. The root mount
-is never removed: its loss ends vfsd (§ Driver death and device loss).
+back to *mounted*, when the driver refuses the unmount. The tree keeps a
+restart budget with each record (§ Driver restart), which a restore keeps.
+The root mount is never removed or restarted: its loss ends vfsd (§ Driver
+death and device loss).
 `NS_LOOKUP`, `NS_READDIR`, the shadowing of fall-through entries, and a
 node's child count skip a node that is not visible, so the name of a
 vacant node, or of a node whose own mount is being removed with no
@@ -122,8 +127,9 @@ does. Only those two requests fall through: `NS_STAT` on a synthetic
 node is answered locally (§ NS_LOOKUP composition), and any other
 request on one is answered `NotSupported`, so nothing is created on the
 root filesystem through one. An `UNMOUNT` (§ Unmount), a driver's
-death and a disk's loss (§ Driver death and device loss) are the callers
-of `begin_unmount`.
+death once its mount's restart budget is spent, and a disk's loss (§ Driver
+death and device loss) are the callers of `begin_unmount`; a restart that
+cannot start its driver ends as a removal too (§ Driver restart).
 
 A `MOUNT` that fails after its driver started releases what its record
 would have held: it revokes and deletes the partition cap, revokes the
@@ -137,7 +143,7 @@ the mount at a path in this order:
 
 1. `find` the path's node and `begin_unmount` it, so no lookup crosses the mount from here on,
    taking its death queue out of the watch set in the same hold (§ Driver death and device loss).
-   A node with no mount, or one whose removal is under way, is refused, as is `/`.
+   A node with no mount, or one whose removal or restart is under way, is refused, as is `/`.
 2. Send the driver `FS_UNMOUNT` on a SEND derived from the record's `endpoint`, bounded by a
    timeout, with `UNMOUNT_FORCE` when the request carries it. A `BUSY` answer to an unforced
    request ends the unmount: `restore_mount` puts the record back, and its death queue back in
@@ -170,21 +176,23 @@ missed) and the death queue of every mount lookups cross; its size is what bound
 `MAX_MOUNTS` (§ Synthetic root state). A death or a class change from before the thread first
 waits stays pending in the set.
 
-Whoever begins a mount's removal (an `UNMOUNT`, a death, a loss) takes the mount's death queue out
-of the set in the same hold of the tree's lock as `begin_unmount`; a refused `UNMOUNT` puts the
-queue back in the hold that restores the mount, and a `MOUNT` adds it in the hold that installs
-the mount. The watch thread acts on a readiness only when, in one hold, the queue belongs to a
-mount lookups cross and yields a death entry, so a readiness taken before another remover claimed
-the mount, or one for a node a later mount reuses, finds nothing to act on.
+Whoever begins a mount's removal (an `UNMOUNT`, a death, a loss) or its restart (a death) takes
+the mount's death queue out of the set in the same hold of the tree's lock as `begin_unmount` or
+`begin_restart`; a refused `UNMOUNT` puts the queue back in the hold that restores the mount, a
+`MOUNT` adds it in the hold that installs the mount, and a restart adds the new driver's queue in
+the hold that ends the restart. The watch thread acts on a readiness only when, in one hold, the
+queue belongs to a mount lookups cross and yields a death entry, so a readiness taken before another
+remover claimed the mount, or one for a node a later mount reuses, finds nothing to act on.
 
-- **A driver's death.** The watch thread claims the mount and tears it down without the driver,
-  which no longer answers: it revokes the partition cap and the driver's service endpoint, as an
-  unmount does (§ Unmount), destroys what is left of the process, and removes the record. The path
-  then falls through to the root filesystem, and every cap a client held through the mount dies.
-  No driver is started again ([#1078](https://github.com/kottlerg/seraph/issues/1078)). The thread
-  then probes the mount's disk, since a driver whose block device was revoked exits at its next
-  block request ([docs/storage.md](../../../docs/storage.md#failure-and-revocation-invariants)
-  § Failure and Revocation Invariants).
+- **A driver's death.** The watch thread claims the mount: it begins its restart (§ Driver
+  restart), or, when the mount's restart budget is spent, its removal, and tears it down without
+  the driver, which no longer answers: it revokes the partition cap and the driver's service
+  endpoint, as an unmount does (§ Unmount), destroys what is left of the process, and removes the
+  record. The path then falls through to the root filesystem. Either way every cap a client held
+  through the mount dies. The thread then probes the mount's disk, since a driver whose block
+  device was revoked exits at its next block request
+  ([docs/storage.md](../../../docs/storage.md#failure-and-revocation-invariants) § Failure and
+  Revocation Invariants).
 - **A change of the class.** devmgr signals the watch when it serves a block driver and when it
   withdraws one. The watch thread probes every held disk. A discovery of new disks (before a
   runtime role lookup) probes each once it is held, since devmgr can withdraw one after discovery
@@ -204,7 +212,8 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   passed, because a `MOUNT` installed it or a refused `UNMOUNT` restored it after them, is torn
   down the same way by that request, which checks the disk after the install or the restore and
   replies `NO_MOUNT`; the disk is marked removed before the claims, so the claims or that check
-  see the mount.
+  see the mount. The claims pass a mount that is restarting, whose restart checks the disk
+  itself (§ Driver restart).
 - **The root.** Once vfsd has mounted the root, before it serves anything, it sends
   `DECLINE_RESTART` on its `block` class SEND for the root disk's ordinal, so devmgr does not
   restart that disk's driver. The death of the root mount's driver, or the loss of its disk, ends
@@ -215,6 +224,45 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   § Exit reason). vfsd is critical and never restarted
   ([vfsd.svc](../../../rootfs/config/svcmgr/services/vfsd.svc)), so svcmgr shuts the system down
   ([docs/supervision.md](../../../docs/supervision.md)).
+
+### Driver restart
+
+A mount below `/` whose driver dies is restarted in place, in the revoke-and-re-resolve shape
+([docs/supervision.md](../../../docs/supervision.md#restart-shapes) § Restart Shapes): a node cap's
+badge names state in the dead instance, which a new one cannot honour. The root mount is never
+restarted: its driver's death ends vfsd (§ Driver death and device loss).
+
+- **Budget.** The tree keeps a restart budget with each mount's record
+  ([shared/restart-budget](../../../shared/restart-budget/README.md): `RESTART_BURST`, 3,
+  restarts in a `RESTART_WINDOW_NS`, 60 s, window). A `MOUNT` starts it whole; a restart, and a
+  refused `UNMOUNT`'s restore, keep it. A death that finds it spent tears the mount down, as
+  § Driver death and device loss says.
+- **Begin.** In the hold that takes the death, the watch thread charges the budget and holds the
+  mount *restarting* (`VfsdRootBackend::begin_restart`), and takes its death queue out of the set.
+  While restarting, the mount is crossed by no lookup and its name stays visible: a lookup that
+  would cross it is answered `IoError`, never resolved through the root filesystem, an `UNMOUNT`
+  of it is answered `NO_MOUNT` and a `MOUNT` at its path `TABLE_FULL`, as during a removal, and
+  a disk's loss passes it. The watch thread then tears the dead instance down: it revokes what the
+  driver held of the partition, keeping the record's `partition` for the next driver; revokes and
+  deletes the driver's service endpoint, which invalidates every cap derived from it, every cap a
+  client holds through the mount among them, so each fails closed; and destroys what is left of the
+  process and deletes its handle and death queue. It starts the new driver on a thread of its own,
+  since that start reads the root filesystem and can block, while the watch thread must stay free
+  to see the root's death and a disk's loss.
+- **Start.** The restart thread checks that the disk is not removed, derives a new partition cap
+  from the record's `partition`, and starts a driver on a new service endpoint, with a new death
+  queue, as a runtime `MOUNT` does: from the installed `/services/fs/fatfs`, through
+  `CREATE_FROM_FILE`, never from the boot module, named `fatfs:` and the mount's path, and
+  probed with `FS_MOUNT`.
+- **End.** In one hold the new driver's death queue joins the set and its record replaces the dead
+  one's (`VfsdRootBackend::finish_restart`); lookups cross into it from then on, so a client
+  resolves the mount's path again and reaches the new driver. The thread then checks the disk again,
+  as a `MOUNT` does after its install, and tears the mount down as a forced `UNMOUNT` when the
+  disk was lost meanwhile.
+- **Failure.** A removed disk, a driver that does not start, or a death queue the set refuses ends
+  the restart as a removal (`VfsdRootBackend::abandon_restart`): the partition cap is revoked and
+  the record removed as at the end of an unmount, and the path falls through to the root
+  filesystem.
 
 A disk added or inserted again is a new driver at a new ordinal. vfsd mounts none of its
 partitions on its own: each runtime role lookup first queries devmgr for the disks served since
@@ -229,7 +277,9 @@ the last query and holds them, so a `MOUNT` resolves its role across every disk 
 endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 
 1. **Local-child match.** `VfsdRootBackend::lookup` walks the
-   parent node's visible children (§ Mount record). A match on a *terminal* child returns
+   parent node's visible children (§ Mount record). A match on a child
+   whose mount is restarting is answered `IoError` (§ Driver restart). A
+   match on a *terminal* child returns
    an `EntryTarget::External` view carrying the driver's unbadged
    endpoint and the peer root node; the namespace-protocol crate
    ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
@@ -414,9 +464,11 @@ A successful `install` stores the mount's record (§ Mount record) and
 any walked `fallthrough_cap`s (synthetic intermediates, plus the root
 mount's badged fall-through cap); the tree keeps them until the mount is
 removed, and the record's caps are vfsd's to release. A mount below `/`
-lasts until an `UNMOUNT` (§ Unmount), its driver's death or its disk's
-loss (§ Driver death and device loss) removes it, which releases the
-record's caps; the root mount, and a node's walked `fallthrough_cap`,
+lasts until an `UNMOUNT` (§ Unmount), its driver's death with its
+restart budget spent, a restart that fails (§ Driver restart), or its
+disk's loss (§ Driver death and device loss) removes it, which releases the
+record's caps, a restart replacing the driver's caps in the record and
+keeping its partition cap; the root mount, and a node's walked `fallthrough_cap`,
 last until vfsd exits, which the root mount's loss makes it do. Per-process
 `system_root_cap` distribution (different processes seeing different
 roots) is not implemented.

@@ -41,6 +41,10 @@ process_table = { path = "../procmgr/process-table", package = "procmgr-process-
 # `RecvPool`: the recv_pool phase serves an endpoint of its own through the
 # worker pool.
 recv-pool = { path = "../../shared/recv-pool" }
+# `RESTART_BURST` and `RESTART_WINDOW_NS`: the vfsd_driver_death phase kills
+# the /data fs driver once per restart vfsd's budget for the mount allows, and
+# once more.
+restart-budget = { path = "../../shared/restart-budget" }
 syscall = { path = "../../shared/syscall" }
 # `MSG_DATA_WORDS_MAX`: the `fs_std` rename cell sizes its long leaf names
 # so two of them overflow the `FS_RENAME` data area, and the

@@ -24,6 +24,7 @@
 
 mod driver;
 mod partition;
+mod restart;
 mod role_guids;
 mod watch;
 mod worker;
@@ -411,9 +412,12 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   request that began it ends it (`restore_mount` or `remove_mount`):
 ///   meanwhile a `MOUNT` at the path is refused and a second `UNMOUNT`
 ///   finds the removal under way. The watch thread begins removals under
-///   the same lock, after a driver's death or a disk's loss, and every
-///   remover takes the mount's death queue out of the watch set in the
-///   hold that begins the removal (the claim rule of `watch`).
+///   the same lock, after a driver's death or a disk's loss, and restarts
+///   after a driver's death, which a restart thread ends under it
+///   (`restart`); a restart is refused as a removal under way is. Every
+///   remover or restarter takes the mount's death queue out of the watch set
+///   in the hold that begins the removal or the restart (the claim rule of
+///   `watch`).
 /// - `rt.discovery` — Mutex; held across a discovery of new disks, a
 ///   `MOUNT`'s or a `GET_SWAP_PARTITION`'s, so one runs at a time.
 /// - `rt.disks` — Mutex; held only across reads and updates of the disk
@@ -1375,7 +1379,9 @@ fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) ->
         }
         Err(root_backend::UnmountError::NotMounted | root_backend::UnmountError::InProgress) =>
         {
-            std::os::seraph::log!(warn: "UNMOUNT: no mount at the path, or its unmount is under way");
+            std::os::seraph::log!(
+                warn: "UNMOUNT: no mount at the path, or its unmount or restart is under way"
+            );
             return IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
         }
     };

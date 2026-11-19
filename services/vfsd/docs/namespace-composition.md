@@ -205,10 +205,13 @@ the mount, or one for a node a later mount reuses, finds nothing to act on.
   down the same way by that request, which checks the disk after the install or the restore and
   replies `NO_MOUNT`; the disk is marked removed before the claims, so the claims or that check
   see the mount.
-- **The root.** The death of the root mount's driver, or the loss of its disk, ends vfsd: it logs
-  `FATAL: root filesystem lost` with the cause and exits with code 1, on the main thread, since
-  the exit syscall ends only the thread that makes it and procmgr tears a process down at its main
-  thread's death ([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)
+- **The root.** Once vfsd has mounted the root, before it serves anything, it sends
+  `DECLINE_RESTART` on its `block` class SEND for the root disk's ordinal, so devmgr does not
+  restart that disk's driver. The death of the root mount's driver, or the loss of its disk, ends
+  vfsd: it logs `FATAL: root filesystem lost` with the cause and exits with code 1, on the main
+  thread, since the exit syscall ends only the thread that makes it and procmgr tears a process
+  down at its main thread's death
+  ([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)
   § Exit reason). vfsd is critical and never restarted
   ([vfsd.svc](../../../rootfs/config/svcmgr/services/vfsd.svc)), so svcmgr shuts the system down
   ([docs/supervision.md](../../../docs/supervision.md)).

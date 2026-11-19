@@ -196,6 +196,7 @@ dependencies = [
  "ns-client",
  "process-abi",
  "recv-pool",
+ "restart-budget",
  "syscall",
  "syscall-abi",
  "virtio-core",
@@ -477,6 +478,7 @@ dependencies = [
 name = "logd"
 version = "0.1.4"
 dependencies = [
+ "death-set",
  "ipc",
  "logd-codec",
  "logd-slot-table",
@@ -497,6 +499,7 @@ dependencies = [
 name = "logd-slot-table"
 version = "0.1.4"
 dependencies = [
+ "death-set",
  "ipc",
  "logd-codec",
 ]
@@ -638,6 +641,7 @@ dependencies = [
 name = "procmgr-process-table"
 version = "0.1.4"
 dependencies = [
+ "death-set",
  "ipc",
  "objsig",
 ]
@@ -678,6 +682,10 @@ dependencies = [
 
 [[package]]
 name = "relrofault"
+version = "0.1.4"
+
+[[package]]
+name = "restart-budget"
 version = "0.1.4"
 
 [[package]]
@@ -819,6 +827,7 @@ dependencies = [
  "ipc",
  "namespace-protocol",
  "registry",
+ "restart-budget",
  "svcmgr-defs",
  "svcmgr-endowment",
  "syscall",
@@ -829,6 +838,7 @@ dependencies = [
 name = "svcmgr-defs"
 version = "0.1.4"
 dependencies = [
+ "death-set",
  "ipc",
  "namespace-protocol",
  "objsig",
@@ -1070,7 +1080,7 @@ dependencies = [
  "logd-codec",
  "objsig",
  "procmgr-process-table",
- "svcmgr-defs",
+ "restart-budget",
  "syscall-abi",
  "vfsd-gpt",
 ]

@@ -1157,11 +1157,44 @@ impl ProcessTable
         Ok(())
     }
 
-    /// Visit every live entry in badge order. Used by the death resync to
-    /// read each child's thread state.
+    /// Visit every live entry in badge order.
     pub fn for_each<F: FnMut(&ProcessEntry)>(&self, f: F)
     {
         self.entries.iter().for_each(f);
+    }
+
+    /// The death resync's scan (`resync_deaths` in procmgr's `main.rs`):
+    /// push onto `dead` the badge and exit reason of every live entry the
+    /// kernel shows dead, in badge order. `read` gives an entry's kernel
+    /// records, its main thread's `CAP_INFO_THREAD_STATE` and its address
+    /// space's `CAP_INFO_ASPACE_TERMINAL_FAULT` (`None` for a read that
+    /// failed), which [`resync_exit_reason`] reads against `exited`, the
+    /// state value meaning the thread exited. Returns `false` when `dead`
+    /// could not grow to hold every such entry; those left out stay live for
+    /// a later resync.
+    pub fn resync_dead<R>(&self, exited: u32, mut read: R, dead: &mut Vec<(u64, u64)>) -> bool
+    where
+        R: FnMut(&ProcessEntry) -> (Option<u64>, Option<u64>),
+    {
+        let mut listed_all = true;
+        for entry in &self.entries
+        {
+            let (main_thread, terminal_fault) = read(entry);
+            let Some(exit_reason) = resync_exit_reason(main_thread, exited, terminal_fault)
+            else
+            {
+                continue;
+            };
+            if dead.try_reserve(1).is_ok()
+            {
+                dead.push((entry.badge, exit_reason));
+            }
+            else
+            {
+                listed_all = false;
+            }
+        }
+        listed_all
     }
 
     /// Copy into `out` the badges of the live entries above `after` (every
@@ -2889,6 +2922,91 @@ mod tests
         let mut seen = Vec::new();
         table.for_each(|e| seen.push(e.badge));
         assert_eq!(seen, [10, 30]);
+    }
+
+    // The defect caught: a death whose post procmgr's full death queue
+    // dropped that is never reaped, leaving its entry, its kernel objects
+    // and its memory held for the life of the system (a scan that skips an
+    // entry or misreads the kernel's records, a drain that does not ask for
+    // the resync). Run against a model of the kernel's queue
+    // (`death_set::model`), drained as procmgr's reaper drains it.
+    #[test]
+    fn a_resync_reaps_every_death_a_full_death_queue_dropped()
+    {
+        use death_set::model::KernelQueue;
+        use std::collections::HashMap;
+
+        const RING: u32 = 2;
+        let running = u64::from(EXITED - 1) << 32;
+        let mut table = ProcessTable::new();
+        // The kernel's records, by cap: each main thread's state and each
+        // address space's retained terminal fault.
+        let mut threads = HashMap::new();
+        let mut faults = HashMap::new();
+        for badge in 1..=6u64
+        {
+            let mut entry = entry_with_badge(badge);
+            entry.thread_cap = 100 + badge;
+            entry.aspace_cap = 200 + badge;
+            threads.insert(entry.thread_cap, running);
+            faults.insert(entry.aspace_cap, 0);
+            assert_eq!(table.insert(entry), Ok(()));
+        }
+        // Five processes die before the reaper drains, more than the ring
+        // holds. The kernel records each death before it posts it: 1 to 4
+        // exit, posting through their main threads' observers, and a worker
+        // thread of 5 faults, posting through its address space's. 6 lives.
+        let mut queue = KernelQueue::new(RING);
+        let mut dropped = 0;
+        for badge in 1..=4u64
+        {
+            threads.insert(100 + badge, (u64::from(EXITED) << 32) | badge);
+            dropped += usize::from(!queue.post((badge, badge)));
+        }
+        faults.insert(205, 0x100E);
+        dropped += usize::from(!queue.post((5, 0x100E)));
+        assert_eq!(dropped, 3);
+
+        let mut reaped = Vec::new();
+        let full = death_set::drain_queues(
+            Some(RING),
+            |idx| (idx == 0).then_some(()),
+            |()| queue.try_recv(),
+            |(badge, exit_reason)| {
+                if table.take_by_badge(badge).is_some()
+                {
+                    reaped.push((badge, exit_reason));
+                }
+            },
+        );
+        assert!(
+            full,
+            "the drain that gave up a full ring asks for the resync"
+        );
+        let mut dead = Vec::new();
+        let listed_all = table.resync_dead(
+            EXITED,
+            |entry| {
+                (
+                    threads.get(&entry.thread_cap).copied(),
+                    faults.get(&entry.aspace_cap).copied(),
+                )
+            },
+            &mut dead,
+        );
+        assert!(listed_all);
+        for (badge, exit_reason) in dead
+        {
+            if table.take_by_badge(badge).is_some()
+            {
+                reaped.push((badge, exit_reason));
+            }
+        }
+        reaped.sort_unstable();
+        assert_eq!(reaped, [(1, 1), (2, 2), (3, 3), (4, 4), (5, 0x100E)]);
+        let mut live = Vec::new();
+        table.for_each(|e| live.push(e.badge));
+        assert_eq!(live, [6]);
     }
 
     #[test]

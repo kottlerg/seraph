@@ -1726,6 +1726,9 @@ fn spawn_and_settle(
             dev_caps: None,
             platform_caps: None,
             process_handle,
+            // The IOMMU driver is never restarted (#1079).
+            restart: None,
+            declined: false,
         },
     };
     crate::record_spawned(&mut roster, spawned, &mut caps.slot_bars, ipc_buf);

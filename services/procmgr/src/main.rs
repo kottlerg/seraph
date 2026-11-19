@@ -1660,35 +1660,23 @@ fn dispatch_death(ctx: &ProcmgrCtx, ipc_buf: *mut u64, batch: &mut Vec<syscall::
 fn resync_deaths(memmgr_ep: u64, ipc_buf: *mut u64, tables: &process::Tables)
 {
     let mut dead: Vec<(u64, u64)> = Vec::new();
-    let mut short = false;
-    // The scan reads kernel state only, under the table lock.
-    tables.lock().table.for_each(|entry| {
-        let main_thread =
-            syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
-        let terminal_fault = syscall::cap_info(
-            entry.aspace_cap,
-            syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
-        )
-        .ok();
-        let Some(exit_reason) = process::resync_exit_reason(
-            main_thread,
-            syscall_abi::THREAD_STATE_EXITED,
-            terminal_fault,
-        )
-        else
-        {
-            return;
-        };
-        if dead.try_reserve(1).is_ok()
-        {
-            dead.push((entry.badge(), exit_reason));
-        }
-        else
-        {
-            short = true;
-        }
-    });
-    if short
+    // The scan reads kernel state only, under the table lock
+    // (`ProcessTable::resync_dead`).
+    let listed_all = tables.lock().table.resync_dead(
+        syscall_abi::THREAD_STATE_EXITED,
+        |entry| {
+            (
+                syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok(),
+                syscall::cap_info(
+                    entry.aspace_cap,
+                    syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
+                )
+                .ok(),
+            )
+        },
+        &mut dead,
+    );
+    if !listed_all
     {
         std::os::seraph::log!(warn: "death resync could not list every dead process");
     }

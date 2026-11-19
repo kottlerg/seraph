@@ -9,7 +9,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`aml/`](aml/README.md) | ACPI Machine Language encodings, resource-template decoder, term parser, namespace and evaluator, host-tested over QEMU's tables |
 | [`crash-report/`](crash-report/README.md) | Crash-report block emitter and parser, shared by crashd and xtask |
 | [`crypto/`](crypto/README.md) | In-OS crypto primitives — SHA-512 hashing, Ed25519 signature verification, Ed25519 key generation and signing for the host signer, and ChaCha20-Poly1305 AEAD, `no_std`, zero-dependency |
-| [`death-set/`](death-set/README.md) | Growable death-queue set and main wait set used by supervisor services |
+| [`death-set/`](death-set/README.md) | Growable death-queue set and main wait set used by supervisor services, and the overflow watch of a death-queue drain |
 | [`driver-binding/`](driver-binding/README.md) | Driver declarations in the ELF note `.note.seraph.driver` (`driver_declaration!`) and the resource list devmgr delivers a bound driver |
 | [`elf/`](elf/README.md) | ELF64 parser — header validation, segment enumeration |
 | [`font/`](font/README.md) | Embedded 9×20 bitmap font shared by every framebuffer console |
@@ -27,6 +27,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`recv-pool/`](recv-pool/README.md) | Worker-pool receive helper: several threads serving one endpoint, each on its own IPC buffer page |
 | [`registry/`](registry/README.md) | Growable name→endpoint-cap registry used by supervisor services |
 | [`registry-client/`](registry-client/README.md) | Client-side helper for the svcmgr name→cap discovery registry |
+| [`restart-budget/`](restart-budget/README.md) | Windowed restart budget svcmgr keeps per service and devmgr per device record whose driver it restarts |
 | [`riscv-step/`](riscv-step/README.md) | Successor-address decoder a debugger single-steps a riscv64 thread with |
 | [`shmem/`](shmem/README.md) | Shared-memory byte transport — multi-page `SharedBuffer` plus SPSC ring |
 | [`svc-grammar/`](svc-grammar/README.md) | Line grammar of the `.svc` files (`key = value`, `#` comments), shared by svcmgr's definition and class parsers and devmgr's platform table parser |

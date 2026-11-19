@@ -23,5 +23,10 @@ process-abi = { path = "../../../abi/process-abi" }
 svc-grammar = { path = "../../../shared/svc-grammar" }
 syscall-abi = { path = "../../../abi/syscall" }
 
+[dev-dependencies]
+# The model of the kernel's death queue and the drain svcmgr's main loop makes,
+# for the death-resync tests.
+death-set = { path = "../../../shared/death-set", features = ["model"] }
+
 [lints]
 workspace = true

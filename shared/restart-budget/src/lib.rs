@@ -1,25 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/svcmgr/svc-defs/src/restart_budget.rs
+// shared/restart-budget/src/lib.rs
 
-//! svcmgr's windowed restart budget: how many restarts a service may run
-//! before a death leaves it permanently down.
+//! The windowed restart budget of a supervisor: how many restarts one
+//! supervised process may run before a death leaves it permanently down.
+//! svcmgr keeps one per service
+//! (services/svcmgr/docs/restart-protocol.md § Decision tree), devmgr one
+//! per device record whose driver it restarts
+//! (services/devmgr/docs/responsibilities.md § Driver Restart).
 //!
-//! A service may restart [`RESTART_BURST`] times within one
+//! A process may restart [`RESTART_BURST`] times within one
 //! [`RESTART_WINDOW_NS`] window. The window opens at the first restart after
-//! the previous window has passed, so a service that crashes rarely restarts
+//! the previous window has passed, so a process that crashes rarely restarts
 //! every time, however long the boot, while one that crash-loops is stopped
-//! after a burst. The policy is specified in
-//! `services/svcmgr/docs/restart-protocol.md` § Decision tree.
+//! after a burst.
+//!
+//! `no_std`, no allocation, no dependency.
 
-/// Restarts a service may run within one [`RESTART_WINDOW_NS`] window.
+#![cfg_attr(not(test), no_std)]
+
+/// Restarts a process may run within one [`RESTART_WINDOW_NS`] window.
 pub const RESTART_BURST: u32 = 3;
 
 /// Length of a restart window, in nanoseconds of monotonic time: 60 s.
 pub const RESTART_WINDOW_NS: u64 = 60_000_000_000;
 
-/// One service's restart budget.
+/// One supervised process's restart budget.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RestartBudget
 {

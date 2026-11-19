@@ -292,8 +292,8 @@ passes, so two declarations of one name share one count and a later pass binds t
 the devices its limit leaves. A PCI device's hotplug removal returns its instance once the removal
 has withdrawn the driver and removed the record, so the limit bounds the devices the driver serves
 at once, and a later pass can bind the driver to the device that replaces it. A withdrawal for any
-other cause, the driver's death among them, returns nothing: the record stays, and a record is
-bound at most once a boot.
+other cause, the driver's death among them, returns nothing: the record stays, and no pass binds a
+record again once its driver is withdrawn.
 
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process
@@ -357,7 +357,9 @@ at `BIND_DRIVERS`, and for a hot-added device:
 `BIND_DRIVERS` (gated on `BIND_AUTHORITY`) carries a directory cap and its absolute path; devmgr
 replies at once and its control thread runs a drivers-directory pass over it against the records
 still unbound, under the declaration bounds of the `SET_DRIVERS_DIR` pass, and settles the drivers
-it binds within the production settle bound. A record is bound at most once a boot.
+it binds within the production settle bound. A pass binds a record at most once a boot, and none
+binds it again once its driver is withdrawn; only devmgr's restart of a served driver that died
+starts that driver again on the record, which stays bound.
 
 Each bind pass is one settle batch: the IOMMU pass, the boot pass over boot-module drivers,
 the pass at `SET_DRIVERS_DIR`, one pass per `BIND_DRIVERS`, and a hotplug pass. Withdrawing a

@@ -659,7 +659,7 @@ fn assert_holds_returned(memmgr: u64, free_before: u64)
     );
 }
 
-/// A record is bound at most once a boot: a second bind over the same
+/// A pass binds a record at most once a boot: a second bind over the same
 /// directory starts nothing, so its settle ends well within `bound` and no
 /// fixture joins the `test-fault` class (`fault`). Returns how long the
 /// second bind took to settle.

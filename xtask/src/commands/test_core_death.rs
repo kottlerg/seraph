@@ -521,7 +521,7 @@ fn kill_through_stub(
     }
     let kills = match point
     {
-        KillPoint::RestartsSpent => svcmgr_defs::restart_budget::RESTART_BURST.saturating_add(1),
+        KillPoint::RestartsSpent => restart_budget::RESTART_BURST.saturating_add(1),
         KillPoint::Attach | KillPoint::SystemUp => 1,
     };
     for kill in 1..=kills

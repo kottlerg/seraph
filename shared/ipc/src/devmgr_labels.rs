@@ -31,14 +31,19 @@
 /// [`super::devmgr_errors::WITHDRAWN`] for the rest of the boot, and the
 /// ordinals after it keep their drivers, so a client probing ordinals 0,
 /// 1, ... passes a `WITHDRAWN` reply and stops at the first other reply
-/// that is not `SUCCESS`. Replies [`super::devmgr_errors::NO_DEVICE`]
+/// that is not `SUCCESS`. A driver devmgr restarts after its death
+/// (services/devmgr/docs/responsibilities.md § Driver Restart) is a new
+/// instance, served at the class's next ordinal: its clients find it as
+/// they find any driver served later. Replies [`super::devmgr_errors::NO_DEVICE`]
 /// past the last served driver, which before [`SET_DRIVERS_DIR`] includes
 /// every ordinal of a class whose drivers devmgr spawns from disk, and
 /// `INVALID_REQUEST` when the derivation fails. A query received once
 /// a bind pass is posted ([`SET_DRIVERS_DIR`]'s or [`BIND_DRIVERS`]'s),
 /// whose answer would name no driver, waits until that pass and the
 /// settle of its drivers are done and is then answered from the settled
-/// drivers; a query that names a served driver is answered at once.
+/// drivers; so does one received once devmgr has taken the death of a
+/// driver it restarts, until the restart's settle is done. A query that
+/// names a served driver is answered at once.
 ///
 /// The handler logs nothing: logd is a caller, blocked in this call
 /// outside its log loop, so a log line here would deadlock.
@@ -141,7 +146,8 @@ pub const QUERY_DEVICE_INFO: u64 = 2;
 /// sticky-failure state); one that names a driver is answered at
 /// once.
 ///
-/// Each spawn is attempted at most once per boot. On failure
+/// Each spawn is attempted at most once per boot, a restart after a
+/// served driver's death apart. On failure
 /// (missing binary, ELF corrupt, carve failure, OOM, a driver that
 /// died or did not report ready within the settle bound, etc.),
 /// devmgr marks the driver permanently unavailable for this boot
@@ -540,14 +546,36 @@ pub const MAX_CLASS_NAME_BYTES: usize = 32;
 /// unbound, starts each driver it binds in a settle batch of its own, and
 /// serves the batch once it settles, within [`SETTLE_TIMEOUT_MS`]. A
 /// [`QUERY_DEVICE`] whose answer would name no driver waits until that
-/// pass and its settle are done. A record is bound at most once a boot,
-/// so a device whose driver was started before (served, failed, or
-/// withdrawn) is not bound again, and a second request over the same
-/// directory binds nothing. devmgr deletes the directory cap once the
+/// pass and its settle are done. A pass binds a record at most once a
+/// boot, and none binds it again once its driver is withdrawn, so a device
+/// whose driver was started before (served, failed, or withdrawn) is not
+/// bound again, and a second request over the same
+/// directory binds nothing. A driver this pass starts is never restarted,
+/// since it is not installed in the drivers directory. devmgr deletes the directory cap once the
 /// pass ends. Replies `INVALID_REQUEST`, deleting the cap, when `caps[0]`
 /// or the path is absent, before [`SET_DRIVERS_DIR`] (whose pass binds first), and
 /// while an earlier request's pass or settle is not done.
 pub const BIND_DRIVERS: u64 = 22;
+/// Decline the restart of a served driver: the caller cannot run on without
+/// it, so devmgr withdraws it at its death and starts no new instance
+/// (services/devmgr/docs/responsibilities.md § Driver Restart). vfsd sends
+/// it for the disk its root filesystem sits on, once it has mounted the
+/// root and before it serves anything (services/vfsd/README.md).
+///
+/// Served on a class SEND ([`MINT_CLASS_SEND`]) alone; a SEND badged
+/// otherwise gets [`super::devmgr_errors::UNAUTHORIZED`]. Request:
+/// `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+/// `data[1]`, when sent, the instance ordinal of the class's driver, an
+/// absent one being 0. Reply: [`super::devmgr_errors::SUCCESS`] once the
+/// driver is marked; [`super::devmgr_errors::REFUSED`] once
+/// [`SET_DRIVERS_DIR`] has arrived, from which point devmgr can restart a
+/// driver, so the marks a restart reads are sealed and a class SEND holder
+/// can decline a driver's restart only in the bootstrap window;
+/// [`super::devmgr_errors::WITHDRAWN`] at a withdrawn driver's ordinal and
+/// [`super::devmgr_errors::NO_DEVICE`] past the last served driver. A
+/// mark lasts as long as the driver it marks. The handler logs nothing, as
+/// [`QUERY_DEVICE`]'s does not.
+pub const DECLINE_RESTART: u64 = 32;
 /// The bound of a bind pass's settle, in milliseconds: how long devmgr
 /// waits, from the start of a batch's settle (after its last spawn), for
 /// each of the batch's drivers to report ready or die before it destroys

@@ -113,13 +113,14 @@ devmgr, vfsd; § Reconciliation), so an `env` key in their recipes reaches nothi
 | `on_failure` | Restart only on a fault exit (`exit_reason >= EXIT_FAULT_BASE`). Clean exits are treated as intentional. |
 | `always` | Restart on every exit, clean or faulty. Default for daemons that should never terminate during normal operation. |
 
-Restarts are budgeted per window: a service may restart three times
-(`RESTART_BURST`) within one 60 s window (`RESTART_WINDOW_NS`), the window
-opening at the first restart after the previous one has passed. A death
-once the open window's restarts are spent leaves the service permanently
-down: degraded, or a graceful shutdown for `critical = yes` (see
-[`critical`](#critical)). A service that crashes less often than that
-restarts every time. See [restart-protocol.md](restart-protocol.md).
+Restarts are budgeted per window (`restart_budget::RestartBudget`): a
+service may restart three times (`RESTART_BURST`) within one 60 s window
+(`RESTART_WINDOW_NS`), the window opening at the first restart after the
+previous one has passed. A death once the open window's restarts
+are spent leaves the service permanently down: degraded, or a graceful
+shutdown for `critical = yes` (see [`critical`](#critical)). A service that
+crashes less often than that restarts every time. See
+[restart-protocol.md](restart-protocol.md).
 
 ## `critical`
 

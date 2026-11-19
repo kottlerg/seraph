@@ -31,9 +31,9 @@ logd-codec = { path = "../services/logd/codec" }
 # procmgr's thread crash badge (`threads::is_crash_badge`): `symbolize --log`
 # tells a block that carries one, which names no process, from a process's.
 procmgr-process-table = { path = "../services/procmgr/process-table" }
-# svcmgr's restart budget (`svcmgr_defs::restart_budget::RESTART_BURST`): test-core-death kills
+# svcmgr's restart budget (`restart_budget::RESTART_BURST`): test-core-death kills
 # logd once per restart the budget allows, and once more.
-svcmgr-defs = { path = "../services/svcmgr/svc-defs" }
+restart-budget = { path = "../shared/restart-budget" }
 # vfsd's GPT parser: `check-disk` finds each image's partitions through it, and
 # the disk tooling's tests read the tables mkdisk writes back through it.
 vfsd-gpt = { path = "../services/vfsd/gpt" }

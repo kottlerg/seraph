@@ -11,15 +11,14 @@
 //! argv/env wire-blob encoder ([`build_blob`]) whose output the parser
 //! bounds by the child's argv/env region, and the policies svcmgr applies at
 //! runtime: the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
-//! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), the windowed restart
-//! budget ([`RestartBudget`]), the death-observer correlator and the rule
-//! that routes a death post by it ([`death_tag`]), the reading of a
-//! service's death from the caps svcmgr holds on it ([`death_caps`]), the
-//! eligibility rule of a stop ([`stop`]), and the create flags a recipe
-//! asks procmgr for ([`create_flags`]). Nothing here touches a syscall, IPC, or
-//! `std::os::seraph` surface, so the whole crate is host-reachable and
-//! host-tested — the `.svc` and class files are external input and their
-//! parsers carry unit tests per
+//! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), the death-observer
+//! correlator and the rule that routes a death post by it ([`death_tag`]),
+//! the reading of a service's death from the caps svcmgr holds on it
+//! ([`death_caps`]), the eligibility rule of a stop ([`stop`]), and the
+//! create flags a recipe asks procmgr for ([`create_flags`]). Nothing here
+//! touches a syscall, IPC, or `std::os::seraph` surface, so the whole crate
+//! is host-reachable and host-tested — the `.svc` and class files are
+//! external input and their parsers carry unit tests per
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
@@ -28,11 +27,9 @@ pub mod class;
 pub mod death_caps;
 pub mod death_tag;
 pub mod parse;
-pub mod restart_budget;
 pub mod stop;
 
 pub use death_tag::DeathTag;
-pub use restart_budget::RestartBudget;
 
 use namespace_protocol::rights as ns_rights;
 

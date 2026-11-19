@@ -1125,6 +1125,7 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
             // synthetic backend, so drop it.
             log_cap_delete("self-mount caller_root_cap", caller_root_cap);
             std::os::seraph::log!("root self-mounted at /");
+            decline_root_disk_restart(rt, ipc_buf);
         }
         Err(code) =>
         {
@@ -1136,6 +1137,45 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
     auto_mount_role(rt, ipc_buf, &role_guids::EFI_SYSTEM_PARTITION, "/esp");
     auto_mount_role(rt, ipc_buf, &role_guids::SERAPH_DATA, "/data");
     true
+}
+
+/// Decline devmgr's restart of the driver of the disk the root filesystem
+/// sits on (`devmgr_labels::DECLINE_RESTART`): the loss of that disk ends
+/// vfsd (`watch::root_lost`), so a new instance of its driver would serve
+/// no one. Sent from the self-mount, before vfsd serves anything and so
+/// before svcmgr, which vfsd's root brings up, hands devmgr its drivers
+/// directory, from which point devmgr refuses the request. A failure is
+/// logged; devmgr then restarts the driver if it dies, and vfsd ends all the
+/// same.
+fn decline_root_disk_restart(rt: &VfsdRuntime, ipc_buf: *mut u64)
+{
+    let disk = rt
+        .root_backend
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .mounted(watch::ROOT_NODE)
+        .map(|m| m.disk);
+    let ordinal = disk.and_then(|disk| {
+        rt.disks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(disk)
+            .map(|d| d.ordinal)
+    });
+    let Some(ordinal) = ordinal
+    else
+    {
+        std::os::seraph::log!(warn: "root disk not found; its driver's restart not declined");
+        return;
+    };
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    match unsafe { ipc::decline_restart(rt.caps.block_class, ordinal, ipc_buf) }
+    {
+        Ok(()) => std::os::seraph::log!("root disk (block ordinal {ordinal}): restart declined"),
+        Err(e) => std::os::seraph::log!(
+            warn: "root disk (block ordinal {ordinal}): restart not declined ({e:?})"
+        ),
+    }
 }
 
 /// Handle a runtime MOUNT request from an authorized client.

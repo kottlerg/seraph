@@ -16,9 +16,9 @@
 //! commits all but [`HOG_MARGIN_PAGES`] of what memmgr can still promise,
 //! sees a grant past that refused although free pages exist, and touches every
 //! page it committed with no fault declined. Each child's charge leaves
-//! svctest's budget subtree before the phase goes on, memmgr's free and
-//! promised totals then return to their levels, and the all-RAM-accounted
-//! identity holds.
+//! svctest's budget subtree before the phase goes on, memmgr's free total net
+//! of eviction and its promised total then return to their levels
+//! ([`PoolLevels`]), and the all-RAM-accounted identity holds.
 
 use std::os::seraph::startup_info;
 use std::process::exit;
@@ -124,7 +124,7 @@ pub(crate) const POOL_POLLS: u32 = 256;
 const RECLAIM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The phase: the labels on a region of svctest's own, then the two children
-/// in windows until memmgr's totals return to their levels around them, then
+/// in windows until memmgr's levels return around them ([`windows_settle`]), then
 /// the identity. Each child's exit is followed by memmgr's reclaim of it
 /// ([`children_reclaimed`]), so no window starts, and no child is created,
 /// while an earlier child's charge and commitment are still held.
@@ -165,65 +165,148 @@ pub(crate) fn pool_totals() -> Option<(u64, u64, u64)>
     })
 }
 
-/// memmgr's free and promised totals in pages, once its deferred list has
-/// settled ([`budget::settled_pool_free`]).
-fn settled_totals() -> (u64, u64)
+/// memmgr's `QUERY_POOL_STATUS` totals a window compares, in pages: the free
+/// total (`data[3]`), the promised total (`data[8]`), and the store and
+/// swapped totals (`data[9]` and `data[10]`) that net eviction out of the
+/// free total ([`Self::net_free`]).
+#[derive(Clone, Copy)]
+struct PoolLevels
 {
-    let _ = budget::settled_pool_free();
-    let (free, promised, _) = pool_totals().expect("QUERY_POOL_STATUS failed");
-    (free, promised)
+    free: u64,
+    promised: u64,
+    store: u64,
+    swapped: u64,
 }
 
-/// Wait until memmgr's free and promised totals read `level`, within
-/// [`POOL_POLLS`] polls, each after a recheck of memmgr's deferred list.
-/// `Err` carries the totals the last poll read.
-fn totals_settle_to(level: (u64, u64)) -> Result<(), (u64, u64)>
+impl PoolLevels
 {
-    let mut last = level;
+    /// Read the totals; panics when the call fails or is refused. Allocates
+    /// nothing.
+    fn read() -> Self
+    {
+        let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
+        // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+        let reply = unsafe {
+            ipc::ipc_call(
+                startup_info().memmgr_endpoint,
+                &req,
+                std::os::seraph::current_ipc_buf(),
+            )
+        }
+        .expect("QUERY_POOL_STATUS failed");
+        assert_eq!(
+            reply.label,
+            memmgr_errors::SUCCESS,
+            "QUERY_POOL_STATUS refused"
+        );
+        Self {
+            free: reply.word(3) / PAGE_SIZE,
+            promised: reply.word(8) / PAGE_SIZE,
+            store: reply.word(9) / PAGE_SIZE,
+            swapped: reply.word(10) / PAGE_SIZE,
+        }
+    }
+
+    /// The free total net of eviction: the free pages there would be with
+    /// every evicted chunk restored and its store runs freed, `free + store -
+    /// swapped`. memmgr evicts other processes' cold chunks in the background
+    /// while the hog holds the pool `LOW`, and restores one on its next fault
+    /// (services/memmgr/docs/memory-pool.md § Eviction), so the free total
+    /// alone can read differently after a window although every page the
+    /// window took came back. An eviction of a chunk of `b` backed pages into
+    /// `s` store pages raises `free` by `b - s`, `store` by `s` and
+    /// `swapped` by `b`; a restore reverses it, and a write of the chunk to
+    /// the disk tier moves its `s` store pages to `free`. None of them moves
+    /// this sum, which an allocation or a free moves page for page.
+    fn net_free(&self) -> i128
+    {
+        i128::from(self.free)
+            .wrapping_add(i128::from(self.store))
+            .wrapping_sub(i128::from(self.swapped))
+    }
+
+    /// What a window compares: the free total net of eviction and the
+    /// promised total.
+    fn level(&self) -> (i128, u64)
+    {
+        (self.net_free(), self.promised)
+    }
+}
+
+impl std::fmt::Display for PoolLevels
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    {
+        write!(
+            f,
+            "{} free net of eviction ({} free, {} in the store, {} swapped) and {} promised",
+            self.net_free(),
+            self.free,
+            self.store,
+            self.swapped,
+            self.promised
+        )
+    }
+}
+
+/// memmgr's levels once its deferred list has settled
+/// ([`budget::settled_pool_free`]).
+fn settled_levels() -> PoolLevels
+{
+    let _ = budget::settled_pool_free();
+    PoolLevels::read()
+}
+
+/// Wait until memmgr's levels read `before`'s ([`PoolLevels::level`]),
+/// within [`POOL_POLLS`] polls, each after a recheck of memmgr's deferred
+/// list. `Err` carries the totals the last poll read.
+fn levels_settle_to(before: PoolLevels) -> Result<(), PoolLevels>
+{
+    let mut last = before;
     for _ in 0..POOL_POLLS
     {
         crate::phases::memmgr::recheck_deferred();
-        let (free, promised, _) = pool_totals().expect("QUERY_POOL_STATUS failed");
-        if (free, promised) == level
+        last = PoolLevels::read();
+        if last.level() == before.level()
         {
             return Ok(());
         }
-        last = (free, promised);
         std::thread::yield_now();
     }
     Err(last)
 }
 
-/// Run `window` in up to [`POOL_WINDOWS`] windows, until memmgr's free and
-/// promised totals return after one to the levels they read before it
-/// ([`settled_totals`], [`totals_settle_to`]). `window` takes what memmgr
-/// charged svctest's descendants before it ([`children_charge`]). Panics,
-/// naming `what`, when no window settles, stating the last window's levels
-/// and the totals it read last, so the failure shows which total missed and
-/// by how many pages.
+/// Run `window` in up to [`POOL_WINDOWS`] windows, until memmgr's free
+/// total net of eviction and its promised total return after one to the
+/// levels they read before it ([`PoolLevels`], [`settled_levels`],
+/// [`levels_settle_to`]). `window` takes what memmgr charged svctest's
+/// descendants before it ([`children_charge`]). Panics, naming `what`,
+/// when no window settles, stating the last window's levels and the totals it
+/// read last, so the failure shows which total missed and by how many pages.
 pub(crate) fn windows_settle(what: &str, mut window: impl FnMut(u64))
 {
-    let mut missed = ((0, 0), (0, 0));
+    let mut missed = None;
     for _ in 0..POOL_WINDOWS
     {
         let children = children_charge();
-        let before = settled_totals();
+        let before = settled_levels();
         window(children);
-        match totals_settle_to(before)
+        match levels_settle_to(before)
         {
             Ok(()) => return,
-            Err(last) => missed = (before, last),
+            Err(last) => missed = Some((before, last)),
         }
     }
-    let ((free, promised), (last_free, last_promised)) = missed;
-    panic!(
-        "memmgr's free and promised totals did not return to their levels after {what} in \
-         any of {POOL_WINDOWS} windows: the last window's levels were {free} free and \
-         {promised} promised pages, and it read last {last_free} free ({:+}) and \
-         {last_promised} promised ({:+})",
-        i128::from(last_free).wrapping_sub(i128::from(free)),
-        i128::from(last_promised).wrapping_sub(i128::from(promised))
-    );
+    if let Some((before, last)) = missed
+    {
+        panic!(
+            "memmgr's levels did not return after {what} in any of {POOL_WINDOWS} windows: \
+             the last window's levels were {before}, and it read last {last}, {:+} free net of \
+             eviction and {:+} promised",
+            last.net_free().wrapping_sub(before.net_free()),
+            i128::from(last.promised).wrapping_sub(i128::from(before.promised))
+        );
+    }
 }
 
 /// What memmgr charges svctest's descendants, in pages: the subtree count of

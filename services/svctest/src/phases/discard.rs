@@ -22,8 +22,9 @@
 //! committed page cannot fail with all that memmgr can promise taken, and a
 //! `heap-release` child ([`heap_release_main`]), whose heap discards a large
 //! freed block and trims its top. Each child's charge leaves svctest's budget
-//! subtree before the phase goes on, memmgr's free and promised totals then
-//! return to their levels, and the all-RAM-accounted identity holds.
+//! subtree before the phase goes on, memmgr's free total net of eviction and
+//! its promised total then return to their levels ([`windows_settle`]), and
+//! the all-RAM-accounted identity holds.
 
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use std::process::exit;
@@ -106,8 +107,8 @@ const RELEASE_NOT_TRIMMED: i32 = 12;
 const RELEASE_NOT_DISCARDED: i32 = 13;
 
 /// The phase: the labels on regions of svctest's own, then the two children
-/// in windows until memmgr's totals return to their levels around them, then
-/// the identity.
+/// in windows until memmgr's levels return around them ([`windows_settle`]),
+/// then the identity.
 fn discard_range_phase(caps: &Caps)
 {
     discard_refusals();

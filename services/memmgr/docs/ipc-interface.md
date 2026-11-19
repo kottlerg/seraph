@@ -537,8 +537,14 @@ count those took back but
 hold on the deferred list, because another process can still reach the
 frames (see [`memory-pool.md`](memory-pool.md) §"Reclamation"); it falls as
 a later recheck moves them to the free runs. A caller asserting that a dead
-process's pages were reclaimed polls `data[3]` back to its pre-spawn
-baseline, and `data[4]` shows what is held instead. `largest_free_bytes`
+process's pages were reclaimed polls `data[3] + data[9] - data[10]`, the
+free total net of eviction, back to its pre-spawn baseline, and `data[4]`
+shows what is held instead: memmgr evicts cold chunks under pressure and
+restores each on its next fault ([`memory-pool.md`](memory-pool.md#eviction)
+§ Eviction), each moving `data[3]` by the chunk's backed pages less its
+store pages, `data[9]` by its store pages and `data[10]` by its backed
+pages, so `data[3]` alone returns to its baseline only while nothing is
+evicted or restored. `largest_free_bytes`
 (`data[5]`) shows how fragmented the free runs are: below
 `DEMAND_CHUNK_PAGES` pages while `data[3]` is not zero, a demand fault is
 backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
@@ -587,7 +593,9 @@ lazily on fault, and only once procmgr has delegated this process's
 region's whole length before it registers it: its pages and a page-table
 reservation to the caller's budget node, and those and a metadata bound to
 `promised` (`QUERY_POOL_STATUS` `data[8]`). A fault in a committed region is
-then not declined for budget or RAM (codes 7 and 10 below) while the region's
+then not declined for budget or RAM (codes 7, 10 and 11 below; code 11 only
+under an overcommit allowance above 0, [`memory-pool.md`](memory-pool.md#commit)
+§ Commit, Overcommit) while the region's
 page-table reservation, which its page-table donations draw on, lasts: a thread
 of the process that maps while a committed fault's map is funded, or a
 reclaiming unmap of page tables in the region's span the process made or asked
@@ -605,8 +613,9 @@ growth region this way.
 **No-evict regions.** With `REGION_NO_EVICT`, memmgr never evicts a page of
 the region into its compressed store, so every page a fault backed stays
 mapped until the region is unregistered or the page discarded. Without it,
-memmgr may evict a cold chunk of an uncommitted region under memory pressure
-and restores it on the next fault on it, which only a debugger's
+memmgr may evict a cold chunk of an uncommitted region under memory pressure,
+or of a committed one under an overcommit allowance above 0, and restores it
+on the next fault on it, which only a debugger's
 `SYS_THREAD_READ_MEM` can tell apart ([`memory-pool.md`](memory-pool.md#eviction)
 § Eviction).
 
@@ -1253,7 +1262,10 @@ the mapping) is resumed without backing. When no free run covers that part, the 
 backs the pages around the faulting one, so the fault is declined for want of RAM only when no page
 it may take is free ([`memory-pool.md`](memory-pool.md#demand-faults) § Demand faults). A fault in a
 committed region (§ Label 7) takes the pages `promised` holds for it, and is admitted without the
-budget and RAM tests that follow ([`memory-pool.md`](memory-pool.md#commit) § Commit). For an
+budget and RAM tests that follow ([`memory-pool.md`](memory-pool.md#commit) § Commit); only under
+an overcommit allowance above 0, or after memmgr's own metadata took free pages without admission,
+can it find no free page, and it is then declined with code 11
+once memmgr's eviction of victims in its turn found none (§ Commit, Overcommit). For an
 uncommitted region of a process whose budget node is outside the system reserve, neither the pages
 `promised` holds nor the growth floor's pages are among them: the fault is declined with code 7 when
 no free page lies above the floor, and with code 9 when the floor refuses the page-table funding its
@@ -1282,7 +1294,8 @@ A fault on a chunk memmgr is evicting maps the chunk's runs back and resumes; a
 fault on a chunk it evicted restores the whole chunk from its compressed store
 before it resumes, declined with code 7 when the free pages outside
 `promised` and, for a process outside it, the system reserve do not cover the
-chunk's backed pages, and with code 9 when a map fails or, with detail 0, the
+chunk's backed pages (code 11 when the chunk is a committed region's and the
+draw finds no frame), and with code 9 when a map fails or, with detail 0, the
 stored chunk does not decode; the chunk then stays evicted
 ([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a writing
 chunk is restored from its store runs as a compressed chunk's, and its write
@@ -1312,7 +1325,8 @@ code 12 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 | 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Label 7); a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
-| 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost |
+| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the system reserve, for a process outside it, while the allowance is above 0 and the pool does not cover `promised`) even after memmgr evicted victims in its turn; only an overcommit allowance above 0, or memmgr's own metadata taking free pages without admission, makes it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it as it holds code 7 |
+| 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim it and the all-RAM-accounted

@@ -375,6 +375,10 @@ pub struct BoundSpawnConfig<'a>
     /// Whether the driver is created `CREATE_PHYS_ACCESS`
     /// (`firmware::binding::Grants::phys_access`).
     pub phys_access: bool,
+    /// Whether the driver is created `CREATE_RESERVE`, inside memmgr's system
+    /// reserve (`firmware::binding::Grants::reserve`); procmgr honours it
+    /// because devmgr's own budget node is a reserve node.
+    pub reserve: bool,
     pub service_ep: u64,
     /// Endpoint the driver's devmgr query cap is a `device_badge`-badged
     /// SEND on: the private driver endpoint of the driver's settle batch
@@ -501,7 +505,8 @@ fn serve_list_round(
 /// DMA; procmgr then holds its pages after it is torn down until devmgr
 /// releases them on its release token ([`destroy_and_release`]). Any other
 /// driver is created demand-paged, with no hold and no release token. A
-/// `phys_access` driver is created `CREATE_PHYS_ACCESS`.
+/// `phys_access` driver is created `CREATE_PHYS_ACCESS`, and a `reserve` one
+/// `CREATE_RESERVE`.
 ///
 /// Returns [`DriverSpawn::Bootstrapped`] with the child's badged process
 /// handle and release token (0 without a hold) ([`HeldChild`]), which the
@@ -586,6 +591,10 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     if config.phys_access
     {
         flags |= procmgr_labels::CREATE_PHYS_ACCESS;
+    }
+    if config.reserve
+    {
+        flags |= procmgr_labels::CREATE_RESERVE;
     }
     let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
     // Caps: [source, creator, argv_env?]. Data word 0 is the object's size,

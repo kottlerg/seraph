@@ -319,10 +319,12 @@ creates on its mint source, and a create there would make a top-level reserve no
 which is what svcmgr's own node is. svctest's test phases set both flags, `CREATE_RESERVE` only to
 see procmgr refuse it; in the default image no process has a max of its own, and no default
 per-process max exists. svcmgr sets
-`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, oomd's, sessiond's, crashd's and
-logd's in the default image, and starts every other service outside the reserve
+`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, oomd's, sessiond's, crashd's,
+logd's and swapd's in the default image, and starts every other service outside the reserve
 ([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
-§ `reserve`).
+§ `reserve`). devmgr, a reserve node, sets it for each driver of the `block` device class and for
+the IOMMU driver, the storage path swapd calls
+([docs/driver-binding.md](../../../docs/driver-binding.md) § Driver Declarations).
 
 The label's bit 33 (`CREATE_NODE_HANDLE`) asks for a node handle to the child's budget node, the
 reply's last cap. procmgr registers the child with memmgr's `REGISTER_NODE_HANDLE` and passes on
@@ -970,6 +972,11 @@ yield). It
 reports `RELEASED` once the value rose, and returns the page to memmgr
 (`RELEASE_MEMORY_CAPS`); otherwise it reports `HELD` and keeps the page, which the
 endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
+
+Two callers read it. svctest's `init_cspace_released` phase reads both words. svcmgr calls it on
+every restart of the log sink and relies on `data[0] = 1` being reported only after the reap has
+run, which procmgr runs only once both init threads, init-logd among them, have exited; until then
+svcmgr mints the restarted logd the handover SEND.
 
 ---
 

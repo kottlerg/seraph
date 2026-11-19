@@ -102,9 +102,9 @@ instance's tag, as any other death:
 - On the first launch the service is recorded as launched, and its provided names published, as
   for a child that took its rounds, since the endpoint outlives the instance; its death is routed
   before reconciliation launches the next recipe, so a dead log sink is restarted before svcmgr's
-  next lines. Until an instance of the log sink has taken all its rounds, each restart of it is
-  served the first launch's round, with the `HANDOVER_PULL` SEND, since init-logd still waits
-  for the handover (§ Supervision hierarchy). An unrecoverable outcome starts the graceful
+  next lines. Until procmgr reports init reaped, each restart of it is served the first launch's
+  round, with the `HANDOVER_PULL` SEND, since init-logd may still wait for the handover
+  (§ Supervision hierarchy). An unrecoverable outcome starts the graceful
   shutdown once reconciliation ends, when the shutdown actuator is recorded. svcmgr logs a death
   on the first launch at once (`svcmgr: <name> died during its bootstrap`), a one-shot service's
   (`restart = never`) and the log sink's included: no instance of the log sink has taken the
@@ -281,8 +281,8 @@ the log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`
 and `reserve` flags, the `stop_source` class, and the scheduling fields on the parallel
 `RestartRecipe`, so
 a restart reproduces the first-launch spawn shape byte-for-byte, except the
-log-sink round, whose history-pull SEND is absent on a restart once an
-instance has taken all its bootstrap rounds (per
+log-sink round, whose history-pull SEND is absent on a restart once procmgr
+reports init reaped (per
 [service-definitions.md](service-definitions.md#log_sink)). The binary path
 is re-walked on every spawn, so a binary update on disk is picked up by
 the next restart without code changes.
@@ -408,11 +408,9 @@ restart. `logd` is the log sink: svcmgr holds the master-log endpoint
 source for the system's life and mints each (re)launched logd a fresh RECV
 on that persistent endpoint, so log senders' caps survive the restart (per
 [service-definitions.md](service-definitions.md#log_sink)). A logd
-restarted before any instance has taken all its bootstrap rounds (its
-first launch died before its request, as § Death detection describes) is
-minted the first launch's round, `HANDOVER_PULL` SEND included, since no
-instance has held the handover and init-logd still serves the endpoint.
-Any later restarted logd skips the history pull, serves a fresh table
+restarted while procmgr does not report init reaped (`QUERY_INIT_REAP`, or the query fails) is
+minted the first launch's round, `HANDOVER_PULL` SEND included, since init-logd may still serve
+the endpoint. Any later restarted logd skips the history pull, serves a fresh table
 (which holds no sender's display name: logd refuses a sender's next message with `NAME_UNKNOWN`, and
 the sender registers its name again and resends, so its lines render under
 its name), and registers its death queue with procmgr, whose

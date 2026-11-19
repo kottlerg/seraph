@@ -83,8 +83,8 @@ devmgr's responsibilities are:
   handed over is left as the firmware left it, and whose scope is the RIMT's
   ID mappings: each bus they cover whole and each scanned function on a bus
   they cover in part.
-  The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and
-  `CREATE_PHYS_ACCESS` at `BOOT_DRIVER_PRIORITY`, and its hold is never
+  The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`,
+  `CREATE_PHYS_ACCESS`, and `CREATE_RESERVE` at `BOOT_DRIVER_PRIORITY`, and its hold is never
   released: devmgr deletes the release token of its create reply at the
   spawn, so its table pages stay quarantined for the boot; devmgr and it are
   the processes that read physical addresses
@@ -159,6 +159,10 @@ devmgr's responsibilities are:
   - for a DMA declaration, the device's DMA capability, after its grant
     attaches it to its IOMMU domain where a unit translates it (above); the
     driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD`;
+  - for a driver of the `block` device class, `CREATE_RESERVE` as well, inside memmgr's system
+    reserve: the storage path swapd calls to end a pressure episode
+    (`firmware::binding::Grants::reserve`, `STORAGE_CLASS`). procmgr honours it because devmgr's
+    own node is a reserve node;
   - a catalog entry carrying the VirtIO startup info for a driver given the
     VirtIO register layout, and no startup info otherwise.
 

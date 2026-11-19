@@ -22,6 +22,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`entropyd/`](entropyd/README.md) | Entropy contributor — mixes the `hwrng` class drivers' bytes into the kernel entropy pool, with no credit |
 | [`sessiond/`](sessiond/README.md) | Operator-session supervisor — creates each session's leader for the interface that opens it, ends the session with its leader, and offers oomd the stop of its programs |
 | [`oomd/`](oomd/README.md) | Out-of-memory policy service — stops a service that opted in to being stopped when memory stays critical |
+| [`swapd/`](swapd/README.md) | Swap service — holds the swap partition and moves memmgr's sealed chunks between it and memmgr, writing chunks out while memory is critical and restoring each on a fault or a debugger's read |
 | [`usertest/`](usertest/README.md) | Programs-surface test orchestrator |
 | [`svctest/`](svctest/README.md) | Services-surface test harness |
 | [`crasher/`](crasher/README.md) | Test-tier fixture: deliberate-crash canary for svcmgr's restart path (gated, opt-in) |

@@ -23,6 +23,8 @@ members = [
     "services/crashd/oom-hold",
     "services/oomd",
     "services/oomd/policy",
+    "services/swapd",
+    "services/swapd/layout",
     "services/memhog",
     "services/stopsrc",
     "services/sessiond",

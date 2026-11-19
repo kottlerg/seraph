@@ -812,6 +812,7 @@ page-table donation are each admitted only when `free - promised - F >= want`, w
 floor (the system reserve and, while chunks are swapped, the restore headroom) for a charge to a
 node outside the reserve and 0 for a charge to a reserve node ([Distribution
 policy](#distribution-policy)). So no charge takes a free page a committed region's fault needs.
+The overcommit allowance (Overcommit below) is 0, which these tests show; above 0 it enters them.
 `QUERY_POOL_STATUS` reports `promised` in `data[8]`, and the pressure level is computed from the
 free pages outside it ([Memory pressure](#memory-pressure)).
 
@@ -863,6 +864,26 @@ arena page and any page tables memmgr's own map of it needs, leave the bound and
 free pages outside `promised` do not fall for metadata the commitment already counts. Growth past
 what is left of the bound takes free pages outside `promised`, as an uncommitted region's does.
 
+**Overcommit.** An overcommit allowance A lets memmgr promise past its free pages. A commitment,
+which takes no frame when it is made, is admitted when `free + A - promised - F >= want`; every
+other admission takes its frames at once and reads the lesser of `free + A - promised` and `free`,
+so the growth floor stays one of free frames, and so does the pressure level ([Memory
+pressure](#memory-pressure)). A is a [docs/limits.md](../../../docs/limits.md) § memmgr constant,
+and it is 0: the tests are those above, and every committed page has a free page held for it, short
+only of what memmgr's own metadata, which takes free pages without admission, took. With A above 0
+a committed region's chunks are evictable ([Eviction](#eviction), Committed pages): evicting one
+returns its runs to the pool and adds its pages to `promised` again, since its restore draws from
+`promised` as its first touch did. A committed draw, a fault in a committed region or a restore of
+a committed chunk, takes any free page while A is 0 or the free pool covers `promised`, and
+otherwise only the pages above the system reserve, for a node outside it, so an overcommitted pool
+leaves the reserve to the reserve nodes. When the draw finds no page, memmgr evicts victims in its
+turn as a restore's direct reclaim does ([Eviction](#eviction), Direct reclaim), any evictable chunk
+but the one the fault backs, up to the same bound; a fault's span is then clamped to the pages
+found, at least its faulting page. A draw still short is declined with code 11, a commit overrun
+([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message), which crashd holds as it holds
+code 7; with A at 0 that is a pool with no free page at all. The admission and draw rules are the
+host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free` and `draw_room`).
+
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
 the directory levels the shorter region does not need, and takes back each run on them, pooled or
@@ -886,8 +907,8 @@ which hold no frame again, and by the metadata the cleared chunks gave back
 the bound of its length. A refault of a discarded page is then admitted from `promised` as its first
 touch was, and is backed by a zero-filled run ([Frame contents](#frame-contents)). A discard frees
 RAM without raising the free pages outside `promised`; a cut does both. std's heap discards whole
-free chunks of a large freed block and cuts the free chunks at its top ([Userspace Memory Model §
-Byte Heap](../../../docs/userspace-memory-model.md#byte-heap)).
+free chunks of a large freed block and cuts the free chunks at its top ([Userspace Memory Model
+§ Byte Heap](../../../docs/userspace-memory-model.md#byte-heap)).
 
 **Retries.** A committed registration or growth whose reply does not reach the caller is undone,
 as a grant whose reply fails is rolled back, so a caller whose call was interrupted makes it again
@@ -950,15 +971,15 @@ Reservations](../../../docs/userspace-memory-model.md#page-reservations)), and i
 procmgr have no pager, so eviction never reaches a page the kernel's non-restartable IPC-buffer
 copies use.
 
-**Overcommit allowance.** Every admission's test ([Commit](#commit)) is to gain an overcommit
-allowance A: `free - promised - R + A >= want`. A is 0, so a fault on a committed page draws from
-`promised`, and is not declined for budget or RAM ([Commit](#commit)), and memmgr evicts only
-uncommitted pages (thread stacks, heap floors, `register_demand_paged` regions): evicting an
-uncommitted chunk frees its frames less the store pages its contents take, while evicting a
-committed chunk would only add store pages against `promised`. An allowance above 0 is design
-intent; not yet implemented ([#230](https://github.com/kottlerg/seraph/issues/230)): heap pages
-would be evictable too, and a committed fault that finds no frame would compress a victim within
-its turn or be declined as a commit overrun.
+**Committed pages.** With the overcommit allowance at 0 ([Commit](#commit), Overcommit), memmgr
+evicts only uncommitted pages (thread stacks, heap floors, `register_demand_paged` regions):
+evicting an uncommitted chunk frees its frames less the store pages its contents take, while
+evicting a committed chunk adds its pages to `promised` again and only takes store pages from the
+free pages outside it. With an allowance above 0 heap pages are evictable too. A victim of
+background eviction, or of an uncommitted restore's direct reclaim, must raise the free pages
+outside `promised`: a committed chunk does only while a chunk's pages more in `promised` keep it
+within the allowance, where the free pool, not `promised`, bounds those pages. A committed draw
+takes any victim, since it needs free pages alone.
 
 **Selection.** While the pool's pressure level reads `LOW` ([Memory pressure](#memory-pressure)),
 memmgr reclaims in the background until it reads `NORMAL`, and stops there. It does not reclaim in
@@ -973,11 +994,13 @@ each process in turn, a bounded number of steps a slice ([docs/limits.md](../../
 § memmgr gives the interval and the bounds). For each span of up to 256 chunks it reads and clears
 the accessed bits with one `SYS_ASPACE_HARVEST`, and ages each resident chunk of the span with its
 two-bit age ([Chunk table](#chunk-table)): a chunk with no accessed page in two sweeps is cold, and
-at `LOW` the slice posts one job for each cold chunk, as many as the compression worker has free job
-slots. The victims a slice finds and posts no job for are kept, a bounded number, for direct
-reclaim; at `CRITICAL` a slice finds the chunks with no accessed page in one sweep. A slice ends at
-the end of a pass, so no slice ages a chunk twice. The granule is the chunk: one unmap and one
-restore fault per chunk, over every run on its run list.
+at `LOW` the slice posts one job for each cold chunk whose eviction raises the free pages outside
+`promised` (Committed pages, above), as many as the compression worker has free job slots. The
+victims a slice finds and posts no job for are kept, a bounded number, for direct reclaim, one whose
+eviction raises the free pages outside `promised` taking the place of one only a committed draw may
+take when the list is full; at `CRITICAL` a slice finds the chunks with no accessed page in one
+sweep. A slice ends at the end of a pass, so no slice ages a chunk twice. The granule is the chunk:
+one unmap and one restore fault per chunk, over every run on its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, maps its
 runs into the job slot's input window of its own address space, and the chunk is evicting while
@@ -996,41 +1019,42 @@ any ancestor, since the node stays charged for its evicted pages, so it is never
 promised - R >= want`, with want the chunk's backed pages and R the system reserve for a node
 outside it and 0 for a reserve node, after the deferred recheck ([Distribution
 policy](#distribution-policy), System reserve): R, not the growth floor, so the restore draws on the
-restore headroom (below). When the free pages do not admit it, memmgr reclaims
-directly (Direct reclaim, below), and declines the restore with code 7 only when that does not make
-room, the chunk staying compressed and its store kept. With an allowance above 0, a restore of a
-committed chunk would be a committed fault, drawing from `promised` as any committed fault does
-([Commit](#commit)). The chunk is the granule, so a restore is never clamped to part of a chunk.
-memmgr takes runs covering exactly the chunk's backed pages (no run spans an unbacked page of a
-chunk backed in parts), selected as a demand fault selects ([Demand faults](#demand-faults), run
-selection only), maps the chunk's store runs at a stream window and each new run at the scrub window
-of its own address space ([Frame contents](#frame-contents)), and writes every byte of every page of
-each run there before it maps the run into the process: it decompresses each stored page and
-zero-fills each all-zero page. That full write replaces the hand-out clear of [Frame
-contents](#frame-contents), so no byte of a run's earlier owner reaches the process. It then returns
-the store runs to the free pool and resumes the thread. A stream that does not decode, which only a
-corruption of memmgr's memory makes, declines the fault with code 9 and detail 0, the chunk staying
-compressed.
+restore headroom (below). When the free pages do not admit it, memmgr reclaims directly (Direct
+reclaim, below), and declines the restore with code 7 only when that does not make room, the chunk
+staying compressed and its store kept. A restore of a committed chunk, which only an allowance above
+0 evicts, is a committed draw instead ([Commit](#commit), Overcommit): it draws from `promised`, and
+is declined with code 11 when it finds no frame. The chunk is the granule, so a restore is never
+clamped to part of a chunk. memmgr takes runs covering exactly the chunk's backed pages (no run
+spans an unbacked page of a chunk backed in parts), selected as a demand fault selects ([Demand
+faults](#demand-faults), run selection only), maps the chunk's store runs at a stream window and
+each new run at the scrub window of its own address space ([Frame contents](#frame-contents)), and
+writes every byte of every page of each run there before it maps the run into the process: it
+decompresses each stored page and zero-fills each all-zero page. That full write replaces the
+hand-out clear of [Frame contents](#frame-contents), so no byte of a run's earlier owner reaches the
+process. It then returns the store runs to the free pool and resumes the thread. A stream that does
+not decode, which only a corruption of memmgr's memory makes, declines the fault with code 9 and
+detail 0, the chunk staying compressed.
 
 **Direct reclaim.** A restore the free pages do not admit evicts victims itself, in its turn, before
 it is declined: the kept victim of the greatest age first, checked again as resident, eligible, and
 unaccessed for at least one sweep, and its pages' accessed bits read once more
 (`SYS_ASPACE_HARVEST`), since its age is the one the last sweep over it recorded: a set bit resets
 its age and passes it over. So a chunk accessed or restored since the last sweep is never taken and
-two processes cannot trade one chunk turn after turn. Any eligible process's chunk may be
-taken, the faulting process's own included. For each, memmgr unmaps the chunk, maps its runs at the
-input window of a synchronous slot of its own, compresses it into that slot's output buffer with a
-hash table of its own, so it shares nothing with the worker, unmaps the window, takes the store
-pages, writes the stream and swaps the chunk, whose runs return to the free pool in the same turn; a
-stream that gains nothing maps the chunk back. It stops when the restore is admitted, or after a
-bounded number of victims ([docs/limits.md](../../../docs/limits.md) § memmgr), and the restore is
-then declined with code 7. The store pages a victim takes can dip below the reserve for the rest of
-the turn, where no other admission runs, and each victim kept leaves more free pages than it took.
-Only a restore reclaims directly: a first touch of an unbacked page grows its node's charge, and at
-the growth floor that growth stays the out-of-memory path's, while a restore returns pages its node
-is charged for already. Compression in the loop costs a restore's turn at most that bound's
-compressions, on a fault that would otherwise be declined; background eviction compresses in the
-worker, so its latency lands on no fault or grant.
+two processes cannot trade one chunk turn after turn. Any eligible process's chunk may be taken, the
+faulting process's own included. For each, memmgr unmaps the chunk, maps its runs at the input
+window of a synchronous slot of its own, compresses it into that slot's output buffer with a hash
+table of its own, so it shares nothing with the worker, unmaps the window, takes the store pages,
+writes the stream and swaps the chunk, whose runs return to the free pool in the same turn; a stream
+that gains nothing maps the chunk back. It stops when the restore is admitted, or after a bounded
+number of victims ([docs/limits.md](../../../docs/limits.md) § memmgr), and the restore is then
+declined with code 7. The store pages a victim takes can dip below the reserve for the rest of the
+turn, where no other admission runs, and each victim kept leaves more free pages than it took. Only
+a restore and a committed draw ([Commit](#commit), Overcommit) reclaim directly: a first touch of an
+unbacked page of an uncommitted region grows its node's charge, and at the growth floor that growth
+stays the out-of-memory path's, while a restore returns pages its node is charged for already and a
+committed draw takes pages its commitment was charged and promised. Compression in the loop costs a
+restore's turn at most that bound's compressions, on a fault that would otherwise be declined;
+background eviction compresses in the worker, so its latency lands on no fault or grant.
 
 **Restore headroom.** While chunks are swapped, a charge to a node outside the reserve leaves a
 restore headroom H free above the reserve R: the swapped pages, and at most R, so it is admitted
@@ -1160,7 +1184,9 @@ runs and mapped, its slot and disk node freed. A restore memmgr cannot make is d
 restore's code, and the chunk stays on disk. A tag failure makes the chunk lost, its slot freed: the
 reply carries the decline word of code 12 with detail 1, which the swap service forwards the held
 fault with, so the faulting thread is killed, as every later fault on the chunk is. A fault on a
-chunk on disk with no swap service registered is declined with code 12 and detail 0. `SWAP_RESTORE`
+chunk on disk with no swap service registered is declined with code 12 and detail 0. Detail 2 is
+the swap service's own: it could not read the chunk's slot, and it forwards the held fault with it;
+the chunk stays on disk. memmgr produces details 0 and 1 only. `SWAP_RESTORE`
 names a slot word, which `SWAP_TAKE`'s reply also carries, not a fault, so the swap service may also
 restore ahead of one, as it does for a debugger's `MAKE_RESIDENT` of a chunk on disk: memmgr posts
 the chunk's slot word to a list of at most `SWAP_WANTED_WORDS` words, sends on the Notification the

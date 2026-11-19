@@ -271,7 +271,8 @@ matches the VirtIO 1.2 §2.9.3 driver-notification contract.
 |---|---|
 | [services/drivers/docs/driver-model.md](../../docs/driver-model.md) | Driver lifecycle and capability delegation |
 | [services/drivers/docs/virtio-architecture.md](../../docs/virtio-architecture.md) | VirtIO transport abstraction, virtqueue internals |
-| [services/fs/docs/fs-driver-protocol.md](../../../fs/docs/fs-driver-protocol.md) | Filesystem-driver IPC; the only client of this driver today |
+| [services/fs/docs/fs-driver-protocol.md](../../../fs/docs/fs-driver-protocol.md) | Filesystem-driver IPC; the filesystem drivers are clients of this driver |
+| [services/swapd/docs/operation.md](../../../swapd/docs/operation.md) | The swap service, the other client: raw slot reads and writes through its partition cap (`BLK_GET_GEOMETRY`, `BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`) |
 | [docs/device-management.md](../../../../docs/device-management.md) | Driver lifecycle, DMA safety, security boundary |
 | [docs/ipc-design.md](../../../../docs/ipc-design.md) | IPC semantics, endpoints, message format |
 | [docs/capability-model.md](../../../../docs/capability-model.md) | Capability types, rights, delegation, badges |

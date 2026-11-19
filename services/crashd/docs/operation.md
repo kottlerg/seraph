@@ -104,7 +104,8 @@ logs a warning and runs with no hold. It reads memmgr's level when the Notificat
 a change since its last read, and takes the level as `CRITICAL` while memmgr does not answer.
 
 A fault is holdable when it is a VM fault memmgr forwarded with decline code 7 (no free page can
-back it), 6 (the metadata arena cannot grow) or 8 (the region's chunk table cannot record the run)
+back it), 11 (a commit overrun: no free frame for a committed page, held as code 7 is), 6 (the
+metadata arena cannot grow) or 8 (the region's chunk table cannot record the run)
 ([memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) § Kernel-origin fault message). Code
 10, a budget node's max, is the process's own limit, and a holdable fault is never one of an
 exception class; crashd handles each such fault at once. A holdable fault that arrives:

@@ -41,7 +41,10 @@ enum Release
 /// Init-logd defers at most [`wire::MAX_RELEASE_DEFERRALS`] times and
 /// acknowledges the release after that, so the
 /// `MAX_RELEASE_DEFERRALS + 1` rounds here end with init-logd released
-/// unless no release attempt reaches it at all.
+/// unless no release attempt reaches it at all. Every call is bounded by
+/// [`wire::HANDOVER_CALL_TIMEOUT_MS`], so an init-logd that has already
+/// exited costs one bound on the pull and one on the release, and the
+/// transfer returns with nothing pulled.
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
@@ -87,13 +90,21 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
         let req = IpcMessage::new(HANDOVER_PULL);
         // SAFETY: caller's invariant — ipc_buf is the registered IPC
         // buffer page.
-        let Ok(reply) = (unsafe { ipc::ipc_call(handover_send_cap, &req, ipc_buf) })
+        let Ok(reply) = (unsafe {
+            ipc::ipc_call_timeout(
+                handover_send_cap,
+                &req,
+                ipc_buf,
+                wire::HANDOVER_CALL_TIMEOUT_MS,
+            )
+        })
         else
         {
-            // Drain aborted (e.g. a kernel IPC rendezvous race on the shared
-            // log endpoint dropped this call). Non-fatal: the caller still
-            // issues HANDOVER_RELEASE, so init-logd is released regardless —
-            // at most some boot history is not transferred.
+            // Drain aborted (a kernel IPC rendezvous race on the shared log
+            // endpoint dropped this call, or no init-logd answered it within
+            // the bound). Non-fatal: the caller still issues HANDOVER_RELEASE,
+            // so a living init-logd is released regardless — at most some boot
+            // history is not transferred.
             return;
         };
         match wire::decode(&reply)
@@ -149,7 +160,11 @@ unsafe fn pull_all(handover_send_cap: u64, ipc_buf: *mut u64, table: &mut SlotTa
 /// The time budget bounds the loop, whatever the system load does to the
 /// pace of attempts; a genuinely unreachable init-logd is left serving
 /// (procmgr reaps init only on init-logd's natural exit), never wedged by
-/// an unbounded spin here.
+/// an unbounded spin here. Each attempt is bounded by
+/// [`wire::HANDOVER_CALL_TIMEOUT_MS`], so a release to an init-logd that has
+/// already exited (a restarted logd minted the SEND before procmgr's reap of
+/// init) ends within the budget and one bound. An attempt that runs out after
+/// init-logd took it may still have released it.
 ///
 /// # Safety
 /// `ipc_buf` must be the calling thread's registered IPC buffer.
@@ -158,7 +173,15 @@ unsafe fn send_release(handover_send_cap: u64, ipc_buf: *mut u64) -> Release
     let req = IpcMessage::new(HANDOVER_RELEASE);
     let attempt = || {
         // SAFETY: caller's invariant — ipc_buf is the registered IPC buffer.
-        unsafe { ipc::ipc_call(handover_send_cap, &req, ipc_buf) }.ok()
+        unsafe {
+            ipc::ipc_call_timeout(
+                handover_send_cap,
+                &req,
+                ipc_buf,
+                wire::HANDOVER_CALL_TIMEOUT_MS,
+            )
+        }
+        .ok()
     };
     let delivered = wire::retry_within(
         wire::RELEASE_RETRY_BUDGET_US,

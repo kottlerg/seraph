@@ -276,7 +276,8 @@ pub fn read_tables(
 /// The platform description table at `entry` of the tables' directory
 /// `dir_cap`, read through procmgr's verified read under its install path,
 /// when it parses and its OEM table ID is `oem_table_id`; `None` otherwise,
-/// logged unless it is a valid table of another machine.
+/// logged unless it is a valid table of another machine or the entry is the
+/// directory's own `.` or its parent's `..`, which are no tables.
 fn read_table(
     dir_cap: u64,
     entry: &[u8],
@@ -284,6 +285,10 @@ fn read_table(
     ipc_buf: *mut u64,
 ) -> Option<PlatformTable>
 {
+    if entry == b"." || entry == b".."
+    {
+        return None;
+    }
     let Ok(entry) = core::str::from_utf8(entry)
     else
     {

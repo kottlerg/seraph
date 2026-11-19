@@ -37,16 +37,15 @@ nothing and reads no key; the bundle's entries are chosen by a list per harness 
 checks, once it has composed the ESP, that each object on it equals its installed file, and
 `cargo xtask check-disk`, which CI runs, checks the same of a packed image, its ESP against its
 root partition (§ The ESP); the
-bootloader refuses an entry without the boot-module role; the bundle is used during bootstrap alone
+bootloader refuses an entry without the boot-module role; the default bundle is the bootstrap
+closure, the consoles' drivers and the platform description tables loaded from the root
+filesystem (§ The Bootstrap Closure); the bundle is used during bootstrap alone
 (§ Bootstrap-Only Boot Copies); the loss of the root filesystem's driver or of its disk is system
 death; and the ESP holds no secret.
 
-Design intent, not yet implemented:
-
-- The bundle carries more than the bootstrap closure: the serial and framebuffer drivers and,
-  on riscv64, the platform description table, none of which the root mount needs
-  ([#1267](https://github.com/kottlerg/seraph/issues/1267)). A table leaves the bundle only once
-  the tables devmgr reads from the root filesystem are verified, which #1267 builds.
+Design intent, not yet implemented: procmgr's verification of the policy-bearing configuration
+files other than the platform description tables
+([#1071](https://github.com/kottlerg/seraph/issues/1071)).
 
 ---
 
@@ -109,13 +108,21 @@ loading from it, and nothing else. On the default boot that is:
 
 A test harness in the `init` slot (ktest) is its own closure. Anything else is loaded from the root
 filesystem once vfsd has mounted it: by svcmgr from its recipes, by devmgr from
-`/services/drivers/`, by vfsd from `/services/fs/`. Each is verified before it is used: an image by
-procmgr as it creates the process, and a data file by procmgr at its reader's request, a platform
-description table devmgr reads among them ([driver-binding.md](driver-binding.md) § Platform
-Description Tables; design intent: [#1267](https://github.com/kottlerg/seraph/issues/1267) for the
-tables, [#1071](https://github.com/kottlerg/seraph/issues/1071) for the other policy-bearing files).
-An object outside the closure costs memory on every boot and is a second path by which the same
-object starts.
+`/services/drivers/`, the serial and framebuffer drivers of the consoles included, by vfsd from
+`/services/fs/`. Each is verified before it is used: an image by procmgr as it creates the process,
+and a data file by procmgr at its reader's request, the platform description tables devmgr reads
+from `/config/devmgr/platform/` among them ([driver-binding.md](driver-binding.md) § Platform
+Description Tables; design intent: [#1071](https://github.com/kottlerg/seraph/issues/1071) for the
+other policy-bearing files). An object outside the closure costs memory on every boot and is a
+second path by which the same object starts.
+
+Until the root mount, the only console is init-logd's: it writes the UART directly, and the
+kernel's console stays on a framebuffer, since no driver has claimed it
+([console-model.md](console-model.md)). A boot whose root does not mount therefore reports the same
+lines on serial as one with the consoles' drivers in the bundle, and leaves the kernel's console on
+the screen of a machine with a framebuffer alone. A table that describes a device the root mount
+needs would be a bundle entry ([driver-binding.md](driver-binding.md) § Platform Description
+Tables); none in the tree does.
 
 ---
 

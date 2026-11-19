@@ -392,9 +392,10 @@ file, so the ESP of every image equals the installed files. The
 bundle's entries are the installed files that the recorded harness's bundle list names
 (`config/bundle/<harness>.<arch>.list` where the architectures differ, `<harness>.list` where
 they do not, from [`rootfs/config/bundle/`](../rootfs/config/bundle/)), each by its install path;
-the list's `init` line names the object of the `init` slot. The data files a list names, the
-log-level configuration and the platform description tables, the build installs under `/config/`
-from the repository (`xtask/src/sysroot.rs`, `data_files`).
+the list's `init` line names the object of the `init` slot. The data files the build
+installs under `/config/` from the repository (`xtask/src/sysroot.rs`, `data_files`) are the
+log-level configuration, which a list names, and the platform description tables, which no list
+names.
 
 The `esp/` and root-partition trees are populated from two sources:
 

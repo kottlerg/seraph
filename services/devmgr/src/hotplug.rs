@@ -39,14 +39,16 @@ const WAIT_STEP_MS: u64 = 10;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Grant
 {
-    /// No grant is known yet: the host bridge's `_OSC` result has not arrived
-    /// and the platform table grants nothing.
+    /// No grant is known yet ([`hp::SlotGrant::Wait`]): the host bridge's
+    /// `_OSC` result has not arrived, or withholds native control while
+    /// devmgr does not know its platform description tables yet.
     Waiting,
     /// devmgr manages the slot: the poller watches it.
     Managed,
     /// The host bridge's `_OSC` withholds native hotplug control, or failed,
-    /// and the platform table grants none: the firmware drives the slot, and
-    /// acpid posts its jobs from the firmware's `Notify`.
+    /// and the platform description tables, known, grant none: the firmware
+    /// drives the slot, and acpid posts its jobs from the firmware's
+    /// `Notify`.
     Firmware,
     /// The slot could not be handed to the poller, or its BAR pages could not
     /// be held; devmgr never touches the slot.
@@ -128,8 +130,10 @@ struct Polled
 pub struct Hotplug
 {
     candidates: Vec<Candidate>,
-    /// The platform description table's `pcie_native_hotplug`.
-    platform_grant: bool,
+    /// The matching platform description table's `pcie_native_hotplug` once
+    /// devmgr knows its tables (`Some(false)` when it knows there is none);
+    /// `None` before ([`Hotplug::tables_known`]).
+    platform_grant: Option<bool>,
     /// devmgr's own address space, which the poller maps pages in.
     aspace: u64,
     /// The control thread's job notification, which the poller signals
@@ -162,16 +166,13 @@ impl Hotplug
     /// pass bound, which `records` holds bound before any other pass runs) is
     /// not, logged; a window that lies outside every boot aperture
     /// (`apertures`, each `(base, end)`) is closed, logged, since no BAR in it
-    /// could be carved. `platform_grant` is the platform description table's
-    /// grant.
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "`platform_grant` is the platform description table's `pcie_native_hotplug` value"
-    )]
+    /// could be carved. `platform_grant` is the matching platform description
+    /// table's grant when devmgr knows its tables already (a boot module's
+    /// table matched), `None` when it does not yet.
     pub fn new(
         found: Vec<Slot>,
         records: &bind::Records,
-        platform_grant: bool,
+        platform_grant: Option<bool>,
         apertures: &[(u64, u64)],
         job_note: u64,
         aspace: u64,
@@ -247,13 +248,37 @@ impl Hotplug
         }
     }
 
-    /// Settle each slot whose grant has come. A slot whose host bridge's
-    /// `_OSC` result among `bridges` grants native hotplug control, or whose
-    /// platform table does ([`hp::native_control`]), is managed, the record
+    /// Whether devmgr knows its platform description tables: a boot module's
+    /// table matched, or [`Self::set_tables`] has recorded the outcome of the
+    /// read from the root filesystem.
+    pub const fn tables_known(&self) -> bool
+    {
+        self.platform_grant.is_some()
+    }
+
+    /// Record that devmgr knows its platform description tables, `grant`
+    /// being the matching table's `pcie_native_hotplug` (`false` when none
+    /// matched). A grant once known is kept.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`grant` is the matching platform description table's `pcie_native_hotplug` value"
+    )]
+    pub fn set_tables(&mut self, grant: bool)
+    {
+        if self.platform_grant.is_none()
+        {
+            self.platform_grant = Some(grant);
+        }
+    }
+
+    /// Settle each slot whose grant has come ([`hp::slot_grant`]). A slot
+    /// whose host bridge's `_OSC` result among `bridges` grants native
+    /// hotplug control, or whose platform table does, is managed, the record
     /// of its port held in `records` ([`hp::hold_port`]). A slot whose host
-    /// bridge's `_OSC` result withholds it, or failed, with no platform grant,
-    /// is left to the firmware ([`Grant::Firmware`]), logged. A slot neither
-    /// grants nor withholds waits.
+    /// bridge's `_OSC` result withholds it, or failed, is left to the
+    /// firmware ([`Grant::Firmware`]), logged, once the platform description
+    /// tables are known and grant none; until then it waits, as does a slot
+    /// with no `_OSC` result.
     pub fn grant(
         &mut self,
         bridges: &Bridges,
@@ -275,25 +300,19 @@ impl Hotplug
             let slot = candidate.slot;
             let (s, b, _, _) = slot.port;
             let osc = hp::host_bridge(bridges, s, b).and_then(|bridge| bridge.osc);
-            let grant = if hp::native_control(osc, self.platform_grant)
+            let grant = match (hp::slot_grant(osc, self.platform_grant), osc)
             {
-                let by = if self.platform_grant
+                (hp::SlotGrant::Manage(by), _) =>
                 {
-                    "the platform table"
+                    let by = match by
+                    {
+                        hp::GrantBy::PlatformTable => "the platform table",
+                        hp::GrantBy::Osc => "_OSC",
+                    };
+                    self.manage(index, slot, records, caps, by)
                 }
-                else
-                {
-                    "_OSC"
-                };
-                self.manage(index, slot, records, caps, by)
-            }
-            else if let Some(osc) = osc
-            {
-                firmware(slot, osc, records, caps)
-            }
-            else
-            {
-                continue;
+                (hp::SlotGrant::Firmware, Some(osc)) => firmware(slot, osc, records, caps),
+                (hp::SlotGrant::Firmware | hp::SlotGrant::Wait, _) => continue,
             };
             if let Some(candidate) = self.candidates.get_mut(index)
             {

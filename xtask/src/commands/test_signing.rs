@@ -22,7 +22,10 @@
 //!   `Failed(Role)`, `Untrusted`) and svcmgr reports the refused launch. The kernel and
 //!   `/programs/terminal` each carry a record of that untrusted key before
 //!   their own, which the bootloader and procmgr skip, and the boot reaches
-//!   the terminal's READY line.
+//!   the terminal's READY line. On riscv64 the platform description table
+//!   `/config/devmgr/platform/qemu-virt.platform` has a body byte flipped
+//!   too: procmgr refuses it at devmgr's verified read (`Failed(BodyHash)`),
+//!   and devmgr passes it over and adds no platform-table record.
 //!
 //! Every boot packs the default-init harness's bundle, which the pack composes
 //! from the installed files; the substitutes are written in the images alone.
@@ -101,6 +104,15 @@ const TAMPERED: &str = "services/timed";
 const WRONG_ROLE: &str = "services/pwrmgr";
 const UNTRUSTED: &str = "services/crashd";
 const EXTRA_RECORD: &str = "programs/terminal";
+/// The platform description table riscv64 installs, which the `rootfs` case
+/// tampers with there.
+const PLATFORM_TABLE: &str = "config/devmgr/platform/qemu-virt.platform";
+
+/// devmgr's lines once procmgr refuses its read of [`PLATFORM_TABLE`] and it
+/// has no other table (`services/devmgr/src/platform.rs`).
+const TABLE_REFUSED: &str = "platform table /config/devmgr/platform/qemu-virt.platform: procmgr's \
+                             verified read refused it (InvalidData); passed over";
+const NO_TABLE: &str = "no platform description table for this machine; no platform-table records";
 
 /// The bundle entry the `bundle` case tampers with.
 const BUNDLE_ENTRY: &str = "/services/drivers/virtio-blk";
@@ -257,7 +269,9 @@ fn revoked_case(ctx: &Context, args: &TestSigningArgs, dir: &Path, signer: &Sign
 }
 
 /// The `rootfs` case: three services procmgr refuses, and the kernel and
-/// the terminal each with an untrusted record before their own.
+/// the terminal each with an untrusted record before their own; on riscv64
+/// also the platform description table, tampered, which procmgr refuses at
+/// devmgr's verified read.
 fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result<Case>
 {
     let untrusted = untrusted_signer(ctx, arch)?;
@@ -299,15 +313,30 @@ fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result
         ));
     }
     expect.push(TERMINAL_READY.to_owned());
+    let mut substitutes = vec![
+        sub(ESP_KERNEL, stage(dir, "kernel.two-records", &kernel)?),
+        sub(TAMPERED, stage(dir, "timed.tampered", &tampered)?),
+        sub(WRONG_ROLE, stage(dir, "pwrmgr.data", &as_data)?),
+        sub(UNTRUSTED, stage(dir, "crashd.untrusted", &foreign)?),
+        sub(EXTRA_RECORD, stage(dir, "terminal.two-records", &terminal)?),
+    ];
+    if arch == Arch::Riscv64
+    {
+        let table = flip_body_byte(&read_sysroot(ctx, PLATFORM_TABLE)?)?;
+        substitutes.push(sub(
+            PLATFORM_TABLE,
+            stage(dir, "platform-table.tampered", &table)?,
+        ));
+        expect.push(format!(
+            "signature verification refused: {}: Failed(BodyHash)",
+            install_name(PLATFORM_TABLE)
+        ));
+        expect.push(TABLE_REFUSED.to_owned());
+        expect.push(NO_TABLE.to_owned());
+    }
     Ok(Case {
         name: "rootfs",
-        substitutes: vec![
-            sub(ESP_KERNEL, stage(dir, "kernel.two-records", &kernel)?),
-            sub(TAMPERED, stage(dir, "timed.tampered", &tampered)?),
-            sub(WRONG_ROLE, stage(dir, "pwrmgr.data", &as_data)?),
-            sub(UNTRUSTED, stage(dir, "crashd.untrusted", &foreign)?),
-            sub(EXTRA_RECORD, stage(dir, "terminal.two-records", &terminal)?),
-        ],
+        substitutes,
         expect,
         timeout: ROOTFS_TIMEOUT,
     })

@@ -87,6 +87,31 @@ impl Records
         })
     }
 
+    /// Append platform records, each unbound: `add` adds at most `more`
+    /// records to the platform record set and its result is returned. Added
+    /// in record order after every record so far, so no index a pass or a
+    /// restart holds changes; a device `add` merges into a record already
+    /// held adds its keys to that record alone
+    /// ([`PlatformRecords::add`]). `None`, nothing added, when the
+    /// records' states cannot grow by `more`.
+    pub fn append_platform<R>(
+        &mut self,
+        more: usize,
+        add: impl FnOnce(&mut PlatformRecords) -> R,
+    ) -> Option<R>
+    {
+        self.platform_states.try_reserve(more).ok()?;
+        let out = add(&mut self.platform);
+        let len = self.platform.records().len();
+        if len.saturating_sub(self.platform_states.len()) <= more
+        {
+            // Within the room reserved above, so the resize allocates
+            // nothing.
+            self.platform_states.resize(len, RecordState::Unbound);
+        }
+        Some(out)
+    }
+
     /// The number of records, PCI and platform, removed ones included: the
     /// most drivers the bind passes can start over them, each record being
     /// bound at most once.

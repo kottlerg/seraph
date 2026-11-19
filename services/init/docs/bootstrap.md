@@ -261,16 +261,17 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     endowed master-log source, gating logd's `QUERY_SLOTS` and
     `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md#queries));
     svctest is the only recipe seeding it.
-  - `SET_DRIVERS_DIR` — svcmgr walks its universal root to `/services/drivers/` at
-    `LOOKUP | READ | READDIR` and hands devmgr the subtree cap, with the directory's absolute path
-    as a name block, on a `DRIVERS_DIR_AUTHORITY`-badged copy of the devmgr-registry source.
-    Devmgr replies SUCCESS *before* any spawn work, then lists the directory, reads each entry's
-    driver declaration, binds the PCI devices still unbound, and spawns the per-arch RTC driver on
-    its control thread after the reply (procmgr `CREATE_FROM_FILE` — the binaries live on the
-    rootfs, not in the boot bundle; see
-    [Driver binary sources](../../../docs/device-management.md#driver-binary-sources)).
-    Best-effort: a failure leaves the system without a wallclock — timed degrades to
-    `WALL_CLOCK_UNAVAILABLE` (see [timed](../../timed/README.md)).
+  - `SET_DRIVERS_DIR` — svcmgr walks its universal root to `/services/drivers/` at `LOOKUP | READ
+    | READDIR` and hands devmgr the subtree cap, with the directory's absolute path as a name block,
+    on a `DRIVERS_DIR_AUTHORITY`-badged copy of the devmgr-registry source, and, when the walk finds
+    it, the platform description tables' directory (`devmgr_labels::PLATFORM_TABLES_PATH`) at the
+    same rights as an optional second cap. Devmgr replies SUCCESS *before* any spawn work, then
+    lists the directory, reads each entry's driver declaration, binds the PCI devices still unbound,
+    and spawns the console drivers and the per-arch RTC driver on its control thread after the reply
+    (procmgr `CREATE_FROM_FILE` — the binaries live on the rootfs, not in the boot bundle; see
+    [Driver binary sources](../../../docs/device-management.md#driver-binary-sources)). Best-effort:
+    a failure leaves the system without a wallclock — timed degrades to `WALL_CLOCK_UNAVAILABLE`
+    (see [timed](../../timed/README.md)).
 
   All four `devmgr.*` names, the three `vfsd.*` names, and `logd.query` are seed-only: svcmgr's
   `QUERY_ENDPOINT` refuses them, so each badge reaches only the recipes that seed the name

@@ -81,9 +81,8 @@ init launches only the bootstrap substrate, the services that must run before sv
 recipe: memmgr and procmgr, by raw syscalls; devmgr and vfsd, from boot modules through procmgr; and
 svcmgr, from the root filesystem through procmgr. devmgr and vfsd start the drivers carried as boot
 modules: those the root mount needs, which are part of the bootstrap closure ([Boot
-Media](boot-media.md) § The Bootstrap Closure), and the console's `serial` and `framebuffer`
-drivers, which leave the bundle for the root filesystem (design intent; not yet implemented,
-[#1267](https://github.com/kottlerg/seraph/issues/1267)). Every other top-level service MUST be
+Media](boot-media.md) § The Bootstrap Closure); devmgr starts the console's `serial` and
+`framebuffer` drivers from the root filesystem. Every other top-level service MUST be
 first-launched by svcmgr from its recipe, never by init, so that one recipe defines its first launch
 and its restart, and the authority it receives is what that recipe grants. A new service adds a
 recipe under `/config/svcmgr/services/`, not an init stage. The stage-by-stage bring-up is specified

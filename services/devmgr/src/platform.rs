@@ -10,16 +10,23 @@
 //!
 //! In record order: the boot framebuffer, the static `Device` objects of the
 //! DSDT and every SSDT, the SPCR's console UART, and the devices of the
-//! platform description table whose OEM table ID is the XSDT's. Each
-//! enumerator knows its firmware standard and no driver; the parsing is in
-//! the host-tested `devmgr-firmware` crate (`aml`, `platform`, `records`).
+//! platform description table whose OEM table ID is the XSDT's. That table
+//! is a boot module's when one matches; otherwise devmgr reads the tables
+//! installed on the root filesystem once `SET_DRIVERS_DIR` hands it their
+//! directory, each through procmgr's verified read ([`read_tables`]), and
+//! appends the matching one's records then
+//! ([docs/driver-binding.md](../../../docs/driver-binding.md) § Platform
+//! Description Tables). Each enumerator knows its firmware standard and no
+//! driver; the parsing is in the host-tested `devmgr-firmware` crate
+//! (`aml`, `platform`, `records`).
 
 use firmware::aml::{self, CrsResource};
 use firmware::platform::{PlatformResource, PlatformTable, SpcrBase};
 use firmware::records::{Added, DeviceInfo, Identity, PlatformKey, PlatformRecords};
+use ipc::devmgr_labels::PLATFORM_TABLES_PATH;
 use syscall_abi::PAGE_SIZE;
 
-use crate::{caps, tables};
+use crate::{bind, caps, decls, tables};
 
 /// The ACPI identifiers of the CMOS-compatible RTC, whose century register's
 /// CMOS RAM index the FADT's `CENTURY` field names (ACPI 6.x section 5.2.9).
@@ -29,10 +36,13 @@ const CMOS_RTC_IDS: [&[u8]; 3] = [b"PNP0B00", b"PNP0B01", b"PNP0B02"];
 /// description tables among the boot modules; the one whose OEM table ID is
 /// the XSDT's describes the devices the machine's tables do not, and whether
 /// the machine grants devmgr native control of its PCI Express hotplug slots
-/// (`pcie_native_hotplug`), which is returned beside the records. Every
-/// record is logged.
-pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable])
--> (PlatformRecords, bool)
+/// (`pcie_native_hotplug`), which is returned beside the records: `None`
+/// when no boot module's table matches, so the tables are read from the root
+/// filesystem later ([`read_tables`]). Every record is logged.
+pub fn enumerate(
+    caps: &caps::DevmgrCaps,
+    tables_found: &[PlatformTable],
+) -> (PlatformRecords, Option<bool>)
 {
     let mut records = PlatformRecords::new();
     boot_framebuffer(caps, &mut records);
@@ -80,7 +90,10 @@ pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable])
             core::iter::once(base).chain(interrupt),
         );
     }
-    let native_hotplug = platform_table(acpi.oem_table_id, tables_found, &mut records);
+    let native_hotplug = acpi
+        .oem_table_id
+        .and_then(|id| tables_found.iter().find(|t| t.is_for(&id)))
+        .map(|table| platform_table(table, &mut records));
     for (index, record) in records.records().iter().enumerate()
     {
         log_record(index, record);
@@ -201,18 +214,41 @@ fn attach_century(caps: &caps::DevmgrCaps, records: &mut PlatformRecords)
     }
 }
 
-/// Add the devices of the platform description table among `tables_found`
-/// whose OEM table ID is `oem_table_id`, and return whether it grants
-/// native PCI Express hotplug control. With no such table no device is
-/// added, logged once, and nothing is granted.
-fn platform_table(
-    oem_table_id: Option<[u8; 8]>,
-    tables_found: &[PlatformTable],
-    records: &mut PlatformRecords,
+/// Read the platform description tables installed in the directory
+/// `dir_cap` names (`PLATFORM_TABLES_PATH`, the `LOOKUP | READ | READDIR`
+/// cap `SET_DRIVERS_DIR` carried; 0 when it carried none), take the first
+/// whose OEM table ID is the XSDT's, append its devices to `records`, each
+/// logged, and return whether it grants native PCI Express hotplug control.
+/// Each table is read through procmgr's verified read
+/// (`std::os::seraph::read_verified`) under its install path,
+/// `PLATFORM_TABLES_PATH/<entry>`, and only the body procmgr returns is
+/// parsed (docs/signing.md § Verifier Discipline). A table procmgr refuses,
+/// or whose body is not a table, is logged and passed over. With no matching
+/// table no device is added, logged once, and nothing is granted. `dir_cap`
+/// is deleted.
+pub fn read_tables(
+    firmware: &caps::Firmware,
+    dir_cap: u64,
+    records: &mut bind::Records,
+    ipc_buf: *mut u64,
 ) -> bool
 {
-    let table = oem_table_id.and_then(|id| tables_found.iter().find(|t| t.is_for(&id)));
-    let Some(table) = table
+    let oem_table_id = tables::platform_tables(firmware).oem_table_id;
+    let mut found: Option<PlatformTable> = None;
+    if let (Some(id), true) = (oem_table_id, dir_cap != 0)
+    {
+        decls::list_dir(dir_cap, ipc_buf, |entry| {
+            if found.is_none()
+            {
+                found = read_table(dir_cap, entry, &id, ipc_buf);
+            }
+        });
+    }
+    if dir_cap != 0
+    {
+        let _ = syscall::cap_delete(dir_cap);
+    }
+    let Some(table) = found
     else
     {
         std::os::seraph::log!(
@@ -220,6 +256,84 @@ fn platform_table(
         );
         return false;
     };
+    let appended = records.append_platform(table.devices().len(), |platform| {
+        let first = platform.records().len();
+        let grant = platform_table(&table, platform);
+        for (index, record) in platform.records().iter().enumerate().skip(first)
+        {
+            log_record(index, record);
+        }
+        grant
+    });
+    appended.unwrap_or_else(|| {
+        std::os::seraph::log!(
+            warn: "no memory for the platform table's records; none added, nothing granted"
+        );
+        false
+    })
+}
+
+/// The platform description table at `entry` of the tables' directory
+/// `dir_cap`, read through procmgr's verified read under its install path,
+/// when it parses and its OEM table ID is `oem_table_id`; `None` otherwise,
+/// logged unless it is a valid table of another machine.
+fn read_table(
+    dir_cap: u64,
+    entry: &[u8],
+    oem_table_id: &[u8; 8],
+    ipc_buf: *mut u64,
+) -> Option<PlatformTable>
+{
+    let Ok(entry) = core::str::from_utf8(entry)
+    else
+    {
+        std::os::seraph::log!(warn: "platform table: an entry not named in UTF-8; passed over");
+        return None;
+    };
+    let path = format!("{PLATFORM_TABLES_PATH}/{entry}");
+    let requested_rights = u64::from(namespace_protocol::rights::READ);
+    // SAFETY: `ipc_buf` is devmgr's registered IPC buffer.
+    let walked =
+        unsafe { ns_client::walk_to_file(dir_cap, entry.as_bytes(), requested_rights, ipc_buf) };
+    let Some(walked) = walked
+    else
+    {
+        std::os::seraph::log!(warn: "platform table {}: not opened; passed over", path);
+        return None;
+    };
+    let data = match std::os::seraph::read_verified(walked.file_cap, walked.size, &path)
+    {
+        Ok(data) => data,
+        Err(e) =>
+        {
+            std::os::seraph::log!(
+                warn: "platform table {}: procmgr's verified read refused it ({:?}); passed over",
+                path,
+                e.kind()
+            );
+            return None;
+        }
+    };
+    match firmware::platform::parse_body(data.bytes())
+    {
+        Ok(table) if table.is_for(oem_table_id) =>
+        {
+            std::os::seraph::log!("platform table {}: read for this machine", path);
+            Some(table)
+        }
+        Ok(_) => None,
+        Err(e) =>
+        {
+            std::os::seraph::log!(warn: "platform table {}: rejected ({:?}); passed over", path, e);
+            None
+        }
+    }
+}
+
+/// Add the devices of the platform description table `table` to `records`,
+/// and return whether it grants native PCI Express hotplug control.
+fn platform_table(table: &PlatformTable, records: &mut PlatformRecords) -> bool
+{
     for device in table.devices()
     {
         let Some(key) = PlatformKey::new(device.key())

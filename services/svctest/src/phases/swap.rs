@@ -8,19 +8,20 @@
 //!
 //! A `swap-fixture` child of `/tests/svctest` registers an uncommitted demand
 //! region of twice memmgr's system reserve, and at least 8 MiB, which it
-//! fills with a pattern of its address except for one chunk it never touches,
-//! so no fault backs its pages (one of them the hole), and a 256 KiB region
-//! registered `REGION_NO_EVICT`, which it fills the same way. Three threads
-//! of its own each keep a 64 KiB array on their stack live and call memmgr's
-//! `QUERY_MEMORY_USAGE` until told to verify. The phase finds the child with
-//! `LIST_PROCESSES`, attaches to it for a thread cap, and reads chunks of its
-//! regions with `SYS_THREAD_READ_MEM`, which does not ask the pager and fails
-//! with `InvalidAddress` on a page that is not present.
+//! fills with a word of each page's offset, repeated over the page, except for
+//! one chunk it never touches, so no fault backs its pages (one of them the
+//! hole), and a 256 KiB region registered `REGION_NO_EVICT`, which it fills
+//! the same way. Three threads of its own each keep a 64 KiB array on their
+//! stack live and call memmgr's `QUERY_MEMORY_USAGE` until told to verify.
+//! The phase finds the child with `LIST_PROCESSES`, attaches to it for a
+//! thread cap, and reads chunks of its regions with `SYS_THREAD_READ_MEM`,
+//! which does not ask the pager and fails with `InvalidAddress` on a page that
+//! is not present.
 //!
 //! The phase then takes grants from memmgr until the pressure level reads
 //! `LOW` and keeps it there, taking more whenever the level falls to
-//! `NORMAL` and giving a block back at `CRITICAL`, until memmgr holds more of
-//! the child's main region swapped than the reserve. It requires:
+//! `NORMAL` and giving a block back at `CRITICAL`, until memmgr holds a quarter
+//! more of the child's main region swapped than the reserve. It requires:
 //!
 //! * a page of the main region that reads `InvalidAddress` reads its pattern
 //!   after procmgr's `MAKE_RESIDENT` of its chunk, and the hole stays not
@@ -709,11 +710,12 @@ fn parse_ready(line: &str) -> Ready
 }
 
 /// The pages of its main region the fixture reports swapped, at least, from its
-/// `swapped <n>` line.
+/// `swapped <n> <charged> <node swapped>` line.
 fn parse_swapped(line: &str) -> u64
 {
     line.trim()
         .strip_prefix("swapped ")
+        .and_then(|n| n.split_whitespace().next())
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("{PHASE}: the fixture answered swapped with {line:?}"))
 }
@@ -798,14 +800,14 @@ fn read_pattern(thread: u64, va: u64, base: u64, xor: u64) -> Result<bool, i64>
 {
     let mut page = [0u8; PAGE_LEN];
     syscall::thread_read_mem(thread, va, &mut page)?;
-    let offset = va.saturating_sub(base);
+    let want = pattern(va, base, xor);
     Ok((0..PAGE_WORDS).all(|word| {
         let start = usize::try_from(word.saturating_mul(8)).unwrap_or(usize::MAX);
         let got = page
             .get(start..start.saturating_add(8))
             .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
             .map(u64::from_ne_bytes);
-        got == Some(offset.saturating_add(word.saturating_mul(8)) ^ xor)
+        got == Some(want)
     }))
 }
 
@@ -921,11 +923,11 @@ fn swap_phase(caps: &Caps)
     let logd = read_logd_stack(authority);
 
     hog.fill_to_low();
-    await_swapped(
-        &mut hog,
-        &mut fixture,
-        reserve.saturating_add(3 * CHUNK_PAGES),
-    );
+    // A restore from the headroom of at most the reserve takes nearly a chunk
+    // of free pages (`pattern`), so the restores that use it up and the one
+    // direct reclaim admits need a little more than the reserve swapped: a
+    // quarter more allows for chunks the clock evicts meanwhile.
+    await_swapped(&mut hog, &mut fixture, reserve.saturating_add(reserve / 4));
     debugger_restore(authority, process, thread, &ready);
     let from_headroom = critical_restore(&mut hog, authority, process, thread, &ready);
     hog.fill_to_low();
@@ -1066,10 +1068,14 @@ fn await_swapped(hog: &mut Hog, fixture: &mut Fixture, want: u64)
         let status = pool();
         if swapped >= want && status.swapped > 0 && status.store > 0
         {
-            println!(
-                "{PHASE}: the fixture reports {swapped} pages of its main region swapped; memmgr \
-                 holds {} bytes swapped in a store of {} bytes",
-                status.swapped, status.store
+            std::os::seraph::log!(
+                "{PHASE}: the fixture reports {:?} (its main region's swapped pages, its \
+                 node's charged and swapped pages); memmgr holds {} bytes swapped in a store of \
+                 {} bytes, reserve {} pages",
+                line.trim(),
+                status.swapped,
+                status.store,
+                status.reserve_pages()
             );
             return;
         }
@@ -1332,8 +1338,17 @@ fn fill_page(va: u64, base: u64, xor: u64)
         // SAFETY: the word is in a region this process registered writable,
         // in a reservation of its own that no Rust object occupies; the
         // write is volatile so that it is made, and faults, here.
-        unsafe { std::ptr::write_volatile(at as *mut u64, at.saturating_sub(base) ^ xor) };
+        unsafe { std::ptr::write_volatile(at as *mut u64, pattern(va, base, xor)) };
     }
+}
+
+/// The word every word of the page at `va` of the region at `base` holds: the
+/// page's offset in the region, XOR `xor`. One word repeated over the page
+/// compresses to a few bytes, so a restore of a chunk of it takes nearly a
+/// chunk of free pages, the store returning almost none.
+const fn pattern(va: u64, base: u64, xor: u64) -> u64
+{
+    (va & !(PAGE_SIZE - 1)).saturating_sub(base) ^ xor
 }
 
 /// Whether each word of the page at `va` reads as [`fill_page`] wrote it.
@@ -1344,7 +1359,7 @@ fn page_intact(va: u64, base: u64, xor: u64) -> bool
         // SAFETY: as in [`fill_page`]; the read restores the page when memmgr
         // evicted it.
         let got = unsafe { std::ptr::read_volatile(at as *const u64) };
-        got == at.saturating_sub(base) ^ xor
+        got == pattern(va, base, xor)
     })
 }
 
@@ -1484,7 +1499,14 @@ fn fixture_main() -> !
         };
         match line.trim()
         {
-            "swapped" => println!("swapped {}", main_swapped_pages(main_pages)),
+            "swapped" =>
+            {
+                let (charged, swapped) = own_usage().unwrap_or((0, 0));
+                println!(
+                    "swapped {} {charged} {swapped}",
+                    main_swapped_pages(main_pages)
+                );
+            }
             "verify" =>
             {
                 VERIFY.store(true, Ordering::Release);

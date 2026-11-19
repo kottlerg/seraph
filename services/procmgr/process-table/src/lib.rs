@@ -1512,8 +1512,9 @@ pub fn request_badge(badge: u64) -> (u64, bool)
 
 /// Whether procmgr serves `opcode` (a label's low 16 bits) on a process
 /// handle: every label but `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`,
-/// `REGISTER_THREAD` and `REGISTER_END_QUEUE`, which name their sender
-/// itself and are served on the child's own procmgr cap alone.
+/// `REGISTER_THREAD`, `REGISTER_END_QUEUE` and `READ_VERIFIED`, which name
+/// their sender itself (`READ_VERIFIED` charges the copy to the sender's
+/// account) and are served on the process's own procmgr cap alone.
 #[must_use]
 pub fn served_on_handle(opcode: u64) -> bool
 {
@@ -1523,6 +1524,7 @@ pub fn served_on_handle(opcode: u64) -> bool
             | ipc::procmgr_labels::DECLARE_NO_CORE
             | ipc::procmgr_labels::REGISTER_THREAD
             | ipc::procmgr_labels::REGISTER_END_QUEUE
+            | ipc::procmgr_labels::READ_VERIFIED
     )
 }
 
@@ -2348,11 +2350,17 @@ mod tests
         use ipc::procmgr_errors::{INVALID_BADGE, UNAUTHORIZED};
         use ipc::procmgr_labels::{
             BIND_DEATH_OBSERVER, DECLARE_NO_CORE, DECLARE_NO_DEBUG, PROCESS_HANDLE_TAG,
-            QUERY_PROCESS, REGISTER_THREAD,
+            QUERY_PROCESS, READ_VERIFIED, REGISTER_THREAD,
         };
         let (own, handle) = (0x50, 0x50 | PROCESS_HANDLE_TAG);
-        // Labels naming their sender are refused on a handle.
-        for opcode in [DECLARE_NO_DEBUG, DECLARE_NO_CORE, REGISTER_THREAD]
+        // Labels naming their sender are refused on a handle. A verified read
+        // on a handle would charge the copy to the child, not its sender.
+        for opcode in [
+            DECLARE_NO_DEBUG,
+            DECLARE_NO_CORE,
+            REGISTER_THREAD,
+            READ_VERIFIED,
+        ]
         {
             assert_eq!(sender_refusal(opcode, handle), Some(INVALID_BADGE));
             assert_eq!(sender_refusal(opcode, own), None);

@@ -18,6 +18,11 @@
 //! memmgr when the buffer drops, once the load has copied the segments out.
 //! [`verify`] checks the copy against the trust store; the loader then
 //! sees only the verified body.
+//!
+//! `READ_VERIFIED` reads a data file the same way, into one run of frames
+//! on its sender's account ([`Shape::Contiguous`]), and once the copy
+//! verifies hands the run to the sender read-only
+//! ([`ImageBuffer::into_read_only`]).
 
 use crate::loader::{ScratchMapping, map_module};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
@@ -35,6 +40,30 @@ const FILE_CAP_CALL_TIMEOUT_MS: u32 = 10_000;
 /// Region ids one `RELEASE_MEMORY_CAPS` names: every data word after the
 /// count.
 const RELEASE_IDS_PER_CALL: usize = MSG_DATA_WORDS_MAX - 1;
+
+/// How the frames of an [`ImageBuffer`] are granted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Shape
+{
+    /// As many runs as memmgr has (`REQUEST_MEMORY_CAPS` best effort): an
+    /// image, whose copy stays procmgr's.
+    BestEffort,
+    /// One run (`REQUIRE_CONTIGUOUS`): a `READ_VERIFIED` copy, which is
+    /// handed to its reader as one cap and one region.
+    Contiguous,
+}
+
+/// The run of a verified `READ_VERIFIED` copy as its reader receives it
+/// ([`ImageBuffer::into_read_only`]).
+pub struct ReadOnlyRun
+{
+    /// A Memory cap on the run carrying `RIGHTS_MEM_MAP` alone.
+    pub cap: u64,
+    /// The run's region id on the account it was granted on.
+    pub region: u64,
+    /// The run's pages.
+    pub pages: u64,
+}
 
 /// The bytes of one object, in frames granted on a child's memmgr account and
 /// mapped writable in procmgr alone, at one contiguous range of procmgr's
@@ -59,20 +88,28 @@ pub struct ImageBuffer
     /// The child's memmgr SEND the frames were granted on.
     memmgr: u64,
     ipc_buf: *mut u64,
+    shape: Shape,
 }
 
 impl ImageBuffer
 {
     /// A buffer of `len` bytes, from frames requested on `memmgr` (the
     /// child's account) until they cover it, each grant mapped writable at
-    /// the next pages of one reservation.
+    /// the next pages of one reservation; with [`Shape::Contiguous`], one
+    /// grant of every page.
     ///
     /// # Errors
     /// `OUT_OF_MEMORY` when `len` is zero or past the address space, no
     /// reservation of its pages is free, memmgr refuses a request or answers
     /// one with a malformed grant; `MAP_FAILED` when a grant cannot be
     /// mapped. Every grant taken is returned.
-    fn new(self_aspace: u64, memmgr: u64, len: u64, ipc_buf: *mut u64) -> Result<Self, u64>
+    fn new(
+        self_aspace: u64,
+        memmgr: u64,
+        len: u64,
+        ipc_buf: *mut u64,
+        shape: Shape,
+    ) -> Result<Self, u64>
     {
         let pages = len.div_ceil(PAGE_SIZE);
         let byte_len = usize::try_from(len).map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
@@ -91,6 +128,7 @@ impl ImageBuffer
             regions: Vec::new(),
             memmgr,
             ipc_buf,
+            shape,
         };
         while buffer.mapped < pages
         {
@@ -101,12 +139,18 @@ impl ImageBuffer
 
     /// Request up to `want` pages on the child's account and map each cap
     /// of the grant at the next unmapped pages; a best-effort grant may cover
-    /// fewer, and the caller asks again for the rest.
+    /// fewer, and the caller asks again for the rest. A contiguous grant is
+    /// one cap of every page, or fails.
     fn grant(&mut self, want: u64) -> Result<(), u64>
     {
         let want = want.min(u64::from(u32::MAX));
+        let flags = match self.shape
+        {
+            Shape::BestEffort => 0,
+            Shape::Contiguous => u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32,
+        };
         let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
-            .word(0, want)
+            .word(0, want | flags)
             .build();
         // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
         let reply = unsafe { ipc::ipc_call(self.memmgr, &msg, self.ipc_buf) }
@@ -182,6 +226,50 @@ impl ImageBuffer
         unsafe { core::slice::from_raw_parts(self.va() as *const u8, self.len) }
     }
 
+    /// Hand the buffer's run to its reader: derive a cap on it carrying
+    /// `RIGHTS_MEM_MAP` alone, unmap the run from procmgr, and delete
+    /// procmgr's own cap, so no process but memmgr holds a cap that can
+    /// write it; the region is the reader's to release from then on. Only a
+    /// [`Shape::Contiguous`] buffer holds the one run this needs.
+    ///
+    /// # Errors
+    /// `OUT_OF_MEMORY` when the buffer is not one run or the derivation
+    /// fails; `MAP_FAILED` when procmgr's mapping will not come down. The
+    /// buffer then drops, returning the run to memmgr.
+    pub fn into_read_only(mut self) -> Result<ReadOnlyRun, u64>
+    {
+        let (&[cap], &[region]) = (self.caps.as_slice(), self.regions.as_slice())
+        else
+        {
+            return Err(procmgr_errors::OUT_OF_MEMORY);
+        };
+        let read_only = syscall::cap_derive(cap, syscall::RIGHTS_MEM_MAP)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        if let Some(range) = self.range.take()
+        {
+            // SAFETY: the span is this buffer's own reservation, and every
+            // slice over it borrows the buffer, which this call owns.
+            if unsafe { syscall::mem_unmap(self.self_aspace, range.va_start(), self.pages) }
+                .is_err()
+            {
+                // Put back for `Drop`, which leaves a span that will not
+                // unmap reserved.
+                self.range = Some(range);
+                let _ = syscall::cap_delete(read_only);
+                return Err(procmgr_errors::MAP_FAILED);
+            }
+            unreserve_pages(range);
+        }
+        let _ = syscall::cap_delete(cap);
+        self.caps.clear();
+        self.regions.clear();
+        Ok(ReadOnlyRun {
+            cap: read_only,
+            region,
+            pages: self.pages,
+        })
+    }
+
     /// The object's bytes, to fill.
     fn bytes_mut(&mut self) -> &mut [u8]
     {
@@ -243,7 +331,7 @@ pub fn read_module(
     {
         return Err(procmgr_errors::INVALID_ARGUMENT);
     }
-    let mut buffer = ImageBuffer::new(self_aspace, memmgr, len, ipc_buf)?;
+    let mut buffer = ImageBuffer::new(self_aspace, memmgr, len, ipc_buf, Shape::BestEffort)?;
     let dst = buffer.bytes_mut();
     // SAFETY: `module` maps the cap's `module_pages` pages read-only from
     // `va()` and `dst.len()` (`len`) is within them; the cap's holder may
@@ -258,7 +346,7 @@ pub fn read_module(
 }
 
 /// Copy the `len`-byte file the caller-transferred node cap `node_cap`
-/// names into a buffer granted on `memmgr`: open it (`FS_OPEN`), copy each
+/// names into a buffer granted on `memmgr` in `shape`: open it (`FS_OPEN`), copy each
 /// cache page `FS_READ_MEMORY` lends (`FS_RELEASE_MEMORY` right after), and
 /// close the open (`FS_CLOSE`). The node cap is deleted, and the open closed
 /// and its caps deleted, on every outcome.
@@ -273,11 +361,12 @@ pub fn read_file(
     len: u64,
     memmgr: u64,
     ipc_buf: *mut u64,
+    shape: Shape,
 ) -> Result<ImageBuffer, u64>
 {
     let file = vfs_open(node_cap, ipc_buf).ok_or(procmgr_errors::IO_ERROR)?;
     let file = std::mem::DropGuard::new(file, move |file| vfs_close(file, ipc_buf));
-    let mut buffer = ImageBuffer::new(self_aspace, memmgr, len, ipc_buf)?;
+    let mut buffer = ImageBuffer::new(self_aspace, memmgr, len, ipc_buf, shape)?;
     let dst = buffer.bytes_mut();
     let mut copied = 0usize;
     while copied < dst.len()

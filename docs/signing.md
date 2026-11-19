@@ -449,6 +449,18 @@ a mode or a mount. How a deployer grants the override, and changes the grant on 
 is decided with the authority work of [#152](https://github.com/kottlerg/seraph/issues/152) and the
 package manager, and the record carries it from then.
 
+Each create therefore costs one Ed25519 verification of its image, with the SHA-512 of the image,
+and a create under a signer procmgr has not yet verified one more, of the signer's certificate. On
+riscv64 under QEMU's TCG emulation that verification is several times slower in procmgr than in
+the bootloader: about 50 to 70 ms per verification (a debug build at 4 vCPUs), against about 10 ms
+for the same code built without the vector extension. Userspace is built for
+`xtask/targets/riscv64a23-seraph.json`, which enables the vector extension (`+v`), so LLVM
+vectorizes the field multiplication, the conditional swap and the point addition of
+[`shared/crypto`](../shared/crypto/README.md) with RVV instructions; the bootloader's target has
+no vector extension, and its copy is scalar. TCG emulates each vector instruction element by
+element through helper calls, so the vector code is the slower one there. The figure is the
+emulator's: the code is the one the target's hardware runs, and no rule bounds the cost.
+
 ---
 
 ## Signing

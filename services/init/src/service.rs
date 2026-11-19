@@ -1376,7 +1376,8 @@ pub struct SvcmgrEndowment
     pub memmgr_service_ep: u64,
     /// Reserved master-log endpoint source (`cap_derive(log_ep, RIGHTS_ALL)`).
     /// svcmgr mints real-logd's master-log RECV from it on every (re)launch,
-    /// plus the one-shot `HANDOVER_PULL` SEND on the first launch. Holding it
+    /// plus the one-shot `HANDOVER_PULL` SEND on the first launch and on a
+    /// restart until procmgr reports init reaped. Holding it
     /// keeps the endpoint object alive across a logd crash so log senders are
     /// agnostic to which process holds the RECV.
     pub master_log_source: u64,

@@ -331,7 +331,7 @@ positional slots, carried with a presence word as
 | Index | Cap |
 |---|---|
 | 0 | `RECV` on the master log endpoint |
-| 1 | `SEND` on the master log endpoint (single-use; the `HANDOVER_PULL` drain then the terminal `HANDOVER_RELEASE`, then deleted; see the [logd handover protocol](../../logd/docs/handover-protocol.md#call-shape)). Absent on a restart once an instance has taken all its bootstrap rounds — no init-logd remains to pull from; present on a restart before that ([Restart Protocol § Death detection](restart-protocol.md#death-detection)) |
+| 1 | `SEND` on the master log endpoint (single-use; the `HANDOVER_PULL` drain then the terminal `HANDOVER_RELEASE`, then deleted; see the [logd handover protocol](../../logd/docs/handover-protocol.md#call-shape)). Absent on a restart once procmgr reports init reaped — no init-logd remains to pull from; present on a restart before that ([Restart Protocol § Death detection](restart-protocol.md#death-detection)) |
 | 2 | badged `SEND\|GRANT` on procmgr carrying `DEATH_EQ_AUTHORITY` (logd registers per-sender death-notifications for slot reclaim; see [logd README](../../logd/README.md#bootstrap-caps)) |
 | 3 | the `serial` class SEND, derived from the `devmgr.class.serial` publication (logd resolves the serial driver via `QUERY_DEVICE`; see [logd README](../../logd/README.md#bootstrap-caps)) |
 | 4 | the `framebuffer` class SEND, derived from the `devmgr.class.framebuffer` publication (logd resolves the framebuffer driver via `QUERY_DEVICE`) |
@@ -344,8 +344,8 @@ present, history pulled from init-logd per the
 from the endowment or not published (slots 3 and 4 when no class file configured the class), or
 whose derive fails, is absent from the round; logd requires only `cap[0]`.
 svcmgr holds the master-log source for the system's life, so the round also
-drives every restart (`cap[1]` absent and the history pull skipped once an
-instance has taken all its bootstrap rounds; present, with the pull, on a
+drives every restart (`cap[1]` absent and the history pull skipped once
+procmgr reports init reaped; present, with the pull, on a
 restart before that), each relaunched logd
 re-attaching a fresh RECV to the same endpoint object every sender already
 targets, with `restart` and `critical` behaving as for any other service. On a

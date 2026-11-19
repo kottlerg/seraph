@@ -973,6 +973,11 @@ reports `RELEASED` once the value rose, and returns the page to memmgr
 (`RELEASE_MEMORY_CAPS`); otherwise it reports `HELD` and keeps the page, which the
 endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 
+Two callers read it. svctest's `init_cspace_released` phase reads both words. svcmgr calls it on
+every restart of the log sink and relies on `data[0] = 1` being reported only after the reap has
+run, which procmgr runs only once both init threads, init-logd among them, have exited; until then
+svcmgr mints the restarted logd the handover SEND.
+
 ---
 
 ## Crash Endpoint and Debug Authority

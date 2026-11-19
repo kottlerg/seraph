@@ -258,6 +258,19 @@ pub fn encode_done() -> IpcMessage
     IpcMessage::new(REPLY_DONE)
 }
 
+/// Bound, in milliseconds, on each of real-logd's handover calls
+/// (`HANDOVER_PULL` and `HANDOVER_RELEASE`), the wait for a receiver and for
+/// its reply together. A restarted logd is minted the handover SEND until
+/// procmgr reports init reaped, which follows init-logd's exit by the reap's
+/// own steps; a logd started in between calls an endpoint no thread receives
+/// on (its own receive workers wait behind their gate), and the bound ends
+/// that call. A tuning bound: it bounds no capacity. It is long enough that
+/// init-logd, which answers each call after the lines queued ahead of it,
+/// answers within it on a loaded system; a call that runs out ends the drain
+/// as a failed call does ([handover-protocol.md](../../docs/handover-protocol.md)
+/// § Failure modes).
+pub const HANDOVER_CALL_TIMEOUT_MS: u32 = 1_000;
+
 /// Wall-clock budget, in microseconds, real-logd spends retrying a
 /// `HANDOVER_RELEASE` call that fails before it leaves init-logd serving.
 /// Time-based, not an attempt count, so a loaded system that runs each

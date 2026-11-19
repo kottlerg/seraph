@@ -518,9 +518,11 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
     }
     else if cause_code == 2
         && (sstatus_at_entry & (1 << 8)) == 0
-        && super::encoding::is_fp_or_v_opcode(stval)
+        && super::encoding::is_lazy_fp_v_trap(sstatus_at_entry, stval)
     {
-        // U-mode illegal-instruction trap on an F/D/V opcode: lazy enable
+        // U-mode illegal-instruction trap on an F/D/V opcode with the units
+        // Off (one refused with them on is the thread's fault, which the
+        // last arm takes): lazy enable
         // by promoting sstatus.FS / sstatus.VS from Off to Initial, then
         // restore the F/D (and V) register file from the thread's per-TCB
         // area. lazy_restore_fp_v mirrors the resulting live FS/VS bits

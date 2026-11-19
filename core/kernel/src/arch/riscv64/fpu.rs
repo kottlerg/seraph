@@ -8,9 +8,10 @@
 //! Concentrates the unsafe surface for FP and Vector state management.
 //! The boot invariant is `sstatus.FS = sstatus.VS = 00 (Off)`. Any F/D or V
 //! instruction in U-mode raises an illegal-instruction trap (`scause = 2`);
-//! the trap handler decodes the opcode (see
-//! [`super::encoding::is_fp_or_v_opcode`]) and lazy-restores via
-//! [`lazy_restore_fp_v`].
+//! the trap handler, which takes such a trap with `FS` Off as the lazy trap
+//! ([`super::encoding::is_lazy_fp_v_trap`]), lazy-restores via
+//! [`lazy_restore_fp_v`]. An F/D/V instruction that traps with the units on
+//! is the thread's illegal-instruction fault.
 //!
 //! The scheduler calls [`switch_out_save`] on switch-out of every user
 //! thread. When `sstatus.FS == 11 (Dirty)` the live F/D register file is
@@ -23,13 +24,7 @@
 //! frame on exit, so any live-CSR change made during dispatch is otherwise
 //! discarded across `sret`.
 
-/// `sstatus.FS` field — bits [14:13]. Two-bit FP unit state: 00=Off,
-/// 01=Initial, 10=Clean, 11=Dirty.
-const SSTATUS_FS_MASK: u64 = 0x3 << 13;
-
-/// `sstatus.VS` field — bits [10:9]. Two-bit Vector unit state, same encoding
-/// as `FS`.
-const SSTATUS_VS_MASK: u64 = 0x3 << 9;
+use super::encoding::{SSTATUS_FS_MASK, SSTATUS_VS_MASK};
 
 /// Force `sstatus.FS = sstatus.VS = 00 (Off)` for the current hart.
 ///
@@ -63,6 +58,31 @@ pub unsafe fn enable_fpu_vector()
 /// No-op test stub: CSR access cannot run in host unit tests.
 #[cfg(test)]
 pub unsafe fn enable_fpu_vector() {}
+
+/// Write a new thread's initial extended state into its save area: the image
+/// its first F/D/V use restores ([`lazy_restore_fp_v`]), and the one
+/// `SYS_THREAD_READ_EXT_REGS` reads until the thread's first switch-out
+/// after that use.
+///
+/// The area is zeroed, and zero is the initial value of every field:
+/// `f0`..`f31` +0.0; `fcsr` 0, rounding to nearest (ties to even) with no
+/// flag accrued, and no field to unmask, since the F and D extensions never
+/// trap on a floating-point exception; `vstart` 0; `vl` 0 with `vtype` 0
+/// (SEW 8, LMUL 1, `vill` clear), a configuration one `vsetvl` restores, as
+/// the V specification asks of the state at reset (it recommends `vill` set,
+/// which differs only to a reader of `vtype`, since a program sets `vtype`
+/// before a vector instruction that depends on it); `vcsr` 0 (`vxrm` round
+/// to nearest up, `vxsat` clear); and `v0`..`v31` zero.
+///
+/// # Safety
+/// `area` must point at `bytes` bytes that the caller owns exclusively and
+/// may write.
+#[cfg(not(test))]
+pub unsafe fn init_save_area(area: *mut u8, bytes: usize)
+{
+    // SAFETY: the caller's contract gives `bytes` writable bytes at `area`.
+    unsafe { core::ptr::write_bytes(area, 0, bytes) };
+}
 
 /// Promote `sstatus.FS` and `sstatus.VS` from 00 (Off) to 01 (Initial) so the
 /// next FP/V instruction executes without re-trapping.
@@ -103,8 +123,8 @@ pub unsafe fn lazy_enable_fp_v_initial() {}
 ///
 /// # Safety
 /// Must execute in supervisor mode. `area` must point at the thread's
-/// per-thread F/D save area (page 6 of its Thread retype slot, zeroed by
-/// `sys_cap_create_thread`). `sstatus.FS` must be non-Off.
+/// per-thread save area (the pages after the TCB page of its Thread retype
+/// slot, `crate::sched::thread_slot`). `sstatus.FS` must be non-Off.
 #[cfg(not(test))]
 #[inline]
 unsafe fn save_fp_to(area: *mut u8)
@@ -167,9 +187,8 @@ unsafe fn save_fp_to(area: *mut u8)
 ///
 /// # Safety
 /// Must execute in supervisor mode. `area` must point at a per-thread
-/// F/D save area previously written by [`save_fp_to`] or zero-initialised
-/// at thread creation (`sys_cap_create_thread`; the zeroed area restores to
-/// f0..f31 = 0.0 and fcsr = 0, matching the architected initial FP state).
+/// F/D save area previously written by [`save_fp_to`] or by
+/// [`init_save_area`] at thread creation.
 #[cfg(not(test))]
 #[inline]
 unsafe fn restore_fp_from(area: *const u8)
@@ -351,13 +370,13 @@ pub unsafe fn lazy_restore_fp_v(area: *const u8, frame: &mut super::trap_frame::
     }
     if !area.is_null()
     {
-        // SAFETY: area is a valid save area pointer or zero-initialised
-        // (slot-resident allocation zeroes the page).
+        // SAFETY: area is the thread's save area, written at its creation
+        // (`init_save_area`) and by its own switch-outs since.
         unsafe { restore_fp_from(area) };
         if vlenb() != 0
         {
-            // SAFETY: as for the F/D restore: the save area is valid or
-            // zero-initialised; `lazy_enable_fp_v_initial` set VS non-Off.
+            // SAFETY: as for the F/D restore: the save area is the thread's;
+            // `lazy_enable_fp_v_initial` set VS non-Off.
             unsafe { restore_v_from(area) };
         }
     }
@@ -605,7 +624,8 @@ unsafe fn save_v_to(area: *mut u8)
 ///
 /// # Safety
 /// Must execute in supervisor mode. `sstatus.VS` must be non-Off. `area`
-/// must be a save area previously written by [`save_v_to`] or zero-init.
+/// must be a save area previously written by [`save_v_to`] or by
+/// [`init_save_area`].
 #[cfg(not(test))]
 #[inline]
 unsafe fn restore_v_from(area: *const u8)

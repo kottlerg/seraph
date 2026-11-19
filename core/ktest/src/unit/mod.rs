@@ -729,6 +729,7 @@ pub fn run_all(ctx: &TestContext)
         "fpu::preempt_isolation_cross_cpu",
         fpu::preempt_isolation_cross_cpu(ctx)
     );
+    run_test!("fpu::initial_state", fpu::initial_state(ctx));
 
     // ── Hardware access syscalls ──────────────────────────────────────────────
     // The merge tests run first: each splits a copy of a boot `Mmio` cap,

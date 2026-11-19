@@ -41,6 +41,7 @@ use registry::{Resolver, Visibility};
 use service::bootstrap_caps;
 use std::os::seraph::{StartupInfo, startup_info};
 use svcmgr_defs::DeathTag;
+use svcmgr_defs::drivers_dir;
 
 /// Monotonic time since the first call, in nanoseconds, for the windowed
 /// restart budget. Saturates rather than wraps.
@@ -397,22 +398,24 @@ fn publish_minted_send(
 const DRIVERS_DIR_PATH: &str = "/services/drivers";
 
 /// Hand devmgr a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
-/// subtree cap and its path via `SET_DRIVERS_DIR`, so devmgr can list the directory, read
-/// the declaration of each driver binary in it, and spawn the drivers that
-/// match its devices (the consoles and the per-arch RTC among them), and,
-/// when the walk finds it, the same-rights cap of the platform description
-/// tables' directory (`devmgr_labels::PLATFORM_TABLES_PATH`), whose tables
-/// devmgr reads first. svcmgr walks its universal root for each dir and mints
-/// a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from the endowed devmgr-registry
-/// source.
+/// subtree cap and its path via `SET_DRIVERS_DIR`, so devmgr can list the
+/// directory, read the declaration of each driver binary in it, and spawn the
+/// drivers that match its devices (the consoles and the per-arch RTC among
+/// them), and, when the walk finds it, the same-rights cap of the platform
+/// description tables' directory (`devmgr_labels::PLATFORM_TABLES_PATH`),
+/// whose tables devmgr reads first. svcmgr walks its universal root for each
+/// dir and mints a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from the endowed
+/// devmgr-registry source.
 ///
-/// The walk goes through vfsd and the call goes to devmgr, so both are
-/// skipped when either is dead (`endowed_servers::death`, read from its
-/// registration in `pending`): a call to a dead server would wait for good.
+/// The walks go through vfsd and the call goes to devmgr, so the step reads
+/// each one's liveness before it and after every call to it that fails, and
+/// ends at a dead one (`svcmgr_defs::drivers_dir::run`,
+/// `endowed_servers::death`): a call to a dead server would wait for good.
 ///
-/// Best-effort: any failure leaves devmgr without a drivers dir, so timed
-/// sees `NO_DEVICE` on its first `QUERY_DEVICE` through the `rtc` class and
-/// degrades to its no-RTC path; the rest of startup proceeds.
+/// Best-effort: any other failure leaves devmgr without a drivers dir, so
+/// none of its drivers starts (the consoles and the RTC among them); timed
+/// sees `NO_DEVICE` on its first `QUERY_DEVICE` through the `rtc` class
+/// and degrades to its no-RTC path; the rest of startup proceeds.
 fn install_drivers_dir(
     caps: &service::SvcmgrCaps,
     pending: &[PendingRegistration],
@@ -430,76 +433,112 @@ fn install_drivers_dir(
         std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: no root_dir_cap");
         return;
     }
-    for server in [endowed_servers::VFSD, endowed_servers::DEVMGR]
+    let mut calls = DriversDirCalls {
+        root_cap,
+        devmgr_registry: caps.devmgr_registry,
+        pending,
+        ipc_buf,
+    };
+    match drivers_dir::run(
+        &mut calls,
+        DRIVERS_DIR_PATH,
+        ipc::devmgr_labels::PLATFORM_TABLES_PATH,
+    )
     {
-        if endowed_servers::death(pending, server, ipc_buf).is_some()
+        drivers_dir::Outcome::Installed { .. } => std::os::seraph::log!("SET_DRIVERS_DIR ok"),
+        drivers_dir::Outcome::Rejected =>
         {
+            std::os::seraph::log!(warn: "SET_DRIVERS_DIR rejected; no driver from the drivers dir");
+        }
+        drivers_dir::Outcome::Dead(server) =>
+        {
+            let server = match server
+            {
+                drivers_dir::Server::Vfsd => endowed_servers::VFSD,
+                drivers_dir::Server::Devmgr => endowed_servers::DEVMGR,
+            };
             std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: {server} is dead");
-            return;
+        }
+        drivers_dir::Outcome::NoDriversDir(e) =>
+        {
+            std::os::seraph::log!(warn: "SET_DRIVERS_DIR: walk {DRIVERS_DIR_PATH} failed: {e}");
+        }
+        drivers_dir::Outcome::NotSent(why) =>
+        {
+            std::os::seraph::log!(warn: "SET_DRIVERS_DIR {why}; no driver from the drivers dir");
+        }
+    }
+}
+
+/// The calls of the `SET_DRIVERS_DIR` step (`svcmgr_defs::drivers_dir`):
+/// walks of `root_cap`, served by vfsd, the request on a
+/// `DRIVERS_DIR_AUTHORITY` SEND derived from `devmgr_registry`, and the
+/// servers' liveness read from their registrations in `pending`.
+struct DriversDirCalls<'a>
+{
+    root_cap: u64,
+    devmgr_registry: u64,
+    pending: &'a [PendingRegistration],
+    ipc_buf: *mut u64,
+}
+
+impl drivers_dir::Calls for DriversDirCalls<'_>
+{
+    type Cap = u64;
+    type Error = std::io::Error;
+
+    fn dead(&mut self, server: drivers_dir::Server) -> bool
+    {
+        let name = match server
+        {
+            drivers_dir::Server::Vfsd => endowed_servers::VFSD,
+            drivers_dir::Server::Devmgr => endowed_servers::DEVMGR,
+        };
+        endowed_servers::death(self.pending, name, self.ipc_buf).is_some()
+    }
+
+    fn walk(&mut self, path: &str) -> std::io::Result<u64>
+    {
+        // Attenuated rights: only what devmgr needs to list the subtree, walk
+        // into it, and read its files; the namespace server intersects per
+        // hop.
+        let rights = u64::from(
+            namespace_protocol::rights::LOOKUP
+                | namespace_protocol::rights::READ
+                | namespace_protocol::rights::READDIR,
+        );
+        std::os::seraph::namespace_lookup_dir(self.root_cap, path, rights)
+    }
+
+    fn send(&mut self, drivers: u64, tables: Option<u64>) -> drivers_dir::Sent
+    {
+        // `RIGHTS_EP_SEND_GRANT` (not bare SEND): SET_DRIVERS_DIR transfers
+        // the dir caps, and the IPC kernel requires the GRANT bit to move
+        // caps.
+        let Ok(bind_ep) = syscall::cap_derive_badge(
+            self.devmgr_registry,
+            syscall::RIGHTS_EP_SEND_GRANT,
+            ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY,
+        )
+        else
+        {
+            return drivers_dir::Sent::NotSent("DRIVERS_DIR_AUTHORITY derive failed");
+        };
+        let sent = send_drivers_dir(bind_ep, drivers, tables, self.ipc_buf);
+        let _ = syscall::cap_delete(bind_ep);
+        match sent
+        {
+            Ok(ipc::devmgr_errors::SUCCESS) => drivers_dir::Sent::Accepted,
+            Ok(_) => drivers_dir::Sent::Rejected,
+            // Not sent, or a transport error before the kernel committed the
+            // transfer: the source slots still own the dir caps.
+            Err(why) => drivers_dir::Sent::NotSent(why),
         }
     }
 
-    // Attenuated rights: only what devmgr needs to list the subtree, walk
-    // into it, and read driver-binary contents; the namespace server
-    // intersects per hop.
-    let rights = u64::from(
-        namespace_protocol::rights::LOOKUP
-            | namespace_protocol::rights::READ
-            | namespace_protocol::rights::READDIR,
-    );
-    let drivers_dir =
-        match std::os::seraph::namespace_lookup_dir(root_cap, DRIVERS_DIR_PATH, rights)
-        {
-            Ok(c) => c,
-            Err(e) =>
-            {
-                std::os::seraph::log!(warn: "SET_DRIVERS_DIR: walk {DRIVERS_DIR_PATH} failed: {e}");
-                return;
-            }
-        };
-
-    // An architecture that installs no platform description table has no
-    // such directory, so a failed walk sends none.
-    let tables_dir = std::os::seraph::namespace_lookup_dir(
-        root_cap,
-        ipc::devmgr_labels::PLATFORM_TABLES_PATH,
-        rights,
-    )
-    .ok();
-    let release = |caps: &[Option<u64>]| {
-        for cap in caps.iter().flatten()
-        {
-            let _ = syscall::cap_delete(*cap);
-        }
-    };
-
-    // `RIGHTS_EP_SEND_GRANT` (not bare SEND): SET_DRIVERS_DIR transfers the
-    // dir caps, and the IPC kernel requires the GRANT bit to move caps.
-    let Ok(bind_ep) = syscall::cap_derive_badge(
-        caps.devmgr_registry,
-        syscall::RIGHTS_EP_SEND_GRANT,
-        ipc::devmgr_labels::DRIVERS_DIR_AUTHORITY,
-    )
-    else
+    fn release(&mut self, cap: u64)
     {
-        std::os::seraph::log!(warn: "SET_DRIVERS_DIR: DRIVERS_DIR_AUTHORITY derive failed");
-        release(&[Some(drivers_dir), tables_dir]);
-        return;
-    };
-
-    let sent = send_drivers_dir(bind_ep, drivers_dir, tables_dir, ipc_buf);
-    let _ = syscall::cap_delete(bind_ep);
-    match sent
-    {
-        Ok(ipc::devmgr_errors::SUCCESS) => std::os::seraph::log!("SET_DRIVERS_DIR ok"),
-        Ok(_) => std::os::seraph::log!(warn: "SET_DRIVERS_DIR rejected; RTC unavailable"),
-        Err(why) =>
-        {
-            // Not sent, or a transport error before the kernel committed the
-            // transfer: the source slots still own the dir caps.
-            release(&[Some(drivers_dir), tables_dir]);
-            std::os::seraph::log!(warn: "SET_DRIVERS_DIR {why}; RTC unavailable");
-        }
+        let _ = syscall::cap_delete(cap);
     }
 }
 

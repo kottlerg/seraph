@@ -471,7 +471,7 @@ See [service-definitions.md](service-definitions.md#restart) for the
 | `POLICY_ON_FAILURE` | Restart only when `exit_reason >= EXIT_FAULT_BASE` |
 | `POLICY_ALWAYS` | Restart on every exit |
 
-Restarts are budgeted per window (`svcmgr_defs::RestartBudget`: three per
+Restarts are budgeted per window (`restart_budget::RestartBudget`: three per
 60 s). A death once the open window's restarts are spent leaves the service
 permanently down — degraded, or a graceful shutdown for `critical = yes` —
 see [restart-protocol.md](restart-protocol.md).

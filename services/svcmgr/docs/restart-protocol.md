@@ -171,7 +171,7 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
    * `POLICY_ALWAYS` → restart unconditionally.
    * A missing restart source (an empty `vfs_path`) reports
      "no restart source" and returns false.
-   * The windowed restart budget (`svcmgr_defs::RestartBudget`) is
+   * The windowed restart budget (`restart_budget::RestartBudget`) is
      charged here: at most `RESTART_BURST` (3) restarts within one
      `RESTART_WINDOW_NS` (60 s) window, the window opening at the first
      restart after the previous one has passed. A spent window reports
@@ -426,7 +426,12 @@ the rest `LOG_CALL_UNANSWERED_TIMEOUT_MS`, per
 once the new instance has started and been served its bootstrap round,
 with one line counting the instances that died during their bootstrap
 before it, and none when no instance follows (the policy or the budget refuses the restart,
-or the restart fails), since no receiver is left to take them. The one line
+or the restart fails), since no receiver is left to take them. Before it writes
+them it tells its log client that the receiver restarted
+(`std::os::seraph::log::receiver_restarted`): a line svcmgr wrote while the dead
+instance received nothing, as when it died in its handover from init-logd before its
+receive workers started, timed out and left svcmgr's later calls at the short bound,
+which the new instance's start outlasts, so the held lines would be dropped. The one line
 written before the respawn is a first launch's death before its bootstrap
 request (§ Death detection), which init-logd, still serving the endpoint,
 receives. A failure

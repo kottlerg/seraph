@@ -27,7 +27,12 @@ filter, and the wire encodings are specified in
 § `stream_labels::STREAM_RECORD`. Every log call is bounded (`LOG_CALL_TIMEOUT_MS`), and once one
 times out the process's later calls take the short `LOG_CALL_UNANSWERED_TIMEOUT_MS` bound until
 one is answered, so a log receiver that stops answering costs a sender one long wait and then a
-short one per line ([docs/limits.md](../../docs/limits.md) § Shared IPC and protocol crates). The
+short one per line ([docs/limits.md](../../docs/limits.md) § Shared IPC and protocol crates).
+`receiver_restarted`, which std exposes as `std::os::seraph::log::receiver_restarted`, returns
+the process to the long bound when it knows a new receiver has started in place of one that
+stopped receiving: svcmgr calls it once it has restarted logd, before it writes the lines it held
+for logd's death, whose start outlasts the short bound
+([Restart Protocol](../../services/svcmgr/docs/restart-protocol.md) § Supervision hierarchy). The
 crate's consumers are std; svctest, whose `log_client` phase drives the wire helpers against an
 endpoint of its own that never answers; init, for `level_entry`; and the host-tested
 `init-log-levels` crate, for `parse_level`.

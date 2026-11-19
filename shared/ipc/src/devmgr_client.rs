@@ -63,7 +63,8 @@ pub unsafe fn report_driver_ready(devmgr_ep: u64, ipc_buf: *mut u64) -> Result<(
 }
 
 /// Why a [`query_device`], [`watch_class`], [`await_device`], or
-/// [`mint_class_send`] call returned no cap.
+/// [`mint_class_send`] call returned no cap, or a [`decline_restart`] call
+/// was not served.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassCallError
 {
@@ -146,6 +147,41 @@ pub unsafe fn watch_class(class_send: u64, ipc_buf: *mut u64)
         note,
         ordinals: reply.word(0),
     })
+}
+
+/// Send [`devmgr_labels::DECLINE_RESTART`] on the class SEND `class_send`
+/// for the driver at instance ordinal `ordinal`, so devmgr does not restart
+/// it when it dies. Logs nothing.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`ClassCallError`]: [`devmgr_errors::REFUSED`] once devmgr holds its
+/// drivers directory, and the other refusals
+/// [`devmgr_labels::DECLINE_RESTART`] names.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std process's main thread)"
+)]
+pub unsafe fn decline_restart(
+    class_send: u64,
+    ordinal: u64,
+    ipc_buf: *mut u64,
+) -> Result<(), ClassCallError>
+{
+    let request = IpcMessage::builder(devmgr_labels::DECLINE_RESTART)
+        .word(0, u64::from(DEVMGR_LABELS_VERSION))
+        .word(1, ordinal)
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(class_send, &request, ipc_buf) }.map_err(ClassCallError::Call)?;
+    match reply.label
+    {
+        devmgr_errors::SUCCESS => Ok(()),
+        label => Err(ClassCallError::Refused(label)),
+    }
 }
 
 /// The driver at the lowest ordinal of the class whose class SEND is

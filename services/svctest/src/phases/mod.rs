@@ -40,7 +40,10 @@
 //!    kills logd, whose next instance holds a fresh table, and runs the
 //!    [`procmgr::logd_forward`] check again against it.
 //! 10. [`logd_sinks`] after [`drivers`] and every phase that uses the
-//!     framebuffer driver: it kills that driver, which nothing restarts.
+//!     framebuffer driver: it kills that driver, whose restart devmgr serves
+//!     at the class's next ordinal, and requires the restart at ordinal 1.
+//!     The `drivers_hwrng_restart` phase last inside [`drivers`], after the
+//!     phases that read the entropy driver, for the same reason.
 //! 11. [`entropyd`] early, before [`logd_restart`]: it reads entropyd's
 //!     first-contribution line, logged once at entropyd's start, from logd's
 //!     history, which a later phase's lines could evict and which the next

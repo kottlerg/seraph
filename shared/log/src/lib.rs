@@ -80,16 +80,18 @@ const STACK_BUF_LEN: usize = CHUNK_SIZE;
 pub const LOG_CALL_TIMEOUT_MS: u32 = 5000;
 
 /// The bound, in milliseconds, on each later log call of the process once
-/// one has timed out, until a call is answered again ([`RECEIVER_UNANSWERED`]):
-/// what a sender pays per line while the log receiver stays wedged.
+/// one has timed out, until a call is answered again or the process is told
+/// that a new receiver has started ([`RECEIVER_UNANSWERED`]): what a sender
+/// pays per line while the log receiver stays wedged.
 pub const LOG_CALL_UNANSWERED_TIMEOUT_MS: u32 = 10;
 
 /// Whether the log receiver has left a log call of this process unanswered:
-/// set when a call times out (`WouldBlock`), cleared when a call is answered,
-/// and left as it is by any other failure, which says nothing of the
-/// receiver ([`unanswered_after`]). While set, log calls are bounded by
-/// [`LOG_CALL_UNANSWERED_TIMEOUT_MS`] instead of [`LOG_CALL_TIMEOUT_MS`]
-/// ([`call_bound`]). Process-wide because every thread of a process logs on
+/// set when a call times out (`WouldBlock`), cleared when a call is answered
+/// or when the process is told that a new receiver has started
+/// ([`receiver_restarted`]), and left as it is by any other failure, which
+/// says nothing of the receiver ([`unanswered_after`]). While set, log calls
+/// are bounded by [`LOG_CALL_UNANSWERED_TIMEOUT_MS`] instead of
+/// [`LOG_CALL_TIMEOUT_MS`] ([`call_bound`]). Process-wide because every thread of a process logs on
 /// the same badged endpoint, so one thread's timeout says the receiver is
 /// answering none of them.
 static RECEIVER_UNANSWERED: AtomicBool = AtomicBool::new(false);
@@ -129,20 +131,41 @@ fn unanswered_after<T>(unanswered: bool, outcome: &Result<T, i64>) -> bool
     }
 }
 
-/// One call of `msg` on `cap`, bounded as [`RECEIVER_UNANSWERED`] selects,
-/// which it then updates from the outcome. The reply's label when the call
-/// was answered.
+/// Forget that the log receiver left a log call of this process unanswered
+/// ([`RECEIVER_UNANSWERED`]), so the process's next log call is bounded by
+/// [`LOG_CALL_TIMEOUT_MS`] again. For a process that knows a new receiver
+/// has started on the log endpoint in place of one that stopped receiving
+/// (svcmgr, once it has restarted logd): a timeout the old receiver caused
+/// says nothing of the new one, whose start takes longer than
+/// [`LOG_CALL_UNANSWERED_TIMEOUT_MS`], so a line written while it starts
+/// would otherwise be dropped.
+pub fn receiver_restarted()
+{
+    RECEIVER_UNANSWERED.store(false, Ordering::Relaxed);
+}
+
+/// One call made by `call` with the bound [`RECEIVER_UNANSWERED`] selects,
+/// which it then updates from the outcome. The reply when the call was
+/// answered.
+fn bounded<T>(call: impl FnOnce(u32) -> Result<T, i64>) -> Option<T>
+{
+    let unanswered = RECEIVER_UNANSWERED.load(Ordering::Relaxed);
+    let outcome = call(call_bound(unanswered));
+    RECEIVER_UNANSWERED.store(unanswered_after(unanswered, &outcome), Ordering::Relaxed);
+    outcome.ok()
+}
+
+/// One call of `msg` on `cap`, bounded as [`RECEIVER_UNANSWERED`] selects
+/// ([`bounded`]). The reply's label when the call was answered.
 ///
 /// # Safety
 /// `ipc_buf` must be this thread's registered IPC buffer page (the contract
 /// of `ipc::ipc_call`).
 unsafe fn bounded_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Option<u64>
 {
-    let unanswered = RECEIVER_UNANSWERED.load(Ordering::Relaxed);
     // SAFETY: the caller's contract covers `ipc_buf`.
-    let outcome = unsafe { ipc::ipc_call_timeout(cap, msg, ipc_buf, call_bound(unanswered)) };
-    RECEIVER_UNANSWERED.store(unanswered_after(unanswered, &outcome), Ordering::Relaxed);
-    outcome.ok().map(|reply| reply.label)
+    bounded(|bound| unsafe { ipc::ipc_call_timeout(cap, msg, ipc_buf, bound) })
+        .map(|reply| reply.label)
 }
 
 /// One log message, `msg`, delivered on `cap` ([`deliver`]): each call
@@ -799,6 +822,41 @@ mod tests
         // Any other failure leaves it as it was.
         assert!(unanswered_after(true, &other));
         assert!(!unanswered_after(false, &other));
+    }
+
+    // Defect caught: the lines svcmgr holds for the death of a log sink that
+    // died while it received nothing (in its handover from init-logd) dropped
+    // by the restarted sink. A line of svcmgr's written while no receiver
+    // received timed out, so every later call took the short bound, which the
+    // restarted sink's start outlasts, and each held line timed out in turn.
+    #[test]
+    fn a_restarted_receiver_gets_the_full_bound_after_a_dead_one_timed_out()
+    {
+        let timeout = || Err::<(), i64>(SyscallError::WouldBlock as i64);
+        // A receiver that starts receiving `start_ms` after a call is made:
+        // it answers a call whose bound outlasts its start.
+        let starting = |start_ms: u32| {
+            move |bound: u32| {
+                if bound > start_ms { Ok(()) } else { timeout() }
+            }
+        };
+        // The restarted logd of the failed boot started receiving about 50 ms
+        // after svcmgr wrote its first held line.
+        let start_ms = 50;
+        assert!(LOG_CALL_UNANSWERED_TIMEOUT_MS < start_ms && start_ms < LOG_CALL_TIMEOUT_MS);
+
+        // A line written while no receiver receives times out.
+        assert_eq!(bounded(|_| timeout()), None);
+        // Its timeout shortens the next call below the restarted receiver's
+        // start: the line is dropped.
+        assert_eq!(bounded(starting(start_ms)), None);
+        // Told of the restart, the process waits the full bound for the next
+        // line, which the restarted receiver answers, and later lines keep the
+        // full bound.
+        receiver_restarted();
+        assert_eq!(bounded(starting(start_ms)), Some(()));
+        assert_eq!(bounded(starting(start_ms)), Some(()));
+        assert!(!RECEIVER_UNANSWERED.load(Ordering::Relaxed));
     }
 
     #[test]

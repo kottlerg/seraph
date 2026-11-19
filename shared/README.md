@@ -27,6 +27,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`recv-pool/`](recv-pool/README.md) | Worker-pool receive helper: several threads serving one endpoint, each on its own IPC buffer page |
 | [`registry/`](registry/README.md) | Growable name→endpoint-cap registry used by supervisor services |
 | [`registry-client/`](registry-client/README.md) | Client-side helper for the svcmgr name→cap discovery registry |
+| [`restart-budget/`](restart-budget/README.md) | Windowed restart budget svcmgr keeps per service and devmgr per device record whose driver it restarts |
 | [`riscv-step/`](riscv-step/README.md) | Successor-address decoder a debugger single-steps a riscv64 thread with |
 | [`shmem/`](shmem/README.md) | Shared-memory byte transport — multi-page `SharedBuffer` plus SPSC ring |
 | [`svc-grammar/`](svc-grammar/README.md) | Line grammar of the `.svc` files (`key = value`, `#` comments), shared by svcmgr's definition and class parsers and devmgr's platform table parser |

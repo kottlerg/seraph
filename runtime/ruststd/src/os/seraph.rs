@@ -1721,6 +1721,16 @@ pub mod log {
         unsafe { ::log::register_name(cap, buf, name) };
     }
 
+    /// Tell this process's log client that a new log receiver has started
+    /// on the log endpoint in place of one that stopped receiving, so the
+    /// next log call waits the full bound again even when an earlier one
+    /// timed out (`::log::receiver_restarted`). svcmgr calls it once it has
+    /// restarted logd, before it writes the lines it held for logd's death.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn receiver_restarted() {
+        ::log::receiver_restarted();
+    }
+
     /// Macro entry point of a bare `log!`: [`__emit_at`] at the info
     /// level.
     #[doc(hidden)]

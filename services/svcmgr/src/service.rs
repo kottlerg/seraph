@@ -11,7 +11,7 @@
 
 use std::os::seraph::StartupInfo;
 
-use svcmgr_defs::RestartBudget;
+use restart_budget::RestartBudget;
 use svcmgr_endowment::{DecodeError, kind as endow_kind};
 
 use crate::definitions::reconcile::PendingRegistration;

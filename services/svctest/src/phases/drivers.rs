@@ -33,6 +33,16 @@
 //! the `devmgr.class.hwrng` class SEND: a `READ` of the most bytes one reply
 //! carries answers with at least one byte and no more than asked, two such
 //! reads differ, and a `READ` of no bytes answers with none.
+//!
+//! The hwrng restart phase kills the entropy driver, through the debug
+//! authority, with a fault at an unmapped address, and requires devmgr to
+//! restart it (services/devmgr/docs/responsibilities.md § Driver Restart):
+//! the killed driver's ordinal answers `WITHDRAWN`, the class's next ordinal
+//! answers with a new instance, started from the driver's installed path,
+//! and a `READ` through it answers with bytes, so the new instance was given
+//! its device's registers, interrupt and DMA again.
+
+use std::time::{Duration, Instant};
 
 use hwrng_protocol::{MAX_READ_BYTES, errors as hwrng_errors};
 use syscall_abi::MSG_CAP_SLOTS_MAX;
@@ -54,6 +64,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "drivers_hwrng_read",
             run: hwrng_read_phase,
+        },
+        Phase {
+            name: "drivers_hwrng_restart",
+            run: hwrng_restart_phase,
         },
     ]
 }
@@ -506,4 +520,82 @@ fn hwrng_read_phase(caps: &Caps)
     );
     let _ = syscall::cap_delete(driver);
     std::os::seraph::log!("drivers hwrng read phase passed ({n1} and {n2} bytes)");
+}
+
+/// The entropy driver's process name: its install path, which devmgr creates
+/// it with as its `argv[0]`.
+const HWRNG_NAME: &[u8] = b"/services/drivers/virtio-rng";
+
+/// How long the restart phase waits, at most, for the killed driver to be
+/// gone and its ordinal withdrawn.
+const RESTART_DEATH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Kill the entropy driver and require devmgr to restart it (see the module
+/// documentation).
+fn hwrng_restart_phase(caps: &Caps)
+{
+    assert!(
+        caps.hwrng_class != 0,
+        "drivers hwrng restart: no devmgr.class.hwrng cap seeded"
+    );
+    assert_ne!(
+        caps.debug_authority, 0,
+        "drivers hwrng restart: no debug authority"
+    );
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let (ordinal, served) = unsafe { ipc::first_device_from(caps.hwrng_class, 0, ipc_buf) }
+        .unwrap_or_else(|e| panic!("drivers hwrng restart: no hwrng driver ({e:?})"));
+    let _ = syscall::cap_delete(served);
+    let process = super::crash::badge_named(caps.debug_authority, HWRNG_NAME)
+        .expect("drivers hwrng restart: LIST_PROCESSES lists no entropy driver");
+
+    super::logd_sinks::kill(caps.debug_authority, process, "virtio-rng");
+    super::logd_sinks::await_gone(caps.debug_authority, process, HWRNG_NAME, "virtio-rng");
+    let start_at = Instant::now();
+    loop
+    {
+        // SAFETY: as above.
+        match unsafe { ipc::query_device(caps.hwrng_class, ordinal, ipc_buf) }
+        {
+            Ok(copy) =>
+            {
+                let _ = syscall::cap_delete(copy);
+            }
+            Err(ipc::ClassCallError::Refused(ipc::devmgr_errors::WITHDRAWN)) => break,
+            Err(e) => panic!("drivers hwrng restart: querying ordinal {ordinal} ({e:?})"),
+        }
+        assert!(
+            start_at.elapsed() < RESTART_DEATH_TIMEOUT,
+            "drivers hwrng restart: devmgr has not withdrawn the killed driver"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // devmgr posts the restart in the hold that withdraws the dead driver, so
+    // this query waits for the restart's settle.
+    let next = ordinal.saturating_add(1);
+    // SAFETY: as above.
+    let driver =
+        unsafe { ipc::query_device(caps.hwrng_class, next, ipc_buf) }.unwrap_or_else(|e| {
+            panic!("drivers hwrng restart: no driver restarted at ordinal {next} ({e:?})")
+        });
+    let restarted = super::crash::badge_named(caps.debug_authority, HWRNG_NAME)
+        .expect("drivers hwrng restart: LIST_PROCESSES lists no restarted entropy driver");
+    assert_ne!(
+        restarted, process,
+        "drivers hwrng restart: the killed driver is listed"
+    );
+    let mut bytes = [0u8; MAX_READ_BYTES];
+    let n = hwrng_read(driver, &mut bytes);
+    assert!(
+        n >= HWRNG_COMPARE_BYTES,
+        "drivers hwrng restart: the restarted driver answered READ({MAX_READ_BYTES}) with {n} \
+         bytes"
+    );
+    let _ = syscall::cap_delete(driver);
+    std::os::seraph::log!(
+        "drivers hwrng restart phase passed (ordinal {ordinal} withdrawn, ordinal {next} served, \
+         {n} bytes read)"
+    );
 }

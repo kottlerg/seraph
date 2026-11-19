@@ -39,10 +39,21 @@
 //!   serial-stopped case. A call to the dead driver ends only when devmgr
 //!   revokes its endpoint, after the `WITHDRAWN` answer, so the first line
 //!   can still wait out the stall bound on a writer blocked in such a call.
+//! - **Framebuffer restarted.** devmgr restarts the killed driver
+//!   (services/devmgr/docs/responsibilities.md § Driver Restart): the phase
+//!   requires the class's next ordinal to answer with the new instance, and
+//!   logd to write to it. It stops the new instance and sends more than a
+//!   queue's worth of lines: once logd has resolved the new instance on its
+//!   class watch, its framebuffer writer blocks in a write to it, and a line
+//!   that finds the queue full waits out the stall bound, which a sink that
+//!   resolved no driver never makes a line do. Until then the phase starts
+//!   the instance, waits, and tries again, within a bound. The lines' calls
+//!   stay under the serial-stopped case's bounds, the last is in logd's
+//!   history, and once the instance is started again logd writes it the
+//!   queued lines and the line counting its drops.
 //!
-//! No driver restarts a killed one yet, so the case ends with the framebuffer
-//! sink resolving no driver; the serial driver is only stopped, since a kill
-//! would end the console the boot is judged on.
+//! The serial driver is only stopped, since a kill would end the console the
+//! boot is judged on.
 
 use std::time::{Duration, Instant};
 
@@ -94,11 +105,22 @@ const STALL_BOUND: Duration = Duration::from_millis(SINK_STALL_MS as u64);
 /// instruction pointer is set to.
 const UNMAPPED_IP: u64 = 0;
 
-/// How long the phase waits, at most, for the killed driver to be gone.
+/// How long the phase waits, at most, for the killed driver to be gone, and
+/// for logd to write to the restarted one.
 const DEATH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The shortest call that counts as a line waiting out the stall bound: half
+/// of it. A line dropped by a sink that resolved no driver is answered in
+/// well under a millisecond, and one that waits on a blocked writer waits
+/// until the bound from the writer's call, sent a few milliseconds earlier.
+const STALL_SEEN: Duration = Duration::from_millis(SINK_STALL_MS as u64 / 2);
+
+/// How long the phase waits between tries for logd to resolve the restarted
+/// framebuffer driver.
+const RESOLVE_RETRY: Duration = Duration::from_millis(200);
+
 /// Check logd's sinks around a stopped serial driver and a stopped, then
-/// killed, framebuffer driver (see the module documentation).
+/// killed and restarted, framebuffer driver (see the module documentation).
 pub fn logd_sinks_phase(caps: &Caps)
 {
     let authority = caps.debug_authority;
@@ -112,7 +134,7 @@ pub fn logd_sinks_phase(caps: &Caps)
     let lines = send_lines("serial stopped", SERIAL_STOP_LINES, 0, LOG_CALL_BOUND);
     start(&threads, "serial");
     detach(authority, serial, threads, "serial");
-    let lines = lines.unwrap_or_else(|e| panic!("{e}"));
+    let (lines, _) = lines.unwrap_or_else(|e| panic!("{e}"));
     check_retained(caps.logd_query, &lines, "serial stopped");
     std::os::seraph::log!(
         "logd_sinks: {SERIAL_STOP_LINES} lines answered while the serial driver was stopped"
@@ -136,15 +158,15 @@ pub fn logd_sinks_phase(caps: &Caps)
     let took = start_at.elapsed().as_millis();
     start(&threads, "framebuffer");
     detach(authority, fb, threads, "framebuffer");
-    let lines = lines.unwrap_or_else(|e| panic!("{e}"));
+    let (lines, _) = lines.unwrap_or_else(|e| panic!("{e}"));
     check_retained(caps.logd_query, &lines, "framebuffer stopped");
     std::os::seraph::log!(
         "logd_sinks: {FLOOD_LINES} lines answered in {took} ms while the framebuffer driver was \
          stopped"
     );
 
-    kill(authority, fb);
-    await_gone(authority, fb);
+    kill(authority, fb, "framebuffer");
+    await_gone(authority, fb, FRAMEBUFFER_NAME, "framebuffer");
     await_withdrawn(caps.framebuffer_deny_class);
     let start_at = Instant::now();
     if let Err(e) = send_lines(
@@ -160,6 +182,69 @@ pub fn logd_sinks_phase(caps: &Caps)
     std::os::seraph::log!(
         "logd_sinks: {FLOOD_LINES} lines answered in {took} ms after the framebuffer driver died"
     );
+
+    await_restarted(caps.framebuffer_deny_class);
+    let restarted = super::crash::badge_named(authority, FRAMEBUFFER_NAME)
+        .expect("logd_sinks: LIST_PROCESSES lists no restarted framebuffer driver");
+    let longest = await_stall_on(caps.logd_query, authority, restarted);
+    std::os::seraph::log!(
+        "logd_sinks: logd writes to the restarted framebuffer driver (a line waited {} ms on it)",
+        longest.as_millis()
+    );
+}
+
+/// Wait until devmgr serves the framebuffer class's ordinal 1, the restart
+/// of the killed driver at ordinal 0, on `class`, a SEND on that class.
+/// devmgr posts the restart in the hold that withdraws the dead driver, so a
+/// query of the next ordinal received after the `WITHDRAWN` answer waits
+/// for the restart's settle and names the new instance, or `NO_DEVICE`
+/// when there is none.
+fn await_restarted(class: u64)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+    match unsafe { ipc::query_device(class, 1, ipc_buf) }
+    {
+        Ok(copy) =>
+        {
+            let _ = syscall::cap_delete(copy);
+        }
+        Err(e) => panic!("logd_sinks: devmgr did not restart the framebuffer driver ({e:?})"),
+    }
+}
+
+/// Stop the restarted framebuffer driver `process` and flood logd until a
+/// line waits out the stall bound on it (see the module documentation),
+/// starting the driver again after each try; the longest call of that try.
+/// Each try's calls must stay under the flood's bounds, and the last line
+/// sent must be in logd's history, read through `query`.
+fn await_stall_on(query: u64, authority: u64, process: u64) -> Duration
+{
+    let start_at = Instant::now();
+    loop
+    {
+        let threads = attach(authority, process, "restarted framebuffer");
+        stop(&threads, "restarted framebuffer");
+        let sent = send_lines(
+            "restarted framebuffer stopped",
+            FLOOD_LINES,
+            FLOOD_LINE_BYTES,
+            LOG_CALL_BOUND,
+        );
+        start(&threads, "restarted framebuffer");
+        detach(authority, process, threads, "restarted framebuffer");
+        let (lines, longest) = sent.unwrap_or_else(|e| panic!("{e}"));
+        if longest >= STALL_SEEN
+        {
+            check_retained(query, &lines, "restarted framebuffer stopped");
+            return longest;
+        }
+        assert!(
+            start_at.elapsed() < DEATH_TIMEOUT,
+            "logd_sinks: logd's framebuffer writer did not reach the restarted driver"
+        );
+        std::thread::sleep(RESOLVE_RETRY);
+    }
 }
 
 /// Attach to `process`, the driver named `what`, and check that it is
@@ -250,18 +335,20 @@ fn detach(authority: u64, process: u64, threads: Vec<u64>, what: &str)
 /// (newline included) when longer than its text, one raw `STREAM_BYTES` call
 /// each on svctest's log cap. The first must be answered within `first`,
 /// every later one within [`STALL_BOUND`]. Each line's text before its
-/// padding, or the first failure: no assertion panics here, since a sink
-/// driver may be stopped, and a panic's message would wait behind it.
+/// padding, with the longest call, or the first failure: no assertion panics
+/// here, since a sink driver may be stopped, and a panic's message would
+/// wait behind it.
 fn send_lines(
     case: &str,
     count: usize,
     pad_to: usize,
     first: Duration,
-) -> Result<Vec<Vec<u8>>, String>
+) -> Result<(Vec<Vec<u8>>, Duration), String>
 {
     let cap = std::os::seraph::log::acquire();
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut sent = Vec::with_capacity(count);
+    let mut longest = Duration::ZERO;
     for i in 0..count
     {
         let within = if i == 0 { first } else { STALL_BOUND };
@@ -292,9 +379,10 @@ fn send_lines(
                 took.as_millis()
             ));
         }
+        longest = longest.max(took);
         sent.push(head);
     }
-    Ok(sent)
+    Ok((sent, longest))
 }
 
 /// Require a line that starts with the last of `lines` in logd's history.
@@ -308,28 +396,32 @@ fn check_retained(query: u64, lines: &[Vec<u8>], case: &str)
     );
 }
 
-/// Kill the driver `process`: stop its main thread, set its instruction
-/// pointer to [`UNMAPPED_IP`], and start it, so it takes a fault no handler
-/// resolves, as the `logd_restart` phase kills logd.
-fn kill(authority: u64, process: u64)
+/// Kill the driver `process`, named `what`: stop its main thread, set its
+/// instruction pointer to [`UNMAPPED_IP`], and start it, so it takes a fault
+/// no handler resolves, as the `logd_restart` phase kills logd. The attach
+/// checks as [`attach`] does.
+pub(super) fn kill(authority: u64, process: u64, what: &str)
 {
-    let threads = attach(authority, process, "framebuffer");
+    let threads = attach(authority, process, what);
     let main = *threads
         .first()
-        .expect("logd_sinks: the framebuffer attach returned no thread");
-    syscall::thread_stop(main).expect("logd_sinks: stopping the framebuffer main thread");
+        .unwrap_or_else(|| panic!("logd_sinks: the {what} attach returned no thread"));
+    syscall::thread_stop(main)
+        .unwrap_or_else(|e| panic!("logd_sinks: stopping the {what} main thread ({e})"));
     let mut regs = [0u8; REGS_SIZE];
     syscall::thread_read_regs(main, &mut regs)
-        .expect("logd_sinks: reading the framebuffer main thread's registers");
+        .unwrap_or_else(|e| panic!("logd_sinks: reading the {what} main thread's registers ({e})"));
     regs.get_mut(IP_OFFSET..IP_OFFSET + 8)
         .expect("logd_sinks: the instruction pointer within the register file")
         .copy_from_slice(&UNMAPPED_IP.to_ne_bytes());
-    // SAFETY: the thread is the framebuffer driver's, bound to its address
-    // space, so the frame it resumes on touches none of svctest's memory; the
-    // write only makes it fault.
-    unsafe { syscall::thread_write_regs(main, &regs) }
-        .expect("logd_sinks: writing the framebuffer main thread's instruction pointer");
-    syscall::thread_start(main).expect("logd_sinks: starting the framebuffer main thread");
+    // SAFETY: the thread is the driver's, bound to its address space, so the
+    // frame it resumes on touches none of svctest's memory; the write only
+    // makes it fault.
+    unsafe { syscall::thread_write_regs(main, &regs) }.unwrap_or_else(|e| {
+        panic!("logd_sinks: writing the {what} main thread's instruction pointer ({e})")
+    });
+    syscall::thread_start(main)
+        .unwrap_or_else(|e| panic!("logd_sinks: starting the {what} main thread ({e})"));
     for cap in threads
     {
         let _ = syscall::cap_delete(cap);
@@ -366,15 +458,19 @@ fn await_withdrawn(class: u64)
     }
 }
 
-/// Wait until `LIST_PROCESSES` no longer lists `process`.
-fn await_gone(authority: u64, process: u64)
+/// Wait until `LIST_PROCESSES` no longer lists `process`, the driver named
+/// `what` whose process name is `name`.
+pub(super) fn await_gone(authority: u64, process: u64, name: &[u8], what: &str)
 {
     let start_at = Instant::now();
-    while super::crash::badge_named(authority, FRAMEBUFFER_NAME) == Some(process)
+    while super::crash::find_listed(authority, |badge, listed| {
+        badge == process && listed == name
+    })
+    .is_some()
     {
         assert!(
             start_at.elapsed() < DEATH_TIMEOUT,
-            "logd_sinks: the killed framebuffer driver is still listed"
+            "logd_sinks: the killed {what} driver is still listed"
         );
         std::thread::sleep(Duration::from_millis(10));
     }

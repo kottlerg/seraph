@@ -580,7 +580,7 @@ fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u6
     };
     match thread
     {
-        Some(thread) => read_thread(thread, ip, kind, authority, ipc_buf, &mut out),
+        Some(thread) => read_thread(thread, ip, kind, authority, generation, ipc_buf, &mut out),
         // The bytes at `ip` through any thread: the threads share the space.
         None => out.code = read_code(first, ip),
     }
@@ -637,12 +637,15 @@ fn page_at_named(
 /// never registered carries its spawner's badge), and the bytes at `ip` in
 /// any case, through the address space every thread of the process shares.
 /// A stack page memmgr evicted is made resident through the debug authority
-/// `authority` for the walk ([`read_stack`]).
+/// `authority` for the walk ([`read_stack`]), under a bound of the fault's:
+/// at most `ipc::PENDING_TRIES` pauses over the whole walk, and no request
+/// once the fault's `generation` has fired.
 fn read_thread(
     thread: u64,
     ip: u64,
     kind: Thread,
     authority: u64,
+    generation: u64,
     ipc_buf: *mut u64,
     out: &mut Gathered,
 )
@@ -666,9 +669,14 @@ fn read_thread(
     if let Some(image) = out.image
     {
         let process = out.badge;
+        let stop = || fired(generation);
+        let mut bound = ipc::ResidentBound::new(&stop);
         let stack = read_stack(word_at(&file, arch::current::SP_OFFSET), |at, part| {
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            unsafe { ipc::read_mem_resident(authority, process, thread, at, part, ipc_buf) }.is_ok()
+            unsafe {
+                ipc::read_mem_resident_bounded(authority, process, thread, at, part, ipc_buf, &mut bound)
+            }
+            .is_ok()
         });
         out.frames.extend(crash_report::walk::scan(
             &stack,
@@ -703,7 +711,7 @@ fn read_code(thread: u64, ip: u64) -> Vec<u8>
 /// The stack from `sp` (rounded down to a word) up, at most
 /// [`STACK_SCAN_BYTES`], read a page at a time with `read`, stopping at the
 /// first page it does not read: one not present, which procmgr could not
-/// make resident ([`ipc::read_mem_resident`]).
+/// make resident within the fault's bound ([`ipc::read_mem_resident_bounded`]).
 fn read_stack(sp: u64, mut read: impl FnMut(u64, &mut [u8]) -> bool) -> Vec<u8>
 {
     let mut stack = Vec::new();

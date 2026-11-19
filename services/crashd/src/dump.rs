@@ -180,9 +180,14 @@ fn capture(
                 .map(|t| word_at(&t.regs, arch::current::SP_OFFSET)),
         )
         .collect();
+    // One bound for every resident request of the dump: a swap service that
+    // is down costs the dump one bound's pauses, about a second, and none is
+    // sent once the dump's generation has fired.
+    let stop = || fired(generation);
+    let mut bound = ipc::ResidentBound::new(&stop);
     // The list holds only mapped pages: first have memmgr restore, with the
     // threads held, what the core keeps first.
-    restore_first(&first, target.process, authority, generation, ipc_buf);
+    restore_first(&first, target.process, authority, ipc_buf, &mut bound);
     let runs = match list_runs(reader, generation)
     {
         Ok(runs) => runs,
@@ -229,23 +234,30 @@ fn capture(
         authority,
         ipc_buf,
     };
-    write_core(&core, &name, &source, generation)
+    write_core(&core, &name, &source, generation, &mut bound)
 }
 
 /// Have memmgr restore the chunks it evicted of `process` from the page of
 /// each address of `first` up, an equal share of the core's budget each
-/// (`ipc::make_resident`), so the list of mapped pages holds them and the core
-/// records them. A chunk on disk memmgr asks the swap service to restore, and
-/// this pauses and asks again, as `ipc::make_resident` does, at most
-/// `ipc::PENDING_TRIES` times over the whole dump (`ipc::resident_range`); a
-/// chunk the swap service does not restore by then is left out, as one not
-/// present, and the rest of each range is still restored. No more is restored: the core keeps at most [`CORE_BYTES_MAX`] of
-/// pages, and a restore for a process about to die spends the free pages, and other processes' idle chunks, that memmgr
-/// keeps for restores. A chunk memmgr cannot restore, for want of memory, is
-/// left out of the list, as it is not present. Each request is started only
-/// while the dump's generation has not fired, so a dump past its bound starts
-/// no more.
-fn restore_first(first: &[u64], process: u64, authority: u64, generation: u64, ipc_buf: *mut u64)
+/// (`ipc::make_resident_bounded`), so the list of mapped pages holds them and
+/// the core records them. A chunk on disk memmgr asks the swap service to
+/// restore, and this pauses and asks again under the dump's `bound`, which
+/// the dump's reads of its pages share ([`write_loads`]): at most
+/// `ipc::PENDING_TRIES` pauses over the whole dump; a chunk the swap service
+/// does not restore by then is left out, as one not present, and the rest of
+/// each range is still restored. No more is restored: the core keeps at most
+/// [`CORE_BYTES_MAX`] of pages, and a restore for a process about to die
+/// spends the free pages, and other processes' idle chunks, that memmgr keeps
+/// for restores. A chunk memmgr cannot restore, for want of memory, is left
+/// out of the list, as it is not present. The bound stops once the dump's
+/// generation has fired, so a dump past its bound starts no more requests.
+fn restore_first(
+    first: &[u64],
+    process: u64,
+    authority: u64,
+    ipc_buf: *mut u64,
+    bound: &mut ipc::ResidentBound<'_>,
+)
 {
     let anchors = u64::try_from(first.len()).unwrap_or(u64::MAX);
     let share = CORE_BYTES_MAX
@@ -253,32 +265,17 @@ fn restore_first(first: &[u64], process: u64, authority: u64, generation: u64, i
         .unwrap_or(CORE_BYTES_MAX)
         .max(PAGE_SIZE)
         & !(PAGE_SIZE - 1);
-    // One pause count for the whole dump: a swap service that is down costs
-    // the dump one bound's wait, about a second, not one per anchor.
-    let mut pauses: u32 = 0;
     for &anchor in first
     {
         let at = anchor & !(PAGE_SIZE - 1);
-        let end = at.saturating_add(share);
+        let len = at.saturating_add(share).saturating_sub(at);
         // memmgr does a bounded part of the range per request and replies
-        // where it stopped; a refusal, a reply that made no progress, or a
-        // fired generation ends this range, and once the dump's pauses are
-        // spent its chunks on disk are passed over.
-        let _ = ipc::resident_range(
-            at,
-            end,
-            &mut pauses,
-            |from| {
-                if fired(generation)
-                {
-                    return None;
-                }
-                // SAFETY: ipc_buf is the registered IPC buffer page.
-                unsafe { ipc::make_resident_step(authority, process, from, end, ipc_buf) }
-            },
-            || std::thread::sleep(std::time::Duration::from_millis(ipc::PENDING_PAUSE_MS)),
-        );
-        if fired(generation)
+        // where it stopped; a refusal, a reply that made no progress, or the
+        // bound's stop ends this range, and once the dump's pauses are spent
+        // its chunks on disk are passed over.
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::make_resident_bounded(authority, process, at, len, ipc_buf, bound) };
+        if bound.stopped()
         {
             return;
         }
@@ -287,7 +284,8 @@ fn restore_first(first: &[u64], process: u64, authority: u64, generation: u64, i
 
 /// Where a dump reads the process's pages: through the held thread `reader`,
 /// asking procmgr through `authority` to make a page memmgr evicted since
-/// the pages were listed resident again ([`ipc::read_mem_resident`]).
+/// the pages were listed resident again, under the dump's bound
+/// ([`ipc::read_mem_resident_bounded`]).
 struct Source
 {
     reader: u64,
@@ -487,9 +485,15 @@ fn list_runs(reader: u64, generation: u64) -> Result<Vec<Run>, Outcome>
 }
 
 /// Write `core` for the process named `name`, reading its pages from
-/// `source`: make room for it, write it under its `.part` name, and rename
-/// it once complete.
-fn write_core(core: &layout::Core, name: &[u8], source: &Source, generation: u64) -> Outcome
+/// `source` under the dump's `bound`: make room for it, write it under its
+/// `.part` name, and rename it once complete.
+fn write_core(
+    core: &layout::Core,
+    name: &[u8],
+    source: &Source,
+    generation: u64,
+    bound: &mut ipc::ResidentBound<'_>,
+) -> Outcome
 {
     let seq = match make_room(core.size, generation)
     {
@@ -514,7 +518,7 @@ fn write_core(core: &layout::Core, name: &[u8], source: &Source, generation: u64
     {
         return outcome;
     }
-    if let Err(outcome) = write_loads(&mut file, core, source, generation)
+    if let Err(outcome) = write_loads(&mut file, core, source, generation, bound)
     {
         return outcome;
     }
@@ -606,12 +610,16 @@ fn make_room(size: u64, generation: u64) -> Result<u64, Outcome>
 
 /// Write the file bytes of each load of `core` to `file`, reading them from
 /// `source` one page at a time; a page the kernel refuses to copy, and
-/// procmgr cannot make resident, is written as zeros.
+/// procmgr cannot make resident under the dump's `bound`, is written as
+/// zeros. The bound's pauses are the dump's ([`restore_first`]), and once the
+/// dump's generation has fired no page is asked for: the next write ends the
+/// dump.
 fn write_loads(
     file: &mut File,
     core: &layout::Core,
     source: &Source,
     generation: u64,
+    bound: &mut ipc::ResidentBound<'_>,
 ) -> Result<(), Outcome>
 {
     let mut buf = vec![0u8; COPY_BYTES];
@@ -634,13 +642,14 @@ fn write_loads(
             {
                 // SAFETY: `source.ipc_buf` is the registered IPC buffer page.
                 let read = unsafe {
-                    ipc::read_mem_resident(
+                    ipc::read_mem_resident_bounded(
                         source.authority,
                         source.process,
                         source.reader,
                         at,
                         page,
                         source.ipc_buf,
+                        bound,
                     )
                 };
                 if read.is_err()

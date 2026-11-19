@@ -562,9 +562,10 @@ commitment is admitted against `data[3] + data[14]` less it and the growth
 floor, and every other admission reads the free pages outside it, so a free
 page it counts beyond the allowance is refused to every other charge.
 `store_bytes` (`data[9]`) and `swapped_bytes` (`data[10]`) rise as memmgr
-evicts cold chunks under pressure and fall as faults restore them or their regions go; their ratio is the store's
-compression; a chunk on disk leaves `data[9]` and stays in `data[10]`, and
-`data[12]` counts it. `data[3]` to `data[14]` are appended after the identity terms;
+evicts cold chunks under pressure and fall as faults restore them or their
+regions go; their ratio is the store's compression; a chunk on disk leaves
+`data[9]` and stays in `data[10]`, and `data[12]` counts it. `data[3]` to
+`data[14]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`

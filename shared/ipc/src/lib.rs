@@ -140,6 +140,10 @@ pub fn name_block(req: &IpcMessage, at: usize, max: usize) -> Option<&[u8]>
 pub const PROCMGR_LABELS_VERSION: u32 = 21;
 pub mod procmgr_labels;
 
+mod procmgr_debug_client;
+
+pub use procmgr_debug_client::{make_resident, read_mem_resident};
+
 pub mod sched_policy;
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above

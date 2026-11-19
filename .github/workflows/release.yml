@@ -4,7 +4,8 @@
 # .github/workflows/release.yml
 
 # Release production on a tag push: the preflight checks, the release
-# images, and the draft Release (docs/conventions.md § Release Production).
+# images and their symbols archives, and the draft Release
+# (docs/conventions.md § Release Production).
 
 name: release
 
@@ -114,6 +115,18 @@ jobs:
           zstd -19 -T0 disk.img -o "${OUT}"
           sha256sum "${OUT}" > "${OUT}.sha256"
 
+      # The build's symbols store, the unstripped link output of every image
+      # the disk image installs and its manifest (docs/build-system.md
+      # § Symbols Store), archived beside the image.
+      - name: Archive and checksum the symbols store
+        run: |
+          TAG="${{ github.ref_name }}"
+          ARCH="${{ matrix.arch }}"
+          OUT="seraph-${TAG}-${ARCH}-symbols.tar.zst"
+          test -f symbols/manifest
+          tar -C symbols -cf - . | zstd -19 -T0 -o "${OUT}"
+          sha256sum "${OUT}" > "${OUT}.sha256"
+
       - name: Upload arch artifact
         uses: actions/upload-artifact@v7
         with:
@@ -121,6 +134,8 @@ jobs:
           path: |
             seraph-*.img.zst
             seraph-*.img.zst.sha256
+            seraph-*-symbols.tar.zst
+            seraph-*-symbols.tar.zst.sha256
           if-no-files-found: error
 
   publish:
@@ -139,8 +154,8 @@ jobs:
       - name: Assemble SHA256SUMS
         run: |
           cd artifacts
-          cat *.img.zst.sha256 | sort > SHA256SUMS
-          rm -f *.img.zst.sha256
+          cat *.sha256 | sort > SHA256SUMS
+          rm -f *.sha256
           ls -la
 
       - name: Create draft release
@@ -158,4 +173,5 @@ jobs:
             --title "Seraph ${TAG}" \
             --notes-file "${NOTES_FILE}" \
             artifacts/seraph-*.img.zst \
+            artifacts/seraph-*-symbols.tar.zst \
             artifacts/SHA256SUMS

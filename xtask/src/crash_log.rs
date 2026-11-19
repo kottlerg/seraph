@@ -11,8 +11,10 @@
 //! only. logd's `reclaim:` line for that badge gives the process's log name,
 //! and the image is the sysroot binary of that name, accepted only when its
 //! executable segments span the block's text; a process logd names no name
-//! for is matched by that span alone. Each address in the block's text is
-//! then the image address `address - load_bias`, which [`crate::symbolize`]
+//! for is matched by that span alone. The image's symbols are the symbols
+//! store's file of its build id ([`crate::symbolize::store`]), since the
+//! sysroot holds it stripped. Each address in the block's text is then the
+//! image address `address - load_bias`, which [`crate::symbolize`]
 //! resolves.
 
 use std::cell::OnceCell;
@@ -25,6 +27,7 @@ use crash_report::Block;
 use logd_codec::reclaim::UNNAMED;
 use procmgr_process_table::threads;
 
+use crate::symbolize::store::{Manifest, Store, Symbols, symbols_for};
 use crate::symbolize::{Symbolizer, describe_resolution, text_span};
 
 /// logd's tag and the message of each of its reclaim lines, the fields after
@@ -82,9 +85,24 @@ pub fn reclaimed_names(log: &str) -> HashMap<u64, String>
 }
 
 /// Where a block's image comes from: a set of binaries, each named by its
-/// path relative to the image root.
+/// path relative to the image root, and the symbols store that holds their
+/// symbols.
 pub trait ImageSource
 {
+    /// The binary at `relative` as a report names it.
+    fn label(&self, relative: &str) -> String;
+
+    /// The bytes of the symbols store's file `name`, `Ok(None)` when there
+    /// is none.
+    ///
+    /// # Errors
+    ///
+    /// The file exists but cannot be read.
+    fn read_symbols(&self, name: &str) -> Result<Option<Vec<u8>>, String>;
+
+    /// The symbols store's file `name` as a report names it.
+    fn symbols_label(&self, name: &str) -> String;
+
     /// The architecture the images are built for, `Ok(None)` when unrecorded.
     ///
     /// # Errors
@@ -107,14 +125,31 @@ pub trait ImageSource
     fn read(&self, relative: &str) -> Result<Option<Vec<u8>>, String>;
 }
 
-/// The images of a sysroot: the files of [`IMAGE_DIRS`].
+/// The images of a sysroot, the files of [`IMAGE_DIRS`], and the symbols
+/// store of its build.
 pub struct SysrootImages
 {
     pub sysroot: PathBuf,
+    pub symbols: PathBuf,
 }
 
 impl ImageSource for SysrootImages
 {
+    fn label(&self, relative: &str) -> String
+    {
+        format!("sysroot/{relative}")
+    }
+
+    fn read_symbols(&self, name: &str) -> Result<Option<Vec<u8>>, String>
+    {
+        Store::at(&self.symbols).read(name)
+    }
+
+    fn symbols_label(&self, name: &str) -> String
+    {
+        format!("symbols/{name}")
+    }
+
     fn arch(&self) -> Result<Option<String>, String>
     {
         let path = self.sysroot.join(".arch");
@@ -164,6 +199,103 @@ impl ImageSource for SysrootImages
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
             Err(err) => Err(format!("cannot read {}: {err}", path.display())),
+        }
+    }
+}
+
+/// The images of a symbols store alone, such as a release's archive: each
+/// binary of [`IMAGE_DIRS`] its manifest names, read as the unstripped
+/// store file the manifest names for it.
+pub struct StoreImages
+{
+    store: Store,
+    dir: PathBuf,
+    manifest: Manifest,
+}
+
+impl StoreImages
+{
+    /// The images of the store at `dir`.
+    ///
+    /// # Errors
+    ///
+    /// The store has no manifest, or it cannot be read or parsed.
+    pub fn open(dir: PathBuf) -> crate::error::Result<Self>
+    {
+        let store = Store::at(&dir);
+        let Some(manifest) = store.manifest()?
+        else
+        {
+            crate::error::bail!(
+                "{} has no manifest: it is not a symbols store",
+                dir.display()
+            );
+        };
+        Ok(StoreImages {
+            store,
+            dir,
+            manifest,
+        })
+    }
+
+    /// The manifest's store file of the binary at `relative`.
+    fn file(&self, relative: &str) -> Option<&str>
+    {
+        self.manifest
+            .files
+            .get(&format!("/{relative}"))
+            .map(String::as_str)
+    }
+}
+
+impl ImageSource for StoreImages
+{
+    fn label(&self, relative: &str) -> String
+    {
+        match self.file(relative)
+        {
+            Some(file) => format!("/{relative} ({file} in the symbols store)"),
+            None => format!("/{relative}"),
+        }
+    }
+
+    fn read_symbols(&self, name: &str) -> Result<Option<Vec<u8>>, String>
+    {
+        self.store.read(name)
+    }
+
+    fn symbols_label(&self, name: &str) -> String
+    {
+        self.dir.join(name).display().to_string()
+    }
+
+    fn arch(&self) -> Result<Option<String>, String>
+    {
+        Ok(Some(self.manifest.arch.clone()))
+    }
+
+    fn list(&self) -> Result<Vec<String>, String>
+    {
+        Ok(self
+            .manifest
+            .files
+            .keys()
+            .filter_map(|path| path.strip_prefix('/'))
+            .filter(|relative| {
+                relative
+                    .rsplit_once('/')
+                    .is_some_and(|(dir, _)| IMAGE_DIRS.contains(&dir))
+            })
+            .map(str::to_owned)
+            .collect())
+    }
+
+    fn read(&self, relative: &str) -> Result<Option<Vec<u8>>, String>
+    {
+        match self.file(relative)
+        {
+            Some(file) => self.store.read(file),
+            None => Ok(None),
         }
     }
 }
@@ -330,18 +462,31 @@ fn symbolize_block(out: &mut String, block: &Block, source: &BlockSource<'_>)
     let _ = writeln!(out, "end {:016x}", block.id);
 }
 
-/// Look up `block`'s image and append the line saying which it is, or why
-/// there is none and how to resolve the block once the binary is known; the
-/// image's bytes, if any.
+/// Look up `block`'s image and its symbols and append the lines saying
+/// which they are, or why there are none and how to resolve the block once
+/// the binary is known; the bytes of the ELF that holds the symbols, if any.
 fn block_image_lines(out: &mut String, block: &Block, source: &BlockSource<'_>) -> Option<Vec<u8>>
 {
-    match block_image(block, source)
-    {
-        Ok((label, bytes)) =>
+    let found = block_image(block, source).and_then(|(label, image)| {
+        let _ = writeln!(out, "  image: {label}");
+        match symbols_for(&image, |name| source.images.read_symbols(name))?
         {
-            let _ = writeln!(out, "  image: {label}");
-            Some(bytes)
+            Symbols::Image =>
+            {
+                let _ = writeln!(out, "  symbols: the image's own");
+                Ok(image)
+            }
+            Symbols::Store { name, elf } =>
+            {
+                let label = source.images.symbols_label(&name);
+                let _ = writeln!(out, "  symbols: {label} (by the image's build id)");
+                Ok(elf)
+            }
         }
+    });
+    match found
+    {
+        Ok(symbols) => Some(symbols),
         Err(reason) =>
         {
             let _ = writeln!(out, "  not symbolized: {reason}");
@@ -453,14 +598,17 @@ fn named_image(
         };
         return match text_span(&bytes)
         {
-            Some(image_span) if image_span == span => Ok((format!("sysroot/{relative}"), bytes)),
+            Some(image_span) if image_span == span => Ok((images.label(&relative), bytes)),
             Some((start, end)) => Err(format!(
-                "sysroot/{relative}'s text spans {start:#x}-{end:#x}, the block's {:#x}-{:#x}: \
-                 the binary is not the one that ran",
-                span.0, span.1
+                "{}'s text spans {start:#x}-{end:#x}, the block's {:#x}-{:#x}: the binary is not \
+                 the one that ran",
+                images.label(&relative),
+                span.0,
+                span.1
             )),
             None => Err(format!(
-                "sysroot/{relative} is not an ELF image with an executable segment"
+                "{} is not an ELF image with an executable segment",
+                images.label(&relative)
             )),
         };
     }
@@ -478,11 +626,14 @@ fn unnamed_image(source: &BlockSource<'_>, span: (u64, u64)) -> Result<(String, 
             .read(relative)?
             .map(|bytes| {
                 (
-                    format!("sysroot/{relative} (the one binary whose text matches the block's)"),
+                    format!(
+                        "{} (the one binary whose text matches the block's)",
+                        source.images.label(relative)
+                    ),
                     bytes,
                 )
             })
-            .ok_or_else(|| format!("sysroot/{relative} is gone")),
+            .ok_or_else(|| format!("{} is gone", source.images.label(relative))),
         several => Err(format!(
             "the process is unnamed, and the text of several binaries matches the block's: {}",
             several.join(", ")
@@ -555,7 +706,8 @@ mod tests
 
     use super::*;
     use crate::symbolize::fixture::{
-        Architecture, Debug, INNER, LEAF, OUTER, USER_BASE, fixture, fixture_with_section,
+        Architecture, Debug, FIXTURE_BUILD_ID, INNER, LEAF, OUTER, USER_BASE, fixture,
+        fixture_with_section, stripped, with_build_id,
     };
 
     /// The fixture image's load bias in the reports below.
@@ -566,12 +718,13 @@ mod tests
         text_end: BIAS + USER_BASE + 0x300,
     };
 
-    /// Images of one architecture, by relative path; with `list_error`,
-    /// listing them fails.
+    /// Images of one architecture, by relative path, and the files of their
+    /// symbols store, by name; with `list_error`, listing them fails.
     struct Fixture
     {
         arch: &'static str,
         images: Vec<(&'static str, Vec<u8>)>,
+        symbols: Vec<(String, Vec<u8>)>,
         list_error: bool,
     }
 
@@ -583,7 +736,18 @@ mod tests
             Fixture {
                 arch,
                 images: vec![("programs/crashme", image)],
+                symbols: Vec::new(),
                 list_error: false,
+            }
+        }
+
+        /// The fixture stripped as `programs/crashme`, built for `x86_64`,
+        /// and `elf` as the store file of the fixture's build id.
+        fn stripped_with(elf: Vec<u8>) -> Self
+        {
+            Fixture {
+                symbols: vec![(store_name(), elf)],
+                ..Self::crashme("x86_64", with_text_segment(stripped(Architecture::X86_64)))
             }
         }
 
@@ -597,8 +761,33 @@ mod tests
         }
     }
 
+    /// The store file name of the fixture's build id.
+    fn store_name() -> String
+    {
+        crate::symbolize::store::elf_name(&crate::symbolize::store::lower_hex(&FIXTURE_BUILD_ID))
+    }
+
     impl ImageSource for Fixture
     {
+        fn label(&self, relative: &str) -> String
+        {
+            format!("sysroot/{relative}")
+        }
+
+        fn read_symbols(&self, name: &str) -> Result<Option<Vec<u8>>, String>
+        {
+            Ok(self
+                .symbols
+                .iter()
+                .find(|(file, _)| file == name)
+                .map(|(_, bytes)| bytes.clone()))
+        }
+
+        fn symbols_label(&self, name: &str) -> String
+        {
+            format!("symbols/{name}")
+        }
+
         fn arch(&self) -> Result<Option<String>, String>
         {
             Ok(Some(self.arch.to_owned()))
@@ -756,7 +945,7 @@ mod tests
         assert!(
             out.starts_with("crash report 00000000000000aa (format version 1): process crashme\n")
         );
-        assert!(out.contains("\n  image: sysroot/programs/crashme\n"));
+        assert!(out.contains("\n  image: sysroot/programs/crashme\n  symbols: the image's own\n"));
         assert!(out.contains(&format!(
             "\n  ip={ip:#018x}  inner at /src/fixture.rs:20 [debug-info]\n      inlined into \
              fixture::outer at /src/fixture.rs:11\n"
@@ -960,6 +1149,7 @@ mod tests
         let none = Fixture {
             arch: "x86_64",
             images: Vec::new(),
+            symbols: Vec::new(),
             list_error: false,
         };
         let out = symbolize_log(&log_of(&report(ip, &regs, &frames), None), &none).unwrap();
@@ -1019,24 +1209,23 @@ mod tests
                 ("programs/one", matching.clone()),
                 ("programs/other", other),
             ],
+            symbols: Vec::new(),
             list_error: false,
         };
         let log = log_of(&report(ip, &regs, &[ip]), None);
         let out = symbolize_log(&log, &images).unwrap();
         assert!(
             out.contains(
-                "\n  image: sysroot/programs/one (the one binary whose text matches the block's)\n"
+                "\n  image: sysroot/programs/one (the one binary whose text matches the block's)\n  \
+                 not symbolized: the image carries no symbols and no build-id note\n"
             ),
-            "{out}"
-        );
-        assert!(
-            out.contains(&format!("\n  ip={ip:#018x}  ?? [unresolved]\n")),
             "{out}"
         );
 
         let twins = Fixture {
             arch: "x86_64",
             images: vec![("programs/one", matching.clone()), ("tests/two", matching)],
+            symbols: Vec::new(),
             list_error: false,
         };
         let out = symbolize_log(&log, &twins).unwrap();
@@ -1160,6 +1349,7 @@ mod tests
         std::fs::write(root.join(".arch"), "riscv64\n").unwrap();
         let images = SysrootImages {
             sysroot: root.clone(),
+            symbols: root.join("symbols"),
         };
         assert_eq!(images.arch(), Ok(Some("riscv64".to_owned())));
         assert_eq!(images.list(), Ok(vec!["programs/crashme".to_owned()]));
@@ -1177,6 +1367,91 @@ mod tests
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(images.arch(), Ok(None));
         assert_eq!(images.list(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_stripped_image_resolves_through_the_store_file_of_its_build_id()
+    {
+        let regs = [0u64; 21];
+        let ip = BIAS + INNER + 4;
+        let log = log_of(&report(ip, &regs, &[ip]), Some("crashme"));
+        let unstripped = with_text_segment(fixture(Architecture::X86_64, USER_BASE, Debug::Dwarf));
+        let out = symbolize_log(&log, &Fixture::stripped_with(unstripped.clone())).unwrap();
+        assert!(
+            out.contains(&format!(
+                "\n  image: sysroot/programs/crashme\n  symbols: symbols/{} (by the image's build \
+                 id)\n",
+                store_name()
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "\n  ip={ip:#018x}  inner at /src/fixture.rs:20 [debug-info]\n"
+            )),
+            "{out}"
+        );
+
+        // The store file of another build is refused, and so is a store
+        // without the file: the addresses stay unresolved.
+        let other = with_build_id(unstripped, b"another-build-id-002");
+        let out = symbolize_log(&log, &Fixture::stripped_with(other)).unwrap();
+        assert!(
+            out.contains("\n  not symbolized: the symbols store's ")
+                && out.contains("not the image's"),
+            "{out}"
+        );
+        assert!(out.contains(&format!("\n  ip={ip:#018x}\n")), "{out}");
+        let missing = Fixture {
+            symbols: Vec::new(),
+            ..Fixture::stripped_with(Vec::new())
+        };
+        let out = symbolize_log(&log, &missing).unwrap();
+        assert!(
+            out.contains(&format!(
+                "\n  not symbolized: the image carries no symbols, and the symbols store has no {}\n",
+                store_name()
+            )),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_symbols_store_alone_serves_as_the_images()
+    {
+        let dir = std::env::temp_dir().join(format!("seraph-crash-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::at(&dir);
+        let unstripped = with_text_segment(fixture(Architecture::X86_64, USER_BASE, Debug::Dwarf));
+        let name = store
+            .keep_elf(crate::arch::Arch::X86_64, "/programs/crashme", &unstripped)
+            .unwrap();
+        store
+            .keep_elf(crate::arch::Arch::X86_64, "/boot/kernel", &unstripped)
+            .unwrap();
+        let images = StoreImages::open(dir.clone()).unwrap();
+        assert_eq!(images.arch(), Ok(Some("x86_64".to_owned())));
+        assert_eq!(images.list(), Ok(vec!["programs/crashme".to_owned()]));
+
+        let regs = [0u64; 21];
+        let ip = BIAS + INNER + 4;
+        let out =
+            symbolize_log(&log_of(&report(ip, &regs, &[ip]), Some("crashme")), &images).unwrap();
+        assert!(
+            out.contains(&format!(
+                "\n  image: /programs/crashme ({name} in the symbols store)\n  symbols: the image's \
+                 own\n"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "\n  ip={ip:#018x}  inner at /src/fixture.rs:20 [debug-info]\n"
+            )),
+            "{out}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(StoreImages::open(dir).is_err());
     }
 
     #[test]

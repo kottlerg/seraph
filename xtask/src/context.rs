@@ -126,6 +126,15 @@ impl Context
         self.sysroot_boot().join("boot.efi")
     }
 
+    /// Path to `symbols/`, the symbols store: the unstripped link output of
+    /// every image the build installs, by build id, and its manifest
+    /// (docs/build-system.md § Symbols Store). Beside the sysroot, so no
+    /// pack copies it to a disk image; cleared by `cargo xtask clean`.
+    pub fn symbols_dir(&self) -> PathBuf
+    {
+        self.root.join("symbols")
+    }
+
     /// Path to the GPT disk image (built from sysroot contents).
     pub fn disk_image(&self) -> PathBuf
     {

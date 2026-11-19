@@ -64,6 +64,7 @@ use crate::qemu::{
 };
 use crate::qemu_gdb::{Stub, field_hex, function_path, le_hex, stop_thread};
 use crate::qmp;
+use crate::symbolize::store::Store;
 use crate::util::{require_tool, step};
 
 /// The terminal's line once the default boot is up. Kept in sync with
@@ -298,7 +299,9 @@ fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Rout
     {
         Route::Hardware(bp) =>
         {
-            let path = ctx.sysroot.join(bp.binary);
+            // The installed image is stripped: its symbols, and its code,
+            // are read from the symbols store's file of its build id.
+            let path = Store::at(ctx.symbols_dir()).symbols_path(&ctx.sysroot.join(bp.binary))?;
             let data =
                 std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             Some(

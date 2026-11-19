@@ -125,10 +125,10 @@ Copy the core off the root partition, or read it in the system with a cap to `/c
 gdb <binary> <core>
 ```
 
-The binary is the sysroot's, at the path the core's `pr_psargs` names (`sysroot/programs/crashme`
-for `/programs/crashme`); on riscv64, a `gdb` built for x86-64 hosts needs
-`set architecture riscv:rv64` before it loads the binary. `gdb` lists every recorded thread, the
-faulting one current, and its stack, registers and floating-point and vector state.
+The binary is the symbols-store file of the build id of the image at the path the core's `pr_psargs`
+names (`symbols/manifest` lists `/programs/crashme <file>`); on riscv64, a `gdb` built for x86-64
+hosts needs `set architecture riscv:rv64` before it loads the binary. `gdb` lists every recorded
+thread, the faulting one current, and its stack, registers and floating-point and vector state.
 
 The code is `services/crashd/core-file`, host-tested: the notes, the layout and the budget's
 choice of runs, the policy, and the directory's names and eviction. crashd reads the process and

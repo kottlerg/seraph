@@ -1,5 +1,6 @@
 # Build output
 /sysroot/
+/symbols/
 /target/
 /disk.img
 /disk-data.img

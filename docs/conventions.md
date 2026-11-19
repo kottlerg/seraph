@@ -628,7 +628,11 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
 6. The tag push triggers `release.yml` and `burnin.yml`. The `preflight` job in
    `release.yml` aborts the run before any image is built if the workspace
    version does not match the tag or the notes file is missing or does not
-   follow `TEMPLATE.md`'s structure.
+   follow `TEMPLATE.md`'s structure. Otherwise the run builds each
+   architecture's release disk image and archives that build's symbols store
+   ([build-system.md](build-system.md#symbols-store) § Symbols Store), and
+   the draft Release carries each image and each archive, compressed, with
+   their checksums in `SHA256SUMS`.
 7. The draft Release is published once the `burnin.yml` run for the same tag
    has completed successfully and the maintainer approves the publishing. No
    workflow publishes it.

@@ -580,7 +580,7 @@ fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u6
     };
     match thread
     {
-        Some(thread) => read_thread(thread, ip, kind, &mut out),
+        Some(thread) => read_thread(thread, ip, kind, authority, ipc_buf, &mut out),
         // The bytes at `ip` through any thread: the threads share the space.
         None => out.code = read_code(first, ip),
     }
@@ -631,12 +631,21 @@ fn page_at_named(
     Ok(None)
 }
 
-/// Read the faulting thread `thread`, of kind `kind`, into `out`: its
-/// registers and stack walk when it is stopped at `ip`, which checks the
-/// thread its badge named (a thread that never registered carries its
-/// spawner's badge), and the bytes at `ip` in any case, through the address
-/// space every thread of the process shares.
-fn read_thread(thread: u64, ip: u64, kind: Thread, out: &mut Gathered)
+/// Read the faulting thread `thread`, of kind `kind`, of the process
+/// `out.badge` names, into `out`: its registers and stack walk when it is
+/// stopped at `ip`, which checks the thread its badge named (a thread that
+/// never registered carries its spawner's badge), and the bytes at `ip` in
+/// any case, through the address space every thread of the process shares.
+/// A stack page memmgr evicted is made resident through the debug authority
+/// `authority` for the walk ([`read_stack`]).
+fn read_thread(
+    thread: u64,
+    ip: u64,
+    kind: Thread,
+    authority: u64,
+    ipc_buf: *mut u64,
+    out: &mut Gathered,
+)
 {
     let mut file = [0u8; arch::current::REGS_SIZE];
     let stopped_at_ip = syscall::thread_read_regs(thread, &mut file).is_ok()
@@ -656,7 +665,11 @@ fn read_thread(thread: u64, ip: u64, kind: Thread, out: &mut Gathered)
     out.frames.push(ip);
     if let Some(image) = out.image
     {
-        let stack = read_stack(thread, word_at(&file, arch::current::SP_OFFSET));
+        let process = out.badge;
+        let stack = read_stack(word_at(&file, arch::current::SP_OFFSET), |at, part| {
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            unsafe { ipc::read_mem_resident(authority, process, thread, at, part, ipc_buf) }.is_ok()
+        });
         out.frames.extend(crash_report::walk::scan(
             &stack,
             image.text_start,
@@ -688,8 +701,10 @@ fn read_code(thread: u64, ip: u64) -> Vec<u8>
 }
 
 /// The stack from `sp` (rounded down to a word) up, at most
-/// [`STACK_SCAN_BYTES`], stopping at the first page that is not present.
-fn read_stack(thread: u64, sp: u64) -> Vec<u8>
+/// [`STACK_SCAN_BYTES`], read a page at a time with `read`, stopping at the
+/// first page it does not read: one not present, which procmgr could not
+/// make resident ([`ipc::read_mem_resident`]).
+fn read_stack(sp: u64, mut read: impl FnMut(u64, &mut [u8]) -> bool) -> Vec<u8>
 {
     let mut stack = Vec::new();
     let mut at = sp & !7;
@@ -710,7 +725,7 @@ fn read_stack(thread: u64, sp: u64) -> Vec<u8>
         {
             break;
         };
-        if syscall::thread_read_mem(thread, at, part).is_err()
+        if !read(at, part)
         {
             break;
         }

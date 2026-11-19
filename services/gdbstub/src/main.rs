@@ -1106,7 +1106,9 @@ impl Stub
         self.reply_ok(ok, ipc_buf);
     }
 
-    /// `m`: read target memory, in chunks the kernel copies at once.
+    /// `m`: read target memory, in chunks the kernel copies at once; a chunk
+    /// on a page memmgr evicted is made resident and read again
+    /// ([`ipc::read_mem_resident`]).
     fn read_memory(&mut self, addr: u64, len: u64, ipc_buf: *mut u64)
     {
         let Some(cap) = self.any_thread()
@@ -1126,7 +1128,11 @@ impl Stub
             {
                 break;
             };
-            if syscall::thread_read_mem(cap, at, chunk).is_err()
+            // SAFETY: ipc_buf is the registered IPC buffer.
+            let copied = unsafe {
+                ipc::read_mem_resident(self.sys.debug, self.sys.target, cap, at, chunk, ipc_buf)
+            };
+            if copied.is_err()
             {
                 break;
             }
@@ -1143,8 +1149,10 @@ impl Stub
         });
     }
 
-    /// Write target memory: a plain write, or through the text route when
-    /// the page is read-only text.
+    /// Write target memory: a plain write, the same after procmgr made the
+    /// range resident when the page is one memmgr evicted
+    /// ([`ipc::make_resident`]), or through the text route when the page is
+    /// read-only text.
     fn write_memory(&self, addr: u64, bytes: &[u8]) -> bool
     {
         let Some(cap) = self.any_thread()
@@ -1165,7 +1173,21 @@ impl Stub
                 // SAFETY: the write lands in the target's address space, not
                 // the stub's own (module doc, § The target is never the
                 // stub); every thread of the target is held.
-                unsafe { syscall::thread_write_mem(cap, at, chunk, 0) }.is_ok()
+                let write = || unsafe { syscall::thread_write_mem(cap, at, chunk, 0) };
+                let first = write();
+                let evicted = first == Err(syscall_abi::SyscallError::InvalidAddress as i64);
+                // SAFETY: `self.sys.ipc_buf` is the registered IPC buffer.
+                let resident = || unsafe {
+                    ipc::make_resident(
+                        self.sys.debug,
+                        self.sys.target,
+                        at,
+                        chunk.len() as u64,
+                        self.sys.ipc_buf,
+                    )
+                };
+                first.is_ok()
+                    || (evicted && resident() && write().is_ok())
                     || write_text(cap, at, chunk)
             })
     }

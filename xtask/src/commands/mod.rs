@@ -39,5 +39,6 @@ pub mod test_powerbutton;
 pub mod test_reboot;
 pub mod test_signing;
 pub mod test_terminal;
+pub mod test_tpm;
 pub mod test_vmgenid;
 pub mod test_wedge;

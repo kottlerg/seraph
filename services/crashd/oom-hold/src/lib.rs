@@ -98,9 +98,11 @@ pub fn parse_stall(value: Option<&str>) -> Result<Stall, NotMilliseconds>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level
 {
-    /// At or below the system reserve: a page outside it cannot be had.
+    /// At or below memmgr's growth floor (the system reserve and, while pages
+    /// are swapped, the restore headroom): a page outside the reserve cannot be
+    /// had.
     Critical,
-    /// `LOW` or `NORMAL`: the free pool holds pages above the reserve.
+    /// `LOW` or `NORMAL`: the free pool holds pages above the growth floor.
     BelowCritical,
 }
 

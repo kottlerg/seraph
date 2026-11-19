@@ -30,6 +30,8 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
 use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError};
 
+mod evict;
+
 // memmgr's handlers grow the arena and fund its page tables from inside a
 // request (a grant, a fault), nesting the growth path under the handler's
 // own frames; declare a 12-page (48 KiB) main-thread stack instead of the
@@ -94,7 +96,7 @@ pub extern "C" fn _start(info_ptr: u64) -> !
         main_tls_vaddr: info.main_tls_vaddr,
     };
 
-    main(&startup)
+    main(&startup, info.sched_control_cap)
 }
 
 #[panic_handler]
@@ -136,6 +138,9 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 // windows, in address order, all below `MAIN_TLS_WINDOW.base`:
 //
 //   scrub window        [SCRUB_VA, + 2 MiB)                 a run being cleared
+//   eviction windows    [evict::EVICT_ZONE_VA, + 256 KiB)   a job's input, a
+//                                                            restore's victim,
+//                                                            a chunk's stream
 //   phys-table scratch  [PHYS_TABLE_TEMP_VA, + 8 GiB)      one page, per-boot drawn
 //   process index       [PROCESS_INDEX_VA, PROCESS_INDEX_END)  bucket heads
 //   metadata arena      [drawn base, META_ARENA_LOW_END)    arena pages, then
@@ -205,7 +210,8 @@ const META_ARENA_HIGH_END: u64 = 1 << 56;
 // arena's worst-case base draw leaves its low zone non-empty.
 const _: () = {
     assert!(SCRUB_VA.is_multiple_of(SCRUB_WINDOW_PAGES * PAGE_SIZE));
-    assert!(SCRUB_VA + SCRUB_WINDOW_PAGES * PAGE_SIZE <= PHYS_TABLE_TEMP_VA);
+    assert!(SCRUB_VA + SCRUB_WINDOW_PAGES * PAGE_SIZE <= evict::EVICT_ZONE_VA);
+    assert!(evict::EVICT_ZONE_END <= PHYS_TABLE_TEMP_VA);
     assert!(PHYS_TABLE_TEMP_VA + (1 << (PHYS_TABLE_TEMP_SLOTS_LOG2 + 12)) <= PROCESS_INDEX_VA);
     assert!(PROCESS_INDEX_END <= META_ARENA_BASE_DEFAULT);
     assert!(META_ARENA_BASE_DEFAULT + (1 << (META_ARENA_SLOTS_LOG2 + 12)) < META_ARENA_LOW_END);
@@ -284,9 +290,10 @@ const LAYOUT_DEFAULT: ArenaLayout = ArenaLayout {
 };
 
 // All bookkeeping (arena, free pool, deferred list, process index) lives in
-// one ledger so it never lands on a syscall stack frame. memmgr is
-// single-threaded: its only thread runs the dispatch loop and owns the
-// ledger exclusively, so the `static mut` access is sound. Each handler
+// one ledger so it never lands on a syscall stack frame. Only the receive
+// loop's thread reaches it, and owns it exclusively: memmgr's other thread,
+// the compression worker (`evict.rs`), touches none of memmgr's statics but
+// its own, so the `static mut` access is sound. Each handler
 // takes the ledger once, through `ledger_mut()`, and passes it down; nothing
 // takes it twice at a time.
 static mut LEDGER: MemLedger = Ledger::new(
@@ -302,19 +309,20 @@ static mut SELF_ASPACE: u64 = 0;
 
 #[expect(
     static_mut_refs,
-    reason = "`LEDGER` is reached only through this accessor, and memmgr is single-threaded, so \
-              the one `&mut` each handler takes is never aliased"
+    reason = "`LEDGER` is reached only through this accessor, by the receive loop's thread \
+              alone, so the one `&mut` each handler takes is never aliased"
 )]
 fn ledger_mut() -> &'static mut MemLedger
 {
-    // SAFETY: single-threaded service; each handler holds the only reference
-    // it takes for the handler's duration.
+    // SAFETY: only the receive loop's thread reaches the ledger; each handler
+    // holds the only reference it takes for the handler's duration.
     unsafe { &mut LEDGER }
 }
 
 fn self_aspace() -> u64
 {
-    // SAFETY: single-threaded; written once in `ledger_init`.
+    // SAFETY: only the receive loop's thread reaches this; written once in
+    // `ledger_init`.
     unsafe { SELF_ASPACE }
 }
 
@@ -331,7 +339,8 @@ fn ledger_init(self_aspace_cap: u64)
                 .saturating_add((r & ((1 << META_ARENA_SLOTS_LOG2) - 1)) << 12),
             Err(_) => META_ARENA_BASE_DEFAULT,
         };
-    // SAFETY: single-threaded; called once before any other ledger use.
+    // SAFETY: only the receive loop's thread reaches this; called once before
+    // any other ledger use.
     unsafe { SELF_ASPACE = self_aspace_cap };
     let l = ledger_mut();
     *l = Ledger::new(
@@ -400,8 +409,9 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 /// Admit a charge of `pages` to the budget node of `rec`, beside `pending`
 /// pages that left the pool for it uncharged, against the max of the node and
 /// its ancestors and against the free pages outside `promised` less, for a
-/// node outside the reserve, the system reserve
-/// (`free_pool::budget::admit`; services/memmgr/docs/memory-pool.md
+/// node outside the reserve, the growth floor: the system reserve and, while
+/// chunks are swapped, the restore headroom (`free_pool::growth_floor`,
+/// `free_pool::budget::admit`; services/memmgr/docs/memory-pool.md
 /// § Distribution policy, § Commit). A refusal first rechecks the deferred
 /// runs, unless this turn of the receive loop already has, and, when one moved
 /// to the pool, which releases its charge and adds free pages, admits once
@@ -413,7 +423,7 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 /// region's reservation already carries it.
 fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<(), ChargeError>
 {
-    let reserve = reserve_pages(pool_total_pages());
+    let reserve = l.growth_floor(pool_total_pages());
     let r = l.admit(rec, pages, pending, reserve).or_else(|e| {
         if recheck_deferred(l) == 0
         {
@@ -441,11 +451,11 @@ fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<()
 /// growth (`free_pool::Ledger::admit_commit`): its data pages and page-table
 /// reservation against the max of the budget node and its ancestors, and
 /// those and its metadata bound against the free pages outside `promised`
-/// less, for a node outside the reserve, the system reserve. A refusal
+/// less, for a node outside the reserve, the growth floor. A refusal
 /// rechecks the deferred runs once, as [`admit`] does.
 fn admit_commit(l: &mut MemLedger, rec: NodeIdx, need: CommitNeed) -> Result<(), ChargeError>
 {
-    let reserve = reserve_pages(pool_total_pages());
+    let reserve = l.growth_floor(pool_total_pages());
     let r = l.admit_commit(rec, need, reserve).or_else(|e| {
         if recheck_deferred(l) == 0
         {
@@ -461,11 +471,11 @@ fn admit_commit(l: &mut MemLedger, rec: NodeIdx, need: CommitNeed) -> Result<(),
 /// The most pages, up to `want`, that may be charged to the budget node of
 /// `rec` (`free_pool::budget::admissible`): `want` clamped to the headroom
 /// under the node's and its ancestors' max and, for a node outside the
-/// reserve, to the free pages above the system reserve. When that falls short
+/// reserve, to the free pages above the growth floor. When that falls short
 /// of `want`, the deferred runs are rechecked first, as [`admit`] does.
 fn admissible(l: &mut MemLedger, rec: NodeIdx, want: u64) -> Result<u64, ChargeError>
 {
-    let reserve = reserve_pages(pool_total_pages());
+    let reserve = l.growth_floor(pool_total_pages());
     let mut r = l.admissible(rec, want, reserve);
     if r != Ok(want) && recheck_deferred(l) != 0
     {
@@ -500,7 +510,7 @@ fn note_admission(l: &MemLedger, rec: NodeIdx, refused: u64)
 /// `refused` pages refused at it.
 fn note_limit_check(node: NodeIdx, refused: u64)
 {
-    // SAFETY: memmgr is single-threaded; no concurrent access.
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     let prior = unsafe { LIMIT_CHECK };
     let refused = match prior
     {
@@ -520,7 +530,7 @@ fn note_limit_check(node: NodeIdx, refused: u64)
 /// blocks; one that fails (a cap the holder revoked) is dropped.
 fn signal_limits()
 {
-    // SAFETY: memmgr is single-threaded; no concurrent access.
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     let Some((node, refused)) = (unsafe { LIMIT_CHECK })
     else
     {
@@ -599,15 +609,15 @@ fn unmapped(cap: u64, pages: u64) -> bool
 /// turn starts when a receive returns, received or failed: it is the
 /// message's handling, if any, then the `CSpace` top-up before the next
 /// receive. A handler's own recheck therefore comes first in its turn, and
-/// the top-up before a failed receive's retry can recheck. Single-threaded
-/// memmgr: a plain static suffices.
+/// the top-up before a failed receive's retry can recheck. Only the receive
+/// loop's thread reaches it, so a plain static suffices.
 static mut RECHECKED_THIS_TURN: bool = false;
 
 /// Start a turn of the receive loop, when a receive returns: its first
 /// [`recheck_deferred`] runs.
 fn begin_turn()
 {
-    // SAFETY: memmgr is single-threaded; no concurrent access.
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     unsafe { RECHECKED_THIS_TURN = false };
 }
 
@@ -619,7 +629,7 @@ fn begin_turn()
 /// the caller coalesces.
 fn recheck_deferred(l: &mut MemLedger) -> u64
 {
-    // SAFETY: memmgr is single-threaded; no concurrent access.
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     if unsafe { RECHECKED_THIS_TURN }
     {
         return 0;
@@ -1261,10 +1271,10 @@ fn pop_frames(l: &mut MemLedger, rec: NodeIdx, n: usize)
 
 /// Admit a grant of `want_pages` to the budget node of `rec` ([`admit`]), then
 /// select its runs, as one run when `flags` carries `REQUIRE_CONTIGUOUS`, else
-/// best-effort. The whole request is admitted before any run leaves the pool:
-/// a charge over a max fails `LIMIT`, whatever part of it the pool could serve;
-/// one that would take the reserve fails as exhaustion, with the out-of-memory
-/// code of the fit, as a failed selection does.
+/// best-effort. The whole request is admitted before any run leaves the pool: a
+/// charge over a max fails `LIMIT`, whatever part of it the pool could serve;
+/// one that would take the growth floor fails as exhaustion, with the
+/// out-of-memory code of the fit, as a failed selection does.
 fn select_admitted(
     l: &mut MemLedger,
     rec: NodeIdx,
@@ -1838,7 +1848,8 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 /// Reply with the all-RAM-accounted identity terms plus the current free and
 /// deferred totals and the largest free run (all in bytes): `system_ram`,
 /// `kernel_reserved`, `pool_total`, `free`, `deferred`, `largest_free`,
-/// then the reserve, the pressure level and `promised`
+/// then the reserve, the pressure level, `promised`, the store, the swapped
+/// pages and the growth floor
 /// (services/memmgr/docs/ipc-interface.md § Label 6).
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
@@ -1865,29 +1876,43 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         .word(6, reserve_bytes)
         .word(7, pressure_wire(current_pressure()))
         .word(8, l.promised().saturating_mul(PAGE_SIZE))
+        .word(9, l.store_pages().saturating_mul(PAGE_SIZE))
+        .word(10, l.swapped_pages().saturating_mul(PAGE_SIZE))
+        .word(
+            11,
+            l.growth_floor(pool_total_pages()).saturating_mul(PAGE_SIZE),
+        )
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Reply with the caller's own budget usage, in pages: `data[0]` the pages
-/// charged to its node, `data[1]` the node's max (`u64::MAX` for none), and
-/// `data[2]` the pages charged to the node and every node below it
+/// charged to its node, `data[1]` the node's max (`u64::MAX` for none),
+/// `data[2]` the pages charged to the node and every node below it, and
+/// `data[3]` and `data[4]` the pages of `data[0]` resident and swapped: a
+/// process's record and its budget node are one to one, so the record's
+/// swapped pages are the node's own
 /// (services/memmgr/docs/ipc-interface.md § Label 10). Attributed by
 /// `req.badge`; an unknown badge is `INVALID_ARGUMENT`. Read-only.
 fn handle_query_memory_usage(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let l = ledger_mut();
-    let Some(node) = l.find(req.badge).and_then(|rec| l.budget(rec))
+    let Some((rec, node)) = l
+        .find(req.badge)
+        .and_then(|rec| l.budget(rec).map(|node| (rec, node)))
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    let swapped = l.swapped_of(rec);
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, node.own)
         .word(1, node.max)
         .word(2, node.subtree)
+        .word(3, node.own.saturating_sub(swapped))
+        .word(4, swapped)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1918,7 +1943,7 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
         || va_base.checked_add(len).is_none()
         || prot & !known_prot != 0
         || prot & wx == wx
-        || flags & !memmgr_labels::REGION_COMMIT != 0
+        || flags & !(memmgr_labels::REGION_COMMIT | memmgr_labels::REGION_NO_EVICT) != 0
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
@@ -1949,7 +1974,14 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
         va_base,
         len,
         prot,
-        evict: Evict::Allowed,
+        evict: if flags & memmgr_labels::REGION_NO_EVICT == 0
+        {
+            Evict::Allowed
+        }
+        else
+        {
+            Evict::Never
+        },
     };
     let mut result = l.add_region(rec, region, commit);
     // A committed region's commitment takes a slot beside the region's.
@@ -1987,8 +2019,8 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
 }
 
 /// The reply code of a refused commitment: `LIMIT` at a max, else
-/// `OUT_OF_MEMORY_BEST_EFFORT`, the RAM outside `promised` and the reserve
-/// being short.
+/// `OUT_OF_MEMORY_BEST_EFFORT`, the RAM outside `promised` and the growth
+/// floor being short.
 const fn commit_refusal(e: ChargeError) -> u64
 {
     match e
@@ -2172,6 +2204,107 @@ fn handle_discard_range(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
+/// Chunks one `MAKE_RESIDENT` request makes resident at most: a tuning value
+/// that bounds the request's turn to as many restores, each with its own
+/// bound on direct reclaim, so a debugger's request delays the faults and
+/// grants behind it no more than a few faults would.
+const MAKE_RESIDENT_CHUNKS: u32 = 4;
+
+/// Chunks with an entry, and regions with none, one `MAKE_RESIDENT` request
+/// visits at most: a tuning value that bounds the turn's walk over chunks
+/// that need nothing.
+const MAKE_RESIDENT_VISITS: u32 = 64;
+
+/// Make a range of a process's demand regions resident for a debugger's read
+/// (services/memmgr/docs/ipc-interface.md § Label 21): each evicted chunk the
+/// range meets is restored from the store, or mapped back while its eviction
+/// is in flight ([`evict::make_resident`]), which counts as an access in its
+/// age; a page no fault backed stays not present. procmgr alone sends it,
+/// for a holder of its debug authority. Words are `[badge, va, len]`, the
+/// process named by its memmgr badge. The walk visits only the chunks that
+/// have an entry ([`free_pool::Ledger::next_chunk_with_entry`]), and stops
+/// after [`MAKE_RESIDENT_CHUNKS`] chunks made resident or
+/// [`MAKE_RESIDENT_VISITS`] visits; the reply's word 0 is where it stopped,
+/// the range's end when it is all done, and the sender asks again from there.
+fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
+{
+    if req.badge != procmgr_badge
+    {
+        reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
+        return;
+    }
+    let (va, len) = (req.word(1), req.word(2));
+    let l = ledger_mut();
+    let (Some(rec), Some(end)) = (l.find(req.word(0)), va.checked_add(len))
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    if len == 0
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    let aspace = l.aspace_cap(rec);
+    let mut at = va & !(PAGE_SIZE - 1);
+    let (mut made, mut visits) = (0u32, 0u32);
+    // Each pass takes the next chunk with an entry of a region the range
+    // meets, in address order, or passes a region with none from `at`, so
+    // the walk visits no chunk no fault backed.
+    while at < end
+        && aspace != 0
+        && made < MAKE_RESIDENT_CHUNKS
+        && visits < MAKE_RESIDENT_VISITS
+        && let Some((reg, node)) = l.region_from(rec, at)
+        && node.region.va_base < end
+    {
+        visits = visits.saturating_add(1);
+        let region_end = node.region.va_base.saturating_add(node.region.len);
+        let from = at.max(node.region.va_base);
+        let Some(next) = l.next_chunk_with_entry(reg, from)
+        else
+        {
+            at = region_end;
+            continue;
+        };
+        let (chunk_base, chunk_pages) = chunk_for(&node.region, next);
+        if chunk_base >= end
+        {
+            at = end;
+            break;
+        }
+        if matches!(
+            l.chunk_at(reg, chunk_base).state(),
+            ChunkState::Evicting | ChunkState::Swapped
+        )
+        {
+            if evict::make_resident(l, rec, reg, &node.region, chunk_base, aspace).is_err()
+            {
+                reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+                return;
+            }
+            made = made.saturating_add(1);
+        }
+        at = chunk_base.saturating_add(u64::from(chunk_pages).saturating_mul(PAGE_SIZE));
+    }
+    // A walk that ran out of regions, or of the range, is done; one the
+    // bounds stopped resumes at `at`.
+    let reached = if made < MAKE_RESIDENT_CHUNKS && visits < MAKE_RESIDENT_VISITS
+    {
+        end
+    }
+    else
+    {
+        at.min(end)
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, reached)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
 /// Unregister a demand-paged region for the calling process, reclaiming every
 /// frame memmgr mapped inside it.
 ///
@@ -2285,8 +2418,9 @@ enum FaultDecline
     NoArenaSlot = 6,
     /// The free pool holds no page to back the faulting page: it is empty,
     /// even after the deferred runs were rechecked, every free page it holds
-    /// is in the system reserve and the process's budget node is outside it,
-    /// or the split of a run larger than the pages to back failed.
+    /// is in the growth floor and the process's budget node is outside the
+    /// system reserve, or the split of a run larger than the pages to back
+    /// failed.
     NoFreePage = 7,
     /// The run could not be recorded on its chunk in the region's chunk
     /// table.
@@ -2331,16 +2465,17 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Admit as much of a demand fault's span of `span_pages` as the budget node
-/// of `rec` takes ([`admissible`]): the span, clamped to the headroom under the
+/// Admit as much of a demand fault's span of `span_pages` as the budget node of
+/// `rec` takes ([`admissible`]): the span, clamped to the headroom under the
 /// max of the node and its ancestors and to the free pages outside `promised`
-/// above, for a node outside the reserve, the system reserve. A fault in a
-/// committed region is admitted whole without that: its commitment carries
-/// the span's charge and `promised` its pages. Then select the run that backs
-/// those pages: one covering them, else the largest free run. The span is a
+/// above, for a node outside the reserve, the growth floor. A fault in a
+/// committed region is admitted whole without that: its commitment carries the
+/// span's charge and `promised` its pages. Then select the run that backs those
+/// pages: one covering them, else the largest free run. The span is a
 /// fault-around preference, so the fault is declined only when not even the
 /// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
-/// [`FaultDecline::NoFreePage`] at the reserve or when the selection fails.
+/// [`FaultDecline::NoFreePage`] at the growth floor or when the selection
+/// fails.
 fn select_fault_run(
     l: &mut MemLedger,
     target: &FaultTarget,
@@ -2455,12 +2590,21 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // backed, because another thread's fault on it was served first, and that
     // mapping satisfies this granted access. Resume.
     let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
+    // An evicting or swapped chunk is made resident whole first: its runs
+    // mapped back, or its pages restored from the store
+    // (services/memmgr/docs/memory-pool.md § Eviction, States). Every backed
+    // page of it is then mapped, and a fault on an unbacked page of it backs
+    // that page as on any resident chunk.
+    if matches!(
+        l.chunk_at(reg, page_base).state(),
+        ChunkState::Evicting | ChunkState::Swapped
+    ) && let Err((reason, detail)) =
+        evict::make_resident(l, rec, reg, &region, page_base, aspace_cap)
+    {
+        decline_fault(ipc_buf, reason, detail);
+        return;
+    }
     let entry = l.chunk_at(reg, page_base);
-    // Nothing evicts a chunk yet, so a fault finds it unbacked or resident.
-    debug_assert!(matches!(
-        entry.state(),
-        ChunkState::Unbacked | ChunkState::Resident
-    ));
     // The page lies in its chunk, below `DEMAND_CHUNK_PAGES`.
     let page = u32::try_from(page_base.saturating_sub(chunk_base) / PAGE_SIZE).unwrap_or(0);
     let Some((first, end)) = entry.unbacked_span(page, chunk_pages)
@@ -2495,6 +2639,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         page_base,
         held: need,
         committed,
+        charged: false,
     };
     let frame = match back_span(l, &target, span_pages)
     {
@@ -2536,6 +2681,10 @@ struct FaultTarget
     /// and its metadata bound the arena's growth for the fault
     /// (services/memmgr/docs/memory-pool.md § Commit).
     committed: Option<NodeIdx>,
+    /// The run's pages are charged already: a chunk's own runs mapped back
+    /// after an eviction is cancelled, or a restore's
+    /// (services/memmgr/docs/memory-pool.md § Eviction).
+    charged: bool,
 }
 
 /// Back the span of `target` with one run of at most `span_pages` pages
@@ -2616,9 +2765,24 @@ enum MapRefusal
     /// Funding the page tables the map needs would take the subtree of the
     /// process's budget node, or of an ancestor, over its max.
     Limit,
-    /// Funding the page tables the map needs would take the system reserve
-    /// from a budget node outside it; the last map failed with this error.
+    /// Funding the page tables the map needs would take the growth floor from a
+    /// budget node outside the system reserve; the last map failed with this
+    /// error.
     Reserve(i64),
+}
+
+impl MapRefusal
+{
+    /// The [`FaultDecline`] and detail word a fault that cannot map its run
+    /// declines with ([`decline_fault`]).
+    const fn decline(&self) -> (FaultDecline, u64)
+    {
+        match *self
+        {
+            Self::Limit => (FaultDecline::BudgetLimit, 0),
+            Self::Map(e) | Self::Reserve(e) => (FaultDecline::MapFailed, e.unsigned_abs()),
+        }
+    }
 }
 
 /// Why [`fund_client_page_tables`] funded nothing.
@@ -2626,8 +2790,8 @@ enum FundRefusal
 {
     /// The process's budget admits not even the smallest donation.
     Limit,
-    /// Not even the smallest donation fits above the system reserve, and the
-    /// process's budget node is outside it.
+    /// Not even the smallest donation fits above the growth floor, and the
+    /// process's budget node is outside the system reserve.
     Reserve,
     /// Any other failure, which leaves the map's own error standing.
     Failed,
@@ -2640,7 +2804,7 @@ enum FundRefusal
 /// slots that recording the chunk takes, and maps again, at most
 /// [`PT_FUND_ROUNDS`] times. Returns the last map error otherwise, [`MapRefusal::Limit`] when
 /// the process's budget refused the funding, or [`MapRefusal::Reserve`] when
-/// the system reserve did.
+/// the growth floor did.
 ///
 /// Pool outers are full-rights, so `mem_map` gates the mapping to `prot`
 /// directly (the kernel grants read at every map, and W^X is enforced); no
@@ -2655,8 +2819,9 @@ fn map_client_chunk(
 ) -> Result<(), MapRefusal>
 {
     let aspace_cap = target.aspace_cap;
-    // A committed region's commitment carries the run's charge already.
-    let pending = if target.committed.is_some()
+    // A committed region's commitment carries the run's charge already, as
+    // the budget node does for a chunk's own runs mapped back.
+    let pending = if target.committed.is_some() || target.charged
     {
         0
     }
@@ -2724,8 +2889,8 @@ fn map_client_chunk(
 /// # Errors
 /// [`FundRefusal::Limit`] when the budget admits not even
 /// [`CLIENT_TOPUP_MIN_PAGES`]; [`FundRefusal::Reserve`] when they would take
-/// the reserve; [`FundRefusal::Failed`] for every other failure: the arena,
-/// the pool or the donation fails.
+/// the growth floor; [`FundRefusal::Failed`] for every other failure: the
+/// arena, the pool or the donation fails.
 fn fund_client_page_tables(
     l: &mut MemLedger,
     target: &FaultTarget,
@@ -2742,7 +2907,7 @@ fn fund_client_page_tables(
     // donations of the size the reservation is computed for. One past it (the
     // process's own mapping took a donation's pages in the middle of a map,
     // or reclaimed page tables in the region's span) is admitted as any other,
-    // so the process's budget and the system reserve bound what it takes
+    // so the process's budget and the growth floor bound what it takes
     // (services/memmgr/docs/memory-pool.md § Commit).
     let drawn = target
         .committed
@@ -2858,21 +3023,21 @@ fn release_unmapped_chunk(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64, fram
 /// This is the `pool_total` of the all-RAM-accounted identity
 /// (`system_ram == kernel_reserved + pool_total`). Surfaced in the
 /// `DONATE_MEMORY_CAPS` reply (`word(2)`) so callers can read it without a separate
-/// IPC. Single-threaded memmgr — plain static suffices. The `u64` matches
+/// IPC. Only the receive loop's thread reaches it, so a plain static suffices. The `u64` matches
 /// that reply word, and 2^64 pages exceed any physical address space, so the
 /// saturating add never clamps.
 static mut POOL_TOTAL_PAGES: u64 = 0;
 
 fn pool_total_pages() -> u64
 {
-    // SAFETY: memmgr is single-threaded; no concurrent access.
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     unsafe { POOL_TOTAL_PAGES }
 }
 
 fn pool_total_add(pages: u64)
 {
     let total = pool_total_pages().saturating_add(pages);
-    // SAFETY: memmgr is single-threaded; no concurrent access.
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     unsafe {
         POOL_TOTAL_PAGES = total;
     }
@@ -2880,15 +3045,15 @@ fn pool_total_add(pages: u64)
 
 // ── Memory pressure ──────────────────────────────────────────────────────────
 
-/// The pressure level memmgr last signalled. Single-threaded memmgr — plain
-/// static suffices.
+/// The pressure level memmgr last signalled. Only the receive loop's
+/// thread reaches it, so a plain static suffices.
 static mut PRESSURE: PressureLevel = PressureLevel::Normal;
 
 /// The pressure level [`signal_pressure`] last computed, at the top of this
 /// turn of the receive loop.
 fn current_pressure() -> PressureLevel
 {
-    // SAFETY: memmgr is single-threaded; no concurrent access.
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     unsafe { PRESSURE }
 }
 
@@ -2914,12 +3079,17 @@ fn signal_pressure()
 {
     let l = ledger_mut();
     let prev = current_pressure();
-    let level = pressure_level(prev, l.uncommitted_free(), pool_total_pages());
+    let level = pressure_level(
+        prev,
+        l.uncommitted_free(),
+        pool_total_pages(),
+        l.swapped_pages(),
+    );
     if level == prev
     {
         return;
     }
-    // SAFETY: memmgr is single-threaded; no concurrent access.
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     unsafe { PRESSURE = level };
     l.for_each_pressure(|cap, bits| {
         let _ = syscall::notification_send(cap, bits);
@@ -3447,6 +3617,13 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
     }
+    route(opcode, req, kept, ipc_buf, boot);
+}
+
+/// Hand a request a client sent to its label's handler, with the caps its
+/// contract keeps ([`dispatch`]).
+fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &InitBootstrap)
+{
     match opcode
     {
         memmgr_labels::REQUEST_MEMORY_CAPS =>
@@ -3505,6 +3682,10 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         {
             handle_discard_range(req, ipc_buf);
         }
+        memmgr_labels::MAKE_RESIDENT =>
+        {
+            handle_make_resident(req, ipc_buf, boot.procmgr_badge);
+        }
         memmgr_labels::NODE_SET_MAX =>
         {
             handle_node_set_max(req, ipc_buf);
@@ -3532,7 +3713,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     }
 }
 
-fn main(startup: &StartupInfo) -> !
+fn main(startup: &StartupInfo, sched_control: u64) -> !
 {
     // SAFETY: init maps `startup.ipc_buffer` as memmgr's own IPC page
     // (`place_stack_and_ipc`), apart from its image and stack; memmgr reaches
@@ -3573,6 +3754,11 @@ fn main(startup: &StartupInfo) -> !
     }
     ingest_in_use(&boot);
 
+    // The compression worker, at the fair class's top under memmgr's own
+    // `SchedControl` cap. Without it memmgr evicts nothing and serves as
+    // before (services/memmgr/docs/memory-pool.md § Eviction).
+    let _ = evict::start_worker(ledger_mut(), startup.self_cspace, sched_control);
+
     // memmgr has no log channel; on persistent recv failure its signals are
     // the kernel's rate-limited pre-allocate diagnostic and the loud
     // EXIT_RECV_WEDGE death itself.
@@ -3583,10 +3769,24 @@ fn main(startup: &StartupInfo) -> !
         // After the top-up, which draws on the free pool too, so the level a
         // registrant reads is the one the next receive starts from.
         signal_pressure();
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let req = match unsafe { ipc::ipc_recv(boot.service_ep, ipc_buf) }
+        // While the clock runs or a compression job is in flight, a receive
+        // that waits a bounded time, so the loop drains completions and runs
+        // the clock with no message arriving; else one that waits for a
+        // message (services/memmgr/docs/memory-pool.md § Eviction).
+        let wait = if evict::in_flight() || evict::clocking()
         {
-            Ok(req) => req,
+            evict::RECLAIM_WAIT_MS
+        }
+        else
+        {
+            0
+        };
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let req = match unsafe { ipc::ipc_recv_timeout(boot.service_ep, ipc_buf, wait) }
+        {
+            Ok(req) => Some(req),
+            // The bounded wait ended with no message: a turn of its own.
+            Err(e) if wait != 0 && e == SyscallError::WouldBlock as i64 => None,
             Err(e) =>
             {
                 guard.on_failure(e);
@@ -3597,9 +3797,13 @@ fn main(startup: &StartupInfo) -> !
                 continue;
             }
         };
-        guard.on_success();
         begin_turn();
-        dispatch(&req, ipc_buf, &boot);
-        signal_limits();
+        if let Some(req) = req
+        {
+            guard.on_success();
+            dispatch(&req, ipc_buf, &boot);
+            signal_limits();
+        }
+        evict::turn(ledger_mut());
     }
 }

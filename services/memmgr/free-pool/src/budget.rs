@@ -10,8 +10,8 @@
 //! points at it. It carries a parent link, an optional max in pages, the pages
 //! charged to it directly (`own`), and the pages charged to it and every node
 //! below it (`subtree`). A charge is admitted ([`admit`]) against the max of
-//! the node and of every ancestor, and against the system reserve for a node
-//! outside it, before memmgr selects the run; it is then recorded
+//! the node and of every ancestor, and against the system reserve and the
+//! restore headroom ([`growth_floor`]) for a node outside it, before memmgr selects the run; it is then recorded
 //! ([`charge`]) where the run is accounted to the process, and released
 //! ([`uncharge`]) where the run rejoins the free pool. A node lives while a
 //! record or a child node refers to it or a page is charged to it, so a node
@@ -126,6 +126,29 @@ pub const fn reserve_pages(pool_total: u64) -> u64
     pool_total / SYSTEM_RESERVE_DIVISOR
 }
 
+/// Free pages above the system reserve that a charge to a node outside the
+/// reserve leaves for restores while `swapped` pages of a pool of
+/// `pool_total` pages are swapped: the swapped pages, and at most the
+/// reserve. A restore is admitted against the reserve alone, so the chunks a
+/// process draining the pool made eviction take find their frames there
+/// (`services/memmgr/docs/memory-pool.md` § Eviction, Restore headroom).
+#[must_use]
+pub const fn restore_headroom(pool_total: u64, swapped: u64) -> u64
+{
+    let reserve = reserve_pages(pool_total);
+    if swapped < reserve { swapped } else { reserve }
+}
+
+/// The free pages a charge to a node outside the system reserve must leave in
+/// a pool of `pool_total` pages while `swapped` of them are swapped: the
+/// reserve and the [`restore_headroom`]. With nothing swapped it is the
+/// reserve.
+#[must_use]
+pub const fn growth_floor(pool_total: u64, swapped: u64) -> u64
+{
+    reserve_pages(pool_total).saturating_add(restore_headroom(pool_total, swapped))
+}
+
 /// The budget node in slot `idx`.
 #[must_use]
 pub fn node<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<BudgetNode>
@@ -220,9 +243,10 @@ pub fn create<S: SlotStore>(arena: &mut Arena<S>, spec: NodeSpec) -> Result<Node
 }
 
 /// Whether `pages` more may be charged to the node `idx`, with `free` pages in
-/// the free pool outside `promised` and `reserve` of them in the system
-/// reserve: `free - R >= pages`, R being `reserve` for a node outside the
-/// reserve and 0 for a reserve node. `pending` pages already left the pool
+/// the free pool outside `promised`, of which a charge to a node outside the
+/// system reserve must leave `reserve` (the reserve, and the restore
+/// headroom while pages are swapped: [`growth_floor`]): `free - R >= pages`,
+/// R being `reserve` for a node outside the reserve and 0 for a reserve node. `pending` pages already left the pool
 /// for the node and are not yet charged to it (a demand run whose map needs
 /// page-table funding first): they count against the max, and are already out
 /// of `free`.
@@ -252,8 +276,9 @@ pub fn admit<S: SlotStore>(
 }
 
 /// The most pages, up to `want`, that may be charged to the node `idx`, with
-/// `free` pages in the free pool outside `promised` and `reserve` of them in
-/// the system reserve: `want`, clamped to the node's [`headroom`] and to the
+/// `free` pages in the free pool outside `promised`, of which a charge to a
+/// node outside the system reserve must leave `reserve` ([`growth_floor`]):
+/// `want`, clamped to the node's [`headroom`] and to the
 /// `free` pages above R, which is `reserve` for a node outside the reserve and
 /// 0 for a reserve node. A demand fault backs that much of its span.
 ///
@@ -286,8 +311,9 @@ pub fn admissible<S: SlotStore>(
     Ok(pages)
 }
 
-/// The free pages a charge to the node `idx` must leave, with `reserve` in the
-/// system reserve: `reserve` for a node outside it, 0 for a reserve node.
+/// The free pages a charge to the node `idx` must leave, with `reserve` the
+/// ones a charge outside the system reserve must leave: `reserve` for a node
+/// outside it, 0 for a reserve node.
 fn floor<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx, reserve: u64) -> u64
 {
     if node(arena, idx).is_some_and(|b| b.reserve())
@@ -516,6 +542,21 @@ mod tests
         .unwrap();
         assert_eq!(admit(&a, child, 20, 0, 20, 4), Ok(()));
         assert_eq!(reserve_pages(6400), 100);
+    }
+
+    #[test]
+    fn the_restore_headroom_is_the_swapped_pages_up_to_the_reserve()
+    {
+        // A pool of 6400 pages: reserve 100.
+        assert_eq!(restore_headroom(6400, 0), 0);
+        assert_eq!(growth_floor(6400, 0), 100);
+        assert_eq!(restore_headroom(6400, 37), 37);
+        assert_eq!(growth_floor(6400, 37), 137);
+        assert_eq!(restore_headroom(6400, 100), 100);
+        assert_eq!(restore_headroom(6400, 5000), 100);
+        assert_eq!(growth_floor(6400, u64::MAX), 200);
+        // A pool too small for a reserve leaves no headroom either.
+        assert_eq!(growth_floor(63, 16), 0);
     }
 
     #[test]

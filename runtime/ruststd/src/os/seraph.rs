@@ -985,8 +985,10 @@ pub fn memmgr_pool_free_bytes() -> Option<u64> {
     pal_alloc::memmgr_query_free_bytes()
 }
 
-/// memmgr's memory-pressure level: how close its free pool is to the system
-/// reserve (`services/memmgr/docs/memory-pool.md` § Memory pressure). The
+/// memmgr's memory-pressure level: how close its free pool is to the growth
+/// floor, the system reserve and, while chunks are swapped, the restore
+/// headroom memmgr keeps above it (`QUERY_POOL_STATUS` `data[11]`;
+/// `services/memmgr/docs/memory-pool.md` § Memory pressure). The
 /// level is advisory: a process that holds memory it can give back, such as
 /// a cache, releases some on `Low` and more on `Critical`.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -999,8 +1001,8 @@ pub enum MemoryPressure {
     /// The free pool is below the low threshold.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     Low,
-    /// The free pool is at or below the system reserve: memmgr refuses a
-    /// grant to a process outside the reserve.
+    /// The free pool is at or below the growth floor: memmgr refuses a grant
+    /// to a process outside the reserve.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     Critical,
 }

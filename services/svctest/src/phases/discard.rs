@@ -424,7 +424,7 @@ fn ballast() -> Vec<u8>
 }
 
 /// Child role: register and touch a committed region of more pages than
-/// [`HOG_MARGIN_PAGES`] and memmgr's reserve together, commit through the
+/// [`HOG_MARGIN_PAGES`] and memmgr's growth floor together, commit through the
 /// heap all but the margin of what memmgr can still promise and touch it,
 /// discard the whole region, commit down to the margin again and touch that,
 /// then read every page of the region, each refaulting, and exit 0. A
@@ -436,13 +436,13 @@ fn discard_hog_main() -> !
 {
     let _ballast = ballast();
     let mut held: Vec<Vec<u8>> = Vec::with_capacity(HOG_MAX_ROUNDS);
-    let Some((_, _, reserve)) = pool_totals()
+    let Some((_, _, floor)) = pool_totals()
     else
     {
         exit(HOG_STATUS_FAILED)
     };
     let pages = HOG_MARGIN_PAGES
-        .saturating_add(reserve)
+        .saturating_add(floor)
         .saturating_mul(2)
         .next_multiple_of(CHUNK_PAGES);
     let Ok(range) = reserve_pages(pages)

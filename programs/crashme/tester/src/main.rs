@@ -345,10 +345,14 @@ const TIMEOUT_HELD_MIN_MS: u128 = 1000;
 const OOM_WAIT: Duration = Duration::from_secs(30);
 /// Bytes of stack the tester touches before a window, below its frame.
 const STACK_TOUCH_BYTES: usize = 16 * 1024;
-/// The pages `oom-touch` writes: one, since no process the tester ends frees
-/// memory between the filler's `full` and the write, so the first write is
-/// declined.
-const TOUCH_PAGES: &str = "1";
+/// The pages `oom-touch` writes: 1024, 64 chunks. No process the tester ends
+/// frees memory between the filler's `full` and the writes, but memmgr goes on
+/// evicting at `CRITICAL`, and once the restore headroom has reached the
+/// reserve each eviction it completes frees pages above the growth floor until
+/// the filler's next top-up takes them back (services/memmgr/docs/memory-pool.md
+/// § Eviction). Each write's fault backs a chunk, so the writes spend those
+/// pages and memmgr declines the first write past them.
+const TOUCH_PAGES: &str = "1024";
 
 /// One `oom-touch` fixture, between its `ready` and its write.
 struct Toucher
@@ -389,8 +393,8 @@ fn start_toucher() -> Toucher
 }
 
 /// Start `/programs/crashme oom-fill <hold_ms>` and wait for its `full`: the
-/// pool is then full up to the reserve, and memmgr declines a demand fault of
-/// any process outside it.
+/// pool is then full down to the growth floor, and memmgr declines a demand
+/// fault of any process outside it.
 #[expect(
     clippy::zombie_processes,
     reason = "the child is returned at `full`, and the caller waits on it (`wait_bounded`)"
@@ -453,10 +457,10 @@ fn touch_stack()
 }
 
 /// The crash service's hold of a fault memmgr declined for want of memory
-/// (services/crashd/docs/operation.md § Hold). A fixture writes a demand page
-/// while a filler keeps the pool full up to the reserve: when the filler gives
-/// it back within the stall, the write completes and the fixture prints how
-/// long it was held; when it holds the pool past the stall, the hold times
+/// (services/crashd/docs/operation.md § Hold). A fixture writes the pages of a
+/// demand region while a filler keeps the pool full down to the growth floor:
+/// when the filler gives it back within the stall, the writes complete and the
+/// fixture prints how long the held one took; when it holds the pool past the stall, the hold times
 /// out and the fixture dies of the fault, with no core written, since memory
 /// was still critical.
 ///

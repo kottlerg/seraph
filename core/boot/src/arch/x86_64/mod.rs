@@ -235,6 +235,23 @@ pub fn default_mmio_apertures() -> &'static [(u64, u64)]
     &[]
 }
 
+/// The TPM register window of the TCG PC Client Platform TPM Profile: five
+/// 4 KiB localities from `0xFED4_0000`, which a PC Client TPM decodes
+/// whichever interface, FIFO or CRB, it presents. The ACPI `TPM2` table
+/// names the interface but not this range, so
+/// [`crate::acpi::parse_aperture_seed`] seeds it for a table naming an
+/// interface the TPM driver speaks (`core/boot/docs/acpi.md` § Tables
+/// Consumed).
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Option is the cross-arch contract with the riscv64 hook, whose platform places no \
+              TPM"
+)]
+pub fn tpm_register_window() -> Option<(u64, u64)>
+{
+    Some((0xFED4_0000, 0x5000))
+}
+
 /// No platform-default PCI windows on x86-64; a no-op stub.
 ///
 /// q35 firmware always publishes MCFG, from which the ACPI seeder derives the

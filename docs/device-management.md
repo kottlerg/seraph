@@ -590,6 +590,7 @@ init
  │    ├── driver/virtio-input      (MMIO + opt. IRQ; input class; on-disk)
  │    ├── driver/virtio-console    (MMIO + opt. IRQ; debug-port class; on-disk)
  │    ├── driver/virtio-rng        (MMIO + opt. IRQ; DMA; hwrng class; on-disk)
+ │    ├── driver/tpm               (MMIO cap; hwrng class; on-disk; x86-64)
  │    ├── driver/serial            (UART hw + IRQ caps; serial class)
  │    ├── driver/framebuffer       (MMIO cap; framebuffer class)
  │    └── driver/{cmos-rtc,goldfish-rtc} (RTC hw cap; rtc class)
@@ -670,7 +671,8 @@ devmgr loads driver binaries from one of two places:
   ([driver-binding.md](driver-binding.md) § Declaration Bounds).
 - **On-disk rootfs** — non-essentials (the per-arch RTC, bound to its platform record, the
   [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's
-  virtio-console driver, the virtio-rng driver, and the test-only `test-dma`) live at
+  virtio-console driver, the virtio-rng driver, the [TPM driver](../services/drivers/tpm/README.md),
+  and the test-only `test-dma`) live at
   `/services/drivers/` and are loaded via `procmgr_labels::CREATE_FROM_FILE`. The test-only
   `test-fault` binary lives in `/tests/drivers/`, which no boot-time pass reads; devmgr binds it
   only on `devmgr_labels::BIND_DRIVERS` (gated on `BIND_AUTHORITY`, which only svctest's seed-only

@@ -134,6 +134,14 @@ subcommands! {
         /// same populated sysroot as `test-terminal`.
         TestVmgenid(TestVmgenidArgs),
 
+        /// Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot
+        /// set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each
+        /// backed by a fresh `swtpm` emulator in place of the virtio RNG, and
+        /// assert the TPM driver's interface line and its first answered READ,
+        /// and entropyd's accepted contribution. Requires the same populated
+        /// sysroot as `test-terminal`, and `swtpm` (see xtask/README.md).
+        TestTpm(TestTpmArgs),
+
         /// Boot the KASLR randomization test: boot twice, scrape the kernel's
         /// serial-only `kaslr:` line, and assert the image slide and direct-map
         /// base differ between boots; then boot once with the `--no-kaslr` knob
@@ -336,6 +344,7 @@ impl CliCommand
             | Self::ComposeBundle(_)
             | Self::TestTerminal(_)
             | Self::TestVmgenid(_)
+            | Self::TestTpm(_)
             | Self::TestKaslr(_)
             | Self::TestCrashReport(_)
             | Self::TestMapRedo(_)
@@ -743,6 +752,26 @@ args! {
 
 args! {
     pub struct TestVmgenidArgs
+    {
+        /// Number of vCPUs to expose to the guest (QEMU -smp).
+        #[arg(long, default_value = "4")]
+        pub cpus: u32,
+
+        /// Guest memory size in MiB (QEMU -m).
+        #[arg(long, default_value = "512")]
+        pub mem: u32,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+// ── TestTpm ───────────────────────────────────────────────────────────────────
+
+args! {
+    pub struct TestTpmArgs
     {
         /// Number of vCPUs to expose to the guest (QEMU -smp).
         #[arg(long, default_value = "4")]

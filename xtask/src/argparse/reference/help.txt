@@ -24,6 +24,7 @@ Commands:
   compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
   test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
   test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
+  test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
@@ -73,6 +74,7 @@ Commands:
   compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
   test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
   test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
+  test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
@@ -849,6 +851,34 @@ Options:
 Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
 
 Usage: xtask test-vmgenid [OPTIONS]
+
+Options:
+      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
+      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
+      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
+  -h, --help              Print help
+=== xtask test-tpm -h
+Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
+
+Usage: xtask test-tpm [OPTIONS]
+
+Options:
+      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
+      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
+      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
+  -h, --help              Print help
+=== xtask test-tpm --help
+Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
+
+Usage: xtask test-tpm [OPTIONS]
 
 Options:
       --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
@@ -2468,6 +2498,7 @@ Commands:
   compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
   test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
   test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
+  test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
   test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `--no-kaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
   test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)

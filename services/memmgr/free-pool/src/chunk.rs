@@ -45,8 +45,8 @@ const RADIX: u64 = DIR_FANOUT as u64;
 const AGE_MAX: u8 = 3;
 
 /// Sweeps without an access after which a resident chunk is cold
-/// ([`ChunkEntry::is_cold`]).
-const COLD_SWEEPS: u8 = 2;
+/// ([`ChunkEntry::is_cold`]), the age background eviction waits for.
+pub const COLD_SWEEPS: u8 = 2;
 
 /// Where a chunk's data is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,12 +389,27 @@ impl ChunkEntry
         }
     }
 
-    /// Whether the chunk is a victim for eviction: resident, not pinned, and
-    /// unaccessed for [`COLD_SWEEPS`] sweeps.
+    /// Whether the chunk can be evicted after `sweeps` sweeps without an
+    /// access: resident, not pinned, and its age at least `sweeps`.
+    #[must_use]
+    pub fn is_idle(&self, sweeps: u8) -> bool
+    {
+        self.state == ChunkState::Resident && !self.pinned && self.age >= sweeps
+    }
+
+    /// Whether the chunk is a victim for background eviction: idle for
+    /// [`COLD_SWEEPS`] sweeps ([`Self::is_idle`]).
     #[must_use]
     pub fn is_cold(&self) -> bool
     {
-        self.state == ChunkState::Resident && !self.pinned && self.age >= COLD_SWEEPS
+        self.is_idle(COLD_SWEEPS)
+    }
+
+    /// Sweeps since the chunk was last seen accessed, at most [`AGE_MAX`].
+    #[must_use]
+    pub const fn age(&self) -> u8
+    {
+        self.age
     }
 }
 
@@ -1070,6 +1085,7 @@ mod tests
         assert!(pinned.pinned());
         assert_eq!(pinned.begin_evict(1), Err(ChunkError::Pinned));
         assert!(!pinned.is_cold());
+        assert!(!pinned.is_idle(0));
         let unpinned = pinned.unpin();
         assert!(unpinned.is_cold());
         assert_eq!(
@@ -1083,6 +1099,8 @@ mod tests
     {
         let e = resident(0, 4);
         assert!(!e.sweep(0).is_cold());
+        assert!(e.sweep(0).is_idle(1) && !e.is_idle(1) && e.is_idle(0));
+        assert_eq!((e.age(), e.sweep(0).age()), (0, 1));
         assert!(e.sweep(0).sweep(0).is_cold());
         // The age saturates in its two bits and an access resets it.
         let old = e.sweep(0).sweep(0).sweep(0).sweep(0).sweep(0);

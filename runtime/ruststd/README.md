@@ -181,10 +181,14 @@ reservation discharges the first by construction.
 A map into a retype-backed `AddressSpace` draws its intermediate page tables
 from that AS's page-table growth pool, and fails with `OutOfMemory` when the
 pool is exhausted. `fund_aspace_pt_budget(self_aspace, n)` tops the pool up: it
-acquires a memmgr-backed RETYPE Memory cap and augments the pool via
-`cap_create_aspace`, donating only the pool's shortfall against the worst case
-for `n` pages. It returns `false` only when a donation was refused (memmgr
-unreachable or refusing the grant, or the kernel refusing the donation).
+asks memmgr for the pool's shortfall against the worst case for `n` pages and
+augments the pool via `cap_create_aspace` with each run memmgr grants. A pool
+takes pages, not a run, so the request is best-effort, without
+`REQUIRE_CONTIGUOUS`: a free pool cut into short runs, as eviction leaves it,
+still funds it, and a grant short of the shortfall is followed by a request for
+the rest (`pool_funding::donate_runs`). It returns `false` only when a donation
+was refused (memmgr unreachable or refusing the grant, or the kernel refusing
+the donation).
 
 The pool is shared by every mapping of the process, the pager's included, so a
 top-up cannot be reserved for the span it was made for: another thread's mapping
@@ -319,10 +323,11 @@ std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n o
 
 - **`cspace_slot_headroom`** returns `CAP_INFO_CSPACE_CAPACITY` less `CAP_INFO_CSPACE_USED`
   and the reserve.
-- **`fund_cspace_slot_budget`** requests a memmgr-backed Memory cap through the object slab
-  when the headroom falls short of `n` plus a page's slots, or the growth budget
-  (`CAP_INFO_CSPACE_BUDGET`) below a page, and donates it with augment-mode `cap_create_cspace`,
-  sized by `syscall_abi::cspace_topup_pages`. The page beyond `n` is for the `CSpace`'s body
+- **`fund_cspace_slot_budget`** asks memmgr for pages when the headroom falls short of `n`
+  plus a page's slots, or the growth budget (`CAP_INFO_CSPACE_BUDGET`) below a page, and donates
+  each run memmgr grants with augment-mode `cap_create_cspace`, sized by
+  `syscall_abi::cspace_topup_pages`. The request is best-effort, as for the page-table pool
+  above, so a fragmented free pool funds it. The page beyond `n` is for the `CSpace`'s body
   arena, which a split or a range-capability copy draws on. It donates the shortfall it reads,
   in at most `FUND_ROUNDS` (2) donations (the `ruststd-pool-funding` crate), and returns `false`
   only when a donation was refused. The headroom is shared by every capability allocation of

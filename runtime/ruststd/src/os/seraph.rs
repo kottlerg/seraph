@@ -1106,10 +1106,10 @@ pub fn wait_memory_pressure(
 /// `region_pages`-page foreign-memory region (MMIO, DMA) into a
 /// retype-backed `AddressSpace`.
 ///
-/// Requests Memory backing from memmgr and retypes it onto the AS's PT pool
-/// via `cap_create_aspace` augment-mode, so a map of the region draws its
-/// intermediate page tables from this caller-funded, memmgr-accounted budget
-/// rather than the fixed kernel PT reserve. Only the pool's shortfall against
+/// Requests Memory backing from memmgr, in runs of any length, and retypes each
+/// run onto the AS's PT pool via `cap_create_aspace` augment-mode, so a map of
+/// the region draws its intermediate page tables from this caller-funded,
+/// memmgr-accounted budget rather than the fixed kernel PT reserve. Only the pool's shortfall against
 /// the region's worst case is donated.
 ///
 /// The pool is shared by every mapping of the process, the pager's included,
@@ -1222,7 +1222,8 @@ pub fn cspace_slot_headroom(self_cspace: u64) -> u64 {
 /// the `CSpace`'s arena, which draws whole pages from the same growth budget.
 /// This helper measures the headroom above the reserve and the budget and, when
 /// either is short (`syscall_abi::cspace_topup_pages`), requests Memory from
-/// memmgr and donates it to the pool via augment-mode `cap_create_cspace`.
+/// memmgr, in runs of any length, and donates each run to the pool via
+/// augment-mode `cap_create_cspace`.
 ///
 /// After a success, `slots` general allocations succeed and the arena can still
 /// take one more page, 31 bodies; a burst of `n` splits needs `slots` of at

@@ -591,11 +591,15 @@ fn demand_fault_fragmented_phase(_: &Caps)
     let page = syscall_abi::PAGE_SIZE;
     let chunk_bytes = DEMAND_CHUNK_PAGES.saturating_mul(page);
     let floor = pool_growth_floor() / page;
-    // The cut starts from `target` free pages and ends at the floor, so it
-    // takes `target - floor` pages, half of them holes. Once the holes are
-    // released, the draw of what the cut left uncut (at most the floor) must
-    // still leave the floor and the headroom free.
-    let target = floor
+    // The floor rises while memmgr evicts at `LOW`, which the cut reaches, up
+    // to twice the reserve: at most twice what it is now, since it is never
+    // below the reserve. The cut starts from `target` free pages and ends at
+    // the floor, at most `ceiling`, so it takes `target - ceiling` pages or
+    // more, half of them holes. Once the holes are released, the draw of what
+    // the cut left uncut (at most the floor) must still leave the floor and the
+    // headroom free.
+    let ceiling = floor.saturating_mul(2);
+    let target = ceiling
         .saturating_mul(3)
         .saturating_add(FRAGMENT_HEADROOM_PAGES.saturating_mul(2))
         .saturating_add(FRAGMENT_SLACK_PAGES);

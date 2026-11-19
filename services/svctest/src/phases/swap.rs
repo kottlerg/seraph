@@ -161,7 +161,7 @@ const HOG_CSPACE_LOW_WATER: u64 = 64;
 /// The slots each top-up of [`HOG_HEADROOM`] funds.
 const HOG_CSPACE_TOPUP_SLOTS: u64 = 1024;
 /// The hold of svctest's `CSpace` above [`HOG_CSPACE_LOW_WATER`] general
-/// slots (runtime/ruststd/README.md § CSpace slot headroom): the hog's caps
+/// slots (runtime/ruststd/README.md § `CSpace` slot headroom): the hog's caps
 /// outgrow the slots procmgr seeded.
 static HOG_HEADROOM: std::os::seraph::CSpaceHeadroom =
     std::os::seraph::CSpaceHeadroom::new(HOG_CSPACE_LOW_WATER, HOG_CSPACE_TOPUP_SLOTS);

@@ -217,7 +217,7 @@ describes, and a signature over the binary would cover its declaration with it.
 | DMA address width | Optional, valid only beside DMA: the address bits the device's DMA reaches, 12 to 64; absent means the device has no limit of its own. devmgr limits the device's IOVA space to the smaller of this and its unit's width (§ Declaration Bounds) |
 | Physical access | Whether the driver programs hardware with physical addresses: it is then created `CREATE_PHYS_ACCESS` ([device-management.md](device-management.md#physical-addresses) § Physical Addresses). Accepted only for an IOMMU record (§ Declaration Bounds) |
 | Withdrawal reset | How devmgr stops the device when it withdraws the driver: the VirtIO `device_status` reset, a PCI Express Function Level Reset, or none, beside the interrupt disable every PCI function gets (§ Binding). The VirtIO reset also makes the driver one of the VirtIO register layout and states whether its device type has a device-specific configuration region, which the layout then includes ([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) § Per-Device Capability Creation) |
-| Reserve | A driver of the `block` device class is created `CREATE_RESERVE`, inside memmgr's system reserve, since it is the storage path swapd calls to end a pressure episode; procmgr honours it because devmgr's own node is a reserve node. Derived from the class, not declared |
+| Reserve | Not a field: a declaration of the `block` device class has its driver created `CREATE_RESERVE`, inside memmgr's system reserve, since it is the storage path swapd calls to end a pressure episode; so is the IOMMU driver. procmgr honours the flag because devmgr's own node is a reserve node. The grant follows the declared class, from either source (§ Declaration Bounds) |
 | Priority tier | Boot (`sched_policy::BOOT_DRIVER_PRIORITY`) or auxiliary (`AUX_DRIVER_PRIORITY`) |
 
 A declaration names standards only: the withdrawal reset and the interrupt kind are methods
@@ -267,7 +267,12 @@ never claims more than its device and the system's policy give it:
   drivers on it.
 - **Class.** Declaring a class decides which of that class's consumers talk to the driver; it
   grants no access, since the class's policy is configuration (§ Device Classes). Consumers
-  treat a driver's data as untrusted.
+  treat a driver's data as untrusted. The `block` class also has the driver created inside
+  memmgr's system reserve, where it may take the reserve's pages and is never evicted, from a
+  declaration of either source. A source bound would give nothing: every start of a driver after
+  the bootstrap, a restart of the boot disk's driver included, is from its drivers-directory
+  entry (§ Source), so the authority that writes `/services/drivers/` already decides the code
+  of the storage path in the reserve.
 - **DMA width.** The width limits the device's IOVA space and never widens it past what its
   remapping unit translates; devmgr knows no device's DMA width, so a driver declares its own.
   A width without DMA, outside 12 to 64 bits, or repeated rejects the declaration whole. A

@@ -63,7 +63,9 @@ chunk again on its store runs. `NOTHING_TO_TAKE` is asked again at once, 64 time
 (`TAKE_SWEEP`), since each walk covers a bounded part of memmgr's records; after that sweep, or on
 `QUOTA`, the thread waits 50 ms (`TAKE_BACKOFF_MS`) or until the level changes. `SWAP_FULL` and a
 refusal make it wait 1 s (`FULL_BACKOFF_MS`) or until the level changes, since a restore frees a
-slot without a change of the level.
+slot without a change of the level. So does a slot it could not write, since a device that fails a
+write, read-only or failing media, may fail every write without losing the device; the first such
+write is logged.
 
 Only `CRITICAL` writes. The compressed store is the cheaper tier: a restore from it takes no device
 read, where a restore from disk takes a slot's read and the open, a few milliseconds
@@ -83,8 +85,12 @@ block driver serves one request at a time, so a restore can wait behind one writ
 The block driver fails every request once a device lost one (`DEVICE_FAULT`). swapd then marks the
 partition lost and logs it once: every fault on a chunk on disk is forwarded with code 12 and detail
 2, killing its process, and nothing more is written. It does not exit: a new instance would hold the
-same failed driver. A call to the block driver that fails, the driver dead, counts as a lost
-partition too.
+same failed driver.
+
+A call to the block driver that fails has no reply, and the buffer it lent may be the driver's: the
+driver died, or a debugger stopped the calling thread. swapd then ends with a fault, as it does when
+a reply brings no buffer back, and the next instance takes the partition again from vfsd and
+registers again, keeping every chunk on disk.
 
 ---
 
@@ -110,7 +116,7 @@ off a system that can run.
 | `READ_TRIES` | 3 reads of a slot | a device I/O error can be transient |
 | `TAKE_SWEEP` | 64 `NOTHING_TO_TAKE` replies in a row | each walk covers part of memmgr's records |
 | `TAKE_BACKOFF_MS` | 50 ms | the wait after a sweep that found nothing, or after `QUOTA` |
-| `FULL_BACKOFF_MS` | 1 s | the wait with every slot taken |
+| `FULL_BACKOFF_MS` | 1 s | the wait with every slot taken, after a refused take, or after a slot not written |
 | `WRITE_OUT_PRIORITY` | 12 | below the restore and want threads (20) |
 
 ---

@@ -33,6 +33,12 @@ pub const TAKE_SWEEP: u32 = 64;
 /// found nothing to take or memmgr could not take a chunk for want of memory.
 pub const TAKE_BACKOFF_MS: u64 = 50;
 
+/// How long the write-out waits, or until the level changes, once every slot
+/// is taken, memmgr refused a take, or a slot was not written: a restore
+/// frees a slot without a change of the level, and a device that fails a
+/// write may fail the next.
+pub const FULL_BACKOFF_MS: u64 = 1000;
+
 /// The swap partition's geometry: its logical block size and its length in
 /// blocks, as the block driver's `BLK_GET_GEOMETRY` reports them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,21 +155,36 @@ pub enum Transfer
     Done,
     /// The device failed this request; another may succeed.
     Failed,
-    /// The block driver fails every request from now on (`DEVICE_FAULT`), or
-    /// the call itself failed: the partition is gone.
+    /// The block driver fails every request from now on (`DEVICE_FAULT`):
+    /// the partition is gone for this boot.
     Lost,
 }
 
-/// The meaning of a block request's reply `label`, `None` for a call that
-/// failed.
+/// The meaning of a block request's reply `label`. A call that failed has
+/// no reply: swapd ends with a fault there (services/swapd/docs/operation.md
+/// § Disk Failure).
 #[must_use]
-pub const fn transfer(label: Option<u64>) -> Transfer
+pub const fn transfer(label: u64) -> Transfer
 {
     match label
     {
-        Some(blk_errors::SUCCESS) => Transfer::Done,
-        Some(blk_errors::DEVICE_FAULT) | None => Transfer::Lost,
-        Some(_) => Transfer::Failed,
+        blk_errors::SUCCESS => Transfer::Done,
+        blk_errors::DEVICE_FAULT => Transfer::Lost,
+        _ => Transfer::Failed,
+    }
+}
+
+/// How long the write-out waits, or until the level changes, after it ended
+/// a write whose transfer had `outcome`: none when the slot was written,
+/// [`FULL_BACKOFF_MS`] when it was not, so a device that fails every write is
+/// not asked again at once.
+#[must_use]
+pub const fn after_write(outcome: Transfer) -> Option<u64>
+{
+    match outcome
+    {
+        Transfer::Done => None,
+        Transfer::Failed | Transfer::Lost => Some(FULL_BACKOFF_MS),
     }
 }
 
@@ -297,16 +318,21 @@ mod tests
     }
 
     #[test]
-    fn a_device_fault_or_a_failed_call_loses_the_partition()
+    fn only_a_device_fault_loses_the_partition()
     {
-        assert_eq!(transfer(Some(blk_errors::SUCCESS)), Transfer::Done);
-        assert_eq!(
-            transfer(Some(blk_errors::DEVICE_STATUS_IOERR)),
-            Transfer::Failed
-        );
-        assert_eq!(transfer(Some(blk_errors::OUT_OF_BOUNDS)), Transfer::Failed);
-        assert_eq!(transfer(Some(blk_errors::DEVICE_FAULT)), Transfer::Lost);
-        assert_eq!(transfer(None), Transfer::Lost);
+        assert_eq!(transfer(blk_errors::SUCCESS), Transfer::Done);
+        assert_eq!(transfer(blk_errors::DEVICE_STATUS_IOERR), Transfer::Failed);
+        assert_eq!(transfer(blk_errors::OUT_OF_BOUNDS), Transfer::Failed);
+        assert_eq!(transfer(blk_errors::DEVICE_STATUS_UNSUPP), Transfer::Failed);
+        assert_eq!(transfer(blk_errors::DEVICE_FAULT), Transfer::Lost);
+    }
+
+    #[test]
+    fn a_write_not_made_backs_off()
+    {
+        assert_eq!(after_write(Transfer::Done), None);
+        assert_eq!(after_write(Transfer::Failed), Some(FULL_BACKOFF_MS));
+        assert_eq!(after_write(Transfer::Lost), Some(FULL_BACKOFF_MS));
     }
 
     #[test]

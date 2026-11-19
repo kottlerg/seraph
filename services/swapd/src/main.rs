@@ -51,10 +51,6 @@ const WANT_BITS: u64 = 1;
 /// write-out on swapd's side.
 const WRITE_OUT_PRIORITY: u8 = 12;
 
-/// How long the write-out waits, or until the level changes, once every slot
-/// is taken: a restore frees a slot without a change of the level.
-const FULL_BACKOFF_MS: u64 = 1000;
-
 /// Bytes of stack swapd touches at start: more than a request's frames take.
 const STACK_TOUCH_BYTES: usize = 32 * 1024;
 
@@ -275,7 +271,10 @@ fn call(ep: u64, msg: &IpcMessage, what: &str) -> IpcMessage
 
 /// Move `extent` between the partition and the buffer `buf` with the block
 /// label `label`, the reply moving the buffer back into `buf`. Its outcome;
-/// a call that failed, or a reply without the buffer, loses the partition.
+/// `DEVICE_FAULT` loses the partition. A call that failed (the driver gone,
+/// or the thread stopped by a debugger while the buffer may be the
+/// driver's), or a reply without the buffer, ends swapd with a fault: the
+/// next instance takes the partition again and keeps every chunk on disk.
 fn transfer(swap: &Swap, label: u64, extent: Extent, buf: &mut u64) -> Transfer
 {
     let msg = IpcMessage::builder(label)
@@ -283,22 +282,12 @@ fn transfer(swap: &Swap, label: u64, extent: Extent, buf: &mut u64) -> Transfer
         .word(1, extent.count)
         .cap(*buf)
         .build();
-    // SAFETY: `current_ipc_buf` is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(swap.partition, &msg, std::os::seraph::current_ipc_buf()) };
-    let label = match reply
-    {
-        Ok(reply) => match reply.caps().first()
-        {
-            Some(&cap) =>
-            {
-                *buf = cap;
-                Some(reply.label)
-            }
-            None => None,
-        },
-        Err(_) => None,
-    };
-    let outcome = layout::transfer(label);
+    let reply = call(swap.partition, &msg, "a block request");
+    *buf = *reply
+        .caps()
+        .first()
+        .unwrap_or_else(|| fail(format_args!("a block request moved no buffer back")));
+    let outcome = layout::transfer(reply.label);
     if outcome == Transfer::Lost
     {
         swap.lose();
@@ -430,6 +419,7 @@ fn serve_wants(swap: &Swap, want: u64, mut buf: u64) -> !
 fn write_out(swap: &Swap, pressure: u64, mut buf: u64) -> !
 {
     let mut empty: u32 = 0;
+    let mut unwritten_logged = false;
     loop
     {
         if swap.lost()
@@ -457,7 +447,18 @@ fn write_out(swap: &Swap, pressure: u64, mut buf: u64) -> !
             AfterTake::Write =>
             {
                 empty = 0;
-                write_slot(swap, reply.word(0), reply.word(1), &mut buf);
+                let outcome = write_slot(swap, reply.word(0), reply.word(1), &mut buf);
+                if let Some(wait) = layout::after_write(outcome)
+                {
+                    if !unwritten_logged
+                    {
+                        unwritten_logged = true;
+                        std::os::seraph::log!(
+                            warn: "a slot was not written; the write-out waits before each take                                    after a slot it could not write"
+                        );
+                    }
+                    let _ = syscall::notification_wait_timeout(pressure, wait);
+                }
             }
             AfterTake::Again => empty = empty.saturating_add(1),
             AfterTake::Backoff =>
@@ -468,13 +469,13 @@ fn write_out(swap: &Swap, pressure: u64, mut buf: u64) -> !
             AfterTake::Full =>
             {
                 empty = 0;
-                let _ = syscall::notification_wait_timeout(pressure, FULL_BACKOFF_MS);
+                let _ = syscall::notification_wait_timeout(pressure, layout::FULL_BACKOFF_MS);
             }
             AfterTake::Refused =>
             {
                 std::os::seraph::log!(warn: "SWAP_TAKE refused ({:#x})", reply.label);
                 empty = 0;
-                let _ = syscall::notification_wait_timeout(pressure, FULL_BACKOFF_MS);
+                let _ = syscall::notification_wait_timeout(pressure, layout::FULL_BACKOFF_MS);
             }
         }
     }
@@ -482,14 +483,17 @@ fn write_out(swap: &Swap, pressure: u64, mut buf: u64) -> !
 
 /// Write the `len` bytes `SWAP_TAKE` put in `buf` to slot `slot`, and end the
 /// write: written, or not, which compresses the chunk again on its store runs.
-fn write_slot(swap: &Swap, slot: u64, len: u64, buf: &mut u64)
+/// The write's outcome, `Failed` for a slot word that names no slot of the
+/// partition.
+fn write_slot(swap: &Swap, slot: u64, len: u64, buf: &mut u64) -> Transfer
 {
-    let written = u32::try_from(slot)
+    let outcome = u32::try_from(slot)
         .ok()
         .and_then(|slot| swap.geometry.extent(slot, len))
-        .is_some_and(|extent| {
-            transfer(swap, blk_labels::BLK_WRITE_FROM_MEMORY, extent, buf) == Transfer::Done
+        .map_or(Transfer::Failed, |extent| {
+            transfer(swap, blk_labels::BLK_WRITE_FROM_MEMORY, extent, buf)
         });
+    let written = outcome == Transfer::Done;
     let msg = IpcMessage::builder(memmgr_labels::SWAP_DONE)
         .word(0, slot)
         .word(1, u64::from(!written))
@@ -499,6 +503,7 @@ fn write_slot(swap: &Swap, slot: u64, len: u64, buf: &mut u64)
     {
         std::os::seraph::log!(warn: "SWAP_DONE of slot {slot} replied {:#x}", reply.label);
     }
+    outcome
 }
 
 /// End swapd with a fault, `why` logged as its panic message: a panic traps,

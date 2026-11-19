@@ -172,8 +172,9 @@ pub const STORAGE_CLASS: &[u8] = b"block";
 /// (`iommu_record`) or not: the boot tier only from a boot module; physical
 /// access only from a boot module and only for an IOMMU record
 /// (docs/driver-binding.md § Declaration Bounds). A drivers-directory driver
-/// runs at the auxiliary tier. A driver of [`STORAGE_CLASS`], and the driver
-/// of an IOMMU record, is created in the reserve.
+/// runs at the auxiliary tier. A driver of [`STORAGE_CLASS`], from either
+/// source, and the driver of an IOMMU record, is created in the reserve
+/// (docs/driver-binding.md § Declaration Bounds, its Class bound).
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,

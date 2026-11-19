@@ -98,6 +98,77 @@ pub fn next(at: u64, end: u64, step: ResidentStep, paused: u32) -> Next
     }
 }
 
+/// A reader's bound on its wait for the chunks on disk of the ranges it makes
+/// resident: the pauses it has spent against [`PENDING_TRIES`], never reset,
+/// so a reader that passes one bound to several ranges, as crashd does to
+/// every read of a dump, pauses at most [`PENDING_TRIES`] times over all of
+/// them; and the reader's own stop, checked before each request, so a reader
+/// whose own bound has passed (crashd's fault or dump bound) sends no further
+/// request.
+pub struct ResidentBound<'a>
+{
+    /// The pauses spent.
+    pauses: u32,
+    /// Whether the reader's own bound has passed.
+    stop: &'a dyn Fn() -> bool,
+}
+
+impl<'a> ResidentBound<'a>
+{
+    /// A bound with no pause spent, which stops once `stop` returns `true`.
+    #[must_use]
+    pub fn new(stop: &'a dyn Fn() -> bool) -> Self
+    {
+        Self { pauses: 0, stop }
+    }
+
+    /// The pauses spent against [`PENDING_TRIES`].
+    #[must_use]
+    pub const fn pauses(&self) -> u32
+    {
+        self.pauses
+    }
+
+    /// Whether the reader's own bound has passed: no further request is sent
+    /// under this bound.
+    #[must_use]
+    pub fn stopped(&self) -> bool
+    {
+        (self.stop)()
+    }
+}
+
+/// Ask procmgr, through the debug-authority cap `authority`, to make the
+/// range of `len` bytes at `va` of the process whose process badge (as
+/// `procmgr_labels::LIST_PROCESSES` lists it) is `process` resident
+/// (`procmgr_labels::MAKE_RESIDENT`), under a bound of its own: at most
+/// [`PENDING_TRIES`] pauses, about a second, and no stop. This is
+/// [`make_resident_bounded`] for a reader that runs under no bound of its
+/// own, as gdbstub does; a reader that does passes its bound to that.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+pub unsafe fn make_resident(
+    authority: u64,
+    process: u64,
+    va: u64,
+    len: u64,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe {
+        make_resident_bounded(
+            authority,
+            process,
+            va,
+            len,
+            ipc_buf,
+            &mut ResidentBound::new(&|| false),
+        )
+    }
+}
+
 /// Ask procmgr, through the debug-authority cap `authority`, to make the
 /// range of `len` bytes at `va` of the process whose process badge (as
 /// `procmgr_labels::LIST_PROCESSES` lists it) is `process` resident
@@ -110,20 +181,23 @@ pub fn next(at: u64, end: u64, step: ResidentStep, paused: u32) -> Next
 /// part of the range per request and replies where it stopped, so this asks
 /// again from there until the whole range is done ([`next`]); where memmgr
 /// stopped at a chunk on disk, it pauses [`PENDING_PAUSE_MS`] before it asks
-/// again, at most [`PENDING_TRIES`] times in all, and past them goes on
-/// past the chunks on disk ([`resident_range`]).
-/// Whether every request was served: `false` when a call failed, procmgr refused (`OUT_OF_MEMORY` when memmgr
-/// could not restore a chunk of the range), a reply made no progress, or a
-/// chunk on disk was not restored within the tries.
+/// again, while `bound` has pauses left, and past them goes on past the
+/// chunks on disk; once `bound` has stopped, it sends no further request
+/// ([`resident_range`]).
+/// Whether every request was served: `false` when a call failed, procmgr
+/// refused (`OUT_OF_MEMORY` when memmgr could not restore a chunk of the
+/// range), a reply made no progress, a chunk on disk was not restored within
+/// the bound's pauses, or the bound stopped.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
-pub unsafe fn make_resident(
+pub unsafe fn make_resident_bounded(
     authority: u64,
     process: u64,
     va: u64,
     len: u64,
     ipc_buf: *mut u64,
+    bound: &mut ResidentBound<'_>,
 ) -> bool
 {
     let Some(end) = va.checked_add(len)
@@ -131,35 +205,35 @@ pub unsafe fn make_resident(
     {
         return false;
     };
-    let mut pauses: u32 = 0;
     resident_range(
         va,
         end,
-        &mut pauses,
+        bound,
         // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
         |at| unsafe { make_resident_step(authority, process, at, end, ipc_buf) },
-        // A sleep cut short only asks again sooner, which the tries bound as
-        // well.
+        // A sleep cut short (crashd's watchdog upcall) only asks again
+        // sooner, which the bound's pauses and its stop bound as well.
         || {
             let _ = syscall::thread_sleep(PENDING_PAUSE_MS);
         },
     )
 }
 
-/// The loop of [`make_resident`] over `[va, end)`: `step` makes one request
-/// from the address it is given (`None` when the call failed, was refused, or
-/// the caller's own bound stops it), and `pause` waits [`PENDING_PAUSE_MS`]
-/// after a pending reply. `pauses` counts the pauses spent against
-/// [`PENDING_TRIES`] and is never reset, so a caller that passes one count
-/// to several ranges, as crashd does for a dump's, bounds the wait on the swap
-/// service over all of them; once it is spent, a range still goes on past its
-/// chunks on disk, so the chunks memmgr restores from its store beyond them
-/// are restored. Whether the whole range is done: `false` when a request
-/// failed, a reply made no progress, or a chunk on disk was passed over.
+/// The loop of [`make_resident_bounded`] over `[va, end)`: `step` makes one
+/// request from the address it is given (`None` when the call failed or was
+/// refused), and `pause` waits [`PENDING_PAUSE_MS`] after a pending reply.
+/// No request is made once `bound` has stopped. `bound` counts the pauses
+/// spent against [`PENDING_TRIES`] and is never reset, so a caller that
+/// passes one bound to several ranges, as crashd does for a dump's, bounds
+/// the wait on the swap service over all of them; once its pauses are spent,
+/// a range still goes on past its chunks on disk, so the chunks memmgr
+/// restores from its store beyond them are restored. Whether the whole range
+/// is done: `false` when the bound stopped, a request failed, a reply made no
+/// progress, or a chunk on disk was passed over.
 pub fn resident_range(
     va: u64,
     end: u64,
-    pauses: &mut u32,
+    bound: &mut ResidentBound<'_>,
     mut step: impl FnMut(u64) -> Option<ResidentStep>,
     mut pause: impl FnMut(),
 ) -> bool
@@ -168,12 +242,16 @@ pub fn resident_range(
     let mut passed = false;
     loop
     {
+        if bound.stopped()
+        {
+            return false;
+        }
         let Some(reply) = step(at)
         else
         {
             return false;
         };
-        match next(at, end, reply, *pauses)
+        match next(at, end, reply, bound.pauses)
         {
             Next::Done => return !passed,
             Next::GiveUp => return false,
@@ -190,7 +268,7 @@ pub fn resident_range(
             Next::Pause(reached) =>
             {
                 at = reached;
-                *pauses = pauses.saturating_add(1);
+                bound.pauses = bound.pauses.saturating_add(1);
                 pause();
             }
         }
@@ -201,8 +279,8 @@ pub fn resident_range(
 /// debug-authority cap `authority`: where procmgr replied that memmgr
 /// stopped, `end` when the range is done, and whether it stopped at a chunk
 /// on disk the swap service was asked to restore, or `None` when the call
-/// failed or procmgr refused. A caller that bounds its own requests, as crashd
-/// bounds a dump's, drives [`resident_range`] with this, one request per step.
+/// failed or procmgr refused. [`make_resident_bounded`] drives
+/// [`resident_range`] with this, one request per step.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -236,12 +314,46 @@ pub unsafe fn make_resident_step(
 }
 
 /// Read `buf.len()` bytes at `va` of the address space of `thread`, a thread
+/// of the process `process` names, as [`read_mem_resident_bounded`] does,
+/// under a bound of its own: at most [`PENDING_TRIES`] pauses, about a
+/// second, and no stop, for a reader that runs under no bound of its own, as
+/// gdbstub does.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// As [`read_mem_resident_bounded`].
+pub unsafe fn read_mem_resident(
+    authority: u64,
+    process: u64,
+    thread: u64,
+    va: u64,
+    buf: &mut [u8],
+    ipc_buf: *mut u64,
+) -> Result<(), i64>
+{
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe {
+        read_mem_resident_bounded(
+            authority,
+            process,
+            thread,
+            va,
+            buf,
+            ipc_buf,
+            &mut ResidentBound::new(&|| false),
+        )
+    }
+}
+
+/// Read `buf.len()` bytes at `va` of the address space of `thread`, a thread
 /// of the process `process` names, as `SYS_THREAD_READ_MEM` reads them
 /// (`syscall::thread_read_mem`). That read fails with `InvalidAddress` on a
 /// page that is not present, as a page of a chunk memmgr evicted is until its
 /// next fault; on that failure this asks procmgr to make the range resident
-/// ([`make_resident`], through `authority`) and, when procmgr did, reads once
-/// more.
+/// under `bound` ([`make_resident_bounded`], through `authority`) and, when
+/// procmgr did, reads once more.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -250,14 +362,16 @@ pub unsafe fn make_resident_step(
 /// The error of the last `SYS_THREAD_READ_MEM`: the first read's when it
 /// failed with anything but `InvalidAddress`, or when procmgr did not make
 /// the range resident (a chunk on disk the swap service did not restore
-/// within [`make_resident`]'s tries included); else the second read's.
-pub unsafe fn read_mem_resident(
+/// within the bound's pauses, or a bound that stopped, included); else the
+/// second read's.
+pub unsafe fn read_mem_resident_bounded(
     authority: u64,
     process: u64,
     thread: u64,
     va: u64,
     buf: &mut [u8],
     ipc_buf: *mut u64,
+    bound: &mut ResidentBound<'_>,
 ) -> Result<(), i64>
 {
     let Err(first) = syscall::thread_read_mem(thread, va, buf)
@@ -271,7 +385,7 @@ pub unsafe fn read_mem_resident(
     }
     let len = u64::try_from(buf.len()).unwrap_or(u64::MAX);
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-    if !unsafe { make_resident(authority, process, va, len, ipc_buf) }
+    if !unsafe { make_resident_bounded(authority, process, va, len, ipc_buf, bound) }
     {
         return Err(first);
     }
@@ -363,8 +477,8 @@ mod tests
     }
 
     /// Drive [`resident_range`] over `[va, end)` with the replies `replies`
-    /// in turn (`None` past the last), sharing `pauses`.
-    fn drive(va: u64, end: u64, pauses: &mut u32, replies: &[ResidentStep]) -> Drove
+    /// in turn (`None` past the last), under `bound`.
+    fn drive(va: u64, end: u64, bound: &mut ResidentBound<'_>, replies: &[ResidentStep]) -> Drove
     {
         let mut asks = 0;
         let mut first = [0; 4];
@@ -372,7 +486,7 @@ mod tests
         let done = resident_range(
             va,
             end,
-            pauses,
+            bound,
             |at| {
                 if let Some(slot) = first.get_mut(asks)
                 {
@@ -392,14 +506,20 @@ mod tests
         }
     }
 
+    /// A reader's own bound that never stops.
+    fn never() -> bool
+    {
+        false
+    }
+
     #[test]
     fn a_range_pauses_on_pending_chunks_and_asks_again_from_them()
     {
-        let mut pauses = 0;
+        let mut bound = ResidentBound::new(&never);
         let d = drive(
             0x1008,
             0x9000,
-            &mut pauses,
+            &mut bound,
             &[
                 pending(0x1008),
                 stopped(0x5000),
@@ -409,38 +529,39 @@ mod tests
         );
         assert!(d.done);
         assert_eq!((d.asks, d.first), (4, [0x1008, 0x1008, 0x5000, 0x6000]));
-        assert_eq!((d.made, pauses), (2, 2));
+        assert_eq!((d.made, bound.pauses()), (2, 2));
         // A failed request ends the range.
-        let d = drive(0x1000, 0x9000, &mut pauses, &[stopped(0x5000)]);
+        let d = drive(0x1000, 0x9000, &mut bound, &[stopped(0x5000)]);
         assert!(!d.done);
         assert_eq!((d.asks, d.first[0], d.first[1]), (2, 0x1000, 0x5000));
     }
 
     #[test]
-    fn one_pause_count_bounds_the_wait_over_every_range_that_shares_it()
+    fn one_bound_limits_the_pauses_over_every_range_that_shares_it()
     {
         let stuck = [pending(0x1000); PENDING_TRIES as usize + 1];
-        let mut pauses = 0;
-        let d = drive(0x1000, 0x9000, &mut pauses, &stuck);
+        let mut bound = ResidentBound::new(&never);
+        let d = drive(0x1000, 0x9000, &mut bound, &stuck);
         assert!(!d.done);
         assert_eq!(
             (d.made, d.asks),
             (PENDING_TRIES, PENDING_TRIES as usize + 1)
         );
-        // A second range sharing the spent count pauses no more: it gives up
+        // A second range sharing the spent bound pauses no more: it gives up
         // at its first pending reply, and still serves one that is not.
-        let d = drive(0x1000, 0x9000, &mut pauses, &stuck);
+        let d = drive(0x1000, 0x9000, &mut bound, &stuck);
         assert!(!d.done && d.made == 0 && d.asks == 1);
-        let d = drive(0x1000, 0x9000, &mut pauses, &[stopped(0x9000)]);
+        let d = drive(0x1000, 0x9000, &mut bound, &[stopped(0x9000)]);
         assert!(d.done && d.made == 0);
     }
 
     #[test]
-    fn a_spent_pause_count_goes_on_past_the_chunks_on_disk()
+    fn a_spent_bound_goes_on_past_the_chunks_on_disk()
     {
-        let mut pauses = PENDING_TRIES;
+        let mut bound = ResidentBound::new(&never);
+        bound.pauses = PENDING_TRIES;
         assert_eq!(
-            next(0x1000, 0x9000, pending_past(0x1000, 0x5000), pauses),
+            next(0x1000, 0x9000, pending_past(0x1000, 0x5000), bound.pauses()),
             Next::PassOver(0x5000)
         );
         // The rest of the range is still asked for, with no pause; the
@@ -448,7 +569,7 @@ mod tests
         let d = drive(
             0x1000,
             0x9000,
-            &mut pauses,
+            &mut bound,
             &[pending_past(0x1000, 0x5000), stopped(0x9000)],
         );
         assert!(!d.done);
@@ -457,7 +578,34 @@ mod tests
             (2, 0x1000, 0x5000, 0)
         );
         // A walk that reached the range's end ends it.
-        let d = drive(0x1000, 0x9000, &mut pauses, &[pending_past(0x3000, 0x9000)]);
+        let d = drive(0x1000, 0x9000, &mut bound, &[pending_past(0x3000, 0x9000)]);
         assert!(!d.done && d.asks == 1);
+    }
+
+    #[test]
+    fn a_stopped_bound_sends_no_further_request()
+    {
+        // The reader's own bound passes during the second pause: the range
+        // ends there, its pauses left unspent, with no third request.
+        let asked = core::cell::Cell::new(0u32);
+        let fired = core::cell::Cell::new(false);
+        let stop = || fired.get();
+        let mut bound = ResidentBound::new(&stop);
+        let done = resident_range(
+            0x1000,
+            0x9000,
+            &mut bound,
+            |_| {
+                asked.set(asked.get() + 1);
+                Some(pending(0x1000))
+            },
+            || fired.set(asked.get() >= 2),
+        );
+        assert!(!done);
+        assert_eq!((asked.get(), bound.pauses()), (2, 2));
+        // Every later range under the stopped bound, one sharing a dump's
+        // bound, sends no request at all.
+        let d = drive(0x1000, 0x9000, &mut bound, &[stopped(0x9000)]);
+        assert!(!d.done && d.asks == 0 && d.made == 0);
     }
 }

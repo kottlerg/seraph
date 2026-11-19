@@ -22,8 +22,9 @@
 //! committed page cannot fail with all that memmgr can promise taken, and a
 //! `heap-release` child ([`heap_release_main`]), whose heap discards a large
 //! freed block and trims its top. Each child's charge leaves svctest's budget
-//! subtree before the phase goes on, memmgr's free and promised totals then
-//! return to their levels, and the all-RAM-accounted identity holds.
+//! subtree before the phase goes on, memmgr's free total net of eviction and
+//! its promised total then return to their levels ([`windows_settle`]), and
+//! the all-RAM-accounted identity holds.
 
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use std::process::exit;
@@ -34,9 +35,9 @@ use syscall_abi::PAGE_SIZE;
 use crate::bootstrap::Caps;
 use crate::phases::heap_commit::{
     CHUNK_PAGES, HOG_BALLAST_BYTES, HOG_BALLAST_FAILED, HOG_MARGIN_PAGES, HOG_MAX_ROUNDS,
-    HOG_NOT_COMMITTED, HOG_STATUS_FAILED, POOL_POLLS, POOL_WINDOWS, children_charge,
-    children_reclaimed, commit_to_margin, expect_region_reply, memmgr_label, own_usage,
-    pool_totals, settled_totals, totals_settle_to, touch_committed,
+    HOG_NOT_COMMITTED, HOG_STATUS_FAILED, POOL_POLLS, POOL_WINDOWS, children_reclaimed,
+    commit_to_margin, expect_region_reply, memmgr_label, own_usage, pool_totals, touch_committed,
+    windows_settle,
 };
 use crate::runner::Phase;
 
@@ -106,8 +107,8 @@ const RELEASE_NOT_TRIMMED: i32 = 12;
 const RELEASE_NOT_DISCARDED: i32 = 13;
 
 /// The phase: the labels on regions of svctest's own, then the two children
-/// in windows until memmgr's totals return to their levels around them, then
-/// the identity.
+/// in windows until memmgr's levels return around them ([`windows_settle`]),
+/// then the identity.
 fn discard_range_phase(caps: &Caps)
 {
     discard_refusals();
@@ -118,9 +119,7 @@ fn discard_range_phase(caps: &Caps)
          frames to the pool in any of {POOL_WINDOWS} windows"
     );
     uncommitted_region();
-    let settled = (0..POOL_WINDOWS).any(|_| {
-        let children = children_charge();
-        let before = settled_totals();
+    windows_settle("the discard children", |children| {
         run_child(
             DISCARD_HOG_ROLE,
             "the discard hog",
@@ -145,13 +144,7 @@ fn discard_range_phase(caps: &Caps)
             ),
         );
         children_reclaimed(children, "the heap-release child");
-        totals_settle_to(before)
     });
-    assert!(
-        settled,
-        "memmgr's free and promised totals did not return to their levels after the discard \
-         children in any of {POOL_WINDOWS} windows"
-    );
     crate::phases::memmgr::ram_accounted_identity_phase(caps);
     std::os::seraph::log!("memmgr_discard_range phase passed");
 }

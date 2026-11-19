@@ -1416,8 +1416,8 @@ when the whole range is done, else the address the caller asks again from, with 
 range; and `data[1]`, memmgr's word 1: `memmgr_labels::RESIDENT_PENDING` when that address is a
 chunk on disk the swap service was asked to restore, else `0`. `ipc::make_resident` asks until it
 is done, pausing `ipc::PENDING_PAUSE_MS` (2 ms) before each request after a pending reply, and
-gives the range up after `ipc::PENDING_TRIES` (500) pending replies in a row at one address, about
-a second, the pages then staying not present. Refusals, in order: `UNAUTHORIZED` without the
+gives the range up after `ipc::PENDING_TRIES` (500) pauses in all, about a second, the pages
+then staying not present. Refusals, in order: `UNAUTHORIZED` without the
 authority; `INVALID_BADGE` when no live process carries the badge; then memmgr's: `INVALID_ARGUMENT`
 for a zero length or a range past the address space, and `OUT_OF_MEMORY` when memmgr could not
 restore a chunk of the range or the call to it failed. svctest's `memmgr_swap` phase reads a page of

@@ -385,9 +385,14 @@ fn resident_step(authority: u64, process: u64, va: u64, len: u64) -> ipc::Reside
 /// The want thread: wait on the want Notification `ntf`, take the words
 /// memmgr posted with `SWAP_WANTED`, and restore the one
 /// [`Shared::restore_wanted`] names from the slot store through `buf`, ahead
-/// of any fault. Returns the buffer once told to stop.
+/// of any fault. A request of the reader's between the take and the restore
+/// posts the word again, so a later take can hand it over once more; memmgr
+/// replies `RESTORE_STALE` to that restore, the use of the slot having ended,
+/// and this accepts it after the first restore. Returns the buffer once told to
+/// stop.
 fn want_server(swap: u64, ntf: u64, mut buf: Buffer, shared: &Shared) -> Buffer
 {
+    let mut restored = false;
     while !shared.want_stop.load(Ordering::Acquire)
     {
         if syscall::notification_wait_timeout(ntf, RESTORER_POLL_MS).is_err()
@@ -402,11 +407,12 @@ fn want_server(swap: u64, ntf: u64, mut buf: Buffer, shared: &Shared) -> Buffer
             {
                 let bytes = stored(shared, free_pool::disk::word_slot(word));
                 let (label, _) = restore(swap, word, &bytes, &mut buf, "a wanted restore");
-                assert_eq!(
-                    label,
-                    memmgr_errors::SUCCESS,
+                assert!(
+                    label == memmgr_errors::SUCCESS
+                        || (restored && label == memmgr_errors::RESTORE_STALE),
                     "{PHASE}: the want thread's SWAP_RESTORE replied {label:#x}"
                 );
+                restored = true;
             }
         }
         shared.wanted.lock().expect("the want lock").extend(words);
@@ -865,8 +871,10 @@ fn swap_client_phase(caps: &Caps)
         "{PHASE}: chunks of the main region not present, against those on disk"
     );
 
-    // The want path end to end: ipc::make_resident of e's chunk returns once
-    // the want thread restored it, and of b's gives up, b staying on disk.
+    // The want path end to end: ipc::make_resident of e's chunk, from an
+    // address inside its first page as a debugger's read gives one, returns
+    // once the want thread restored it, and of b's gives up, b staying on
+    // disk.
     let va_of = |word: u64| {
         on_disk
             .iter()
@@ -882,8 +890,15 @@ fn swap_client_phase(caps: &Caps)
         .unwrap_or_else(|e| panic!("{PHASE}: spawning the want thread: {e}"));
     let va_e = va_of(word_e);
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let made =
-        unsafe { ipc::make_resident(authority, process, va_e, CHUNK_LEN, current_ipc_buf()) };
+    let made = unsafe {
+        ipc::make_resident(
+            authority,
+            process,
+            va_e.saturating_add(8),
+            CHUNK_LEN - 8,
+            current_ipc_buf(),
+        )
+    };
     assert!(
         made,
         "{PHASE}: ipc::make_resident of e's chunk at {va_e:#x} failed"

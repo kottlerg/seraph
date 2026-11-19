@@ -1086,9 +1086,10 @@ memmgr walks on past a chunk it posts, posting each chunk on disk and restoring
 each chunk in RAM it meets within its bounds. A word stays posted until the swap
 service takes it, at most `SWAP_WANTED_WORDS` (8) at a time, a full list dropping
 its oldest word for a new one; a reader whose word was dropped posts it again when
-it asks again. `ipc::make_resident` pauses 2 ms (`ipc::PENDING_PAUSE_MS`) between
-requests that stay pending and gives the range up after 500 of them
-(`ipc::PENDING_TRIES`), about a second: a swap service that is down, restarting,
+it asks again. `ipc::make_resident` pauses 2 ms (`ipc::PENDING_PAUSE_MS`) after
+each pending reply and gives the range up after 500 pauses in all
+(`ipc::PENDING_TRIES`), about a second, and crashd counts them over a whole
+dump: a swap service that is down, restarting,
 or cannot read the slot leaves the pages not present, and the reader reads them as
 such.
 
@@ -1108,8 +1109,9 @@ swap authority only (§ Badge Discipline); every other badge is refused
 `UNAUTHORIZED`, its caps deleted. memmgr performs no device I/O and waits on
 no swap service: each label is a request the swap service makes, and the
 redirect of a fault on a chunk on disk is a fault reply (§ Kernel-origin fault
-message). Each label that carries a cap moves it to memmgr for the call, and
-memmgr moves it back on every reply.
+message). `SWAP_REGISTER` gives memmgr its caps to keep; each other label that
+carries a cap moves it to memmgr for the call, and memmgr moves it back on every
+reply.
 
 #### Label 22: `SWAP_REGISTER`
 

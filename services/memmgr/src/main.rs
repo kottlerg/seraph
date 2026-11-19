@@ -23,8 +23,8 @@ use free_pool::{
     FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError,
     NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError,
     ResidentPath, ResizeError, SelectError, SlotStore, WordStore, arena::Slot, chunk::table_height,
-    chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pressure_level,
-    region_grants, reserve_pages,
+    chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pending_from,
+    pressure_level, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -2261,8 +2261,9 @@ const MAKE_RESIDENT_VISITS: u32 = 64;
 /// visits; the reply's word 0 is where it stopped, the range's end when it is
 /// all done, and the sender asks again from there. Word 1 is
 /// `RESIDENT_PENDING` when a chunk on disk was posted: word 0 is then the
-/// first such chunk's base, from which the sender asks again once the swap
-/// service has had time to restore it.
+/// first such chunk's base, or `va` when that is above it
+/// ([`free_pool::pending_from`]), from which the sender asks again once the
+/// swap service has had time to restore it.
 fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
@@ -2351,10 +2352,7 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     };
     let (reached, flag) = match pending
     {
-        Some(base) => (
-            base.max(va & !(PAGE_SIZE - 1)),
-            memmgr_labels::RESIDENT_PENDING,
-        ),
+        Some(base) => (pending_from(base, va), memmgr_labels::RESIDENT_PENDING),
         None => (reached, 0),
     };
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)

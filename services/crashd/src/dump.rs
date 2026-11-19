@@ -232,15 +232,15 @@ fn capture(
     write_core(&core, &name, &source, generation)
 }
 
-/// Have memmgr restore the chunks it evicted into its compressed store of
-/// `process` from the page of each address of `first` up, an equal share of
-/// the core's budget each (`ipc::make_resident`), so the list of mapped pages
-/// holds them and the core records them. A chunk on disk memmgr asks the swap
-/// service to restore, and this pauses and asks again, as
-/// `ipc::make_resident` does, at most `ipc::PENDING_TRIES` times; a chunk the
-/// swap service does not restore by then is left out, as one not present. No more is restored: the core keeps
-/// at most [`CORE_BYTES_MAX`] of pages, and a restore for a process about to
-/// die spends the free pages, and other processes' idle chunks, that memmgr
+/// Have memmgr restore the chunks it evicted of `process` from the page of
+/// each address of `first` up, an equal share of the core's budget each
+/// (`ipc::make_resident`), so the list of mapped pages holds them and the core
+/// records them. A chunk on disk memmgr asks the swap service to restore, and
+/// this pauses and asks again, as `ipc::make_resident` does, at most
+/// `ipc::PENDING_TRIES` times over the whole dump (`ipc::resident_range`); a
+/// chunk the swap service does not restore by then is left out, as one not
+/// present. No more is restored: the core keeps at most [`CORE_BYTES_MAX`] of
+/// pages, and a restore for a process about to die spends the free pages, and other processes' idle chunks, that memmgr
 /// keeps for restores. A chunk memmgr cannot restore, for want of memory, is
 /// left out of the list, as it is not present. Each request is started only
 /// while the dump's generation has not fired, so a dump past its bound starts
@@ -253,46 +253,34 @@ fn restore_first(first: &[u64], process: u64, authority: u64, generation: u64, i
         .unwrap_or(CORE_BYTES_MAX)
         .max(PAGE_SIZE)
         & !(PAGE_SIZE - 1);
+    // One pause count for the whole dump: a swap service that is down costs
+    // the dump one bound's wait, about a second, not one per anchor.
+    let mut pauses: u32 = 0;
     for &anchor in first
     {
-        let mut at = anchor & !(PAGE_SIZE - 1);
+        let at = anchor & !(PAGE_SIZE - 1);
         let end = at.saturating_add(share);
         // memmgr does a bounded part of the range per request and replies
-        // where it stopped; a refusal, a reply that made no progress, or a
-        // chunk on disk not restored within the tries ends this range.
-        let mut paused: u32 = 0;
-        while at < end
+        // where it stopped; a refusal, a reply that made no progress, a chunk
+        // on disk not restored within the dump's pauses, or a fired generation
+        // ends this range.
+        let _ = ipc::resident_range(
+            at,
+            end,
+            &mut pauses,
+            |from| {
+                if fired(generation)
+                {
+                    return None;
+                }
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                unsafe { ipc::make_resident_step(authority, process, from, end, ipc_buf) }
+            },
+            || std::thread::sleep(std::time::Duration::from_millis(ipc::PENDING_PAUSE_MS)),
+        );
+        if fired(generation)
         {
-            if fired(generation)
-            {
-                return;
-            }
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let Some(step) =
-                (unsafe { ipc::make_resident_step(authority, process, at, end, ipc_buf) })
-            else
-            {
-                break;
-            };
-            match ipc::resident_next(at, end, step, paused)
-            {
-                ipc::ResidentNext::Done | ipc::ResidentNext::GiveUp => break,
-                ipc::ResidentNext::From(reached) =>
-                {
-                    at = reached;
-                    paused = 0;
-                }
-                ipc::ResidentNext::Pause(reached) =>
-                {
-                    if reached > at
-                    {
-                        paused = 0;
-                    }
-                    at = reached;
-                    paused = paused.saturating_add(1);
-                    std::thread::sleep(std::time::Duration::from_millis(ipc::PENDING_PAUSE_MS));
-                }
-            }
+            return;
         }
     }
 }

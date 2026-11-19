@@ -85,7 +85,7 @@ const _: () = core::assert!(
 );
 /// Badge bit of the swap authority: a SEND on memmgr's endpoint badged with
 /// this bit alone, which init mints, is the authority to serve the swap
-/// labels ([`SWAP_REGISTER`] to [`SWAP_RESTORE`]), the swap service's
+/// labels ([`SWAP_REGISTER`] to [`SWAP_WANTED`]), the swap service's
 /// interface to memmgr's disk tier. No process badge or node handle carries
 /// it, so memmgr serves the swap labels only on a badge carrying it and the
 /// other labels only on one without it, and refuses the rest with

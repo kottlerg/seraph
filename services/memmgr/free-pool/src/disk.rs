@@ -454,6 +454,17 @@ pub const fn resident_path(entry: &ChunkEntry, wants: Registered) -> ResidentPat
     }
 }
 
+/// The address a pending `MAKE_RESIDENT` reply names, from the base of the
+/// first chunk the request posted, `first_posted`, and the request's start,
+/// `va`: the chunk's base, or `va` when the chunk starts below it, so the
+/// reader, which asks from `va` as it gave it, page boundary or not, asks
+/// again from there and never sees a reply below its own address.
+#[must_use]
+pub const fn pending_from(first_posted: u64, va: u64) -> u64
+{
+    if first_posted > va { first_posted } else { va }
+}
+
 /// Words the want list holds at most, and so the most one `SWAP_WANTED` reply
 /// carries.
 pub const WANT_WORDS: usize = 8;
@@ -841,5 +852,15 @@ mod tests
         assert_eq!(wants.take(&mut out), WANT_WORDS);
         let expected: Vec<u64> = (2..words + 2).collect();
         assert_eq!(out.to_vec(), expected);
+    }
+
+    #[test]
+    fn a_pending_reply_never_names_an_address_below_the_request()
+    {
+        // The request starts inside the posted chunk, off a page boundary.
+        assert_eq!(pending_from(0x40_0000, 0x40_1008), 0x40_1008);
+        assert_eq!(pending_from(0x40_0000, 0x40_0000), 0x40_0000);
+        // The posted chunk lies past the start.
+        assert_eq!(pending_from(0x41_0000, 0x40_1008), 0x41_0000);
     }
 }

@@ -48,7 +48,7 @@ pub use commit::{CommitNeed, PT_DONATION_PAGES};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use disk::{
     FaultPath, Posted, Registered, ResidentPath, SlotError, SwapSlots, WANT_WORDS, WantList,
-    fault_path, resident_path,
+    fault_path, pending_from, resident_path,
 };
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
 pub use ledger::{

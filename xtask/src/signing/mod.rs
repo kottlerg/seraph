@@ -69,6 +69,13 @@ const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
 /// on the root filesystem at its sysroot path.
 const SIGNED_TREES: &[&str] = &["services", "programs", "tests"];
 
+/// The sysroot trees whose every regular file [`sign_sysroot`] signs in the
+/// data role, each under its install path: the data files a process reads
+/// from the root filesystem as trusted input through procmgr's verified
+/// read (docs/signing.md § Which Stage Verifies What). `data/svctest/signed`
+/// holds svctest's fixture of that read.
+const DATA_TREES: &[&str] = &["data/svctest/signed"];
+
 /// The signing configuration a build reads from its environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config
@@ -501,7 +508,9 @@ fn install_name(path: &Path) -> Result<String>
 /// bundle of `harness`, as the installed bundle lists of `arch` say
 /// (`crate::bundle::read_list`): the installed kernel, `kernel` with the
 /// kernel role alone; every ELF image under [`SIGNED_TREES`] as
-/// [`image_signature`] says; and every other installed file a list names,
+/// [`image_signature`] says; every regular file under [`DATA_TREES`] under
+/// its install path in the data role, and the boot-module role beside it
+/// when a list names it; and every other installed file a list names,
 /// `init` with the init role alone when it is the object of a signed
 /// `init` slot, under its install path with the boot-module role alone
 /// otherwise. The `init` slot objects signed are the init harness's, always,
@@ -549,11 +558,28 @@ pub fn sign_sysroot(
     let mut done = std::collections::HashSet::new();
     for tree in SIGNED_TREES
     {
-        for relative in elf_images(&ctx.sysroot, Path::new(tree))?
+        for relative in tree_files(&ctx.sysroot, Path::new(tree), Files::Elf)?
         {
             let install = install_name(&relative)?;
             let (name, roles) = image_signature(&install, &relative, &slots, &boot_modules);
             count(signer.sign_file(&ctx.sysroot.join(&relative), roles, &name)?);
+            done.insert(install);
+        }
+    }
+    for tree in DATA_TREES
+    {
+        for relative in tree_files(&ctx.sysroot, Path::new(tree), Files::All)?
+        {
+            let install = install_name(&relative)?;
+            let roles = if boot_modules.contains(&install)
+            {
+                RoleSet::of(&[Role::Data, Role::BootModule])
+            }
+            else
+            {
+                RoleSet::of(&[Role::Data])
+            };
+            count(signer.sign_file(&ctx.sysroot.join(&relative), roles, &install)?);
             done.insert(install);
         }
     }
@@ -593,10 +619,20 @@ pub fn sign_for_harness(ctx: &BuildContext, arch: Arch, harness: Harness) -> Res
     Ok(())
 }
 
-/// The regular files under `root/dir` whose bytes begin with the ELF
-/// magic, as paths relative to `root`, sorted; none when `dir` is absent.
-/// A symbolic link is not followed.
-fn elf_images(root: &Path, dir: &Path) -> Result<Vec<PathBuf>>
+/// Which regular files of a tree [`tree_files`] lists.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Files
+{
+    /// Those whose bytes begin with the ELF magic.
+    Elf,
+    /// Every one.
+    All,
+}
+
+/// The regular files under `root/dir` that `which` selects, as paths
+/// relative to `root`, sorted; none when `dir` is absent. A symbolic link
+/// is not followed.
+fn tree_files(root: &Path, dir: &Path, which: Files) -> Result<Vec<PathBuf>>
 {
     let mut found = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -620,7 +656,8 @@ fn elf_images(root: &Path, dir: &Path) -> Result<Vec<PathBuf>>
             {
                 pending.push(path);
             }
-            else if kind.is_file() && starts_with_elf_magic(&entry.path())?
+            else if kind.is_file()
+                && (which == Files::All || starts_with_elf_magic(&entry.path())?)
             {
                 found.push(path);
             }
@@ -1195,6 +1232,45 @@ mod tests
         )
         .unwrap();
         sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a file under a data tree left unsigned, signed in an
+    // image role, or under a name other than its install path, so procmgr's
+    // verified read refuses the file it is meant to hand its reader; or a
+    // file outside every data tree given a trailer.
+    #[test]
+    fn a_file_under_a_data_tree_is_signed_in_the_data_role_under_its_install_path()
+    {
+        let arch = Arch::Riscv64;
+        let fixture = "data/svctest/signed/verified.dat";
+        let nested = "data/svctest/signed/sub/nested.dat";
+        let plain = "data/svctest/large.bin";
+        let (root, ctx) = sysroot_of(
+            "data-trees",
+            &[
+                (fixture, b"body\n".as_slice()),
+                (nested, b"\x7fELF-looking data".as_slice()),
+                (plain, b"plain".as_slice()),
+            ],
+        );
+        testing::install_lists(&ctx);
+        let signer = signer(&root.join("keys"), arch);
+        sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
+        for path in [fixture, nested]
+        {
+            let name = format!("/{path}");
+            let object = fs::read(ctx.sysroot.join(path)).unwrap();
+            let attrs = objsig::split(&object)
+                .unwrap()
+                .records()
+                .next()
+                .unwrap()
+                .attrs;
+            assert_eq!(attrs.roles, RoleSet::of(&[Role::Data]), "{path}");
+            assert!(verifies(&signer, &object, Role::Data, &name), "{path}");
+        }
+        assert_eq!(fs::read(ctx.sysroot.join(plain)).unwrap(), b"plain");
         let _ = fs::remove_dir_all(&root);
     }
 

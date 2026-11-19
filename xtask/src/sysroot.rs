@@ -220,6 +220,7 @@ pub fn install_rootfs(ctx: &BuildContext, arch: Arch) -> Result<()>
     keep.extend(install_data_files(ctx, arch)?);
     keep.insert(synthesise_svctest_large_bin(ctx)?);
     keep.insert(synthesise_svctest_bench_bin(ctx)?);
+    keep.insert(synthesise_svctest_verified(ctx)?);
     for dir in EMPTY_DIRS
     {
         let dst = ctx.sysroot.join(dir);
@@ -320,6 +321,35 @@ fn synthesise_svctest_bench_bin(ctx: &BuildContext) -> Result<PathBuf>
     }
     fs::write(&dst, bench_bin_bytes()).with_context(|| format!("writing {}", dst.display()))?;
     step(&format!("Rootfs: {} (synthesised, 64 KiB)", dst.display()));
+    Ok(dst)
+}
+
+/// The body of `/data/svctest/signed/verified.dat`. Kept in sync with
+/// `services/svctest/src/phases/verified_read.rs`, `VERIFIED_BODY`.
+const SVCTEST_VERIFIED_BODY: &[u8] = b"seraph: the body procmgr's verified read returns\n";
+
+/// Emit `/data/svctest/signed/verified.dat`, the fixture svctest's
+/// `procmgr_read_verified` phase reads through procmgr's verified read: a
+/// file under a data tree, which the sign before every pack signs in the
+/// data role under its install path (`crate::signing::sign_sysroot`).
+/// Written only when absent, so the signed file a pack left stands. Returns
+/// the destination path (kept through the prune pass).
+fn synthesise_svctest_verified(ctx: &BuildContext) -> Result<PathBuf>
+{
+    let dst = ctx.sysroot.join("data/svctest/signed/verified.dat");
+    if dst.exists()
+    {
+        return Ok(dst);
+    }
+    if let Some(parent) = dst.parent()
+    {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(&dst, SVCTEST_VERIFIED_BODY).with_context(|| format!("writing {}", dst.display()))?;
+    step(&format!(
+        "Rootfs: {} (synthesised, data role)",
+        dst.display()
+    ));
     Ok(dst)
 }
 
@@ -533,6 +563,11 @@ mod tests
         assert!(
             sysroot.join("data/svctest/bench.bin").exists(),
             "bench fixture kept"
+        );
+        assert_eq!(
+            fs::read(sysroot.join("data/svctest/signed/verified.dat")).unwrap(),
+            SVCTEST_VERIFIED_BODY,
+            "verified-read fixture kept"
         );
         assert!(
             !sys_services.join("stale.svc").exists(),

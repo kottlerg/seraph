@@ -95,6 +95,7 @@ pub mod swap;
 pub mod threading;
 pub mod timed;
 pub mod unmount;
+pub mod verified_read;
 pub mod vfsd;
 
 /// Ordered phase list. Order encodes cross-module dependencies (see
@@ -130,6 +131,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_ipc::phases_pre_relative());
     out.extend_from_slice(fs_std::phases());
     out.extend_from_slice(fs_faults::phases());
+    out.extend_from_slice(verified_read::phases());
     out.extend_from_slice(namespace::late());
     out.extend_from_slice(procmgr::command_phases());
     out.extend_from_slice(process_tree::phases());

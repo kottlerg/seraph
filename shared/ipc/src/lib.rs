@@ -137,7 +137,7 @@ pub fn name_block(req: &IpcMessage, at: usize, max: usize) -> Option<&[u8]>
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 21;
+pub const PROCMGR_LABELS_VERSION: u32 = 22;
 pub mod procmgr_labels;
 
 mod procmgr_debug_client;

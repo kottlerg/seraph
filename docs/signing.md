@@ -39,19 +39,23 @@ only, since its host tests sign fixtures. The formats of § Signed Object Format
 Format and § Trust Store, and the verification of § Verification, are implemented and host-tested in
 [`shared/objsig`](../shared/objsig/README.md), which xtask and the bootloader link. xtask's keys and
 signing of § Signing are implemented: every build signs the kernel, every ELF image of the root
-filesystem and the data files the bundle lists name, each once, in the sysroot, under the role set
-and the name of § Signed Attributes, composes the ESP by copying the installed files, builds the
-trust store at the path § Signing names, and embeds it in the bootloader. The bootloader verifies
-the kernel and every bundle entry against that store and hands the store to procmgr (§ Trust Store),
-which parses it and keeps it. procmgr verifies every image it creates against that store before it
-parses it (§ Verifier Discipline), under its creator's signature policy and the name the creator
-gives (§ Signature Policy in procmgr). The override that § Signature Policy in procmgr describes is
-design intent, not yet implemented: no creator can hold it, so procmgr creates no process from an
-image that does not verify. `cargo xtask test-signing` boots each refusal on both architectures: a
-tampered kernel, a tampered bundle entry and a revoked signing key in the bootloader, and a tampered
-service, one signed without a role its creator's policy admits and one signed by an untrusted key in
-procmgr, beside a kernel and a program whose untrusted record both verifiers skip
-([testing.md](testing.md) § Gating, Signature refusals).
+filesystem, the files of its data trees and the data files the bundle lists name, each once, in the
+sysroot, under the role set and the name of § Signed Attributes, composes the ESP by copying the
+installed files, builds the trust store at the path § Signing names, and embeds it in the
+bootloader. The bootloader verifies the kernel and every bundle entry against that store and hands
+the store to procmgr (§ Trust Store), which parses it and keeps it. procmgr verifies every image it
+creates against that store before it parses it (§ Verifier Discipline), under its creator's
+signature policy and the name the creator gives (§ Signature Policy in procmgr), and verifies a data
+file in the data role at its reader's request (`procmgr_labels::READ_VERIFIED`, § Verifier
+Discipline), which svctest's `procmgr_read_verified` phase exercises on both architectures; devmgr's
+read of the platform description tables through it is design intent, not yet implemented
+([#1267](https://github.com/kottlerg/seraph/issues/1267)). The override that § Signature Policy in
+procmgr describes is design intent, not yet implemented: no creator can hold it, so procmgr creates
+no process from an image that does not verify. `cargo xtask test-signing` boots each refusal on both
+architectures: a tampered kernel, a tampered bundle entry and a revoked signing key in the
+bootloader, and a tampered service, one signed without a role its creator's policy admits and one
+signed by an untrusted key in procmgr, beside a kernel and a program whose untrusted record both
+verifiers skip ([testing.md](testing.md) § Gating, Signature refusals).
 
 [boot-media.md](boot-media.md) states why one object carries one signature, and how the bundle
 lists in configuration choose the bundle's entries.
@@ -60,9 +64,8 @@ lists in configuration choose the bundle's entries.
 
 ## Principles
 
-Implemented, apart from the override of the third principle and procmgr's verification of a data
-file for its reader, which are design intent, not yet implemented (§ Signature Policy in procmgr;
-[#1267](https://github.com/kottlerg/seraph/issues/1267)).
+Implemented, apart from the override of the third principle, which is design intent, not yet
+implemented (§ Signature Policy in procmgr).
 
 - **Verify at the loader.** An object is verified by the stage that turns its bytes into running
   code or into input that code trusts: the bootloader for what it loads, procmgr for every image it
@@ -113,7 +116,7 @@ trusted to execute as built.
 | (nothing) | Kernel | Not applicable | Not applicable |
 | memmgr, procmgr | init loads them from boot modules the bootloader verified | Nothing further | Not applicable |
 | Every image procmgr creates, from a file or a Memory cap | procmgr | The store the bootloader hands forward | The roles the creator's policy allows; the name the creator gives, an install path |
-| A data file a process reads from the root filesystem as trusted input (a platform description table devmgr reads) | procmgr, at the reader's request (design intent, not yet implemented, [#1267](https://github.com/kottlerg/seraph/issues/1267)) | The same store | data, its install path |
+| A data file a process reads from the root filesystem as trusted input (a platform description table devmgr reads: design intent, not yet implemented, [#1267](https://github.com/kottlerg/seraph/issues/1267)) | procmgr, at the reader's request (`procmgr_labels::READ_VERIFIED`) | The same store | data, its install path |
 
 The bundle container itself is not signed: the bootloader parses its header with the bounds-checking
 parser of [`abi/boot-protocol::bundle`](../abi/boot-protocol/src/bundle.rs) and verifies each entry
@@ -214,7 +217,7 @@ and a set that holds kernel or init holds no other role.
 | 4 | service | A service image |
 | 5 | driver | A driver image |
 | 6 | program | A program image |
-| 7 | data | A data file (no verifier reads this role yet) |
+| 7 | data | A data file procmgr verifies for its reader (§ Verifier Discipline) |
 
 A role is a permission the signer grants, not a place: an installed service the bootstrap needs
 carries service and boot module, and the bundle's copy of it is the same bytes.
@@ -375,10 +378,13 @@ it does.
 ## Verifier Discipline
 
 The bootloader and procmgr follow it. procmgr follows it for a data file it verifies at its reader's
-request too: it copies the file, refusing one past the request's size bound, into frames it
-allocates on the reader's account, verifies that copy, and gives the reader the body read-only, so
-the reader parses only bytes no other process can write (design intent, not yet implemented,
-[#1267](https://github.com/kottlerg/seraph/issues/1267)).
+request too (`procmgr_labels::READ_VERIFIED`): it refuses a file past
+`procmgr_labels::READ_VERIFIED_MAX` (32 KiB) before it reads any byte, copies the file once into
+one run of frames it requests on the reader's account and maps in its own address space alone,
+verifies that copy in the data role under the name the reader gives, and gives the reader the run
+through a capability that maps it read-only, keeping none of its own, so the reader parses only the
+verified body, in bytes no process but memmgr can write
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 31: `READ_VERIFIED`).
 
 - **Verify before parse.** No stage parses an object's body (its ELF headers, its table text)
   before the verifier has accepted it.
@@ -510,23 +516,25 @@ carries no second object that boots as init. The data files a bundle list names 
 and the log-level configuration) are installed files, at `/config/devmgr/platform/` and
 `/config/init/log-levels.conf`, signed with the boot-module role, and their readers take the body
 through the parse-only split (§ Verifier Discipline). A platform table devmgr reads from the root
-filesystem is signed with the data role, and procmgr verifies it for devmgr before devmgr parses it
-(§ Which Stage Verifies What; design intent, not yet implemented:
-[#1267](https://github.com/kottlerg/seraph/issues/1267) builds that verification, and
-[#1071](https://github.com/kottlerg/seraph/issues/1071) reuses it for the other policy-bearing
-files). The ESP is composed by copying installed files and signs nothing, so each object on it, each
-bundle entry included, is its installed file byte for byte ([boot-media.md](boot-media.md) § The
-ESP). The sysroot's objects are signed in place each time a disk image is packed, before the pack
-composes the ESP, for the harness whose bundle it composes. The refusal test's pack alone writes
-objects as it is given them, in place of the sysroot's files in the images and never in the sysroot,
-so no later pack signs a tampered body. Signing replaces a trailer the object already carries, and
-is deterministic, so re-signing an unchanged image writes the same bytes. The other files under
-`config/` and `data/` carry no trailer, since their readers take each file whole and configuration
-is not signed (§ Threat Model), and neither does the bootloader, which Secure Boot covers (§ Secure
-Boot). Role 7 is reserved for a data file verified before its reader parses it. The security version
-is one integer in the tree (`SECURITY_VERSION` in `xtask/src/signing/mod.rs`), raised by a security
-fix that MUST make older images unbootable; every record carries it, and the store's floor is at
-least it.
+filesystem is to be signed with the data role, and procmgr verifies it for devmgr before devmgr
+parses it (§ Which Stage Verifies What; design intent, not yet implemented:
+[#1267](https://github.com/kottlerg/seraph/issues/1267) moves the tables there, and
+[#1071](https://github.com/kottlerg/seraph/issues/1071) reuses the verified read for the other
+policy-bearing files). Every regular file under a data tree (`DATA_TREES` in
+`xtask/src/signing/mod.rs`: `/data/svctest/signed/`, svctest's fixture of the verified read) is
+signed with the data role under its install path, beside the boot-module role when a bundle list
+names it. The ESP is composed by copying installed files and signs nothing, so each object on it,
+each bundle entry included, is its installed file byte for byte ([boot-media.md](boot-media.md) §
+The ESP). The sysroot's objects are signed in place each time a disk image is packed, before the
+pack composes the ESP, for the harness whose bundle it composes. The refusal test's pack alone
+writes objects as it is given them, in place of the sysroot's files in the images and never in the
+sysroot, so no later pack signs a tampered body. Signing replaces a trailer the object already
+carries, and is deterministic, so re-signing an unchanged image writes the same bytes. The other
+files under `config/` and `data/` carry no trailer, since their readers take each file whole and
+configuration is not signed (§ Threat Model), and neither does the bootloader, which Secure Boot
+covers (§ Secure Boot). The security version is one integer in the tree (`SECURITY_VERSION` in
+`xtask/src/signing/mod.rs`), raised by a security fix that MUST make older images unbootable; every
+record carries it, and the store's floor is at least it.
 
 **The trust store** is built from public key files: by default the builder's local root. A build
 option (`SERAPH_TRUST_STORE`) names a deployer's store, which is merged with the default or, as

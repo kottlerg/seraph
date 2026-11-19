@@ -483,6 +483,20 @@ The cap-as-namespace model that defines this surface lives in
 protocol is in
 [`shared/namespace-protocol/README.md`](../../shared/namespace-protocol/README.md).
 
+## Verified data files
+
+`std::os::seraph::read_verified(file_cap, len, name)` reads a data file a process takes as trusted
+input through procmgr (`procmgr_labels::READ_VERIFIED`): procmgr copies the file once into frames
+on the caller's memmgr account, verifies the copy in the data role under the install path `name`,
+and hands the run back through a capability that maps it read-only. The returned `VerifiedData`
+maps it and gives the verified body (`bytes`); dropping it unmaps the run, deletes the cap and
+returns the frames to memmgr. `len` is the size hint of the lookup that resolved the file cap
+(`namespace_lookup_file`), and the file cap moves to procmgr. A refusal maps to an
+`io::ErrorKind`: `InvalidData` for a file that does not verify, `InvalidInput` for a length of
+zero or past `READ_VERIFIED_MAX` or a name procmgr does not take
+([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md) § Label 31:
+`READ_VERIFIED`; [docs/signing.md](../../docs/signing.md) § Verifier Discipline).
+
 ---
 
 ## Directory entries

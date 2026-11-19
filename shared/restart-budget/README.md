@@ -34,6 +34,7 @@ every time, however long the boot, while one that crash-loops is stopped after a
 |---|---|
 | [`services/svcmgr`](../../services/svcmgr/README.md) | Service ([restart protocol](../../services/svcmgr/docs/restart-protocol.md)) |
 | [`services/devmgr`](../../services/devmgr/README.md) | Device record whose driver devmgr restarts ([responsibilities](../../services/devmgr/docs/responsibilities.md)) |
+| [`xtask`](../../xtask/README.md) | None: `test-core-death` reads `RESTART_BURST` to kill logd once per restart svcmgr's budget allows, and once more |
 
 ---
 

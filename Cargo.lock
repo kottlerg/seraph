@@ -839,7 +839,6 @@ dependencies = [
  "namespace-protocol",
  "objsig",
  "process-abi",
- "restart-budget",
  "svc-grammar",
  "syscall-abi",
 ]
@@ -1077,7 +1076,7 @@ dependencies = [
  "logd-codec",
  "objsig",
  "procmgr-process-table",
- "svcmgr-defs",
+ "restart-budget",
  "syscall-abi",
  "vfsd-gpt",
 ]

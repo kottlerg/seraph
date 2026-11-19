@@ -18,8 +18,6 @@ namespace-protocol = { path = "../../../shared/namespace-protocol" }
 objsig = { path = "../../../shared/objsig" }
 # `process_abi::ARGV_ENV_MAX_BYTES` bounds a recipe's argv and env together.
 process-abi = { path = "../../../abi/process-abi" }
-# TEMPORARY (W143): xtask reads RESTART_BURST through this until #1309 merges.
-restart-budget = { path = "../../../shared/restart-budget" }
 # The line grammar (`key = value`, `#` comments) both parsers read through,
 # shared with devmgr's platform description table parser.
 svc-grammar = { path = "../../../shared/svc-grammar" }

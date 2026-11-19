@@ -29,7 +29,6 @@ pub mod death_tag;
 pub mod parse;
 pub mod stop;
 
-pub use ::restart_budget;
 pub use death_tag::DeathTag;
 
 use namespace_protocol::rights as ns_rights;

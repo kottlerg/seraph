@@ -75,7 +75,8 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    the bootstrap-round protocol: its own endpoints, the publish-role
    source caps (`rootfs.root` SEND, devmgr-registry `SEND|GRANT` source,
    and the `MOUNT_AUTHORITY`-, `DENY_BADGE`- and `SWAP_AUTHORITY`-badged SENDs on vfsd's
-   service endpoint),
+   service endpoint), a `Contribute` copy of the `EntropyControl` root (svcmgr derives the
+   `entropy_authority` service's copy from it),
    one `(name, thread_cap, observer)` round per init-bootstrapped substrate
    service (the observer is an address-space cap or a process handle), and a terminal round
    carrying the reserved log-sink sources

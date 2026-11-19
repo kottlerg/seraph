@@ -2,6 +2,6 @@
 #
 # A QUERY_DEVICE reply through the class SEND carries
 # hwrng_protocol::READ_AUTHORITY (bit 63), which gates READ. svcmgr
-# publishes it seed-only as `devmgr.class.hwrng`; entropyd's seed takes it, and
-# svctest's.
+# publishes it seed-only as `devmgr.class.hwrng`, which entropyd's and
+# svctest's recipes seed.
 verbs = 63

@@ -101,13 +101,16 @@ enum Failure
 }
 
 /// The failure and contribution log state across passes: one line for the
-/// first accepted contribution, and one for the first failure of each run of
-/// failures, so a driver that keeps failing does not flood the log.
+/// first accepted contribution, and one for the first failure of each
+/// driver's run of failures, so a driver that keeps failing does not flood the
+/// log whatever the other drivers of the class do.
 #[derive(Default)]
 struct Log
 {
     accepted: bool,
-    failing: bool,
+    /// The ordinals in a run of failures, each logged once: at most the
+    /// ordinals the class has served and the one a pass stopped at.
+    failing: Vec<u64>,
 }
 
 impl Log
@@ -119,16 +122,16 @@ impl Log
             std::os::seraph::log!("{FIRST_LINE}: {bytes} bytes from hwrng ordinal {ordinal}");
             self.accepted = true;
         }
-        self.failing = false;
+        self.failing.retain(|&o| o != ordinal);
     }
 
     fn failed(&mut self, ordinal: u64, failure: &Failure)
     {
-        if self.failing
+        if self.failing.contains(&ordinal)
         {
             return;
         }
-        self.failing = true;
+        self.failing.push(ordinal);
         match failure
         {
             Failure::Query(e) =>

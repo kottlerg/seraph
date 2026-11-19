@@ -395,7 +395,8 @@ svcmgr also serves the recognised actuator the means to observe svcmgr's own dea
 ([Supervision § Observing svcmgr](../../../docs/supervision.md#observing-svcmgr)): on its first
 launch and on every restart, a derivation carrying only the receive right of the event queue
 svcmgr's own main thread and address space post their death to, in the bootstrap slot after the
-`seed` caps and after any debug-authority and stop-authority slots (`cap[3]` for pwrmgr). A derive
+`seed` caps and after any debug-authority, stop-authority and entropy-authority slots (`cap[3]` for
+pwrmgr). A derive
 that fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the
 key but is not recognised gets no such slot.
 
@@ -616,6 +617,7 @@ The shipped classes:
 | `framebuffer` | 63 (framebuffer `WRITE`) |
 | `rtc` | 63 (rtc `READ`) |
 | `input` | 63 (input `READ`) |
+| `hwrng` | 63 (hwrng `READ`) |
 | `debug-port` | 63 62 (serial `WRITE`, `READ`) |
 
 init requests the `block` class SEND itself, for vfsd's root mount.

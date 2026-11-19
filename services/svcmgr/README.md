@@ -106,9 +106,10 @@ svcmgr/
   [`service::bootstrap_caps`](src/service.rs): svcmgr's own endpoints,
   the publish-role source caps (`rootfs.root` SEND, devmgr-registry
   `SEND|GRANT` source, the `vfsd.mount`, `vfsd.deny` and `vfsd.swap` SENDs on vfsd's
-  service endpoint), one `(name, thread_cap, observer)` round per substrate
-  service init bootstrapped before svcmgr existed (the observer is a Control-only
-  address-space cap or a process handle), and a terminal
+  service endpoint), the `EntropyControl` source carrying `Contribute`, which svcmgr never
+  publishes and derives the `entropy_authority` service's copy from, one
+  `(name, thread_cap, observer)` round per substrate service init bootstrapped before svcmgr
+  existed (the observer is a Control-only address-space cap or a process handle), and a terminal
   `LOGD_SOURCES` round carrying the two log-sink source caps svcmgr holds
   for the system's lifetime (the master-log source and a badge-0
   `SEND|GRANT` death-auth source on procmgr's service endpoint). Recipes

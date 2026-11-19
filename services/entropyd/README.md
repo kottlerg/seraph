@@ -100,7 +100,8 @@ driver and contributes them:
 entropyd logs `entropy contribution accepted: <n> bytes from hwrng ordinal <o>` once, on the
 first contribution the kernel accepts, which svctest's `entropyd_contribution` phase awaits. A
 failure (a refused query, a failed or refused `READ`, a malformed reply, a refused contribution)
-is logged on the first pass of a run of failures and not again until a contribution is accepted.
+is logged on the first pass of a driver's run of failures, and not again for that driver's ordinal
+until a contribution from it is accepted, so a failing driver beside a working one logs once.
 
 ---
 

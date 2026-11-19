@@ -8,9 +8,9 @@ log.
 ## Role
 
 The fixture's per-program tester, `crashme-tester`, runs it once in each of the `vm`, `exception`,
-`worker`, and `registry-declare` modes, then twice in the `oom-touch` mode, with one page, beside
-the `oom-fill` mode, and the `usertest` orchestrator discovers and runs that tester. svctest's
-`crash_endpoint` phase also spawns it, in the `vm`, `exception`, `registry-main`,
+`worker`, and `registry-declare` modes, then twice in the `oom-touch` mode, with 1024 pages,
+beside the `oom-fill` mode, and the `usertest` orchestrator discovers and runs that tester.
+svctest's `crash_endpoint` phase also spawns it, in the `vm`, `exception`, `registry-main`,
 `registry-worker`, and `debugger-tag` modes, and its `oom_policy` phase in the `oom-touch` mode,
 with 1024 pages, and, through the shell of an operator session it opens, in the `oom-hold` mode
 ([services/svctest/README.md § Fixtures](../../services/svctest/README.md#fixtures)). The fixture
@@ -45,11 +45,12 @@ fault: a non-clean exit whose reason is in the fault range, and left one new cor
 `registry-declare` passed, and when the crash service's hold of a fault declined for want of memory
 ([services/crashd/docs/operation.md](../../services/crashd/docs/operation.md) § Hold) behaved in its
 two cases. In the first, the filler keeps memory critical for 1000 ms after `full` while `oom-touch`
-writes its page: the write completes, held at least 500 ms. In the second, the filler keeps it
-critical for the usertest crash service's stall, 3000 ms, and 1500 ms more: the fixture dies of the
-fault, with a fault reason, at least 1000 ms after its write, and leaves no core, since memory was
-still critical. The usertest boot stages a crash service whose `CORE_DUMP` names `crashme`
-([docs/testing.md](../../docs/testing.md) § Gating), so each faulting death leaves an ELF core
+writes its pages: the writes complete, the held one taking at least 500 ms. In the second, the
+filler keeps it critical for the usertest crash service's stall, 3000 ms, and 1500 ms more: the
+fixture dies of the fault, with a fault reason, at least 1000 ms after it was told to write, and
+leaves no core, since memory was still critical. The usertest boot stages a crash service whose
+`CORE_DUMP` names `crashme` ([docs/testing.md](../../docs/testing.md) § Gating), so each faulting
+death leaves an ELF core
 ([services/crashd/docs/core-format.md](../../services/crashd/docs/core-format.md)). The tester reads
 it with a reader of its own, not crashd's code, and checks that it is an `ET_CORE` of the machine,
 that its first `NT_PRSTATUS` carries the fault's signal (`SIGSEGV` for `vm`, `SIGILL` for the

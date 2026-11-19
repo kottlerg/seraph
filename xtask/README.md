@@ -121,8 +121,10 @@ command that repacks) signs in place the kernel installed at `boot/kernel` (`ker
 role), every ELF image under `services/`, `programs/` and `tests/` (under its install path with the
 role of its location, and the boot-module role when a bundle list names it as an entry;
 `/services/init` as `init` with the init role, and `/tests/ktest` too when the pack composes the
-ktest harness's bundle), and every other file a bundle list names, the data files installed under
-`/config/` (the boot-module role). A pack signs for the harness recorded in `sysroot/.harness`
+ktest harness's bundle), every regular file under a data tree (`DATA_TREES` in
+`src/signing/mod.rs`: `data/svctest/signed/`), under its install path with the data role, which
+procmgr's verified read accepts, and every other file a bundle list names, the data files installed
+under `/config/` (the boot-module role). A pack signs for the harness recorded in `sysroot/.harness`
 ([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot), then composes the ESP
 (`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and composes the bundle by
 copying the installed files the harness's list in `config/bundle/` names (`src/bundle.rs`). The

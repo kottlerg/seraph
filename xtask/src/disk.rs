@@ -9,10 +9,10 @@
 //! sysroot/data/) that vfsd auto-mounts at /data, and a raw Seraph swap
 //! partition. `disk.img` carries all four, or all but the data partition,
 //! which then sits alone on a second image; the logical block size, 512 or
-//! 4096 bytes, is chosen per authoring. The kernel, every ELF image the
-//! partitions carry and the bundle's data entries are signed first, for the
-//! harness the staged bundle boots ([`crate::signing::sign_sysroot`]). The
-//! refusal boots of `test-signing` pack through
+//! 4096 bytes, is chosen per authoring. Every pack signs the sysroot for the
+//! harness whose bundle it composes ([`crate::signing::sign_sysroot`]), then
+//! composes the ESP from the installed files ([`crate::esp::compose`]), then
+//! writes the images. The refusal boots of `test-signing` pack through
 //! [`create_disk_image_substituting`], which writes bytes the harness staged
 //! in place of named sysroot files and leaves the sysroot as it was.
 
@@ -24,6 +24,7 @@ use crate::error::{Context, Result};
 use boot_protocol::role_guids;
 
 use crate::arch::Arch;
+use crate::bundle::Harness;
 use crate::context::Context as BuildContext;
 use crate::fat;
 use crate::gpt::{self, Guid, guid};
@@ -221,6 +222,9 @@ struct Sources
 /// attached. Every image's GPT LBAs and FAT sectors are `layout.block_size`
 /// bytes.
 ///
+/// The ESP is composed first, for the harness `sysroot/.harness` records
+/// (`crate::sysroot::recorded_harness`), as [`create_disk_image_for`] says.
+///
 /// ROOT's GPT type-GUID is the arch-specific Seraph root GUID, DATA's the
 /// arch-neutral Seraph data GUID, and SWAP's the arch-neutral Seraph swap
 /// GUID (see [`boot_protocol::role_guids`]) so vfsd can identify each by
@@ -230,10 +234,30 @@ struct Sources
 /// root on images that choose to carry it there instead.
 pub fn create_disk_image(ctx: &BuildContext, arch: Arch, layout: DiskLayout) -> Result<()>
 {
-    pack(ctx, arch, layout, Vec::new())
+    let harness = crate::sysroot::recorded_harness(ctx)?;
+    pack(ctx, arch, layout, harness, Vec::new())
 }
 
-/// [`create_disk_image`], with each of `substitutes` written in place of the
+/// [`create_disk_image`], composing the bundle of `harness` rather than the
+/// recorded one: sign the sysroot for `harness`
+/// ([`crate::signing::sign_for_harness`]), compose the ESP from the installed
+/// files ([`crate::esp::compose`]), and write the images. A test that boots
+/// another harness's bundle packs with it, and packs again with
+/// [`create_disk_image`] to restore the recorded one.
+///
+/// # Errors
+/// Fails as [`create_disk_image`] does.
+pub fn create_disk_image_for(
+    ctx: &BuildContext,
+    arch: Arch,
+    layout: DiskLayout,
+    harness: Harness,
+) -> Result<()>
+{
+    pack(ctx, arch, layout, harness, Vec::new())
+}
+
+/// [`create_disk_image_for`], with each of `substitutes` written in place of the
 /// sysroot file at its path. The sysroot is signed and left as every pack
 /// leaves it; only the images carry the substitutes, as written, so a test can
 /// boot an object no pack would sign (a tampered or foreign-signed image)
@@ -247,17 +271,20 @@ pub fn create_disk_image_substituting(
     ctx: &BuildContext,
     arch: Arch,
     layout: DiskLayout,
+    harness: Harness,
     substitutes: &[Substitute],
 ) -> Result<()>
 {
-    pack(ctx, arch, layout, substitutes.to_vec())
+    pack(ctx, arch, layout, harness, substitutes.to_vec())
 }
 
-/// The pack of [`create_disk_image`] and [`create_disk_image_substituting`].
+/// The pack of [`create_disk_image`], [`create_disk_image_for`] and
+/// [`create_disk_image_substituting`].
 fn pack(
     ctx: &BuildContext,
     arch: Arch,
     layout: DiskLayout,
+    harness: Harness,
     substitutes: Vec<Substitute>,
 ) -> Result<()>
 {
@@ -268,25 +295,13 @@ fn pack(
         layout.block_size.bytes()
     ));
 
-    // `mkdisk` is the refresh-from-sysroot path — it never authors the
-    // bundle. `build` and `compose-bundle` are responsible for producing
-    // `bootstrap.bundle` before this point; fail loudly if it is absent
-    // rather than producing a disk image the bootloader will refuse.
-    let bundle_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
-    if !bundle_path.exists()
-    {
-        crate::error::bail!(
-            "mkdisk: {} missing — run `cargo xtask build` (default-init bundle) or \
-             `cargo xtask compose-bundle --harness {{init,ktest}}` first",
-            bundle_path.display()
-        );
-    }
-
-    // Every pack signs what it packs, so no path writes an unsigned image:
-    // `build`, `mkdisk`, `compose-bundle` and every harness that repacks.
-    // The signing follows the staged bundle's harness, so ktest is signed
-    // `init` only in an image whose bundle boots it.
-    sign_for_harness(ctx, arch, crate::bundle::staged_harness(ctx)?)?;
+    // Every pack signs what it packs, so no path writes an unsigned image,
+    // and composes the ESP from what it signed, so the ESP of every image is
+    // copies of the installed files: `build`, `mkdisk`, `compose-bundle` and
+    // every harness that repacks. ktest is signed `init` only in an image
+    // whose bundle boots it.
+    sign_for_harness(ctx, arch, harness)?;
+    crate::esp::compose(ctx, arch, harness)?;
 
     let sources = Sources {
         esp: ctx.sysroot_esp(),
@@ -777,9 +792,9 @@ fn substitute(tree: &mut [fat::Entry], path: &Path, source: &Path) -> Result<()>
 
 /// The files and directories under `host_dir`, in name order, as a FAT volume holds them.
 ///
-/// Skips build metadata (`.arch`, `NvVars`), the `esp` directory, and at the top of
-/// `sysroot_root` the `data` directory: `esp` and `data` are mount points with their own
-/// partitions, and so not root content. Entries other than files and directories are skipped.
+/// Skips build metadata (`.arch`, `.harness`, `NvVars`), the `esp` directory, and
+/// at the top of `sysroot_root` the `data` directory: `esp` and `data` are mount
+/// points with their own partitions, and so not root content. Entries other than files and directories are skipped.
 ///
 /// # Errors
 /// Fails when a directory cannot be read or a name is not UTF-8.
@@ -801,7 +816,7 @@ fn host_tree(host_dir: &Path, sysroot_root: &Path) -> Result<Vec<fat::Entry>>
             .map_err(|_| crate::error::err!("{} has a name that is not UTF-8", path.display()))?;
 
         // Skip build metadata and the ESP mount point (populated separately).
-        if name == ".arch" || name == "NvVars" || name == "esp"
+        if name == ".arch" || name == ".harness" || name == "NvVars" || name == "esp"
         {
             continue;
         }
@@ -1309,6 +1324,59 @@ mod tests
             )
             .expect_err(path);
         }
+    }
+
+    // Defect caught: the installed kernel and bootloader left off the root
+    // partition, so the root filesystem holds no copy the ESP derives from,
+    // or the build's metadata or the ESP tree packed onto it.
+    #[test]
+    fn the_root_partition_carries_the_installed_boot_files_and_no_metadata()
+    {
+        use crate::fat::read::{Node, read_volume};
+
+        let scratch = Scratch::new("root-content");
+        let sysroot = scratch.0.join("sysroot");
+        for (path, bytes) in [
+            ("boot/kernel", b"kernel".as_slice()),
+            ("boot/boot.efi", b"bootloader"),
+            ("esp/EFI/seraph/kernel", b"kernel"),
+            (".arch", b"x86_64"),
+            (".harness", b"init\n"),
+        ]
+        {
+            let full = sysroot.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, bytes).unwrap();
+        }
+        let main = scratch.0.join("disk.img");
+        let sources = Sources {
+            esp: sysroot.join("esp"),
+            root: sysroot.clone(),
+            data: sysroot.join("data"),
+            substitutes: Vec::new(),
+        };
+        author_images(
+            &main,
+            &scratch.0.join("disk-data.img"),
+            Arch::X86_64,
+            DiskLayout::default(),
+            &sources,
+        )
+        .unwrap();
+        let mut image = File::open(&main).unwrap();
+        let root = read_volume(&mut image, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512);
+        let file = |bytes: &[u8]| Some(Node::File(bytes.to_vec()));
+        assert_eq!(root.get("/boot/kernel"), file(b"kernel").as_ref());
+        assert_eq!(root.get("/boot/boot.efi"), file(b"bootloader").as_ref());
+        for absent in ["/.arch", "/.harness", "/esp"]
+        {
+            assert!(
+                !root.keys().any(|path| path.starts_with(absent)),
+                "{absent}"
+            );
+        }
+        let esp = read_volume(&mut image, IMAGE_MARGIN, 512);
+        assert_eq!(esp.get("/EFI/seraph/kernel"), file(b"kernel").as_ref());
     }
 
     #[test]

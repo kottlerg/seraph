@@ -420,11 +420,12 @@ The log level of each service init spawns comes from the boot bundle's log-level
 and a driver devmgr spawns and a fatfs instance vfsd spawns inherit their spawner's
 ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels). The
 committed configuration sets no level, so no default boot shows whether a level reaches its
-service. `cargo xtask test-log-level [--arch]` (both arches) composes the bundle with vfsd set to
-debug, repacks the disk images in the layout they have, and boots the current sysroot once through
-`run-parallel`. It passes when the boot reaches its harness's pass marker, vfsd's and fatfs's
-debug lines appear, and devmgr's and procmgr's do not; the staged bundle is always put back and
-the images repacked in that layout afterward. See
+service. `cargo xtask test-log-level [--arch]` (both arches) installs a configuration setting vfsd
+to debug, repacks the disk images in the layout they have with the default-init bundle, and boots
+the current sysroot once through `run-parallel`. It passes when the boot reaches its harness's
+pass marker, vfsd's and fatfs's debug lines appear, and devmgr's and procmgr's do not; the
+installed configuration is always put back and the images repacked in that layout, with the
+recorded harness's bundle, afterward. See
 [xtask/README.md § test-log-level](../xtask/README.md#cargo-xtask-test-log-level) for the
 command.
 

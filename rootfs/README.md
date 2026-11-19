@@ -21,6 +21,8 @@ directly to their sysroot destinations, not via this tree (see
 ```
 rootfs/
   config/
+    bundle/           # The bundle lists: per harness, and per architecture where
+      *.list          #   they differ, the installed files the bootstrap bundle copies
     svcmgr/
       services/       # `.svc` recipes svcmgr scans at handover
         *.svc
@@ -42,10 +44,18 @@ The build never prunes it, so cores written to a disk image survive until
 the image is rebuilt.
 
 The bootloader's `bootstrap.bundle` (init plus every boot module) is
-composed by `cargo xtask build` and written to
+composed by every pack of the disk image and written to
 `sysroot/esp/EFI/seraph/bootstrap.bundle` (see
-[`docs/build-system.md`](../docs/build-system.md#build-output-the-sysroot));
-it has no hand-authored counterpart under `rootfs/`. The bootloader reads
+[`docs/build-system.md`](../docs/build-system.md#build-output-the-sysroot)).
+Its entries are byte copies of the installed files that the harness's list
+under `config/bundle/` names, each by its install path: `init.x86_64.list`
+and `init.riscv64.list` for the init harness, `ktest.list` for ktest. A
+list holds one `init <path>` line, naming the object of the bundle's `init`
+slot, and one install path per line for every other entry; `#` starts a
+comment. A harness has one list for every architecture or one per
+architecture, never both. Adding a boot module is a line in its harness's
+list ([docs/boot-media.md](../docs/boot-media.md) § The Bootstrap Closure
+says what belongs there). The bootloader reads
 hardcoded ESP paths (see [`core/boot/README.md`](../core/boot/README.md)),
 and vfsd discovers mounts by GPT role GUID and auto-mounts `/esp` (see
 [`docs/storage.md`](../docs/storage.md#gpt-role-guid-discovery)); neither

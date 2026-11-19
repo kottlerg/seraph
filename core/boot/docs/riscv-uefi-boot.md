@@ -217,8 +217,9 @@ Internally the pipeline runs in three steps:
 2. `llvm-objcopy -O binary` strips all ELF structure and emits only the
    section data in load-address order. Byte 0 of the output is the MZ
    signature from `.pecoff_header`; byte `0x1000` is the entry trampoline.
-3. `llvm-objcopy` writes the flat binary to `EFI/seraph/boot.efi` in the sysroot's ESP tree,
-   and xtask copies it to the UEFI fallback path `EFI/BOOT/BOOTRISCV64.EFI`, per
+3. `llvm-objcopy` writes the flat binary to the installed bootloader, `boot/boot.efi` in the
+   sysroot, and every pack copies it to `EFI/seraph/boot.efi` and to the UEFI fallback path
+   `EFI/BOOT/BOOTRISCV64.EFI` on the ESP (`xtask/src/esp.rs`), per
    [docs/build-system.md § Build Output: the Sysroot](../../../docs/build-system.md#build-output-the-sysroot).
 
 The intermediate ELF is not a usable UEFI image — UEFI does not

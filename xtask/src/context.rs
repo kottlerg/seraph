@@ -106,13 +106,24 @@ impl Context
         self.sysroot.join("esp").join("EFI").join("seraph")
     }
 
-    /// Path to `sysroot/services/` — canonical home for bootloader-loaded
-    /// userspace components (init, ktest, procmgr, memmgr, devmgr, vfsd,
-    /// virtio-blk, fatfs). The bundle composer copies them from here; the kernel
-    /// and bootloader binaries stay loose on the ESP and have no home here.
-    pub fn sysroot_services(&self) -> PathBuf
+    /// Path to `sysroot/boot/`: the installed kernel and bootloader, whose
+    /// ESP copies every pack writes (docs/boot-media.md § Installed Copies).
+    pub fn sysroot_boot(&self) -> PathBuf
     {
-        self.sysroot.join("services")
+        self.sysroot.join("boot")
+    }
+
+    /// Path to the installed kernel, `/boot/kernel`, signed there.
+    pub fn installed_kernel(&self) -> PathBuf
+    {
+        self.sysroot_boot().join("kernel")
+    }
+
+    /// Path to the installed bootloader, `/boot/boot.efi`, whose embedded
+    /// trust store every pack signs under.
+    pub fn installed_bootloader(&self) -> PathBuf
+    {
+        self.sysroot_boot().join("boot.efi")
     }
 
     /// Path to the GPT disk image (built from sysroot contents).

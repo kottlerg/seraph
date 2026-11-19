@@ -156,9 +156,11 @@ A table holds at most `MAX_TABLE_BYTES` = 8192 bytes, `MAX_PLATFORM_DEVICES` = 1
 `MAX_PLATFORM_KEY_BYTES` = 32 bytes per key, and `MAX_PLATFORM_RESOURCES` = 4 resources per
 device; a table past a bound is rejected whole and logged.
 
-Tables live in the tree at `services/devmgr/platform/<machine>.platform`. `xtask/src/bundle.rs`
-(`ARCH_TABLES`) installs them per architecture under `/config/devmgr/platform/` and bundles them as
-boot modules named by that install path (riscv64: `/config/devmgr/platform/qemu-virt.platform`, from
+Tables live in the tree at `services/devmgr/platform/<machine>.platform`. The build
+(`xtask/src/sysroot.rs`, `data_files`) installs them per architecture under
+`/config/devmgr/platform/`, and the init harness's bundle list of the architecture
+([`rootfs/config/bundle/`](../rootfs/config/bundle/)) names them as boot modules, by that install
+path (riscv64: `/config/devmgr/platform/qemu-virt.platform`, from
 `services/devmgr/platform/qemu-virt.platform`; x86-64: none), init forwards them to devmgr with the
 driver modules, and devmgr tells one from a driver image by its content. devmgr uses the table whose
 `oem_table_id` equals the XSDT's OEM table ID. With no such table there are no platform-table

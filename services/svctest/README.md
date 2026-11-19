@@ -93,6 +93,11 @@ services/svctest/
         │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
         │                      #   headroom and by direct reclaim; a no-evict region, logd's
         │                      #   reserve stack; all-RAM-accounted identity
+        ├── swap_client.rs     # memmgr's disk tier with svctest as the swap service over a
+        │                      #   RAM slot store: register, take, done, stale restores, a
+        │                      #   fault redirected and restored, a re-registration, a
+        │                      #   tampered slot killing its faulting child;
+        │                      #   all-RAM-accounted identity
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -161,21 +166,21 @@ skip and return when their cap is zero; the devmgr class-deny phase (`caps[2]` a
 bind-deny phase (`caps[2]`), the input-ordinal phase (`caps[8]`), the on-demand-bind phase
 (`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement and MSI delivery, forge, churn, and
 release phases (`caps[9]`), the drivers stray-cap phases (`caps[7]`, `caps[8]`, and `caps[16]`), the
-drivers hwrng read phase (`caps[16]`), the drivers hwrng restart phase (`caps[16]` and `caps[18]`),
+drivers hwrng read phase (`caps[16]`), the drivers hwrng restart phase (`caps[16]` and `caps[19]`),
 the drivers deny phase (`caps[11]` to `caps[13]` and `caps[17]`), the `logd_sinks` phase's
 framebuffer-killed and framebuffer-restarted cases (`caps[13]`), the svcmgr seed-only phase (every
 seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and `acpid.deny` names it resolves), the
 svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd and vfsd unmount phases
 (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`,
 `logd_sinks`, and `entropyd_contribution` phases (`caps[6]`), the vfsd swap-partition phase
-(`caps[14]`), the `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]`
-and `caps[19]`), the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`,
-`memmgr_swap`, and `vfsd_driver_death` phases, and the drivers hwrng restart phase (`caps[18]`), the
-`svcmgr_stop_service` phase (`caps[19]`, and `caps[18]` with `stopsrc` staged), and the no-stop
-cases of the `oom_policy` and `logd_reserve` phases (`caps[19]`), instead fail their assertions. The
-seed-only phase thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so
-that phase's own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the
-same zero cap, and the run ends idle.
+(`caps[14]`), the `memmgr_swap_client` phase (`caps[18]`), the `sessiond_operator` phase and the
+`oom_policy` phase's session case (`caps[15]` and `caps[20]`), the `crash_endpoint`, `logd_reserve`,
+`logd_restart`, `logd_sinks`, `memmgr_swap`, `memmgr_swap_client`, and `vfsd_driver_death` phases,
+and the drivers hwrng restart phase (`caps[19]`), the `svcmgr_stop_service` phase (`caps[20]`, and
+`caps[19]` with `stopsrc` staged), and the no-stop cases of the `oom_policy` and `logd_reserve`
+phases (`caps[20]`), instead fail their assertions. The seed-only phase thus fails the run on a zero
+`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
+reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -187,9 +192,9 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, four slots
 to a round (`caps[0]` to `caps[3]`, `caps[4]` to `caps[7]`, `caps[8]` to `caps[11]`,
-`caps[12]` to `caps[15]`, and `caps[16]` to `caps[19]`), the last two being the debug-authority cap
-the recipe's `debug_authority = yes` grants and the stop-authority cap its `stop_authority = yes`
-grants; [service-definitions.md §
+`caps[12]` to `caps[15]`, `caps[16]` to `caps[19]`, and `caps[20]`), the last two being the
+debug-authority cap the recipe's `debug_authority = yes` grants and the stop-authority cap its
+`stop_authority = yes` grants; [service-definitions.md §
 `seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's cap shape and the zero slot
 an unresolved name leaves. With no creator endpoint, every slot stays zero.
 
@@ -213,8 +218,9 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose shell runs the large job |
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
-| `caps[18]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
-| `caps[19]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
+| `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client` phase: memmgr's swap labels, as the swap service over a RAM slot store |
+| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the nine `devmgr.class.*` names among them. `caps[2]` carries
@@ -258,12 +264,12 @@ the terminal keeps a blocking read pending, so the deny would wait behind it for
 The drivers hwrng read phase waits (bounded by `DEVICE_WAIT_MS`) for a granted SEND from
 `caps[16]`, then requires two `READ` calls of `MAX_READ_BYTES` (504) each to answer `SUCCESS` with
 at least 16 and at most 504 bytes, the two answers to differ, and `READ(0)` to answer zero bytes.
-The drivers hwrng restart phase kills the virtio-rng driver through `caps[18]`, requires its ordinal
+The drivers hwrng restart phase kills the virtio-rng driver through `caps[19]`, requires its ordinal
 on `caps[16]` to answer `WITHDRAWN` and the class's next ordinal to answer with a new instance, and
 requires a `READ` through that instance to answer with bytes.
 
 The `logd_sinks` phase's framebuffer-restarted case queries the framebuffer class's ordinal 1
-through `caps[13]`, finds, attaches to, and stops the instance devmgr restarted through `caps[18]`,
+through `caps[13]`, finds, attaches to, and stops the instance devmgr restarted through `caps[19]`,
 requires a line to wait out logd's stall bound on it, then the line in logd's history through
 `caps[6]`.
 `caps[4]` and `caps[5]` are SENDs on vfsd's service endpoint, badged `MOUNT_AUTHORITY` and the
@@ -289,7 +295,7 @@ when either arrives empty.
 interface](../logd/docs/ipc-interface.md) § Queries); the `logd_death_forward` phase reads its dead
 child's retired slot and history through it, and requires `QUERY_DENIED` for a query on svctest's
 own log cap.
-The `logd_restart` phase kills logd through `caps[18]`: it finds logd by name
+The `logd_restart` phase kills logd through `caps[19]`: it finds logd by name
 (`LIST_PROCESSES`), attaches to it, requires the attach to report logd on the core path
 (`ATTACH_FLAG_NO_CORE`), stops its main thread, sets the thread's instruction pointer to
 0, and starts it, so the thread faults and the fault takes the path any fault of logd takes, to
@@ -320,7 +326,7 @@ frames the kill frees until memhog's next tick takes them back, so the attach fl
 timing, are what fail for a logd outside the reserve. It attaches to logd before the fill, has
 memhog fill the pool, faults logd's main thread once the level reads `CRITICAL`, and waits for
 the level to fall: oomd's stop of memhog ends the window when oomd is staged in its stop mode, and
-svctest's own stop through `caps[19]`, 5 s after the fill, otherwise. It then requires, through
+svctest's own stop through `caps[20]`, 5 s after the fill, otherwise. It then requires, through
 `caps[6]`, svcmgr's `service restarted: logd` line in the new instance's history stamped before
 svcmgr's `stop memhog` line, the first of each after the kill, and memhog's next instance to
 answer `PROBE` with a new nonce and no pages. svcmgr writes the stop line once procmgr has
@@ -359,7 +365,7 @@ writes the token again at its end, so a later boot of the same image repeats the
 The `svcmgr_stop_service` phase checks the stop authority
 ([svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) § Stop authority). Through the
 per-process `service_registry_cap`, `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`
-must reply `UNAUTHORIZED`. Through `caps[19]`, the whole `LIST_CANDIDATES` walk must list exactly
+must reply `UNAUTHORIZED`. Through `caps[20]`, the whole `LIST_CANDIDATES` walk must list exactly
 the staged fixtures whose recipes set `oom_stop = yes` (`crasher-worker` and `memhog`), each with
 a non-zero usage and the service rank, and nothing when neither is staged; `STOP_CANDIDATE` must
 reply `NO_CANDIDATE` for the first instance's key of every svcmgr table slot below 32 it does not
@@ -371,7 +377,7 @@ staged, both with the program class, and nothing when neither is staged; through
 carries, the fixture's `LIST_CANDIDATES` must reply `SUCCESS` and `STOP_CANDIDATE` of a key it never
 gave `NO_CANDIDATE`, and through the fixture's `:deny` SEND,
 which `QUERY_ENDPOINT` resolves, both must reply `UNAUTHORIZED`. With `stopsrc.svc` staged, the
-phase also checks that svcmgr creates the source contained: through `caps[18]`, `LIST_PROCESSES`
+phase also checks that svcmgr creates the source contained: through `caps[19]`, `LIST_PROCESSES`
 must list one new process named `/tests/stopsrc`, the job's first argv word, after `START_JOB`;
 once the fixture has exited (`EXIT`, which leaves the job running) and its next instance answers
 `PROBE` with a new nonce, the job's badge must leave the list within 2 s. With
@@ -403,7 +409,7 @@ stop: a cooldown with sessiond staged, else the grace and a cooldown for `stopsr
 `OOMD_STOP=no`, or without `oomd.svc` staged, it checks that memhog stays running and the level
 stays `CRITICAL` past the grace, the cooldown and 2000 ms, that oomd, if staged, logged at least
 one `would stop ` line, which names the operator session while one is open, and no stop, and then
-stops memhog itself through `caps[19]`, by the key svcmgr listed it under before the fill. In
+stops memhog itself through `caps[20]`, by the key svcmgr listed it under before the fill. In
 every case memhog's next instance answers `PROBE` with a new nonce and 0 pages
 ([oomd](../oomd/README.md)).
 
@@ -457,7 +463,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 | `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
 | `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
-| `swap-fixture`              | `swap`         | `memmgr_swap` (evicted regions, threads)    |
+| `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client` (evicted regions, threads) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---

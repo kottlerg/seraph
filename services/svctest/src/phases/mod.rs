@@ -92,6 +92,7 @@ pub mod shmem;
 pub mod startup;
 pub mod svcmgr;
 pub mod swap;
+pub mod swap_client;
 pub mod threading;
 pub mod timed;
 pub mod unmount;
@@ -145,6 +146,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(swap::phases());
+    out.extend_from_slice(swap_client::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());

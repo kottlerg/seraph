@@ -358,6 +358,26 @@ The supported failure-handling primitives are:
 
 ---
 
+## Data at Rest
+
+Pages written to swap are encrypted and authenticated. memmgr seals each chunk it hands the swap
+service with ChaCha20-Poly1305 (`shared/crypto`) under a 256-bit key it draws from `SYS_GETRANDOM`
+at start, with a nonce it never repeats within a boot, before the bytes leave its own memory, and
+checks the tag of every slot handed back before it decrypts it
+([`services/memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md#disk-tier) § Disk
+tier). The key is held by memmgr only: it is never sent, so the swap service, the block driver and
+the disk see ciphertext alone. It lives for one boot, so swap holds nothing a later boot can read,
+and a slot's bytes open only as the last seal of the chunk that holds it: bytes changed on disk,
+another chunk's bytes, or an older seal fail the tag, and the faulting process is killed rather
+than handed them.
+
+The rule covers swap alone. Filesystem contents on the root and data partitions are stored as
+written; a block-level encrypting service, key derivation and an unlock flow are not part of the
+storage system ([#149](https://github.com/kottlerg/seraph/issues/149) D29,
+[#152](https://github.com/kottlerg/seraph/issues/152) D32).
+
+---
+
 ## What the Storage System Is Not
 
 To prevent inference of behavior that does not exist:

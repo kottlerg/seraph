@@ -31,7 +31,8 @@ works from a long or summarized context. Three consequences hold throughout this
   hand-over.
 - "The maintainer" below is reached through the supervisor: send to `main` by `SendMessage`
   only what § Reporting to the maintainer allows, as text ready to show; the supervisor shows
-  it whole and returns the maintainer's words alone, as `Maintainer, verbatim: "<text>"`
+  it whole and returns the maintainer's words alone, as `Maintainer, verbatim: "<text>"`, after
+  at most one line `Answers: "<the question as shown>"` that names the question they answer
   (`.claude/skills/orchestrate/SKILL.md`, step 2). Ending your turn reports nothing: the
   harness does not reliably notify the supervisor of your stop while a background child of yours
   is alive; such a stop has produced no notification at all. Every line this file sends to the

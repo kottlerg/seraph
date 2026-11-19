@@ -42,7 +42,9 @@ over the session's. When this session runs on a larger model, say so once and co
    - **Nothing of your own in a relay.** A remark, a question or a recommendation of yours, for
      either side, is added to no relay. Put it to the maintainer first, as your own and apart
      from any relayed text; it reaches the orchestrator only as the maintainer's words, if they
-     then say it.
+     then say it. The messages the other steps and § A silent orchestrator have you send the
+     orchestrator (its id, `park`, a spawn answer, a confirmed stop, `resume`, a request for its
+     state among them) are no relay and go to it directly.
 
    Never paraphrase in either direction, and decide nothing. The maintainer's words go no
    further than the orchestrator and its local record; nothing tracked or outward-facing quotes

@@ -494,7 +494,8 @@ between steps and past 200,000.
   what is no longer in force (§ Plan, step 7). Send `main` the one word `parked` and end your
   turn. Parked, you take no further step: a message that wakes you afterwards (a worker that
   read the record before your successor wrote its id) goes to `main` verbatim, for the
-  supervisor to pass on, and you stop again.
+  supervisor to pass on, and you stop again. A message sent to a stopped agent can still revive
+  it, so this holds whenever you wake, before or after the supervisor stops you.
 - Started with "resume from the record": first read from disk each file the start line names
   (§ Plan, after an instruction-file merge), and, once `cargo xtask orch state` has printed the
   rulings, each path of a `spawns read from disk` ruling that is this file or a supporting file
@@ -502,7 +503,15 @@ between steps and past 200,000.
   Follow each where it differs from the copy loaded for you. Read this file's supporting files
   only as needed, run `cargo xtask orch state`, and record your id with
   `cargo xtask orch orchestrator <id>` before any other step: each worker reads the id it
-  reports to from the record, so the record is how it learns yours.
+  reports to from the record before each message, so the record is how it learns yours. Then
+  log the names of the workers the state holds (`orch log "hand-over workers: <names>"`). Your
+  predecessor stays parked while any of them lives, since its stop would interrupt each worker it
+  spawned mid-turn, with its background children. Once every worker of that line has been removed
+  from the state (§ Plan, step 7), tell the supervisor in one line that the orchestrators parked
+  at or before that hand-over may be stopped; it tells you once the stops are confirmed. Send a
+  predecessor nothing: a message to it revives it at its full context, and its id may be
+  undeliverable. A message it forwards through the supervisor is a worker's report like any
+  other.
 - An agent id is reachable only within the session that spawned it, the supervisor's. Within
   that session, a worker spawned by an earlier orchestrator is still alive and reachable by its
   id; the harness's notifications of its stops go to the supervisor, which forwards each to you

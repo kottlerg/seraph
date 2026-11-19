@@ -48,16 +48,27 @@ only if that does not cure it.
    2>/dev/null | head -n 1`. A task notification
    that arrives carries the count as well. At that size, or when it asks, send `park`; when its
    `parked` message arrives, spawn a new one with "resume from the record" and give it its id.
-   The old one stays idle and forwards you what still reaches it (step 4). Stop it only when no
-   `parked` comes and § A silent orchestrator shows it is gone. When it asks because a merge
+   The old one is left parked: it forwards you whatever wakes it (step 4), and every worker
+   reads the id from the record before each message (`.claude/agents/worker.md` § Reporting),
+   so only a send in the moments before the new one records its id reaches it. Stop a parked
+   orchestrator only when the current orchestrator says so: a stop interrupts every worker that
+   orchestrator spawned, mid-turn, with its background children (a CI watch, a review run). The
+   current one says so once every worker that was in the state at that hand-over has been
+   removed from it; then stop (`TaskStop` with its id; an answer that it is not running confirms
+   the stop too) every orchestrator parked at or before that hand-over, and tell the current one
+   in one line once the stops are confirmed. A stop does not close an id: a message sent to a
+   stopped or finished agent can revive it at its full context, to forward what woke it. When no
+   `parked` comes, replace it only once § A silent orchestrator shows it is gone, and leave it to
+   be stopped the same way. When it asks because a merge
    changed its own file, the request names the changed files: the new one's line is "resume
    from the record; read from disk first: <the files>", since the definition this session
    loaded is the old one. When the orchestrator names this file after a merge, read it again
    yourself. A merge that changes `.claude/` needs no new session
    (`.claude/agents/orchestrator.md` § Plan); this session continues.
 4. **Forward what reaches you for the orchestrator.** A parked orchestrator sends you, verbatim,
-   any message that still reaches it, and a worker spawned by an earlier orchestrator stays
-   alive, with the harness's notifications of its stops arriving here. Forward a parked
+   any message that wakes it, before or after a stop (step 3), and a worker spawned by an
+   earlier orchestrator stays alive, with the harness's notifications of its stops arriving
+   here. Forward a parked
    orchestrator's message to the current orchestrator verbatim: it can be a worker's only copy of
    its report (a gate report, a question that blocks it, a composition check's verdict, a
    stand-down line). Forward a notification in one line: the worker and the notification's
@@ -84,7 +95,7 @@ an `assistant` entry that stopped on `tool_use`, means it is working. When the e
 turn that ended (`end_turn`), send it one line asking for its state; it answers by message.
 Treat it as gone only when a message to it is undeliverable, or when neither a reply nor a new
 entry in the file follows within ten minutes. Then spawn a new one with "resume from the
-record", as in step 3.
+record", as in step 3, which also says when the old one is stopped.
 
 ## What you do not do
 

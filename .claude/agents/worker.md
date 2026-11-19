@@ -72,7 +72,11 @@ interim, and a notification carries only your last text in any case. Every repor
 orchestrator must read therefore goes by `SendMessage` to its agent id, and none is left to the
 stop. That id is the one `cargo xtask orch orchestrator` prints, which the record keeps current
 when the orchestrator is replaced, or, when the command finds no batch, the one your prompt or a
-later orchestrator's message names. Never send to `main`, which is the supervisor above it.
+later orchestrator's message names. Read it with the command right before each message, never
+from your prompt or an earlier read: a message to a replaced orchestrator wakes it at its full
+context only for it to pass the message on. When a message is refused as undeliverable, read the
+id again and send the message again to the id the command prints. Never send to `main`, which
+is the supervisor above it.
 
 - **Status**: one line of at most 200 characters, recorded with
   `cargo xtask orch worker <name> --status "<line>"`, `<name>` being the record name your prompt

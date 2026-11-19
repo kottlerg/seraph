@@ -657,19 +657,20 @@ replies `NO_DEVICE`. A further console device is left unbound.
 
 devmgr loads driver binaries from one of two places:
 
-- **Boot bundle** — bootstrap-essentials (virtio-blk, serial, framebuffer, and the IOMMU driver of
-  the architecture's family, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64, which must confine
-  the disk before its driver maps a ring) ship in the bundle and arrive untagged as Memory caps in
-  devmgr's MODULE bootstrap rounds, with any platform description table; each module's round words
-  carry its size and its bundle entry name, which devmgr gives procmgr to verify the module under.
-  devmgr tells a module by its content: it reads the declaration of each ELF image, parses valid
-  UTF-8 text as a platform description table, and logs and releases anything else. It binds the PCI
-  and platform records those declarations match in the boot settle batch (the IOMMU family record in
-  a batch of its own before it), and spawns every driver via `procmgr_labels::CREATE_PROCESS`.
-  A bundle copy runs only for that boot pass; a device added later, a disk included, binds the
-  copy under `/services/drivers/` at the auxiliary tier
+- **Boot bundle** — bootstrap-essentials (virtio-blk, and the IOMMU driver of the architecture's
+  family, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64, which must confine the disk before its
+  driver maps a ring) ship in the bundle and arrive untagged as Memory caps in devmgr's MODULE
+  bootstrap rounds, with any platform description table a root mount needs; each module's round
+  words carry its size and its bundle entry name, which devmgr gives procmgr to verify the module
+  under. devmgr tells a module by its content: it reads the declaration of each ELF image, parses
+  valid UTF-8 text as a platform description table, and logs and releases anything else. It binds
+  the PCI and platform records those declarations match in the boot settle batch (the IOMMU family
+  record in a batch of its own before it), and spawns every driver via
+  `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only for that boot pass; a device added
+  later, a disk included, binds the copy under `/services/drivers/` at the auxiliary tier
   ([driver-binding.md](driver-binding.md) § Declaration Bounds).
-- **On-disk rootfs** — non-essentials (the per-arch RTC, bound to its platform record, the
+- **On-disk rootfs** — non-essentials (the serial and framebuffer drivers of the consoles, the
+  per-arch RTC, bound to its platform record, the
   [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's
   virtio-console driver, the virtio-rng driver, the [TPM driver](../services/drivers/tpm/README.md),
   and the test-only `test-dma`) live at
@@ -688,8 +689,10 @@ devmgr loads driver binaries from one of two places:
   subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from
   the devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ | READDIR` rights only
   — devmgr lists the directory and cannot reach outside the drivers subtree), with the directory's
-  absolute path as a name block, under which devmgr names each driver it starts (`<path>/<entry>`).
-  The handshake is specified in
+  absolute path as a name block, under which devmgr names each driver it starts (`<path>/<entry>`),
+  and, when the walk finds it, the directory of the platform description tables as an optional
+  second cap at the same rights ([driver-binding.md](driver-binding.md#platform-description-tables)
+  § Platform Description Tables). The handshake is specified in
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
   [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md). Devmgr
   replies SUCCESS before doing any spawn work so svcmgr never blocks on driver bring-up; the actual

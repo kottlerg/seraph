@@ -532,8 +532,9 @@ mod tests
 
     // Defect caught: a list that does not parse, names a file no build
     // installs for its architecture (a mistyped path, the other
-    // architecture's IOMMU driver or platform table), or puts another object
-    // than the harness's in the `init` slot.
+    // architecture's IOMMU driver), names an object outside the bootstrap
+    // closure (a console driver, a platform description table), or puts
+    // another object than the harness's in the `init` slot.
     #[test]
     fn every_list_names_files_the_build_installs_for_its_architecture()
     {
@@ -569,10 +570,19 @@ mod tests
         let has = |list: &[String], path: &str| list.iter().any(|entry| entry == path);
         assert!(has(&x86, "/services/drivers/iommu-vtd"));
         assert!(has(&riscv, "/services/drivers/iommu-riscv"));
-        assert!(has(&riscv, "/config/devmgr/platform/qemu-virt.platform"));
         for list in [&x86, &riscv]
         {
             assert!(has(list, crate::sysroot::LOG_LEVELS.install));
+            // The bootstrap closure (docs/boot-media.md): the consoles and
+            // the platform description tables load from the root filesystem.
+            for outside in [
+                "/services/drivers/serial",
+                "/services/drivers/framebuffer",
+                "/config/devmgr/platform/qemu-virt.platform",
+            ]
+            {
+                assert!(!has(list, outside), "{outside}");
+            }
         }
     }
 

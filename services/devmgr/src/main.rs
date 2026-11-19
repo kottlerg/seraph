@@ -176,7 +176,9 @@ fn main() -> !
 
     // The PCI Express hotplug slots the scan found, taken while the IOMMU
     // pass's records are the only ones bound, none managed until its grant
-    // comes (`hotplug::Hotplug::grant`).
+    // comes (`hotplug::Hotplug::grant`). The platform description tables
+    // are known here only when a boot module's table matched; otherwise the
+    // drivers-directory job reads them (`run_jobs`).
     let mut hotplug = hotplug::Hotplug::new(
         slots,
         &records,
@@ -224,6 +226,7 @@ fn main() -> !
         run_jobs(
             &registry,
             &mut records,
+            &mut hotplug,
             &mut bind::Carve {
                 caps: &mut caps,
                 irq_range: &mut irq_range,
@@ -277,11 +280,13 @@ fn driver_watch(records: &bind::Records) -> settle::DriverWatch
 /// Locate and scan every PCI ECAM window, then enumerate the platform
 /// records, returning the device records, the classified boot modules, the
 /// PCI Express hotplug slots the scan found, and whether the platform
-/// description table grants native control of them. Halts, logged, when no
-/// window is scanned or the records cannot be held.
+/// description table grants native control of them: `None` when no boot
+/// module's table matched, the tables then being read from the root
+/// filesystem. Halts, logged, when no window is scanned or the records
+/// cannot be held.
 fn enumerate_records(
     caps: &mut caps::DevmgrCaps,
-) -> (bind::Records, decls::BootModules, Vec<Slot>, bool)
+) -> (bind::Records, decls::BootModules, Vec<Slot>, Option<bool>)
 {
     // Parse firmware to locate every PCI ECAM window. ACPI wins when RSDP is
     // present; DTB is the fallback; the arch platform default (QEMU virt
@@ -373,13 +378,19 @@ fn start_registry_workers(registry: &Arc<Registry>)
 const REGISTRY_WORKERS: usize = 4;
 
 /// Run the work registry requests left for the control thread, in this
-/// order: the drivers-directory pass and settle, the restarts of drivers
-/// that died, each in a settle batch of its own, then the on-demand pass and
-/// settle. Each job, once done, is counted settled ([`Registry::finish_job`]),
+/// order: the drivers-directory job, the restarts of drivers that died, each
+/// in a settle batch of its own, then the on-demand pass and settle. The
+/// drivers-directory job reads the platform description tables from the
+/// root filesystem and appends the matching one's records, unless a boot
+/// module's table matched ([`platform::read_tables`]), settles the hotplug
+/// slots' grants now that the tables are known (`hotplug`), and runs the
+/// drivers-directory pass and settle, which binds the tables' devices too.
+/// Each job, once done, is counted settled ([`Registry::finish_job`]),
 /// which releases the queries waiting for it.
 fn run_jobs(
     registry: &Registry,
     records: &mut bind::Records,
+    hotplug: &mut hotplug::Hotplug,
     tables: &mut bind::Carve,
     watch: &mut settle::DriverWatch,
     ipc_buf: *mut u64,
@@ -398,6 +409,21 @@ fn run_jobs(
     };
     if jobs.drivers_dir
     {
+        let tables_dir_cap = core::mem::take(&mut registry.lock().tables_dir_cap);
+        if hotplug.tables_known()
+        {
+            if tables_dir_cap != 0
+            {
+                let _ = syscall::cap_delete(tables_dir_cap);
+            }
+        }
+        else
+        {
+            let grant =
+                platform::read_tables(&tables.caps.firmware, tables_dir_cap, records, ipc_buf);
+            hotplug.set_tables(grant);
+        }
+        hotplug.grant(tables.bridges, records, tables.caps);
         spawn_dir_drivers(
             "on-disk batch",
             records,
@@ -522,6 +548,11 @@ struct RegistryState
     /// The absolute path of the directory `drivers_dir_cap` names, from the
     /// same request; empty until then.
     drivers_dir_path: DirPath,
+    /// The `LOOKUP | READ | READDIR` cap of the platform description tables'
+    /// directory (`devmgr_labels::PLATFORM_TABLES_PATH`) the same request
+    /// carried, which the drivers-directory job takes, reads once and
+    /// deletes; 0 when the request carried none, and once taken.
+    tables_dir_cap: u64,
     /// The directory cap of the `BIND_DRIVERS` request whose pass is posted
     /// and not yet done, which the control thread deletes once the pass
     /// ends; 0 when none is, so a request is admitted only then.
@@ -565,10 +596,11 @@ impl RegistryState
     }
 
     /// `SET_DRIVERS_DIR`'s state change: keep `cap` as the drivers-directory
-    /// cap, with `path` its absolute path, and post the drivers-directory
-    /// pass, when no cap is kept yet. Returns whether it did; on `false` the
-    /// caller releases `cap`.
-    fn install_drivers_dir(&mut self, cap: u64, path: &DirPath) -> bool
+    /// cap, with `path` its absolute path, and `tables` as the platform
+    /// tables' directory cap (0 for none), and post the drivers-directory
+    /// job, when no cap is kept yet. Returns whether it did; on `false` the
+    /// caller releases `cap` and `tables`.
+    fn install_drivers_dir(&mut self, cap: u64, tables: u64, path: &DirPath) -> bool
     {
         if self.drivers_dir_cap != 0
         {
@@ -576,6 +608,7 @@ impl RegistryState
         }
         self.drivers_dir_cap = cap;
         self.drivers_dir_path = *path;
+        self.tables_dir_cap = tables;
         Registry::post(self, |j| &mut j.drivers_dir)
     }
 
@@ -643,6 +676,7 @@ impl Registry
                 unsettled: 0,
                 drivers_dir_cap: 0,
                 drivers_dir_path: DirPath::EMPTY,
+                tables_dir_cap: 0,
                 bind_dir_cap: 0,
                 bind_dir_path: DirPath::EMPTY,
                 restarts: Vec::new(),
@@ -1024,13 +1058,16 @@ impl Registry
     {
         let badge = msg.badge;
         // A client whose SEND carries GRANT (`devmgr.bind`, svcmgr, init) can
-        // move caps here with any label. `SET_DRIVERS_DIR` and `BIND_DRIVERS`
-        // take `caps[0]` and own its release; every other cap a request
-        // carries is released here, so none stays in devmgr's CSpace.
-        let kept = usize::from(matches!(
-            msg.label,
-            ipc::devmgr_labels::SET_DRIVERS_DIR | ipc::devmgr_labels::BIND_DRIVERS
-        ));
+        // move caps here with any label. `SET_DRIVERS_DIR` takes `caps[0]`
+        // and `caps[1]`, `BIND_DRIVERS` `caps[0]`, and each owns their
+        // release; every other cap a request carries is released here, so
+        // none stays in devmgr's CSpace.
+        let kept = match msg.label
+        {
+            ipc::devmgr_labels::SET_DRIVERS_DIR => 2,
+            ipc::devmgr_labels::BIND_DRIVERS => 1,
+            _ => 0,
+        };
         for &cap in msg.caps().iter().skip(kept)
         {
             let _ = syscall::cap_delete(cap);
@@ -1150,19 +1187,20 @@ impl Registry
     }
 
     /// `SET_DRIVERS_DIR`, svcmgr's handshake: keep the subtree cap it
-    /// carries and the directory's absolute path (a name block from data word
-    /// `DRIVERS_DIR_PATH_WORD`), reply, and post the drivers-directory pass,
-    /// which the control thread runs, so svcmgr never waits on driver work.
-    /// Every rejection
-    /// releases the cap the kernel transferred into devmgr's `CSpace` before
-    /// it replies, and a re-send keeps the first cap and releases the new
-    /// one; a request with no path is refused with `INVALID_REQUEST`; the pass
-    /// is posted at most once per boot.
+    /// carries, the directory's absolute path (a name block from data word
+    /// `DRIVERS_DIR_PATH_WORD`) and the platform tables' directory cap it may
+    /// carry second, reply, and post the drivers-directory job, which the
+    /// control thread runs, so svcmgr never waits on driver work. Every
+    /// rejection releases the caps the kernel transferred into devmgr's
+    /// `CSpace` before it replies, and a re-send keeps the first caps and
+    /// releases the new ones; a request with no path is refused with
+    /// `INVALID_REQUEST`; the job is posted at most once per boot.
     fn set_drivers_dir(&self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
         let delivered_cap = msg.caps().first().copied();
+        let tables_cap = msg.caps().get(1).copied().unwrap_or(0);
         let release = || {
-            if let Some(c) = delivered_cap
+            for &c in msg.caps().iter().take(2)
             {
                 let _ = syscall::cap_delete(c);
             }
@@ -1195,15 +1233,15 @@ impl Registry
             reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
             return;
         };
-        let installed = self.lock().install_drivers_dir(new_cap, &path);
+        let installed = self.lock().install_drivers_dir(new_cap, tables_cap, &path);
         if installed
         {
             std::os::seraph::log!("devmgr: SET_DRIVERS_DIR cap installed");
         }
         else
         {
-            // Idempotent re-send: keep the original, drop the new.
-            let _ = syscall::cap_delete(new_cap);
+            // Idempotent re-send: keep the originals, drop the new ones.
+            release();
         }
         reply_status(ipc::devmgr_errors::SUCCESS, ipc_buf);
         if installed

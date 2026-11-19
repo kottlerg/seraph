@@ -63,13 +63,14 @@ pub const PROCMGR_PRIORITY: u8 = 27;
 /// it serves during bootstrap; matches the boot-critical drivers.
 pub const INIT_LOGD_PRIORITY: u8 = 26;
 
-/// Boot-critical device drivers: serial (console path) and
-/// virtio-blk (root-disk path); also devmgr's DMA thread, which
-/// virtio-blk blocks on for every transfer.
+/// Boot-critical device drivers, the boot tier of a boot module's
+/// declaration: virtio-blk (root-disk path) and the IOMMU driver; also
+/// devmgr's DMA thread, which virtio-blk blocks on for every transfer.
 pub const BOOT_DRIVER_PRIORITY: u8 = 26;
 
-/// Non-boot-critical device drivers: framebuffer, RTC, virtio-input, virtio-rng,
-/// and the debug port's virtio-console.
+/// Non-boot-critical device drivers, every driver started from the root
+/// filesystem: serial, framebuffer, RTC, virtio-input, virtio-rng, and the
+/// debug port's virtio-console.
 pub const AUX_DRIVER_PRIORITY: u8 = 25;
 
 /// devmgr — device enumeration and driver supervision.

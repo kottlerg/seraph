@@ -117,13 +117,11 @@ the bundle bodies are already 4096-byte aligned within the bundle allocation. At
 the bootloader does not inspect module content; what each module does and in what order init spawns
 them is init's concern ([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)).
 Each module is named by its install path: typically `/services/procmgr`, `/services/memmgr`,
-`/services/devmgr`, `/services/vfsd`, `/services/drivers/virtio-blk`, `/services/drivers/serial`,
-`/services/drivers/framebuffer`, `/services/fs/fatfs`, and `/services/drivers/iommu-vtd` on x86-64
-or `/services/drivers/iommu-riscv` on riscv64, the log-level configuration
-`/config/init/log-levels.conf`, and the text platform description tables of the architecture's
-machines (`/config/devmgr/platform/qemu-virt.platform` on riscv64) that devmgr reads (the
-authoritative lists are the init harness's bundle lists, `init.x86_64.list` and
-`init.riscv64.list` in [`rootfs/config/bundle/`](../../../rootfs/config/bundle/)).
+`/services/devmgr`, `/services/vfsd`, `/services/drivers/virtio-blk`, `/services/fs/fatfs`, and
+`/services/drivers/iommu-vtd` on x86-64 or `/services/drivers/iommu-riscv` on riscv64, and the
+log-level configuration `/config/init/log-levels.conf` (the authoritative lists are the init
+harness's bundle lists, `init.x86_64.list` and `init.riscv64.list` in
+[`rootfs/config/bundle/`](../../../rootfs/config/bundle/)).
 
 Last, the bootloader copies the trust store into a page allocation of its own, the slack
 after it zeroed, and describes it as the boot module `trust-store` (`TRUST_STORE_MODULE`),

@@ -72,9 +72,10 @@ const SIGNED_TREES: &[&str] = &["services", "programs", "tests"];
 /// The sysroot trees whose every regular file [`sign_sysroot`] signs in the
 /// data role, each under its install path: the data files a process reads
 /// from the root filesystem as trusted input through procmgr's verified
-/// read (docs/signing.md § Which Stage Verifies What). `data/svctest/signed`
-/// holds svctest's fixture of that read.
-const DATA_TREES: &[&str] = &["data/svctest/signed"];
+/// read (docs/signing.md § Which Stage Verifies What): `config/devmgr/platform`
+/// the platform description tables devmgr reads, and `data/svctest/signed`
+/// svctest's fixture of that read.
+const DATA_TREES: &[&str] = &["config/devmgr/platform", "data/svctest/signed"];
 
 /// The signing configuration a build reads from its environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1127,17 +1128,16 @@ mod tests
     // init in an image that does not boot it), a data file a list names left
     // unsigned, a file outside the signed trees given a trailer (the
     // installed bootloader among them), or an object signed both into an
-    // `init` slot and as an entry.
+    // `init` slot and as an entry, or a platform description table, which no
+    // list names, signed in another role than the data role.
     #[test]
     fn the_sysroot_objects_are_signed_under_their_names_and_roles()
     {
         let arch = Arch::Riscv64;
         let images = SIGNED_IMAGES;
-        let data: Vec<&str> = [
-            "/config/devmgr/platform/qemu-virt.platform",
-            "/config/init/log-levels.conf",
-        ]
-        .into();
+        let table = "/config/devmgr/platform/qemu-virt.platform";
+        let listed = "/config/init/log-levels.conf";
+        let data: Vec<&str> = [table, listed].into();
         // ELF files outside the signed trees, and a text file inside one.
         let outside = ["config/x", "boot/boot.efi", "esp/EFI/seraph/kernel"];
         let text = "services/init.conf";
@@ -1184,7 +1184,7 @@ mod tests
         let ktest = fs::read(ctx.sysroot.join("tests/ktest")).unwrap();
         assert!(verifies(&signer, &ktest, Role::Service, "/tests/ktest"));
         assert!(!verifies(&signer, &ktest, Role::Init, "init"));
-        for install in &data
+        for (install, role) in [(table, Role::Data), (listed, Role::BootModule)]
         {
             let object = fs::read(ctx.sysroot.join(&install[1..])).unwrap();
             let attrs = objsig::split(&object)
@@ -1193,8 +1193,8 @@ mod tests
                 .next()
                 .unwrap()
                 .attrs;
-            assert_eq!(attrs.roles, RoleSet::of(&[Role::BootModule]), "{install}");
-            assert!(verifies(&signer, &object, Role::BootModule, install));
+            assert_eq!(attrs.roles, RoleSet::of(&[role]), "{install}");
+            assert!(verifies(&signer, &object, role, install));
         }
         assert_eq!(fs::read(ctx.sysroot.join(text)).unwrap(), b"vfsd = debug\n");
         for path in outside
@@ -1220,7 +1220,7 @@ mod tests
         assert_eq!(objsig::split(&ktest).unwrap().body(), b"\x7fELF ktest");
         // A file a list names that the sysroot does not install is not
         // signed; the compose of a bundle that names it refuses it.
-        fs::remove_file(ctx.sysroot.join(&data[0][1..])).unwrap();
+        fs::remove_file(ctx.sysroot.join(&listed[1..])).unwrap();
         assert_eq!(
             sign_sysroot(&ctx, &signer, arch, Harness::Ktest).unwrap(),
             (objects - 1, 0)

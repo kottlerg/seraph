@@ -88,13 +88,6 @@ pub(crate) fn assemble_boot_caps(provided_recv: u64, seeds: Vec<u64>) -> Vec<u64
     caps
 }
 
-/// The interval, in milliseconds, at which svcmgr's wait for a child's
-/// bootstrap request reads whether the child has died ([`serve_boot_slots`]).
-/// A tuning value that bounds no capacity: a request wakes the wait at once,
-/// so the interval is only how late a child that died before its request is
-/// seen.
-pub(crate) const BOOTSTRAP_POLL_MS: u64 = 50;
-
 /// Serve a child's bootstrap rounds from its positional `slots` (`0` marks
 /// an absent cap). A round carries at most `MSG_CAP_SLOTS_MAX` caps, so the
 /// slots are split over [`ipc::bootstrap::slot_rounds`] windows, one round
@@ -106,9 +99,10 @@ pub(crate) const BOOTSTRAP_POLL_MS: u64 = 50;
 /// Shared by the launch and restart paths.
 ///
 /// Each round's wait for the child's request is watched
-/// ([`ipc::bootstrap::serve_round_watched`]): every [`BOOTSTRAP_POLL_MS`]
-/// svcmgr reads the child's main thread through `thread_cap`
-/// ([`caps_death`]), so a child that dies before a request ends the serve
+/// ([`ipc::bootstrap::serve_round_watched`]): every
+/// [`ipc::bootstrap::WATCH_POLL_MS`] svcmgr reads the child's main thread
+/// through `thread_cap` ([`caps_death`]), so a child that dies before a
+/// request ends the serve
 /// instead of holding svcmgr's only thread, and with it every death svcmgr
 /// routes, for good. The read is svcmgr's own `cap_info`, which no other
 /// service answers. A live child that sends no request is still waited for.
@@ -136,7 +130,7 @@ pub(crate) fn serve_boot_slots(
                 k.saturating_add(1) == rounds,
                 packed.caps(),
                 &[packed.presence()],
-                BOOTSTRAP_POLL_MS,
+                ipc::bootstrap::WATCH_POLL_MS,
                 || caps_death(thread_cap, 0),
             )
         }?;

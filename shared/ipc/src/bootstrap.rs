@@ -569,6 +569,47 @@ pub unsafe fn serve_round(
     unsafe { answer_request(&request, expected_badge, ipc_buf, done, caps, data) }
 }
 
+/// The interval, in milliseconds, at which a creator's watched wait for a
+/// child's bootstrap request ([`serve_round_watched`]) reads whether the
+/// child has died. A tuning value that bounds no capacity: a request wakes the
+/// wait at once, so the interval is only how late a child that died before its
+/// request is seen, at one liveness read per expiry while a live child is slow
+/// to ask. Every creator that serves through [`serve_round_watched`] waits at
+/// this interval.
+pub const WATCH_POLL_MS: u64 = 50;
+
+/// The exit reason of a thread whose `cap_info(CAP_INFO_THREAD_STATE)` read,
+/// `state`, shows it dead, else `None`. An exited thread gives the reason the
+/// kernel recorded, the low half of the packed state. A cap that no longer
+/// resolves gives `EXIT_KILLED`, since procmgr's teardown of a process revokes
+/// the caps on its threads. A thread that runs or has not started shows
+/// nothing.
+#[must_use]
+pub fn thread_death(state: Result<u64, i64>) -> Option<u64>
+{
+    match state
+    {
+        Ok(packed) if packed >> 32 == u64::from(syscall_abi::THREAD_STATE_EXITED) =>
+        {
+            Some(packed & 0xFFFF_FFFF)
+        }
+        Ok(_) => None,
+        Err(_) => Some(syscall_abi::EXIT_KILLED),
+    }
+}
+
+/// [`thread_death`] of the thread `thread_cap` names, read with `cap_info`:
+/// the liveness check a creator gives [`serve_round_watched`] for a child
+/// whose main-thread cap it holds.
+#[must_use]
+pub fn thread_cap_death(thread_cap: u64) -> Option<u64>
+{
+    thread_death(syscall::cap_info(
+        thread_cap,
+        syscall_abi::CAP_INFO_THREAD_STATE,
+    ))
+}
+
 /// Why [`serve_round_watched`] ended without its round delivered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ServeFailure
@@ -905,6 +946,36 @@ mod tests
         );
         let got = await_request(script(&[Err(INTERRUPTED)]), &mut || Some(0x2000));
         assert_eq!(got.map(|m| m.label), Err(ServeFailure::ChildDied(0x2000)));
+    }
+
+    #[test]
+    fn an_exited_thread_gives_its_recorded_reason()
+    {
+        let exited = (u64::from(syscall_abi::THREAD_STATE_EXITED) << 32) | 0x1003;
+        assert_eq!(thread_death(Ok(exited)), Some(0x1003));
+    }
+
+    // A child torn down by procmgr leaves its creator a revoked cap, not an
+    // exited thread: that too is its death.
+    #[test]
+    fn a_cap_that_no_longer_resolves_is_a_kill()
+    {
+        assert_eq!(
+            thread_death(Err(SyscallError::InvalidCapability as i64)),
+            Some(syscall_abi::EXIT_KILLED)
+        );
+    }
+
+    #[test]
+    fn a_running_or_unstarted_thread_shows_no_death()
+    {
+        for state in [
+            syscall_abi::THREAD_STATE_ALIVE,
+            syscall_abi::THREAD_STATE_CREATED,
+        ]
+        {
+            assert_eq!(thread_death(Ok(u64::from(state) << 32)), None);
+        }
     }
 
     #[test]

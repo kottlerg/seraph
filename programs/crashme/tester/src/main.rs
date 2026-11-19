@@ -389,8 +389,8 @@ fn start_toucher() -> Toucher
 }
 
 /// Start `/programs/crashme oom-fill <hold_ms>` and wait for its `full`: the
-/// pool is then full up to the reserve, and memmgr declines a demand fault of
-/// any process outside it.
+/// pool is then full down to the growth floor, and memmgr declines a demand
+/// fault of any process outside it.
 #[expect(
     clippy::zombie_processes,
     reason = "the child is returned at `full`, and the caller waits on it (`wait_bounded`)"
@@ -454,9 +454,9 @@ fn touch_stack()
 
 /// The crash service's hold of a fault memmgr declined for want of memory
 /// (services/crashd/docs/operation.md § Hold). A fixture writes a demand page
-/// while a filler keeps the pool full up to the reserve: when the filler gives
-/// it back within the stall, the write completes and the fixture prints how
-/// long it was held; when it holds the pool past the stall, the hold times
+/// while a filler keeps the pool full down to the growth floor: when the filler
+/// gives it back within the stall, the write completes and the fixture prints
+/// how long it was held; when it holds the pool past the stall, the hold times
 /// out and the fixture dies of the fault, with no core written, since memory
 /// was still critical.
 ///

@@ -397,10 +397,10 @@ in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
-3000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The crashme
-tester fills memory up to the system reserve and has the fixture write a page it has not touched:
-once the filler gives the memory back within the stall, and the write completes after the hold;
-once the filler keeps it past the stall, and the fixture dies of the fault with no core written.
+3000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The crashme tester
+fills memory down to memmgr's growth floor and has the fixture write a page it has not touched: once
+the filler gives the memory back within the stall, and the write completes after the hold; once the
+filler keeps it past the stall, and the fixture dies of the fault with no core written.
 
 In CI the usertest cell keeps crashd and runs the first after its `run-parallel` boot; the svctest
 cell drops `crashd.svc` with `terminal.svc` and runs the second, while crasher's faults go

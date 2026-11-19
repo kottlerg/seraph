@@ -1271,10 +1271,10 @@ fn pop_frames(l: &mut MemLedger, rec: NodeIdx, n: usize)
 
 /// Admit a grant of `want_pages` to the budget node of `rec` ([`admit`]), then
 /// select its runs, as one run when `flags` carries `REQUIRE_CONTIGUOUS`, else
-/// best-effort. The whole request is admitted before any run leaves the pool:
-/// a charge over a max fails `LIMIT`, whatever part of it the pool could serve;
-/// one that would take the reserve fails as exhaustion, with the out-of-memory
-/// code of the fit, as a failed selection does.
+/// best-effort. The whole request is admitted before any run leaves the pool: a
+/// charge over a max fails `LIMIT`, whatever part of it the pool could serve;
+/// one that would take the growth floor fails as exhaustion, with the
+/// out-of-memory code of the fit, as a failed selection does.
 fn select_admitted(
     l: &mut MemLedger,
     rec: NodeIdx,
@@ -2019,8 +2019,8 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
 }
 
 /// The reply code of a refused commitment: `LIMIT` at a max, else
-/// `OUT_OF_MEMORY_BEST_EFFORT`, the RAM outside `promised` and the reserve
-/// being short.
+/// `OUT_OF_MEMORY_BEST_EFFORT`, the RAM outside `promised` and the growth
+/// floor being short.
 const fn commit_refusal(e: ChargeError) -> u64
 {
     match e
@@ -2364,8 +2364,9 @@ enum FaultDecline
     NoArenaSlot = 6,
     /// The free pool holds no page to back the faulting page: it is empty,
     /// even after the deferred runs were rechecked, every free page it holds
-    /// is in the system reserve and the process's budget node is outside it,
-    /// or the split of a run larger than the pages to back failed.
+    /// is in the growth floor and the process's budget node is outside the
+    /// system reserve, or the split of a run larger than the pages to back
+    /// failed.
     NoFreePage = 7,
     /// The run could not be recorded on its chunk in the region's chunk
     /// table.
@@ -2410,16 +2411,17 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
-/// Admit as much of a demand fault's span of `span_pages` as the budget node
-/// of `rec` takes ([`admissible`]): the span, clamped to the headroom under the
+/// Admit as much of a demand fault's span of `span_pages` as the budget node of
+/// `rec` takes ([`admissible`]): the span, clamped to the headroom under the
 /// max of the node and its ancestors and to the free pages outside `promised`
-/// above, for a node outside the reserve, the system reserve. A fault in a
-/// committed region is admitted whole without that: its commitment carries
-/// the span's charge and `promised` its pages. Then select the run that backs
-/// those pages: one covering them, else the largest free run. The span is a
+/// above, for a node outside the reserve, the growth floor. A fault in a
+/// committed region is admitted whole without that: its commitment carries the
+/// span's charge and `promised` its pages. Then select the run that backs those
+/// pages: one covering them, else the largest free run. The span is a
 /// fault-around preference, so the fault is declined only when not even the
 /// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
-/// [`FaultDecline::NoFreePage`] at the reserve or when the selection fails.
+/// [`FaultDecline::NoFreePage`] at the growth floor or when the selection
+/// fails.
 fn select_fault_run(
     l: &mut MemLedger,
     target: &FaultTarget,
@@ -2709,8 +2711,9 @@ enum MapRefusal
     /// Funding the page tables the map needs would take the subtree of the
     /// process's budget node, or of an ancestor, over its max.
     Limit,
-    /// Funding the page tables the map needs would take the system reserve
-    /// from a budget node outside it; the last map failed with this error.
+    /// Funding the page tables the map needs would take the growth floor from a
+    /// budget node outside the system reserve; the last map failed with this
+    /// error.
     Reserve(i64),
 }
 
@@ -2733,8 +2736,8 @@ enum FundRefusal
 {
     /// The process's budget admits not even the smallest donation.
     Limit,
-    /// Not even the smallest donation fits above the system reserve, and the
-    /// process's budget node is outside it.
+    /// Not even the smallest donation fits above the growth floor, and the
+    /// process's budget node is outside the system reserve.
     Reserve,
     /// Any other failure, which leaves the map's own error standing.
     Failed,
@@ -2747,7 +2750,7 @@ enum FundRefusal
 /// slots that recording the chunk takes, and maps again, at most
 /// [`PT_FUND_ROUNDS`] times. Returns the last map error otherwise, [`MapRefusal::Limit`] when
 /// the process's budget refused the funding, or [`MapRefusal::Reserve`] when
-/// the system reserve did.
+/// the growth floor did.
 ///
 /// Pool outers are full-rights, so `mem_map` gates the mapping to `prot`
 /// directly (the kernel grants read at every map, and W^X is enforced); no
@@ -2832,8 +2835,8 @@ fn map_client_chunk(
 /// # Errors
 /// [`FundRefusal::Limit`] when the budget admits not even
 /// [`CLIENT_TOPUP_MIN_PAGES`]; [`FundRefusal::Reserve`] when they would take
-/// the reserve; [`FundRefusal::Failed`] for every other failure: the arena,
-/// the pool or the donation fails.
+/// the growth floor; [`FundRefusal::Failed`] for every other failure: the
+/// arena, the pool or the donation fails.
 fn fund_client_page_tables(
     l: &mut MemLedger,
     target: &FaultTarget,
@@ -2850,7 +2853,7 @@ fn fund_client_page_tables(
     // donations of the size the reservation is computed for. One past it (the
     // process's own mapping took a donation's pages in the middle of a map,
     // or reclaimed page tables in the region's span) is admitted as any other,
-    // so the process's budget and the system reserve bound what it takes
+    // so the process's budget and the growth floor bound what it takes
     // (services/memmgr/docs/memory-pool.md § Commit).
     let drawn = target
         .committed

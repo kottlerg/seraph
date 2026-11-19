@@ -78,8 +78,8 @@ pub struct ServiceEntry
     /// Whether this service is currently active.
     pub active: bool,
     /// The exit reason of the death whose restart waits for memory: procmgr
-    /// refused the create for want of memory while memmgr's level read
-    /// `CRITICAL`, and svcmgr retries it once the level reads below
+    /// refused the create for want of memory, and svcmgr retries it once
+    /// memmgr's level changes to below `CRITICAL`
     /// (`services/svcmgr/docs/restart-protocol.md` § Decision tree). The entry
     /// is inactive and holds no instance meanwhile. `None` otherwise.
     pub memory_wait: Option<u64>,

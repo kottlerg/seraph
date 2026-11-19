@@ -48,10 +48,9 @@ pub enum DeathOutcome
     /// (restart not attempted, budget exhausted, or restart failed).
     /// Caller must ask the shutdown actuator to power the system off.
     Unrecoverable,
-    /// procmgr refused the restart's create for want of memory while
-    /// memmgr's level read `CRITICAL`: the service is inactive, holds no
-    /// instance, and is retried once the level reads below
-    /// ([`retry_memory_wait`]).
+    /// procmgr refused the restart's create for want of memory: the service
+    /// is inactive, holds no instance, and is retried once memmgr's level
+    /// changes to below `CRITICAL` ([`retry_memory_wait`]).
     WaitingForMemory,
 }
 
@@ -500,9 +499,9 @@ pub struct RestartCtx
 /// repeats. Its late posts carry an instance already routed and are dropped.
 ///
 /// A create procmgr refuses for want of memory is decided by
-/// [`after_create_failure`]: the restart waits for memmgr's level to leave
-/// `CRITICAL` ([`retry_memory_wait`]), is decided again at once when the level
-/// already has, or ends the service down as any other failure does.
+/// [`after_create_failure`]: the restart waits for memmgr's level to read below
+/// `CRITICAL` ([`retry_memory_wait`]), is decided again at once, once, when it
+/// already reads below, or ends the service down as any other failure does.
 ///
 /// Returns a [`DeathOutcome`] the caller routes:
 ///
@@ -602,6 +601,8 @@ fn decide_restart(
     let mut exit_reason = exit_reason;
     let mut bootstrap_deaths: u32 = 0;
     let mut announce = announce;
+    // Whether this decision has retried a refusal for want of memory at once.
+    let mut retried = false;
     loop
     {
         if lines == DeathLines::Written && announce
@@ -629,6 +630,7 @@ fn decide_restart(
                 reserve_path,
                 ctx.pressure_notification != 0,
                 pressure_level(),
+                retried,
             )
             {
                 AfterCreateFailure::Permanent =>
@@ -638,15 +640,16 @@ fn decide_restart(
                 }
                 AfterCreateFailure::RetryNow =>
                 {
-                    // The level fell between procmgr's refusal and the read;
-                    // no later change need be signalled, so the restart is
-                    // decided again now, charged to the budget again, which
-                    // bounds the repeats.
+                    // The level may have fallen between procmgr's refusal and
+                    // the read, after which no later change need be signalled,
+                    // so the restart is decided again now, once, charged to
+                    // the budget again; a second refusal waits.
                     std::os::seraph::log!(
                         "create refused for want of memory, and the level no longer reads \
                          CRITICAL; deciding the restart again"
                     );
                     announce = false;
+                    retried = true;
                     continue;
                 }
                 AfterCreateFailure::WaitForMemory =>
@@ -654,8 +657,8 @@ fn decide_restart(
                     svc.active = false;
                     svc.memory_wait = Some(exit_reason);
                     std::os::seraph::log!(
-                        warn: "restart of {} waits for memory: create refused while the \
-                         level reads CRITICAL",
+                        warn: "restart of {} waits for memory: create refused for want of \
+                         memory",
                         svc.name_str()
                     );
                     return DeathOutcome::WaitingForMemory;

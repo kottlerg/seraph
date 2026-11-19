@@ -7,13 +7,17 @@
 //! restart that waits for memory is retried
 //! (`services/svcmgr/docs/restart-protocol.md` § Decision tree).
 //!
-//! memmgr refuses a grant to a budget node outside the system reserve while
-//! its pressure level reads `CRITICAL` (`services/memmgr/docs/memory-pool.md`
-//! § Memory pressure), so procmgr's create of such a service then replies
-//! `OUT_OF_MEMORY`. That refusal lasts only while the level stays there, and
-//! memmgr signals each change of level on the Notification the std runtime
-//! registers for every process; svcmgr waits on it rather than leave the
-//! service down.
+//! memmgr refuses a request from a budget node outside the system reserve
+//! that would leave fewer free pages outside `promised` than the growth floor
+//! (`services/memmgr/docs/memory-pool.md` § Allocation), and procmgr's create
+//! of such a service then replies `OUT_OF_MEMORY`. Its pressure level reads
+//! `CRITICAL` at or below that floor, and leaves it only once the free pool
+//! clears the floor by a hysteresis band (§ Memory pressure), so a create
+//! needing more than the margin above the floor is refused below `CRITICAL`
+//! too, as is one needing a contiguous run memmgr cannot find. Only memory
+//! coming free ends such a refusal, and memmgr signals each change of level on
+//! the Notification the std runtime registers for every process; svcmgr waits
+//! on it rather than leave the service down.
 
 use ipc::memmgr_labels::PRESSURE_CRITICAL;
 
@@ -35,9 +39,11 @@ pub enum AfterCreateFailure
     /// The service is permanently down: its `critical` key decides the rest.
     Permanent,
     /// Decide the restart again at once, charging the budget again: the level
-    /// had already left `CRITICAL` when svcmgr read it.
+    /// read below `CRITICAL` after the refusal, and the decision had made no
+    /// such retry yet.
     RetryNow,
-    /// The restart waits for memmgr's level to leave `CRITICAL`.
+    /// The restart waits for memmgr's next change of level to below
+    /// `CRITICAL` ([`retry_due`]).
     WaitForMemory,
 }
 
@@ -49,24 +55,29 @@ pub enum AfterCreateFailure
 /// death's lines svcmgr holds until a next instance runs. `registered` is
 /// whether svcmgr has the pressure Notification to wait on. `level` is
 /// memmgr's pressure level read after the refusal (`PRESSURE_*`), `None`
-/// when memmgr did not answer.
+/// when memmgr did not answer. `retried` is whether this decision has already
+/// retried at once ([`AfterCreateFailure::RetryNow`]).
 ///
 /// An `OUT_OF_MEMORY` refusal of any other service waits while the level
 /// reads `CRITICAL`, or cannot be read, since memmgr's next change of level
-/// wakes svcmgr; read below `CRITICAL`, the level fell between the refusal and
-/// the read, and the restart is decided again at once. Without a
-/// registration nothing would wake the wait, so the service is down.
+/// wakes svcmgr. Read below `CRITICAL`, the level may have fallen between the
+/// refusal and the read, so the restart is decided again at once, once: a
+/// second refusal read below `CRITICAL` is one memmgr makes at that level (a
+/// create larger than the margin above the floor), which no retry before memory
+/// comes free ends, so it waits too, and the budget is not spent on it. Without
+/// a registration nothing would wake the wait, so the service is down.
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
-    reason = "`reserve_path` and `registered` are the two facts besides the failure and the \
-              level that the decision reads"
+    reason = "`reserve_path`, `registered` and `retried` are the facts besides the failure \
+              and the level that the decision reads"
 )]
 pub fn after_create_failure(
     failure: CreateFailure,
     reserve_path: bool,
     registered: bool,
     level: Option<u64>,
+    retried: bool,
 ) -> AfterCreateFailure
 {
     if failure != CreateFailure::OutOfMemory || reserve_path || !registered
@@ -75,7 +86,7 @@ pub fn after_create_failure(
     }
     match level
     {
-        Some(level) if level != PRESSURE_CRITICAL => AfterCreateFailure::RetryNow,
+        Some(level) if level != PRESSURE_CRITICAL && !retried => AfterCreateFailure::RetryNow,
         _ => AfterCreateFailure::WaitForMemory,
     }
 }
@@ -105,7 +116,7 @@ mod tests
     fn a_refusal_for_memory_at_critical_waits()
     {
         assert_eq!(
-            after_create_failure(OutOfMemory, false, true, Some(PRESSURE_CRITICAL)),
+            after_create_failure(OutOfMemory, false, true, Some(PRESSURE_CRITICAL), false),
             WaitForMemory
         );
     }
@@ -117,12 +128,39 @@ mod tests
     fn a_refusal_for_memory_read_below_critical_retries_at_once()
     {
         assert_eq!(
-            after_create_failure(OutOfMemory, false, true, Some(PRESSURE_LOW)),
+            after_create_failure(OutOfMemory, false, true, Some(PRESSURE_LOW), false),
             RetryNow
         );
         assert_eq!(
-            after_create_failure(OutOfMemory, false, true, Some(PRESSURE_NORMAL)),
+            after_create_failure(OutOfMemory, false, true, Some(PRESSURE_NORMAL), false),
             RetryNow
+        );
+    }
+
+    // memmgr also refuses below CRITICAL a create larger than the margin above
+    // the growth floor: the one retry at once is refused again, and the restart
+    // then waits for memory to come free rather than spend the budget.
+    #[test]
+    fn a_second_refusal_read_below_critical_waits()
+    {
+        for level in [PRESSURE_LOW, PRESSURE_NORMAL]
+        {
+            assert_eq!(
+                after_create_failure(OutOfMemory, false, true, Some(level), true),
+                WaitForMemory
+            );
+        }
+        assert_eq!(
+            after_create_failure(OutOfMemory, false, true, Some(PRESSURE_CRITICAL), true),
+            WaitForMemory
+        );
+        assert_eq!(
+            after_create_failure(OutOfMemory, true, true, Some(PRESSURE_LOW), true),
+            Permanent
+        );
+        assert_eq!(
+            after_create_failure(Other, false, true, Some(PRESSURE_LOW), true),
+            Permanent
         );
     }
 
@@ -130,7 +168,7 @@ mod tests
     fn an_unread_level_waits_for_memmgrs_signal()
     {
         assert_eq!(
-            after_create_failure(OutOfMemory, false, true, None),
+            after_create_failure(OutOfMemory, false, true, None, false),
             WaitForMemory
         );
     }
@@ -141,7 +179,7 @@ mod tests
         for level in [None, Some(PRESSURE_CRITICAL), Some(PRESSURE_NORMAL)]
         {
             assert_eq!(
-                after_create_failure(OutOfMemory, true, true, level),
+                after_create_failure(OutOfMemory, true, true, level, false),
                 Permanent
             );
         }
@@ -153,7 +191,7 @@ mod tests
         for level in [None, Some(PRESSURE_CRITICAL), Some(PRESSURE_NORMAL)]
         {
             assert_eq!(
-                after_create_failure(OutOfMemory, false, false, level),
+                after_create_failure(OutOfMemory, false, false, level, false),
                 Permanent
             );
         }
@@ -164,7 +202,10 @@ mod tests
     {
         for level in [None, Some(PRESSURE_CRITICAL), Some(PRESSURE_NORMAL)]
         {
-            assert_eq!(after_create_failure(Other, false, true, level), Permanent);
+            assert_eq!(
+                after_create_failure(Other, false, true, level, false),
+                Permanent
+            );
         }
     }
 

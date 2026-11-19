@@ -221,31 +221,36 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
    * On failure: any failure after `CREATE_FROM_FILE` destroys the new
      child via `DESTROY_PROCESS`, as first launch does; then route
      through `permanent_death_outcome`. A create procmgr refuses with
-     `OUT_OF_MEMORY` is decided first, as below (the memory wait). A create whose reply caps never
-     reach svcmgr needs no destroy: when the reply's cap transfer into
+     `OUT_OF_MEMORY` is decided first, as below (the memory wait). A create
+     whose reply caps never reach svcmgr needs no destroy: when the reply's cap transfer into
      svcmgr's CSpace fails, svcmgr receives `IPC_REPLY_TRANSFER_FAILED`
      with no process handle, and procmgr destroys the child it created
      (see the [procmgr IPC interface](../../procmgr/docs/ipc-interface.md)
      § Label 1), on first launch and on restart alike.
 
-**The memory wait.** memmgr refuses a grant to a budget node outside the system reserve while its
-pressure level reads `CRITICAL` ([memmgr Memory Pool § Memory
-pressure](../../memmgr/docs/memory-pool.md#memory-pressure)), so a restart made then, as when oomd
-stops a service that is not the one holding the memory, has its create refused with
-`OUT_OF_MEMORY` for as long as the level stays there. svcmgr reads the level after such a refusal,
-and `svcmgr_defs::memory_wait::after_create_failure` decides:
+**The memory wait.** memmgr refuses a request from a budget node outside the system reserve that
+would leave fewer free pages than the growth floor ([memmgr Memory Pool §
+Allocation](../../memmgr/docs/memory-pool.md#allocation)). Its pressure level reads `CRITICAL` at
+or below that floor and leaves it only once the free pool clears it by a hysteresis band
+([§ Memory pressure](../../memmgr/docs/memory-pool.md#memory-pressure)), so a restart made while
+the level reads `CRITICAL`, as when oomd stops a service that is not the one holding the memory,
+has its create refused with `OUT_OF_MEMORY`, and so does one that needs more than the margin above
+the floor below `CRITICAL`. Only memory coming free ends such a refusal. svcmgr reads the level
+after it, and `svcmgr_defs::memory_wait::after_create_failure` decides:
 
 * A service created in the reserve (`reserve = yes`), whose refusal means the reserve itself is
   spent, and the log sink, whose death's lines svcmgr holds until a next instance runs, are
   permanently down, as for any failure. So is every service when svcmgr has no memory-pressure
   registration, since nothing would end its wait.
-* Read below `CRITICAL`, the level fell between the refusal and the read: the restart is decided
-  again at once, from step 1, charged to the budget again, which bounds the repeats.
-* Otherwise (the level reads `CRITICAL`, or memmgr does not answer the read) the restart waits for
-  memory: the entry is inactive, holds no instance, and records the death's exit reason
-  (`ServiceEntry::memory_wait`), and `handle_death` returns `WaitingForMemory`, on which the
-  caller does nothing more: no shutdown follows, `critical = yes` or not. svcmgr logs
-  `restart of <name> waits for memory`.
+* Read below `CRITICAL` for the first time in the decision, the level may have fallen between the
+  refusal and the read, after which no change need be signalled: the restart is decided again at
+  once, from step 1, charged to the budget again.
+* Otherwise (the level reads `CRITICAL`, memmgr does not answer the read, or the retry at once was
+  refused too, a create larger than the margin above the floor) the restart waits for memory,
+  charging the budget nothing more: the entry is inactive, holds no instance, and records the
+  death's exit reason (`ServiceEntry::memory_wait`), and `handle_death` returns
+  `WaitingForMemory`, on which the caller does nothing more: no shutdown follows, `critical = yes`
+  or not. svcmgr logs `restart of <name> waits for memory`.
 
 The std runtime registers every process's Notification for memmgr's changes of level
 (`std::os::seraph::memory_pressure_notification`), and svcmgr waits on its own in its main wait set

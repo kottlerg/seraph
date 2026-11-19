@@ -360,7 +360,12 @@ mod tests
             0x1008,
             0x9000,
             &mut pauses,
-            &[pending(0x1008), stopped(0x5000), pending(0x6000), stopped(0x9000)],
+            &[
+                pending(0x1008),
+                stopped(0x5000),
+                pending(0x6000),
+                stopped(0x9000),
+            ],
         );
         assert!(d.done);
         assert_eq!((d.asks, d.first), (4, [0x1008, 0x1008, 0x5000, 0x6000]));
@@ -378,7 +383,10 @@ mod tests
         let mut pauses = 0;
         let d = drive(0x1000, 0x9000, &mut pauses, &stuck);
         assert!(!d.done);
-        assert_eq!((d.made, d.asks), (PENDING_TRIES, PENDING_TRIES as usize + 1));
+        assert_eq!(
+            (d.made, d.asks),
+            (PENDING_TRIES, PENDING_TRIES as usize + 1)
+        );
         // A second range sharing the spent count pauses no more: it gives up
         // at its first pending reply, and still serves one that is not.
         let d = drive(0x1000, 0x9000, &mut pauses, &stuck);

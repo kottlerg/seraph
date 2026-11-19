@@ -64,7 +64,12 @@
 //! page fewer than a demand chunk and no run of a chunk's size, and touches a
 //! demand region: memmgr must back each fault from a smaller run.
 //!
-//! A tenth phase, **sparse region**, registers a region of 2^14 chunks, whose
+//! A tenth phase, **fragmented `CSpace` top-up**, fragments the pool the same
+//! way and funds svctest's own `CSpace` for more slot pages than any free run
+//! holds: a slot-page pool takes pages, not a run, so the top-up must be funded
+//! from the short runs.
+//!
+//! An eleventh phase, **sparse region**, registers a region of 2^14 chunks, whose
 //! chunk table in memmgr has six directory levels, and touches a spread of
 //! its chunks and its last one: each fault must find its chunk's entry, back
 //! it, and leave every other chunk's data in place.

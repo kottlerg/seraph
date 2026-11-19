@@ -44,9 +44,10 @@ which svcmgr publishes seed-only as `vfsd.mount`, one carrying
 one carrying `SWAP_AUTHORITY` alone, published seed-only as `vfsd.swap`.
 svctest alone seeds `vfsd.mount` and `vfsd.deny`, to drive `MOUNT`'s and
 `UNMOUNT`'s refusal and rejection paths and to unmount and remount the
-data partition. `vfsd.swap` is the swap service's, and svctest's recipe
-seeds it while no swap service exists, to drive `GET_SWAP_PARTITION`;
-two services seeding it would revoke each other's partition cap.
+data partition. `vfsd.swap` is swapd's, and svctest's recipe
+seeds it too, to drive only the stale-version refusal of `GET_SWAP_PARTITION`
+(`LABEL_VERSION_MISMATCH`), which hands nothing out; a hand-out to svctest would revoke swapd's
+partition cap.
 
 | Badge bit | Constant | Gates | Holder |
 |---|---|---|---|

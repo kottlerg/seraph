@@ -6,7 +6,7 @@
 //! What crashd decides about a fault memmgr declined for want of memory:
 //! whether it holds it, until when, and which held fault ends how.
 //!
-//! crashd holds such a fault (memmgr's decline codes 6, 7 and 8,
+//! crashd holds such a fault (memmgr's decline codes 6, 7, 8 and 11,
 //! [`holdable`]) in one of [`SLOTS`] slots for at most its stall
 //! (`CRASHD_OOM_STALL_MS`, [`parse_stall`]), resumes it when memmgr's pressure
 //! level falls below `CRITICAL`, and reports and declines it when the stall
@@ -37,10 +37,10 @@ pub const STALL_MAX_MS: u64 = 600_000;
 /// memmgr's decline codes for a fault it could not back for want of memory:
 /// 6, the metadata arena cannot grow for the run's slots; 7, no free page can
 /// back the faulting page; 8, the run cannot be recorded in the region's chunk
-/// table (`services/memmgr/docs/ipc-interface.md`, the fault arm's table).
-/// Code 10, a budget node's max, is the process's own limit and is never
-/// held.
-const HOLDABLE_CODES: [u64; 3] = [6, 7, 8];
+/// table; 11, a commit overrun, a committed page with no free frame for it
+/// (`services/memmgr/docs/ipc-interface.md`, the fault arm's table). Code 10,
+/// a budget node's max, is the process's own limit and is never held.
+const HOLDABLE_CODES: [u64; 4] = [6, 7, 8, 11];
 
 /// Whether a pager's decline reason word names a decline for want of memory
 /// ([`HOLDABLE_CODES`]): the code is its low 32 bits.
@@ -435,13 +435,16 @@ mod tests
     #[test]
     fn only_declines_for_want_of_memory_are_holdable()
     {
-        for code in [6, 7, 8]
+        // A commit overrun (11) is held as a page with no frame (7) is.
+        for code in [6, 7, 8, 11]
         {
             assert!(holdable(code));
         }
+        assert!(holdable((1 << 32) + 11));
         // A budget max (10), a refused access (4), no region (3), a failed
-        // map (9) with its error magnitude in the high half.
-        for reason in [10, 4, 3, 9 | (5 << 32), 0]
+        // map (9) with its error magnitude in the high half, a chunk on disk
+        // (12).
+        for reason in [10, 4, 3, 9 | (5 << 32), 12, 0]
         {
             assert!(!holdable(reason));
         }

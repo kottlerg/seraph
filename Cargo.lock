@@ -881,6 +881,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "swapd"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "swapd-layout",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "swapd-layout"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "memmgr-free-pool",
+]
+
+[[package]]
 name = "syscall"
 version = "0.1.4"
 dependencies = [

@@ -5,7 +5,7 @@
 
 //! The disk tier's interface to the swap service
 //! (services/memmgr/docs/memory-pool.md § Disk tier;
-//! services/memmgr/docs/ipc-interface.md § Labels 22 to 25): its registration,
+//! services/memmgr/docs/ipc-interface.md § Labels 22 to 26): its registration,
 //! the chunks it takes for its swap slots and their bytes, the end of each
 //! write, the restore of a slot's bytes, and the redirect of a fault on a chunk
 //! on disk to it.
@@ -26,6 +26,7 @@ use core::ptr::addr_of_mut;
 
 use free_pool::disk::{self, KEY_BYTES, Registered, SLOT_WORDS_PER_PAGE, SlotError};
 use free_pool::{CHUNK_BYTES, ClockHand, FaultPath, Fit, NodeIdx, SwapError};
+use free_pool::{WANT_WORDS, WantList};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::{MAP_READ, PAGE_SIZE};
 
@@ -81,13 +82,18 @@ static mut BUF: Buf = Buf([0; BUF_BYTES]);
 
 /// The disk tier's state: the per-boot key (`None` when its draw failed, and
 /// the disk tier then stays off), the next nonce, the swap service's endpoint
-/// (`0` while none is registered), and the hand of the walk `SWAP_TAKE`
-/// makes. The receive loop's alone.
+/// (`0` while none is registered), its want Notification and the bits to
+/// send on it (`0` while it registered none), the slot words
+/// `MAKE_RESIDENT` posted for it to restore, and the hand of the walk
+/// `SWAP_TAKE` makes. The receive loop's alone.
 struct Disk
 {
     key: Option<[u8; KEY_BYTES]>,
     nonce: u64,
     endpoint: u64,
+    want: u64,
+    want_bits: u64,
+    wants: WantList,
     hand: ClockHand,
 }
 
@@ -95,8 +101,13 @@ static mut DISK: Disk = Disk {
     key: None,
     nonce: 0,
     endpoint: 0,
+    want: 0,
+    want_bits: 0,
+    wants: WantList::new(),
     hand: ClockHand::START,
 };
+
+const _: () = assert!(WANT_WORDS as u64 == memmgr_labels::SWAP_WANTED_WORDS);
 
 #[expect(
     static_mut_refs,
@@ -145,6 +156,7 @@ pub(crate) fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u
         memmgr_labels::SWAP_TAKE => handle_take(kept, ipc_buf),
         memmgr_labels::SWAP_DONE => handle_done(req, ipc_buf),
         memmgr_labels::SWAP_RESTORE => handle_restore(req, kept, ipc_buf),
+        memmgr_labels::SWAP_WANTED => handle_wanted(ipc_buf),
         _ => reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT),
     }
 }
@@ -160,6 +172,41 @@ pub(crate) fn registered() -> Registered
     {
         Registered::Yes
     }
+}
+
+/// Whether a registered swap service can be asked to restore a chunk on disk
+/// ahead of a fault: it registered a want Notification.
+pub(crate) fn wants_registered() -> Registered
+{
+    let s = state();
+    if s.endpoint != 0 && s.want != 0
+    {
+        Registered::Yes
+    }
+    else
+    {
+        Registered::No
+    }
+}
+
+/// Post the slot word of the chunk on disk whose disk node is `disk` for the
+/// swap service to restore (`MAKE_RESIDENT`, services/memmgr/docs/memory-pool.md
+/// § Eviction, Debugger reads), and send the want bits on its Notification
+/// when the word is new. The send never blocks; one that fails, to a cap the
+/// swap service revoked, is dropped. `false` when `disk` names no disk node.
+pub(crate) fn post_want(l: &MemLedger, disk: Option<NodeIdx>) -> bool
+{
+    let Some(n) = disk.and_then(|s| l.disk_node(s))
+    else
+    {
+        return false;
+    };
+    let s = state();
+    if s.wants.post(disk::slot_word(n.slot, n.len, n.nonce)) == free_pool::Posted::Added
+    {
+        let _ = syscall::notification_send(s.want, s.want_bits);
+    }
+    true
 }
 
 /// The swap slots free, `0` while no swap service is registered
@@ -260,7 +307,9 @@ fn unmap_window(pages: u64)
 
 /// `SWAP_REGISTER` (services/memmgr/docs/ipc-interface.md § Label 22):
 /// `caps[0]` a SEND on the swap service's restore endpoint, `data[0]` its
-/// slot count. memmgr refuses a cap that is no Endpoint cap or names its own
+/// slot count, and, optional, `caps[1]` the Notification memmgr sends
+/// `data[1]` on when `MAKE_RESIDENT` posts a slot word for it (refused unless
+/// it is a Notification with the Notify right and `data[1]` is nonzero). memmgr refuses a cap that is no Endpoint cap or names its own
 /// endpoint `service_ep` (a fault redirected there would reach memmgr with the
 /// badge of the cap, a process's, and be served in the wrong address space),
 /// and a count below a slot ever taken (one on the free list included). A
@@ -276,19 +325,43 @@ fn handle_register(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    let want = caps.get(1).copied().unwrap_or(0);
+    let want_bits = req.word(1);
     let total = req.word(0).min(MAX_SLOTS);
     let l = ledger_mut();
     let ours = syscall::endpoint_badge(service_ep, cap).is_ok();
-    if state().key.is_none() || ours || !is_endpoint_cap(cap) || !l.slots.set_total(total)
+    let want_ok = want == 0 || (want_bits != 0 && crate::is_notify_cap(want));
+    if state().key.is_none()
+        || ours
+        || !is_endpoint_cap(cap)
+        || !want_ok
+        || !l.slots.set_total(total)
     {
         let _ = syscall::cap_delete(cap);
+        if want != 0
+        {
+            let _ = syscall::cap_delete(want);
+        }
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    let prior = core::mem::replace(&mut state().endpoint, cap);
-    if prior != 0
+    let s = state();
+    for prior in [
+        core::mem::replace(&mut s.endpoint, cap),
+        core::mem::replace(&mut s.want, want),
+    ]
     {
-        let _ = syscall::cap_delete(prior);
+        if prior != 0
+        {
+            let _ = syscall::cap_delete(prior);
+        }
+    }
+    s.want_bits = if want == 0 { 0 } else { want_bits };
+    // Words posted for the swap service before it registered stay posted: a
+    // restarted swap service restores them as its predecessor would have.
+    if want != 0 && !s.wants.is_empty()
+    {
+        let _ = syscall::notification_send(want, want_bits);
     }
     let _ = l.end_writes();
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
@@ -482,6 +555,23 @@ fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
             memmgr_errors::INVALID_ARGUMENT
         },
     );
+}
+
+/// `SWAP_WANTED` (services/memmgr/docs/ipc-interface.md § Label 26): reply the
+/// slot words `MAKE_RESIDENT` posted for the swap service, oldest first, and
+/// empty the list. The words name uses of slots that may have ended since: a
+/// `SWAP_RESTORE` of one replies `RESTORE_STALE` then, and changes nothing.
+fn handle_wanted(ipc_buf: *mut u64)
+{
+    let mut words = [0u64; WANT_WORDS];
+    let n = state().wants.take(&mut words);
+    let taken = words.get(..n).unwrap_or(&[]);
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, u64::try_from(n).unwrap_or(0))
+        .words(1, taken)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// `SWAP_RESTORE` (services/memmgr/docs/ipc-interface.md § Label 25):

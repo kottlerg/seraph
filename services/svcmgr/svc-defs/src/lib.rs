@@ -11,10 +11,11 @@
 //! argv/env wire-blob encoder ([`build_blob`]) whose output the parser
 //! bounds by the child's argv/env region, and the policies svcmgr applies at
 //! runtime: the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
-//! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), the death-observer
-//! correlator and the rule that routes a death post by it ([`death_tag`]),
-//! the reading of a service's death from the caps svcmgr holds on it
-//! ([`death_caps`]), the eligibility rule of a stop ([`stop`]), the order of
+//! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), whether a restarted log
+//! sink is owed the handover SEND ([`log_sink_handover_owed`]), the
+//! death-observer correlator and the rule that routes a death post by it
+//! ([`death_tag`]), the reading of a service's death from the caps svcmgr holds
+//! on it ([`death_caps`]), the eligibility rule of a stop ([`stop`]), the order of
 //! the `SET_DRIVERS_DIR` step and its liveness reads ([`drivers_dir`]), and
 //! the create flags a recipe asks procmgr for ([`create_flags`]). Nothing here
 //! touches a syscall, IPC, or `std::os::seraph` surface, so the whole crate
@@ -61,6 +62,26 @@ pub fn cwd_rights(subtree_rights: Option<u32>) -> u32
 pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
 {
     badge & ipc::svcmgr_labels::HANDOVER_AUTHORITY != 0 && !handover_done
+}
+
+/// Whether a restarted log sink is minted the `HANDOVER_PULL` SEND, from
+/// procmgr's reply to `QUERY_INIT_REAP`: its label and data word 0, or
+/// `None` when the call failed. Only a `SUCCESS` reply that says the reap
+/// has run answers no: procmgr reaps init once init-logd has exited, so
+/// init-logd no longer receives on the master log endpoint and there is no
+/// handover source. Any other answer leaves init-logd possibly serving, and
+/// the new instance must pull from it and release it, or init-logd would go
+/// on writing the UART beside it
+/// (`services/logd/docs/handover-protocol.md`). Erring that way
+/// costs at most the bound of logd's handover calls, which end on an
+/// endpoint with no receiver.
+#[must_use]
+pub fn log_sink_handover_owed(reap_reply: Option<(u64, u64)>) -> bool
+{
+    !matches!(
+        reap_reply,
+        Some((label, reaped)) if label & 0xFFFF == ipc::procmgr_errors::SUCCESS && reaped == 1
+    )
 }
 
 /// The procmgr create flags svcmgr adds to a service's `CREATE_FROM_FILE`
@@ -327,8 +348,9 @@ pub struct Definition
     /// ([`launch_order`]), so its names resolve before they are queried.
     pub provides: Vec<ProvidedName>,
     /// `log_sink = yes` marks the service as the system log sink (real-logd).
-    /// svcmgr mints its bootstrap round — master-log RECV, the first-launch
-    /// `HANDOVER_PULL` SEND, a `DEATH_EQ_AUTHORITY` `SEND|GRANT`, and the
+    /// svcmgr mints its bootstrap round — master-log RECV, the
+    /// `HANDOVER_PULL` SEND (on the first launch, and on a restart until
+    /// procmgr reports init reaped: [`log_sink_handover_owed`]), a `DEATH_EQ_AUTHORITY` `SEND|GRANT`, and the
     /// `serial` and `framebuffer` class SENDs — from the reserved log-sink
     /// sources and its `devmgr.class.serial` and `devmgr.class.framebuffer`
     /// publications, rather than from `seed` /
@@ -623,6 +645,26 @@ mod tests
             ipc::svcmgr_labels::PUBLISH_AUTHORITY,
             false
         ));
+    }
+
+    #[test]
+    fn only_a_reaped_init_ends_the_log_sinks_handover()
+    {
+        use ipc::procmgr_errors::SUCCESS;
+        // The reap has run: init-logd has exited, no SEND.
+        assert!(!log_sink_handover_owed(Some((SUCCESS, 1))));
+        // The reap has not run: init-logd may still serve.
+        assert!(log_sink_handover_owed(Some((SUCCESS, 0))));
+        // A refused or failed query does not say init-logd is gone.
+        assert!(log_sink_handover_owed(Some((
+            ipc::procmgr_errors::UNKNOWN_OPCODE,
+            1
+        ))));
+        assert!(log_sink_handover_owed(None));
+        // An unexpected word is not read as a reap.
+        assert!(log_sink_handover_owed(Some((SUCCESS, 2))));
+        // The label's upper bits carry no status.
+        assert!(!log_sink_handover_owed(Some((SUCCESS | (8 << 16), 1))));
     }
 
     #[test]

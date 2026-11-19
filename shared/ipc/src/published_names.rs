@@ -123,17 +123,17 @@ pub const VFSD_DENY: &[u8] = b"vfsd.deny";
 
 /// SEND on vfsd's service endpoint badged
 /// `vfsd_labels::SWAP_AUTHORITY` alone: the `GET_SWAP_PARTITION`
-/// surface. Seed-only; the swap service's recipe is to seed it, and
-/// svctest's recipe seeds it while no swap service exists, to drive the
-/// hand-out.
+/// surface. Seed-only; swapd's recipe seeds it, and
+/// svctest's recipe seeds it too, to drive only the stale-version refusal,
+/// which hands nothing out.
 pub const VFSD_SWAP: &[u8] = b"vfsd.swap";
 
 /// `SEND|GRANT` on memmgr's endpoint badged
 /// `memmgr_labels::SWAP_AUTHORITY` alone: the swap service's interface to
-/// memmgr's disk tier (`SWAP_REGISTER` to `SWAP_RESTORE`). Seed-only, its
-/// seeds keeping `GRANT`, since the swap labels move caps to memmgr; the swap
-/// service's recipe is to seed it, and svctest's recipe seeds it while no
-/// swap service exists, to act as the swap client.
+/// memmgr's disk tier (`SWAP_REGISTER` to `SWAP_WANTED`). Seed-only, its
+/// seeds keeping `GRANT`, since the swap labels move caps to memmgr; swapd's
+/// recipe seeds it, and svctest's recipe seeds it too, as a second swap
+/// client that registers nothing.
 pub const MEMMGR_SWAP: &[u8] = b"memmgr.swap";
 
 /// SEND on the master log endpoint badged

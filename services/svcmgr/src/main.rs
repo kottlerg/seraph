@@ -232,16 +232,16 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
     // vfsd.mount / vfsd.deny / vfsd.swap — SENDs on vfsd's service
     // endpoint, endowed pre-badged by init (`MOUNT_AUTHORITY`, the
     // no-authority `DENY_BADGE`, and `SWAP_AUTHORITY`). Seed-only: svctest
-    // alone seeds the first two; the swap service's recipe is to seed
-    // `vfsd.swap`, which svctest's seeds while no swap service exists.
+    // alone seeds the first two; swapd's recipe seeds `vfsd.swap`, which
+    // svctest's seeds too, to drive only the stale-version refusal.
     publish_endowed_send(registry, caps.vfsd_mount, ipc::published_names::VFSD_MOUNT);
     publish_endowed_send(registry, caps.vfsd_deny, ipc::published_names::VFSD_DENY);
     publish_endowed_send(registry, caps.vfsd_swap, ipc::published_names::VFSD_SWAP);
     // memmgr.swap — memmgr's swap authority, endowed pre-badged by init
     // (`SWAP_AUTHORITY`) with `GRANT`, which its seeds keep: each swap label
-    // but `SWAP_DONE` moves a cap to memmgr. Seed-only: the swap service's
-    // recipe is to seed it, and svctest's seeds it while no swap service
-    // exists.
+    // but `SWAP_DONE` moves a cap to memmgr. Seed-only: swapd's
+    // recipe seeds it, and svctest's seeds it too, as a second swap client
+    // that registers nothing.
     publish_endowed(
         registry,
         caps.memmgr_swap,

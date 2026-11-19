@@ -22,9 +22,9 @@ use free_pool::{
     ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Evict, Fit, FrameDesc,
     FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError,
     NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError,
-    ResizeError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState,
-    chunk::table_height, chunk_count, chunk_for, commit::grow_need, commit::regrow_need,
-    fault_window, pressure_level, region_grants, reserve_pages,
+    ResidentPath, ResizeError, SelectError, SlotStore, WordStore, arena::Slot, chunk::table_height,
+    chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pending_from,
+    pressure_level, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -2249,13 +2249,23 @@ const MAKE_RESIDENT_VISITS: u32 = 64;
 /// (services/memmgr/docs/ipc-interface.md § Label 21): each evicted chunk the
 /// range meets is restored from the store, or mapped back while its eviction
 /// is in flight ([`evict::make_resident`]), which counts as an access in its
-/// age; a page no fault backed stays not present. procmgr alone sends it,
-/// for a holder of its debug authority. Words are `[badge, va, len]`, the
-/// process named by its memmgr badge. The walk visits only the chunks that
-/// have an entry ([`free_pool::Ledger::next_chunk_with_entry`]), and stops
-/// after [`MAKE_RESIDENT_CHUNKS`] chunks made resident or
-/// [`MAKE_RESIDENT_VISITS`] visits; the reply's word 0 is where it stopped,
-/// the range's end when it is all done, and the sender asks again from there.
+/// age; a page no fault backed stays not present. A chunk on disk is posted
+/// to the swap service to restore ahead of a fault ([`disk::post_want`]),
+/// when it registered a want Notification, and passed over otherwise, as a
+/// lost one is ([`free_pool::resident_path`]): memmgr reads no slot and waits
+/// on no swap service. procmgr alone sends it, for a holder of its debug
+/// authority. Words are `[badge, va, len]`, the process named by its memmgr
+/// badge. The walk visits only the chunks that have an entry
+/// ([`free_pool::Ledger::next_chunk_with_entry`]), and stops after
+/// [`MAKE_RESIDENT_CHUNKS`] chunks made resident or [`MAKE_RESIDENT_VISITS`]
+/// visits; the reply's word 0 is where it stopped, the range's end when it is
+/// all done, and the sender asks again from there. Word 1 is
+/// `RESIDENT_PENDING` when a chunk on disk was posted: word 0 is then the
+/// first such chunk's base, or `va` when that is above it
+/// ([`free_pool::pending_from`]), from which the sender asks again once the
+/// swap service has had time to restore it. Word 2 is where the walk stopped,
+/// past every chunk it posted, from which a sender that will wait no longer
+/// asks again, leaving the posted chunks not present.
 fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
@@ -2277,8 +2287,10 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         return;
     }
     let aspace = l.aspace_cap(rec);
+    let wants = disk::wants_registered();
     let mut at = va & !(PAGE_SIZE - 1);
     let (mut made, mut visits) = (0u32, 0u32);
+    let mut pending: Option<u64> = None;
     // Each pass takes the next chunk with an entry of a region the range
     // meets, in address order, or passes a region with none from `at`, so
     // the walk visits no chunk no fault backed.
@@ -2304,19 +2316,29 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
             at = end;
             break;
         }
-        // A chunk on disk is passed over, as a lost one: memmgr waits on no
-        // swap service (services/memmgr/docs/ipc-interface.md § Label 21).
-        if matches!(
-            l.chunk_at(reg, chunk_base).state(),
-            ChunkState::Evicting | ChunkState::Compressed | ChunkState::Writing
-        )
+        let entry = l.chunk_at(reg, chunk_base);
+        match free_pool::resident_path(&entry, wants)
         {
-            if evict::make_resident(l, rec, reg, &node.region, chunk_base, aspace).is_err()
+            ResidentPath::Restore =>
             {
-                reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
-                return;
+                if evict::make_resident(l, rec, reg, &node.region, chunk_base, aspace).is_err()
+                {
+                    reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+                    return;
+                }
+                made = made.saturating_add(1);
             }
-            made = made.saturating_add(1);
+            // The swap service reads the slot and restores the chunk ahead of
+            // a fault; the reply sends the reader back here.
+            ResidentPath::Want =>
+            {
+                if disk::post_want(l, entry.disk())
+                {
+                    pending.get_or_insert(chunk_base);
+                }
+            }
+            ResidentPath::Skip | ResidentPath::PassOver =>
+            {}
         }
         at = chunk_base.saturating_add(u64::from(chunk_pages).saturating_mul(PAGE_SIZE));
     }
@@ -2330,8 +2352,15 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     {
         at.min(end)
     };
+    let (from, flag) = match pending
+    {
+        Some(base) => (pending_from(base, va), memmgr_labels::RESIDENT_PENDING),
+        None => (reached, 0),
+    };
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
-        .word(0, reached)
+        .word(0, from)
+        .word(1, flag)
+        .word(2, reached)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -2468,6 +2497,14 @@ enum FaultDecline
     /// subtree of the process's budget node, or of an ancestor, over its max
     /// (services/memmgr/docs/memory-pool.md § Distribution policy).
     BudgetLimit = 10,
+    /// A commit overrun: the faulting page lies in a committed region, or its
+    /// chunk is an evicted chunk of one, whose pages `promised` holds, and the
+    /// free pool has no frame for it even after memmgr evicted victims in its
+    /// turn ([`evict::draw_room`]). Only an overcommit allowance above 0, or
+    /// memmgr's own metadata taking the free pages `promised` counts, leaves
+    /// the pool short of `promised` (services/memmgr/docs/memory-pool.md
+    /// § Commit, Overcommit).
+    CommitOverrun = 11,
     /// The faulting page's chunk is on disk, its pages in a swap slot only
     /// (services/memmgr/docs/memory-pool.md § Disk tier): detail
     /// [`disk::DETAIL_UNREGISTERED`] when no swap service is registered to
@@ -2507,27 +2544,43 @@ pub(crate) fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64
 /// `rec` takes ([`admissible`]): the span, clamped to the headroom under the
 /// max of the node and its ancestors and to the free pages outside `promised`
 /// above, for a node outside the reserve, the growth floor. A fault in a
-/// committed region is admitted whole without that: its commitment carries the
-/// span's charge and `promised` its pages. Then select the run that backs those
-/// pages: one covering them, else the largest free run. The span is a
+/// committed region is admitted without that, since its commitment carries the
+/// span's charge and `promised` its pages: it draws from `promised`, the span
+/// clamped to the frames the draw may take, which memmgr evicts victims for
+/// when they are short ([`evict::draw_room`]). Then select the run that backs
+/// those pages: one covering them, else the largest free run. The span is a
 /// fault-around preference, so the fault is declined only when not even the
 /// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
 /// [`FaultDecline::NoFreePage`] at the growth floor or when the selection
-/// fails.
+/// fails (a split, after a draw found a page), and
+/// [`FaultDecline::CommitOverrun`] for a committed draw that finds no frame.
 fn select_fault_run(
     l: &mut MemLedger,
     target: &FaultTarget,
     span_pages: u32,
 ) -> Result<Grant, FaultDecline>
 {
-    let admitted = if target.committed.is_some()
+    if let Some(reg) = target.committed
     {
-        Ok(u64::from(span_pages))
+        // The chunk the fault backs, which its own draw does not evict.
+        let spare = l
+            .region_for(target.rec, target.page_base)
+            .map(|(_, region)| (reg, chunk_for(&region, target.page_base).0));
+        // The span is a preference: the draw evicts only for the faulting page.
+        let room = evict::draw_room(l, target.rec, u64::from(span_pages), 1, spare);
+        // At most `span_pages`, so it fits a `u32`.
+        let pages = u32::try_from(room).unwrap_or(span_pages);
+        if pages == 0
+        {
+            return Err(FaultDecline::CommitOverrun);
+        }
+        // The draw found a free page, so a selection can fail only to split a
+        // run, as an uncommitted fault's can.
+        return select(l, pages, Fit::Contiguous)
+            .or_else(|_| select(l, pages, Fit::UpTo))
+            .map_err(|_| FaultDecline::NoFreePage);
     }
-    else
-    {
-        admissible(l, target.rec, u64::from(span_pages))
-    };
+    let admitted = admissible(l, target.rec, u64::from(span_pages));
     match admitted
     {
         Ok(pages) =>
@@ -3422,7 +3475,7 @@ fn handle_node_release(req: &IpcMessage, ipc_buf: *mut u64)
 }
 
 /// Whether `cap` is a Notification cap with Notify rights.
-fn is_notify_cap(cap: u64) -> bool
+pub(crate) fn is_notify_cap(cap: u64) -> bool
 {
     syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_ok_and(|packed| {
         packed >> 32 == u64::from(syscall::CAP_TAG_NOTIFICATION)
@@ -3615,8 +3668,8 @@ fn delete_caps(caps: &[u64])
 /// Number of attached caps, counted from `caps[0]`, that the contract of the
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
 /// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first two
-/// for `NODE_REGISTER_LIMIT`, the first for `DELEGATE_ASPACE`,
-/// `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_REGISTER`, `SWAP_TAKE`
+/// for `NODE_REGISTER_LIMIT` and `SWAP_REGISTER`, the first for
+/// `DELEGATE_ASPACE`, `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`
 /// and `SWAP_RESTORE`, none for any other label. [`dispatch`] deletes the
 /// rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
@@ -3627,10 +3680,9 @@ fn contract_cap_count(opcode: u64, attached: usize) -> usize
         memmgr_labels::DELEGATE_ASPACE
         | memmgr_labels::REGISTER_PRESSURE
         | memmgr_labels::REGISTER_PROCESS
-        | memmgr_labels::SWAP_REGISTER
         | memmgr_labels::SWAP_TAKE
         | memmgr_labels::SWAP_RESTORE => attached.min(1),
-        memmgr_labels::NODE_REGISTER_LIMIT => attached.min(2),
+        memmgr_labels::NODE_REGISTER_LIMIT | memmgr_labels::SWAP_REGISTER => attached.min(2),
         _ => 0,
     }
 }
@@ -3663,7 +3715,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     // everything else (services/memmgr/docs/ipc-interface.md § Node Handles,
     // § Badge Discipline).
     let node_label = (memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE).contains(&opcode);
-    let swap_label = (memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_RESTORE).contains(&opcode);
+    let swap_label = (memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED).contains(&opcode);
     if node_label != (req.badge & memmgr_labels::NODE_HANDLE_TAG != 0)
         || swap_label != (req.badge & memmgr_labels::SWAP_AUTHORITY != 0)
     {
@@ -3760,7 +3812,7 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             handle_node_release(req, ipc_buf);
         }
-        memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_RESTORE =>
+        memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED =>
         {
             disk::route(opcode, req, kept, ipc_buf, boot.service_ep);
         }

@@ -141,6 +141,11 @@ pub fn decl_rank(decl: &DriverDecl, source: Source, record: &RecordKeys<'_>) -> 
 /// What a declaration from `source` is given, within the source bounds, and
 /// which of the fields it asked for were ignored (each logged by devmgr).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "two independent grants (physical access, the reserve) and two independent records \
+              of a field ignored, each read on its own by devmgr; no two form a state"
+)]
 pub struct Grants
 {
     /// The priority tier the driver is created at.
@@ -151,13 +156,25 @@ pub struct Grants
     pub tier_ignored: bool,
     /// The declaration asked for physical access where it is not accepted.
     pub phys_access_ignored: bool,
+    /// Whether the driver is created `CREATE_RESERVE`, inside memmgr's system
+    /// reserve: a driver of the storage path, which the swap service calls to
+    /// end a pressure episode ([`STORAGE_CLASS`] and the IOMMU driver).
+    pub reserve: bool,
 }
+
+/// The device class of the block drivers, the storage path the swap service
+/// writes and reads its partition through: a driver of it is created in the
+/// reserve ([`Grants::reserve`];
+/// services/svcmgr/docs/service-definitions.md § `reserve`).
+pub const STORAGE_CLASS: &[u8] = b"block";
 
 /// What `decl`, from `source`, is given for a record that is an IOMMU record
 /// (`iommu_record`) or not: the boot tier only from a boot module; physical
 /// access only from a boot module and only for an IOMMU record
 /// (docs/driver-binding.md § Declaration Bounds). A drivers-directory driver
-/// runs at the auxiliary tier.
+/// runs at the auxiliary tier. A driver of [`STORAGE_CLASS`], from either
+/// source, and the driver of an IOMMU record, is created in the reserve
+/// (docs/driver-binding.md § Declaration Bounds, its Class bound).
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
@@ -181,6 +198,11 @@ pub fn grants(decl: &DriverDecl, source: Source, iommu_record: bool) -> Grants
         phys_access,
         tier_ignored,
         phys_access_ignored: decl.phys_access && !phys_access,
+        reserve: iommu_record
+            || decl
+                .class
+                .as_ref()
+                .is_some_and(|class| class.as_bytes() == STORAGE_CLASS),
     }
 }
 
@@ -941,6 +963,7 @@ mod tests
                 phys_access: true,
                 tier_ignored: false,
                 phys_access_ignored: false,
+                reserve: true,
             }
         );
         // Physical access only for an IOMMU record.
@@ -951,6 +974,7 @@ mod tests
                 phys_access: false,
                 tier_ignored: false,
                 phys_access_ignored: true,
+                reserve: false,
             }
         );
         // Neither from the drivers directory.
@@ -961,6 +985,7 @@ mod tests
                 phys_access: false,
                 tier_ignored: true,
                 phys_access_ignored: true,
+                reserve: true,
             }
         );
         let plain = decl(&m, None);
@@ -971,8 +996,41 @@ mod tests
                 phys_access: false,
                 tier_ignored: false,
                 phys_access_ignored: false,
+                reserve: false,
             }
         );
+    }
+
+    #[test]
+    fn a_storage_driver_and_the_iommu_driver_are_created_in_the_reserve()
+    {
+        let m = [Match::PciId {
+            vendor: 0x1af4,
+            device: 0x1042,
+        }];
+        let class = |class| {
+            decode(
+                encode(&Declaration {
+                    name: "d",
+                    class: Some(class),
+                    matches: &m,
+                    instance_limit: None,
+                    interrupt: Interrupt::NONE,
+                    dma: false,
+                    dma_width: None,
+                    phys_access: false,
+                    reset: Reset::None,
+                    tier: Tier::Boot,
+                })
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        assert!(grants(&class("block"), Source::BootModule, false).reserve);
+        assert!(grants(&class("block"), Source::DriversDir, false).reserve);
+        assert!(!grants(&class("input"), Source::BootModule, false).reserve);
+        // The IOMMU record's driver, whatever its class.
+        assert!(grants(&class("iommu"), Source::BootModule, true).reserve);
     }
 
     #[test]
@@ -996,6 +1054,7 @@ mod tests
                 phys_access: false,
                 tier_ignored: true,
                 phys_access_ignored: false,
+                reserve: false,
             }
         );
     }

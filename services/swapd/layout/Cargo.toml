@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "swapd-layout"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The slot word's layout and a slot's size are memmgr's disk tier's
+# (`free_pool::disk`), the one statement of them.
+free_pool = { path = "../../memmgr/free-pool", package = "memmgr-free-pool" }
+# The reply labels of the swap labels and of the block driver.
+ipc = { path = "../../../shared/ipc" }
+
+[lints]
+workspace = true

@@ -17,7 +17,9 @@
 //! 2. **Defined only** — call [`super::launch::launch`] to spawn the
 //!    service (it binds death-notification before `START_PROCESS` when
 //!    `restart != never`), then, for a supervised service, persist a
-//!    `ServiceEntry`.
+//!    `ServiceEntry`. A supervised service that died during its bootstrap
+//!    rounds has its death routed at once, by its restart policy
+//!    (`restart::handle_death`), before the next recipe is launched.
 //! 3. **Registered without definition** — log a hard error and refuse
 //!    to bind. svcmgr cannot restart what it has no recipe for; this
 //!    is a configuration error.
@@ -34,9 +36,10 @@ use svcmgr_defs::DeathTag;
 use svcmgr_endowment::SubstrateObserver;
 
 use crate::endowed_servers;
-use crate::restart::{RestartCtx, bind_fault_observer};
+use crate::restart::{DeathOutcome, RestartCtx, bind_fault_observer, handle_death};
 use crate::service::{
-    POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
+    Bootstrap, POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry,
+    try_string,
 };
 
 /// Entry in svcmgr's pending-registration table populated from init's
@@ -141,6 +144,20 @@ impl ServiceTable
     }
 }
 
+/// How a reconciliation left the system: whether the death of a service that
+/// died during its bootstrap rounds, routed during it, was unrecoverable (a
+/// `critical` service svcmgr cannot recover), so the caller starts the
+/// graceful shutdown once every recipe is handled and the shutdown actuator
+/// recorded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reconciled
+{
+    /// Every death routed during the reconciliation left the system running.
+    Running,
+    /// A death routed during the reconciliation was unrecoverable.
+    Unrecoverable,
+}
+
 /// Whether `name` is a service recipe's file name: it ends in `.svc`, compared
 /// case-sensitively.
 #[expect(
@@ -168,6 +185,10 @@ fn is_recipe_name(name: &str) -> bool
 /// vfsd found dead; nothing is then recorded or launched, and `pending` is
 /// left as it was, for the caller to route the death.
 ///
+/// A supervised service that dies during its bootstrap rounds has its death
+/// routed before the next recipe is launched; [`Reconciled`] reports whether
+/// such a death was unrecoverable.
+///
 /// # Errors
 /// vfsd's exit reason when it is dead before or during the scan.
 pub fn reconcile_and_launch(
@@ -175,7 +196,7 @@ pub fn reconcile_and_launch(
     table: &mut ServiceTable,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
-) -> Result<(), u64>
+) -> Result<Reconciled, u64>
 {
     let server_death = |pending: &[PendingRegistration]| -> Result<(), u64> {
         endowed_servers::death(pending, endowed_servers::VFSD, ctx.ipc_buf).map_or(Ok(()), Err)
@@ -193,7 +214,7 @@ pub fn reconcile_and_launch(
             // Still report pending-without-def errors so a missing
             // /config/svcmgr/services/ does not silently swallow them.
             report_orphans(pending);
-            return Ok(());
+            return Ok(Reconciled::Running);
         }
     };
 
@@ -252,7 +273,7 @@ pub fn reconcile_and_launch(
     {
         log!(warn: "svcmgr: no memory to parse {} recipes", entries.len());
         release_unsupervised(pending, "no memory for the recipes");
-        return Ok(());
+        return Ok(Reconciled::Running);
     };
     svcmgr_defs::launch_order(&mut defs, |def| {
         log!(
@@ -264,6 +285,7 @@ pub fn reconcile_and_launch(
     // One actuator, the first declaration in launch order; any later one is
     // a configuration error, launched as an ordinary service.
     let actuator = shutdown_actuator(&defs);
+    let mut reconciled = Reconciled::Running;
     for (i, def) in defs.iter().enumerate()
     {
         let role = if Some(i) == actuator
@@ -274,7 +296,7 @@ pub fn reconcile_and_launch(
         {
             launch::Role::Ordinary
         };
-        let slot = handle_definition(def, role, pending, table, ctx, registry);
+        let slot = handle_definition(def, role, pending, table, ctx, registry, &mut reconciled);
         if let Some(provided) = &def.shutdown_actuator
         {
             if Some(i) == actuator
@@ -292,7 +314,7 @@ pub fn reconcile_and_launch(
     }
 
     report_orphans(pending);
-    Ok(())
+    Ok(reconciled)
 }
 
 /// Read and parse the recipe file of each of `entries`, `.svc` file names in
@@ -384,6 +406,16 @@ fn record_shutdown_actuator(
 /// recognised shutdown actuator: a supervised launch of it, and each restart,
 /// carries the receive-only derivation of svcmgr's own death queue
 /// (`launch::launch`).
+///
+/// A supervised service that died during its bootstrap rounds
+/// (`launch::Launched::died`) is recorded as launched, then its death is
+/// routed as any death is, by its restart policy, budget and `critical` flag
+/// ([`handle_death`]); an unrecoverable outcome is set in `reconciled`.
+/// Routed here, not left to the death queues, so a log sink that died is
+/// restarted before svcmgr's next lines and a restart's instance runs before
+/// the services launched after it. The death posts of the dead instance carry
+/// an instance already routed, and are dropped. A service that died so,
+/// one-shot or supervised, is logged at once ([`log_boot_death`]).
 fn handle_definition(
     def: &Definition,
     role: launch::Role,
@@ -391,6 +423,7 @@ fn handle_definition(
     table: &mut ServiceTable,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
+    reconciled: &mut Reconciled,
 ) -> Option<usize>
 {
     // Match against pending registrations parked from init's
@@ -421,7 +454,11 @@ fn handle_definition(
             log!(warn: "svcmgr: launch failed: {}", def.name);
             return None;
         };
-        log!("svcmgr: launched ephemeral: {}", def.name);
+        match launched.died
+        {
+            None => log!("svcmgr: launched ephemeral: {}", def.name),
+            Some(exit_reason) => log_boot_death(def, exit_reason),
+        }
         let _ = syscall::cap_delete(launched.thread_cap);
         let _ = syscall::cap_delete(launched.process_handle);
         for cap in [launched.provided_endpoint, launched.node_handle]
@@ -483,8 +520,36 @@ fn handle_definition(
     entry.provided_endpoint = launched.provided_endpoint;
     entry.node_handle = launched.node_handle;
     entry.launched = true;
+    if launched.died.is_none()
+    {
+        entry.bootstrap = Bootstrap::Served;
+    }
     table.install(idx, entry, recipe)?;
+    if let Some(exit_reason) = launched.died
+        && let Some(entry) = table.services.get_mut(idx)
+    {
+        log_boot_death(def, exit_reason);
+        let recipe = table.recipes.get(idx).and_then(Option::as_ref);
+        if handle_death(entry, exit_reason, ctx, tag, recipe, registry)
+            == DeathOutcome::Unrecoverable
+        {
+            *reconciled = Reconciled::Unrecoverable;
+        }
+    }
     Some(idx)
+}
+
+/// Log the death of a service launched from `def` before its bootstrap
+/// request. The line reaches the serial line through whichever logger serves
+/// the log endpoint: a dead log sink's first launch leaves init-logd serving
+/// it. `cargo xtask test-core-death` matches the line's `died during its
+/// bootstrap`.
+fn log_boot_death(def: &Definition, exit_reason: u64)
+{
+    log!(
+        warn: "svcmgr: {} died during its bootstrap (exit reason {exit_reason:#x})",
+        def.name
+    );
 }
 
 /// Bind-only path: bind death-notification on a thread init already

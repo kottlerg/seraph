@@ -89,6 +89,33 @@ Reconciliation records a devmgr that died before its bind, or a vfsd that died a
 scan, with the thread cap init endowed, and a resync right after reconciliation routes its death
 (`EXIT_KILLED` for a revoked cap).
 
+A child that dies after `START_PROCESS` and before its bootstrap request sends none, so svcmgr does
+not wait for a request without bound. Its wait for each of a child's requests
+([`serve_boot_slots`](../src/definitions/launch.rs), through
+`ipc::bootstrap::serve_round_watched`) is a receive bounded at `BOOTSTRAP_POLL_MS` (50 ms), and
+after each one that expires svcmgr reads the child's main thread through its own thread cap, as a
+resync does (the kernel's reason for an exited thread, `EXIT_KILLED` for a revoked cap); a round
+that fails is read the same way. A dead child ends the serve: svcmgr releases the caps of the
+rounds it did not serve and routes the death at once through `restart::handle_death`, under the
+instance's tag, as any other death:
+
+- On the first launch the service is recorded as launched, and its provided names published, as
+  for a child that took its rounds, since the endpoint outlives the instance; its death is routed
+  before reconciliation launches the next recipe, so a dead log sink is restarted before svcmgr's
+  next lines. Until an instance of the log sink has taken all its rounds, each restart of it is
+  served the first launch's round, with the `HANDOVER_PULL` SEND, since init-logd still waits
+  for the handover (§ Supervision hierarchy). An unrecoverable outcome starts the graceful
+  shutdown once reconciliation ends, when the shutdown actuator is recorded. svcmgr logs a death
+  on the first launch at once (`svcmgr: <name> died during its bootstrap`), a one-shot service's
+  (`restart = never`) and the log sink's included: no instance of the log sink has taken the
+  handover then, so init-logd still receives the line.
+- On a restart the dead new instance is a death of its own, decided by the same steps
+  (§ Decision tree), its restart charged to the same budget, which bounds the repeats.
+
+The posts the dead instance's observers make arrive later and are dropped, its instance already
+routed. A child that is alive and sends no request, one a debugger holds stopped among them, is
+still waited for, `BOOTSTRAP_POLL_MS` at a time.
+
 svcmgr calls vfsd and devmgr before reconciliation records them. vfsd serves svcmgr's namespace
 root: before the handover svcmgr reads the device class files and walks the drivers directory
 through it, and at the handover it reads the recipe directory. devmgr mints each device class and
@@ -179,9 +206,15 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
    * Start the child via [`start_process`](#shared-spawn-primitives)
      (`START_PROCESS`).
    * Serve the restart bootstrap rounds, re-resolving the recipe's
-     `seed` names from the discovery registry in declaration order.
+     `seed` names from the discovery registry in declaration order,
+     each wait for a request watched for the new instance's death
+     (§ Death detection).
    * On success: increment `restart_count` (a lifetime count for the
      restart log line), return `Restarted`.
+   * When the new instance dies during its rounds: increment
+     `restart_count`, and decide its death from step 1 with its exit
+     reason. The entry names the dead instance, which the next restart
+     releases as above.
    * On failure: any failure after `CREATE_FROM_FILE` destroys the new
      child via `DESTROY_PROCESS`, as first launch does; then route
      through `permanent_death_outcome`. A create whose reply caps never
@@ -248,7 +281,8 @@ the log-sink, debug-authority, stop-authority, `oom_stop` and `reserve`
 flags, the `stop_source` class, and the scheduling fields on the parallel
 `RestartRecipe`, so
 a restart reproduces the first-launch spawn shape byte-for-byte, except the
-log-sink round, whose history-pull SEND is absent on a restart (per
+log-sink round, whose history-pull SEND is absent on a restart once an
+instance has taken all its bootstrap rounds (per
 [service-definitions.md](service-definitions.md#log_sink)). The binary path
 is re-walked on every spawn, so a binary update on disk is picked up by
 the next restart without code changes.
@@ -369,9 +403,13 @@ RECV on the persistent service endpoint so cached client caps survive the
 restart. `logd` is the log sink: svcmgr holds the master-log endpoint
 source for the system's life and mints each (re)launched logd a fresh RECV
 on that persistent endpoint, so log senders' caps survive the restart (per
-[service-definitions.md](service-definitions.md#log_sink)). The restarted
-logd skips the history pull, serves a fresh table (which holds no sender's
-display name: logd refuses a sender's next message with `NAME_UNKNOWN`, and
+[service-definitions.md](service-definitions.md#log_sink)). A logd
+restarted before any instance has taken all its bootstrap rounds (its
+first launch died before its request, as § Death detection describes) is
+minted the first launch's round, `HANDOVER_PULL` SEND included, since no
+instance has held the handover and init-logd still serves the endpoint.
+Any later restarted logd skips the history pull, serves a fresh table
+(which holds no sender's display name: logd refuses a sender's next message with `NAME_UNKNOWN`, and
 the sender registers its name again and resends, so its lines render under
 its name), and registers its death queue with procmgr, whose
 `REGISTER_DEATH_EQ` takes it in place of the dead instance's
@@ -381,9 +419,13 @@ writes none of a logd death's lines before the respawn: with no logd
 receiving, each would wait out its bound (the first `LOG_CALL_TIMEOUT_MS`,
 the rest `LOG_CALL_UNANSWERED_TIMEOUT_MS`, per
 [shared/log](../../../shared/log/README.md)) and be dropped. It writes them
-once the new instance has started and been served its bootstrap round, and
-none when no instance follows (the policy or the budget refuses the restart,
-or the restart fails), since no receiver is left to take them. A failure
+once the new instance has started and been served its bootstrap round,
+with one line counting the instances that died during their bootstrap
+before it, and none when no instance follows (the policy or the budget refuses the restart,
+or the restart fails), since no receiver is left to take them. The one line
+written before the respawn is a first launch's death before its bootstrap
+request (§ Death detection), which init-logd, still serving the endpoint,
+receives. A failure
 line of the create path itself (`restart_process` and the helpers it
 calls) is written as it occurs and waits out its bound. procmgr writes a
 create's success lines after its reply, so the create of the new instance

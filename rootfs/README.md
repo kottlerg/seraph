@@ -32,6 +32,8 @@ rootfs/
         gdbstub.svc   #   run-parallel --debug-target, test-gdb), naming its target
   data/
     test.txt          # Marker fixture for svctest fs / namespace phases
+    crasher-boot/
+      die-early       # Token the crasher boot-fault fixture removes before it dies
 ```
 
 xtask synthesises additional data fixtures at build time directly into

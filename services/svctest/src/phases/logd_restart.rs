@@ -56,9 +56,16 @@
 //! them whatever its node: the restart check shows that a logd in the reserve
 //! restarts while memory is critical, and the attach flags are what fail for a
 //! logd outside it. The phase attaches to logd before the fill, faults it once
-//! the level reads `CRITICAL`, and, once the level has fallen, finds svcmgr's
-//! restart line in the new instance's history stamped no later than the last
-//! reading of the level that gave `CRITICAL`.
+//! the level reads `CRITICAL`, and, once the level has fallen, requires
+//! svcmgr's restart line in the new instance's history to be stamped before
+//! svcmgr's line for its stop of the fixture, the first of each after the
+//! kill. svcmgr writes the stop line once procmgr has destroyed the fixture,
+//! which frees the memory, and it serves a stop and restarts a service on one
+//! event loop (`services/svcmgr/docs/restart-protocol.md` § Death detection),
+//! so a stop asked for while it restarts logd waits for the restart. logd
+//! stamps each line while svcmgr's call of it waits, so the order of the two
+//! stamps is the order of the restart and the destroy, however long the
+//! restart takes and whether oomd or svctest asks for the stop.
 
 use std::time::{Duration, Instant};
 
@@ -102,9 +109,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// next instance runs (`services/svcmgr/src/restart.rs` `handle_death`).
 const SVCMGR_LINES: [&[u8]; 2] = [b"service died: logd", b"service restarted: logd"];
 
+/// svcmgr's line for its stop of the `memhog` fixture, which it writes once
+/// procmgr has destroyed the fixture's process, and with it freed the memory
+/// the fixture held (`services/svcmgr/src/stop.rs` `handle_stop_candidate`).
+const MEMHOG_STOP_LINE: &[u8] = b"stop memhog: stopped for a stop-authority holder";
+
 /// How long the `logd_reserve` phase holds memory critical when no oomd stops
-/// the `memhog` fixture, and svctest stops it: longer than a restart of logd
-/// takes (a few hundred milliseconds under TCG). A test wait bound.
+/// the `memhog` fixture, and svctest stops it. svcmgr serves the stop only
+/// once it has restarted logd, so the hold need not outlast the restart. A test
+/// wait bound.
 const RESERVE_HOLD: Duration = Duration::from_secs(5);
 
 /// Kill logd while memory is critical and require its next instance to run
@@ -125,7 +138,7 @@ pub fn logd_reserve_phase(caps: &Caps)
     let (threads, flags) = attach(authority, killed, phase);
     require_reserve(flags, phase, "the running");
     let mut killed_us = 0;
-    let critical_until = super::oom::critical_window(caps, phase, RESERVE_HOLD, || {
+    super::oom::critical_window(caps, phase, RESERVE_HOLD, || {
         killed_us = super::oom::elapsed_us();
         fault_main(&threads, phase);
     });
@@ -134,12 +147,8 @@ pub fn logd_reserve_phase(caps: &Caps)
         let _ = syscall::cap_delete(cap);
     }
     await_restart(caps.logd_query, authority, killed, phase);
-    let restarted_us = super::procmgr::logd_history_with(caps.logd_query, None, |entry| {
-        (entry.us, contains(entry.bytes, SVCMGR_LINES[1]))
-    })
-    .into_iter()
-    .find_map(|(us, restart)| restart.then_some(us))
-    .unwrap_or_else(|| panic!("{phase}: the next instance holds no restart line"));
+    let restarted_us = await_line_after(caps.logd_query, SVCMGR_LINES[1], killed_us, phase);
+    let stopped_us = await_line_after(caps.logd_query, MEMHOG_STOP_LINE, killed_us, phase);
     let next = super::crash::badge_named(authority, LOGD_NAME)
         .filter(|&badge| badge != killed)
         .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no next logd"));
@@ -150,14 +159,15 @@ pub fn logd_reserve_phase(caps: &Caps)
     }
     require_reserve(flags, phase, "the restarted");
     assert!(
-        restarted_us <= critical_until,
-        "{phase}: logd's next instance took svcmgr's restart line at {restarted_us} us, after the \
-         level last read CRITICAL at {critical_until} us: logd restarted only once memory was freed"
+        restarted_us < stopped_us,
+        "{phase}: logd's next instance took svcmgr's restart line at {restarted_us} us, after \
+         svcmgr's stop of memhog at {stopped_us} us: logd restarted only once memory was freed"
     );
     let took = restarted_us.saturating_sub(killed_us) / 1000;
+    let lead = stopped_us.saturating_sub(restarted_us) / 1000;
     std::os::seraph::log!(
         "logd_reserve phase passed (logd killed while memory was critical, and restarted and \
-         serving {took} ms later, before the level fell)"
+         serving {took} ms later, {lead} ms before svcmgr stopped memhog)"
     );
 }
 
@@ -449,6 +459,36 @@ fn await_restart(query: u64, authority: u64, killed: u64, phase: &str)
         assert!(
             start.elapsed() < RESTART_TIMEOUT,
             "{phase}: no next logd instance holding svcmgr's restart lines"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The stamp of the oldest entry of logd's history, through `query`, that is
+/// stamped at or after `after_us` and holds `line`, read every
+/// [`POLL_INTERVAL`] until one is there, for up to [`RESTART_TIMEOUT`].
+/// `phase` names the phase in a failure.
+fn await_line_after(query: u64, line: &[u8], after_us: u64, phase: &str) -> u64
+{
+    let start = Instant::now();
+    loop
+    {
+        // Newest first: the last match read is the oldest.
+        let oldest = super::procmgr::logd_history_with(query, None, |entry| {
+            (entry.us >= after_us && contains(entry.bytes, line)).then_some(entry.us)
+        })
+        .into_iter()
+        .rev()
+        .flatten()
+        .next();
+        if let Some(us) = oldest
+        {
+            return us;
+        }
+        assert!(
+            start.elapsed() < RESTART_TIMEOUT,
+            "{phase}: logd's history holds no {:?} line stamped after {after_us} us",
+            String::from_utf8_lossy(line)
         );
         std::thread::sleep(POLL_INTERVAL);
     }

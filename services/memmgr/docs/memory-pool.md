@@ -214,8 +214,9 @@ and never reclaims them. Each entry records:
   `REGISTER_PRESSURE` gave, with the bits it is signalled with
   ([Memory pressure](#memory-pressure)), the head of the list of node
   handle states the process owns, and the head of the list of the limit
-  registrations it made ([Distribution policy](#distribution-policy)), all
-  of which go with the record.
+  registrations it made ([Distribution policy](#distribution-policy)), and
+  the count of its pages that are swapped ([Eviction](#eviction)), all of
+  which go with the record.
 - The next region id: a sequence from 1 that numbers the process's grants.
   Each grant's frame node keeps its id, which no later grant of the process
   reuses; bootstrap arenas and demand-fault runs carry none.
@@ -293,8 +294,10 @@ entry records:
 - The chunk's state: unbacked; resident, its pages backed by the runs on the entry's run list and
   mapped in the process; evicting; or swapped.
 - A pin flag and a two-bit age.
-- A link: the head of the chunk's run list while it is resident or evicting, the handle of its
-  stored pages while it is swapped.
+- The job slot of its eviction while it is evicting, so a completion is applied only to the
+  eviction it was posted for.
+- A link: the head of the chunk's run list while it is resident or evicting, the head of the list
+  of store runs its pages are stored in while it is swapped.
 
 The evicting and swapped states, the pin flag, and the age are the swap path's: memmgr reclaiming
 a cold chunk's runs under memory pressure and storing its pages, a fault restoring them. That path
@@ -324,7 +327,8 @@ leaves the entry as it was.
 nodes on a stack threaded through their own `next` links, which no table node uses otherwise. The
 walk needs no memory and no recursion. It rewrites each run's descriptor into a run node in place,
 which joins the free pool or the deferred list as any reclaimed frame does (see
-[Reclamation](#reclamation)), and returns every directory and leaf node to the arena's free list.
+[Reclamation](#reclamation)), returns each store run of a swapped chunk, which no process ever
+mapped, to the free pool, and returns every directory and leaf node to the arena's free list.
 
 ---
 
@@ -927,6 +931,14 @@ every demand fault from RAM, and exhaustion surfaces as the out-of-memory errors
 of [Failure Modes](#failure-modes) and [Demand faults](#demand-faults), and as refused commitments
 ([Commit](#commit)).
 
+The ledger's side of eviction is in place in the `memmgr-free-pool` crate, and no memmgr path
+calls it yet: the page codec (`compress.rs`); the stream a chunk's pages are stored as
+(`store.rs`), which holds each backed page as a two-byte header and the page compressed, raw, or
+as nothing for an all-zero page, so a chunk whose every page is zero takes no store page; the
+chunk transitions and their accounting below; the teardown of a swapped chunk, whose store runs
+return to the free pool and whose pages' charge is released; and the clock's sweep, which ages the
+chunks of eligible regions from a harvest of their accessed bits and reports the cold ones.
+
 **Eligible pages.** memmgr evicts only pages it mapped as pager: the runs it backs on a demand
 fault. It never evicts a granted frame, since a client holding a Memory cap to it may have retyped,
 sent or DMA-mapped it; a page of a process whose budget node is a reserve node ([Distribution
@@ -954,26 +966,27 @@ eligible regions through the kernel's harvest syscall and ages each chunk with i
 is the chunk: one unmap and one restore fault per chunk, over every run on its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, and the
-chunk is evicting while the compression worker stores its pages; a fault on an evicting chunk
-remaps the same frames and cancels the job. Once stored, the chunk is swapped: its runs return to
-the free pool and its entry's link holds the store handle. An all-zero page takes no store space.
-A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
+chunk is evicting while the compression worker stores its pages; a fault on an evicting chunk remaps
+the same frames and cancels the job. Once stored, the chunk is swapped: its runs return to the free
+pool and its entry's link holds the head of its store-run list. An all-zero page takes no store
+space. A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
 bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
-any ancestor, since the node stays charged for its evicted pages, so it is never declined with code
-10. A restore of a committed chunk is a committed fault: it draws from `promised` as any committed
-fault does ([Commit](#commit)), and with A above 0 a restore that finds no frame compresses a
-victim within its turn or is declined as a commit overrun. A restore of an uncommitted chunk passes
-the RAM test of an uncommitted demand run, `free - promised - R + A >= want`, with want the chunk's
-backed pages and R the system reserve for a node outside it and 0 for a reserve node, after the
-deferred recheck ([Distribution policy](#distribution-policy), System reserve), and is otherwise
-declined with code 7, the chunk staying swapped and its store slot kept. The chunk is the granule,
-so a restore is never clamped to part of a chunk. memmgr takes runs covering exactly the chunk's
-backed pages (no run spans an unbacked page of a chunk backed in parts), selected as a demand fault
-selects ([Demand faults](#demand-faults), run selection only), maps them in a scratch window of its
-own, and writes every byte of every page of each run there before it maps the run into the process:
-it decompresses each stored page and zero-fills each all-zero page, which takes no store space. That
-full write replaces the hand-out clear of [Frame contents](#frame-contents), so no byte of a run's
-earlier owner reaches the process. It then frees the store slot and resumes the thread.
+any ancestor, since the node stays charged for its evicted pages, so it is never declined with
+code 10. A restore of a committed chunk is a committed fault: it draws from `promised` as any
+committed fault does ([Commit](#commit)), and with A above 0 a restore that finds no frame
+compresses a victim within its turn or is declined as a commit overrun. A restore of an uncommitted
+chunk passes the RAM test of an uncommitted demand run, `free - promised - R + A >= want`, with want
+the chunk's backed pages and R the system reserve for a node outside it and 0 for a reserve node,
+after the deferred recheck ([Distribution policy](#distribution-policy), System reserve), and is
+otherwise declined with code 7, the chunk staying swapped and its store slot kept. The chunk is the
+granule, so a restore is never clamped to part of a chunk. memmgr takes runs covering exactly the
+chunk's backed pages (no run spans an unbacked page of a chunk backed in parts), selected as a
+demand fault selects ([Demand faults](#demand-faults), run selection only), maps them in a scratch
+window of its own, and writes every byte of every page of each run there before it maps the run into
+the process: it decompresses each stored page and zero-fills each all-zero page, which takes no
+store space. That full write replaces the hand-out clear of [Frame contents](#frame-contents), so no
+byte of a run's earlier owner reaches the process. It then frees the store slot and resumes the
+thread.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr below the receive
 loop's priority, which touches no ledger state: it takes a job from a single-producer ring,

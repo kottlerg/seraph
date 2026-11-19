@@ -1232,7 +1232,9 @@ current sysroot once per target, headless, with a QMP socket, and kills the targ
 its threads to program counter 0. svcmgr, devmgr, vfsd and logd are reached through the GDB stub
 service, which the command stages naming the target and boots with the debug port, as
 `run --debug-target` does, removing it again and repacking the disk images in the layout they had,
-whatever the outcome; logd is killed four times, once more than svcmgr's restart budget allows.
+whatever the outcome; logd is killed four times, once more than svcmgr's restart budget allows,
+and a first kill that falls before logd's bootstrap request also requires init-logd's handover to
+the restarted logd.
 memmgr and procmgr are reached through QEMU's own gdbstub, on a unix socket, with a hardware
 breakpoint on a function of the target's binary, read from the symbols store's file of its build id,
 hit by a `hello` the command types at the shell. It passes for a target when QMP's `SHUTDOWN` event,

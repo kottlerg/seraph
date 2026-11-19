@@ -134,9 +134,11 @@ svcmgr/
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)
   (`walk_and_create_from_file`, `configure_namespace_caps`,
-  `start_process`) and serve the seed bootstrap rounds; only restart
-  resolves the namespace through `apply_namespace_policy`
-  ([docs/restart-protocol.md](docs/restart-protocol.md) § Shared spawn primitives).
+  `start_process`) and serve the seed bootstrap rounds, routing the death
+  of a child that dies before its request instead of waiting on it; only
+  restart resolves the namespace through `apply_namespace_policy`
+  ([docs/restart-protocol.md](docs/restart-protocol.md) § Shared spawn
+  primitives, § Death detection).
 - **Health monitoring** — bind two death observers per supervised
   service to svcmgr's death queues, one on the main thread and one on the
   address space (posted by the first terminal fault of any thread), both

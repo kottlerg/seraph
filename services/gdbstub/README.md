@@ -171,6 +171,9 @@ stub's endpoint.
   fault maps to: `SIGTRAP` for a breakpoint or a step, `SIGILL`, `SIGBUS`, `SIGFPE` for those
   exceptions, `SIGSEGV` for any other fault and a page fault the pager forwarded, and `SIGINT` for
   an interrupt. GDB's thread ids are the table's indices plus one; thread 1 is the main thread.
+  `Hg` of a thread GDB cannot select is answered `E04` when its bind failed, `E05` when it has
+  exited, and `E01` when the table has no such slot, and the stub logs the refusal, so the cause
+  reaches the host even when the line cannot, as when the target held is logd.
 - **Memory.** `m` reads and `M` and `X` write the target's memory through a live thread of it, in
   the chunks the kernel copies at once. A chunk on a page memmgr evicted, into its compressed store
   or to disk, is not present to the kernel's copy, so the stub asks procmgr, through its debug

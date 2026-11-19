@@ -86,6 +86,10 @@ const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Budget from the kill to QEMU's exit.
 const POWER_OFF_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// How long the guest's serial lines are still shown after a stub request
+/// failed, for the stub's own lines on its refusal.
+const STUB_FAILURE_ECHO: Duration = Duration::from_secs(8);
+
 /// Budget for QEMU's exit once its serial stream has ended.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -351,7 +355,16 @@ fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Rout
         (Route::Stub(name, point, contact), _, Some(port), stdin) =>
         {
             let _stdin = stdin;
-            kill_through_stub(&mut guest, args.arch, port, name, point, contact)
+            let killed = kill_through_stub(&mut guest, args.arch, port, name, point, contact);
+            if killed.is_err()
+            {
+                // Show the stub's lines on a refusal, which reach the serial
+                // line when its log sink is not the target it holds. With
+                // logd held its lines are dropped, and the answer's `E`
+                // number carries the cause.
+                let _ = guest.echo_until_end(STUB_FAILURE_ECHO);
+            }
+            killed
         }
         (Route::Hardware(bp), Some(function), _, Some(stdin)) => guest
             .collect_until(READY_MARKER, BOOT_TIMEOUT)

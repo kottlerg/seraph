@@ -6,10 +6,10 @@ description: Run a milestone's Issues as parallel worker agents under an orchest
 # Supervising a batch
 
 `/orchestrate` makes this session the supervisor of a batch; `/orchestrate resume` does the same
-for a batch whose record already exists (a session that died, a new day). The work is done by
-the `orchestrator` agent (`.claude/agents/orchestrator.md`), which holds every rule of a batch,
-and by the workers it spawns. You hold almost nothing, on purpose: your context is the one that
-is never reset, so everything you read stays for the whole milestone.
+for a batch whose record already exists (a session that died, a new day). The work is done by the
+`orchestrator` agent (`.claude/agents/orchestrator.md`), which holds every rule of a batch, and by
+the workers you spawn at its request. You hold almost nothing, on purpose: your context is the one
+that is never reset, so everything you read stays for the whole milestone.
 
 **The session's model.** A supervisor relays, counts and replaces; it makes no project decision.
 Run it on Sonnet 5.5 at medium effort: start the session with `claude --model sonnet`, or run
@@ -47,44 +47,70 @@ only if that does not cure it.
    .message.usage | .input_tokens + .cache_creation_input_tokens + .cache_read_input_tokens'
    2>/dev/null | head -n 1`. A task notification
    that arrives carries the count as well. At that size, or when it asks, send `park`; when its
-   `parked` message arrives, spawn a new one with "resume from the record" and give it its id.
-   The old one stays idle and forwards you what still reaches it (step 4). Stop it only when no
-   `parked` comes and § A silent orchestrator shows it is gone. When it asks because a merge
-   changed its own file, the request names the changed files: the new one's line is "resume
-   from the record; read from disk first: <the files>", since the definition this session
-   loaded is the old one. When the orchestrator names this file after a merge, read it again
-   yourself. A merge that changes `.claude/` needs no new session
+   `parked` message arrives, spawn a new one with "resume from the record" and give it its id. The
+   old one parks with no agent of its own running and ends its turn, so its task is complete: there
+   is nothing to stop, and you stop no parked orchestrator. A message that still reaches it (a
+   worker that read the record before the new one recorded its id) wakes it, and it sends you the
+   message verbatim (step 4). When no `parked` comes, replace it as § A silent orchestrator says.
+   When it asks because a merge changed its own file, the request names the changed files: the new
+   one's line is "resume from the record; read from disk first: <the files>", since the definition
+   this session loaded is the old one. When the orchestrator names this file after a merge, read it
+   again yourself. A merge that changes `.claude/` needs no new session
    (`.claude/agents/orchestrator.md` § Plan); this session continues.
-4. **Forward what reaches you for the orchestrator.** A parked orchestrator sends you, verbatim,
-   any message that still reaches it, and a worker spawned by an earlier orchestrator stays
-   alive, with the harness's notifications of its stops arriving here. Forward a parked
-   orchestrator's message to the current orchestrator verbatim: it can be a worker's only copy of
-   its report (a gate report, a question that blocks it, a composition check's verdict, a
-   stand-down line). Forward a notification in one line: the worker and the notification's
+4. **Forward what reaches you for the orchestrator.** Forward a message a parked orchestrator
+   sends you to the current orchestrator verbatim: it can be a worker's only copy of its report
+   (a gate report, a question that blocks it, a composition check's verdict, a stand-down line).
+   The harness's notifications of a worker's stops come to you for the whole batch, since you
+   spawned it (step 5). A worker reports by message to the orchestrator, so end such a turn
+   without a reply and forward nothing, except a notification that the worker's session ended
+   without a hand-back or failed: forward that in one line, the worker and the notification's
    status.
-5. **Do for the orchestrator what only the top session can**: stop an agent it names and tell it
+5. **Spawn each worker the orchestrator asks for.** Every worker is yours, never the
+   orchestrator's: the harness stops an agent together with every running agent it spawned, and
+   has no stop that spares them, so a worker spawned by an orchestrator could be interrupted by
+   anything done to that orchestrator. The orchestrator writes the worker's whole prompt to a
+   scratchpad file and records the worker, then sends you one line:
+   `spawn <name>: prompt <path>; model <m>; effort <e>; worktree: new`, or
+   `worktree: <existing path>` for a respawn into its predecessor's worktree.
+   - Make one `Agent` call: `subagent_type` `worker`, that model and effort, `isolation`
+     `worktree` for `new` and none for an existing path, and as the prompt only the line
+     "Read <path> and follow it as your prompt." The result echoes the prompt back, and a
+     one-line prompt keeps that echo out of your context. Read nothing of the file.
+   - Answer the orchestrator with one line, `<name>: <agent id>`. Keep and relay nothing else of
+     the result.
+   - A respawn into a predecessor's worktree comes only after you have ended the predecessor's
+     task and confirmed it (step 6); the spawn line then names that worktree.
+6. **Do for the orchestrator what only the top session can**: stop an agent it names and tell it
    once the stop is confirmed (a respawn into that agent's worktree waits for it), schedule
    or cancel a tick it asks for, apply a `.claude/CLAUDE.md`, settings or hook patch on the
    maintainer's direct word in this conversation, and make a `release-review` workflow call it
    gives you: save the report and the returned object to the paths it names, show the
    maintainer both verdict lines, and answer the orchestrator with those lines and the paths.
-6. **Wake a drifted orchestrator.** A turn of the orchestrator that ran in a worker's worktree
+7. **Wake a drifted orchestrator.** A turn of the orchestrator that ran in a worker's worktree
    and deferred work sends "drift: wake me" as its last action (`.claude/agents/orchestrator.md`
    § Failure modes). On it, reply "resume" at once and show the maintainer nothing.
 
 ## A silent orchestrator
 
-The harness does not reliably notify you of the orchestrator's stop while a background child of
-its own is alive, and its workers nearly always are: such a stop has produced no notification at
-all. Silence is therefore no sign: an orchestrator that has sent nothing may be working,
-waiting on a worker, or idle. Before you replace or stop one, check it. Read its output file's
-last entry, and only what the check needs:
-`tail -n 1 <file> | jq -c '{timestamp, type, stop: .message.stop_reason}'`. A recent entry, or
-an `assistant` entry that stopped on `tool_use`, means it is working. When the entry shows a
-turn that ended (`end_turn`), send it one line asking for its state; it answers by message.
-Treat it as gone only when a message to it is undeliverable, or when neither a reply nor a new
-entry in the file follows within ten minutes. Then spawn a new one with "resume from the
-record", as in step 3.
+The harness does not reliably notify you of the orchestrator's stop while a background child of its
+own is alive (an `Explore` or `scribe` it started, a background command): such a stop has produced
+no notification at all. Silence is therefore no sign: an orchestrator that has sent nothing may be
+working, waiting on a worker, or idle. Before you replace or stop one, check it. Read its output
+file's last entry, and only what the check needs:
+`tail -n 1 <file> | jq -c '{timestamp, type, stop: .message.stop_reason}'`. A recent entry, or an
+`assistant` entry that stopped on `tool_use`, means it is working. When the entry shows a turn that
+ended (`end_turn`), send it one line asking for its state; it answers by message. Treat it as gone
+only when a message to it is undeliverable, or when neither a reply nor a new entry in the file
+follows within ten minutes. Then stop it, but only once no agent it spawned is running, since the
+stop would end that agent too. The meta files of the agents it spawned sit beside its transcript;
+this lists those of the ones still running:
+
+```sh
+d=$(dirname "$(readlink <file>)")
+grep -l '"parentAgentId":"<id>"' "$d"/*.meta.json | xargs -r grep -L '"finished":true' || true
+```
+
+Then spawn a new one with "resume from the record", as in step 3.
 
 ## What you do not do
 
@@ -95,13 +121,13 @@ notification that needs none of the steps above ends without a reply.
 
 ## Your own context
 
-Every relay, every orphan's notification and every hand-over wakes you and stays in your
-context, so it fills slowly and is never reset. Keep each turn to its one action. When it is
-compacted, this file is reloaded whole (it is well under the size a compaction keeps), and you
-lose nothing you need: the batch's state is the orchestrator's record, not yours. What you need
-is the current orchestrator's agent id, which is the last one you spawned; if the summary does
-not hold it, `cargo xtask orch orchestrator` prints it, and nothing else of the record. Its
-output file follows from the id: `ls /tmp/claude-*/*/*/tasks/<id>.output` finds it.
+Every relay, every spawn, every worker's notification and every hand-over wakes you and stays in
+your context, so it fills slowly and is never reset. Keep each turn to its one action. When it is
+compacted, this file is reloaded whole (it is well under the size a compaction keeps), and you lose
+nothing you need: the batch's state is the orchestrator's record, not yours. What you need is the
+current orchestrator's agent id, which is the last orchestrator you spawned; if the summary does not
+hold it, `cargo xtask orch orchestrator` prints it, and nothing else of the record. Its output file
+follows from the id: `ls /tmp/claude-*/*/*/tasks/<id>.output` finds it.
 
 ## Supporting files
 

@@ -32,8 +32,8 @@ use free_pool::chunk::{ChunkEntry, ChunkState};
 use free_pool::compress::{HASH_ENTRIES, HashTable, PAGE_BYTES};
 use free_pool::store::{Decoder, encode_chunk, store_pages};
 use free_pool::{
-    CHUNK_BYTES, COLD_SWEEPS, ClockHand, DEMAND_CHUNK_PAGES, DemandRegion, Fit, FrameDesc,
-    FreeRun, NO_REGION_ID, NodeIdx, PressureLevel, Victim, chunk_for, reserve_pages,
+    CHUNK_BYTES, COLD_SWEEPS, ClockHand, DEMAND_CHUNK_PAGES, DemandRegion, Fit, FrameDesc, FreeRun,
+    NO_REGION_ID, NodeIdx, PressureLevel, Victim, chunk_for, reserve_pages,
 };
 use syscall_abi::PAGE_SIZE;
 
@@ -297,8 +297,10 @@ fn compress_job(slot: usize)
 {
     let backed = BACKED.get(slot).map_or(0, |b| b.load(Ordering::Relaxed));
     // SAFETY: the slot is posted, so its output buffer is the worker's alone
-    // until it marks the slot done, and the table is the worker's alone.
-    let (out, table) = unsafe { (&mut *out_buf(slot), &mut *addr_of_mut!(TABLE)) };
+    // until it marks the slot done.
+    let out = unsafe { &mut *out_buf(slot) };
+    // SAFETY: the table is the worker's alone.
+    let table = unsafe { &mut *addr_of_mut!(TABLE) };
     // SAFETY: the loop mapped each backed page of the chunk at its offset in
     // the slot's input window before it posted the job, and unmaps it only
     // once the job is done; nothing writes the pages meanwhile, since the
@@ -318,8 +320,12 @@ fn compress_job(slot: usize)
 /// # Safety
 /// Each backed page of the chunk is mapped readable at its offset from
 /// `input`, and nothing writes it until this returns.
-unsafe fn compress(backed: u16, input: u64, out: &mut [u8; OUT_BYTES], table: &mut HashTable)
--> usize
+unsafe fn compress(
+    backed: u16,
+    input: u64,
+    out: &mut [u8; OUT_BYTES],
+    table: &mut HashTable,
+) -> usize
 {
     // A stream gains only when it takes fewer pages than the chunk's backed
     // pages.
@@ -478,7 +484,8 @@ fn take_victim(l: &MemLedger) -> Option<Victim>
             best = Some((i, age));
         }
     }
-    best.and_then(|(i, _)| cache.get_mut(i)).and_then(Option::take)
+    best.and_then(|(i, _)| cache.get_mut(i))
+        .and_then(Option::take)
 }
 
 /// The runs of the resident or evicting chunk holding `page_base` in region
@@ -591,18 +598,14 @@ fn evict_now(l: &mut MemLedger, v: &Victim)
         return;
     };
     let backed = l.chunk_at(job.reg, job.page_base).backed();
-    // SAFETY: the synchronous slot's buffer and table are the loop's alone;
-    // `begin` mapped each backed page of the chunk at its offset in the
-    // slot's input window, and the process's mappings of them are gone, so
-    // nothing writes them.
-    let len = unsafe {
-        compress(
-            backed,
-            input_va(SYNC_SLOT),
-            &mut *out_buf(SYNC_SLOT),
-            &mut *addr_of_mut!(SYNC_TABLE),
-        )
-    };
+    // SAFETY: the synchronous slot's buffer is the loop's alone.
+    let out = unsafe { &mut *out_buf(SYNC_SLOT) };
+    // SAFETY: the synchronous slot's table is the loop's alone.
+    let table = unsafe { &mut *addr_of_mut!(SYNC_TABLE) };
+    // SAFETY: `begin` mapped each backed page of the chunk at its offset in
+    // the slot's input window, and the process's mappings of them are gone,
+    // so nothing writes them until the window is unmapped below.
+    let len = unsafe { compress(backed, input_va(SYNC_SLOT), out, table) };
     // SAFETY: the window is memmgr's own zone, mapped for this eviction alone.
     let _ = unsafe { syscall::mem_unmap(self_aspace(), input_va(SYNC_SLOT), CHUNK_PAGES) };
     if len == NO_GAIN || !store(l, &job, SYNC_SLOT, len)

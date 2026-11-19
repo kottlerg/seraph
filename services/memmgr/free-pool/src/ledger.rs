@@ -3770,7 +3770,8 @@ mod tests
         for va in [BASE, BASE + CHUNK]
         {
             let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
-            l.back_chunk(rec, open, frame(cap, pages, phys, va)).unwrap();
+            l.back_chunk(rec, open, frame(cap, pages, phys, va))
+                .unwrap();
         }
         // Every harvest sees page 0 of chunk 1 accessed.
         let mut harvest = |_: u64, _: u64, _: u64, bitmap: &mut [u8]| {
@@ -3865,9 +3866,15 @@ mod tests
         };
         let mut hand = ClockHand::default();
         let mut victims = [Victim::default(); 4];
-        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS), 0);
+        assert_eq!(
+            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS),
+            0
+        );
         // The second pass finds chunk 0 cold; chunk 2 stays warm.
-        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS), 1);
+        assert_eq!(
+            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS),
+            1
+        );
         assert_eq!(
             victims[0],
             Victim {
@@ -3895,12 +3902,21 @@ mod tests
         assert_eq!(found, 1);
         assert_eq!(*calls.borrow(), [(7, BASE, 64)]);
         assert_eq!(
-            l.sweep(&mut hand, 1000, |_, _, _, _| false, &mut victims, COLD_SWEEPS),
+            l.sweep(
+                &mut hand,
+                1000,
+                |_, _, _, _| false,
+                &mut victims,
+                COLD_SWEEPS
+            ),
             0
         );
         // Evicting, the cold chunk is no longer reported.
         l.begin_evict(rec, open, BASE, 1).unwrap();
-        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS), 0);
+        assert_eq!(
+            l.sweep(&mut hand, 1000, &mut harvest, &mut victims, COLD_SWEEPS),
+            0
+        );
     }
 
     #[test]

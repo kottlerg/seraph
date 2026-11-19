@@ -674,7 +674,9 @@ fn read_thread(
         let stack = read_stack(word_at(&file, arch::current::SP_OFFSET), |at, part| {
             // SAFETY: ipc_buf is the registered IPC buffer page.
             unsafe {
-                ipc::read_mem_resident_bounded(authority, process, thread, at, part, ipc_buf, &mut bound)
+                ipc::read_mem_resident_bounded(
+                    authority, process, thread, at, part, ipc_buf, &mut bound,
+                )
             }
             .is_ok()
         });

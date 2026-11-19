@@ -412,9 +412,12 @@ pub const DISCARD_RANGE: u64 = 20;
 ///
 /// Reply: `memmgr_errors::SUCCESS` with `data[0]` where memmgr stopped:
 /// `va + len_bytes` when the whole range is done, else the address to send
-/// the request again from, and `data[1]` [`RESIDENT_PENDING`] when that
+/// the request again from; `data[1]` [`RESIDENT_PENDING`] when that
 /// address is a chunk on disk the swap service was asked to restore, else
-/// `0`; `UNAUTHORIZED` (caller is not procmgr);
+/// `0`; and `data[2]` where the walk stopped: `data[0]` when not pending,
+/// else past every chunk on disk memmgr posted, from which a reader that will
+/// wait no longer asks again, passing those chunks over;
+/// `UNAUTHORIZED` (caller is not procmgr);
 /// `INVALID_ARGUMENT` (unknown badge, zero length, or a range
 /// past the address space); or `OUT_OF_MEMORY_BEST_EFFORT` (a chunk could
 /// not be restored, for want of free RAM or a map). Specified in

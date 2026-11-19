@@ -22,9 +22,11 @@ use crate::{IpcMessage, ipc_call, memmgr_labels, procmgr_errors, procmgr_labels}
 pub const PENDING_PAUSE_MS: u64 = 2;
 
 /// How many times a reader pauses for chunks memmgr replied pending on, in
-/// all, so it waits about a second, [`PENDING_PAUSE_MS`] apart, before it gives
-/// the range up: a swap service that is down, or restarting, or whose disk has failed,
-/// leaves the pages not present, and the reader reads them as such.
+/// all, so it waits about a second, [`PENDING_PAUSE_MS`] apart; then it asks
+/// on from where memmgr's walk stopped, passing the chunks on disk over, so a
+/// swap service that is down, or restarting, or whose disk has failed, leaves
+/// their pages not present, which the reader reads as such, while the rest of
+/// the range is still made resident ([`resident_range`]).
 pub const PENDING_TRIES: u32 = 500;
 
 /// One `MAKE_RESIDENT` reply: where memmgr stopped, whether it stopped at a

@@ -43,9 +43,9 @@ protocol. There is no per-file extension mechanism: the bundle is a
 single composed artifact carrying the userspace `init` entry plus every
 module init needs to bootstrap the system, parsed by the bundle module
 in [`abi/boot-protocol/src/bundle.rs`](../../../abi/boot-protocol/src/bundle.rs).
-Adding a new boot module is therefore a bundle-composer change in
-[`xtask/src/bundle.rs`](../../../xtask/src/bundle.rs), not a bootloader
-change.
+Adding a new boot module is therefore a line in its harness's bundle list
+in [`rootfs/config/bundle/`](../../../rootfs/config/bundle/), not a
+bootloader change.
 
 ---
 
@@ -228,8 +228,8 @@ and is responsible for validating and starting each service.
 ## Extensibility
 
 The bundle is the single boot-module container. Adding a new boot
-module is a bundle-composer change in
-[`xtask/src/bundle.rs`](../../../xtask/src/bundle.rs); the bootloader
+module is a line in its harness's bundle list in
+[`rootfs/config/bundle/`](../../../rootfs/config/bundle/); the bootloader
 binary needs no change. `BootInfo.modules.count` is the bundle's
 non-`init` entry count plus one, the `trust-store` module, which is
 always last; the kernel iterates the modules without assuming a fixed

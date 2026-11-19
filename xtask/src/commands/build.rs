@@ -48,11 +48,13 @@ enum BuildProfile
 #[derive(Clone, Copy, Debug)]
 enum InstallDest
 {
-    /// Installed under `sysroot/EFI/seraph/<install_name>` — only the
-    /// kernel ELF, which the bootloader loads loose from the ESP. Init,
-    /// ktest, and all userspace modules live under [`Self::Services`] and
-    /// reach the ESP via the bundle composer (see `xtask/src/bundle.rs`).
-    EfiSeraph,
+    /// Installed under `sysroot/boot/<install_name>`: only the kernel ELF,
+    /// signed there, which every pack copies to `\EFI\seraph\kernel` on the
+    /// ESP for the bootloader to load (`xtask/src/esp.rs`). Init, ktest, and
+    /// the userspace modules live under [`Self::Services`] and
+    /// [`Self::Tests`], and reach the ESP through the bundle
+    /// (`xtask/src/bundle.rs`).
+    Boot,
     /// Installed under `sysroot/services/<install_name>`. Holds the
     /// non-driver, non-fs userspace components sourced from
     /// `services/<x>/` (init, procmgr, memmgr, devmgr, vfsd, svcmgr,
@@ -131,7 +133,7 @@ const SPECS: &[Spec] = &[
         name: "kernel",
         install_name: None,
         profile: BuildProfile::Kernel,
-        dest: InstallDest::EfiSeraph,
+        dest: InstallDest::Boot,
         arch_only: None,
     },
     Spec {
@@ -255,8 +257,9 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::ServicesDrivers,
         arch_only: None,
     },
-    // The VT-d IOMMU driver: a boot-bundle module (`bundle::ARCH_MODULES`)
-    // devmgr spawns before any DMA-capable driver.
+    // The VT-d IOMMU driver: a module of the init harness's bundle
+    // (`rootfs/config/bundle/init.x86_64.list`) devmgr spawns before any
+    // DMA-capable driver.
     Spec {
         name: "iommu-vtd",
         install_name: None,
@@ -626,12 +629,11 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
             build_boot(ctx, args)?;
             build_all_specs(ctx, args)?;
             sysroot::install_rootfs(ctx, args.arch)?;
-            // `build` is an authoring step: always (re)compose the default-
-            // init bundle, after signing the sysroot for it, since the bundle
-            // copies the signed installed files. Operators who want ktest run
-            // `cargo xtask compose-bundle --harness ktest` after `build`.
-            crate::signing::sign_for_harness(ctx, args.arch, crate::bundle::Harness::Init)?;
-            crate::bundle::compose(ctx, args.arch, crate::bundle::Harness::Init)?;
+            // A full build records the init harness, whose bundle every later
+            // pack composes until `cargo xtask compose-bundle` records
+            // another; the pack signs the sysroot and composes the ESP from
+            // it.
+            sysroot::record_harness(ctx, crate::bundle::Harness::Init)?;
             crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())?;
         }
         c @ BuildComponent::Spec(_) =>
@@ -672,19 +674,13 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     let store = crate::signing::write_boot_store(ctx, &signer)?;
     step(&format!("Trust store: {}", store.display()));
 
-    let efi_boot_dir = ctx.sysroot_efi_boot();
-    let efi_seraph_dir = ctx.sysroot_efi_seraph();
-    fs::create_dir_all(&efi_boot_dir)
-        .with_context(|| format!("creating {}", efi_boot_dir.display()))?;
-    fs::create_dir_all(&efi_seraph_dir)
-        .with_context(|| format!("creating {}", efi_seraph_dir.display()))?;
-
-    let dst_boot = efi_seraph_dir.join("boot.efi");
+    // Installed at `/boot/boot.efi`; every pack copies it to the ESP
+    // (`xtask/src/esp.rs`).
+    let boot_dir = ctx.sysroot_boot();
+    fs::create_dir_all(&boot_dir).with_context(|| format!("creating {}", boot_dir.display()))?;
+    let dst_boot = ctx.installed_bootloader();
     compile_boot(ctx, args, &store, &dst_boot)?;
-    let dst_efi = efi_boot_dir.join(args.arch.boot_efi_filename());
-    copy_file(&dst_boot, &dst_efi)?;
     step(&format!("Bootloader: {}", dst_boot.display()));
-    step(&format!("Bootloader: {}", dst_efi.display()));
     Ok(())
 }
 
@@ -1093,24 +1089,37 @@ fn profile_params(arch: Arch, profile: BuildProfile) -> (&'static str, &'static 
 
 fn install_paths(ctx: &BuildContext, spec: &Spec) -> Vec<PathBuf>
 {
-    let n = spec.install_name();
-    match spec.dest
+    vec![ctx.sysroot.join(install_relative(spec))]
+}
+
+/// The sysroot-relative path `spec` installs its binary at.
+fn install_relative(spec: &Spec) -> PathBuf
+{
+    let dir: &[&str] = match spec.dest
     {
-        InstallDest::EfiSeraph => vec![ctx.sysroot_efi_seraph().join(n)],
-        InstallDest::Services => vec![ctx.sysroot_services().join(n)],
-        InstallDest::ServicesDrivers =>
-        {
-            vec![ctx.sysroot_services().join("drivers").join(n)]
-        }
-        InstallDest::ServicesFs => vec![ctx.sysroot_services().join("fs").join(n)],
-        InstallDest::Programs => vec![ctx.sysroot.join("programs").join(n)],
-        InstallDest::Tests => vec![ctx.sysroot.join("tests").join(n)],
-        InstallDest::TestsPrograms =>
-        {
-            vec![ctx.sysroot.join("tests").join("programs").join(n)]
-        }
-        InstallDest::TestsDrivers => vec![ctx.sysroot.join("tests").join("drivers").join(n)],
-    }
+        InstallDest::Boot => &["boot"],
+        InstallDest::Services => &["services"],
+        InstallDest::ServicesDrivers => &["services", "drivers"],
+        InstallDest::ServicesFs => &["services", "fs"],
+        InstallDest::Programs => &["programs"],
+        InstallDest::Tests => &["tests"],
+        InstallDest::TestsPrograms => &["tests", "programs"],
+        InstallDest::TestsDrivers => &["tests", "drivers"],
+    };
+    dir.iter().collect::<PathBuf>().join(spec.install_name())
+}
+
+/// The install path of every binary a build of `arch` installs, the
+/// kernel's and the bootloader's included.
+#[cfg(test)]
+pub(crate) fn install_names(arch: Arch) -> Vec<String>
+{
+    SPECS
+        .iter()
+        .filter(|spec| arch_refusal(spec, arch).is_none())
+        .map(|spec| format!("/{}", install_relative(spec).display()))
+        .chain(["/boot/boot.efi".to_owned()])
+        .collect()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

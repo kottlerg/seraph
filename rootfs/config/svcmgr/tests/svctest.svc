@@ -41,6 +41,10 @@
 # devmgr.class.hwrng-deny its twin whose only verb bit (58) no such
 # driver checks, which the drivers deny phase sends READ on; its class
 # file lives in /config/devmgr/tests/ with the other deny classes.
+# memmgr.swap is memmgr's SWAP_AUTHORITY SEND|GRANT, through which the
+# memmgr_swap phase acts as the swap service over a RAM slot store.
+# svctest holds it only while no swap service exists: the swap service's
+# recipe is to seed it, and a second registrant would replace the first's.
 # svctest resolves the public pwrmgr.deny no-auth twin itself via
 # QUERY_ENDPOINT. debug_authority = yes delivers procmgr's
 # DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds, and svctest,
@@ -74,6 +78,6 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap sessiond.operator devmgr.class.hwrng devmgr.class.hwrng-deny memmgr.swap
 debug_authority = yes
 stop_authority  = yes

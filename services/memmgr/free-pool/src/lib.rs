@@ -27,6 +27,7 @@ pub mod chunk;
 pub mod commit;
 pub mod compress;
 pub mod deferred;
+pub mod disk;
 pub mod index;
 pub mod ledger;
 pub mod pool;
@@ -34,8 +35,9 @@ pub mod pressure;
 pub mod store;
 
 pub use arena::{
-    Arena, ArenaLayout, Commitment, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node,
-    NodeHandle, NodeIdx, ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE, SlotStore,
+    Arena, ArenaLayout, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, NO_REGION_ID,
+    NODE_NULL, Node, NodeHandle, NodeIdx, ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE,
+    SlotStore,
 };
 pub use budget::{
     BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, growth_floor,
@@ -44,6 +46,7 @@ pub use budget::{
 pub use chunk::{COLD_SWEEPS, ChunkEntry, ChunkError, ChunkState};
 pub use commit::{CommitNeed, PT_DONATION_PAGES};
 pub use deferred::{DeferredList, RecheckBudget};
+pub use disk::{FaultPath, Registered, SlotError, SwapSlots, fault_path};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
 pub use ledger::{
     BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SwapError,

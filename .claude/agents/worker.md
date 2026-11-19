@@ -65,10 +65,11 @@ git on the main checkout (`.claude/agents/orchestrator.md` § Failure modes). So
 has one of three shapes, each with its channel, and the detail lives in files: the PR body, the
 run records, the scratchpad.
 
-Ending your turn reports nothing. The harness does not reliably notify the orchestrator of your
-stop while a background child of yours is alive (a CI watch, a `pr-reviewer` or `pr-auditor`
-agent, a background command): such a stop produces at most an interim notice, whose text may be
-interim, and a notification carries only your last text in any case. Every report the
+Ending your turn reports nothing. The harness's notifications of your stops go to the supervisor,
+which spawned you, never to the orchestrator, and they are unreliable: while a background child
+of yours is alive (a CI watch, a `pr-reviewer` or `pr-auditor` agent, a background command), a
+stop produces at most an interim notice, whose text may be interim, and a notification carries
+only your last text in any case. Every report the
 orchestrator must read therefore goes by `SendMessage` to its agent id, and none is left to the
 stop. That id is the one `cargo xtask orch orchestrator` prints, which the record keeps current
 when the orchestrator is replaced, or, when the command finds no batch, the one your prompt or a
@@ -106,9 +107,10 @@ summary in the status line.
 A hand-back is the message after which you stop and wait for the orchestrator. Send the whole
 report in one `SendMessage`, since nothing else you wrote reaches the orchestrator, and then end
 your turn with one line saying that it was sent: when the harness does send a notification of
-your stop, that line is what it adds to the orchestrator's context. Standalone, your replies to
-the maintainer take the place of all of this, and there the verdict lines and results are shown
-in the reply.
+your stop, that line is what the supervisor reads, and it tells the supervisor that your session
+handed back rather than ended without a hand-back
+(`.claude/skills/orchestrate/SKILL.md`, step 4). Standalone, your replies to the maintainer take
+the place of all of this, and there the verdict lines and results are shown in the reply.
 
 Hand back in two cases only: a question the orchestrator must answer before you can go on (a
 host request is one), or the gate report. A pending CI run or review is not a reason, and

@@ -36,7 +36,7 @@ const _: () = assert!(READ_BYTES <= syscall_abi::MAX_ENTROPY_CONTRIBUTE_LEN);
 /// The bound on one `READ` call: the driver answers within its own 1 s wait
 /// bound, so twice that leaves its reply room and keeps a driver that never
 /// answers from stalling the pass.
-const READ_TIMEOUT_MS: u64 = 2_000;
+const READ_TIMEOUT_MS: u32 = 2_000;
 
 /// The line logged on the first contribution the kernel accepts, which
 /// svctest's `entropyd_contribution` phase awaits.

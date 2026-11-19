@@ -1390,6 +1390,17 @@ pub struct SvcmgrEndowment
     pub entropy_root: u64,
 }
 
+/// `cap_derive(source, rights)`, or `0` when `source` is `0` or the derive
+/// fails: an absent endowment source is left off its `CAPS` round.
+fn derive_or_absent(source: u64, rights: u64) -> u64
+{
+    if source == 0
+    {
+        return 0;
+    }
+    syscall::cap_derive(source, rights).unwrap_or(0)
+}
+
 /// Start svcmgr, then serve the handover endowment over the bootstrap
 /// protocol.
 ///
@@ -1470,25 +1481,12 @@ fn endow_svcmgr(
     }
     // rootfs.root SEND — badge inherited from the system-root cap (vfsd's
     // synthetic root at full namespace rights).
-    let rootfs_send = if endow.rootfs_root_cap != 0
-    {
-        syscall::cap_derive(endow.rootfs_root_cap, syscall::RIGHTS_EP_SEND).unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
+    let rootfs_send = derive_or_absent(endow.rootfs_root_cap, syscall::RIGHTS_EP_SEND);
     // devmgr-registry source: badge-0 SEND|GRANT so svcmgr can mint the
     // badged query + drivers-dir caps. SEND|GRANT (not RIGHTS_ALL) is the
     // minimum — it withholds the RECV right on devmgr's registry endpoint.
-    let devmgr_registry_src = if endow.devmgr_registry_ep != 0
-    {
-        syscall::cap_derive(endow.devmgr_registry_ep, syscall::RIGHTS_EP_SEND_GRANT).unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
+    let devmgr_registry_src =
+        derive_or_absent(endow.devmgr_registry_ep, syscall::RIGHTS_EP_SEND_GRANT);
 
     // vfsd service-endpoint SENDs: one badged MOUNT_AUTHORITY alone (no
     // SEED_AUTHORITY, which would hand over the system root), one badged
@@ -1508,14 +1506,7 @@ fn endow_svcmgr(
     let vfsd_swap = vfsd_send(ipc::vfsd_labels::SWAP_AUTHORITY);
     // EntropyControl source: `Contribute`, the type's one right, so svcmgr
     // can derive the holder's copy and nothing more.
-    let entropy_source = if endow.entropy_root != 0
-    {
-        syscall::cap_derive(endow.entropy_root, syscall::RIGHTS_ENTROPY_CONTRIBUTE).unwrap_or(0)
-    }
-    else
-    {
-        0
-    };
+    let entropy_source = derive_or_absent(endow.entropy_root, syscall::RIGHTS_ENTROPY_CONTRIBUTE);
 
     // The CAPS rounds: the positional slot list [service, bootstrap, rootfs,
     // devmgr_reg, vfsd_mount, vfsd_deny, vfsd_swap, entropy], split over as many

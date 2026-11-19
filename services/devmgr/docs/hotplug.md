@@ -55,12 +55,21 @@ logged:
 
 ### Grant
 
-On each turn of its control loop, after acpid's jobs, devmgr checks every slot still waiting: under
-a grant (§ Event Sources) it hands the slot to the poller, logged `managed (native control by _OSC)`
-or `by the platform table`; when the host bridge's `_OSC` result has arrived and withholds native
-control or reports a failed evaluation, with no platform grant, it leaves the slot to the firmware,
-logged `firmware hotplug`, and runs the jobs acpid posts for it (§ ACPI Hotplug). A slot whose
-`_OSC` result has not arrived waits. The slot's host bridge is the one whose `_CRS` bus window holds
+On each turn of its control loop, after acpid's jobs, and in its drivers-directory job once it
+knows its platform description tables, before that job's pass, devmgr checks every slot still
+waiting (`firmware::hotplug::slot_grant`): under a grant (§ Event Sources) it hands the slot to
+the poller, logged `managed (native control by _OSC)` or `by the platform table`; when the host
+bridge's `_OSC` result has arrived and withholds native control or reports a failed evaluation,
+it leaves the slot to the firmware, logged `firmware hotplug`, and runs the jobs acpid posts for it
+(§ ACPI Hotplug), but only once devmgr knows its platform description tables and they grant none.
+devmgr knows them at boot when a boot module's table matches the machine, and otherwise once its
+drivers-directory job has read the tables of the root filesystem, or knows there is none
+([docs/driver-binding.md](../../../docs/driver-binding.md#platform-description-tables)
+§ Platform Description Tables). Until then a slot whose `_OSC` result withholds native control
+waits, so that result cannot settle the slot to the firmware, a final grant, ahead of a table's
+`pcie_native_hotplug`; a slot whose `_OSC` result grants native control is managed at once,
+since a table can only add native control, never withdraw it. A slot whose `_OSC` result has not
+arrived waits. The slot's host bridge is the one whose `_CRS` bus window holds
 the port's bus, else the one whose root bus it is (`firmware::hotplug::host_bridge`). Once the slot
 is handed over, devmgr marks the port's record bound (`firmware::hotplug::hold_port`): the poller
 writes the port's Slot Control and Slot Status, past the configuration header, so no pass binds the

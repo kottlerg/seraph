@@ -55,7 +55,7 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     dma_width: None,
     phys_access: false,
     reset: driver_binding::decl::Reset::None,
-    tier: driver_binding::decl::Tier::Boot,
+    tier: driver_binding::decl::Tier::Auxiliary,
 });
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────

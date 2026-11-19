@@ -715,8 +715,8 @@ per hotplug control, and then makes a disk leave and arrive again and a second d
 2. Boot the current sysroot with two empty `pcie-root-port`s and a QMP control socket, on x86_64
    first under the machine's default, the firmware's ACPI PCI hotplug, whose `_OSC` withholds
    native hotplug control, then under native control (QEMU's ACPI PCI hotplug off, so `_OSC`
-   grants it); on riscv64 under native control alone, which the `qemu-virt.platform` key grants.
-   Steps 3 to 7 run in each of these boots.
+   grants it); on riscv64 under native control alone, which the `qemu-virt.platform` key grants once
+   devmgr has read the table from the root filesystem. Steps 3 to 7 run in each of these boots.
 3. Wait for devmgr's grant line for a slot, `firmware hotplug: _OSC control` under the
    firmware's control and `managed (native control by` under native control (the other one fails
    the boot), and the fixture's `READY for the hot-added device` line.

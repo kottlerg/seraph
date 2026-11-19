@@ -409,8 +409,9 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 /// Admit a charge of `pages` to the budget node of `rec`, beside `pending`
 /// pages that left the pool for it uncharged, against the max of the node and
 /// its ancestors and against the free pages outside `promised` less, for a
-/// node outside the reserve, the system reserve
-/// (`free_pool::budget::admit`; services/memmgr/docs/memory-pool.md
+/// node outside the reserve, the growth floor: the system reserve and, while
+/// chunks are swapped, the restore headroom (`free_pool::growth_floor`,
+/// `free_pool::budget::admit`; services/memmgr/docs/memory-pool.md
 /// § Distribution policy, § Commit). A refusal first rechecks the deferred
 /// runs, unless this turn of the receive loop already has, and, when one moved
 /// to the pool, which releases its charge and adds free pages, admits once
@@ -422,7 +423,7 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 /// region's reservation already carries it.
 fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<(), ChargeError>
 {
-    let reserve = reserve_pages(pool_total_pages());
+    let reserve = l.growth_floor(pool_total_pages());
     let r = l.admit(rec, pages, pending, reserve).or_else(|e| {
         if recheck_deferred(l) == 0
         {
@@ -450,11 +451,11 @@ fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<()
 /// growth (`free_pool::Ledger::admit_commit`): its data pages and page-table
 /// reservation against the max of the budget node and its ancestors, and
 /// those and its metadata bound against the free pages outside `promised`
-/// less, for a node outside the reserve, the system reserve. A refusal
+/// less, for a node outside the reserve, the growth floor. A refusal
 /// rechecks the deferred runs once, as [`admit`] does.
 fn admit_commit(l: &mut MemLedger, rec: NodeIdx, need: CommitNeed) -> Result<(), ChargeError>
 {
-    let reserve = reserve_pages(pool_total_pages());
+    let reserve = l.growth_floor(pool_total_pages());
     let r = l.admit_commit(rec, need, reserve).or_else(|e| {
         if recheck_deferred(l) == 0
         {
@@ -470,11 +471,11 @@ fn admit_commit(l: &mut MemLedger, rec: NodeIdx, need: CommitNeed) -> Result<(),
 /// The most pages, up to `want`, that may be charged to the budget node of
 /// `rec` (`free_pool::budget::admissible`): `want` clamped to the headroom
 /// under the node's and its ancestors' max and, for a node outside the
-/// reserve, to the free pages above the system reserve. When that falls short
+/// reserve, to the free pages above the growth floor. When that falls short
 /// of `want`, the deferred runs are rechecked first, as [`admit`] does.
 fn admissible(l: &mut MemLedger, rec: NodeIdx, want: u64) -> Result<u64, ChargeError>
 {
-    let reserve = reserve_pages(pool_total_pages());
+    let reserve = l.growth_floor(pool_total_pages());
     let mut r = l.admissible(rec, want, reserve);
     if r != Ok(want) && recheck_deferred(l) != 0
     {
@@ -3016,7 +3017,12 @@ fn signal_pressure()
 {
     let l = ledger_mut();
     let prev = current_pressure();
-    let level = pressure_level(prev, l.uncommitted_free(), pool_total_pages());
+    let level = pressure_level(
+        prev,
+        l.uncommitted_free(),
+        pool_total_pages(),
+        l.swapped_pages(),
+    );
     if level == prev
     {
         return;

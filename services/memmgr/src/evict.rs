@@ -356,7 +356,7 @@ pub(crate) fn in_flight() -> bool
 
 /// Whether memmgr reclaims in the background: the worker runs and the
 /// pressure level reads `LOW`. At `CRITICAL` the free pages above the
-/// reserve are gone, so a frame background eviction frees goes to the next
+/// growth floor are gone, so a frame background eviction frees goes to the next
 /// admission, which a process draining the pool makes first; there only a
 /// restore evicts, for itself ([`admit_restore`];
 /// services/memmgr/docs/memory-pool.md § Eviction, Selection).
@@ -955,7 +955,8 @@ fn restore(
 
 /// Whether a restore of `pages` pages for `rec` is admitted: the free pages
 /// outside `promised` cover them and, for a budget node outside the reserve,
-/// the system reserve. When they do not, after the turn's deferred recheck,
+/// the system reserve, but not the restore headroom that growth leaves for
+/// restores (`free_pool::growth_floor`). When they do not, after the turn's deferred recheck,
 /// memmgr reclaims directly (services/memmgr/docs/memory-pool.md § Eviction,
 /// Direct reclaim): it evicts the kept victims of greatest age now, one by
 /// one ([`evict_now`]), until the restore is admitted or

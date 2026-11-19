@@ -38,7 +38,8 @@ pub use arena::{
     NodeHandle, NodeIdx, ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE, SlotStore,
 };
 pub use budget::{
-    BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, reserve_pages,
+    BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, growth_floor,
+    reserve_pages, restore_headroom,
 };
 pub use chunk::{COLD_SWEEPS, ChunkEntry, ChunkError, ChunkState};
 pub use commit::{CommitNeed, PT_DONATION_PAGES};

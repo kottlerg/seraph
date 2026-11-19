@@ -723,9 +723,10 @@ else in the default image, sets a max, so no default per-process ceiling exists.
 
 **System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
 take: a charge to any other node fails as exhaustion when it would leave fewer free pages outside
-`promised` ([Commit](#commit)) than the reserve, and a demand fault of such a node in an
-uncommitted region backs only the free pages outside `promised` above the reserve, declined with
-code 7 when they hold not even the faulting page. A charge to a reserve node may take the reserve,
+`promised` ([Commit](#commit)) than the growth floor, which is the reserve and, while chunks are
+swapped, the restore headroom above it ([Eviction](#eviction), Restore headroom), and a demand
+fault of such a node in an uncommitted region backs only the free pages outside `promised` above
+the growth floor, declined with code 7 when they hold not even the faulting page. A charge to a reserve node may take the reserve,
 but not a page `promised` holds. It is a floor for the core and a limit on no
 process: memmgr's self-funding, which is charged to no node, and the reserve nodes draw on it.
 Reserve membership is an attribute each node takes when it is created, not one its children
@@ -892,13 +893,14 @@ repeated finds no run in its range and succeeds.
 
 ## Memory pressure
 
-memmgr tells processes how close the free pool is to the system reserve, so a process holding
+memmgr tells processes how close the free pool is to the growth floor, so a process holding
 memory it can give back (a cache) gives it back before a grant is refused. It acts on the level in
 no other way: it only signals, and kills nothing.
 
 **Levels.** The level is computed from the free pool's pages outside `promised`
 ([Commit](#commit)), deferred pages excluded, against `pool_total`. It is `CRITICAL` at or below the
-system reserve (§ Distribution policy), where a grant to a process outside the reserve is refused;
+growth floor, the system reserve and, while chunks are swapped, the restore headroom (§ Distribution
+policy; § Eviction, Restore headroom), where a grant to a process outside the reserve is refused;
 `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A worse level applies
 at once. A better one applies only once the free pool clears that level's threshold by a hysteresis
 band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a pool that hovers at a
@@ -955,8 +957,8 @@ its turn or be declined as a commit overrun.
 
 **Selection.** While the pool's pressure level reads `LOW` ([Memory pressure](#memory-pressure)),
 memmgr reclaims in the background until it reads `NORMAL`, and stops there. It does not reclaim in
-the background at `CRITICAL`: the free pages above the reserve are gone, so every frame an eviction
-frees goes to the next admission, which a process draining the pool makes before any victim faults.
+the background at `CRITICAL`: the free pages above the growth floor are gone, so every frame an
+eviction frees past the restore headroom goes to the next admission, which a process draining the pool makes before any victim faults.
 Eviction makes room for the processes that run while memory is low; at `CRITICAL` only a restore
 evicts, for itself (Direct reclaim, below), and the pool is otherwise left to the out-of-memory path
 (crashd's hold of a declined fault, oomd's stop of a job). While the level reads `LOW` or
@@ -987,7 +989,8 @@ any ancestor, since the node stays charged for its evicted pages, so it is never
 10. A restore of an uncommitted chunk passes the RAM test of an uncommitted demand run, `free -
 promised - R >= want`, with want the chunk's backed pages and R the system reserve for a node
 outside it and 0 for a reserve node, after the deferred recheck ([Distribution
-policy](#distribution-policy), System reserve). When the free pages do not admit it, memmgr reclaims
+policy](#distribution-policy), System reserve): R, not the growth floor, so the restore draws on the
+restore headroom (below). When the free pages do not admit it, memmgr reclaims
 directly (Direct reclaim, below), and declines the restore with code 7 only when that does not make
 room, the chunk staying swapped and its store kept. With an allowance above 0, a restore of a
 committed chunk would be a committed fault, drawing from `promised` as any committed fault does
@@ -1016,11 +1019,26 @@ back. It stops when the restore is admitted, or after a bounded number of victim
 ([docs/limits.md](../../../docs/limits.md) § memmgr), and the restore is then declined with code 7.
 The store pages a victim takes can dip below the reserve for the rest of the turn, where no other
 admission runs, and each victim kept leaves more free pages than it took. Only a restore reclaims
-directly: a first touch of an unbacked page grows its node's charge, and at the reserve that growth
-stays the out-of-memory path's, while a restore returns pages its node is charged for already.
+directly: a first touch of an unbacked page grows its node's charge, and at the growth floor that
+growth stays the out-of-memory path's, while a restore returns pages its node is charged for already.
 Compression in the loop costs a restore's turn at most that bound's compressions, on a fault that
 would otherwise be declined; background eviction compresses in the worker, so its latency lands on
 no fault or grant.
+
+**Restore headroom.** While chunks are swapped, a charge to a node outside the reserve leaves a
+restore headroom H free above the reserve R: the swapped pages, and at most R, so it is admitted when
+`free - promised - R - H >= want` with `H = min(swapped, R)`, and the level is `CRITICAL` at or
+below `R + H` ([Memory pressure](#memory-pressure)). A restore is admitted against R alone, so it
+draws on H. Without it, the frames background eviction frees at `LOW` go to a process draining the
+pool, whose grants are never victims, and by `CRITICAL` the evicted chunks of idle processes, a
+filesystem driver's thread stacks woken by the pressure signal among them, find neither a free page
+nor a victim, and their faults are declined. With it, the restores of up to R swapped pages find
+their frames whatever a drainer took, and direct reclaim covers the rest. The cost falls on growth:
+each chunk eviction swaps raises H by its pages and frees them less its store pages, so eviction
+gives growth no page until H reaches R. With nothing swapped H is 0, and every admission and level
+is as it is without eviction. H is at most R, a sixty-fourth of the pool, so `LOW`'s threshold
+stays above `CRITICAL`'s. The computation is the host-tested `free-pool` function
+`budget::growth_floor`.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr, at the top of the
 fair class (`ipc::sched_policy::MEMMGR_WORKER_PRIORITY`), below the receive loop's priority. It

@@ -289,6 +289,16 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.pool.free_pages().saturating_sub(self.promised)
     }
 
+    /// The free pages outside `promised` that a charge to a node outside the
+    /// system reserve must leave in a pool of `pool_total` pages: the reserve,
+    /// and the restore headroom while chunks are swapped
+    /// ([`budget::growth_floor`]).
+    #[must_use]
+    pub const fn growth_floor(&self, pool_total: u64) -> u64
+    {
+        budget::growth_floor(pool_total, self.swapped_pages)
+    }
+
     /// The record slot keyed by `badge`, the badge of a process.
     #[must_use]
     pub fn find(&self, badge: u64) -> Option<NodeIdx>
@@ -485,9 +495,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Whether `pages` more may be charged to the budget node of `rec`, beside
-    /// `pending` pages taken from the pool for it and not yet charged, with
-    /// `reserve` of the pool's free pages in the system reserve, against the
-    /// free pages outside `promised` ([`budget::admit`]). A record that does
+    /// `pending` pages taken from the pool for it and not yet charged, against
+    /// the free pages outside `promised`, of which a charge to a node outside
+    /// the system reserve must leave `reserve` ([`Self::growth_floor`];
+    /// [`budget::admit`]). A record that does
     /// not exist admits nothing.
     ///
     /// # Errors
@@ -512,11 +523,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Whether the growth `need` of a committed region of `rec` may be
-    /// committed, with `reserve` of the pool's free pages in the system
-    /// reserve: its data pages and page-table reservation charged to the
-    /// budget node of `rec`, and those and its metadata bound taken from the
-    /// free pages outside `promised` ([`budget::admit`]). A record that does
-    /// not exist admits nothing.
+    /// committed, with `reserve` the free pages a charge to a node outside the
+    /// system reserve must leave ([`Self::growth_floor`]): its data pages and
+    /// page-table reservation charged to the budget node of `rec`, and those
+    /// and its metadata bound taken from the free pages outside `promised`
+    /// ([`budget::admit`]). A record that does not exist admits nothing.
     ///
     /// # Errors
     /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
@@ -544,8 +555,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// The most pages, up to `want`, that may be charged to the budget node of
-    /// `rec`, with `reserve` of the pool's free pages in the system reserve,
-    /// against the free pages outside `promised` ([`budget::admissible`]). A
+    /// `rec`, against the free pages outside `promised`, of which a charge to
+    /// a node outside the system reserve must leave `reserve`
+    /// ([`Self::growth_floor`]; [`budget::admissible`]). A
     /// record that does not exist admits nothing.
     ///
     /// # Errors
@@ -3670,6 +3682,64 @@ mod tests
         assert_eq!(l.swapped_of(rec), 0);
         assert_eq!(usage(&l, rec).0, 32);
         assert_eq!(pool_pages(&l), total);
+    }
+
+    #[test]
+    fn growth_leaves_the_restore_headroom_while_chunks_are_swapped()
+    {
+        // A pool of 1280 pages: a reserve of 20.
+        const TOTAL: u64 = 1280;
+        let reserve = reserve_pages(TOTAL);
+        let (mut l, rec, reg) = swap_ledger(2);
+        let core = l.insert_process(2, NodeSpec::TOP_RESERVE).unwrap();
+        assert_eq!(l.growth_floor(TOTAL), reserve);
+        // Admission against the floor: a node outside the reserve leaves it,
+        // a reserve node may take every free page.
+        let at_floor = |l: &Ledger<VecStore, VecWords>| {
+            let floor = l.growth_floor(TOTAL);
+            let free = l.uncommitted_free();
+            assert_eq!(l.admit(rec, free - floor, 0, floor), Ok(()));
+            assert_eq!(
+                l.admit(rec, free - floor + 1, 0, floor),
+                Err(ChargeError::Reserve)
+            );
+            assert_eq!(l.admissible(rec, free, floor), Ok(free - floor));
+            assert_eq!(l.admit(core, free, 0, floor), Ok(()));
+            floor
+        };
+        assert_eq!(at_floor(&l), reserve);
+        // One chunk swapped: the headroom is its 16 pages.
+        l.begin_evict(rec, reg, BASE, 1).unwrap();
+        let store = [store_run(&mut l, 2)];
+        assert_eq!(l.finish_evict(rec, reg, BASE, 1, &store, pool_all), Ok(16));
+        assert_eq!(at_floor(&l), reserve + 16);
+        // Two: 32 swapped pages, the headroom held at the reserve's 20.
+        l.begin_evict(rec, reg, BASE + CHUNK, 2).unwrap();
+        let store = [store_run(&mut l, 2)];
+        assert_eq!(
+            l.finish_evict(rec, reg, BASE + CHUNK, 2, &store, pool_all),
+            Ok(16)
+        );
+        assert_eq!(l.swapped_pages(), 32);
+        assert_eq!(at_floor(&l), 2 * reserve);
+        // Each restore lowers it with the swapped pages.
+        let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
+        assert_eq!(
+            l.restore_chunk(rec, reg, BASE, &[frame(cap, pages, phys, BASE)]),
+            Ok(2)
+        );
+        assert_eq!(at_floor(&l), reserve + 16);
+        let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
+        assert_eq!(
+            l.restore_chunk(
+                rec,
+                reg,
+                BASE + CHUNK,
+                &[frame(cap, pages, phys, BASE + CHUNK)]
+            ),
+            Ok(2)
+        );
+        assert_eq!(at_floor(&l), reserve);
     }
 
     #[test]

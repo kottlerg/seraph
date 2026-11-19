@@ -2,8 +2,9 @@
 #
 # svcmgr launches and supervises logd post-handover, minting its bootstrap
 # round from the reserved log-sink sources init endows: the master log
-# endpoint RECV, a first-launch SEND for the HANDOVER_PULL of init-logd's
-# boot history, a DEATH_EQ_AUTHORITY SEND|GRANT on procmgr (for sender slot
+# endpoint RECV, a SEND for the HANDOVER_PULL of init-logd's boot history
+# (on the first launch, and on a restart until procmgr reports init reaped),
+# a DEATH_EQ_AUTHORITY SEND|GRANT on procmgr (for sender slot
 # reclaim), and the devmgr.class.serial and devmgr.class.framebuffer class
 # SENDs (logd resolves the serial and framebuffer drivers via QUERY_DEVICE
 # and routes output through them — it holds no UART hardware).
@@ -12,9 +13,9 @@
 #
 # `restart = on_failure`: svcmgr holds the master-log source for the system's
 # life, so a fresh logd re-attaches to the same endpoint object every log
-# sender already targets, skipping the one-shot history pull (no init-logd
-# remains once an instance has taken all its bootstrap rounds; a restart
-# before that is served the pull) and serving a fresh table; svcmgr writes
+# sender already targets, skipping the one-shot history pull once procmgr
+# reports init reaped (QUERY_INIT_REAP; a restart before that, or when the
+# query fails, is served the pull) and serving a fresh table; svcmgr writes
 # the death's lines only once it runs, but for a first launch's death before
 # its bootstrap request (see services/svcmgr/docs/restart-protocol.md). `critical =
 # yes`: a permanently-down logd leaves the system blind, so graceful shutdown

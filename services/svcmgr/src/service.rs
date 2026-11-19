@@ -28,18 +28,6 @@ pub const POLICY_NEVER: u8 = 2;
 
 // ── Service table ───────────────────────────────────────────────────────────
 
-/// Whether any instance of a service has taken every one of its bootstrap
-/// rounds ([`ServiceEntry::bootstrap`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Bootstrap
-{
-    /// No instance has: each died before its rounds were all served, or the
-    /// entry records a service svcmgr did not launch.
-    Pending,
-    /// An instance svcmgr launched or restarted has.
-    Served,
-}
-
 /// A monitored service entry in svcmgr's service table.
 pub struct ServiceEntry
 {
@@ -104,13 +92,6 @@ pub struct ServiceEntry
     /// Per-child badge used on the svcmgr bootstrap endpoint for restart
     /// bootstrap (`cap_derive_badge(svcmgr_bootstrap_ep, SEND, badge)`).
     pub bootstrap_badge: u64,
-    /// Whether an instance svcmgr launched or restarted has taken every one
-    /// of its bootstrap rounds. Only the log sink's respawn reads it: while
-    /// it is [`Bootstrap::Pending`], no instance has received the
-    /// `HANDOVER_PULL` SEND and init-logd still serves the log endpoint, so
-    /// the respawn's round is minted as the first launch's
-    /// (`crate::definitions::launch::LaunchKind::First`).
-    pub bootstrap: Bootstrap,
     /// Badged SEND cap on procmgr's service endpoint identifying the
     /// current process instance. Set at first launch for svcmgr-launched
     /// services (reconciliation records the launch's handle) and refreshed
@@ -160,7 +141,6 @@ impl ServiceEntry
             launched: false,
             node_handle: 0,
             bootstrap_badge: 0,
-            bootstrap: Bootstrap::Pending,
             process_handle: 0,
             // Fail-safe default: an empty slot has no installed
             // policy yet, so `None` (no namespace cap delivered) is
@@ -200,8 +180,9 @@ pub struct RestartRecipe
     pub cwd: Option<String>,
     pub seed: Vec<String>,
     /// The log-sink service: its restart bootstrap round is minted from the
-    /// reserved log-sink sources (with no `HANDOVER_PULL` SEND), not from
-    /// `seed`/provider caps. See `definitions::launch::mint_logd_boot_caps`.
+    /// reserved log-sink sources, not from `seed`/provider caps, and carries
+    /// the `HANDOVER_PULL` SEND while `svcmgr_defs::log_sink_handover_owed`
+    /// holds (until procmgr reports init reaped) and none after. See `definitions::launch::mint_logd_boot_caps`.
     pub log_sink: bool,
     /// The `debug_authority = yes` service: a freshly minted
     /// `DEBUG_AUTHORITY` cap rides the slot after its seeds on every launch.
@@ -292,7 +273,8 @@ pub struct SvcmgrCaps
     pub memmgr_swap: u64,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
-    /// one-shot `HANDOVER_PULL` SEND on the first launch, and publishes the
+    /// one-shot `HANDOVER_PULL` SEND on the first launch and on a restart
+    /// until procmgr reports init reaped, and publishes the
     /// `LOG_QUERY_AUTHORITY` SEND minted from it as `logd.query`. Holding it
     /// keeps the log endpoint object alive across a logd crash. Zero if
     /// absent.

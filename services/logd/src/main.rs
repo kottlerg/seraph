@@ -248,9 +248,12 @@ fn main() -> !
 
     if caps.log_ep_handover_send != 0
     {
-        // First launch: pull init-logd's accrued boot history, release
-        // init-logd, then drop the single-use SEND so logd carries no SEND cap
-        // to its own log endpoint.
+        // First launch, or a restart before procmgr reported init reaped:
+        // pull init-logd's accrued boot history, release init-logd, then drop
+        // the single-use SEND so logd carries no SEND cap to its own log
+        // endpoint. Until the release, init-logd writes the UART beside this
+        // logd. Every handover call is bounded, so an init-logd that exited
+        // after svcmgr minted the SEND ends the transfer with nothing pulled.
         self_log("started; pulling init-logd handover state");
         // Drain, then the terminal release: init-logd exits on an acknowledged
         // release, not on the drain's DONE, so a dropped data chunk cannot
@@ -275,11 +278,11 @@ fn main() -> !
     }
     else
     {
-        // A restart after an instance took its bootstrap rounds: there is
-        // no handover source (that instance held the handover; svcmgr serves
-        // `cap[1]` again to a restart before that). Serve a fresh table;
-        // in-flight history from the prior instance is not recoverable. No
-        // init-logd writes the UART, so nothing needs holding.
+        // A restart after procmgr reported init reaped: init-logd has exited,
+        // so there is no handover source (svcmgr serves `cap[1]` to every
+        // restart before that). Serve a fresh table; in-flight history from
+        // the prior instance is not recoverable. No init-logd writes the UART,
+        // so nothing needs holding.
         open_self_log();
         self_log("started (restart); no handover source, serving fresh");
     }

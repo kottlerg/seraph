@@ -656,7 +656,7 @@ args! {
         pub debug_target: Option<String>,
 
         /// Attach the test devices svctest's devmgr phases drive through the
-        /// test-only drivers: QEMU's `edu` device and four `pci-testdev`
+        /// test-only drivers: QEMU's `edu` device and five `pci-testdev`
         /// functions. A svctest boot needs them (docs/testing.md § Gating).
         #[arg(long)]
         pub test_devices: bool,

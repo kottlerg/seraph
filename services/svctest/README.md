@@ -501,12 +501,14 @@ drivers-directory pass at boot reads, so devmgr binds the
 [`test-fault`](../drivers/test-fault/README.md) driver to the QEMU `pci-testdev` functions that
 `--test-devices` attaches, one instance each. The
 phase asks `caps[10]` for the fixtures: the two serving instances hold instance ordinals 0 and 1,
-and ordinal 2 answers `NO_DEVICE`; `FAULT_EXIT` on ordinal 0 makes the next query on it answer
-`WITHDRAWN`; `FAULT_WORKER` on ordinal 1, whose worker thread then faults, returns a call
-queued on it and makes the next query on it answer `WITHDRAWN`; the free pool then returns to
-its size before the bind, so the instance that never reports ready and the instance that fails
-its bootstrap's terminal round were destroyed; and a second `BIND_DRIVERS` over the directory
-binds nothing. The watch, registered at ordinal count 0, is signalled when the bind serves the
+and ordinal 2 answers `NO_DEVICE`, so devmgr abandoned the bind of the instance devmgr binds between
+them, which exits before its next bootstrap request, and went on binding; `FAULT_EXIT` on ordinal 0
+makes the next query on it answer `WITHDRAWN`; `FAULT_WORKER` on ordinal 1, whose worker thread then
+faults, returns a call queued on it and makes the next query on it answer `WITHDRAWN`; the free pool
+then returns to its size before the bind, so the instance that never reports ready and the instance
+that fails its bootstrap's terminal round were destroyed; and a second `BIND_DRIVERS` over the
+directory binds nothing. The watch, registered at ordinal count 0, is signalled when the bind serves
+the
 fixtures and again at each withdrawal. With
 that watch held, the phase fills the class to `MAX_CLASS_WATCHERS` (8): the next registration is
 refused `WATCHERS_FULL`, and once it deletes one watch a new registration is admitted. The DMA

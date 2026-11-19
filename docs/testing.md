@@ -214,7 +214,7 @@ cargo xtask run --test-devices
 
 The svctest recipe also stages the test class files of `sysroot/config/devmgr/tests/` into
 `sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and boots with
-`--test-devices`, which attaches `edu` and four QEMU `pci-testdev` functions that no other launch
+`--test-devices`, which attaches `edu` and five QEMU `pci-testdev` functions that no other launch
 attaches and no production driver binds. svctest fails, naming the flag, when they are missing.
 
 The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
@@ -878,7 +878,7 @@ Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 with the virtio-blk, virtio-keyboard, and virtio-rng devices behind it — `intel-iommu` on x86_64,
 `riscv-iommu-pci` at 00:01.0 on riscv64 — and, on x86_64, `vmgenid,guid=auto`; the svctest cells
 also attach the test devices (`--test-devices`): QEMU's `edu` DMA test device, which svctest's DMA
-confinement and MSI forge phases drive, and four `pci-testdev` functions, which its
+confinement and MSI forge phases drive, and five `pci-testdev` functions, which its
 on-demand-bind phase drives through the test-only test-fault driver; CI boots headless, so no
 framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
 the framebuffer boot, `--display framebuffer`, and the debug-port boots, `test-debug-port` and
@@ -954,7 +954,7 @@ surface.
     it): svctest's filesystem phases;
   - and the devices the harnesses drive, which only the svctest launches attach
     (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
-    confinement and MSI delivery, forge, churn, and release phases, four `pci-testdev` functions,
+    confinement and MSI delivery, forge, churn, and release phases, five `pci-testdev` functions,
     which the test-only test-fault driver serves in svctest's on-demand-bind phase, and, on x86_64,
     `vmgenid`, the generation source the kernel's snapshot detection reads: `test-vmgenid`.
 

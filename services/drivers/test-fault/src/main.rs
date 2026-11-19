@@ -25,7 +25,10 @@
 //! - a function whose BAR 2 is `ORPHAN_BAR_BYTES` long holds `HOLD_BYTES`
 //!   once that BAR's round arrives and answers the next round with a request
 //!   devmgr's bootstrap server refuses, so devmgr destroys it before its
-//!   bootstrap ends.
+//!   bootstrap ends;
+//! - a function whose BAR 2 is `DIE_BAR_BYTES` long exits once that BAR's
+//!   round arrives, without its next request, so devmgr's wait for that
+//!   request sees the death and abandons the bind.
 //!
 //! svctest watches the held memory return to memmgr in both fault cases.
 
@@ -88,8 +91,9 @@ fn main() -> !
         syscall::thread_exit();
     }
 
-    // Request the rounds one at a time, so the orphan role can refuse the
-    // round after its BAR 2 arrives instead of finishing the list.
+    // Request the rounds one at a time, so the orphan role can refuse, and
+    // the die role skip, the round after its BAR 2 arrives instead of
+    // finishing the list.
     let mut list = ResourceList::new();
     loop
     {
@@ -103,13 +107,17 @@ fn main() -> !
         match list.absorb(&round)
         {
             Ok(true) => break,
-            Ok(false) =>
+            Ok(false) => match role_bar_bytes(&list)
             {
-                if role_bar_bytes(&list) == Some(test_fault_labels::ORPHAN_BAR_BYTES)
+                Some(test_fault_labels::ORPHAN_BAR_BYTES) => orphan(creator, ipc_buf),
+                Some(test_fault_labels::DIE_BAR_BYTES) =>
                 {
-                    orphan(creator, ipc_buf);
+                    std::os::seraph::log!("test-fault: exiting before the next round");
+                    syscall::thread_exit();
                 }
-            }
+                _ =>
+                {}
+            },
             Err(_) =>
             {
                 std::os::seraph::log!("test-fault: resource list does not decode");

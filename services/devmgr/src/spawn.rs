@@ -443,11 +443,20 @@ fn resource_round(resource: &Resource, copy: u64) -> Option<Round>
 }
 
 /// Serve `round` of a resource list on `bootstrap_ep` to the child whose
-/// bootstrap badge is `child_badge`; false, logged, when it could not be
-/// encoded (`None`) or served.
+/// bootstrap badge is `child_badge` and whose main thread `thread_cap`
+/// names; false, logged, when it could not be encoded (`None`) or served, or
+/// the child died before the round reached it.
+///
+/// The wait for the child's request is watched
+/// (`ipc::bootstrap::serve_round_watched`): every
+/// `ipc::bootstrap::WATCH_POLL_MS` devmgr reads the child's main thread
+/// through `thread_cap`, so a driver that dies after its start and before a
+/// request ends the serve instead of holding the devmgr thread that binds it
+/// for good. A live driver that sends no request is still waited for.
 fn serve_list_round(
     bootstrap_ep: u64,
     child_badge: u64,
+    thread_cap: u64,
     ipc_buf: *mut u64,
     round: Option<Round>,
 ) -> bool
@@ -460,20 +469,33 @@ fn serve_list_round(
     };
     // SAFETY: every caller passes devmgr's registered IPC buffer.
     let served = unsafe {
-        ipc::bootstrap::serve_round(
+        ipc::bootstrap::serve_round_watched(
             bootstrap_ep,
             child_badge,
             ipc_buf,
             round.done(),
             round.caps(),
             round.data(),
+            ipc::bootstrap::WATCH_POLL_MS,
+            || ipc::bootstrap::thread_cap_death(thread_cap),
         )
     };
-    if served.is_err()
+    match served
     {
-        std::os::seraph::log!(warn: "driver bootstrap round failed");
+        Ok(()) => true,
+        Err(ipc::bootstrap::ServeFailure::ChildDied(reason)) =>
+        {
+            std::os::seraph::log!(
+                warn: "driver died during its bootstrap (exit reason {reason:#x}); bind abandoned"
+            );
+            false
+        }
+        Err(ipc::bootstrap::ServeFailure::Refused(_)) =>
+        {
+            std::os::seraph::log!(warn: "driver bootstrap round failed");
+            false
+        }
     }
-    served.is_ok()
 }
 
 /// Start a driver devmgr has bound to a device record and deliver it the
@@ -507,7 +529,8 @@ fn serve_list_round(
 /// handle and release token (0 without a hold) ([`HeldChild`]), which the
 /// caller keeps to withdraw the driver through;
 /// [`DriverSpawn::Unbootstrapped`] with them when a round or the death
-/// observer's bind failed after the start; and [`DriverSpawn::Failed`], the
+/// observer's bind failed after the start, the driver's death before one of
+/// its requests among the round failures ([`serve_list_round`]); and [`DriverSpawn::Failed`], the
 /// child torn down, on any failure before the start.
 #[expect(
     clippy::too_many_lines,
@@ -763,7 +786,8 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
 
     // The resource rounds, each unit's round before the first resource of
     // its group, then the end round, each built just before it is served.
-    let serve = |round| serve_list_round(config.bootstrap_ep, child_badge, ipc_buf, round);
+    let serve =
+        |round| serve_list_round(config.bootstrap_ep, child_badge, thread_cap, ipc_buf, round);
     let served = 'rounds: {
         for at in 0..=count
         {

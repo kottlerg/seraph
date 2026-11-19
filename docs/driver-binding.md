@@ -485,8 +485,9 @@ attaches (`cargo xtask run --test-devices`), like any driver, and a test reaches
 - `test-dma` binds QEMU's `edu` device (PCI `1234:11e8`) in the `SET_DRIVERS_DIR` pass.
 - `test-fault` is installed in `/tests/drivers/`, which no boot-time pass reads, and binds the
   QEMU `pci-testdev` functions (PCI `1b36:0005`) only through `BIND_DRIVERS`. Each instance takes
-  its role from its resource list: no BAR 2 serves, a 4 KiB BAR 2 never reports ready, and an
-  8 KiB BAR 2 fails its bootstrap so devmgr destroys it mid-bootstrap.
+  its role from its resource list: no BAR 2 serves, a 16 KiB BAR 2 exits once its round arrives so
+  devmgr abandons that bind and goes on, a 4 KiB BAR 2 never reports ready, and an 8 KiB BAR 2
+  fails its bootstrap so devmgr destroys it mid-bootstrap.
 
 ---
 

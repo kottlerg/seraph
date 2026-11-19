@@ -202,7 +202,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own, and launch both disks with no MSI-X (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 | `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
-| `--test-devices` | Attach the test devices (see Attached devices): `edu` and four `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
+| `--test-devices` | Attach the test devices (see Attached devices): `edu` and five `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -243,12 +243,12 @@ QEMU's ACPI RIMT describes the IOMMU as translating only the requester IDs above
 device (PCI `1234:11e8`) with a 32-bit DMA mask so its engine reaches the interrupt addresses the
 forged-message phase writes, behind the IOMMU when one is attached, which only svctest's DMA
 confinement and MSI phases drive
-([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)), and four QEMU
-`pci-testdev` functions (PCI `1b36:0005`) at pinned slots 0x15, 0x16, 0x17 (`membar=4K`) and 0x18
-(`membar=8K`), which the test-only `test-fault` driver binds
-([services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md)). No other launch
-attaches them, and no production driver binds them. On x86-64 a launch also attaches `-device
-vmgenid,guid=auto`, the VMGENID generation-ID device
+([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)), and five QEMU
+`pci-testdev` functions (PCI `1b36:0005`) at pinned addresses 0x15 (`multifunction=on`), 0x15.1
+(`membar=16K`), 0x16, 0x17 (`membar=4K`) and 0x18 (`membar=8K`), which the test-only `test-fault`
+driver binds ([services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md)). No
+other launch attaches them, and no production driver binds them. On x86-64 a launch also attaches
+`-device vmgenid,guid=auto`, the VMGENID generation-ID device
 ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Whole-VM-snapshot detection
 (VMGENID)); QEMU's riscv64 `virt` machine has no VMGENID. A non-headless run adds QEMU std VGA: the
 q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair, added

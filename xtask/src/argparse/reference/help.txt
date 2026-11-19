@@ -193,7 +193,7 @@ Options:
       --debug-target <NAME>
           Stage the GDB stub for this boot, attached to the process named NAME (its argv[0]), and print the GDB command line that connects to it; the stub is unstaged when QEMU exits. Requires `--debug-port`
       --test-devices
-          Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and four `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
+          Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and five `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
       --host-override
@@ -309,7 +309,7 @@ Options:
           Stage the GDB stub for this boot, attached to the process named NAME (its argv[0]), and print the GDB command line that connects to it; the stub is unstaged when QEMU exits. Requires `--debug-port`
 
       --test-devices
-          Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and four `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
+          Attach the test devices svctest's devmgr phases drive through the test-only drivers: QEMU's `edu` device and five `pci-testdev` functions. A svctest boot needs them (docs/testing.md § Gating)
 
       --wait-host <SECS>
           When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal

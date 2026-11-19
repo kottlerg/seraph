@@ -10,9 +10,10 @@
 //! enablement and CR0's user-visible x87 and alignment controls, set at boot,
 //! and the save/restore primitives consumed by the `#NM` handler and the
 //! context-switch path. The per-thread XSAVE area is
-//! the last page of the thread's slab, carved by the thread-create path
-//! (`syscall::cap::sys_cap_create_thread`) and, for init's thread, by boot code
-//! (`kernel_entry_post_rebase`).
+//! the pages after the TCB page of the thread's slot (`sched::thread_slot`),
+//! carved and given its initial state ([`init_save_area`]) by the
+//! thread-create path (`syscall::cap::sys_cap_create_thread`) and, for init's
+//! thread, by boot code (`kernel_entry_post_rebase`).
 //!
 //! ## Eager-save, lazy-restore discipline
 //!
@@ -258,6 +259,77 @@ fn xsave_area_bytes() -> u64
     u64::from(super::cpu::cpuid(0xD).1)
 }
 
+/// Byte offset of the x87 control word (`FCW`, 2 bytes) in the XSAVE legacy
+/// region (Intel SDM Vol. 1 § 13.4.1).
+const LEGACY_FCW_OFFSET: usize = 0;
+
+/// Byte offset of `MXCSR` (4 bytes) in the XSAVE legacy region (Intel SDM
+/// Vol. 1 § 13.4.1).
+const LEGACY_MXCSR_OFFSET: usize = 24;
+
+/// Bytes of the XSAVE legacy region, which holds both fields above; every
+/// XSAVE area is longer.
+const LEGACY_REGION_BYTES: usize = 512;
+
+/// The x87 control word `FNINIT` sets, and so the one a component-initial
+/// XRSTOR leaves: every x87 exception masked, double-extended precision,
+/// round to nearest (Intel SDM Vol. 1 § 8.1.5). The System V AMD64 psABI
+/// gives a new process this value.
+const FCW_INIT: u16 = 0x037F;
+
+/// `MXCSR`'s power-up value: every SIMD floating-point exception masked,
+/// round to nearest, flush-to-zero and denormals-are-zero clear (Intel SDM
+/// Vol. 1 § 10.2.3). The System V AMD64 psABI gives a new process this value.
+const MXCSR_INIT: u32 = 0x1F80;
+
+/// Write a new thread's initial extended state into its save area: the image
+/// its first x87/SSE/AVX use restores ([`restore_from`]), and the one
+/// `SYS_THREAD_READ_EXT_REGS` reads until the thread's first switch-out
+/// after that use.
+///
+/// The area is zeroed, so `XSTATE_BV` and `XCOMP_BV` are 0: the standard
+/// format, every component in its initial configuration (x87 as `FNINIT`
+/// leaves it, the XMM registers and the YMM upper halves zero). `MXCSR` is
+/// the exception: XRSTOR loads it from the legacy region whenever RFBM\[1\]
+/// or RFBM\[2\] is set, whatever `XSTATE_BV` holds (Intel SDM Vol. 1
+/// § 13.8.1), so a zero there would start the thread with every SIMD
+/// floating-point exception unmasked, and its first inexact SSE result would
+/// raise `#XM`. It is written as [`MXCSR_INIT`]. `FCW` is written as
+/// [`FCW_INIT`], which XRSTOR ignores while `XSTATE_BV`\[0\] is clear, so
+/// that every field of the image reads as the value the thread starts with.
+///
+/// # Safety
+/// `area` must point at `bytes` bytes that the caller owns exclusively and
+/// may write, `bytes` being at least the legacy region (the per-thread save
+/// area of `crate::sched::thread_slot` is).
+#[cfg(not(test))]
+pub unsafe fn init_save_area(area: *mut u8, bytes: usize)
+{
+    debug_assert!(bytes >= LEGACY_REGION_BYTES);
+    // SAFETY: the caller's contract gives `bytes` writable bytes at `area`.
+    unsafe { core::ptr::write_bytes(area, 0, bytes) };
+    let fcw = FCW_INIT.to_le_bytes();
+    // SAFETY: FCW's 2 bytes lie inside the legacy region, which the area
+    // holds (the caller's contract); the source is a local array.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            fcw.as_ptr(),
+            area.wrapping_add(LEGACY_FCW_OFFSET),
+            fcw.len(),
+        );
+    }
+    let mxcsr = MXCSR_INIT.to_le_bytes();
+    // SAFETY: MXCSR's 4 bytes lie inside the legacy region, which the area
+    // holds (the caller's contract); the source is a local array.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            mxcsr.as_ptr(),
+            area.wrapping_add(LEGACY_MXCSR_OFFSET),
+            mxcsr.len(),
+        );
+    }
+}
+
 /// Report the BSP's per-thread save-area size, [`xsave_area_bytes`], which
 /// sizes every Thread retype slot (`crate::sched::thread_slot`). Every CPU
 /// enables the same XCR0 components ([`enable_xsave`]), and the standard
@@ -316,12 +388,13 @@ pub unsafe fn save_to(area: *mut u8)
 /// Restore the x87/SSE/AVX state of the executing CPU from `area`.
 ///
 /// The `XSTATE_BV` header in `area` selects which components actually get
-/// reloaded; the others reach the architected initial state. A zeroed
-/// area reaches FINIT + zeroed XMM/YMM.
+/// reloaded; the others reach their initial configuration. `MXCSR` is
+/// loaded from the area whatever `XSTATE_BV` holds, which is why
+/// [`init_save_area`] writes its initial value there.
 ///
 /// # Safety
 /// Must execute at ring 0. `area` must point at an XSAVE buffer previously
-/// written by [`save_to`] (or zero-initialised). Called from the `#NM`
+/// written by [`save_to`] or by [`init_save_area`]. Called from the `#NM`
 /// trap handler with CR0.TS already cleared.
 #[cfg(not(test))]
 #[inline]

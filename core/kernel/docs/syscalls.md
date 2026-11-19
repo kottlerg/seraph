@@ -2222,14 +2222,18 @@ The image is the thread's extended-state save area, which every switch-out of a 
 the state writes. On x86-64 it is the XSAVE area, in standard format, for the components of
 `EXT_REGS_X86_64_XCR0` (x87, SSE and AVX): `xmm`*i* at byte 160 + 16*i*, `XSTATE_BV` at 512, and
 the upper halves of `ymm`*i* at 576 + 16*i*, 832 bytes in all (Intel SDM Vol. 1 § 13.4); a
-component whose `XSTATE_BV` bit is clear holds its initial value whatever its bytes say. On
+component whose `XSTATE_BV` bit is clear holds its initial value whatever its bytes say, apart from
+`MXCSR` (bytes 24..28), which the image always holds (Intel SDM Vol. 1 § 13.7 and § 13.8.1). On
 riscv64 it is `f0`..`f31` from `EXT_REGS_RISCV64_F0_OFFSET`, then `fcsr`, `vstart`, `vl`, `vtype`
 and `vcsr` as one `u64` each at their `EXT_REGS_RISCV64_*` offsets, then `v0`..`v31` from
 `EXT_REGS_RISCV64_V0_OFFSET`, `vlenb` bytes each, so `size` is that offset plus 32 `vlenb`, and
-`vlenb` is a 32nd of the bytes past it. Thread creation zeroes the area, so a thread that has not
-used the state reads as zeros, the state its first use starts from (on x86-64, `XSTATE_BV` 0: every
-component initial), and the image holds nothing but the thread's own register state. The image is
-read in parts because riscv64's grows with `VLEN` past what one call copies.
+`vlenb` is a 32nd of the bytes past it. Thread creation writes the initial state into the area, so
+a thread that has not used the state reads that state, which its first use starts from: on x86-64
+`XSTATE_BV` 0 (every component initial), the x87 control word 0x037F, `MXCSR` 0x1F80 (every SIMD
+floating-point exception masked; XRSTOR loads `MXCSR` whatever `XSTATE_BV` holds), and every other
+byte zero; on riscv64 every byte zero (`fcsr` 0, `vl` 0 and `vtype` 0). The image holds nothing but
+the thread's own register state. The image is read in parts because riscv64's grows with `VLEN`
+past what one call copies.
 
 The thread MUST be held still as for `SYS_THREAD_READ_REGS`: `Stopped` and `current` on no CPU
 with its last save published, or fault-blocked; the kernel copies the requested bytes into the

@@ -1295,12 +1295,26 @@ impl CSpaceHeadroom {
     /// `topup_slots` when its headroom or its growth budget is short of the
     /// mark. A refused top-up is recorded for
     /// [`failure_to_report`](Self::failure_to_report).
+    ///
+    /// Returns `false` when the `CSpace` was short of the mark and the top-up
+    /// was refused, else `true` (a thread that found another holding counts
+    /// the mark as held, since the mark covers it). After `false`, the general
+    /// headroom ([`cspace_slot_headroom`]) is all the operation may take: a
+    /// capability received by IPC takes a general slot while one is free and
+    /// then a slot of the IPC receive reserve, and the next top-up's own
+    /// reply needs that reserve. So an operation that receives capabilities
+    /// goes on only while the headroom covers what it receives, and
+    /// otherwise fails as if refused for memory.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
-    pub fn hold(&self, self_cspace: u64) {
-        let _ = self.state.hold(
-            || pal_alloc::cspace_below_low_water(self_cspace, self.low_water),
-            || pal_alloc::fund_cspace_slot_budget(self_cspace, self.topup_slots),
-        );
+    #[must_use = "a refused top-up leaves the CSpace short of the mark: act on it, or say why the caller's capability intake is bounded"]
+    pub fn hold(&self, self_cspace: u64) -> bool {
+        !self
+            .state
+            .hold(
+                || pal_alloc::cspace_below_low_water(self_cspace, self.low_water),
+                || pal_alloc::fund_cspace_slot_budget(self_cspace, self.topup_slots),
+            )
+            .is_refused()
     }
 
     /// Whether a run of refused top-ups is under way that no caller has

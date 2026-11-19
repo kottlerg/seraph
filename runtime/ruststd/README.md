@@ -345,7 +345,9 @@ serves) holds its headroom above a low-water mark instead, through a `static`
 ```rust
 static HEADROOM: CSpaceHeadroom = CSpaceHeadroom::new(LOW_WATER, TOPUP_SLOTS);
 
-HEADROOM.hold(self_cspace);           // before each operation that allocates slots
+if !HEADROOM.hold(self_cspace) {      // before each operation that allocates slots
+    // refused: take no more caps than cspace_slot_headroom covers
+}
 if HEADROOM.failure_to_report() {     // once per run of refused top-ups
     log!(warn: "...");
 }
@@ -356,6 +358,12 @@ if HEADROOM.failure_to_report() {     // once per run of refused top-ups
   (`syscall_abi::cspace_topup_pages`). One thread at a time reads and funds the pool; a thread
   that finds another doing so goes on at once, so the mark is sized to cover every allocation
   the process's threads make while one tops up. A refused top-up is retried at the next hold.
+  `hold` returns `false` when the headroom was short and its top-up was refused, and the result
+  must be used: a capability received by IPC takes a general slot while one is free and then a
+  slot of the IPC receive reserve, which the next top-up's own reply needs, so after `false` an
+  operation that receives capabilities goes on only while `cspace_slot_headroom` covers what it
+  receives, and otherwise fails as if refused for memory. A caller whose intake it does not yet
+  bound discards the result explicitly and says so where it does.
   The body arena takes its pages from the same growth budget and lowers the capacity by a page's
   slots for each, so the page beyond the mark covers the first arena page an operation takes,
   and a service whose operations take more (many splits or range-capability copies) counts

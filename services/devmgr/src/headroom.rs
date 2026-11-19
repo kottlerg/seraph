@@ -59,7 +59,9 @@ static HEADROOM: CSpaceHeadroom = CSpaceHeadroom::new(CSPACE_LOW_WATER, CSPACE_T
 /// ([`hold_and_report`]).
 pub fn hold()
 {
-    HEADROOM.hold(startup_info().self_cspace);
+    // Not acted on: devmgr serves each operation whatever its headroom, so its
+    // capability intake is not bounded against a refused top-up (#1102).
+    let _ = HEADROOM.hold(startup_info().self_cspace);
 }
 
 /// [`hold`], then log a run of failed top-ups, whichever thread's top-up

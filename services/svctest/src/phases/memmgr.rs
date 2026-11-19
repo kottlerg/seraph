@@ -567,8 +567,9 @@ const HEADROOM_TOPUP_SLOTS: u64 = 256;
 /// `std::os::seraph::CSpaceHeadroom` holds a `CSpace` past what it holds
 /// when the phase starts, the seed procmgr gave svctest and every top-up
 /// since: holding before each, svctest derives copies of an endpoint cap until
-/// it holds two top-ups' worth more than its headroom at the start allowed,
-/// and every derivation must succeed with no failed top-up to report. Without
+/// it holds two top-ups' worth more than its headroom at the start allowed.
+/// Every hold must answer that the mark is held, and every derivation must
+/// succeed, with no failed top-up to report. Without
 /// the hold the derivations fail once that headroom is spent. Deletes every
 /// copy.
 pub fn cspace_headroom_phase(_: &Caps)
@@ -593,7 +594,18 @@ pub fn cspace_headroom_phase(_: &Caps)
         .expect("no memory for the copies' list");
     for i in 0..copies
     {
-        HEADROOM.hold(cspace);
+        if !HEADROOM.hold(cspace)
+        {
+            let headroom = std::os::seraph::cspace_slot_headroom(cspace);
+            for copy in held
+            {
+                let _ = syscall::cap_delete(copy);
+            }
+            panic!(
+                "a CSpaceHeadroom top-up was refused before derivation {i} of {copies}, at \
+                 headroom {headroom}, from {start_headroom} at the start"
+            );
+        }
         match syscall::cap_derive(info.memmgr_endpoint, syscall::RIGHTS_EP_SEND)
         {
             Ok(copy) => held.push(copy),

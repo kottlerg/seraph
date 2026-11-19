@@ -587,7 +587,9 @@ static HEADROOM: std::os::seraph::CSpaceHeadroom =
 /// request, and the log names only the first failure of a streak.
 fn hold_cspace_headroom(self_cspace: u64)
 {
-    HEADROOM.hold(self_cspace);
+    // Not acted on: procmgr serves a request whatever its headroom, so its
+    // capability intake is not bounded against a refused top-up (#1241).
+    let _ = HEADROOM.hold(self_cspace);
     if HEADROOM.failure_to_report()
     {
         std::os::seraph::log!(warn: "CSpace headroom top-up failed; retrying each pass");

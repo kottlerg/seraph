@@ -172,6 +172,16 @@ fn capture(
     {
         return Outcome::Failed("no thread of the process could be read");
     };
+    // The list holds only mapped pages: first have memmgr restore every chunk
+    // of the process it evicted into its compressed store, with the threads
+    // held, so the core records them. A chunk memmgr cannot restore, for want
+    // of memory, is left out of the list, as it is not present.
+    if !fired(generation)
+        && let Ok(top) = syscall::user_va_top()
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::make_resident(authority, target.process, 0, top, ipc_buf) };
+    }
     let runs = match list_runs(reader, generation)
     {
         Ok(runs) => runs,
@@ -219,7 +229,25 @@ fn capture(
     {
         return Outcome::Failed("the notes alone exceed the core budget");
     };
-    write_core(&core, &name, reader, generation)
+    let source = Source {
+        reader,
+        process: target.process,
+        authority,
+        ipc_buf,
+    };
+    write_core(&core, &name, &source, generation)
+}
+
+/// Where a dump reads the process's pages: through the held thread `reader`,
+/// asking procmgr through `authority` to make a page memmgr evicted since
+/// the pages were listed resident again ([`ipc::read_mem_resident`]).
+struct Source
+{
+    reader: u64,
+    /// The process badge.
+    process: u64,
+    authority: u64,
+    ipc_buf: *mut u64,
 }
 
 /// The name of the process `badge` names, from `LIST_PROCESSES`.
@@ -411,10 +439,10 @@ fn list_runs(reader: u64, generation: u64) -> Result<Vec<Run>, Outcome>
     }
 }
 
-/// Write `core` for the process named `name`, reading its pages through
-/// `reader`: make room for it, write it under its `.part` name, and rename
+/// Write `core` for the process named `name`, reading its pages from
+/// `source`: make room for it, write it under its `.part` name, and rename
 /// it once complete.
-fn write_core(core: &layout::Core, name: &[u8], reader: u64, generation: u64) -> Outcome
+fn write_core(core: &layout::Core, name: &[u8], source: &Source, generation: u64) -> Outcome
 {
     let seq = match make_room(core.size, generation)
     {
@@ -439,7 +467,7 @@ fn write_core(core: &layout::Core, name: &[u8], reader: u64, generation: u64) ->
     {
         return outcome;
     }
-    if let Err(outcome) = write_loads(&mut file, core, reader, generation)
+    if let Err(outcome) = write_loads(&mut file, core, source, generation)
     {
         return outcome;
     }
@@ -529,13 +557,13 @@ fn make_room(size: u64, generation: u64) -> Result<u64, Outcome>
     Ok(store::next_seq(&entries))
 }
 
-/// Write the file bytes of each load of `core` to `file`, reading them
-/// through `reader` one page at a time; a page the kernel refuses to copy
-/// is written as zeros.
+/// Write the file bytes of each load of `core` to `file`, reading them from
+/// `source` one page at a time; a page the kernel refuses to copy, and
+/// procmgr cannot make resident, is written as zeros.
 fn write_loads(
     file: &mut File,
     core: &layout::Core,
-    reader: u64,
+    source: &Source,
     generation: u64,
 ) -> Result<(), Outcome>
 {
@@ -557,7 +585,18 @@ fn write_loads(
                 .chunks_mut(MAX_THREAD_MEM_COPY)
                 .zip((va..).step_by(MAX_THREAD_MEM_COPY))
             {
-                if syscall::thread_read_mem(reader, at, page).is_err()
+                // SAFETY: `source.ipc_buf` is the registered IPC buffer page.
+                let read = unsafe {
+                    ipc::read_mem_resident(
+                        source.authority,
+                        source.process,
+                        source.reader,
+                        at,
+                        page,
+                        source.ipc_buf,
+                    )
+                };
+                if read.is_err()
                 {
                     page.fill(0);
                 }

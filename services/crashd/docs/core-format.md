@@ -51,10 +51,14 @@ The file is laid out as:
 
 ### Page runs
 
-The runs are the mapped user pages of the process's address space as `SYS_THREAD_LIST_PAGES`
-reports them ([core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md)), adjacent
-pages of one protection joined into one run, in address order, at most 65 533 (`e_phnum` is 16
-bits and the `PN_XNUM` extension is not written). Each `PT_LOAD` carries:
+The runs are the mapped user pages of the process's address space as `SYS_THREAD_LIST_PAGES` reports
+them ([core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md)), listed after crashd
+asks procmgr to make the whole address space resident (`MAKE_RESIDENT`), so a chunk memmgr evicted
+into its compressed store is mapped again and listed ([memmgr Memory
+Pool](../../memmgr/docs/memory-pool.md#eviction) § Eviction); a chunk memmgr cannot restore, for
+want of memory, is not listed. Adjacent pages of one protection joined into one run, in address
+order, at most 65 533 (`e_phnum` is 16 bits and the `PN_XNUM` extension is not written). Each
+`PT_LOAD` carries:
 
 | Field | Value |
 |---|---|
@@ -69,7 +73,8 @@ the kernel reports it cannot be copied (`PAGE_RUN_NO_COPY`: device memory and th
 it does not fit the budget. The budget keeps the runs that hold the fault's instruction pointer,
 then those holding each recorded thread's stack pointer, in thread order, then the others in
 address order; each is kept whole when it fits what the budget leaves. A page of a kept run that
-the kernel refuses to copy when crashd reads it is written as zeros.
+the kernel refuses to copy when crashd reads it, and that procmgr cannot make resident again (a
+page memmgr evicted after the list), is written as zeros.
 
 ### Notes
 

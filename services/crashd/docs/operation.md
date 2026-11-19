@@ -199,12 +199,15 @@ A dump follows the block when the report attached and read the process within it
    reads the registers and extended state of each, the faulting thread first, at most 256 threads
    (`CORE_THREADS_MAX`); a thread past them is stopped and not recorded. When the faulting thread
    is not listed (one that never registered), it writes no core.
-5. It lists the address space's pages (`SYS_THREAD_LIST_PAGES`), reads the image's ELF header at
-   the load bias for the core's `NT_AUXV`, and lays the core out within the per-core budget.
+5. It asks procmgr to make the whole address space resident (`MAKE_RESIDENT`), so memmgr restores
+   each chunk it evicted, then lists the address space's pages (`SYS_THREAD_LIST_PAGES`), reads
+   the image's ELF header at the load bias for the core's `NT_AUXV`, and lays the core out within
+   the per-core budget.
 6. It deletes the `.part` files earlier dumps left, and the oldest cores until the new one fits
    the directory budget.
 7. It writes the core under its `.part` name, reading the pages through the faulting thread's
-   cap, and renames it.
+   cap, and renames it. A page the read finds not present, one memmgr evicted since the list, is
+   made resident through procmgr and read again.
 
 The threads it stopped stay stopped: the decline that follows ends the process, whose teardown ends
 every thread. The core's names, budgets and contents are in [core-format.md](core-format.md).

@@ -571,7 +571,7 @@ struct Lines
     /// job, of `stopsrc`'s job and of the fixture, and the newest and the
     /// oldest stop of a session, sit.
     at: Positions,
-    /// oomd's advice to stop the fixture.
+    /// oomd's advice lines, each naming a candidate it would stop.
     advice: usize,
     /// crashd's held faults.
     held: usize,

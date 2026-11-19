@@ -806,15 +806,33 @@ fn detach(authority: u64, process: u64, threads: &[u64], what: &str)
     );
 }
 
-/// procmgr's label for `MAKE_RESIDENT` of `[va, va + len)` of `process`.
+/// procmgr's label for `MAKE_RESIDENT` of `[va, va + len)` of `process`,
+/// asked again from where each success stopped until it reaches the range's
+/// end: memmgr makes a bounded part of a range resident per request. A
+/// success that stops where it started fails the phase.
 fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> u64
 {
-    let req = IpcMessage::builder(procmgr_labels::MAKE_RESIDENT)
-        .word(0, process)
-        .word(1, va)
-        .word(2, len)
-        .build();
-    procmgr_call(authority, &req, "MAKE_RESIDENT").label
+    let end = va.saturating_add(len);
+    let mut at = va;
+    loop
+    {
+        let req = IpcMessage::builder(procmgr_labels::MAKE_RESIDENT)
+            .word(0, process)
+            .word(1, at)
+            .word(2, end.saturating_sub(at))
+            .build();
+        let reply = procmgr_call(authority, &req, "MAKE_RESIDENT");
+        if reply.label != procmgr_errors::SUCCESS || reply.word(0) >= end
+        {
+            return reply.label;
+        }
+        assert!(
+            reply.word(0) > at,
+            "{PHASE}: MAKE_RESIDENT from {at:#x} to {end:#x} stopped at {:#x}",
+            reply.word(0)
+        );
+        at = reply.word(0);
+    }
 }
 
 /// Whether the page at `va` of `thread`'s process holds the pattern of a region

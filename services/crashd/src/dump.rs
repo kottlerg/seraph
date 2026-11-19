@@ -172,15 +172,19 @@ fn capture(
     {
         return Outcome::Failed("no thread of the process could be read");
     };
-    // The list holds only mapped pages: first have memmgr restore every chunk
-    // of the process it evicted into its compressed store, with the threads
-    // held, so the core records them. A chunk memmgr cannot restore, for want
-    // of memory, is left out of the list, as it is not present.
+    // The fault's instruction first, then each thread's stack: the layout
+    // keeps the runs holding them first.
+    let first: Vec<u64> = core::iter::once(target.ip)
+        .chain(
+            held.iter()
+                .map(|t| word_at(&t.regs, arch::current::SP_OFFSET)),
+        )
+        .collect();
+    // The list holds only mapped pages: first have memmgr restore, with the
+    // threads held, what the core keeps first.
     if !fired(generation)
-        && let Ok(top) = syscall::user_va_top()
     {
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe { ipc::make_resident(authority, target.process, 0, top, ipc_buf) };
+        restore_first(&first, target.process, authority, ipc_buf);
     }
     let runs = match list_runs(reader, generation)
     {
@@ -211,13 +215,6 @@ fn capture(
         },
         &threads,
     );
-    // The fault's instruction first, then each thread's stack.
-    let first: Vec<u64> = core::iter::once(target.ip)
-        .chain(
-            held.iter()
-                .map(|t| word_at(&t.regs, arch::current::SP_OFFSET)),
-        )
-        .collect();
     let Ok(core) = layout::plan(
         arch::current::MACHINE,
         &notes,
@@ -236,6 +233,31 @@ fn capture(
         ipc_buf,
     };
     write_core(&core, &name, &source, generation)
+}
+
+/// Have memmgr restore the chunks it evicted into its compressed store of
+/// `process` from the page of each address of `first` up, an equal share of
+/// the core's budget each (`ipc::make_resident`), so the list of mapped pages
+/// holds them and the core records them. No more is restored: the core keeps
+/// at most [`CORE_BYTES_MAX`] of pages, and a restore for a process about to
+/// die spends the free pages, and other processes' idle chunks, that memmgr
+/// keeps for restores. A chunk memmgr cannot restore, for want of memory, is
+/// left out of the list, as it is not present.
+fn restore_first(first: &[u64], process: u64, authority: u64, ipc_buf: *mut u64)
+{
+    let anchors = u64::try_from(first.len()).unwrap_or(u64::MAX);
+    let share = CORE_BYTES_MAX
+        .checked_div(anchors)
+        .unwrap_or(CORE_BYTES_MAX)
+        .max(PAGE_SIZE)
+        & !(PAGE_SIZE - 1);
+    for &at in first
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe {
+            ipc::make_resident(authority, process, at & !(PAGE_SIZE - 1), share, ipc_buf)
+        };
+    }
 }
 
 /// Where a dump reads the process's pages: through the held thread `reader`,

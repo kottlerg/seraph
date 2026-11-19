@@ -1190,7 +1190,9 @@ fn handle_detach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
 /// § `MAKE_RESIDENT`). A process that declared itself undebuggable is served
 /// too: making its pages resident reads and writes nothing of it, and only
 /// does what its own next touch of them would. The target is found under the
-/// table lock, and memmgr is called after it, as for `RELEASE_HOLD`.
+/// table lock, and memmgr is called after it, as for `RELEASE_HOLD`. A
+/// success carries memmgr's word 0: where it stopped, which the sender asks
+/// again from until it is the range's end.
 fn handle_make_resident(
     req: &IpcMessage,
     ipc_buf: *mut u64,
@@ -1208,12 +1210,19 @@ fn handle_make_resident(
         .table
         .find_by_badge(req.word(0))
         .map(|e| e.memmgr_badge);
-    let code = match target
+    let (code, reached) = match target
     {
         Some(badge) => process::make_resident(memmgr_ep, badge, req.word(1), req.word(2), ipc_buf),
-        None => procmgr_errors::INVALID_BADGE,
+        None => (procmgr_errors::INVALID_BADGE, 0),
     };
-    reply_empty(ipc_buf, code);
+    if code != procmgr_errors::SUCCESS
+    {
+        reply_empty(ipc_buf, code);
+        return;
+    }
+    let reply = IpcMessage::builder(code).word(0, reached).build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Times an attach sweeps and derives its page again when a registered

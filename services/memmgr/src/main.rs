@@ -2204,13 +2204,28 @@ fn handle_discard_range(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
+/// Chunks one `MAKE_RESIDENT` request makes resident at most: a tuning value
+/// that bounds the request's turn to as many restores, each with its own
+/// bound on direct reclaim, so a debugger's request delays the faults and
+/// grants behind it no more than a few faults would.
+const MAKE_RESIDENT_CHUNKS: u32 = 4;
+
+/// Chunks with an entry, and regions with none, one `MAKE_RESIDENT` request
+/// visits at most: a tuning value that bounds the turn's walk over chunks
+/// that need nothing.
+const MAKE_RESIDENT_VISITS: u32 = 64;
+
 /// Make a range of a process's demand regions resident for a debugger's read
 /// (services/memmgr/docs/ipc-interface.md § Label 21): each evicted chunk the
 /// range meets is restored from the store, or mapped back while its eviction
 /// is in flight ([`evict::make_resident`]), which counts as an access in its
 /// age; a page no fault backed stays not present. procmgr alone sends it,
 /// for a holder of its debug authority. Words are `[badge, va, len]`, the
-/// process named by its memmgr badge.
+/// process named by its memmgr badge. The walk visits only the chunks that
+/// have an entry ([`free_pool::Ledger::next_chunk_with_entry`]), and stops
+/// after [`MAKE_RESIDENT_CHUNKS`] chunks made resident or
+/// [`MAKE_RESIDENT_VISITS`] visits; the reply's word 0 is where it stopped,
+/// the range's end when it is all done, and the sender asks again from there.
 fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
@@ -2233,22 +2248,61 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     }
     let aspace = l.aspace_cap(rec);
     let mut at = va & !(PAGE_SIZE - 1);
-    // Each pass takes one chunk of a region the range meets, in address
-    // order, so the walk visits no address no region holds.
+    let (mut made, mut visits) = (0u32, 0u32);
+    // Each pass takes the next chunk with an entry of a region the range
+    // meets, in address order, or passes a region with none from `at`, so
+    // the walk visits no chunk no fault backed.
     while at < end
         && aspace != 0
+        && made < MAKE_RESIDENT_CHUNKS
+        && visits < MAKE_RESIDENT_VISITS
         && let Some((reg, node)) = l.region_from(rec, at)
         && node.region.va_base < end
     {
-        let (chunk_base, chunk_pages) = chunk_for(&node.region, at.max(node.region.va_base));
-        if evict::make_resident(l, rec, reg, &node.region, chunk_base, aspace).is_err()
+        visits = visits.saturating_add(1);
+        let region_end = node.region.va_base.saturating_add(node.region.len);
+        let from = at.max(node.region.va_base);
+        let Some(next) = l.next_chunk_with_entry(reg, from)
+        else
         {
-            reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
-            return;
+            at = region_end;
+            continue;
+        };
+        let (chunk_base, chunk_pages) = chunk_for(&node.region, next);
+        if chunk_base >= end
+        {
+            at = end;
+            break;
+        }
+        if matches!(
+            l.chunk_at(reg, chunk_base).state(),
+            ChunkState::Evicting | ChunkState::Swapped
+        )
+        {
+            if evict::make_resident(l, rec, reg, &node.region, chunk_base, aspace).is_err()
+            {
+                reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+                return;
+            }
+            made = made.saturating_add(1);
         }
         at = chunk_base.saturating_add(u64::from(chunk_pages).saturating_mul(PAGE_SIZE));
     }
-    reply_label(ipc_buf, memmgr_errors::SUCCESS);
+    // A walk that ran out of regions, or of the range, is done; one the
+    // bounds stopped resumes at `at`.
+    let reached = if made < MAKE_RESIDENT_CHUNKS && visits < MAKE_RESIDENT_VISITS
+    {
+        end
+    }
+    else
+    {
+        at.min(end)
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, reached)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
 /// Unregister a demand-paged region for the calling process, reclaiming every

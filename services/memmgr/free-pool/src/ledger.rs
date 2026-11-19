@@ -1726,6 +1726,58 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         })
     }
 
+    /// The base of the first chunk of region `reg` that has an entry, at or
+    /// past the chunk holding `va`, which lies in the region: `None` when no
+    /// chunk from there has one, or when `reg` holds no region. The walk
+    /// visits the table's nodes above the chunks that have an entry, and skips
+    /// every subtree with none ([`chunk::next_entry`]), so its cost follows
+    /// the chunks the process touched, not the VA the region spans.
+    #[must_use]
+    pub fn next_chunk_with_entry(&self, reg: NodeIdx, va: u64) -> Option<u64>
+    {
+        let node = self.region_node(reg)?;
+        let (i, _) = chunk::next_entry(
+            &self.arena,
+            node.table,
+            chunk::table_height(chunk_count(&node.region)),
+            chunk_index(&node.region, va),
+        )?;
+        Some(
+            node.region
+                .va_base
+                .saturating_add(i.saturating_mul(CHUNK_BYTES)),
+        )
+    }
+
+    /// Record on the resident chunk of region `reg` holding `page_base` the
+    /// accessed bits `accessed` read from its pages since the last sweep (one
+    /// bit per page of the chunk, as [`ChunkEntry::sweep`] takes them): when
+    /// one is set for a page the chunk holds, its age resets to 0. Returns
+    /// whether one was; `false`, changing nothing, otherwise, and for a
+    /// chunk in another state or a `reg` that holds no region.
+    pub fn record_access(&mut self, reg: NodeIdx, page_base: u64, accessed: u16) -> bool
+    {
+        let Some(node) = self.region_node(reg)
+        else
+        {
+            return false;
+        };
+        let entry = self.chunk_at(reg, page_base);
+        if entry.state() != ChunkState::Resident || accessed & entry.backed() == 0
+        {
+            return false;
+        }
+        let mut table = node.table;
+        chunk::set_entry(
+            &mut self.arena,
+            &mut table,
+            chunk::table_height(chunk_count(&node.region)),
+            chunk_index(&node.region, page_base),
+            entry.sweep(accessed),
+        );
+        true
+    }
+
     /// Free slots outside the arena's reserve that [`Ledger::back_chunk`]
     /// needs for a run of the chunk of region `reg` holding `page_base`: one
     /// for the run's descriptor, and one for each node of the chunk's path in
@@ -2969,6 +3021,59 @@ mod tests
         assert!(matches!(head.node, Node::Frame(f) if f.cap_slot == 2));
         assert!(matches!(l.arena.get(head.next).node, Node::Frame(f) if f.cap_slot == 1));
         assert_eq!(l.arena.get(head.next).next, NODE_NULL);
+    }
+
+    #[test]
+    fn next_chunk_with_entry_skips_the_chunks_with_none()
+    {
+        let (mut l, _, rec, reg) = backed_ledger();
+        assert_eq!(
+            l.next_chunk_with_entry(reg, BASE + 5 * PAGE_SIZE),
+            Some(BASE)
+        );
+        assert_eq!(
+            l.next_chunk_with_entry(reg, BASE + CHUNK),
+            Some(BASE + 63 * CHUNK)
+        );
+        assert_eq!(
+            l.next_chunk_with_entry(reg, BASE + 63 * CHUNK + 2 * PAGE_SIZE),
+            Some(BASE + 63 * CHUNK)
+        );
+        assert_eq!(l.next_chunk_with_entry(NODE_NULL, BASE), None);
+        // A region no fault backed has no chunk with an entry.
+        l.add_region(
+            rec,
+            region(BASE + 64 * CHUNK, 4 * CHUNK),
+            Commit::Uncommitted,
+        )
+        .unwrap();
+        let empty = l.region_exact(rec, BASE + 64 * CHUNK, 4 * CHUNK).unwrap();
+        assert_eq!(l.next_chunk_with_entry(empty, BASE + 64 * CHUNK), None);
+    }
+
+    #[test]
+    fn record_access_resets_the_age_only_for_a_backed_page()
+    {
+        let (mut l, _, _, reg) = backed_ledger();
+        let last = BASE + 63 * CHUNK;
+        // Age the last chunk (pages 1 to 3 backed) by one sweep with no access.
+        let node = l.region_node(reg).unwrap();
+        let mut table = node.table;
+        let aged = l.chunk_at(reg, last).sweep(0);
+        chunk::set_entry(
+            &mut l.arena,
+            &mut table,
+            chunk::table_height(chunk_count(&node.region)),
+            63,
+            aged,
+        );
+        assert!(l.chunk_at(reg, last).is_idle(1));
+        // An access to page 0, which the chunk does not hold, is no access.
+        assert!(!l.record_access(reg, last, 0b0001));
+        assert!(l.chunk_at(reg, last).is_idle(1));
+        assert!(l.record_access(reg, last, 0b0100));
+        assert_eq!(l.chunk_at(reg, last).age(), 0);
+        assert!(!l.record_access(NODE_NULL, last, 0b0100));
     }
 
     #[test]

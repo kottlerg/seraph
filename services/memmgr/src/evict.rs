@@ -63,6 +63,7 @@ const MAX_SYNC_VICTIMS: usize = 4;
 const VICTIM_CACHE: usize = 8;
 
 /// Sweeps without an access after which direct reclaim may take a chunk: one,
+/// with its pages read once more for an access since ([`accessed_since_sweep`]),
 /// so a chunk accessed, or restored, since the last sweep is never taken.
 const RECLAIM_IDLE_SWEEPS: u8 = 1;
 
@@ -586,12 +587,18 @@ fn post(l: &mut MemLedger, v: &Victim, slot: usize)
 
 /// Evict the victim `v` now, in the loop's turn, through the synchronous
 /// slot (services/memmgr/docs/memory-pool.md § Eviction, Direct reclaim):
-/// unmap it and map it at the slot's input window ([`begin`]), compress it
+/// pass it over when its pages were accessed since the sweep that aged it
+/// ([`accessed_since_sweep`]), else unmap it and map it at the slot's input
+/// window ([`begin`]), compress it
 /// into the slot's buffer, unmap the window, and store the stream
 /// ([`store`]), which returns the chunk's runs to the pool. A stream that
 /// gains nothing, or a step that fails, maps the chunk back.
 fn evict_now(l: &mut MemLedger, v: &Victim)
 {
+    if accessed_since_sweep(l, v)
+    {
+        return;
+    }
     let Some(job) = begin(l, v, SYNC_SLOT, RECLAIM_IDLE_SWEEPS)
     else
     {
@@ -612,6 +619,33 @@ fn evict_now(l: &mut MemLedger, v: &Victim)
     {
         cancel(l, &job);
     }
+}
+
+/// Whether the victim `v`'s chunk was accessed since the sweep that aged it:
+/// a kept victim's age is the one the clock's last sweep over it recorded,
+/// which may be many turns old, so its pages' accessed bits are read now
+/// (`SYS_ASPACE_HARVEST`). The read clears them, so an access it finds is
+/// recorded on the chunk at once, its age back to 0
+/// ([`free_pool::Ledger::record_access`]). A chunk whose bits cannot be read
+/// counts as accessed.
+fn accessed_since_sweep(l: &mut MemLedger, v: &Victim) -> bool
+{
+    let Some((reg, region)) = l
+        .region_for(v.rec, v.page_base)
+        .filter(|(reg, _)| *reg == v.reg)
+    else
+    {
+        return true;
+    };
+    let aspace = l.aspace_cap(v.rec);
+    let (chunk_base, pages) = chunk_for(&region, v.page_base);
+    let mut bitmap = [0u8; 2];
+    if aspace == 0
+        || syscall::aspace_harvest(aspace, chunk_base, u64::from(pages), &mut bitmap).is_err()
+    {
+        return true;
+    }
+    l.record_access(reg, chunk_base, u16::from_le_bytes(bitmap))
 }
 
 /// Start evicting the victim `v` through slot `slot`: unmap its runs from
@@ -939,7 +973,12 @@ fn restore(
     let target = remap_target(rec, aspace, region, page_base, held);
     if let Err(e) = map_runs(l, &target, runs)
     {
-        give_back(l, runs);
+        // A run the failed map left mapped may still be: each goes back
+        // through the unmap that keeps it on the record when it fails.
+        for run in runs
+        {
+            release_unmapped_chunk(l, rec, aspace, *run);
+        }
         return Err(e);
     }
     if l.restore_chunk(rec, reg, page_base, runs).is_err()

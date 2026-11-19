@@ -929,7 +929,10 @@ pub const DETACH_PROCESS: u64 = 24;
 /// page succeeds when the reader retries; a page no fault has backed stays
 /// not present. Served only on a badge carrying [`DEBUG_AUTHORITY`].
 /// `data[0]` is the target's process badge, `data[1]` the address and
-/// `data[2]` the length in bytes, nonzero. Replies `SUCCESS`;
+/// `data[2]` the length in bytes, nonzero. Replies `SUCCESS` with `data[0]`
+/// where memmgr stopped, which does a bounded part of the range per
+/// request: the range's end when it is all done, else the address to ask
+/// again from (`ipc::make_resident` asks until it is done);
 /// `UNAUTHORIZED` without the authority; `INVALID_BADGE` when no live
 /// process carries the badge; `INVALID_ARGUMENT` for a zero length or a
 /// range past the address space; `OUT_OF_MEMORY` when a chunk could not be

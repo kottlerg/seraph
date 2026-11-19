@@ -3533,11 +3533,18 @@ pub fn release_hold(
 
 /// Have memmgr make the range `[va, va + len)` of the process its badge
 /// `memmgr_badge` names resident (`memmgr_labels::MAKE_RESIDENT`), and
-/// return the `MAKE_RESIDENT` reply code: `SUCCESS`; `INVALID_ARGUMENT` for
-/// a range memmgr refuses; `OUT_OF_MEMORY` when memmgr could not restore a
-/// chunk of it, or the call failed.
-pub fn make_resident(memmgr_ep: u64, memmgr_badge: u64, va: u64, len: u64, ipc_buf: *mut u64)
--> u64
+/// return the `MAKE_RESIDENT` reply code with, on `SUCCESS`, where memmgr
+/// stopped: the range's end when it is all resident, else the address to ask
+/// again from, memmgr bounding the work of one request. The code is
+/// `INVALID_ARGUMENT` for a range memmgr refuses, and `OUT_OF_MEMORY` when
+/// memmgr could not restore a chunk of it, or the call failed.
+pub fn make_resident(
+    memmgr_ep: u64,
+    memmgr_badge: u64,
+    va: u64,
+    len: u64,
+    ipc_buf: *mut u64,
+) -> (u64, u64)
 {
     let msg = IpcMessage::builder(memmgr_labels::MAKE_RESIDENT)
         .word(0, memmgr_badge)
@@ -3547,12 +3554,15 @@ pub fn make_resident(memmgr_ep: u64, memmgr_badge: u64, va: u64, len: u64, ipc_b
     // SAFETY: ipc_buf is the registered IPC buffer page.
     match unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }
     {
-        Ok(reply) if reply.label == memmgr_errors::SUCCESS => procmgr_errors::SUCCESS,
+        Ok(reply) if reply.label == memmgr_errors::SUCCESS =>
+        {
+            (procmgr_errors::SUCCESS, reply.word(0))
+        }
         Ok(reply) if reply.label == memmgr_errors::INVALID_ARGUMENT =>
         {
-            procmgr_errors::INVALID_ARGUMENT
+            (procmgr_errors::INVALID_ARGUMENT, 0)
         }
-        _ => procmgr_errors::OUT_OF_MEMORY,
+        _ => (procmgr_errors::OUT_OF_MEMORY, 0),
     }
 }
 

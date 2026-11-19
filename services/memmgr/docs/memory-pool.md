@@ -1007,8 +1007,10 @@ swapped.
 
 **Direct reclaim.** A restore the free pages do not admit evicts victims itself, in its turn, before
 it is declined: the kept victim of the greatest age first, checked again as resident, eligible, and
-unaccessed for at least one sweep, so a chunk accessed or restored since the last sweep is never
-taken and two processes cannot trade one chunk turn after turn. Any eligible process's chunk may be
+unaccessed for at least one sweep, and its pages' accessed bits read once more
+(`SYS_ASPACE_HARVEST`), since its age is the one the last sweep over it recorded: a set bit resets
+its age and passes it over. So a chunk accessed or restored since the last sweep is never taken and
+two processes cannot trade one chunk turn after turn. Any eligible process's chunk may be
 taken, the faulting process's own included. For each, memmgr unmaps the chunk, maps its runs at the
 input window of a synchronous slot of its own, compresses it into that slot's output buffer with a
 hash table of its own, so it shares nothing with the worker, unmaps the window, takes the store
@@ -1070,8 +1072,12 @@ evicted chunk asks procmgr, through the debug authority, to make the range resid
 (`MAKE_RESIDENT`, [procmgr's IPC interface](../../procmgr/docs/ipc-interface.md)); only a holder of
 the debug authority may ask, and memmgr takes the request from procmgr alone
 ([`ipc-interface.md`](ipc-interface.md) § Label 21). memmgr restores each swapped chunk of the
-range, and maps back each evicting one; either counts as an access in the chunk's age. The reader
-retries. The request restores and backs nothing else: a page no fault has backed stays not present.
+range, and maps back each evicting one; either counts as an access in the chunk's age. It walks
+only the chunks that have an entry, and one request makes at most a few chunks resident and visits
+at most a bounded number ([docs/limits.md](../../../docs/limits.md) § memmgr); its reply says where
+it stopped, and the reader asks again from there, so a request's turn delays the faults and grants
+behind it no more than a few restores would. The reader then retries its read. The request
+restores and backs nothing else: a page no fault has backed stays not present.
 
 ---
 

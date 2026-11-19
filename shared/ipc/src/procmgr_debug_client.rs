@@ -23,10 +23,12 @@ use crate::{IpcMessage, ipc_call, procmgr_errors, procmgr_labels};
 /// range it evicted into its compressed store, so a `SYS_THREAD_READ_MEM` or
 /// `SYS_THREAD_WRITE_MEM` that failed with `InvalidAddress` on such a page
 /// succeeds when retried (`services/memmgr/docs/memory-pool.md` § Eviction,
-/// Debugger reads). A page no fault has backed stays not present. Whether
-/// procmgr replied `SUCCESS`: `false` when the call failed, or procmgr
-/// refused (`OUT_OF_MEMORY` when memmgr could not restore a chunk of the
-/// range).
+/// Debugger reads). A page no fault has backed stays not present. memmgr does
+/// a bounded part of the range per request and replies where it stopped, so
+/// this asks again from there until the whole range is done. Whether every
+/// request was served: `false` when a call failed, procmgr refused
+/// (`OUT_OF_MEMORY` when memmgr could not restore a chunk of the range), or
+/// a reply made no progress.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -38,14 +40,61 @@ pub unsafe fn make_resident(
     ipc_buf: *mut u64,
 ) -> bool
 {
+    let Some(end) = va.checked_add(len)
+    else
+    {
+        return false;
+    };
+    let mut at = va;
+    loop
+    {
+        // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+        let Some(reached) = (unsafe { ask_resident(authority, process, at, end, ipc_buf) })
+        else
+        {
+            return false;
+        };
+        if reached >= end
+        {
+            return true;
+        }
+        if reached <= at
+        {
+            return false;
+        }
+        at = reached;
+    }
+}
+
+/// One `MAKE_RESIDENT` request for `[at, end)` of `process`: where procmgr
+/// replied that memmgr stopped, or `None` when the call failed or procmgr
+/// refused.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, a std service's thread (crashd, gdbstub), 32 KiB at the smallest"
+)]
+unsafe fn ask_resident(
+    authority: u64,
+    process: u64,
+    at: u64,
+    end: u64,
+    ipc_buf: *mut u64,
+) -> Option<u64>
+{
     let request = IpcMessage::builder(procmgr_labels::MAKE_RESIDENT)
         .word(0, process)
-        .word(1, va)
-        .word(2, len)
+        .word(1, at)
+        .word(2, end.saturating_sub(at))
         .build();
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
     unsafe { ipc_call(authority, &request, ipc_buf) }
-        .is_ok_and(|reply| reply.label == procmgr_errors::SUCCESS)
+        .ok()
+        .filter(|reply| reply.label == procmgr_errors::SUCCESS)
+        .map(|reply| reply.word(0))
 }
 
 /// Read `buf.len()` bytes at `va` of the address space of `thread`, a thread

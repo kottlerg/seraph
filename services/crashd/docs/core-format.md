@@ -53,12 +53,13 @@ The file is laid out as:
 
 The runs are the mapped user pages of the process's address space as `SYS_THREAD_LIST_PAGES` reports
 them ([core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md)), listed after crashd
-asks procmgr to make the whole address space resident (`MAKE_RESIDENT`), so a chunk memmgr evicted
-into its compressed store is mapped again and listed ([memmgr Memory
-Pool](../../memmgr/docs/memory-pool.md#eviction) § Eviction); a chunk memmgr cannot restore, for
-want of memory, is not listed. Adjacent pages of one protection joined into one run, in address
-order, at most 65 533 (`e_phnum` is 16 bits and the `PN_XNUM` extension is not written). Each
-`PT_LOAD` carries:
+asks procmgr to make resident (`MAKE_RESIDENT`), from the page of the fault's instruction and of
+each thread's stack pointer up, an equal share of the per-core budget each, so a chunk memmgr
+evicted into its compressed store there is mapped again and listed ([memmgr Memory
+Pool](../../memmgr/docs/memory-pool.md#eviction) § Eviction). A chunk memmgr cannot restore, for
+want of memory, is not listed, nor is an evicted chunk outside those ranges. Adjacent pages of one
+protection joined into one run, in address order, at most 65 533 (`e_phnum` is 16 bits and the
+`PN_XNUM` extension is not written). Each `PT_LOAD` carries:
 
 | Field | Value |
 |---|---|

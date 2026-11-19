@@ -384,8 +384,13 @@ pub const DISCARD_RANGE: u64 = 20;
 /// * `data[1]` — `va`.
 /// * `data[2]` — `len_bytes` (nonzero).
 ///
-/// Reply: `memmgr_errors::SUCCESS`; `UNAUTHORIZED` (caller is not
-/// procmgr); `INVALID_ARGUMENT` (unknown badge, zero length, or a range
+/// memmgr makes at most a few chunks resident per request and walks only
+/// the chunks that have an entry.
+///
+/// Reply: `memmgr_errors::SUCCESS` with `data[0]` where memmgr stopped:
+/// `va + len_bytes` when the whole range is done, else the address to send
+/// the request again from; `UNAUTHORIZED` (caller is not procmgr);
+/// `INVALID_ARGUMENT` (unknown badge, zero length, or a range
 /// past the address space); or `OUT_OF_MEMORY_BEST_EFFORT` (a chunk could
 /// not be restored, for want of free RAM or a map). Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 21: `MAKE_RESIDENT`.

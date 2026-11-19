@@ -1048,9 +1048,17 @@ Privilege: procmgr only, which sends it for a holder of its debug authority
 Each restore is admitted and made as a fault's on the chunk
 ([`memory-pool.md`](memory-pool.md#eviction) § Eviction), and counts as an
 access in the chunk's age. A process with no delegated address space has
-nothing evicted, and the request succeeds.
+nothing evicted, and the request succeeds. memmgr walks only the chunks that
+have an entry, in address order, and stops after `MAKE_RESIDENT_CHUNKS` (4)
+chunks made resident or `MAKE_RESIDENT_VISITS` (64) chunks and regions
+visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
 
-**Reply (success):** `label` 0.
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 |
+| data[0] | where memmgr stopped: `va + len_bytes` when the whole range is done, else the address to send the request again from, with the rest of the range |
 
 **Error codes:**
 

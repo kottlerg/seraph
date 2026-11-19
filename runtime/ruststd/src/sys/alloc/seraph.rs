@@ -1515,8 +1515,8 @@ pub fn register_pressure() {
 /// caller-funded, memmgr-accounted budget rather than the fixed kernel PT
 /// reserve. The need is `pool_funding::pt_pages_for(region_pages)`, the
 /// worst case for a contiguous run, and only the pool's shortfall against
-/// it is donated, in at most `pool_funding::FUND_ROUNDS` donations
-/// (`pool_funding::top_up`).
+/// it is donated, in at most `pool_funding::FUND_ROUNDS` rounds of one
+/// donation or more (`pool_funding::top_up`).
 ///
 /// The pool is shared by every mapping of the process, the pager's
 /// included, so the top-up is not reserved for the region: another thread's
@@ -1656,7 +1656,7 @@ pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
 /// allocations can take the donated slots first, and the caller's own
 /// allocation then decides, failing with the refillable `OutOfMemory`. The
 /// donations follow `pool_funding::top_up`: the shortfall each round reads,
-/// in at most `pool_funding::FUND_ROUNDS` donations.
+/// in at most `pool_funding::FUND_ROUNDS` rounds of one donation or more.
 ///
 /// `slots == 0` still keeps the arena's page. Returns `false` only when a
 /// top-up was needed and could not be had: memmgr is unreachable or refuses

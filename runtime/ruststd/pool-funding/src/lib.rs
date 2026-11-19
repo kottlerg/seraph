@@ -48,14 +48,16 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-/// Donations one [`top_up`] makes at most.
+/// Rounds one [`top_up`] makes at most. Each round reads the shortfall and
+/// donates it, in as many donations as the grants' runs take
+/// ([`donate_runs`]).
 ///
 /// The kernel keeps a donation's first page as its own donation bookkeeping
 /// once per record page, for either pool (see `SYS_CAP_CREATE_ASPACE` and
-/// `SYS_CAP_CREATE_CSPACE`), so a single donation can seed one page fewer than
-/// it carried. A record page opened by one round has room for the next round's
-/// record, so with no other thread drawing the pool the second round covers
-/// the shortfall. A shortfall another thread's allocation causes is not
+/// `SYS_CAP_CREATE_CSPACE`), so a round seeds a page fewer than it carried for
+/// each record page its donations open. The second round donates what those
+/// pages kept, and with no other thread drawing the pool it covers the
+/// shortfall unless its own donations open a record page. A shortfall another thread's allocation causes is not
 /// chased: the allocation that needs the pages decides (for a map,
 /// [`map_with_top_ups`]). The bound limits no capacity: a top-up that still
 /// reads short is no failure.
@@ -113,7 +115,8 @@ pub const fn pt_pages_for(region_pages: u64) -> u64
 /// Each round reads the pages the pool still lacks through `shortfall` (zero
 /// once it covers the need) and, while that is non-zero, donates them through
 /// `donate`, which returns whether the donation was made (memmgr granted the
-/// Memory and the kernel took it). At most [`FUND_ROUNDS`] donations are made.
+/// Memory and the kernel took it); one round may make several donations, one
+/// for each run memmgr grants. At most [`FUND_ROUNDS`] rounds are made.
 ///
 /// Returns `false` only when a donation was refused. A pool that still reads
 /// short after donations that were made is not a failure: another thread's

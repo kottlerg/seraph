@@ -57,18 +57,26 @@ static HEADROOM: CSpaceHeadroom = CSpaceHeadroom::new(CSPACE_LOW_WATER, CSPACE_T
 /// worker or the DMA thread may call it while logd, or a driver logd writes
 /// through, waits on its reply; the control thread reports a failed top-up
 /// ([`hold_and_report`]).
-pub fn hold()
+///
+/// Returns `false` when the `CSpace` was short of the mark and its top-up
+/// was refused. The operation then takes no capability it would keep: a
+/// record's bind and a driver spawn fail, and the registry's `WATCH_CLASS`
+/// and the DMA thread's `DMA_MAP` are refused (`firmware::headroom`), so
+/// the slots left, and the IPC receive reserve the next top-up's reply needs,
+/// stay free.
+#[must_use]
+pub fn hold() -> bool
 {
-    // Not acted on: devmgr serves each operation whatever its headroom, so its
-    // capability intake is not bounded against a refused top-up (#1102).
-    let _ = HEADROOM.hold(startup_info().self_cspace);
+    HEADROOM.hold(startup_info().self_cspace)
 }
 
 /// [`hold`], then log a run of failed top-ups, whichever thread's top-up
 /// failed, once per run: the control thread's hold, which may log.
 pub fn hold_and_report()
 {
-    hold();
+    // Not acted on: the turn's own work allocates through the binds and
+    // spawns it starts, each of which holds again and fails on `false`.
+    let _ = hold();
     if HEADROOM.failure_to_report()
     {
         std::os::seraph::log!(warn: "CSpace headroom top-up failed; retrying before each operation");

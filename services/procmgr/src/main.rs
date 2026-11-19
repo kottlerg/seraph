@@ -579,21 +579,25 @@ const CSPACE_TOPUP_SLOTS: u64 = 1024;
 static HEADROOM: std::os::seraph::CSpaceHeadroom =
     std::os::seraph::CSpaceHeadroom::new(CSPACE_LOW_WATER, CSPACE_TOPUP_SLOTS);
 
-/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, so
-/// its allocations never meet an exhausted `CSpace` and its receives keep the
-/// IPC receive reserve. Each request runs it before it is served; a worker
-/// that finds another topping up goes on, since the low-water mark leaves
-/// room for every worker's request. A failed top-up is retried on the next
-/// request, and the log names only the first failure of a streak.
-fn hold_cspace_headroom(self_cspace: u64)
+/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots.
+/// Each request runs it before it is served; a worker that finds another
+/// topping up goes on, since the low-water mark leaves room for every
+/// worker's request. A failed top-up is retried on the next request, and the
+/// log names only the first failure of a streak.
+///
+/// Returns `false` when the `CSpace` was short of the mark and its top-up was
+/// refused. The request is then refused if it would keep capabilities in
+/// procmgr's `CSpace` that grow with requests
+/// ([`process_table::headroom_refusal`]), so the slots left, and the IPC
+/// receive reserve the next top-up's reply needs, are not taken.
+fn hold_cspace_headroom(self_cspace: u64) -> bool
 {
-    // Not acted on: procmgr serves a request whatever its headroom, so its
-    // capability intake is not bounded against a refused top-up (#1241).
-    let _ = HEADROOM.hold(self_cspace);
+    let held = HEADROOM.hold(self_cspace);
     if HEADROOM.failure_to_report()
     {
         std::os::seraph::log!(warn: "CSpace headroom top-up failed; retrying each pass");
     }
+    held
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -624,7 +628,7 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 )]
 fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
-    hold_cspace_headroom(ctx.self_cspace);
+    let held = hold_cspace_headroom(ctx.self_cspace);
     // A crash service or a debugger watch that is a thread other than its
     // process's main thread posts no death when it exits, so every request
     // makes the checks before it is served, as the reaper does on a death.
@@ -639,6 +643,12 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     // registry, and `BIND_DEATH_OBSERVER` is refused on any other cap, so only the
     // creator chooses who observes the child.
     if let Some(code) = process_table::sender_refusal(label & 0xFFFF, req.badge)
+    {
+        release_caps(req.caps());
+        reply_empty(ipc_buf, code);
+        return;
+    }
+    if !held && let Some(code) = process_table::headroom_refusal(label & 0xFFFF)
     {
         release_caps(req.caps());
         reply_empty(ipc_buf, code);

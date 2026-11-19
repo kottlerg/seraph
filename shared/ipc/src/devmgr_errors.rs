@@ -60,5 +60,11 @@ pub const WATCHERS_FULL: u64 = 6;
 /// `PRT_TABLE` or `BRIDGE_WINDOWS` push that fails devmgr's check. The
 /// refusal is logged.
 pub const REFUSED: u64 = 7;
+/// devmgr could not hold what the request would keep: its own `CSpace` is
+/// short of its slot headroom and a top-up from memmgr was refused
+/// (services/devmgr/docs/responsibilities.md § `CSpace` headroom), or an
+/// allocation failed. Not a policy refusal and not permanent: the caller may
+/// send the request again. Returned by `WATCH_CLASS`.
+pub const OUT_OF_RESOURCES: u64 = 8;
 /// Unknown opcode on devmgr endpoint.
 pub const UNKNOWN_OPCODE: u64 = 0xFF;

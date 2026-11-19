@@ -329,7 +329,8 @@ std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n o
   `syscall_abi::cspace_topup_pages`. The request is best-effort, as for the page-table pool
   above, so a fragmented free pool funds it. The page beyond `n` is for the `CSpace`'s body
   arena, which a split or a range-capability copy draws on. It donates the shortfall it reads,
-  in at most `FUND_ROUNDS` (2) donations (the `ruststd-pool-funding` crate), and returns `false`
+  in at most `FUND_ROUNDS` (2) rounds of one donation or more, one for each run memmgr grants
+  (the `ruststd-pool-funding` crate), and returns `false`
   only when a donation was refused. The headroom is shared by every capability allocation of
   the process, so another thread's allocations can take the donated slots first; a headroom that
   reads short after donations that were made is no failure, and the caller's own allocation

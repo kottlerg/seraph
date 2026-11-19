@@ -848,7 +848,11 @@ fn carve_platform_device(
 ) -> Option<PlatformDeviceCaps>
 {
     // As for a PCI record's carves (`carve_pci_device`).
-    crate::headroom::hold();
+    if !crate::headroom::hold()
+    {
+        std::os::seraph::log!(warn: "{}: CSpace short of its headroom; not bound", name);
+        return None;
+    }
     let Some(mut dev) = PlatformDeviceCaps::empty()
     else
     {
@@ -1238,8 +1242,13 @@ fn carve_pci_device(
 ) -> Option<PciDeviceCaps>
 {
     // The carves and the spawn that follows take the most slots and arena
-    // bodies devmgr holds at once (`crate::headroom`).
-    crate::headroom::hold();
+    // bodies devmgr holds at once (`crate::headroom`). A refused top-up
+    // leaves too few for them, so the record is not bound.
+    if !crate::headroom::hold()
+    {
+        std::os::seraph::log!(warn: "{}: CSpace short of its headroom; not bound", name);
+        return None;
+    }
     let Ok(virtio) = virtio_layout(name, pci_dev, decl)
     else
     {

@@ -451,7 +451,13 @@ fn serve(ep: u64, shared: &Shared)
             }
         };
         guard.on_success();
-        crate::headroom::hold();
+        if !crate::headroom::hold()
+            && let Some(code) = firmware::headroom::dma_refusal(msg.label)
+        {
+            release_caps(msg.caps());
+            reply(&IpcMessage::new(code), ipc_buf);
+            continue;
+        }
         match msg.label
         {
             devmgr_dma_labels::DMA_MAP => handle_map(&msg, shared, ipc_buf),

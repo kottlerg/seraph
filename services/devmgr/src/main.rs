@@ -345,8 +345,8 @@ fn start_registry_workers(registry: &Arc<Registry>)
     let pool = {
         let shared = Arc::clone(registry);
         recv_pool::RecvPool::new(registry.endpoint, recv_diag, move |msg, buf| {
-            headroom::hold();
-            shared.handle(msg, buf.as_ptr());
+            let held = headroom::hold();
+            shared.handle(msg, buf.as_ptr(), held);
         })
     };
     match pool.spawn("devmgr-registry", REGISTRY_WORKERS)
@@ -1019,8 +1019,10 @@ impl Registry
 impl Registry
 {
     /// Serve one registry request on a worker whose IPC buffer page is
-    /// `ipc_buf`, replying before it returns.
-    fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    /// `ipc_buf`, replying before it returns. `held` is the worker's
+    /// [`headroom::hold`]: on `false` a request that would keep slots is
+    /// refused (`firmware::headroom::registry_refusal`).
+    fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64, held: bool)
     {
         let badge = msg.badge;
         // A client whose SEND carries GRANT (`devmgr.bind`, svcmgr, init) can
@@ -1034,6 +1036,12 @@ impl Registry
         for &cap in msg.caps().iter().skip(kept)
         {
             let _ = syscall::cap_delete(cap);
+        }
+        // A refused label keeps no cap it was sent (`kept` is 0 for it).
+        if !held && let Some(code) = firmware::headroom::registry_refusal(msg.label)
+        {
+            reply_status(code, ipc_buf);
+            return;
         }
         match msg.label
         {
@@ -1242,7 +1250,7 @@ impl Registry
         )
         else
         {
-            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            reply_status(ipc::devmgr_errors::OUT_OF_RESOURCES, ipc_buf);
             return;
         };
         let Ok(copy) = syscall::cap_derive(note, syscall::RIGHTS_NTF_WAIT)

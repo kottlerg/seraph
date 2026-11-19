@@ -37,8 +37,8 @@ A bind takes one death-observer node from its queue's pool, fixed when the
 queue is created, so svcmgr keeps a growable set of queues: a bind tries the
 newest queue first, then the older ones, and only when every queue is out of
 nodes creates a further queue, funded from svcmgr's own memory, with twice
-the last pool (4 nodes first, below the two each of a boot's seven supervised
-and adopted services takes, so every boot grows the set; up to
+the last pool (4 nodes first, below the two each of a boot's supervised and
+adopted services take, a dozen services or more, so every boot grows the set; up to
 `EVENT_QUEUE_MAX_CAPACITY`). A
 further queue is one contiguous grant from memmgr; when memmgr refuses it,
 svcmgr retries at half the pool, down to the first pool's size. A bind that
@@ -277,8 +277,8 @@ The launch path is documented in
 [service-definitions.md](service-definitions.md#reconciliation). The
 `.svc` recipe is the single source of truth for both paths: the fixed
 fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
-the log-sink, debug-authority, stop-authority, `oom_stop` and `reserve`
-flags, the `stop_source` class, and the scheduling fields on the parallel
+the log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`
+and `reserve` flags, the `stop_source` class, and the scheduling fields on the parallel
 `RestartRecipe`, so
 a restart reproduces the first-launch spawn shape byte-for-byte, except the
 log-sink round, whose history-pull SEND is absent on a restart once an
@@ -313,7 +313,7 @@ string at its own length:
 
 The launch surfaces svcmgr replays beyond that record (the
 argv / env / cwd / seed, plus the log-sink, debug-authority,
-stop-authority, `oom_stop` and `reserve` flags, the `stop_source`
+stop-authority, entropy-authority, `oom_stop` and `reserve` flags, the `stop_source`
 class and the scheduling fields) are held in a parallel
 [`RestartRecipe`](../src/service.rs) table
 (`ServiceTable.recipes`), index-aligned with `services` by slot:
@@ -327,6 +327,7 @@ class and the scheduling fields) are held in a parallel
 | `log_sink` | `log_sink = ...` |
 | `debug_authority` | `debug_authority = ...` |
 | `stop_authority` | `stop_authority = ...` |
+| `entropy_authority` | `entropy_authority = ...`; cleared on every declaration after the first in launch order |
 | `oom_stop` | `oom_stop = ...` |
 | `reserve` | `reserve = ...` |
 | `stop_source` | `stop_source = ...` (`None` = unset); svcmgr lists a running source by it (`LIST_STOP_SOURCES`) |
@@ -338,7 +339,7 @@ scheduling fields and the create flags `reserve`, `oom_stop` and `stop_source`
 ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`) into
 `CREATE_FROM_FILE`, cwd
 through `apply_namespace_policy`, seeds re-resolved from the discovery
-registry, a fresh `DEBUG_AUTHORITY` and `STOP_AUTHORITY` cap after them,
+registry, a fresh `DEBUG_AUTHORITY` and `STOP_AUTHORITY` cap and `EntropyControl` copy after them,
 and `log_sink` selecting the log-sink round — so a restarted child comes
 back with the same surfaces first launch gave it, the log-sink round's
 history-pull SEND aside.
@@ -385,6 +386,9 @@ that the functional harness boots drop `terminal` (per
 | `crashd` | svcmgr-launched | `on_failure` | `no` |
 | `sessiond` | svcmgr-launched (stop source) | `on_failure` | `no` |
 | `terminal` | svcmgr-launched | `on_failure` | `no` |
+| `acpid` | svcmgr-launched (provider) | `on_failure` | `no` |
+| `oomd` | svcmgr-launched (stop-authority holder) | `on_failure` | `no` |
+| `entropyd` | svcmgr-launched (entropy-authority holder) | `on_failure` | `no` |
 
 memmgr and procmgr are in the core set and never restart; devmgr and vfsd
 are not, but no restart of either is designed. svcmgr holds none of the

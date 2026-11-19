@@ -190,7 +190,8 @@ impl ServiceEntry
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is one independent `yes | no` recipe key: `log_sink`, \
-              `debug_authority`, `oom_stop`, `stop_authority` and `reserve`"
+              `debug_authority`, `oom_stop`, `stop_authority`, `entropy_authority` \
+              and `reserve`"
 )]
 pub struct RestartRecipe
 {
@@ -215,6 +216,11 @@ pub struct RestartRecipe
     /// its seeds and debug-authority cap on every launch. See
     /// `restart::mint_stop_authority`.
     pub stop_authority: bool,
+    /// The `entropy_authority = yes` service, the one launch order names
+    /// (`svcmgr_defs::entropy_holder`): a freshly derived `EntropyControl`
+    /// copy rides the slot after its seeds, debug- and stop-authority caps on
+    /// every launch. See `restart::mint_entropy_authority`.
+    pub entropy_authority: bool,
     /// The `reserve = yes` service: each instance is created in the system
     /// reserve (`svcmgr_defs::create_flags`).
     pub reserve: bool,
@@ -277,6 +283,10 @@ pub struct SvcmgrCaps
     /// `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, published
     /// seed-only as `vfsd.swap`. Zero if absent.
     pub vfsd_swap: u64,
+    /// `EntropyControl` source carrying `Contribute`. svcmgr derives a copy
+    /// from it per launch for the one `entropy_authority = yes` service, and
+    /// never publishes it. Zero if absent.
+    pub entropy_source: u64,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
     /// one-shot `HANDOVER_PULL` SEND on the first launch, and publishes the
@@ -337,6 +347,7 @@ pub fn bootstrap_caps(
                             vfsd_mount: c.vfsd_mount,
                             vfsd_deny: c.vfsd_deny,
                             vfsd_swap: c.vfsd_swap,
+                            entropy_source: c.entropy_source,
                             master_log_source: 0,
                             procmgr_death_auth_source: 0,
                         });

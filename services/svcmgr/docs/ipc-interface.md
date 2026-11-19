@@ -42,8 +42,8 @@ and svcmgr decodes with.
 
 **First rounds — `CAPS` (`data[0] = 1`, not terminal):** a positional
 slot list, split into windows of `MSG_CAP_SLOTS_MAX` slots, one `CAPS`
-round per window (`ipc::bootstrap::slot_rounds`); the seven slots below
-take two rounds (slots 0-3, then 4-6), and a longer list takes more with
+round per window (`ipc::bootstrap::slot_rounds`); the eight slots below
+take two rounds (slots 0-3, then 4-7), and a longer list takes more with
 no change to the encoding.
 
 | Field | Value |
@@ -55,9 +55,10 @@ no change to the encoding.
 | slot 4 | `vfsd_labels::MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.mount`; absent if its derive fails) |
 | slot 5 | `vfsd_labels::DENY_BADGE`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.deny`; absent if its derive fails) |
 | slot 6 | `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.swap`; absent if its derive fails) |
+| slot 7 | `EntropyControl` source carrying `Contribute`, derived from the root capability the kernel mints into init; svcmgr never publishes it, and derives the [`entropy_authority`](service-definitions.md#entropy_authority) service's copy from it on every launch (absent if init holds none or its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `14`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `15`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -157,7 +158,7 @@ to teardown), then runs
    parked from the endowment):
    * **parked AND defined** — bind death-notification, record the
      recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
-     log-sink, debug-authority, stop-authority, `oom_stop` and `reserve`
+     log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop` and `reserve`
      flags, `stop_source` class, and scheduling fields in the parallel
      `RestartRecipe` table.
    * **defined only** — launch via [`definitions::launch`](../src/definitions/launch.rs).

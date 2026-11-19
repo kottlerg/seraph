@@ -1,0 +1,23 @@
+# entropyd — the kernel entropy pool's userspace contributor.
+#
+# `seed = devmgr.class.hwrng` delivers cap[0], the hwrng class SEND on
+# devmgr's registry, through which entropyd finds each hardware-RNG driver
+# with QUERY_DEVICE and watches the class with WATCH_CLASS.
+# `entropy_authority = yes` makes svcmgr derive a copy of the EntropyControl
+# source init endows it with and deliver it in the bootstrap slot after the
+# seeds (cap[1] here). One service holds it: svcmgr gives it to the first
+# recipe in launch order that declares the key, and to no other.
+#
+# entropyd reads 64 bytes from each live hwrng driver at start and every
+# 10 s, and mixes them into the kernel pool with SYS_ENTROPY_CONTRIBUTE,
+# which credits them with no entropy (services/entropyd/README.md). It
+# provides no endpoint: it serves no draws, which SYS_GETRANDOM alone does.
+#
+# `restart = on_failure`, `critical = no`: without entropyd the pool runs
+# on the kernel's own sources, as it does on a machine with no hardware RNG.
+binary            = /services/entropyd
+restart           = on_failure
+critical          = no
+namespace         = none
+seed              = devmgr.class.hwrng
+entropy_authority = yes

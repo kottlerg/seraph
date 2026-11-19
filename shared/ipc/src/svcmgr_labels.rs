@@ -73,7 +73,8 @@ pub fn unpack_name(words: &[u64], len: usize) -> Option<[u8; NAME_MAX]>
 // its recipe). The `CAPS` rounds carry svcmgr's own endpoints plus the source
 // caps it needs for its publish role (`rootfs.root` SEND,
 // devmgr-registry `SEND|GRANT` source, `vfsd.mount`, `vfsd.deny`, and
-// `vfsd.swap` SENDs) and `SVCMGR_LABELS_VERSION` in
+// `vfsd.swap` SENDs), the `EntropyControl` source it gives the
+// `entropy_authority` service a copy of, and `SVCMGR_LABELS_VERSION` in
 // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap, observer)`
 // triple svcmgr parks in its pending-registration table; a final
 // `LOGD_SOURCES` round carries the master-log and procmgr death-auth

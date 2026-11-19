@@ -232,6 +232,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "entropyd"
+version = "0.1.4"
+dependencies = [
+ "hwrng-protocol",
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "fatfs"
 version = "0.1.4"
 dependencies = [

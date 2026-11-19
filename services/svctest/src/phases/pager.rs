@@ -583,10 +583,7 @@ const FRAGMENT_SLACK_PAGES: u64 = 1024;
 /// nothing between the first draw and the release allocates or logs.
 fn demand_fault_fragmented_phase(_: &Caps)
 {
-    use super::memmgr::{
-        SCRUB_MARKER, nonzero_words, pool_free_and_largest, pool_growth_floor, release_grant,
-        words_mut,
-    };
+    use super::memmgr::{SCRUB_MARKER, nonzero_words, pool_growth_floor, release_grant, words_mut};
 
     let page = syscall_abi::PAGE_SIZE;
     let chunk_bytes = DEMAND_CHUNK_PAGES.saturating_mul(page);
@@ -619,9 +616,17 @@ fn demand_fault_fragmented_phase(_: &Caps)
             .saturating_add(1),
     );
     let mut holes: Vec<(u64, u64)> = Vec::with_capacity(hole_cap);
-    let (drawn_pages, hole_count) = fragment_pool(&mut held, &mut holes, target);
-    let (free, largest) = pool_free_and_largest();
-    let floor = pool_growth_floor() / page;
+    // The pool as the cut's last query read it: memmgr's eviction, which runs
+    // while the level reads `LOW`, can free a chunk's runs at any moment
+    // after, and a fault of the region may then be backed from such a run; the
+    // region's pages read and write the same either way.
+    let Fragmented {
+        drawn_pages,
+        hole_count,
+        free,
+        largest,
+        floor,
+    } = fragment_pool(&mut held, &mut holes, target);
     assert!(
         largest < chunk_bytes,
         "demand_fault_fragmented: the pool kept a run of {largest} bytes, a chunk or more"
@@ -684,13 +689,11 @@ fn demand_fault_fragmented_phase(_: &Caps)
 ///    and a hole merged with its run's remainder.
 ///
 /// Every grant kept goes onto `held` and every hole onto `holes`, which have
-/// room for every draw and the cut, so nothing here allocates. Returns the
-/// pages drawn and the holes released.
-fn fragment_pool(
-    held: &mut Vec<(u64, u64)>,
-    holes: &mut Vec<(u64, u64)>,
-    target: u64,
-) -> (u64, usize)
+/// room for every draw and the cut, so nothing here allocates. Returns what
+/// step 4 read last: the pool once no run of a chunk or more was left free,
+/// or with one memmgr would refuse at the floor, or at the draws' bound.
+fn fragment_pool(held: &mut Vec<(u64, u64)>, holes: &mut Vec<(u64, u64)>, target: u64)
+-> Fragmented
 {
     use super::memmgr::{
         pool_free_and_largest, pool_growth_floor, release_grant, try_request_contiguous,
@@ -747,14 +750,22 @@ fn fragment_pool(
         release_grant(cap, id);
     }
 
+    let mut seen = Fragmented::default();
     for _ in 0..FRAGMENT_MAX_DRAWS
     {
         let (free, largest) = pool_free_and_largest();
+        let floor = pool_growth_floor() / page;
+        seen = Fragmented {
+            drawn_pages,
+            hole_count,
+            free,
+            largest,
+            floor,
+        };
         let run = largest / page;
         // A run memmgr would refuse at the floor stays; the phase's check
         // reports it.
-        if run < DEMAND_CHUNK_PAGES
-            || (free / page).saturating_sub(run) < pool_growth_floor() / page
+        if run < DEMAND_CHUNK_PAGES || (free / page).saturating_sub(run) < floor
         {
             break;
         }
@@ -763,7 +774,24 @@ fn fragment_pool(
         {
             held.push(grant);
             drawn_pages = drawn_pages.saturating_add(run);
+            seen.drawn_pages = drawn_pages;
         }
     }
-    (drawn_pages, hole_count)
+    seen
+}
+
+/// What [`fragment_pool`] drew, and the pool as its last query read it.
+#[derive(Clone, Copy, Default)]
+struct Fragmented
+{
+    /// Pages the draws and the cut hold.
+    drawn_pages: u64,
+    /// Holes the cut released.
+    hole_count: usize,
+    /// Free bytes.
+    free: u64,
+    /// Bytes of the largest free run.
+    largest: u64,
+    /// The growth floor, in pages.
+    floor: u64,
 }

@@ -12,33 +12,48 @@
 //! into `FB_SET_ATTRS` attribute changes (the driver never sees `ESC`), while
 //! the serial mirror receives the raw bytes so ANSI-capable serial consumers
 //! still see colour.
+//!
+//! Each write takes the current framebuffer and serial drivers from their
+//! [`Device`]s, so output reaches the instance devmgr serves after a driver's
+//! restart. A new framebuffer instance starts at the driver's default
+//! attributes, so the parser starts again with it.
 
 use ansi::{AnsiParser, Event};
 use ipc::{IpcMessage, fb_errors, fb_labels, serial_errors, serial_labels};
 
+use crate::device::Device;
+
 /// Maximum payload bytes per `*_WRITE_BYTES` call (label bits 16-31, 0..=512).
 const PAYLOAD_MAX: usize = 512;
 
-/// Holds the framebuffer and serial driver write caps plus the SGR parser for
-/// the framebuffer path. The framebuffer is optional: a headless boot has none,
+/// Holds the framebuffer and serial drivers plus the SGR parser for the
+/// framebuffer path. The framebuffer is optional: a headless boot has none,
 /// and the terminal then mirrors to serial only. Cap handles are process-wide;
 /// the per-thread IPC buffer is fetched per write. The parser carries colour
 /// and partial-sequence state across writes, so the sink is `&mut`.
 pub struct Sink
 {
-    framebuffer: Option<u64>,
-    serial: u64,
+    framebuffer: Device,
+    serial: Device,
     parser: AnsiParser,
+    /// The generation of the framebuffer driver the parser's state is for.
+    fb_generation: Option<u64>,
+    /// The generation of a framebuffer driver no write has reached yet, after
+    /// the first: the terminal logs the first write that reaches it.
+    fb_unconfirmed: Option<u64>,
 }
 
 impl Sink
 {
-    pub fn new(framebuffer: Option<u64>, serial: u64) -> Self
+    pub fn new(framebuffer: Device, serial: Device) -> Self
     {
+        let fb_generation = framebuffer.current().map(|d| d.generation);
         Self {
             framebuffer,
             serial,
             parser: AnsiParser::new(),
+            fb_generation,
+            fb_unconfirmed: None,
         }
     }
 
@@ -53,15 +68,26 @@ impl Sink
         }
         // Framebuffer (primary): SGR is parsed into FB_SET_ATTRS colour
         // changes; only literal text reaches FB_WRITE_BYTES.
-        if let Some(fb) = self.framebuffer
+        if let Some(fb) = self.framebuffer.current()
         {
+            if self.fb_generation != Some(fb.generation)
+            {
+                // A new instance, at the driver's default attributes.
+                if self.fb_generation.is_some()
+                {
+                    self.fb_unconfirmed = Some(fb.generation);
+                }
+                self.fb_generation = Some(fb.generation);
+                self.parser = AnsiParser::new();
+            }
+            let mut reached = false;
             self.parser.feed(bytes, |ev| match ev
             {
-                Event::Attrs(fg, bg) => fb_set_attrs(fb, fg, bg, ipc_buf),
+                Event::Attrs(fg, bg) => fb_set_attrs(fb.cap, fg, bg, ipc_buf),
                 Event::Text(text) =>
                 {
-                    write_chunked(
-                        fb,
+                    reached |= write_chunked(
+                        fb.cap,
                         fb_labels::FB_WRITE_BYTES,
                         fb_errors::SUCCESS,
                         text,
@@ -71,17 +97,28 @@ impl Sink
                     true // text is not deduped; the sink result is for attrs
                 }
             });
+            if reached && self.fb_unconfirmed == Some(fb.generation)
+            {
+                self.fb_unconfirmed = None;
+                std::os::seraph::log!(
+                    "terminal: framebuffer output reaches the driver at ordinal {}",
+                    fb.ordinal
+                );
+            }
         }
         // Serial mirror (debug): raw bytes, ESC sequences intact so
         // ANSI-capable serial consumers still see colour.
-        write_chunked(
-            self.serial,
-            serial_labels::SERIAL_WRITE_BYTES,
-            serial_errors::SUCCESS,
-            bytes,
-            ipc_buf,
-            "serial",
-        );
+        if let Some(serial) = self.serial.current()
+        {
+            write_chunked(
+                serial.cap,
+                serial_labels::SERIAL_WRITE_BYTES,
+                serial_errors::SUCCESS,
+                bytes,
+                ipc_buf,
+                "serial",
+            );
+        }
     }
 }
 
@@ -118,8 +155,15 @@ fn fb_set_attrs(cap: u64, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64) -> bool
 /// Submit `bytes` as `*_WRITE_BYTES` calls, chunking to [`PAYLOAD_MAX`]. The
 /// framebuffer and serial drivers share this wire format (`label = opcode |
 /// (len << 16)`, payload via `.bytes(0, …)`); only the opcode/success code and
-/// the cap differ.
-fn write_chunked(cap: u64, opcode: u64, success: u64, bytes: &[u8], ipc_buf: *mut u64, label: &str)
+/// the cap differ. Returns whether the driver answered every call `success`.
+fn write_chunked(
+    cap: u64,
+    opcode: u64,
+    success: u64,
+    bytes: &[u8],
+    ipc_buf: *mut u64,
+    label: &str,
+) -> bool
 {
     for chunk in bytes.chunks(PAYLOAD_MAX)
     {
@@ -137,13 +181,14 @@ fn write_chunked(cap: u64, opcode: u64, success: u64, bytes: &[u8], ipc_buf: *mu
                     warn: "terminal: {label} driver returned label={:#x}",
                     reply.label
                 );
-                return;
+                return false;
             }
             Err(_) =>
             {
                 std::os::seraph::log!(warn: "terminal: {label} ipc_call failed mid-write");
-                return;
+                return false;
             }
         }
     }
+    true
 }

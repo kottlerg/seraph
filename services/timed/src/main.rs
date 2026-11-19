@@ -137,10 +137,12 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 
 // ── Entry ──────────────────────────────────────────────────────────────────
 
-/// Resolve the first RTC driver's SEND through `rtc_class`, the `rtc` class
-/// SEND (`QUERY_DEVICE` at ordinal 0). Returns `0` when devmgr replies
-/// anything other than success (label-version mismatch, no RTC driver
-/// served).
+/// Resolve the RTC driver's SEND through `rtc_class`, the `rtc` class SEND:
+/// the class's first live driver (`ipc::first_device`), which passes an
+/// ordinal devmgr answers `WITHDRAWN`. devmgr serves a restarted driver at
+/// the class's next ordinal, so a timed started after an RTC driver restart
+/// finds the new instance there. Returns `0` when devmgr replies anything
+/// other than success (label-version mismatch, no RTC driver served).
 fn resolve_rtc_cap(rtc_class: u64, ipc_buf: *mut u64) -> u64
 {
     if rtc_class == 0
@@ -148,7 +150,7 @@ fn resolve_rtc_cap(rtc_class: u64, ipc_buf: *mut u64) -> u64
         return 0;
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    unsafe { ipc::query_device(rtc_class, 0, ipc_buf) }.unwrap_or(0)
+    unsafe { ipc::first_device(rtc_class, ipc_buf) }.unwrap_or(0)
 }
 
 /// Resolve the RTC via devmgr and compute the wall-clock offset.

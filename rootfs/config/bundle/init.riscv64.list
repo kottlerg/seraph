@@ -5,24 +5,20 @@
 # file into the bundle byte for byte, and signs every entry but `init` with
 # the boot-module role.
 #
-# Only what userspace needs before the root filesystem is mounted belongs
-# here: the block and filesystem drivers that read it, the consoles before
-# vfsd, and the services that bring userspace up. Every other driver is loaded
-# from the root filesystem after the mount; an entry here costs memory that
+# Only the bootstrap closure belongs here (docs/boot-media.md § The Bootstrap
+# Closure): the block and filesystem drivers that read the root filesystem,
+# and the services that bring userspace up to its mount. Every other driver,
+# the consoles' included, and every platform description table is loaded from
+# the root filesystem after the mount; an entry here costs memory that
 # outlives the bootloader (step9_populate_boot_info, core/boot/src/main.rs).
 init /services/init
 /services/procmgr
 /services/devmgr
 /services/vfsd
 /services/drivers/virtio-blk
-/services/drivers/serial
-/services/drivers/framebuffer
 /services/fs/fatfs
 /services/memmgr
 # The IOMMU driver, which devmgr spawns before the first DMA-capable driver.
 /services/drivers/iommu-riscv
-# The platform description table of QEMU virt, which lists the devices no
-# firmware table describes.
-/config/devmgr/platform/qemu-virt.platform
 # The log-level configuration init reads at boot.
 /config/init/log-levels.conf

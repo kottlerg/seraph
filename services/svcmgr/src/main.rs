@@ -399,9 +399,12 @@ const DRIVERS_DIR_PATH: &str = "/services/drivers";
 /// Hand devmgr a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
 /// subtree cap and its path via `SET_DRIVERS_DIR`, so devmgr can list the directory, read
 /// the declaration of each driver binary in it, and spawn the drivers that
-/// match its devices (the per-arch RTC among them). svcmgr walks its universal
-/// root for the dir and mints a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from
-/// the endowed devmgr-registry source.
+/// match its devices (the consoles and the per-arch RTC among them), and,
+/// when the walk finds it, the same-rights cap of the platform description
+/// tables' directory (`devmgr_labels::PLATFORM_TABLES_PATH`), whose tables
+/// devmgr reads first. svcmgr walks its universal root for each dir and mints
+/// a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from the endowed devmgr-registry
+/// source.
 ///
 /// The walk goes through vfsd and the call goes to devmgr, so both are
 /// skipped when either is dead (`endowed_servers::death`, read from its
@@ -455,8 +458,23 @@ fn install_drivers_dir(
             }
         };
 
+    // An architecture that installs no platform description table has no
+    // such directory, so a failed walk sends none.
+    let tables_dir = std::os::seraph::namespace_lookup_dir(
+        root_cap,
+        ipc::devmgr_labels::PLATFORM_TABLES_PATH,
+        rights,
+    )
+    .ok();
+    let release = |caps: &[Option<u64>]| {
+        for cap in caps.iter().flatten()
+        {
+            let _ = syscall::cap_delete(*cap);
+        }
+    };
+
     // `RIGHTS_EP_SEND_GRANT` (not bare SEND): SET_DRIVERS_DIR transfers the
-    // dir cap, and the IPC kernel requires the GRANT bit to move caps.
+    // dir caps, and the IPC kernel requires the GRANT bit to move caps.
     let Ok(bind_ep) = syscall::cap_derive_badge(
         caps.devmgr_registry,
         syscall::RIGHTS_EP_SEND_GRANT,
@@ -465,46 +483,59 @@ fn install_drivers_dir(
     else
     {
         std::os::seraph::log!(warn: "SET_DRIVERS_DIR: DRIVERS_DIR_AUTHORITY derive failed");
-        let _ = syscall::cap_delete(drivers_dir);
+        release(&[Some(drivers_dir), tables_dir]);
         return;
     };
 
+    let sent = send_drivers_dir(bind_ep, drivers_dir, tables_dir, ipc_buf);
+    let _ = syscall::cap_delete(bind_ep);
+    match sent
+    {
+        Ok(ipc::devmgr_errors::SUCCESS) => std::os::seraph::log!("SET_DRIVERS_DIR ok"),
+        Ok(_) => std::os::seraph::log!(warn: "SET_DRIVERS_DIR rejected; RTC unavailable"),
+        Err(why) =>
+        {
+            // Not sent, or a transport error before the kernel committed the
+            // transfer: the source slots still own the dir caps.
+            release(&[Some(drivers_dir), tables_dir]);
+            std::os::seraph::log!(warn: "SET_DRIVERS_DIR {why}; RTC unavailable");
+        }
+    }
+}
+
+/// Send `SET_DRIVERS_DIR` on `bind_ep`: `drivers_dir`, its path, and
+/// `tables_dir` second when the walk found it. Returns the reply's label;
+/// `Err`, naming why, when the request is not sendable or the call fails
+/// before the kernel moved the caps, which svcmgr then still holds. A
+/// function of its own, so the request and its reply live in this frame
+/// alone and [`install_drivers_dir`]'s holds neither.
+fn send_drivers_dir(
+    bind_ep: u64,
+    drivers_dir: u64,
+    tables_dir: Option<u64>,
+    ipc_buf: *mut u64,
+) -> Result<u64, &'static str>
+{
     let builder = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
         .cap(drivers_dir);
-    let Some(builder) = ipc::with_name_block(
+    let builder = match tables_dir
+    {
+        Some(cap) => builder.cap(cap),
+        None => builder,
+    };
+    let msg = ipc::with_name_block(
         builder,
         ipc::devmgr_labels::DRIVERS_DIR_PATH_WORD,
         DRIVERS_DIR_PATH.as_bytes(),
         ipc::devmgr_labels::DRIVERS_DIR_PATH_MAX,
     )
-    else
-    {
-        std::os::seraph::log!(warn: "SET_DRIVERS_DIR: path not sendable");
-        let _ = syscall::cap_delete(bind_ep);
-        let _ = syscall::cap_delete(drivers_dir);
-        return;
-    };
-    let msg = builder.build();
+    .ok_or("path not sendable")?
+    .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let result = unsafe { ipc::ipc_call(bind_ep, &msg, ipc_buf) };
-    let _ = syscall::cap_delete(bind_ep);
-
-    match result
-    {
-        Ok(reply) if reply.label == ipc::devmgr_errors::SUCCESS =>
-        {
-            std::os::seraph::log!("SET_DRIVERS_DIR ok");
-        }
-        Ok(_) => std::os::seraph::log!(warn: "SET_DRIVERS_DIR rejected; RTC unavailable"),
-        Err(_) =>
-        {
-            // Transport error before the kernel committed the transfer;
-            // the source slot still owns `drivers_dir`.
-            let _ = syscall::cap_delete(drivers_dir);
-            std::os::seraph::log!(warn: "SET_DRIVERS_DIR ipc error; RTC unavailable");
-        }
-    }
+    unsafe { ipc::ipc_call(bind_ep, &msg, ipc_buf) }
+        .map(|reply| reply.label)
+        .map_err(|_| "ipc error")
 }
 
 /// `WaitSet` badge for svcmgr's service endpoint.

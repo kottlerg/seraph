@@ -121,27 +121,27 @@ command that repacks) signs in place the kernel installed at `boot/kernel` (`ker
 role), every ELF image under `services/`, `programs/` and `tests/` (under its install path with the
 role of its location, and the boot-module role when a bundle list names it as an entry;
 `/services/init` as `init` with the init role, and `/tests/ktest` too when the pack composes the
-ktest harness's bundle), every regular file under a data tree (`DATA_TREES` in
-`src/signing/mod.rs`: `data/svctest/signed/`), under its install path with the data role, which
-procmgr's verified read accepts, and every other file a bundle list names, the data files installed
-under `/config/` (the boot-module role). A pack signs for the harness recorded in `sysroot/.harness`
-([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot), then composes the ESP
-(`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and composes the bundle by
-copying the installed files the harness's list in `config/bundle/` names (`src/bundle.rs`). The
-composition signs nothing and reads no key; it verifies the kernel and each bundle entry as the
-bootloader will before it writes them, and once it has written the ESP, reads it back and refuses it
-unless every object on it equals its installed file and it holds no other file than a presence-only
-knob ([docs/boot-media.md](../docs/boot-media.md) § The ESP; [`check-disk`](#cargo-xtask-check-disk)
-makes the same check of a packed image). Every signed object is verified under the build's trust
-store, with each of its roles, its name and the architecture its loaders expect, before it is
-written. Each command derives the store from the signing identity and the deployer's store its
-environment names. `cargo xtask build` passes the store's path to the bootloader's build in
-`SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader embeds it. Every pack
-after that (the build's own, `compose-bundle`, `mkdisk` including `--repack-only`, and the harness
-commands that repack) reads the store out of the installed bootloader, `boot/boot.efi`, and refuses
-to sign when it is missing, holds no marker or two, or embeds another store; the error names the
-image and tells to run `cargo xtask build` (docs/signing.md § Signing). Signing a pack's images
-takes about half a second (`src/signing/`).
+ktest harness's bundle), every regular file under a data tree (`DATA_TREES` in `src/signing/mod.rs`:
+`config/devmgr/platform/` and `data/svctest/signed/`), under its install path with the data role
+alone, which procmgr's verified read accepts, and every other file a bundle list names, the data
+files installed under `/config/` (the boot-module role). A pack signs for the harness recorded in
+`sysroot/.harness` ([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot),
+then composes the ESP (`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and
+composes the bundle by copying the installed files the harness's list in `config/bundle/` names
+(`src/bundle.rs`). The composition signs nothing and reads no key; it verifies the kernel and each
+bundle entry as the bootloader will before it writes them, and once it has written the ESP, reads it
+back and refuses it unless every object on it equals its installed file and it holds no other file
+than a presence-only knob ([docs/boot-media.md](../docs/boot-media.md) § The ESP;
+[`check-disk`](#cargo-xtask-check-disk) makes the same check of a packed image). Every signed object
+is verified under the build's trust store, with each of its roles, its name and the architecture its
+loaders expect, before it is written. Each command derives the store from the signing identity and
+the deployer's store its environment names. `cargo xtask build` passes the store's path to the
+bootloader's build in `SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader
+embeds it. Every pack after that (the build's own, `compose-bundle`, `mkdisk` including
+`--repack-only`, and the harness commands that repack) reads the store out of the installed
+bootloader, `boot/boot.efi`, and refuses to sign when it is missing, holds no marker or two, or
+embeds another store; the error names the image and tells to run `cargo xtask build`
+(docs/signing.md § Signing). Signing a pack's images takes about half a second (`src/signing/`).
 
 The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
 one, whose canonical path lies inside it, `target/` included. When the directory is absent or
@@ -464,9 +464,8 @@ path: `/config/bundle/init.x86_64.list` or `init.riscv64.list` for `init`, and
 object of the bundle's `init` slot, and one install path per line for every other entry; `#` starts
 a comment. A harness has either one list for every architecture or one per architecture, never
 both. The bootloader and init address entries by name, so order is not significant. `init`'s
-bundle holds 11 entries on x86-64 and 12 on riscv64: `init`, the 8 boot modules, the IOMMU driver of
-the architecture's family (`iommu-vtd` on x86-64, `iommu-riscv` on riscv64), on riscv64 the platform
-description table `/config/devmgr/platform/qemu-virt.platform`, and the log-level configuration
+bundle holds 9 entries: `init`, the 6 boot modules, the IOMMU driver of the architecture's
+family (`iommu-vtd` on x86-64, `iommu-riscv` on riscv64), and the log-level configuration
 `/config/init/log-levels.conf`, installed from the repository's `services/init/log-levels.conf`.
 The configuration names the log level of each service init spawns
 ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels); an edit to it
@@ -938,8 +937,11 @@ none. `run-parallel` writes the same report beside each log it keeps.
 ### `cargo xtask test-terminal`
 
 Boot the terminal interactive test, exercising keyboard input end-to-end
-through the live virtio-input driver and the autostarted `terminal`. Launches
-QEMU headless with a QMP control socket, waits for the guest to print
+through the live virtio-input driver and the autostarted `terminal`. Stages the
+GDB stub on the virtio-input driver (`/services/drivers/virtio-input`), as
+`run --debug-target` stages it, launches QEMU headless with a QMP control socket
+and the debug port, connects to the stub once it attaches and detaches, which
+releases the driver, waits for the guest to print
 `terminal: READY for injection` on the serial log, injects a known key
 sequence (`help`, a stray `x`, Backspace, Return) via QMP `input-send-event`,
 and asserts — host-side — that the terminal's local echo, the shell's `$ `
@@ -947,11 +949,18 @@ prompt, and the relayed `help` output (`shell built-ins:`) appear on the serial
 stream. After the keyboard round passes, the transcript is cleared and the same
 sequence is written to the guest UART over QEMU's bidirectional `-serial stdio`,
 with the same echo, prompt, and `shell built-ins:` assertions (the serial RX
-round, #291). Exits non-zero on an injection error or the 180 s timeout. This
+round, #291). It then kills the virtio-input driver through the stub, moving its
+main thread to program counter 0, waits for the terminal's
+`terminal: input driver at ordinal 1` line once devmgr has restarted it, and
+injects the key sequence again on a cleared transcript, with the echo and
+`shell built-ins:` assertions (the input restart round). The stub's recipe is
+removed and the disk images repacked in the layout they had afterwards. Exits
+non-zero on an injection or stub error or the 300 s timeout. This
 subsumes the former standalone keyboard smoke test: the echoed `help` proves
 keysym decode, and Return/Backspace prove the named-key decodes.
 
-A pure runner — it neither builds nor stages. `terminal.svc` is in the default
+A pure runner — it does not build, and stages only the GDB stub, which it
+removes again. `terminal.svc` is in the default
 boot set, so the terminal autostarts
 ([programs/terminal/README.md](../programs/terminal/README.md) § Scope); just build and repack:
 
@@ -1421,21 +1430,22 @@ pcie-root-port,id=hotplug-disk-port,chassis=2,slot=2,addr=0x1d`) and a QMP socke
    withholds native hotplug control: devmgr must log the slot `firmware hotplug: _OSC control`,
    and the cycle of step 2 runs with the firmware's removal: devmgr's removal lines on its eject
    request, then acpid's `ejected (_EJ0) once devmgr removed 1 functions`;
-2. under native control (on x86_64 with
-   `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off`, so `_OSC` grants it; on riscv64
-   the `qemu-virt.platform` key grants it): once devmgr logs the slot `managed (native control
-   by` and the fixture logs `[hotplug-check] READY for the hot-added device`, it hot-adds QEMU's
-   `edu` device behind the first port (QMP `device_add`, `dma_mask=0xffffffff` as the test devices'
-   `edu` has). Once the fixture logs `[hotplug-check] READY for the removal`, it removes the
-   device (QMP `device_del`) and waits up to a minute for QEMU's `DEVICE_DELETED` event, then
-   for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
-   then hot-adds the device again and waits for the fixture's `[hotplug-check] PASS` line. It
-   then adds a raw block node over a zero-filled 1 MiB image (QMP `blockdev-add`) and hot-adds a
-   `virtio-blk-pci` on it behind the second port and the IOMMU (`iommu_platform=on`) with no MSI-X
-   vectors (`vectors=0`), and passes once devmgr logs `[devmgr] virtio-blk: binds PCI`,
-   `virtio-blk: boot tier not granted from the drivers directory` (the drivers directory's copy,
-   at the auxiliary tier) and `[devmgr] virtio-blk: Wired interrupt, 1 vector(s)` (the line of the
-   disk's `INTx` pin) and the driver logs `[virtio-blk] ready, entering service loop`.
+2. under native control (on x86_64 with `-global
+   ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off`, so `_OSC` grants it; on riscv64 the
+   `qemu-virt.platform` key grants it once devmgr has read the table): once devmgr logs the slot
+   `managed (native control by` and the fixture logs `[hotplug-check] READY for the hot-added
+   device`, it hot-adds QEMU's `edu` device behind the first port (QMP `device_add`,
+   `dma_mask=0xffffffff` as the test devices' `edu` has). Once the fixture logs `[hotplug-check]
+   READY for the removal`, it removes the device (QMP `device_del`) and waits up to a minute for
+   QEMU's `DEVICE_DELETED` event, then for devmgr's removal lines in their order and the fixture's
+   `WITHDRAWN at ordinal 0` line; it then hot-adds the device again and waits for the fixture's
+   `[hotplug-check] PASS` line. It then adds a raw block node over a zero-filled 1 MiB image (QMP
+   `blockdev-add`) and hot-adds a `virtio-blk-pci` on it behind the second port and the IOMMU
+   (`iommu_platform=on`) with no MSI-X vectors (`vectors=0`), and passes once devmgr logs `[devmgr]
+   virtio-blk: binds PCI`, `virtio-blk: boot tier not granted from the drivers directory` (the
+   drivers directory's copy, at the auxiliary tier) and `[devmgr] virtio-blk: Wired interrupt, 1
+   vector(s)` (the line of the disk's `INTx` pin) and the driver logs `[virtio-blk] ready, entering
+   service loop`.
 
 Then two storage boots on the split-data layout, under native control, with the disk-mode recipe
 (`hotplug-check-disk.svc`) staged alone:

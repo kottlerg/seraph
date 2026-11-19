@@ -478,8 +478,8 @@ devmgr's responsibilities are:
 
   Driver binaries are sourced from one of two places:
 
-  - **Boot bundle** — bootstrap-essentials (virtio-blk, serial, framebuffer, and the IOMMU driver,
-    `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64, and any platform description table) arrive
+  - **Boot bundle** — bootstrap-essentials (virtio-blk and the IOMMU driver, `iommu-vtd` on x86-64
+    and `iommu-riscv` on riscv64, and any platform description table a root mount needs) arrive
     untagged as `procmgr_labels::CREATE_PROCESS`-ready Memory caps in devmgr's MODULE bootstrap
     rounds. devmgr tells a module by its content, after taking the body of each through the
     parse-only `objsig::split` (`decls::classify`; a module whose trailer does not parse is logged
@@ -497,9 +497,14 @@ devmgr's responsibilities are:
     subtree cap via `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by
     `DRIVERS_DIR_AUTHORITY`), with the directory's absolute path as a name block from data word
     `DRIVERS_DIR_PATH_WORD`, so devmgr names each driver `<path>/<entry>` to procmgr (a request
-    with no path is refused `INVALID_REQUEST`); devmgr replies SUCCESS immediately (so svcmgr
+    with no path is refused `INVALID_REQUEST`), and, when its walk finds it, the directory of the
+    platform description tables (`devmgr_labels::PLATFORM_TABLES_PATH`) as an optional `caps[1]`
+    at the same rights; devmgr replies SUCCESS immediately (so svcmgr
     never blocks on driver work), and its control thread runs the
-    drivers-directory pass, settling the on-disk batch (above). The pass
+    drivers-directory pass, settling the on-disk batch (above). Before the pass, unless a boot
+    module's table matched, the job reads the platform description tables as
+    [docs/driver-binding.md](../../../docs/driver-binding.md#platform-description-tables)
+    § Platform Description Tables describes, and deletes the directory cap. The pass
     lists the directory (`NS_READDIR`, at most 4096 entries) and reads each
     entry's declaration through `FS_READ` on its file cap, bounded as
     [docs/driver-binding.md](../../../docs/driver-binding.md#declaration-bounds)
@@ -664,9 +669,9 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and acpid's FADT register-block ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64, and the RIMT's PCI IOMMUs and ID mappings on riscv64 |
-| Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer, and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table, untagged and held in `DevmgrCaps.modules`; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed; a module that is neither, or that fails to read, is logged and released |
+| Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table a root mount needs, untagged and held in `DevmgrCaps.modules`; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed; a module that is neither, or that fails to read, is logged and released |
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
-| SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (each driver of the boot tier from a boot module, the serial and IOMMU drivers and each PCI-bound one, at 26; every other driver, the framebuffer and RTC drivers included, at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, the IOMMU fault-log thread at 24, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
+| SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (each driver of the boot tier from a boot module, the IOMMU driver and each PCI-bound one, at 26; every other driver, the serial, framebuffer and RTC drivers included, at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, the IOMMU fault-log thread at 24, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 
 devmgr's own `AddressSpace` cap, which procmgr installs, carries no `RIGHTS_AS_READ`: procmgr
 mints every child's address space without it, a phys-class child's included
@@ -849,7 +854,8 @@ ordinal, and its `WATCH_CLASS` watch is signalled at the withdrawal and again wh
 instance is served. A `QUERY_DEVICE` at the next ordinal (`first_device_from`) then waits for the
 restart's settle and names the new instance, or answers `NO_DEVICE` when the restart was refused or
 failed. A client re-registers with the new instance whatever it registered with the dead one. logd's
-sinks and entropyd re-resolve this way on their class watches.
+sinks, entropyd and the terminal re-resolve this way on their class watches; `ipc::refresh_device`
+is the look a client makes at its class on a signal.
 
 ### Root disk
 

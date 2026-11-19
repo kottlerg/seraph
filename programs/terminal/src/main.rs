@@ -25,9 +25,13 @@
 //! ownership of the sink is why no locking is needed, and its source-agnostic
 //! discipline is why a new input source is just another producer.
 //!
+//! Each driver class is followed by a [`device::Device`], which keeps its
+//! current driver across devmgr's restart of it, on the class's watch.
+//!
 //! Remaining deferrals are documented in `README.md`: signals/cooked-raw/
 //! job-control/multi-session (#29) and the real interactive shell (#112).
 
+mod device;
 mod input;
 mod output;
 mod session;
@@ -69,23 +73,23 @@ fn main() -> !
         std::os::seraph::log!(error: "terminal: a seed is missing; exiting");
         syscall::thread_exit();
     };
-    let Some(input_cap) = await_device(input_class, "input", ipc_buf)
+    let input = device::Device::start(input_class, "input", ipc_buf);
+    let Some(input_driver) = input.await_first("input")
     else
     {
         std::os::seraph::log!(error: "terminal: no input device; exiting");
         syscall::thread_exit();
     };
     // The framebuffer is the primary output but optional: a headless boot has
-    // none, and the terminal then mirrors to serial only. With that no-device
-    // path, a NO_DEVICE reply is terminal (`devmgr_errors::NO_DEVICE`), so the
-    // query is made once, and any refusal takes the serial-only path.
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let fb_cap = unsafe { ipc::query_device(fb_class, 0, ipc_buf) }.ok();
-    if fb_cap.is_none()
+    // none, and the terminal then mirrors to serial only, until devmgr serves
+    // one.
+    let framebuffer = device::Device::start(fb_class, "framebuffer", ipc_buf);
+    if framebuffer.current().is_none()
     {
         std::os::seraph::log!(warn: "terminal: framebuffer unavailable; serial-only output");
     }
-    let Some(serial_cap) = await_device(serial_class, "serial", ipc_buf)
+    let serial = device::Device::start(serial_class, "serial", ipc_buf);
+    let Some(serial_driver) = serial.await_first("serial")
     else
     {
         std::os::seraph::log!(error: "terminal: no serial device; exiting");
@@ -94,13 +98,16 @@ fn main() -> !
 
     let (tx, rx) = channel::<Msg>();
     let kbd_tx = tx.clone();
-    std::thread::spawn(move || input::keyboard_loop(input_cap, &kbd_tx));
-    // Second input producer: serial RX. `serial_cap` is also the Sink's TX cap
-    // (a Copy `u64`); the driver multiplexes read and write on the one endpoint.
+    let kbd_input = input.clone();
+    std::thread::spawn(move || input::keyboard_loop(&kbd_input, input_driver, &kbd_tx));
+    // Second input producer: serial RX. The serial driver multiplexes read and
+    // write on one endpoint, so the RX thread and the Sink's TX share the
+    // device.
     let serial_rx_tx = tx.clone();
-    std::thread::spawn(move || input::serial_loop(serial_cap, &serial_rx_tx));
+    let rx_serial = serial.clone();
+    std::thread::spawn(move || input::serial_loop(&rx_serial, serial_driver, &serial_rx_tx));
 
-    let mut sink = Sink::new(fb_cap, serial_cap);
+    let mut sink = Sink::new(framebuffer, serial);
     std::os::seraph::log!("{READY_MARKER}");
 
     let mut client = session::Client::new(operator);
@@ -270,31 +277,4 @@ fn bootstrap_seeds(creator_ep: u64, ipc_buf: *mut u64) -> Option<[u64; 4]>
     // absent slot decodes as `0`.
     let caps = unsafe { ipc::bootstrap::request_slots::<4>(creator_ep, ipc_buf) }.ok()?;
     caps.iter().all(|&cap| cap != 0).then_some(caps)
-}
-
-/// The first live driver of the class whose class SEND is `class_send`, a
-/// class the terminal cannot run without: while the class serves none, wait
-/// on a `WATCH_CLASS` watch until devmgr serves one (`ipc::await_device`),
-/// logging the wait once. `None` when devmgr refuses the query or the watch,
-/// logged.
-fn await_device(class_send: u64, what: &str, ipc_buf: *mut u64) -> Option<u64>
-{
-    let mut logged = false;
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let found = unsafe {
-        ipc::await_device(class_send, 0, ipc_buf, || {
-            if !logged
-            {
-                logged = true;
-                std::os::seraph::log!(
-                    "terminal: no {what} device yet; waiting for devmgr to serve one"
-                );
-            }
-        })
-    };
-    found
-        .inspect_err(|e| {
-            std::os::seraph::log!(error: "terminal: {what} device query failed ({e:?})");
-        })
-        .ok()
 }

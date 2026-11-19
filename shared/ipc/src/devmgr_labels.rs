@@ -124,16 +124,27 @@ pub const QUERY_DEVICE_INFO: u64 = 2;
 /// (`/services/drivers`) as a name block (`crate::with_name_block`, at
 /// most [`DRIVERS_DIR_PATH_MAX`] bytes), under which devmgr names each
 /// entry it starts, `<path>/<entry>`, the name procmgr verifies the entry
-/// was signed under (docs/signing.md § Signed Attributes).
+/// was signed under (docs/signing.md § Signed Attributes); optionally
+/// `caps[1]` = the `LOOKUP | READ | READDIR` directory cap of
+/// [`PLATFORM_TABLES_PATH`], walked the same way, which svcmgr sends when
+/// the walk succeeds (an architecture that installs no platform
+/// description table has no such directory).
 /// Caller's badge MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
 /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
 /// [`super::devmgr_errors::INVALID_REQUEST`] when `caps[0]` or the
-/// path is absent. A repeated request keeps the first cap and path and
-/// replies `SUCCESS`.
+/// path is absent, releasing every cap the request carried. A repeated
+/// request keeps the first caps and path, releases its own, and replies
+/// `SUCCESS`.
 ///
-/// Devmgr stashes the cap and replies
+/// Devmgr stashes the caps and replies
 /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
-/// work, so svcmgr never blocks on driver bring-up. The
+/// work, so svcmgr never blocks on driver bring-up. Unless a platform
+/// description table among its boot modules matched the machine, devmgr
+/// first reads the tables of the `caps[1]` directory, each through
+/// [`super::procmgr_labels::READ_VERIFIED`] under
+/// `<PLATFORM_TABLES_PATH>/<entry>`, takes the one whose OEM table ID is
+/// the XSDT's and adds its device records, then deletes the cap
+/// (docs/driver-binding.md § Platform Description Tables). The
 /// drivers-directory pass (the listing, the read of each entry's driver
 /// declaration, and the bind of every PCI device and platform device
 /// record still unbound that a declaration matches, the RTC's among
@@ -161,6 +172,12 @@ pub const SET_DRIVERS_DIR: u64 = 6;
 /// the length of the directory's path, whose bytes follow
 /// (`crate::with_name_block`).
 pub const DRIVERS_DIR_PATH_WORD: usize = 1;
+
+/// The absolute path of the directory of platform description tables
+/// whose cap [`SET_DRIVERS_DIR`] carries as `caps[1]`; devmgr names each
+/// table it reads `<PLATFORM_TABLES_PATH>/<entry>`, its install path, the
+/// name procmgr verifies it was signed under in the data role.
+pub const PLATFORM_TABLES_PATH: &str = "/config/devmgr/platform";
 
 /// Longest drivers-directory path, in bytes, [`SET_DRIVERS_DIR`] and
 /// [`BIND_DRIVERS`] carry: the longest name procmgr verifies an object

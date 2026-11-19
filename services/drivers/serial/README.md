@@ -32,8 +32,9 @@ serial/
 platform device record of the console UART (the ACPI namespace's `PNP0501` device or the SPCR's
 console UART, merged into one record; COM1 at I/O port `0x3F8` on x86-64, the QEMU `virt`
 NS16550 at `0x1000_0000` on RISC-V). The driver carries a declaration in the ELF note section
-`.note.seraph.driver` (SPCR interface types `0x00` and `0x12` and ACPI `PNP0501`) and is a boot
-module, bound in the boot pass. devmgr spawns it via procmgr and delegates the record's
+`.note.seraph.driver` (SPCR interface types `0x00` and `0x12` and ACPI `PNP0501`) and is a
+drivers-directory driver, bound in the drivers-directory pass at the auxiliary tier. devmgr spawns
+it via procmgr and delegates the record's
 resources — an `IoPort` on x86-64, an `Mmio` on RISC-V — plus the UART interrupt cap, carved
 exclusive (COM1 is ISA IRQ 4; the QEMU `virt` NS16550 is APLIC source 10). The driver owns those
 caps end-to-end. Outside the driver, UART authority
@@ -51,7 +52,7 @@ serial until the driver writes again, and keeps writing them to the framebuffer 
 them in its history. Should logd fail to spawn that writer, each line's producer writes it, and a
 stopped driver then costs every line up to that bound
 ([logd IPC Interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks).
-devmgr creates it with its bundle entry name, its install path `/services/drivers/serial`, as its
+devmgr creates it with its install path `/services/drivers/serial` as its
 `argv[0]`, under which procmgr's
 `LIST_PROCESSES` names it to a debugger.
 

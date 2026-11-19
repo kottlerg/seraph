@@ -22,8 +22,8 @@ use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::registry_lookup_derived;
 use crate::restart::{
     CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, caps_death,
-    create_label_bits, destroy_partial_child, mint_debug_authority, mint_self_death_recv,
-    mint_stop_authority, start_process, walk_and_create_from_file,
+    create_label_bits, destroy_partial_child, mint_debug_authority, mint_entropy_authority,
+    mint_self_death_recv, mint_stop_authority, start_process, walk_and_create_from_file,
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
@@ -345,8 +345,9 @@ fn assemble_provided_boot_caps(
 
     // Resolve seeds after namespace setup. Resolution cannot fail: an
     // unresolved name becomes `0` in its slot (see `resolve_seeds`). A
-    // debug-authority holder's authority cap rides the slot after them, and a
-    // stop-authority holder's the slot after that.
+    // debug-authority holder's authority cap rides the slot after them, a
+    // stop-authority holder's the slot after that, and the entropy-authority
+    // holder's the slot after those.
     let mut seed_caps = resolve_seeds(&def.seed, &def.name, registry);
     if def.debug_authority
     {
@@ -355,6 +356,10 @@ fn assemble_provided_boot_caps(
     if def.stop_authority
     {
         seed_caps.push(mint_stop_authority(ctx));
+    }
+    if def.entropy_authority
+    {
+        seed_caps.push(mint_entropy_authority(ctx));
     }
     if role == Role::ShutdownActuator
     {

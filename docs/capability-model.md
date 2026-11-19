@@ -552,9 +552,14 @@ degradation).
 no split or merge. The kernel mints the one root cap at boot into init's CSpace, carrying
 **Contribute**, and init finds it by its descriptor's type. `EntropyControl` capabilities are not
 creatable at runtime. Which process holds it after init is userspace policy, set by ordinary
-minimum-privilege distribution; a cap init has not passed on by its reap is released when the
-reap frees init's CSpace, and no process can contribute until the next boot (see
-[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)).
+minimum-privilege distribution: init endows svcmgr with a derived copy, and svcmgr derives one,
+on each launch, for the one service whose recipe sets `entropy_authority = yes` ([.svc Service
+Definitions](../services/svcmgr/docs/service-definitions.md#entropy_authority)), which in the
+default image is entropyd, the contributor of the `hwrng` class drivers' bytes
+([services/entropyd/README.md](../services/entropyd/README.md)). The root stays in init's CSpace and
+is released when the reap frees it; a copy init has not derived by then is never made, and no
+process can contribute until the next boot (see [process-lifecycle.md § Init
+reap](process-lifecycle.md#init-reap)).
 
 ---
 

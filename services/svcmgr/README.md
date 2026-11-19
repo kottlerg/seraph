@@ -106,9 +106,10 @@ svcmgr/
   [`service::bootstrap_caps`](src/service.rs): svcmgr's own endpoints,
   the publish-role source caps (`rootfs.root` SEND, devmgr-registry
   `SEND|GRANT` source, the `vfsd.mount`, `vfsd.deny` and `vfsd.swap` SENDs on vfsd's
-  service endpoint), one `(name, thread_cap, observer)` round per substrate
-  service init bootstrapped before svcmgr existed (the observer is a Control-only
-  address-space cap or a process handle), and a terminal
+  service endpoint), the `EntropyControl` source carrying `Contribute`, which svcmgr never
+  publishes and derives the `entropy_authority` service's copy from, one
+  `(name, thread_cap, observer)` round per substrate service init bootstrapped before svcmgr
+  existed (the observer is a Control-only address-space cap or a process handle), and a terminal
   `LOGD_SOURCES` round carrying the two log-sink source caps svcmgr holds
   for the system's lifetime (the master-log source and a badge-0
   `SEND|GRANT` death-auth source on procmgr's service endpoint). Recipes
@@ -154,7 +155,7 @@ svcmgr/
   re-spawn the service from the recorded recipe. The `.svc` file is the
   single source of truth for both launch and restart — fixed fields on
   `ServiceEntry`, the argv/env/cwd/seed, the log-sink, debug-authority,
-  stop-authority, `oom_stop` and `reserve` flags, the `stop_source`
+  stop-authority, entropy-authority, `oom_stop` and `reserve` flags, the `stop_source`
   class, and the scheduling fields on a parallel `RestartRecipe` — so a restart reproduces the
   first-launch surfaces
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Recipe storage).
@@ -219,7 +220,8 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
 `seed`, `provides`, `log_sink`, `shutdown_actuator`, `debug_authority`,
-`stop_authority`, `oom_stop`, `reserve`, `priority`, `sched_max`. Unknown keys are hard
+`stop_authority`, `entropy_authority`, `oom_stop`, `reserve`, `priority`, `sched_max`. Unknown
+keys are hard
 errors. Restart values: `never | on_failure | always`.
 Critical values: `yes | no`. Namespace forms:
 `none | universal | subtree:<path>:<rights>`. `priority` / `sched_max`

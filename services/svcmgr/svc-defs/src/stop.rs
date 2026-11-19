@@ -32,8 +32,8 @@ pub struct StopFacts
     /// The recipe's `critical = yes`.
     pub critical: bool,
     /// The recipe gives the service a core role: `log_sink`,
-    /// `debug_authority`, `stop_authority`, `reserve`, `shutdown_actuator`,
-    /// or `stop_source` (see [`core_role`]).
+    /// `debug_authority`, `stop_authority`, `entropy_authority`, `reserve`,
+    /// `shutdown_actuator`, or `stop_source` (see [`core_role`]).
     pub core_role: bool,
     /// The recipe's `oom_stop = yes`.
     pub oom_stop: bool,
@@ -70,8 +70,8 @@ impl StopRefusal
             Self::Critical => "critical = yes",
             Self::CoreRole =>
             {
-                "holds a core role (log_sink, debug_authority, stop_authority, reserve, \
-                 shutdown_actuator or stop_source)"
+                "holds a core role (log_sink, debug_authority, stop_authority, \
+                 entropy_authority, reserve, shutdown_actuator or stop_source)"
             }
             Self::NotOptedIn => "oom_stop is not yes",
         }
@@ -80,7 +80,8 @@ impl StopRefusal
 
 /// Whether a recipe's keys give its service a core role, which the
 /// eligibility rule never stops: the system log sink, the holders of
-/// procmgr's debug authority and of the stop authority, a service in the
+/// procmgr's debug authority, of the stop authority and of the kernel's
+/// entropy-contribution authority, a service in the
 /// system reserve, the shutdown actuator, and a stop source, which holds kill
 /// authority over processes of its own.
 #[must_use]
@@ -92,12 +93,19 @@ pub const fn core_role(
     log_sink: bool,
     debug_authority: bool,
     stop_authority: bool,
+    entropy_authority: bool,
     reserve: bool,
     shutdown_actuator: bool,
     stop_source: bool,
 ) -> bool
 {
-    log_sink || debug_authority || stop_authority || reserve || shutdown_actuator || stop_source
+    log_sink
+        || debug_authority
+        || stop_authority
+        || entropy_authority
+        || reserve
+        || shutdown_actuator
+        || stop_source
 }
 
 /// The class a `stop_source = <class>` recipe names: the class svcmgr gives
@@ -290,13 +298,15 @@ mod tests
     #[test]
     fn each_core_role_key_alone_is_a_core_role()
     {
-        assert!(!core_role(false, false, false, false, false, false));
-        assert!(core_role(true, false, false, false, false, false));
-        assert!(core_role(false, true, false, false, false, false));
-        assert!(core_role(false, false, true, false, false, false));
-        assert!(core_role(false, false, false, true, false, false));
-        assert!(core_role(false, false, false, false, true, false));
-        assert!(core_role(false, false, false, false, false, true));
+        let none = [false; 7];
+        let role = |k: [bool; 7]| core_role(k[0], k[1], k[2], k[3], k[4], k[5], k[6]);
+        assert!(!role(none));
+        for key in 0..7
+        {
+            let mut keys = none;
+            keys[key] = true;
+            assert!(role(keys), "key {key}");
+        }
     }
 
     #[test]

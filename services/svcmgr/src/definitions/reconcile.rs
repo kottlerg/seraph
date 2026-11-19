@@ -282,6 +282,15 @@ pub fn reconcile_and_launch(
         );
     });
 
+    // One entropy-authority holder, the first declaration in launch order;
+    // any later one is a configuration error, launched without the cap.
+    svcmgr_defs::keep_one_entropy_holder(&mut defs, |def| {
+        log!(
+            warn: "svcmgr: {} also declares entropy_authority; not given",
+            def.name
+        );
+    });
+
     // One actuator, the first declaration in launch order; any later one is
     // a configuration error, launched as an ordinary service.
     let actuator = shutdown_actuator(&defs);
@@ -663,7 +672,8 @@ fn release_registration(pending: &PendingRegistration)
 
 /// Clone the launch surfaces the restart path replays from a parsed
 /// definition: argv/env/cwd/seed byte-for-byte, the log-sink,
-/// debug-authority, `oom_stop`, stop-authority and reserve flags, the
+/// debug-authority, `oom_stop`, stop-authority, entropy-authority and
+/// reserve flags, the
 /// `stop_source` class, and the
 /// scheduling fields. The name, binary, policy and namespace live on the
 /// `ServiceEntry` instead ([`build_entry`]). `None` when the heap cannot hold
@@ -684,6 +694,7 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         debug_authority: def.debug_authority,
         oom_stop: def.oom_stop,
         stop_authority: def.stop_authority,
+        entropy_authority: def.entropy_authority,
         reserve: def.reserve,
         stop_source: def.stop_source,
         observes_svcmgr: false,

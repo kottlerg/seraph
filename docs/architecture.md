@@ -123,6 +123,11 @@ Wall-clock service. Resolves the platform RTC through devmgr at startup and serv
 `GET_WALL_TIME` from a fixed offset against the kernel's monotonic clock. See
 [`services/timed/README.md`](../services/timed/README.md).
 
+**entropyd**
+Entropy contributor. Holds the one `EntropyControl` capability svcmgr gives, reads each driver of
+the `hwrng` device class, and mixes the bytes into the kernel entropy pool on a fixed pace, with
+no credit; it serves nothing. See [`services/entropyd/README.md`](../services/entropyd/README.md).
+
 **drivers**
 Isolated userspace processes. Access hardware only through capabilities
 granted by devmgr; see [device-management.md](device-management.md).

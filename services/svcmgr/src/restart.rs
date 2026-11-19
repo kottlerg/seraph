@@ -13,7 +13,7 @@
 //! `sched_max`), its create flags (`reserve`, the node handle an
 //! `oom_stop` service is created with, and the containment of a
 //! `stop_source` service), its log-sink flag and its
-//! debug- and stop-authority caps, binds the new instance's death observers
+//! debug-, stop- and entropy-authority caps, binds the new instance's death observers
 //! before it starts, and serves its bootstrap.
 //!
 //! Bootstrap delivery re-resolves the recipe's `seed` caps (the log-sink
@@ -127,6 +127,19 @@ pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
         ipc::stop_labels::STOP_AUTHORITY,
     )
     .unwrap_or(0)
+}
+
+/// Derive the `EntropyControl` copy carrying `Contribute` for the
+/// `entropy_authority` service's bootstrap round, from the source init
+/// endows. `0` when the source is absent or the derive fails, and the slot is
+/// then absent.
+pub(crate) fn mint_entropy_authority(ctx: &RestartCtx) -> u64
+{
+    if ctx.entropy_source == 0
+    {
+        return 0;
+    }
+    syscall::cap_derive(ctx.entropy_source, syscall::RIGHTS_ENTROPY_CONTRIBUTE).unwrap_or(0)
 }
 
 /// Mint a receive-only derivation of the queue svcmgr's own death posts to,
@@ -414,6 +427,10 @@ pub struct RestartCtx
     /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it, and a
     /// `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND|GRANT` cap.
     pub procmgr_death_auth_source: u64,
+    /// `EntropyControl` source carrying `Contribute`, from which svcmgr
+    /// derives the `entropy_authority = yes` service's copy on every launch
+    /// ([`mint_entropy_authority`]). `0` when init endowed none.
+    pub entropy_source: u64,
     /// The queue svcmgr's own main thread and address space post their
     /// death to (`observe_own_death` in `main.rs`), from which svcmgr mints
     /// the shutdown actuator's receive-only derivation on every launch
@@ -823,6 +840,11 @@ fn restart_boot_caps(
     if matches!(recipe, Some(r) if r.stop_authority)
     {
         restart_caps.push(mint_stop_authority(ctx));
+    }
+    // The entropy-authority holder's cap rides the slot after those.
+    if matches!(recipe, Some(r) if r.entropy_authority)
+    {
+        restart_caps.push(mint_entropy_authority(ctx));
     }
     // The shutdown actuator's receive-only derivation of svcmgr's own death
     // queue rides the slot after those, so each instance observes svcmgr.

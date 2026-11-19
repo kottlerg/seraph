@@ -599,10 +599,11 @@ init
       ├── logd     (serial, framebuffer endpoints via QUERY_DEVICE on class SENDs)
       ├── pwrmgr   (acpid power requests on x86-64; SbiControl via QUERY_SHUTDOWN_DEVICE on RISC-V)
       ├── timed    (RTC endpoint via QUERY_DEVICE on the rtc class SEND)
+      ├── entropyd (each hwrng driver's endpoint via QUERY_DEVICE on the hwrng class SEND)
       └── terminal (input, framebuffer, serial endpoints via QUERY_DEVICE on class SENDs)
 ```
 
-vfsd and the consumers svcmgr launches after handover (logd, pwrmgr, timed, terminal)
+vfsd and the consumers svcmgr launches after handover (logd, pwrmgr, timed, entropyd, terminal)
 query devmgr's registry for their device endpoints and hardware caps, which devmgr serves
 only after initial enumeration and binding complete. A device endpoint is queried with
 `devmgr_labels::QUERY_DEVICE`, and a class's changes are watched with `devmgr_labels::WATCH_CLASS`,
@@ -697,10 +698,11 @@ devmgr loads driver binaries from one of two places:
   ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
   `QUERY_DEVICE` calls on the rtc, input, hwrng, and debug-port classes and clients
   ([timed](../services/timed/README.md) degrades to its no-RTC path; the terminal, today's only
-  input class consumer, keeps waiting). Before `SET_DRIVERS_DIR` arrives the reply is the same
-  `NO_DEVICE`, so a client that cannot proceed without the device waits on a `WATCH_CLASS` watch
-  ([driver-binding.md](driver-binding.md) § Device Classes; the terminal, the GDB stub and the
-  debug-echo fixture do), while a client with a no-device path treats the first `NO_DEVICE` as
+  input class consumer, keeps waiting, and [entropyd](../services/entropyd/README.md) waits on its
+  class watch). Before `SET_DRIVERS_DIR` arrives the reply is the same `NO_DEVICE`, so a client that
+  cannot proceed without the device waits on a `WATCH_CLASS` watch
+  ([driver-binding.md](driver-binding.md) § Device Classes; the terminal, entropyd, the GDB stub and
+  the debug-echo fixture do), while a client with a no-device path treats the first `NO_DEVICE` as
   terminal (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the rule). Keeping non-essentials out of
   the boot bundle keeps the ESP-loaded image to what the system needs before the rootfs is mounted,
   so on-disk loading is preferred for anything not on the read-the-disk-in-the-first-place critical

@@ -1211,7 +1211,7 @@ architecture-neutral code calls them:
 bsp_tss_ptr}`,
 `platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions,
 MMIO_DIRECT_MAP_REGIONS}`,
-`fpu::{switch_out_save, switch_in_restore, report_save_area}`, `idt::load`, and
+`fpu::{switch_out_save, switch_in_restore, report_save_area, init_save_area}`, `idt::load`, and
 `ap_trampoline::{setup_trampoline, start_ap}` (the `gdt` items are stubs on RISC-V); the rest
 of those modules is arch-private:
 
@@ -1255,6 +1255,13 @@ pub unsafe fn fpu::switch_in_restore(tcb: *mut ThreadControlBlock);
 /// `vlenb` of 0, above 8192, or not a power of two. Called once in Phase 5,
 /// after the per-CPU install, before any Thread exists.
 pub unsafe fn fpu::report_save_area();
+/// Write a new thread's initial extended state into its save area of `bytes`
+/// bytes, the image its first FP/SIMD/V use restores: x86-64 zeroes the XSAVE
+/// area (`XSTATE_BV` 0, every component initial) and writes the x87 control
+/// word 0x037F and `MXCSR` 0x1F80, which XRSTOR loads whatever `XSTATE_BV`
+/// holds; RISC-V zeroes it, zero being every field's initial value. Called by
+/// Thread creation and by Phase 9 for init's thread.
+pub unsafe fn fpu::init_save_area(area: *mut u8, bytes: usize);
 
 /// Physical (base, size) of a boot console UART needing a dedicated `Mmio`
 /// capability at Phase 7: `Some` on RISC-V (ns16550, which may also lie inside an aperture);

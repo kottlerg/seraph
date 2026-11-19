@@ -13,6 +13,9 @@
 //! and finally captures the live register file into memory. The parent
 //! verifies both captures match the pattern the child wrote. Any
 //! cross-thread bleed surfaces as a mismatch and fails the test.
+//!
+//! [`initial_state`] checks the extended state a new thread starts with,
+//! which thread creation writes into its save area.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -335,4 +338,140 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
     // existing `thread::affinity_migrate_ready_queued` test already covers
     // strict affinity enforcement.
     Ok(())
+}
+
+// ── A new thread's initial state ─────────────────────────────────────────────
+
+/// Stack of the initial-state child.
+static mut STACK_INITIAL: ChildStack = ChildStack::ZERO;
+
+/// Outcome of the initial-state child's check of its control words:
+/// [`NOT_REACHED`] until it runs, 0 when every word holds its initial
+/// value, else one more than the index into `crate::arch::fpu::STATE_WORDS`
+/// of the first that does not.
+static INITIAL_MISMATCH: AtomicU64 = AtomicU64::new(NOT_REACHED);
+/// The value of the word [`INITIAL_MISMATCH`] names.
+static INITIAL_VALUE: AtomicU64 = AtomicU64::new(0);
+/// Outcome of the child's inexact division: [`NOT_REACHED`] until it
+/// completes, 0 when the status after it is the expected one, else 1.
+static DIVIDE_MISMATCH: AtomicU64 = AtomicU64::new(NOT_REACHED);
+/// The status word the child read after its division.
+static DIVIDE_VALUE: AtomicU64 = AtomicU64::new(0);
+
+/// An outcome the child has not written.
+const NOT_REACHED: u64 = u64::MAX;
+
+/// Polls of the wait for the child to exit, ~1 ms each, applied through
+/// [`crate::scaled_polls`]: the child runs two checks and exits.
+const EXIT_POLLS: u32 = 2000;
+
+/// Initial-state child entry: check the control words before any other use
+/// of the extended state, publish the result, then divide inexactly and
+/// publish that, and exit. A child whose state unmasks the inexact exception
+/// dies at the division, leaving [`DIVIDE_MISMATCH`] unwritten.
+extern "C" fn initial_state_entry(_arg: u64) -> !
+{
+    let (mismatch, value) = match crate::arch::fpu::initial_state_check()
+    {
+        Ok(()) => (0, 0),
+        Err((i, got)) => ((i as u64).saturating_add(1), got),
+    };
+    INITIAL_VALUE.store(value, Ordering::Relaxed);
+    INITIAL_MISMATCH.store(mismatch, Ordering::Release);
+    let (mismatch, value) = match crate::arch::fpu::inexact_divide_check()
+    {
+        Ok(()) => (0, 0),
+        Err(got) => (1, got),
+    };
+    DIVIDE_VALUE.store(value, Ordering::Relaxed);
+    DIVIDE_MISMATCH.store(mismatch, Ordering::Release);
+    thread_exit();
+}
+
+/// A new thread starts with the architected initial extended state: its
+/// floating-point control words read their initial values at its first use
+/// (on x86-64 `MXCSR` 0x1F80, every SIMD exception masked, and the x87
+/// control word 0x037F; on riscv64 `fcsr`, `vl`, `vtype`, `vstart` and
+/// `vcsr` 0), and an inexact division completes and sets only the inexact
+/// flag, where an unmasked exception would kill the thread. ktest's own
+/// thread, which the kernel creates at boot by the same path, holds the same
+/// control fields.
+pub fn initial_state(ctx: &TestContext) -> TestResult
+{
+    control_words_hold(
+        "ktest's own thread",
+        crate::arch::fpu::control_state_check(),
+    )?;
+    INITIAL_MISMATCH.store(NOT_REACHED, Ordering::Relaxed);
+    DIVIDE_MISMATCH.store(NOT_REACHED, Ordering::Relaxed);
+    let mut child =
+        crate::spawn::new_child(ctx).map_err(|_| "fpu::initial_state: spawn::new_child failed")?;
+    // SAFETY: `STACK_INITIAL` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_INITIAL)) };
+    // SAFETY: the stack is `STACK_INITIAL`, this test's own `ChildStack`, on
+    // which no other live thread runs (`ChildStack`'s rule).
+    let started =
+        unsafe { crate::spawn::configure_and_start(&child, initial_state_entry, stack_top, 0) };
+    let exited = started
+        .and_then(|()| crate::spawn::wait_until_exited(child.th, crate::scaled_polls(EXIT_POLLS)));
+    let released = child
+        .delete_thread()
+        .and_then(|()| child.delete_cspace())
+        .map_err(|_| "fpu::initial_state: teardown of the child failed");
+    exited?;
+    released?;
+    child_outcome()
+}
+
+/// Judge what the initial-state child published.
+fn child_outcome() -> TestResult
+{
+    let initial = INITIAL_MISMATCH.load(Ordering::Acquire);
+    if initial == NOT_REACHED
+    {
+        return Err("fpu::initial_state: the child exited before checking its state");
+    }
+    let initial = match initial.checked_sub(1)
+    {
+        None => Ok(()),
+        Some(i) => Err((
+            usize::try_from(i).unwrap_or(usize::MAX),
+            INITIAL_VALUE.load(Ordering::Relaxed),
+        )),
+    };
+    control_words_hold("a new thread", initial)?;
+    match DIVIDE_MISMATCH.load(Ordering::Acquire)
+    {
+        0 => Ok(()),
+        NOT_REACHED => Err("fpu::initial_state: a new thread died at an inexact division"),
+        _ =>
+        {
+            crate::log_u64(
+                "ktest: fpu::initial_state status after the division=",
+                DIVIDE_VALUE.load(Ordering::Relaxed),
+            );
+            Err("fpu::initial_state: an inexact division left a wrong status word")
+        }
+    }
+}
+
+/// Map a control-word check of `whose` state to the test's result, logging
+/// the word that differs and its value.
+fn control_words_hold(whose: &str, check: Result<(), (usize, u64)>) -> TestResult
+{
+    let Err((i, got)) = check
+    else
+    {
+        return Ok(());
+    };
+    crate::log("ktest: fpu::initial_state: a control word differs in the state of");
+    crate::log(whose);
+    crate::log(
+        crate::arch::fpu::STATE_WORDS
+            .get(i)
+            .copied()
+            .unwrap_or("an unnamed word"),
+    );
+    crate::log_u64("ktest: fpu::initial_state value=", got);
+    Err("fpu::initial_state: a control word does not hold its initial value")
 }

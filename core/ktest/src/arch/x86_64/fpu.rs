@@ -16,6 +16,9 @@
 //! `crate::integration::fpu_survives_ipc_call`. [`load_and_spin`] instead
 //! holds the loaded values while the thread spins, for a stop to find them in
 //! the image `SYS_THREAD_READ_EXT_REGS` reads (`crate::integration::thread_ext_regs`).
+//! [`initial_state_check`], [`control_state_check`] and
+//! [`inexact_divide_check`] read the control state a thread starts with
+//! (`crate::unit::fpu::initial_state`).
 
 /// Load `pattern` into xmm0..xmm15, spin `iters` iterations so the timer can
 /// preempt the thread, then capture the registers; returns the mismatched-lane
@@ -354,4 +357,127 @@ pub fn for_each_ext_word(
                 && check(high_at, u64::MAX, hi)
                 && check(high_at | 8, u64::MAX, hi)
         })
+}
+
+// ── A new thread's initial state ─────────────────────────────────────────────
+
+/// Names of the control words [`initial_state_check`] and
+/// [`control_state_check`] read, in the order their errors index.
+pub const STATE_WORDS: [&str; 2] = ["mxcsr", "x87 control word"];
+
+/// `MXCSR` at power-up, the value a new thread starts with: every SIMD
+/// floating-point exception masked, round to nearest, flush-to-zero and
+/// denormals-are-zero clear, no flag set (Intel SDM Vol. 1 § 10.2.3).
+const MXCSR_INIT: u64 = 0x1F80;
+
+/// `MXCSR`'s sticky exception flags (bits 5:0), which arithmetic sets.
+const MXCSR_FLAGS: u64 = 0x3F;
+
+/// `MXCSR`'s precision flag (`PE`), which an inexact result sets.
+const MXCSR_PE: u64 = 1 << 5;
+
+/// The x87 control word `FNINIT` sets, the value a new thread starts with:
+/// every x87 exception masked, double-extended precision, round to nearest
+/// (Intel SDM Vol. 1 § 8.1.5).
+const FCW_INIT: u64 = 0x037F;
+
+/// Read `MXCSR` and the x87 control word, in that order. The `stmxcsr` is
+/// the thread's first use of the extended state when it has made none, so
+/// the `#NM` it takes restores the thread's saved state first.
+fn read_control_words() -> [u64; 2]
+{
+    let mut mxcsr = 0u32;
+    let mut fcw = 0u16;
+    // SAFETY: `stmxcsr` stores MXCSR's 4 bytes into `mxcsr` and `fnstcw` the
+    // x87 control word's 2 bytes into `fcw`, both live locals; neither
+    // writes a register, and neither changes the extended state.
+    unsafe {
+        core::arch::asm!(
+            "stmxcsr [{m}]",
+            "fnstcw [{c}]",
+            m = in(reg) &raw mut mxcsr,
+            c = in(reg) &raw mut fcw,
+            options(nostack, preserves_flags),
+        );
+    }
+    [u64::from(mxcsr), u64::from(fcw)]
+}
+
+/// The index into [`STATE_WORDS`] and the value of the first of `words`
+/// whose bits under its mask differ from its expected value.
+fn first_mismatch(words: [(u64, u64, u64); 2]) -> Result<(), (usize, u64)>
+{
+    match words
+        .iter()
+        .enumerate()
+        .find(|&(_, &(got, mask, want))| got & mask != want)
+    {
+        Some((i, &(got, _, _))) => Err((i, got)),
+        None => Ok(()),
+    }
+}
+
+/// Check the executing thread's extended-state control words against a new
+/// thread's, before the thread has used the state: `MXCSR` 0x1F80 and the
+/// x87 control word 0x037F, exactly.
+///
+/// # Errors
+///
+/// The index into [`STATE_WORDS`] and the value of the first word that
+/// differs.
+pub fn initial_state_check() -> Result<(), (usize, u64)>
+{
+    let [mxcsr, fcw] = read_control_words();
+    first_mismatch([(mxcsr, u64::MAX, MXCSR_INIT), (fcw, u64::MAX, FCW_INIT)])
+}
+
+/// Check the control fields a thread keeps until it writes them: `MXCSR`
+/// apart from its sticky flags, and the x87 control word. For a thread that
+/// may have computed since its first use, such as ktest's own.
+///
+/// # Errors
+///
+/// The index into [`STATE_WORDS`] and the value of the first word that
+/// differs.
+pub fn control_state_check() -> Result<(), (usize, u64)>
+{
+    let [mxcsr, fcw] = read_control_words();
+    first_mismatch([(mxcsr, !MXCSR_FLAGS, MXCSR_INIT), (fcw, u64::MAX, FCW_INIT)])
+}
+
+/// Divide 1.0 by 3.0 with `divsd`, whose result is inexact, then read
+/// `MXCSR`, which must be 0x1F80 with the precision flag set. A thread whose
+/// `MXCSR` unmasks the precision exception takes `#XM` at the division and
+/// dies instead.
+///
+/// # Errors
+///
+/// `MXCSR` after the division, when it is not the expected value.
+pub fn inexact_divide_check() -> Result<(), u64>
+{
+    let operands = [1.0f64, 3.0f64];
+    let mut mxcsr = 0u32;
+    // SAFETY: the asm loads `operands[0]` into xmm0, divides it by
+    // `operands[1]` read from memory, and stores MXCSR into `mxcsr`; both
+    // are live locals. It clobbers xmm0, which this soft-float binary's
+    // compiled code never holds a value in.
+    unsafe {
+        core::arch::asm!(
+            "movsd xmm0, qword ptr [{o}]",
+            "divsd xmm0, qword ptr [{o} + 8]",
+            "stmxcsr [{m}]",
+            o = in(reg) operands.as_ptr(),
+            m = in(reg) &raw mut mxcsr,
+            options(nostack, preserves_flags),
+        );
+    }
+    let mxcsr = u64::from(mxcsr);
+    if mxcsr == MXCSR_INIT | MXCSR_PE
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(mxcsr)
+    }
 }

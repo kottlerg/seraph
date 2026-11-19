@@ -1585,7 +1585,8 @@ const _: () = assert!(
 /// components: the legacy region at 0, the XSAVE header (`XSTATE_BV` first)
 /// at 512, and the upper halves of the YMM registers at 576. A component
 /// whose `XSTATE_BV` bit is clear is in its initial state, whatever its
-/// bytes hold. Bytes 464..512 of the legacy region are not written.
+/// bytes hold, apart from `MXCSR` (bytes 24..28), which the image always
+/// holds. Bytes 464..512 of the legacy region are not written.
 pub const EXT_REGS_X86_64_XCR0: u64 = 0b111;
 /// Byte offset of `f0` in the riscv64 extended-state image: `fN` sits at
 /// this offset plus `N * 8`, NaN-boxed when it holds a single.

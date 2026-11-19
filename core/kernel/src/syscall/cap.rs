@@ -1254,16 +1254,17 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // Inside the wrapper page, so inside the slot.
     let tcb_ptr = kstack_top.wrapping_add(tcb_offset) as *mut ThreadControlBlock;
     // Per-thread FPU/SIMD/V save area: its pages directly after the wrapper
-    // page. Zero-initialised so the first XRSTOR / F-D restore sees the
-    // architected initial state. The area's lifecycle is the Thread retype
-    // slot's; `retype_free` reclaims it wholesale, so no separate free
-    // path is needed.
+    // page, holding the initial extended state the thread's first FP/SIMD/V
+    // use restores. The area's lifecycle is the Thread retype slot's;
+    // `retype_free` reclaims it wholesale, so no separate free path is
+    // needed.
     let extended_area = slot_field::<u8>(block_virt, EXTENDED_OFFSET);
     // SAFETY: extended_area points at the freshly-retyped save-area pages,
-    // `extended_bytes` of them below the shadow-stack page or at the end of
-    // the slot, exclusively owned by this TCB construction.
+    // `extended_bytes` of them (the boot CPU's save-area size)
+    // below the shadow-stack page or at the end of the slot, exclusively
+    // owned by this TCB construction.
     unsafe {
-        core::ptr::write_bytes(extended_area, 0u8, extended_bytes as usize);
+        crate::arch::current::fpu::init_save_area(extended_area, extended_bytes as usize);
     }
 
     // Build the initial SavedState. The "entry point" is the user_thread_trampoline

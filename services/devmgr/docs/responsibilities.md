@@ -760,6 +760,7 @@ its own. What a badge names differs:
 | `virtio-input` | its verbs (`READ_AUTHORITY`) | nothing |
 | `virtio-console` | its verbs | the receive notification (`SERIAL_REGISTER_RX_NOTIFY`) |
 | `virtio-rng` | its verbs (`READ_AUTHORITY`) | nothing |
+| `tpm` | its verbs (`READ_AUTHORITY`) | nothing |
 | `serial` | its verbs | the receive notification (`SERIAL_REGISTER_RX_NOTIFY`) |
 | `framebuffer` | its verbs (`WRITE_AUTHORITY`) | nothing |
 | `cmos`, `goldfish-rtc` | its verbs (`READ_AUTHORITY`) | nothing |

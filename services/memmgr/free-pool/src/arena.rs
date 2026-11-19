@@ -196,6 +196,50 @@ const _: () = assert!(size_of::<Commitment>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<LimitReg>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<SpillNode>() <= size_of::<ProcessRecord>());
+
+/// Where a spill stands ([`SpillNode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpillState
+{
+    /// `SPILL_TAKE` handed the chunk's sealed bytes to the swap service, whose
+    /// write to the slot is in flight; the chunk's store runs are kept.
+    Spilling,
+    /// The swap service wrote the slot: the chunk's bytes are on disk only.
+    OnDisk,
+    /// The chunk was restored or torn down while its write was in flight. The
+    /// slot stays taken until the swap service ends the write
+    /// (`SPILL_DONE`), so the write cannot land in a slot another chunk took.
+    Cancelled,
+}
+
+/// One chunk the swap service holds, or is writing, in a swap slot
+/// (`services/memmgr/docs/memory-pool.md` § Disk tier): the chunk, the nonce
+/// its bytes were sealed under, its store runs while the write is in flight,
+/// and the slot. The chunk's entry names this slot; the slot map names it by
+/// its swap slot ([`crate::spill::SwapSlots`]). The chunk fields are stale once
+/// it is [`SpillState::Cancelled`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpillNode
+{
+    /// The record slot of the chunk's process.
+    pub rec: NodeIdx,
+    /// The region slot of the chunk.
+    pub reg: NodeIdx,
+    /// The chunk's base address.
+    pub page_base: u64,
+    /// The per-boot nonce counter the chunk's bytes were sealed under, used
+    /// for no other seal.
+    pub nonce: u64,
+    /// The head of the chunk's store-run list while it is spilling,
+    /// [`NODE_NULL`] otherwise.
+    pub store: NodeIdx,
+    /// The swap slot.
+    pub slot: u32,
+    /// Bytes the slot holds: the sealed stream and its tag.
+    pub len: u16,
+    pub state: SpillState,
+}
 
 /// The payload of one arena slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +266,8 @@ pub enum Node
     ChunkDir([NodeIdx; DIR_FANOUT]),
     /// A leaf of a chunk table: one chunk's entry.
     Chunk(ChunkEntry),
+    /// A chunk the swap service holds or is writing in a swap slot.
+    Spill(SpillNode),
 }
 
 /// An arena slot: a payload plus the index of the next slot on whichever

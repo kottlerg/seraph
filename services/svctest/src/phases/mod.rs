@@ -86,6 +86,7 @@ pub mod recv_guard;
 pub mod recv_pool;
 pub mod sessiond;
 pub mod shmem;
+pub mod spill;
 pub mod startup;
 pub mod svcmgr;
 pub mod swap;
@@ -140,6 +141,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(swap::phases());
+    out.extend_from_slice(spill::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());

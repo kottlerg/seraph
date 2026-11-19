@@ -236,6 +236,17 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
     publish_endowed_send(registry, caps.vfsd_mount, ipc::published_names::VFSD_MOUNT);
     publish_endowed_send(registry, caps.vfsd_deny, ipc::published_names::VFSD_DENY);
     publish_endowed_send(registry, caps.vfsd_swap, ipc::published_names::VFSD_SWAP);
+    // memmgr.spill — memmgr's spill authority, endowed pre-badged by init
+    // (`SPILL_AUTHORITY`) with `GRANT`, which its seeds keep: each spill label
+    // but `SPILL_DONE` moves a cap to memmgr. Seed-only: the swap service's
+    // recipe is to seed it, and svctest's seeds it while no swap service
+    // exists.
+    publish_endowed(
+        registry,
+        caps.memmgr_spill,
+        ipc::published_names::MEMMGR_SPILL,
+        Visibility::SeedOnlyGrant,
+    );
 
     // svcmgr — SEND on svcmgr's own service endpoint (crasher seeds it),
     // badged so no consumer holds an unbadged source it could re-badge with
@@ -319,13 +330,20 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
 /// publish fails.
 fn publish_endowed_send(registry: &mut registry::Registry, cap: u64, name: &[u8])
 {
+    publish_endowed(registry, cap, name, Visibility::SeedOnly);
+}
+
+/// [`publish_endowed_send`] with `visibility`: [`Visibility::SeedOnlyGrant`]
+/// for an endowed `SEND|GRANT` whose seeds keep `GRANT`.
+fn publish_endowed(registry: &mut registry::Registry, cap: u64, name: &[u8], visibility: Visibility)
+{
     let shown = core::str::from_utf8(name).unwrap_or("?");
     if cap == 0
     {
         std::os::seraph::log!(warn: "no {shown} source cap; not published");
         return;
     }
-    if registry.publish(name, cap, Visibility::SeedOnly).is_err()
+    if registry.publish(name, cap, visibility).is_err()
     {
         std::os::seraph::log!(warn: "publish {shown} failed");
         let _ = syscall::cap_delete(cap);

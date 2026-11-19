@@ -518,6 +518,9 @@ pub const fn remap_entry_unpack(word: u64) -> (u16, u8, u32)
 /// `CapTag::Memory` discriminant.
 pub const CAP_TAG_MEMORY: u8 = 1;
 
+/// `CapTag::Endpoint` discriminant.
+pub const CAP_TAG_ENDPOINT: u8 = 3;
+
 /// `CapTag::Notification` discriminant.
 pub const CAP_TAG_NOTIFICATION: u8 = 4;
 

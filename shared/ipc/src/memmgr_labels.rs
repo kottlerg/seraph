@@ -83,6 +83,20 @@ pub const NODE_HANDLE_TAG: u64 = 1 << 62;
 const _: () = core::assert!(
     NODE_HANDLE_TAG & crate::VERB_BIT_MASK != 0 && NODE_HANDLE_TAG != PHYS_CLASS_BADGE_BIT
 );
+/// Badge bit of the spill authority: a SEND on memmgr's endpoint badged with
+/// this bit alone, which init mints, is the authority to serve the spill
+/// labels ([`SPILL_REGISTER`] to [`SPILL_RESTORE`]), the swap service's
+/// interface to memmgr's disk tier. No process badge or node handle carries
+/// it, so memmgr serves the spill labels only on a badge carrying it and the
+/// other labels only on one without it, and refuses the rest with
+/// `UNAUTHORIZED`. Specified in `services/memmgr/docs/ipc-interface.md`
+/// § Badge Discipline.
+pub const SPILL_AUTHORITY: u64 = 1 << 61;
+const _: () = core::assert!(
+    SPILL_AUTHORITY & crate::VERB_BIT_MASK != 0
+        && SPILL_AUTHORITY != NODE_HANDLE_TAG
+        && SPILL_AUTHORITY != PHYS_CLASS_BADGE_BIT
+);
 /// Procmgr-only: notify process death. `data[0]` carries the dead process's
 /// memmgr badge (no cap is required); memmgr reclaims every Memory cap
 /// it had issued to that badge, runs coalescing, and clears the
@@ -138,11 +152,15 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   above it, `data[6]` plus the lesser of `data[10]` and `data[6]`. What
 ///   such a node can still be granted is `data[3]` less `data[8]` less
 ///   this; the level is [`PRESSURE_CRITICAL`] at or below it.
+/// * `data[12]` — `spilled_bytes`: the pages of every chunk on disk, the
+///   subset of `data[10]` the swap service's slots alone hold.
+/// * `data[13]` — `swap_slots_free`: the swap slots registered and not
+///   taken, `0` while no swap service is registered.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[11]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[13]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.
@@ -395,6 +413,38 @@ pub const DISCARD_RANGE: u64 = 20;
 /// not be restored, for want of free RAM or a map). Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 21: `MAKE_RESIDENT`.
 pub const MAKE_RESIDENT: u64 = 21;
+/// Spill authority only ([`SPILL_AUTHORITY`]): register the swap service.
+/// `caps[0`] is a SEND on the endpoint memmgr redirects each fault on an
+/// on-disk chunk to; `data[0]` the swap slots the service's partition holds,
+/// each [`DEMAND_CHUNK_BYTES`]. A registration replaces the one before it
+/// and ends every write in flight, the chunks staying in memmgr's store.
+/// Reply: `SUCCESS` with `data[0]` the slots memmgr uses; `INVALID_ARGUMENT`
+/// when `caps[0]` is no endpoint cap or the count is below a slot in use.
+/// Specified in `services/memmgr/docs/ipc-interface.md` § Label 22:
+/// `SPILL_REGISTER`.
+pub const SPILL_REGISTER: u64 = 22;
+/// Spill authority only: take one evicted chunk for a swap slot. `caps[0]`
+/// is a Memory cap of at least [`DEMAND_CHUNK_BYTES`] memmgr writes the
+/// slot's bytes into (the chunk's stream, encrypted and authenticated under
+/// memmgr's per-boot key, and its tag). Reply: `SUCCESS` with `data[0]` the
+/// slot and `data[1]` its byte count, or an error code; `caps[0]` moved back
+/// on every reply. Specified in `services/memmgr/docs/ipc-interface.md`
+/// § Label 23: `SPILL_TAKE`.
+pub const SPILL_TAKE: u64 = 23;
+/// Spill authority only: end the write of a slot [`SPILL_TAKE`] named.
+/// `data[0]` the slot, `data[1]` 0 when the slot is written, else nonzero.
+/// Specified in `services/memmgr/docs/ipc-interface.md` § Label 24:
+/// `SPILL_DONE`.
+pub const SPILL_DONE: u64 = 24;
+/// Spill authority only: hand memmgr a slot's bytes, read back for a fault
+/// redirected to the swap service or ahead of one. `data[0]` the slot,
+/// `caps[0]` a Memory cap holding the slot's bytes from offset 0. memmgr
+/// checks the tag, decrypts, and makes the chunk resident. Reply: `SUCCESS`,
+/// or `RESTORE_DECLINED` with `data[0]` the decline word the swap service
+/// forwards the held fault with; `caps[0]` moved back on every reply.
+/// Specified in `services/memmgr/docs/ipc-interface.md` § Label 25:
+/// `SPILL_RESTORE`.
+pub const SPILL_RESTORE: u64 = 25;
 
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.

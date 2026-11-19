@@ -535,6 +535,7 @@ dependencies = [
 name = "memmgr-free-pool"
 version = "0.1.4"
 dependencies = [
+ "crypto",
  "ruststd-pool-funding",
  "syscall-abi",
 ]

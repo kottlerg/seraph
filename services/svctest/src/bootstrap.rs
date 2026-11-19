@@ -74,11 +74,14 @@ pub struct Caps
     /// no hwrng driver checks (`devmgr.class.hwrng-deny`), in slot 17, from
     /// a test class file the svctest recipe stages.
     pub hwrng_deny_class: u64,
+    /// `SPILL_AUTHORITY`-badged `SEND|GRANT` on memmgr's endpoint
+    /// (`memmgr.spill`), in slot 18.
+    pub memmgr_spill: u64,
     /// `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which the recipe's
-    /// `debug_authority = yes` delivers in slot 18, after the seeds.
+    /// `debug_authority = yes` delivers in slot 19, after the seeds.
     pub debug_authority: u64,
     /// `STOP_AUTHORITY`-badged SEND on svcmgr's service endpoint, which the
-    /// recipe's `stop_authority = yes` delivers in slot 19, after the
+    /// recipe's `stop_authority = yes` delivers in slot 20, after the
     /// debug-authority slot.
     pub stop_authority: u64,
 }
@@ -108,7 +111,7 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Eighteen seeds, the debug-authority slot and the stop-authority slot take five rounds; an
+    // Nineteen seeds, the debug-authority slot and the stop-authority slot take six rounds; an
     // absent slot decodes as `0`, and a round that does not decode leaves every slot `0`.
     let Ok(
         [
@@ -130,10 +133,11 @@ fn request_round() -> Caps
             sessiond_operator,
             hwrng_class,
             hwrng_deny_class,
+            memmgr_spill,
             debug_authority,
             stop_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<20>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<21>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -156,6 +160,7 @@ fn request_round() -> Caps
     caps.sessiond_operator = sessiond_operator;
     caps.hwrng_class = hwrng_class;
     caps.hwrng_deny_class = hwrng_deny_class;
+    caps.memmgr_spill = memmgr_spill;
     caps.debug_authority = debug_authority;
     caps.stop_authority = stop_authority;
 

@@ -28,11 +28,14 @@ memmgr/
 │                               # per-region chunk tables, commitment
 │                               # bounds (`commit.rs`), the compressed
 │                               # store's page codec and chunk stream
-│                               # (`compress.rs`, `store.rs`)
+│                               # (`compress.rs`, `store.rs`), the swap
+│                               # slot map and slot sealing (`spill.rs`)
 ├── src/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
-│   └── evict.rs                # Eviction: the clock's slices, the compression
+│   ├── evict.rs                # Eviction: the clock's slices, the compression
 │                               # worker, the store, restore
+│   └── spill.rs                # Disk tier: the spill labels, the per-boot
+│                               # key, the fault redirect to the swap service
 └── docs/
     ├── memory-pool.md          # Pool, allocation, reclamation, coalescing
     └── ipc-interface.md        # memmgr IPC labels and wire shapes
@@ -89,6 +92,12 @@ Allocation Contract").
   (a demand fault with decline code 10), and keep the system reserve for the
   core (see [`docs/memory-pool.md`](docs/memory-pool.md) § Distribution
   policy).
+- **Disk tier** — serve the swap service's spill labels on the spill
+  authority alone: hand it swapped chunks sealed under a per-boot key that
+  never leaves memmgr, redirect a fault on a chunk on disk to it, and restore
+  the chunk from the bytes it hands back once their tag checks (see
+  [`docs/memory-pool.md`](docs/memory-pool.md#disk-tier) § Disk tier and
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 22 to 25).
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments. Runs after every
@@ -117,9 +126,11 @@ Allocation Contract").
   as pager into a compressed store it keeps in RAM, and restores them on the
   next fault (see [`docs/memory-pool.md`](docs/memory-pool.md#eviction)
   § Eviction). Swap to
-  disk is that store's second tier: a separate swap service writes store pages
-  out and reads them back
-  ([#43](https://github.com/kottlerg/seraph/issues/43)).
+  disk is that store's second tier: a separate swap service takes chunks memmgr
+  seals under a per-boot key it alone holds, writes them to its partition, and
+  hands their bytes back on a fault memmgr redirects to it; memmgr reads and
+  writes no slot and waits on no swap service (see
+  [`docs/memory-pool.md`](docs/memory-pool.md#disk-tier) § Disk tier).
 - **Operate a page cache.** Caching of file pages (when fs drivers
   implement it) lives in the fs driver, not in memmgr.
 

@@ -220,8 +220,9 @@ svcmgr-launched services.
 
 Space-separated discovery-registry names. svcmgr resolves each name to a freshly-derived
 `RIGHTS_EP_SEND` cap on the published endpoint (`RIGHTS_EP_SEND_GRANT` for `devmgr.bind`, whose
-`BIND_DRIVERS` moves a directory cap and so needs `GRANT`, and for each [`:grant`](#provides) name)
-and injects them positionally into the child's bootstrap rounds:
+`BIND_DRIVERS` moves a directory cap and so needs `GRANT`, for `memmgr.spill`, whose spill labels
+move caps to memmgr, and for each [`:grant`](#provides) name) and injects them positionally into the
+child's bootstrap rounds:
 
 ```
 seed = rootfs.root pwrmgr.shutdown pwrmgr.deny
@@ -270,6 +271,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest and the hotplug-check disk mode) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 | `vfsd.swap` | svcmgr (endowed `SWAP_AUTHORITY` SEND) | `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, the `GET_SWAP_PARTITION` surface (seeded by the swap service's recipe; by svctest while no swap service exists) | no |
+| `memmgr.spill` | svcmgr (endowed `SPILL_AUTHORITY` `SEND\|GRANT`) | `SPILL_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint, the spill labels of memmgr's disk tier; its seeds keep `GRANT` (seeded by the swap service's recipe; by svctest while no swap service exists) | no |
 | `sessiond.operator` | svcmgr (`sessiond.svc` provider) | `:grant`-badged `SEND\|GRANT` on sessiond's service endpoint, the operator authority, which carries no stop bit (seeded by terminal and svctest) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 

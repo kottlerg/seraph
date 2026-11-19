@@ -31,11 +31,13 @@ pub mod index;
 pub mod ledger;
 pub mod pool;
 pub mod pressure;
+pub mod spill;
 pub mod store;
 
 pub use arena::{
     Arena, ArenaLayout, Commitment, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node,
     NodeHandle, NodeIdx, ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE, SlotStore,
+    SpillNode, SpillState,
 };
 pub use budget::{
     BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, growth_floor,
@@ -51,6 +53,7 @@ pub use ledger::{
 };
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 pub use pressure::{PRESSURE_BAND_DIVISOR, PRESSURE_LOW_DIVISOR, PressureLevel, pressure_level};
+pub use spill::{FaultPath, Registered, SlotError, SwapSlots, fault_path};
 
 use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_WRITABLE, PAGE_SIZE};
 

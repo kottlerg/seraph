@@ -10,9 +10,11 @@
 //! An entry records which pages of its chunk hold data (the backed mask), the
 //! chunk's [`ChunkState`], a pin flag, a two-bit age, the job slot of an
 //! eviction in flight, and a link: the head of the list of runs that back the
-//! chunk while it is resident or evicting, or the store handle of its
+//! chunk while it is resident or evicting, the store handle of its
 //! compressed pages while it is swapped, the head of the list of store runs
-//! that hold its stream ([`crate::store`]). The tree's
+//! that hold its stream ([`crate::store`]), or its spill node
+//! ([`crate::arena::SpillNode`]) while the swap service writes or holds it.
+//! The tree's
 //! leaves are [`Node::Chunk`] slots and its directory nodes [`Node::ChunkDir`]
 //! slots of [`DIR_FANOUT`] children; the table's height is fixed by the
 //! region's chunk count ([`table_height`]), and a node exists only on the path
@@ -63,6 +65,16 @@ pub enum ChunkState
     /// The pages the backed mask names are held compressed under the entry's
     /// store handle, and no run backs the chunk.
     Swapped,
+    /// Swapped, and the swap service is writing the chunk's sealed stream to a
+    /// swap slot: the entry names the spill node, which holds the store handle
+    /// until the write ends.
+    Spilling,
+    /// The chunk's pages are held only in the swap slot the entry's spill node
+    /// names; a fault on the chunk is redirected to the swap service.
+    OnDisk,
+    /// The chunk's bytes read back from its swap slot failed authentication:
+    /// its pages are gone, and every fault on it is declined.
+    Lost,
 }
 
 /// Why a chunk-entry transition was refused.
@@ -92,7 +104,8 @@ pub struct ChunkEntry
     /// ([`Self::begin_evict`]), 0 otherwise.
     job: u8,
     /// The head of the run list while resident or evicting, the store handle
-    /// while swapped, [`NODE_NULL`] while unbacked.
+    /// while swapped, the spill node while spilling or on disk, [`NODE_NULL`]
+    /// while unbacked or lost.
     link: u64,
 }
 
@@ -139,7 +152,11 @@ impl ChunkEntry
         match self.state
         {
             ChunkState::Resident | ChunkState::Evicting => self.link,
-            ChunkState::Unbacked | ChunkState::Swapped => NODE_NULL,
+            ChunkState::Unbacked
+            | ChunkState::Swapped
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => NODE_NULL,
         }
     }
 
@@ -150,7 +167,12 @@ impl ChunkEntry
         match self.state
         {
             ChunkState::Evicting => Some(self.job),
-            ChunkState::Unbacked | ChunkState::Resident | ChunkState::Swapped => None,
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Swapped
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => None,
         }
     }
 
@@ -162,7 +184,43 @@ impl ChunkEntry
         match self.state
         {
             ChunkState::Swapped => Some(self.link),
-            ChunkState::Unbacked | ChunkState::Resident | ChunkState::Evicting => None,
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Evicting
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => None,
+        }
+    }
+
+    /// The spill node of the chunk, while it is spilling or on disk.
+    #[must_use]
+    pub const fn spill(&self) -> Option<NodeIdx>
+    {
+        match self.state
+        {
+            ChunkState::Spilling | ChunkState::OnDisk => Some(self.link),
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Evicting
+            | ChunkState::Swapped
+            | ChunkState::Lost => None,
+        }
+    }
+
+    /// Whether the chunk's pages are evicted, held in the store, in a swap
+    /// slot, or lost: no run backs it, and its budget node stays charged for
+    /// its pages.
+    #[must_use]
+    pub const fn is_evicted(&self) -> bool
+    {
+        match self.state
+        {
+            ChunkState::Swapped | ChunkState::Spilling | ChunkState::OnDisk | ChunkState::Lost =>
+            {
+                true
+            }
+            ChunkState::Unbacked | ChunkState::Resident | ChunkState::Evicting => false,
         }
     }
 
@@ -225,7 +283,7 @@ impl ChunkEntry
     /// The access that faulted resets its age.
     ///
     /// # Errors
-    /// [`ChunkError::State`] when the chunk is evicting or swapped, and
+    /// [`ChunkError::State`] when the chunk is not unbacked or resident, and
     /// [`ChunkError::Window`] when the window is empty, leaves the chunk, or
     /// covers a page the chunk already holds.
     pub fn back(self, first: u32, pages: u32, runs: NodeIdx) -> Result<Self, ChunkError>
@@ -234,7 +292,11 @@ impl ChunkEntry
         {
             ChunkState::Unbacked | ChunkState::Resident =>
             {}
-            ChunkState::Evicting | ChunkState::Swapped => return Err(ChunkError::State),
+            ChunkState::Evicting
+            | ChunkState::Swapped
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => return Err(ChunkError::State),
         }
         let window = Self::window(first, pages).ok_or(ChunkError::Window)?;
         if self.backed & window != 0
@@ -268,10 +330,12 @@ impl ChunkEntry
                 job,
                 ..self
             }),
-            ChunkState::Unbacked | ChunkState::Evicting | ChunkState::Swapped =>
-            {
-                Err(ChunkError::State)
-            }
+            ChunkState::Unbacked
+            | ChunkState::Evicting
+            | ChunkState::Swapped
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => Err(ChunkError::State),
         }
     }
 
@@ -290,10 +354,12 @@ impl ChunkEntry
                 job: 0,
                 ..self
             }),
-            ChunkState::Unbacked | ChunkState::Resident | ChunkState::Swapped =>
-            {
-                Err(ChunkError::State)
-            }
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Swapped
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => Err(ChunkError::State),
         }
     }
 
@@ -313,33 +379,128 @@ impl ChunkEntry
                 link: store,
                 ..self
             }),
-            ChunkState::Unbacked | ChunkState::Resident | ChunkState::Swapped =>
-            {
-                Err(ChunkError::State)
-            }
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Swapped
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => Err(ChunkError::State),
         }
     }
 
-    /// A fault on a swapped chunk restored its pages into the runs from
-    /// `runs`: it is resident with the same mask, and its store handle is
-    /// gone, so the caller frees the store first ([`Self::store`]).
+    /// A swapped, spilling or on-disk chunk's pages were restored into the
+    /// runs from `runs`: it is resident with the same mask, and its store
+    /// handle or spill node is gone, so the caller settles them first
+    /// ([`Self::store`], [`Self::spill`]).
     ///
     /// # Errors
-    /// [`ChunkError::State`] for a chunk that is not swapped.
+    /// [`ChunkError::State`] for a chunk in another state.
     pub fn restore(self, runs: NodeIdx) -> Result<Self, ChunkError>
     {
         match self.state
         {
-            ChunkState::Swapped => Ok(Self {
+            ChunkState::Swapped | ChunkState::Spilling | ChunkState::OnDisk => Ok(Self {
                 state: ChunkState::Resident,
                 age: 0,
                 link: runs,
                 ..self
             }),
-            ChunkState::Unbacked | ChunkState::Resident | ChunkState::Evicting =>
-            {
-                Err(ChunkError::State)
-            }
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Evicting
+            | ChunkState::Lost => Err(ChunkError::State),
+        }
+    }
+
+    /// The swap service takes a swapped chunk's sealed stream for the slot of
+    /// the spill node `spill`, which holds the chunk's store handle from now
+    /// on: the chunk is spilling.
+    ///
+    /// # Errors
+    /// [`ChunkError::State`] for a chunk that is not swapped.
+    pub fn begin_spill(self, spill: NodeIdx) -> Result<Self, ChunkError>
+    {
+        match self.state
+        {
+            ChunkState::Swapped => Ok(Self {
+                state: ChunkState::Spilling,
+                link: spill,
+                ..self
+            }),
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Evicting
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => Err(ChunkError::State),
+        }
+    }
+
+    /// The swap service wrote a spilling chunk's slot: the chunk is on disk,
+    /// under the same spill node, whose store handle the caller frees.
+    ///
+    /// # Errors
+    /// [`ChunkError::State`] for a chunk that is not spilling.
+    pub fn finish_spill(self) -> Result<Self, ChunkError>
+    {
+        match self.state
+        {
+            ChunkState::Spilling => Ok(Self {
+                state: ChunkState::OnDisk,
+                ..self
+            }),
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Evicting
+            | ChunkState::Swapped
+            | ChunkState::OnDisk
+            | ChunkState::Lost => Err(ChunkError::State),
+        }
+    }
+
+    /// A spilling chunk's write failed or was abandoned: the chunk is swapped
+    /// again under `store`, the store handle its spill node held.
+    ///
+    /// # Errors
+    /// [`ChunkError::State`] for a chunk that is not spilling.
+    pub fn cancel_spill(self, store: u64) -> Result<Self, ChunkError>
+    {
+        match self.state
+        {
+            ChunkState::Spilling => Ok(Self {
+                state: ChunkState::Swapped,
+                link: store,
+                ..self
+            }),
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Evicting
+            | ChunkState::Swapped
+            | ChunkState::OnDisk
+            | ChunkState::Lost => Err(ChunkError::State),
+        }
+    }
+
+    /// An on-disk chunk's bytes failed authentication when read back: the
+    /// chunk is lost, its spill node gone.
+    ///
+    /// # Errors
+    /// [`ChunkError::State`] for a chunk that is not on disk.
+    pub fn lose(self) -> Result<Self, ChunkError>
+    {
+        match self.state
+        {
+            ChunkState::OnDisk => Ok(Self {
+                state: ChunkState::Lost,
+                link: NODE_NULL,
+                ..self
+            }),
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Evicting
+            | ChunkState::Swapped
+            | ChunkState::Spilling
+            | ChunkState::Lost => Err(ChunkError::State),
         }
     }
 
@@ -385,7 +546,12 @@ impl ChunkEntry
                 };
                 Self { age, ..self }
             }
-            ChunkState::Unbacked | ChunkState::Evicting | ChunkState::Swapped => self,
+            ChunkState::Unbacked
+            | ChunkState::Evicting
+            | ChunkState::Swapped
+            | ChunkState::Spilling
+            | ChunkState::OnDisk
+            | ChunkState::Lost => self,
         }
     }
 
@@ -463,7 +629,8 @@ fn child<S: SlotStore>(arena: &Arena<S>, dir: NodeIdx, pos: usize) -> NodeIdx
         | Node::Caps(_)
         | Node::Commit(_)
         | Node::Handle(_)
-        | Node::Limit(_) => NODE_NULL,
+        | Node::Limit(_)
+        | Node::Spill(_) => NODE_NULL,
     }
 }
 
@@ -517,7 +684,8 @@ pub fn entry<S: SlotStore>(arena: &Arena<S>, root: NodeIdx, height: u32, index: 
             | Node::Commit(_)
             | Node::ChunkDir(_)
             | Node::Handle(_)
-            | Node::Limit(_),
+            | Node::Limit(_)
+            | Node::Spill(_),
         )
         | None => ChunkEntry::UNBACKED,
     }
@@ -652,7 +820,8 @@ pub fn release<S: SlotStore>(
             | Node::Caps(_)
             | Node::Commit(_)
             | Node::Handle(_)
-            | Node::Limit(_) =>
+            | Node::Limit(_)
+            | Node::Spill(_) =>
             {
                 continue;
             }
@@ -1560,5 +1729,90 @@ mod tests
         assert!(set_entry(&mut a, &mut one, 0, 0, resident(0, 1)));
         assert_eq!(next_entry(&a, one, 0, 0).map(|(i, _)| i), Some(0));
         assert_eq!(next_entry(&a, one, 0, 1), None);
+    }
+
+    #[test]
+    fn a_swapped_chunk_spills_to_disk_and_is_restored_from_either_spill_state()
+    {
+        let swapped = resident(0, 16)
+            .begin_evict(1)
+            .unwrap()
+            .finish_evict(0xABC)
+            .unwrap();
+        let spilling = swapped.begin_spill(0x55).unwrap();
+        assert_eq!(
+            (spilling.state(), spilling.spill(), spilling.store()),
+            (ChunkState::Spilling, Some(0x55), None)
+        );
+        let on_disk = spilling.finish_spill().unwrap();
+        assert_eq!(
+            (on_disk.state(), on_disk.spill(), on_disk.backed()),
+            (ChunkState::OnDisk, Some(0x55), 0xFFFF)
+        );
+        assert!(spilling.is_evicted() && on_disk.is_evicted());
+        for from in [spilling, on_disk]
+        {
+            let back = from.restore(11).unwrap();
+            assert_eq!(
+                (back.state(), back.runs(), back.spill(), back.age()),
+                (ChunkState::Resident, 11, None, 0)
+            );
+        }
+        // An abandoned write leaves the chunk swapped on the store it had.
+        let again = spilling.cancel_spill(0xABC).unwrap();
+        assert_eq!(again, swapped);
+    }
+
+    #[test]
+    fn a_lost_chunk_keeps_its_mask_and_refuses_every_transition()
+    {
+        let on_disk = resident(2, 3)
+            .begin_evict(1)
+            .unwrap()
+            .finish_evict(0xABC)
+            .unwrap()
+            .begin_spill(0x55)
+            .unwrap()
+            .finish_spill()
+            .unwrap();
+        let lost = on_disk.lose().unwrap();
+        assert_eq!(
+            (lost.state(), lost.backed(), lost.spill(), lost.store()),
+            (ChunkState::Lost, 0x001C, None, None)
+        );
+        assert!(lost.is_evicted());
+        assert_eq!(lost.restore(1), Err(ChunkError::State));
+        assert_eq!(lost.back(0, 1, 1), Err(ChunkError::State));
+        assert_eq!(lost.lose(), Err(ChunkError::State));
+        assert_eq!(lost.begin_spill(1), Err(ChunkError::State));
+        assert_eq!(lost.sweep(0), lost);
+    }
+
+    #[test]
+    fn each_spill_transition_refuses_a_chunk_in_another_state()
+    {
+        let resident = resident(0, 4);
+        let swapped = resident
+            .begin_evict(1)
+            .unwrap()
+            .finish_evict(0xABC)
+            .unwrap();
+        let spilling = swapped.begin_spill(0x55).unwrap();
+        let on_disk = spilling.finish_spill().unwrap();
+        assert_eq!(resident.begin_spill(1), Err(ChunkError::State));
+        assert_eq!(spilling.begin_spill(1), Err(ChunkError::State));
+        assert_eq!(swapped.finish_spill(), Err(ChunkError::State));
+        assert_eq!(on_disk.finish_spill(), Err(ChunkError::State));
+        assert_eq!(on_disk.cancel_spill(1), Err(ChunkError::State));
+        assert_eq!(spilling.lose(), Err(ChunkError::State));
+        // A chunk on the swap tier is neither backed nor evicted again, and a
+        // sweep leaves it as it is.
+        for e in [spilling, on_disk]
+        {
+            assert_eq!(e.back(4, 1, 1), Err(ChunkError::State));
+            assert_eq!(e.begin_evict(1), Err(ChunkError::State));
+            assert_eq!(e.sweep(0), e);
+            assert!(!e.is_idle(0));
+        }
     }
 }

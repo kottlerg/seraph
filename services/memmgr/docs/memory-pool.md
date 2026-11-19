@@ -294,17 +294,21 @@ entry records:
 
 - The backed mask: one bit per page of the chunk, set when a run backs the page.
 - The chunk's state: unbacked; resident, its pages backed by the runs on the entry's run list and
-  mapped in the process; evicting; or swapped.
+  mapped in the process; evicting; swapped; spilling or on disk, its pages taken by the swap
+  service ([Disk tier](#disk-tier)); or lost, its swap slot's bytes having failed authentication.
 - A pin flag and a two-bit age.
 - The job slot of its eviction while it is evicting, so a completion is applied only to the
   eviction it was posted for.
 - A link: the head of the chunk's run list while it is resident or evicting, the head of the list
-  of store runs its pages are stored in while it is swapped.
+  of store runs its pages are stored in while it is swapped, and its spill node while it is
+  spilling or on disk.
 
 The evicting and swapped states, the pin flag, and the age are the swap path's: memmgr reclaiming
 a cold chunk's runs under memory pressure and storing its pages, a fault restoring them
-([Eviction](#eviction)). A fault on an evicting or swapped chunk makes the whole chunk resident
-before it backs anything, so a resident chunk's every backed page is mapped.
+([Eviction](#eviction)); the spilling, on-disk and lost states are the disk tier's. A fault on an
+evicting, swapped or spilling chunk makes the whole chunk resident before it backs anything, so a
+resident chunk's every backed page is mapped; a fault on a chunk on disk is redirected to the swap
+service, and one on a lost chunk is declined.
 
 The table is a radix tree of [Metadata Arena](#metadata-arena) slots rooted in the region's node.
 A directory node holds `DIR_FANOUT` (6) children: the slot indices that fit in the slot's largest
@@ -329,8 +333,10 @@ leaves the entry as it was.
 nodes on a stack threaded through their own `next` links, which no table node uses otherwise. The
 walk needs no memory and no recursion. It rewrites each run's descriptor into a run node in place,
 which joins the free pool or the deferred list as any reclaimed frame does (see
-[Reclamation](#reclamation)), returns each store run of a swapped chunk, which no process ever
-mapped, to the free pool, and returns every directory and leaf node to the arena's free list.
+[Reclamation](#reclamation)), returns each store run of a swapped or spilling chunk, which no
+process ever mapped, to the free pool, frees an on-disk chunk's swap slot and spill node, cancels a
+spilling chunk's spill ([Disk tier](#disk-tier)), and returns every directory and leaf node to the
+arena's free list.
 
 ---
 
@@ -1062,7 +1068,8 @@ pages the compressed store holds. The worker's thread and Notification are memmg
 budget node stays charged for its evicted pages: a charge counts logical pages, resident and
 swapped. `QUERY_POOL_STATUS` reports the store's size and the swapped pages' size, and
 `QUERY_MEMORY_USAGE` a process's resident and swapped pages apart
-([`ipc-interface.md`](ipc-interface.md)).
+([`ipc-interface.md`](ipc-interface.md)). The swapped pages count every evicted chunk: swapped,
+spilling, on disk and lost ([Disk tier](#disk-tier)).
 
 **Debugger reads.** `SYS_THREAD_READ_MEM` fails on a page that is not present and does not ask
 the pager
@@ -1077,7 +1084,80 @@ only the chunks that have an entry, and one request makes at most a few chunks r
 at most a bounded number ([docs/limits.md](../../../docs/limits.md) § memmgr); its reply says where
 it stopped, and the reader asks again from there, so a request's turn delays the faults and grants
 behind it no more than a few restores would. The reader then retries its read. The request
-restores and backs nothing else: a page no fault has backed stays not present.
+restores and backs nothing else: a page no fault has backed stays not present. A chunk on disk or
+lost is passed over, since memmgr reads no swap slot and waits on no swap service; a page of it
+stays not present ([Disk tier](#disk-tier)).
+
+---
+
+## Disk tier
+
+A swapped chunk can leave memmgr's store for a swap slot the swap service holds on disk
+([#43](https://github.com/kottlerg/seraph/issues/43)). memmgr performs no device I/O and waits on no
+peer: the swap service drives every step over memmgr's spill labels, and a fault on a chunk on disk
+is redirected to it by a fault reply ([`ipc-interface.md`](ipc-interface.md) § Labels 22 to 25).
+The labels are served only on the spill authority, a SEND on memmgr's endpoint badged
+`SPILL_AUTHORITY` alone, which init mints and svcmgr publishes seed-only as `memmgr.spill`.
+
+**Slots.** `SPILL_REGISTER` names the swap service's restore endpoint and how many slots its
+partition holds. A slot holds one chunk, at the slot's index times a chunk's bytes into the
+partition, so any free slot holds any chunk, whatever it compresses to. memmgr owns the slots: a
+slot map grown a page at a time as far as the highest slot taken, in a window of memmgr's own
+address space ([docs/limits.md](../../../docs/limits.md) § memmgr), maps each taken slot to its
+chunk's spill node and threads the free slots on a list, so a slot is taken and freed in constant
+time and the swap service keeps no table. A registration replaces the one before it and ends every
+write in flight, since a new swap service knows nothing of its predecessor's; the chunks on disk
+stay, so a restarted swap service restores every one of them.
+
+**Write-out.** `SPILL_TAKE` takes the next swapped chunk: a hand over every process's regions,
+walking only the chunks that have an entry, a bounded number of steps a request. memmgr copies the
+chunk's stream from its store runs into a buffer of its own, seals it there, takes a slot and a
+spill node, and only then copies the slot's bytes into the swap service's buffer, a Memory cap the
+request carries, which memmgr maps itself at a window of its own address space. No memmgr frame
+leaves memmgr, and memmgr writes the swap service's buffer through its own mapping, which neither
+faults nor blocks: a revoke of the cap does not withdraw a mapping
+([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md) § `SYS_CAP_REVOKE`). One
+`SPILL_TAKE`'s time in memmgr's loop is bounded by that walk, one copy of a stream shorter than a
+chunk, one seal of it, and one copy of the sealed bytes, the order of a chunk's restore. The chunk
+is then spilling: its store runs stay, held on its spill node, until `SPILL_DONE` ends the write. A
+written chunk is on disk and its store runs return to the free pool; an unwritten one is swapped
+again on them. A fault on a spilling chunk restores it from those store runs and cancels the spill;
+its slot is freed only at `SPILL_DONE`, so a late write never lands on a slot taken since.
+
+**Encryption.** A slot holds the chunk's stream encrypted and authenticated with ChaCha20-Poly1305
+(`shared/crypto`) under a 256-bit key memmgr draws from `SYS_GETRANDOM` at start, followed by the
+16-byte tag. The key is in memmgr's memory only and is never sent: the swap service and the disk see
+only ciphertext. The nonce is a 64-bit counter memmgr never repeats within a boot, recorded on the
+chunk's spill node, so a slot's bytes open only as the seal memmgr last made of the chunk that holds
+it: another chunk's bytes, an older seal, or any change fail the tag. A failed key draw leaves the
+disk tier off: `SPILL_REGISTER` is refused. The rule is [docs/storage.md](../../../docs/storage.md)
+§ Data at Rest's.
+
+**Read-back.** A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming the swap service's
+endpoint ([docs/fault-handling.md](../../../docs/fault-handling.md) § Reply), with the slot and its
+byte count as the redirect word: the faulting thread stays fault-blocked, and the swap service reads
+the slot and hands memmgr its bytes with `SPILL_RESTORE`, then resumes the thread. memmgr maps the
+buffer read-only, copies the bytes into its own buffer, and checks the tag there, so the check and
+the decryption read one snapshot. A good slot is restored as a swapped chunk is
+([Eviction](#eviction), States): admitted, with direct reclaim, its pages written whole into new
+runs and mapped, its slot and spill node freed. A restore memmgr cannot make is declined with that
+restore's code, and the chunk stays on disk. A tag failure makes the chunk lost, its slot freed: the
+reply carries the decline word of code 12 with detail 1, which the swap service forwards the held
+fault with, so the faulting thread is killed, as every later fault on the chunk is. A fault on a
+chunk on disk with no swap service registered is declined with code 12 and detail 0. `SPILL_RESTORE`
+names a slot, not a fault, so the swap service may also restore ahead of one.
+
+**Read-back is serial.** virtio-blk keeps one request in flight
+([virtio-blk README](../../drivers/virtio/blk/README.md)), and one driver instance serves the root,
+data and swap partitions of a disk, so a restore's read waits behind the request in flight (a
+slot's write-out, or a filesystem request), and restores are served one after another.
+
+**Accounting.** A spilling chunk's store runs stay in `store`; an on-disk or lost chunk holds no
+page of `pool_total`. The swapped pages count every evicted chunk, and the budget node stays
+charged for its pages throughout, until a restore or a teardown; a lost chunk's charge goes with
+its region. `QUERY_POOL_STATUS` reports the pages on disk and the free slots apart
+([`ipc-interface.md`](ipc-interface.md) § Label 6). A spill node is an arena slot, and the slot
+map's pages are memmgr's metadata.
 
 ---
 
@@ -1102,12 +1182,12 @@ terminal fault tears down the whole process (see
 
 ## Non-Goals
 
-- **Disk swap.** The eviction store ([Eviction](#eviction)) is compressed
-  RAM inside `pool_total`. Its disk tier
-  belongs to a separate swap service
-  ([#43](https://github.com/kottlerg/seraph/issues/43)); memmgr performs no
-  device I/O. memmgr evicts only pages it mapped as pager, never a grant, a
-  page of a process whose budget node is a reserve node, or a no-evict region.
+- **Disk I/O.** The eviction store ([Eviction](#eviction)) is compressed
+  RAM inside `pool_total`. Its disk tier ([Disk tier](#disk-tier)) is a
+  separate swap service's, which reads and writes the slots; memmgr performs
+  no device I/O and waits on no swap service. memmgr evicts only pages it
+  mapped as pager, never a grant, a page of a process whose budget node is a
+  reserve node, or a no-evict region.
 - **Live migration.** memmgr does not relocate pages held by a live
   process to defragment the pool. Defragmentation depends on processes
   exiting (or calling `RELEASE_MEMORY_CAPS`) and the resulting coalesce.

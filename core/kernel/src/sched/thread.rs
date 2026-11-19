@@ -200,8 +200,10 @@ impl SleepExpiry
 /// arms `CR0.TS=1`. On RISC-V it inspects `sstatus.FS/VS` and saves
 /// only on Dirty. After switch-in the first user FP/SIMD/V op traps
 /// (`#NM` on x86-64, illegal-instruction on RISC-V) and the trap handler
-/// restores from `area` (XRSTOR on x86-64, `lazy_restore_fp_v` on RISC-V);
-/// a zero-initialised area restores the architected initial state.
+/// restores from `area` (XRSTOR on x86-64, `lazy_restore_fp_v` on RISC-V).
+/// Thread creation writes the initial state into the area
+/// (`arch::current::fpu::init_save_area`), so the first restore starts the
+/// thread from it.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct ExtendedState

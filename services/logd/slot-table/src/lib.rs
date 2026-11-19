@@ -657,4 +657,75 @@ mod tests
         assert_eq!(table.history.len(), RETIRED_SLOTS);
         assert_eq!(table.history.bytes(), recount(&table));
     }
+
+    // The defect caught: a child whose death post logd's full death queue
+    // dropped that keeps its live slot for the life of logd (a drain whose
+    // watch misses the drop, a resync that evicts nothing, or one that
+    // evicts a live sender or a system special). The drain takes as logd's
+    // does, each take through one `death_set::OverflowWatch`, from a model
+    // of the kernel's queue (`death_set::model`), and the resync decides as
+    // logd's does (`logd_codec::resync`).
+    #[test]
+    fn a_resync_evicts_every_slot_whose_death_a_full_queue_dropped()
+    {
+        use death_set::OverflowWatch;
+        use death_set::model::KernelQueue;
+        use ipc::log_badges::{LOG_BADGE_FIRST_CHILD, LOG_BADGE_PROCMGR};
+        use logd_codec::resync::{WalkGate, evictable, is_resync_candidate};
+
+        const RING: u32 = 2;
+        let mut table = SlotTable::default();
+        let children: Vec<u64> = (0..6).map(|n| LOG_BADGE_FIRST_CHILD + n).collect();
+        table.install_from_handover(LOG_BADGE_PROCMGR, b"procmgr");
+        for &badge in &children
+        {
+            table.install_from_handover(badge, b"child");
+        }
+        // procmgr's live processes. Five children die before logd drains,
+        // more than the ring holds; procmgr takes each out of its table
+        // before it posts the death to logd's queue.
+        let mut live = children.clone();
+        let mut queue = KernelQueue::new(RING);
+        for &badge in &children[..5]
+        {
+            live.retain(|&b| b != badge);
+            let _ = queue.post((badge, 0));
+        }
+
+        let mut watch = OverflowWatch::new(RING);
+        let mut gate = WalkGate::new();
+        let mut walk_started = false;
+        while let Some((badge, exit_reason)) = queue.try_recv()
+        {
+            if watch.took()
+            {
+                walk_started |= gate.request();
+            }
+            table.retire(badge, Eviction::Death { exit_reason });
+        }
+        watch.found_empty();
+        assert!(
+            walk_started,
+            "the drain that gave up a full ring starts a walk"
+        );
+
+        // The walk: the snapshot of child slots, procmgr's live list, and the
+        // evictions.
+        let mut snapshot: Vec<u64> = table
+            .slots
+            .keys()
+            .copied()
+            .filter(|&b| is_resync_candidate(b))
+            .collect();
+        snapshot.sort_unstable();
+        let missing: Vec<u64> = evictable(&snapshot, &live).collect();
+        for badge in missing
+        {
+            table.retire(badge, Eviction::Resync);
+        }
+        assert!(!gate.finished(), "no further resync was asked for");
+        let mut left: Vec<u64> = table.slots.keys().copied().collect();
+        left.sort_unstable();
+        assert_eq!(left, [LOG_BADGE_PROCMGR, children[5]]);
+    }
 }

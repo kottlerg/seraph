@@ -496,9 +496,12 @@ impl Hog
 
     /// Take grants, each of at most [`HOG_BLOCK_PAGES`] and halved on a
     /// refusal, until memmgr refuses one of a page with the level at
-    /// `CRITICAL`: growth outside the system reserve has then stopped at the
-    /// floor memmgr keeps, the reserve and, while pages are swapped, the
-    /// restore headroom. Returns the status read then.
+    /// `CRITICAL` and no more pages available than the floor: growth outside
+    /// the system reserve has then stopped at the floor memmgr keeps, the
+    /// reserve and, while pages are swapped, the restore headroom. Pages that
+    /// come free between the refusal and the status read, such as a chunk's
+    /// runs an eviction in flight returns, are taken too. Returns the status
+    /// read then.
     fn fill_to_floor(&mut self) -> Pool
     {
         let start = Instant::now();
@@ -517,6 +520,7 @@ impl Hog
             let status = pool();
             self.note(&status);
             if status.level == memmgr_labels::PRESSURE_CRITICAL
+                && status.available_pages() <= status.floor / PAGE_SIZE
             {
                 return status;
             }

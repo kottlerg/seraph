@@ -3,12 +3,13 @@
 
 // xtask/src/sysroot.rs
 
-//! Sysroot architecture consistency checks, arch recording, and rootfs
-//! installation, the bundle's data entries included.
+//! Sysroot architecture consistency checks, arch and harness recording, and
+//! rootfs installation, the repository's data files included.
 //!
 //! The sysroot is built for one architecture at a time. The active arch is
 //! recorded in `sysroot/.arch`. Switching architectures requires `cargo xtask
-//! clean` first to avoid mixing binaries.
+//! clean` first to avoid mixing binaries. The harness whose bundle every pack
+//! composes is recorded in `sysroot/.harness` ([`record_harness`]).
 
 use std::collections::HashSet;
 use std::fs;
@@ -17,8 +18,103 @@ use std::path::{Path, PathBuf};
 use crate::error::{Context, Result, bail};
 
 use crate::arch::Arch;
+use crate::argparse::{Leaf as _, ValueEnum as _};
+use crate::bundle::Harness;
 use crate::context::Context as BuildContext;
 use crate::util::step;
+
+/// The sysroot file that records the harness every pack composes the bundle
+/// of.
+const HARNESS_FILE: &str = ".harness";
+
+/// Record `harness` as the one whose bundle every later pack composes
+/// (`crate::disk::create_disk_image`): `build` records the init harness,
+/// `compose-bundle` the one it is given.
+///
+/// # Errors
+///
+/// On an I/O failure.
+pub fn record_harness(ctx: &BuildContext, harness: Harness) -> Result<()>
+{
+    fs::create_dir_all(&ctx.sysroot)
+        .with_context(|| format!("creating sysroot at {}", ctx.sysroot.display()))?;
+    let path = ctx.sysroot.join(HARNESS_FILE);
+    fs::write(&path, format!("{}\n", harness.name()))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// The harness [`record_harness`] recorded, or the init harness when none
+/// is.
+///
+/// # Errors
+///
+/// When the record cannot be read or names no harness.
+pub fn recorded_harness(ctx: &BuildContext) -> Result<Harness>
+{
+    let path = ctx.sysroot.join(HARNESS_FILE);
+    let text = match fs::read_to_string(&path)
+    {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Harness::Init),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Harness::parse(text.trim()).map_err(|e| {
+        crate::error::err!(
+            "{} names no harness ({e}): run `cargo xtask compose-bundle --harness <h>`",
+            path.display()
+        )
+    })
+}
+
+/// A file of the repository that the sysroot installs at `install`, outside
+/// `rootfs/` since it lives beside the component that reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataFile
+{
+    /// The install path.
+    pub install: &'static str,
+    /// The repository-relative path of the file installed there.
+    pub source: &'static str,
+}
+
+impl DataFile
+{
+    /// The sysroot-relative path of the installed file.
+    pub fn relative(&self) -> String
+    {
+        self.install.trim_start_matches('/').to_owned()
+    }
+}
+
+/// The log-level configuration init reads at boot
+/// (`services/init/docs/bootstrap.md` § Log levels), on every architecture.
+pub const LOG_LEVELS: DataFile = DataFile {
+    install: "/config/init/log-levels.conf",
+    source: "services/init/log-levels.conf",
+};
+
+/// Data files installed on one architecture only: the platform description
+/// tables of the machines of that architecture, which list the devices no
+/// firmware table describes (`services/devmgr/platform/`).
+const ARCH_DATA_FILES: &[(Arch, DataFile)] = &[(
+    Arch::Riscv64,
+    DataFile {
+        install: "/config/devmgr/platform/qemu-virt.platform",
+        source: "services/devmgr/platform/qemu-virt.platform",
+    },
+)];
+
+/// The data files the sysroot installs for `arch`: the architecture's
+/// platform tables, then the log-level configuration.
+pub fn data_files(arch: Arch) -> Vec<DataFile>
+{
+    ARCH_DATA_FILES
+        .iter()
+        .filter(|(a, _)| *a == arch)
+        .map(|(_, file)| *file)
+        .chain([LOG_LEVELS])
+        .collect()
+}
 
 /// Check that the sysroot is either absent or was built for `arch`.
 ///
@@ -55,10 +151,10 @@ pub fn record_arch(ctx: &BuildContext, arch: Arch) -> Result<()>
 }
 
 /// Top-level sysroot subtrees the rootfs mirror owns exclusively: rootfs static
-/// files, the bundle's data entries ([`install_data_entries`]) and the
+/// files, the repository's data files ([`install_data_files`]) and the
 /// synthesised `data/svctest/` fixtures. The prune pass is
-/// authoritative over these and only these. Build-owned trees (`esp/`,
-/// `services/`, `programs/`, `tests/`) and metadata (`.arch`, `NvVars`) are
+/// authoritative over these and only these. Build-owned trees (`boot/`, `esp/`,
+/// `services/`, `programs/`, `tests/`) and metadata (`.arch`, `.harness`, `NvVars`) are
 /// deliberately absent, so a scoping mistake cannot delete a binary.
 const ROOTFS_MANAGED_ROOTS: &[&str] = &["config", "data"];
 
@@ -69,7 +165,7 @@ const ROOTFS_MANAGED_ROOTS: &[&str] = &["config", "data"];
 const EMPTY_DIRS: &[&str] = &["crash"];
 
 /// Mirror `rootfs/` into the sysroot (skipping README.md), install the data
-/// entries of `arch`'s bundle ([`install_data_entries`]), create
+/// files of `arch` ([`install_data_files`]), create
 /// [`EMPTY_DIRS`], then make the mirror authoritative over
 /// [`ROOTFS_MANAGED_ROOTS`].
 ///
@@ -79,7 +175,7 @@ const EMPTY_DIRS: &[&str] = &["crash"];
 /// changes required.
 ///
 /// After copying, files under the managed roots with no `rootfs/` source (nor a
-/// data-entry or synthesised-fixture origin) are removed, so deleting a file from `rootfs/` is
+/// data-file or synthesised-fixture origin) are removed, so deleting a file from `rootfs/` is
 /// reflected in the sysroot and the disk image on the next build. Build-owned
 /// subtrees are never touched. `mkdisk --repack-only` bypasses this whole step
 /// to pack a hand-staged sysroot as it stands, its objects re-signed as every
@@ -121,7 +217,7 @@ pub fn install_rootfs(ctx: &BuildContext, arch: Arch) -> Result<()>
         keep.insert(dst);
     }
 
-    keep.extend(install_data_entries(ctx, arch)?);
+    keep.extend(install_data_files(ctx, arch)?);
     keep.insert(synthesise_svctest_large_bin(ctx)?);
     keep.insert(synthesise_svctest_bench_bin(ctx)?);
     for dir in EMPTY_DIRS
@@ -140,29 +236,28 @@ pub fn install_rootfs(ctx: &BuildContext, arch: Arch) -> Result<()>
     Ok(())
 }
 
-/// Install each data entry of `arch`'s default-init bundle
-/// (`crate::bundle::data_entries`): copy its repository source to its install
-/// path, unsigned, for the sign that precedes every compose and pack
-/// (`crate::signing::sign_sysroot`). Returns the installed paths, which the
-/// prune pass keeps.
+/// Install each data file of `arch` ([`data_files`]): copy its repository
+/// source to its install path, unsigned, for the sign that precedes every
+/// pack (`crate::signing::sign_sysroot`). Returns the installed paths, which
+/// the prune pass keeps.
 ///
 /// # Errors
 ///
 /// When a source is missing or a copy fails.
-pub fn install_data_entries(ctx: &BuildContext, arch: Arch) -> Result<Vec<PathBuf>>
+pub fn install_data_files(ctx: &BuildContext, arch: Arch) -> Result<Vec<PathBuf>>
 {
     let mut installed = Vec::new();
-    for entry in crate::bundle::data_entries(arch)
+    for file in data_files(arch)
     {
-        let src = ctx.root.join(entry.source);
-        let dst = ctx.sysroot.join(entry.relative());
+        let src = ctx.root.join(file.source);
+        let dst = ctx.sysroot.join(file.relative());
         if let Some(parent) = dst.parent()
         {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         fs::copy(&src, &dst)
             .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
-        step(&format!("Rootfs: {} (bundle data entry)", dst.display()));
+        step(&format!("Rootfs: {} (data file)", dst.display()));
         installed.push(dst);
     }
     Ok(installed)
@@ -371,8 +466,8 @@ mod tests
         fs::remove_dir_all(&sysroot).unwrap();
     }
 
-    /// End-to-end: `install_rootfs` mirrors `rootfs/`, installs the bundle's
-    /// data entries, synthesises the fixtures, and prunes a stale sysroot
+    /// End-to-end: `install_rootfs` mirrors `rootfs/`, installs the
+    /// repository's data files, synthesises the fixtures, and prunes a stale sysroot
     /// recipe while leaving a build-owned binary untouched. Covers `ROOTFS_MANAGED_ROOTS` and the keep-set construction —
     /// the pieces that make the prune safe — which the `prune_stale` unit tests,
     /// rebuilding roots and keep by hand, do not.
@@ -393,14 +488,14 @@ mod tests
         .unwrap();
         fs::create_dir_all(root.join("rootfs/data")).unwrap();
         fs::write(root.join("rootfs/data/test.txt"), b"marker").unwrap();
-        // The repository sources of the bundle's data entries.
+        // The repository sources of the data files.
         let arch = Arch::Riscv64;
-        let data = crate::bundle::data_entries(arch);
-        for entry in &data
+        let data = data_files(arch);
+        for file in &data
         {
-            let src = root.join(entry.source);
+            let src = root.join(file.source);
             fs::create_dir_all(src.parent().unwrap()).unwrap();
-            fs::write(&src, entry.install.as_bytes()).unwrap();
+            fs::write(&src, file.install.as_bytes()).unwrap();
         }
 
         // Pre-existing sysroot: a stale recipe under a managed root (no rootfs
@@ -451,17 +546,65 @@ mod tests
             sysroot.join("crash").is_dir(),
             "empty image directory created"
         );
-        // Defect caught: a data entry not installed, or pruned as a file with
-        // no `rootfs/` source, so the sign before a compose fails.
+        // Defect caught: a data file not installed, or pruned as a file with
+        // no `rootfs/` source, so the bundle that names it cannot be composed.
         assert!(data.len() >= 2, "riscv64 installs a platform table");
-        for entry in &data
+        for file in &data
         {
             assert_eq!(
-                fs::read(sysroot.join(entry.relative())).unwrap(),
-                entry.install.as_bytes()
+                fs::read(sysroot.join(file.relative())).unwrap(),
+                file.install.as_bytes()
             );
         }
 
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // Defect caught: a data file whose source the repository does not hold,
+    // an install path that is not one, or an architecture installing the
+    // other's platform table.
+    #[test]
+    fn every_data_file_installs_a_repository_file_at_an_install_path()
+    {
+        let root = crate::signing::testing::work_tree();
+        for arch in [Arch::X86_64, Arch::Riscv64]
+        {
+            for file in data_files(arch)
+            {
+                assert!(root.join(file.source).is_file(), "{}", file.source);
+                assert!(objsig::name_is_install_path(file.install.as_bytes()));
+                assert_eq!(file.relative(), &file.install[1..]);
+            }
+        }
+        let platform = "/config/devmgr/platform/qemu-virt.platform";
+        let installs = |arch| -> Vec<&str> { data_files(arch).iter().map(|f| f.install).collect() };
+        assert!(installs(Arch::Riscv64).contains(&platform));
+        assert!(!installs(Arch::X86_64).contains(&platform));
+        for arch in [Arch::X86_64, Arch::Riscv64]
+        {
+            assert!(installs(arch).contains(&LOG_LEVELS.install));
+        }
+    }
+
+    // Defect caught: a pack that composes another harness's bundle than the
+    // one `build` or `compose-bundle` chose, or an unreadable record taken
+    // for the init harness, which would sign and boot the wrong `init`.
+    #[test]
+    fn the_recorded_harness_is_the_last_one_recorded_and_init_by_default()
+    {
+        let base = scratch("harness");
+        let ctx = BuildContext {
+            root: base.clone(),
+            sysroot: base.join("sysroot"),
+            target_dir: base.join("target"),
+        };
+        assert_eq!(recorded_harness(&ctx).unwrap(), Harness::Init);
+        record_harness(&ctx, Harness::Ktest).unwrap();
+        assert_eq!(recorded_harness(&ctx).unwrap(), Harness::Ktest);
+        record_harness(&ctx, Harness::Init).unwrap();
+        assert_eq!(recorded_harness(&ctx).unwrap(), Harness::Init);
+        fs::write(ctx.sysroot.join(HARNESS_FILE), "svctest\n").unwrap();
+        recorded_harness(&ctx).unwrap_err();
         fs::remove_dir_all(&base).unwrap();
     }
 }

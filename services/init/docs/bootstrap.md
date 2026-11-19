@@ -356,9 +356,9 @@ services in the running system are init and
 A std process logs at the level of its `SERAPH_LOG` environment entry ([logd IPC
 interface](../../logd/docs/ipc-interface.md) § Levels, "Filter"). The std services init spawns
 (procmgr, devmgr, vfsd, svcmgr) take theirs from the log-level configuration,
-`services/init/log-levels.conf`, which xtask installs at `/config/init/log-levels.conf` and `cargo
-xtask compose-bundle` copies from there into the boot bundle as the module of that name, so an edit
-needs no rebuild. memmgr is `no_std` and has no level.
+`services/init/log-levels.conf`, which xtask installs at `/config/init/log-levels.conf` and every
+pack of the disk image copies from there into the boot bundle as the module of that name, so an
+edit needs no rebuild. memmgr is `no_std` and has no level.
 
 - **Format.** Text, one setting per line, `<service> = <level>`: a service
   of the four above and a level `log::parse_level` accepts (`error`, `warn`,

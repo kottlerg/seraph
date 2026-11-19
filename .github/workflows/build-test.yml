@@ -209,10 +209,11 @@ jobs:
               ;;
           esac
 
-      - name: Check the FAT volumes
+      - name: Check the disk image
         # fsck.fat -n, a reader independent of xtask's FAT writer, on every
-        # FAT volume of the image the cell boots; see xtask/README.md
-        # § cargo xtask check-disk.
+        # FAT volume of the image the cell boots, then that every object on
+        # its ESP equals its installed file on the root partition; see
+        # xtask/README.md § cargo xtask check-disk.
         run: cargo xtask check-disk
 
       - name: Run ${{ matrix.tester }}

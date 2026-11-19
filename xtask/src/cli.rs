@@ -107,8 +107,9 @@ subcommands! {
 
         /// Check every FAT volume of `disk.img`, and of `disk-data.img` when it
         /// is there, with `fsck.fat -n` (dosfstools), an independent reader of
-        /// the volumes mkdisk writes. Runs in CI's validate job; see
-        /// xtask/README.md.
+        /// the volumes mkdisk writes, then that every object on the ESP of
+        /// `disk.img` equals its installed file on the root partition. Runs in
+        /// CI's validate job; see xtask/README.md.
         CheckDisk(CheckDiskArgs),
 
         /// Record the harness whose bundle every pack composes from the

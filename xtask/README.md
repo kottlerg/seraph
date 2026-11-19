@@ -28,6 +28,7 @@ xtask/
 │   ├── disk.rs                 # GPT disk-image construction from the sysroot
 │   ├── error.rs                # Error type with its context chain; Context, err!, bail!, ensure!
 │   ├── fat.rs                  # FAT16/FAT32 volume writer on fatfs-parse (mkdisk)
+│   ├── fat_read.rs             # FAT volume reader on fatfs-parse (check-disk, the disk tests)
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
@@ -116,20 +117,23 @@ when the image has no such section. No other build has the check.
 Every object a build packs is signed once, in the sysroot, as [docs/signing.md](../docs/signing.md)
 § Signing specifies: each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every
 command that repacks) signs in place the kernel installed at `boot/kernel` (`kernel`, the kernel
-role), every ELF image under `services/`, `programs/` and `tests/` (under its install path with
-the role of its location, and the boot-module role when a bundle list names it as an entry;
+role), every ELF image under `services/`, `programs/` and `tests/` (under its install path with the
+role of its location, and the boot-module role when a bundle list names it as an entry;
 `/services/init` as `init` with the init role, and `/tests/ktest` too when the pack composes the
 ktest harness's bundle), and every other file a bundle list names, the data files installed under
 `/config/` (the boot-module role). A pack signs for the harness recorded in `sysroot/.harness`
-([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot), then composes the
-ESP (`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and composes the
-bundle by copying the installed files the harness's list in `config/bundle/` names
-(`src/bundle.rs`). The composition signs nothing and reads no key; it verifies the kernel and each
-bundle entry as the bootloader will before it writes them. Every signed object is verified under
-the build's trust store, with each of its roles, its name and the architecture its loaders expect,
-before it is written. Each command derives the store from the signing identity and the deployer's
-store its environment names. `cargo xtask build` passes the store's path to the bootloader's build
-in `SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader embeds it. Every pack
+([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot), then composes the ESP
+(`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and composes the bundle by
+copying the installed files the harness's list in `config/bundle/` names (`src/bundle.rs`). The
+composition signs nothing and reads no key; it verifies the kernel and each bundle entry as the
+bootloader will before it writes them, and once it has written the ESP, reads it back and refuses it
+unless every object on it equals its installed file and it holds no other file than a presence-only
+knob ([docs/boot-media.md](../docs/boot-media.md) § The ESP; [`check-disk`](#cargo-xtask-check-disk)
+makes the same check of a packed image). Every signed object is verified under the build's trust
+store, with each of its roles, its name and the architecture its loaders expect, before it is
+written. Each command derives the store from the signing identity and the deployer's store its
+environment names. `cargo xtask build` passes the store's path to the bootloader's build in
+`SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader embeds it. Every pack
 after that (the build's own, `compose-bundle`, `mkdisk` including `--repack-only`, and the harness
 commands that repack) reads the store out of the installed bootloader, `boot/boot.efi`, and refuses
 to sign when it is missing, holds no marker or two, or embeds another store; the error names the
@@ -399,9 +403,11 @@ contract.
 ### `cargo xtask check-disk`
 
 Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with
-`fsck.fat -n` from dosfstools, a reader independent of the writer in `src/fat.rs`. Runs in CI's
-`validate` job after each cell stages its image
-([docs/build-system.md](../docs/build-system.md) § Continuous Integration).
+`fsck.fat -n` from dosfstools, a reader independent of the writer in `src/fat.rs`, then check
+that every object on the ESP of `disk.img` equals the installed file on its root partition that
+it copies ([docs/boot-media.md](../docs/boot-media.md) § The ESP). Runs in CI's `validate` job
+after each cell stages its image ([docs/build-system.md](../docs/build-system.md) § Continuous
+Integration).
 
 ```
 cargo xtask check-disk
@@ -411,6 +417,20 @@ The command reads each image's GPT through vfsd's parser (`vfsd-gpt`), copies ev
 but the raw swap partition to `target/xtask/check-disk/`, and runs `fsck.fat -n`, which
 changes nothing, on the copy. It fails on the first volume `fsck.fat` does not pass, printing
 what `fsck.fat` printed, and when `fsck.fat` is not on `PATH`, naming the package to install.
+
+It then reads the ESP and the root partition of `disk.img` with xtask's FAT reader
+(`src/fat_read.rs`, built on the `fatfs` service's decoders) and makes the check every pack
+makes of the ESP it composes (`src/esp.rs`): the bootloader at both of its paths equals
+`/boot/boot.efi`, the kernel `/boot/kernel`, and each entry of the bundle the installed file
+its bundle list names, the list read from the root partition's `/config/bundle/` and the
+harness chosen by the bundle's entries; the bundle holds every entry its list names and no other;
+and the ESP holds no other file than an empty presence-only knob in `\EFI\seraph\`, the
+firmware's `\NvVars` aside: OVMF writes its variables there when an x86_64 launcher boots the
+image without a variable store, so an image that has been booted is checked as well as a fresh
+one, the reader following chains the guest or the firmware fragmented. The architecture is the
+root partition's type. It fails naming every object that differs, is
+missing, or copies a file the root partition does not install, so a repack that changed one side
+of the image alone is caught.
 
 ---
 

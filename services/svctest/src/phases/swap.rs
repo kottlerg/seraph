@@ -6,12 +6,12 @@
 //! memmgr's eviction of cold demand-region chunks into its compressed store
 //! and their restore (services/memmgr/docs/memory-pool.md), end to end.
 //!
-//! A `swap-fixture` child of `/tests/svctest` registers an 8 MiB uncommitted
-//! demand region, which it fills with a pattern of its address except for one
-//! chunk it never touches, so no fault backs its pages (one of them the
-//! hole), and a 256 KiB region registered
-//! `REGION_NO_EVICT`, which it fills the same way. Three threads of its own each
-//! keep a 64 KiB array on their stack live and call memmgr's
+//! A `swap-fixture` child of `/tests/svctest` registers an uncommitted demand
+//! region of twice memmgr's system reserve, and at least 8 MiB, which it
+//! fills with a pattern of its address except for one chunk it never touches,
+//! so no fault backs its pages (one of them the hole), and a 256 KiB region
+//! registered `REGION_NO_EVICT`, which it fills the same way. Three threads
+//! of its own each keep a 64 KiB array on their stack live and call memmgr's
 //! `QUERY_MEMORY_USAGE` until told to verify. The phase finds the child with
 //! `LIST_PROCESSES`, attaches to it for a thread cap, and reads chunks of its
 //! regions with `SYS_THREAD_READ_MEM`, which does not ask the pager and fails
@@ -19,16 +19,19 @@
 //!
 //! The phase then takes grants from memmgr until the pressure level reads
 //! `LOW` and keeps it there, taking more whenever the level falls to
-//! `NORMAL` and giving a block back at `CRITICAL`, until memmgr's store holds
-//! pages of the child. It requires:
+//! `NORMAL` and giving a block back at `CRITICAL`, until memmgr holds more of
+//! the child's pages swapped than the reserve. It requires:
 //!
 //! * a page of the main region that reads `InvalidAddress` reads its pattern
 //!   after procmgr's `MAKE_RESIDENT` of its chunk, and the hole stays not
 //!   present across the same request on its chunk;
-//! * with the phase's grants holding the pool at its reserve, at `CRITICAL`,
-//!   where the free pages admit no restore of a chunk, another such page
-//!   reads its pattern after `MAKE_RESIDENT` of its chunk: memmgr's direct
-//!   reclaim made the room;
+//! * with the phase's grants taking every page memmgr grants, at `CRITICAL`,
+//!   growth stops with at least a chunk free above the reserve: the restore
+//!   headroom memmgr keeps while pages are swapped;
+//! * chunks of the main region restored by `MAKE_RESIDENT` from that headroom
+//!   read their pattern, and once the free pages fall short of the reserve and
+//!   a chunk, where they admit no restore, another chunk reads its pattern
+//!   after `MAKE_RESIDENT` of it: memmgr's direct reclaim made the room;
 //! * the no-evict region reads whole, and every page of logd's stack that
 //!   read before the hog reads while the hog holds the level (logd's budget
 //!   node is in the system reserve);
@@ -90,10 +93,8 @@ const PAGE_WORDS: u64 = PAGE_SIZE / 8;
 const CHUNK_PAGES: u64 = memmgr_labels::DEMAND_CHUNK_BYTES / PAGE_SIZE;
 /// Bytes of one chunk.
 const CHUNK_LEN: u64 = memmgr_labels::DEMAND_CHUNK_BYTES;
-/// Pages of the fixture's main region: 8 MiB.
-const MAIN_PAGES: u64 = 2048;
-/// Chunks of the main region.
-const MAIN_CHUNKS: u64 = MAIN_PAGES / CHUNK_PAGES;
+/// Pages of the fixture's main region at the least: 8 MiB.
+const MAIN_PAGES_MIN: u64 = 2048;
 /// The chunk of the main region the fixture never touches: a demand fault
 /// backs the unbacked pages of the faulting page's whole chunk, so a page no
 /// fault backs lies in a chunk no page of which is touched.
@@ -103,9 +104,6 @@ const HOLE_CHUNK: u64 = 1;
 const HOLE_PAGE: u64 = (HOLE_CHUNK + 1) * CHUNK_PAGES - 1;
 /// Pages of the fixture's no-evict region: 256 KiB.
 const NOEVICT_PAGES: u64 = 64;
-/// Chunks of the main region whose first page the phase reads before the hog
-/// takes memory.
-const PROBE_CHUNKS: [u64; 4] = [0, 2, MAIN_CHUNKS / 2, MAIN_CHUNKS - 1];
 /// What each word of the main region is xored with: the word's byte offset
 /// in the region gives the word.
 const MAIN_XOR: u64 = 0x5eed_5eed_0000_0001;
@@ -137,6 +135,9 @@ const FIXTURE_THREAD_FAILED: i32 = 12;
 /// Exit code of the fixture: its threads did not fill their arrays within
 /// [`THREADS_READY_BOUND`].
 const FIXTURE_THREADS_NOT_READY: i32 = 13;
+/// Exit code of the fixture: argv[2], the main region's pages, is missing, or
+/// is not a whole number of chunks past the hole's.
+const FIXTURE_BAD_ARGUMENT: i32 = 14;
 
 /// Set by the fixture's main thread when its threads are to verify their
 /// arrays and end.
@@ -158,8 +159,8 @@ const HOG_TICK: Duration = Duration::from_millis(10);
 /// How long the hog takes to bring the level to `LOW`. A test wait bound.
 const FILL_BOUND: Duration = Duration::from_secs(120);
 /// How long the phase waits, with the hog holding the level, for memmgr to
-/// store pages of the fixture. A test wait bound.
-const SWAP_BOUND: Duration = Duration::from_secs(30);
+/// swap more of the fixture's pages than the reserve. A test wait bound.
+const SWAP_BOUND: Duration = Duration::from_secs(90);
 /// How often the phase asks the fixture how many of its pages are swapped.
 const SWAP_POLL: Duration = Duration::from_millis(50);
 /// How long the phase waits for a line of the fixture. A test wait bound.
@@ -177,8 +178,9 @@ const SETTLE_POLL: Duration = Duration::from_millis(50);
 /// its worker with the level held at `LOW`, or another restore's direct
 /// reclaim at `CRITICAL`.
 const RESIDENT_TRIES: u32 = 8;
-/// Time the phase holds the pool at its reserve before the restore there, so
-/// memmgr's clock runs a few slices at `CRITICAL` (one each 10 ms).
+/// Time the phase holds the level at `CRITICAL` before the restores there and
+/// before the one direct reclaim pays for, so memmgr's clock runs a few slices
+/// (one each 10 ms) and ages the chunks it may take.
 const CRITICAL_SETTLE: Duration = Duration::from_millis(100);
 /// Pages of logd's stack, from the one the stack pointer lies in down, whose
 /// readability the phase records: 256 KiB.
@@ -239,14 +241,12 @@ impl Pool
         self.reserve / PAGE_SIZE
     }
 
-    /// Whether memmgr holds the pool at its reserve: the level reads
-    /// `CRITICAL` and the pages free outside `promised` fall short of the
-    /// reserve and a chunk, so no restore of a whole chunk is admitted on the
-    /// free pages alone.
-    fn at_reserve(&self) -> bool
+    /// Whether the pages free outside `promised` fall short of the reserve and
+    /// a chunk, so no restore of a whole chunk is admitted on the free pages
+    /// alone.
+    fn short_of_a_chunk(&self) -> bool
     {
-        self.level == memmgr_labels::PRESSURE_CRITICAL
-            && self.available_pages() < self.reserve_pages().saturating_add(CHUNK_PAGES)
+        self.available_pages() < self.reserve_pages().saturating_add(CHUNK_PAGES)
     }
 }
 
@@ -456,35 +456,46 @@ impl Hog
         self.peaks.hogged = self.peaks.hogged.max(self.pages);
     }
 
-    /// Take grants until memmgr holds the pool at its reserve
-    /// ([`Pool::at_reserve`]), each of the pages free above the reserve.
-    fn fill_to_reserve(&mut self)
+    /// Take grants, each of at most [`HOG_BLOCK_PAGES`] and halved on a
+    /// refusal, until memmgr refuses one of a page with the level at
+    /// `CRITICAL`: growth outside the system reserve has then stopped at the
+    /// floor memmgr keeps, the reserve and, while pages are swapped, the
+    /// restore headroom. Returns the status read then.
+    fn fill_to_floor(&mut self) -> Pool
     {
         let start = Instant::now();
+        let mut want = HOG_BLOCK_PAGES;
         loop
         {
+            if self.take(want)
+            {
+                continue;
+            }
+            if want > 1
+            {
+                want /= 2;
+                continue;
+            }
             let status = pool();
             self.note(&status);
-            if status.at_reserve()
+            if status.level == memmgr_labels::PRESSURE_CRITICAL
             {
-                return;
-            }
-            let above = status
-                .available_pages()
-                .saturating_sub(status.reserve_pages());
-            if above == 0 || !self.take(above.min(HOG_BLOCK_PAGES))
-            {
-                // The level is read again at memmgr's next turn.
-                std::thread::sleep(HOG_TICK);
+                return status;
             }
             assert!(
                 start.elapsed() < FILL_BOUND,
-                "{PHASE}: the pool not at its reserve after {FILL_BOUND:?} of taking grants: level                  {}, {} pages available against a reserve of {}, {} pages held",
+                "{PHASE}: a grant of a page refused with the level at {} (0 normal, 1 low, 2 \
+                 critical) after {FILL_BOUND:?} of taking grants: {} pages available against a \
+                 reserve of {}, {} pages held",
                 status.level,
                 status.available_pages(),
                 status.reserve_pages(),
                 self.pages
             );
+            // The level is read again at memmgr's next turn, and pages may
+            // have come free meanwhile.
+            std::thread::sleep(HOG_TICK);
+            want = HOG_BLOCK_PAGES;
         }
     }
 
@@ -530,6 +541,8 @@ impl Hog
 struct Ready
 {
     region: u64,
+    /// Chunks of the main region.
+    chunks: u64,
     hole: u64,
     noevict: u64,
 }
@@ -545,12 +558,13 @@ struct Fixture
 
 impl Fixture
 {
-    /// Spawn the fixture with piped stdin and stdout, and a thread that
-    /// passes each line it prints on.
-    fn spawn() -> Self
+    /// Spawn the fixture with a main region of `main_pages` pages, piped
+    /// stdin and stdout, and a thread that passes each line it prints on.
+    fn spawn(main_pages: u64) -> Self
     {
         let mut child = Command::new("/tests/svctest")
             .arg(FIXTURE_ROLE)
+            .arg(main_pages.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -663,12 +677,13 @@ fn parse_ready(line: &str) -> Ready
             .unwrap_or_else(|| panic!("{PHASE}: the fixture's ready line is {line:?}"))
     };
     let region = hex();
-    let _region_len = hex();
+    let region_len = hex();
     let hole = hex();
     let noevict = hex();
     let _noevict_len = hex();
     Ready {
         region,
+        chunks: region_len / CHUNK_LEN,
         hole,
         noevict,
     }
@@ -878,16 +893,21 @@ fn swap_phase(caps: &Caps)
     // empty.
     let _ = settle_resident(authority, None);
     let baseline = baseline_totals();
-    let (mut fixture, ready, process) = start_fixture(authority);
+    let reserve = pool().reserve_pages();
+    let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve));
     let threads = attach(authority, process, "the fixture");
     let thread = *threads.first().expect("the attach returned a thread");
     read_before_hog(thread, &ready);
     let logd = read_logd_stack(authority);
 
     hog.fill_to_low();
-    await_swapped(&mut hog, &mut fixture);
+    await_swapped(
+        &mut hog,
+        &mut fixture,
+        reserve.saturating_add(3 * CHUNK_PAGES),
+    );
     debugger_restore(authority, process, thread, &ready);
-    critical_restore(&mut hog, authority, process, thread, &ready);
+    let from_headroom = critical_restore(&mut hog, authority, process, thread, &ready);
     hog.fill_to_low();
     require_no_evict(thread, &ready);
     require_logd_stack(authority, &logd);
@@ -910,7 +930,8 @@ fn swap_phase(caps: &Caps)
     let peaks = &hog.peaks;
     std::os::seraph::log!(
         "memmgr_swap phase passed (store peak {} pages, swapped peak {} pages, hogged {} pages, \
-         free and deferred {} pages above the start)",
+         {from_headroom} chunks restored from the headroom at CRITICAL, free and deferred {} \
+         pages above the start)",
         peaks.store,
         peaks.swapped,
         peaks.hogged,
@@ -941,12 +962,24 @@ fn baseline_totals() -> u64
     base.free.saturating_add(base.deferred)
 }
 
-/// Spawn the fixture, wait for its ready line, and find its process badge as
-/// the one entry `LIST_PROCESSES` lists that it did not before the spawn.
-fn start_fixture(authority: u64) -> (Fixture, Ready, u64)
+/// The pages of the fixture's main region for a system reserve of `reserve`
+/// pages: twice the reserve in whole chunks, so more than the reserve of them
+/// can be swapped, and at least [`MAIN_PAGES_MIN`].
+fn main_pages(reserve: u64) -> u64
+{
+    reserve
+        .saturating_mul(2)
+        .next_multiple_of(CHUNK_PAGES)
+        .max(MAIN_PAGES_MIN)
+}
+
+/// Spawn the fixture with a main region of `main_pages` pages, wait for its
+/// ready line, and find its process badge as the one entry `LIST_PROCESSES`
+/// lists that it did not before the spawn.
+fn start_fixture(authority: u64, main_pages: u64) -> (Fixture, Ready, u64)
 {
     let before = listed_badges(authority);
-    let mut fixture = Fixture::spawn();
+    let mut fixture = Fixture::spawn(main_pages);
     let line = fixture.line(None, "ready");
     let ready = parse_ready(&line);
     let new: Vec<u64> = listed_badges(authority)
@@ -961,11 +994,13 @@ fn start_fixture(authority: u64) -> (Fixture, Ready, u64)
     (fixture, ready, process)
 }
 
-/// Read, with no pressure on memmgr, the first page of each of
-/// [`PROBE_CHUNKS`] of the main region and every page of the no-evict region.
+/// Read, with no pressure on memmgr, the first page of the first, the third,
+/// the middle and the last chunk of the main region, and every page of the
+/// no-evict region.
 fn read_before_hog(thread: u64, ready: &Ready)
 {
-    for chunk in PROBE_CHUNKS
+    let last = ready.chunks.saturating_sub(1);
+    for chunk in [0, 2, ready.chunks / 2, last]
     {
         let va = page_va(ready.region, chunk.saturating_mul(CHUNK_PAGES));
         require_pattern(
@@ -989,9 +1024,9 @@ fn read_before_hog(thread: u64, ready: &Ready)
     }
 }
 
-/// With the hog holding the level, wait until the fixture reports pages
-/// swapped and memmgr's store and swapped total are nonzero.
-fn await_swapped(hog: &mut Hog, fixture: &mut Fixture)
+/// With the hog holding the level, wait until the fixture reports at least
+/// `want` pages swapped and memmgr's store and swapped total are nonzero.
+fn await_swapped(hog: &mut Hog, fixture: &mut Fixture, want: u64)
 {
     let start = Instant::now();
     loop
@@ -1006,14 +1041,14 @@ fn await_swapped(hog: &mut Hog, fixture: &mut Fixture)
         let line = fixture.line(Some(&mut *hog), "swapped");
         let swapped = parse_swapped(&line);
         let status = pool();
-        if swapped > 0 && status.swapped > 0 && status.store > 0
+        if swapped >= want && status.swapped > 0 && status.store > 0
         {
             return;
         }
         assert!(
             start.elapsed() < SWAP_BOUND,
             "{PHASE}: after {SWAP_BOUND:?} at level {}, the fixture reports {swapped} pages \
-             swapped, memmgr's swapped total {} bytes and store {} bytes",
+             swapped of the {want} awaited, memmgr's swapped total {} bytes and store {} bytes",
             status.level,
             status.swapped,
             status.store
@@ -1027,7 +1062,7 @@ fn await_swapped(hog: &mut Hog, fixture: &mut Fixture)
 fn debugger_restore(authority: u64, process: u64, thread: u64, ready: &Ready)
 {
     let region = ready.region;
-    let evicted = first_evicted(thread, ready);
+    let evicted = next_evicted(thread, ready, &mut 0);
     restore_chunk(authority, process, thread, ready, evicted, "");
     let mut hole_probe = [0u8; 8];
     assert_eq!(
@@ -1050,14 +1085,16 @@ fn debugger_restore(authority: u64, process: u64, thread: u64, ready: &Ready)
     );
 }
 
-/// The first page of the first chunk of the main region, the hole's aside,
-/// that reads `InvalidAddress`: a page of an evicted chunk.
-fn first_evicted(thread: u64, ready: &Ready) -> u64
+/// The first page of the first chunk of the main region from chunk `*from`
+/// on, the hole's aside, that reads `InvalidAddress`: a page of an evicted
+/// chunk. `*from` moves past that chunk.
+fn next_evicted(thread: u64, ready: &Ready, from: &mut u64) -> u64
 {
     let region = ready.region;
-    for chunk in (0..MAIN_CHUNKS).filter(|&c| c != HOLE_CHUNK)
+    for chunk in (*from..ready.chunks).filter(|&c| c != HOLE_CHUNK)
     {
         let va = page_va(region, chunk.saturating_mul(CHUNK_PAGES));
+        *from = chunk.saturating_add(1);
         match read_pattern(thread, va, region, MAIN_XOR)
         {
             Ok(true) =>
@@ -1073,8 +1110,10 @@ fn first_evicted(thread: u64, ready: &Ready) -> u64
         }
     }
     panic!(
-        "{PHASE}: every first page of the main region's {MAIN_CHUNKS} chunks reads while memmgr \
-         holds {} bytes swapped",
+        "{PHASE}: every first page of the main region's {} chunks from chunk {} on reads while \
+         memmgr holds {} bytes swapped",
+        ready.chunks,
+        *from,
         pool().swapped
     )
 }
@@ -1115,29 +1154,68 @@ fn restore_chunk(authority: u64, process: u64, thread: u64, ready: &Ready, evict
     );
 }
 
-/// With memmgr holding the pool at its reserve ([`Pool::at_reserve`]), a
-/// swapped chunk of the main region is restored: `MAKE_RESIDENT` of it
-/// succeeds and its page reads its pattern. The free pages cannot admit the
-/// restore, so memmgr's direct reclaim made the room by evicting idle chunks
-/// in its turn (services/memmgr/docs/memory-pool.md § Eviction). The hog then
-/// gives grants back until the level leaves `CRITICAL`.
+/// With the hog taking every page memmgr grants, at `CRITICAL`, growth stops
+/// with at least a chunk free above the system reserve: the restore headroom
+/// memmgr keeps while pages are swapped (services/memmgr/docs/memory-pool.md
+/// § Eviction, Restore headroom). Swapped chunks of the main region are then
+/// restored with `MAKE_RESIDENT`, one by one, from that headroom, until the
+/// pages free outside `promised` fall short of the reserve and a chunk; one
+/// more is restored there, which the free pages cannot admit, so memmgr's
+/// direct reclaim made the room by evicting idle chunks in its turn. Each
+/// restored page reads its pattern. The hog then gives grants back until the
+/// level leaves `CRITICAL`. Returns the chunks restored from the headroom.
 fn critical_restore(hog: &mut Hog, authority: u64, process: u64, thread: u64, ready: &Ready)
+-> u64
 {
-    let evicted = first_evicted(thread, ready);
-    hog.fill_to_reserve();
+    let status = hog.fill_to_floor();
+    assert!(
+        !status.short_of_a_chunk(),
+        "{PHASE}: growth stopped at CRITICAL with {} pages available against a reserve of {} \
+         while {} pages are swapped: no restore headroom",
+        status.available_pages(),
+        status.reserve_pages(),
+        status.swapped / PAGE_SIZE
+    );
     // The clock's slices run at `CRITICAL` too: let a few age the chunks
-    // and keep victims, then take the pool to the reserve again.
+    // and keep victims, then take what came free meanwhile.
     std::thread::sleep(CRITICAL_SETTLE);
-    hog.fill_to_reserve();
+    let _ = hog.fill_to_floor();
+    let mut from = 0;
+    let mut restored: u64 = 0;
+    loop
+    {
+        if pool().short_of_a_chunk()
+        {
+            // Let the clock age the chunks restored so far, which direct
+            // reclaim may take; pages may come free meanwhile, so look again.
+            std::thread::sleep(CRITICAL_SETTLE);
+            if pool().short_of_a_chunk()
+            {
+                break;
+            }
+        }
+        let evicted = next_evicted(thread, ready, &mut from);
+        restore_chunk(
+            authority,
+            process,
+            thread,
+            ready,
+            evicted,
+            " from the restore headroom",
+        );
+        restored = restored.saturating_add(1);
+    }
+    let evicted = next_evicted(thread, ready, &mut from);
     restore_chunk(
         authority,
         process,
         thread,
         ready,
         evicted,
-        " with the pool at its reserve",
+        " with the pool short of the reserve and a chunk",
     );
     hog.release_from_critical();
+    restored
 }
 
 /// Require every page of the no-evict region to read its pattern.
@@ -1271,13 +1349,21 @@ fn fixture_thread(index: u32)
 /// on stdin until one of `exit` or the end of the input, then exit 0.
 fn fixture_main() -> !
 {
-    let Ok(region) = register_demand_paged(MAIN_PAGES)
+    let Some(main_pages) = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse::<u64>().ok())
+        .filter(|&p| p > HOLE_PAGE && p % CHUNK_PAGES == 0)
+    else
+    {
+        exit(FIXTURE_BAD_ARGUMENT);
+    };
+    let Ok(region) = register_demand_paged(main_pages)
     else
     {
         exit(FIXTURE_REGION_FAILED);
     };
     let base = region.va_start();
-    for page in 0..MAIN_PAGES
+    for page in 0..main_pages
     {
         if page / CHUNK_PAGES != HOLE_CHUNK
         {
@@ -1336,7 +1422,7 @@ fn fixture_main() -> !
     }
     println!(
         "ready {base:x} {:x} {:x} {noevict_base:x} {noevict_len:x}",
-        MAIN_PAGES.saturating_mul(PAGE_SIZE),
+        main_pages.saturating_mul(PAGE_SIZE),
         page_va(base, HOLE_PAGE)
     );
     let _ = std::io::stdout().flush();
@@ -1353,7 +1439,7 @@ fn fixture_main() -> !
             "verify" =>
             {
                 VERIFY.store(true, Ordering::Release);
-                let verdict = fixture_verdict(base, noevict_base);
+                let verdict = fixture_verdict(base, main_pages, noevict_base);
                 for handle in threads.drain(..)
                 {
                     let _ = handle.join();
@@ -1375,11 +1461,11 @@ fn fixture_main() -> !
     exit(0);
 }
 
-/// Read every page of both regions but the hole's chunk; the first that does not
-/// read as written, named.
-fn fixture_verdict(base: u64, noevict_base: u64) -> Option<String>
+/// Read every page of both regions, the main one of `main_pages` pages, but
+/// the hole's chunk; the first that does not read as written, named.
+fn fixture_verdict(base: u64, main_pages: u64, noevict_base: u64) -> Option<String>
 {
-    for page in 0..MAIN_PAGES
+    for page in 0..main_pages
     {
         if page / CHUNK_PAGES != HOLE_CHUNK && !page_intact(page_va(base, page), base, MAIN_XOR)
         {

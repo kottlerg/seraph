@@ -87,8 +87,9 @@ services/svctest/
         │                      #   the std heap's discard and trim; all-RAM-accounted identity
         ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
         │                      #   held `LOW` level and restores them: debugger reads and
-        │                      #   `MAKE_RESIDENT`, a no-evict region, logd's reserve stack;
-        │                      #   all-RAM-accounted identity
+        │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
+        │                      #   headroom and by direct reclaim; a no-evict region, logd's
+        │                      #   reserve stack; all-RAM-accounted identity
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd

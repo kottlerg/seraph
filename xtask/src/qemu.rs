@@ -301,6 +301,56 @@ const HOTPLUG_DISK_PORT_DEVICE: &str =
 /// firmware's `_OSC` grants the operating system native hotplug control.
 const X86_NATIVE_HOTPLUG_GLOBAL: &str = "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off";
 
+/// The interface of the TPM a launch attaches ([`build_qemu_argv_with_tpm`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TpmInterface
+{
+    /// The FIFO interface: QEMU's `tpm-tis` device, ACPI `TPM2` start
+    /// method 6.
+    Fifo,
+    /// The CRB interface: QEMU's `tpm-crb` device, start method 7.
+    Crb,
+}
+
+impl TpmInterface
+{
+    /// QEMU's device of this interface.
+    pub const fn device(self) -> &'static str
+    {
+        match self
+        {
+            Self::Fifo => "tpm-tis",
+            Self::Crb => "tpm-crb",
+        }
+    }
+}
+
+/// A TPM 2.0 a launch attaches ([`build_qemu_argv_with_tpm`]): QEMU's device of
+/// `interface`, its backend the `swtpm` emulator whose control socket is
+/// `socket` (`-tpmdev emulator`). QEMU places the device in the PC Client
+/// TPM range at `0xFED4_0000` and publishes the ACPI `TPM2` table and the
+/// `MSFT0101` device for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tpm<'a>
+{
+    pub interface: TpmInterface,
+    pub socket: &'a Path,
+}
+
+/// The arguments that attach `tpm`: the character device on the emulator's
+/// socket, the TPM backend over it, and the device.
+fn tpm_args(tpm: Tpm<'_>) -> Vec<String>
+{
+    vec![
+        "-chardev".into(),
+        format!("socket,id=chrtpm,path={}", tpm.socket.display()),
+        "-tpmdev".into(),
+        "emulator,id=tpm0,chardev=chrtpm".into(),
+        "-device".into(),
+        format!("{},tpmdev=tpm0", tpm.interface.device()),
+    ]
+}
+
 /// Who controls the hotplug of the root ports a launch attaches
 /// ([`QemuLaunchSpec::hotplug_port`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -736,6 +786,22 @@ fn smp_arg(cpus: u32, threads_per_core: u32) -> Result<String>
 /// is suitable for `Command::new(binary).args(&argv)`.
 pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 {
+    build_qemu_argv_with_tpm(spec, None)
+}
+
+/// [`build_qemu_argv`], with `tpm` attached when it is set (`test-tpm`
+/// alone), in place of the `virtio-rng-pci` device, so the TPM driver is the
+/// `hwrng` class's only member. `x86_64` only: QEMU's TPM devices sit in the
+/// PC Client TPM range, which the riscv64 `virt` machine does not decode.
+pub fn build_qemu_argv_with_tpm(spec: &QemuLaunchSpec, tpm: Option<Tpm<'_>>)
+-> Result<Vec<String>>
+{
+    if tpm.is_some() && spec.arch != Arch::X86_64
+    {
+        bail!(
+            "a TPM is attached on x86_64 only: QEMU's TPM devices sit in the PC Client TPM range"
+        );
+    }
     let smp = smp_arg(spec.cpus, spec.threads_per_core)?;
     if spec.mem_mib == 0
     {
@@ -800,6 +866,8 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             "virtio-keyboard-pci,disable-legacy=on,id=kbd0{}",
             spec.iommu.virtio_property()
         ),
+    ]);
+    let rng: [String; 2] = [
         // Entropy source, driven twice. The firmware's RNG driver binds it
         // first and exposes EFI_RNG_PROTOCOL, which the bootloader draws from
         // for the KASLR slide / direct-map base and the pool seed. On riscv64
@@ -815,10 +883,13 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             "virtio-rng-pci,disable-legacy=on{}",
             spec.iommu.virtio_property()
         ),
-        "-serial".into(),
-        "stdio".into(),
-        "-no-reboot".into(),
-    ]);
+    ];
+    // A TPM launch leaves the RNG out, so the TPM driver is the `hwrng`
+    // class's only member and entropyd's first contribution is the TPM's;
+    // such a launch is x86-64's, where OVMF's RDRAND driver answers the
+    // bootloader's draw either way.
+    args.extend(tpm.map_or_else(|| Vec::from(rng), tpm_args));
+    args.extend(["-serial".into(), "stdio".into(), "-no-reboot".into()]);
 
     if let Some(port) = spec.debug_port
     {
@@ -838,17 +909,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         args.extend(["-incoming".into(), uri.into()]);
     }
 
-    match spec.gdb
-    {
-        GdbMode::Off =>
-        {}
-        GdbMode::Listen => args.push("-s".into()),
-        GdbMode::Freeze => args.extend(["-s".into(), "-S".into()]),
-        GdbMode::Unix(path) => args.extend([
-            "-gdb".into(),
-            format!("unix:{},server=on,wait=off", path.display()),
-        ]),
-    }
+    args.extend(gdb_args(spec.gdb));
 
     let accel = accel::detect_for_arch(spec.arch);
     match spec.arch
@@ -858,6 +919,21 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
     }
 
     Ok(args)
+}
+
+/// The arguments that expose QEMU's gdbstub as `gdb` asks.
+fn gdb_args(gdb: GdbMode<'_>) -> Vec<String>
+{
+    match gdb
+    {
+        GdbMode::Off => Vec::new(),
+        GdbMode::Listen => vec!["-s".into()],
+        GdbMode::Freeze => vec!["-s".into(), "-S".into()],
+        GdbMode::Unix(path) => vec![
+            "-gdb".into(),
+            format!("unix:{},server=on,wait=off", path.display()),
+        ],
+    }
 }
 
 /// PCI slots of the two disks of a two-disk launch (a single disk takes
@@ -2059,6 +2135,50 @@ mod tests
                 }
             }
         }
+    }
+
+    // Defect caught: a TPM launch that keeps the RNG, so the TPM driver is
+    // not the `hwrng` class's only member, or attaches a device on a backend
+    // the emulator's socket does not carry, or a riscv64 launch that takes a
+    // TPM QEMU's `virt` machine cannot decode.
+    #[test]
+    fn a_tpm_launch_attaches_the_tpm_in_place_of_the_rng()
+    {
+        let rng = |argv: &[String]| argv.iter().any(|a| a.starts_with("virtio-rng-pci"));
+        let spec = x86_spec(X86Paging::Four);
+        assert!(rng(&build_qemu_argv(&spec).unwrap()));
+        assert!(
+            !build_qemu_argv(&spec)
+                .unwrap()
+                .iter()
+                .any(|a| a == "-tpmdev")
+        );
+        for (interface, device) in [
+            (TpmInterface::Fifo, "tpm-tis,tpmdev=tpm0"),
+            (TpmInterface::Crb, "tpm-crb,tpmdev=tpm0"),
+        ]
+        {
+            let tpm = Tpm {
+                interface,
+                socket: Path::new("swtpm.sock"),
+            };
+            let argv = build_qemu_argv_with_tpm(&spec, Some(tpm)).unwrap();
+            assert!(!rng(&argv));
+            assert!(devices(&argv).contains(&device));
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "-chardev" && w[1] == "socket,id=chrtpm,path=swtpm.sock")
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "-tpmdev" && w[1] == "emulator,id=tpm0,chardev=chrtpm")
+            );
+        }
+        let tpm = Tpm {
+            interface: TpmInterface::Fifo,
+            socket: Path::new("swtpm.sock"),
+        };
+        build_qemu_argv_with_tpm(&riscv_spec(4, 512), Some(tpm)).unwrap_err();
     }
 
     #[test]

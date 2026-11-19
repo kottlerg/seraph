@@ -38,11 +38,14 @@ only if that does not cure it.
    orchestrator and its local record; nothing tracked or outward-facing quotes them
    (docs/documentation-standards.md § Tone and Language; docs/conventions.md § Style).
 3. **Replace the orchestrator at about 250,000 tokens.** Its context size is the input of its
-   last turn, which the `usage` of its own last `assistant` entry in its output file records;
-   the file's other entries carry the usage of its children's notifications. This prints it as
-   one number:
-   `tail -n 20 <file> | jq 'select(.type=="assistant") | .message.usage | .input_tokens +
-   .cache_creation_input_tokens + .cache_read_input_tokens' | tail -1`. A task notification
+   last turn, which the `usage` of its last model reply in its output file records: the last
+   `assistant` entry whose `model` is not `<synthetic>`. The harness writes `<synthetic>`
+   `assistant` entries of its own, with zero usage, and the file's other entries carry the usage
+   of the orchestrator's children's notifications. This prints the size as one number, reading
+   the file from its end:
+   `tac <file> | jq 'select(.type=="assistant" and .message.model != "<synthetic>") |
+   .message.usage | .input_tokens + .cache_creation_input_tokens + .cache_read_input_tokens'
+   2>/dev/null | head -n 1`. A task notification
    that arrives carries the count as well. At that size, or when it asks, send `park`; when its
    `parked` message arrives, spawn a new one with "resume from the record" and give it its id.
    The old one stays idle and forwards you what still reaches it (step 4). Stop it only when no

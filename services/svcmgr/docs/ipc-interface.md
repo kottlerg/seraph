@@ -126,8 +126,8 @@ endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
 configures devmgr's device classes and publishes each as `devmgr.class.<stem>` (the class file's
 name without `.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`,
 with the cap of `/config/devmgr/platform/` as its optional second cap when the walk to it
-succeeds, before entering the event loop. Both read through vfsd and call devmgr, and are skipped when either is dead
-([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
+succeeds, before entering the event loop. Both read through vfsd and call devmgr, and are skipped
+when either is dead ([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
 
 ---
 

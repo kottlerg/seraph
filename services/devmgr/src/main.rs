@@ -337,16 +337,15 @@ fn now_ns() -> u64
 
 /// Start the registry's workers and let them receive: the
 /// [`REGISTRY_WORKERS`] threads of a [`recv_pool::RecvPool`] on the registry
-/// endpoint, each serving its requests with [`Registry::handle`] once it has
-/// held devmgr's `CSpace` headroom ([`headroom::hold`]). Halts,
+/// endpoint, each serving its requests with [`Registry::handle`], which first
+/// holds devmgr's `CSpace` headroom ([`headroom::hold`]). Halts,
 /// logged, when none can be started; fewer serve, logged, when some cannot.
 fn start_registry_workers(registry: &Arc<Registry>)
 {
     let pool = {
         let shared = Arc::clone(registry);
         recv_pool::RecvPool::new(registry.endpoint, recv_diag, move |msg, buf| {
-            let held = headroom::hold();
-            shared.handle(msg, buf.as_ptr(), held);
+            shared.handle(msg, buf.as_ptr());
         })
     };
     match pool.spawn("devmgr-registry", REGISTRY_WORKERS)
@@ -1019,11 +1018,13 @@ impl Registry
 impl Registry
 {
     /// Serve one registry request on a worker whose IPC buffer page is
-    /// `ipc_buf`, replying before it returns. `held` is the worker's
-    /// [`headroom::hold`]: on `false` a request that would keep slots is
-    /// refused (`firmware::headroom::registry_refusal`).
-    fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64, held: bool)
+    /// `ipc_buf`, replying before it returns. It first holds devmgr's
+    /// `CSpace` headroom ([`headroom::hold`]); when that is refused, a
+    /// request that would keep slots is refused
+    /// (`firmware::headroom::registry_refusal`).
+    fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
+        let held = headroom::hold();
         let badge = msg.badge;
         // A client whose SEND carries GRANT (`devmgr.bind`, svcmgr, init) can
         // move caps here with any label. `SET_DRIVERS_DIR` and `BIND_DRIVERS`

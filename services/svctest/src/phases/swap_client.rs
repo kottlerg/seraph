@@ -1,35 +1,35 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/svctest/src/phases/spill.rs
+// services/svctest/src/phases/swap_client.rs
 
-//! memmgr's disk tier through its spill interface
+//! memmgr's disk tier through its swap interface
 //! (services/memmgr/docs/ipc-interface.md § Labels 22 to 25), with svctest
 //! acting as the swap service over a RAM slot store, through the
-//! `memmgr.spill` seed.
+//! `memmgr.swap` seed.
 //!
 //! The phase reuses `memmgr_swap`'s fixture and hog (`super::swap`), whose
-//! failure messages name that phase. It first requires the spill labels to
-//! refuse a process badge and the spill authority to refuse another label.
+//! failure messages name that phase. It first requires the swap labels to
+//! refuse a process badge and the swap authority to refuse another label.
 //! The hog then holds the level at `LOW` until memmgr holds chunks of the
 //! fixture's main region swapped, and is released; with the level back at
 //! `NORMAL`, where memmgr evicts nothing, the phase makes every other range
 //! of every process resident and requires memmgr's swapped total to be the
-//! fixture's, so every chunk `SPILL_TAKE` takes is one of the main region's.
+//! fixture's, so every chunk `SWAP_TAKE` takes is one of the main region's.
 //! It requires:
 //!
-//! * `SPILL_REGISTER` with an endpoint of the phase's own, and the pool
+//! * `SWAP_REGISTER` with an endpoint of the phase's own, and the pool
 //!   status's free slots then;
-//! * `SPILL_TAKE` and `SPILL_DONE` of three chunks to disk and a fourth left
+//! * `SWAP_TAKE` and `SWAP_DONE` of three chunks to disk and a fourth left
 //!   in flight, the bytes taken looking as ciphertext does (their byte counts'
 //!   chi-square over 256 values below [`CHI_SQUARE_BOUND`]), and the pool
-//!   status's spilled pages and free slots;
-//! * a second `SPILL_REGISTER` ending the write in flight, so its
-//!   `SPILL_DONE` is refused, and keeping the chunks on disk;
-//! * a `SPILL_RESTORE` of one slot ahead of any fault, and its slot refused
+//!   status's pages on disk and free slots;
+//! * a second `SWAP_REGISTER` ending the write in flight, so its
+//!   `SWAP_DONE` is refused, and keeping the chunks on disk;
+//! * a `SWAP_RESTORE` of one slot ahead of any fault, and its slot refused
 //!   after;
 //! * a write in flight that procmgr's `MAKE_RESIDENT` cancels, its
-//!   `SPILL_DONE` then freeing its slot, while `MAKE_RESIDENT` passes the two
+//!   `SWAP_DONE` then freeing its slot, while `MAKE_RESIDENT` passes the two
 //!   chunks on disk over: they are the main region's only chunks not present
 //!   but the hole's;
 //! * the fixture's read of a page of one of them redirected to the phase's
@@ -65,13 +65,13 @@ use crate::runner::Phase;
 pub fn phases() -> &'static [Phase]
 {
     &[Phase {
-        name: "memmgr_spill",
-        run: spill_phase,
+        name: "memmgr_swap_client",
+        run: swap_client_phase,
     }]
 }
 
 /// The phase's name in its failure messages.
-const PHASE: &str = "memmgr_spill";
+const PHASE: &str = "memmgr_swap_client";
 
 /// Swap slots the phase registers.
 const SLOTS: u64 = 64;
@@ -79,11 +79,11 @@ const SLOTS: u64 = 64;
 /// the map grows a page at a time as slots are taken, up to the slots
 /// registered, and keeps its pages as memmgr's metadata
 /// (services/memmgr/docs/memory-pool.md § Disk tier).
-const SLOT_MAP_PAGES: u64 = SLOTS.div_ceil(free_pool::spill::SLOT_WORDS_PER_PAGE);
+const SLOT_MAP_PAGES: u64 = SLOTS.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
 /// Chunks of the main region the phase awaits swapped: three to disk, one in
 /// flight, and one more for a chunk the clock's last slice did not reach.
 const SWAPPED_CHUNKS: u64 = 5;
-/// `SPILL_TAKE`s the phase makes for one chunk at most: each walks a bounded
+/// `SWAP_TAKE`s the phase makes for one chunk at most: each walks a bounded
 /// part of memmgr's records, and successive ones cover them all.
 const TAKE_TRIES: u32 = 256;
 /// Pages of a buffer: a chunk, the most a slot's bytes take.
@@ -110,7 +110,7 @@ const SETTLE_BOUND: Duration = Duration::from_secs(30);
 const SERVE_BOUND: Duration = Duration::from_secs(30);
 
 /// A fault the restore thread served: the slot its redirect named, the
-/// faulting address, and memmgr's reply to the `SPILL_RESTORE`, its label and
+/// faulting address, and memmgr's reply to the `SWAP_RESTORE`, its label and
 /// word 0.
 #[derive(Clone, Copy, Debug)]
 struct Served
@@ -133,7 +133,7 @@ struct Shared
 }
 
 /// A buffer of [`BUF_PAGES`] pages: a contiguous grant mapped read-write in
-/// svctest, and its cap, which a spill label moves to memmgr and back.
+/// svctest, and its cap, which a swap label moves to memmgr and back.
 struct Buffer
 {
     cap: u64,
@@ -194,53 +194,53 @@ impl Buffer
     }
 }
 
-/// memmgr's reply to `msg` on the spill authority `spill`, panicking with
+/// memmgr's reply to `msg` on the swap authority `swap`, panicking with
 /// `what` when the call fails. A cap the reply moves back is the caller's.
-fn spill_call(spill: u64, msg: &IpcMessage, what: &str) -> IpcMessage
+fn swap_call(swap: u64, msg: &IpcMessage, what: &str) -> IpcMessage
 {
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    unsafe { ipc::ipc_call(spill, msg, current_ipc_buf()) }
+    unsafe { ipc::ipc_call(swap, msg, current_ipc_buf()) }
         .unwrap_or_else(|e| panic!("{PHASE}: {what}: ipc_call failed ({e})"))
 }
 
-/// `SPILL_REGISTER` with a SEND on `endpoint` and [`SLOTS`] slots.
-fn register(spill: u64, endpoint: u64, what: &str)
+/// `SWAP_REGISTER` with a SEND on `endpoint` and [`SLOTS`] slots.
+fn register(swap: u64, endpoint: u64, what: &str)
 {
     let send = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND)
         .unwrap_or_else(|e| panic!("{PHASE}: {what}: deriving the restore SEND ({e})"));
-    let msg = IpcMessage::builder(memmgr_labels::SPILL_REGISTER)
+    let msg = IpcMessage::builder(memmgr_labels::SWAP_REGISTER)
         .word(0, SLOTS)
         .cap(send)
         .build();
-    let reply = spill_call(spill, &msg, what);
+    let reply = swap_call(swap, &msg, what);
     assert_eq!(
         (reply.label, reply.word(0)),
         (memmgr_errors::SUCCESS, SLOTS),
-        "{PHASE}: {what}: SPILL_REGISTER replied {:#x} with {} slots",
+        "{PHASE}: {what}: SWAP_REGISTER replied {:#x} with {} slots",
         reply.label,
         reply.word(0)
     );
 }
 
-/// `SPILL_TAKE` into `buf`: the slot and its bytes, kept in the store. A walk
-/// that finds no chunk within memmgr's bound replies `NOTHING_TO_SPILL`, and
+/// `SWAP_TAKE` into `buf`: the slot and its bytes, kept in the store. A walk
+/// that finds no chunk within memmgr's bound replies `NOTHING_TO_TAKE`, and
 /// the next goes on from where it stopped, so it is asked again, at most
 /// [`TAKE_TRIES`] times.
-fn take(spill: u64, buf: &mut Buffer, shared: &Shared, what: &str) -> u32
+fn take(swap: u64, buf: &mut Buffer, shared: &Shared, what: &str) -> u32
 {
     let mut tries: u32 = 0;
     let reply = loop
     {
-        let msg = IpcMessage::builder(memmgr_labels::SPILL_TAKE)
+        let msg = IpcMessage::builder(memmgr_labels::SWAP_TAKE)
             .cap(buf.cap)
             .build();
-        let reply = spill_call(spill, &msg, what);
+        let reply = swap_call(swap, &msg, what);
         buf.cap = *reply
             .caps()
             .first()
-            .unwrap_or_else(|| panic!("{PHASE}: {what}: SPILL_TAKE moved no buffer back"));
+            .unwrap_or_else(|| panic!("{PHASE}: {what}: SWAP_TAKE moved no buffer back"));
         tries = tries.saturating_add(1);
-        if reply.label != memmgr_errors::NOTHING_TO_SPILL || tries >= TAKE_TRIES
+        if reply.label != memmgr_errors::NOTHING_TO_TAKE || tries >= TAKE_TRIES
         {
             break reply;
         }
@@ -248,7 +248,7 @@ fn take(spill: u64, buf: &mut Buffer, shared: &Shared, what: &str) -> u32
     assert_eq!(
         reply.label,
         memmgr_errors::SUCCESS,
-        "{PHASE}: {what}: SPILL_TAKE replied {:#x}",
+        "{PHASE}: {what}: SWAP_TAKE replied {:#x}",
         reply.label
     );
     let slot = u32::try_from(reply.word(0))
@@ -267,19 +267,19 @@ fn take(spill: u64, buf: &mut Buffer, shared: &Shared, what: &str) -> u32
     slot
 }
 
-/// `SPILL_DONE` of `slot` with status `status`: memmgr's reply label.
-fn done(spill: u64, slot: u32, status: u64, what: &str) -> u64
+/// `SWAP_DONE` of `slot` with status `status`: memmgr's reply label.
+fn done(swap: u64, slot: u32, status: u64, what: &str) -> u64
 {
-    let msg = IpcMessage::builder(memmgr_labels::SPILL_DONE)
+    let msg = IpcMessage::builder(memmgr_labels::SWAP_DONE)
         .word(0, u64::from(slot))
         .word(1, status)
         .build();
-    spill_call(spill, &msg, what).label
+    swap_call(swap, &msg, what).label
 }
 
-/// `SPILL_RESTORE` of `slot` with its stored bytes, written into `buf`:
+/// `SWAP_RESTORE` of `slot` with its stored bytes, written into `buf`:
 /// memmgr's reply label and word 0.
-fn restore(spill: u64, slot: u32, buf: &mut Buffer, shared: &Shared, what: &str) -> (u64, u64)
+fn restore(swap: u64, slot: u32, buf: &mut Buffer, shared: &Shared, what: &str) -> (u64, u64)
 {
     let bytes = shared
         .slots
@@ -289,15 +289,15 @@ fn restore(spill: u64, slot: u32, buf: &mut Buffer, shared: &Shared, what: &str)
         .cloned()
         .unwrap_or_default();
     buf.write(&bytes);
-    let msg = IpcMessage::builder(memmgr_labels::SPILL_RESTORE)
+    let msg = IpcMessage::builder(memmgr_labels::SWAP_RESTORE)
         .word(0, u64::from(slot))
         .cap(buf.cap)
         .build();
-    let reply = spill_call(spill, &msg, what);
+    let reply = swap_call(swap, &msg, what);
     buf.cap = *reply
         .caps()
         .first()
-        .unwrap_or_else(|| panic!("{PHASE}: {what}: SPILL_RESTORE moved no buffer back"));
+        .unwrap_or_else(|| panic!("{PHASE}: {what}: SWAP_RESTORE moved no buffer back"));
     (reply.label, reply.word(0))
 }
 
@@ -305,37 +305,37 @@ fn restore(spill: u64, slot: u32, buf: &mut Buffer, shared: &Shared, what: &str)
 fn disk_and_free() -> (u64, u64)
 {
     let status = pool();
-    (status.spilled / PAGE_SIZE, status.free_slots)
+    (status.on_disk / PAGE_SIZE, status.free_slots)
 }
 
-/// The spill labels refuse svctest's own memmgr SEND, a process badge, with
-/// `UNAUTHORIZED`, and the spill authority refuses `QUERY_POOL_STATUS` so.
-fn require_refusals(spill: u64)
+/// The swap labels refuse svctest's own memmgr SEND, a process badge, with
+/// `UNAUTHORIZED`, and the swap authority refuses `QUERY_POOL_STATUS` so.
+fn require_refusals(swap: u64)
 {
     for label in [
-        memmgr_labels::SPILL_REGISTER,
-        memmgr_labels::SPILL_TAKE,
-        memmgr_labels::SPILL_DONE,
-        memmgr_labels::SPILL_RESTORE,
+        memmgr_labels::SWAP_REGISTER,
+        memmgr_labels::SWAP_TAKE,
+        memmgr_labels::SWAP_DONE,
+        memmgr_labels::SWAP_RESTORE,
     ]
     {
-        let reply = super::swap::memmgr_call(&IpcMessage::new(label), "a spill label");
+        let reply = super::swap::memmgr_call(&IpcMessage::new(label), "a swap label");
         assert_eq!(
             reply.label,
             memmgr_errors::UNAUTHORIZED,
-            "{PHASE}: spill label {label} on a process badge replied {:#x}",
+            "{PHASE}: swap label {label} on a process badge replied {:#x}",
             reply.label
         );
     }
-    let reply = spill_call(
-        spill,
+    let reply = swap_call(
+        swap,
         &IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS),
         "QUERY_POOL_STATUS",
     );
     assert_eq!(
         reply.label,
         memmgr_errors::UNAUTHORIZED,
-        "{PHASE}: QUERY_POOL_STATUS on the spill authority replied {:#x}",
+        "{PHASE}: QUERY_POOL_STATUS on the swap authority replied {:#x}",
         reply.label
     );
 }
@@ -441,7 +441,7 @@ fn isolate(authority: u64, process: u64, ready: &Ready, fixture: &mut super::swa
 /// [`Shared::tamper`] names, through `buf`, then resume the fault on
 /// `SUCCESS` or forward it with memmgr's decline word. Returns the buffer once
 /// told to stop.
-fn restorer(spill: u64, endpoint: u64, mut buf: Buffer, shared: &Shared) -> Buffer
+fn restorer(swap: u64, endpoint: u64, mut buf: Buffer, shared: &Shared) -> Buffer
 {
     let ipc_buf = current_ipc_buf();
     while !shared.stop.load(Ordering::Acquire)
@@ -473,7 +473,7 @@ fn restorer(spill: u64, endpoint: u64, mut buf: Buffer, shared: &Shared) -> Buff
         {
             *b ^= 1;
         }
-        let (label, decline) = restore(spill, slot, &mut buf, shared, "a redirected fault");
+        let (label, decline) = restore(swap, slot, &mut buf, shared, "a redirected fault");
         let reply = if label == memmgr_errors::SUCCESS
         {
             IpcMessage::new(FAULT_REPLY_RESUME)
@@ -527,13 +527,13 @@ fn await_served(shared: &Shared, n: usize) -> Vec<Served>
     reason = "the request and reply `IpcMessage`s of its calls (568 B each) and their builder \
               temporaries; on svctest's main-thread stack, which every phase shares"
 )]
-fn spill_phase(caps: &Caps)
+fn swap_client_phase(caps: &Caps)
 {
     let authority = caps.debug_authority;
-    let spill = caps.memmgr_spill;
+    let swap = caps.memmgr_swap;
     assert_ne!(authority, 0, "{PHASE}: no debug authority");
-    assert_ne!(spill, 0, "{PHASE}: no memmgr.spill seed");
-    require_refusals(spill);
+    assert_ne!(swap, 0, "{PHASE}: no memmgr.swap seed");
+    require_refusals(swap);
 
     let mut hog = Hog::new();
     let _ = settle_resident(authority, None);
@@ -556,7 +556,7 @@ fn spill_phase(caps: &Caps)
             syscall::cap_create_endpoint(slab).ok()
         })
         .unwrap_or_else(|| panic!("{PHASE}: a restore endpoint"));
-    register(spill, endpoint, "the first registration");
+    register(swap, endpoint, "the first registration");
     assert_eq!(
         disk_and_free(),
         (0, SLOTS),
@@ -566,19 +566,19 @@ fn spill_phase(caps: &Caps)
     let restorer_buf = Buffer::new();
     let thread_shared = Arc::clone(&shared);
     let restorer = std::thread::Builder::new()
-        .name("spill-restorer".into())
-        .spawn(move || restorer(spill, endpoint, restorer_buf, &thread_shared))
+        .name("swap-restorer".into())
+        .spawn(move || restorer(swap, endpoint, restorer_buf, &thread_shared))
         .unwrap_or_else(|e| panic!("{PHASE}: spawning the restore thread: {e}"));
 
     // Three chunks to disk and one in flight.
     let mut buf = Buffer::new();
-    let slot_a = take(spill, &mut buf, &shared, "take a");
-    assert_eq!(done(spill, slot_a, 0, "done a"), memmgr_errors::SUCCESS);
-    let slot_b = take(spill, &mut buf, &shared, "take b");
-    assert_eq!(done(spill, slot_b, 0, "done b"), memmgr_errors::SUCCESS);
-    let slot_t = take(spill, &mut buf, &shared, "take t");
-    assert_eq!(done(spill, slot_t, 0, "done t"), memmgr_errors::SUCCESS);
-    let slot_c = take(spill, &mut buf, &shared, "take c");
+    let slot_a = take(swap, &mut buf, &shared, "take a");
+    assert_eq!(done(swap, slot_a, 0, "done a"), memmgr_errors::SUCCESS);
+    let slot_b = take(swap, &mut buf, &shared, "take b");
+    assert_eq!(done(swap, slot_b, 0, "done b"), memmgr_errors::SUCCESS);
+    let slot_t = take(swap, &mut buf, &shared, "take t");
+    assert_eq!(done(swap, slot_t, 0, "done t"), memmgr_errors::SUCCESS);
+    let slot_c = take(swap, &mut buf, &shared, "take c");
     assert_eq!(
         disk_and_free(),
         (3 * CHUNK_PAGES, SLOTS - 4),
@@ -600,9 +600,9 @@ fn spill_phase(caps: &Caps)
 
     // A second registration ends the write in flight and keeps the chunks on
     // disk.
-    register(spill, endpoint, "the second registration");
+    register(swap, endpoint, "the second registration");
     assert_eq!(
-        done(spill, slot_c, 0, "done c after the registration"),
+        done(swap, slot_c, 0, "done c after the registration"),
         memmgr_errors::INVALID_ARGUMENT
     );
     assert_eq!(
@@ -612,13 +612,13 @@ fn spill_phase(caps: &Caps)
     );
 
     // A write in flight, and a restore ahead of any fault.
-    let slot_d = take(spill, &mut buf, &shared, "take d");
+    let slot_d = take(swap, &mut buf, &shared, "take d");
     assert_eq!(
-        restore(spill, slot_a, &mut buf, &shared, "restore a"),
+        restore(swap, slot_a, &mut buf, &shared, "restore a"),
         (memmgr_errors::SUCCESS, 0)
     );
     assert_eq!(
-        restore(spill, slot_a, &mut buf, &shared, "restore a again").0,
+        restore(swap, slot_a, &mut buf, &shared, "restore a again").0,
         memmgr_errors::INVALID_ARGUMENT
     );
 
@@ -631,7 +631,7 @@ fn spill_phase(caps: &Caps)
         procmgr_errors::SUCCESS,
         "{PHASE}: MAKE_RESIDENT of the main region replied {label:#x}"
     );
-    assert_eq!(done(spill, slot_d, 0, "done d"), memmgr_errors::SUCCESS);
+    assert_eq!(done(swap, slot_d, 0, "done d"), memmgr_errors::SUCCESS);
     assert_eq!(
         disk_and_free(),
         (2 * CHUNK_PAGES, SLOTS - 2),
@@ -705,7 +705,7 @@ fn spill_phase(caps: &Caps)
     let floor = baseline.saturating_sub(SLOT_MAP_PAGES.saturating_mul(PAGE_SIZE));
     let end = settle_resident(authority, Some(floor));
     std::os::seraph::log!(
-        "memmgr_spill phase passed ({} bytes sealed, chi-square {chi:.1}, free and deferred {} \
+        "memmgr_swap_client phase passed ({} bytes sealed, chi-square {chi:.1}, free and deferred {} \
          pages above the start less the {SLOT_MAP_PAGES} slot-map pages)",
         sealed.len(),
         end.saturating_sub(floor) / PAGE_SIZE

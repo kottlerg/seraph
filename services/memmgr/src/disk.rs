@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/memmgr/src/spill.rs
+// services/memmgr/src/disk.rs
 
 //! The disk tier's interface to the swap service
 //! (services/memmgr/docs/memory-pool.md § Disk tier;
@@ -13,18 +13,18 @@
 //! memmgr performs no device I/O and waits on no peer: every label here is a
 //! request the swap service makes, and the redirect is a fault reply. The
 //! bytes memmgr hands the swap service are sealed in memmgr's own buffer
-//! ([`free_pool::spill::seal`]) under a key drawn at start that never leaves
+//! ([`free_pool::disk::seal`]) under a key drawn at start that never leaves
 //! memmgr, and copied out only once sealed; the bytes the swap service hands
 //! back are copied into the same buffer before their tag is checked, so the
 //! check and the decryption read one snapshot the swap service can no longer
 //! change. memmgr reaches a buffer of the swap service's only through a Memory
-//! cap it maps itself at [`SPILL_WINDOW_VA`], from its own page tables, which
+//! cap it maps itself at [`SWAP_WINDOW_VA`], from its own page tables, which
 //! a revoke of the cap does not withdraw (core/kernel/docs/syscalls.md
 //! § `SYS_CAP_REVOKE`), so a copy into or out of it neither faults nor blocks.
 
 use core::ptr::addr_of_mut;
 
-use free_pool::spill::{self, KEY_BYTES, Registered, SLOT_WORDS_PER_PAGE, SlotError};
+use free_pool::disk::{self, KEY_BYTES, Registered, SLOT_WORDS_PER_PAGE, SlotError};
 use free_pool::{CHUNK_BYTES, ClockHand, FaultPath, Fit, NodeIdx, SwapError};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::{MAP_READ, PAGE_SIZE};
@@ -36,10 +36,10 @@ use crate::{
 
 /// The window where memmgr maps a buffer of the swap service's for one
 /// request: a chunk, after the eviction windows (the zone map in main.rs).
-pub(crate) const SPILL_WINDOW_VA: u64 = evict::EVICT_ZONE_END;
+pub(crate) const SWAP_WINDOW_VA: u64 = evict::EVICT_ZONE_END;
 
-/// Exclusive end of the spill window.
-pub(crate) const SPILL_WINDOW_END: u64 = SPILL_WINDOW_VA + CHUNK_BYTES;
+/// Exclusive end of the swap window.
+pub(crate) const SWAP_WINDOW_END: u64 = SWAP_WINDOW_VA + CHUNK_BYTES;
 
 /// Base of the swap slot map's words ([`free_pool::SwapSlots`]), grown one
 /// page at a time from the pool as far as the highest slot taken.
@@ -54,14 +54,14 @@ pub(crate) const SWAP_SLOTS_END: u64 = 0x0000_0002_0000_0000;
 const MAX_SLOTS: u64 = (SWAP_SLOTS_END - SWAP_SLOTS_VA) / 8;
 const _: () = assert!(SLOT_WORDS_PER_PAGE * 8 == PAGE_SIZE);
 
-/// Steps of the walk one `SPILL_TAKE` makes for a swapped chunk
-/// ([`free_pool::Ledger::next_swapped`]): a chunk visited, or a region or
+/// Steps of the walk one `SWAP_TAKE` makes for a compressed chunk
+/// ([`free_pool::Ledger::next_compressed`]): a chunk visited, or a region or
 /// record passed. A tuning value that bounds the request's turn as a slice of
-/// the clock is bounded; a walk that finds none replies `NOTHING_TO_SPILL`,
+/// the clock is bounded; a walk that finds none replies `NOTHING_TO_TAKE`,
 /// and the next request goes on from where it stopped.
 const TAKE_STEPS: u64 = 512;
 
-/// Bytes of memmgr's own spill buffer: a slot.
+/// Bytes of memmgr's own swap buffer: a slot.
 const BUF_BYTES: usize = CHUNK_BYTES as usize;
 
 /// The decline detail of a chunk on disk with no swap service registered.
@@ -80,9 +80,9 @@ static mut BUF: Buf = Buf([0; BUF_BYTES]);
 
 /// The disk tier's state: the per-boot key (`None` when its draw failed, and
 /// the disk tier then stays off), the next nonce, the swap service's endpoint
-/// (`0` while none is registered), and the hand of the walk `SPILL_TAKE`
+/// (`0` while none is registered), and the hand of the walk `SWAP_TAKE`
 /// makes. The receive loop's alone.
-struct Spill
+struct Disk
 {
     key: Option<[u8; KEY_BYTES]>,
     nonce: u64,
@@ -90,7 +90,7 @@ struct Spill
     hand: ClockHand,
 }
 
-static mut SPILL: Spill = Spill {
+static mut DISK: Disk = Disk {
     key: None,
     nonce: 0,
     endpoint: 0,
@@ -99,17 +99,17 @@ static mut SPILL: Spill = Spill {
 
 #[expect(
     static_mut_refs,
-    reason = "`SPILL` is reached only through this accessor, by the receive loop, the one \
+    reason = "`DISK` is reached only through this accessor, by the receive loop, the one \
               thread that touches it, and each caller holds one `&mut` at a time"
 )]
-fn state() -> &'static mut Spill
+fn state() -> &'static mut Disk
 {
-    // SAFETY: the receive loop is the only thread that reaches `SPILL`, and no
+    // SAFETY: the receive loop is the only thread that reaches `DISK`, and no
     // caller holds the reference across another call of this accessor.
-    unsafe { &mut SPILL }
+    unsafe { &mut DISK }
 }
 
-/// memmgr's spill buffer, reached alone.
+/// memmgr's swap buffer, reached alone.
 fn buf() -> &'static mut [u8; BUF_BYTES]
 {
     // SAFETY: only the receive loop reaches `BUF`, through this accessor, and
@@ -120,7 +120,7 @@ fn buf() -> &'static mut [u8; BUF_BYTES]
 
 /// Draw the per-boot key from the kernel's entropy pool (`SYS_GETRANDOM`).
 /// Called once at start. A failed draw, a kernel-contract violation, leaves
-/// the disk tier off: `SPILL_REGISTER` is refused.
+/// the disk tier off: `SWAP_REGISTER` is refused.
 pub(crate) fn init()
 {
     let mut key = [0u8; KEY_BYTES];
@@ -134,16 +134,16 @@ pub(crate) fn init()
     state().key = drawn.then_some(key);
 }
 
-/// Hand a spill label's request to its handler, with the caps its contract
+/// Hand a swap label's request to its handler, with the caps its contract
 /// keeps (`crate::dispatch`).
 pub(crate) fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, service_ep: u64)
 {
     match opcode
     {
-        memmgr_labels::SPILL_REGISTER => handle_register(req, kept, ipc_buf, service_ep),
-        memmgr_labels::SPILL_TAKE => handle_take(kept, ipc_buf),
-        memmgr_labels::SPILL_DONE => handle_done(req, ipc_buf),
-        memmgr_labels::SPILL_RESTORE => handle_restore(req, kept, ipc_buf),
+        memmgr_labels::SWAP_REGISTER => handle_register(req, kept, ipc_buf, service_ep),
+        memmgr_labels::SWAP_TAKE => handle_take(kept, ipc_buf),
+        memmgr_labels::SWAP_DONE => handle_done(req, ipc_buf),
+        memmgr_labels::SWAP_RESTORE => handle_restore(req, kept, ipc_buf),
         _ => reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT),
     }
 }
@@ -178,7 +178,7 @@ const fn decline_word(reason: FaultDecline, detail: u64) -> u64
     (detail << 32) | reason as u64
 }
 
-/// Reply to a fault on the chunk whose entry names the spill node `spill`
+/// Reply to a fault on the chunk whose entry names the disk node `disk`
 /// by its path ([`free_pool::fault_path`]): redirect it to the swap
 /// service's endpoint with the word naming the slot and its byte count, or
 /// decline it with code 12. Returns `false` for a path that is not the disk
@@ -186,7 +186,7 @@ const fn decline_word(reason: FaultDecline, detail: u64) -> u64
 pub(crate) fn reply_fault(
     l: &MemLedger,
     path: FaultPath,
-    spill: Option<NodeIdx>,
+    disk: Option<NodeIdx>,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -194,14 +194,14 @@ pub(crate) fn reply_fault(
     {
         FaultPath::Redirect =>
         {
-            let Some(n) = spill.and_then(|s| l.spill_node(s))
+            let Some(n) = disk.and_then(|s| l.disk_node(s))
             else
             {
-                crate::decline_fault(ipc_buf, FaultDecline::SpilledChunk, DETAIL_UNREGISTERED);
+                crate::decline_fault(ipc_buf, FaultDecline::OnDiskChunk, DETAIL_UNREGISTERED);
                 return true;
             };
             let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_REDIRECT)
-                .word(0, spill::redirect_word(n.slot, n.len))
+                .word(0, disk::redirect_word(n.slot, n.len))
                 .cap(state().endpoint)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page. The kernel
@@ -211,12 +211,12 @@ pub(crate) fn reply_fault(
         }
         FaultPath::DeclineUnregistered =>
         {
-            crate::decline_fault(ipc_buf, FaultDecline::SpilledChunk, DETAIL_UNREGISTERED);
+            crate::decline_fault(ipc_buf, FaultDecline::OnDiskChunk, DETAIL_UNREGISTERED);
             true
         }
         FaultPath::DeclineLost =>
         {
-            crate::decline_fault(ipc_buf, FaultDecline::SpilledChunk, DETAIL_LOST);
+            crate::decline_fault(ipc_buf, FaultDecline::OnDiskChunk, DETAIL_LOST);
             true
         }
         FaultPath::Back | FaultPath::CancelEvict | FaultPath::RestoreFromStore => false,
@@ -250,21 +250,21 @@ fn is_memory_of(cap: u64, bytes: u64) -> bool
         && syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_SIZE).is_ok_and(|size| size >= bytes)
 }
 
-/// Unmap the first `pages` pages of the spill window.
+/// Unmap the first `pages` pages of the swap window.
 fn unmap_window(pages: u64)
 {
-    // SAFETY: the spill window is memmgr's own zone (the zone map in main.rs).
-    let _ = unsafe { syscall::mem_unmap(self_aspace(), SPILL_WINDOW_VA, pages) };
+    // SAFETY: the swap window is memmgr's own zone (the zone map in main.rs).
+    let _ = unsafe { syscall::mem_unmap(self_aspace(), SWAP_WINDOW_VA, pages) };
 }
 
-/// `SPILL_REGISTER` (services/memmgr/docs/ipc-interface.md § Label 22):
+/// `SWAP_REGISTER` (services/memmgr/docs/ipc-interface.md § Label 22):
 /// `caps[0]` a SEND on the swap service's restore endpoint, `data[0]` its
 /// slot count. memmgr refuses a cap that is no Endpoint cap or names its own
 /// endpoint `service_ep` (a fault redirected there would reach memmgr with the
 /// badge of the cap, a process's, and be served in the wrong address space),
 /// and a count below a slot in use. A registration replaces the one before it,
 /// whose cap is deleted, and ends every write in flight
-/// ([`free_pool::Ledger::end_spills`]): a new swap service knows nothing of
+/// ([`free_pool::Ledger::end_writes`]): a new swap service knows nothing of
 /// its predecessor's. The reply's `data[0]` is the slots memmgr uses, the
 /// count clamped to [`MAX_SLOTS`].
 fn handle_register(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
@@ -289,7 +289,7 @@ fn handle_register(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep
     {
         let _ = syscall::cap_delete(prior);
     }
-    let _ = l.end_spills();
+    let _ = l.end_writes();
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, total)
         .build();
@@ -332,18 +332,18 @@ fn grow_slots(l: &mut MemLedger) -> bool
     true
 }
 
-/// `SPILL_TAKE` (services/memmgr/docs/ipc-interface.md § Label 23): take the
-/// next swapped chunk for a swap slot. `caps[0]` is the swap service's buffer,
+/// `SWAP_TAKE` (services/memmgr/docs/ipc-interface.md § Label 23): take the
+/// next compressed chunk for a swap slot. `caps[0]` is the swap service's buffer,
 /// a Memory cap of at least a chunk, moved back on every reply. memmgr copies
 /// the chunk's stream from its store runs into its own buffer, seals it there
-/// under the next nonce, takes a slot and a spill node, and only then writes
-/// the slot's bytes into the swap service's buffer, mapped at the spill
-/// window. The chunk is spilling: its store runs stay until `SPILL_DONE`, so
+/// under the next nonce, takes a slot and a disk node, and only then writes
+/// the slot's bytes into the swap service's buffer, mapped at the swap
+/// window. The chunk is writing: its store runs stay until `SWAP_DONE`, so
 /// a fault meanwhile restores from them. Reply: `SUCCESS` with `data[0]` the
 /// slot and `data[1]` its byte count; `INVALID_ARGUMENT` for a missing or
 /// small cap, one memmgr cannot map, or with no swap service registered;
-/// `SWAP_FULL` when every registered slot is taken; `NOTHING_TO_SPILL` when
-/// the walk finds no swapped chunk within [`TAKE_STEPS`]; `QUOTA` when the
+/// `SWAP_FULL` when every registered slot is taken; `NOTHING_TO_TAKE` when
+/// the walk finds no compressed chunk within [`TAKE_STEPS`]; `QUOTA` when the
 /// arena or the slot map cannot grow.
 ///
 /// Its time in memmgr's loop is bounded: a walk of at most [`TAKE_STEPS`]
@@ -383,10 +383,10 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 2])
     {
         return (memmgr_errors::QUOTA, [0; 2]);
     }
-    let Some(v) = l.next_swapped(&mut state().hand, TAKE_STEPS)
+    let Some(v) = l.next_compressed(&mut state().hand, TAKE_STEPS)
     else
     {
-        return (memmgr_errors::NOTHING_TO_SPILL, [0; 2]);
+        return (memmgr_errors::NOTHING_TO_TAKE, [0; 2]);
     };
     let entry = l.chunk_at(v.reg, v.page_base);
     let buf = buf();
@@ -400,15 +400,15 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 2])
     // A nonce is used once under the key, whatever follows: 2^64 seals never
     // run out within a boot.
     s.nonce = s.nonce.wrapping_add(1);
-    let Ok(total) = spill::seal(&key, nonce, buf, len)
+    let Ok(total) = disk::seal(&key, nonce, buf, len)
     else
     {
         return (memmgr_errors::QUOTA, [0; 2]);
     };
     let pages = u64::try_from(total).unwrap_or(u64::MAX).div_ceil(PAGE_SIZE);
-    // SAFETY: the spill window is memmgr's own zone, which every use leaves
+    // SAFETY: the swap window is memmgr's own zone, which every use leaves
     // unmapped; `pages` is at most a chunk's, the window's size.
-    if unsafe { map_self(l, cap, SPILL_WINDOW_VA, 0, pages) }.is_err()
+    if unsafe { map_self(l, cap, SWAP_WINDOW_VA, 0, pages) }.is_err()
     {
         unmap_window(pages);
         return (memmgr_errors::INVALID_ARGUMENT, [0; 2]);
@@ -420,17 +420,17 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 2])
         return (memmgr_errors::QUOTA, [0; 2]);
     };
     // SAFETY: `pages` pages of the swap service's buffer are mapped
-    // read-write at the spill window, which nothing else in memmgr refers to,
+    // read-write at the swap window, which nothing else in memmgr refers to,
     // and `sealed` fits them. Through memmgr's own mapping the stores neither
     // fault nor block. The unmap below is inline assembly without `nomem`, so
     // the stores are made before it.
     unsafe {
-        core::ptr::copy_nonoverlapping(sealed.as_ptr(), SPILL_WINDOW_VA as *mut u8, total);
+        core::ptr::copy_nonoverlapping(sealed.as_ptr(), SWAP_WINDOW_VA as *mut u8, total);
     }
     unmap_window(pages);
     // `total` is at most a slot's bytes, which fit a `u16` less one.
     let len16 = u16::try_from(total).unwrap_or(u16::MAX);
-    match l.begin_spill(v.rec, v.reg, v.page_base, nonce, len16)
+    match l.begin_write(v.rec, v.reg, v.page_base, nonce, len16)
     {
         Ok(slot) => (
             memmgr_errors::SUCCESS,
@@ -441,24 +441,24 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 2])
     }
 }
 
-/// `SPILL_DONE` (services/memmgr/docs/ipc-interface.md § Label 24): `data[0]`
+/// `SWAP_DONE` (services/memmgr/docs/ipc-interface.md § Label 24): `data[0]`
 /// the slot, `data[1]` `0` when its write ended well. A written chunk is on
 /// disk and its store runs return to the pool
-/// ([`free_pool::Ledger::finish_spill`]); an unwritten one is swapped again
-/// on them ([`free_pool::Ledger::abandon_spill`]); a spill a restore or a
+/// ([`free_pool::Ledger::finish_write`]); an unwritten one is compressed again
+/// on them ([`free_pool::Ledger::abandon_write`]); a write a restore or a
 /// teardown cancelled meanwhile frees its slot either way. Reply: `SUCCESS`,
-/// or `INVALID_ARGUMENT` for a slot that holds no spill in flight.
+/// or `INVALID_ARGUMENT` for a slot that holds no write in flight.
 fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let l = ledger_mut();
     let done = u32::try_from(req.word(0)).is_ok_and(|slot| {
         if req.word(1) == 0
         {
-            l.finish_spill(slot).is_ok()
+            l.finish_write(slot).is_ok()
         }
         else
         {
-            l.abandon_spill(slot).is_ok()
+            l.abandon_write(slot).is_ok()
         }
     });
     if done
@@ -478,9 +478,9 @@ fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
     );
 }
 
-/// `SPILL_RESTORE` (services/memmgr/docs/ipc-interface.md § Label 25):
+/// `SWAP_RESTORE` (services/memmgr/docs/ipc-interface.md § Label 25):
 /// `data[0]` the slot, `caps[0]` a Memory cap holding its bytes from offset
-/// 0, moved back on every reply. memmgr maps the cap read-only at the spill
+/// 0, moved back on every reply. memmgr maps the cap read-only at the swap
 /// window, copies the slot's bytes into its own buffer, and opens them there
 /// under the nonce of the chunk's last seal: on a tag failure the chunk is
 /// lost ([`free_pool::Ledger::lose_chunk`]), and the reply is
@@ -516,8 +516,8 @@ fn restore(l: &mut MemLedger, slot: u64, cap: u64) -> (u64, u64)
     };
     let Some((slot, n)) = u32::try_from(slot)
         .ok()
-        .and_then(|slot| l.spill_at(slot).map(|(_, n)| (slot, n)))
-        .filter(|(_, n)| n.state == free_pool::SpillState::OnDisk)
+        .and_then(|slot| l.disk_at(slot).map(|(_, n)| (slot, n)))
+        .filter(|(_, n)| n.state == free_pool::DiskState::OnDisk)
     else
     {
         return (memmgr_errors::INVALID_ARGUMENT, 0);
@@ -529,9 +529,9 @@ fn restore(l: &mut MemLedger, slot: u64, cap: u64) -> (u64, u64)
         return (memmgr_errors::INVALID_ARGUMENT, 0);
     }
     let pages = bytes.div_ceil(PAGE_SIZE);
-    // SAFETY: the spill window is memmgr's own zone, which every use leaves
+    // SAFETY: the swap window is memmgr's own zone, which every use leaves
     // unmapped; `pages` is at most a chunk's, the window's size.
-    if unsafe { map_self_with(l, cap, SPILL_WINDOW_VA, 0, pages, MAP_READ) }.is_err()
+    if unsafe { map_self_with(l, cap, SWAP_WINDOW_VA, 0, pages, MAP_READ) }.is_err()
     {
         unmap_window(pages);
         return (memmgr_errors::INVALID_ARGUMENT, 0);
@@ -540,16 +540,16 @@ fn restore(l: &mut MemLedger, slot: u64, cap: u64) -> (u64, u64)
     if let Some(dst) = buf.get_mut(..total)
     {
         // SAFETY: `pages` pages of the swap service's buffer are mapped
-        // read-only at the spill window, which nothing else in memmgr refers
+        // read-only at the swap window, which nothing else in memmgr refers
         // to, and `dst` fits them. Through memmgr's own mapping the loads
         // neither fault nor block; what the swap service writes meanwhile
         // changes only what the tag check below refuses.
         unsafe {
-            core::ptr::copy_nonoverlapping(SPILL_WINDOW_VA as *const u8, dst.as_mut_ptr(), total);
+            core::ptr::copy_nonoverlapping(SWAP_WINDOW_VA as *const u8, dst.as_mut_ptr(), total);
         }
     }
     unmap_window(pages);
-    let stream = match spill::open(&key, n.nonce, buf, total)
+    let stream = match disk::open(&key, n.nonce, buf, total)
     {
         Ok(len) => len,
         Err(SlotError::Tampered | SlotError::Size) =>
@@ -557,7 +557,7 @@ fn restore(l: &mut MemLedger, slot: u64, cap: u64) -> (u64, u64)
             let _ = l.lose_chunk(slot);
             return (
                 memmgr_errors::RESTORE_DECLINED,
-                decline_word(FaultDecline::SpilledChunk, DETAIL_LOST),
+                decline_word(FaultDecline::OnDiskChunk, DETAIL_LOST),
             );
         }
     };

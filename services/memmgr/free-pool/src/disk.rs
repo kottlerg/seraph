@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// services/memmgr/free-pool/src/spill.rs
+// services/memmgr/free-pool/src/disk.rs
 
 //! The disk tier of the compressed store (`services/memmgr/docs/memory-pool.md`
 //! § Disk tier): the swap slots memmgr hands the swap service, the sealing of a
@@ -11,11 +11,11 @@
 //! A swap slot holds one chunk: its stream ([`crate::store`]), encrypted and
 //! authenticated with ChaCha20-Poly1305 under memmgr's per-boot key, followed by
 //! the tag. The nonce is a per-boot counter memmgr never repeats under the key,
-//! recorded on the chunk's spill node, so the bytes of a slot open only as the
+//! recorded on the chunk's disk node, so the bytes of a slot open only as the
 //! seal memmgr last made for the chunk that holds it: another chunk's bytes, an
 //! older seal of the same chunk, or any change fail the tag.
 //!
-//! [`SwapSlots`] maps each taken slot to the spill node of its chunk, so a
+//! [`SwapSlots`] maps each taken slot to the disk node of its chunk, so a
 //! request naming a slot finds the chunk, and keeps the free slots on a list
 //! threaded through the same words, so a slot is taken and freed in constant
 //! time. Its words grow a page at a time, as far as the highest slot ever taken,
@@ -49,7 +49,7 @@ const FREE: u64 = 1 << 63;
 /// The end of the free list.
 const END: u64 = FREE - 1;
 
-/// The swap slots: which spill node each taken slot holds, and the free list.
+/// The swap slots: which disk node each taken slot holds, and the free list.
 pub struct SwapSlots<W>
 {
     words: W,
@@ -163,7 +163,7 @@ impl<W: WordStore> SwapSlots<W>
         }
     }
 
-    /// Take a free slot for the spill node `node`: the most recently freed
+    /// Take a free slot for the disk node `node`: the most recently freed
     /// one, else the lowest never taken. `None` when every registered slot is
     /// taken, when the storage has no word for the next one
     /// ([`SwapSlots::wants_page`]), or for a node index with the free tag.
@@ -195,7 +195,7 @@ impl<W: WordStore> SwapSlots<W>
         u32::try_from(slot).ok()
     }
 
-    /// The spill node slot `slot` holds, or `None` when it is free or was
+    /// The disk node slot `slot` holds, or `None` when it is free or was
     /// never taken.
     #[must_use]
     pub fn node(&self, slot: u32) -> Option<NodeIdx>
@@ -225,7 +225,7 @@ impl<W: WordStore> SwapSlots<W>
         true
     }
 
-    /// The first taken slot at or past `from`, with its spill node.
+    /// The first taken slot at or past `from`, with its disk node.
     #[must_use]
     pub fn next_taken(&self, from: u32) -> Option<(u32, NodeIdx)>
     {
@@ -343,11 +343,11 @@ pub enum FaultPath
     Back,
     /// The evicting chunk's runs mapped back.
     CancelEvict,
-    /// The chunk restored from the store: swapped, or spilling, whose store
+    /// The chunk restored from the store: compressed, or writing, whose store
     /// runs are kept until its write ends.
     RestoreFromStore,
     /// The fault redirected to the swap service, which reads the slot and
-    /// hands memmgr its bytes (`SPILL_RESTORE`).
+    /// hands memmgr its bytes (`SWAP_RESTORE`).
     Redirect,
     /// Declined: the chunk is on disk and no swap service is registered.
     DeclineUnregistered,
@@ -364,7 +364,7 @@ pub const fn fault_path(entry: &ChunkEntry, registered: Registered) -> FaultPath
     {
         ChunkState::Unbacked | ChunkState::Resident => FaultPath::Back,
         ChunkState::Evicting => FaultPath::CancelEvict,
-        ChunkState::Swapped | ChunkState::Spilling => FaultPath::RestoreFromStore,
+        ChunkState::Compressed | ChunkState::Writing => FaultPath::RestoreFromStore,
         ChunkState::OnDisk => match registered
         {
             Registered::Yes => FaultPath::Redirect,
@@ -548,21 +548,21 @@ mod tests
     {
         let resident = ChunkEntry::UNBACKED.back(0, 4, 7).unwrap();
         let evicting = resident.begin_evict(1).unwrap();
-        let swapped = evicting.finish_evict(9).unwrap();
-        let spilling = swapped.begin_spill(5).unwrap();
-        let on_disk = spilling.finish_spill().unwrap();
+        let compressed = evicting.finish_evict(9).unwrap();
+        let writing = compressed.begin_write(5).unwrap();
+        let on_disk = writing.finish_write().unwrap();
         let lost = on_disk.lose().unwrap();
         for (entry, yes, no) in [
             (ChunkEntry::UNBACKED, FaultPath::Back, FaultPath::Back),
             (resident, FaultPath::Back, FaultPath::Back),
             (evicting, FaultPath::CancelEvict, FaultPath::CancelEvict),
             (
-                swapped,
+                compressed,
                 FaultPath::RestoreFromStore,
                 FaultPath::RestoreFromStore,
             ),
             (
-                spilling,
+                writing,
                 FaultPath::RestoreFromStore,
                 FaultPath::RestoreFromStore,
             ),

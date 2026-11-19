@@ -51,18 +51,18 @@ Two privilege classes:
 - **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
   `NODE_REGISTER_LIMIT`, `NODE_RELEASE`) are callable only over a node
   handle, and act on the budget node it names (§ Node Handles).
-- **Spill** labels (`SPILL_REGISTER`, `SPILL_TAKE`, `SPILL_DONE`,
-  `SPILL_RESTORE`) are callable only over the spill authority, a
-  `SEND|GRANT` badged `SPILL_AUTHORITY` (bit 61) alone, which init mints on
-  memmgr's endpoint and svcmgr publishes seed-only as `memmgr.spill`: the swap
+- **Swap** labels (`SWAP_REGISTER`, `SWAP_TAKE`, `SWAP_DONE`,
+  `SWAP_RESTORE`) are callable only over the swap authority, a
+  `SEND|GRANT` badged `SWAP_AUTHORITY` (bit 61) alone, which init mints on
+  memmgr's endpoint and svcmgr publishes seed-only as `memmgr.swap`: the swap
   service's interface to the disk tier (§ Labels 22 to 25).
 
 memmgr tells the classes apart by two verb bits, the node-handle bit
-`NODE_HANDLE_TAG` (bit 62) and the spill authority's `SPILL_AUTHORITY` (bit
+`NODE_HANDLE_TAG` (bit 62) and the swap authority's `SWAP_AUTHORITY` (bit
 61), the pattern of
 [docs/capability-model.md](../../../docs/capability-model.md) § Verb-bit
 authority pattern: it serves the node labels only on a badge that carries bit
-62, the spill labels only on one that carries bit 61, and every other label
+62, the swap labels only on one that carries bit 61, and every other label
 only on one that carries neither, and replies `UNAUTHORIZED` otherwise,
 deleting any cap the message carries. No process badge carries either:
 memmgr draws a process badge with every verb bit of `ipc::VERB_BIT_MASK`
@@ -144,9 +144,9 @@ carry arguments; the reply carries results. Error codes below are the
 `memmgr_errors` constants in `shared/ipc`. A label memmgr does not define
 replies `INVALID_ARGUMENT`, or `UNAUTHORIZED` over a node handle. Every
 label but the node labels also replies `UNAUTHORIZED` over a node handle, and
-every label but the spill labels over the spill authority (§ Badge
+every label but the swap labels over the swap authority (§ Badge
 Discipline); the node labels' tables list the refusal over any other badge, as
-§ Labels 22 to 25 does for the spill labels.
+§ Labels 22 to 25 does for the swap labels.
 
 ### Label 1: `REQUEST_MEMORY_CAPS`
 
@@ -521,9 +521,9 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL`, at or below the growth floor ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
 | data[8] | `promised_bytes` — what the committed regions can still take from the free runs: their pages that hold no frame yet, and bounds on the page tables and metadata they can need ([`memory-pool.md`](memory-pool.md) § Commit) |
 | data[9] | `store_bytes` — subset of `pool_total_bytes` the compressed store holds: the stored pages of every evicted chunk ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
-| data[10] | `swapped_bytes` — the pages of every evicted chunk, which the store holds compressed and their processes' budget nodes stay charged for |
+| data[10] | `swapped_bytes` — the pages of every evicted chunk, in either tier (compressed in the store, being written, on disk, or lost), which their processes' budget nodes stay charged for |
 | data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
-| data[12] | `spilled_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
+| data[12] | `disk_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
 | data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 25) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
@@ -707,7 +707,7 @@ process's node, carries no caps and changes no state.
 | data[1] | `max_pages` — the node's max, `u64::MAX` for none |
 | data[2] | `subtree_pages` — pages charged to the node and to every node below it |
 | data[3] | `resident_pages` — the pages of `own_pages` not swapped |
-| data[4] | `swapped_pages` — the pages of `own_pages` memmgr evicted into its compressed store, which the node stays charged for ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
+| data[4] | `swapped_pages` — the pages of `own_pages` memmgr evicted, in either tier (its compressed store or the swap service's slots), which the node stays charged for ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
 
 The charge counts each grant, demand chunk of an uncommitted region and
 page-table donation memmgr accounts to the caller, each committed region's
@@ -1042,7 +1042,7 @@ run changes nothing, so an interrupted call is safe to repeat.
 ### Label 21: `MAKE_RESIDENT`
 
 Make a range of a process's demand regions resident for a debugger: memmgr
-restores each chunk of the range it holds in its store, swapped or spilling,
+restores each chunk of the range it holds in its store, compressed or writing,
 and maps back each it is evicting, so a `SYS_THREAD_READ_MEM` that failed on a
 page of it succeeds when the reader retries. A page no fault has backed stays
 not present, and so does a page of a chunk on disk or lost, which memmgr
@@ -1083,18 +1083,18 @@ visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
 | 4 | `INVALID_ARGUMENT` | Unknown badge, zero length, or a range past the address space |
 | 5 | `UNAUTHORIZED` | The caller is not procmgr |
 
-### Labels 22 to 25: the spill labels
+### Labels 22 to 25: the swap labels
 
 The swap service's interface to memmgr's disk tier
 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier). Privilege: the
-spill authority only (§ Badge Discipline); every other badge is refused
+swap authority only (§ Badge Discipline); every other badge is refused
 `UNAUTHORIZED`, its caps deleted. memmgr performs no device I/O and waits on
 no swap service: each label is a request the swap service makes, and the
 redirect of a fault on a chunk on disk is a fault reply (§ Kernel-origin fault
 message). Each label that carries a cap moves it to memmgr for the call, and
 memmgr moves it back on every reply.
 
-#### Label 22: `SPILL_REGISTER`
+#### Label 22: `SWAP_REGISTER`
 
 Register the swap service: its restore endpoint and its slot count. A slot
 holds one chunk (`DEMAND_CHUNK_BYTES`).
@@ -1106,8 +1106,8 @@ holds one chunk (`DEMAND_CHUNK_BYTES`).
 | caps[0] | a SEND on the endpoint memmgr redirects each fault on a chunk on disk to, with any rights; memmgr keeps it |
 
 A registration replaces the one before it, whose cap memmgr deletes, and ends
-every write in flight: each spilling chunk is swapped again on its store runs,
-and each slot whose spill a restore or a teardown cancelled is freed. The
+every write in flight: each writing chunk is compressed again on its store runs,
+and each slot whose write a restore or a teardown cancelled is freed. The
 chunks on disk stay. The reply's `data[0]` is the slots memmgr uses: the count,
 clamped to the slot map's window ([docs/limits.md](../../../docs/limits.md)
 § memmgr).
@@ -1117,9 +1117,9 @@ clamped to the slot map's window ([docs/limits.md](../../../docs/limits.md)
 | 0 | `SUCCESS` | Registered; `data[0]` the slots memmgr uses |
 | 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Endpoint cap, or a cap on memmgr's own endpoint; the count below a slot in use; or memmgr's key draw failed at start, so the disk tier is off. memmgr deletes the cap, and any earlier registration stays |
 
-#### Label 23: `SPILL_TAKE`
+#### Label 23: `SWAP_TAKE`
 
-Take the next swapped chunk for a swap slot, and write the slot's bytes into
+Take the next compressed chunk for a swap slot, and write the slot's bytes into
 the swap service's buffer.
 
 | Field | Value |
@@ -1127,25 +1127,25 @@ the swap service's buffer.
 | label | 23 |
 | caps[0] | a Memory cap of at least `DEMAND_CHUNK_BYTES` with the write right: the swap service's buffer |
 
-memmgr walks its records' regions for a swapped chunk, a bounded number of
+memmgr walks its records' regions for a compressed chunk, a bounded number of
 steps a request (`TAKE_STEPS`, [docs/limits.md](../../../docs/limits.md)
 § memmgr), from where the last walk stopped. It copies the chunk's stream into
 its own buffer, seals it there under its per-boot key and the next nonce,
-takes a slot and a spill node, and writes the slot's bytes, the sealed stream
+takes a slot and a disk node, and writes the slot's bytes, the sealed stream
 and its 16-byte tag, into the buffer from offset 0 through its own mapping of
-the cap. The chunk is spilling until `SPILL_DONE`.
+the cap. The chunk is writing until `SWAP_DONE`.
 
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | `data[0]` the slot, `data[1]` its byte count |
 | 3 | `QUOTA` | The arena or the slot map could not grow, or the chunk's store runs could not be mapped |
 | 4 | `INVALID_ARGUMENT` | No swap service is registered, or `caps[0]` missing, no Memory cap, smaller than a chunk, or not mappable writable |
-| 9 | `NOTHING_TO_SPILL` | The walk found no swapped chunk within its bound; the next request goes on from where it stopped |
+| 9 | `NOTHING_TO_TAKE` | The walk found no compressed chunk within its bound; the next request goes on from where it stopped |
 | 10 | `SWAP_FULL` | Every registered slot is taken |
 
-#### Label 24: `SPILL_DONE`
+#### Label 24: `SWAP_DONE`
 
-End the write of a slot `SPILL_TAKE` named.
+End the write of a slot `SWAP_TAKE` named.
 
 | Field | Value |
 |---|---|
@@ -1154,15 +1154,15 @@ End the write of a slot `SPILL_TAKE` named.
 | data[1] | `0` when the slot is written, nonzero when it is not |
 
 A written chunk is on disk, its store runs returned to the free pool; an
-unwritten one is swapped again on them, its slot freed. A spill a restore or a
+unwritten one is compressed again on them, its slot freed. A write a restore or a
 teardown cancelled while it was in flight frees its slot either way.
 
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | The write ended |
-| 4 | `INVALID_ARGUMENT` | The slot holds no spill in flight: never taken, ended already, or ended by a later `SPILL_REGISTER` |
+| 4 | `INVALID_ARGUMENT` | The slot holds no write in flight: never taken, ended already, or ended by a later `SWAP_REGISTER` |
 
-#### Label 25: `SPILL_RESTORE`
+#### Label 25: `SWAP_RESTORE`
 
 Hand memmgr a slot's bytes, read back for a fault redirected to the swap
 service or ahead of one.
@@ -1175,8 +1175,8 @@ service or ahead of one.
 
 memmgr maps the cap read-only, copies the slot's bytes into its own buffer,
 and checks the tag there under the nonce of the chunk's last seal. A good slot
-is restored as a fault restores a swapped chunk (§ Kernel-origin fault message),
-its slot and spill node freed. A tag failure makes the chunk lost and frees
+is restored as a fault restores a compressed chunk (§ Kernel-origin fault message),
+its slot and disk node freed. A tag failure makes the chunk lost and frees
 its slot.
 
 | Code | Name | Meaning |
@@ -1234,8 +1234,8 @@ before it resumes, declined with code 7 when the free pages outside
 `promised` and, for a process outside it, the system reserve do not cover the
 chunk's backed pages, and with code 9 when a map fails or, with detail 0, the
 stored chunk does not decode; the chunk then stays evicted
-([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a spilling
-chunk is restored from its store runs as a swapped chunk's, and its spill
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a writing
+chunk is restored from its store runs as a compressed chunk's, and its write
 cancelled. A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming
 the registered swap service's endpoint, with data word 0 the slot in its low
 32 bits and the slot's byte count above them, which the endpoint receives as
@@ -1288,17 +1288,17 @@ caller's cap.
 Only eight labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
 attached cap), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE` (`cap[0]`),
 `REGISTER_PROCESS` (`cap[0]`), `NODE_REGISTER_LIMIT` (`cap[0]` and
-`cap[1]`), and the spill labels `SPILL_REGISTER`, `SPILL_TAKE` and
-`SPILL_RESTORE` (`cap[0]`). memmgr deletes every other cap a message carries before it
+`cap[1]`), and the swap labels `SWAP_REGISTER`, `SWAP_TAKE` and
+`SWAP_RESTORE` (`cap[0]`). memmgr deletes every other cap a message carries before it
 handles the message, whatever the label, the caller, or the reply: the caps
 attached to any other label (a `FAULT_LABEL` message and an unknown label
 included), the caps after `cap[0]` on `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
-`REGISTER_PROCESS` and the spill labels, and the caps after `cap[1]` on
+`REGISTER_PROCESS` and the swap labels, and the caps after `cap[1]` on
 `NODE_REGISTER_LIMIT`. It deletes the contract caps as well when a
 procmgr-only label's caller is not procmgr, when a label's class does not
 match the badge (§ Badge Discipline), and in the error cases the labels'
-sections state. `SPILL_REGISTER` keeps its `cap[0]` as the swap service's
-endpoint; `SPILL_TAKE` and `SPILL_RESTORE` move their `cap[0]` back on every
+sections state. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's
+endpoint; `SWAP_TAKE` and `SWAP_RESTORE` move their `cap[0]` back on every
 reply, and delete it only when that reply cannot reach the caller. `REGISTER_PROCESS` reads the
 badge of its `cap[0]` and deletes it on every path, and `NODE_REGISTER_LIMIT` its `cap[1]`. An
 attached cap therefore never outlives the call that carried it unless memmgr takes ownership of it,

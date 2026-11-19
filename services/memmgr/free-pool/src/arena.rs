@@ -196,20 +196,20 @@ const _: () = assert!(size_of::<Commitment>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<LimitReg>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
-const _: () = assert!(size_of::<SpillNode>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<DiskNode>() <= size_of::<ProcessRecord>());
 
-/// Where a spill stands ([`SpillNode`]).
+/// Where a write stands ([`DiskNode`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpillState
+pub enum DiskState
 {
-    /// `SPILL_TAKE` handed the chunk's sealed bytes to the swap service, whose
+    /// `SWAP_TAKE` handed the chunk's sealed bytes to the swap service, whose
     /// write to the slot is in flight; the chunk's store runs are kept.
-    Spilling,
+    Writing,
     /// The swap service wrote the slot: the chunk's bytes are on disk only.
     OnDisk,
     /// The chunk was restored or torn down while its write was in flight. The
     /// slot stays taken until the swap service ends the write
-    /// (`SPILL_DONE`), so the write cannot land in a slot another chunk took.
+    /// (`SWAP_DONE`), so the write cannot land in a slot another chunk took.
     Cancelled,
 }
 
@@ -217,10 +217,10 @@ pub enum SpillState
 /// (`services/memmgr/docs/memory-pool.md` § Disk tier): the chunk, the nonce
 /// its bytes were sealed under, its store runs while the write is in flight,
 /// and the slot. The chunk's entry names this slot; the slot map names it by
-/// its swap slot ([`crate::spill::SwapSlots`]). The chunk fields are stale once
-/// it is [`SpillState::Cancelled`].
+/// its swap slot ([`crate::disk::SwapSlots`]). The chunk fields are stale once
+/// it is [`DiskState::Cancelled`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SpillNode
+pub struct DiskNode
 {
     /// The record slot of the chunk's process.
     pub rec: NodeIdx,
@@ -231,14 +231,14 @@ pub struct SpillNode
     /// The per-boot nonce counter the chunk's bytes were sealed under, used
     /// for no other seal.
     pub nonce: u64,
-    /// The head of the chunk's store-run list while it is spilling,
+    /// The head of the chunk's store-run list while it is writing,
     /// [`NODE_NULL`] otherwise.
     pub store: NodeIdx,
     /// The swap slot.
     pub slot: u32,
     /// Bytes the slot holds: the sealed stream and its tag.
     pub len: u16,
-    pub state: SpillState,
+    pub state: DiskState,
 }
 
 /// The payload of one arena slot.
@@ -267,7 +267,7 @@ pub enum Node
     /// A leaf of a chunk table: one chunk's entry.
     Chunk(ChunkEntry),
     /// A chunk the swap service holds or is writing in a swap slot.
-    Spill(SpillNode),
+    Disk(DiskNode),
 }
 
 /// An arena slot: a payload plus the index of the next slot on whichever
@@ -654,7 +654,7 @@ mod tests
     }
 
     #[test]
-    fn layout_spills_from_the_low_zone_into_the_high_zone_then_ends()
+    fn layout_writes_from_the_low_zone_into_the_high_zone_then_ends()
     {
         let layout = ArenaLayout {
             low_base: 0x1000,

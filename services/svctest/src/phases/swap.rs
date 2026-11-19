@@ -228,7 +228,7 @@ pub(super) struct Pool
     /// `data[11]`: the growth floor.
     pub(super) floor: u64,
     /// `data[12]`: pages of chunks on disk.
-    pub(super) spilled: u64,
+    pub(super) on_disk: u64,
     /// `data[13]`: the swap slots free.
     pub(super) free_slots: u64,
 }
@@ -302,7 +302,7 @@ pub(super) fn pool() -> Pool
         store: reply.word(9),
         swapped: reply.word(10),
         floor: reply.word(11),
-        spilled: reply.word(12),
+        on_disk: reply.word(12),
         free_slots: reply.word(13),
     }
 }

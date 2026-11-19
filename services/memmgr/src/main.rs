@@ -30,8 +30,8 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
 use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError};
 
+mod disk;
 mod evict;
-mod spill;
 
 // memmgr's handlers grow the arena and fund its page tables from inside a
 // request (a grant, a fault), nesting the growth path under the handler's
@@ -142,9 +142,9 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 //   eviction windows    [evict::EVICT_ZONE_VA, + 256 KiB)   a job's input, a
 //                                                            restore's victim,
 //                                                            a chunk's stream
-//   spill window        [spill::SPILL_WINDOW_VA, + 64 KiB)  a swap service's
+//   swap window        [disk::SWAP_WINDOW_VA, + 64 KiB)  a swap service's
 //                                                            buffer
-//   swap slot map       [spill::SWAP_SLOTS_VA, + 2 GiB)     slot words
+//   swap slot map       [disk::SWAP_SLOTS_VA, + 2 GiB)     slot words
 //   phys-table scratch  [PHYS_TABLE_TEMP_VA, + 8 GiB)      one page, per-boot drawn
 //   process index       [PROCESS_INDEX_VA, PROCESS_INDEX_END)  bucket heads
 //   metadata arena      [drawn base, META_ARENA_LOW_END)    arena pages, then
@@ -215,9 +215,9 @@ const META_ARENA_HIGH_END: u64 = 1 << 56;
 const _: () = {
     assert!(SCRUB_VA.is_multiple_of(SCRUB_WINDOW_PAGES * PAGE_SIZE));
     assert!(SCRUB_VA + SCRUB_WINDOW_PAGES * PAGE_SIZE <= evict::EVICT_ZONE_VA);
-    assert!(evict::EVICT_ZONE_END <= spill::SPILL_WINDOW_VA);
-    assert!(spill::SPILL_WINDOW_END <= spill::SWAP_SLOTS_VA);
-    assert!(spill::SWAP_SLOTS_END <= PHYS_TABLE_TEMP_VA);
+    assert!(evict::EVICT_ZONE_END <= disk::SWAP_WINDOW_VA);
+    assert!(disk::SWAP_WINDOW_END <= disk::SWAP_SLOTS_VA);
+    assert!(disk::SWAP_SLOTS_END <= PHYS_TABLE_TEMP_VA);
     assert!(PHYS_TABLE_TEMP_VA + (1 << (PHYS_TABLE_TEMP_SLOTS_LOG2 + 12)) <= PROCESS_INDEX_VA);
     assert!(PROCESS_INDEX_END <= META_ARENA_BASE_DEFAULT);
     assert!(META_ARENA_BASE_DEFAULT + (1 << (META_ARENA_SLOTS_LOG2 + 12)) < META_ARENA_LOW_END);
@@ -260,7 +260,7 @@ impl SlotStore for MappedSlots
 
 /// Word storage mapped from `base`: the process index's bucket heads from
 /// [`PROCESS_INDEX_VA`], and the swap slot map's words from
-/// [`spill::SWAP_SLOTS_VA`].
+/// [`disk::SWAP_SLOTS_VA`].
 struct MappedWords
 {
     base: u64,
@@ -271,7 +271,7 @@ impl WordStore for MappedWords
     unsafe fn read(&self, i: u64) -> u64
     {
         // SAFETY: the caller's contract puts word `i` in a page its owner
-        // (`ensure_index`, `spill::grow_slots`) mapped writable at
+        // (`ensure_index`, `disk::grow_slots`) mapped writable at
         // `base + page * PAGE_SIZE`.
         unsafe { core::ptr::read(self.base.saturating_add(i.saturating_mul(8)) as *const u64) }
     }
@@ -292,7 +292,7 @@ const INDEX_WORDS: MappedWords = MappedWords {
 
 /// The swap slot map's word storage.
 const SWAP_SLOT_WORDS: MappedWords = MappedWords {
-    base: spill::SWAP_SLOTS_VA,
+    base: disk::SWAP_SLOTS_VA,
 };
 
 type MemLedger = Ledger<MappedSlots, MappedWords>;
@@ -1911,7 +1911,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
             l.growth_floor(pool_total_pages()).saturating_mul(PAGE_SIZE),
         )
         .word(12, l.disk_pages().saturating_mul(PAGE_SIZE))
-        .word(13, spill::free_slots(l))
+        .word(13, disk::free_slots(l))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -2308,7 +2308,7 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         // swap service (services/memmgr/docs/ipc-interface.md § Label 21).
         if matches!(
             l.chunk_at(reg, chunk_base).state(),
-            ChunkState::Evicting | ChunkState::Swapped | ChunkState::Spilling
+            ChunkState::Evicting | ChunkState::Compressed | ChunkState::Writing
         )
         {
             if evict::make_resident(l, rec, reg, &node.region, chunk_base, aspace).is_err()
@@ -2470,10 +2470,10 @@ enum FaultDecline
     BudgetLimit = 10,
     /// The faulting page's chunk is on disk, its pages in a swap slot only
     /// (services/memmgr/docs/memory-pool.md § Disk tier): detail
-    /// [`spill::DETAIL_UNREGISTERED`] when no swap service is registered to
-    /// restore it, [`spill::DETAIL_LOST`] when its slot's bytes failed
+    /// [`disk::DETAIL_UNREGISTERED`] when no swap service is registered to
+    /// restore it, [`disk::DETAIL_LOST`] when its slot's bytes failed
     /// authentication and the chunk is lost.
-    SpilledChunk = 12,
+    OnDiskChunk = 12,
 }
 
 /// Decline the fault, with data word 0 the reason word: `reason` in its low
@@ -2628,17 +2628,17 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // backed, because another thread's fault on it was served first, and that
     // mapping satisfies this granted access. Resume.
     let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
-    // An evicting, swapped or spilling chunk is made resident whole first: its
+    // An evicting, compressed or writing chunk is made resident whole first: its
     // runs mapped back, or its pages restored from the store
     // (services/memmgr/docs/memory-pool.md § Eviction, States). Every backed
     // page of it is then mapped, and a fault on an unbacked page of it backs
     // that page as on any resident chunk. A fault on a chunk on disk is
     // redirected to the swap service, which reads its slot and hands memmgr
-    // the bytes (`SPILL_RESTORE`), or declined with no swap service or for a
+    // the bytes (`SWAP_RESTORE`), or declined with no swap service or for a
     // lost chunk (§ Disk tier): memmgr reads no slot itself.
     let current = l.chunk_at(reg, page_base);
-    let path = free_pool::fault_path(&current, spill::registered());
-    if spill::reply_fault(l, path, current.spill(), ipc_buf)
+    let path = free_pool::fault_path(&current, disk::registered());
+    if disk::reply_fault(l, path, current.disk(), ipc_buf)
     {
         return;
     }
@@ -3616,8 +3616,8 @@ fn delete_caps(caps: &[u64])
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
 /// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first two
 /// for `NODE_REGISTER_LIMIT`, the first for `DELEGATE_ASPACE`,
-/// `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SPILL_REGISTER`, `SPILL_TAKE`
-/// and `SPILL_RESTORE`, none for any other label. [`dispatch`] deletes the
+/// `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_REGISTER`, `SWAP_TAKE`
+/// and `SWAP_RESTORE`, none for any other label. [`dispatch`] deletes the
 /// rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
@@ -3627,9 +3627,9 @@ fn contract_cap_count(opcode: u64, attached: usize) -> usize
         memmgr_labels::DELEGATE_ASPACE
         | memmgr_labels::REGISTER_PRESSURE
         | memmgr_labels::REGISTER_PROCESS
-        | memmgr_labels::SPILL_REGISTER
-        | memmgr_labels::SPILL_TAKE
-        | memmgr_labels::SPILL_RESTORE => attached.min(1),
+        | memmgr_labels::SWAP_REGISTER
+        | memmgr_labels::SWAP_TAKE
+        | memmgr_labels::SWAP_RESTORE => attached.min(1),
         memmgr_labels::NODE_REGISTER_LIMIT => attached.min(2),
         _ => 0,
     }
@@ -3658,15 +3658,14 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     let opcode = req.label & 0xFFFF;
     let (kept, stray) = attached.split_at(contract_cap_count(opcode, attached.len()));
     delete_caps(stray);
-    // A node handle is served the node labels and nothing else, the spill
-    // authority the spill labels and nothing else, and every other badge
+    // A node handle is served the node labels and nothing else, the swap
+    // authority the swap labels and nothing else, and every other badge
     // everything else (services/memmgr/docs/ipc-interface.md § Node Handles,
     // § Badge Discipline).
     let node_label = (memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE).contains(&opcode);
-    let spill_label =
-        (memmgr_labels::SPILL_REGISTER..=memmgr_labels::SPILL_RESTORE).contains(&opcode);
+    let swap_label = (memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_RESTORE).contains(&opcode);
     if node_label != (req.badge & memmgr_labels::NODE_HANDLE_TAG != 0)
-        || spill_label != (req.badge & memmgr_labels::SPILL_AUTHORITY != 0)
+        || swap_label != (req.badge & memmgr_labels::SWAP_AUTHORITY != 0)
     {
         delete_caps(kept);
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
@@ -3761,9 +3760,9 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             handle_node_release(req, ipc_buf);
         }
-        memmgr_labels::SPILL_REGISTER..=memmgr_labels::SPILL_RESTORE =>
+        memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_RESTORE =>
         {
-            spill::route(opcode, req, kept, ipc_buf, boot.service_ep);
+            disk::route(opcode, req, kept, ipc_buf, boot.service_ep);
         }
         _ =>
         {
@@ -3800,7 +3799,7 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
     // insert carves the first arena page).
     ledger_init(startup.self_aspace);
     // The disk tier's per-boot key, drawn before any request can use it.
-    spill::init();
+    disk::init();
 
     ingest_pool(&boot);
 

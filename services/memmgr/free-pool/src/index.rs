@@ -73,7 +73,7 @@ pub const fn key_of(node: &Node) -> Option<u64>
         | Node::Caps(_)
         | Node::Commit(_)
         | Node::Limit(_)
-        | Node::Spill(_) => None,
+        | Node::Disk(_) => None,
     }
 }
 

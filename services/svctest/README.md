@@ -91,7 +91,7 @@ services/svctest/
         │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
         │                      #   headroom and by direct reclaim; a no-evict region, logd's
         │                      #   reserve stack; all-RAM-accounted identity
-        ├── spill.rs           # memmgr's disk tier with svctest as the swap service over a
+        ├── swap_client.rs     # memmgr's disk tier with svctest as the swap service over a
         │                      #   RAM slot store: register, take, done, a fault redirected
         │                      #   and restored, a re-registration, a tampered slot killing
         │                      #   its faulting child; all-RAM-accounted identity
@@ -166,14 +166,15 @@ svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`, `pwrmgr.
 `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
 vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`,
 `logd_reserve`, `logd_restart`, `logd_sinks`, and `entropyd_contribution` phases (`caps[6]`), the
-vfsd swap-partition phase (`caps[14]`), the `memmgr_spill` phase (`caps[18]`), the
+vfsd swap-partition phase (`caps[14]`), the `memmgr_swap_client` phase (`caps[18]`), the
 `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[20]`), the
-`crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`, `memmgr_spill`, and
-`vfsd_driver_death` phases (`caps[19]`), the `svcmgr_stop_service` phase (`caps[20]`, and `caps[19]`
-with `stopsrc` staged), and the no-stop cases of the `oom_policy` and `logd_reserve` phases
-(`caps[20]`), instead fail their assertions. The seed-only phase thus fails the run on a zero
-`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
-reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
+`crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`,
+`memmgr_swap_client`, and `vfsd_driver_death` phases (`caps[19]`), the `svcmgr_stop_service` phase
+(`caps[20]`, and `caps[19]` with `stopsrc` staged), and the no-stop cases of the `oom_policy` and
+`logd_reserve` phases (`caps[20]`), instead fail their assertions. The seed-only phase thus fails
+the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap
+skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run
+ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -211,8 +212,8 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose shell runs the large job |
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read and drivers stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
-| `caps[18]` | `memmgr.spill` (`SEND\|GRANT`) | `memmgr_spill` phase: memmgr's spill labels, as the swap service over a RAM slot store |
-| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_spill` phase: the same for its fixture child, and every other process's ranges; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client` phase: memmgr's swap labels, as the swap service over a RAM slot store |
+| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -448,7 +449,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 | `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
 | `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
-| `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_spill` (evicted regions, threads) |
+| `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client` (evicted regions, threads) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---

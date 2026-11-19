@@ -236,15 +236,15 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
     publish_endowed_send(registry, caps.vfsd_mount, ipc::published_names::VFSD_MOUNT);
     publish_endowed_send(registry, caps.vfsd_deny, ipc::published_names::VFSD_DENY);
     publish_endowed_send(registry, caps.vfsd_swap, ipc::published_names::VFSD_SWAP);
-    // memmgr.spill — memmgr's spill authority, endowed pre-badged by init
-    // (`SPILL_AUTHORITY`) with `GRANT`, which its seeds keep: each spill label
-    // but `SPILL_DONE` moves a cap to memmgr. Seed-only: the swap service's
+    // memmgr.swap — memmgr's swap authority, endowed pre-badged by init
+    // (`SWAP_AUTHORITY`) with `GRANT`, which its seeds keep: each swap label
+    // but `SWAP_DONE` moves a cap to memmgr. Seed-only: the swap service's
     // recipe is to seed it, and svctest's seeds it while no swap service
     // exists.
     publish_endowed(
         registry,
-        caps.memmgr_spill,
-        ipc::published_names::MEMMGR_SPILL,
+        caps.memmgr_swap,
+        ipc::published_names::MEMMGR_SWAP,
         Visibility::SeedOnlyGrant,
     );
 

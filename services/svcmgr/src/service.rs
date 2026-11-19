@@ -287,9 +287,9 @@ pub struct SvcmgrCaps
     /// from it per launch for the one `entropy_authority = yes` service, and
     /// never publishes it. Zero if absent.
     pub entropy_source: u64,
-    /// `SPILL_AUTHORITY`-badged `SEND|GRANT` on memmgr's endpoint, published
-    /// seed-only, with `GRANT`, as `memmgr.spill`. Zero if absent.
-    pub memmgr_spill: u64,
+    /// `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's endpoint, published
+    /// seed-only, with `GRANT`, as `memmgr.swap`. Zero if absent.
+    pub memmgr_swap: u64,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
     /// one-shot `HANDOVER_PULL` SEND on the first launch, and publishes the
@@ -351,7 +351,7 @@ pub fn bootstrap_caps(
                             vfsd_deny: c.vfsd_deny,
                             vfsd_swap: c.vfsd_swap,
                             entropy_source: c.entropy_source,
-                            memmgr_spill: c.memmgr_spill,
+                            memmgr_swap: c.memmgr_swap,
                             master_log_source: 0,
                             procmgr_death_auth_source: 0,
                         });

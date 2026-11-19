@@ -43,12 +43,12 @@ pub const LABEL_VERSION_MISMATCH: u64 = 7;
 /// an ancestor, over its max. Distinct from the out-of-memory codes: the
 /// RAM may exist, and the caller's budget refuses it.
 pub const LIMIT: u64 = 8;
-/// `SPILL_TAKE`: memmgr's walk found no evicted chunk to take within its bound;
+/// `SWAP_TAKE`: memmgr's walk found no evicted chunk to take within its bound;
 /// a later call goes on from where it stopped.
-pub const NOTHING_TO_SPILL: u64 = 9;
-/// `SPILL_TAKE`: every registered swap slot is taken.
+pub const NOTHING_TO_TAKE: u64 = 9;
+/// `SWAP_TAKE`: every registered swap slot is taken.
 pub const SWAP_FULL: u64 = 10;
-/// `SPILL_RESTORE`: memmgr could not make the slot's chunk resident; the
+/// `SWAP_RESTORE`: memmgr could not make the slot's chunk resident; the
 /// reply's `data[0]` is the fault decline word the swap service forwards the
 /// held fault with.
 pub const RESTORE_DECLINED: u64 = 11;

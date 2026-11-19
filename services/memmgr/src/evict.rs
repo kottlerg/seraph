@@ -877,8 +877,8 @@ fn unmap_stream(pages: u64)
 
 /// Make the chunk holding `page_base` in region `reg` of `rec` resident, for a
 /// fault on it or a make-resident request: an evicting chunk's runs are
-/// mapped back and its job made stale; a swapped or spilling chunk is restored
-/// from its store runs ([`restore`]), a spilling one's spill cancelled. A
+/// mapped back and its job made stale; a compressed or writing chunk is restored
+/// from its store runs ([`restore`]), a writing one's write cancelled. A
 /// chunk in another state needs nothing here: one on disk or lost is routed by
 /// the caller before ([`free_pool::fault_path`]).
 ///
@@ -903,7 +903,7 @@ pub(crate) fn make_resident(
             let _ = l.cancel_evict(rec, reg, page_base);
             Ok(())
         }
-        ChunkState::Swapped | ChunkState::Spilling =>
+        ChunkState::Compressed | ChunkState::Writing =>
         {
             restore(l, rec, reg, region, page_base, aspace, None)
         }
@@ -932,9 +932,9 @@ fn give_back(l: &mut MemLedger, runs: &[FrameDesc])
     }
 }
 
-/// Restore the swapped, spilling or on-disk chunk holding `page_base` in
+/// Restore the compressed, writing or on-disk chunk holding `page_base` in
 /// region `reg` of `rec` from its stream: `stream`, the bytes a swap slot
-/// held opened, for a chunk on disk (`crate::spill`), else its store runs
+/// held opened, for a chunk on disk (`crate::disk`), else its store runs
 /// (services/memmgr/docs/memory-pool.md § Eviction, States): admitted when the
 /// free pages outside `promised` cover its backed pages and, for a node outside
 /// it, the system reserve, once direct reclaim has made room when needed
@@ -965,7 +965,7 @@ pub(crate) fn restore(
         return Err((FaultDecline::NoFreePage, 0));
     }
     // Read after the admission, whose direct reclaim changes the chunk
-    // tables: the chunk itself stays swapped, since it is no victim.
+    // tables: the chunk itself stays compressed, since it is no victim.
     let entry = l.chunk_at(reg, page_base);
     let (chunk_base, _) = chunk_for(region, page_base);
     let mut runs = [FrameDesc::default(); CHUNK_RUNS];
@@ -1104,7 +1104,7 @@ fn select_restore_runs(
     Ok(n)
 }
 
-/// The store runs of the swapped or spilling chunk `entry`, in stream order,
+/// The store runs of the compressed or writing chunk `entry`, in stream order,
 /// into `store`. Returns their count.
 fn store_runs(l: &MemLedger, entry: ChunkEntry, store: &mut [FreeRun; CHUNK_RUNS]) -> usize
 {
@@ -1119,8 +1119,8 @@ fn store_runs(l: &MemLedger, entry: ChunkEntry, store: &mut [FreeRun; CHUNK_RUNS
     n
 }
 
-/// Copy the stream of the swapped chunk `entry`, its store runs' pages whole,
-/// into `dst`, through the stream window, for its spill (`crate::spill`).
+/// Copy the stream of the compressed chunk `entry`, its store runs' pages whole,
+/// into `dst`, through the stream window, for its write (`crate::disk`).
 /// Returns the bytes copied, or `None`, nothing copied, when a map fails or
 /// they do not fit `dst`.
 pub(crate) fn read_store(l: &mut MemLedger, entry: ChunkEntry, dst: &mut [u8]) -> Option<usize>
@@ -1143,7 +1143,7 @@ pub(crate) fn read_store(l: &mut MemLedger, entry: ChunkEntry, dst: &mut [u8]) -
 }
 
 /// Write every byte of every page of `runs`, in page order, from the stream of
-/// the swapped or spilling chunk `entry`, its store runs mapped at the stream
+/// the compressed or writing chunk `entry`, its store runs mapped at the stream
 /// window meanwhile ([`decode_runs`]).
 ///
 /// # Errors

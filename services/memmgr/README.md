@@ -29,12 +29,12 @@ memmgr/
 │                               # bounds (`commit.rs`), the compressed
 │                               # store's page codec and chunk stream
 │                               # (`compress.rs`, `store.rs`), the swap
-│                               # slot map and slot sealing (`spill.rs`)
+│                               # slot map and slot sealing (`disk.rs`)
 ├── src/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── evict.rs                # Eviction: the clock's slices, the compression
 │                               # worker, the store, restore
-│   └── spill.rs                # Disk tier: the spill labels, the per-boot
+│   └── disk.rs                # Disk tier: the swap labels, the per-boot
 │                               # key, the fault redirect to the swap service
 └── docs/
     ├── memory-pool.md          # Pool, allocation, reclamation, coalescing
@@ -92,8 +92,8 @@ Allocation Contract").
   (a demand fault with decline code 10), and keep the system reserve for the
   core (see [`docs/memory-pool.md`](docs/memory-pool.md) § Distribution
   policy).
-- **Disk tier** — serve the swap service's spill labels on the spill
-  authority alone: hand it swapped chunks sealed under a per-boot key that
+- **Disk tier** — serve the swap service's swap labels on the swap
+  authority alone: hand it compressed chunks sealed under a per-boot key that
   never leaves memmgr, redirect a fault on a chunk on disk to it, and restore
   the chunk from the bytes it hands back once their tag checks (see
   [`docs/memory-pool.md`](docs/memory-pool.md#disk-tier) § Disk tier and

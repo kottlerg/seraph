@@ -32,8 +32,8 @@
 //! `store_pages` and held on its entry, and its pages in `swapped_pages` and the
 //! process's swapped count, until a restore maps it again or a teardown frees
 //! its store and releases the charge (`services/memmgr/docs/memory-pool.md`
-//! § Eviction). A swapped chunk the swap service takes is spilling while its
-//! write is in flight, its store runs held on its spill node, and on disk once
+//! § Eviction). A compressed chunk the swap service takes is writing while its
+//! write is in flight, its store runs held on its disk node, and on disk once
 //! the write ends, its store runs back in the pool and its pages counted in
 //! `disk_pages` too; it stays in `swapped_pages` and keeps its charge
 //! throughout, and so does a chunk lost to a failed authentication (§ Disk
@@ -47,16 +47,16 @@
 //! § Commit).
 
 use crate::arena::{
-    Arena, Commitment, DeferredRun, FrameDesc, LimitReg, NO_REGION_ID, NODE_NULL, Node, NodeHandle,
-    NodeIdx, ProcessCaps, ProcessRecord, RegionNode, Slot, SlotStore, SpillNode, SpillState,
+    Arena, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, LimitReg, NO_REGION_ID,
+    NODE_NULL, Node, NodeHandle, NodeIdx, ProcessCaps, ProcessRecord, RegionNode, Slot, SlotStore,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError, ChunkState};
 use crate::commit::{self, CommitNeed};
 use crate::deferred::{DeferredList, RecheckBudget};
+use crate::disk::SwapSlots;
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
-use crate::spill::SwapSlots;
 use crate::{
     CHUNK_BYTES, DEMAND_CHUNK_PAGES, DemandRegion, Evict, FreeRun, chunk_count, chunk_for,
     chunk_index, region_contains, regions_overlap,
@@ -152,8 +152,8 @@ pub enum SwapError
     NoSlot,
     /// No swap slot is free, or the slot map has no storage for the next.
     NoSwapSlot,
-    /// The swap slot named holds no spill in the state the step needs.
-    NoSpill,
+    /// The swap slot named holds no write in the state the step needs.
+    NotWriting,
 }
 
 /// Chunks one harvest of a [`Ledger::sweep`] covers: as many as
@@ -207,7 +207,7 @@ struct Released
 {
     /// Pages of the runs taken back.
     run_pages: u64,
-    /// Pages of the swapped chunks freed, still charged.
+    /// Pages of the compressed chunks freed, still charged.
     swapped: u64,
     /// Store pages returned to the pool.
     store: u64,
@@ -239,12 +239,12 @@ pub struct Ledger<S, W>
     /// not drawn, and what the arena's growth has not drawn of their metadata
     /// bounds ([`crate::commit`]).
     promised: u64,
-    /// Pool pages the compressed store holds: the store runs of every swapped
+    /// Pool pages the compressed store holds: the store runs of every compressed
     /// chunk.
     store_pages: u64,
-    /// Pages of every evicted chunk: swapped, spilling, on disk, or lost.
+    /// Pages of every evicted chunk: compressed, writing, on disk, or lost.
     swapped_pages: u64,
-    /// The swap slots and the spill node each taken one holds.
+    /// The swap slots and the disk node each taken one holds.
     pub slots: SwapSlots<W>,
     /// Pages of every on-disk chunk, which only its swap slot holds.
     disk_pages: u64,
@@ -285,14 +285,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.store_pages
     }
 
-    /// Pages of the swapped chunks of every process.
+    /// Pages of the compressed chunks of every process.
     #[must_use]
     pub const fn swapped_pages(&self) -> u64
     {
         self.swapped_pages
     }
 
-    /// Pages of the swapped chunks of the record `rec`, which its budget node
+    /// Pages of the compressed chunks of the record `rec`, which its budget node
     /// stays charged for; 0 for a slot that holds no record.
     #[must_use]
     pub fn swapped_of(&self, rec: NodeIdx) -> u64
@@ -318,7 +318,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// The free pages outside `promised` that a charge to a node outside the
     /// system reserve must leave in a pool of `pool_total` pages: the reserve,
-    /// and the restore headroom while chunks are swapped
+    /// and the restore headroom while chunks are compressed
     /// ([`budget::growth_floor`]).
     #[must_use]
     pub const fn growth_floor(&self, pool_total: u64) -> u64
@@ -354,7 +354,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Spill(_) => None,
+            | Node::Disk(_) => None,
         }
     }
 
@@ -376,7 +376,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Spill(_) => None,
+            | Node::Disk(_) => None,
         }
     }
 
@@ -399,7 +399,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Caps(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Spill(_) => None,
+            | Node::Disk(_) => None,
         }
     }
 
@@ -446,7 +446,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Spill(_) => None,
+            | Node::Disk(_) => None,
         }
     }
 
@@ -629,7 +629,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Caps(_)
             | Node::Commit(_)
             | Node::Limit(_)
-            | Node::Spill(_) => None,
+            | Node::Disk(_) => None,
         }
     }
 
@@ -653,7 +653,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Caps(_)
             | Node::Commit(_)
             | Node::Handle(_)
-            | Node::Spill(_) => None,
+            | Node::Disk(_) => None,
         }
     }
 
@@ -1532,11 +1532,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// the region's bound rising by it, at most to [`commit::meta_bound`] of
     /// its length). A refault of a discarded page is then admitted from
     /// `promised` as its first touch was, so it is declined for neither budget
-    /// nor RAM. A swapped chunk, which only an uncommitted region holds, frees
+    /// nor RAM. A compressed chunk, which only an uncommitted region holds, frees
     /// its store to the free pool and its pages' charge ([`Ledger::settle`]).
     /// A range that holds no run changes nothing, so a repeat is safe.
     /// Returns the pages that held data: those of the runs taken back and of
-    /// the swapped chunks freed.
+    /// the compressed chunks freed.
     ///
     /// # Errors
     /// As [`Ledger::discard_region`]. Nothing changes then.
@@ -1845,7 +1845,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// [`BackError::NoRegion`] when `reg` holds no region,
     /// [`BackError::Outside`] when the run is unaligned or leaves the region,
     /// [`BackError::Chunk`] when the chunk's entry refuses the run (it leaves
-    /// the chunk, covers a backed page, or the chunk is evicting or swapped),
+    /// the chunk, covers a backed page, or the chunk is evicting or compressed),
     /// and [`BackError::NoSlot`] when the arena has fewer free slots than
     /// [`Ledger::back_slots`].
     pub fn back_chunk(
@@ -2032,7 +2032,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Finish the eviction the job slot `job` holds of the chunk holding
     /// `page_base` in region `reg` of `rec`, whose stream the caller wrote into
-    /// the pool runs `store`, in order: the chunk is swapped with `store` as
+    /// the pool runs `store`, in order: the chunk is compressed with `store` as
     /// its store runs (none for the empty stream), and each of its runs, which
     /// the caller has unmapped everywhere, is taken back, pooled or deferred as
     /// `quiescent` decides, charged to no node, since the record's budget node
@@ -2077,7 +2077,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 .ok_or(SwapError::NoSlot)?;
             store_pages = store_pages.saturating_add(run.page_count);
         }
-        let swapped = entry.finish_evict(head).map_err(SwapError::Chunk)?;
+        let compressed = entry.finish_evict(head).map_err(SwapError::Chunk)?;
         let mut run_pages: u64 = 0;
         {
             let Self {
@@ -2099,7 +2099,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 );
             });
         }
-        self.put_chunk(reg, node, height, index, swapped);
+        self.put_chunk(reg, node, height, index, compressed);
         let pages = u64::from(entry.backed().count_ones());
         self.store_pages = self.store_pages.saturating_add(store_pages);
         self.swapped_pages = self.swapped_pages.saturating_add(pages);
@@ -2120,7 +2120,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
     }
 
-    /// Call `f` with each store run of the swapped or spilling chunk `entry`,
+    /// Call `f` with each store run of the compressed or writing chunk `entry`,
     /// in the order its stream fills them: the runs a restore reads.
     pub fn for_each_store_run(&self, entry: ChunkEntry, mut f: impl FnMut(&FreeRun))
     {
@@ -2132,23 +2132,23 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
     }
 
-    /// The head of the store-run list of `entry`: its own while swapped, its
-    /// spill node's while spilling, [`NODE_NULL`] otherwise.
+    /// The head of the store-run list of `entry`: its own while compressed, its
+    /// disk node's while writing, [`NODE_NULL`] otherwise.
     fn store_head(&self, entry: ChunkEntry) -> NodeIdx
     {
-        if entry.state() == ChunkState::Spilling
-            && let Some(n) = entry.spill().and_then(|s| self.spill_node(s))
+        if entry.state() == ChunkState::Writing
+            && let Some(n) = entry.disk().and_then(|s| self.disk_node(s))
         {
             return n.store;
         }
         entry.store().unwrap_or(NODE_NULL)
     }
 
-    /// The spill node in arena slot `idx`.
+    /// The disk node in arena slot `idx`.
     #[must_use]
-    pub fn spill_node(&self, idx: NodeIdx) -> Option<SpillNode>
+    pub fn disk_node(&self, idx: NodeIdx) -> Option<DiskNode>
     {
-        if let Node::Spill(n) = self.arena.get(idx).node
+        if let Node::Disk(n) = self.arena.get(idx).node
         {
             Some(n)
         }
@@ -2158,21 +2158,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
     }
 
-    /// The spill node swap slot `slot` holds, with its arena slot.
+    /// The disk node swap slot `slot` holds, with its arena slot.
     #[must_use]
-    pub fn spill_at(&self, slot: u32) -> Option<(NodeIdx, SpillNode)>
+    pub fn disk_at(&self, slot: u32) -> Option<(NodeIdx, DiskNode)>
     {
         let idx = self.slots.node(slot)?;
-        self.spill_node(idx).map(|n| (idx, n))
+        self.disk_node(idx).map(|n| (idx, n))
     }
 
-    /// Restore the swapped, spilling or on-disk chunk holding `page_base` in
+    /// Restore the compressed, writing or on-disk chunk holding `page_base` in
     /// region `reg` of `rec` onto `runs`, which the caller filled with the
     /// chunk's pages and mapped into the process: the chunk is resident on
     /// them, its store runs return to the free pool, and `store_pages`,
-    /// `swapped_pages` and the record's swapped count fall. A spilling chunk's
-    /// spill is cancelled, its slot kept until the swap service ends the write
-    /// ([`Ledger::finish_spill`]); an on-disk chunk's slot is freed, and
+    /// `swapped_pages` and the record's swapped count fall. A writing chunk's
+    /// write is cancelled, its slot kept until the swap service ends the write
+    /// ([`Ledger::finish_write`]); an on-disk chunk's slot is freed, and
     /// `disk_pages` falls. The runs are charged nothing: the budget node
     /// stayed charged for the chunk's pages while they were evicted. Returns
     /// the store pages freed.
@@ -2231,9 +2231,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         let resident = entry.restore(head).map_err(SwapError::Chunk)?;
         let store_pages = self.free_store(self.store_head(entry));
         let pages = u64::from(entry.backed().count_ones());
-        if let Some(spill) = entry.spill()
+        if let Some(disk) = entry.disk()
         {
-            self.drop_spill(spill, pages);
+            self.drop_disk(disk, pages);
         }
         self.put_chunk(reg, node, height, index, resident);
         self.store_pages = self.store_pages.saturating_sub(store_pages);
@@ -2258,49 +2258,49 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         pages
     }
 
-    /// The chunk of `pages` pages whose spill node is `spill` left the swap
-    /// tier: a spill in flight is cancelled, its store already freed and its
+    /// The chunk of `pages` pages whose disk node is `disk` left the swap
+    /// tier: a write in flight is cancelled, its store already freed and its
     /// slot kept until the swap service ends the write; an on-disk chunk's slot
     /// and node are freed, and `disk_pages` falls.
-    fn drop_spill(&mut self, spill: NodeIdx, pages: u64)
+    fn drop_disk(&mut self, disk: NodeIdx, pages: u64)
     {
-        let Some(n) = self.spill_node(spill)
+        let Some(n) = self.disk_node(disk)
         else
         {
             return;
         };
         match n.state
         {
-            SpillState::Spilling =>
+            DiskState::Writing =>
             {
                 self.arena.set_node(
-                    spill,
-                    Node::Spill(SpillNode {
-                        state: SpillState::Cancelled,
+                    disk,
+                    Node::Disk(DiskNode {
+                        state: DiskState::Cancelled,
                         store: NODE_NULL,
                         ..n
                     }),
                 );
             }
-            SpillState::OnDisk =>
+            DiskState::OnDisk =>
             {
                 self.slots.release(n.slot);
-                self.arena.free(spill);
+                self.arena.free(disk);
                 self.disk_pages = self.disk_pages.saturating_sub(pages);
             }
-            SpillState::Cancelled =>
+            DiskState::Cancelled =>
             {}
         }
     }
 
-    /// The next swapped chunk from `hand` for the swap service
-    /// (`SPILL_TAKE`): a walk over the chunks with an entry of every record's
+    /// The next compressed chunk from `hand` for the swap service
+    /// (`SWAP_TAKE`): a walk over the chunks with an entry of every record's
     /// regions, in record order and, within a record, in address order, of at
     /// most `budget` steps, a step being a chunk visited or a region or record
     /// passed. Leaves the hand past the chunk found, or where the walk stopped;
     /// a walk that reaches the last record goes on from the first, once.
     /// `None` when it finds none within the budget.
-    pub fn next_swapped(&self, hand: &mut ClockHand, budget: u64) -> Option<Victim>
+    pub fn next_compressed(&self, hand: &mut ClockHand, budget: u64) -> Option<Victim>
     {
         let mut rec = hand.badge.and_then(|b| self.find(b)).or_else(|| {
             hand.va = 0;
@@ -2343,7 +2343,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             {
                 left = left.saturating_sub(1);
                 index = i.saturating_add(1);
-                if entry.state() == ChunkState::Swapped
+                if entry.state() == ChunkState::Compressed
                 {
                     hand.va = chunk_va(index);
                     hand.badge = self.record(rec).map(|r| r.badge);
@@ -2363,18 +2363,18 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         None
     }
 
-    /// The swap service takes the swapped chunk holding `page_base` in region
+    /// The swap service takes the compressed chunk holding `page_base` in region
     /// `reg` of `rec`, whose stream the caller sealed under the nonce
-    /// `nonce` into `len` bytes: a spill node and a swap slot are taken for
-    /// it, the node holds the chunk's store runs, and the chunk is spilling.
+    /// `nonce` into `len` bytes: a disk node and a swap slot are taken for
+    /// it, the node holds the chunk's store runs, and the chunk is writing.
     /// Returns the slot.
     ///
     /// # Errors
     /// [`SwapError::NoRegion`], [`SwapError::Chunk`] for a chunk that is not
-    /// swapped, [`SwapError::NoSlot`] when the arena has no free slot outside
+    /// compressed, [`SwapError::NoSlot`] when the arena has no free slot outside
     /// its reserve for the node, and [`SwapError::NoSwapSlot`] when no swap
     /// slot can be taken. Nothing changes then.
-    pub fn begin_spill(
+    pub fn begin_write(
         &mut self,
         rec: NodeIdx,
         reg: NodeIdx,
@@ -2384,11 +2384,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ) -> Result<u32, SwapError>
     {
         let (node, height, index, entry) = self.swap_chunk(rec, reg, page_base)?;
-        // Only a swapped chunk has a store handle of its own, and only it can
-        // begin a spill, so the transition below cannot be refused.
+        // Only a compressed chunk has a store handle of its own, and only it can
+        // begin a write, so the transition below cannot be refused.
         let store = entry.store().ok_or(SwapError::Chunk(ChunkError::State))?;
         let (chunk_base, _) = chunk_for(&node.region, page_base);
-        let spill = SpillNode {
+        let disk = DiskNode {
             rec,
             reg,
             page_base: chunk_base,
@@ -2396,11 +2396,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             store,
             slot: 0,
             len,
-            state: SpillState::Spilling,
+            state: DiskState::Writing,
         };
         let idx = self
             .arena
-            .alloc(Node::Spill(spill), NODE_NULL)
+            .alloc(Node::Disk(disk), NODE_NULL)
             .ok_or(SwapError::NoSlot)?;
         let Some(slot) = self.slots.take(idx)
         else
@@ -2408,7 +2408,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             self.arena.free(idx);
             return Err(SwapError::NoSwapSlot);
         };
-        let Ok(spilling) = entry.begin_spill(idx)
+        let Ok(writing) = entry.begin_write(idx)
         else
         {
             self.slots.release(slot);
@@ -2416,48 +2416,48 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(SwapError::Chunk(ChunkError::State));
         };
         self.arena
-            .set_node(idx, Node::Spill(SpillNode { slot, ..spill }));
-        self.put_chunk(reg, node, height, index, spilling);
+            .set_node(idx, Node::Disk(DiskNode { slot, ..disk }));
+        self.put_chunk(reg, node, height, index, writing);
         Ok(slot)
     }
 
-    /// The swap service wrote swap slot `slot`: a spilling chunk is on disk,
+    /// The swap service wrote swap slot `slot`: a writing chunk is on disk,
     /// its store runs back in the free pool, `store_pages` falling and
-    /// `disk_pages` rising by its pages. A spill the chunk's restore or
+    /// `disk_pages` rising by its pages. A write the chunk's restore or
     /// teardown cancelled frees the slot and its node. Returns the store pages
     /// freed.
     ///
     /// # Errors
-    /// [`SwapError::NoSpill`] when the slot holds no spill in flight. Nothing
+    /// [`SwapError::NotWriting`] when the slot holds no write in flight. Nothing
     /// changes then.
-    pub fn finish_spill(&mut self, slot: u32) -> Result<u64, SwapError>
+    pub fn finish_write(&mut self, slot: u32) -> Result<u64, SwapError>
     {
-        let (idx, n) = self.spill_at(slot).ok_or(SwapError::NoSpill)?;
+        let (idx, n) = self.disk_at(slot).ok_or(SwapError::NotWriting)?;
         match n.state
         {
-            SpillState::Spilling =>
+            DiskState::Writing =>
             {}
-            SpillState::Cancelled =>
+            DiskState::Cancelled =>
             {
                 self.slots.release(slot);
                 self.arena.free(idx);
                 return Ok(0);
             }
-            SpillState::OnDisk => return Err(SwapError::NoSpill),
+            DiskState::OnDisk => return Err(SwapError::NotWriting),
         }
         let (node, height, index, entry) = self
             .swap_chunk(n.rec, n.reg, n.page_base)
-            .map_err(|_| SwapError::NoSpill)?;
-        if entry.spill() != Some(idx)
+            .map_err(|_| SwapError::NotWriting)?;
+        if entry.disk() != Some(idx)
         {
-            return Err(SwapError::NoSpill);
+            return Err(SwapError::NotWriting);
         }
-        let on_disk = entry.finish_spill().map_err(SwapError::Chunk)?;
+        let on_disk = entry.finish_write().map_err(SwapError::Chunk)?;
         let freed = self.free_store(n.store);
         self.arena.set_node(
             idx,
-            Node::Spill(SpillNode {
-                state: SpillState::OnDisk,
+            Node::Disk(DiskNode {
+                state: DiskState::OnDisk,
                 store: NODE_NULL,
                 ..n
             }),
@@ -2470,33 +2470,33 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Ok(freed)
     }
 
-    /// The swap service did not write swap slot `slot`: a spilling chunk is
-    /// swapped again on the store runs its node held, and the slot and node are
-    /// freed, as they are for a cancelled spill.
+    /// The swap service did not write swap slot `slot`: a writing chunk is
+    /// compressed again on the store runs its node held, and the slot and node are
+    /// freed, as they are for a cancelled write.
     ///
     /// # Errors
-    /// [`SwapError::NoSpill`] when the slot holds no spill in flight. Nothing
+    /// [`SwapError::NotWriting`] when the slot holds no write in flight. Nothing
     /// changes then.
-    pub fn abandon_spill(&mut self, slot: u32) -> Result<(), SwapError>
+    pub fn abandon_write(&mut self, slot: u32) -> Result<(), SwapError>
     {
-        let (idx, n) = self.spill_at(slot).ok_or(SwapError::NoSpill)?;
+        let (idx, n) = self.disk_at(slot).ok_or(SwapError::NotWriting)?;
         match n.state
         {
-            SpillState::Spilling =>
+            DiskState::Writing =>
             {
                 let (node, height, index, entry) = self
                     .swap_chunk(n.rec, n.reg, n.page_base)
-                    .map_err(|_| SwapError::NoSpill)?;
-                if entry.spill() != Some(idx)
+                    .map_err(|_| SwapError::NotWriting)?;
+                if entry.disk() != Some(idx)
                 {
-                    return Err(SwapError::NoSpill);
+                    return Err(SwapError::NotWriting);
                 }
-                let swapped = entry.cancel_spill(n.store).map_err(SwapError::Chunk)?;
-                self.put_chunk(n.reg, node, height, index, swapped);
+                let compressed = entry.cancel_write(n.store).map_err(SwapError::Chunk)?;
+                self.put_chunk(n.reg, node, height, index, compressed);
             }
-            SpillState::Cancelled =>
+            DiskState::Cancelled =>
             {}
-            SpillState::OnDisk => return Err(SwapError::NoSpill),
+            DiskState::OnDisk => return Err(SwapError::NotWriting),
         }
         self.slots.release(slot);
         self.arena.free(idx);
@@ -2508,21 +2508,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// charged and counted in `swapped_pages` until its teardown.
     ///
     /// # Errors
-    /// [`SwapError::NoSpill`] when the slot holds no on-disk chunk. Nothing
+    /// [`SwapError::NotWriting`] when the slot holds no on-disk chunk. Nothing
     /// changes then.
     pub fn lose_chunk(&mut self, slot: u32) -> Result<(), SwapError>
     {
-        let (idx, n) = self.spill_at(slot).ok_or(SwapError::NoSpill)?;
-        if n.state != SpillState::OnDisk
+        let (idx, n) = self.disk_at(slot).ok_or(SwapError::NotWriting)?;
+        if n.state != DiskState::OnDisk
         {
-            return Err(SwapError::NoSpill);
+            return Err(SwapError::NotWriting);
         }
         let (node, height, index, entry) = self
             .swap_chunk(n.rec, n.reg, n.page_base)
-            .map_err(|_| SwapError::NoSpill)?;
-        if entry.spill() != Some(idx)
+            .map_err(|_| SwapError::NotWriting)?;
+        if entry.disk() != Some(idx)
         {
-            return Err(SwapError::NoSpill);
+            return Err(SwapError::NotWriting);
         }
         let lost = entry.lose().map_err(SwapError::Chunk)?;
         self.put_chunk(n.reg, node, height, index, lost);
@@ -2534,20 +2534,20 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Ok(())
     }
 
-    /// End every spill in flight, for a swap service that registered anew and
-    /// knows nothing of its predecessor's writes: each spilling chunk is
-    /// swapped again ([`Ledger::abandon_spill`]) and each cancelled spill's
-    /// slot freed. On-disk chunks stay. Returns the spills ended.
-    pub fn end_spills(&mut self) -> u64
+    /// End every write in flight, for a swap service that registered anew and
+    /// knows nothing of its predecessor's writes: each writing chunk is
+    /// compressed again ([`Ledger::abandon_write`]) and each cancelled write's
+    /// slot freed. On-disk chunks stay. Returns the writes ended.
+    pub fn end_writes(&mut self) -> u64
     {
         let mut ended: u64 = 0;
         let mut from: u32 = 0;
         while let Some((slot, idx)) = self.slots.next_taken(from)
         {
             let in_flight = self
-                .spill_node(idx)
-                .is_some_and(|n| n.state != SpillState::OnDisk);
-            if in_flight && self.abandon_spill(slot).is_ok()
+                .disk_node(idx)
+                .is_some_and(|n| n.state != DiskState::OnDisk);
+            if in_flight && self.abandon_write(slot).is_ok()
             {
                 ended = ended.saturating_add(1);
             }
@@ -2818,7 +2818,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Free every node of the chunk table of the region `node` of the record
     /// `rec`, taking each run back, pooled or deferred as `quiescent` decides,
-    /// its charge on the budget node `charged` ([`retire`]), and each swapped
+    /// its charge on the budget node `charged` ([`retire`]), and each compressed
     /// chunk's store, its charge released ([`Ledger::settle`]), and, for a
     /// committed region,
     /// release the rest of its commitment: the charge of its pages that hold no
@@ -3032,11 +3032,11 @@ fn retire<S: SlotStore>(
 /// Take back what the entry `entry` of a chunk being freed holds, adding it to
 /// `released`: each run of a resident or evicting chunk, as [`retire`] does
 /// with its charge on the budget node `charged`, or each store run of a
-/// swapped or spilling chunk, which no process ever reached, to `pool`, the
+/// compressed or writing chunk, which no process ever reached, to `pool`, the
 /// chunk's pages counted as swapped for [`Ledger::settle`] to release their
-/// charge, as are an on-disk or lost chunk's. A spilling chunk's spill is
+/// charge, as are an on-disk or lost chunk's. A writing chunk's write is
 /// cancelled, its swap slot kept until the swap service ends the write; an
-/// on-disk chunk's slot in `slots` and its spill node are freed. The moves need
+/// on-disk chunk's slot in `slots` and its disk node are freed. The moves need
 /// no fresh slot, so they cannot fail.
 #[expect(
     clippy::too_many_arguments,
@@ -3058,7 +3058,7 @@ fn retire_entry<S: SlotStore, W: WordStore>(
     let pages = u64::from(entry.backed().count_ones());
     match entry.state()
     {
-        ChunkState::Swapped =>
+        ChunkState::Compressed =>
         {
             released.swapped = released.swapped.saturating_add(pages);
             chunk::take_store(arena, entry, |arena, idx, run| {
@@ -3066,20 +3066,20 @@ fn retire_entry<S: SlotStore, W: WordStore>(
                 pool.push_node(arena, idx);
             });
         }
-        ChunkState::Spilling | ChunkState::OnDisk =>
+        ChunkState::Writing | ChunkState::OnDisk =>
         {
             released.swapped = released.swapped.saturating_add(pages);
-            let spill = entry.spill().unwrap_or(NODE_NULL);
-            let Node::Spill(n) = arena.get(spill).node
+            let disk = entry.disk().unwrap_or(NODE_NULL);
+            let Node::Disk(n) = arena.get(disk).node
             else
             {
                 return;
             };
-            if n.state == SpillState::OnDisk
+            if n.state == DiskState::OnDisk
             {
                 released.disk = released.disk.saturating_add(pages);
                 slots.release(n.slot);
-                arena.free(spill);
+                arena.free(disk);
                 return;
             }
             let mut run = n.store;
@@ -3091,9 +3091,9 @@ fn retire_entry<S: SlotStore, W: WordStore>(
                 run = next;
             }
             arena.set_node(
-                spill,
-                Node::Spill(SpillNode {
-                    state: SpillState::Cancelled,
+                disk,
+                Node::Disk(DiskNode {
+                    state: DiskState::Cancelled,
                     store: NODE_NULL,
                     ..n
                 }),
@@ -3119,7 +3119,7 @@ fn retire_entry<S: SlotStore, W: WordStore>(
 mod tests
 {
     use super::*;
-    use crate::arena::SpillState;
+    use crate::arena::DiskState;
     use crate::arena::test_store::VecStore;
     use crate::budget::{NO_MAX, reserve_pages};
     use crate::chunk::{COLD_SWEEPS, ChunkState};
@@ -3800,7 +3800,7 @@ mod tests
         pages
     }
 
-    /// The pages of the swapped chunks of the region `have`, which stay charged.
+    /// The pages of the compressed chunks of the region `have`, which stay charged.
     fn swapped_in(l: &Ledger<VecStore, VecWords>, have: &RegionNode) -> u64
     {
         let height = chunk::table_height(chunk_count(&have.region));
@@ -4054,7 +4054,7 @@ mod tests
     /// The pool's pages wherever they are: free, in the store, in a run a
     /// record or a chunk holds, or deferred. Every page the tests take comes
     /// from the pool, so this stays the pool's total. Checks `store_pages`
-    /// against the store runs of every swapped chunk, and `swapped_pages`
+    /// against the store runs of every compressed chunk, and `swapped_pages`
     /// against their pages.
     fn pool_pages(l: &Ledger<VecStore, VecWords>) -> u64
     {
@@ -4087,7 +4087,7 @@ mod tests
                 | Node::Commit(_)
                 | Node::Handle(_)
                 | Node::Limit(_)
-                | Node::Spill(_)
+                | Node::Disk(_)
                 | Node::ChunkDir(_)
                 | Node::Chunk(_) => (),
             }
@@ -4181,16 +4181,16 @@ mod tests
         // The runs return to the pool; the store holds two pages; the charge
         // stays.
         assert_eq!(l.finish_evict(rec, reg, BASE, 3, &store, pool_all), Ok(16));
-        let swapped = l.chunk_at(reg, BASE);
-        assert_eq!(swapped.state(), ChunkState::Swapped);
-        assert_eq!(swapped.backed(), 0xFFFF);
+        let compressed = l.chunk_at(reg, BASE);
+        assert_eq!(compressed.state(), ChunkState::Compressed);
+        assert_eq!(compressed.backed(), 0xFFFF);
         assert_eq!(l.store_pages(), 2);
         assert_eq!(l.swapped_pages(), 16);
         assert_eq!(l.swapped_of(rec), 16);
         assert_eq!(usage(&l, rec).0, 32);
         assert_eq!(pool_pages(&l), total);
         let mut seen = Vec::new();
-        l.for_each_store_run(swapped, |r| seen.push(*r));
+        l.for_each_store_run(compressed, |r| seen.push(*r));
         assert_eq!(seen, store);
         // A restore needs runs that back exactly the chunk's pages.
         let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
@@ -4224,7 +4224,7 @@ mod tests
             ),
             Err(SwapError::Chunk(_))
         ));
-        assert_eq!(l.chunk_at(reg, BASE), swapped);
+        assert_eq!(l.chunk_at(reg, BASE), compressed);
         assert_eq!(
             l.restore_chunk(rec, reg, BASE, &[frame(cap, pages, phys, BASE)]),
             Ok(2)
@@ -4243,7 +4243,7 @@ mod tests
     }
 
     #[test]
-    fn growth_leaves_the_restore_headroom_while_chunks_are_swapped()
+    fn growth_leaves_the_restore_headroom_while_chunks_are_compressed()
     {
         // A pool of 1280 pages: a reserve of 20.
         const TOTAL: u64 = 1280;
@@ -4266,7 +4266,7 @@ mod tests
             floor
         };
         assert_eq!(at_floor(&l), reserve);
-        // One chunk swapped: the headroom is its 16 pages.
+        // One chunk compressed: the headroom is its 16 pages.
         l.begin_evict(rec, reg, BASE, 1).unwrap();
         let store = [store_run(&mut l, 2)];
         assert_eq!(l.finish_evict(rec, reg, BASE, 1, &store, pool_all), Ok(16));
@@ -4347,7 +4347,7 @@ mod tests
     }
 
     #[test]
-    fn a_teardown_returns_each_swapped_chunks_store_and_releases_its_charge()
+    fn a_teardown_returns_each_compressed_chunks_store_and_releases_its_charge()
     {
         let (mut l, rec, reg) = swap_ledger(4);
         let total = pool_pages(&l);
@@ -4365,7 +4365,7 @@ mod tests
         assert_eq!(l.swapped_of(rec), 32);
         assert_eq!(usage(&l, rec).0, 48);
         assert_eq!(pool_pages(&l), total);
-        // An unregister of the region: the store, the swapped chunks' charge,
+        // An unregister of the region: the store, the compressed chunks' charge,
         // and the resident chunk's run.
         assert!(l.remove_region(rec, reg, pool_all).is_some());
         assert_eq!(l.store_pages(), 0);
@@ -4373,7 +4373,7 @@ mod tests
         assert_eq!(l.swapped_of(rec), 0);
         assert_eq!(usage(&l, rec).0, 0);
         assert_eq!(pool_pages(&l), total);
-        // A process's teardown frees its swapped chunks' store.
+        // A process's teardown frees its compressed chunks' store.
         let reg = l
             .add_region(rec, region(BASE, 4 * CHUNK), Commit::Uncommitted)
             .unwrap();
@@ -5329,16 +5329,16 @@ mod tests
     fn register_slots(l: &mut Ledger<VecStore, VecWords>, total: u64)
     {
         assert!(l.slots.set_total(total));
-        while l.slots.pages() * crate::spill::SLOT_WORDS_PER_PAGE < total
+        while l.slots.pages() * crate::disk::SLOT_WORDS_PER_PAGE < total
         {
             // SAFETY: VecWords grows on write.
             unsafe { l.slots.add_page() };
         }
     }
 
-    /// A swap ledger whose first two chunks are swapped into three store
+    /// A swap ledger whose first two chunks are compressed into three store
     /// pages each, with four swap slots.
-    fn spill_ledger() -> (Ledger<VecStore, VecWords>, NodeIdx, NodeIdx)
+    fn disk_ledger() -> (Ledger<VecStore, VecWords>, NodeIdx, NodeIdx)
     {
         let (mut l, rec, reg) = swap_ledger(2);
         swap_out(&mut l, rec, reg, 0, 1, 3);
@@ -5348,25 +5348,25 @@ mod tests
     }
 
     #[test]
-    fn a_spilled_chunk_frees_its_store_once_written_and_a_restore_frees_its_slot()
+    fn a_chunk_written_to_disk_frees_its_store_and_a_restore_frees_its_slot()
     {
-        let (mut l, rec, reg) = spill_ledger();
+        let (mut l, rec, reg) = disk_ledger();
         let total = pool_pages(&l);
         let free = l.pool.free_pages();
-        let slot = l.begin_spill(rec, reg, BASE + PAGE_SIZE, 41, 1000).unwrap();
+        let slot = l.begin_write(rec, reg, BASE + PAGE_SIZE, 41, 1000).unwrap();
         let entry = l.chunk_at(reg, BASE);
-        assert_eq!(entry.state(), ChunkState::Spilling);
-        let (idx, n) = l.spill_at(slot).unwrap();
-        assert_eq!(entry.spill(), Some(idx));
+        assert_eq!(entry.state(), ChunkState::Writing);
+        let (idx, n) = l.disk_at(slot).unwrap();
+        assert_eq!(entry.disk(), Some(idx));
         assert_eq!(
             (n.rec, n.reg, n.page_base, n.nonce, n.len, n.state),
-            (rec, reg, BASE, 41, 1000, SpillState::Spilling)
+            (rec, reg, BASE, 41, 1000, DiskState::Writing)
         );
         // In flight, the store stays: a fault restores from it.
         assert_eq!((l.store_pages(), l.disk_pages(), l.slots.used()), (6, 0, 1));
         assert_eq!(pool_pages(&l), total);
         // Written: the store returns to the pool; the pages stay charged.
-        assert_eq!(l.finish_spill(slot), Ok(3));
+        assert_eq!(l.finish_write(slot), Ok(3));
         assert_eq!(l.chunk_at(reg, BASE).state(), ChunkState::OnDisk);
         assert_eq!(
             (l.store_pages(), l.disk_pages(), l.swapped_pages()),
@@ -5376,7 +5376,7 @@ mod tests
         assert_eq!(usage(&l, rec).0, 32);
         assert_eq!(pool_pages(&l), total);
         // A second end of the same write changes nothing.
-        assert_eq!(l.finish_spill(slot), Err(SwapError::NoSpill));
+        assert_eq!(l.finish_write(slot), Err(SwapError::NotWriting));
         // The restore takes runs for the chunk and frees the slot and node.
         let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
         let slots_free = l.arena.free_count();
@@ -5389,21 +5389,21 @@ mod tests
             (l.disk_pages(), l.swapped_pages(), l.swapped_of(rec)),
             (0, 16, 16)
         );
-        assert_eq!((l.spill_at(slot), l.slots.used()), (None, 0));
-        // The run's descriptor took a slot; the spill node gave one back.
+        assert_eq!((l.disk_at(slot), l.slots.used()), (None, 0));
+        // The run's descriptor took a slot; the disk node gave one back.
         assert_eq!(l.arena.free_count(), slots_free);
         assert_eq!(usage(&l, rec).0, 32);
         assert_eq!(pool_pages(&l), total);
     }
 
     #[test]
-    fn a_restore_during_a_spill_cancels_it_and_its_slot_waits_for_the_write()
+    fn a_restore_during_a_write_cancels_it_and_its_slot_waits_for_the_write()
     {
-        let (mut l, rec, reg) = spill_ledger();
+        let (mut l, rec, reg) = disk_ledger();
         let total = pool_pages(&l);
-        let slot = l.begin_spill(rec, reg, BASE, 1, 100).unwrap();
+        let slot = l.begin_write(rec, reg, BASE, 1, 100).unwrap();
         let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
-        // The restore reads the store the spill node holds and frees it.
+        // The restore reads the store the disk node holds and frees it.
         let mut seen = 0;
         l.for_each_store_run(l.chunk_at(reg, BASE), |r| seen += r.page_count);
         assert_eq!(seen, 3);
@@ -5412,69 +5412,75 @@ mod tests
             Ok(3)
         );
         assert_eq!(
-            l.spill_at(slot).map(|(_, n)| n.state),
-            Some(SpillState::Cancelled)
+            l.disk_at(slot).map(|(_, n)| n.state),
+            Some(DiskState::Cancelled)
         );
         assert_eq!((l.slots.used(), l.store_pages()), (1, 3));
         // The write's end frees the slot and leaves the chunk alone.
         let resident = l.chunk_at(reg, BASE);
-        assert_eq!(l.finish_spill(slot), Ok(0));
+        assert_eq!(l.finish_write(slot), Ok(0));
         assert_eq!((l.slots.used(), l.chunk_at(reg, BASE)), (0, resident));
         assert_eq!(pool_pages(&l), total);
     }
 
     #[test]
-    fn an_abandoned_or_ended_spill_leaves_the_chunk_swapped_on_its_store()
+    fn an_abandoned_or_ended_write_leaves_the_chunk_compressed_on_its_store()
     {
-        let (mut l, rec, reg) = spill_ledger();
+        let (mut l, rec, reg) = disk_ledger();
         let total = pool_pages(&l);
-        let swapped = l.chunk_at(reg, BASE);
-        let slot = l.begin_spill(rec, reg, BASE, 1, 100).unwrap();
-        assert_eq!(l.abandon_spill(slot), Ok(()));
-        assert_eq!(l.chunk_at(reg, BASE), swapped);
+        let compressed = l.chunk_at(reg, BASE);
+        let slot = l.begin_write(rec, reg, BASE, 1, 100).unwrap();
+        assert_eq!(l.abandon_write(slot), Ok(()));
+        assert_eq!(l.chunk_at(reg, BASE), compressed);
         assert_eq!((l.slots.used(), l.store_pages()), (0, 6));
-        assert_eq!(l.abandon_spill(slot), Err(SwapError::NoSpill));
+        assert_eq!(l.abandon_write(slot), Err(SwapError::NotWriting));
         // A new registration ends both writes in flight, and keeps the chunk
         // already on disk.
-        let a = l.begin_spill(rec, reg, BASE, 2, 100).unwrap();
-        l.finish_spill(a).unwrap();
-        let b = l.begin_spill(rec, reg, BASE + CHUNK, 3, 100).unwrap();
-        assert_eq!(l.end_spills(), 1);
+        let a = l.begin_write(rec, reg, BASE, 2, 100).unwrap();
+        l.finish_write(a).unwrap();
+        let b = l.begin_write(rec, reg, BASE + CHUNK, 3, 100).unwrap();
+        assert_eq!(l.end_writes(), 1);
         assert_eq!(l.chunk_at(reg, BASE).state(), ChunkState::OnDisk);
-        assert_eq!(l.chunk_at(reg, BASE + CHUNK).state(), ChunkState::Swapped);
-        assert_eq!((l.slots.used(), l.spill_at(b)), (1, None));
+        assert_eq!(
+            l.chunk_at(reg, BASE + CHUNK).state(),
+            ChunkState::Compressed
+        );
+        assert_eq!((l.slots.used(), l.disk_at(b)), (1, None));
         assert_eq!(pool_pages(&l), total);
     }
 
     #[test]
-    fn a_spill_is_refused_unchanged_for_a_chunk_not_swapped_or_with_no_slot_free()
+    fn a_write_is_refused_unchanged_for_a_chunk_not_compressed_or_with_no_slot_free()
     {
-        let (mut l, rec, reg) = spill_ledger();
+        let (mut l, rec, reg) = disk_ledger();
         let resident = l.chunk_at(reg, BASE + 2 * CHUNK);
         assert!(matches!(
-            l.begin_spill(rec, reg, BASE + 2 * CHUNK, 1, 1),
+            l.begin_write(rec, reg, BASE + 2 * CHUNK, 1, 1),
             Err(SwapError::Chunk(_))
         ));
         assert_eq!(l.chunk_at(reg, BASE + 2 * CHUNK), resident);
         assert!(l.slots.set_total(1));
         let free = l.arena.free_count();
-        l.begin_spill(rec, reg, BASE, 1, 1).unwrap();
+        l.begin_write(rec, reg, BASE, 1, 1).unwrap();
         assert_eq!(
-            l.begin_spill(rec, reg, BASE + CHUNK, 2, 1),
+            l.begin_write(rec, reg, BASE + CHUNK, 2, 1),
             Err(SwapError::NoSwapSlot)
         );
-        assert_eq!(l.chunk_at(reg, BASE + CHUNK).state(), ChunkState::Swapped);
+        assert_eq!(
+            l.chunk_at(reg, BASE + CHUNK).state(),
+            ChunkState::Compressed
+        );
         assert_eq!(l.arena.free_count(), free - 1);
     }
 
     #[test]
     fn a_lost_chunk_stays_charged_until_its_region_goes()
     {
-        let (mut l, rec, reg) = spill_ledger();
+        let (mut l, rec, reg) = disk_ledger();
         let total = pool_pages(&l);
-        let slot = l.begin_spill(rec, reg, BASE, 1, 100).unwrap();
-        assert_eq!(l.lose_chunk(slot), Err(SwapError::NoSpill));
-        l.finish_spill(slot).unwrap();
+        let slot = l.begin_write(rec, reg, BASE, 1, 100).unwrap();
+        assert_eq!(l.lose_chunk(slot), Err(SwapError::NotWriting));
+        l.finish_write(slot).unwrap();
         assert_eq!(l.lose_chunk(slot), Ok(()));
         let lost = l.chunk_at(reg, BASE);
         assert_eq!(lost.state(), ChunkState::Lost);
@@ -5492,24 +5498,24 @@ mod tests
     }
 
     #[test]
-    fn a_teardown_frees_an_on_disk_slot_and_cancels_a_spill_in_flight()
+    fn a_teardown_frees_an_on_disk_slot_and_cancels_a_write_in_flight()
     {
-        let (mut l, rec, reg) = spill_ledger();
+        let (mut l, rec, reg) = disk_ledger();
         let total = pool_pages(&l);
-        let on_disk = l.begin_spill(rec, reg, BASE, 1, 100).unwrap();
-        l.finish_spill(on_disk).unwrap();
-        let spilling = l.begin_spill(rec, reg, BASE + CHUNK, 2, 100).unwrap();
+        let on_disk = l.begin_write(rec, reg, BASE, 1, 100).unwrap();
+        l.finish_write(on_disk).unwrap();
+        let writing = l.begin_write(rec, reg, BASE + CHUNK, 2, 100).unwrap();
         l.remove_process(1, pool_all, |_| {}).unwrap();
         assert_eq!(
             (l.store_pages(), l.disk_pages(), l.swapped_pages()),
             (0, 0, 0)
         );
-        assert_eq!(l.spill_at(on_disk), None);
+        assert_eq!(l.disk_at(on_disk), None);
         assert_eq!(
-            l.spill_at(spilling).map(|(_, n)| n.state),
-            Some(SpillState::Cancelled)
+            l.disk_at(writing).map(|(_, n)| n.state),
+            Some(DiskState::Cancelled)
         );
-        assert_eq!(l.finish_spill(spilling), Ok(0));
+        assert_eq!(l.finish_write(writing), Ok(0));
         assert_eq!(l.slots.used(), 0);
         // Every page the record held, and every store page, is back in the pool.
         assert_eq!(l.pool.free_pages(), total);
@@ -5518,9 +5524,9 @@ mod tests
     #[test]
     fn a_discard_frees_the_swap_slot_of_each_chunk_it_clears()
     {
-        let (mut l, rec, reg) = spill_ledger();
-        let slot = l.begin_spill(rec, reg, BASE, 1, 100).unwrap();
-        l.finish_spill(slot).unwrap();
+        let (mut l, rec, reg) = disk_ledger();
+        let slot = l.begin_write(rec, reg, BASE, 1, 100).unwrap();
+        l.finish_write(slot).unwrap();
         l.discard_range(rec, BASE, CHUNK, pool_all).unwrap();
         assert_eq!(l.chunk_at(reg, BASE).state(), ChunkState::Unbacked);
         assert_eq!(
@@ -5531,29 +5537,29 @@ mod tests
     }
 
     #[test]
-    fn the_spill_hand_visits_each_swapped_chunk_in_turn_and_wraps()
+    fn the_write_hand_visits_each_compressed_chunk_in_turn_and_wraps()
     {
-        let (mut l, rec, reg) = spill_ledger();
+        let (mut l, rec, reg) = disk_ledger();
         let mut hand = ClockHand::START;
-        let first = l.next_swapped(&mut hand, 64).unwrap();
-        let second = l.next_swapped(&mut hand, 64).unwrap();
+        let first = l.next_compressed(&mut hand, 64).unwrap();
+        let second = l.next_compressed(&mut hand, 64).unwrap();
         assert_eq!((first.rec, first.reg, first.page_base), (rec, reg, BASE));
         assert_eq!(second.page_base, BASE + CHUNK);
         assert_eq!(
-            l.next_swapped(&mut hand, 64).map(|v| v.page_base),
+            l.next_compressed(&mut hand, 64).map(|v| v.page_base),
             Some(BASE)
         );
         // A chunk taken is passed over; with none left the walk finds none.
-        l.begin_spill(rec, reg, BASE, 1, 1).unwrap();
-        l.begin_spill(rec, reg, BASE + CHUNK, 2, 1).unwrap();
-        assert_eq!(l.next_swapped(&mut hand, 64), None);
+        l.begin_write(rec, reg, BASE, 1, 1).unwrap();
+        l.begin_write(rec, reg, BASE + CHUNK, 2, 1).unwrap();
+        assert_eq!(l.next_compressed(&mut hand, 64), None);
         // A budget too small to reach a chunk finds none, and the next walk
         // goes on from where it stopped.
-        let (l2, _, _) = spill_ledger();
+        let (l2, _, _) = disk_ledger();
         let mut hand = ClockHand::START;
-        assert_eq!(l2.next_swapped(&mut hand, 1), None);
+        assert_eq!(l2.next_compressed(&mut hand, 1), None);
         assert_eq!(
-            l2.next_swapped(&mut hand, 64).map(|v| v.page_base),
+            l2.next_compressed(&mut hand, 64).map(|v| v.page_base),
             Some(BASE)
         );
     }

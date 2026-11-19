@@ -67,9 +67,9 @@ pub mod caps_slot
     /// root capability the kernel mints into init. Never published: svcmgr
     /// derives the `entropy_authority = yes` service's copy from it.
     pub const ENTROPY_SOURCE: usize = 7;
-    /// The `memmgr_labels::SPILL_AUTHORITY`-badged `SEND|GRANT` on memmgr's
-    /// endpoint (`memmgr.spill`).
-    pub const MEMMGR_SPILL: usize = 8;
+    /// The `memmgr_labels::SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's
+    /// endpoint (`memmgr.swap`).
+    pub const MEMMGR_SWAP: usize = 8;
 }
 
 /// Number of slots in the `CAPS` slot list: one per role in [`caps_slot`],
@@ -135,8 +135,8 @@ pub struct CapsRound
     pub vfsd_swap: u64,
     /// `EntropyControl` source carrying `Contribute`, or `0`.
     pub entropy_source: u64,
-    /// `SPILL_AUTHORITY`-badged `SEND|GRANT` on memmgr's endpoint, or `0`.
-    pub memmgr_spill: u64,
+    /// `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's endpoint, or `0`.
+    pub memmgr_swap: u64,
 }
 
 impl CapsRound
@@ -153,7 +153,7 @@ impl CapsRound
         slots[caps_slot::VFSD_DENY] = self.vfsd_deny;
         slots[caps_slot::VFSD_SWAP] = self.vfsd_swap;
         slots[caps_slot::ENTROPY_SOURCE] = self.entropy_source;
-        slots[caps_slot::MEMMGR_SPILL] = self.memmgr_spill;
+        slots[caps_slot::MEMMGR_SWAP] = self.memmgr_swap;
         slots
     }
 
@@ -168,7 +168,7 @@ impl CapsRound
             vfsd_deny: slots[caps_slot::VFSD_DENY],
             vfsd_swap: slots[caps_slot::VFSD_SWAP],
             entropy_source: slots[caps_slot::ENTROPY_SOURCE],
-            memmgr_spill: slots[caps_slot::MEMMGR_SPILL],
+            memmgr_swap: slots[caps_slot::MEMMGR_SWAP],
         }
     }
 }
@@ -627,7 +627,7 @@ mod tests
             vfsd_deny: 0,
             vfsd_swap: 0,
             entropy_source: 0,
-            memmgr_spill: 0,
+            memmgr_swap: 0,
         }
     }
 
@@ -661,7 +661,7 @@ mod tests
                 vfsd_deny: pick(8, 0x24),
                 vfsd_swap: pick(16, 0x25),
                 entropy_source: pick(32, 0x26),
-                memmgr_spill: pick(64, 0x27),
+                memmgr_swap: pick(64, 0x27),
                 ..caps_round(pick(1, 0x21), pick(2, 0x22))
             };
             assert_eq!(decode_all(&encode_caps(&sent)), Ok(Some(sent)));

@@ -21,13 +21,13 @@
 //! A name whose cap carries authority is seed-only: `rootfs.root`, the
 //! four `devmgr.*` names, [`published_names::VFSD_MOUNT`](crate::published_names::VFSD_MOUNT),
 //! [`published_names::VFSD_SWAP`](crate::published_names::VFSD_SWAP),
-//! [`published_names::MEMMGR_SPILL`](crate::published_names::MEMMGR_SPILL), [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY), and each provider
+//! [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP), [`published_names::LOGD_QUERY`](crate::published_names::LOGD_QUERY), and each provider
 //! name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
 //! `pwrmgr.shutdown` and `acpid.power`) resolve only through a recipe's `seed = ...` line, and
 //! `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND
 //! without `GRANT`, apart from [`published_names::DEVMGR_BIND`](crate::published_names::DEVMGR_BIND), which its
 //! seeds receive with `GRANT`, since `devmgr_labels::BIND_DRIVERS` moves a cap
-//! to devmgr, [`published_names::MEMMGR_SPILL`](crate::published_names::MEMMGR_SPILL), whose seeds move caps to memmgr,
+//! to devmgr, [`published_names::MEMMGR_SWAP`](crate::published_names::MEMMGR_SWAP), whose seeds move caps to memmgr,
 //! and `sessiond.operator` (a `:grant` entry), whose seeds move caps to sessiond;
 //! `QUERY_ENDPOINT` never yields `GRANT`.
 //! [`published_names::VFSD_DENY`](crate::published_names::VFSD_DENY) carries no authority but is seed-only
@@ -129,12 +129,12 @@ pub const VFSD_DENY: &[u8] = b"vfsd.deny";
 pub const VFSD_SWAP: &[u8] = b"vfsd.swap";
 
 /// `SEND|GRANT` on memmgr's endpoint badged
-/// `memmgr_labels::SPILL_AUTHORITY` alone: the swap service's interface to
-/// memmgr's disk tier (`SPILL_REGISTER` to `SPILL_RESTORE`). Seed-only, its
-/// seeds keeping `GRANT`, since the spill labels move caps to memmgr; the swap
+/// `memmgr_labels::SWAP_AUTHORITY` alone: the swap service's interface to
+/// memmgr's disk tier (`SWAP_REGISTER` to `SWAP_RESTORE`). Seed-only, its
+/// seeds keeping `GRANT`, since the swap labels move caps to memmgr; the swap
 /// service's recipe is to seed it, and svctest's recipe seeds it while no
-/// swap service exists, to act as the spill client.
-pub const MEMMGR_SPILL: &[u8] = b"memmgr.spill";
+/// swap service exists, to act as the swap client.
+pub const MEMMGR_SWAP: &[u8] = b"memmgr.swap";
 
 /// SEND on the master log endpoint badged
 /// `log_labels::LOG_QUERY_AUTHORITY`: logd's `QUERY_SLOTS` and

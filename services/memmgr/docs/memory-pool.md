@@ -276,7 +276,7 @@ in parts, each part one run and one frame record. A fault is therefore declined 
 (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the free
 pool holds no page, when every free page is in the growth floor (the system reserve and, while
 chunks are swapped, the restore headroom) and the process's node is outside the reserve, or when the
-split of a run larger than the pages to back fails. A fault on an evicting or swapped chunk first
+split of a run larger than the pages to back fails. A fault on an evicting or compressed chunk first
 makes the chunk resident, a restore with its own admission ([Eviction](#eviction)).
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
@@ -294,19 +294,19 @@ entry records:
 
 - The backed mask: one bit per page of the chunk, set when a run backs the page.
 - The chunk's state: unbacked; resident, its pages backed by the runs on the entry's run list and
-  mapped in the process; evicting; swapped; spilling or on disk, its pages taken by the swap
+  mapped in the process; evicting; compressed; writing or on disk, its pages taken by the swap
   service ([Disk tier](#disk-tier)); or lost, its swap slot's bytes having failed authentication.
 - A pin flag and a two-bit age.
 - The job slot of its eviction while it is evicting, so a completion is applied only to the
   eviction it was posted for.
 - A link: the head of the chunk's run list while it is resident or evicting, the head of the list
-  of store runs its pages are stored in while it is swapped, and its spill node while it is
-  spilling or on disk.
+  of store runs its pages are stored in while it is compressed, and its disk node while it is
+  writing or on disk.
 
-The evicting and swapped states, the pin flag, and the age are the swap path's: memmgr reclaiming
+The evicting and compressed states, the pin flag, and the age are the swap path's: memmgr reclaiming
 a cold chunk's runs under memory pressure and storing its pages, a fault restoring them
-([Eviction](#eviction)); the spilling, on-disk and lost states are the disk tier's. A fault on an
-evicting, swapped or spilling chunk makes the whole chunk resident before it backs anything, so a
+([Eviction](#eviction)); the writing, on-disk and lost states are the disk tier's. A fault on an
+evicting, compressed or writing chunk makes the whole chunk resident before it backs anything, so a
 resident chunk's every backed page is mapped; a fault on a chunk on disk is redirected to the swap
 service, and one on a lost chunk is declined.
 
@@ -333,9 +333,9 @@ leaves the entry as it was.
 nodes on a stack threaded through their own `next` links, which no table node uses otherwise. The
 walk needs no memory and no recursion. It rewrites each run's descriptor into a run node in place,
 which joins the free pool or the deferred list as any reclaimed frame does (see
-[Reclamation](#reclamation)), returns each store run of a swapped or spilling chunk, which no
-process ever mapped, to the free pool, frees an on-disk chunk's swap slot and spill node, cancels a
-spilling chunk's spill ([Disk tier](#disk-tier)), and returns every directory and leaf node to the
+[Reclamation](#reclamation)), returns each store run of a compressed or writing chunk, which no
+process ever mapped, to the free pool, frees an on-disk chunk's swap slot and disk node, cancels a
+writing chunk's write ([Disk tier](#disk-tier)), and returns every directory and leaf node to the
 arena's free list.
 
 ---
@@ -983,12 +983,13 @@ restore fault per chunk, over every run on its run list.
 runs into the job slot's input window of its own address space, and the chunk is evicting while
 the compression worker stores its pages. A fault on an evicting chunk maps the same runs back and
 cancels the eviction: the job's completion is then stale, since the chunk's entry names the job
-slot of the eviction in flight. Once stored, the chunk is swapped: its runs return to the free pool
-and its entry's link holds the head of its store-run list. An all-zero page takes no store space,
-and a chunk whose every page is zero takes no store page. A stream that would take as many pages as
-the chunk's backed pages gains nothing: memmgr maps the runs back, and the chunk stays resident.
+slot of the eviction in flight. Once stored, the chunk is compressed: its runs return to the
+free pool and its entry's link holds the head of its store-run list. An all-zero page takes no store
+space, and a chunk whose every page is zero takes no store page. A stream that would take as many
+pages as the chunk's backed pages gains nothing: memmgr maps the runs back, and the chunk stays
+resident.
 
-A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
+A fault on a compressed chunk is restored in the fault arm within the turn, since the restore is
 bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
 any ancestor, since the node stays charged for its evicted pages, so it is never declined with code
 10. A restore of an uncommitted chunk passes the RAM test of an uncommitted demand run, `free -
@@ -997,7 +998,7 @@ outside it and 0 for a reserve node, after the deferred recheck ([Distribution
 policy](#distribution-policy), System reserve): R, not the growth floor, so the restore draws on the
 restore headroom (below). When the free pages do not admit it, memmgr reclaims
 directly (Direct reclaim, below), and declines the restore with code 7 only when that does not make
-room, the chunk staying swapped and its store kept. With an allowance above 0, a restore of a
+room, the chunk staying compressed and its store kept. With an allowance above 0, a restore of a
 committed chunk would be a committed fault, drawing from `promised` as any committed fault does
 ([Commit](#commit)). The chunk is the granule, so a restore is never clamped to part of a chunk.
 memmgr takes runs covering exactly the chunk's backed pages (no run spans an unbacked page of a
@@ -1009,7 +1010,7 @@ zero-fills each all-zero page. That full write replaces the hand-out clear of [F
 contents](#frame-contents), so no byte of a run's earlier owner reaches the process. It then returns
 the store runs to the free pool and resumes the thread. A stream that does not decode, which only a
 corruption of memmgr's memory makes, declines the fault with code 9 and detail 0, the chunk staying
-swapped.
+compressed.
 
 **Direct reclaim.** A restore the free pages do not admit evicts victims itself, in its turn, before
 it is declined: the kept victim of the greatest age first, checked again as resident, eligible, and
@@ -1068,8 +1069,8 @@ pages the compressed store holds. The worker's thread and Notification are memmg
 budget node stays charged for its evicted pages: a charge counts logical pages, resident and
 swapped. `QUERY_POOL_STATUS` reports the store's size and the swapped pages' size, and
 `QUERY_MEMORY_USAGE` a process's resident and swapped pages apart
-([`ipc-interface.md`](ipc-interface.md)). The swapped pages count every evicted chunk: swapped,
-spilling, on disk and lost ([Disk tier](#disk-tier)).
+([`ipc-interface.md`](ipc-interface.md)). The swapped pages count every evicted chunk: compressed,
+writing, on disk and lost ([Disk tier](#disk-tier)).
 
 **Debugger reads.** `SYS_THREAD_READ_MEM` fails on a page that is not present and does not ask
 the pager
@@ -1078,7 +1079,7 @@ the pager
 evicted chunk asks procmgr, through the debug authority, to make the range resident
 (`MAKE_RESIDENT`, [procmgr's IPC interface](../../procmgr/docs/ipc-interface.md)); only a holder of
 the debug authority may ask, and memmgr takes the request from procmgr alone
-([`ipc-interface.md`](ipc-interface.md) § Label 21). memmgr restores each swapped chunk of the
+([`ipc-interface.md`](ipc-interface.md) § Label 21). memmgr restores each compressed chunk of the
 range, and maps back each evicting one; either counts as an access in the chunk's age. It walks
 only the chunks that have an entry, and one request makes at most a few chunks resident and visits
 at most a bounded number ([docs/limits.md](../../../docs/limits.md) § memmgr); its reply says where
@@ -1092,60 +1093,60 @@ stays not present ([Disk tier](#disk-tier)).
 
 ## Disk tier
 
-A swapped chunk can leave memmgr's store for a swap slot the swap service holds on disk
+A compressed chunk can leave memmgr's store for a swap slot the swap service holds on disk
 ([#43](https://github.com/kottlerg/seraph/issues/43)). memmgr performs no device I/O and waits on no
-peer: the swap service drives every step over memmgr's spill labels, and a fault on a chunk on disk
+peer: the swap service drives every step over memmgr's swap labels, and a fault on a chunk on disk
 is redirected to it by a fault reply ([`ipc-interface.md`](ipc-interface.md) § Labels 22 to 25).
-The labels are served only on the spill authority, a SEND on memmgr's endpoint badged
-`SPILL_AUTHORITY` alone, which init mints and svcmgr publishes seed-only as `memmgr.spill`.
+The labels are served only on the swap authority, a SEND on memmgr's endpoint badged
+`SWAP_AUTHORITY` alone, which init mints and svcmgr publishes seed-only as `memmgr.swap`.
 
-**Slots.** `SPILL_REGISTER` names the swap service's restore endpoint and how many slots its
+**Slots.** `SWAP_REGISTER` names the swap service's restore endpoint and how many slots its
 partition holds. A slot holds one chunk, at the slot's index times a chunk's bytes into the
 partition, so any free slot holds any chunk, whatever it compresses to. memmgr owns the slots: a
 slot map grown a page at a time as far as the highest slot taken, in a window of memmgr's own
 address space ([docs/limits.md](../../../docs/limits.md) § memmgr), maps each taken slot to its
-chunk's spill node and threads the free slots on a list, so a slot is taken and freed in constant
+chunk's disk node and threads the free slots on a list, so a slot is taken and freed in constant
 time and the swap service keeps no table. The map's pages leave the pool for good and stay in its
 total as memmgr's metadata, as the process index's pages do. A registration replaces the one before
 it and ends every write in flight, since a new swap service knows nothing of its predecessor's; the
 chunks on disk stay, so a restarted swap service restores every one of them.
 
-**Write-out.** `SPILL_TAKE` takes the next swapped chunk: a hand over every process's regions,
+**Write-out.** `SWAP_TAKE` takes the next compressed chunk: a hand over every process's regions,
 walking only the chunks that have an entry, a bounded number of steps a request. memmgr copies the
 chunk's stream from its store runs into a buffer of its own, seals it there, takes a slot and a
-spill node, and only then copies the slot's bytes into the swap service's buffer, a Memory cap the
+disk node, and only then copies the slot's bytes into the swap service's buffer, a Memory cap the
 request carries, which memmgr maps itself at a window of its own address space. No memmgr frame
 leaves memmgr, and memmgr writes the swap service's buffer through its own mapping, which neither
 faults nor blocks: a revoke of the cap does not withdraw a mapping
 ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md) § `SYS_CAP_REVOKE`). One
-`SPILL_TAKE`'s time in memmgr's loop is bounded by that walk, one copy of a stream shorter than a
+`SWAP_TAKE`'s time in memmgr's loop is bounded by that walk, one copy of a stream shorter than a
 chunk, one seal of it, and one copy of the sealed bytes, the order of a chunk's restore. The chunk
-is then spilling: its store runs stay, held on its spill node, until `SPILL_DONE` ends the write. A
-written chunk is on disk and its store runs return to the free pool; an unwritten one is swapped
-again on them. A fault on a spilling chunk restores it from those store runs and cancels the spill;
-its slot is freed only at `SPILL_DONE`, so a late write never lands on a slot taken since.
+is then writing: its store runs stay, held on its disk node, until `SWAP_DONE` ends the write. A
+written chunk is on disk and its store runs return to the free pool; an unwritten one is compressed
+again on them. A fault on a writing chunk restores it from those store runs and cancels the write;
+its slot is freed only at `SWAP_DONE`, so a late write never lands on a slot taken since.
 
 **Encryption.** A slot holds the chunk's stream encrypted and authenticated with ChaCha20-Poly1305
 (`shared/crypto`) under a 256-bit key memmgr draws from `SYS_GETRANDOM` at start, followed by the
 16-byte tag. The key is in memmgr's memory only and is never sent: the swap service and the disk see
 only ciphertext. The nonce is a 64-bit counter memmgr never repeats within a boot, recorded on the
-chunk's spill node, so a slot's bytes open only as the seal memmgr last made of the chunk that holds
+chunk's disk node, so a slot's bytes open only as the seal memmgr last made of the chunk that holds
 it: another chunk's bytes, an older seal, or any change fail the tag. A failed key draw leaves the
-disk tier off: `SPILL_REGISTER` is refused. The rule is [docs/storage.md](../../../docs/storage.md)
+disk tier off: `SWAP_REGISTER` is refused. The rule is [docs/storage.md](../../../docs/storage.md)
 § Data at Rest's.
 
 **Read-back.** A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming the swap service's
 endpoint ([docs/fault-handling.md](../../../docs/fault-handling.md) § Reply), with the slot and its
 byte count as the redirect word: the faulting thread stays fault-blocked, and the swap service reads
-the slot and hands memmgr its bytes with `SPILL_RESTORE`, then resumes the thread. memmgr maps the
+the slot and hands memmgr its bytes with `SWAP_RESTORE`, then resumes the thread. memmgr maps the
 buffer read-only, copies the bytes into its own buffer, and checks the tag there, so the check and
-the decryption read one snapshot. A good slot is restored as a swapped chunk is
+the decryption read one snapshot. A good slot is restored as a compressed chunk is
 ([Eviction](#eviction), States): admitted, with direct reclaim, its pages written whole into new
-runs and mapped, its slot and spill node freed. A restore memmgr cannot make is declined with that
+runs and mapped, its slot and disk node freed. A restore memmgr cannot make is declined with that
 restore's code, and the chunk stays on disk. A tag failure makes the chunk lost, its slot freed: the
 reply carries the decline word of code 12 with detail 1, which the swap service forwards the held
 fault with, so the faulting thread is killed, as every later fault on the chunk is. A fault on a
-chunk on disk with no swap service registered is declined with code 12 and detail 0. `SPILL_RESTORE`
+chunk on disk with no swap service registered is declined with code 12 and detail 0. `SWAP_RESTORE`
 names a slot, not a fault, so the swap service may also restore ahead of one.
 
 **Read-back is serial.** virtio-blk keeps one request in flight
@@ -1153,11 +1154,11 @@ names a slot, not a fault, so the swap service may also restore ahead of one.
 data and swap partitions of a disk, so a restore's read waits behind the request in flight (a
 slot's write-out, or a filesystem request), and restores are served one after another.
 
-**Accounting.** A spilling chunk's store runs stay in `store`; an on-disk or lost chunk holds no
+**Accounting.** A writing chunk's store runs stay in `store`; an on-disk or lost chunk holds no
 page of `pool_total`. The swapped pages count every evicted chunk, and the budget node stays
 charged for its pages throughout, until a restore or a teardown; a lost chunk's charge goes with
 its region. `QUERY_POOL_STATUS` reports the pages on disk and the free slots apart
-([`ipc-interface.md`](ipc-interface.md) § Label 6). A spill node is an arena slot, and the slot
+([`ipc-interface.md`](ipc-interface.md) § Label 6). A disk node is an arena slot, and the slot
 map's pages are memmgr's metadata.
 
 ---

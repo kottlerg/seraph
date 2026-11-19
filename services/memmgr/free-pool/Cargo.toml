@@ -15,7 +15,7 @@ syscall-abi = { path = "../../../abi/syscall" }
 # runtime tops its own page-table pool up by (`pool_funding::pt_pages_for`).
 pool-funding = { path = "../../../runtime/ruststd/pool-funding", package = "ruststd-pool-funding" }
 # The swap tier seals each chunk's stream into its swap slot with the in-tree
-# ChaCha20-Poly1305 (`spill.rs`).
+# ChaCha20-Poly1305 (`disk.rs`).
 crypto = { path = "../../../shared/crypto" }
 
 [lints]

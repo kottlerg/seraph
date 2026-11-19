@@ -345,9 +345,10 @@ fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Rout
                     "core-death test: moved the CPU at {:#x} to 0",
                     killed.pc
                 ));
-                // The typist's stdin stays open until QEMU exits: its close
-                // is the serial line's end of input.
-                let _stdin = killed.triggered;
+                // QEMU's stdin closes here, ending the serial line's input:
+                // the typed bytes are already in the pipe, and nothing is
+                // typed after the kill.
+                drop(killed.triggered);
                 Ok(killed.resumed)
             }),
         _ => Err(crate::error::err!("the route's launch is incomplete")),

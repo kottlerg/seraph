@@ -12,15 +12,16 @@ one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliatio
 
 svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
 (`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
-`vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `logd.query`, a `devmgr.class.<stem>` per device class file
-(`<stem>` is the file's name without `.class`), and each provider's `provides` names like
-`pwrmgr.shutdown` / `acpid.power` / `timed`) into the registry itself — from the source caps init
-endows it with at handover, and from each provider's launch. Consumers resolve any name through
-their `.svc` `seed = ...` line at launch time, and the public names (`svcmgr`, `pwrmgr.deny`,
-`acpid.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority is seed-only,
-so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields `GRANT`; a seed is
-`SEND` except `devmgr.bind` and each `:grant` name (`sessiond.operator`), which are `SEND|GRANT`.
-The endowment and registry wire format are in [docs/ipc-interface.md](docs/ipc-interface.md).
+`vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`, a `devmgr.class.<stem>` per
+device class file (`<stem>` is the file's name without `.class`), and each provider's `provides`
+names like `pwrmgr.shutdown` / `acpid.power` / `timed`) into the registry itself — from the source
+caps init endows it with at handover, and from each provider's launch. Consumers resolve any name
+through their `.svc` `seed = ...` line at launch time, and the public names (`svcmgr`,
+`pwrmgr.deny`, `acpid.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority
+is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields `GRANT`;
+a seed is `SEND` except `devmgr.bind`, `memmgr.swap` and each `:grant` name (`sessiond.operator`),
+which are `SEND|GRANT`. The endowment and registry wire format are in
+[docs/ipc-interface.md](docs/ipc-interface.md).
 
 svcmgr is also the stop authority: a service whose recipe sets `stop_authority = yes` receives a
 `STOP_AUTHORITY` SEND on svcmgr's endpoint, through which it lists the services svcmgr would stop,
@@ -106,7 +107,8 @@ svcmgr/
   the publish-role source caps (`rootfs.root` SEND, devmgr-registry
   `SEND|GRANT` source, the `vfsd.mount`, `vfsd.deny` and `vfsd.swap` SENDs on vfsd's
   service endpoint), the `EntropyControl` source carrying `Contribute`, which svcmgr never
-  publishes and derives the `entropy_authority` service's copy from, one
+  publishes and derives the `entropy_authority` service's copy from, the `memmgr.swap`
+  `SEND|GRANT` on memmgr's endpoint, one
   `(name, thread_cap, observer)` round per substrate service init bootstrapped before svcmgr
   existed (the observer is a Control-only address-space cap or a process handle), and a terminal
   `LOGD_SOURCES` round carrying the two log-sink source caps svcmgr holds
@@ -257,6 +259,7 @@ column). The handover endowment and
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest and the hotplug-check disk mode) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 | `vfsd.swap` | svcmgr (endowed `SWAP_AUTHORITY` SEND) | `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, the `GET_SWAP_PARTITION` surface (seeded by the swap service's recipe; by svctest while no swap service exists) | no |
+| `memmgr.swap` | svcmgr (endowed `SWAP_AUTHORITY` `SEND\|GRANT`) | `SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint, the swap labels of memmgr's disk tier; its seeds keep `GRANT` (seeded by the swap service's recipe; by svctest while no swap service exists) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |

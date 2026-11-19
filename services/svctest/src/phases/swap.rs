@@ -91,9 +91,9 @@ const _: () = assert!(PAGE_LEN as u64 == PAGE_SIZE);
 /// Words of one page.
 const PAGE_WORDS: u64 = PAGE_SIZE / 8;
 /// Pages of one memmgr demand chunk, the unit of eviction.
-const CHUNK_PAGES: u64 = memmgr_labels::DEMAND_CHUNK_BYTES / PAGE_SIZE;
+pub(super) const CHUNK_PAGES: u64 = memmgr_labels::DEMAND_CHUNK_BYTES / PAGE_SIZE;
 /// Bytes of one chunk.
-const CHUNK_LEN: u64 = memmgr_labels::DEMAND_CHUNK_BYTES;
+pub(super) const CHUNK_LEN: u64 = memmgr_labels::DEMAND_CHUNK_BYTES;
 /// Pages of the fixture's main region at the least: 8 MiB.
 const MAIN_PAGES_MIN: u64 = 2048;
 /// The chunk of the main region the fixture never touches: a demand fault
@@ -168,7 +168,7 @@ static HOG_HEADROOM: std::os::seraph::CSpaceHeadroom =
 /// Grant region ids one `RELEASE_MEMORY_CAPS` of the hog's release names.
 const RELEASE_BATCH: usize = 32;
 /// How often the hog looks at the level once it holds it.
-const HOG_TICK: Duration = Duration::from_millis(10);
+pub(super) const HOG_TICK: Duration = Duration::from_millis(10);
 /// How long the hog takes to bring the level to `LOW`. A test wait bound.
 const FILL_BOUND: Duration = Duration::from_secs(120);
 /// How long the phase waits, with the hog holding the level, for memmgr to
@@ -203,30 +203,34 @@ const LOGD_STACK_PAGES: u64 = 64;
 const INVALID_ADDRESS: i64 = SyscallError::InvalidAddress as i64;
 
 /// What the phase reads of memmgr's `QUERY_POOL_STATUS`, in bytes.
-struct Pool
+pub(super) struct Pool
 {
     /// `data[0]`: installed RAM.
-    system_ram: u64,
+    pub(super) system_ram: u64,
     /// `data[1]`: the kernel's reserve.
-    kernel_reserved: u64,
+    pub(super) kernel_reserved: u64,
     /// `data[2]`: every page memmgr owns.
-    total: u64,
+    pub(super) total: u64,
     /// `data[3]`: free pages.
-    free: u64,
+    pub(super) free: u64,
     /// `data[4]`: deferred pages.
-    deferred: u64,
+    pub(super) deferred: u64,
     /// `data[6]`: the system reserve.
-    reserve: u64,
+    pub(super) reserve: u64,
     /// `data[7]`: the pressure level.
-    level: u64,
+    pub(super) level: u64,
     /// `data[8]`: promised pages.
-    promised: u64,
+    pub(super) promised: u64,
     /// `data[9]`: pages the compressed store holds.
-    store: u64,
+    pub(super) store: u64,
     /// `data[10]`: pages of evicted chunks.
-    swapped: u64,
+    pub(super) swapped: u64,
     /// `data[11]`: the growth floor.
-    floor: u64,
+    pub(super) floor: u64,
+    /// `data[12]`: pages of chunks on disk.
+    pub(super) on_disk: u64,
+    /// `data[13]`: the swap slots free.
+    pub(super) free_slots: u64,
 }
 
 impl Pool
@@ -251,7 +255,7 @@ impl Pool
     }
 
     /// The system reserve's pages, which only a reserve node's charge takes.
-    fn reserve_pages(&self) -> u64
+    pub(super) fn reserve_pages(&self) -> u64
     {
         self.reserve / PAGE_SIZE
     }
@@ -266,7 +270,7 @@ impl Pool
 }
 
 /// memmgr's reply to `msg`, panicking with `what` when the call fails.
-fn memmgr_call(msg: &IpcMessage, what: &str) -> IpcMessage
+pub(super) fn memmgr_call(msg: &IpcMessage, what: &str) -> IpcMessage
 {
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
     unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, msg, current_ipc_buf()) }
@@ -274,7 +278,7 @@ fn memmgr_call(msg: &IpcMessage, what: &str) -> IpcMessage
 }
 
 /// memmgr's pool status, from one `QUERY_POOL_STATUS`.
-fn pool() -> Pool
+pub(super) fn pool() -> Pool
 {
     let reply = memmgr_call(
         &IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS),
@@ -298,6 +302,8 @@ fn pool() -> Pool
         store: reply.word(9),
         swapped: reply.word(10),
         floor: reply.word(11),
+        on_disk: reply.word(12),
+        free_slots: reply.word(13),
     }
 }
 
@@ -347,7 +353,7 @@ struct Peaks
 }
 
 /// The grants the phase holds to keep memmgr's pressure level at `LOW`.
-struct Hog
+pub(super) struct Hog
 {
     /// Each grant's cap, region id and pages.
     grants: Vec<(u64, u64, u64)>,
@@ -361,7 +367,7 @@ struct Hog
 impl Hog
 {
     /// An empty hog whose list has room for [`HOG_MAX_GRANTS`] grants.
-    fn new() -> Self
+    pub(super) fn new() -> Self
     {
         let mut grants = Vec::new();
         grants
@@ -430,7 +436,7 @@ impl Hog
 
     /// Return every grant: delete the caps, then release the regions in
     /// batches of [`RELEASE_BATCH`].
-    fn release_all(&mut self)
+    pub(super) fn release_all(&mut self)
     {
         for &(cap, _, _) in &self.grants
         {
@@ -561,7 +567,7 @@ impl Hog
     }
 
     /// Take grants until the level reads `LOW`, without a pause between them.
-    fn fill_to_low(&mut self)
+    pub(super) fn fill_to_low(&mut self)
     {
         let start = Instant::now();
         loop
@@ -585,17 +591,17 @@ impl Hog
 // ── The fixture, parent side ─────────────────────────────────────────────────
 
 /// What the fixture's `ready` line reports.
-struct Ready
+pub(super) struct Ready
 {
-    region: u64,
+    pub(super) region: u64,
     /// Chunks of the main region.
-    chunks: u64,
-    hole: u64,
+    pub(super) chunks: u64,
+    pub(super) hole: u64,
     noevict: u64,
 }
 
 /// The fixture child and the means to talk to it.
-struct Fixture
+pub(super) struct Fixture
 {
     child: Child,
     stdin: ChildStdin,
@@ -649,7 +655,7 @@ impl Fixture
     }
 
     /// Send the command `cmd`.
-    fn send(&mut self, cmd: &str)
+    pub(super) fn send(&mut self, cmd: &str)
     {
         self.stdin
             .write_all(format!("{cmd}\n").as_bytes())
@@ -659,7 +665,7 @@ impl Fixture
 
     /// The fixture's next line, within [`LINE_BOUND`]; with a `hog`, it takes
     /// a step every [`HOG_TICK`] while it waits.
-    fn line(&mut self, mut hog: Option<&mut Hog>, what: &str) -> String
+    pub(super) fn line(&mut self, mut hog: Option<&mut Hog>, what: &str) -> String
     {
         let start = Instant::now();
         loop
@@ -687,7 +693,15 @@ impl Fixture
     }
 
     /// Wait for the fixture's exit and its reader's end, and require status 0.
-    fn finish(mut self)
+    fn finish(self)
+    {
+        let status = self.exit_status();
+        assert!(status.success(), "{PHASE}: the fixture exited {status:?}");
+    }
+
+    /// Close the fixture's stdin, wait for its exit and its reader's end, and
+    /// return its status.
+    pub(super) fn exit_status(mut self) -> std::process::ExitStatus
     {
         drop(self.stdin);
         let start = Instant::now();
@@ -703,8 +717,8 @@ impl Fixture
             );
             std::thread::sleep(HOG_TICK);
         };
-        assert!(status.success(), "{PHASE}: the fixture exited {status:?}");
         let _ = self.reader.join();
+        status
     }
 }
 
@@ -758,7 +772,7 @@ fn procmgr_call(authority: u64, msg: &IpcMessage, what: &str) -> IpcMessage
 }
 
 /// The badges `LIST_PROCESSES` lists.
-fn listed_badges(authority: u64) -> Vec<u64>
+pub(super) fn listed_badges(authority: u64) -> Vec<u64>
 {
     let badges = RefCell::new(Vec::new());
     let _ = super::crash::find_listed(authority, |badge, _| {
@@ -770,7 +784,7 @@ fn listed_badges(authority: u64) -> Vec<u64>
 
 /// Attach to the process `process` without a watch: its thread caps, its main
 /// thread's first, which the caller deletes through [`detach`].
-fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
+pub(super) fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
 {
     let attach = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
         .word(0, process)
@@ -792,7 +806,7 @@ fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
 }
 
 /// Delete the thread caps `threads` and detach from `process`.
-fn detach(authority: u64, process: u64, threads: &[u64], what: &str)
+pub(super) fn detach(authority: u64, process: u64, threads: &[u64], what: &str)
 {
     for &cap in threads
     {
@@ -814,7 +828,7 @@ fn detach(authority: u64, process: u64, threads: &[u64], what: &str)
 /// asked again from where each success stopped until it reaches the range's
 /// end: memmgr makes a bounded part of a range resident per request. A
 /// success that stops where it started fails the phase.
-fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> u64
+pub(super) fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> u64
 {
     let end = va.saturating_add(len);
     let mut at = va;
@@ -882,7 +896,7 @@ fn sp_offset() -> usize
 }
 
 /// Whether the page at `va` of `thread`'s process is present.
-fn page_present(thread: u64, va: u64) -> bool
+pub(super) fn page_present(thread: u64, va: u64) -> bool
 {
     let mut probe = [0u8; 8];
     syscall::thread_read_mem(thread, va, &mut probe).is_ok()
@@ -1009,7 +1023,7 @@ fn swap_phase(caps: &Caps)
 /// Check the phase's baseline: the identity holds and the store and the
 /// swapped total are empty. Memmgr's free and deferred bytes together, once its
 /// deferred list has settled.
-fn baseline_totals() -> u64
+pub(super) fn baseline_totals() -> u64
 {
     let _ = crate::phases::memmgr::settled_deferred_bytes();
     let base = pool();
@@ -1032,7 +1046,7 @@ fn baseline_totals() -> u64
 /// The pages of the fixture's main region for a system reserve of `reserve`
 /// pages: twice the reserve in whole chunks, so more than the reserve of them
 /// can be swapped, and at least [`MAIN_PAGES_MIN`].
-fn main_pages(reserve: u64) -> u64
+pub(super) fn main_pages(reserve: u64) -> u64
 {
     reserve
         .saturating_mul(2)
@@ -1043,7 +1057,7 @@ fn main_pages(reserve: u64) -> u64
 /// Spawn the fixture with a main region of `main_pages` pages, wait for its
 /// ready line, and find its process badge as the one entry `LIST_PROCESSES`
 /// lists that it did not before the spawn.
-fn start_fixture(authority: u64, main_pages: u64) -> (Fixture, Ready, u64)
+pub(super) fn start_fixture(authority: u64, main_pages: u64) -> (Fixture, Ready, u64)
 {
     let before = listed_badges(authority);
     let mut fixture = Fixture::spawn(main_pages);
@@ -1096,7 +1110,7 @@ fn read_before_hog(thread: u64, ready: &Ready)
 /// total are nonzero. Only the main region's chunks are restored at
 /// `CRITICAL` ([`critical_restore`]), and they must outnumber the restore
 /// headroom.
-fn await_swapped(hog: &mut Hog, fixture: &mut Fixture, want: u64)
+pub(super) fn await_swapped(hog: &mut Hog, fixture: &mut Fixture, want: u64)
 {
     let start = Instant::now();
     loop
@@ -1330,7 +1344,7 @@ fn require_no_evict(thread: u64, ready: &Ready)
 /// free and deferred bytes total at least it: the phase's pages are all back,
 /// while another process may have returned pages of its own meanwhile.
 /// Returns memmgr's free and deferred bytes then.
-fn settle_resident(authority: u64, baseline: Option<u64>) -> u64
+pub(super) fn settle_resident(authority: u64, baseline: Option<u64>) -> u64
 {
     let top = syscall::user_va_top()
         .unwrap_or_else(|e| panic!("{PHASE}: SystemInfoType::UserVaTop failed ({e})"));
@@ -1569,8 +1583,20 @@ fn fixture_main() -> !
                 }
             }
             "exit" => break,
-            _ =>
-            {}
+            other =>
+            {
+                // `touch <hex va>`: read the page at that address of the main
+                // region, and say whether it holds its pattern.
+                if let Some(va) = other
+                    .strip_prefix("touch ")
+                    .and_then(|v| u64::from_str_radix(v, 16).ok())
+                {
+                    let ok = va >= base
+                        && va < page_va(base, main_pages)
+                        && page_intact(va & !(PAGE_SIZE - 1), base, MAIN_XOR);
+                    println!("touched {}", if ok { "ok" } else { "bad" });
+                }
+            }
         }
         let _ = std::io::stdout().flush();
     }

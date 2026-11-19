@@ -25,12 +25,18 @@
 use std::collections::VecDeque;
 use std::os::seraph::process::ArgvEnvCap;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::worker;
 
 /// Number of active worker threads. A concurrency knob that bounds no
 /// capacity: a queued job waits for the next free worker.
 pub const ACTIVE_WORKER_COUNT: usize = 2;
+
+/// How often a wait for a child's bootstrap round looks at the child's death
+/// queue ([`WorkHandle::wait_while_alive`]): how long the wait outlives a
+/// child that died before its round, at most.
+const DEATH_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Caps to deliver to one fatfs child during its bootstrap round, via
 /// `bootstrap::reply_round` when its REQUEST arrives on the worker-owned
@@ -130,6 +136,39 @@ impl<T: Default> WorkHandle<T>
                 .unwrap_or_else(PoisonError::into_inner);
         }
         st.take().unwrap_or_default()
+    }
+
+    /// Block until the worker reports completion, as [`Self::wait`], or
+    /// until the child whose death queue is `death_queue` dies, whichever
+    /// comes first. A child that died before its bootstrap round sends no
+    /// `REQUEST`, so its round would never complete. Returns the result,
+    /// or `None` when the death came first: the death's entry is then taken
+    /// from the queue, and the caller withdraws the order with
+    /// [`abandon_bootstrap`], which waits for a round the bootstrap worker
+    /// already took.
+    pub fn wait_while_alive(&self, death_queue: u64) -> Option<T>
+    {
+        let mut st = self
+            .channel
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        loop
+        {
+            if let Some(result) = st.take()
+            {
+                return Some(result);
+            }
+            if syscall::event_try_recv(death_queue).is_ok()
+            {
+                return None;
+            }
+            st = self
+                .channel
+                .1
+                .wait_timeout(st, DEATH_CHECK_INTERVAL)
+                .map_or_else(|e| e.into_inner().0, |(guard, _)| guard);
+        }
     }
 }
 

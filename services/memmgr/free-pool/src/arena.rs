@@ -96,8 +96,8 @@ pub struct ProcessCaps
     /// Each registration goes with the record
     /// ([`crate::Ledger::remove_process`]).
     pub limits: NodeIdx,
-    /// Pages of the process's demand chunks held in the compressed store,
-    /// which its budget node stays charged for
+    /// Pages of the process's evicted demand chunks (compressed, writing or
+    /// on disk), which its budget node stays charged for
     /// ([`crate::Ledger::finish_evict`]).
     pub swapped: u64,
 }
@@ -196,6 +196,50 @@ const _: () = assert!(size_of::<Commitment>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<LimitReg>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<DiskNode>() <= size_of::<ProcessRecord>());
+
+/// Where a write stands ([`DiskNode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskState
+{
+    /// `SWAP_TAKE` handed the chunk's sealed bytes to the swap service, whose
+    /// write to the slot is in flight; the chunk's store runs are kept.
+    Writing,
+    /// The swap service wrote the slot: the chunk's bytes are on disk only.
+    OnDisk,
+    /// The chunk was restored or torn down while its write was in flight. The
+    /// slot stays taken until the swap service ends the write
+    /// (`SWAP_DONE`), so the write cannot land in a slot another chunk took.
+    Cancelled,
+}
+
+/// One chunk the swap service holds, or is writing, in a swap slot
+/// (`services/memmgr/docs/memory-pool.md` § Disk tier): the chunk, the nonce
+/// its bytes were sealed under, its store runs while the write is in flight,
+/// and the slot. The chunk's entry names this slot; the slot map names it by
+/// its swap slot ([`crate::disk::SwapSlots`]). The chunk fields are stale once
+/// it is [`DiskState::Cancelled`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskNode
+{
+    /// The record slot of the chunk's process.
+    pub rec: NodeIdx,
+    /// The region slot of the chunk.
+    pub reg: NodeIdx,
+    /// The chunk's base address.
+    pub page_base: u64,
+    /// The per-boot nonce counter the chunk's bytes were sealed under, used
+    /// for no other seal.
+    pub nonce: u64,
+    /// The head of the chunk's store-run list while it is writing,
+    /// [`NODE_NULL`] otherwise.
+    pub store: NodeIdx,
+    /// The swap slot.
+    pub slot: u32,
+    /// Bytes the slot holds: the sealed stream and its tag.
+    pub len: u16,
+    pub state: DiskState,
+}
 
 /// The payload of one arena slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +266,8 @@ pub enum Node
     ChunkDir([NodeIdx; DIR_FANOUT]),
     /// A leaf of a chunk table: one chunk's entry.
     Chunk(ChunkEntry),
+    /// A chunk the swap service holds or is writing in a swap slot.
+    Disk(DiskNode),
 }
 
 /// An arena slot: a payload plus the index of the next slot on whichever
@@ -608,7 +654,7 @@ mod tests
     }
 
     #[test]
-    fn layout_spills_from_the_low_zone_into_the_high_zone_then_ends()
+    fn layout_writes_from_the_low_zone_into_the_high_zone_then_ends()
     {
         let layout = ArenaLayout {
             low_base: 0x1000,

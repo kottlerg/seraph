@@ -538,6 +538,7 @@ dependencies = [
 name = "memmgr-free-pool"
 version = "0.1.4"
 dependencies = [
+ "crypto",
  "ruststd-pool-funding",
  "syscall-abi",
 ]
@@ -866,12 +867,14 @@ dependencies = [
  "ipc",
  "log",
  "logd-codec",
+ "memmgr-free-pool",
  "namespace-protocol",
  "oomd-policy",
  "process-abi",
  "process-layout",
  "procmgr-process-table",
  "recv-pool",
+ "restart-budget",
  "shmem",
  "syscall",
  "syscall-abi",
@@ -999,6 +1002,7 @@ name = "vfsd-root-backend"
 version = "0.1.4"
 dependencies = [
  "namespace-protocol",
+ "restart-budget",
 ]
 
 [[package]]

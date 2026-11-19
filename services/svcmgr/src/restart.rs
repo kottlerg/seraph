@@ -481,6 +481,14 @@ pub fn handle_death(
     // svcmgr writes this death's lines once the new instance has started and
     // been served its bootstrap round, and none when no instance follows,
     // since then no receiver is left to take them.
+    //
+    // A line svcmgr wrote while the dead instance received nothing (one
+    // that died before its receive workers started, in its handover from
+    // init-logd) timed out, and after a timeout the log client bounds each
+    // call by a few milliseconds until one is answered, less than the new
+    // instance takes to start receiving. svcmgr therefore tells the client
+    // that the receiver restarted before it writes the held lines, so they
+    // wait for the new instance as any first line would.
     let lines = if matches!(recipe, Some(r) if r.log_sink)
     {
         DeathLines::Held
@@ -538,6 +546,7 @@ pub fn handle_death(
 
     if lines == DeathLines::Held
     {
+        std::os::seraph::log::receiver_restarted();
         log_death(svc, routed_reason);
         if bootstrap_deaths != 0
         {

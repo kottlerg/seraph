@@ -1662,7 +1662,7 @@ pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
 /// top-up was needed and could not be had: memmgr is unreachable or refuses
 /// the grant, or the kernel refuses the donation. A granted run's cap takes a
 /// free slot, the IPC receive reserve's included, until it is donated, so a
-/// `CSpace` with no free slot cannot be topped up. A headroom that reads short after donations
+/// `CSpace` with no free slot cannot be topped up (#1328). A headroom that reads short after donations
 /// that were made is no failure, since another thread's allocations took it.
 pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     let short = || {

@@ -140,8 +140,9 @@ PR number or branch slug (`pr581-body.md`). The records and drafts this file nam
 records, PR bodies, Issue drafts) are deliverables; write them even where a harness note says
 not to write report files.
 
-Told to stand down (your PR or branch now belongs to another worker), edit no file, PR or
-Issue, commit and push nothing further on that branch, and hand back one line.
+Told to stand down (your PR or branch now belongs to another worker, or you are about to be
+replaced in your own worktree), edit no file, PR or Issue, commit and push nothing further on
+that branch, and hand back one line.
 
 Run `git fetch origin` at the start of every step, so each step reads the current `master`.
 
@@ -152,7 +153,8 @@ Run `git fetch origin` at the start of every step, so each step reads the curren
   mean several branches and PRs, each cut from `master`, never stacked. When the prompt names an
   existing branch (a respawn), continue its PR: in the existing worktree the prompt names, on the
   branch it holds, running every command there by absolute path, or, when it names none, on a
-  checkout of `origin/<branch>`.
+  checkout of `origin/<branch>`. An existing worktree is as your predecessor left it: read
+  `git status` there first, and decide what to keep of any uncommitted work.
 - Touch only the files of your task. A change the rules force elsewhere is an expansion: state
   it in one line in the report and the PR body, and continue. Forced means a caller of a changed
   signature, every copy of a changed fact (docs/documentation-standards.md § Change propagation

@@ -56,11 +56,15 @@
 //!     with its endpoint still published.
 //! 13. [`swapd`] after [`swap`] and [`swap_client`]: it reuses their fixture and
 //!     hog, and kills swapd, which no phase after it needs for a restore.
+//! 14. [`commit_swap`] after [`swapd`]: its toucher can leave chunks of any
+//!     process on disk, which the swap phases require none of when they
+//!     start, and it needs the slots swapd's next instance registers.
 
 use crate::runner::Phase;
 
 pub mod acpi;
 pub mod budget;
+pub mod commit_swap;
 pub mod crash;
 pub mod devmgr;
 pub mod discard;
@@ -151,6 +155,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(swap::phases());
     out.extend_from_slice(swap_client::phases());
     out.extend_from_slice(swapd::phases());
+    out.extend_from_slice(commit_swap::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());

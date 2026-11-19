@@ -627,7 +627,7 @@ on the next fault on it, which only a debugger's
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A committed region's charge would leave fewer free pages outside `promised` than the growth floor, for a caller outside the system reserve, or than none |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A committed region's charge would leave the free pages and the overcommit allowance less `promised` (`QUERY_POOL_STATUS` `data[3] + data[14] - data[8]`) below the growth floor, for a caller outside the system reserve, or below none |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) |
 | 4 | `INVALID_ARGUMENT` | Bad alignment, zero length, W^X violation, unknown prot or flag bit, unknown badge, or overlap |
 | 8 | `LIMIT` | A committed region's charge would take the subtree of the caller's budget node, or of an ancestor, over its max |

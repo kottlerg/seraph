@@ -51,6 +51,7 @@ pub fn dispatch(role: &str)
     phases::node_handle::reentry_main(role);
     phases::heap_commit::reentry_main(role);
     phases::discard::reentry_main(role);
+    phases::commit_swap::reentry_main(role);
     phases::swap::reentry_main(role);
     phases::unmount::reentry_main(role);
     phases::pwrmgr::reentry_main(role);

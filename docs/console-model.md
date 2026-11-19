@@ -65,9 +65,15 @@ direct console paths remain as fallbacks for the life of the system.
    § Startup ordering). The handover is unconditional, so if the serial driver never
    comes up, userspace serial output after the handover is dropped (real-logd keeps the lines in
    its history). init-logd has no direct-framebuffer path; before the framebuffer driver is
-   up, userspace output reaches only the UART.
+   up, userspace output reaches only the UART, and the screen keeps what the kernel's console
+   drew there. Neither console driver is in the bootstrap bundle
+   ([boot-media.md](boot-media.md) § The Bootstrap Closure): devmgr starts both from the root
+   filesystem, so a boot whose root does not mount ends with init-logd's lines on the UART and the
+   kernel's console on the screen.
 
-4. **Serial-driver-mediated path** — devmgr spawns the serial driver (`services/drivers/serial/`);
+4. **Serial-driver-mediated path** — devmgr spawns the serial driver (`services/drivers/serial/`)
+   from the root filesystem, in the drivers-directory pass that svcmgr's `SET_DRIVERS_DIR` posts
+   after the root mount;
    once init-logd has released the master log endpoint to real-logd, every userspace UART writer
    routes bytes to it via `serial_labels::SERIAL_WRITE_BYTES`. real-logd
    (`services/logd/src/main.rs`) is the primary client: svcmgr launches and supervises it, it
@@ -117,9 +123,13 @@ direct console paths remain as fallbacks for the life of the system.
      steady-state userspace log stream reaches the screen as well as the
      UART. The mirror is a sink of its own, with its own queue and writer, so a framebuffer driver
      that is stopped or dead holds neither the serial output nor the log stream beyond
-     `SINK_STALL_MS`. The framebuffer driver, when present, is spawned before svcmgr launches logd;
+     `SINK_STALL_MS`. The framebuffer driver, when present, is spawned from the root filesystem
+     in devmgr's drivers-directory pass, which svcmgr posts with `SET_DRIVERS_DIR` before it
+     launches logd, and a `QUERY_DEVICE` of logd's that would find no driver waits for that pass;
      logd's emit path never calls devmgr and, while no framebuffer driver is resolved (headless
-     boot), skips the mirror, so serial stays the authoritative channel.
+     boot), skips the mirror, so serial stays the authoritative channel. The driver clears the
+     screen when it starts (`FramebufferWriter::new`), so the kernel's console stays on it until
+     then.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
      framebuffer write cap via `QUERY_DEVICE` on its framebuffer class SEND, again on the class
      watch when devmgr restarts the driver, and renders the

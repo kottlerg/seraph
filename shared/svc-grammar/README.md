@@ -36,7 +36,7 @@ parser, which keeps its own error type over this one.
 | Consumer | Files |
 |---|---|
 | [`services/svcmgr/svc-defs`](../../services/svcmgr/README.md) | The `.svc` service definitions and the device class files (`/config/devmgr/classes/<class>.class`) |
-| [`services/devmgr/firmware`](../../services/devmgr/README.md) | The platform description tables of the boot bundle (`firmware::platform::parse_table`) |
+| [`services/devmgr/firmware`](../../services/devmgr/README.md) | The platform description tables (`firmware::platform::parse_table`) |
 
 ---
 

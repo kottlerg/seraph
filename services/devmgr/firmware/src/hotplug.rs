@@ -333,18 +333,58 @@ pub const fn osc_grants(osc: Option<Osc>) -> bool
     }
 }
 
-/// The native-control grant of a slot: the `_OSC` result `osc` of its host
-/// bridge grants native hotplug control, or the machine's platform
-/// description table does (`platform_grant`, its `pcie_native_hotplug = yes`).
-/// With neither, devmgr does not manage the slot.
-#[must_use]
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`platform_grant` is the platform description table's `pcie_native_hotplug` value"
-)]
-pub const fn native_control(osc: Option<Osc>, platform_grant: bool) -> bool
+/// What decides a slot's native-control grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantBy
 {
-    platform_grant || osc_grants(osc)
+    /// The machine's platform description table (`pcie_native_hotplug = yes`).
+    PlatformTable,
+    /// The `_OSC` result of the slot's host bridge.
+    Osc,
+}
+
+/// Where a slot's native-control grant stands, as [`slot_grant`] decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotGrant
+{
+    /// devmgr manages the slot, native control granted by the given source.
+    Manage(GrantBy),
+    /// The firmware drives the slot: its host bridge's `_OSC` result
+    /// withholds native control, or failed, and the platform description
+    /// tables, known, grant none. Final.
+    Firmware,
+    /// Not decided yet: no `_OSC` result has arrived, or one that withholds
+    /// native control has while the platform description tables are not
+    /// known.
+    Wait,
+}
+
+/// The native-control grant of a slot whose host bridge's `_OSC` result is
+/// `osc` (`None` until it arrives), `tables` being the machine's
+/// platform description table's `pcie_native_hotplug` once devmgr knows its
+/// tables (`Some(false)` when it knows there is none), `None` before.
+///
+/// A table can only add native control, never withdraw it: a grant by
+/// either source manages the slot at once. A withheld or failed `_OSC`
+/// settles the slot to the firmware only once the tables are known and grant
+/// nothing, so a table read later is never preempted by that result
+/// (docs/driver-binding.md § Platform Description Tables).
+#[must_use]
+pub const fn slot_grant(osc: Option<Osc>, tables: Option<bool>) -> SlotGrant
+{
+    if matches!(tables, Some(true))
+    {
+        return SlotGrant::Manage(GrantBy::PlatformTable);
+    }
+    if osc_grants(osc)
+    {
+        return SlotGrant::Manage(GrantBy::Osc);
+    }
+    if osc.is_some() && tables.is_some()
+    {
+        return SlotGrant::Firmware;
+    }
+    SlotGrant::Wait
 }
 
 /// The host bridge bus `bus` of `segment` lies below: the one whose bus
@@ -1693,18 +1733,42 @@ mod tests
     }
 
     #[test]
-    fn native_control_needs_the_osc_bit_or_the_platform_key()
+    fn a_slot_is_managed_on_the_osc_bit_or_the_platform_key()
     {
-        // q35 with ACPI PCI hotplug of the bridges off: 0x1f.
-        assert!(native_control(Some(osc(0x1F)), false));
-        // Default q35: 0x1e, native hotplug withheld.
-        assert!(!native_control(Some(osc(0x1E)), false));
-        // A failed or absent _OSC grants nothing.
-        assert!(!native_control(Some(failed_osc(0x1F)), false));
-        assert!(!native_control(None, false));
+        let by_osc = SlotGrant::Manage(GrantBy::Osc);
+        // q35 with ACPI PCI hotplug of the bridges off: 0x1f, managed at
+        // once, whether the tables are known or not.
+        assert_eq!(slot_grant(Some(osc(0x1F)), None), by_osc);
+        assert_eq!(slot_grant(Some(osc(0x1F)), Some(false)), by_osc);
         // riscv64 virt: the platform key grants, whatever _OSC returned.
-        assert!(native_control(Some(osc(0x1E)), true));
-        assert!(native_control(None, true));
+        let by_table = SlotGrant::Manage(GrantBy::PlatformTable);
+        assert_eq!(slot_grant(Some(osc(0x1E)), Some(true)), by_table);
+        assert_eq!(slot_grant(Some(failed_osc(0x1F)), Some(true)), by_table);
+        assert_eq!(slot_grant(None, Some(true)), by_table);
+        assert_eq!(slot_grant(Some(osc(0x1F)), Some(true)), by_table);
+    }
+
+    #[test]
+    fn a_withheld_or_failed_osc_waits_for_the_tables()
+    {
+        // Default q35: 0x1e, native hotplug withheld; a failed _OSC grants
+        // nothing either. Neither settles the slot while the tables are not
+        // known, since a table read later may still grant.
+        assert_eq!(slot_grant(Some(osc(0x1E)), None), SlotGrant::Wait);
+        assert_eq!(slot_grant(Some(failed_osc(0x1F)), None), SlotGrant::Wait);
+        // Once devmgr knows its tables grant nothing, the firmware drives
+        // the slot.
+        assert_eq!(
+            slot_grant(Some(osc(0x1E)), Some(false)),
+            SlotGrant::Firmware
+        );
+        assert_eq!(
+            slot_grant(Some(failed_osc(0x1F)), Some(false)),
+            SlotGrant::Firmware
+        );
+        // No _OSC result yet: nothing is decided but a table's grant.
+        assert_eq!(slot_grant(None, None), SlotGrant::Wait);
+        assert_eq!(slot_grant(None, Some(false)), SlotGrant::Wait);
     }
 
     #[test]

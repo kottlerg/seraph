@@ -101,15 +101,14 @@ is **not discoverable** at runtime:
   standard `_HID`).
 
 The device is therefore described by the `qemu-virt` platform description table
-(`services/devmgr/platform/qemu-virt.platform`,
-[Driver Binding](../../../docs/driver-binding.md#platform-description-tables)), which devmgr uses
-when the XSDT's OEM table ID is `BXPC`, and the driver depends on the bootloader seeding
-`(0x101000, 0x1000)` as a platform-default aperture, which its ACPI
-walker appends whenever the RSDP and XSDT validate, MCFG present or
-absent (beside the PCI-ECAM default that exists for the same
-firmware-discovery reason; see
-[ACPI Parsing](../../../core/boot/docs/acpi.md#tables-consumed)). devmgr carves the record's
-`Mmio` from that aperture.
+(`services/devmgr/platform/qemu-virt.platform`, [Driver
+Binding](../../../docs/driver-binding.md#platform-description-tables)), which devmgr reads from the
+root filesystem and uses when the XSDT's OEM table ID is `BXPC`, and the driver depends on the
+bootloader seeding `(0x101000, 0x1000)` as a platform-default aperture, which its ACPI walker
+appends whenever the RSDP and XSDT validate, MCFG present or absent (beside the PCI-ECAM default
+that exists for the same firmware-discovery reason; see [ACPI
+Parsing](../../../core/boot/docs/acpi.md#tables-consumed)). devmgr carves the record's `Mmio` from
+that aperture.
 
 Real RISC-V boards diverge from QEMU `virt`. Per-board RTC support
 (I2C chips, vendor-specific MMIO RTCs, boards with no RTC at all)

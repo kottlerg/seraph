@@ -13,8 +13,10 @@
 # `restart = on_failure`: svcmgr holds the master-log source for the system's
 # life, so a fresh logd re-attaches to the same endpoint object every log
 # sender already targets, skipping the one-shot history pull (no init-logd
-# remains) and serving a fresh table; svcmgr writes the death's lines only
-# once it runs (see services/svcmgr/docs/restart-protocol.md). `critical =
+# remains once an instance has taken all its bootstrap rounds; a restart
+# before that is served the pull) and serving a fresh table; svcmgr writes
+# the death's lines only once it runs, but for a first launch's death before
+# its bootstrap request (see services/svcmgr/docs/restart-protocol.md). `critical =
 # yes`: a permanently-down logd leaves the system blind, so graceful shutdown
 # is the terminal escape once the restart budget is spent.
 #

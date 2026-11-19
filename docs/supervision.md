@@ -144,8 +144,12 @@ svcmgr, devmgr, vfsd and logd (until svcmgr's restart budget for it is spent), o
 terminal fault made from outside the guest, and checks that the system powers off, on both
 architectures ([Testing § Core death](testing.md#core-death-test-core-death)). It kills devmgr and
 vfsd once svcmgr has reconciled its recipes, after the window that #1185 leaves open above, and
-logd once the boot is up: a service that dies after its start and before it asks svcmgr for its
-bootstrap round leaves svcmgr waiting for the request for good (#1297). The path does not yet
+logd from the stub's first attach to it, which can fall before logd asks svcmgr for its bootstrap
+round. svcmgr does not wait for good on a service that dies after its start and before that
+request: its wait for the request ends at the death, which it routes by the service's restart
+policy, on the first launch and on a restart alike, and it goes on with its reconciliation or its
+supervision ([Restart Protocol § Death
+detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). The path does not yet
 hold the requirement by construction: svcmgr, pwrmgr and, on x86-64, acpid are
 demand-paged on memmgr and grow their heaps through it (memmgr and procmgr are pinned by
 construction, per [Fault Handling § Default System Pager](fault-handling.md#default-system-pager)),

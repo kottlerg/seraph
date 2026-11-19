@@ -5,11 +5,12 @@
 
 //! Deliberate-crash fixture validating svcmgr's restart path.
 //!
-//! Two roles, chosen by `argv[1]`: `selftest` checks its restart surfaces and
+//! Three roles, chosen by `argv[1]`: `selftest` checks its restart surfaces and
 //! faults its main thread; `worker-fault` serves `ipc::restart_probe_labels`
-//! and, on request, faults a worker thread. Gating, the surface checks, the
-//! fail rules, and the capability slots are defined in
-//! `services/crasher/README.md`.
+//! and, on request, faults a worker thread; `boot-fault` faults its main
+//! thread before its bootstrap request when it finds a token file, and is
+//! `worker-fault` otherwise. Gating, the surface checks, the fail rules, and
+//! the capability slots are defined in `services/crasher/README.md`.
 
 use std::os::seraph::startup_info;
 use std::thread;
@@ -22,13 +23,18 @@ fn main()
     std::os::seraph::log::register_name(b"crasher");
     let info = startup_info();
 
-    if std::env::args().nth(1).as_deref() == Some("worker-fault")
+    let role = std::env::args().nth(1);
+    if matches!(role.as_deref(), Some("worker-fault" | "boot-fault"))
     {
         #[expect(
             clippy::cast_ptr_alignment,
             reason = "the IPC buffer is page-aligned (4 KiB), satisfying u64 alignment"
         )]
         let ipc_buf = info.ipc_buffer.cast::<u64>();
+        if role.as_deref() == Some("boot-fault")
+        {
+            take_boot_fault_token();
+        }
         worker_fault_role(info.creator_endpoint, ipc_buf);
     }
 
@@ -55,10 +61,14 @@ fn main()
     thread::sleep(Duration::from_millis(500));
 
     std::os::seraph::log!("triggering fault");
+    fault_main()
+}
 
-    // Trigger a fault: write to null pointer.
-    // x86-64: #PF (vector 14) for unmapped page.
-    // RISC-V: store page fault (scause 15).
+/// Fault the calling thread: a write to the null pointer.
+/// x86-64: #PF (vector 14) for unmapped page.
+/// RISC-V: store page fault (scause 15).
+fn fault_main() -> !
+{
     // SAFETY: deliberately invalid — this is the point.
     unsafe {
         core::ptr::write_volatile(core::ptr::null_mut::<u8>(), 0x42);
@@ -66,6 +76,37 @@ fn main()
 
     // SAFETY: unreachable — the write above faults and the kernel kills this thread.
     unsafe { core::hint::unreachable_unchecked() }
+}
+
+/// The `boot-fault` role's token, in its namespace (`/data/crasher-boot` in
+/// its recipe, `rootfs/config/svcmgr/tests/crasher-boot.svc`). The data
+/// partition ships it (`rootfs/data/crasher-boot/die-early`), and svctest's
+/// `svcmgr_boot_death` phase writes it again.
+const BOOT_FAULT_TOKEN: &str = "/die-early";
+
+/// The `boot-fault` role's first step: when [`BOOT_FAULT_TOKEN`] is there,
+/// remove it and fault the main thread before the bootstrap request, so
+/// svcmgr's wait for the request ends at this instance's death; return when it
+/// is not, the instance then serving as `worker-fault`. Removing the token
+/// makes one instance die so per token. A namespace that cannot be read logs
+/// `FATAL:`.
+fn take_boot_fault_token()
+{
+    match std::fs::remove_file(BOOT_FAULT_TOKEN)
+    {
+        Ok(()) =>
+        {
+            std::os::seraph::log!("boot-fault: token taken; faulting before the bootstrap request");
+            fault_main()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+        {}
+        Err(e) =>
+        {
+            std::os::seraph::log!("FATAL: boot-fault: token not removed: {e}");
+            syscall::thread_exit();
+        }
+    }
 }
 
 /// Assert argv survived the (re)spawn: the recipe declares

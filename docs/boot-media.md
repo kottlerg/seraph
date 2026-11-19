@@ -33,15 +33,16 @@ and every signed one is signed there once, with the set of roles it may be loade
 ([signing.md](signing.md) § Signing); every pack composes the ESP from the installed files, so
 each object on it is its installed file byte for byte, and the composition copies files, signs
 nothing and reads no key; the bundle's entries are chosen by a list per harness in configuration
-(`/config/bundle/`), and every entry other than `init` is named by its install path; the
+(`/config/bundle/`), and every entry other than `init` is named by its install path; every pack
+checks, once it has composed the ESP, that each object on it equals its installed file, and
+`cargo xtask check-disk`, which CI runs, checks the same of a packed image, its ESP against its
+root partition (§ The ESP); the
 bootloader refuses an entry without the boot-module role; the bundle is used during bootstrap alone
 (§ Bootstrap-Only Boot Copies); the loss of the root filesystem's driver or of its disk is system
 death; and the ESP holds no secret.
 
 Design intent, not yet implemented:
 
-- No step checks that the ESP's objects equal their installed files
-  ([#1265](https://github.com/kottlerg/seraph/issues/1265)).
 - The bundle carries more than the bootstrap closure: the serial and framebuffer drivers and,
   on riscv64, the platform description table, none of which the root mount needs
   ([#1267](https://github.com/kottlerg/seraph/issues/1267)). A table leaves the bundle only once
@@ -81,8 +82,13 @@ that carry the boot-module role; the bootloader refuses an entry without it, so 
 cannot make an object bootable that its signer did not permit.
 
 An ESP whose objects all equal their installed files verifies as those files do. Composition
-checks that equality, and refuses an ESP it cannot establish it for (design intent,
-[#1265](https://github.com/kottlerg/seraph/issues/1265)).
+checks that equality once it has written the ESP, and refuses an ESP it cannot establish it for:
+one whose object is missing, differs from its installed file or copies one that is not installed,
+whose bundle holds an entry its list does not name or lacks one it names, or that holds any other
+file than an empty presence-only knob in `\EFI\seraph\`. `cargo xtask check-disk` makes the
+same check of a packed disk image, its ESP against the installed files of its root partition, so
+a repack that changed one side alone is caught
+([xtask/README.md](../xtask/README.md#cargo-xtask-check-disk)).
 
 ---
 

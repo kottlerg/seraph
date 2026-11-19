@@ -37,8 +37,11 @@ rootfs/
 ```
 
 xtask synthesises additional data fixtures at build time directly into
-the sysroot at `sysroot/data/svctest/{large.bin, bench.bin}`; they are
-not stored under `rootfs/` since they are deterministic build artifacts.
+the sysroot at `sysroot/data/svctest/{large.bin, bench.bin}` and
+`sysroot/data/svctest/signed/verified.dat`, the data-role fixture of
+procmgr's verified read, which every pack signs
+([docs/signing.md](../docs/signing.md) § Signing); they are not stored
+under `rootfs/` since they are deterministic build artifacts.
 It also creates `sysroot/crash/` empty, which git cannot carry here: the
 directory crashd writes cores to
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md)).

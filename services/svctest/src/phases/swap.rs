@@ -212,6 +212,8 @@ struct Pool
     store: u64,
     /// `data[10]`: pages of evicted chunks.
     swapped: u64,
+    /// `data[11]`: the growth floor.
+    floor: u64,
 }
 
 impl Pool
@@ -282,6 +284,7 @@ fn pool() -> Pool
         promised: reply.word(8),
         store: reply.word(9),
         swapped: reply.word(10),
+        floor: reply.word(11),
     }
 }
 
@@ -1168,6 +1171,17 @@ fn critical_restore(hog: &mut Hog, authority: u64, process: u64, thread: u64, re
 -> u64
 {
     let status = hog.fill_to_floor();
+    let reserve = status.reserve_pages();
+    let headroom = (status.swapped / PAGE_SIZE).min(reserve);
+    assert!(
+        status.floor / PAGE_SIZE == reserve.saturating_add(headroom)
+            && status.available_pages() <= status.floor / PAGE_SIZE,
+        "{PHASE}: growth stopped at CRITICAL with {} pages available, against a reported \
+         growth floor of {} pages; the reserve of {reserve} pages and {headroom} pages of \
+         restore headroom expected",
+        status.available_pages(),
+        status.floor / PAGE_SIZE
+    );
     assert!(
         !status.short_of_a_chunk(),
         "{PHASE}: growth stopped at CRITICAL with {} pages available against a reserve of {} \

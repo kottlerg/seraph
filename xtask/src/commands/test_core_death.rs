@@ -188,7 +188,7 @@ fn route(target: CoreDeathTarget) -> Route
     const PROCMGR_BIAS: &str = "init: procmgr image bias=";
     match target
     {
-        // memmgr's one thread, in the admission of an allocation the spawn
+        // memmgr's receive loop, in the admission of an allocation the spawn
         // charges. A function the release build keeps out of line, as it
         // does not `memmgr::select`.
         CoreDeathTarget::Memmgr => Route::Hardware(Breakpoint {

@@ -342,6 +342,8 @@ struct Hog
     /// Pages held.
     pages: u64,
     peaks: Peaks,
+    /// The label and first three words of memmgr's last refusal of a grant.
+    refusal: (u64, [u64; 3]),
 }
 
 impl Hog
@@ -357,6 +359,7 @@ impl Hog
             grants,
             pages: 0,
             peaks: Peaks::default(),
+            refusal: (0, [0; 3]),
         }
     }
 
@@ -369,6 +372,7 @@ impl Hog
         let reply = memmgr_call(&req, "REQUEST_MEMORY_CAPS");
         if reply.label != memmgr_errors::SUCCESS
         {
+            self.refusal = (reply.label, [reply.word(0), reply.word(1), reply.word(2)]);
             return false;
         }
         let (counts, ids) = ipc::memmgr_grant_layout(&reply)
@@ -506,11 +510,16 @@ impl Hog
                 start.elapsed() < FILL_BOUND,
                 "{PHASE}: a grant of a page refused with the level at {} (0 normal, 1 low, 2 \
                  critical) after {FILL_BOUND:?} of taking grants: {} pages available against a \
-                 reserve of {}, {} pages held",
+                 reserve of {} and a growth floor of {} pages, {} pages held in {} grants; the \
+                 refusal's label {:#x} and words {:?}",
                 status.level,
                 status.available_pages(),
                 status.reserve_pages(),
-                self.pages
+                status.floor / PAGE_SIZE,
+                self.pages,
+                self.grants.len(),
+                self.refusal.0,
+                self.refusal.1
             );
             // The level is read again at memmgr's next turn, and pages may
             // have come free meanwhile.

@@ -309,7 +309,7 @@ sysroot/
   services/               # Long-running userspace components sourced
                           # from services/ in the repo tree (init,
                           # procmgr, memmgr, devmgr, vfsd, svcmgr, logd,
-                          # pwrmgr, timed).
+                          # pwrmgr, timed, entropyd).
   services/drivers/       # Device drivers sourced from
                           # services/drivers/<x>/ (the
                           # InstallDest::ServicesDrivers entries in

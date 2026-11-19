@@ -58,7 +58,7 @@ enum InstallDest
     /// Installed under `sysroot/services/<install_name>`. Holds the
     /// non-driver, non-fs userspace components sourced from
     /// `services/<x>/` (init, procmgr, memmgr, devmgr, vfsd, svcmgr,
-    /// logd, pwrmgr, acpid, timed).
+    /// logd, pwrmgr, acpid, timed, entropyd).
     Services,
     /// Installed under `sysroot/services/drivers/<install_name>`.
     /// Holds device drivers sourced from `services/drivers/<x>/`
@@ -383,6 +383,13 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "timed",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Services,
+        arch_only: None,
+    },
+    Spec {
+        name: "entropyd",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::Services,

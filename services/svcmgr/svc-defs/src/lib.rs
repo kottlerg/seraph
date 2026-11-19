@@ -138,6 +138,30 @@ pub fn shutdown_actuator(defs: &[Definition]) -> Option<usize>
     defs.iter().position(|d| d.shutdown_actuator.is_some())
 }
 
+/// Keep [`Definition::entropy_authority`] on the first definition, in
+/// `defs`' order, that sets it, and clear it on every later one, calling
+/// `on_extra` with each definition it clears before clearing it. svcmgr
+/// passes its scan in launch order, so one service holds the entropy
+/// authority, and every later declaration is a configuration error, launched
+/// without the cap. Returns the index of the holder, `None` when no
+/// definition sets the key.
+pub fn keep_one_entropy_holder(
+    defs: &mut [Definition],
+    mut on_extra: impl FnMut(&Definition),
+) -> Option<usize>
+{
+    let holder = defs.iter().position(|d| d.entropy_authority)?;
+    for def in defs.iter_mut().skip(holder.saturating_add(1))
+    {
+        if def.entropy_authority
+        {
+            on_extra(def);
+            def.entropy_authority = false;
+        }
+    }
+    Some(holder)
+}
+
 /// Put `defs` in launch order: providers (a non-empty
 /// [`Definition::provides`]) ahead of pure consumers, so a provided name is
 /// published before any consumer launched in the same scan resolves it; each
@@ -256,7 +280,8 @@ pub enum NamespaceShape
 #[expect(
     clippy::struct_excessive_bools,
     reason = "each bool is one independent `yes | no` recipe key: `critical`, `log_sink`, \
-              `debug_authority`, `oom_stop`, `stop_authority` and `reserve`"
+              `debug_authority`, `oom_stop`, `stop_authority`, `entropy_authority` and \
+              `reserve`"
 )]
 pub struct Definition
 {
@@ -339,6 +364,14 @@ pub struct Definition
     /// service endpoint and delivers it in the bootstrap slot after the
     /// `seed` caps and the debug-authority cap. Exclusive of `log_sink`.
     pub stop_authority: bool,
+    /// `entropy_authority = yes` endows the service with the kernel's
+    /// entropy-contribution authority: svcmgr derives a copy of its
+    /// `EntropyControl` source carrying `Contribute` and delivers it in the
+    /// bootstrap slot after the `seed` caps, the debug-authority cap and the
+    /// stop-authority cap. One service holds it: [`keep_one_entropy_holder`]
+    /// clears the key on every later declaration in launch order. Exclusive of
+    /// `log_sink`. A core role ([`stop::core_role`]).
+    pub entropy_authority: bool,
     /// `reserve = yes` creates the service in the system reserve
     /// (`procmgr_labels::CREATE_RESERVE`, [`create_flags`]), on its launch
     /// and on every restart, so it may take the pages memmgr keeps in reserve.
@@ -437,6 +470,55 @@ mod tests
         assert_eq!(shutdown_actuator(&defs), Some(1));
         assert_eq!(shutdown_actuator(&[recipe("a", false)]), None);
         assert_eq!(shutdown_actuator(&[]), None);
+    }
+
+    /// A recipe named `name` that sets `entropy_authority` to `holds`.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`holds` is the recipe's entropy_authority key"
+    )]
+    fn entropy(name: &str, holds: bool) -> Definition
+    {
+        let value = if holds { "yes" } else { "no" };
+        let contents = format!(
+            "binary = /services/x\nrestart = on_failure\ncritical = no\nnamespace = none\n\
+             entropy_authority = {value}\n"
+        );
+        parse::parse(name, &contents).expect("valid recipe")
+    }
+
+    // A second holder would be a second contributor the design does not have:
+    // every declaration after the first loses the key, and each is reported.
+    #[test]
+    fn only_the_first_entropy_authority_declaration_keeps_the_key()
+    {
+        let mut defs = [
+            entropy("a", false),
+            entropy("b", true),
+            entropy("c", false),
+            entropy("d", true),
+            entropy("e", true),
+        ];
+        let mut extra = Vec::new();
+        let holder = keep_one_entropy_holder(&mut defs, |def| extra.push(def.name.clone()));
+        assert_eq!(holder, Some(1));
+        assert_eq!(extra, ["d", "e"]);
+        let kept: Vec<bool> = defs.iter().map(|d| d.entropy_authority).collect();
+        assert_eq!(kept, [false, true, false, false, false]);
+    }
+
+    #[test]
+    fn no_entropy_authority_declaration_leaves_no_holder()
+    {
+        let mut defs = [entropy("a", false), entropy("b", false)];
+        assert_eq!(
+            keep_one_entropy_holder(&mut defs, |_| panic!("no extra")),
+            None
+        );
+        assert_eq!(
+            keep_one_entropy_holder(&mut [], |_| panic!("no extra")),
+            None
+        );
     }
 
     /// A recipe named `name` providing the names `provides` (a consumer when

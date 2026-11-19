@@ -19,6 +19,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`pwrmgr/`](pwrmgr/README.md) | Power manager — platform shutdown and reboot |
 | [`acpid/`](acpid/README.md) | ACPI service — runs the firmware's AML and pushes each PCI host bridge's `_OSC`, windows and routes to devmgr |
 | [`timed/`](timed/README.md) | Wall-clock service over the devmgr-resolved RTC |
+| [`entropyd/`](entropyd/README.md) | Entropy contributor — mixes the `hwrng` class drivers' bytes into the kernel entropy pool, with no credit |
 | [`sessiond/`](sessiond/README.md) | Operator-session supervisor — creates each session's leader for the interface that opens it, ends the session with its leader, and offers oomd the stop of its programs |
 | [`oomd/`](oomd/README.md) | Out-of-memory policy service — stops a service that opted in to being stopped when memory stays critical |
 | [`usertest/`](usertest/README.md) | Programs-surface test orchestrator |

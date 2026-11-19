@@ -154,7 +154,7 @@ svcmgr/
   re-spawn the service from the recorded recipe. The `.svc` file is the
   single source of truth for both launch and restart — fixed fields on
   `ServiceEntry`, the argv/env/cwd/seed, the log-sink, debug-authority,
-  stop-authority, `oom_stop` and `reserve` flags, the `stop_source`
+  stop-authority, entropy-authority, `oom_stop` and `reserve` flags, the `stop_source`
   class, and the scheduling fields on a parallel `RestartRecipe` — so a restart reproduces the
   first-launch surfaces
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Recipe storage).
@@ -219,7 +219,8 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
 `seed`, `provides`, `log_sink`, `shutdown_actuator`, `debug_authority`,
-`stop_authority`, `oom_stop`, `reserve`, `priority`, `sched_max`. Unknown keys are hard
+`stop_authority`, `entropy_authority`, `oom_stop`, `reserve`, `priority`, `sched_max`. Unknown
+keys are hard
 errors. Restart values: `never | on_failure | always`.
 Critical values: `yes | no`. Namespace forms:
 `none | universal | subtree:<path>:<rights>`. `priority` / `sched_max`

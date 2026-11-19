@@ -97,7 +97,7 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR` from the endowment (see
    [svcmgr IPC interface](../svcmgr/docs/ipc-interface.md)); it then
    launches the non-bootstrap services itself — real-logd (the log sink), `timed` and
-   `pwrmgr` (providers), `terminal`, the staged test harnesses — and publishes their
+   `pwrmgr` (providers), `entropyd`, `terminal`, the staged test harnesses — and publishes their
    names (see [svcmgr](../svcmgr/README.md)). The per-arch RTC chip driver is
    spawned lazily by devmgr after `SET_DRIVERS_DIR` (see
    [devmgr responsibilities](../devmgr/docs/responsibilities.md#responsibilities)) and

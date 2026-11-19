@@ -66,6 +66,7 @@ fn stop_facts(state: &SvcmgrState, idx: usize) -> Option<StopFacts>
             key(|r| r.log_sink),
             key(|r| r.debug_authority),
             key(|r| r.stop_authority),
+            key(|r| r.entropy_authority),
             key(|r| r.reserve),
             actuator,
             key(|r| r.stop_source.is_some()),

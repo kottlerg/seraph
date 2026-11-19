@@ -1383,12 +1383,17 @@ pub struct SvcmgrEndowment
     /// and a `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND|GRANT`
     /// cap per launch.
     pub procmgr_death_auth_source: u64,
+    /// The root `EntropyControl` capability the kernel minted into init, or
+    /// `0` when none is described. init derives the endowed `Contribute` copy
+    /// from it in `endow_svcmgr`; svcmgr derives the one
+    /// `entropy_authority = yes` service's copy from that on every launch.
+    pub entropy_root: u64,
 }
 
 /// Start svcmgr, then serve the handover endowment over the bootstrap
 /// protocol.
 ///
-/// The `CAPS` rounds (two rounds for the seven slots) deliver
+/// The `CAPS` rounds (two rounds for the eight slots) deliver
 /// svcmgr's service + bootstrap endpoints (full
 /// rights) and the publish-role source caps: a `SEND` on vfsd's synthetic
 /// root derived from the system-root cap (svcmgr publishes it as
@@ -1399,7 +1404,9 @@ pub struct SvcmgrEndowment
 /// `SET_DRIVERS_DIR` cap from it), plus three SENDs on
 /// vfsd's service endpoint svcmgr publishes seed-only: `MOUNT_AUTHORITY`-badged
 /// (`vfsd.mount`), `DENY_BADGE`-badged (`vfsd.deny`), and
-/// `SWAP_AUTHORITY`-badged (`vfsd.swap`). An absent source
+/// `SWAP_AUTHORITY`-badged (`vfsd.swap`), and an `EntropyControl` copy
+/// carrying `Contribute`, which svcmgr keeps as a source and never
+/// publishes. An absent source
 /// cap is left off its round and its presence bit clear (the
 /// `svcmgr_endowment` encoding), since the kernel refuses a null cap slot.
 ///
@@ -1499,9 +1506,19 @@ fn endow_svcmgr(
     let vfsd_mount = vfsd_send(ipc::vfsd_labels::MOUNT_AUTHORITY);
     let vfsd_deny = vfsd_send(ipc::vfsd_labels::DENY_BADGE);
     let vfsd_swap = vfsd_send(ipc::vfsd_labels::SWAP_AUTHORITY);
+    // EntropyControl source: `Contribute`, the type's one right, so svcmgr
+    // can derive the holder's copy and nothing more.
+    let entropy_source = if endow.entropy_root != 0
+    {
+        syscall::cap_derive(endow.entropy_root, syscall::RIGHTS_ENTROPY_CONTRIBUTE).unwrap_or(0)
+    }
+    else
+    {
+        0
+    };
 
     // The CAPS rounds: the positional slot list [service, bootstrap, rootfs,
-    // devmgr_reg, vfsd_mount, vfsd_deny, vfsd_swap], split over as many
+    // devmgr_reg, vfsd_mount, vfsd_deny, vfsd_swap, entropy], split over as many
     // rounds as it needs, each carrying the present caps of its window, named
     // by its presence word, and the count of CAPS rounds after it. The
     // LOGD_SOURCES round is always terminal, so no earlier round is.
@@ -1513,6 +1530,7 @@ fn endow_svcmgr(
         vfsd_mount,
         vfsd_deny,
         vfsd_swap,
+        entropy_source,
     });
     for caps_round in &caps_rounds
     {
@@ -1668,7 +1686,7 @@ fn end_endowment(bootstrap_ep: u64, child_badge: u64, ipc_buf: *mut u64)
 /// endowment: it publishes the well-known names, installs devmgr's drivers
 /// dir, and launches + supervises the non-bootstrap services. On a normal
 /// boot the defined services are the bind-only substrate plus the
-/// svcmgr-launched services (`logd`, `timed`, `pwrmgr`); svcmgr's
+/// svcmgr-launched services (`logd`, `timed`, `pwrmgr`, `entropyd`, ...); svcmgr's
 /// pure-consumer launch path fires only for staged test recipes (svctest /
 /// usertest, and crasher co-staged with svctest).
 #[expect(
@@ -1721,11 +1739,11 @@ pub fn phase3_svcmgr_handover(
     };
 
     // Serve svcmgr its handover endowment: the CAPS rounds carry svcmgr's own
-    // endpoints plus the publish-role source caps (rootfs root, devmgr
-    // registry, the three vfsd SENDs), then one round per init-bootstrapped
-    // substrate service carries that service's (name, thread_cap, observer)
-    // for death-supervision binding, and the terminal round carries the reserved
-    // log-sink sources. svcmgr drains it all in `bootstrap_caps`, publishes
+    // endpoints plus the source caps (rootfs root, devmgr registry, the three
+    // vfsd SENDs, the EntropyControl source), then one round per
+    // init-bootstrapped substrate service carries that service's (name,
+    // thread_cap, observer) for death-supervision binding, and the terminal
+    // round carries the reserved log-sink sources. svcmgr drains it all in `bootstrap_caps`, publishes
     // the well-known names it owns (`rootfs.root` / `svcmgr` / the `devmgr.*`
     // and `vfsd.*` names), installs devmgr's drivers dir, and reconciles
     // `/config/svcmgr/services/` on HANDOVER_COMPLETE — launching
@@ -1750,6 +1768,7 @@ pub fn phase3_svcmgr_handover(
         vfsd_service_ep,
         master_log_source,
         procmgr_death_auth_source,
+        entropy_root: crate::find_cap_by_type(info, CapType::EntropyControl).unwrap_or(0),
     };
     let svcmgr_endowed = endow_svcmgr(
         bootstrap_ep,

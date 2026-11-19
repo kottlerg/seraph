@@ -143,8 +143,9 @@ pub mod procmgr_labels;
 mod procmgr_debug_client;
 
 pub use procmgr_debug_client::{
-    PENDING_PAUSE_MS, PENDING_TRIES, ResidentStep, make_resident, make_resident_step,
-    read_mem_resident, resident_range,
+    PENDING_PAUSE_MS, PENDING_TRIES, ResidentBound, ResidentStep, make_resident,
+    make_resident_bounded, make_resident_step, read_mem_resident, read_mem_resident_bounded,
+    resident_range,
 };
 
 pub mod sched_policy;

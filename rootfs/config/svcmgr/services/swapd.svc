@@ -1,0 +1,31 @@
+# swapd — the swap service.
+#
+# swapd holds the swap partition, which vfsd hands it (`vfsd.swap`), and
+# moves memmgr's sealed chunks between it and memmgr through the swap labels
+# (`memmgr.swap`): at CRITICAL it writes chunks out of memmgr's compressed
+# store, and it restores each chunk on disk a fault or a debugger's read
+# wants (services/swapd/docs/operation.md). With no swap partition on any
+# disk it logs so and exits cleanly, and swap stays in RAM.
+#
+# `provides` makes svcmgr create swapd's endpoint, which memmgr redirects
+# each fault on a chunk on disk to; svcmgr holds it across restarts, so a
+# fault queued while swapd is down is served by the next instance, which
+# registers again and keeps every chunk on disk. The name is seeded by no
+# recipe; it exists so the endpoint is svcmgr's.
+#
+# `restart = on_failure`, `critical = no`: while swapd is down nothing is
+# written to disk and each fault on a chunk on disk waits; once it is
+# permanently down those faults wait for good, and the system runs degraded,
+# its core in the reserve, which memmgr never evicts.
+#
+# `reserve = yes`: swapd acts to end a pressure episode. It touches its
+# stack and heap at start and allocates nothing after.
+binary    = /services/swapd
+priority  = 20
+sched_max = 20
+restart   = on_failure
+critical  = no
+namespace = none
+provides  = swapd.restore:auth
+seed      = vfsd.swap memmgr.swap
+reserve   = yes

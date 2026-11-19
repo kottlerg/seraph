@@ -109,7 +109,7 @@ devmgr's responsibilities are:
   IOMMU client at once; devmgr logs once, refuses every later `DMA_MAP` of
   every confined device, answers any of its own calls still queued on the
   driver's endpoint from a drain thread, and withdraws every confined device's
-  driver; it restarts nothing ([#262](https://github.com/kottlerg/seraph/issues/262)). See
+  driver; it restarts none of them, nor the IOMMU driver (§ Driver Restart). See
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming).
 
   devmgr binds PCI devices in two passes
@@ -124,7 +124,7 @@ devmgr's responsibilities are:
   specific matches are a conflict that devmgr logs and binds neither of, and a
   declaration's instance limit counts the devices bound to a driver of its
   name in that order.
-  A device is bound at most once a boot, so a drivers-directory declaration
+  A pass binds a device at most once a boot, so a drivers-directory declaration
   never takes a device a boot module's driver holds. The bind
   (`services/devmgr/src/bind.rs`) gives the driver its own service endpoint
   and, from the device's record only
@@ -399,10 +399,10 @@ devmgr's responsibilities are:
   the `SET_DRIVERS_DIR` pass (auxiliary tier, no physical access, no IOMMU
   family key) against the device records still unbound,
   starts the drivers it binds in a settle batch of its own, and serves them once
-  it settles, within `SETTLE_TIMEOUT`. A record is bound at most once a boot, so
-  a second request over the same directory binds nothing; a limited driver's
-  bound devices are counted across passes by driver name (`BoundCounts`), so
-  each pass binds it only to the devices its limit leaves, and a device's
+  it settles, within `SETTLE_TIMEOUT`. A pass binds a record at most once a boot, and none binds
+  it again once its driver is withdrawn, so a second request over the same directory binds
+  nothing; a limited driver's bound devices are counted across passes by driver name
+  (`BoundCounts`), so each pass binds it only to the devices its limit leaves, and a device's
   hotplug removal returns its instance. A request with no directory cap or no
   path, before `SET_DRIVERS_DIR`, or while an earlier one is not done gets
   `INVALID_REQUEST`. A `QUERY_DEVICE` whose answer would name no driver waits
@@ -729,13 +729,126 @@ address-space observer reports that death. A fault of the main thread that is th
 terminal fault posts to both observers; devmgr takes the first post and drops the second, which
 names a driver already dead or withdrawn. An
 exit of the main thread posts only the thread observer, since the kernel fires an address space's
-observers on a terminal fault alone, so neither observer covers the other. Restarting a driver is
-design intent; not yet
-implemented (#1077; the supervision hierarchy is in
+observers on a terminal fault alone, so neither observer covers the other. A served driver that dies
+is restarted as § Driver Restart describes (the supervision hierarchy is in
 [docs/supervision.md](../../../docs/supervision.md)). After
 discovering a device, devmgr requests procmgr to create the driver process and then delegates
 the per-device capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [`drivers/README.md`](../../drivers/README.md) for the driver model.
+
+---
+
+## Driver Restart
+
+devmgr restarts a served driver that dies: it starts the same driver again on the same device
+record, from the driver's installed path, and serves the new instance at its class's next ordinal
+([docs/supervision.md](../../../docs/supervision.md) § Restart Shapes). The policy's decisions are
+pure functions of `services/devmgr/firmware/src/restart.rs`, host-tested there; the restart itself
+is `bind::restart` (`services/devmgr/src/bind.rs`), run by the control thread.
+
+### Restart shape
+
+Every driver bound to a device record serves on an endpoint devmgr creates at the bind; the driver
+is delivered its receive copy, and a client holds a SEND devmgr derives from it at
+`QUERY_DEVICE`, badged with the verbs the client may use
+([`devmgr_labels`](../../../shared/ipc/src/devmgr_labels.rs)). No driver creates an endpoint of
+its own. What a badge names differs:
+
+| Driver | A client's badge names | A client registers |
+|---|---|---|
+| `virtio-blk` | its verbs (`MOUNT_AUTHORITY`); on a partition's SEND, the partition | a partition range, whose badged SEND the driver derives (vfsd) |
+| `virtio-input` | its verbs (`READ_AUTHORITY`) | nothing |
+| `virtio-console` | its verbs | the receive notification (`SERIAL_REGISTER_RX_NOTIFY`) |
+| `virtio-rng` | its verbs (`READ_AUTHORITY`) | nothing |
+| `serial` | its verbs | the receive notification (`SERIAL_REGISTER_RX_NOTIFY`) |
+| `framebuffer` | its verbs (`WRITE_AUTHORITY`) | nothing |
+| `cmos`, `goldfish-rtc` | its verbs (`READ_AUTHORITY`) | nothing |
+| `test-dma`, `test-fault` | nothing | nothing |
+
+Every driver restarts by revoke and re-resolve. The withdrawal of the dead instance revokes its
+endpoint, so every call queued on it and every later call through a client's SEND fails at once,
+whether a restart follows or not; the class's watchers are signalled; and a client resolves the new
+instance at the class's next ordinal (Clients below). A persistent endpoint, kept across instances,
+is used for no driver, the stateless ones included: a caller of such an endpoint whose restart was
+refused or failed would wait on an endpoint no instance receives on, state a client registered
+with the dead instance would be lost without a sign to the client, and the registry's answers would
+stop being final (an ordinal's driver once answered could change).
+
+### When a driver restarts
+
+A restart is considered for the death of a served driver of a class, which devmgr's death watch
+takes (§ Relationship to drivers). No other withdrawal restarts its driver: a hotplug removal's,
+the IOMMU driver's death's (`fail_iommu`), or a settle's withdrawal of a driver that died or did
+not report ready before its batch settled, which was never served. The IOMMU driver itself is never
+restarted ([#1079](https://github.com/kottlerg/seraph/issues/1079)).
+
+The death is restarted when every check passes, in this order:
+
+1. **A fault or a kill.** The exit reason is `EXIT_FAULT_BASE` or above. A driver that exits with
+   a code of its own has decided to stop serving, and is not restarted.
+2. **Not declined.** The driver's consumer has not declined its restart (§ Root disk below).
+3. **Installed.** `SET_DRIVERS_DIR` has installed the drivers directory, and the driver's install
+   path is an entry of it. A boot module is named by its install path
+   ([docs/boot-media.md](../../../docs/boot-media.md)), so a driver of the boot pass restarts from
+   its entry under `/services/drivers/`, never from a boot module or an image kept from boot. A
+   driver started through `BIND_DRIVERS` from another directory is never restarted.
+4. **Quiet.** The withdrawal released the driver's DMA hold, or it held none: its device was
+   confirmed quiet ([docs/device-management.md](../../../docs/device-management.md) § DMA-Safe
+   Teardown). A device that may still write to memory procmgr keeps for it is not handed to a new
+   instance.
+5. **Within the budget.** The record's restart budget has room: `restart_budget::RestartBudget`
+   ([shared/restart-budget](../../../shared/restart-budget/README.md)), `RESTART_BURST` restarts in
+   a `RESTART_WINDOW_NS` window, the bound svcmgr applies to a service, carried from each instance
+   of the record's driver to the next. It stops a driver that dies at once on its device from
+   restarting in a loop; a rarer death always restarts. Only a restart that passes every other
+   check is charged.
+
+The first three are read in the hold of the registry lock that takes the dead driver out, which
+also posts the restart as a registry job, so a `QUERY_DEVICE` from then on that would find no
+driver waits until the restart's settle ends. The last two are read once the withdrawal is done.
+A refused restart is logged with its reason, and the record stays bound with no driver, as a
+withdrawal leaves it.
+
+### How a driver restarts
+
+The control thread runs each restart in a settle batch of its own. It reads the declaration of the
+drivers-directory entry at the dead driver's install path, and starts it only when it declares the
+dead driver's name and interrupt and matches the record under the drivers-directory declaration
+bounds (the auxiliary tier, no physical access, no IOMMU family key): an entry replaced by another
+driver, or by a version that declares another interrupt, is not started in its place. It binds the
+record to the driver as a pass does, which delivers the new instance the device's caps again: a PCI
+device's BARs, carved again from the held BAR pages its withdrawal gave them back to, its interrupt,
+and its DMA grant and IOMMU domain; a platform record's resources, which devmgr cannot carve again
+once released, kept from the dead instance's withdrawal, every copy derived from them revoked, and
+delivered again. Each instance gets a new catalog entry, and so a new device badge, so a late death
+post of the dead instance names no live driver.
+
+The record stays bound throughout, so no drivers-directory, `BIND_DRIVERS` or hotplug pass takes
+it, and the new instance replaces the dead one in its driver's instance count. A restart whose entry
+is missing or unreadable, whose declaration differs, or whose bind fails is logged, and the record
+stays bound with no driver. A new instance that dies or does not report ready before its batch
+settles is withdrawn and not served, as any batch's driver is, and its death is not restarted.
+
+### Clients
+
+A client recovers from a restart the same way every time. Its calls on the dead instance fail once
+the withdrawal revokes the endpoint, `QUERY_DEVICE` answers `WITHDRAWN` at the dead instance's
+ordinal, and its `WATCH_CLASS` watch is signalled at the withdrawal and again when the new
+instance is served. A `QUERY_DEVICE` at the next ordinal (`first_device_from`) then waits for the
+restart's settle and names the new instance, or answers `NO_DEVICE` when the restart was refused or
+failed. A client re-registers with the new instance whatever it registered with the dead one. logd's
+sinks and entropyd re-resolve this way on their class watches.
+
+### Root disk
+
+The driver of the disk the root filesystem sits on is not restarted: its loss is fatal
+([docs/boot-media.md](../../../docs/boot-media.md); vfsd ends on the loss of the root's disk,
+[services/vfsd/docs/namespace-composition.md](../../vfsd/docs/namespace-composition.md) § Driver
+death and device loss). vfsd declines that driver's restart with `DECLINE_RESTART` on its `block`
+class SEND once it has mounted the root, before it serves anything. devmgr marks the served driver,
+and its death is then withdrawn and not restarted. devmgr refuses the request once
+`SET_DRIVERS_DIR` has arrived: from then a restart can happen and reads the mark, so the marks are
+sealed, and no class SEND holder can switch off a driver's restart once restarts are possible.
 
 ---
 

@@ -117,6 +117,13 @@ impl<T> Served<T>
         }
     }
 
+    /// The served driver at `ordinal`, for the caller to change; `None` when
+    /// the ordinal is withdrawn or past the last driver.
+    pub fn get_mut(&mut self, ordinal: usize) -> Option<&mut T>
+    {
+        self.slots.get_mut(ordinal).and_then(|s| s.driver.as_mut())
+    }
+
     /// The ordinals the class has served: its served drivers, withdrawn ones
     /// included, so the first ordinal a later driver takes.
     #[must_use]
@@ -228,6 +235,20 @@ mod tests
         assert_eq!(s.get(0), Lookup::Withdrawn);
         assert_eq!(s.get(1), Lookup::Withdrawn);
         assert_eq!(s.get(2), Lookup::Live(&3));
+    }
+
+    #[test]
+    fn only_a_live_ordinal_is_reached_for_a_change()
+    {
+        let mut s = serving(&[1, 2]);
+        s.withdraw(1);
+        assert_eq!(s.get_mut(0), None);
+        if let Some(d) = s.get_mut(1)
+        {
+            *d = 20;
+        }
+        assert_eq!(s.get(1), Lookup::Live(&20));
+        assert_eq!(s.get_mut(2), None);
     }
 
     #[test]

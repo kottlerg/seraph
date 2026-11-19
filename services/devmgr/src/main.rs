@@ -40,6 +40,7 @@ use firmware::classes::{Classes, MAX_CLASSES, Mismatch};
 use firmware::hotplug::Slot;
 use firmware::lines::{HeldLines, LineError};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
+use firmware::restart::Decline;
 use firmware::roster::{DeathPost, DriverState, Roster};
 use firmware::served::{Lookup, Served};
 use ipc::IpcMessage;
@@ -325,6 +326,15 @@ fn enumerate_records(
     (records, modules, slots, platform_grant)
 }
 
+/// Monotonic time since the first call, in nanoseconds, for the restart
+/// budgets. Saturates rather than wraps.
+fn now_ns() -> u64
+{
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// Start the registry's workers and let them receive: the
 /// [`REGISTRY_WORKERS`] threads of a [`recv_pool::RecvPool`] on the registry
 /// endpoint, each serving its requests with [`Registry::handle`] once it has
@@ -363,7 +373,8 @@ fn start_registry_workers(registry: &Arc<Registry>)
 const REGISTRY_WORKERS: usize = 4;
 
 /// Run the work registry requests left for the control thread, in this
-/// order: the drivers-directory pass and settle, then the on-demand pass and
+/// order: the drivers-directory pass and settle, the restarts of drivers
+/// that died, each in a settle batch of its own, then the on-demand pass and
 /// settle. Each job, once done, is counted settled ([`Registry::finish_job`]),
 /// which releases the queries waiting for it.
 fn run_jobs(
@@ -374,10 +385,11 @@ fn run_jobs(
     ipc_buf: *mut u64,
 )
 {
-    let (jobs, drivers_dir_cap, drivers_dir_path, bind_dir_cap, bind_dir_path) = {
+    let (jobs, restarts, drivers_dir_cap, drivers_dir_path, bind_dir_cap, bind_dir_path) = {
         let mut state = registry.lock();
         (
             core::mem::take(&mut state.jobs),
+            core::mem::take(&mut state.restarts),
             state.drivers_dir_cap,
             state.drivers_dir_path,
             state.bind_dir_cap,
@@ -397,6 +409,23 @@ fn run_jobs(
             ipc_buf,
         );
         registry.log_mismatches();
+        registry.finish_job(|_| ());
+    }
+    if jobs.restart
+    {
+        for source in restarts
+        {
+            restart_driver(
+                source,
+                records,
+                tables,
+                drivers_dir_cap,
+                drivers_dir_path.as_bytes(),
+                watch,
+                registry,
+                ipc_buf,
+            );
+        }
         registry.finish_job(|_| ());
     }
     if jobs.bind
@@ -428,6 +457,10 @@ struct Jobs
     drivers_dir: bool,
     /// The on-demand pass `BIND_DRIVERS` posts and its batch's settle.
     bind: bool,
+    /// The restarts of served drivers that died
+    /// ([`RegistryState::restarts`]) and their batches' settles; posted in
+    /// the hold that takes each death.
+    restart: bool,
 }
 
 /// The absolute path of a directory a request names, as a name block of the
@@ -496,6 +529,9 @@ struct RegistryState
     /// The absolute path of the directory `bind_dir_cap` names; empty when
     /// `bind_dir_cap` is 0.
     bind_dir_path: DirPath,
+    /// The drivers whose restart is admitted and charged, for the restart
+    /// job to start, in death order.
+    restarts: Vec<bind::RestartSource>,
 }
 
 // A class name a `MINT_CLASS_SEND` request can carry is one a declaration
@@ -541,6 +577,13 @@ impl RegistryState
         self.drivers_dir_cap = cap;
         self.drivers_dir_path = *path;
         Registry::post(self, |j| &mut j.drivers_dir)
+    }
+
+    /// The drivers directory's path once `SET_DRIVERS_DIR` has installed it;
+    /// `None` before.
+    fn drivers_dir(&self) -> Option<&[u8]>
+    {
+        (self.drivers_dir_cap != 0).then(|| self.drivers_dir_path.as_bytes())
     }
 
     /// `BIND_DRIVERS`'s state change: keep `cap`, with `path` its absolute
@@ -602,6 +645,7 @@ impl Registry
                 drivers_dir_path: DirPath::EMPTY,
                 bind_dir_cap: 0,
                 bind_dir_path: DirPath::EMPTY,
+                restarts: Vec::new(),
             }),
             settled: Condvar::new(),
             job_note,
@@ -728,10 +772,38 @@ impl Registry
     /// Withdraw the served driver the death `post` names, if any: one a batch
     /// served that has since died. A post for a driver no class serves (one
     /// already withdrawn, or one destroyed when its batch timed out) changes
-    /// nothing.
+    /// nothing. A class's driver is then restarted when
+    /// [`firmware::restart`] admits it: what the death and the registry say
+    /// is read in the hold that takes the driver out, which posts the restart
+    /// job, so a query from then on that would find no driver waits for the
+    /// restart; what the withdrawal left is read once it is done
+    /// ([`Self::admit_restart`]).
     fn withdraw_dead(&self, post: DeathPost, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
     {
-        let taken = self.lock().served.take_dead(post.badge);
+        let (taken, entry) = {
+            let mut state = self.lock();
+            let taken = state.served.take_dead(post.badge);
+            let entry = match &taken
+            {
+                Some((Some(_), driver)) =>
+                {
+                    let path = driver.restart.as_ref().map_or(&[][..], |r| &r.path[..]);
+                    firmware::restart::restart_entry(
+                        post.reason,
+                        driver.declined,
+                        state.drivers_dir(),
+                        path,
+                    )
+                    .map(|_| ())
+                }
+                _ => Err(firmware::restart::Refusal::Exited),
+            };
+            if entry.is_ok()
+            {
+                Self::post(&mut state, |j| &mut j.restart);
+            }
+            (taken, entry)
+        };
         match taken
         {
             // The IOMMU driver's record holds nothing to release.
@@ -744,7 +816,7 @@ impl Registry
                 );
                 self.fail_iommu(held, ipc_buf);
             }
-            Some((Some(class), driver)) =>
+            Some((Some(class), mut driver)) =>
             {
                 std::os::seraph::log!(
                     warn: "{}: served driver of device {} died (reason={:#x}); withdrawn",
@@ -752,11 +824,85 @@ impl Registry
                     post.badge,
                     post.reason
                 );
-                driver.withdraw(held, ipc_buf);
+                // A platform record's caps cannot be carved again once
+                // released, so a restart keeps them, taken from the dead
+                // instance, for the next one.
+                let kept = entry.ok().and_then(|()| driver.platform_caps.take());
+                if let Some(kept) = &kept
+                {
+                    kept.take_from_driver();
+                }
+                let released = driver.withdraw(held, ipc_buf);
+                let restarted = entry.and_then(|()| self.admit_restart(driver, released, kept));
+                match restarted
+                {
+                    Ok(()) => std::os::seraph::log!(
+                        "{}: device {}'s driver restarts",
+                        class.as_str(),
+                        post.badge
+                    ),
+                    Err(why) => std::os::seraph::log!(
+                        warn: "{}: device {}'s driver not restarted: {}",
+                        class.as_str(),
+                        post.badge,
+                        why
+                    ),
+                }
+                if entry.is_ok()
+                {
+                    self.signal_jobs();
+                }
             }
             None =>
             {}
         }
+    }
+
+    /// The second step of a restart [`Self::withdraw_dead`] admitted on the
+    /// death: once `driver` is withdrawn, `released` saying whether its DMA
+    /// hold was released, charge its record's restart budget
+    /// ([`firmware::restart::after_withdrawal`]) and queue it for the
+    /// restart job, with `kept`, a platform record's caps taken from the
+    /// dead instance, which a refusal releases.
+    ///
+    /// # Errors
+    /// The [`firmware::restart::Refusal`].
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`released` is data: what the withdrawal did with the driver's DMA hold"
+    )]
+    fn admit_restart(
+        &self,
+        driver: ServedDriver,
+        released: bool,
+        kept: Option<bind::PlatformDeviceCaps>,
+    ) -> Result<(), firmware::restart::Refusal>
+    {
+        let Some(mut source) = driver.restart
+        else
+        {
+            if let Some(kept) = kept
+            {
+                kept.release();
+            }
+            return Err(firmware::restart::Refusal::NotInstalled);
+        };
+        source.platform = kept;
+        if let Err(why) =
+            firmware::restart::after_withdrawal(released, || source.budget.try_charge(now_ns()))
+        {
+            source.release();
+            return Err(why);
+        }
+        let mut state = self.lock();
+        if state.restarts.try_reserve(1).is_ok()
+        {
+            state.restarts.push(source);
+            return Ok(());
+        }
+        drop(state);
+        source.release();
+        Err(firmware::restart::Refusal::NoMemory)
     }
 
     /// The IOMMU driver died after it enabled translation: fail its client
@@ -927,38 +1073,7 @@ impl Registry
                     ipc_buf,
                 );
             }
-            ipc::devmgr_labels::MINT_CLASS_SEND =>
-            {
-                // Logs nothing, as QUERY_DEVICE does not.
-                if badge & ipc::devmgr_labels::CLASS_AUTHORITY == 0
-                {
-                    reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
-                    return;
-                }
-                if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
-                {
-                    reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-                    return;
-                }
-                let minted = self.lock().mint_class_send(self.endpoint, msg);
-                match minted
-                {
-                    Ok(send) =>
-                    {
-                        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-                            .cap(send)
-                            .build();
-                        // A reply that fails moves no cap: the SEND is
-                        // devmgr's still, and deleted, so no slot leaks.
-                        // SAFETY: ipc_buf is this worker's registered IPC buffer.
-                        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-                        {
-                            let _ = syscall::cap_delete(send);
-                        }
-                    }
-                    Err(code) => reply_status(code, ipc_buf),
-                }
-            }
+            ipc::devmgr_labels::MINT_CLASS_SEND => self.mint_class_send(msg, ipc_buf),
             ipc::devmgr_labels::SET_DRIVERS_DIR => self.set_drivers_dir(msg, ipc_buf),
             ipc::devmgr_labels::QUERY_ACPI_TABLE =>
             {
@@ -994,6 +1109,7 @@ impl Registry
             }
             ipc::devmgr_labels::BIND_DRIVERS => self.bind_drivers(msg, ipc_buf),
             ipc::devmgr_labels::WATCH_CLASS => self.watch_class(msg, ipc_buf),
+            ipc::devmgr_labels::DECLINE_RESTART => self.decline_restart(msg, ipc_buf),
             // QUERY_DEVICE_INFO and DRIVER_READY included: drivers send both
             // on their settle batch's private endpoint, never here.
             _ => reply_status(ipc::devmgr_errors::UNKNOWN_OPCODE, ipc_buf),
@@ -1162,6 +1278,87 @@ impl Registry
         {
             let _ = syscall::cap_delete(copy);
         }
+    }
+
+    /// `MINT_CLASS_SEND`: past its gate (`CLASS_AUTHORITY`) and version
+    /// check, reply the class SEND [`RegistryState::mint_class_send`]
+    /// derives, or its refusal. A reply that fails moves no cap: the SEND is
+    /// devmgr's still, and deleted, so no slot leaks. Logs nothing, as
+    /// `QUERY_DEVICE` does not.
+    fn mint_class_send(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    {
+        if msg.badge & ipc::devmgr_labels::CLASS_AUTHORITY == 0
+        {
+            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            return;
+        }
+        if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+        {
+            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            return;
+        }
+        let minted = self.lock().mint_class_send(self.endpoint, msg);
+        match minted
+        {
+            Ok(send) =>
+            {
+                let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+                    .cap(send)
+                    .build();
+                // SAFETY: ipc_buf is this worker's registered IPC buffer.
+                if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+                {
+                    let _ = syscall::cap_delete(send);
+                }
+            }
+            Err(code) => reply_status(code, ipc_buf),
+        }
+    }
+
+    /// `DECLINE_RESTART`: mark the driver at the requested ordinal of the
+    /// class the caller's class badge names as one whose death is not
+    /// restarted ([`firmware::restart::decline`]), until `SET_DRIVERS_DIR`
+    /// has arrived, from which point a restart can read the mark, so marks
+    /// are sealed and the request refused. Logs nothing, as `QUERY_DEVICE`
+    /// does not.
+    fn decline_restart(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    {
+        let class = ipc::devmgr_labels::class_badge::decode(msg.badge)
+            .map(|(slot, _)| slot)
+            .filter(|&slot| self.lock().served.classes.get_slot(slot).is_some());
+        let Some(slot) = class
+        else
+        {
+            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            return;
+        };
+        if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+        {
+            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            return;
+        }
+        let ordinal = instance_ordinal(msg);
+        let outcome = {
+            let mut state = self.lock();
+            let sealed = state.drivers_dir().is_some();
+            state
+                .served
+                .classes
+                .get_slot_mut(slot)
+                .map_or(Decline::Absent, |served| {
+                    firmware::restart::decline(served, ordinal, sealed, |d| d.declined = true)
+                })
+        };
+        reply_status(
+            match outcome
+            {
+                Decline::Declined => ipc::devmgr_errors::SUCCESS,
+                Decline::Sealed => ipc::devmgr_errors::REFUSED,
+                Decline::Withdrawn => ipc::devmgr_errors::WITHDRAWN,
+                Decline::Absent => ipc::devmgr_errors::NO_DEVICE,
+            },
+            ipc_buf,
+        );
     }
 
     /// `BIND_DRIVERS`: keep the directory cap it carries and the directory's
@@ -2066,6 +2263,11 @@ struct ServedDriver
     /// procmgr holds after its death until devmgr releases it when the
     /// driver performs DMA (`CREATE_DMA_HOLD`); 0 once released.
     process_handle: u64,
+    /// What devmgr restarts the driver from when it dies; `None` for the
+    /// IOMMU driver, and for a driver whose install path could not be kept.
+    restart: Option<bind::RestartSource>,
+    /// Its consumer declined its restart (`DECLINE_RESTART`).
+    declined: bool,
 }
 
 impl ServedDriver
@@ -2074,10 +2276,12 @@ impl ServedDriver
     /// destroy it ([`bind::withdraw_device`]), or destroy a driver with no
     /// such device through its process handle when devmgr still keeps one (a
     /// no-op for one procmgr has reaped); then [`Self::release`], the caps on
-    /// its device's BARs given back to the held BAR pages `held`.
-    fn withdraw(&self, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
+    /// its device's BARs given back to the held BAR pages `held`. Returns
+    /// whether the driver's DMA hold is released: it held none, or its
+    /// device was confirmed quiet and its held memory released.
+    fn withdraw(&self, held: &mut SpanTable<u64>, ipc_buf: *mut u64) -> bool
     {
-        if let Some(dev_caps) = &self.dev_caps
+        let released = if let Some(dev_caps) = &self.dev_caps
         {
             bind::withdraw_device(
                 dev_caps,
@@ -2086,7 +2290,7 @@ impl ServedDriver
                     release_token: dev_caps.release_token,
                 },
                 ipc_buf,
-            );
+            )
         }
         else
         {
@@ -2098,8 +2302,10 @@ impl ServedDriver
             {
                 spawn::destroy_child(self.process_handle, ipc_buf);
             }
-        }
+            true
+        };
         self.release(held);
+        released
     }
 
     /// Release what the registry holds for the driver: revoke its service
@@ -2478,6 +2684,63 @@ fn spawn_dir_drivers(
     let mut roster = Roster::new();
     bind::drivers_dir_pass(
         records,
+        dir_cap,
+        dir_path,
+        carve,
+        &mut bind::Pass {
+            batch: &batch,
+            watch,
+            roster: &mut roster,
+        },
+        ipc_buf,
+    );
+    settle_batch(
+        batch,
+        roster,
+        watch,
+        carve.catalog,
+        registry,
+        &mut carve.caps.slot_bars,
+        settle::SETTLE_TIMEOUT,
+        ipc_buf,
+    );
+}
+
+/// Restart the driver `source` describes in a settle batch of its own, on
+/// the control thread, as the restart job runs it: its drivers-directory
+/// entry read through `dir_cap`, the drivers directory at `dir_path`
+/// ([`bind::restart`]), and the batch settled and served
+/// ([`settle_batch`]), the new instance at its class's next ordinal.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the restart takes its source, the records, the carve tables, the drivers directory's \
+              cap and path, and the watch, registry and IPC buffer its batch settles with"
+)]
+fn restart_driver(
+    source: bind::RestartSource,
+    records: &bind::Records,
+    carve: &mut bind::Carve,
+    dir_cap: u64,
+    dir_path: &[u8],
+    watch: &mut settle::DriverWatch,
+    registry: &Registry,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(batch) = settle::SettleBatch::new()
+    else
+    {
+        std::os::seraph::log!(
+            warn: "{}: no settle batch; not restarted",
+            source.name.as_str()
+        );
+        source.release();
+        return;
+    };
+    let mut roster = Roster::new();
+    bind::restart(
+        records,
+        source,
         dir_cap,
         dir_path,
         carve,

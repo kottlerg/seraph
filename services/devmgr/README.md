@@ -27,7 +27,8 @@ devmgr/
 │                                   #   PCI device records (states, appends, INTx routes),
 │                                   #   acpid's side (region policy, configuration access,
 │                                   #   per-bridge results), PCI Express hotplug (slots,
-│                                   #   control grant, poller decisions, BAR placement)
+│                                   #   control grant, poller decisions, BAR placement),
+│                                   #   the driver restart policy
 ├── platform/                       # Platform description tables, one `<machine>.platform` each
 ├── src/
 │   ├── main.rs                     # Bootstrap, the registry's workers and control thread,
@@ -72,8 +73,8 @@ devmgr parses firmware tables, enumerates PCI devices, binds and spawns drivers,
 registry, brokers ACPI tables to acpid and the RISC-V shutdown cap to pwrmgr, and adds the functions
 a card brings to a PCI Express hotplug slot, one it controls natively or one whose firmware's events
 acpid posts, and withdraws and removes them when the card leaves; it is the sole authority for
-spawning device drivers. Each responsibility, the capabilities devmgr receives at bootstrap, and its
-relationship to driver processes are specified in
+spawning device drivers, and restarts a served driver that dies. Each responsibility, the
+capabilities devmgr receives at bootstrap, and its relationship to driver processes are specified in
 [docs/responsibilities.md](docs/responsibilities.md); the system-scope design is
 [docs/device-management.md](../../docs/device-management.md).
 

@@ -125,8 +125,9 @@ booted included: vfsd starts `fatfs` from the bundle for the root mount alone an
 constraint), and devmgr starts a driver from its bundle copy in its IOMMU and boot passes alone, and
 from the root filesystem in every later pass, a hot-added device's included
 ([driver-binding.md](driver-binding.md) § Declaration Bounds, Source). A
-restart of a driver or a filesystem driver ([#1077](https://github.com/kottlerg/seraph/issues/1077),
-[#1078](https://github.com/kottlerg/seraph/issues/1078)) is a later start.
+restart of a driver by devmgr ([devmgr responsibilities § Driver
+Restart](../services/devmgr/docs/responsibilities.md#driver-restart)) or of a filesystem driver
+([#1078](https://github.com/kottlerg/seraph/issues/1078)) is a later start.
 
 Loss of what the root filesystem stands on is fatal: the root filesystem's driver and the driver
 of the disk under it are never restarted, and the root is not remounted in a running system. No
@@ -134,8 +135,8 @@ image is kept from boot for a restart, since a copy kept for that purpose would 
 copy, kept in memory for the life of the system, that no update of the installed file reaches.
 vfsd ends on the death of the root mount's driver or the loss of its disk, and its death is
 system death ([storage.md](storage.md) § Failure and Revocation Invariants;
-[supervision.md](supervision.md) § Core Set and System Death); the restarts of
-[#1077](https://github.com/kottlerg/seraph/issues/1077) and
+[supervision.md](supervision.md) § Core Set and System Death); devmgr's restart of a driver
+(vfsd declines it for the root disk's driver) and the restart of
 [#1078](https://github.com/kottlerg/seraph/issues/1078) exclude both drivers.
 
 ---

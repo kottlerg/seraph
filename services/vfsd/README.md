@@ -117,8 +117,11 @@ vfsd/
   down and the path falls through to the root filesystem (no restart,
   #1078); a disk devmgr withdrew is marked removed and each mount on it
   torn down as a forced unmount; the loss of the root mount's driver or
-  disk ends vfsd, and svcmgr shuts the system down. Fall-through calls
-  to the root filesystem are bounded (10 s, answered `IoError`). See
+  disk ends vfsd, and svcmgr shuts the system down. Once the root is
+  mounted, vfsd sends `DECLINE_RESTART` on the `block` class SEND for
+  the root disk's ordinal, so devmgr does not restart that disk's driver.
+  Fall-through calls to the root filesystem are bounded (10 s, answered
+  `IoError`). See
   [`docs/namespace-composition.md`](docs/namespace-composition.md#driver-death-and-device-loss).
   On both paths a vfsd logging at any level but info creates the
   driver with its own level as the driver's `SERAPH_LOG` env entry, so

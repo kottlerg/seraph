@@ -414,8 +414,8 @@ fn record_shutdown_actuator(
 /// Routed here, not left to the death queues, so a log sink that died is
 /// restarted before svcmgr's next lines and a restart's instance runs before
 /// the services launched after it. The death posts of the dead instance carry
-/// an instance already routed, and are dropped. A one-shot service that died
-/// so is logged.
+/// an instance already routed, and are dropped. A service that died so,
+/// one-shot or supervised, is logged at once ([`log_boot_death`]).
 fn handle_definition(
     def: &Definition,
     role: launch::Role,

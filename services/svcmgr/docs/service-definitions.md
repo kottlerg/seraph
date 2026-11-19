@@ -340,12 +340,17 @@ present, history pulled from init-logd per the
 from the endowment or not published (slots 3 and 4 when no class file configured the class), or
 whose derive fails, is absent from the round; logd requires only `cap[0]`.
 svcmgr holds the master-log source for the system's life, so the round also
-drives every restart (`cap[1]` absent, history pull skipped), each relaunched logd
+drives every restart (`cap[1]` absent and the history pull skipped once an
+instance has taken all its bootstrap rounds; present, with the pull, on a
+restart before that), each relaunched logd
 re-attaching a fresh RECV to the same endpoint object every sender already
 targets, with `restart` and `critical` behaving as for any other service. On a
 `log_sink` service's death svcmgr writes no line before the respawn, since no
 logd receives until then, and writes the death's lines once the new instance
-runs ([restart-protocol.md](restart-protocol.md#supervision-hierarchy)).
+runs ([restart-protocol.md](restart-protocol.md#supervision-hierarchy)). The
+one exception is a first launch that dies before its bootstrap request, whose
+`died during its bootstrap` line svcmgr writes at once, since init-logd still
+receives on the endpoint then ([restart-protocol.md](restart-protocol.md#death-detection)).
 
 ```
 binary    = /services/logd

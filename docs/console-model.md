@@ -100,7 +100,9 @@ direct console paths remain as fallbacks for the life of the system.
    then `LOG_CALL_UNANSWERED_TIMEOUT_MS` once one of the process's calls has gone unanswered, per
    [shared/log](../shared/log/README.md)), and a line no logd takes within it is dropped; the kernel
    panic console remains the guaranteed output path for any fault in that window. svcmgr writes no
-   line of logd's death before the respawn, so none of its own waits on those bounds, and procmgr
+   line of logd's death before the respawn, so none of its own waits on those bounds (but for a
+   first launch's death before its bootstrap request, which init-logd, still serving, receives),
+   and procmgr
    takes a restarted logd's `REGISTER_DEATH_EQ` in place of the dead instance's, per [svcmgr
    restart protocol](../services/svcmgr/docs/restart-protocol.md) § Supervision hierarchy.
 

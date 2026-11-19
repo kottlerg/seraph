@@ -34,9 +34,9 @@ use syscall_abi::PAGE_SIZE;
 use crate::bootstrap::Caps;
 use crate::phases::heap_commit::{
     CHUNK_PAGES, HOG_BALLAST_BYTES, HOG_BALLAST_FAILED, HOG_MARGIN_PAGES, HOG_MAX_ROUNDS,
-    HOG_NOT_COMMITTED, HOG_STATUS_FAILED, POOL_POLLS, POOL_WINDOWS, children_charge,
-    children_reclaimed, commit_to_margin, expect_region_reply, memmgr_label, own_usage,
-    pool_totals, settled_totals, totals_settle_to, touch_committed,
+    HOG_NOT_COMMITTED, HOG_STATUS_FAILED, POOL_POLLS, POOL_WINDOWS, children_reclaimed,
+    commit_to_margin, expect_region_reply, memmgr_label, own_usage, pool_totals, touch_committed,
+    windows_settle,
 };
 use crate::runner::Phase;
 
@@ -118,9 +118,7 @@ fn discard_range_phase(caps: &Caps)
          frames to the pool in any of {POOL_WINDOWS} windows"
     );
     uncommitted_region();
-    let settled = (0..POOL_WINDOWS).any(|_| {
-        let children = children_charge();
-        let before = settled_totals();
+    windows_settle("the discard children", |children| {
         run_child(
             DISCARD_HOG_ROLE,
             "the discard hog",
@@ -145,13 +143,7 @@ fn discard_range_phase(caps: &Caps)
             ),
         );
         children_reclaimed(children, "the heap-release child");
-        totals_settle_to(before)
     });
-    assert!(
-        settled,
-        "memmgr's free and promised totals did not return to their levels after the discard \
-         children in any of {POOL_WINDOWS} windows"
-    );
     crate::phases::memmgr::ram_accounted_identity_phase(caps);
     std::os::seraph::log!("memmgr_discard_range phase passed");
 }

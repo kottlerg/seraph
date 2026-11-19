@@ -131,20 +131,12 @@ const RECLAIM_TIMEOUT: Duration = Duration::from_secs(120);
 fn heap_commit_phase(caps: &Caps)
 {
     region_resize();
-    let settled = (0..POOL_WINDOWS).any(|_| {
-        let children = children_charge();
-        let before = settled_totals();
+    windows_settle("the heap-commit children", |children| {
         run_limited_child();
         children_reclaimed(children, "the heap-commit limited child");
         run_hog();
         children_reclaimed(children, "the heap-commit hog");
-        totals_settle_to(before)
     });
-    assert!(
-        settled,
-        "memmgr's free and promised totals did not return to their levels after the \
-         heap-commit children in any of {POOL_WINDOWS} windows"
-    );
     crate::phases::memmgr::ram_accounted_identity_phase(caps);
     std::os::seraph::log!("memmgr_heap_commit phase passed");
 }
@@ -175,28 +167,63 @@ pub(crate) fn pool_totals() -> Option<(u64, u64, u64)>
 
 /// memmgr's free and promised totals in pages, once its deferred list has
 /// settled ([`budget::settled_pool_free`]).
-pub(crate) fn settled_totals() -> (u64, u64)
+fn settled_totals() -> (u64, u64)
 {
     let _ = budget::settled_pool_free();
     let (free, promised, _) = pool_totals().expect("QUERY_POOL_STATUS failed");
     (free, promised)
 }
 
-/// Whether memmgr's free and promised totals read `level` within
+/// Wait until memmgr's free and promised totals read `level`, within
 /// [`POOL_POLLS`] polls, each after a recheck of memmgr's deferred list.
-pub(crate) fn totals_settle_to(level: (u64, u64)) -> bool
+/// `Err` carries the totals the last poll read.
+fn totals_settle_to(level: (u64, u64)) -> Result<(), (u64, u64)>
 {
+    let mut last = level;
     for _ in 0..POOL_POLLS
     {
         crate::phases::memmgr::recheck_deferred();
         let (free, promised, _) = pool_totals().expect("QUERY_POOL_STATUS failed");
         if (free, promised) == level
         {
-            return true;
+            return Ok(());
         }
+        last = (free, promised);
         std::thread::yield_now();
     }
-    false
+    Err(last)
+}
+
+/// Run `window` in up to [`POOL_WINDOWS`] windows, until memmgr's free and
+/// promised totals return after one to the levels they read before it
+/// ([`settled_totals`], [`totals_settle_to`]). `window` takes what memmgr
+/// charged svctest's descendants before it ([`children_charge`]). Panics,
+/// naming `what`, when no window settles, stating the last window's levels
+/// and the totals it read last, so the failure shows which total missed and
+/// by how many pages.
+pub(crate) fn windows_settle(what: &str, mut window: impl FnMut(u64))
+{
+    let mut missed = ((0, 0), (0, 0));
+    for _ in 0..POOL_WINDOWS
+    {
+        let children = children_charge();
+        let before = settled_totals();
+        window(children);
+        match totals_settle_to(before)
+        {
+            Ok(()) => return,
+            Err(last) => missed = (before, last),
+        }
+    }
+    let ((free, promised), (last_free, last_promised)) = missed;
+    panic!(
+        "memmgr's free and promised totals did not return to their levels after {what} in \
+         any of {POOL_WINDOWS} windows: the last window's levels were {free} free and \
+         {promised} promised pages, and it read last {last_free} free ({:+}) and \
+         {last_promised} promised ({:+})",
+        i128::from(last_free).wrapping_sub(i128::from(free)),
+        i128::from(last_promised).wrapping_sub(i128::from(promised))
+    );
 }
 
 /// What memmgr charges svctest's descendants, in pages: the subtree count of

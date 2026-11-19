@@ -34,8 +34,9 @@ The shape mirrors the README's "Bootstrap caps" table:
 Every (re)launch mints `cap[0]` fresh from svcmgr's persistent master-log
 source, so a restarted logd re-attaches its RECV to the same endpoint
 object every sender already targets. Only `cap[1]` differs across the two
-paths: present on the first launch (one-shot history pull from init-logd),
-absent on a restart (history pull skipped, fresh table served), per svcmgr's
+paths: present on the first launch, and on a restart while no instance has
+taken all its bootstrap rounds (one-shot history pull from init-logd);
+absent on a later restart (history pull skipped, fresh table served), per svcmgr's
 [`restart-protocol.md`](../../svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy.
 
@@ -52,7 +53,7 @@ that class's watch; `cap[1]` is deleted after the handover release.
 | logd's receive workers | `RECV` | each receives on the endpoint with `ipc_recv` (§ Receive pool) |
 | every userspace sender | `SEND` (badged) | `STREAM_BYTES`, `STREAM_RECORD`, `STREAM_REGISTER_NAME` |
 | a service that seeds `logd.query` | `SEND` badged `LOG_QUERY_AUTHORITY` | `QUERY_SLOTS`, `QUERY_HISTORY` (§ Queries) |
-| real-logd on its first launch | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a restart |
+| real-logd on its first launch, or on a restart before an instance has taken all its bootstrap rounds | `SEND` (un-badged) | single-use `HANDOVER_PULL` drain to init-logd, then `HANDOVER_RELEASE` (a failed call retried for up to `RELEASE_RETRY_BUDGET_US` (1 s); repeated after a further drain while init-logd defers it), then deleted via `cap_delete` whether or not it was acked. Absent (`cap[1]` reads as `0`) on a later restart |
 
 ## Labels accepted
 

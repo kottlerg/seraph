@@ -54,8 +54,8 @@ driver_binding::driver_declaration!(Declaration {
 });
 
 /// A round request whose low 16 label bits are not `bootstrap::REQUEST`
-/// (`1`), so devmgr's `serve_round` rejects it with `INVALID` and the spawn
-/// fails mid-bootstrap.
+/// (`1`), so devmgr's `serve_round_watched` rejects it with `INVALID` and
+/// the spawn fails mid-bootstrap.
 const BAD_ROUND_LABEL: u64 = 0x7E57_0000;
 
 /// The PCI index of the BAR whose length selects the role.

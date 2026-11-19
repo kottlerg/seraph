@@ -532,43 +532,6 @@ pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
     unsafe { crate::ipc_reply(&msg, ipc_buf) }
 }
 
-/// Receive one bootstrap request, verify the sender's badge, and reply
-/// with the given round.
-///
-/// Blocks until a [`REQUEST`] arrives on `bootstrap_ep`. If the badge
-/// embedded in the received cap does not match `expected_badge`, replies with
-/// [`bootstrap_errors::NO_CHILD`] and returns `Err`. If the label is not
-/// [`REQUEST`], replies with [`bootstrap_errors::INVALID`] and returns `Err`.
-/// Otherwise, replies with the round (caps + data + done flag). A child that
-/// dies before its request leaves this wait without end; a creator that must
-/// go on then serves with [`serve_round_watched`].
-///
-/// # Safety
-/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
-///
-/// # Errors
-/// * `Err(bootstrap_errors::NO_CHILD)` — unexpected badge.
-/// * `Err(bootstrap_errors::INVALID)` — protocol error.
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`done` is the round's terminal flag, sent in the reply label"
-)]
-pub unsafe fn serve_round(
-    bootstrap_ep: u64,
-    expected_badge: u64,
-    ipc_buf: *mut u64,
-    done: bool,
-    caps: &[u64],
-    data: &[u64],
-) -> Result<(), u64>
-{
-    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
-    let request =
-        unsafe { crate::ipc_recv(bootstrap_ep, ipc_buf) }.map_err(|_| bootstrap_errors::INVALID)?;
-    // SAFETY: same invariant.
-    unsafe { answer_request(&request, expected_badge, ipc_buf, done, caps, data) }
-}
-
 /// The interval, in milliseconds, at which a creator's watched wait for a
 /// child's bootstrap request ([`serve_round_watched`]) reads whether the
 /// child has died. A tuning value that bounds no capacity: a request wakes the
@@ -614,19 +577,27 @@ pub fn thread_cap_death(thread_cap: u64) -> Option<u64>
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ServeFailure
 {
-    /// The round failed as [`serve_round`] fails, the child still alive: the
-    /// [`bootstrap_errors`] code.
+    /// The round failed, the child still alive: the [`bootstrap_errors`]
+    /// code, `NO_CHILD` when the request received was another child's, which
+    /// was refused, so the named child's request is still pending, and
+    /// `INVALID` otherwise, a failed reply that has already woken the child
+    /// with an error included.
     Refused(u64),
     /// The child died before the round reached it: its exit reason, as the
     /// caller's liveness check read it.
     ChildDied(u64),
 }
 
-/// [`serve_round`] for a child that can die before its request: the wait for
-/// the request is a receive bounded at `poll_ms` milliseconds, and after each
-/// one that expires `child_death` is read, which gives the child's exit
-/// reason once it has died and `None` while it lives. A dead child ends the
-/// wait. A round that fails is read against `child_death` as well, so a child
+/// Receive one bootstrap request on `bootstrap_ep` and answer it with the
+/// round (caps, data and the `done` flag) when its badge is `expected_badge`
+/// and its label [`REQUEST`]. A request with another badge is answered
+/// [`bootstrap_errors::NO_CHILD`], and one with another label
+/// [`bootstrap_errors::INVALID`]; either fails the round.
+///
+/// The child can die before its request, so the wait for the request is a
+/// receive bounded at `poll_ms` milliseconds, and after each one that expires
+/// `child_death` is read, which gives the child's exit reason once it has died
+/// and `None` while it lives. A dead child ends the wait. A round that fails is read against `child_death` as well, so a child
 /// that died after its request, before the reply reached it, is a death and
 /// not a refusal. A live child that sends no request is waited for without
 /// end, `poll_ms` at a time.
@@ -640,15 +611,15 @@ pub enum ServeFailure
 /// # Errors
 /// * `Err(ServeFailure::ChildDied(reason))` — the child died before the round
 ///   reached it.
-/// * `Err(ServeFailure::Refused(code))` — the round failed as
-///   [`serve_round`]'s does, with its code, and the child lives.
+/// * `Err(ServeFailure::Refused(code))` — the round failed, with its
+///   [`bootstrap_errors`] code, and the child lives.
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "`done` is the round's terminal flag, sent in the reply label"
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "serve_round's six, and the poll interval and the liveness check the watch adds"
+    reason = "the round's six, and the poll interval and the liveness check the watch adds"
 )]
 pub unsafe fn serve_round_watched(
     bootstrap_ep: u64,

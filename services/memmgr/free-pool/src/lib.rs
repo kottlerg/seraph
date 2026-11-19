@@ -25,11 +25,13 @@ pub mod arena;
 pub mod budget;
 pub mod chunk;
 pub mod commit;
+pub mod compress;
 pub mod deferred;
 pub mod index;
 pub mod ledger;
 pub mod pool;
 pub mod pressure;
+pub mod store;
 
 pub use arena::{
     Arena, ArenaLayout, Commitment, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node,
@@ -42,7 +44,10 @@ pub use chunk::{ChunkEntry, ChunkError, ChunkState};
 pub use commit::{CommitNeed, PT_DONATION_PAGES};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
-pub use ledger::{BackError, Commit, Ledger, RegionError, ResizeError};
+pub use ledger::{
+    BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SwapError,
+    Victim,
+};
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 pub use pressure::{PRESSURE_BAND_DIVISOR, PRESSURE_LOW_DIVISOR, PressureLevel, pressure_level};
 
@@ -79,6 +84,20 @@ pub struct DemandRegion
     pub va_base: u64,
     pub len: u64,
     pub prot: u64,
+    /// Whether memmgr may evict the region's chunks.
+    pub evict: Evict,
+}
+
+/// Whether memmgr may evict a demand region's chunks into the compressed store
+/// (`services/memmgr/docs/memory-pool.md` § Eviction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Evict
+{
+    /// Its cold chunks are evicted under memory pressure, unless its process
+    /// is a reserve node's or the region is committed.
+    Allowed,
+    /// Registered no-evict: its chunks stay resident.
+    Never,
 }
 
 /// Whether `region`'s protection grants a fault's `access`, the
@@ -185,6 +204,7 @@ mod tests
             va_base: 0x1000,
             len: 0x1000,
             prot,
+            evict: Evict::Allowed,
         };
         let ro = region(MAP_READ);
         let rw = region(MAP_READ | MAP_WRITABLE);
@@ -234,6 +254,7 @@ mod tests
             va_base: 0x10000,
             len: 0x10_0000,
             prot: 0,
+            evict: Evict::Allowed,
         };
         let chunk_bytes = u64::from(DEMAND_CHUNK_PAGES) * PAGE_SIZE;
         // A fault at the region base maps to the first full chunk.
@@ -289,6 +310,7 @@ mod tests
             va_base: 0x10000,
             len: pages * PAGE_SIZE,
             prot: 0,
+            evict: Evict::Allowed,
         };
         assert_eq!(chunk_count(&region(0)), 0);
         assert_eq!(chunk_count(&region(1)), 1);
@@ -304,6 +326,7 @@ mod tests
             va_base: 0x10000,
             len: 5 * PAGE_SIZE,
             prot: 0,
+            evict: Evict::Allowed,
         };
         assert_eq!(chunk_for(&region, 0x10000), (0x10000, 5));
     }

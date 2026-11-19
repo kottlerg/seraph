@@ -26,7 +26,9 @@ memmgr/
 │                               # arena, free pool, deferred list, process
 │                               # index, budget nodes, region logic,
 │                               # per-region chunk tables, commitment
-│                               # bounds (`commit.rs`)
+│                               # bounds (`commit.rs`), the compressed
+│                               # store's page codec and chunk stream
+│                               # (`compress.rs`, `store.rs`)
 ├── src/
 │   └── main.rs                 # _start() entry point, IPC dispatch loop
 └── docs/

@@ -27,6 +27,13 @@
 //! and deferred runs charged to it ([`crate::budget`]), and the commitment of
 //! each committed region of its records.
 //!
+//! A chunk evicted into the compressed store keeps its charge: its runs return
+//! to the free pool charged to no node, its stream's store runs are counted in
+//! `store_pages` and held on its entry, and its pages in `swapped_pages` and the
+//! process's swapped count, until a restore maps it again or a teardown frees
+//! its store and releases the charge (`services/memmgr/docs/memory-pool.md`
+//! § Eviction).
+//!
 //! A committed region is charged its whole length and its page-table
 //! reservation when it is committed or extended, and its runs are charged
 //! nothing more when they are backed; the ledger counts in `promised` the pages
@@ -39,16 +46,17 @@ use crate::arena::{
     NodeIdx, ProcessCaps, ProcessRecord, RegionNode, Slot, SlotStore,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
-use crate::chunk::{self, ChunkEntry, ChunkError};
+use crate::chunk::{self, ChunkEntry, ChunkError, ChunkState};
 use crate::commit::{self, CommitNeed};
 use crate::deferred::{DeferredList, RecheckBudget};
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
 use crate::{
-    DemandRegion, FreeRun, chunk_count, chunk_for, chunk_index, region_contains, regions_overlap,
+    CHUNK_BYTES, DEMAND_CHUNK_PAGES, DemandRegion, Evict, FreeRun, chunk_count, chunk_for,
+    chunk_index, region_contains, regions_overlap,
 };
 
-use syscall_abi::PAGE_SIZE;
+use syscall_abi::{MAX_HARVEST_PAGES, PAGE_SIZE};
 
 /// Why registering a region failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +121,80 @@ pub enum BackError
     Chunk(ChunkError),
 }
 
+/// Why an eviction or restore step ([`Ledger::begin_evict`],
+/// [`Ledger::cancel_evict`], [`Ledger::finish_evict`],
+/// [`Ledger::restore_chunk`]) changed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapError
+{
+    /// The record slot named holds no record, the region slot no region of
+    /// it, or the page lies outside the region.
+    NoRegion,
+    /// The chunk may not be evicted: its region is committed or registered
+    /// no-evict, or its process's budget node is a reserve node.
+    Ineligible,
+    /// The chunk's entry refused the transition ([`ChunkEntry`]).
+    Chunk(ChunkError),
+    /// The chunk is not evicting under the job slot named: the eviction the
+    /// job was posted for was cancelled, or its chunk torn down.
+    Stale,
+    /// The runs given for a restore do not cover exactly the chunk's backed
+    /// pages, or leave the chunk, or overlap.
+    Runs,
+    /// The arena has fewer free slots outside its reserve than the step's
+    /// list nodes.
+    NoSlot,
+}
+
+/// Chunks one harvest of a [`Ledger::sweep`] covers: as many as
+/// `MAX_HARVEST_PAGES` pages hold, so a span is one harvest call.
+pub const SWEEP_SPAN_CHUNKS: u64 = MAX_HARVEST_PAGES / DEMAND_CHUNK_PAGES as u64;
+
+/// Bytes of the accessed bitmap of one span.
+const SPAN_BITMAP_BYTES: usize = (MAX_HARVEST_PAGES / 8) as usize;
+
+/// Where the eviction clock's sweep ([`Ledger::sweep`]) goes on: the badge of
+/// the process it reached, and the address in that process's regions it
+/// sweeps from. A hand whose process is gone starts again at the first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClockHand
+{
+    badge: Option<u64>,
+    va: u64,
+}
+
+/// A chunk a sweep found cold ([`ChunkEntry::is_cold`]) in an eligible
+/// region: the record and region slots, and the chunk's base.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Victim
+{
+    pub rec: NodeIdx,
+    pub reg: NodeIdx,
+    pub page_base: u64,
+}
+
+/// The state of one [`Ledger::sweep`]: the harvest, the victims written, and
+/// the steps left of its budget.
+struct Sweep<'a, H>
+{
+    harvest: H,
+    victims: &'a mut [Victim],
+    found: usize,
+    left: u64,
+}
+
+/// What a teardown released from the chunks it freed ([`retire_entry`]).
+#[derive(Clone, Copy, Default)]
+struct Released
+{
+    /// Pages of the runs taken back.
+    run_pages: u64,
+    /// Pages of the swapped chunks freed, still charged.
+    swapped: u64,
+    /// Store pages returned to the pool.
+    store: u64,
+}
+
 /// How many matching frames [`Ledger::return_frames_where`] moves.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Take
@@ -137,6 +219,11 @@ pub struct Ledger<S, W>
     /// not drawn, and what the arena's growth has not drawn of their metadata
     /// bounds ([`crate::commit`]).
     promised: u64,
+    /// Pool pages the compressed store holds: the store runs of every swapped
+    /// chunk.
+    store_pages: u64,
+    /// Pages of every swapped chunk, which the store holds compressed.
+    swapped_pages: u64,
 }
 
 impl<S: SlotStore, W: WordStore> Ledger<S, W>
@@ -149,7 +236,33 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             deferred: DeferredList::new(),
             index: ProcessIndex::new(words),
             promised: 0,
+            store_pages: 0,
+            swapped_pages: 0,
         }
+    }
+
+    /// Pool pages the compressed store holds, which count in `pool_total`
+    /// beside the free pool, the deferred runs, the records' frames and the
+    /// metadata.
+    #[must_use]
+    pub const fn store_pages(&self) -> u64
+    {
+        self.store_pages
+    }
+
+    /// Pages of the swapped chunks of every process.
+    #[must_use]
+    pub const fn swapped_pages(&self) -> u64
+    {
+        self.swapped_pages
+    }
+
+    /// Pages of the swapped chunks of the record `rec`, which its budget node
+    /// stays charged for; 0 for a slot that holds no record.
+    #[must_use]
+    pub fn swapped_of(&self, rec: NodeIdx) -> u64
+    {
+        self.caps(rec).map_or(0, |c| c.swapped)
     }
 
     /// Pages the committed regions can still take from the pool
@@ -323,6 +436,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             pressure_bits: 0,
             handles: NODE_NULL,
             limits: NODE_NULL,
+            swapped: 0,
         });
         let Some(caps) = self.arena.alloc(no_caps, NODE_NULL)
         else
@@ -1237,7 +1351,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
         let charged = self.record(rec).ok_or(ResizeError::NoRegion)?.budget;
         let height = chunk::table_height(chunk_count(&node.region));
-        let mut run_pages: u64 = 0;
+        let mut released = Released::default();
         {
             let Self {
                 arena,
@@ -1245,14 +1359,25 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 deferred,
                 ..
             } = self;
-            chunk::truncate(arena, &mut node.table, height, keep, |arena, idx, frame| {
-                run_pages = run_pages.saturating_add(u64::from(frame.page_count));
-                retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
+            chunk::truncate(arena, &mut node.table, height, keep, |arena, entry| {
+                retire_entry(
+                    arena,
+                    pool,
+                    deferred,
+                    entry,
+                    charged,
+                    &mut quiescent,
+                    &mut released,
+                );
             });
         }
+        self.settle(rec, charged, released);
         let cut = commit::grow_need(new_len, old_len);
-        // The runs cut lay in the pages cut, so their pages are at most those.
-        let unbacked = cut.pages.saturating_sub(run_pages);
+        // The chunks cut lay in the pages cut, so the pages that held data, in
+        // runs or in the store, are at most those.
+        let unbacked = cut
+            .pages
+            .saturating_sub(released.run_pages.saturating_add(released.swapped));
         let meta = cut.meta.min(c.meta_left);
         node.region = new_region;
         self.arena.set_node(reg, Node::Region(node));
@@ -1352,8 +1477,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// the region's bound rising by it, at most to [`commit::meta_bound`] of
     /// its length). A refault of a discarded page is then admitted from
     /// `promised` as its first touch was, so it is declined for neither budget
-    /// nor RAM. A range that holds no run changes nothing, so a repeat is safe.
-    /// Returns the pages of the runs taken back.
+    /// nor RAM. A swapped chunk, which only an uncommitted region holds, frees
+    /// its store to the free pool and its pages' charge ([`Ledger::settle`]).
+    /// A range that holds no run changes nothing, so a repeat is safe.
+    /// Returns the pages that held data: those of the runs taken back and of
+    /// the swapped chunks freed.
     ///
     /// # Errors
     /// As [`Ledger::discard_region`]. Nothing changes then.
@@ -1382,7 +1510,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             budget
         };
         let height = chunk::table_height(chunk_count(&region));
-        let mut run_pages: u64 = 0;
+        let mut released = Released::default();
         let cleared = {
             let Self {
                 arena,
@@ -1396,13 +1524,22 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 height,
                 offset / crate::CHUNK_BYTES,
                 end.div_ceil(crate::CHUNK_BYTES),
-                |arena, idx, frame| {
-                    run_pages = run_pages.saturating_add(u64::from(frame.page_count));
-                    retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
+                |arena, entry| {
+                    retire_entry(
+                        arena,
+                        pool,
+                        deferred,
+                        entry,
+                        charged,
+                        &mut quiescent,
+                        &mut released,
+                    );
                 },
             )
         };
         self.arena.set_node(reg, Node::Region(node));
+        self.settle(rec, charged, released);
+        let run_pages = released.run_pages.saturating_add(released.swapped);
         if let Some(c) = committed
         {
             let meta_left = c
@@ -1663,6 +1800,516 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Ok(())
     }
 
+    /// Whether the chunks of region `reg` of the record `rec` may be evicted:
+    /// the region is uncommitted and not registered no-evict, and the
+    /// record's budget node is not a reserve node, whose process frees memory
+    /// under exhaustion and must not wait on a restore to do so
+    /// (`services/memmgr/docs/memory-pool.md` § Eviction). A committed chunk is
+    /// not evicted: evicting it frees no page outside `promised`.
+    #[must_use]
+    pub fn evictable(&self, rec: NodeIdx, reg: NodeIdx) -> bool
+    {
+        let (Some(r), Some(node)) = (self.record(rec), self.region_node(reg))
+        else
+        {
+            return false;
+        };
+        self.commit_at(node.commit).is_none()
+            && node.region.evict == Evict::Allowed
+            && budget::node(&self.arena, r.budget).is_some_and(|b| !b.reserve())
+    }
+
+    /// The region node `reg` of `rec` and the chunk holding `page_base` in it:
+    /// the region, its table's height, the chunk's index and its entry.
+    fn swap_chunk(
+        &self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        page_base: u64,
+    ) -> Result<(RegionNode, u32, u64, ChunkEntry), SwapError>
+    {
+        let r = self.record(rec).ok_or(SwapError::NoRegion)?;
+        let mut cur = r.region_head;
+        while cur != reg
+        {
+            if self.region_node(cur).is_none()
+            {
+                return Err(SwapError::NoRegion);
+            }
+            cur = self.arena.get(cur).next;
+        }
+        let node = self.region_node(reg).ok_or(SwapError::NoRegion)?;
+        if !region_contains(node.region.va_base, node.region.len, page_base)
+        {
+            return Err(SwapError::NoRegion);
+        }
+        let height = chunk::table_height(chunk_count(&node.region));
+        let index = chunk_index(&node.region, page_base);
+        Ok((
+            node,
+            height,
+            index,
+            chunk::entry(&self.arena, node.table, height, index),
+        ))
+    }
+
+    /// Write `entry`, the new entry of a chunk that has a leaf, into the table
+    /// of the region `reg`, whose node is `node`. A chunk with a leaf takes no
+    /// slot, so the write does not fail.
+    fn put_chunk(
+        &mut self,
+        reg: NodeIdx,
+        mut node: RegionNode,
+        height: u32,
+        index: u64,
+        entry: ChunkEntry,
+    )
+    {
+        let written = chunk::set_entry(&mut self.arena, &mut node.table, height, index, entry);
+        debug_assert!(written, "a chunk with a leaf took a slot");
+        self.arena.set_node(reg, Node::Region(node));
+    }
+
+    /// Start evicting the resident chunk holding `page_base` in region `reg` of
+    /// `rec` under the job slot `job` ([`ChunkEntry::begin_evict`]), once the
+    /// caller has unmapped it from the process: its runs stay on its entry
+    /// until [`Ledger::finish_evict`] stores it or a fault cancels it
+    /// ([`Ledger::cancel_evict`]). Returns the evicting entry, whose runs the
+    /// caller hands the compression worker.
+    ///
+    /// # Errors
+    /// [`SwapError::NoRegion`], [`SwapError::Ineligible`] when the region's
+    /// chunks may not be evicted ([`Ledger::evictable`]), and
+    /// [`SwapError::Chunk`] for a chunk that is not resident, or is pinned.
+    /// Nothing changes then.
+    pub fn begin_evict(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        page_base: u64,
+        job: u8,
+    ) -> Result<ChunkEntry, SwapError>
+    {
+        let (node, height, index, entry) = self.swap_chunk(rec, reg, page_base)?;
+        if !self.evictable(rec, reg)
+        {
+            return Err(SwapError::Ineligible);
+        }
+        let evicting = entry.begin_evict(job).map_err(SwapError::Chunk)?;
+        self.put_chunk(reg, node, height, index, evicting);
+        Ok(evicting)
+    }
+
+    /// A fault on the evicting chunk holding `page_base` in region `reg` of
+    /// `rec`, whose runs the caller mapped into the process again: the chunk is
+    /// resident, and its eviction's job, when it completes, is stale
+    /// ([`Ledger::finish_evict`]). Returns the resident entry.
+    ///
+    /// # Errors
+    /// [`SwapError::NoRegion`], and [`SwapError::Chunk`] for a chunk that is
+    /// not evicting. Nothing changes then.
+    pub fn cancel_evict(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        page_base: u64,
+    ) -> Result<ChunkEntry, SwapError>
+    {
+        let (node, height, index, entry) = self.swap_chunk(rec, reg, page_base)?;
+        let resident = entry.cancel_evict().map_err(SwapError::Chunk)?;
+        self.put_chunk(reg, node, height, index, resident);
+        Ok(resident)
+    }
+
+    /// Finish the eviction the job slot `job` holds of the chunk holding
+    /// `page_base` in region `reg` of `rec`, whose stream the caller wrote into
+    /// the pool runs `store`, in order: the chunk is swapped with `store` as
+    /// its store runs (none for the empty stream), and each of its runs, which
+    /// the caller has unmapped everywhere, is taken back, pooled or deferred as
+    /// `quiescent` decides, charged to no node, since the record's budget node
+    /// stays charged for the chunk's pages. `store_pages` rises by the store
+    /// runs' pages, and `swapped_pages` and the record's swapped count by the
+    /// chunk's backed pages. Returns the pages of the runs taken back.
+    ///
+    /// # Errors
+    /// [`SwapError::NoRegion`], [`SwapError::Stale`] when the chunk is not
+    /// evicting under `job` (a fault cancelled the eviction, or a teardown
+    /// freed the chunk), and [`SwapError::NoSlot`] when the arena has fewer
+    /// free slots outside its reserve than `store` has runs. Nothing changes
+    /// then, and `store` stays the caller's.
+    pub fn finish_evict(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        page_base: u64,
+        job: u8,
+        store: &[FreeRun],
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> Result<u64, SwapError>
+    {
+        let (node, height, index, entry) = self.swap_chunk(rec, reg, page_base)?;
+        if entry.job() != Some(job)
+        {
+            return Err(SwapError::Stale);
+        }
+        let count = u64::try_from(store.len()).map_err(|_| SwapError::NoSlot)?;
+        if self.arena.available() < count
+        {
+            return Err(SwapError::NoSlot);
+        }
+        let mut head = NODE_NULL;
+        let mut store_pages: u64 = 0;
+        for run in store.iter().rev()
+        {
+            // The check above left a free slot for every run.
+            head = self
+                .arena
+                .alloc(Node::Run(*run), head)
+                .ok_or(SwapError::NoSlot)?;
+            store_pages = store_pages.saturating_add(run.page_count);
+        }
+        let swapped = entry.finish_evict(head).map_err(SwapError::Chunk)?;
+        let mut run_pages: u64 = 0;
+        {
+            let Self {
+                arena,
+                pool,
+                deferred,
+                ..
+            } = self;
+            chunk::take_runs(arena, entry, |arena, idx, frame| {
+                run_pages = run_pages.saturating_add(u64::from(frame.page_count));
+                retire(
+                    arena,
+                    pool,
+                    deferred,
+                    idx,
+                    &frame,
+                    NODE_NULL,
+                    &mut quiescent,
+                );
+            });
+        }
+        self.put_chunk(reg, node, height, index, swapped);
+        let pages = u64::from(entry.backed().count_ones());
+        self.store_pages = self.store_pages.saturating_add(store_pages);
+        self.swapped_pages = self.swapped_pages.saturating_add(pages);
+        self.update_caps(rec, |c| c.swapped = c.swapped.saturating_add(pages));
+        Ok(run_pages)
+    }
+
+    /// Call `f` with each run of the chunk `entry` holds, resident or
+    /// evicting, in list order: the runs a cancelled eviction maps again, and
+    /// the compression worker reads.
+    pub fn for_each_run(&self, entry: ChunkEntry, mut f: impl FnMut(&FrameDesc))
+    {
+        let mut run = entry.runs();
+        while let Node::Frame(frame) = self.arena.get(run).node
+        {
+            f(&frame);
+            run = self.arena.get(run).next;
+        }
+    }
+
+    /// Call `f` with each store run of the swapped chunk `entry`, in the order
+    /// its stream fills them: the runs a restore reads.
+    pub fn for_each_store_run(&self, entry: ChunkEntry, mut f: impl FnMut(&FreeRun))
+    {
+        let mut run = entry.store().unwrap_or(NODE_NULL);
+        while let Node::Run(r) = self.arena.get(run).node
+        {
+            f(&r);
+            run = self.arena.get(run).next;
+        }
+    }
+
+    /// Restore the swapped chunk holding `page_base` in region `reg` of `rec`
+    /// onto `runs`, which the caller filled with the chunk's pages and mapped
+    /// into the process: the chunk is resident on them, its store runs return
+    /// to the free pool, and `store_pages`, `swapped_pages` and the record's
+    /// swapped count fall. The runs are charged nothing: the budget node
+    /// stayed charged for the chunk's pages while they were swapped. Returns
+    /// the store pages freed.
+    ///
+    /// # Errors
+    /// [`SwapError::NoRegion`], [`SwapError::Chunk`] for a chunk that is not
+    /// swapped, [`SwapError::Runs`] when `runs` do not cover exactly the
+    /// chunk's backed pages, each inside the chunk and none over another, and
+    /// [`SwapError::NoSlot`] when the arena has fewer free slots outside its
+    /// reserve than `runs`. Nothing changes then, and `runs` stay the
+    /// caller's.
+    pub fn restore_chunk(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        page_base: u64,
+        runs: &[FrameDesc],
+    ) -> Result<u64, SwapError>
+    {
+        let (node, height, index, entry) = self.swap_chunk(rec, reg, page_base)?;
+        entry.restore(NODE_NULL).map_err(SwapError::Chunk)?;
+        let (chunk_base, _) = chunk_for(&node.region, page_base);
+        // The runs back the chunk's pages exactly when backing an empty chunk
+        // with each in turn accepts every one and yields the chunk's mask.
+        let mut cover = ChunkEntry::UNBACKED;
+        for run in runs
+        {
+            let offset = run
+                .va
+                .checked_sub(chunk_base)
+                .filter(|o| o.is_multiple_of(PAGE_SIZE))
+                .ok_or(SwapError::Runs)?;
+            let first = u32::try_from(offset / PAGE_SIZE).map_err(|_| SwapError::Runs)?;
+            cover = cover
+                .back(first, run.page_count, NODE_NULL)
+                .map_err(|_| SwapError::Runs)?;
+        }
+        if cover.backed() != entry.backed()
+        {
+            return Err(SwapError::Runs);
+        }
+        let count = u64::try_from(runs.len()).map_err(|_| SwapError::NoSlot)?;
+        if self.arena.available() < count
+        {
+            return Err(SwapError::NoSlot);
+        }
+        let mut head = NODE_NULL;
+        for run in runs.iter().rev()
+        {
+            // The check above left a free slot for every run.
+            head = self
+                .arena
+                .alloc(Node::Frame(*run), head)
+                .ok_or(SwapError::NoSlot)?;
+        }
+        let resident = entry.restore(head).map_err(SwapError::Chunk)?;
+        let mut store_pages: u64 = 0;
+        {
+            let Self { arena, pool, .. } = self;
+            chunk::take_store(arena, entry, |arena, idx, run| {
+                store_pages = store_pages.saturating_add(run.page_count);
+                pool.push_node(arena, idx);
+            });
+        }
+        self.put_chunk(reg, node, height, index, resident);
+        let pages = u64::from(entry.backed().count_ones());
+        self.store_pages = self.store_pages.saturating_sub(store_pages);
+        self.swapped_pages = self.swapped_pages.saturating_sub(pages);
+        self.update_caps(rec, |c| c.swapped = c.swapped.saturating_sub(pages));
+        Ok(store_pages)
+    }
+
+    /// Account what a teardown of chunks of the record `rec` released
+    /// ([`retire_entry`]): the swapped pages' charge on the budget node
+    /// `charged`, which no run carried, and the store's and the swapped counts.
+    fn settle(&mut self, rec: NodeIdx, charged: NodeIdx, released: Released)
+    {
+        budget::uncharge(&mut self.arena, charged, released.swapped);
+        self.store_pages = self.store_pages.saturating_sub(released.store);
+        self.swapped_pages = self.swapped_pages.saturating_sub(released.swapped);
+        self.update_caps(rec, |c| {
+            c.swapped = c.swapped.saturating_sub(released.swapped);
+        });
+    }
+
+    /// One slice of the eviction clock: from `hand`, sweep at most `budget`
+    /// steps over the chunks of the eligible regions ([`Ledger::evictable`])
+    /// of every process with a delegated address space, in record order and,
+    /// within a record, in address order, and write each chunk found cold into
+    /// `victims` until it is full. A step is a chunk swept, or a region or
+    /// record passed; a span read is swept whole, so a slice passes `budget`
+    /// by at most one span's chunks. Each span of up to [`SWEEP_SPAN_CHUNKS`] chunks from a
+    /// chunk that has an entry is read with one call of `harvest(aspace, va,
+    /// pages, bitmap)`, which reads and clears the accessed bit of each of the
+    /// `pages` pages from `va` into `bitmap` (page `i` is bit `i % 8` of byte
+    /// `i / 8`) and returns `false` when it could not, which passes the
+    /// region over for this sweep. Each resident chunk of the span with an
+    /// entry is aged by it ([`ChunkEntry::sweep`]). Returns the victims
+    /// written. A slice ends at the end of a pass, with the hand at the first
+    /// record, so no slice sweeps a chunk twice and successive slices visit
+    /// every eligible chunk in turn.
+    pub fn sweep(
+        &mut self,
+        hand: &mut ClockHand,
+        budget: u64,
+        harvest: impl FnMut(u64, u64, u64, &mut [u8]) -> bool,
+        victims: &mut [Victim],
+    ) -> usize
+    {
+        let found = hand.badge.and_then(|b| self.find(b)).or_else(|| {
+            hand.va = 0;
+            self.next_record(None)
+        });
+        let Some(mut rec) = found
+        else
+        {
+            *hand = ClockHand::default();
+            return 0;
+        };
+        let mut s = Sweep {
+            harvest,
+            victims,
+            found: 0,
+            left: budget,
+        };
+        while s.left > 0
+        {
+            s.left = s.left.saturating_sub(1);
+            let aspace = self.aspace_cap(rec);
+            let reg = (aspace != 0)
+                .then(|| self.region_from(rec, hand.va))
+                .flatten();
+            let Some((reg, node)) = reg
+            else
+            {
+                // The record is done: on to the next. Past the last, the pass is
+                // done and the slice ends with the hand at the first.
+                hand.va = 0;
+                if let Some(next) = self.next_record(Some(rec))
+                {
+                    rec = next;
+                    continue;
+                }
+                if let Some(first) = self.next_record(None)
+                {
+                    rec = first;
+                }
+                break;
+            };
+            hand.va = self.sweep_region(&mut s, rec, aspace, reg, node, hand.va);
+        }
+        hand.badge = self.record(rec).map(|r| r.badge);
+        s.found
+    }
+
+    /// One step of [`Ledger::sweep`] in the region `reg` of `rec`, whose node
+    /// is `node`, from `va`: pass the region over when its chunks may not be
+    /// evicted or none from `va` has an entry, else harvest the span from the
+    /// first that has one through `aspace` and sweep each of its chunks.
+    /// Returns where the sweep goes on: past the span, or past the region.
+    fn sweep_region<H: FnMut(u64, u64, u64, &mut [u8]) -> bool>(
+        &mut self,
+        s: &mut Sweep<'_, H>,
+        rec: NodeIdx,
+        aspace: u64,
+        reg: NodeIdx,
+        node: RegionNode,
+        va: u64,
+    ) -> u64
+    {
+        let region_end = node.region.va_base.saturating_add(node.region.len);
+        let height = chunk::table_height(chunk_count(&node.region));
+        let from = chunk_index(&node.region, va.max(node.region.va_base));
+        let first = if self.evictable(rec, reg)
+        {
+            chunk::next_entry(&self.arena, node.table, height, from)
+        }
+        else
+        {
+            None
+        };
+        let Some((first, _)) = first
+        else
+        {
+            return region_end;
+        };
+        let span_end = first
+            .saturating_add(SWEEP_SPAN_CHUNKS)
+            .min(chunk_count(&node.region));
+        let chunk_va = |i: u64| {
+            node.region
+                .va_base
+                .saturating_add(i.saturating_mul(CHUNK_BYTES))
+        };
+        let span_top = chunk_va(span_end).min(region_end);
+        let pages = span_top.saturating_sub(chunk_va(first)) / PAGE_SIZE;
+        let mut bitmap = [0u8; SPAN_BITMAP_BYTES];
+        if !(s.harvest)(aspace, chunk_va(first), pages, &mut bitmap)
+        {
+            return region_end;
+        }
+        // The harvest cleared the span's accessed bits, so every chunk of it
+        // is swept now, whatever is left of the budget: an access it read
+        // and no sweep recorded would be lost.
+        let mut index = first;
+        while let Some((i, entry)) = chunk::next_entry(&self.arena, node.table, height, index)
+            && i < span_end
+        {
+            s.left = s.left.saturating_sub(1);
+            // The chunk lies in the span, whose pages one bitmap holds: its
+            // 16 bits start at a whole byte.
+            let at = usize::try_from(i.saturating_sub(first))
+                .unwrap_or(0)
+                .saturating_mul(2);
+            let accessed = u16::from_le_bytes([
+                bitmap.get(at).copied().unwrap_or(0),
+                bitmap.get(at.saturating_add(1)).copied().unwrap_or(0),
+            ]);
+            let swept = entry.sweep(accessed);
+            if swept != entry
+            {
+                let mut table = node.table;
+                chunk::set_entry(&mut self.arena, &mut table, height, i, swept);
+            }
+            if swept.is_cold()
+                && let Some(v) = s.victims.get_mut(s.found)
+            {
+                *v = Victim {
+                    rec,
+                    reg,
+                    page_base: chunk_va(i),
+                };
+                s.found = s.found.saturating_add(1);
+            }
+            index = i.saturating_add(1);
+        }
+        span_top
+    }
+
+    /// The record after `after` in index order, or the first for `None`;
+    /// `None` past the last, or when `after` is not indexed.
+    fn next_record(&self, after: Option<NodeIdx>) -> Option<NodeIdx>
+    {
+        let mut passed = after.is_none();
+        let mut next = None;
+        self.index.for_each(&self.arena, |idx| {
+            if next.is_some()
+            {
+                return;
+            }
+            if passed
+            {
+                if self.record(idx).is_some()
+                {
+                    next = Some(idx);
+                }
+            }
+            else if Some(idx) == after
+            {
+                passed = true;
+            }
+        });
+        next
+    }
+
+    /// The region of `rec` that holds `va`, else the lowest-based one above
+    /// it, with its slot.
+    fn region_from(&self, rec: NodeIdx, va: u64) -> Option<(NodeIdx, RegionNode)>
+    {
+        let mut best: Option<(NodeIdx, RegionNode)> = None;
+        let mut cur = self.record(rec)?.region_head;
+        while let Some(have) = self.region_node(cur)
+        {
+            let end = have.region.va_base.saturating_add(have.region.len);
+            if end > va && best.is_none_or(|(_, b)| have.region.va_base < b.region.va_base)
+            {
+                best = Some((cur, have));
+            }
+            cur = self.arena.get(cur).next;
+        }
+        best
+    }
+
     /// Unlink the region in slot `reg` from `rec`'s region list and free its
     /// slot and its chunk table, taking each run of the table back, pooled or
     /// deferred as `quiescent` decides. memmgr unmaps the region first, so the
@@ -1692,7 +2339,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 {
                     self.arena.set_next(prev, next);
                 }
-                self.release_region(&have, r.budget, quiescent);
+                self.release_region(&have, rec, r.budget, quiescent);
                 self.arena.free(cur);
                 return Some(have.region);
             }
@@ -1702,9 +2349,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         None
     }
 
-    /// Free every node of the chunk table of the region `node`, taking each
-    /// run back, pooled or deferred as `quiescent` decides, its charge on the
-    /// budget node `charged` ([`retire`]), and, for a committed region,
+    /// Free every node of the chunk table of the region `node` of the record
+    /// `rec`, taking each run back, pooled or deferred as `quiescent` decides,
+    /// its charge on the budget node `charged` ([`retire`]), and each swapped
+    /// chunk's store, its charge released ([`Ledger::settle`]), and, for a
+    /// committed region,
     /// release the rest of its commitment: the charge of its pages that hold no
     /// run and of what is left of its page-table reservation, and its part of
     /// `promised`, what is left of its metadata bound with them; its
@@ -1712,11 +2361,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     fn release_region(
         &mut self,
         node: &RegionNode,
+        rec: NodeIdx,
         charged: NodeIdx,
         mut quiescent: impl FnMut(&FreeRun) -> bool,
     )
     {
-        let mut run_pages: u64 = 0;
+        let mut released = Released::default();
         {
             let Self {
                 arena,
@@ -1724,15 +2374,25 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 deferred,
                 ..
             } = self;
-            chunk::release(arena, node.table, |arena, idx, frame| {
-                run_pages = run_pages.saturating_add(u64::from(frame.page_count));
-                retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
+            chunk::release(arena, node.table, |arena, entry| {
+                retire_entry(
+                    arena,
+                    pool,
+                    deferred,
+                    entry,
+                    charged,
+                    &mut quiescent,
+                    &mut released,
+                );
             });
         }
+        self.settle(rec, charged, released);
         if let Some(c) = self.commit_at(node.commit)
         {
-            // The runs lay in the region, so their pages are at most its own.
-            let unbacked = (node.region.len / PAGE_SIZE).saturating_sub(run_pages);
+            // The chunks lay in the region, so the pages that held data, in
+            // runs or in the store, are at most its own.
+            let unbacked = (node.region.len / PAGE_SIZE)
+                .saturating_sub(released.run_pages.saturating_add(released.swapped));
             let held = unbacked.saturating_add(c.pt_left);
             budget::uncharge(&mut self.arena, charged, held);
             self.promised = self
@@ -1829,7 +2489,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         while let Some(have) = self.region_node(cur)
         {
             let next = self.arena.get(cur).next;
-            self.release_region(&have, r.budget, &mut quiescent);
+            self.release_region(&have, rec, r.budget, &mut quiescent);
             self.arena.free(cur);
             cur = next;
         }
@@ -1900,6 +2560,46 @@ fn retire<S: SlotStore>(
     }
 }
 
+/// Take back what the entry `entry` of a chunk being freed holds, adding it to
+/// `released`: each run of a resident or evicting chunk, as [`retire`] does
+/// with its charge on the budget node `charged`, or each store run of a
+/// swapped chunk, which no process ever reached, to `pool`, the chunk's pages
+/// counted as swapped for [`Ledger::settle`] to release their charge. The
+/// moves need no fresh slot, so they cannot fail.
+fn retire_entry<S: SlotStore>(
+    arena: &mut Arena<S>,
+    pool: &mut FreePool,
+    deferred: &mut DeferredList,
+    entry: ChunkEntry,
+    charged: NodeIdx,
+    quiescent: &mut impl FnMut(&FreeRun) -> bool,
+    released: &mut Released,
+)
+{
+    match entry.state()
+    {
+        ChunkState::Swapped =>
+        {
+            released.swapped = released
+                .swapped
+                .saturating_add(u64::from(entry.backed().count_ones()));
+            chunk::take_store(arena, entry, |arena, idx, run| {
+                released.store = released.store.saturating_add(run.page_count);
+                pool.push_node(arena, idx);
+            });
+        }
+        ChunkState::Unbacked | ChunkState::Resident | ChunkState::Evicting =>
+        {
+            chunk::take_runs(arena, entry, |arena, idx, frame| {
+                released.run_pages = released
+                    .run_pages
+                    .saturating_add(u64::from(frame.page_count));
+                retire(arena, pool, deferred, idx, &frame, charged, quiescent);
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -1966,6 +2666,7 @@ mod tests
             va_base,
             len,
             prot: 0,
+            evict: Evict::Allowed,
         }
     }
 
@@ -2003,6 +2704,7 @@ mod tests
                 pressure_bits: 1,
                 handles: NODE_NULL,
                 limits: NODE_NULL,
+                swapped: 0,
             }
         );
         assert!(l.find(42).is_none());
@@ -2492,7 +3194,7 @@ mod tests
                 pages += match l.commit_at(have.commit)
                 {
                     Some(c) => have.region.len / PAGE_SIZE + c.pt_left,
-                    None => run_pages(l, &have),
+                    None => run_pages(l, &have) + swapped_in(l, &have),
                 };
                 reg = l.arena.get(reg).next;
             }
@@ -2515,6 +3217,17 @@ mod tests
             }
         }
         pages
+    }
+
+    /// The pages of the swapped chunks of the region `have`, which stay charged.
+    fn swapped_in(l: &Ledger<VecStore, VecWords>, have: &RegionNode) -> u64
+    {
+        let height = chunk::table_height(chunk_count(&have.region));
+        (0..chunk_count(&have.region))
+            .map(|c| chunk::entry(&l.arena, have.table, height, c))
+            .filter(|e| e.state() == ChunkState::Swapped)
+            .map(|e| u64::from(e.backed().count_ones()))
+            .sum()
     }
 
     /// What `promised` must equal, walked from every committed region: its
@@ -2755,6 +3468,385 @@ mod tests
             unsafe { l.arena.add_page() };
         }
         l
+    }
+
+    /// The pool's pages wherever they are: free, in the store, in a run a
+    /// record or a chunk holds, or deferred. Every page the tests take comes
+    /// from the pool, so this stays the pool's total. Checks `store_pages`
+    /// against the store runs of every swapped chunk, and `swapped_pages`
+    /// against their pages.
+    fn pool_pages(l: &Ledger<VecStore, VecWords>) -> u64
+    {
+        let mut held = 0;
+        let mut store = 0;
+        let mut swapped = 0;
+        for idx in 0..l.arena.pages() * crate::SLOTS_PER_PAGE
+        {
+            match l.arena.get(idx).node
+            {
+                Node::Frame(f) => held += u64::from(f.page_count),
+                Node::Deferred(d) => held += d.run.page_count,
+                Node::Region(have) =>
+                {
+                    swapped += swapped_in(l, &have);
+                    let height = chunk::table_height(chunk_count(&have.region));
+                    for c in 0..chunk_count(&have.region)
+                    {
+                        l.for_each_store_run(chunk::entry(&l.arena, have.table, height, c), |r| {
+                            store += r.page_count;
+                        });
+                    }
+                }
+                // Free runs count in `free_pages`, store runs on their chunk.
+                Node::Free
+                | Node::Run(_)
+                | Node::Budget(_)
+                | Node::Process(_)
+                | Node::Caps(_)
+                | Node::Commit(_)
+                | Node::Handle(_)
+                | Node::Limit(_)
+                | Node::ChunkDir(_)
+                | Node::Chunk(_) => (),
+            }
+        }
+        assert_eq!(l.store_pages(), store);
+        assert_eq!(l.swapped_pages(), swapped);
+        l.pool.free_pages() + store + held
+    }
+
+    /// A store run of `pages` pages taken from the pool.
+    fn store_run(l: &mut Ledger<VecStore, VecWords>, pages: u32) -> FreeRun
+    {
+        let (cap_slot, pages, phys_base) = take(l, pages, crate::Fit::Contiguous);
+        FreeRun {
+            cap_slot,
+            page_count: u64::from(pages),
+            phys_base,
+        }
+    }
+
+    /// Evict chunk `c` of the region `reg` of `rec` at `BASE` under the job
+    /// slot `job` into a store of `pages` pages taken from the pool.
+    fn swap_out(
+        l: &mut Ledger<VecStore, VecWords>,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        c: u64,
+        job: u8,
+        pages: u32,
+    )
+    {
+        let va = BASE + c * CHUNK;
+        l.begin_evict(rec, reg, va, job).unwrap();
+        let store: Vec<FreeRun> = (pages > 0)
+            .then(|| store_run(l, pages))
+            .into_iter()
+            .collect();
+        l.finish_evict(rec, reg, va, job, &store, pool_all).unwrap();
+    }
+
+    /// A roomy ledger with a record holding an uncommitted region of four
+    /// chunks at `BASE`, the first `backed` backed whole from the pool.
+    fn swap_ledger(backed: u64) -> (Ledger<VecStore, VecWords>, NodeIdx, NodeIdx)
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let reg = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        for c in 0..backed
+        {
+            back_whole(&mut l, rec, reg, c);
+        }
+        (l, rec, reg)
+    }
+
+    #[test]
+    fn an_evicted_chunk_keeps_its_charge_and_a_restore_returns_its_store()
+    {
+        let (mut l, rec, reg) = swap_ledger(2);
+        let total = pool_pages(&l);
+        assert_eq!(usage(&l, rec).0, 32);
+        let resident = l.chunk_at(reg, BASE);
+        let evicting = l.begin_evict(rec, reg, BASE + PAGE_SIZE, 3).unwrap();
+        assert_eq!(evicting.state(), ChunkState::Evicting);
+        assert_eq!(evicting.job(), Some(3));
+        assert_eq!(evicting.runs(), resident.runs());
+        // Refusals change nothing: a chunk already evicting, an unbacked
+        // chunk, a slot that is not the record's region, a page outside it.
+        assert!(matches!(
+            l.begin_evict(rec, reg, BASE, 4),
+            Err(SwapError::Chunk(_))
+        ));
+        assert!(matches!(
+            l.begin_evict(rec, reg, BASE + 2 * CHUNK, 4),
+            Err(SwapError::Chunk(_))
+        ));
+        assert_eq!(l.begin_evict(rec, rec, BASE, 4), Err(SwapError::NoRegion));
+        assert_eq!(
+            l.begin_evict(rec, reg, BASE + 4 * CHUNK, 4),
+            Err(SwapError::NoRegion)
+        );
+        assert_eq!(l.chunk_at(reg, BASE), evicting);
+        // A completion under another job slot is stale.
+        let store = [store_run(&mut l, 2)];
+        assert_eq!(
+            l.finish_evict(rec, reg, BASE, 4, &store, pool_all),
+            Err(SwapError::Stale)
+        );
+        assert_eq!(l.chunk_at(reg, BASE), evicting);
+        // The runs return to the pool; the store holds two pages; the charge
+        // stays.
+        assert_eq!(l.finish_evict(rec, reg, BASE, 3, &store, pool_all), Ok(16));
+        let swapped = l.chunk_at(reg, BASE);
+        assert_eq!(swapped.state(), ChunkState::Swapped);
+        assert_eq!(swapped.backed(), 0xFFFF);
+        assert_eq!(l.store_pages(), 2);
+        assert_eq!(l.swapped_pages(), 16);
+        assert_eq!(l.swapped_of(rec), 16);
+        assert_eq!(usage(&l, rec).0, 32);
+        assert_eq!(pool_pages(&l), total);
+        let mut seen = Vec::new();
+        l.for_each_store_run(swapped, |r| seen.push(*r));
+        assert_eq!(seen, store);
+        // A restore needs runs that back exactly the chunk's pages.
+        let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
+        for bad in [
+            frame(cap, pages, phys, BASE + PAGE_SIZE),
+            frame(cap, pages - 1, phys, BASE),
+            frame(cap, pages, phys, BASE + 0x800),
+            frame(cap, pages, phys, BASE - CHUNK),
+        ]
+        {
+            assert_eq!(
+                l.restore_chunk(rec, reg, BASE, &[bad]),
+                Err(SwapError::Runs),
+                "{bad:?}"
+            );
+        }
+        let halves = [
+            frame(cap, 8, phys, BASE),
+            frame(cap, 8, phys, BASE + 4 * PAGE_SIZE),
+        ];
+        assert_eq!(
+            l.restore_chunk(rec, reg, BASE, &halves),
+            Err(SwapError::Runs)
+        );
+        assert!(matches!(
+            l.restore_chunk(
+                rec,
+                reg,
+                BASE + CHUNK,
+                &[frame(cap, pages, phys, BASE + CHUNK)]
+            ),
+            Err(SwapError::Chunk(_))
+        ));
+        assert_eq!(l.chunk_at(reg, BASE), swapped);
+        assert_eq!(
+            l.restore_chunk(rec, reg, BASE, &[frame(cap, pages, phys, BASE)]),
+            Ok(2)
+        );
+        let back = l.chunk_at(reg, BASE);
+        assert_eq!(back.state(), ChunkState::Resident);
+        assert_eq!(back.backed(), 0xFFFF);
+        let mut runs = Vec::new();
+        l.for_each_run(back, |f| runs.push(f.cap_slot));
+        assert_eq!(runs, [cap]);
+        assert_eq!(l.store_pages(), 0);
+        assert_eq!(l.swapped_pages(), 0);
+        assert_eq!(l.swapped_of(rec), 0);
+        assert_eq!(usage(&l, rec).0, 32);
+        assert_eq!(pool_pages(&l), total);
+    }
+
+    #[test]
+    fn a_fault_cancels_an_eviction_and_a_completion_after_it_or_a_teardown_is_stale()
+    {
+        let (mut l, rec, reg) = swap_ledger(2);
+        let total = pool_pages(&l);
+        let resident = l.chunk_at(reg, BASE);
+        l.begin_evict(rec, reg, BASE, 1).unwrap();
+        assert_eq!(l.cancel_evict(rec, reg, BASE), Ok(resident));
+        assert_eq!(l.chunk_at(reg, BASE), resident);
+        assert!(matches!(
+            l.cancel_evict(rec, reg, BASE),
+            Err(SwapError::Chunk(_))
+        ));
+        let store = [store_run(&mut l, 1)];
+        assert_eq!(
+            l.finish_evict(rec, reg, BASE, 1, &store, pool_all),
+            Err(SwapError::Stale)
+        );
+        // Evicted again under another job, the first job's completion is
+        // still stale.
+        l.begin_evict(rec, reg, BASE, 2).unwrap();
+        assert_eq!(
+            l.finish_evict(rec, reg, BASE, 1, &store, pool_all),
+            Err(SwapError::Stale)
+        );
+        // A discard frees the evicting chunk's runs; its completion is stale.
+        assert_eq!(l.discard_range(rec, BASE, CHUNK, pool_all), Ok(16));
+        assert_eq!(l.chunk_at(reg, BASE), ChunkEntry::UNBACKED);
+        assert_eq!(
+            l.finish_evict(rec, reg, BASE, 2, &store, pool_all),
+            Err(SwapError::Stale)
+        );
+        assert_eq!(usage(&l, rec).0, 16);
+        // An unregister frees the region; a completion then finds none.
+        l.begin_evict(rec, reg, BASE + CHUNK, 3).unwrap();
+        assert!(l.remove_region(rec, reg, pool_all).is_some());
+        assert_eq!(
+            l.finish_evict(rec, reg, BASE + CHUNK, 3, &store, pool_all),
+            Err(SwapError::NoRegion)
+        );
+        assert_eq!(usage(&l, rec).0, 0);
+        assert_eq!(l.store_pages(), 0);
+        // The refused store run stays the caller's.
+        assert_eq!(pool_pages(&l) + store[0].page_count, total);
+    }
+
+    #[test]
+    fn a_teardown_returns_each_swapped_chunks_store_and_releases_its_charge()
+    {
+        let (mut l, rec, reg) = swap_ledger(4);
+        let total = pool_pages(&l);
+        swap_out(&mut l, rec, reg, 0, 1, 1);
+        swap_out(&mut l, rec, reg, 1, 2, 3);
+        // An all-zero chunk is the empty stream, which takes no store page.
+        swap_out(&mut l, rec, reg, 2, 3, 0);
+        assert_eq!(l.store_pages(), 4);
+        assert_eq!(l.swapped_pages(), 48);
+        assert_eq!(usage(&l, rec).0, 64);
+        assert_eq!(pool_pages(&l), total);
+        // A discard of the first chunk.
+        assert_eq!(l.discard_range(rec, BASE, CHUNK, pool_all), Ok(16));
+        assert_eq!(l.store_pages(), 3);
+        assert_eq!(l.swapped_of(rec), 32);
+        assert_eq!(usage(&l, rec).0, 48);
+        assert_eq!(pool_pages(&l), total);
+        // An unregister of the region: the store, the swapped chunks' charge,
+        // and the resident chunk's run.
+        assert!(l.remove_region(rec, reg, pool_all).is_some());
+        assert_eq!(l.store_pages(), 0);
+        assert_eq!(l.swapped_pages(), 0);
+        assert_eq!(l.swapped_of(rec), 0);
+        assert_eq!(usage(&l, rec).0, 0);
+        assert_eq!(pool_pages(&l), total);
+        // A process's teardown frees its swapped chunks' store.
+        let reg = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        back_whole(&mut l, rec, reg, 3);
+        swap_out(&mut l, rec, reg, 3, 4, 2);
+        assert_eq!(l.store_pages(), 2);
+        assert!(l.remove_process(1, pool_all, |_| ()).is_some());
+        assert_eq!(l.store_pages(), 0);
+        assert_eq!(l.swapped_pages(), 0);
+        assert_eq!(pool_pages(&l), total);
+    }
+
+    #[test]
+    fn the_clock_sweeps_only_evictable_chunks_and_reports_the_cold_ones()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        l.set_aspace_cap(rec, 7);
+        let open = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        let committed = l
+            .add_region(rec, region(BASE + 0x100_0000, 4 * CHUNK), Commit::Committed)
+            .unwrap();
+        let pinned = l
+            .add_region(
+                rec,
+                DemandRegion {
+                    evict: Evict::Never,
+                    ..region(BASE + 0x200_0000, 4 * CHUNK)
+                },
+                Commit::Uncommitted,
+            )
+            .unwrap();
+        let reserve = l.insert_process(2, NodeSpec::TOP_RESERVE).unwrap();
+        l.set_aspace_cap(reserve, 8);
+        let boot = l
+            .add_region(reserve, region(BASE, 4 * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        // A process with no delegated address space cannot be harvested.
+        let bare = l.insert_process(3, NodeSpec::TOP).unwrap();
+        let unmapped = l
+            .add_region(bare, region(BASE, 4 * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        for (r, g, va) in [
+            (rec, open, BASE),
+            (rec, open, BASE + 2 * CHUNK),
+            (rec, committed, BASE + 0x100_0000),
+            (rec, pinned, BASE + 0x200_0000),
+            (reserve, boot, BASE),
+            (bare, unmapped, BASE),
+        ]
+        {
+            let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
+            l.back_chunk(r, g, frame(cap, pages, phys, va)).unwrap();
+        }
+        // Only the open region's chunks may be evicted.
+        assert!(l.evictable(rec, open));
+        for (r, g, va) in [
+            (rec, committed, BASE + 0x100_0000),
+            (rec, pinned, BASE + 0x200_0000),
+            (reserve, boot, BASE),
+        ]
+        {
+            assert!(!l.evictable(r, g));
+            assert_eq!(l.begin_evict(r, g, va, 1), Err(SwapError::Ineligible));
+        }
+        // Each harvest reads the open region's span, from its first chunk
+        // with an entry to its end, and sees page 3 of chunk 2 accessed.
+        let calls = core::cell::RefCell::new(Vec::new());
+        let mut harvest = |aspace: u64, va: u64, pages: u64, bitmap: &mut [u8]| {
+            calls.borrow_mut().push((aspace, va, pages));
+            bitmap[(2 * 16 + 3) / 8] |= 1 << ((2 * 16 + 3) % 8);
+            true
+        };
+        let mut hand = ClockHand::default();
+        let mut victims = [Victim::default(); 4];
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims), 0);
+        // The second pass finds chunk 0 cold; chunk 2 stays warm.
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims), 1);
+        assert_eq!(
+            victims[0],
+            Victim {
+                rec,
+                reg: open,
+                page_base: BASE,
+            }
+        );
+        assert_eq!(*calls.borrow(), [(7, BASE, 64); 2]);
+        assert_eq!(l.chunk_at(boot, BASE).state(), ChunkState::Resident);
+        assert!(!l.chunk_at(boot, BASE).is_cold());
+        // A slice of one step harvests one span, sweeps it whole, and leaves
+        // the hand past it; a harvest that fails passes the region over.
+        // A step may pass another record first.
+        calls.borrow_mut().clear();
+        let mut found = 0;
+        for _ in 0..8
+        {
+            found = l.sweep(&mut hand, 1, &mut harvest, &mut victims);
+            if !calls.borrow().is_empty()
+            {
+                break;
+            }
+        }
+        assert_eq!(found, 1);
+        assert_eq!(*calls.borrow(), [(7, BASE, 64)]);
+        assert_eq!(
+            l.sweep(&mut hand, 1000, |_, _, _, _| false, &mut victims),
+            0
+        );
+        // Evicting, the cold chunk is no longer reported.
+        l.begin_evict(rec, open, BASE, 1).unwrap();
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims), 0);
     }
 
     #[test]

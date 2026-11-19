@@ -142,7 +142,7 @@ pub mod procmgr_labels;
 
 mod procmgr_debug_client;
 
-pub use procmgr_debug_client::{make_resident, read_mem_resident};
+pub use procmgr_debug_client::{make_resident, make_resident_step, read_mem_resident};
 
 pub mod sched_policy;
 

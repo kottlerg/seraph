@@ -182,10 +182,7 @@ fn capture(
         .collect();
     // The list holds only mapped pages: first have memmgr restore, with the
     // threads held, what the core keeps first.
-    if !fired(generation)
-    {
-        restore_first(&first, target.process, authority, ipc_buf);
-    }
+    restore_first(&first, target.process, authority, generation, ipc_buf);
     let runs = match list_runs(reader, generation)
     {
         Ok(runs) => runs,
@@ -242,8 +239,10 @@ fn capture(
 /// at most [`CORE_BYTES_MAX`] of pages, and a restore for a process about to
 /// die spends the free pages, and other processes' idle chunks, that memmgr
 /// keeps for restores. A chunk memmgr cannot restore, for want of memory, is
-/// left out of the list, as it is not present.
-fn restore_first(first: &[u64], process: u64, authority: u64, ipc_buf: *mut u64)
+/// left out of the list, as it is not present. Each request is started only
+/// while the dump's generation has not fired, so a dump past its bound starts
+/// no more.
+fn restore_first(first: &[u64], process: u64, authority: u64, generation: u64, ipc_buf: *mut u64)
 {
     let anchors = u64::try_from(first.len()).unwrap_or(u64::MAX);
     let share = CORE_BYTES_MAX
@@ -251,12 +250,26 @@ fn restore_first(first: &[u64], process: u64, authority: u64, ipc_buf: *mut u64)
         .unwrap_or(CORE_BYTES_MAX)
         .max(PAGE_SIZE)
         & !(PAGE_SIZE - 1);
-    for &at in first
+    for &anchor in first
     {
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe {
-            ipc::make_resident(authority, process, at & !(PAGE_SIZE - 1), share, ipc_buf)
-        };
+        let mut at = anchor & !(PAGE_SIZE - 1);
+        let end = at.saturating_add(share);
+        // memmgr does a bounded part of the range per request and replies
+        // where it stopped; a refusal or a reply that made no progress ends
+        // this range.
+        while at < end
+        {
+            if fired(generation)
+            {
+                return;
+            }
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            match unsafe { ipc::make_resident_step(authority, process, at, end, ipc_buf) }
+            {
+                Some(reached) if reached > at => at = reached,
+                _ => break,
+            }
+        }
     }
 }
 

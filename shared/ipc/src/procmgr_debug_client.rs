@@ -49,7 +49,7 @@ pub unsafe fn make_resident(
     loop
     {
         // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-        let Some(reached) = (unsafe { ask_resident(authority, process, at, end, ipc_buf) })
+        let Some(reached) = (unsafe { make_resident_step(authority, process, at, end, ipc_buf) })
         else
         {
             return false;
@@ -66,9 +66,12 @@ pub unsafe fn make_resident(
     }
 }
 
-/// One `MAKE_RESIDENT` request for `[at, end)` of `process`: where procmgr
-/// replied that memmgr stopped, or `None` when the call failed or procmgr
-/// refused.
+/// One `MAKE_RESIDENT` request for `[at, end)` of `process`, through the
+/// debug-authority cap `authority`: where procmgr replied that memmgr
+/// stopped, `end` when the range is done, or `None` when the call failed or
+/// procmgr refused. A caller that bounds its own requests, as crashd bounds a
+/// dump's, drives the loop of [`make_resident`] with this, one request per
+/// step.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -77,7 +80,7 @@ pub unsafe fn make_resident(
     reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
               caller's stack, a std service's thread (crashd, gdbstub), 32 KiB at the smallest"
 )]
-unsafe fn ask_resident(
+pub unsafe fn make_resident_step(
     authority: u64,
     process: u64,
     at: u64,

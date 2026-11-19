@@ -955,8 +955,12 @@ snapshotting — exist only if a manager sits on the fault path of most processe
 default pager to all ordinary processes is a userspace policy decision (a creator default
 plus the runtime's copy of the spawning thread's bindings onto each thread it spawns), not a
 kernel one. Of swap, memmgr implements compressed eviction in RAM
-([Demand Paging](#demand-paging-and-the-default-system-pager) above), and a separate swap service
-is to implement its disk tier ([#43](https://github.com/kottlerg/seraph/issues/43)).
+([Demand Paging](#demand-paging-and-the-default-system-pager) above), and the interface of its disk
+tier: a fault on a chunk on disk is redirected (`FAULT_REPLY_REDIRECT`, [Reply](#reply)) to the
+swap service, which holds it while it reads the slot and hands memmgr the bytes, so memmgr waits on
+no storage ([memmgr Memory Pool § Disk
+tier](../services/memmgr/docs/memory-pool.md#disk-tier)). The swap service itself is to come
+([#43](https://github.com/kottlerg/seraph/issues/43)).
 
 Demand paging is the **system-wide default**: procmgr binds memmgr (the pager) as the
 fault handler on every process it creates and advertises it in

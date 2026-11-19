@@ -42,8 +42,8 @@ and svcmgr decodes with.
 
 **First rounds — `CAPS` (`data[0] = 1`, not terminal):** a positional
 slot list, split into windows of `MSG_CAP_SLOTS_MAX` slots, one `CAPS`
-round per window (`ipc::bootstrap::slot_rounds`); the eight slots below
-take two rounds (slots 0-3, then 4-7), and a longer list takes more with
+round per window (`ipc::bootstrap::slot_rounds`); the nine slots below
+take three rounds (slots 0-3, 4-7, then 8), and a longer list takes more with
 no change to the encoding.
 
 | Field | Value |
@@ -56,9 +56,10 @@ no change to the encoding.
 | slot 5 | `vfsd_labels::DENY_BADGE`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.deny`; absent if its derive fails) |
 | slot 6 | `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.swap`; absent if its derive fails) |
 | slot 7 | `EntropyControl` source carrying `Contribute`, derived from the root capability the kernel mints into init; svcmgr never publishes it, and derives the [`entropy_authority`](service-definitions.md#entropy_authority) service's copy from it on every launch (absent if init holds none or its derive fails) |
+| slot 8 | `memmgr_labels::SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint (published seed-only, its seeds keeping `GRANT`, as `memmgr.swap`; absent if its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `15`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `16`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -121,11 +122,11 @@ definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
 `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
-`vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `logd.query`) into its own registry, configures devmgr's
-device classes and publishes each as `devmgr.class.<stem>` (the class file's name without
-`.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`, with the cap of
-`/config/devmgr/platform/` as its optional second cap when the walk to it succeeds, before entering
-the event loop. Both read through vfsd and call devmgr, and are skipped when either is dead
+`vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `memmgr.swap`, `logd.query`) into its own registry,
+configures devmgr's device classes and publishes each as `devmgr.class.<stem>` (the class file's
+name without `.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`,
+with the cap of `/config/devmgr/platform/` as its optional second cap when the walk to it
+succeeds, before entering the event loop. Both read through vfsd and call devmgr, and are skipped when either is dead
 ([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
 
 ---
@@ -218,15 +219,16 @@ freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint. `QUERY_ENDPOINT`
 
 Only public names resolve. A name whose cap carries authority is published seed-only and answers
 `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`, the five `devmgr.*` names (`devmgr.bind` and
-`devmgr.acpi` included), `vfsd.mount`, `vfsd.swap`, `logd.query`, and each provider name whose badge
-carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` and `:grant` entries, today `pwrmgr.shutdown`,
-`acpid.power` and `sessiond.operator`). `vfsd.deny` carries no authority but is seed-only too: it is
-svctest's test twin, reached only through svctest's recipe. A seed-only name reaches a process only
-through a recipe's `seed = ...` line, which svcmgr resolves itself, so its authority stays with the
-recipes that seed it ([service-definitions.md § `seed`](service-definitions.md#seed)). A seed is
-`SEND` except `devmgr.bind` and each `:grant` entry (`sessiond.operator`), which are `SEND|GRANT`:
-`BIND_DRIVERS` moves a directory cap and the kernel requires `GRANT` for that, and a `:grant` name's
-seeds move caps to its provider. The public names are `svcmgr`, `pwrmgr.deny`, `acpid.deny`,
+`devmgr.acpi` included), `vfsd.mount`, `vfsd.swap`, `memmgr.swap`, `logd.query`, and each provider
+name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` and `:grant` entries, today
+`pwrmgr.shutdown`, `acpid.power` and `sessiond.operator`). `vfsd.deny` carries no authority but is
+seed-only too: it is svctest's test twin, reached only through svctest's recipe. A seed-only name
+reaches a process only through a recipe's `seed = ...` line, which svcmgr resolves itself, so its
+authority stays with the recipes that seed it ([service-definitions.md §
+`seed`](service-definitions.md#seed)). A seed is `SEND` except `devmgr.bind`, `memmgr.swap` and
+each `:grant` entry (`sessiond.operator`), which are `SEND|GRANT`: `BIND_DRIVERS` moves a directory
+cap and the kernel requires `GRANT` for that, the swap labels move caps to memmgr, and a `:grant`
+name's seeds move caps to its provider. The public names are `svcmgr`, `pwrmgr.deny`, `acpid.deny`,
 `timed`, and any name published through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 
 **Request:**

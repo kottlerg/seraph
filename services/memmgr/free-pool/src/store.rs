@@ -3,7 +3,7 @@
 
 // services/memmgr/free-pool/src/store.rs
 
-//! The stream a swapped chunk's pages are stored as
+//! The stream a compressed chunk's pages are stored as
 //! (`services/memmgr/docs/memory-pool.md` § Eviction).
 //!
 //! For each page the chunk's backed mask names, in page order, the stream

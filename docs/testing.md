@@ -582,7 +582,10 @@ sysroot itself is never changed:
    role alone, and `/services/crashd` signed by a key no anchor holds. procmgr refuses each
    (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr reports each refused launch.
    The kernel and `/programs/terminal` each carry a record of that key before their own, which
-   the bootloader and procmgr skip, and the boot reaches the terminal's READY line.
+   the bootloader and procmgr skip, and the boot reaches the terminal's READY line. On riscv64
+   the platform description table `/config/devmgr/platform/qemu-virt.platform` also has a body
+   byte flipped: procmgr refuses devmgr's verified read of it, `Failed(BodyHash)`, and devmgr
+   passes it over and adds no platform-table record.
 
 A boot passes when every line it owes appears, and fails on any other refusal or fatal line, or at
 its deadline. The images are packed again from the sysroot afterwards, whatever the outcome. See

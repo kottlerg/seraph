@@ -18,8 +18,8 @@
 //! | 30 | init (kernel-assigned `INIT_PRIORITY`) |
 //! | 28 | memmgr |
 //! | 27 | procmgr |
-//! | 26 | init-logd, serial, virtio-blk, devmgr's DMA thread |
-//! | 25 | framebuffer, rtc, virtio-input, virtio-console, virtio-rng |
+//! | 26 | init-logd, virtio-blk, the IOMMU driver, devmgr's DMA thread |
+//! | 25 | serial, framebuffer, rtc, virtio-input, virtio-console, virtio-rng |
 //! | 24 | devmgr, every thread but its DMA thread |
 //! | 23 | vfsd, fs drivers (fatfs) |
 //! | 21 | svcmgr |

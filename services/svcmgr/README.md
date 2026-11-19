@@ -81,8 +81,10 @@ svcmgr/
 │                                  # decisions, the device class file
 │                                  # parser, the death correlator and
 │                                  # cap decoding (`death_tag`, `death_caps`),
-│                                  # and the stop eligibility rule
-│                                  # (`stop::stop_refusal`)
+│                                  # the stop eligibility rule
+│                                  # (`stop::stop_refusal`), and the order
+│                                  # of the SET_DRIVERS_DIR step and its
+│                                  # liveness reads (`drivers_dir::run`)
 ├── endowment/                     # `svcmgr-endowment`, its own component
 │                                  # shared with init: host-tested codec of
 │                                  # init's handover endowment (see

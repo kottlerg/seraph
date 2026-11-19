@@ -180,8 +180,9 @@ pub struct RestartRecipe
     pub cwd: Option<String>,
     pub seed: Vec<String>,
     /// The log-sink service: its restart bootstrap round is minted from the
-    /// reserved log-sink sources (with no `HANDOVER_PULL` SEND), not from
-    /// `seed`/provider caps. See `definitions::launch::mint_logd_boot_caps`.
+    /// reserved log-sink sources, not from `seed`/provider caps, and carries
+    /// the `HANDOVER_PULL` SEND while `svcmgr_defs::log_sink_handover_owed`
+    /// holds (until procmgr reports init reaped) and none after. See `definitions::launch::mint_logd_boot_caps`.
     pub log_sink: bool,
     /// The `debug_authority = yes` service: a freshly minted
     /// `DEBUG_AUTHORITY` cap rides the slot after its seeds on every launch.
@@ -272,7 +273,8 @@ pub struct SvcmgrCaps
     pub memmgr_swap: u64,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
-    /// one-shot `HANDOVER_PULL` SEND on the first launch, and publishes the
+    /// one-shot `HANDOVER_PULL` SEND on the first launch and on a restart
+    /// until procmgr reports init reaped, and publishes the
     /// `LOG_QUERY_AUTHORITY` SEND minted from it as `logd.query`. Holding it
     /// keeps the log endpoint object alive across a logd crash. Zero if
     /// absent.

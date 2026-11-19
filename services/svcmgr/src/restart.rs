@@ -420,8 +420,9 @@ pub struct RestartCtx
     /// `dispatch_deaths` lands on the same `ServiceEntry` and drops a late
     /// post of the dead instance.
     pub deaths: death_set::DeathSet,
-    /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
-    /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
+    /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV from
+    /// it on every (re)launch, and the `HANDOVER_PULL` SEND on the first
+    /// launch and on a restart until procmgr reports init reaped.
     pub master_log_source: u64,
     /// Badge-0 `SEND|GRANT` source on procmgr's service endpoint. svcmgr mints
     /// real-logd's `DEATH_EQ_AUTHORITY` `SEND|GRANT` cap from it, and a

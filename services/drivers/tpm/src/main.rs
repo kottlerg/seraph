@@ -375,8 +375,6 @@ impl Reader
                 reply_status(hwrng_errors::NOT_READY, ipc_buf);
             }
         }
-        // The bytes went to the caller; none stay in the driver.
-        bytes.fill(0);
     }
 }
 
@@ -467,7 +465,6 @@ fn main() -> !
         std::os::seraph::log!(error: "TPM probe failed ({fault:?}); not driven");
         syscall::thread_exit();
     }
-    probe.fill(0);
     std::os::seraph::log!("TPM 2.0 answers TPM2_GetRandom");
 
     // SAFETY: ipc_buf is the registered IPC buffer page.

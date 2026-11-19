@@ -524,7 +524,7 @@ gives the PR-level linear view.
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each
   boundary run, the memory variation, and each device cell: the storage cells,
   the no-IOMMU variant, the framebuffer cell, the debug-port cell, and the hotplug cell, per
-  architecture, and the CET cell on x86_64), with its
+  architecture, and the CET and TPM cells on x86_64), with its
   `--runs` count, its
   outcome, and the head it ran at (a run the PR does not owe that HANGs or
   fails as that section allows, with the link to its record), or state that

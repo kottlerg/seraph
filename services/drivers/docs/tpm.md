@@ -124,8 +124,9 @@ every millisecond against one deadline for the whole read.
   none replies `NOT_READY`, and the caller asks again later. A run of failed reads is logged at
   its first and once the TPM reads again.
 
-The driver serves one request at a time and keeps no byte it handed out: it zeroes its buffer
-after each reply.
+The driver serves one request at a time and keeps no byte for a later reply: each `READ` asks
+the TPM for fresh bytes, so no byte is handed out twice. It does not scrub the copies of a reply
+it has sent, which stay in its own address space until they are overwritten.
 
 ---
 

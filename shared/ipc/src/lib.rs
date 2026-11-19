@@ -163,7 +163,7 @@ pub mod procmgr_process_state;
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 14;
+pub const SVCMGR_LABELS_VERSION: u32 = 15;
 pub mod svcmgr_labels;
 
 /// Wire-protocol version of [`stop_labels`]; bumped as the block comment above

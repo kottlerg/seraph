@@ -41,6 +41,10 @@
 //!    [`procmgr::logd_forward`] check again against it.
 //! 10. [`logd_sinks`] after [`drivers`] and every phase that uses the
 //!     framebuffer driver: it kills that driver, which nothing restarts.
+//! 11. [`entropyd`] early, before [`logd_restart`]: it reads entropyd's
+//!     first-contribution line, logged once at entropyd's start, from logd's
+//!     history, which a later phase's lines could evict and which the next
+//!     logd instance does not hold.
 
 use crate::runner::Phase;
 
@@ -50,6 +54,7 @@ pub mod crash;
 pub mod devmgr;
 pub mod discard;
 pub mod drivers;
+pub mod entropyd;
 pub mod exit_code;
 pub mod fs_faults;
 pub mod fs_ipc;
@@ -97,6 +102,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(process_faults::phases());
     out.extend_from_slice(exit_code::phases());
     out.extend_from_slice(random::phases());
+    out.extend_from_slice(entropyd::phases());
     out.extend_from_slice(recv_guard::phases());
     out.extend_from_slice(recv_pool::phases());
     out.extend_from_slice(devmgr::phases());

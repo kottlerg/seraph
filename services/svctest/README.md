@@ -2,11 +2,11 @@
 
 Services-surface test harness. A std-built binary installed at `/tests/svctest` that exercises
 the services tier (procmgr, memmgr, vfsd and fatfs, devmgr and the authority gates of its serial,
-input, framebuffer, and hwrng drivers, svcmgr, pwrmgr, timed), the kernel objects those services
-hand out, and the `ruststd` runtime layer end to end. `svcmgr` spawns it from the `svctest.svc`
-recipe, which lives in `/config/svcmgr/tests/` and runs only when staged into
-`/config/svcmgr/services/`, per [docs/testing.md § Gating](../../docs/testing.md#gating). Its
-devmgr phases also need the test class files of `/config/devmgr/tests/` staged into
+input, framebuffer, and hwrng drivers, svcmgr, pwrmgr, timed, entropyd), the kernel objects those
+services hand out, and the `ruststd` runtime layer end to end. `svcmgr` spawns it from the
+`svctest.svc` recipe, which lives in `/config/svcmgr/tests/` and runs only when staged into
+`/config/svcmgr/services/`, per [docs/testing.md § Gating](../../docs/testing.md#gating). Its devmgr
+phases also need the test class files of `/config/devmgr/tests/` staged into
 `/config/devmgr/classes/` and a boot with `cargo xtask run --test-devices`; a phase that finds the
 devices missing fails, naming the flag.
 
@@ -59,6 +59,7 @@ services/svctest/
         ├── crash.rs           # procmgr's crash endpoint: registration, handover, take-back
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
+        ├── entropyd.rs        # entropyd's first contribution accepted by the kernel
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
         ├── recv_pool.rs       # Worker-pool receive helper under concurrent nested IPC;
         │                      #   concurrent logging through logd
@@ -160,11 +161,11 @@ drivers hwrng read phase (`caps[16]`), the drivers deny phase (`caps[11]` to `ca
 svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and
 `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
 vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`,
-`logd_reserve`, `logd_restart`, and `logd_sinks` phases (`caps[6]`), the vfsd swap-partition phase
-(`caps[14]`), the `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]`
-and `caps[19]`), the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`,
-`memmgr_swap`, and `vfsd_driver_death` phases (`caps[18]`), the `svcmgr_stop_service` phase
-(`caps[19]`, and `caps[18]` with `stopsrc` staged), and the no-stop cases of the `oom_policy`
+`logd_reserve`, `logd_restart`, `logd_sinks`, and `entropyd_contribution` phases (`caps[6]`), the
+vfsd swap-partition phase (`caps[14]`), the `sessiond_operator` phase and the `oom_policy` phase's
+session case (`caps[15]` and `caps[19]`), the `crash_endpoint`, `logd_reserve`, `logd_restart`,
+`logd_sinks`, `memmgr_swap`, and `vfsd_driver_death` phases (`caps[18]`), the `svcmgr_stop_service`
+phase (`caps[19]`, and `caps[18]` with `stopsrc` staged), and the no-stop cases of the `oom_policy`
 and `logd_reserve` phases (`caps[19]`), instead fail their assertions. The seed-only phase thus
 fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
 zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
@@ -194,7 +195,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks` phases: read logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
@@ -348,9 +349,9 @@ must reply `UNAUTHORIZED`. Through `caps[19]`, the whole `LIST_CANDIDATES` walk 
 the staged fixtures whose recipes set `oom_stop = yes` (`crasher-worker` and `memhog`), each with
 a non-zero usage and the service rank, and nothing when neither is staged; `STOP_CANDIDATE` must
 reply `NO_CANDIDATE` for the first instance's key of every svcmgr table slot below 32 it does not
-list, which covers svctest itself (`restart = never`), the services init started, logd
-(`critical = yes`), pwrmgr and `stopsrc` (core roles), timed (no `oom_stop`) and the slots past
-the table. The whole `LIST_STOP_SOURCES` walk must list exactly
+list, which covers svctest itself (`restart = never`), the services init started, logd (`critical =
+yes`), pwrmgr, entropyd and `stopsrc` (core roles), timed (no `oom_stop`) and the slots past the
+table. The whole `LIST_STOP_SOURCES` walk must list exactly
 [sessiond](../sessiond/README.md) and [stopsrc](../stopsrc/README.md), each when its recipe is
 staged, both with the program class, and nothing when neither is staged; through the SEND it
 carries, the fixture's `LIST_CANDIDATES` must reply `SUCCESS` and `STOP_CANDIDATE` of a key it never

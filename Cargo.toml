@@ -35,6 +35,7 @@ members = [
     "services/pwrmgr",
     "services/acpid",
     "services/timed",
+    "services/entropyd",
     "services/vfsd",
     "services/vfsd/gpt",
     "services/vfsd/root-backend",

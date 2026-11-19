@@ -145,7 +145,7 @@ Init requests procmgr to start only the bootstrap-essential services
 — devmgr and vfsd (`CREATE_PROCESS`, from boot modules), then svcmgr
 (`CREATE_FROM_FILE`, from `/services/svcmgr`) — by IPC to procmgr's service
 endpoint. The
-non-bootstrap services (`logd`, `timed`, `pwrmgr`, `crashd`, `terminal`, the staged test
+non-bootstrap services (`logd`, `timed`, `pwrmgr`, `crashd`, `entropyd`, `terminal`, the staged test
 harnesses) are not in this list: svcmgr launches them itself
 post-handover from
 their `/config/svcmgr/services/*.svc` recipes. Nor is the per-arch RTC
@@ -162,7 +162,7 @@ post-handover.
 Init then serves svcmgr the **handover endowment** (see
 [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md)
 § Handover endowment) over the
-bootstrap-round protocol: the `CAPS` rounds (two rounds for its seven
+bootstrap-round protocol: the `CAPS` rounds (two rounds for its eight
 slots) carry svcmgr's own endpoints plus the publish-role source caps
 (a `SEND` on vfsd's synthetic root, derived from init's system-root
 cap, a badge-0 `SEND|GRANT` source on devmgr's registry
@@ -202,7 +202,7 @@ round, so procmgr's death observers are bound before real-logd can release
 init-logd. After the handover reply (svcmgr replies immediately, then scans
 `/config/svcmgr/services/`, binds the endowed substrate bind-only, and
 launches every defined-but-unparked service — `logd`, the `timed` and
-`pwrmgr` providers, and `terminal` on a normal boot, plus any staged test
+`pwrmgr` providers, `entropyd`, and `terminal` on a normal boot, plus any staged test
 recipes such as `svctest.svc` / `usertest.svc` and the co-staged
 `crasher.svc`, `crasher-worker.svc` and `crasher-boot.svc` restart fixtures), init streams
 every reclaimable Memory cap it solely owns (ELF segments, user stack pages, `InitInfo` pages, the

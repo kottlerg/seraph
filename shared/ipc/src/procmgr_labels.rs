@@ -941,6 +941,55 @@ pub const DETACH_PROCESS: u64 = 24;
 /// Specified in `services/procmgr/docs/ipc-interface.md` § `MAKE_RESIDENT`.
 pub const MAKE_RESIDENT: u64 = 30;
 
+/// Read a signed data file for the sender and give it the body read-only,
+/// once it verifies (docs/signing.md § Verifier Discipline). Sent on the
+/// sender's own procmgr cap: a process handle, which names another
+/// process, is refused `INVALID_BADGE`, as is a badge no live process
+/// carries.
+///
+/// `data[0]` is the file's length in bytes, 1 to [`READ_VERIFIED_MAX`];
+/// from word [`READ_VERIFIED_NAME_WORD`] the name block
+/// (`crate::with_name_block`, at most [`CREATE_NAME_MAX`] bytes): the
+/// install path the file must be signed under, in the data role. `caps[0]`
+/// is the file cap, which procmgr opens, reads once (`FS_READ_MEMORY`) into
+/// one run of frames it requests on the sender's memmgr account and maps
+/// in its own address space alone, and deletes. procmgr verifies the copy
+/// in the data role under the name, for this architecture.
+///
+/// Replies `SUCCESS` with `data[0]` the body's length, `data[1]` the
+/// run's region id on the sender's account and `data[2]` its pages, and
+/// `caps[0]` a Memory cap on the run carrying `RIGHTS_MEM_MAP` alone, whose
+/// first `data[0]` bytes are the verified body; procmgr keeps no cap on the
+/// run, so no process but memmgr can write it. The sender unmaps it,
+/// deletes the cap and releases the region (`memmgr_labels::RELEASE_MEMORY_CAPS`
+/// on its own memmgr cap) when done; its death releases it with its
+/// record. Refusals: `INVALID_ARGUMENT` for a missing cap, a length of zero
+/// or past the bound, or a missing or non-canonical name, before any read;
+/// `SIGNATURE_REFUSED` when the copy does not verify; `IO_ERROR`,
+/// `OUT_OF_MEMORY` and `MAP_FAILED` as for [`CREATE_FROM_FILE`]'s read.
+/// Specified in `services/procmgr/docs/ipc-interface.md` § `READ_VERIFIED`.
+pub const READ_VERIFIED: u64 = 31;
+
+/// The most bytes a [`READ_VERIFIED`] file may hold, its trailer included:
+/// 32 KiB, room for a platform description table
+/// (`MAX_TABLE_BYTES`, 8 KiB) and the other policy-bearing configuration
+/// files. procmgr refuses a longer request before it reads anything.
+pub const READ_VERIFIED_MAX: u64 = 32 * 1024;
+
+/// The data word of a [`READ_VERIFIED`] request holding the name block's
+/// length, whose bytes follow.
+pub const READ_VERIFIED_NAME_WORD: usize = 1;
+
+/// The name a [`READ_VERIFIED`] request carries in its name block: `None`
+/// when the request delivers no length word, the length is zero or above
+/// [`CREATE_NAME_MAX`], or the words delivered do not cover the name's
+/// bytes.
+#[must_use]
+pub fn read_verified_name(req: &crate::IpcMessage) -> Option<&[u8]>
+{
+    crate::name_block(req, READ_VERIFIED_NAME_WORD, CREATE_NAME_MAX)
+}
+
 /// Badge bit on procmgr service caps that authorises
 /// [`REGISTER_CRASH_SERVICE`], [`ATTACH_PROCESS`], [`LIST_PROCESSES`],
 /// and [`DETACH_PROCESS`]. svcmgr mints it for

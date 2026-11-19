@@ -26,7 +26,8 @@ procmgr/
 │                                 table + badge logic, the create-request
 │                                 argv/env header decoder and checks,
 │                                 the requested name and the signature
-│                                 policy, the create-request cap split, the
+│                                 policy, the verified read's request
+│                                 checks, the create-request cap split, the
 │                                 fs-reply bounds, the init-reap state
 │                                 machine, the first death queue's
 │                                 size (`FIRST_POOL_OBSERVERS`), the
@@ -39,7 +40,8 @@ procmgr/
 │   ├── main.rs                 # main() (std runtime), request workers, reaper
 │   ├── crash.rs                # Crash endpoint, its decliner, the handover
 │   ├── death_queues.rs         # Death-queue ring capacity (`DEATH_EQ_CAPACITY`)
-│   ├── image.rs                # One copy of a create's object, its verification
+│   ├── image.rs                # One copy of a create's object or of a verified
+│   │                           #   read's file, its verification, the read-only hand-over
 │   ├── trust_store.rs          # The trust store the bootloader hands forward
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
@@ -60,6 +62,12 @@ procmgr/
   parsed; a refusal creates nothing (`SIGNATURE_REFUSED`). See
   [docs/ipc-interface.md](docs/ipc-interface.md) § Image Verification and
   [docs/signing.md](../../docs/signing.md) § Signature Policy in procmgr.
+- **Verified data reads** — copy a data file a process asks for
+  (`READ_VERIFIED`) once into frames on that process's account, verify the
+  copy in the data role under the name it gives, and hand it the run
+  read-only, so it parses only a verified body no other process can write.
+  See [docs/ipc-interface.md](docs/ipc-interface.md) § Label 31:
+  `READ_VERIFIED`.
 - **ELF loading** — parse the verified ELF image,
   request memory caps from memmgr, map LOAD segments with correct
   permissions. Each segment's pages are fresh pages memmgr allocates to the
@@ -237,6 +245,9 @@ The full procmgr IPC specification is in
   child `Thread` cap. Caller has already walked its own namespace cap to the
   binary and names it by its install path; procmgr opens the supplied file cap
   (`FS_OPEN`), copies the signed object through its own open and verifies it.
+- `READ_VERIFIED(file_cap, file_size, name)` → the verified body of a data
+  file, read-only, in frames on the sender's account; procmgr verifies the
+  copy in the data role under `name`.
 - `START_PROCESS(process_handle)` — start a previously created process
 - `CONFIGURE_NAMESPACE(process_handle)` — install root and (optional)
   cwd caps on the child before start; the sole path that writes
@@ -334,7 +345,7 @@ on a thread of its own, the reaper (`procmgr-reaper`), the only thread that wait
 queues' wait set. A create that waits on a slow file server, on memmgr, or on the kernel holds one
 worker; the others go on serving, and the reaper goes on reaping. A file server is the creator's to
 choose, so each call on a caller-supplied file cap is bounded at `FILE_CAP_CALL_TIMEOUT_MS` (10 s),
-past which the create fails with `IO_ERROR`
+past which the create, or the verified read (`READ_VERIFIED`), fails with `IO_ERROR`
 ([docs/ipc-interface.md](docs/ipc-interface.md) § Label 13: `CREATE_FROM_FILE`). A caller past the
 four workers waits in the endpoint's queue. procmgr's own `ProcessInfo` names no procmgr endpoint,
 so its threads send no `REGISTER_THREAD` and start without waiting on one
@@ -345,8 +356,10 @@ The shared state is behind these locks:
 - The table lock guards the process table and the recent-exits ring (`process::Tables`). Its holder
   makes syscalls that do not block on another process, the create reply among them (an
   `ipc_reply`, made under the lock so a destroy marks the child either before the reply or after
-  it), and no IPC call but the two below; every other call, to memmgr for a child, to a file
-  server, or to the crash decliner, is made after it is released.
+  it), and no IPC call but the two below; every other call, to memmgr for a child or for a verified
+  read's sender, to a file server, or to the crash decliner, is made after it is released. A
+  verified read derives its copy of the sender's memmgr SEND under it, a syscall, and makes its
+  calls with that copy after.
 - The death-set lock guards the death queues and their wait set. A bind that grows the set funds
   the new queue or wait set from memmgr while it holds the lock; memmgr calls no procmgr label, so
   that call cannot wait on a lock procmgr holds.

@@ -27,6 +27,41 @@ pub fn requested_name(req: &IpcMessage) -> Option<&[u8]>
     ipc::procmgr_labels::create_name(req).filter(|name| objsig::name_is_install_path(name))
 }
 
+/// The roles a `READ_VERIFIED` copy is verified in: the data role alone, so a
+/// process image (service, driver, program) or a bundle-only object is never
+/// handed to a reader as trusted input, and a data file is never code.
+pub const DATA: RoleSet = RoleSet::of(&[Role::Data]);
+
+/// What a checked `READ_VERIFIED` request asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataRead<'a>
+{
+    /// The file's length in bytes, 1 to `READ_VERIFIED_MAX`.
+    pub len: u64,
+    /// The install path the file must be signed under.
+    pub name: &'a [u8],
+}
+
+/// The read a `READ_VERIFIED` request `req` asks for: its length,
+/// `data[0]`, when it is 1 to `ipc::procmgr_labels::READ_VERIFIED_MAX`,
+/// and its name block, when that is a canonical install path
+/// (`objsig::name_is_install_path`). `None`, which procmgr refuses
+/// `INVALID_ARGUMENT` before it opens the file, otherwise: a length past
+/// the bound would have procmgr reserve and map a copy the request does not
+/// bound.
+#[must_use]
+pub fn data_read(req: &IpcMessage) -> Option<DataRead<'_>>
+{
+    let len = req.word(0);
+    if req.word_count() == 0 || len == 0 || len > ipc::procmgr_labels::READ_VERIFIED_MAX
+    {
+        return None;
+    }
+    let name = ipc::procmgr_labels::read_verified_name(req)
+        .filter(|name| objsig::name_is_install_path(name))?;
+    Some(DataRead { len, name })
+}
+
 /// The un-badged creator's set (init, and svcmgr's mint source): every role
 /// a process runs in. `Kernel` and `Init` are loaded by the bootloader
 /// alone, `BootModule` is the bootloader's permission alone, and `Data` is
@@ -111,6 +146,61 @@ mod tests
         }
         let bare = IpcMessage::builder(CREATE_FROM_FILE).word(0, 4096).build();
         assert_eq!(requested_name(&bare), None);
+    }
+
+    fn data_request(len: u64, name: &[u8]) -> IpcMessage
+    {
+        use ipc::procmgr_labels::{READ_VERIFIED, READ_VERIFIED_NAME_WORD};
+        let builder = IpcMessage::builder(READ_VERIFIED).word(0, len);
+        ipc::with_name_block(builder, READ_VERIFIED_NAME_WORD, name, CREATE_NAME_MAX)
+            .unwrap()
+            .build()
+    }
+
+    #[test]
+    fn a_data_read_within_the_bound_under_an_install_path_is_admitted()
+    {
+        use ipc::procmgr_labels::READ_VERIFIED_MAX;
+        let name = &b"/config/devmgr/platform/qemu-virt.platform"[..];
+        for len in [1, 4096, READ_VERIFIED_MAX]
+        {
+            assert_eq!(
+                data_read(&data_request(len, name)),
+                Some(DataRead { len, name }),
+                "{len}"
+            );
+        }
+    }
+
+    // Defect guarded: a request past the size bound, or of no bytes, reaching
+    // the read, so procmgr reserves and maps a copy no bound limits; a
+    // request whose name names the file another way reaching the verifier.
+    #[test]
+    fn a_data_read_past_the_bound_empty_or_misnamed_is_refused()
+    {
+        use ipc::procmgr_labels::{READ_VERIFIED, READ_VERIFIED_MAX};
+        let name = &b"/data/x"[..];
+        assert_eq!(data_read(&data_request(0, name)), None);
+        assert_eq!(data_read(&data_request(READ_VERIFIED_MAX + 1, name)), None);
+        assert_eq!(data_read(&data_request(u64::MAX, name)), None);
+        for name in [&b"/data//x"[..], b"data/x", b"init", b"kernel"]
+        {
+            assert_eq!(data_read(&data_request(64, name)), None, "{name:?}");
+        }
+        let bare = IpcMessage::builder(READ_VERIFIED).word(0, 64).build();
+        assert_eq!(data_read(&bare), None);
+        assert_eq!(data_read(&IpcMessage::new(READ_VERIFIED)), None);
+    }
+
+    // Defect guarded: a verified read accepting an image role, so a reader
+    // is handed a signed program as configuration it trusts.
+    #[test]
+    fn a_data_read_accepts_the_data_role_alone()
+    {
+        for role in Role::ALL
+        {
+            assert_eq!(DATA.contains(role), role == Role::Data, "{role:?}");
+        }
     }
 
     // Defect guarded: a creator's set holding the boot-module role, so a

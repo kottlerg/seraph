@@ -863,6 +863,166 @@ pub fn namespace_lookup_dir(
     Ok(walked.dir_cap)
 }
 
+// ── Verified data files (procmgr's READ_VERIFIED) ──────────────────────────
+
+/// A data file procmgr read and verified for this process
+/// (`procmgr_labels::READ_VERIFIED`, docs/signing.md § Verifier Discipline):
+/// its verified body, mapped read-only from frames on this process's memmgr
+/// account that no other process but memmgr holds a cap on. Dropping it
+/// unmaps the frames, deletes the cap and returns the frames to memmgr
+/// (`RELEASE_MEMORY_CAPS`).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub struct VerifiedData {
+    range: Option<ReservedRange>,
+    pages: u64,
+    len: usize,
+    cap: u64,
+    region: u64,
+}
+
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+impl VerifiedData {
+    /// The verified body: the bytes the file was signed over, its trailer
+    /// excluded.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        let Some(range) = &self.range else {
+            return &[];
+        };
+        // SAFETY: `read_verified` mapped the run's `pages` pages read-only
+        // from `va_start` before it built `self`, and `len` is at most those
+        // pages' bytes (checked there); no process holds a cap that can write
+        // the frames (procmgr derived a map-only cap and deleted its own), and
+        // the slice borrows `self`, so it ends before `Drop` unmaps them.
+        unsafe { crate::slice::from_raw_parts(range.va_start() as *const u8, self.len) }
+    }
+}
+
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+impl Drop for VerifiedData {
+    fn drop(&mut self) {
+        let self_aspace = startup_info().self_aspace;
+        let mut unmapped = true;
+        if let Some(range) = self.range.take() {
+            // SAFETY: the span is this value's own reservation, which only
+            // `bytes`'s borrows of `self` reach, and none is live here.
+            unmapped = unsafe { syscall::mem_unmap(self_aspace, range.va_start(), self.pages) }
+                .is_ok();
+            if unmapped {
+                unreserve_pages(range);
+            }
+        }
+        let _ = syscall::cap_delete(self.cap);
+        let ipc_buf = current_ipc_buf();
+        let memmgr_ep = startup_info().memmgr_endpoint;
+        // A run still mapped would sit on memmgr's deferred list; it is left
+        // on the account instead, which this process's exit releases.
+        if unmapped && !ipc_buf.is_null() && memmgr_ep != 0 {
+            let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
+                .word(0, 1)
+                .word(1, self.region)
+                .build();
+            // SAFETY: current_ipc_buf returns the registered IPC buffer page;
+            // a release is safe to repeat (memmgr ignores an id it has
+            // taken back).
+            let _ = unsafe { ipc_call_until_answered(memmgr_ep, &msg, ipc_buf) };
+        }
+    }
+}
+
+/// Have procmgr read the data file `file_cap` names, `len` bytes long (the
+/// size hint of the lookup that resolved it, [`namespace_lookup_file`]),
+/// verify it as signed in the data role under the install path `name`, and
+/// map the verified body read-only (`procmgr_labels::READ_VERIFIED`). The
+/// file cap moves to procmgr, which deletes it, and is deleted here when the
+/// request is not delivered; the caller holds it no longer either way.
+///
+/// The copy is charged to this process's memmgr account while the returned
+/// value lives.
+///
+/// # Errors
+/// `InvalidInput` for a length of zero or past
+/// `procmgr_labels::READ_VERIFIED_MAX`, or a name procmgr does not take;
+/// `InvalidData` when the file does not verify; `OutOfMemory` when the copy
+/// or its mapping cannot be had; `PermissionDenied` when procmgr does not
+/// know this process; `Other` for a failed read or IPC.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn read_verified(file_cap: u64, len: u64, name: &str) -> crate::io::Result<VerifiedData> {
+    use crate::io::{Error, ErrorKind};
+    let ipc_buf = current_ipc_buf();
+    let info = startup_info();
+    let builder = ipc::IpcMessage::builder(ipc::procmgr_labels::READ_VERIFIED).word(0, len);
+    let builder = ipc::with_name_block(
+        builder,
+        ipc::procmgr_labels::READ_VERIFIED_NAME_WORD,
+        name.as_bytes(),
+        ipc::procmgr_labels::CREATE_NAME_MAX,
+    );
+    let (Some(builder), false, true) = (builder, ipc_buf.is_null(), info.procmgr_endpoint != 0)
+    else {
+        let _ = syscall::cap_delete(file_cap);
+        return Err(Error::new(ErrorKind::InvalidInput, "seraph: verified read not sendable"));
+    };
+    let msg = builder.cap(file_cap).build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+    let reply = match unsafe { ipc::ipc_call(info.procmgr_endpoint, &msg, ipc_buf) } {
+        Ok(reply) => reply,
+        Err(_) => {
+            // The call failed before the kernel moved the cap: the slot
+            // still holds it.
+            let _ = syscall::cap_delete(file_cap);
+            return Err(Error::other("seraph: verified read IPC failed"));
+        }
+    };
+    let caps = reply.caps();
+    if reply.label != ipc::procmgr_errors::SUCCESS {
+        for &cap in caps {
+            let _ = syscall::cap_delete(cap);
+        }
+        let kind = match reply.label {
+            ipc::procmgr_errors::INVALID_ARGUMENT => ErrorKind::InvalidInput,
+            ipc::procmgr_errors::SIGNATURE_REFUSED => ErrorKind::InvalidData,
+            ipc::procmgr_errors::OUT_OF_MEMORY | ipc::procmgr_errors::MAP_FAILED => {
+                ErrorKind::OutOfMemory
+            }
+            ipc::procmgr_errors::INVALID_BADGE => ErrorKind::PermissionDenied,
+            _ => ErrorKind::Other,
+        };
+        return Err(Error::new(kind, "seraph: verified read refused"));
+    }
+    let (body_len, region, pages) = (reply.word(0), reply.word(1), reply.word(2));
+    let [cap] = *caps else {
+        for &cap in caps {
+            let _ = syscall::cap_delete(cap);
+        }
+        return Err(Error::other("seraph: verified read reply malformed"));
+    };
+    // From here the value owns the cap and the region, so every exit
+    // releases them.
+    let mut data = VerifiedData { range: None, pages, len: 0, cap, region };
+    let bytes = pages.checked_mul(syscall_abi::PAGE_SIZE);
+    let whole = bytes.is_some_and(|bytes| {
+        syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_SIZE) == Ok(bytes) && body_len <= bytes
+    });
+    let len = usize::try_from(body_len).ok().filter(|_| whole && pages != 0);
+    let Some(len) = len else {
+        return Err(Error::other("seraph: verified read reply malformed"));
+    };
+    let range = reserve_pages(pages).map_err(|_| Error::from(ErrorKind::OutOfMemory))?;
+    let va = range.va_start();
+    data.range = Some(range);
+    // SAFETY: `[va, va + pages * PAGE_SIZE)` is the fresh reservation `data`
+    // now owns, VA no Rust object or IPC page occupies.
+    let mapped =
+        unsafe { mem_map_funded(cap, info.self_aspace, va, 0, pages, syscall::MAP_READ) };
+    if mapped.is_err() {
+        return Err(Error::from(ErrorKind::OutOfMemory));
+    }
+    data.len = len;
+    Ok(data)
+}
+
 // Raw retype debits the kernel charges for one object of each kind, the
 // `min_bytes` to pass to `object_slab_retype`. Each constant is defined as the
 // ABI crate's item and the function forwards to the ABI crate's, so each

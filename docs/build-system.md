@@ -356,7 +356,9 @@ sysroot/
   data/                   # Data files used by fs / namespace tests
                           # (from rootfs/), plus deterministic svctest
                           # fixtures synthesised under data/svctest/,
-                          # which svctest also uses as scratch space.
+                          # which svctest also uses as scratch space;
+                          # data/svctest/signed/ is signed in the data
+                          # role (docs/signing.md § Signing).
   crash/                  # Created empty: the directory crashd writes
                           # cores to (services/crashd/docs/core-format.md).
 ```

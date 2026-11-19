@@ -105,6 +105,9 @@ services/svctest/
         │   ├── pressure.rs    # Own fatfs gives idle cache pages back at memory pressure Low
         │   ├── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
         │   └── run_fill.rs    # Own fatfs fills sequential reads in runs; chain cursor retired
+        ├── verified_read.rs   # procmgr's verified read of a data file: the body returned and
+        │                      #   charged while held; another name, a flipped byte, no
+        │                      #   signature, past the bound, and no length refused
         ├── pwrmgr.rs          # Shutdown cap-deny check, terminal shutdown, `reboot` role
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
         ├── sessiond.rs        # sessiond's operator interface: badge gates, interface registration

@@ -118,8 +118,8 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   unreachable. A caller polls `free_bytes` and `deferred_bytes`
 ///   together to confirm a dead process's pages were reclaimed.
 /// * `data[5]` — `largest_free_bytes`: the largest single free run.
-/// * `data[6]` — `reserve_bytes`: the system reserve, the free pages a
-///   charge to a budget node outside the reserve may not take.
+/// * `data[6]` — `reserve_bytes`: the system reserve, the free pages only a
+///   charge to a reserve node may take.
 /// * `data[7]` — the memory-pressure level: [`PRESSURE_NORMAL`],
 ///   [`PRESSURE_LOW`] or [`PRESSURE_CRITICAL`]. A [`REGISTER_PRESSURE`]
 ///   bit says it changed; this read is the level.
@@ -132,11 +132,17 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 /// * `data[10]` — `swapped_bytes`: the pages of every evicted chunk,
 ///   which the store holds compressed and their processes' budget nodes
 ///   stay charged for.
+/// * `data[11]` — `growth_floor_bytes`: the free pages outside
+///   `promised` a charge to a budget node outside the reserve may not take:
+///   the system reserve and, while chunks are swapped, the restore headroom
+///   above it, `data[6]` plus the lesser of `data[10]` and `data[6]`. What
+///   such a node can still be granted is `data[3]` less `data[8]` less
+///   this; the level is [`PRESSURE_CRITICAL`] at or below it.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[10]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[11]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.
@@ -392,8 +398,9 @@ pub const PRESSURE_NORMAL: u64 = 0;
 /// promised are below the low threshold.
 pub const PRESSURE_LOW: u64 = 1;
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
-/// promised are at or below the system reserve, so a grant to a process
-/// outside it is refused.
+/// promised are at or below the growth floor (the system reserve and, while
+/// chunks are swapped, the restore headroom), so a grant to a process outside
+/// the reserve is refused.
 pub const PRESSURE_CRITICAL: u64 = 2;
 
 /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap

@@ -1848,7 +1848,8 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 /// Reply with the all-RAM-accounted identity terms plus the current free and
 /// deferred totals and the largest free run (all in bytes): `system_ram`,
 /// `kernel_reserved`, `pool_total`, `free`, `deferred`, `largest_free`,
-/// then the reserve, the pressure level and `promised`
+/// then the reserve, the pressure level, `promised`, the store, the swapped
+/// pages and the growth floor
 /// (services/memmgr/docs/ipc-interface.md § Label 6).
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
@@ -1877,6 +1878,10 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         .word(8, l.promised().saturating_mul(PAGE_SIZE))
         .word(9, l.store_pages().saturating_mul(PAGE_SIZE))
         .word(10, l.swapped_pages().saturating_mul(PAGE_SIZE))
+        .word(
+            11,
+            l.growth_floor(pool_total_pages()).saturating_mul(PAGE_SIZE),
+        )
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

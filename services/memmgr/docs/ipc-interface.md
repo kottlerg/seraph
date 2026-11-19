@@ -508,11 +508,12 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[3] | `free_bytes` — subset of `pool_total_bytes` in free runs, lent to no process |
 | data[4] | `deferred_bytes` — subset of `pool_total_bytes` reclaimed but held out of the free runs while another process can still reach it |
 | data[5] | `largest_free_bytes` — the largest single free run, the most one `REQUIRE_CONTIGUOUS` grant can take; 0 when the pool is empty |
-| data[6] | `reserve_bytes` — the system reserve: the free pages a charge to a budget node outside the reserve may not take ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
-| data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL` ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
+| data[6] | `reserve_bytes` — the system reserve: the free pages only a charge to a reserve node may take ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
+| data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL`, at or below the growth floor ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
 | data[8] | `promised_bytes` — what the committed regions can still take from the free runs: their pages that hold no frame yet, and bounds on the page tables and metadata they can need ([`memory-pool.md`](memory-pool.md) § Commit) |
 | data[9] | `store_bytes` — subset of `pool_total_bytes` the compressed store holds: the stored pages of every evicted chunk ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
 | data[10] | `swapped_bytes` — the pages of every evicted chunk, which the store holds compressed and their processes' budget nodes stay charged for |
+| data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -530,9 +531,11 @@ baseline, and `data[4]` shows what is held instead. `largest_free_bytes`
 (`data[5]`) shows how fragmented the free runs are: below
 `DEMAND_CHUNK_PAGES` pages while `data[3]` is not zero, a demand fault is
 backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
-(`data[6]`) is `pool_total / 64` pages: a process outside the reserve has its
+(`data[6]`) is `pool_total / 64` pages. `growth_floor_bytes` (`data[11]`) is
+the reserve while nothing is swapped: a process outside the reserve has its
 grants refused, and its demand faults declined, once `data[3]` less
-`data[8]` less the request would fall below it. `pressure` (`data[7]`) is the
+`data[8]` less the request would fall below it, and the level is
+`PRESSURE_CRITICAL` at or below it. `pressure` (`data[7]`) is the
 level memmgr last signalled to the `REGISTER_PRESSURE` registrants, so a
 registrant woken by its bit reads here the level the bit announced, or a later
 one. `promised_bytes` (`data[8]`) is held for the committed regions' faults:
@@ -540,7 +543,7 @@ every admission reads `data[3]` less it, so a free page it counts is refused to
 every other charge. `store_bytes` (`data[9]`) and `swapped_bytes`
 (`data[10]`) rise as memmgr evicts cold chunks under pressure and fall as
 faults restore them or their regions go; their ratio is the store's
-compression. `data[3]` to `data[10]` are appended after the identity terms;
+compression. `data[3]` to `data[11]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`

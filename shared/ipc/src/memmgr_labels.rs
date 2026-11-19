@@ -118,8 +118,8 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   unreachable. A caller polls `free_bytes` and `deferred_bytes`
 ///   together to confirm a dead process's pages were reclaimed.
 /// * `data[5]` — `largest_free_bytes`: the largest single free run.
-/// * `data[6]` — `reserve_bytes`: the system reserve, the free pages a
-///   charge to a budget node outside the reserve may not take.
+/// * `data[6]` — `reserve_bytes`: the system reserve, the free pages only a
+///   charge to a reserve node may take.
 /// * `data[7]` — the memory-pressure level: [`PRESSURE_NORMAL`],
 ///   [`PRESSURE_LOW`] or [`PRESSURE_CRITICAL`]. A [`REGISTER_PRESSURE`]
 ///   bit says it changed; this read is the level.
@@ -127,11 +127,22 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   ([`REGION_COMMIT`]) can still take from the free runs: their pages
 ///   that hold no frame yet, with bounds on the page tables and metadata
 ///   they can need. Every admission reads `data[3]` less this.
+/// * `data[9]` — `store_bytes`: the subset of `pool_total_bytes` the
+///   compressed store holds, the stored pages of every evicted chunk.
+/// * `data[10]` — `swapped_bytes`: the pages of every evicted chunk,
+///   which the store holds compressed and their processes' budget nodes
+///   stay charged for.
+/// * `data[11]` — `growth_floor_bytes`: the free pages outside
+///   `promised` a charge to a budget node outside the reserve may not take:
+///   the system reserve and, while chunks are swapped, the restore headroom
+///   above it, `data[6]` plus the lesser of `data[10]` and `data[6]`. What
+///   such a node can still be granted is `data[3]` less `data[8]` less
+///   this; the level is [`PRESSURE_CRITICAL`] at or below it.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[8]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[11]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.
@@ -150,7 +161,7 @@ pub const QUERY_POOL_STATUS: u64 = 6;
 /// * `data[0]` — `va_base` (page-aligned virtual address).
 /// * `data[1]` — `len_bytes` (region length; page-multiple, nonzero).
 /// * `data[2]` — `prot` (MAP_* protection bits; W^X enforced).
-/// * `data[3]` — flags: [`REGION_COMMIT`]; 0 for none.
+/// * `data[3]` — flags: [`REGION_COMMIT`], [`REGION_NO_EVICT`]; 0 for none.
 ///
 /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (bad alignment,
 /// zero length, W^X violation, unknown prot or flag bit, unknown badge, or
@@ -172,6 +183,11 @@ pub const REGISTER_REGION: u64 = 7;
 /// registration, so a caller whose call was interrupted makes it again.
 /// The std heap grows this way.
 pub const REGION_COMMIT: u64 = 1 << 0;
+/// [`REGISTER_REGION`] flag (`data[3]` bit 1): memmgr never evicts a page
+/// of the region into its compressed store, so every page a fault backed
+/// stays mapped until the region is unregistered or discarded
+/// (`services/memmgr/docs/ipc-interface.md` § Label 7).
+pub const REGION_NO_EVICT: u64 = 1 << 1;
 /// Procmgr-only: delegate a demand-paged child's `AddressSpace` cap to
 /// memmgr so the pager can map frames into it on fault.
 ///
@@ -216,8 +232,10 @@ pub const UNREGISTER_REGION: u64 = 9;
 /// attributed by `recv.badge`; read-only.
 ///
 /// Reply (`SUCCESS`): `data[0]` the pages charged to the caller's budget
-/// node, `data[1]` its max (`u64::MAX` for none), and `data[2]` the pages
-/// charged to it and every node below it. `INVALID_ARGUMENT` for an
+/// node, `data[1]` its max (`u64::MAX` for none), `data[2]` the pages
+/// charged to it and every node below it, `data[3]` the pages of `data[0]`
+/// resident, and `data[4]` those swapped, which the compressed store holds
+/// and the node stays charged for. `INVALID_ARGUMENT` for an
 /// unknown badge. Specified in `services/memmgr/docs/ipc-interface.md`
 /// § Label 10: `QUERY_MEMORY_USAGE`.
 pub const QUERY_MEMORY_USAGE: u64 = 10;
@@ -355,6 +373,29 @@ pub const DEMAND_CHUNK_BYTES: u64 = 64 * 1024;
 /// `services/memmgr/docs/ipc-interface.md` § Label 20: `DISCARD_RANGE`.
 pub const DISCARD_RANGE: u64 = 20;
 
+/// Procmgr-only: make a range of a process's demand regions resident, for a
+/// debugger's read (`procmgr_labels::MAKE_RESIDENT`). memmgr restores each
+/// evicted chunk of the range from its compressed store and maps it into
+/// the process; a page no fault has backed stays not present.
+///
+/// Wire format:
+/// * `data[0]` — the process's memmgr badge (from its `REGISTER_PROCESS`
+///   reply).
+/// * `data[1]` — `va`.
+/// * `data[2]` — `len_bytes` (nonzero).
+///
+/// memmgr makes at most a few chunks resident per request and walks only
+/// the chunks that have an entry.
+///
+/// Reply: `memmgr_errors::SUCCESS` with `data[0]` where memmgr stopped:
+/// `va + len_bytes` when the whole range is done, else the address to send
+/// the request again from; `UNAUTHORIZED` (caller is not procmgr);
+/// `INVALID_ARGUMENT` (unknown badge, zero length, or a range
+/// past the address space); or `OUT_OF_MEMORY_BEST_EFFORT` (a chunk could
+/// not be restored, for want of free RAM or a map). Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 21: `MAKE_RESIDENT`.
+pub const MAKE_RESIDENT: u64 = 21;
+
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.
 pub const PRESSURE_NORMAL: u64 = 0;
@@ -362,8 +403,9 @@ pub const PRESSURE_NORMAL: u64 = 0;
 /// promised are below the low threshold.
 pub const PRESSURE_LOW: u64 = 1;
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
-/// promised are at or below the system reserve, so a grant to a process
-/// outside it is refused.
+/// promised are at or below the growth floor (the system reserve and, while
+/// chunks are swapped, the restore headroom), so a grant to a process outside
+/// the reserve is refused.
 pub const PRESSURE_CRITICAL: u64 = 2;
 
 /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap

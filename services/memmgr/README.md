@@ -126,7 +126,7 @@ Allocation Contract").
   as pager into a compressed store it keeps in RAM, and restores them on the
   next fault (see [`docs/memory-pool.md`](docs/memory-pool.md#eviction)
   § Eviction). Swap to
-  disk is that store's second tier: a separate swap service takes chunks memmgr
+  disk is that store's second tier: a separate swap service, swapd, takes chunks memmgr
   seals under a per-boot key it alone holds, writes them to its partition, and
   hands their bytes back on a fault memmgr redirects to it; memmgr reads and
   writes no slot and waits on no swap service (see

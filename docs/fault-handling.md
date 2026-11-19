@@ -959,8 +959,8 @@ kernel one. Of swap, memmgr implements compressed eviction in RAM
 tier: a fault on a chunk on disk is redirected (`FAULT_REPLY_REDIRECT`, [Reply](#reply)) to the
 swap service, which holds it while it reads the slot and hands memmgr the bytes, so memmgr waits on
 no storage ([memmgr Memory Pool § Disk
-tier](../services/memmgr/docs/memory-pool.md#disk-tier)). The swap service itself is to come
-([#43](https://github.com/kottlerg/seraph/issues/43)).
+tier](../services/memmgr/docs/memory-pool.md#disk-tier)). The swap service is swapd
+([services/swapd/README.md](../services/swapd/README.md)).
 
 Demand paging is the **system-wide default**: procmgr binds memmgr (the pager) as the
 fault handler on every process it creates and advertises it in

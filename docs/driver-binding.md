@@ -217,6 +217,7 @@ describes, and a signature over the binary would cover its declaration with it.
 | DMA address width | Optional, valid only beside DMA: the address bits the device's DMA reaches, 12 to 64; absent means the device has no limit of its own. devmgr limits the device's IOVA space to the smaller of this and its unit's width (§ Declaration Bounds) |
 | Physical access | Whether the driver programs hardware with physical addresses: it is then created `CREATE_PHYS_ACCESS` ([device-management.md](device-management.md#physical-addresses) § Physical Addresses). Accepted only for an IOMMU record (§ Declaration Bounds) |
 | Withdrawal reset | How devmgr stops the device when it withdraws the driver: the VirtIO `device_status` reset, a PCI Express Function Level Reset, or none, beside the interrupt disable every PCI function gets (§ Binding). The VirtIO reset also makes the driver one of the VirtIO register layout and states whether its device type has a device-specific configuration region, which the layout then includes ([services/devmgr/docs/pci-enumeration.md](../services/devmgr/docs/pci-enumeration.md) § Per-Device Capability Creation) |
+| Reserve | A driver of the `block` device class is created `CREATE_RESERVE`, inside memmgr's system reserve, since it is the storage path swapd calls to end a pressure episode; procmgr honours it because devmgr's own node is a reserve node. Derived from the class, not declared |
 | Priority tier | Boot (`sched_policy::BOOT_DRIVER_PRIORITY`) or auxiliary (`AUX_DRIVER_PRIORITY`) |
 
 A declaration names standards only: the withdrawal reset and the interrupt kind are methods
@@ -322,7 +323,8 @@ and Programming specifies:
 - every unit's register `Mmio` capability is delivered to it, and devmgr deletes its own once
   the spawn returns, keeping no copy;
 - it is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS` at the boot tier,
-  from its declaration's DMA and physical-access fields;
+  from its declaration's DMA and physical-access fields, and `CREATE_RESERVE`, inside memmgr's
+  system reserve;
 - it is given no DMA capability;
 - devmgr deletes its hold's release token at the spawn.
 

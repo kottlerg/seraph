@@ -254,12 +254,15 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     `DENY_BADGE`-badged SENDs on vfsd's service endpoint, published as
     they arrive; svctest is the only recipe seeding them.
   - `vfsd.swap` — the endowed `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, the
-    `GET_SWAP_PARTITION` surface, published as it arrives; the swap service's recipe is to seed
-    it, and svctest's recipe seeds it while no swap service exists, since two seeders would
-    revoke each other's partition cap.
+    `GET_SWAP_PARTITION` surface, published as it arrives; swapd's recipe seeds it, and
+    svctest's recipe seeds it too, to drive only the stale-version refusal of
+    `GET_SWAP_PARTITION`, which hands nothing out, since a hand-out to svctest would revoke
+    swapd's partition cap.
   - `memmgr.swap` — the endowed `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's endpoint, the
     swap labels of memmgr's disk tier, published as it arrives with `GRANT` kept for its seeds; the
-    swap service's recipe is to seed it, and svctest's recipe seeds it while no swap service exists.
+    swapd's recipe seeds it, and svctest's recipe seeds it too, as a second swap client beside
+    swapd that takes and restores chunks of its own and registers nothing, since a registration
+    would replace swapd's.
   - `logd.query` — `LOG_QUERY_AUTHORITY`-badged SEND minted from the
     endowed master-log source, gating logd's `QUERY_SLOTS` and
     `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md#queries));

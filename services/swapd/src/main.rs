@@ -136,7 +136,7 @@ fn main()
     touch_stack();
     touch_heap();
     let used = register(memmgr, recv, want, slots, ipc_buf);
-    std::os::seraph::log!("swap partition: {slots} slots of 64 KiB, {used} in use");
+    std::os::seraph::log!("swap partition: {slots} slots of 64 KiB, memmgr uses {used}");
 
     let swap = Arc::new(Swap {
         memmgr,

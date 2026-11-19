@@ -21,6 +21,7 @@
 # `reserve = yes`: swapd acts to end a pressure episode. It touches its
 # stack and heap at start and allocates nothing after.
 binary    = /services/swapd
+argv      = swapd
 priority  = 20
 sched_max = 20
 restart   = on_failure

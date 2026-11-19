@@ -985,8 +985,10 @@ pub fn memmgr_pool_free_bytes() -> Option<u64> {
     pal_alloc::memmgr_query_free_bytes()
 }
 
-/// memmgr's memory-pressure level: how close its free pool is to the system
-/// reserve (`services/memmgr/docs/memory-pool.md` § Memory pressure). The
+/// memmgr's memory-pressure level: how close its free pool is to the growth
+/// floor, the system reserve and, while chunks are swapped, the restore
+/// headroom memmgr keeps above it (`QUERY_POOL_STATUS` `data[11]`;
+/// `services/memmgr/docs/memory-pool.md` § Memory pressure). The
 /// level is advisory: a process that holds memory it can give back, such as
 /// a cache, releases some on `Low` and more on `Critical`.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -999,8 +1001,8 @@ pub enum MemoryPressure {
     /// The free pool is below the low threshold.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     Low,
-    /// The free pool is at or below the system reserve: memmgr refuses a
-    /// grant to a process outside the reserve.
+    /// The free pool is at or below the growth floor: memmgr refuses a grant
+    /// to a process outside the reserve.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     Critical,
 }
@@ -1717,6 +1719,16 @@ pub mod log {
         // buffer page (`_start` and the spawn trampoline set it after
         // registering).
         unsafe { ::log::register_name(cap, buf, name) };
+    }
+
+    /// Tell this process's log client that a new log receiver has started
+    /// on the log endpoint in place of one that stopped receiving, so the
+    /// next log call waits the full bound again even when an earlier one
+    /// timed out (`::log::receiver_restarted`). svcmgr calls it once it has
+    /// restarted logd, before it writes the lines it held for logd's death.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn receiver_restarted() {
+        ::log::receiver_restarted();
     }
 
     /// Macro entry point of a bare `log!`: [`__emit_at`] at the info

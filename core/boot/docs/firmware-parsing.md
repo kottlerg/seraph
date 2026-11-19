@@ -129,10 +129,11 @@ Apertures are coarse but **not indiscriminate**. No aperture covers RAM or
 firmware-exclusive state. Step 1 collects only MMIO descriptors, and step 2
 clips each seed by its class:
 
-- **Named seeds** are LAPIC, IOAPIC, APLIC, IMSIC, ECAM, VT-d remapping units (DMAR),
-  UART, RTC, `virtio,mmio` and other DTB nodes, and the framebuffer. They are windows a firmware
-  table, the DTB, or GOP names as a device's registers or frame buffer, or that the arch
-  defaults fix at a platform-defined register address (`default_mmio_apertures`).
+- **Named seeds** are LAPIC, IOAPIC, APLIC, IMSIC, ECAM, VT-d remapping units (DMAR), the
+  TPM's register window (TPM2), UART, RTC, `virtio,mmio` and other DTB nodes, and the
+  framebuffer. They are windows a firmware table, the DTB, or GOP names as a device's registers
+  or frame buffer, or that the arch defaults fix at a platform-defined register address
+  (`default_mmio_apertures`, and `tpm_register_window` for a TPM the `TPM2` table reports).
   - Every range of the RAM-class types (`EfiConventionalMemory`, `EfiBootServicesCode`,
     `EfiBootServicesData`, `EfiLoaderCode`, `EfiLoaderData`, `EfiACPIReclaimMemory`,
     `EfiPersistentMemory`) and of the firmware-exclusive types (`EfiRuntimeServicesCode`,

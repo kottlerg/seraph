@@ -38,9 +38,10 @@ pub use arena::{
     NodeHandle, NodeIdx, ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE, SlotStore,
 };
 pub use budget::{
-    BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, reserve_pages,
+    BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, growth_floor,
+    reserve_pages, restore_headroom,
 };
-pub use chunk::{ChunkEntry, ChunkError, ChunkState};
+pub use chunk::{COLD_SWEEPS, ChunkEntry, ChunkError, ChunkState};
 pub use commit::{CommitNeed, PT_DONATION_PAGES};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
@@ -67,7 +68,7 @@ pub const CHUNK_BYTES: u64 = DEMAND_CHUNK_PAGES as u64 * PAGE_SIZE;
 /// One free run: a Memory cap memmgr owns, covering `page_count` pages
 /// starting at physical address `phys_base`. The page count is `u64`, so a
 /// run of any size the kernel can mint is held whole.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FreeRun
 {
     pub cap_slot: u64,

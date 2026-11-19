@@ -162,6 +162,13 @@ Each feature is classified per architecture as one of:
   [core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)
   § Data-operand-independent timing.
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.
+- **TPM 2.0** — a hardware random number generator independent of RDSEED and RDRAND: when the
+  firmware reports a TPM 2.0 in the ACPI `TPM2` table on the FIFO interface or on the CRB
+  interface started through its start register (start methods 6 and 7), the TPM driver reads it
+  with `TPM2_GetRandom` and `entropyd` mixes its bytes into the kernel pool
+  ([services/drivers/docs/tpm.md](../services/drivers/docs/tpm.md)). It is not a boot dependency:
+  without a TPM, or with one the driver does not start, the system runs unchanged. No other TPM
+  function (measured boot, sealing, attestation) is used.
 - **GOP framebuffer** — graphical console; a headless serial-only boot is valid.
 - **PCIe ECAM (MCFG)** — discovered when firmware publishes it; not required by the kernel.
 - **LA57 (5-level paging)** — a larger-VA expansion above 4-level paging, the x86-64 analogue of
@@ -185,7 +192,7 @@ Each feature is classified per architecture as one of:
   pursued
   ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 - **Legacy BIOS / multiboot** — boot is UEFI-only.
-- **Secure Boot, TPM, RTC** — not boot dependencies.
+- **Secure Boot, RTC** — not boot dependencies.
 
 ---
 

@@ -126,7 +126,7 @@ See [core/boot/docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md) for details.
 | [core/boot/docs/uefi-environment.md](docs/uefi-environment.md) | UEFI protocols, memory allocation, the stack, `ExitBootServices`, error handling |
 | [core/boot/docs/elf-loading.md](docs/elf-loading.md) | ELF validation, LOAD segment processing, boot module loading |
 | [core/boot/docs/firmware-parsing.md](docs/firmware-parsing.md) | ACPI and Device Tree extractors: CPU topology, kernel-facing MMIO bases, coarse MMIO apertures, the DTB rng-seed fallback, and the VMGENID GUID address |
-| [core/boot/docs/acpi.md](docs/acpi.md) | ACPI table-walk invariants (RSDP, XSDT, MADT, MCFG, SPCR, RHCT, SSDT) |
+| [core/boot/docs/acpi.md](docs/acpi.md) | ACPI table-walk invariants (RSDP, XSDT, MADT, MCFG, DMAR, TPM2, SPCR, RHCT, SSDT) |
 | [core/boot/docs/dtb.md](docs/dtb.md) | Flat Device Tree walk invariants (header validation, compatible matching, rng-seed extraction and scrub) |
 | [core/boot/docs/memory-map.md](docs/memory-map.md) | UEFI memory map → `BootInfo.memory_map` translation policy |
 | [core/boot/docs/console.md](docs/console.md) | Early console (serial + framebuffer): backend discovery, glyph rendering, handoff |

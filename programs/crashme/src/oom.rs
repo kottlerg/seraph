@@ -13,8 +13,8 @@
 //! other processes free meanwhile, and exits, which gives it all back.
 //! `crashme oom-touch <pages>` registers a demand region of `<pages>` pages
 //! before that, and on its second line of stdin writes each page in turn:
-//! memmgr declines the first write past the free pages above the reserve, the
-//! crash service holds it, and the write either completes once the filler
+//! memmgr declines the first write past the free pages above its growth floor,
+//! the crash service holds it, and the write either completes once the filler
 //! exits, the process printing how long its longest write took, or the hold
 //! times out and the process dies of the fault.
 //! Neither allocates while the level is `CRITICAL`. The fill is
@@ -54,7 +54,7 @@ const PAGE_BYTES: usize = 4096;
 /// Bytes of stack each mode touches before the window, below its frame.
 const STACK_TOUCH_BYTES: usize = 16 * 1024;
 
-/// `crashme oom-fill <ms>`: fill memmgr's pool up to the system reserve, print
+/// `crashme oom-fill <ms>`: fill memmgr's pool down to its growth floor, print
 /// `full`, hold it there for `<ms>`, and exit 0.
 pub fn fill(arg: Option<&str>) -> !
 {
@@ -96,8 +96,8 @@ pub fn fill(arg: Option<&str>) -> !
 /// write each page of the region in turn and print how long the longest write
 /// took.
 ///
-/// The writes after the first spend whatever free pages lie above the system
-/// reserve when the window opens (a stop's frees, until the filler's next
+/// The writes after the first spend whatever free pages lie above the growth
+/// floor when the window opens (a stop's frees, until the filler's next
 /// top-up takes them back), so a region larger than those makes the write
 /// that memmgr declines, and the crash service holds, certain.
 pub fn touch(arg: Option<&str>) -> !

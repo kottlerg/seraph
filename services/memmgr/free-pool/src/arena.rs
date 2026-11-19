@@ -33,7 +33,7 @@ pub const NODE_NULL: NodeIdx = u64::MAX;
 /// mapped it at (a run backing part of a demand chunk, kept on that chunk's
 /// run list in the region's chunk table), or the caller-owned-mapping marker
 /// the service chooses (a frame on the record's frame list).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameDesc
 {
     pub cap_slot: u64,

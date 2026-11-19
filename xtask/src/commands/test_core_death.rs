@@ -22,7 +22,9 @@
 //!   stub's first attach, which can fall before logd asks svcmgr for its
 //!   bootstrap round, and as it restarts, it is killed again, through the
 //!   stub's attach to each new instance, until svcmgr's restart budget is
-//!   spent.
+//!   spent. A first kill before logd's release of init-logd leaves init-logd
+//!   serving the log endpoint, so the first restart must take the handover:
+//!   the test waits for init-logd's last line before the second kill.
 //! - **QEMU's own gdbstub** (memmgr and procmgr, which init creates with raw
 //!   syscalls, so no debugger can attach to them): once the default boot is
 //!   up, the host sets a hardware breakpoint on a function of the target's
@@ -532,23 +534,36 @@ fn kill_through_stub(
                 .with_context(|| {
                     format!("{name}'s restart after kill {}", kill.saturating_sub(1))
                 })?;
-            // A first kill that fell before the log sink's bootstrap request
-            // left init-logd serving the log endpoint: the restarted instance
-            // must take the handover from it, as the first launch would have.
+            // logd, the only target killed more than once, is the log sink:
+            // until an instance's release reaches init-logd, init-logd serves
+            // the log endpoint and writes the UART directly, whether the first
+            // kill fell before that instance's bootstrap request or after it.
+            // The restarted instance must take the handover from it, as the
+            // first launch would have, or both write the UART and their lines
+            // interleave byte by byte.
             let died_early = format!("svcmgr: {name}{BOOT_DEATH_MARKER}");
-            if kill == 2 && lines.iter().any(|l| l.contains(&died_early))
+            if kill == 2
+                && !seen
+                    .iter()
+                    .chain(&lines)
+                    .any(|l| l.contains(HANDOVER_MARKER))
             {
-                if !lines.iter().any(|l| l.contains(HANDOVER_MARKER))
+                guest
+                    .collect_until(HANDOVER_MARKER, BOOT_TIMEOUT)
+                    .with_context(|| {
+                        format!("the handover to {name}'s restart after its first instance died")
+                    })?;
+                let when = if lines.iter().any(|l| l.contains(&died_early))
                 {
-                    guest
-                        .collect_until(HANDOVER_MARKER, BOOT_TIMEOUT)
-                        .with_context(|| {
-                            format!("the handover to {name}'s restart after its first launch died")
-                        })?;
+                    "before"
                 }
+                else
+                {
+                    "after"
+                };
                 step(&format!(
-                    "core-death test: {name}'s first launch died before its bootstrap request; \
-                     its restart took the handover"
+                    "core-death test: {name}'s first instance died {when} its bootstrap request, \
+                     before its release; its restart took the handover"
                 ));
             }
             stub.request(b"qSupported")?;

@@ -26,7 +26,7 @@ use crate::definitions::launch::{
     serve_boot_slots,
 };
 use crate::definitions::{build_blob, cwd_rights};
-use crate::service::{Bootstrap, POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
+use crate::service::{POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
 use ipc::bootstrap::ServeFailure;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use std::os::seraph::process::ArgvEnvCap;
@@ -790,7 +790,6 @@ fn restart_process(
     }
 
     svc.bootstrap_badge = child_badge;
-    svc.bootstrap = Bootstrap::Served;
     Respawn::Started
 }
 
@@ -799,14 +798,16 @@ fn restart_process(
 /// caller then destroys the new child.
 ///
 /// The log-sink service (real-logd) gets a freshly-minted round from the
-/// reserved log-sink sources. Once an instance has taken all its rounds
-/// (`ServiceEntry::bootstrap`) the round carries no `HANDOVER_PULL`
-/// SEND: that instance held the handover, so the restarted logd skips the
-/// history pull and takes over the log endpoint directly. Until then no
-/// instance has received the SEND and init-logd still serves the endpoint, so
-/// the round is the first launch's, with the SEND. Senders are unaffected:
-/// their SENDs target the endpoint object, and svcmgr's reserved source kept
-/// it alive across the crash.
+/// reserved log-sink sources. While procmgr does not report init reaped
+/// ([`init_reaped`]), init-logd may still serve the log endpoint: the last
+/// instance can have died anywhere before its `HANDOVER_RELEASE` reached
+/// init-logd, even before its bootstrap request. The round is then the first
+/// launch's, with the `HANDOVER_PULL` SEND, and the restarted logd takes the
+/// handover and releases init-logd, which would otherwise write the UART
+/// beside it. Once init is reaped the round carries no SEND, and the
+/// restarted logd takes over the log endpoint directly. Senders are
+/// unaffected: their SENDs target the endpoint object, and svcmgr's reserved
+/// source kept it alive across the crash.
 ///
 /// Otherwise the recipe's `seed = ...` names are re-resolved from the
 /// registry, in declaration order — byte-for-byte the positional set first
@@ -826,10 +827,13 @@ fn restart_boot_caps(
 {
     if matches!(recipe, Some(r) if r.log_sink)
     {
-        let kind = match svc.bootstrap
+        let kind = if svcmgr_defs::log_sink_handover_owed(init_reaped(ctx))
         {
-            Bootstrap::Served => LaunchKind::Restart,
-            Bootstrap::Pending => LaunchKind::First,
+            LaunchKind::First
+        }
+        else
+        {
+            LaunchKind::Restart
         };
         return Some(mint_logd_boot_caps(ctx, kind, registry));
     }
@@ -878,6 +882,18 @@ fn restart_boot_caps(
         0
     };
     Some(assemble_boot_caps(provided_recv, restart_caps))
+}
+
+/// procmgr's `QUERY_INIT_REAP` reply, its label and data word 0 (whether the
+/// init reap has run), or `None` when the call failed
+/// (`services/procmgr/docs/ipc-interface.md` § `QUERY_INIT_REAP`).
+/// [`svcmgr_defs::log_sink_handover_owed`] reads it.
+fn init_reaped(ctx: &RestartCtx) -> Option<(u64, u64)>
+{
+    let query = IpcMessage::new(procmgr_labels::QUERY_INIT_REAP);
+    // SAFETY: ctx.ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(ctx.procmgr_ep, &query, ctx.ipc_buf) }.ok()?;
+    Some((reply.label, reply.word(0)))
 }
 
 /// Spawn a fresh instance of `svc` via procmgr from its recorded

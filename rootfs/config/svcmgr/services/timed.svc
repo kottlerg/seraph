@@ -17,7 +17,11 @@
 # `critical = no`: a dead timed leaves `SystemTime::now()` returning
 # UNIX_EPOCH but does not break the system; logged and left inactive once
 # the restart budget is spent.
+# `argv = timed` names the process for procmgr's LIST_PROCESSES, through
+# which svctest's timed_rtc_restart phase finds and kills it; timed reads
+# no argument.
 binary    = /services/timed
+argv      = timed
 priority  = 16
 restart   = on_failure
 critical  = no

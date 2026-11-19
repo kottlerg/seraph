@@ -1115,7 +1115,7 @@ clamped to the slot map's window ([docs/limits.md](../../../docs/limits.md)
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | Registered; `data[0]` the slots memmgr uses |
-| 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Endpoint cap, or a cap on memmgr's own endpoint; the count below a slot in use; or memmgr's key draw failed at start, so the disk tier is off. memmgr deletes the cap, and any earlier registration stays |
+| 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Endpoint cap, or a cap on memmgr's own endpoint; the count below a slot ever taken, one on the free list included; or memmgr's key draw failed at start, so the disk tier is off. memmgr deletes the cap, and any earlier registration stays |
 
 #### Label 23: `SWAP_TAKE`
 
@@ -1137,7 +1137,7 @@ the cap. The chunk is writing until `SWAP_DONE`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 0 | `SUCCESS` | `data[0]` the slot, `data[1]` its byte count |
+| 0 | `SUCCESS` | `data[0]` the slot, `data[1]` its byte count, `data[2]` its slot word, the word a fault on the chunk is redirected with (§ Kernel-origin fault message) |
 | 3 | `QUOTA` | The arena or the slot map could not grow, or the chunk's store runs could not be mapped |
 | 4 | `INVALID_ARGUMENT` | No swap service is registered, or `caps[0]` missing, no Memory cap, smaller than a chunk, or not mappable writable |
 | 9 | `NOTHING_TO_TAKE` | The walk found no compressed chunk within its bound; the next request goes on from where it stopped |
@@ -1170,20 +1170,28 @@ service or ahead of one.
 | Field | Value |
 |---|---|
 | label | 25 |
-| data[0] | the slot |
+| data[0] | the slot word: the redirect's (§ Kernel-origin fault message), or `SWAP_TAKE`'s `data[2]` |
 | caps[0] | a Memory cap holding the slot's bytes from offset 0 |
 
-memmgr maps the cap read-only, copies the slot's bytes into its own buffer,
-and checks the tag there under the nonce of the chunk's last seal. A good slot
-is restored as a fault restores a compressed chunk (§ Kernel-origin fault message),
-its slot and disk node freed. A tag failure makes the chunk lost and frees
-its slot.
+The slot word names one use of a slot: the slot, its byte count, and the
+generation of the seal it holds. A word whose slot holds no chunk on disk, or
+holds one under another seal, was made for a use that has ended (the chunk
+restored by another fault or ahead of one, or torn down, and the slot taken
+again since): memmgr replies `RESTORE_STALE` and changes nothing, so a late
+or repeated request never reaches a chunk it was not made for. Two uses of a
+slot share a word only when `2^20` seals, or a multiple, came between them.
+Otherwise memmgr maps the cap read-only, copies the slot's bytes into its own
+buffer, and checks the tag there under the nonce of the chunk's last seal. A
+good slot is restored as a fault restores a compressed chunk (§ Kernel-origin
+fault message), its slot and disk node freed. A tag failure makes the chunk
+lost and frees its slot.
 
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | The chunk is resident |
-| 4 | `INVALID_ARGUMENT` | The slot holds no chunk on disk, or `caps[0]` missing, no Memory cap, smaller than the slot's bytes, or not mappable |
+| 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Memory cap, smaller than the slot's bytes, or not mappable: a request the swap service corrects; the fault it holds stays held |
 | 11 | `RESTORE_DECLINED` | `data[0]` the fault decline word the swap service forwards the held fault with (`FAULT_REPLY_FORWARD`): code 12 with detail 1 when the tag failed and the chunk is lost, else the code of the restore memmgr could not make, the chunk staying on disk |
+| 12 | `RESTORE_STALE` | The word names no chunk on disk; nothing changed. The swap service resumes the held fault (`FAULT_REPLY_RESUME`): the thread faults again and memmgr serves the fault as the chunk now stands, mapped when another restore made it resident |
 
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
@@ -1237,12 +1245,17 @@ stored chunk does not decode; the chunk then stays evicted
 ([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a writing
 chunk is restored from its store runs as a compressed chunk's, and its write
 cancelled. A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming
-the registered swap service's endpoint, with data word 0 the slot in its low
-32 bits and the slot's byte count above them, which the endpoint receives as
-data word `FAULT_REDIRECT_WORD` (4): the thread stays fault-blocked until the
-swap service, having handed memmgr the slot's bytes (§ Label 25), resumes it
-or forwards it with the decline word memmgr replied. A fault on a chunk on disk
-with no swap service registered, and one on a lost chunk, are declined with
+the registered swap service's endpoint, with data word 0 the slot word, which
+the endpoint receives as data word `FAULT_REDIRECT_WORD` (4): the slot in its
+low 28 bits, the slot's byte count in the next 16, and in the top 20 the low
+bits of the nonce counter of the seal the slot holds
+(`free_pool::disk::slot_word`). The thread stays fault-blocked until the
+swap service, having handed memmgr the slot's bytes with the word (§ Label
+25), resumes it on `SUCCESS` or `RESTORE_STALE`, or forwards it with the
+decline word of `RESTORE_DECLINED`. Two threads faulting on one chunk on disk
+are redirected twice; the first restore makes the chunk resident, the second
+is `RESTORE_STALE`, and both threads resume onto the mapped chunk. A fault on
+a chunk on disk with no swap service registered, and one on a lost chunk, are declined with
 code 12 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 
 | Code | Decline |

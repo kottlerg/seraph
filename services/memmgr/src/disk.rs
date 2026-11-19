@@ -53,6 +53,7 @@ pub(crate) const SWAP_SLOTS_END: u64 = 0x0000_0002_0000_0000;
 /// The most slots memmgr uses: the words the slot map's window holds.
 const MAX_SLOTS: u64 = (SWAP_SLOTS_END - SWAP_SLOTS_VA) / 8;
 const _: () = assert!(SLOT_WORDS_PER_PAGE * 8 == PAGE_SIZE);
+const _: () = assert!(MAX_SLOTS <= disk::WORD_SLOTS);
 
 /// Steps of the walk one `SWAP_TAKE` makes for a compressed chunk
 /// ([`free_pool::Ledger::next_compressed`]): a chunk visited, or a region or
@@ -180,7 +181,7 @@ const fn decline_word(reason: FaultDecline, detail: u64) -> u64
 
 /// Reply to a fault on the chunk whose entry names the disk node `disk`
 /// by its path ([`free_pool::fault_path`]): redirect it to the swap
-/// service's endpoint with the word naming the slot and its byte count, or
+/// service's endpoint with the slot word ([`disk::slot_word`]), or
 /// decline it with code 12. Returns `false` for a path that is not the disk
 /// tier's, replying nothing.
 pub(crate) fn reply_fault(
@@ -201,7 +202,7 @@ pub(crate) fn reply_fault(
                 return true;
             };
             let reply = IpcMessage::builder(syscall_abi::FAULT_REPLY_REDIRECT)
-                .word(0, disk::redirect_word(n.slot, n.len))
+                .word(0, disk::slot_word(n.slot, n.len, n.nonce))
                 .cap(state().endpoint)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page. The kernel
@@ -262,11 +263,11 @@ fn unmap_window(pages: u64)
 /// slot count. memmgr refuses a cap that is no Endpoint cap or names its own
 /// endpoint `service_ep` (a fault redirected there would reach memmgr with the
 /// badge of the cap, a process's, and be served in the wrong address space),
-/// and a count below a slot in use. A registration replaces the one before it,
-/// whose cap is deleted, and ends every write in flight
-/// ([`free_pool::Ledger::end_writes`]): a new swap service knows nothing of
-/// its predecessor's. The reply's `data[0]` is the slots memmgr uses, the
-/// count clamped to [`MAX_SLOTS`].
+/// and a count below a slot ever taken (one on the free list included). A
+/// registration replaces the one before it, whose cap is deleted, and ends
+/// every write in flight ([`free_pool::Ledger::end_writes`]): a new swap
+/// service knows nothing of its predecessor's. The reply's `data[0]` is the
+/// slots memmgr uses, the count clamped to [`MAX_SLOTS`].
 fn handle_register(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
 {
     let Some(&cap) = caps.first()
@@ -340,7 +341,8 @@ fn grow_slots(l: &mut MemLedger) -> bool
 /// the slot's bytes into the swap service's buffer, mapped at the swap
 /// window. The chunk is writing: its store runs stay until `SWAP_DONE`, so
 /// a fault meanwhile restores from them. Reply: `SUCCESS` with `data[0]` the
-/// slot and `data[1]` its byte count; `INVALID_ARGUMENT` for a missing or
+/// slot, `data[1]` its byte count and `data[2]` its slot word
+/// ([`disk::slot_word`]); `INVALID_ARGUMENT` for a missing or
 /// small cap, one memmgr cannot map, or with no swap service registered;
 /// `SWAP_FULL` when every registered slot is taken; `NOTHING_TO_TAKE` when
 /// the walk finds no compressed chunk within [`TAKE_STEPS`]; `QUOTA` when the
@@ -363,37 +365,37 @@ fn handle_take(caps: &[u64], ipc_buf: *mut u64)
 }
 
 /// [`handle_take`]'s work: its reply label and words.
-fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 2])
+fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
 {
     let s = state();
     let Some(key) = s.key.filter(|_| s.endpoint != 0)
     else
     {
-        return (memmgr_errors::INVALID_ARGUMENT, [0; 2]);
+        return (memmgr_errors::INVALID_ARGUMENT, [0; 3]);
     };
     if !is_memory_of(cap, CHUNK_BYTES)
     {
-        return (memmgr_errors::INVALID_ARGUMENT, [0; 2]);
+        return (memmgr_errors::INVALID_ARGUMENT, [0; 3]);
     }
     if l.slots.free() == 0
     {
-        return (memmgr_errors::SWAP_FULL, [0; 2]);
+        return (memmgr_errors::SWAP_FULL, [0; 3]);
     }
     if !grow_slots(l) || !ensure_slots(l, 1)
     {
-        return (memmgr_errors::QUOTA, [0; 2]);
+        return (memmgr_errors::QUOTA, [0; 3]);
     }
     let Some(v) = l.next_compressed(&mut state().hand, TAKE_STEPS)
     else
     {
-        return (memmgr_errors::NOTHING_TO_TAKE, [0; 2]);
+        return (memmgr_errors::NOTHING_TO_TAKE, [0; 3]);
     };
     let entry = l.chunk_at(v.reg, v.page_base);
     let buf = buf();
     let Some(len) = evict::read_store(l, entry, buf)
     else
     {
-        return (memmgr_errors::QUOTA, [0; 2]);
+        return (memmgr_errors::QUOTA, [0; 3]);
     };
     let s = state();
     let nonce = s.nonce;
@@ -403,7 +405,7 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 2])
     let Ok(total) = disk::seal(&key, nonce, buf, len)
     else
     {
-        return (memmgr_errors::QUOTA, [0; 2]);
+        return (memmgr_errors::QUOTA, [0; 3]);
     };
     let pages = u64::try_from(total).unwrap_or(u64::MAX).div_ceil(PAGE_SIZE);
     // SAFETY: the swap window is memmgr's own zone, which every use leaves
@@ -411,13 +413,13 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 2])
     if unsafe { map_self(l, cap, SWAP_WINDOW_VA, 0, pages) }.is_err()
     {
         unmap_window(pages);
-        return (memmgr_errors::INVALID_ARGUMENT, [0; 2]);
+        return (memmgr_errors::INVALID_ARGUMENT, [0; 3]);
     }
     let Some(sealed) = buf.get(..total)
     else
     {
         unmap_window(pages);
-        return (memmgr_errors::QUOTA, [0; 2]);
+        return (memmgr_errors::QUOTA, [0; 3]);
     };
     // SAFETY: `pages` pages of the swap service's buffer are mapped
     // read-write at the swap window, which nothing else in memmgr refers to,
@@ -434,10 +436,14 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 2])
     {
         Ok(slot) => (
             memmgr_errors::SUCCESS,
-            [u64::from(slot), u64::try_from(total).unwrap_or(0)],
+            [
+                u64::from(slot),
+                u64::from(len16),
+                disk::slot_word(slot, len16, nonce),
+            ],
         ),
-        Err(SwapError::NoSwapSlot) => (memmgr_errors::SWAP_FULL, [0; 2]),
-        Err(_) => (memmgr_errors::QUOTA, [0; 2]),
+        Err(SwapError::NoSwapSlot) => (memmgr_errors::SWAP_FULL, [0; 3]),
+        Err(_) => (memmgr_errors::QUOTA, [0; 3]),
     }
 }
 
@@ -479,8 +485,14 @@ fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
 }
 
 /// `SWAP_RESTORE` (services/memmgr/docs/ipc-interface.md § Label 25):
-/// `data[0]` the slot, `caps[0]` a Memory cap holding its bytes from offset
-/// 0, moved back on every reply. memmgr maps the cap read-only at the swap
+/// `data[0]` the slot word of a fault's redirect or of `SWAP_TAKE`'s reply
+/// ([`disk::slot_word`]), `caps[0]` a Memory cap holding the slot's bytes
+/// from offset 0, moved back on every reply. A word that names no chunk on
+/// disk ([`free_pool::Ledger::on_disk_named`]), its slot holding none or a
+/// later seal's, replies `RESTORE_STALE` and changes nothing: the request
+/// was made for a use of the slot that has ended, and the swap service
+/// resumes the held fault, which faults again and is served as its chunk now
+/// stands. Otherwise memmgr maps the cap read-only at the swap
 /// window, copies the slot's bytes into its own buffer, and opens them there
 /// under the nonce of the chunk's last seal: on a tag failure the chunk is
 /// lost ([`free_pool::Ledger::lose_chunk`]), and the reply is
@@ -490,9 +502,9 @@ fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
 /// restored from the opened stream as from the store (`evict::restore`):
 /// admitted, its pages filled and mapped, its slot freed. A restore memmgr
 /// cannot make replies `RESTORE_DECLINED` with that restore's decline word,
-/// the chunk staying on disk. Reply: `SUCCESS`; `RESTORE_DECLINED`; or
-/// `INVALID_ARGUMENT` for a slot that holds no chunk on disk, or a missing or
-/// small cap, or one memmgr cannot map.
+/// the chunk staying on disk. Reply: `SUCCESS`; `RESTORE_DECLINED`;
+/// `RESTORE_STALE`; or `INVALID_ARGUMENT` for a missing or small cap, or
+/// one memmgr cannot map.
 fn handle_restore(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
 {
     let Some(&cap) = caps.first()
@@ -507,21 +519,19 @@ fn handle_restore(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
 }
 
 /// [`handle_restore`]'s work: its reply label and word.
-fn restore(l: &mut MemLedger, slot: u64, cap: u64) -> (u64, u64)
+fn restore(l: &mut MemLedger, word: u64, cap: u64) -> (u64, u64)
 {
     let Some(key) = state().key
     else
     {
         return (memmgr_errors::INVALID_ARGUMENT, 0);
     };
-    let Some((slot, n)) = u32::try_from(slot)
-        .ok()
-        .and_then(|slot| l.disk_at(slot).map(|(_, n)| (slot, n)))
-        .filter(|(_, n)| n.state == free_pool::DiskState::OnDisk)
+    let Some(n) = l.on_disk_named(word)
     else
     {
-        return (memmgr_errors::INVALID_ARGUMENT, 0);
+        return (memmgr_errors::RESTORE_STALE, 0);
     };
+    let slot = n.slot;
     let total = usize::from(n.len);
     let bytes = u64::from(n.len);
     if !is_memory_of(cap, bytes)

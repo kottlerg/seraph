@@ -52,3 +52,8 @@ pub const SWAP_FULL: u64 = 10;
 /// reply's `data[0]` is the fault decline word the swap service forwards the
 /// held fault with.
 pub const RESTORE_DECLINED: u64 = 11;
+/// `SWAP_RESTORE`: the slot word names no chunk on disk, its slot holding
+/// none or one of a later seal: the request was made for a use of the slot
+/// that has ended. Nothing changes; the swap service resumes the held fault,
+/// which faults again and is served as its chunk now stands.
+pub const RESTORE_STALE: u64 = 12;

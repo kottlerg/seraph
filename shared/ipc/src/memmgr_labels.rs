@@ -419,7 +419,7 @@ pub const MAKE_RESIDENT: u64 = 21;
 /// each [`DEMAND_CHUNK_BYTES`]. A registration replaces the one before it
 /// and ends every write in flight, the chunks staying in memmgr's store.
 /// Reply: `SUCCESS` with `data[0]` the slots memmgr uses; `INVALID_ARGUMENT`
-/// when `caps[0]` is no endpoint cap or the count is below a slot in use.
+/// when `caps[0]` is no endpoint cap or the count is below a slot ever taken.
 /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 22:
 /// `SWAP_REGISTER`.
 pub const SWAP_REGISTER: u64 = 22;
@@ -427,8 +427,9 @@ pub const SWAP_REGISTER: u64 = 22;
 /// is a Memory cap of at least [`DEMAND_CHUNK_BYTES`] memmgr writes the
 /// slot's bytes into (the chunk's stream, encrypted and authenticated under
 /// memmgr's per-boot key, and its tag). Reply: `SUCCESS` with `data[0]` the
-/// slot and `data[1]` its byte count, or an error code; `caps[0]` moved back
-/// on every reply. Specified in `services/memmgr/docs/ipc-interface.md`
+/// slot, `data[1]` its byte count and `data[2]` its slot word, the word a
+/// fault on the chunk is redirected with, or an error code; `caps[0]` moved
+/// back on every reply. Specified in `services/memmgr/docs/ipc-interface.md`
 /// § Label 23: `SWAP_TAKE`.
 pub const SWAP_TAKE: u64 = 23;
 /// Swap authority only: end the write of a slot [`SWAP_TAKE`] named.
@@ -437,11 +438,14 @@ pub const SWAP_TAKE: u64 = 23;
 /// `SWAP_DONE`.
 pub const SWAP_DONE: u64 = 24;
 /// Swap authority only: hand memmgr a slot's bytes, read back for a fault
-/// redirected to the swap service or ahead of one. `data[0]` the slot,
-/// `caps[0]` a Memory cap holding the slot's bytes from offset 0. memmgr
-/// checks the tag, decrypts, and makes the chunk resident. Reply: `SUCCESS`,
-/// or `RESTORE_DECLINED` with `data[0]` the decline word the swap service
-/// forwards the held fault with; `caps[0]` moved back on every reply.
+/// redirected to the swap service or ahead of one. `data[0]` the slot word
+/// of the redirect or of [`SWAP_TAKE`]'s reply, `caps[0]` a Memory cap
+/// holding the slot's bytes from offset 0. memmgr checks the tag, decrypts,
+/// and makes the chunk resident. Reply: `SUCCESS`; `RESTORE_DECLINED` with
+/// `data[0]` the decline word the swap service forwards the held fault
+/// with; or `RESTORE_STALE` for a word that names no chunk on disk, after
+/// which the swap service resumes the held fault; `caps[0]` moved back on
+/// every reply.
 /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 25:
 /// `SWAP_RESTORE`.
 pub const SWAP_RESTORE: u64 = 25;

@@ -96,8 +96,8 @@ pub struct ProcessCaps
     /// Each registration goes with the record
     /// ([`crate::Ledger::remove_process`]).
     pub limits: NodeIdx,
-    /// Pages of the process's demand chunks held in the compressed store,
-    /// which its budget node stays charged for
+    /// Pages of the process's evicted demand chunks (compressed, writing or
+    /// on disk), which its budget node stays charged for
     /// ([`crate::Ledger::finish_evict`]).
     pub swapped: u64,
 }

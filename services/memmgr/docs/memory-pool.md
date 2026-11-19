@@ -1136,9 +1136,16 @@ disk tier off: `SWAP_REGISTER` is refused. The rule is [docs/storage.md](../../.
 § Data at Rest's.
 
 **Read-back.** A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming the swap service's
-endpoint ([docs/fault-handling.md](../../../docs/fault-handling.md) § Reply), with the slot and its
-byte count as the redirect word: the faulting thread stays fault-blocked, and the swap service reads
-the slot and hands memmgr its bytes with `SWAP_RESTORE`, then resumes the thread. memmgr maps the
+endpoint ([docs/fault-handling.md](../../../docs/fault-handling.md) § Reply), with the slot word as
+the redirect word: the slot, its byte count, and the generation of the seal it holds, the low bits
+of its nonce counter. The faulting thread stays fault-blocked, and the swap service reads the slot
+and hands memmgr its bytes and the word with `SWAP_RESTORE`, then resumes the thread. A word whose
+slot holds no chunk on disk, or one under another seal, was made for a use of the slot that ended
+(the chunk restored, by another thread's fault or ahead of one, or torn down, and the slot taken
+again since): memmgr replies `RESTORE_STALE` and changes nothing, and the swap service resumes the
+thread, which faults again and is served as the chunk now stands. So a late or repeated request
+never reaches a chunk it was not made for, and a tag failure is always the failure of the chunk's
+own slot. memmgr maps the
 buffer read-only, copies the bytes into its own buffer, and checks the tag there, so the check and
 the decryption read one snapshot. A good slot is restored as a compressed chunk is
 ([Eviction](#eviction), States): admitted, with direct reclaim, its pages written whole into new
@@ -1147,7 +1154,8 @@ restore's code, and the chunk stays on disk. A tag failure makes the chunk lost,
 reply carries the decline word of code 12 with detail 1, which the swap service forwards the held
 fault with, so the faulting thread is killed, as every later fault on the chunk is. A fault on a
 chunk on disk with no swap service registered is declined with code 12 and detail 0. `SWAP_RESTORE`
-names a slot, not a fault, so the swap service may also restore ahead of one.
+names a slot word, which `SWAP_TAKE`'s reply also carries, not a fault, so the swap service may also
+restore ahead of one.
 
 **Read-back is serial.** virtio-blk keeps one request in flight
 ([virtio-blk README](../../drivers/virtio/blk/README.md)), and one driver instance serves the root,

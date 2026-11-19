@@ -285,15 +285,17 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.store_pages
     }
 
-    /// Pages of the compressed chunks of every process.
+    /// Pages of the evicted chunks of every process: compressed, writing or
+    /// on disk.
     #[must_use]
     pub const fn swapped_pages(&self) -> u64
     {
         self.swapped_pages
     }
 
-    /// Pages of the compressed chunks of the record `rec`, which its budget node
-    /// stays charged for; 0 for a slot that holds no record.
+    /// Pages of the evicted chunks (compressed, writing or on disk) of the
+    /// record `rec`, which its budget node stays charged for; 0 for a slot
+    /// that holds no record.
     #[must_use]
     pub fn swapped_of(&self, rec: NodeIdx) -> u64
     {
@@ -318,8 +320,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// The free pages outside `promised` that a charge to a node outside the
     /// system reserve must leave in a pool of `pool_total` pages: the reserve,
-    /// and the restore headroom while chunks are compressed
-    /// ([`budget::growth_floor`]).
+    /// and the restore headroom while chunks are evicted, compressed, writing
+    /// or on disk ([`budget::growth_floor`]).
     #[must_use]
     pub const fn growth_floor(&self, pool_total: u64) -> u64
     {
@@ -2164,6 +2166,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     {
         let idx = self.slots.node(slot)?;
         self.disk_node(idx).map(|n| (idx, n))
+    }
+
+    /// The on-disk chunk the slot word `word` names
+    /// ([`crate::disk::slot_word`]): its slot's disk node, when the slot holds
+    /// a chunk on disk whose seal the word was made for. `None` when the slot
+    /// holds no chunk on disk, or holds one under a seal of another
+    /// generation: a word made for an earlier use of the slot, freed and
+    /// taken again since.
+    #[must_use]
+    pub fn on_disk_named(&self, word: u64) -> Option<DiskNode>
+    {
+        let slot = crate::disk::word_slot(word);
+        let (_, n) = self.disk_at(slot)?;
+        (n.state == DiskState::OnDisk && crate::disk::slot_word(slot, n.len, n.nonce) == word)
+            .then_some(n)
     }
 
     /// Restore the compressed, writing or on-disk chunk holding `page_base` in
@@ -5394,6 +5411,44 @@ mod tests
         assert_eq!(l.arena.free_count(), slots_free);
         assert_eq!(usage(&l, rec).0, 32);
         assert_eq!(pool_pages(&l), total);
+    }
+
+    // Defect guarded: a SWAP_RESTORE that names only a slot, made for a use of
+    // the slot that a restore ended, reaches the chunk a later SWAP_TAKE put
+    // in the slot, whose tag check then fails on the old bytes and loses a
+    // chunk whose bytes are good.
+    #[test]
+    fn a_slot_word_names_only_the_on_disk_chunk_of_the_seal_it_was_made_for()
+    {
+        let (mut l, rec, reg) = disk_ledger();
+        let slot = l.begin_write(rec, reg, BASE, 41, 1000).unwrap();
+        let word = crate::disk::slot_word(slot, 1000, 41);
+        // In flight, the chunk is not on disk.
+        assert_eq!(l.on_disk_named(word), None);
+        assert_eq!(l.finish_write(slot), Ok(3));
+        let n = l.on_disk_named(word).unwrap();
+        assert_eq!((n.page_base, n.nonce, n.slot), (BASE, 41, slot));
+        // Another seal's generation, or another byte count, names nothing.
+        assert_eq!(
+            l.on_disk_named(crate::disk::slot_word(slot, 1000, 42)),
+            None
+        );
+        assert_eq!(l.on_disk_named(crate::disk::slot_word(slot, 999, 41)), None);
+        // Restored, the slot is free; taken again for the other chunk, the
+        // first word names nothing, and the chunk on disk stays.
+        let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
+        assert_eq!(
+            l.restore_chunk(rec, reg, BASE, &[frame(cap, pages, phys, BASE)]),
+            Ok(0)
+        );
+        assert_eq!(l.on_disk_named(word), None);
+        let other = BASE + crate::CHUNK_BYTES;
+        assert_eq!(l.begin_write(rec, reg, other, 42, 1000), Ok(slot));
+        assert_eq!(l.finish_write(slot), Ok(3));
+        assert_eq!(l.on_disk_named(word), None);
+        let later = crate::disk::slot_word(slot, 1000, 42);
+        assert_eq!(l.on_disk_named(later).map(|n| n.page_base), Some(other));
+        assert_eq!(l.chunk_at(reg, other).state(), ChunkState::OnDisk);
     }
 
     #[test]

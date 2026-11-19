@@ -94,9 +94,10 @@ services/svctest/
         │                      #   headroom and by direct reclaim; a no-evict region, logd's
         │                      #   reserve stack; all-RAM-accounted identity
         ├── swap_client.rs     # memmgr's disk tier with svctest as the swap service over a
-        │                      #   RAM slot store: register, take, done, a fault redirected
-        │                      #   and restored, a re-registration, a tampered slot killing
-        │                      #   its faulting child; all-RAM-accounted identity
+        │                      #   RAM slot store: register, take, done, stale restores, a
+        │                      #   fault redirected and restored, a re-registration, a
+        │                      #   tampered slot killing its faulting child;
+        │                      #   all-RAM-accounted identity
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd

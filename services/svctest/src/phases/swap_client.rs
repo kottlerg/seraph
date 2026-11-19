@@ -20,14 +20,17 @@
 //!
 //! * `SWAP_REGISTER` with an endpoint of the phase's own, and the pool
 //!   status's free slots then;
-//! * `SWAP_TAKE` and `SWAP_DONE` of three chunks to disk and a fourth left
-//!   in flight, the bytes taken looking as ciphertext does (their byte counts'
-//!   chi-square over 256 values below [`CHI_SQUARE_BOUND`]), and the pool
+//! * `SWAP_TAKE` and `SWAP_DONE` of three chunks to disk, and the pool
 //!   status's pages on disk and free slots;
-//! * a second `SWAP_REGISTER` ending the write in flight, so its
-//!   `SWAP_DONE` is refused, and keeping the chunks on disk;
-//! * a `SWAP_RESTORE` of one slot ahead of any fault, and its slot refused
-//!   after;
+//! * a `SWAP_RESTORE` of one of them ahead of any fault, and its slot word
+//!   `RESTORE_STALE` after;
+//! * the slot it freed taken again for a fourth chunk, written, and the first
+//!   chunk's word and bytes `RESTORE_STALE` there, the fourth staying on disk
+//!   and then restored with its own word;
+//! * a fifth chunk left in flight, the bytes taken looking as ciphertext does
+//!   (their byte counts' chi-square over 256 values below
+//!   [`CHI_SQUARE_BOUND`]), and a second `SWAP_REGISTER` ending the write,
+//!   so its `SWAP_DONE` is refused, and keeping the chunks on disk;
 //! * a write in flight that procmgr's `MAKE_RESIDENT` cancels, its
 //!   `SWAP_DONE` then freeing its slot, while `MAKE_RESIDENT` passes the two
 //!   chunks on disk over: they are the main region's only chunks not present
@@ -80,9 +83,9 @@ const SLOTS: u64 = 64;
 /// registered, and keeps its pages as memmgr's metadata
 /// (services/memmgr/docs/memory-pool.md § Disk tier).
 const SLOT_MAP_PAGES: u64 = SLOTS.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
-/// Chunks of the main region the phase awaits swapped: three to disk, one in
+/// Chunks of the main region the phase awaits swapped: four to disk, one in
 /// flight, and one more for a chunk the clock's last slice did not reach.
-const SWAPPED_CHUNKS: u64 = 5;
+const SWAPPED_CHUNKS: u64 = 6;
 /// `SWAP_TAKE`s the phase makes for one chunk at most: each walks a bounded
 /// part of memmgr's records, and successive ones cover them all.
 const TAKE_TRIES: u32 = 256;
@@ -93,7 +96,7 @@ const BUF_PAGES: u64 = CHUNK_PAGES;
 /// standard deviation about 23, so uniform bytes exceed it with a
 /// probability below 10^-20, and a compressed stream of the fixture's pattern
 /// lies far above it.
-const CHI_SQUARE_BOUND: f64 = 512.0;
+const CHI_SQUARE_BOUND: u64 = 512;
 /// Bytes of ciphertext the chi-square needs at the least.
 const CHI_SQUARE_MIN_BYTES: usize = 8192;
 /// The decline word memmgr hands back for a slot that fails authentication:
@@ -109,9 +112,9 @@ const SETTLE_BOUND: Duration = Duration::from_secs(30);
 /// A test wait bound.
 const SERVE_BOUND: Duration = Duration::from_secs(30);
 
-/// A fault the restore thread served: the slot its redirect named, the
-/// faulting address, and memmgr's reply to the `SWAP_RESTORE`, its label and
-/// word 0.
+/// A fault the restore thread served: the slot its redirect's word named,
+/// the faulting address, and memmgr's reply to the `SWAP_RESTORE`, its label
+/// and word 0.
 #[derive(Clone, Copy, Debug)]
 struct Served
 {
@@ -222,11 +225,11 @@ fn register(swap: u64, endpoint: u64, what: &str)
     );
 }
 
-/// `SWAP_TAKE` into `buf`: the slot and its bytes, kept in the store. A walk
-/// that finds no chunk within memmgr's bound replies `NOTHING_TO_TAKE`, and
-/// the next goes on from where it stopped, so it is asked again, at most
-/// [`TAKE_TRIES`] times.
-fn take(swap: u64, buf: &mut Buffer, shared: &Shared, what: &str) -> u32
+/// `SWAP_TAKE` into `buf`: the slot and its slot word, the slot's bytes kept
+/// in the store. A walk that finds no chunk within memmgr's bound replies
+/// `NOTHING_TO_TAKE`, and the next goes on from where it stopped, so it is
+/// asked again, at most [`TAKE_TRIES`] times.
+fn take(swap: u64, buf: &mut Buffer, shared: &Shared, what: &str) -> (u32, u64)
 {
     let mut tries: u32 = 0;
     let reply = loop
@@ -258,13 +261,34 @@ fn take(swap: u64, buf: &mut Buffer, shared: &Shared, what: &str) -> u32
         len > 16 && len <= usize::try_from(CHUNK_LEN).unwrap_or(0),
         "{PHASE}: {what}: slot {slot} of {len} bytes"
     );
+    let word = reply.word(2);
+    assert_eq!(
+        (
+            free_pool::disk::word_slot(word),
+            usize::from(free_pool::disk::word_len(word))
+        ),
+        (slot, len),
+        "{PHASE}: {what}: slot word {word:#x}"
+    );
     let bytes = buf.read(len);
     shared
         .slots
         .lock()
         .expect("the slot store's lock")
         .insert(slot, bytes);
-    slot
+    (slot, word)
+}
+
+/// The bytes the store holds for `slot`.
+fn stored(shared: &Shared, slot: u32) -> Vec<u8>
+{
+    shared
+        .slots
+        .lock()
+        .expect("the slot store's lock")
+        .get(&slot)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// `SWAP_DONE` of `slot` with status `status`: memmgr's reply label.
@@ -277,20 +301,13 @@ fn done(swap: u64, slot: u32, status: u64, what: &str) -> u64
     swap_call(swap, &msg, what).label
 }
 
-/// `SWAP_RESTORE` of `slot` with its stored bytes, written into `buf`:
+/// `SWAP_RESTORE` of the slot word `word` with `bytes`, written into `buf`:
 /// memmgr's reply label and word 0.
-fn restore(swap: u64, slot: u32, buf: &mut Buffer, shared: &Shared, what: &str) -> (u64, u64)
+fn restore(swap: u64, word: u64, bytes: &[u8], buf: &mut Buffer, what: &str) -> (u64, u64)
 {
-    let bytes = shared
-        .slots
-        .lock()
-        .expect("the slot store's lock")
-        .get(&slot)
-        .cloned()
-        .unwrap_or_default();
-    buf.write(&bytes);
+    buf.write(bytes);
     let msg = IpcMessage::builder(memmgr_labels::SWAP_RESTORE)
-        .word(0, u64::from(slot))
+        .word(0, word)
         .cap(buf.cap)
         .build();
     let reply = swap_call(swap, &msg, what);
@@ -340,8 +357,11 @@ fn require_refusals(swap: u64)
     );
 }
 
-/// The chi-square of `bytes`' counts over the 256 byte values.
-fn chi_square(bytes: &[u8]) -> f64
+/// The chi-square of `bytes`' counts over the 256 byte values, rounded
+/// down; `u64::MAX` for no bytes. In integers: with `n` bytes, each value
+/// expected `n / 256` times, the sum of `(c - n/256)^2 / (n/256)` over the
+/// counts `c` is `256 * sum(c^2) / n - n`.
+fn chi_square(bytes: &[u8]) -> u64
 {
     let mut counts = [0u64; 256];
     for &b in bytes
@@ -351,22 +371,18 @@ fn chi_square(bytes: &[u8]) -> f64
             *c = c.saturating_add(1);
         }
     }
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a test statistic over at most a few hundred KiB, well inside f64's exact range"
-    )]
-    let expected = bytes.len() as f64 / 256.0;
-    counts
+    let n = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if n == 0
+    {
+        return u64::MAX;
+    }
+    let squares = counts
         .iter()
-        .map(|&c| {
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "a count of at most a few hundred thousand, exact in f64"
-            )]
-            let d = c as f64 - expected;
-            d * d / expected
-        })
-        .sum()
+        .fold(0u64, |sum, &c| sum.saturating_add(c.saturating_mul(c)));
+    (squares.saturating_mul(256))
+        .checked_div(n)
+        .unwrap_or(u64::MAX)
+        .saturating_sub(n)
 }
 
 /// Wait for the level to read `NORMAL`, where memmgr evicts nothing.
@@ -437,10 +453,10 @@ fn isolate(authority: u64, process: u64, ready: &Ready, fixture: &mut super::swa
 }
 
 /// The restore thread: receive each fault redirected to `endpoint`, hand
-/// memmgr its slot's stored bytes, with the first byte changed for the slot
-/// [`Shared::tamper`] names, through `buf`, then resume the fault on
-/// `SUCCESS` or forward it with memmgr's decline word. Returns the buffer once
-/// told to stop.
+/// memmgr its slot word and its slot's stored bytes, with the first byte
+/// changed for the slot [`Shared::tamper`] names, through `buf`, then resume
+/// the fault on `SUCCESS` or `RESTORE_STALE` or forward it with memmgr's
+/// decline word. Returns the buffer once told to stop.
 fn restorer(swap: u64, endpoint: u64, mut buf: Buffer, shared: &Shared) -> Buffer
 {
     let ipc_buf = current_ipc_buf();
@@ -460,7 +476,7 @@ fn restorer(swap: u64, endpoint: u64, mut buf: Buffer, shared: &Shared) -> Buffe
             continue;
         }
         let word = msg.word(FAULT_REDIRECT_WORD);
-        let slot = u32::try_from(word & 0xFFFF_FFFF).unwrap_or(u32::MAX);
+        let slot = free_pool::disk::word_slot(word);
         let va = msg.word(1);
         let tamper = *shared.tamper.lock().expect("the tamper lock") == Some(slot);
         if tamper
@@ -473,8 +489,9 @@ fn restorer(swap: u64, endpoint: u64, mut buf: Buffer, shared: &Shared) -> Buffe
         {
             *b ^= 1;
         }
-        let (label, decline) = restore(swap, slot, &mut buf, shared, "a redirected fault");
-        let reply = if label == memmgr_errors::SUCCESS
+        let bytes = stored(shared, slot);
+        let (label, decline) = restore(swap, word, &bytes, &mut buf, "a redirected fault");
+        let reply = if label == memmgr_errors::SUCCESS || label == memmgr_errors::RESTORE_STALE
         {
             IpcMessage::new(FAULT_REPLY_RESUME)
         }
@@ -570,19 +587,61 @@ fn swap_client_phase(caps: &Caps)
         .spawn(move || restorer(swap, endpoint, restorer_buf, &thread_shared))
         .unwrap_or_else(|e| panic!("{PHASE}: spawning the restore thread: {e}"));
 
-    // Three chunks to disk and one in flight.
+    // Three chunks to disk.
     let mut buf = Buffer::new();
-    let slot_a = take(swap, &mut buf, &shared, "take a");
+    let (slot_a, word_a) = take(swap, &mut buf, &shared, "take a");
     assert_eq!(done(swap, slot_a, 0, "done a"), memmgr_errors::SUCCESS);
-    let slot_b = take(swap, &mut buf, &shared, "take b");
+    let (slot_b, _) = take(swap, &mut buf, &shared, "take b");
     assert_eq!(done(swap, slot_b, 0, "done b"), memmgr_errors::SUCCESS);
-    let slot_t = take(swap, &mut buf, &shared, "take t");
+    let (slot_t, _) = take(swap, &mut buf, &shared, "take t");
     assert_eq!(done(swap, slot_t, 0, "done t"), memmgr_errors::SUCCESS);
-    let slot_c = take(swap, &mut buf, &shared, "take c");
     assert_eq!(
         disk_and_free(),
-        (3 * CHUNK_PAGES, SLOTS - 4),
-        "{PHASE}: three chunks on disk and one in flight"
+        (3 * CHUNK_PAGES, SLOTS - 3),
+        "{PHASE}: three chunks on disk"
+    );
+
+    // A restore ahead of any fault, and its word stale after.
+    let bytes_a = stored(&shared, slot_a);
+    assert_eq!(
+        restore(swap, word_a, &bytes_a, &mut buf, "restore a"),
+        (memmgr_errors::SUCCESS, 0)
+    );
+    assert_eq!(
+        restore(swap, word_a, &bytes_a, &mut buf, "restore a again").0,
+        memmgr_errors::RESTORE_STALE
+    );
+
+    // The slot a's restore freed, taken again first, holds another chunk on
+    // disk: a's word and bytes there are stale and leave it on disk, and its
+    // own word restores it.
+    let (slot_c, word_c) = take(swap, &mut buf, &shared, "take c");
+    assert_eq!(
+        slot_c, slot_a,
+        "{PHASE}: the take after a's restore did not reuse the slot it freed"
+    );
+    assert_eq!(done(swap, slot_c, 0, "done c"), memmgr_errors::SUCCESS);
+    assert_eq!(
+        restore(swap, word_a, &bytes_a, &mut buf, "a's late restore").0,
+        memmgr_errors::RESTORE_STALE
+    );
+    assert_eq!(
+        disk_and_free(),
+        (3 * CHUNK_PAGES, SLOTS - 3),
+        "{PHASE}: after a's late restore"
+    );
+    let bytes_c = stored(&shared, slot_c);
+    assert_eq!(
+        restore(swap, word_c, &bytes_c, &mut buf, "restore c"),
+        (memmgr_errors::SUCCESS, 0)
+    );
+
+    // A write in flight.
+    let (slot_x, _) = take(swap, &mut buf, &shared, "take x");
+    assert_eq!(
+        disk_and_free(),
+        (2 * CHUNK_PAGES, SLOTS - 3),
+        "{PHASE}: two chunks on disk and one in flight"
     );
     let sealed: Vec<u8> = shared
         .slots
@@ -594,7 +653,7 @@ fn swap_client_phase(caps: &Caps)
     let chi = chi_square(&sealed);
     assert!(
         sealed.len() >= CHI_SQUARE_MIN_BYTES && chi < CHI_SQUARE_BOUND,
-        "{PHASE}: {} bytes taken, chi-square {chi:.1}: not ciphertext",
+        "{PHASE}: {} bytes taken, chi-square {chi}: not ciphertext",
         sealed.len()
     );
 
@@ -602,25 +661,17 @@ fn swap_client_phase(caps: &Caps)
     // disk.
     register(swap, endpoint, "the second registration");
     assert_eq!(
-        done(swap, slot_c, 0, "done c after the registration"),
+        done(swap, slot_x, 0, "done x after the registration"),
         memmgr_errors::INVALID_ARGUMENT
     );
     assert_eq!(
         disk_and_free(),
-        (3 * CHUNK_PAGES, SLOTS - 3),
+        (2 * CHUNK_PAGES, SLOTS - 2),
         "{PHASE}: after the second registration"
     );
 
-    // A write in flight, and a restore ahead of any fault.
-    let slot_d = take(swap, &mut buf, &shared, "take d");
-    assert_eq!(
-        restore(swap, slot_a, &mut buf, &shared, "restore a"),
-        (memmgr_errors::SUCCESS, 0)
-    );
-    assert_eq!(
-        restore(swap, slot_a, &mut buf, &shared, "restore a again").0,
-        memmgr_errors::INVALID_ARGUMENT
-    );
+    // A write in flight for MAKE_RESIDENT to cancel.
+    let (slot_d, _) = take(swap, &mut buf, &shared, "take d");
 
     // MAKE_RESIDENT restores the chunk in flight and passes the two on disk
     // over: they are the main region's only chunks not present but the hole's.
@@ -705,7 +756,7 @@ fn swap_client_phase(caps: &Caps)
     let floor = baseline.saturating_sub(SLOT_MAP_PAGES.saturating_mul(PAGE_SIZE));
     let end = settle_resident(authority, Some(floor));
     std::os::seraph::log!(
-        "memmgr_swap_client phase passed ({} bytes sealed, chi-square {chi:.1}, free and deferred {} \
+        "memmgr_swap_client phase passed ({} bytes sealed, chi-square {chi}, free and deferred {} \
          pages above the start less the {SLOT_MAP_PAGES} slot-map pages)",
         sealed.len(),
         end.saturating_sub(floor) / PAGE_SIZE

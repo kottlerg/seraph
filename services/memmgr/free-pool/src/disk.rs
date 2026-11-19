@@ -323,13 +323,52 @@ pub fn open(
     Ok(len)
 }
 
-/// The word a fault redirected to the swap service carries
-/// (`FAULT_REDIRECT_WORD`): the slot in its low 32 bits and the slot's byte
-/// count above them.
+/// Bits of a slot word's slot: [`WORD_SLOTS`] slots.
+const SLOT_BITS: u32 = 28;
+
+/// Bits of a slot word's byte count.
+const LEN_BITS: u32 = 16;
+
+/// Bits of a slot word's generation: the low bits of the nonce counter of the
+/// seal the slot holds.
+pub const GENERATION_BITS: u32 = 20;
+
+const _: () = assert!(SLOT_BITS + LEN_BITS + GENERATION_BITS == 64);
+
+/// The slots a slot word can name.
+pub const WORD_SLOTS: u64 = 1 << SLOT_BITS;
+
+/// The word naming slot `slot` while it holds the seal numbered `counter`,
+/// of `len` bytes: the slot in its low 28 bits, the byte count in the next
+/// 16, and the counter's low [`GENERATION_BITS`] bits above them. A fault
+/// redirected to the swap service carries it (`FAULT_REDIRECT_WORD`), as
+/// `SWAP_TAKE`'s reply does, and `SWAP_RESTORE` names it back, so a request
+/// made for one use of a slot is told from one made for a later use: the slot
+/// freed, by a restore or a teardown, and taken again since. Two uses of a
+/// slot share a word only when `2^GENERATION_BITS` seals, or a multiple,
+/// came between them.
 #[must_use]
-pub const fn redirect_word(slot: u32, len: u16) -> u64
+pub const fn slot_word(slot: u32, len: u16, counter: u64) -> u64
 {
-    ((len as u64) << 32) | slot as u64
+    (counter << (SLOT_BITS + LEN_BITS))
+        | ((len as u64) << SLOT_BITS)
+        | (slot as u64 & (WORD_SLOTS - 1))
+}
+
+/// The slot a slot word names.
+#[must_use]
+pub fn word_slot(word: u64) -> u32
+{
+    // The mask keeps 28 bits, which a `u32` holds.
+    u32::try_from(word & (WORD_SLOTS - 1)).unwrap_or(u32::MAX)
+}
+
+/// The byte count a slot word names.
+#[must_use]
+pub fn word_len(word: u64) -> u16
+{
+    // The mask keeps 16 bits, which a `u16` holds.
+    u16::try_from((word >> SLOT_BITS) & ((1 << LEN_BITS) - 1)).unwrap_or(u16::MAX)
 }
 
 /// What a fault on a chunk of a demand region needs before the page can be
@@ -541,6 +580,23 @@ mod tests
         assert_eq!(open(&KEY, 2, &mut big, total), Ok(len));
         assert_eq!(seal(&KEY, 3, &mut buf, 0), Ok(TAG_BYTES));
         assert_eq!(open(&KEY, 3, &mut buf, TAG_BYTES), Ok(0));
+    }
+
+    #[test]
+    fn a_slot_word_names_its_slot_length_and_seal_and_tells_a_later_use_apart()
+    {
+        let word = slot_word(5, 4112, 9);
+        assert_eq!((word_slot(word), word_len(word)), (5, 4112));
+        // The last slot and the longest count round-trip.
+        let top = u32::try_from(WORD_SLOTS - 1).unwrap();
+        let word_top = slot_word(top, u16::MAX, u64::MAX);
+        assert_eq!((word_slot(word_top), word_len(word_top)), (top, u16::MAX));
+        // Another seal of the same slot and length is another word, until the
+        // generation wraps.
+        assert_ne!(slot_word(5, 4112, 10), word);
+        assert_ne!(slot_word(5, 4112, 9 + (1 << (GENERATION_BITS - 1))), word);
+        assert_eq!(slot_word(5, 4112, 9 + (1 << GENERATION_BITS)), word);
+        assert_ne!(slot_word(6, 4112, 9), word);
     }
 
     #[test]

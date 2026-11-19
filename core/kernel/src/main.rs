@@ -1576,16 +1576,17 @@ unsafe fn kernel_entry_post_rebase(
             let tcb_ptr =
                 kstack_top.wrapping_add(tcb_offset) as *mut sched::thread::ThreadControlBlock;
             // Per-thread FPU/SIMD/V save area: its pages directly after the
-            // wrapper page in the retyped slab.
+            // wrapper page in the retyped slab, holding the initial extended
+            // state, as thread creation writes it.
             let init_extended_area =
                 block_virt.wrapping_add(sched::thread_slot::EXTENDED_OFFSET) as *mut u8;
             // SAFETY: init_extended_area starts on page 6 of the freshly-retyped
-            // slab, and its `extended_area_bytes` end the slab, exclusively
-            // owned by this init bootstrap.
+            // slab, and its `extended_area_bytes` (the boot CPU's
+            // save-area size) follow it inside the slab, exclusively owned by
+            // this init bootstrap.
             unsafe {
-                core::ptr::write_bytes(
+                arch::current::fpu::init_save_area(
                     init_extended_area,
-                    0u8,
                     sched::thread_slot::extended_area_bytes() as usize,
                 );
             }

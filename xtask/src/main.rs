@@ -57,6 +57,7 @@ mod disk;
 mod error;
 mod esp;
 mod fat;
+mod fat_read;
 mod firmware;
 mod fs_compat;
 mod gh;

@@ -952,77 +952,66 @@ pub(crate) fn observed_death(entry: &service::ServiceEntry) -> Option<u64>
 /// Route a death for every active service whose current instance is dead:
 /// the recovery for death posts a full queue dropped, and, after
 /// reconciliation, for a devmgr whose observers could not be bound because
-/// it had already died. The kernel records the state before it posts, so a
-/// main-thread exit, a revoked thread cap, and a fault of memmgr or procmgr,
-/// whose address spaces svcmgr holds, are found in svcmgr's own caps
-/// ([`observed_death`]). A worker-thread fault of a service procmgr created
-/// shows there only once procmgr's teardown revokes the thread cap, which can
-/// follow this resync, so each such service the caps show alive is asked of
+/// it had already died. The resync is `svcmgr_defs::death_caps::resync` over
+/// [`ResyncCtx`]: the deaths svcmgr's own caps show ([`observed_death`])
+/// first, then, while memmgr and procmgr are active and alive
+/// ([`substrate_alive`]), each service the caps show alive is asked of
 /// procmgr (`restart::queried_death`), which reads the space's retained
-/// fault. That call runs only while memmgr and procmgr are active and alive
-/// ([`substrate_alive`]), so procmgr answers it. A restart binds the new
-/// instance's observers, whose posts go to the queue this drain has emptied.
-/// A post for a service routed here that does arrive later carries the dead
-/// instance, and [`route_death`] drops it.
+/// fault of a worker thread. A restart binds the new instance's observers,
+/// whose posts go to the queue this drain has emptied. A post for a service
+/// routed here that does arrive later carries the dead instance, and
+/// [`route_death`] drops it.
 fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
-    // Slots svcmgr's caps showed alive, which procmgr is asked about.
-    let mut alive = Vec::new();
-    for idx in 0..state.table.services.len()
+    svcmgr_defs::death_caps::resync(&mut ResyncCtx { state, ctx });
+}
+
+/// svcmgr's service table and the calls its death resync makes
+/// (`svcmgr_defs::death_caps::ResyncTable`).
+struct ResyncCtx<'a>
+{
+    state: &'a mut SvcmgrState,
+    ctx: &'a restart::RestartCtx,
+}
+
+impl svcmgr_defs::death_caps::ResyncTable for ResyncCtx<'_>
+{
+    fn slots(&self) -> usize
     {
-        let Some(svc) = state.table.services.get(idx)
-        else
-        {
-            continue;
-        };
-        if !svc.active
-        {
-            continue;
-        }
-        let Some(exit_reason) = observed_death(svc)
-        else
-        {
-            // A failed reservation only narrows the query to the slots
-            // recorded before it.
-            if svc.process_handle != 0 && alive.try_reserve(1).is_ok()
-            {
-                alive.push(idx);
-            }
-            continue;
-        };
-        // `idx` came from the table, whose slots each have a tag
-        // (`ServiceTable::reserve`).
-        let Some(tag) = DeathTag::new(idx, svc.instance)
-        else
-        {
-            continue;
-        };
-        route_death(tag, exit_reason, state, ctx);
+        self.state.table.services.len()
     }
-    if alive.is_empty() || !substrate_alive(state)
+
+    fn slot(&self, idx: usize) -> Option<svcmgr_defs::death_caps::ResyncSlot>
     {
-        return;
+        self.state
+            .table
+            .services
+            .get(idx)
+            .map(|svc| svcmgr_defs::death_caps::ResyncSlot {
+                active: svc.active,
+                instance: svc.instance,
+                process_handle: svc.process_handle,
+            })
     }
-    for idx in alive
+
+    fn caps_death(&self, idx: usize) -> Option<u64>
     {
-        let Some(svc) = state.table.services.get(idx)
-        else
-        {
-            continue;
-        };
-        if !svc.active
-        {
-            continue;
-        }
-        let Some(tag) = DeathTag::new(idx, svc.instance)
-        else
-        {
-            continue;
-        };
-        if let Some(exit_reason) = restart::queried_death(svc.process_handle, ctx.ipc_buf)
-        {
-            route_death(tag, exit_reason, state, ctx);
-        }
+        self.state.table.services.get(idx).and_then(observed_death)
+    }
+
+    fn route(&mut self, tag: DeathTag, exit_reason: u64)
+    {
+        route_death(tag, exit_reason, self.state, self.ctx);
+    }
+
+    fn substrate_alive(&self) -> bool
+    {
+        substrate_alive(self.state)
+    }
+
+    fn queried_death(&mut self, process_handle: u64) -> Option<u64>
+    {
+        restart::queried_death(process_handle, self.ctx.ipc_buf)
     }
 }
 

@@ -15,5 +15,10 @@ ipc = { path = "../../../shared/ipc" }
 # (`sign_policy`).
 objsig = { path = "../../../shared/objsig" }
 
+[dev-dependencies]
+# The model of the kernel's death queue and the drain procmgr's reaper makes,
+# for the death-resync test.
+death-set = { path = "../../../shared/death-set", features = ["model"] }
+
 [lints]
 workspace = true

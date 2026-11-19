@@ -478,6 +478,7 @@ dependencies = [
 name = "logd"
 version = "0.1.4"
 dependencies = [
+ "death-set",
  "ipc",
  "logd-codec",
  "logd-slot-table",
@@ -498,6 +499,7 @@ dependencies = [
 name = "logd-slot-table"
 version = "0.1.4"
 dependencies = [
+ "death-set",
  "ipc",
  "logd-codec",
 ]
@@ -640,6 +642,7 @@ dependencies = [
 name = "procmgr-process-table"
 version = "0.1.4"
 dependencies = [
+ "death-set",
  "ipc",
  "objsig",
 ]
@@ -836,6 +839,7 @@ dependencies = [
 name = "svcmgr-defs"
 version = "0.1.4"
 dependencies = [
+ "death-set",
  "ipc",
  "namespace-protocol",
  "objsig",

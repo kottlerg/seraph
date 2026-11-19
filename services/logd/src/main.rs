@@ -28,6 +28,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use death_set::OverflowWatch;
 use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
 use ipc::log_query::{HistoryRequest, QUERY_DENIED, decode_slots_request, refusal};
 use ipc::log_record::{RECORD_MAX_BYTES, Record};
@@ -203,7 +204,10 @@ fn main() -> !
         syscall::thread_exit();
     };
     let logd: &'static Logd = Box::leak(Box::new(Logd {
-        state: Mutex::new(LogdState::default()),
+        state: Mutex::new(LogdState {
+            table: SlotTable::default(),
+            deaths: OverflowWatch::new(DEATH_EQ_CAPACITY),
+        }),
         death_eq,
         resync_note,
     }));
@@ -301,14 +305,13 @@ struct Logd
 }
 
 /// What [`Logd::state`] guards.
-#[derive(Default)]
 struct LogdState
 {
     table: SlotTable,
-    /// Death events taken since a take last found the queue empty, by any
-    /// thread: a drain's count, as one thread's drain from a ready queue to an
-    /// empty one would take them ([`drain_deaths`]).
-    drain_run: u32,
+    /// The death events taken since a take last found the queue empty, by
+    /// any thread, as one thread's drain from a ready queue to an empty one
+    /// would take them ([`drain_deaths`]).
+    deaths: OverflowWatch,
 }
 
 impl Logd
@@ -728,11 +731,12 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// slot of exactly that badge.
 ///
 /// Each take is made under the state lock, with its eviction, and the reclaim
-/// line is written after the lock is released. [`LogdState::drain_run`] counts
-/// the takes since one last found the queue empty, whichever thread made them.
-/// When it reaches a full queue's worth, the queue may have filled, and a post
-/// to a full queue is dropped, so the drain asks the main thread for a
-/// [`Resync`] ([`RESYNC_REQUESTED`]) and counts again from zero.
+/// line is written after the lock is released. [`LogdState::deaths`] counts
+/// the takes since one last found the queue empty, whichever thread made them
+/// (`death_set::OverflowWatch`). When it reaches a full queue's worth, the
+/// queue may have filled, and a post to a full queue is dropped, so the drain
+/// asks the main thread for a [`Resync`] ([`RESYNC_REQUESTED`]) and counts
+/// again from zero.
 fn drain_deaths(logd: &Logd)
 {
     loop
@@ -742,15 +746,10 @@ fn drain_deaths(logd: &Logd)
             let Ok(death) = syscall::event_try_recv_death(logd.death_eq)
             else
             {
-                state.drain_run = 0;
+                state.deaths.found_empty();
                 return;
             };
-            state.drain_run = state.drain_run.saturating_add(1);
-            let full = state.drain_run >= DEATH_EQ_CAPACITY;
-            if full
-            {
-                state.drain_run = 0;
-            }
+            let full = state.deaths.took();
             let exit_reason = death.exit_reason;
             let evicted = state
                 .table

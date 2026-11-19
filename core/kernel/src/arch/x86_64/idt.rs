@@ -1241,8 +1241,8 @@ unsafe extern "custom" fn isr_nm()
 /// new `fpu_owner`. The trapping x87/SSE/AVX instruction then proceeds
 /// on re-execution. The area is allocated as the pages after the wrapper page
 /// of the Thread retype slot (`sched::thread_slot::EXTENDED_OFFSET`), so user threads
-/// always have a non-null area; the slot zero-init makes the first
-/// XRSTOR restore the architected initial state.
+/// always have a non-null area; thread creation writes the initial state
+/// into it (`fpu::init_save_area`), which the first XRSTOR restores.
 ///
 /// Preemption is disabled across the handler body so a timer tick mid-
 /// sequence cannot reschedule between the prev-owner save and the new-

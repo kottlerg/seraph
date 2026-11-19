@@ -64,7 +64,12 @@
 //! page fewer than a demand chunk and no run of a chunk's size, and touches a
 //! demand region: memmgr must back each fault from a smaller run.
 //!
-//! A tenth phase, **sparse region**, registers a region of 2^14 chunks, whose
+//! A tenth phase, **fragmented `CSpace` top-up**, fragments the pool the same
+//! way and funds svctest's own `CSpace` for more slot pages than any free run
+//! holds: a slot-page pool takes pages, not a run, so the top-up must be funded
+//! from the short runs.
+//!
+//! An eleventh phase, **sparse region**, registers a region of 2^14 chunks, whose
 //! chunk table in memmgr has six directory levels, and touches a spread of
 //! its chunks and its last one: each fault must find its chunk's entry, back
 //! it, and leave every other chunk's data in place.
@@ -113,6 +118,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "demand_fault_fragmented",
             run: demand_fault_fragmented_phase,
+        },
+        Phase {
+            name: "cspace_topup_fragmented",
+            run: cspace_topup_fragmented_phase,
         },
         Phase {
             name: "demand_paging_sparse_region",
@@ -587,26 +596,7 @@ fn demand_fault_fragmented_phase(_: &Caps)
 
     let page = syscall_abi::PAGE_SIZE;
     let chunk_bytes = DEMAND_CHUNK_PAGES.saturating_mul(page);
-    let floor = pool_growth_floor() / page;
-    // The floor rises while memmgr evicts at `LOW`, which the cut reaches, up
-    // to twice the reserve: at most twice what it is now, since it is never
-    // below the reserve. The cut starts from `target` free pages and ends at
-    // the floor, at most `ceiling`, so it takes `target - ceiling` pages or
-    // more, half of them holes. Once the holes are released, the draw of what
-    // the cut left uncut (at most the floor) must still leave the floor and the
-    // headroom free.
-    let ceiling = floor.saturating_mul(2);
-    let target = ceiling
-        .saturating_mul(3)
-        .saturating_add(FRAGMENT_HEADROOM_PAGES.saturating_mul(2))
-        .saturating_add(FRAGMENT_SLACK_PAGES);
-    let hole_cap = usize::try_from(
-        target
-            .saturating_sub(floor)
-            .div_ceil(DEMAND_CHUNK_PAGES.saturating_sub(1).saturating_mul(2))
-            .saturating_add(1),
-    )
-    .expect("demand_fault_fragmented: hole count beyond usize");
+    let (target, hole_cap) = fragment_bounds(pool_growth_floor() / page);
     let region = std::os::seraph::register_demand_paged(FRAGMENTED_REGION_PAGES)
         .expect("demand_fault_fragmented: registering the region failed");
     let mut held: Vec<(u64, u64)> = Vec::with_capacity(
@@ -672,7 +662,114 @@ fn demand_fault_fragmented_phase(_: &Caps)
     );
 }
 
-/// Fragment the pool for [`demand_fault_fragmented_phase`] so that no free run
+/// Slots [`cspace_topup_fragmented_phase`] asks a top-up for beyond the
+/// headroom svctest's `CSpace` holds: two chunks' pages of slot pages, more
+/// than any free run of the fragmented pool holds, and fewer than the
+/// [`FRAGMENT_HEADROOM_PAGES`] the pool keeps free above the floor.
+const FRAGMENTED_TOPUP_SLOTS: u64 = 2 * DEMAND_CHUNK_PAGES * syscall_abi::CSPACE_SLOTS_PER_PAGE;
+
+/// A `CSpace` top-up on a pool that holds free pages but no run of a chunk's
+/// size is funded from smaller runs, not refused
+/// (runtime/ruststd/README.md § `CSpace` slot headroom): a slot-page pool takes
+/// pages, not a run. svctest fragments the pool as
+/// [`demand_fault_fragmented_phase`] does, then funds its own `CSpace` for
+/// [`FRAGMENTED_TOPUP_SLOTS`] slots beyond the headroom it then holds, about
+/// two chunks' pages. The top-up must succeed and the headroom must then cover
+/// those slots. The grants are released after, and nothing between the first
+/// draw and the release allocates or logs.
+fn cspace_topup_fragmented_phase(_: &Caps)
+{
+    use super::memmgr::{pool_growth_floor, release_grant};
+    use std::os::seraph::{cspace_slot_headroom, fund_cspace_slot_budget};
+
+    let page = syscall_abi::PAGE_SIZE;
+    let chunk_bytes = DEMAND_CHUNK_PAGES.saturating_mul(page);
+    let cspace = startup_info().self_cspace;
+    let (target, hole_cap) = fragment_bounds(pool_growth_floor() / page);
+    let mut held: Vec<(u64, u64)> = Vec::with_capacity(
+        FRAGMENT_MAX_DRAWS
+            .saturating_mul(2)
+            .saturating_add(hole_cap)
+            .saturating_add(1),
+    );
+    let mut holes: Vec<(u64, u64)> = Vec::with_capacity(hole_cap);
+    let Fragmented {
+        drawn_pages,
+        hole_count,
+        free,
+        largest,
+        floor,
+    } = fragment_pool(&mut held, &mut holes, target);
+    // Read after the draws, whose grants' caps take slots of the same `CSpace`.
+    let before = cspace_slot_headroom(cspace);
+    let want = before.saturating_add(FRAGMENTED_TOPUP_SLOTS);
+    let funded = fund_cspace_slot_budget(cspace, want);
+    let after = cspace_slot_headroom(cspace);
+
+    let grants = held.len();
+    for (cap, id) in held
+    {
+        release_grant(cap, id);
+    }
+    assert!(
+        largest < chunk_bytes,
+        "cspace_topup_fragmented: the pool kept a run of {largest} bytes, a chunk or more"
+    );
+    assert!(
+        free >= floor
+            .saturating_add(FRAGMENT_HEADROOM_PAGES)
+            .saturating_mul(page),
+        "cspace_topup_fragmented: {hole_count} holes left {free} free bytes, too few above the \
+         {floor}-page growth floor for the top-up"
+    );
+    assert!(
+        funded,
+        "cspace_topup_fragmented: a top-up for {want} slots from a headroom of {before} was \
+         refused with {free} bytes free in runs of at most {largest} over a {floor}-page growth \
+         floor"
+    );
+    assert!(
+        after >= want,
+        "cspace_topup_fragmented: the headroom read {after} after a top-up for {want} slots, from \
+         {before}"
+    );
+    assert_ram_identity();
+    std::os::seraph::log!(
+        "cspace_topup_fragmented: {grants} grants drew {drawn_pages} pages and {hole_count} holes \
+         left {free} free bytes in runs of at most {largest} over a {floor}-page growth floor; \
+         headroom {before} -> {after} slots"
+    );
+}
+
+/// The free target [`fragment_pool`] draws the pool to and the bound on the
+/// holes its cut makes, for a growth floor of `floor` pages.
+///
+/// The floor rises while memmgr evicts at `LOW`, which the cut reaches, up to
+/// twice the reserve: at most twice what it is now, since it is never below
+/// the reserve. The cut starts from the target's free pages and ends at the
+/// floor, at most `ceiling`, so it takes `target - ceiling` pages or more,
+/// half of them holes. Once the holes are released, the draw of what the cut
+/// left uncut (at most the floor) must still leave the floor and
+/// [`FRAGMENT_HEADROOM_PAGES`] free.
+fn fragment_bounds(floor: u64) -> (u64, usize)
+{
+    let ceiling = floor.saturating_mul(2);
+    let target = ceiling
+        .saturating_mul(3)
+        .saturating_add(FRAGMENT_HEADROOM_PAGES.saturating_mul(2))
+        .saturating_add(FRAGMENT_SLACK_PAGES);
+    let hole_cap = usize::try_from(
+        target
+            .saturating_sub(floor)
+            .div_ceil(DEMAND_CHUNK_PAGES.saturating_sub(1).saturating_mul(2))
+            .saturating_add(1),
+    )
+    .expect("fragment_bounds: hole count beyond usize");
+    (target, hole_cap)
+}
+
+/// Fragment the pool for [`demand_fault_fragmented_phase`] and
+/// [`cspace_topup_fragmented_phase`] so that no free run
 /// covers a chunk while the free pages exceed memmgr's growth floor
 /// ([`pool_growth_floor`](super::memmgr::pool_growth_floor)). memmgr refuses a
 /// grant to svctest that would leave fewer free pages than the floor, so the

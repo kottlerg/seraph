@@ -12,10 +12,12 @@
 //! a comment line, blank lines are skipped. It lists the devices a machine
 //! has that no firmware table describes, and whether the machine grants
 //! devmgr native control of its PCI Express hotplug slots, keyed by the
-//! XSDT's OEM table ID. It reaches devmgr as a boot module: a signed object
-//! (docs/signing.md) whose body is the table, which [`parse_module`] takes
-//! through the parse-only `objsig::split`, since the bootloader verified the
-//! module before it exposed it.
+//! XSDT's OEM table ID. It is a signed object (docs/signing.md) whose body
+//! is the table. devmgr reads it from the root filesystem through procmgr's
+//! verified read, which returns the verified body alone, parsed by
+//! [`parse_body`]; a table in the bundle reaches devmgr as a boot module,
+//! which [`parse_module`] takes through the parse-only `objsig::split`, since
+//! the bootloader verified the module before it exposed it.
 //!
 //! ```text
 //! # <comment>
@@ -283,11 +285,13 @@ pub enum TableError
     NoMemory,
 }
 
-/// Why a platform description table's boot module did not parse.
+/// Why a platform description table's boot module, or the body of one,
+/// did not parse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModuleError
 {
     /// The module's signature trailer does not parse; its body was not read.
+    /// Only [`parse_module`] reports it.
     Trailer(objsig::ParseError),
     /// The module's body is not UTF-8 text.
     NotText,
@@ -305,7 +309,19 @@ pub enum ModuleError
 pub fn parse_module(module: &[u8]) -> Result<PlatformTable, ModuleError>
 {
     let signed = objsig::split(module).map_err(ModuleError::Trailer)?;
-    let text = core::str::from_utf8(signed.body()).map_err(|_| ModuleError::NotText)?;
+    parse_body(signed.body())
+}
+
+/// Parse `body`, the body of a platform description table a verifier has
+/// already checked, its trailer excluded: what procmgr's verified read
+/// returns (docs/signing.md § Verifier Discipline).
+///
+/// # Errors
+/// A body that is not UTF-8, or the [`TableError`] of a body that is not a
+/// table.
+pub fn parse_body(body: &[u8]) -> Result<PlatformTable, ModuleError>
+{
+    let text = core::str::from_utf8(body).map_err(|_| ModuleError::NotText)?;
     parse_table(text).map_err(ModuleError::Table)
 }
 
@@ -591,6 +607,24 @@ mod tests
         );
         assert_eq!(
             parse_module(&signed(b"junk\n")).map(|_| ()),
+            Err(ModuleError::Table(TableError::MissingEquals(1)))
+        );
+    }
+
+    // Defect caught: a verified body read as a signed object (a table from
+    // the root filesystem refused at every boot).
+    #[test]
+    fn a_verified_body_is_its_table()
+    {
+        let table = parse_body(b"oem_table_id = BXPC\npcie_native_hotplug = yes\n").unwrap();
+        assert!(table.is_for(b"BXPC"));
+        assert!(table.pcie_native_hotplug());
+        assert_eq!(
+            parse_body(b"\xff\xfe").map(|_| ()),
+            Err(ModuleError::NotText)
+        );
+        assert_eq!(
+            parse_body(b"junk\n").map(|_| ()),
             Err(ModuleError::Table(TableError::MissingEquals(1)))
         );
     }

@@ -35,7 +35,8 @@
 //! configuration-access rules and the per-bridge results it keeps (`acpid`),
 //! and finds the PCI Express hotplug slots, decides their native-control
 //! grant and their poller's actions, and places, programs and admits a
-//! hot-added function's BARs and record (`hotplug`). The
+//! hot-added function's BARs and record (`hotplug`), and names the requests
+//! refused while devmgr's `CSpace` is short of its headroom (`headroom`). The
 //! functions read caller-mapped byte slices or values, or reach the platform
 //! only through a caller-supplied accessor or split operation, and touch no
 //! syscall, IPC, or `std::os::seraph` surface, so the crate is host-reachable
@@ -54,6 +55,7 @@ pub mod classes;
 pub mod dma;
 pub mod dmar;
 pub mod dtb;
+pub mod headroom;
 pub mod hotplug;
 pub mod image;
 pub mod lines;

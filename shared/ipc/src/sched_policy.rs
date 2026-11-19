@@ -18,8 +18,8 @@
 //! | 30 | init (kernel-assigned `INIT_PRIORITY`) |
 //! | 28 | memmgr |
 //! | 27 | procmgr |
-//! | 26 | init-logd, serial, virtio-blk, devmgr's DMA thread |
-//! | 25 | framebuffer, rtc, virtio-input, virtio-console, virtio-rng |
+//! | 26 | init-logd, virtio-blk, the IOMMU driver, devmgr's DMA thread |
+//! | 25 | serial, framebuffer, rtc, virtio-input, virtio-console, virtio-rng |
 //! | 24 | devmgr, every thread but its DMA thread |
 //! | 23 | vfsd, fs drivers (fatfs) |
 //! | 21 | svcmgr |
@@ -63,13 +63,14 @@ pub const PROCMGR_PRIORITY: u8 = 27;
 /// it serves during bootstrap; matches the boot-critical drivers.
 pub const INIT_LOGD_PRIORITY: u8 = 26;
 
-/// Boot-critical device drivers: serial (console path) and
-/// virtio-blk (root-disk path); also devmgr's DMA thread, which
-/// virtio-blk blocks on for every transfer.
+/// Boot-critical device drivers, the boot tier of a boot module's
+/// declaration: virtio-blk (root-disk path) and the IOMMU driver; also
+/// devmgr's DMA thread, which virtio-blk blocks on for every transfer.
 pub const BOOT_DRIVER_PRIORITY: u8 = 26;
 
-/// Non-boot-critical device drivers: framebuffer, RTC, virtio-input, virtio-rng,
-/// and the debug port's virtio-console.
+/// Non-boot-critical device drivers, every driver started from the root
+/// filesystem: serial, framebuffer, RTC, virtio-input, virtio-rng, and the
+/// debug port's virtio-console.
 pub const AUX_DRIVER_PRIORITY: u8 = 25;
 
 /// devmgr — device enumeration and driver supervision.

@@ -169,6 +169,10 @@ Each feature is classified per architecture as one of:
   ([services/drivers/docs/tpm.md](../services/drivers/docs/tpm.md)). It is not a boot dependency:
   without a TPM, or with one the driver does not start, the system runs unchanged. No other TPM
   function (measured boot, sealing, attestation) is used.
+- **RTC (CMOS / MC146818)** — the wall clock: when firmware describes one, the `cmos-rtc` driver
+  answers `timed`'s wall-time reads ([services/drivers/README.md](../services/drivers/README.md)
+  § Existing Drivers). It is not a boot dependency: without one, wall-time reads fail and the
+  system runs unchanged.
 - **GOP framebuffer** — graphical console; a headless serial-only boot is valid.
 - **PCIe ECAM (MCFG)** — discovered when firmware publishes it; not required by the kernel.
 - **LA57 (5-level paging)** — a larger-VA expansion above 4-level paging, the x86-64 analogue of
@@ -192,7 +196,7 @@ Each feature is classified per architecture as one of:
   pursued
   ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 - **Legacy BIOS / multiboot** — boot is UEFI-only.
-- **Secure Boot, RTC** — not boot dependencies.
+- **Secure Boot** — not a boot dependency.
 
 ---
 
@@ -283,6 +287,10 @@ Each feature is classified per architecture as one of:
   boot seed; used where the hart implements `Zkr` and the M-mode firmware grants S-mode the CSR
   (`mseccfg.SSEED`, which OpenSBI sets on such a hart), which the kernel learns by probing the
   CSR (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
+- **Goldfish RTC** — the wall clock: when the platform describes one, the `goldfish-rtc` driver
+  answers `timed`'s wall-time reads ([services/drivers/README.md](../services/drivers/README.md)
+  § Existing Drivers). It is not a boot dependency: without one, wall-time reads fail and the
+  system runs unchanged.
 - **GOP framebuffer, PCIe ECAM** — as on x86-64.
 - **Zicfiss** — supervisor shadow stacks, return-address integrity for the kernel, enabled
   through the SBI Firmware Features extension; an RVA23 option, not mandatory. Used only when
@@ -304,7 +312,7 @@ Each feature is classified per architecture as one of:
   cache-coherent DMA, and denies U-mode `cbo.zero`, `cbo.clean`, `cbo.flush` and `cbo.inval`
   (`senvcfg` written whole with 0). (Distinct from Svpbmt: the PBMT memory type governs how a
   hart's own accesses to a mapping behave, not DMA cache coherence.)
-- **Secure Boot, TPM, RTC** — not boot dependencies.
+- **Secure Boot, TPM** — not boot dependencies.
 - **Sdtrig debug triggers (SBI Debug Triggers, DBTR)** — not used: the kernel programs no trigger.
   The reference platform (QEMU `-cpu max` under OpenSBI) offers two triggers through DBTR, of the
   address-match types, and no instruction-count (`icount`) trigger, which a single-step would

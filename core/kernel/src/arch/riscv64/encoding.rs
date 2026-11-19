@@ -5,7 +5,8 @@
 
 //! RISC-V register-map and instruction-encoding arithmetic: the SBI hart-mask
 //! window, page rounding, the timer's tick and microsecond conversions, the
-//! F/D/V opcode decode the lazy extended-state trap uses, the Zkr `seed` CSR's
+//! F/D/V opcode decode and the `sstatus` test the lazy extended-state trap
+//! uses, the Zkr `seed` CSR's
 //! status decode and the word the hardware RNG builds from its samples, the
 //! `sstateen0` and `senvcfg` values and the check of their read back, the PTE
 //! permission bits and their test in the kernel's spurious-fault retry, and the
@@ -95,7 +96,7 @@ pub(super) fn ticks_to_us(ticks: u64, freq: u64) -> u64
 /// Returns `false` if `insn == 0`, which some implementations write to
 /// `stval` instead of the trapping encoding — the caller must then treat
 /// the trap as a non-FP/V illegal instruction.
-pub(super) fn is_fp_or_v_opcode(insn: u64) -> bool
+fn is_fp_or_v_opcode(insn: u64) -> bool
 {
     if insn == 0
     {
@@ -129,6 +130,33 @@ pub(super) fn is_fp_or_v_opcode(insn: u64) -> bool
     // (`c.fldsp`/`c.fsdsp`) both use funct3 (bits[15:13]) ∈ {0b001, 0b101},
     // which are FP-only in those quadrants on RV64.
     matches!(insn & 0x3, 0b00 | 0b10) && matches!((insn >> 13) & 0x7, 0b001 | 0b101)
+}
+
+/// `sstatus.FS` (bits 14:13), the F/D unit's state: 00 Off, 01 Initial,
+/// 10 Clean, 11 Dirty.
+pub(super) const SSTATUS_FS_MASK: u64 = 0x3 << 13;
+
+/// `sstatus.VS` (bits 10:9), the V unit's state, in `FS`'s encoding.
+pub(super) const SSTATUS_VS_MASK: u64 = 0x3 << 9;
+
+/// Whether a U-mode illegal-instruction trap is the lazy extended-state
+/// trap, which turns the F/D and V units on and restores the thread's saved
+/// state: the thread ran with `sstatus.FS` Off (`sstatus`, the value the
+/// trap saved), and the trapping instruction (`stval`) is one
+/// [`is_fp_or_v_opcode`] matches. The lazy path turns `FS` and `VS` on
+/// together and off together (`fpu::lazy_enable_fp_v_initial`,
+/// `fpu::switch_out_save`), so `FS` Off is the state of both units.
+///
+/// An F/D/V instruction that traps with the units on was refused for a
+/// reason of its own: a reserved rounding mode, in the instruction or in
+/// `frm`, a vector instruction that depends on `vtype` while `vtype.vill`
+/// is set, or an extension the hart lacks. That trap is the thread's
+/// illegal-instruction fault; restoring the saved state would instead
+/// re-execute the instruction for ever, each pass replacing the live
+/// registers with those of the thread's last switch-out.
+pub(super) fn is_lazy_fp_v_trap(sstatus: u64, stval: u64) -> bool
+{
+    sstatus & SSTATUS_FS_MASK == 0 && is_fp_or_v_opcode(stval)
 }
 
 // ── The Zkr `seed` CSR ────────────────────────────────────────────────────────
@@ -542,6 +570,27 @@ mod tests
         assert!(!is_fp_or_v_opcode(0x0001)); // c.nop / c.addi (C1)
         assert!(!is_fp_or_v_opcode(0x4000)); // C0 funct3=010 (c.lw)
         assert!(!is_fp_or_v_opcode(0x4002)); // C2 funct3=010 (c.lwsp)
+    }
+
+    // Defect caught: a lazy-trap test that ignored the saved `sstatus.FS`
+    // would restore the saved state over the live one for an F/D/V
+    // instruction refused with the units on, and re-execute it for ever,
+    // instead of delivering the thread's illegal-instruction fault.
+    #[test]
+    fn only_an_fp_v_trap_with_the_units_off_is_the_lazy_trap()
+    {
+        /// `fadd.d f0, f0, f0` with the reserved rounding mode 101.
+        const FADD_RESERVED_RM: u64 = 0x0200_5053;
+        /// `sstatus.SPIE` (bit 5), so the units' fields are not the only bits.
+        const OTHER_BITS: u64 = 1 << 5;
+        assert!(is_lazy_fp_v_trap(OTHER_BITS, FADD_RESERVED_RM));
+        for fs in [1u64, 2, 3]
+        {
+            let units_on = OTHER_BITS | (fs << 13) | (fs << 9);
+            assert!(!is_lazy_fp_v_trap(units_on, FADD_RESERVED_RM), "FS {fs}");
+        }
+        assert!(!is_lazy_fp_v_trap(OTHER_BITS, 0x0000_0013)); // addi: not F/D/V
+        assert!(!is_lazy_fp_v_trap(OTHER_BITS, 0)); // stval 0: no encoding
     }
 
     // Defect caught: a predicate that swapped R and W, or ignored them, would

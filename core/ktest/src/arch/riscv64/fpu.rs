@@ -17,6 +17,9 @@
 //! `crate::integration::fpu_survives_ipc_call`. [`load_and_spin`] instead
 //! holds the loaded values while the thread spins, for a stop to find them in
 //! the image `SYS_THREAD_READ_EXT_REGS` reads (`crate::integration::thread_ext_regs`).
+//! [`initial_state_check`], [`control_state_check`] and
+//! [`inexact_divide_check`] read the control state a thread starts with
+//! (`crate::unit::fpu::initial_state`).
 
 /// Load `pattern` into f0..f31 and lane 0 of v0..v31, spin `iters` iterations so the timer can
 /// preempt the thread, then capture the registers; returns the mismatched-lane
@@ -688,4 +691,140 @@ pub fn for_each_ext_word(
         && (0u64..32).zip(f.zip(v)).all(|(i, (f_at, v_at))| {
             check(f_at, u64::MAX, pattern ^ i) && check(v_at, u64::MAX, !pattern ^ i)
         })
+}
+
+// ── A new thread's initial state ─────────────────────────────────────────────
+
+/// Names of the control words [`initial_state_check`] and
+/// [`control_state_check`] read, in the order their errors index.
+pub const STATE_WORDS: [&str; 5] = ["fcsr", "vl", "vtype", "vstart", "vcsr"];
+
+/// `fcsr`'s rounding-mode field `frm` (bits 7:5); 0 is round to nearest,
+/// ties to even.
+const FCSR_FRM: u64 = 0b111 << 5;
+
+/// `fcsr`'s inexact flag `NX`, which an inexact result sets.
+const FCSR_NX: u64 = 1;
+
+/// Read `fcsr`, `vl`, `vtype`, `vstart` and `vcsr`, in that order, in one
+/// asm block, so no compiled code runs between the reads. The `fcsr` read
+/// is the thread's first use of the extended state when it has made none, so
+/// the illegal-instruction trap it takes restores the thread's saved F/D and
+/// V state first.
+fn read_control_words() -> [u64; 5]
+{
+    let (fcsr, vl, vtype, vstart, vcsr): (u64, u64, u64, u64, u64);
+    // SAFETY: the asm reads five CSRs into the five output registers and
+    // writes nothing else. `.option arch, +d, +v` enables the CSR names
+    // locally, since ktest's target is RV64IMAC; the reads execute once the
+    // U-mode lazy-trap path has turned sstatus.FS and VS on.
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +d, +v",
+            "csrr {fcsr}, fcsr",
+            "csrr {vl}, vl",
+            "csrr {vtype}, vtype",
+            "csrr {vstart}, vstart",
+            "csrr {vcsr}, vcsr",
+            ".option pop",
+            fcsr = out(reg) fcsr,
+            vl = out(reg) vl,
+            vtype = out(reg) vtype,
+            vstart = out(reg) vstart,
+            vcsr = out(reg) vcsr,
+            options(nostack, nomem),
+        );
+    }
+    [fcsr, vl, vtype, vstart, vcsr]
+}
+
+/// The index into [`STATE_WORDS`] and the value of the first of `words`
+/// (the value read, the mask of the bits compared, and their expected value)
+/// whose bits under its mask differ from its expected value.
+fn first_mismatch(words: [(u64, u64, u64); 5]) -> Result<(), (usize, u64)>
+{
+    match words
+        .iter()
+        .enumerate()
+        .find(|&(_, &(got, mask, want))| got & mask != want)
+    {
+        Some((i, &(got, _, _))) => Err((i, got)),
+        None => Ok(()),
+    }
+}
+
+/// Check the executing thread's extended-state control words against a new
+/// thread's, before the thread has used the state: `fcsr`, `vl`, `vtype`,
+/// `vstart` and `vcsr` all 0, exactly.
+///
+/// # Errors
+///
+/// The index into [`STATE_WORDS`] and the value of the first word that
+/// differs.
+pub fn initial_state_check() -> Result<(), (usize, u64)>
+{
+    let [fcsr, vl, vtype, vstart, vcsr] = read_control_words();
+    first_mismatch([
+        (fcsr, u64::MAX, 0),
+        (vl, u64::MAX, 0),
+        (vtype, u64::MAX, 0),
+        (vstart, u64::MAX, 0),
+        (vcsr, u64::MAX, 0),
+    ])
+}
+
+/// Check the control field a thread keeps until it writes it: `fcsr`'s
+/// rounding mode. The vector configuration is the program's own once it
+/// runs a `vsetvl`, and the flags accrue, so neither is compared. For a
+/// thread that may have computed since its first use, such as ktest's own.
+///
+/// # Errors
+///
+/// The index into [`STATE_WORDS`] and the value of the first word that
+/// differs.
+pub fn control_state_check() -> Result<(), (usize, u64)>
+{
+    let [fcsr, vl, vtype, vstart, vcsr] = read_control_words();
+    first_mismatch([
+        (fcsr, FCSR_FRM, 0),
+        (vl, 0, 0),
+        (vtype, 0, 0),
+        (vstart, 0, 0),
+        (vcsr, 0, 0),
+    ])
+}
+
+/// Divide 1.0 by 3.0 with `fdiv.d`, whose result is inexact, then read
+/// `fcsr`, which must be 0 with the inexact flag set. The F and D extensions
+/// never trap on a floating-point exception, so the division completes on
+/// any `fcsr`.
+///
+/// # Errors
+///
+/// `fcsr` after the division, when it is not the expected value.
+pub fn inexact_divide_check() -> Result<(), u64>
+{
+    let (one, three) = (1.0f64.to_bits(), 3.0f64.to_bits());
+    let fcsr: u64;
+    // SAFETY: the asm moves the two operands into ft0 and ft1, divides, and
+    // reads fcsr into an output register. It clobbers ft0 and ft1, which this
+    // soft-float binary's compiled code never holds a value in;
+    // `.option arch, +d` enables D locally, since ktest's target is RV64IMAC.
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +d",
+            "fmv.d.x ft0, {one}",
+            "fmv.d.x ft1, {three}",
+            "fdiv.d ft0, ft0, ft1",
+            "csrr {fcsr}, fcsr",
+            ".option pop",
+            one = in(reg) one,
+            three = in(reg) three,
+            fcsr = out(reg) fcsr,
+            options(nostack, nomem),
+        );
+    }
+    if fcsr == FCSR_NX { Ok(()) } else { Err(fcsr) }
 }

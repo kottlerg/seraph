@@ -19,6 +19,8 @@
 //! - `ioport_syscalls.rs` — `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT` return
 //!   `NotSupported`
 //! - `sbi_call.rs` — `SYS_SBI_CALL` reaches the SBI firmware
+//! - `fp_refusal.rs` — an F/D instruction the hart refuses with the thread's
+//!   units on is the thread's illegal-instruction fault, not the lazy trap
 //!
 //! Tier 2 scenarios:
 //! - `sbi_gating.rs` — `SYS_SBI_CALL` refuses kernel-reserved extensions and
@@ -30,6 +32,7 @@
 
 pub mod callee_saved;
 pub mod code_stub;
+mod fp_refusal;
 pub mod fpu;
 mod ioport_syscalls;
 mod sbi_call;
@@ -285,6 +288,10 @@ pub fn run_unit(ctx: &TestContext)
     crate::run_test!(
         "hw::sbi_call_get_spec_version",
         sbi_call::get_spec_version(ctx)
+    );
+    crate::run_test!(
+        "hw::fp_refused_instruction_faults",
+        fp_refusal::refused_instruction_faults(ctx)
     );
 }
 

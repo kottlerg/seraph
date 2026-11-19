@@ -43,17 +43,16 @@ identity dies with UEFI `ExitBootServices` (only GOP knows it pre-exit),
 so the bootloader is the only entity that can carry this information to
 userspace (see [docs/console-model.md](../../../docs/console-model.md)).
 
-The driver carries a declaration in the ELF note section `.note.seraph.driver`
-(`boot-framebuffer`), a boot-module declaration that the boot pass matches against the boot
-framebuffer's device record. Devmgr binds the record and delivers its resource list, decoded
-with `driver_binding::resources::PlatformDelivery`: the framebuffer's pages as one `Mmio`
-resource, the service endpoint, and a devmgr query cap, a badged SEND on the private endpoint of
-the driver's spawn batch, so the driver can fetch its geometry via `QUERY_DEVICE_INFO`
-(generic kind/version/bytes payload schema, shared with virtio). Once the
-framebuffer is mapped the driver reports `DRIVER_READY` on the same cap,
-immediately before its service loop, and exits when devmgr refuses it:
-devmgr serves the driver's endpoint only after the report, and withdraws
-it when the driver dies.
+The driver carries a declaration in the ELF note section `.note.seraph.driver` (`boot-framebuffer`),
+a drivers-directory declaration that the drivers-directory pass matches against the boot
+framebuffer's device record. Devmgr binds the record and delivers its resource list, decoded with
+`driver_binding::resources::PlatformDelivery`: the framebuffer's pages as one `Mmio` resource, the
+service endpoint, and a devmgr query cap, a badged SEND on the private endpoint of the driver's
+spawn batch, so the driver can fetch its geometry via `QUERY_DEVICE_INFO` (generic
+kind/version/bytes payload schema, shared with virtio). Once the framebuffer is mapped the driver
+reports `DRIVER_READY` on the same cap, immediately before its service loop, and exits when devmgr
+refuses it: devmgr serves the driver's endpoint only after the report, and withdraws it when the
+driver dies.
 
 Clients obtain a write cap through
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities), not svcmgr: a framebuffer
@@ -73,8 +72,8 @@ for the framebuffer until the driver writes again, and keeps writing them to ser
 them in its history. Should logd fail to spawn that writer, each line's producer writes it, and a
 stopped driver then costs every line up to that bound
 ([logd IPC Interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks).
-devmgr creates it with its bundle entry name, its install path `/services/drivers/framebuffer`, as
-its `argv[0]`, under which procmgr's `LIST_PROCESSES` names it to a debugger.
+devmgr creates it with its install path `/services/drivers/framebuffer` as its
+`argv[0]`, under which procmgr's `LIST_PROCESSES` names it to a debugger.
 
 ---
 

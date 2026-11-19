@@ -48,14 +48,16 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-/// Donations one [`top_up`] makes at most.
+/// Rounds one [`top_up`] makes at most. Each round reads the shortfall and
+/// donates it, in as many donations as the grants' runs take
+/// ([`donate_runs`]).
 ///
 /// The kernel keeps a donation's first page as its own donation bookkeeping
 /// once per record page, for either pool (see `SYS_CAP_CREATE_ASPACE` and
-/// `SYS_CAP_CREATE_CSPACE`), so a single donation can seed one page fewer than
-/// it carried. A record page opened by one round has room for the next round's
-/// record, so with no other thread drawing the pool the second round covers
-/// the shortfall. A shortfall another thread's allocation causes is not
+/// `SYS_CAP_CREATE_CSPACE`), so a round seeds a page fewer than it carried for
+/// each record page its donations open. The second round donates what those
+/// pages kept, and with no other thread drawing the pool it covers the
+/// shortfall unless its own donations open a record page. A shortfall another thread's allocation causes is not
 /// chased: the allocation that needs the pages decides (for a map,
 /// [`map_with_top_ups`]). The bound limits no capacity: a top-up that still
 /// reads short is no failure.
@@ -113,7 +115,8 @@ pub const fn pt_pages_for(region_pages: u64) -> u64
 /// Each round reads the pages the pool still lacks through `shortfall` (zero
 /// once it covers the need) and, while that is non-zero, donates them through
 /// `donate`, which returns whether the donation was made (memmgr granted the
-/// Memory and the kernel took it). At most [`FUND_ROUNDS`] donations are made.
+/// Memory and the kernel took it); one round may make several donations, one
+/// for each run memmgr grants. At most [`FUND_ROUNDS`] rounds are made.
 ///
 /// Returns `false` only when a donation was refused. A pool that still reads
 /// short after donations that were made is not a failure: another thread's
@@ -131,6 +134,70 @@ pub fn top_up(mut shortfall: impl FnMut() -> u64, mut donate: impl FnMut(u64) ->
         if !donate(short)
         {
             return false;
+        }
+    }
+    true
+}
+
+/// One run of a memmgr grant: its Memory cap, its pages, and the region id
+/// that names it to `RELEASE_MEMORY_CAPS`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GrantRun
+{
+    /// The run's Memory cap.
+    pub cap: u64,
+    /// Pages the run covers.
+    pub pages: u64,
+    /// memmgr's id of the run's grant.
+    pub region_id: u64,
+}
+
+/// Donate `pages` pages to a growth pool from grants of runs of any length.
+///
+/// A growth pool takes pages, not a run (augment-mode `cap_create_aspace` and
+/// `cap_create_cspace` take any count of one page or more), so the pages are
+/// asked for best-effort: a pool whose free pages lie in runs shorter than
+/// `pages` still serves them. `request(left)` asks memmgr for `left` pages and
+/// returns the runs it granted, the first `count` of the array, or `None` on a
+/// refusal. A grant covers fewer pages than asked when its runs fall short, so
+/// the remainder is asked for again until `pages` pages are donated. `donate`
+/// donates one run whole and returns whether the kernel took it. A refused
+/// donation ends the call: `give_back` returns that run and every run of its
+/// grant after it, as it does a grant whose runs hold no page.
+///
+/// Returns `true` once `pages` pages are donated, `false` on a refused
+/// request, a grant of no page, or a refused donation; the runs donated before
+/// stay in the pool. Each round donates at least a page, so at most `pages`
+/// requests are made.
+pub fn donate_runs<const N: usize>(
+    pages: u64,
+    mut request: impl FnMut(u64) -> Option<([GrantRun; N], usize)>,
+    mut donate: impl FnMut(GrantRun) -> bool,
+    mut give_back: impl FnMut(&[GrantRun]),
+) -> bool
+{
+    let mut left = pages;
+    while left > 0
+    {
+        let Some((runs, count)) = request(left)
+        else
+        {
+            return false;
+        };
+        let runs = runs.get(..count).unwrap_or(&runs);
+        if runs.iter().all(|run| run.pages == 0)
+        {
+            give_back(runs);
+            return false;
+        }
+        for (i, run) in runs.iter().enumerate()
+        {
+            if !donate(*run)
+            {
+                give_back(runs.get(i..).unwrap_or_default());
+                return false;
+            }
+            left = left.saturating_sub(run.pages);
         }
     }
     true
@@ -184,6 +251,19 @@ pub enum Held
     /// Another thread was holding the pool: this caller neither read nor
     /// funded it.
     Busy,
+}
+
+impl Held
+{
+    /// Whether the pool was below its mark and its top-up was refused: the
+    /// one outcome after which the pool may not cover what the caller takes
+    /// next. A busy hold is not refused, since the mark covers every thread's
+    /// allocations while one tops up.
+    #[must_use]
+    pub const fn is_refused(self) -> bool
+    {
+        matches!(self, Self::Failed)
+    }
 }
 
 /// The failure streak of a [`LowWaterHold`]: no failure since the last
@@ -750,6 +830,177 @@ mod tests
                 "the streak after {end:?} was not reported"
             );
         }
+    }
+
+    #[test]
+    fn only_a_failed_hold_is_refused()
+    {
+        assert!(Held::Failed.is_refused());
+        for held in [Held::Enough, Held::ToppedUp, Held::Busy]
+        {
+            assert!(!held.is_refused(), "{held:?} read as refused");
+        }
+    }
+
+    /// A run of `pages` pages whose cap and region id are `n`.
+    fn run(n: u64, pages: u64) -> GrantRun
+    {
+        GrantRun {
+            cap: n,
+            pages,
+            region_id: n,
+        }
+    }
+
+    #[test]
+    fn nothing_to_donate_asks_for_nothing()
+    {
+        let donated = donate_runs::<4>(
+            0,
+            |_| panic!("asked for pages with none needed"),
+            |_| panic!("donated with none needed"),
+            |_| panic!("gave back with none needed"),
+        );
+        assert!(donated);
+    }
+
+    #[test]
+    fn partial_grants_are_asked_again_for_the_remainder()
+    {
+        // A pool of runs of three pages: a grant carries four of them at most.
+        let asked = core::cell::RefCell::new([0u64; 8]);
+        let rounds = Cell::new(0usize);
+        let donated = Cell::new(0u64);
+        let next = Cell::new(1u64);
+        let ok = donate_runs::<4>(
+            30,
+            |left| {
+                let round = rounds.get();
+                asked.borrow_mut()[round] = left;
+                rounds.set(round + 1);
+                let mut runs = [GrantRun::default(); 4];
+                let mut granted = 0;
+                let mut count = 0;
+                while count < 4 && granted < left
+                {
+                    let pages = (left - granted).min(3);
+                    runs[count] = run(next.get(), pages);
+                    next.set(next.get() + 1);
+                    granted += pages;
+                    count += 1;
+                }
+                Some((runs, count))
+            },
+            |r| {
+                donated.set(donated.get() + r.pages);
+                true
+            },
+            |_| panic!("gave back a run with every donation taken"),
+        );
+        assert!(ok);
+        assert_eq!(donated.get(), 30);
+        assert_eq!(rounds.get(), 3);
+        assert_eq!(asked.borrow()[..3], [30, 18, 6]);
+    }
+
+    #[test]
+    fn a_refused_request_ends_the_donation()
+    {
+        let rounds = Cell::new(0);
+        let ok = donate_runs::<4>(
+            10,
+            |_| {
+                rounds.set(rounds.get() + 1);
+                if rounds.get() == 1
+                {
+                    let mut runs = [GrantRun::default(); 4];
+                    runs[0] = run(1, 4);
+                    Some((runs, 1))
+                }
+                else
+                {
+                    None
+                }
+            },
+            |_| true,
+            |_| panic!("gave back after a refused request"),
+        );
+        assert!(!ok);
+        assert_eq!(rounds.get(), 2);
+    }
+
+    #[test]
+    fn a_grant_of_no_page_ends_the_donation()
+    {
+        let given = Cell::new(usize::MAX);
+        let ok = donate_runs::<4>(
+            5,
+            |_| Some(([GrantRun::default(); 4], 0)),
+            |_| panic!("donated from an empty grant"),
+            |rest| given.set(rest.len()),
+        );
+        assert!(!ok);
+        assert_eq!(given.get(), 0);
+        let ok = donate_runs::<4>(
+            5,
+            |_| {
+                let mut runs = [GrantRun::default(); 4];
+                runs[0] = run(7, 0);
+                Some((runs, 1))
+            },
+            |_| panic!("donated a run of no pages"),
+            |rest| given.set(rest.len()),
+        );
+        assert!(!ok);
+        assert_eq!(given.get(), 1, "the run of no pages was not given back");
+    }
+
+    #[test]
+    fn a_refused_donation_gives_back_the_rest_of_its_grant()
+    {
+        let given = core::cell::RefCell::new([0u64; 4]);
+        let given_count = Cell::new(0);
+        let donated = Cell::new(0);
+        let ok = donate_runs::<4>(
+            12,
+            |_| Some(([run(1, 3), run(2, 3), run(3, 3), run(4, 3)], 4)),
+            |r| {
+                if r.cap == 2
+                {
+                    return false;
+                }
+                donated.set(donated.get() + 1);
+                true
+            },
+            |rest| {
+                given_count.set(rest.len());
+                for (slot, r) in given.borrow_mut().iter_mut().zip(rest)
+                {
+                    *slot = r.region_id;
+                }
+            },
+        );
+        assert!(!ok);
+        assert_eq!(donated.get(), 1);
+        assert_eq!(given_count.get(), 3);
+        assert_eq!(given.borrow()[..3], [2, 3, 4]);
+    }
+
+    #[test]
+    fn a_count_past_the_array_takes_the_whole_array()
+    {
+        let donated = Cell::new(0);
+        let ok = donate_runs::<2>(
+            4,
+            |_| Some(([run(1, 2), run(2, 2)], 9)),
+            |r| {
+                donated.set(donated.get() + r.pages);
+                true
+            },
+            |_| panic!("gave back with every donation taken"),
+        );
+        assert!(ok);
+        assert_eq!(donated.get(), 4);
     }
 
     #[test]

@@ -428,7 +428,14 @@ it serves each request, a request worker holds it, and below `CSPACE_LOW_WATER` 
 page for its body arena procmgr funds the slot-page pool from memmgr for `CSPACE_TOPUP_SLOTS`
 (1024). The mark leaves room for every worker's request while one worker tops up. A failed top-up
 is retried on the next request, and the worker that finds a run of failures unreported logs it
-once.
+once. While the headroom is short of the mark and its top-up was refused, procmgr refuses with
+`OUT_OF_MEMORY` the requests whose capabilities it keeps in a number that grows with requests:
+`CREATE_PROCESS` and `CREATE_FROM_FILE`, each child's caps, before they are served
+(`process_table::headroom_refusal`), and `REGISTER_THREAD`, a cap for each thread, at its
+reservation, after the label's own checks, so a debugger's binding on the refused thread is taken
+back as for any refusal there (`ThreadRegistry::reserve_within`). Every other request keeps no
+capability, or at most one per process or for the boot, so the slots left and the IPC receive
+reserve the next top-up's reply needs stay free.
 
 ---
 

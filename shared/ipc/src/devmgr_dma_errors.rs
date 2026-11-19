@@ -25,8 +25,11 @@ pub const TOO_MANY_MAPPINGS: u64 = 5;
 /// The device address devmgr would give the frames is in use by another
 /// mapping of the device: with no IOMMU, the same frames mapped twice.
 pub const ADDRESS_IN_USE: u64 = 6;
-/// devmgr could not make the frames reachable: an allocation failed, or
-/// the device's IOVA space holds no free range of the cap's length.
+/// devmgr could not make the frames reachable: an allocation failed, its
+/// own `CSpace` is short of its slot headroom and a top-up was refused, so
+/// it cannot keep the cap (services/devmgr/docs/responsibilities.md
+/// § `CSpace` headroom), or the device's IOVA space holds no free range of the
+/// cap's length.
 pub const OUT_OF_RESOURCES: u64 = 7;
 /// The IOMMU driver that confines the device did not complete the
 /// request: it refused it, it timed out, or it is dead. A refused

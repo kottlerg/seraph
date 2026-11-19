@@ -158,27 +158,41 @@ device; a table past a bound is rejected whole and logged.
 
 Tables live in the tree at `services/devmgr/platform/<machine>.platform`. The build
 (`xtask/src/sysroot.rs`, `data_files`) installs them per architecture under
-`/config/devmgr/platform/`, and the init harness's bundle list of the architecture
-([`rootfs/config/bundle/`](../rootfs/config/bundle/)) names them as boot modules, by that install
-path (riscv64: `/config/devmgr/platform/qemu-virt.platform`, from
-`services/devmgr/platform/qemu-virt.platform`; x86-64: none), init forwards them to devmgr with the
-driver modules, and devmgr tells one from a driver image by its content. devmgr uses the table whose
-`oem_table_id` equals the XSDT's OEM table ID. With no such table there are no platform-table
-records, and devmgr logs that once.
+`/config/devmgr/platform/` (`devmgr_labels::PLATFORM_TABLES_PATH`; riscv64:
+`/config/devmgr/platform/qemu-virt.platform`, from `services/devmgr/platform/qemu-virt.platform`;
+x86-64: none), and signs each with the data role alone under its install path
+([signing.md](signing.md) § Signed Attributes). devmgr uses the table whose `oem_table_id` equals
+the XSDT's OEM table ID. With no such table there are no platform-table records, and devmgr logs
+that once.
 
 A table belongs to the bundle only when it describes a device the root mount needs, since the bundle
-is the bootstrap closure ([boot-media.md](boot-media.md) § The Bootstrap Closure); any other table
-is installed on the root filesystem, signed with the data role under its install path, and read by
-devmgr from there. A table grants a driver register ranges, I/O ports and interrupt lines, and can
-grant native hotplug control, so devmgr has procmgr verify a table it reads from the root
-filesystem, in the data role under its install path, and parses only the body procmgr returns
-([signing.md](signing.md) § Which Stage Verifies What). `qemu-virt.platform` describes the RTC and
-the hotplug grant, neither of which the root mount needs. That is design intent, not yet implemented
-([#1267](https://github.com/kottlerg/seraph/issues/1267), which builds that verification of a
-data-role file; [#1071](https://github.com/kottlerg/seraph/issues/1071) lists the tables among the
-policy-bearing files and reuses it): devmgr reads tables from its boot modules alone, and the bundle
-carries every table of the architecture. A table leaves the bundle only once the tables devmgr reads
-from the root filesystem are verified.
+is the bootstrap closure ([boot-media.md](boot-media.md) § The Bootstrap Closure); none in the tree
+does, so no bundle list names one. Every other table is read by devmgr from the root filesystem.
+svcmgr hands devmgr the tables' directory with `SET_DRIVERS_DIR`, beside the drivers directory
+(`LOOKUP | READ | READDIR`; absent when the directory is, as on x86-64), and devmgr's
+drivers-directory job, before its pass, lists it and reads each table through procmgr's verified
+read (`procmgr_labels::READ_VERIFIED`): procmgr copies the file into frames charged to devmgr,
+verifies the copy in the data role under the table's install path, and returns the body read-only.
+devmgr parses only that body (`firmware::platform::parse_body`), since a table grants a driver
+register ranges, I/O ports and interrupt lines, and can grant native hotplug control
+([signing.md](signing.md) § Which Stage Verifies What, § Verifier Discipline). A table procmgr
+refuses, or whose body is not a table, is logged and passed over. devmgr appends the matching
+table's device records after the records it enumerated at boot, and deletes the directory cap; the
+pass that follows binds them, `qemu-virt.platform`'s RTC among them.
+
+A table that does describe a device the root mount needs is a boot module of the bundle, by its
+install path, which the bootloader verified; init forwards it to devmgr with the driver modules,
+devmgr tells it from a driver image by its content and parses its body after the parse-only split
+of its trailer (`firmware::platform::parse_module`). When a boot module's table matches the
+machine, devmgr reads no table from the root filesystem.
+
+Until devmgr knows its tables (a boot module's table matched, or the read from the root filesystem
+is done, or devmgr knows there is no table to read), it leaves no PCI Express hotplug slot to the
+firmware: a slot whose host bridge's `_OSC` result withholds native control, or failed, stays
+`Waiting`, so that result cannot settle the slot (`Grant::Firmware`, final) ahead of the table's
+`pcie_native_hotplug` grant. A slot whose `_OSC` result grants native control is managed at once:
+a table can only add native control, never withdraw it
+([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#grant) § Grant).
 
 ---
 

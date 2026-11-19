@@ -2249,8 +2249,11 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// records whose thread the binding showed before any rebind, carried
 /// through a thread procmgr already lists under that binding
 /// (`ProcessTable::origin_of`), which decides what a restore binds back. A
-/// thread refused at the bound or for the heap runs unregistered, so a
-/// debugger's binding on it is taken back then, under the process badge; one
+/// thread refused at the bound, for the heap, or under
+/// [`process_table::Headroom::Short`] (procmgr's own `CSpace` short of its
+/// headroom, which the registry's Thread cap would draw) runs unregistered,
+/// so a debugger's binding on it is taken back then, under the process
+/// badge; one
 /// refused because its process declared itself undebuggable is unbound as
 /// the declaration unbinds its threads.
 ///
@@ -2259,9 +2262,14 @@ fn bind_exception_class(thread: u64, badge: u64) -> bool
 /// `NOT_ATTACHABLE` when it declared itself undebuggable,
 /// `INVALID_ARGUMENT` when the cap is not a Thread cap with `RIGHTS_THREAD`,
 /// `THREAD_LIMIT` at `procmgr_labels::REGISTERED_THREADS_MAX`, and
-/// `OUT_OF_MEMORY` when the heap cannot hold the entry. The caller deletes
-/// the cap on every error.
-pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) -> Result<(), u64>
+/// `OUT_OF_MEMORY` when the heap cannot hold the entry or under
+/// `Headroom::Short`. The caller deletes the cap on every error.
+pub fn register_thread(
+    badge: u64,
+    thread_cap: u64,
+    table: &mut ProcessTable,
+    headroom: process_table::Headroom,
+) -> Result<(), u64>
 {
     // A crash badge the thread copied from a spawner that has exited, and
     // that a sweep dropped, is still procmgr's: the tag tells it. A cap that
@@ -2300,7 +2308,7 @@ pub fn register_thread(badge: u64, thread_cap: u64, table: &mut ProcessTable) ->
             .threads
             .sweep(|t| thread_is_listed(t.cap), release_registered_thread);
     }
-    if let Err(r) = entry.threads.reserve()
+    if let Err(r) = entry.threads.reserve_within(headroom)
     {
         // The thread runs unregistered, so no attach lists it and no restore
         // reaches it later: a debugger's binding it copied, a watched one's

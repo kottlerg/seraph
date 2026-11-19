@@ -226,7 +226,7 @@ pub mod fs_labels;
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 26;
+pub const DEVMGR_LABELS_VERSION: u32 = 27;
 pub mod devmgr_labels;
 
 pub mod test_fault_labels;

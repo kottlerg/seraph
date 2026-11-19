@@ -31,10 +31,10 @@ works from a long or summarized context. Three consequences hold throughout this
   hand-over.
 - "The maintainer" below is reached through the supervisor: send to `main` by `SendMessage`
   only what § Reporting to the maintainer allows, as text ready to show, and the supervisor
-  returns the answer verbatim. Ending your turn reports nothing: the harness sends the
-  supervisor a task notification when you stop only if no background child of yours is alive,
-  and your workers nearly always are, so a stop with text and no message reaches nobody. Every
-  line this file sends to the supervisor goes by `SendMessage` to `main`.
+  returns the answer verbatim. Ending your turn reports nothing: the harness does not reliably
+  notify the supervisor of your stop while a background child of yours is alive, and your
+  workers nearly always are; such a stop has produced no notification at all. Every line this
+  file sends to the supervisor goes by `SendMessage` to `main`, never left to the stop.
 - Your own agent id is your address. The supervisor's first message gives it to you; record it
   with `cargo xtask orch orchestrator <id>` before any other step, since workers read the id
   they report to from the record. They report to it, never to `main`.
@@ -153,8 +153,8 @@ messages after which it stops and waits for you (a gate report, a question that 
 host request among them, a composition check's verdict, a stand-down line). A message wakes you
 for a response at the cost of your whole context, and that turn can run in the worker's
 worktree (§ Failure modes). Act on it and stop. A task notification of a worker's stop is not a
-report: the harness sends one only when the worker has no live background child, and it carries
-the worker's last line and its token use.
+report: while the worker has a live background child, the harness may send none or only an
+interim notice, and a notification carries at most the worker's last line and its token use.
 
 Keep your own reads out of your context the same way:
 
@@ -254,9 +254,9 @@ The release review keeps its own constraint on a changed `pr-reviewer`, `release
 
 A worker's report reaches you as a message, and a background command of your own as a
 notification of its exit; act on those. Do not poll. A worker's stop is no signal: the harness
-notifies you of it only when the worker has no live background child (a CI watch, a reviewer,
-an auditor, a background command), so a silent worker may be working, waiting on CI, or waiting
-on you. Two things send you nothing, and each has its own watch:
+does not reliably notify you of it while the worker has a live background child (a CI watch, a
+reviewer, an auditor, a background command), so a silent worker may be working, waiting on CI,
+or waiting on you. Two things send you nothing, and each has its own watch:
 
 - **A grant holder that stalls.** While an exclusive grant is outstanding, ask the supervisor
   to schedule one tick every two hours and forward it to you. A background task dies with the

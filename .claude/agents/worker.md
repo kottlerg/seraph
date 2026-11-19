@@ -65,14 +65,14 @@ git on the main checkout (`.claude/agents/orchestrator.md` § Failure modes). So
 has one of three shapes, each with its channel, and the detail lives in files: the PR body, the
 run records, the scratchpad.
 
-Ending your turn reports nothing. The harness sends the orchestrator a task notification when you
-stop only if no background child of yours is alive (a CI watch, a `pr-reviewer` or
-`pr-auditor` agent, a background command), and that notification carries only your last text;
-with one alive, your stop reaches nobody. Every report the orchestrator must read therefore goes
-by `SendMessage` to its agent id: the one `cargo xtask orch orchestrator` prints, which the
-record keeps current when the orchestrator is replaced, or, when the command finds no batch, the
-one your prompt or a later orchestrator's message names. Never send to `main`, which is the
-supervisor above it.
+Ending your turn reports nothing. The harness does not reliably notify the orchestrator of your
+stop while a background child of yours is alive (a CI watch, a `pr-reviewer` or `pr-auditor`
+agent, a background command): such a stop produces at most an interim notice, whose text may be
+interim, and a notification carries only your last text in any case. Every report the
+orchestrator must read therefore goes by `SendMessage` to its agent id, and none is left to the
+stop. That id is the one `cargo xtask orch orchestrator` prints, which the record keeps current
+when the orchestrator is replaced, or, when the command finds no batch, the one your prompt or a
+later orchestrator's message names. Never send to `main`, which is the supervisor above it.
 
 - **Status**: one line of at most 200 characters, recorded with
   `cargo xtask orch worker <name> --status "<line>"`, `<name>` being the record name your prompt

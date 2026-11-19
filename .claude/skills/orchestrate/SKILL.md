@@ -68,14 +68,15 @@ only if that does not cure it.
 
 ## A silent orchestrator
 
-The harness sends you a task notification when the orchestrator stops only if no background
-child of its own is alive, and with workers alive that is almost never. Silence is therefore no
-sign: an orchestrator that has sent nothing may be working, waiting on a worker, or idle. Before
-you replace or stop one, check it. Read the tail of its output file: a recent entry, or a tool
-call with no result yet, means it is working. When the file shows a turn that ended, send it one
-line asking for its state; it answers by message. Treat it as gone only when a message to it is
-undeliverable, or when neither a reply nor a new entry in the file follows within ten minutes.
-Then spawn a new one with "resume from the record", as in step 3.
+The harness does not reliably notify you of the orchestrator's stop while a background child of
+its own is alive, and its workers nearly always are: such a stop has produced no notification at
+all. Silence is therefore no sign: an orchestrator that has sent nothing may be working,
+waiting on a worker, or idle. Before you replace or stop one, check it. Read the tail of its
+output file: a recent entry, or a tool call with no result yet, means it is working. When the
+file shows a turn that ended, send it one line asking for its state; it answers by message.
+Treat it as gone only when a message to it is undeliverable, or when neither a reply nor a new
+entry in the file follows within ten minutes. Then spawn a new one with "resume from the
+record", as in step 3.
 
 ## What you do not do
 

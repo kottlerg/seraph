@@ -35,7 +35,9 @@ use std::os::seraph::process::ArgvEnvCap;
 use ipc::{FS_LABELS_VERSION, IpcMessage, fs_labels, procmgr_labels};
 
 use crate::VfsdCaps;
-use crate::worker_pool::{BootstrapOrder, CreateFromFileOrder, WorkerPool, delete_bootstrap_caps};
+use crate::worker_pool::{
+    BootstrapOrder, CreateFromFileOrder, WorkHandle, WorkerPool, delete_bootstrap_caps,
+};
 
 /// Where fatfs is installed: the path vfsd walks to start it from the root
 /// filesystem, and the name its signed object is verified under, whether
@@ -191,8 +193,10 @@ pub fn teardown_driver(endpoint: u64)
 }
 
 /// Spawn the driver behind `driver.endpoint`, deliver its bootstrap caps,
-/// and probe it with `FS_MOUNT`. Returns the `SEND_GRANT` derivation of
-/// the endpoint and the driver's process handle on success. On `None`,
+/// and probe it with `FS_MOUNT`, within [`PROBE_TIMEOUT_MS`]; a child that
+/// dies before its bootstrap round ends the wait for it. Returns the
+/// `SEND_GRANT` derivation of the endpoint and the driver's process handle on
+/// success. On `None`,
 /// `driver.partition_ep`, the process handle, and every cap not derived
 /// from the endpoint or the death queue are released; the caller revokes
 /// the endpoint to release the rest, and deletes the death queue.
@@ -241,10 +245,22 @@ fn start_driver(
     let send = probe_driver(driver.endpoint, ipc_buf);
     if send.is_none()
     {
+        // A driver that did not answer the probe in time may still run: end
+        // it, which a driver that exited takes as a no-op.
+        let destroy = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_call(process, &destroy, ipc_buf) };
         let _ = syscall::cap_delete(process);
     }
     Some((send?, process))
 }
+
+/// Bound on a started driver's answer to its `FS_MOUNT` probe, whose
+/// handling reads the volume's boot sector. A driver that died before it
+/// received the probe leaves the call unanswered, since vfsd's endpoint
+/// original keeps the endpoint alive; the bound turns that, and a driver that
+/// does not answer, into a failed spawn.
+const PROBE_TIMEOUT_MS: u32 = 10_000;
 
 /// Derive vfsd's `SEND_GRANT` on `endpoint` and probe the driver behind it
 /// with `FS_MOUNT`. Returns the derived cap when the driver accepts the
@@ -264,7 +280,19 @@ fn probe_driver(endpoint: u64, ipc_buf: *mut u64) -> Option<u64>
         .word(0, u64::from(FS_LABELS_VERSION))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let mount_reply = unsafe { ipc::ipc_call(send, &mount_msg, ipc_buf) }.ok()?;
+    let mount_reply = match unsafe {
+        ipc::ipc_call_timeout(send, &mount_msg, ipc_buf, PROBE_TIMEOUT_MS)
+    }
+    {
+        Ok(reply) => reply,
+        Err(code) =>
+        {
+            std::os::seraph::log!(
+                warn: "fatfs FS_MOUNT probe not answered within {PROBE_TIMEOUT_MS} ms (code={code})"
+            );
+            return None;
+        }
+    };
     if mount_reply.label != 0
     {
         std::os::seraph::log!(warn: "fatfs FS_MOUNT probe failed (label={})", mount_reply.label);
@@ -501,14 +529,39 @@ fn spawn_via_module(
         return None;
     };
 
-    if !handle.wait()
-    {
-        std::os::seraph::log!(warn: "fatfs bootstrap delivery failed");
-        let _ = syscall::cap_delete(process);
-        return None;
-    }
+    await_bootstrap(pool, badge, handle, driver.death_queue, process)
+}
 
-    Some(process)
+/// Wait for the bootstrap round of the started child `process`, registered
+/// under `badge`, or for the child's death on `death_queue`
+/// (`WorkHandle::wait_while_alive`). Returns `process` once the child holds
+/// its bootstrap caps; on `None` the order is withdrawn and the process
+/// handle deleted.
+fn await_bootstrap(
+    pool: &WorkerPool,
+    badge: u64,
+    handle: WorkHandle<bool>,
+    death_queue: u64,
+    process: u64,
+) -> Option<u64>
+{
+    match handle.wait_while_alive(death_queue)
+    {
+        Some(true) => Some(process),
+        Some(false) =>
+        {
+            std::os::seraph::log!(warn: "fatfs bootstrap delivery failed");
+            let _ = syscall::cap_delete(process);
+            None
+        }
+        None =>
+        {
+            std::os::seraph::log!(warn: "fatfs died before its bootstrap round");
+            pool.abandon_bootstrap(badge, handle);
+            let _ = syscall::cap_delete(process);
+            None
+        }
+    }
 }
 
 /// The prefix of every fs driver's name: the driver's own name and a colon,

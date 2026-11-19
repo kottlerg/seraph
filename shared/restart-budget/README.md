@@ -1,6 +1,6 @@
 # shared/restart-budget
 
-The windowed restart budget a supervisor keeps for each process it restarts.
+The windowed restart budget a supervisor keeps for each process or mount it restarts.
 
 ---
 
@@ -34,12 +34,15 @@ every time, however long the boot, while one that crash-loops is stopped after a
 |---|---|
 | [`services/svcmgr`](../../services/svcmgr/README.md) | Service ([restart protocol](../../services/svcmgr/docs/restart-protocol.md)) |
 | [`services/devmgr`](../../services/devmgr/README.md) | Device record whose driver devmgr restarts ([responsibilities](../../services/devmgr/docs/responsibilities.md)) |
+| [`services/vfsd`](../../services/vfsd/README.md) | Mount below `/` whose fs driver vfsd restarts, in the synthetic-root tree (crate `vfsd-root-backend`), fresh at each `MOUNT` ([driver restart](../../services/vfsd/docs/namespace-composition.md#driver-restart)) |
 | [`xtask`](../../xtask/README.md) | None: `test-core-death` reads `RESTART_BURST` to kill logd once per restart svcmgr's budget allows, and once more |
 
 ---
 
 ## Summarized By
 
+[Storage](../../docs/storage.md),
 [Supervision](../../docs/supervision.md),
 [devmgr Responsibilities and Capabilities](../../services/devmgr/docs/responsibilities.md),
-[services/svcmgr/README.md](../../services/svcmgr/README.md)
+[services/svcmgr/README.md](../../services/svcmgr/README.md),
+[Synthetic Root and Namespace Composition](../../services/vfsd/docs/namespace-composition.md)

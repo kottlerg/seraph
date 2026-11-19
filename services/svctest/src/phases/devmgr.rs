@@ -31,8 +31,10 @@
 //! two, one on which it never reports ready, and one on which it refuses its
 //! bootstrap. It asserts that the registry serves another class while the
 //! bind's settle runs, that the settle ends no earlier than its bound with
-//! the two serving fixtures at ordinals 0 and 1 and no other, so devmgr
-//! abandoned the dead fixture's bind and went on binding, that a served
+//! the two serving fixtures at ordinals 0 and 1 and no other, that devmgr
+//! logged the death of the fixture that exits before its bootstrap request
+//! (read from logd's history through `logd.query`) and went on binding, so
+//! the second serving fixture holds ordinal 1, that a served
 //! fixture's death withdraws it (a call queued on it returns, its ordinal
 //! replies `WITHDRAWN`) while ordinal 1 keeps its fixture, that a fault of a
 //! thread other than the main thread of the fixture at ordinal 1 withdraws
@@ -535,6 +537,7 @@ fn on_demand_bind_phase(caps: &Caps)
         "devmgr_on_demand_bind: the settle ended after {settle:?}, before its bound {bound:?}, \
          with a fixture that never reports ready"
     );
+    assert_death_in_bootstrap_logged(caps.logd_query);
     // The function devmgr binds after the one whose fixture exits before its
     // next bootstrap request: served only when devmgr's wait for that request
     // saw the death and the bind went on.
@@ -596,6 +599,47 @@ fn on_demand_bind_phase(caps: &Caps)
          kept, driver whose worker thread faulted withdrawn, second bind settled after \
          {rebind:?}, watch signalled on serve and withdrawals"
     );
+}
+
+/// The line devmgr logs when a driver dies before a bootstrap request it
+/// waits for (`serve_list_round` in `services/devmgr/src/spawn.rs`).
+const DIED_IN_BOOTSTRAP: &[u8] = b"driver died during its bootstrap";
+
+/// devmgr logged the death of the fixture that exits before its next
+/// bootstrap request, read from logd's history through `query`
+/// (`logd.query`): the function was bound, and devmgr's wait for that
+/// request saw the death. Polled for at most [`DEVICE_WAIT_MS`], since the
+/// line reaches logd's history after devmgr sends it.
+fn assert_death_in_bootstrap_logged(query: u64)
+{
+    assert!(
+        query != 0,
+        "devmgr_on_demand_bind: no logd.query cap seeded"
+    );
+    let start = Instant::now();
+    let wait = Duration::from_millis(DEVICE_WAIT_MS);
+    loop
+    {
+        let logged = super::procmgr::logd_history_with(query, None, |entry| {
+            entry
+                .bytes
+                .windows(DIED_IN_BOOTSTRAP.len())
+                .any(|w| w == DIED_IN_BOOTSTRAP)
+        })
+        .into_iter()
+        .any(|hit| hit);
+        if logged
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < wait,
+            "devmgr_on_demand_bind: devmgr logged no driver death during its bootstrap within \
+             {wait:?}: the fixture that exits before its next bootstrap request was not bound, or \
+             its death was not seen"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A fault of a thread other than the main thread of the served fixture at

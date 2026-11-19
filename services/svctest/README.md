@@ -174,10 +174,11 @@ framebuffer-killed and framebuffer-restarted cases (`caps[13]`), the svcmgr seed
 seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and `acpid.deny` names it resolves), the
 svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd and vfsd unmount phases
 (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`,
-`logd_sinks`, and `entropyd_contribution` phases (`caps[6]`), the vfsd swap-partition phase
-(`caps[14]`), the `memmgr_swap_client` phase (`caps[18]`), the `sessiond_operator` phase and the
-`oom_policy` phase's session case (`caps[15]` and `caps[20]`), the `crash_endpoint`, `logd_reserve`,
-`logd_restart`, `logd_sinks`, `memmgr_swap`, `memmgr_swap_client`, `vfsd_driver_death`, and
+`logd_sinks`, `entropyd_contribution`, and `devmgr_on_demand_bind` phases (`caps[6]`), the vfsd
+swap-partition phase (`caps[14]`), the `memmgr_swap_client` phase (`caps[18]`), the
+`sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[20]`), the
+`crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`, `memmgr_swap_client`,
+`vfsd_driver_death`, and
 `timed_rtc_restart` phases, and the drivers hwrng restart phase (`caps[19]`), the
 `svcmgr_stop_service` phase (`caps[20]`, and `caps[19]` with `stopsrc` staged), and the no-stop
 cases of the `oom_policy` and `logd_reserve` phases (`caps[20]`), instead fail their assertions. The
@@ -209,7 +210,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution` phases: read logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
@@ -501,13 +502,14 @@ drivers-directory pass at boot reads, so devmgr binds the
 [`test-fault`](../drivers/test-fault/README.md) driver to the QEMU `pci-testdev` functions that
 `--test-devices` attaches, one instance each. The
 phase asks `caps[10]` for the fixtures: the two serving instances hold instance ordinals 0 and 1,
-and ordinal 2 answers `NO_DEVICE`, so devmgr abandoned the bind of the instance devmgr binds between
-them, which exits before its next bootstrap request, and went on binding; `FAULT_EXIT` on ordinal 0
-makes the next query on it answer `WITHDRAWN`; `FAULT_WORKER` on ordinal 1, whose worker thread then
-faults, returns a call queued on it and makes the next query on it answer `WITHDRAWN`; the free pool
-then returns to its size before the bind, so the instance that never reports ready and the instance
-that fails its bootstrap's terminal round were destroyed; and a second `BIND_DRIVERS` over the
-directory binds nothing. The watch, registered at ordinal count 0, is signalled when the bind serves
+and ordinal 2 answers `NO_DEVICE`, and logd's history (`caps[6]`) holds devmgr's line for the death
+of the instance devmgr binds between them, which exits before its next bootstrap request, so devmgr
+abandoned that bind and went on binding; `FAULT_EXIT` on ordinal 0 makes the next query on it answer
+`WITHDRAWN`; `FAULT_WORKER` on ordinal 1, whose worker thread then faults, returns a call queued on
+it and makes the next query on it answer `WITHDRAWN`; the free pool then returns to its size before
+the bind, so the instance that never reports ready and the instance that fails its bootstrap's
+terminal round were destroyed; and a second `BIND_DRIVERS` over the directory binds nothing. The
+watch, registered at ordinal count 0, is signalled when the bind serves
 the
 fixtures and again at each withdrawal. With
 that watch held, the phase fills the class to `MAX_CLASS_WATCHERS` (8): the next registration is

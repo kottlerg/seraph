@@ -2401,7 +2401,11 @@ mod tests
         use ipc::procmgr_labels::{CREATE_FROM_FILE, CREATE_PROCESS, REGISTER_THREAD};
         for opcode in [CREATE_PROCESS, CREATE_FROM_FILE, REGISTER_THREAD]
         {
-            assert_eq!(headroom_refusal(opcode), Some(OUT_OF_MEMORY), "opcode {opcode}");
+            assert_eq!(
+                headroom_refusal(opcode),
+                Some(OUT_OF_MEMORY),
+                "opcode {opcode}"
+            );
         }
         // Every other label, the ones that keep one cap per process or for
         // the boot among them, and an unknown opcode, is served.

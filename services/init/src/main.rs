@@ -1066,6 +1066,7 @@ fn run(info_ptr: u64) -> !
         svcmgr_service_ep,
         devmgr_registry_ep,
         vfsd_service_ep,
+        memmgr_service_ep,
         system_root_cap,
         log_ep,
         thread_caps,

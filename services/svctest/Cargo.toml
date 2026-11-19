@@ -19,6 +19,9 @@ fat_parse = { path = "../fs/fat/fat-parse", package = "fatfs-parse" }
 # `validate_executable` and `parse_stack_note`: the layout stack-note phase
 # reads svctest's own image with the parser procmgr loads it with.
 elf = { path = "../../shared/elf" }
+# `SLOT_WORDS_PER_PAGE`: the memmgr_spill phase bounds the slot-map pages
+# memmgr keeps after the phase's takes by the map memmgr grows.
+free_pool = { path = "../memmgr/free-pool", package = "memmgr-free-pool" }
 # `READ`, its error codes, and `decode_reply`: the drivers phases read the
 # entropy driver through the `hwrng` class protocol.
 hwrng-protocol = { path = "../../shared/hwrng-protocol" }

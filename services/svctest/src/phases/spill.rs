@@ -40,7 +40,8 @@
 //! * and once the fixture is gone, no chunk on disk, every slot free, and the
 //!   end of `memmgr_swap`: the store and the swapped total empty, the
 //!   identity holding, and memmgr's free and deferred pages at least what
-//!   they were at the start.
+//!   they were at the start, less the pages of the swap slot map, which
+//!   memmgr keeps as its metadata once the takes grew it.
 
 use std::collections::HashMap;
 use std::os::seraph::{current_ipc_buf, startup_info};
@@ -74,6 +75,11 @@ const PHASE: &str = "memmgr_spill";
 
 /// Swap slots the phase registers.
 const SLOTS: u64 = 64;
+/// Pages of memmgr's swap slot map the phase's takes can leave at the most:
+/// the map grows a page at a time as slots are taken, up to the slots
+/// registered, and keeps its pages as memmgr's metadata
+/// (services/memmgr/docs/memory-pool.md § Disk tier).
+const SLOT_MAP_PAGES: u64 = SLOTS.div_ceil(free_pool::spill::SLOT_WORDS_PER_PAGE);
 /// Chunks of the main region the phase awaits swapped: three to disk, one in
 /// flight, and one more for a chunk the clock's last slice did not reach.
 const SWAPPED_CHUNKS: u64 = 5;
@@ -696,11 +702,12 @@ fn spill_phase(caps: &Caps)
         .unwrap_or_else(|_| panic!("{PHASE}: the restore thread panicked"));
     restorer_buf.release();
     buf.release();
-    let end = settle_resident(authority, Some(baseline));
+    let floor = baseline.saturating_sub(SLOT_MAP_PAGES.saturating_mul(PAGE_SIZE));
+    let end = settle_resident(authority, Some(floor));
     std::os::seraph::log!(
         "memmgr_spill phase passed ({} bytes sealed, chi-square {chi:.1}, free and deferred {} \
-         pages above the start)",
+         pages above the start less the {SLOT_MAP_PAGES} slot-map pages)",
         sealed.len(),
-        end.saturating_sub(baseline) / PAGE_SIZE
+        end.saturating_sub(floor) / PAGE_SIZE
     );
 }

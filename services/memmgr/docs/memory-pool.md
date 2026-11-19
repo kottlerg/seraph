@@ -1105,9 +1105,10 @@ partition, so any free slot holds any chunk, whatever it compresses to. memmgr o
 slot map grown a page at a time as far as the highest slot taken, in a window of memmgr's own
 address space ([docs/limits.md](../../../docs/limits.md) § memmgr), maps each taken slot to its
 chunk's spill node and threads the free slots on a list, so a slot is taken and freed in constant
-time and the swap service keeps no table. A registration replaces the one before it and ends every
-write in flight, since a new swap service knows nothing of its predecessor's; the chunks on disk
-stay, so a restarted swap service restores every one of them.
+time and the swap service keeps no table. The map's pages leave the pool for good and stay in its
+total as memmgr's metadata, as the process index's pages do. A registration replaces the one before
+it and ends every write in flight, since a new swap service knows nothing of its predecessor's; the
+chunks on disk stay, so a restarted swap service restores every one of them.
 
 **Write-out.** `SPILL_TAKE` takes the next swapped chunk: a hand over every process's regions,
 walking only the chunks that have an entry, a bounded number of steps a request. memmgr copies the

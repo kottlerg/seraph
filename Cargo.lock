@@ -857,6 +857,7 @@ dependencies = [
  "ipc",
  "log",
  "logd-codec",
+ "memmgr-free-pool",
  "namespace-protocol",
  "oomd-policy",
  "process-abi",

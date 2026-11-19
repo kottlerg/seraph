@@ -356,8 +356,10 @@ fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Rout
             let killed = kill_through_stub(&mut guest, args.arch, port, name, point, contact);
             if killed.is_err()
             {
-                // The stub's lines on a refusal reach the serial line after
-                // its answer, or once a held logd runs again: show them.
+                // Show the stub's lines on a refusal, which reach the serial
+                // line when its log sink is not the target it holds. With
+                // logd held its lines are dropped, and the answer's `E`
+                // number carries the cause.
                 let _ = guest.echo_until_end(STUB_FAILURE_ECHO);
             }
             killed

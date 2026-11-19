@@ -67,7 +67,7 @@ pub const CHUNK_BYTES: u64 = DEMAND_CHUNK_PAGES as u64 * PAGE_SIZE;
 /// One free run: a Memory cap memmgr owns, covering `page_count` pages
 /// starting at physical address `phys_base`. The page count is `u64`, so a
 /// run of any size the kernel can mint is held whole.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FreeRun
 {
     pub cap_slot: u64,

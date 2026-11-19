@@ -30,7 +30,9 @@ memmgr/
 │                               # store's page codec and chunk stream
 │                               # (`compress.rs`, `store.rs`)
 ├── src/
-│   └── main.rs                 # _start() entry point, IPC dispatch loop
+│   ├── main.rs                 # _start() entry point, IPC dispatch loop
+│   └── evict.rs                # Eviction: the clock's slices, the compression
+│                               # worker, the store, restore
 └── docs/
     ├── memory-pool.md          # Pool, allocation, reclamation, coalescing
     └── ipc-interface.md        # memmgr IPC labels and wire shapes
@@ -111,10 +113,10 @@ Allocation Contract").
   (see [docs/fault-handling.md](../../docs/fault-handling.md) § Demand Paging
   and the Default System Pager); a failed allocation returns an out-of-memory
   error to the caller (see [`docs/memory-pool.md`](docs/memory-pool.md)
-  §"Failure Modes"). Under memory pressure memmgr is to evict cold pages it
-  mapped as pager into a compressed store it keeps in RAM, and restore them on
-  the next fault (design intent; not yet implemented: see
-  [`docs/memory-pool.md`](docs/memory-pool.md#eviction) § Eviction). Swap to
+  §"Failure Modes"). Under memory pressure memmgr evicts cold pages it mapped
+  as pager into a compressed store it keeps in RAM, and restores them on the
+  next fault (see [`docs/memory-pool.md`](docs/memory-pool.md#eviction)
+  § Eviction). Swap to
   disk is that store's second tier: a separate swap service writes store pages
   out and reads them back
   ([#43](https://github.com/kottlerg/seraph/issues/43)).

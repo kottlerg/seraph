@@ -77,6 +77,7 @@ pub mod sessiond;
 pub mod shmem;
 pub mod startup;
 pub mod svcmgr;
+pub mod swap;
 pub mod threading;
 pub mod timed;
 pub mod unmount;
@@ -122,6 +123,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(pwrmgr::deny_only());
     out.extend_from_slice(svcmgr::phases());
     out.extend_from_slice(sessiond::phases());
+    out.extend_from_slice(swap::phases());
     out.extend_from_slice(oom::phases());
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(log_client::phases());

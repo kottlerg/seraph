@@ -163,6 +163,12 @@ pub struct ClockHand
     va: u64,
 }
 
+impl ClockHand
+{
+    /// A hand at the start of the first record.
+    pub const START: Self = Self { badge: None, va: 0 };
+}
+
 /// A chunk a sweep found cold ([`ChunkEntry::is_cold`]) in an eligible
 /// region: the record and region slots, and the chunk's base.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2294,7 +2300,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// The region of `rec` that holds `va`, else the lowest-based one above
     /// it, with its slot.
-    fn region_from(&self, rec: NodeIdx, va: u64) -> Option<(NodeIdx, RegionNode)>
+    #[must_use]
+    pub fn region_from(&self, rec: NodeIdx, va: u64) -> Option<(NodeIdx, RegionNode)>
     {
         let mut best: Option<(NodeIdx, RegionNode)> = None;
         let mut cur = self.record(rec)?.region_head;

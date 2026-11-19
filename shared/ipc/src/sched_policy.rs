@@ -23,6 +23,7 @@
 //! | 24 | devmgr, every thread but its DMA thread |
 //! | 23 | vfsd, fs drivers (fatfs) |
 //! | 21 | svcmgr |
+//! | 20 | memmgr's compression worker |
 //! | ≤21 | svcmgr-launched services, per `.svc` recipe (crashd 20, logd 18, timed/pwrmgr 16, terminal/svctest/usertest 10, crasher 5), and what they spawn (the shell, at 5 from terminal) |
 //!
 //! Levels for svcmgr-launched services live in their `.svc` recipes
@@ -48,6 +49,12 @@ pub const DEFAULT_SPAWN_PRIORITY: u8 = 10;
 /// memmgr — the system pager and frame-pool owner. Everything below
 /// it can fault into it, so it outranks all of them.
 pub const MEMMGR_PRIORITY: u8 = 28;
+
+/// memmgr's compression worker: the top of the fair class, below every
+/// level init and procmgr assign, so it compresses with the CPU time the
+/// services above leave and the fair class shares, and is never starved by
+/// a fair thread (services/memmgr/docs/memory-pool.md § Eviction).
+pub const MEMMGR_WORKER_PRIORITY: u8 = 20;
 
 /// procmgr — process lifecycle authority.
 pub const PROCMGR_PRIORITY: u8 = 27;

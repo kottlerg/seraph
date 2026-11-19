@@ -503,7 +503,7 @@ terminal. Two routes reach the thread:
   debugger can attach to them. Once the terminal's READY line has appeared, the host sets a
   hardware breakpoint on a function of the target's binary, at the image bias init logs for it
   plus the function's address in the binary's symbol table, and types `hello` at the shell over
-  the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's one thread, in an
+  the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's receive loop, in an
   allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the create), and
   `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main thread, in the
   reap). On each stop it checks that the program counter is the function's and the code there is

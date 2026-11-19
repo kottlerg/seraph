@@ -511,6 +511,8 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[6] | `reserve_bytes` — the system reserve: the free pages a charge to a budget node outside the reserve may not take ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
 | data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL` ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
 | data[8] | `promised_bytes` — what the committed regions can still take from the free runs: their pages that hold no frame yet, and bounds on the page tables and metadata they can need ([`memory-pool.md`](memory-pool.md) § Commit) |
+| data[9] | `store_bytes` — subset of `pool_total_bytes` the compressed store holds: the stored pages of every evicted chunk ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
+| data[10] | `swapped_bytes` — the pages of every evicted chunk, which the store holds compressed and their processes' budget nodes stay charged for |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -535,8 +537,11 @@ level memmgr last signalled to the `REGISTER_PRESSURE` registrants, so a
 registrant woken by its bit reads here the level the bit announced, or a later
 one. `promised_bytes` (`data[8]`) is held for the committed regions' faults:
 every admission reads `data[3]` less it, so a free page it counts is refused to
-every other charge. `data[3]` to `data[8]` are appended after the identity
-terms; readers needing only the identity may ignore them.
+every other charge. `store_bytes` (`data[9]`) and `swapped_bytes`
+(`data[10]`) rise as memmgr evicts cold chunks under pressure and fall as
+faults restore them or their regions go; their ratio is the store's
+compression. `data[3]` to `data[10]` are appended after the identity terms;
+readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
 
@@ -557,7 +562,7 @@ Privilege: universal — attributed to the caller by `recv.badge`.
 | data[0] | `va_base` (page-aligned virtual address) |
 | data[1] | `len_bytes` (region length; page-multiple, nonzero) |
 | data[2] | `prot` (MAP_* protection bits; W^X enforced) |
-| data[3] | flags: bit 0 `REGION_COMMIT`; 0 for none |
+| data[3] | flags: bit 0 `REGION_COMMIT`, bit 1 `REGION_NO_EVICT`; 0 for none |
 
 **Reply (success):** `label` 0. No mapping is installed — backing happens
 lazily on fault, and only once procmgr has delegated this process's
@@ -581,6 +586,14 @@ unregisters the region again, as a grant whose reply fails is rolled back, so a
 caller whose call was interrupted makes it again
 ([`memory-pool.md`](memory-pool.md) § Commit). The std heap registers its
 growth region this way.
+
+**No-evict regions.** With `REGION_NO_EVICT`, memmgr never evicts a page of
+the region into its compressed store, so every page a fault backed stays
+mapped until the region is unregistered or the page discarded. Without it,
+memmgr may evict a cold chunk of an uncommitted region under memory pressure
+and restores it on the next fault on it, which only a debugger's
+`SYS_THREAD_READ_MEM` can tell apart ([`memory-pool.md`](memory-pool.md#eviction)
+§ Eviction).
 
 **Error codes:**
 
@@ -678,6 +691,8 @@ process's node, carries no caps and changes no state.
 | data[0] | `own_pages` — pages charged to the caller's node |
 | data[1] | `max_pages` — the node's max, `u64::MAX` for none |
 | data[2] | `subtree_pages` — pages charged to the node and to every node below it |
+| data[3] | `resident_pages` — the pages of `own_pages` not swapped |
+| data[4] | `swapped_pages` — the pages of `own_pages` memmgr evicted into its compressed store, which the node stays charged for ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
 
 The charge counts each grant, demand chunk of an uncommitted region and
 page-table donation memmgr accounts to the caller, each committed region's
@@ -1009,6 +1024,39 @@ run changes nothing, so an interrupted call is safe to repeat.
 | 4 | `INVALID_ARGUMENT` | Unknown badge, no region holds `va`, or a range that breaks the rule above or leaves the region |
 | 5 | `UNAUTHORIZED` | The badge is a node handle |
 
+### Label 21: `MAKE_RESIDENT`
+
+Make a range of a process's demand regions resident for a debugger: memmgr
+restores each chunk of the range it evicted, and maps back each it is
+evicting, so a `SYS_THREAD_READ_MEM` that failed on a page of it succeeds
+when the reader retries. A page no fault has backed stays not present.
+Privilege: procmgr only, which sends it for a holder of its debug authority
+(`services/procmgr/docs/ipc-interface.md` § `MAKE_RESIDENT`).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 21 |
+| data[0] | the process's memmgr badge (from its `REGISTER_PROCESS` reply) |
+| data[1] | `va` |
+| data[2] | `len_bytes` (nonzero) |
+
+Each restore is admitted and made as a fault's on the chunk
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction), and counts as an
+access in the chunk's age. A process with no delegated address space has
+nothing evicted, and the request succeeds.
+
+**Reply (success):** `label` 0.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A chunk could not be restored: its restore was not admitted, or a map failed; the chunks before it are resident |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, zero length, or a range past the address space |
+| 5 | `UNAUTHORIZED` | The caller is not procmgr |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page fault the kernel cannot
@@ -1051,6 +1099,14 @@ bound, or for the fault of a kernel copy (a restartable syscall's user copy, whi
 of a user-mode access ([docs/fault-handling.md § Reply](../../../docs/fault-handling.md#reply)).
 Either way the fault takes the decline's outcome unless that handler resumes it, and memmgr waits on
 no handler it forwards to.
+
+A fault on a chunk memmgr is evicting maps the chunk's runs back and resumes; a
+fault on a chunk it evicted restores the whole chunk from its compressed store
+before it resumes, declined with code 7 when the free pages outside
+`promised` and, for a process outside it, the system reserve do not cover the
+chunk's backed pages, and with code 9 when a map fails or, with detail 0, the
+stored chunk does not decode; the chunk then stays evicted
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction).
 
 | Code | Decline |
 |---|---|

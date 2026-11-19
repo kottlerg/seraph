@@ -999,14 +999,14 @@ has with no handler bound, and the kernel's decline line for a forwarded fault i
 pager's own decline printed. The decliner shares nothing with procmgr's request workers but a wake
 notification, so a receive on the endpoint never waits behind a request.
 
-Labels 19–21, 23, and 24 are the **debug authority**, label 22 the **thread registry** it
-reads, and label 26 the **core-path declaration** its `ATTACH_PROCESS` reply reports.
-`REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, and `DETACH_PROCESS` are served
-only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the
-un-badged procmgr source init endows it, for a service whose definition sets
-`debug_authority = yes` ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md));
-no other path mints it, so an image that stages no such service has no attach path. The crash
-service ([services/crashd/README.md](../../crashd/README.md)) and the GDB stub
+Labels 19–21, 23, 24 and 30 are the **debug authority**, label 22 the **thread registry** it reads,
+and label 26 the **core-path declaration** its `ATTACH_PROCESS` reply reports.
+`REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, and `MAKE_RESIDENT`
+are served only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the
+un-badged procmgr source init endows it, for a service whose definition sets `debug_authority = yes`
+([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)); no other path mints it, so
+an image that stages no such service has no attach path. The crash service
+([services/crashd/README.md](../../crashd/README.md)) and the GDB stub
 ([services/gdbstub/README.md](../../gdbstub/README.md)) are its consumers.
 
 ### Label 19: `REGISTER_CRASH_SERVICE`
@@ -1383,6 +1383,35 @@ Operation](../../crashd/docs/operation.md) § Bounds), as does the wait of a dum
 process that never declared. A process can declare itself only, so the declaration removes no core
 of another process. Its mark leaves out a core of the declarer alone, which holds nothing of another
 process.
+
+### Label 30: `MAKE_RESIDENT`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::MAKE_RESIDENT` (30) |
+| caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
+| `data[0]` | The target's process badge |
+| `data[1]` | The first address of the range |
+| `data[2]` | The range's length in bytes, nonzero |
+| caps | none; procmgr deletes any cap the message carried |
+
+`SYS_THREAD_READ_MEM` fails with `InvalidAddress` on a page that is not present and does not ask the
+pager ([core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md) §
+`SYS_THREAD_READ_MEM`), and memmgr evicts cold pages of a demand-paged process into its compressed
+store under memory pressure
+([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#eviction) § Eviction). A
+debugger that gets that failure on a page asks for its range here and retries: procmgr finds the
+target under the table lock and, after it, sends memmgr its `MAKE_RESIDENT` with the target's memmgr
+badge ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 21).
+memmgr restores every evicted chunk the range meets; a page no fault has backed stays not present,
+so the retry fails again on it. A process that declared itself undebuggable (Label 21) is served
+too: the request reads and writes nothing of the target, and only does what the target's own next
+touch of the pages would.
+
+Replies `SUCCESS`; refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_BADGE` when
+no live process carries the badge; then memmgr's: `INVALID_ARGUMENT` for a zero length or a range
+past the address space, and `OUT_OF_MEMORY` when memmgr could not restore a chunk of the range or
+the call to it failed. svctest's `memmgr_swap` phase reads a page of an evicted chunk this way.
 
 ---
 

@@ -592,6 +592,10 @@ Every entry here is `correct as is`; none is tracked.
 | memmgr page tables | `services/init/src/main.rs` (`ASPACE_RETYPE_PAGES`) | 48-page seed, self-augmented from memmgr's pool | refillable seed (augment) | 48 pages | correct as is | None |
 | `ASPACE_TOPUP_PAGES`, `PT_FUND_ROUNDS` | `services/memmgr/src/main.rs` | 4 pages / 4 rounds | tuning (page-table top-up step and retries per map) | none | correct as is | None |
 | `CSPACE_LOW_WATER`, `CSPACE_TOPUP_PAGES` | `services/memmgr/src/main.rs` | 256 slots / 16 pages | tuning (headroom over a burst of grants) | none | correct as is | None |
+| `JOB_SLOTS` | `services/memmgr/src/evict.rs` | 2 compression jobs in flight, each with a 64 KiB input window in memmgr's address space and a 60 KiB output buffer in its image | tuning (evictions in flight at once; a slice posts no more victims than free slots, and later slices find the rest; bounds no capacity) | 120 KiB of memmgr's image, and the windows' page tables | correct as is | None |
+| `SWEEP_SLICE_STEPS`, `SWEEP_INTERVAL_US` | `services/memmgr/src/evict.rs` | 512 steps (a chunk swept, or a region or record passed; a harvested span of up to 256 chunks is swept whole) a slice, at most one slice per 10 ms while the pressure level reads `LOW` | tuning (bound the receive loop's share of its CPU while it reclaims; successive slices visit every eligible chunk; bound no capacity) | none | correct as is | None |
+| `RECLAIM_WAIT_MS` | `services/memmgr/src/evict.rs` | 2 ms | tuning (the receive loop's bounded wait while it reclaims or a job is in flight, so it drains completions and runs slices with no message arriving) | none | correct as is | None |
+| `WORKER_STACK_BYTES` | `services/memmgr/src/evict.rs` | 16 KiB, a static of memmgr's image | per-call bound (the compressor's frames; its hash table is a static of its own) | 16 KiB of memmgr's image, and an 8 KiB hash table | correct as is | None |
 
 ### procmgr
 

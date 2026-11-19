@@ -160,6 +160,38 @@ pub trait Kernel
     fn detach_process(&mut self) -> bool;
 }
 
+/// What a table slot holds, as [`Session::slot_state`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotState
+{
+    /// A thread bound under the slot's badge: GDB can select it.
+    Live,
+    /// No slot: the id is past the table, or names none.
+    Absent,
+    /// A thread whose bind failed, kept while it lives and hidden from GDB.
+    Unbound,
+    /// A thread that has exited.
+    Gone,
+}
+
+impl SlotState
+{
+    /// The error number a refused `Hg` of a slot in this state answers:
+    /// `E04` unbound, `E05` gone, `E01` otherwise. The number names the
+    /// cause where the stub's log line cannot reach the host, as when the
+    /// target it holds is logd.
+    #[must_use]
+    pub fn refusal_code(self) -> u8
+    {
+        match self
+        {
+            Self::Unbound => 4,
+            Self::Gone => 5,
+            Self::Live | Self::Absent => 1,
+        }
+    }
+}
+
 /// One stop the session holds.
 #[derive(Clone, Copy, Debug)]
 struct Held
@@ -1013,6 +1045,26 @@ impl Session
         self.threads.get(index).filter(|t| t.live()).map(|_| index)
     }
 
+    /// What the slot `thread` names holds, the reason [`Self::select`]
+    /// refuses it when it is not [`SlotState::Live`]; with the table's size.
+    #[must_use]
+    pub fn slot_state(&self, thread: ThreadId) -> (SlotState, usize)
+    {
+        let index = match thread
+        {
+            ThreadId::Id(id) => usize::try_from(id).ok().and_then(|id| id.checked_sub(1)),
+            ThreadId::Any | ThreadId::All => Some(self.current),
+        };
+        let state = match index.and_then(|i| self.threads.get(i))
+        {
+            None => SlotState::Absent,
+            Some(t) if t.gone => SlotState::Gone,
+            Some(t) if !t.bound => SlotState::Unbound,
+            Some(_) => SlotState::Live,
+        };
+        (state, self.threads.len())
+    }
+
     /// Whether slot `index` holds a stop.
     #[must_use]
     pub fn is_held(&self, index: usize) -> bool
@@ -1159,6 +1211,8 @@ mod tests
         /// The receivers on the endpoint, and how many hold a delivery.
         receivers: usize,
         busy: usize,
+        /// Threads whose bind the kernel refuses.
+        refuse_bind: Vec<usize>,
     }
 
     fn cap_of(t: usize) -> u64
@@ -1191,6 +1245,7 @@ mod tests
                 deaf: Vec::new(),
                 receivers: 0,
                 busy: 0,
+                refuse_bind: Vec::new(),
             };
             sim.spawn(None, true);
             sim
@@ -1494,6 +1549,10 @@ mod tests
         fn bind(&mut self, slot: usize, cap: u64) -> bool
         {
             let t = thread_of(cap);
+            if self.refuse_bind.contains(&t)
+            {
+                return false;
+            }
             // The service starts a receiver per slot as it binds.
             self.receivers = self.receivers.max(slot + 1);
             let badge = control::thread_badge(slot);
@@ -2086,5 +2145,40 @@ mod tests
         let d = sim.queue.pop_front().unwrap();
         sim.reply(d, RESUME);
         assert_ne!(sim.broken, [] as [String; 0]);
+    }
+
+    // Defect caught: a refused `Hg` whose log cannot tell a slot past the
+    // table from a thread whose bind failed or one that has exited, the three
+    // causes of the E01 a `Hg` answers (#1339).
+    #[test]
+    fn slot_state_tells_each_reason_a_selection_is_refused()
+    {
+        let mut sim = Sim::new();
+        let refused = sim.spawn(Some(0), true);
+        let worker = sim.spawn(Some(0), true);
+        // Last, so no later thread of the attach takes its gone slot.
+        let exited_unbound = sim.spawn(Some(0), true);
+        sim.refuse_bind.extend([refused, exited_unbound]);
+        // One thread exits between procmgr's list and its bind.
+        let page = sim.page();
+        sim.exit(exited_unbound);
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        sim.exit(worker);
+        s.alive_count(&mut sim);
+        let id = |slot: usize| ThreadId::Id(slot as u64 + 1);
+        assert_eq!(s.slot_state(id(0)), (SlotState::Live, 4));
+        assert_eq!(s.slot_state(id(refused)), (SlotState::Unbound, 4));
+        assert_eq!(s.slot_state(id(exited_unbound)), (SlotState::Gone, 4));
+        assert_eq!(s.slot_state(id(worker)), (SlotState::Gone, 4));
+        assert_eq!(s.slot_state(id(4)), (SlotState::Absent, 4));
+        assert_eq!(s.slot_state(ThreadId::Id(0)), (SlotState::Absent, 4));
+        for slot in [refused, exited_unbound, worker, 4]
+        {
+            assert_eq!(s.select(id(slot)), None);
+        }
+        assert_eq!(s.select(id(0)), Some(0));
+        assert_eq!(SlotState::Absent.refusal_code(), 1);
+        assert_eq!(SlotState::Unbound.refusal_code(), 4);
+        assert_eq!(SlotState::Gone.refusal_code(), 5);
     }
 }

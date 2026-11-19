@@ -25,6 +25,10 @@
 //! * a page of the main region that reads `InvalidAddress` reads its pattern
 //!   after procmgr's `MAKE_RESIDENT` of its chunk, and the hole stays not
 //!   present across the same request on its chunk;
+//! * with the phase's grants holding the pool at its reserve, at `CRITICAL`,
+//!   where the free pages admit no restore of a chunk, another such page
+//!   reads its pattern after `MAKE_RESIDENT` of its chunk: memmgr's direct
+//!   reclaim made the room;
 //! * the no-evict region reads whole, and every page of logd's stack that
 //!   read before the hog reads while the hog holds the level (logd's budget
 //!   node is in the system reserve);
@@ -169,9 +173,13 @@ const SETTLE_BOUND: Duration = Duration::from_secs(30);
 /// How often the final wait looks again.
 const SETTLE_POLL: Duration = Duration::from_millis(50);
 /// Times the phase asks for a chunk to be made resident and reads its page
-/// again: memmgr's worker may evict the chunk anew, with the level held at
-/// `LOW`, between the request and the read.
+/// again: memmgr may evict the chunk anew between the request and the read,
+/// its worker with the level held at `LOW`, or another restore's direct
+/// reclaim at `CRITICAL`.
 const RESIDENT_TRIES: u32 = 8;
+/// Time the phase holds the pool at its reserve before the restore there, so
+/// memmgr's clock runs a few slices at `CRITICAL` (one each 10 ms).
+const CRITICAL_SETTLE: Duration = Duration::from_millis(100);
 /// Pages of logd's stack, from the one the stack pointer lies in down, whose
 /// readability the phase records: 256 KiB.
 const LOGD_STACK_PAGES: u64 = 64;
@@ -192,6 +200,8 @@ struct Pool
     free: u64,
     /// `data[4]`: deferred pages.
     deferred: u64,
+    /// `data[6]`: the system reserve.
+    reserve: u64,
     /// `data[7]`: the pressure level.
     level: u64,
     /// `data[8]`: promised pages.
@@ -222,6 +232,22 @@ impl Pool
     {
         self.total / 16 / PAGE_SIZE
     }
+
+    /// The system reserve's pages, which only a reserve node's charge takes.
+    fn reserve_pages(&self) -> u64
+    {
+        self.reserve / PAGE_SIZE
+    }
+
+    /// Whether memmgr holds the pool at its reserve: the level reads
+    /// `CRITICAL` and the pages free outside `promised` fall short of the
+    /// reserve and a chunk, so no restore of a whole chunk is admitted on the
+    /// free pages alone.
+    fn at_reserve(&self) -> bool
+    {
+        self.level == memmgr_labels::PRESSURE_CRITICAL
+            && self.available_pages() < self.reserve_pages().saturating_add(CHUNK_PAGES)
+    }
 }
 
 /// memmgr's reply to `msg`, panicking with `what` when the call fails.
@@ -251,6 +277,7 @@ fn pool() -> Pool
         total: reply.word(2),
         free: reply.word(3),
         deferred: reply.word(4),
+        reserve: reply.word(6),
         level: reply.word(7),
         promised: reply.word(8),
         store: reply.word(9),
@@ -396,9 +423,7 @@ impl Hog
     /// `CRITICAL` give one grant back, at `LOW` do nothing. Notes the peaks.
     fn step(&mut self, status: &Pool)
     {
-        self.peaks.store = self.peaks.store.max(status.store / PAGE_SIZE);
-        self.peaks.swapped = self.peaks.swapped.max(status.swapped / PAGE_SIZE);
-        self.peaks.hogged = self.peaks.hogged.max(self.pages);
+        self.note(status);
         match status.level
         {
             memmgr_labels::PRESSURE_CRITICAL => self.release_one(),
@@ -421,6 +446,60 @@ impl Hog
         let status = pool();
         self.step(&status);
         status
+    }
+
+    /// Note the peaks `status` shows.
+    fn note(&mut self, status: &Pool)
+    {
+        self.peaks.store = self.peaks.store.max(status.store / PAGE_SIZE);
+        self.peaks.swapped = self.peaks.swapped.max(status.swapped / PAGE_SIZE);
+        self.peaks.hogged = self.peaks.hogged.max(self.pages);
+    }
+
+    /// Take grants until memmgr holds the pool at its reserve
+    /// ([`Pool::at_reserve`]), each of the pages free above the reserve.
+    fn fill_to_reserve(&mut self)
+    {
+        let start = Instant::now();
+        loop
+        {
+            let status = pool();
+            self.note(&status);
+            if status.at_reserve()
+            {
+                return;
+            }
+            let above = status
+                .available_pages()
+                .saturating_sub(status.reserve_pages());
+            if above == 0 || !self.take(above.min(HOG_BLOCK_PAGES))
+            {
+                // The level is read again at memmgr's next turn.
+                std::thread::sleep(HOG_TICK);
+            }
+            assert!(
+                start.elapsed() < FILL_BOUND,
+                "{PHASE}: the pool not at its reserve after {FILL_BOUND:?} of taking grants: level                  {}, {} pages available against a reserve of {}, {} pages held",
+                status.level,
+                status.available_pages(),
+                status.reserve_pages(),
+                self.pages
+            );
+        }
+    }
+
+    /// Give grants back, one by one, until the level reads `LOW` or
+    /// `NORMAL`.
+    fn release_from_critical(&mut self)
+    {
+        while pool().level == memmgr_labels::PRESSURE_CRITICAL
+        {
+            assert!(
+                !self.grants.is_empty(),
+                "{PHASE}: the level reads CRITICAL with every hog grant returned"
+            );
+            self.release_one();
+        }
     }
 
     /// Take grants until the level reads `LOW`, without a pause between them.
@@ -808,6 +887,8 @@ fn swap_phase(caps: &Caps)
     hog.fill_to_low();
     await_swapped(&mut hog, &mut fixture);
     debugger_restore(authority, process, thread, &ready);
+    critical_restore(&mut hog, authority, process, thread, &ready);
+    hog.fill_to_low();
     require_no_evict(thread, &ready);
     require_logd_stack(authority, &logd);
 
@@ -946,68 +1027,8 @@ fn await_swapped(hog: &mut Hog, fixture: &mut Fixture)
 fn debugger_restore(authority: u64, process: u64, thread: u64, ready: &Ready)
 {
     let region = ready.region;
-    let mut evicted = None;
-    for chunk in (0..MAIN_CHUNKS).filter(|&c| c != HOLE_CHUNK)
-    {
-        let va = page_va(region, chunk.saturating_mul(CHUNK_PAGES));
-        match read_pattern(thread, va, region, MAIN_XOR)
-        {
-            Ok(true) =>
-            {}
-            Ok(false) =>
-            {
-                panic!(
-                    "{PHASE}: the page at {va:#x} of the main region reads other than its pattern"
-                )
-            }
-            Err(INVALID_ADDRESS) =>
-            {
-                evicted = Some(va);
-                break;
-            }
-            Err(code) => panic!("{PHASE}: reading the page at {va:#x} failed ({code})"),
-        }
-    }
-    let evicted = evicted.unwrap_or_else(|| {
-        panic!(
-            "{PHASE}: every first page of the main region's {MAIN_CHUNKS} chunks reads while \
-             memmgr holds {} bytes swapped",
-            pool().swapped
-        )
-    });
-    let mut restored = false;
-    for _ in 0..RESIDENT_TRIES
-    {
-        let label = make_resident(authority, process, evicted, CHUNK_LEN);
-        assert_eq!(
-            label,
-            procmgr_errors::SUCCESS,
-            "{PHASE}: MAKE_RESIDENT of the chunk at {evicted:#x} replied {label:#x}"
-        );
-        match read_pattern(thread, evicted, region, MAIN_XOR)
-        {
-            Ok(true) =>
-            {
-                restored = true;
-                break;
-            }
-            Ok(false) =>
-            {
-                panic!("{PHASE}: the restored page at {evicted:#x} reads other than its pattern")
-            }
-            Err(INVALID_ADDRESS) =>
-            {}
-            Err(code) =>
-            {
-                panic!("{PHASE}: reading the restored page at {evicted:#x} failed ({code})")
-            }
-        }
-    }
-    assert!(
-        restored,
-        "{PHASE}: the page at {evicted:#x} did not read after {RESIDENT_TRIES} MAKE_RESIDENT of \
-         its chunk"
-    );
+    let evicted = first_evicted(thread, ready);
+    restore_chunk(authority, process, thread, ready, evicted, "");
     let mut hole_probe = [0u8; 8];
     assert_eq!(
         syscall::thread_read_mem(thread, ready.hole, &mut hole_probe),
@@ -1027,6 +1048,96 @@ fn debugger_restore(authority: u64, process: u64, thread: u64, ready: &Ready)
         "{PHASE}: the hole at {:#x} reads after MAKE_RESIDENT, which backs no page",
         ready.hole
     );
+}
+
+/// The first page of the first chunk of the main region, the hole's aside,
+/// that reads `InvalidAddress`: a page of an evicted chunk.
+fn first_evicted(thread: u64, ready: &Ready) -> u64
+{
+    let region = ready.region;
+    for chunk in (0..MAIN_CHUNKS).filter(|&c| c != HOLE_CHUNK)
+    {
+        let va = page_va(region, chunk.saturating_mul(CHUNK_PAGES));
+        match read_pattern(thread, va, region, MAIN_XOR)
+        {
+            Ok(true) =>
+            {}
+            Ok(false) =>
+            {
+                panic!(
+                    "{PHASE}: the page at {va:#x} of the main region reads other than its pattern"
+                )
+            }
+            Err(INVALID_ADDRESS) => return va,
+            Err(code) => panic!("{PHASE}: reading the page at {va:#x} failed ({code})"),
+        }
+    }
+    panic!(
+        "{PHASE}: every first page of the main region's {MAIN_CHUNKS} chunks reads while memmgr \
+         holds {} bytes swapped",
+        pool().swapped
+    )
+}
+
+/// Make the evicted page `evicted` of the main region resident with
+/// `MAKE_RESIDENT` of its chunk, which must succeed, and require it to read
+/// its pattern; `when` names the moment in a failure. The request is made up
+/// to [`RESIDENT_TRIES`] times.
+fn restore_chunk(authority: u64, process: u64, thread: u64, ready: &Ready, evicted: u64, when: &str)
+{
+    let region = ready.region;
+    for _ in 0..RESIDENT_TRIES
+    {
+        let label = make_resident(authority, process, evicted, CHUNK_LEN);
+        assert_eq!(
+            label,
+            procmgr_errors::SUCCESS,
+            "{PHASE}: MAKE_RESIDENT of the chunk at {evicted:#x}{when} replied {label:#x}"
+        );
+        match read_pattern(thread, evicted, region, MAIN_XOR)
+        {
+            Ok(true) => return,
+            Ok(false) =>
+            {
+                panic!("{PHASE}: the restored page at {evicted:#x} reads other than its pattern")
+            }
+            Err(INVALID_ADDRESS) =>
+            {}
+            Err(code) =>
+            {
+                panic!("{PHASE}: reading the restored page at {evicted:#x} failed ({code})")
+            }
+        }
+    }
+    panic!(
+        "{PHASE}: the page at {evicted:#x} did not read after {RESIDENT_TRIES} MAKE_RESIDENT of \
+         its chunk{when}"
+    );
+}
+
+/// With memmgr holding the pool at its reserve ([`Pool::at_reserve`]), a
+/// swapped chunk of the main region is restored: `MAKE_RESIDENT` of it
+/// succeeds and its page reads its pattern. The free pages cannot admit the
+/// restore, so memmgr's direct reclaim made the room by evicting idle chunks
+/// in its turn (services/memmgr/docs/memory-pool.md § Eviction). The hog then
+/// gives grants back until the level leaves `CRITICAL`.
+fn critical_restore(hog: &mut Hog, authority: u64, process: u64, thread: u64, ready: &Ready)
+{
+    let evicted = first_evicted(thread, ready);
+    hog.fill_to_reserve();
+    // The clock's slices run at `CRITICAL` too: let a few age the chunks
+    // and keep victims, then take the pool to the reserve again.
+    std::thread::sleep(CRITICAL_SETTLE);
+    hog.fill_to_reserve();
+    restore_chunk(
+        authority,
+        process,
+        thread,
+        ready,
+        evicted,
+        " with the pool at its reserve",
+    );
+    hog.release_from_critical();
 }
 
 /// Require every page of the no-evict region to read its pattern.

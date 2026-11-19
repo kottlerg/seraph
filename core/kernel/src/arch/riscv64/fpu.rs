@@ -8,9 +8,10 @@
 //! Concentrates the unsafe surface for FP and Vector state management.
 //! The boot invariant is `sstatus.FS = sstatus.VS = 00 (Off)`. Any F/D or V
 //! instruction in U-mode raises an illegal-instruction trap (`scause = 2`);
-//! the trap handler decodes the opcode (see
-//! [`super::encoding::is_fp_or_v_opcode`]) and lazy-restores via
-//! [`lazy_restore_fp_v`].
+//! the trap handler, which takes such a trap with `FS` Off as the lazy trap
+//! ([`super::encoding::is_lazy_fp_v_trap`]), lazy-restores via
+//! [`lazy_restore_fp_v`]. An F/D/V instruction that traps with the units on
+//! is the thread's illegal-instruction fault.
 //!
 //! The scheduler calls [`switch_out_save`] on switch-out of every user
 //! thread. When `sstatus.FS == 11 (Dirty)` the live F/D register file is
@@ -23,13 +24,7 @@
 //! frame on exit, so any live-CSR change made during dispatch is otherwise
 //! discarded across `sret`.
 
-/// `sstatus.FS` field — bits [14:13]. Two-bit FP unit state: 00=Off,
-/// 01=Initial, 10=Clean, 11=Dirty.
-const SSTATUS_FS_MASK: u64 = 0x3 << 13;
-
-/// `sstatus.VS` field — bits [10:9]. Two-bit Vector unit state, same encoding
-/// as `FS`.
-const SSTATUS_VS_MASK: u64 = 0x3 << 9;
+use super::encoding::{SSTATUS_FS_MASK, SSTATUS_VS_MASK};
 
 /// Force `sstatus.FS = sstatus.VS = 00 (Off)` for the current hart.
 ///

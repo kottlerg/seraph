@@ -39,7 +39,7 @@ use firmware::pci::{BarSpan, InterruptPlan, MessagesRefused, Msi, Msix};
 use firmware::pci_records::{PciRecords, RecordState};
 use firmware::records::{PlatformRecord, PlatformRecords};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
-use firmware::restart::RecordId;
+use firmware::restart::{RecordId, Teardown};
 use firmware::roster::Roster;
 use restart_budget::RestartBudget;
 use syscall_abi::PAGE_SIZE;
@@ -2356,26 +2356,34 @@ impl PciDeviceCaps
     /// decides). `false`, logged, means the device may still be accessing the
     /// driver's memory and the mapped frames, and those caps stay for the
     /// boot ([`dma::Withdrawal::quarantine`]). A device with no DMA grant is
-    /// stopped and reset all the same, and its result returned.
-    fn take_from_driver(&self) -> bool
+    /// stopped and reset all the same, and its result returned. Returns that
+    /// first, then whether the device was confirmed quiet
+    /// ([`Self::stop_and_reset`]).
+    fn take_from_driver(&self) -> (bool, bool)
     {
         let Some(dma) = &self.dma
         else
         {
-            return self.stop_and_reset();
+            let quiet = self.stop_and_reset();
+            return (quiet, quiet);
         };
         let withdrawal = dma.withdraw();
-        match firmware::dma::settle_withdrawal(withdrawal.block(), || self.stop_and_reset())
+        let mut quiet = false;
+        let settled = firmware::dma::settle_withdrawal(withdrawal.block(), || {
+            quiet = self.stop_and_reset();
+            quiet
+        });
+        match settled
         {
             firmware::dma::WithdrawnMappings::Release =>
             {
                 withdrawal.release();
-                true
+                (true, quiet)
             }
             firmware::dma::WithdrawnMappings::Quarantine =>
             {
                 withdrawal.quarantine();
-                false
+                (false, quiet)
             }
         }
     }
@@ -2437,13 +2445,36 @@ impl PciDeviceCaps
 /// token ([`spawn::destroy_and_release`]) only when the device is confirmed
 /// quiet; otherwise it stays held for the rest of the boot
 /// ([`spawn::destroy_held`]), since the device may still be writing it. One
-/// reset per withdrawal; both caps of `child` are consumed. Returns whether
-/// the driver's DMA hold is released: it held none, or its held memory was
-/// released.
-pub fn withdraw_device(dev_caps: &PciDeviceCaps, child: spawn::HeldChild, ipc_buf: *mut u64)
--> bool
+/// reset per withdrawal; both caps of `child` are consumed. Returns what the
+/// withdrawal left: whether the device was confirmed quiet
+/// ([`PciDeviceCaps::stop_and_reset`]), which an IOMMU's block of the device
+/// does not stand in for, and whether the driver's DMA hold is released: it
+/// held none, or its held memory was released.
+pub fn withdraw_device(
+    dev_caps: &PciDeviceCaps,
+    child: spawn::HeldChild,
+    ipc_buf: *mut u64,
+) -> Teardown
 {
-    let quiet = dev_caps.take_from_driver();
+    let (unreachable, quiet) = dev_caps.take_from_driver();
+    let released = release_hold(dev_caps, child, unreachable, ipc_buf);
+    Teardown { quiet, released }
+}
+
+/// Destroy the driver `child` names and release its held memory when the
+/// device can no longer reach it (`unreachable`); whether its DMA hold is
+/// released (see [`withdraw_device`]).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`unreachable` is data: what taking the device from its driver confirmed"
+)]
+fn release_hold(
+    dev_caps: &PciDeviceCaps,
+    child: spawn::HeldChild,
+    unreachable: bool,
+    ipc_buf: *mut u64,
+) -> bool
+{
     if child.process_handle == 0
     {
         return child.release_token == 0;
@@ -2453,7 +2484,7 @@ pub fn withdraw_device(dev_caps: &PciDeviceCaps, child: spawn::HeldChild, ipc_bu
         spawn::destroy_child(child.process_handle, ipc_buf);
         true
     }
-    else if quiet
+    else if unreachable
     {
         let released = spawn::destroy_and_release(child, ipc_buf);
         if released

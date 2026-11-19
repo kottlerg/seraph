@@ -13,8 +13,9 @@
 //! withdraws the driver, [`restart_entry`] reads what the death and the
 //! registry say: the death's reason, the consumer's refusal, and the drivers
 //! directory and the driver's place in it. Once the withdrawal is done,
-//! [`after_withdrawal`] reads what it left: the driver's DMA hold, and then
-//! the record's restart budget, which only a restart that passes every other
+//! [`after_withdrawal`] reads what it left ([`Teardown`]): whether the device
+//! was confirmed quiet and the driver's DMA hold released, and then the
+//! record's restart budget, which only a restart that passes every other
 //! check is charged.
 
 use core::fmt;
@@ -49,7 +50,9 @@ pub enum Refusal
     /// Its install path is no entry of the drivers directory: it was started
     /// from another directory (`BIND_DRIVERS`).
     NotInstalled,
-    /// Its DMA hold stays, since its device was not confirmed quiet.
+    /// Its device was not confirmed quiet: it may still perform DMA.
+    NotQuiet,
+    /// Its DMA hold stays.
     HoldKept,
     /// Its record's restart budget for the window is spent.
     BudgetSpent,
@@ -67,6 +70,7 @@ impl fmt::Display for Refusal
             Self::Declined => "its consumer declined its restart",
             Self::NoDriversDir => "no drivers directory is installed",
             Self::NotInstalled => "it was not started from the drivers directory",
+            Self::NotQuiet => "its device was not confirmed quiet",
             Self::HoldKept => "its DMA hold stays",
             Self::BudgetSpent => "its device's restart budget for this window is spent",
             Self::NoMemory => "no memory to queue its restart",
@@ -116,21 +120,34 @@ pub fn restart_entry<'a>(
     entry(dir, path).ok_or(Refusal::NotInstalled)
 }
 
+/// What a driver's withdrawal left of its device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Teardown
+{
+    /// The device was confirmed quiet: it performs no DMA. A platform device
+    /// has no DMA and is quiet once its caps are taken.
+    pub quiet: bool,
+    /// The driver's DMA hold was released, or it held none.
+    pub released: bool,
+}
+
 /// Once the withdrawal of a driver [`restart_entry`] admitted is done:
-/// whether it restarts. `released` is whether the withdrawal released its
-/// DMA hold, or it held none; `charge` charges one restart to its record's
-/// budget and returns whether the budget had room, and is called only when
-/// every other check passes.
+/// whether it restarts, from what the withdrawal left, `teardown`. A device
+/// is handed to a new instance only when it was confirmed quiet, an IOMMU's
+/// block alone not sufficing, since the new instance's bind enables its bus
+/// mastering again; and only once the dead driver's DMA hold is released.
+/// `charge` charges one restart to its record's budget and returns whether
+/// the budget had room, and is called only when every other check passes.
 ///
 /// # Errors
-/// [`Refusal::HoldKept`] or [`Refusal::BudgetSpent`].
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`released` is data: what the withdrawal did with the driver's DMA hold"
-)]
-pub fn after_withdrawal(released: bool, charge: impl FnOnce() -> bool) -> Result<(), Refusal>
+/// [`Refusal::NotQuiet`], [`Refusal::HoldKept`] or [`Refusal::BudgetSpent`].
+pub fn after_withdrawal(teardown: Teardown, charge: impl FnOnce() -> bool) -> Result<(), Refusal>
 {
-    if !released
+    if !teardown.quiet
+    {
+        return Err(Refusal::NotQuiet);
+    }
+    if !teardown.released
     {
         return Err(Refusal::HoldKept);
     }
@@ -279,19 +296,51 @@ mod tests
     }
 
     #[test]
-    fn a_kept_hold_refuses_without_charging_the_budget()
+    fn a_device_not_quiet_or_a_kept_hold_refuses_without_charging_the_budget()
     {
+        let done = Teardown {
+            quiet: true,
+            released: true,
+        };
         let mut charged = false;
+        let mut charge = || {
+            charged = true;
+            true
+        };
         assert_eq!(
-            after_withdrawal(false, || {
-                charged = true;
-                true
-            }),
+            after_withdrawal(
+                Teardown {
+                    quiet: false,
+                    released: true,
+                },
+                &mut charge
+            ),
+            Err(Refusal::NotQuiet),
+            "an IOMMU's block releases the hold of a device not confirmed quiet"
+        );
+        assert_eq!(
+            after_withdrawal(
+                Teardown {
+                    quiet: false,
+                    released: false,
+                },
+                &mut charge
+            ),
+            Err(Refusal::NotQuiet)
+        );
+        assert_eq!(
+            after_withdrawal(
+                Teardown {
+                    quiet: true,
+                    released: false,
+                },
+                &mut charge
+            ),
             Err(Refusal::HoldKept)
         );
         assert!(!charged);
-        assert_eq!(after_withdrawal(true, || false), Err(Refusal::BudgetSpent));
-        assert_eq!(after_withdrawal(true, || true), Ok(()));
+        assert_eq!(after_withdrawal(done, || false), Err(Refusal::BudgetSpent));
+        assert_eq!(after_withdrawal(done, || true), Ok(()));
     }
 
     fn decl(name: &str, matches: &[Match<'_>], interrupt: Interrupt) -> DriverDecl

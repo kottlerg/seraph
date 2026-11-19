@@ -40,7 +40,7 @@ use firmware::classes::{Classes, MAX_CLASSES, Mismatch};
 use firmware::hotplug::Slot;
 use firmware::lines::{HeldLines, LineError};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
-use firmware::restart::Decline;
+use firmware::restart::{Decline, Teardown};
 use firmware::roster::{DeathPost, DriverState, Roster};
 use firmware::served::{Lookup, Served};
 use ipc::IpcMessage;
@@ -832,8 +832,8 @@ impl Registry
                 {
                     kept.take_from_driver();
                 }
-                let released = driver.withdraw(held, ipc_buf);
-                let restarted = entry.and_then(|()| self.admit_restart(driver, released, kept));
+                let teardown = driver.withdraw(held, ipc_buf);
+                let restarted = entry.and_then(|()| self.admit_restart(driver, teardown, kept));
                 match restarted
                 {
                     Ok(()) => std::os::seraph::log!(
@@ -859,22 +859,18 @@ impl Registry
     }
 
     /// The second step of a restart [`Self::withdraw_dead`] admitted on the
-    /// death: once `driver` is withdrawn, `released` saying whether its DMA
-    /// hold was released, charge its record's restart budget
+    /// death: once `driver` is withdrawn, `teardown` saying what the
+    /// withdrawal left of its device, charge its record's restart budget
     /// ([`firmware::restart::after_withdrawal`]) and queue it for the
     /// restart job, with `kept`, a platform record's caps taken from the
     /// dead instance, which a refusal releases.
     ///
     /// # Errors
     /// The [`firmware::restart::Refusal`].
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "`released` is data: what the withdrawal did with the driver's DMA hold"
-    )]
     fn admit_restart(
         &self,
         driver: ServedDriver,
-        released: bool,
+        teardown: Teardown,
         kept: Option<bind::PlatformDeviceCaps>,
     ) -> Result<(), firmware::restart::Refusal>
     {
@@ -889,7 +885,7 @@ impl Registry
         };
         source.platform = kept;
         if let Err(why) =
-            firmware::restart::after_withdrawal(released, || source.budget.try_charge(now_ns()))
+            firmware::restart::after_withdrawal(teardown, || source.budget.try_charge(now_ns()))
         {
             source.release();
             return Err(why);
@@ -2277,11 +2273,11 @@ impl ServedDriver
     /// such device through its process handle when devmgr still keeps one (a
     /// no-op for one procmgr has reaped); then [`Self::release`], the caps on
     /// its device's BARs given back to the held BAR pages `held`. Returns
-    /// whether the driver's DMA hold is released: it held none, or its
-    /// device was confirmed quiet and its held memory released.
-    fn withdraw(&self, held: &mut SpanTable<u64>, ipc_buf: *mut u64) -> bool
+    /// what the withdrawal left ([`bind::withdraw_device`]); a driver with no
+    /// PCI device leaves its device quiet and no DMA hold.
+    fn withdraw(&self, held: &mut SpanTable<u64>, ipc_buf: *mut u64) -> Teardown
     {
-        let released = if let Some(dev_caps) = &self.dev_caps
+        let teardown = if let Some(dev_caps) = &self.dev_caps
         {
             bind::withdraw_device(
                 dev_caps,
@@ -2302,10 +2298,13 @@ impl ServedDriver
             {
                 spawn::destroy_child(self.process_handle, ipc_buf);
             }
-            true
+            Teardown {
+                quiet: true,
+                released: true,
+            }
         };
         self.release(held);
-        released
+        teardown
     }
 
     /// Release what the registry holds for the driver: revoke its service

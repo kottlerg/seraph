@@ -48,8 +48,9 @@ pub const NO_DEVICE: u64 = 4;
 /// it returned. Returned by `QUERY_DEVICE` at the withdrawn driver's
 /// instance ordinal, which stays held for the rest of the boot so the
 /// ordinals after it keep their drivers (a client probing ordinals
-/// continues at the next one). Sticky for the boot: devmgr restarts no
-/// driver.
+/// continues at the next one). Sticky for the boot: a driver devmgr
+/// restarts after its death is a new instance, served at the class's next
+/// ordinal (services/devmgr/docs/responsibilities.md § Driver Restart).
 pub const WITHDRAWN: u64 = 5;
 /// The class holds `devmgr_labels::MAX_CLASS_WATCHERS` watches and
 /// none of them is gone (`WATCH_CLASS`).

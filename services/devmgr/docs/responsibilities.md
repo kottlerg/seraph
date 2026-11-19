@@ -792,10 +792,13 @@ The death is restarted when every check passes, in this order:
    ([docs/boot-media.md](../../../docs/boot-media.md)), so a driver of the boot pass restarts from
    its entry under `/services/drivers/`, never from a boot module or an image kept from boot. A
    driver started through `BIND_DRIVERS` from another directory is never restarted.
-4. **Quiet.** The withdrawal released the driver's DMA hold, or it held none: its device was
-   confirmed quiet ([docs/device-management.md](../../../docs/device-management.md) § DMA-Safe
-   Teardown). A device that may still write to memory procmgr keeps for it is not handed to a new
-   instance.
+4. **Quiet.** The withdrawal confirmed the device quiet: Bus Master Enable read back clear, every
+   copy of its BAR caps revoked, and the reset its driver declares confirmed
+   ([docs/device-management.md](../../../docs/device-management.md) § DMA-Safe Teardown). An
+   IOMMU's block of the device does not suffice: it releases the dead driver's memory, but the
+   new instance's bind enables the device's bus mastering again, under a new domain. A platform
+   device has no DMA and is quiet once its caps are taken. The withdrawal also released the
+   driver's DMA hold, or it held none.
 5. **Within the budget.** The record's restart budget has room: `restart_budget::RestartBudget`
    ([shared/restart-budget](../../../shared/restart-budget/README.md)), `RESTART_BURST` restarts in
    a `RESTART_WINDOW_NS` window, the bound svcmgr applies to a service, carried from each instance

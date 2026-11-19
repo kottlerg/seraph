@@ -1357,33 +1357,11 @@ fn fixture_thread(index: u32)
     }
 }
 
-/// Child role: register the main region and the no-evict region and fill
-/// them, start [`FIXTURE_THREADS`] threads, print `ready <region> <len> <hole>
-/// <noevict> <len>` in hex, and serve `swapped`, `verify` and `exit` lines
-/// on stdin until one of `exit` or the end of the input, then exit 0.
-fn fixture_main() -> !
+/// Reserve, register and fill the fixture's no-evict region of
+/// [`NOEVICT_PAGES`] pages; its base and length in bytes. Exits
+/// [`FIXTURE_NOEVICT_FAILED`] when the reservation or the registration fails.
+fn fixture_noevict() -> (u64, u64)
 {
-    let Some(main_pages) = std::env::args()
-        .nth(2)
-        .and_then(|a| a.parse::<u64>().ok())
-        .filter(|&p| p > HOLE_PAGE && p % CHUNK_PAGES == 0)
-    else
-    {
-        exit(FIXTURE_BAD_ARGUMENT);
-    };
-    let Ok(region) = register_demand_paged(main_pages)
-    else
-    {
-        exit(FIXTURE_REGION_FAILED);
-    };
-    let base = region.va_start();
-    for page in 0..main_pages
-    {
-        if page / CHUNK_PAGES != HOLE_CHUNK
-        {
-            fill_page(page_va(base, page), base, MAIN_XOR);
-        }
-    }
     let Ok(noevict) = reserve_pages(NOEVICT_PAGES)
     else
     {
@@ -1412,6 +1390,37 @@ fn fixture_main() -> !
     {
         fill_page(page_va(noevict_base, page), noevict_base, NOEVICT_XOR);
     }
+    (noevict_base, noevict_len)
+}
+
+/// Child role: register the main region and the no-evict region and fill
+/// them, start [`FIXTURE_THREADS`] threads, print `ready <region> <len> <hole>
+/// <noevict> <len>` in hex, and serve `swapped`, `verify` and `exit` lines
+/// on stdin until one of `exit` or the end of the input, then exit 0.
+fn fixture_main() -> !
+{
+    let Some(main_pages) = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse::<u64>().ok())
+        .filter(|&p| p > HOLE_PAGE && p % CHUNK_PAGES == 0)
+    else
+    {
+        exit(FIXTURE_BAD_ARGUMENT);
+    };
+    let Ok(region) = register_demand_paged(main_pages)
+    else
+    {
+        exit(FIXTURE_REGION_FAILED);
+    };
+    let base = region.va_start();
+    for page in 0..main_pages
+    {
+        if page / CHUNK_PAGES != HOLE_CHUNK
+        {
+            fill_page(page_va(base, page), base, MAIN_XOR);
+        }
+    }
+    let (noevict_base, noevict_len) = fixture_noevict();
     let mut threads = Vec::new();
     for index in 0..FIXTURE_THREADS
     {

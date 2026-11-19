@@ -220,11 +220,23 @@ pub unsafe fn first_device_from(
     ipc_buf: *mut u64,
 ) -> Result<(u64, u64), ClassCallError>
 {
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    first_live_from(start, |ordinal| unsafe {
+        query_device(class_send, ordinal, ipc_buf)
+    })
+}
+
+/// [`first_device_from`]'s walk over the answers of `query`, the
+/// `QUERY_DEVICE` of an ordinal.
+fn first_live_from(
+    start: u64,
+    mut query: impl FnMut(u64) -> Result<u64, ClassCallError>,
+) -> Result<(u64, u64), ClassCallError>
+{
     let mut ordinal = start;
     loop
     {
-        // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-        match unsafe { query_device(class_send, ordinal, ipc_buf) }
+        match query(ordinal)
         {
             Ok(cap) => return Ok((ordinal, cap)),
             Err(ClassCallError::Refused(devmgr_errors::WITHDRAWN)) =>
@@ -235,6 +247,106 @@ pub unsafe fn first_device_from(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// What [`refresh_device`] found for a client of a class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refresh
+{
+    /// The driver the client holds is still served, or it holds none and the
+    /// class serves none: the client keeps what it holds.
+    Unchanged,
+    /// A live driver at `ordinal`, its SEND `cap`, replaces what the client
+    /// holds: the driver it held was withdrawn, or it held none.
+    Replaced
+    {
+        /// The new driver's instance ordinal.
+        ordinal: u64,
+        /// The `SEND_GRANT` cap on its service endpoint.
+        cap: u64,
+    },
+    /// The driver the client held was withdrawn and the class serves no live
+    /// driver past it: the client holds none.
+    Lost,
+}
+
+/// Look again at the class whose class SEND is `class_send`, as a client does
+/// when its [`devmgr_labels::WATCH_CLASS`] watch is signalled
+/// (services/devmgr/docs/responsibilities.md § Driver Restart, Clients).
+/// `held` is the ordinal of the driver the client holds, `None` when it
+/// holds none. devmgr's answer at `held` decides, not the held SEND: devmgr
+/// signals a withdrawal before it revokes the driver's endpoint, so the SEND
+/// can still work. A held driver still served is kept; a withdrawn one is
+/// replaced by the first live driver past it ([`first_device_from`], which
+/// waits for a restart's settle), or lost when there is none; a client that
+/// holds none takes the class's first live driver. The copy a still-served
+/// query returns is deleted. The client deletes the SEND it replaces or
+/// loses. Logs nothing, so logd can call it too.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// The first [`query_device`] error that is neither `WITHDRAWN` nor, past a
+/// withdrawn `held` or with none held, [`devmgr_errors::NO_DEVICE`]; the
+/// client then keeps what it holds until the next signal.
+pub unsafe fn refresh_device(
+    class_send: u64,
+    held: Option<u64>,
+    ipc_buf: *mut u64,
+) -> Result<Refresh, ClassCallError>
+{
+    refresh_with(
+        held,
+        // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+        |ordinal| unsafe { query_device(class_send, ordinal, ipc_buf) },
+        |copy| {
+            let _ = syscall::cap_delete(copy);
+        },
+    )
+}
+
+/// [`refresh_device`]'s decision over the answers of `query`, the
+/// `QUERY_DEVICE` of an ordinal; `release` deletes the copy a still-served
+/// query returns.
+fn refresh_with(
+    held: Option<u64>,
+    mut query: impl FnMut(u64) -> Result<u64, ClassCallError>,
+    release: impl FnOnce(u64),
+) -> Result<Refresh, ClassCallError>
+{
+    let start = match held
+    {
+        None => 0,
+        Some(ordinal) => match query(ordinal)
+        {
+            Ok(copy) =>
+            {
+                release(copy);
+                return Ok(Refresh::Unchanged);
+            }
+            Err(ClassCallError::Refused(devmgr_errors::WITHDRAWN)) =>
+            {
+                let Some(next) = ordinal.checked_add(1)
+                else
+                {
+                    return Ok(Refresh::Lost);
+                };
+                next
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    match first_live_from(start, query)
+    {
+        Ok((ordinal, cap)) => Ok(Refresh::Replaced { ordinal, cap }),
+        Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE)) if held.is_some() =>
+        {
+            Ok(Refresh::Lost)
+        }
+        Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE)) => Ok(Refresh::Unchanged),
+        Err(e) => Err(e),
     }
 }
 
@@ -363,6 +475,10 @@ fn class_call_cap(reply: &IpcMessage) -> Result<u64, ClassCallError>
 #[cfg(test)]
 mod tests
 {
+    extern crate std;
+
+    use std::vec::Vec;
+
     use super::*;
 
     #[test]
@@ -379,6 +495,153 @@ mod tests
         assert_eq!(class_call_cap(&empty), Err(ClassCallError::NoCap));
         let null = IpcMessage::builder(devmgr_errors::SUCCESS).cap(0).build();
         assert_eq!(class_call_cap(&null), Err(ClassCallError::NoCap));
+    }
+
+    /// A class as devmgr answers it: `withdrawn` ordinals answer `WITHDRAWN`,
+    /// `served` ones a cap of the ordinal plus 100, and past `served`'s last
+    /// `NO_DEVICE`; the ordinals queried are recorded.
+    fn class(
+        withdrawn: &[u64],
+        served: &[u64],
+        asked: &mut Vec<u64>,
+    ) -> impl FnMut(u64) -> Result<u64, ClassCallError>
+    {
+        move |ordinal| {
+            asked.push(ordinal);
+            if withdrawn.contains(&ordinal)
+            {
+                Err(ClassCallError::Refused(devmgr_errors::WITHDRAWN))
+            }
+            else if served.contains(&ordinal)
+            {
+                Ok(ordinal + 100)
+            }
+            else
+            {
+                Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE))
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_live_driver_is_past_every_withdrawn_ordinal()
+    {
+        let mut asked = Vec::new();
+        assert_eq!(
+            first_live_from(0, class(&[0, 1], &[2, 3], &mut asked)),
+            Ok((2, 102))
+        );
+        assert_eq!(asked, [0, 1, 2]);
+        let mut asked = Vec::new();
+        assert_eq!(
+            first_live_from(0, class(&[0], &[], &mut asked)),
+            Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE))
+        );
+        let mut asked = Vec::new();
+        assert_eq!(
+            first_live_from(u64::MAX, class(&[u64::MAX], &[], &mut asked)),
+            Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE))
+        );
+    }
+
+    #[test]
+    fn a_held_driver_still_served_is_kept_and_the_copy_released()
+    {
+        let mut asked = Vec::new();
+        let mut released = None;
+        assert_eq!(
+            refresh_with(Some(1), class(&[0], &[1, 2], &mut asked), |c| released =
+                Some(c)),
+            Ok(Refresh::Unchanged)
+        );
+        assert_eq!(asked, [1]);
+        assert_eq!(released, Some(101));
+    }
+
+    #[test]
+    fn a_withdrawn_driver_is_replaced_past_its_ordinal_or_lost()
+    {
+        let mut asked = Vec::new();
+        assert_eq!(
+            refresh_with(Some(0), class(&[0, 1], &[2], &mut asked), |_| panic!(
+                "no copy"
+            )),
+            Ok(Refresh::Replaced {
+                ordinal: 2,
+                cap: 102
+            })
+        );
+        assert_eq!(asked, [0, 1, 2]);
+        let mut asked = Vec::new();
+        assert_eq!(
+            refresh_with(Some(1), class(&[0, 1], &[], &mut asked), |_| panic!(
+                "no copy"
+            )),
+            Ok(Refresh::Lost)
+        );
+        let mut asked = Vec::new();
+        assert_eq!(
+            refresh_with(
+                Some(u64::MAX),
+                class(&[u64::MAX], &[], &mut asked),
+                |_| panic!("no copy")
+            ),
+            Ok(Refresh::Lost)
+        );
+    }
+
+    #[test]
+    fn a_client_holding_none_takes_the_first_live_driver_or_stays_empty()
+    {
+        let mut asked = Vec::new();
+        assert_eq!(
+            refresh_with(None, class(&[0], &[1], &mut asked), |_| panic!("no copy")),
+            Ok(Refresh::Replaced {
+                ordinal: 1,
+                cap: 101
+            })
+        );
+        assert_eq!(asked, [0, 1]);
+        let mut asked = Vec::new();
+        assert_eq!(
+            refresh_with(None, class(&[0], &[], &mut asked), |_| panic!("no copy")),
+            Ok(Refresh::Unchanged)
+        );
+    }
+
+    #[test]
+    fn a_refusal_other_than_withdrawn_or_none_is_returned()
+    {
+        let refused = |_| Err(ClassCallError::Refused(devmgr_errors::INVALID_REQUEST));
+        assert_eq!(
+            refresh_with(Some(0), refused, |_| panic!("no copy")),
+            Err(ClassCallError::Refused(devmgr_errors::INVALID_REQUEST))
+        );
+        assert_eq!(
+            refresh_with(
+                None,
+                |_| Err(ClassCallError::Call(-1)),
+                |_| panic!("no copy")
+            ),
+            Err(ClassCallError::Call(-1))
+        );
+        let mut asked = Vec::new();
+        let mut withdrawn_then_refused = class(&[0], &[], &mut asked);
+        assert_eq!(
+            refresh_with(
+                Some(0),
+                |o| if o == 0
+                {
+                    withdrawn_then_refused(o)
+                }
+                else
+                {
+                    Err(ClassCallError::Call(-2))
+                },
+                |_| panic!("no copy")
+            ),
+            Err(ClassCallError::Call(-2))
+        );
     }
 
     #[test]

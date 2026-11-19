@@ -25,7 +25,7 @@ Three harnesses exercise three surfaces:
 |---|---|---|---|
 | `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask compose-bundle --harness ktest`) |
 | `svctest` | Services | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (`cargo xtask test-terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX |
+| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (`cargo xtask test-terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
@@ -258,7 +258,7 @@ to one reader. So input is tested *through* the terminal.
 
 `cargo xtask test-terminal` boots QEMU with a QMP control socket, waits for the
 terminal's `terminal: READY for injection` marker, then drives both input
-sources in one boot (command reference:
+sources and a restart of the input driver in one boot (command reference:
 [xtask/README.md § test-terminal](../xtask/README.md#cargo-xtask-test-terminal)):
 
 1. **Keyboard round** — inject a known key sequence via QMP `input-send-event`
@@ -267,16 +267,24 @@ sources in one boot (command reference:
 2. **Serial RX round** — on a cleared transcript, write the same sequence to the
    guest UART receive path via QEMU's bidirectional `-serial stdio` (host stdin
    reaches the guest serial RX), assert the same echo + child round-trip.
+3. **Input restart round** — the host kills the virtio-input driver through the
+   GDB stub, which the test stages on that driver and attaches over the debug
+   port; devmgr restarts it at the class's next ordinal
+   ([Driver Restart](../services/devmgr/docs/responsibilities.md#driver-restart)).
+   The terminal must log that it holds the instance at ordinal
+   1, and, on a cleared transcript, the keyboard sequence injected again must give
+   the same echo and child output, which a terminal still holding the dead
+   driver never shows.
 
 Unlike the other harnesses the verdict is computed by the host (the terminal
 cannot know the expected sequence), and the host kills QEMU on success. The
 driver carries no test hooks — injection happens at the hardware boundary, so
 the whole stack (device → decode/IRQ → IPC → terminal → child → output) is
-exercised as in production. Both rounds run on both arches.
+exercised as in production. All three rounds run on both arches.
 
-The terminal autostarts on a normal boot, so no recipe staging is needed; just
-build, repack, and run the host driver (not `run-parallel`, which cannot
-inject):
+The terminal autostarts on a normal boot, and the test stages the GDB stub itself
+and removes it again, so no recipe staging is needed; just build, repack, and run
+the host driver (not `run-parallel`, which cannot inject):
 
 ```sh
 cargo xtask build
@@ -924,9 +932,9 @@ surface.
   - console: the machine's 16550-compatible UART (COM1 on `q35`, the NS16550 on `virt`), through
     the serial driver: the output of every svctest and usertest boot, and the serial receive round
     of `test-terminal`;
-  - input: `virtio-keyboard-pci`, through the virtio-input driver: the keyboard round of
-    `test-terminal`, and svctest's input checks (the drivers phase's input case and the devmgr
-    phase's input ordinal);
+  - input: `virtio-keyboard-pci`, through the virtio-input driver: the keyboard and input
+    restart rounds of `test-terminal`, and svctest's input checks (the drivers phase's input case
+    and the devmgr phase's input ordinal);
   - entropy: `virtio-rng-pci`, which the firmware's RNG driver drives first, and from which the
     bootloader draws the pool seed and the KASLR words through its `EFI_RNG_PROTOCOL`: the
     `test-kaslr` boots of the ktest cells, and svctest's random phase; and at run time through the

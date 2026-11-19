@@ -44,8 +44,15 @@
 //! shadowing skip it, so its name falls through to the root filesystem
 //! as an absent one does. The root mount is never removed.
 //!
+//! A mount below `/` whose driver died is restarted in place: the tree
+//! keeps a restart budget for each mount ([`RestartBudget`], fresh at each
+//! install), [`VfsdRootBackend::begin_restart`] charges it and holds the
+//! mount *restarting*, visible but crossed by no lookup, until
+//! [`VfsdRootBackend::finish_restart`] stores the new driver's record or
+//! [`VfsdRootBackend::abandon_restart`] turns the restart into a removal.
+//!
 //! The tree holds at most [`MAX_MOUNTS`] mounts, the root mount and
-//! those being removed included: vfsd observes each mount's driver on one
+//! those restarting or being removed included: vfsd observes each mount's driver on one
 //! wait set of `syscall_abi::WAIT_SET_MAX_MEMBERS` members, one of which is
 //! its device-class watch.
 //!
@@ -71,6 +78,7 @@ use namespace_protocol::{
     EntryName, EntryTarget, EntryView, MemoryReply, NamespaceBackend, NamespaceRights, NodeId,
     NodeKind, NodeStat, NsError, validate_name,
 };
+use restart_budget::RestartBudget;
 
 /// Sentinel marking "no node" in `parent` / `first_child` /
 /// `next_sibling` links. `u32::MAX` is unambiguous because
@@ -79,7 +87,7 @@ use namespace_protocol::{
 const NONE: u32 = u32::MAX;
 
 /// The most mounts the tree holds at once, counting the root mount and
-/// every mount whose removal has begun and not finished: one wait-set member
+/// every mount restarting, or whose removal has begun and not finished: one wait-set member
 /// each in vfsd's watch set beside its device-class watch
 /// (`services/vfsd/docs/namespace-composition.md` § Mount record).
 pub const MAX_MOUNTS: usize = 1023;
@@ -125,8 +133,23 @@ pub enum UnmountError
     Root,
     /// No mount is on the node, or the index is outside the pool.
     NotMounted,
-    /// The mount's removal has already begun.
+    /// The mount is restarting, or its removal has already begun.
     InProgress,
+}
+
+/// Why [`VfsdRootBackend::begin_restart`] refused a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartError
+{
+    /// The node is the synthetic root: the root mount is never restarted.
+    Root,
+    /// No mount is on the node, or the index is outside the pool.
+    NotMounted,
+    /// The mount is already restarting, or its removal has begun.
+    InProgress,
+    /// The mount's restart budget is spent for the open window
+    /// ([`RestartBudget::try_charge`]).
+    BudgetSpent,
 }
 
 /// What a node holds besides its links.
@@ -135,12 +158,29 @@ enum Slot
 {
     /// No mount: a synthetic intermediate, or a vacant node.
     Empty,
-    /// A mount that lookups cross.
-    Mounted(Mount),
+    /// A mount that lookups cross, with the restart budget of its driver.
+    Mounted
+    {
+        mount: Mount, budget: RestartBudget
+    },
+    /// A mount whose driver died and is being started again: the node stays
+    /// visible, a lookup that would cross it is answered `NsError::IoError`,
+    /// and no install may take the node until
+    /// [`VfsdRootBackend::finish_restart`] or
+    /// [`VfsdRootBackend::abandon_restart`]. `mount` is the dead driver's
+    /// record.
+    Restarting
+    {
+        mount: Mount, budget: RestartBudget
+    },
     /// A mount whose removal has begun: no lookup crosses it, and no
     /// install may take the node until [`VfsdRootBackend::remove_mount`]
-    /// or [`VfsdRootBackend::restore_mount`].
-    Unmounting(Mount),
+    /// or [`VfsdRootBackend::restore_mount`], which gives the mount back its
+    /// budget.
+    Unmounting
+    {
+        mount: Mount, budget: RestartBudget
+    },
 }
 
 /// One node in the synthetic-root tree.
@@ -160,9 +200,10 @@ struct TreeNode
     next_sibling: u32,
     /// The mount on this node, if any, with its state.
     slot: Slot,
-    /// Mounts in [`Slot::Mounted`] state in this node's subtree, the node
-    /// itself included. A node other than the root is visible (lookups,
-    /// listings, and shadowing see it) exactly when this is non-zero.
+    /// Mounts in [`Slot::Mounted`] or [`Slot::Restarting`] state in this
+    /// node's subtree, the node itself included. A node other than the root
+    /// is visible (lookups, listings, and shadowing see it) exactly when this
+    /// is non-zero.
     live: u32,
     /// Badged SEND on the root mount's namespace endpoint addressing
     /// the directory at the path corresponding to this node, used to
@@ -181,8 +222,19 @@ impl TreeNode
     {
         match &self.slot
         {
-            Slot::Mounted(mount) => Some(mount),
-            Slot::Empty | Slot::Unmounting(_) => None,
+            Slot::Mounted { mount, .. } => Some(mount),
+            Slot::Empty | Slot::Restarting { .. } | Slot::Unmounting { .. } => None,
+        }
+    }
+
+    /// Whether this node holds a mount it counts in [`Self::live`]: one
+    /// lookups cross, or one restarting.
+    fn holds_live_mount(&self) -> bool
+    {
+        match self.slot
+        {
+            Slot::Mounted { .. } | Slot::Restarting { .. } => true,
+            Slot::Empty | Slot::Unmounting { .. } => false,
         }
     }
 }
@@ -200,7 +252,7 @@ pub struct VfsdRootBackend
     root: TreeNode,
     /// Every other node; pool index `i` (from 1) is `nodes[i - 1]`.
     nodes: Vec<TreeNode>,
-    /// Nodes holding a mount, mounted or being removed; at most
+    /// Nodes holding a mount, mounted, restarting, or being removed; at most
     /// [`MAX_MOUNTS`].
     mounts: usize,
 }
@@ -284,7 +336,7 @@ impl VfsdRootBackend
     ///
     /// Returns `None`, leaving the tree unchanged, on a component that
     /// fails [`validate_name`], an attempt to mount on a node that holds
-    /// a mount (one being removed included), a re-install of the root
+    /// a mount (one restarting or being removed included), a re-install of the root
     /// mount (see [`Self::can_install`]), a tree that already holds
     /// [`MAX_MOUNTS`] mounts, or a failure to allocate the new nodes.
     pub fn install(&mut self, path: &[u8], mount: Mount) -> Option<InstallResult>
@@ -296,7 +348,10 @@ impl VfsdRootBackend
         if component_count == 0
         {
             self.root.fallthrough_cap = mount.cap;
-            self.root.slot = Slot::Mounted(mount);
+            self.root.slot = Slot::Mounted {
+                mount,
+                budget: RestartBudget::new(),
+            };
             self.root.live = self.root.live.saturating_add(1);
             self.mounts = self.mounts.saturating_add(1);
             return Some(InstallResult {
@@ -352,7 +407,10 @@ impl VfsdRootBackend
             };
             if is_last
             {
-                self.node_mut(next)?.slot = Slot::Mounted(mount);
+                self.node_mut(next)?.slot = Slot::Mounted {
+                    mount,
+                    budget: RestartBudget::new(),
+                };
             }
             else if self.node(next)?.live == 0
             {
@@ -373,7 +431,8 @@ impl VfsdRootBackend
 
     /// Whether the node at `idx` is a synthetic intermediate without a
     /// fall-through cap: a node other than the root, holding no mount
-    /// lookups cross, with a mount below it, and no `fallthrough_cap`.
+    /// lookups cross and none restarting, with a mount below it, and no
+    /// `fallthrough_cap`.
     /// An install lists such a node when it makes it visible; a node
     /// whose own mount [`Self::begin_unmount`] stopped while a mount
     /// below it stays becomes one when it had no fall-through cap before.
@@ -383,7 +442,7 @@ impl VfsdRootBackend
         idx != 0
             && self
                 .node(idx)
-                .is_some_and(|n| n.live != 0 && n.mounted().is_none() && n.fallthrough_cap == 0)
+                .is_some_and(|n| n.live != 0 && !n.holds_live_mount() && n.fallthrough_cap == 0)
     }
 
     /// The pool index of the existing node `path` names (`0` for `/`),
@@ -406,7 +465,8 @@ impl VfsdRootBackend
     /// [`UnmountError::Root`] for the synthetic root,
     /// [`UnmountError::NotMounted`] for a node holding no mount or an
     /// index outside the pool, and [`UnmountError::InProgress`] when the
-    /// mount's removal has already begun. A refusal changes nothing.
+    /// mount is restarting or its removal has already begun. A refusal
+    /// changes nothing.
     pub fn begin_unmount(&mut self, idx: u32) -> Result<Mount, UnmountError>
     {
         if idx == 0
@@ -414,15 +474,100 @@ impl VfsdRootBackend
             return Err(UnmountError::Root);
         }
         let node = self.node_mut(idx).ok_or(UnmountError::NotMounted)?;
-        let mount = match node.slot
+        let (mount, budget) = match node.slot
         {
-            Slot::Mounted(mount) => mount,
-            Slot::Unmounting(_) => return Err(UnmountError::InProgress),
+            Slot::Mounted { mount, budget } => (mount, budget),
+            Slot::Restarting { .. } | Slot::Unmounting { .. } =>
+            {
+                return Err(UnmountError::InProgress);
+            }
             Slot::Empty => return Err(UnmountError::NotMounted),
         };
-        node.slot = Slot::Unmounting(mount);
+        node.slot = Slot::Unmounting { mount, budget };
         self.adjust_live(idx, u32::saturating_sub);
         Ok(mount)
+    }
+
+    /// Begin restarting the mount on the node at `idx`, whose driver died:
+    /// charge one restart to the mount's budget at monotonic time `now_ns`
+    /// and hold the mount restarting. From now on no lookup crosses it and a
+    /// lookup that would is answered `NsError::IoError`, while its name
+    /// stays visible, so it never falls through to the root filesystem; no
+    /// install may take the node, and [`Self::begin_unmount`] refuses it,
+    /// until [`Self::finish_restart`] or [`Self::abandon_restart`]. Returns
+    /// the dead driver's record.
+    ///
+    /// # Errors
+    ///
+    /// [`RestartError::Root`] for the synthetic root,
+    /// [`RestartError::NotMounted`] for a node holding no mount or an index
+    /// outside the pool, [`RestartError::InProgress`] when the mount is
+    /// already restarting or its removal has begun, and
+    /// [`RestartError::BudgetSpent`] when the budget's open window has no
+    /// restart left. A refusal changes nothing.
+    pub fn begin_restart(&mut self, idx: u32, now_ns: u64) -> Result<Mount, RestartError>
+    {
+        if idx == 0
+        {
+            return Err(RestartError::Root);
+        }
+        let node = self.node_mut(idx).ok_or(RestartError::NotMounted)?;
+        let (mount, mut budget) = match node.slot
+        {
+            Slot::Mounted { mount, budget } => (mount, budget),
+            Slot::Restarting { .. } | Slot::Unmounting { .. } =>
+            {
+                return Err(RestartError::InProgress);
+            }
+            Slot::Empty => return Err(RestartError::NotMounted),
+        };
+        // A refused charge charges nothing (`try_charge`), so the refusal
+        // leaves the slot as it was.
+        if !budget.try_charge(now_ns)
+        {
+            return Err(RestartError::BudgetSpent);
+        }
+        node.slot = Slot::Restarting { mount, budget };
+        Ok(mount)
+    }
+
+    /// End the restart [`Self::begin_restart`] began on the node at `idx`
+    /// with the new driver's record `mount`: lookups cross it from now on,
+    /// and the mount keeps the budget the restart was charged to. `false`,
+    /// changing nothing, when no restart is under way on the node.
+    pub fn finish_restart(&mut self, idx: u32, mount: Mount) -> bool
+    {
+        let Some(node) = self.node_mut(idx)
+        else
+        {
+            return false;
+        };
+        let Slot::Restarting { budget, .. } = node.slot
+        else
+        {
+            return false;
+        };
+        node.slot = Slot::Mounted { mount, budget };
+        true
+    }
+
+    /// Give up the restart [`Self::begin_restart`] began on the node at
+    /// `idx`: the mount becomes one whose removal has begun, as after
+    /// [`Self::begin_unmount`], so its name falls through to the root
+    /// filesystem unless a mount below it keeps the node visible, and
+    /// [`Self::remove_mount`] finishes it. Returns the dead driver's record;
+    /// `None`, changing nothing, when no restart is under way on the node.
+    pub fn abandon_restart(&mut self, idx: u32) -> Option<Mount>
+    {
+        let node = self.node_mut(idx)?;
+        let Slot::Restarting { mount, budget } = node.slot
+        else
+        {
+            return None;
+        };
+        node.slot = Slot::Unmounting { mount, budget };
+        self.adjust_live(idx, u32::saturating_sub);
+        Some(mount)
     }
 
     /// Finish removing the mount whose removal [`Self::begin_unmount`]
@@ -433,7 +578,7 @@ impl VfsdRootBackend
     pub fn remove_mount(&mut self, idx: u32) -> Option<Mount>
     {
         let node = self.node_mut(idx)?;
-        let Slot::Unmounting(mount) = node.slot
+        let Slot::Unmounting { mount, .. } = node.slot
         else
         {
             return None;
@@ -445,7 +590,7 @@ impl VfsdRootBackend
 
     /// The node holding the first mount lookups cross whose record
     /// `matches`, the root first, then the other nodes in pool order; a
-    /// mount whose removal has begun is skipped. vfsd finds the mount a
+    /// mount restarting, or whose removal has begun, is skipped. vfsd finds the mount a
     /// death queue belongs to, and the mounts of a removed disk, with it.
     #[must_use]
     pub fn find_mounted(&self, matches: impl Fn(&Mount) -> bool) -> Option<u32>
@@ -456,11 +601,12 @@ impl VfsdRootBackend
             .and_then(|i| u32::try_from(i).ok())
     }
 
-    /// Whether a mount in the tree, mounted or being removed, is of the
-    /// partition at `first_lba` on the disk at index `disk`. vfsd refuses a
-    /// second mount of a partition with it, in the hold of the install, so
-    /// no two drivers serve one partition: a removal's driver may still
-    /// write until the removal finishes.
+    /// Whether a mount in the tree, mounted, restarting or being removed, is
+    /// of the partition at `first_lba` on the disk at index `disk`. vfsd
+    /// refuses a second mount of a partition with it, in the hold of the
+    /// install, so no two drivers serve one partition: a removal's driver may
+    /// still write until the removal finishes, and a restart's new driver
+    /// serves the partition when it lands.
     #[must_use]
     pub fn holds_partition(&self, disk: usize, first_lba: u64) -> bool
     {
@@ -468,16 +614,15 @@ impl VfsdRootBackend
             .chain(self.nodes.iter())
             .any(|n| match &n.slot
             {
-                Slot::Mounted(m) | Slot::Unmounting(m) =>
-                {
-                    m.disk == disk && m.first_lba == first_lba
-                }
+                Slot::Mounted { mount: m, .. }
+                | Slot::Restarting { mount: m, .. }
+                | Slot::Unmounting { mount: m, .. } => m.disk == disk && m.first_lba == first_lba,
                 Slot::Empty => false,
             })
     }
 
     /// The record of the mount lookups cross on the node at `idx`; `None`
-    /// for a node holding none, one being removed included.
+    /// for a node holding none, one restarting or being removed included.
     #[must_use]
     pub fn mounted(&self, idx: u32) -> Option<Mount>
     {
@@ -495,12 +640,12 @@ impl VfsdRootBackend
         {
             return false;
         };
-        let Slot::Unmounting(mount) = node.slot
+        let Slot::Unmounting { mount, budget } = node.slot
         else
         {
             return false;
         };
-        node.slot = Slot::Mounted(mount);
+        node.slot = Slot::Mounted { mount, budget };
         self.adjust_live(idx, u32::saturating_add);
         true
     }
@@ -521,8 +666,8 @@ impl VfsdRootBackend
     /// Whether [`Self::install`] would accept `path` against the current
     /// tree: the tree holds fewer than [`MAX_MOUNTS`] mounts, the root is
     /// not yet mounted (for `/`), every component passes
-    /// [`validate_name`], the final node holds no mount (one being removed
-    /// included), and the pool can index every node the install would
+    /// [`validate_name`], the final node holds no mount (one restarting or
+    /// being removed included), and the pool can index every node the install would
     /// create. The MOUNT path checks this before it registers a
     /// partition or spawns a driver, so a mount `install` would reject
     /// acquires nothing; only an allocation failure in `install` itself
@@ -567,7 +712,7 @@ impl VfsdRootBackend
         if let Some(last) = existing
             && !matches!(self.node(last)?.slot, Slot::Empty)
         {
-            // Path is already a mount point, or one being removed.
+            // Path is already a mount point, restarting or being removed.
             return None;
         }
         // Every index, the root's included, stays below `NONE`.
@@ -769,6 +914,12 @@ impl NamespaceBackend for VfsdRootBackend
         {
             return Err(NsError::NotFound);
         };
+        if matches!(child.slot, Slot::Restarting { .. })
+        {
+            // The mount's driver is being started again: no driver serves
+            // it, and its name must not fall through to the root filesystem.
+            return Err(NsError::IoError);
+        }
         let target = if let Some(mount) = child.mounted()
         {
             // Terminal mount: cross into the peer fs by minting a fresh
@@ -1509,5 +1660,177 @@ mod tests
         assert!(b.needs_fallthrough(a));
         let second = b.install(b"/a/c", mount(CAP + 1)).expect("install fits");
         assert_eq!(second.as_slice().len(), 0);
+    }
+
+    /// Install `path` at `cap` and begin its restart at time 0, returning
+    /// its node.
+    fn restarting(b: &mut VfsdRootBackend, path: &[u8], cap: u64) -> u32
+    {
+        assert!(b.install(path, mount(cap)).is_some());
+        let idx = b.find(path).expect("installed path has a node");
+        assert_eq!(b.begin_restart(idx, 0), Ok(mount(cap)));
+        idx
+    }
+
+    #[test]
+    fn a_restarting_mount_point_shadows_the_fall_through_and_answers_io_error()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = restarting(&mut b, b"/data", CAP);
+        assert_eq!(
+            b.lookup(NodeId::ROOT, b"data").err(),
+            Some(NsError::IoError)
+        );
+        // Still listed and still shadowing the root filesystem's name.
+        assert!(b.has_local_child(0, b"data"));
+        assert_eq!(b.local_child_count(0), 1);
+        assert!(b.readdir_entry(NodeId::ROOT, 0).unwrap().is_some());
+        // Crossed by no lookup, so no claim finds it.
+        assert_eq!(b.mounted(idx), None);
+        assert_eq!(b.find_mounted(|m| m.cap == CAP), None);
+        // Neither an intermediate needing a fall-through cap.
+        assert!(!b.needs_fallthrough(idx));
+        assert!(!b.set_fallthrough_cap(idx, CAP + 1));
+    }
+
+    #[test]
+    fn a_restarting_mount_keeps_its_partition_and_node_from_other_requests()
+    {
+        let mut b = VfsdRootBackend::new();
+        let held = mount(CAP);
+        let idx = restarting(&mut b, b"/data", CAP);
+        assert!(b.holds_partition(held.disk, held.first_lba));
+        assert!(!b.can_install(b"/data"));
+        assert!(b.install(b"/data", mount(CAP + 1)).is_none());
+        assert_eq!(b.begin_unmount(idx), Err(UnmountError::InProgress));
+        assert_eq!(b.begin_restart(idx, 1), Err(RestartError::InProgress));
+        assert!(!b.restore_mount(idx));
+        assert_eq!(b.remove_mount(idx), None);
+        // The refusals left it restarting.
+        assert_eq!(
+            b.lookup(NodeId::ROOT, b"data").err(),
+            Some(NsError::IoError)
+        );
+    }
+
+    #[test]
+    fn begin_restart_refuses_the_root_a_node_without_a_mount_and_a_removal()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/", mount(CAP)).is_some());
+        assert_eq!(b.begin_restart(0, 0), Err(RestartError::Root));
+        let a = intermediate_a(&mut b);
+        assert_eq!(b.begin_restart(a, 0), Err(RestartError::NotMounted));
+        assert_eq!(
+            b.begin_restart(UNUSED_IDX, 0),
+            Err(RestartError::NotMounted)
+        );
+        let idx = unmounting(&mut b, b"/data", CAP + 1);
+        assert_eq!(b.begin_restart(idx, 0), Err(RestartError::InProgress));
+        // The refusals left the removal under way and the root mounted.
+        assert_eq!(b.remove_mount(idx), Some(mount(CAP + 1)));
+        assert_eq!(b.root_mount_cap(), CAP);
+    }
+
+    #[test]
+    fn a_finished_restart_is_crossed_through_the_new_record()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = restarting(&mut b, b"/data", CAP);
+        let new = mount(CAP + 1);
+        assert!(b.finish_restart(idx, new));
+        assert_eq!(b.mounted(idx), Some(new));
+        assert_eq!(
+            b.find_mounted(|m| m.death_queue == new.death_queue),
+            Some(idx)
+        );
+        let view = b.lookup(NodeId::ROOT, b"data").unwrap();
+        assert!(matches!(
+            view.target,
+            EntryTarget::External { endpoint, .. } if endpoint == new.cap
+        ));
+        // Only a restart under way is finished.
+        assert!(!b.finish_restart(idx, mount(CAP + 2)));
+        assert_eq!(b.mounted(idx), Some(new));
+        assert!(!b.finish_restart(UNUSED_IDX, mount(CAP + 2)));
+    }
+
+    #[test]
+    fn restarts_past_the_burst_within_a_window_are_refused_until_it_passes()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/data", mount(CAP)).is_some());
+        let idx = b.find(b"/data").expect("installed path has a node");
+        for i in 0..restart_budget::RESTART_BURST
+        {
+            assert_eq!(
+                b.begin_restart(idx, u64::from(i)),
+                Ok(mount(CAP)),
+                "restart {i}"
+            );
+            assert!(b.finish_restart(idx, mount(CAP)));
+        }
+        let spent = u64::from(restart_budget::RESTART_BURST);
+        assert_eq!(b.begin_restart(idx, spent), Err(RestartError::BudgetSpent));
+        // The refusal left the mount crossed, for its removal to take.
+        assert_eq!(b.mounted(idx), Some(mount(CAP)));
+        assert_eq!(
+            b.begin_restart(idx, restart_budget::RESTART_WINDOW_NS),
+            Ok(mount(CAP))
+        );
+    }
+
+    #[test]
+    fn the_budget_survives_a_refused_unmount_and_is_fresh_for_a_new_mount()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/data", mount(CAP)).is_some());
+        let idx = b.find(b"/data").expect("installed path has a node");
+        for i in 0..restart_budget::RESTART_BURST
+        {
+            assert_eq!(b.begin_restart(idx, u64::from(i)), Ok(mount(CAP)));
+            assert!(b.finish_restart(idx, mount(CAP)));
+        }
+        let spent = u64::from(restart_budget::RESTART_BURST);
+        assert_eq!(b.begin_unmount(idx), Ok(mount(CAP)));
+        assert!(b.restore_mount(idx));
+        assert_eq!(b.begin_restart(idx, spent), Err(RestartError::BudgetSpent));
+        // A mount installed after the removal starts with a whole budget.
+        assert_eq!(b.begin_unmount(idx), Ok(mount(CAP)));
+        assert!(b.remove_mount(idx).is_some());
+        assert!(b.install(b"/data", mount(CAP)).is_some());
+        assert_eq!(b.begin_restart(idx, spent), Ok(mount(CAP)));
+    }
+
+    #[test]
+    fn an_abandoned_restart_is_a_removal_whose_name_falls_through()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = restarting(&mut b, b"/data", CAP);
+        assert_eq!(b.abandon_restart(idx), Some(mount(CAP)));
+        assert_eq!(
+            b.lookup(NodeId::ROOT, b"data").err(),
+            Some(NsError::NotFound)
+        );
+        assert!(!b.has_local_child(0, b"data"));
+        assert_eq!(b.local_child_count(0), 0);
+        // A removal under way: only remove_mount ends it.
+        assert_eq!(b.abandon_restart(idx), None);
+        assert!(!b.finish_restart(idx, mount(CAP + 1)));
+        assert!(!b.can_install(b"/data"));
+        assert_eq!(b.remove_mount(idx), Some(mount(CAP)));
+        assert!(b.can_install(b"/data"));
+    }
+
+    #[test]
+    fn an_abandoned_restart_below_a_kept_mount_leaves_an_intermediate_needing_a_fall_through()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = restarting(&mut b, b"/a", CAP);
+        assert!(b.install(b"/a/b", mount(CAP + 1)).is_some());
+        assert!(!b.needs_fallthrough(a));
+        assert_eq!(b.abandon_restart(a), Some(mount(CAP)));
+        assert!(b.needs_fallthrough(a));
+        assert!(b.has_local_child(0, b"a"));
     }
 }

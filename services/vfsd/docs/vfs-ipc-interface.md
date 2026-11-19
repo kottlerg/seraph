@@ -98,8 +98,8 @@ serves, under the priority and tie rules of
 [docs/storage.md](../../../docs/storage.md#gpt-role-guid-discovery): a disk
 added or inserted again after startup is found, and its partition wins or
 ties against those of the disks held before it. A partition is mounted
-once: a mount of a partition a mount holds, at another path, one whose
-removal is under way included, is rejected (`TABLE_FULL`) before any
+once: a mount of a partition a mount holds, at another path, one
+restarting or whose removal is under way included, is rejected (`TABLE_FULL`) before any
 driver is spawned, so no two drivers serve one partition. A mount that
 fails after the spawn (the `FS_MOUNT` probe, an install a concurrent
 `MOUNT` beat, an install past the tree's
@@ -145,7 +145,7 @@ on any held disk matches the role GUID after the query for new disks,
 if duplicate-priority partitions are detected, or if the disk was
 removed during the mount, `SPAWN_FAILED`, `IO_ERROR`, `TABLE_FULL` if
 the synthetic-root install fails: root already mounted, the path
-already a mount point (one whose removal is under way included), the
+already a mount point (one restarting or whose removal is under way included), the
 role's partition already mounted at another path (likewise), a path
 component the namespace protocol's name rule rejects, the tree already
 holding `MAX_MOUNTS` (1023) mounts
@@ -205,8 +205,8 @@ opens; the mount is kept.
 **Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a badge without
 `MOUNT_AUTHORITY` and for `/`, `LABEL_VERSION_MISMATCH` when `data[0]` differs from vfsd's
 `VFSD_LABELS_VERSION`, `NOT_FOUND` for an invalid path length, `NO_MOUNT` when no mount is at
-the path or its unmount is already under way, and when the mount's disk was lost while the driver
-answered `BUSY`).
+the path, its unmount is already under way or its driver is restarting, and when the mount's disk
+was lost while the driver answered `BUSY`).
 
 ---
 

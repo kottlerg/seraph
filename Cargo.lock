@@ -874,6 +874,7 @@ dependencies = [
  "process-layout",
  "procmgr-process-table",
  "recv-pool",
+ "restart-budget",
  "shmem",
  "syscall",
  "syscall-abi",
@@ -1002,6 +1003,7 @@ name = "vfsd-root-backend"
 version = "0.1.4"
 dependencies = [
  "namespace-protocol",
+ "restart-budget",
 ]
 
 [[package]]

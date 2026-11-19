@@ -269,9 +269,13 @@ never claims more than its device and the system's policy give it:
   grants no access, since the class's policy is configuration (§ Device Classes). Consumers
   treat a driver's data as untrusted. The `block` class also has the driver created inside
   memmgr's system reserve, where it may take the reserve's pages and is never evicted, from a
-  declaration of either source. A source bound would give nothing: every start of a driver after
-  the bootstrap, a restart of the boot disk's driver included, is from its drivers-directory
-  entry (§ Source), so the authority that writes `/services/drivers/` already decides the code
+  declaration of either source. A source bound would give nothing. The root disk's driver is
+  never restarted
+  ([devmgr responsibilities § Root disk](../services/devmgr/docs/responsibilities.md#root-disk)),
+  so the boot-bundle copy the boot pass binds serves that disk for the whole boot, and every
+  later start of a `block` driver, a restart or a bind after a hot-add, is from its
+  drivers-directory entry (§ Source). Either way the authority that installs the driver's
+  binary, the bundle's composer or the writer of `/services/drivers/`, already decides the code
   of the storage path in the reserve.
 - **DMA width.** The width limits the device's IOVA space and never widens it past what its
   remapping unit translates; devmgr knows no device's DMA width, so a driver declares its own.

@@ -779,10 +779,7 @@ mod tests
         );
         for left in (1..last).rev()
         {
-            assert_eq!(
-                decoder.push(&[], &[kind::CAPS, VERSION, 0, left]),
-                Ok(None)
-            );
+            assert_eq!(decoder.push(&[], &[kind::CAPS, VERSION, 0, left]), Ok(None));
         }
         assert_eq!(
             decoder.push(&[], &[kind::CAPS, VERSION, 0, 0]),

@@ -50,6 +50,7 @@ members = [
     "services/drivers/serial",
     "services/drivers/test-dma",
     "services/drivers/test-fault",
+    "services/drivers/tpm",
     "services/drivers/virtio/core",
     "services/drivers/virtio/blk",
     "services/drivers/virtio/input",

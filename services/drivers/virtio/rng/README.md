@@ -1,6 +1,6 @@
 # virtio/rng
 
-VirtIO entropy device (virtio-rng) driver: the driver of the `hwrng` device class. It serves
+VirtIO entropy device (virtio-rng) driver: a driver of the `hwrng` device class. It serves
 [`hwrng_protocol::READ`](../../../../shared/hwrng-protocol/README.md), answering each read with
 bytes the device wrote. It holds the device's capabilities and nothing more: no kernel authority,
 and no say in what the bytes are used for. Whoever reads the class decides that.

@@ -3,7 +3,8 @@
 
 // core/boot/src/acpi.rs
 
-//! Minimal ACPI table parser: RSDP → XSDT → MADT, MCFG, RHCT, SSDT (VMGENID).
+//! Minimal ACPI table parser: RSDP → XSDT → MADT, MCFG, DMAR, TPM2, RHCT,
+//! SSDT (VMGENID).
 //!
 //! Reads tables in-place from identity-mapped physical memory. No allocation.
 //! Architecture-neutral: runs on any platform where `acpi_rsdp != 0`, which
@@ -22,7 +23,7 @@
 //!   the hardware IDs `BootInfo.cpu_ids` names.
 //! - [`count_aperture_seed`]: the aperture-seed walk counting the register
 //!   and heuristic-window seeds, which sizes the seed buffers.
-//! - [`parse_aperture_seed`]: MADT + MCFG + DMAR walk, plus the arch's
+//! - [`parse_aperture_seed`]: MADT + MCFG + DMAR + TPM2 walk, plus the arch's
 //!   platform-default MMIO apertures and PCI windows
 //!   (`core/boot/docs/acpi.md` § Tables Consumed), producing the register
 //!   and heuristic-window MMIO aperture seeds fed into
@@ -840,6 +841,8 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// - Each MCFG ECAM window.
 /// - Each VT-d remapping unit's register set (DMAR DRHD), which no other
 ///   table names.
+/// - The TPM's register window, when a `TPM2` table names a start method the
+///   TPM driver speaks ([`tpm2_register_window`]).
 /// - The arch's platform-default register windows from
 ///   `crate::arch::current::default_mmio_apertures` (empty on x86-64),
 ///   appended once the RSDP and XSDT validate.
@@ -867,7 +870,7 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// ACPI RSDP. A zero `rsdp_addr` returns zero counts without reading.
 #[expect(
     clippy::too_many_lines,
-    reason = "linear walk over MADT, MCFG, and DMAR with per-entry push dispatch; the cases are \
+    reason = "linear walk over MADT, MCFG, DMAR, and TPM2 with per-entry push dispatch; the cases are \
               flat and inline-local, splitting them loses the walk's shape"
 )]
 unsafe fn walk_aperture_seed(
@@ -1084,6 +1087,17 @@ unsafe fn walk_aperture_seed(
                 rest = tail;
             }
         }
+        else if &sig == b"TPM2"
+        {
+            // The TPM's register window, which devmgr hands the TPM driver as
+            // an `Mmio` cap: the table names the interface, the arch's
+            // platform profile the range.
+            let platform = crate::arch::current::tpm_register_window();
+            if let Some((base, size)) = tpm2_register_window(table, platform)
+            {
+                push!(base, size);
+            }
+        }
     }
 
     // Per-arch platform-default MMIO apertures; the early returns above
@@ -1134,6 +1148,53 @@ fn drhd_register_window(entry: &[u8], kind: u16) -> Option<(u64, u64)>
     }
     base.checked_add(size)?;
     Some((base, size))
+}
+
+// TPM2 (TCG ACPI Specification, the TPM 2.0 table), after the SDT header:
+//  36: platform_class(u16)  38: reserved(u16)
+//  40: crb_control_area(u64)  48: start_method(u32)
+//  52: start-method parameters, then the optional log fields.
+const TPM2_OFF_CONTROL_AREA: usize = SDT_HDR_LEN + 4;
+const TPM2_OFF_START_METHOD: usize = SDT_HDR_LEN + 12;
+/// The shortest `TPM2` table: through the start method.
+const TPM2_MIN_LEN: usize = TPM2_OFF_START_METHOD + 4;
+/// Start method 6: the FIFO (TIS) interface, memory-mapped.
+const TPM2_START_FIFO: u32 = 6;
+/// Start method 7: the CRB interface, started through its `CRB_CTRL_START`
+/// register.
+const TPM2_START_CRB: u32 = 7;
+
+/// The TPM register window to seed for the `TPM2` table `table`, given the
+/// platform's TPM window `platform` (`crate::arch::current::tpm_register_window`):
+/// `platform` when the table names the FIFO interface (start method 6), or
+/// the CRB interface (start method 7) with its control area inside
+/// `platform`. `None` for any other start method, which the TPM driver does
+/// not speak (an ACPI-started CRB, a firmware TPM reached by SMC), a table
+/// shorter than its start method, a CRB control area elsewhere, or a
+/// platform with no TPM window.
+///
+/// The table gives no range of its own: its one address is the CRB control
+/// area's, inside locality 0, and the FIFO interface has none.
+fn tpm2_register_window(table: &[u8], platform: Option<(u64, u64)>) -> Option<(u64, u64)>
+{
+    let (base, size) = platform?;
+    if table.len() < TPM2_MIN_LEN
+    {
+        return None;
+    }
+    match read_u32(table, TPM2_OFF_START_METHOD)
+    {
+        TPM2_START_FIFO => Some((base, size)),
+        TPM2_START_CRB =>
+        {
+            let control = read_u64(table, TPM2_OFF_CONTROL_AREA);
+            control
+                .checked_sub(base)
+                .is_some_and(|offset| offset < size)
+                .then_some((base, size))
+        }
+        _ => None,
+    }
 }
 
 /// ECAM window `(phys_base, size)` of one MCFG allocation entry: the MCFG
@@ -1192,6 +1253,65 @@ mod tests
         assert_eq!(drhd_register_window(&drhd(0, 0), 0), None);
         assert_eq!(drhd_register_window(&drhd(0, 0xfed9_0010), 0), None);
         assert_eq!(drhd_register_window(&drhd(0, !0xfff), 0), None);
+    }
+
+    /// The PC Client TPM window the tests give [`tpm2_register_window`].
+    const TPM_WINDOW: (u64, u64) = (0xFED4_0000, 0x5000);
+
+    /// A synthetic `TPM2` table: `start_method`, the CRB control area at
+    /// `control`, and no start-method parameters.
+    fn tpm2(start_method: u32, control: u64) -> Vec<u8>
+    {
+        let mut body = vec![0u8; 4];
+        body.extend_from_slice(&control.to_le_bytes());
+        body.extend_from_slice(&start_method.to_le_bytes());
+        body.extend_from_slice(&[0u8; 12]);
+        sdt(*b"TPM2", &body)
+    }
+
+    // Defect caught: a TPM the table names left without an aperture, so
+    // devmgr refuses to carve its register window and the driver never binds.
+    #[test]
+    fn a_fifo_or_crb_tpm2_table_seeds_the_platform_window()
+    {
+        let platform = Some(TPM_WINDOW);
+        assert_eq!(tpm2_register_window(&tpm2(6, 0), platform), platform);
+        assert_eq!(
+            tpm2_register_window(&tpm2(7, 0xFED4_0040), platform),
+            platform
+        );
+    }
+
+    // Defect caught: a seed for a TPM the driver does not speak or the
+    // window does not hold, granting devmgr a range no device decodes.
+    #[test]
+    fn another_start_method_or_a_crb_elsewhere_seeds_nothing()
+    {
+        let platform = Some(TPM_WINDOW);
+        // ACPI start, and the CRB with ACPI start.
+        assert_eq!(tpm2_register_window(&tpm2(2, 0xFED4_0040), platform), None);
+        assert_eq!(tpm2_register_window(&tpm2(8, 0xFED4_0040), platform), None);
+        // A CRB control area below and past the window.
+        assert_eq!(tpm2_register_window(&tpm2(7, 0xFED3_F040), platform), None);
+        assert_eq!(tpm2_register_window(&tpm2(7, 0xFED4_5040), platform), None);
+        // A table cut before its start method.
+        assert_eq!(
+            tpm2_register_window(&tpm2(6, 0)[..TPM2_MIN_LEN - 1], platform),
+            None
+        );
+        // A platform with no TPM window.
+        assert_eq!(tpm2_register_window(&tpm2(6, 0), None), None);
+    }
+
+    // Defect caught: the walk not reading the `TPM2` table, or seeding a
+    // window on a platform whose profile places none.
+    #[test]
+    fn the_walk_seeds_the_arch_tpm_window_from_a_tpm2_table()
+    {
+        let expected: Vec<(u64, u64)> = crate::arch::current::tpm_register_window()
+            .into_iter()
+            .collect();
+        assert_eq!(named_seeds(&tpm2(7, 0xFED4_0040)), expected);
     }
 
     #[test]
@@ -1444,11 +1564,11 @@ mod tests
     }
 
     /// The named seeds, sorted, that the ACPI walk finds in an XSDT holding
-    /// only `madt`, less the arch's platform defaults.
-    fn madt_named_seeds(madt: &[u8]) -> Vec<(u64, u64)>
+    /// only `table`, less the arch's platform defaults.
+    fn named_seeds(table: &[u8]) -> Vec<(u64, u64)>
     {
         let mut xsdt_body = Vec::new();
-        xsdt_body.extend_from_slice(&(madt.as_ptr() as u64).to_le_bytes());
+        xsdt_body.extend_from_slice(&(table.as_ptr() as u64).to_le_bytes());
         let xsdt = sdt(*b"XSDT", &xsdt_body);
         let mut rsdp = [0u8; 36];
         rsdp[..8].copy_from_slice(RSDP_SIG);
@@ -1461,7 +1581,7 @@ mod tests
             phys_base: 0,
             size: 0,
         };
-        // SAFETY: rsdp, xsdt and the MADT are live, well-formed tables at the
+        // SAFETY: rsdp, xsdt and `table` are live, well-formed tables at the
         // addresses they name.
         let (named, heuristic) = unsafe { count_aperture_seed(addr) };
         let mut out = vec![empty; named];
@@ -1483,7 +1603,7 @@ mod tests
     fn the_qemu_virt_aia_madt_seeds_the_aplic_and_the_imsic_files()
     {
         assert_eq!(
-            madt_named_seeds(QEMU_VIRT_AIA_MADT),
+            named_seeds(QEMU_VIRT_AIA_MADT),
             [
                 (0xd00_0000, 0x8000),
                 (0x2800_0000, 0x1000),
@@ -1506,7 +1626,7 @@ mod tests
             let at = qemu_rintc_off(hart) + 24;
             madt[at..at + 8].copy_from_slice(&file.to_le_bytes());
         }
-        let seeds = madt_named_seeds(&madt);
+        let seeds = named_seeds(&madt);
         assert_eq!(
             seeds,
             [

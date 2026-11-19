@@ -230,6 +230,15 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::ServicesDrivers,
         arch_only: Some(Arch::X86_64),
     },
+    // The TPM 2.0 driver: devmgr binds it to the ACPI `MSFT0101` device, an
+    // x86-64 PC Client TPM, which a launch attaches only for `test-tpm`.
+    Spec {
+        name: "tpm",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::ServicesDrivers,
+        arch_only: Some(Arch::X86_64),
+    },
     Spec {
         name: "goldfish-rtc",
         install_name: None,

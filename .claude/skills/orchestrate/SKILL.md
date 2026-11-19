@@ -62,7 +62,8 @@ only if that does not cure it.
    its report (a gate report, a question that blocks it, a composition check's verdict, a
    stand-down line). Forward a notification in one line: the worker and the notification's
    status.
-5. **Do for the orchestrator what only the top session can**: stop an agent it names, schedule
+5. **Do for the orchestrator what only the top session can**: stop an agent it names and tell it
+   once the stop is confirmed (a respawn into that agent's worktree waits for it), schedule
    or cancel a tick it asks for, apply a `.claude/CLAUDE.md`, settings or hook patch on the
    maintainer's direct word in this conversation, and make a `release-review` workflow call it
    gives you: save the report and the returned object to the paths it names, show the

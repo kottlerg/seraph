@@ -80,6 +80,17 @@ services/drivers/
 │   ├── README.md
 │   └── src/
 │       └── main.rs
+├── tpm/                            # TPM 2.0 driver: the hwrng class (binary + lib; x86-64)
+│   ├── Cargo.toml
+│   ├── README.md                   # hwrng binding, READ
+│   └── src/
+│       ├── lib.rs                  # Interface id, GetRandom loop, READ gate (host-tested)
+│       ├── command.rs              # TPM2 command marshalling (host-tested)
+│       ├── regs.rs                 # Register access, wait bound, faults
+│       ├── fifo.rs                 # FIFO (TIS) interface (host-tested)
+│       ├── crb.rs                  # CRB interface (host-tested)
+│       ├── sim.rs                  # Simulated TPM (test only)
+│       └── main.rs
 ├── virtio/
 │   ├── core/                       # Shared VirtIO transport and queue primitives (library)
 │   │   ├── Cargo.toml
@@ -118,6 +129,7 @@ services/drivers/
 │           └── main.rs
 └── docs/
     ├── driver-model.md             # Driver lifecycle and capability delegation
+    ├── tpm.md                      # TPM 2.0 driver: discovery, FIFO and CRB, commands, bounds
     └── virtio-architecture.md      # VirtIO transport abstraction and queue internals
 ```
 
@@ -190,6 +202,7 @@ The full driver lifecycle is specified in
 | [`virtio/input/`](virtio/input/README.md) | Binary + library | VirtIO input (keyboard) device driver — decodes `EV_KEY` events into keysyms; answers `INPUT_READ_EVENTS` behind devmgr's `QUERY_DEVICE` on the `input` class |
 | [`virtio/console/`](virtio/console/README.md) | Binary + library | VirtIO console device driver — the debug port; serves the serial protocol behind devmgr's `QUERY_DEVICE` on the `debug-port` class |
 | [`virtio/rng/`](virtio/rng/README.md) | Binary + library | VirtIO entropy device driver — serves `hwrng_protocol::READ` behind devmgr's `QUERY_DEVICE` on the `hwrng` class; holds no kernel authority |
+| [`tpm/`](tpm/README.md) | Binary + library | TPM 2.0 driver (x86-64) — bound by devmgr to the record whose `_HID` is `MSFT0101`; serves `hwrng_protocol::READ` with `TPM2_GetRandom` behind devmgr's `QUERY_DEVICE` on the `hwrng` class; holds no kernel authority |
 | [`serial/`](serial/README.md) | Binary | Serial (UART) device driver — COM1 (x86-64) / NS16550 (RISC-V); sole driver-mediated serial-byte sink |
 | [`framebuffer/`](framebuffer/README.md) | Binary + library | Linear framebuffer text driver — owns the GOP framebuffer MMIO; sole driver-mediated framebuffer-byte sink |
 | [`cmos/`](cmos/README.md) | Binary + library | x86-64 CMOS / MC146818 RTC driver — bound by devmgr to the record whose `_HID` or a `_CID` is `PNP0B00`, `PNP0B01` or `PNP0B02`; answers `RTC_GET_EPOCH_TIME` behind devmgr's `QUERY_DEVICE` on the `rtc` class |
@@ -226,6 +239,7 @@ driver, and reuses shared crates such as
 | Document | Content |
 |---|---|
 | [docs/driver-model.md](docs/driver-model.md) | Driver lifecycle and capability delegation |
+| [docs/tpm.md](docs/tpm.md) | TPM 2.0 driver: discovery, the FIFO and CRB interfaces, commands, bounds |
 | [docs/virtio-architecture.md](docs/virtio-architecture.md) | VirtIO transport abstraction and queue internals |
 | [docs/device-management.md](../../docs/device-management.md) | Driver lifecycle, DMA safety, security boundary |
 | [docs/ipc-design.md](../../docs/ipc-design.md) | IPC semantics, endpoints, message format |

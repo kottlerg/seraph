@@ -2497,6 +2497,14 @@ enum FaultDecline
     /// subtree of the process's budget node, or of an ancestor, over its max
     /// (services/memmgr/docs/memory-pool.md § Distribution policy).
     BudgetLimit = 10,
+    /// A commit overrun: the faulting page lies in a committed region, or its
+    /// chunk is an evicted chunk of one, whose pages `promised` holds, and the
+    /// free pool has no frame for it even after memmgr evicted victims in its
+    /// turn ([`evict::draw_room`]). Only an overcommit allowance above 0, or
+    /// memmgr's own metadata taking the free pages `promised` counts, leaves
+    /// the pool short of `promised` (services/memmgr/docs/memory-pool.md
+    /// § Commit, Overcommit).
+    CommitOverrun = 11,
     /// The faulting page's chunk is on disk, its pages in a swap slot only
     /// (services/memmgr/docs/memory-pool.md § Disk tier): detail
     /// [`disk::DETAIL_UNREGISTERED`] when no swap service is registered to
@@ -2536,27 +2544,43 @@ pub(crate) fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64
 /// `rec` takes ([`admissible`]): the span, clamped to the headroom under the
 /// max of the node and its ancestors and to the free pages outside `promised`
 /// above, for a node outside the reserve, the growth floor. A fault in a
-/// committed region is admitted whole without that: its commitment carries the
-/// span's charge and `promised` its pages. Then select the run that backs those
-/// pages: one covering them, else the largest free run. The span is a
+/// committed region is admitted without that, since its commitment carries the
+/// span's charge and `promised` its pages: it draws from `promised`, the span
+/// clamped to the frames the draw may take, which memmgr evicts victims for
+/// when they are short ([`evict::draw_room`]). Then select the run that backs
+/// those pages: one covering them, else the largest free run. The span is a
 /// fault-around preference, so the fault is declined only when not even the
 /// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
 /// [`FaultDecline::NoFreePage`] at the growth floor or when the selection
-/// fails.
+/// fails (a split, after a draw found a page), and
+/// [`FaultDecline::CommitOverrun`] for a committed draw that finds no frame.
 fn select_fault_run(
     l: &mut MemLedger,
     target: &FaultTarget,
     span_pages: u32,
 ) -> Result<Grant, FaultDecline>
 {
-    let admitted = if target.committed.is_some()
+    if let Some(reg) = target.committed
     {
-        Ok(u64::from(span_pages))
+        // The chunk the fault backs, which its own draw does not evict.
+        let spare = l
+            .region_for(target.rec, target.page_base)
+            .map(|(_, region)| (reg, chunk_for(&region, target.page_base).0));
+        // The span is a preference: the draw evicts only for the faulting page.
+        let room = evict::draw_room(l, target.rec, u64::from(span_pages), 1, spare);
+        // At most `span_pages`, so it fits a `u32`.
+        let pages = u32::try_from(room).unwrap_or(span_pages);
+        if pages == 0
+        {
+            return Err(FaultDecline::CommitOverrun);
+        }
+        // The draw found a free page, so a selection can fail only to split a
+        // run, as an uncommitted fault's can.
+        return select(l, pages, Fit::Contiguous)
+            .or_else(|_| select(l, pages, Fit::UpTo))
+            .map_err(|_| FaultDecline::NoFreePage);
     }
-    else
-    {
-        admissible(l, target.rec, u64::from(span_pages))
-    };
+    let admitted = admissible(l, target.rec, u64::from(span_pages));
     match admitted
     {
         Ok(pages) =>

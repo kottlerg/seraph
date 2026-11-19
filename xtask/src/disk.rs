@@ -1095,16 +1095,17 @@ mod tests
 
             // The data volume is populated, and reads back, at this size.
             let mut file = File::open(&main).unwrap();
-            let tree = fat::read::read_volume(
+            let tree = crate::fat_read::read_volume(
                 &mut file,
                 starts[2] * block,
                 block_size.fat_sector().into(),
-            );
+            )
+            .unwrap();
             assert_eq!(
                 tree.into_iter().collect::<Vec<_>>(),
                 [(
                     "/test.txt".to_owned(),
-                    fat::read::Node::File(b"seraph".to_vec())
+                    crate::fat_read::Node::File(b"seraph".to_vec())
                 )]
             );
         }
@@ -1228,7 +1229,7 @@ mod tests
     #[test]
     fn a_substitute_replaces_the_named_file_on_its_volume_alone()
     {
-        use crate::fat::read::{Node, read_volume};
+        use crate::fat_read::{Node, read_volume};
 
         let scratch = Scratch::new("substitute");
         let sysroot = scratch.0.join("sysroot");
@@ -1282,12 +1283,12 @@ mod tests
 
         let mut image = File::open(&main).unwrap();
         let file = |bytes: &[u8]| Some(Node::File(bytes.to_vec()));
-        let esp = read_volume(&mut image, IMAGE_MARGIN, 512);
+        let esp = read_volume(&mut image, IMAGE_MARGIN, 512).unwrap();
         assert_eq!(
             esp.get("/EFI/seraph/kernel"),
             file(b"tampered kernel").as_ref()
         );
-        let root = read_volume(&mut image, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512);
+        let root = read_volume(&mut image, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512).unwrap();
         assert_eq!(
             root.get("/services/timed"),
             file(b"tampered timed").as_ref()
@@ -1300,7 +1301,8 @@ mod tests
             &mut image,
             IMAGE_MARGIN + ESP_PARTITION_SIZE + ROOT_PARTITION_SIZE,
             512,
-        );
+        )
+        .unwrap();
         assert_eq!(data.get("/note"), file(b"tampered note").as_ref());
         assert_eq!(fs::read(sysroot.join("services/timed")).unwrap(), b"timed");
 
@@ -1332,7 +1334,7 @@ mod tests
     #[test]
     fn the_root_partition_carries_the_installed_boot_files_and_no_metadata()
     {
-        use crate::fat::read::{Node, read_volume};
+        use crate::fat_read::{Node, read_volume};
 
         let scratch = Scratch::new("root-content");
         let sysroot = scratch.0.join("sysroot");
@@ -1364,7 +1366,7 @@ mod tests
         )
         .unwrap();
         let mut image = File::open(&main).unwrap();
-        let root = read_volume(&mut image, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512);
+        let root = read_volume(&mut image, IMAGE_MARGIN + ESP_PARTITION_SIZE, 512).unwrap();
         let file = |bytes: &[u8]| Some(Node::File(bytes.to_vec()));
         assert_eq!(root.get("/boot/kernel"), file(b"kernel").as_ref());
         assert_eq!(root.get("/boot/boot.efi"), file(b"bootloader").as_ref());
@@ -1375,7 +1377,7 @@ mod tests
                 "{absent}"
             );
         }
-        let esp = read_volume(&mut image, IMAGE_MARGIN, 512);
+        let esp = read_volume(&mut image, IMAGE_MARGIN, 512).unwrap();
         assert_eq!(esp.get("/EFI/seraph/kernel"), file(b"kernel").as_ref());
     }
 

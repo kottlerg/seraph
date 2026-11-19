@@ -27,6 +27,16 @@ use crate::{CHUNK_BYTES, DEMAND_CHUNK_PAGES};
 
 use syscall_abi::PAGE_SIZE;
 
+/// The overcommit allowance: the pages `promised` may exceed the free pool by.
+/// A commitment is admitted against the free pool and the allowance less
+/// `promised`, so with an allowance above 0 memmgr may promise pages it holds
+/// no frame for, and a committed fault that then finds no frame evicts a
+/// victim in its turn or is declined as a commit overrun; committed chunks
+/// become evictable (`services/memmgr/docs/memory-pool.md` § Commit,
+/// Overcommit). 0: every commitment is backed by a free page, so a committed
+/// fault always finds one (docs/limits.md § memmgr).
+pub const OVERCOMMIT_ALLOWANCE_PAGES: u64 = 0;
+
 /// Pages of each page-table donation a committed region's fault draws from
 /// the region's reservation, and the pages the reservation holds for each
 /// intermediate page table a map of the region can need.

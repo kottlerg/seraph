@@ -42,9 +42,10 @@
 //! A committed region is charged its whole length and its page-table
 //! reservation when it is committed or extended, and its runs are charged
 //! nothing more when they are backed; the ledger counts in `promised` the pages
-//! committed regions can still take ([`crate::commit`]), and every admission
-//! reads the free pool less `promised` (`services/memmgr/docs/memory-pool.md`
-//! § Commit).
+//! committed regions can still take ([`crate::commit`]), an evicted chunk's
+//! among them, and every admission reads the free pool less `promised`, with
+//! the overcommit allowance for a commitment
+//! (`services/memmgr/docs/memory-pool.md` § Commit).
 
 use crate::arena::{
     Arena, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, LimitReg, NO_REGION_ID,
@@ -239,6 +240,9 @@ pub struct Ledger<S, W>
     /// not drawn, and what the arena's growth has not drawn of their metadata
     /// bounds ([`crate::commit`]).
     promised: u64,
+    /// The overcommit allowance: the pages `promised` may exceed the free pool
+    /// by ([`commit::OVERCOMMIT_ALLOWANCE_PAGES`] until it is set).
+    allowance: u64,
     /// Pool pages the compressed store holds: the store runs of every compressed
     /// chunk.
     store_pages: u64,
@@ -262,6 +266,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             deferred: DeferredList::new(),
             index: ProcessIndex::new(words),
             promised: 0,
+            allowance: commit::OVERCOMMIT_ALLOWANCE_PAGES,
             store_pages: 0,
             swapped_pages: 0,
             slots: SwapSlots::new(swap_words),
@@ -310,12 +315,62 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.promised
     }
 
-    /// Free pages no committed region is promised: the free pool less
-    /// `promised`, which every admission reads.
+    /// The overcommit allowance: the pages `promised` may exceed the free pool
+    /// by (`services/memmgr/docs/memory-pool.md` § Commit, Overcommit).
+    #[must_use]
+    pub const fn allowance(&self) -> u64
+    {
+        self.allowance
+    }
+
+    /// Set the overcommit allowance to `pages`.
+    pub const fn set_allowance(&mut self, pages: u64)
+    {
+        self.allowance = pages;
+    }
+
+    /// The pages a commitment may still promise: the free pool and the
+    /// overcommit allowance, less `promised`, which a committed registration
+    /// or growth reads ([`Ledger::admit_commit`]).
+    #[must_use]
+    pub fn promise_free(&self) -> u64
+    {
+        self.pool
+            .free_pages()
+            .saturating_add(self.allowance)
+            .saturating_sub(self.promised)
+    }
+
+    /// Free pages no committed region is promised: the free pages a charge
+    /// that takes frames now may take, which every other admission and the
+    /// pressure level read. They are [`Ledger::promise_free`], and at most
+    /// the free pool itself: with an allowance above 0 the free pool can be
+    /// the lesser, and the growth floor stays one of free frames.
     #[must_use]
     pub fn uncommitted_free(&self) -> u64
     {
-        self.pool.free_pages().saturating_sub(self.promised)
+        self.promise_free().min(self.pool.free_pages())
+    }
+
+    /// The most pages a committed draw (a fault in a committed region, or a
+    /// restore of a committed chunk, each drawing from `promised`) may take
+    /// from the free pool: every free page while the pool covers `promised`,
+    /// else only those above `reserve`, the system reserve for a budget node
+    /// outside it and 0 for a reserve node. With an allowance of 0 the pool
+    /// always covers `promised`, so a draw is never short while a page is
+    /// free (`services/memmgr/docs/memory-pool.md` § Commit, Overcommit).
+    #[must_use]
+    pub fn draw_room(&self, reserve: u64) -> u64
+    {
+        let free = self.pool.free_pages();
+        if free >= self.promised
+        {
+            free
+        }
+        else
+        {
+            free.saturating_sub(reserve)
+        }
     }
 
     /// The free pages outside `promised` that a charge to a node outside the
@@ -559,8 +614,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// committed, with `reserve` the free pages a charge to a node outside the
     /// system reserve must leave ([`Self::growth_floor`]): its data pages and
     /// page-table reservation charged to the budget node of `rec`, and those
-    /// and its metadata bound taken from the free pages outside `promised`
-    /// ([`budget::admit`]). A record that does not exist admits nothing.
+    /// and its metadata bound taken from the pages a commitment may still
+    /// promise ([`Self::promise_free`]; [`budget::admit`]). A commitment takes
+    /// no frame when it is made, so the overcommit allowance counts here
+    /// whole. A record that does not exist admits nothing.
     ///
     /// # Errors
     /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
@@ -572,7 +629,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ) -> Result<(), ChargeError>
     {
         let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
-        let free = self.uncommitted_free();
+        let free = self.promise_free();
         if free < need.meta
         {
             return Err(ChargeError::Reserve);
@@ -1431,10 +1488,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.settle(rec, charged, released);
         let cut = commit::grow_need(new_len, old_len);
         // The chunks cut lay in the pages cut, so the pages that held data, in
-        // runs or in the store, are at most those.
+        // runs or in the store, are at most those. The charge of the evicted
+        // ones went with them ([`Ledger::settle`]); `promised` held every page
+        // cut that held no run, the evicted ones among them.
         let unbacked = cut
             .pages
             .saturating_sub(released.run_pages.saturating_add(released.swapped));
+        let unpromised = cut.pages.saturating_sub(released.run_pages);
         let meta = cut.meta.min(c.meta_left);
         node.region = new_region;
         self.arena.set_node(reg, Node::Region(node));
@@ -1446,7 +1506,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             },
         );
         budget::uncharge(&mut self.arena, charged, unbacked);
-        self.promised = self.promised.saturating_sub(unbacked.saturating_add(meta));
+        self.promised = self
+            .promised
+            .saturating_sub(unpromised.saturating_add(meta));
         Ok(())
     }
 
@@ -1534,8 +1596,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// the region's bound rising by it, at most to [`commit::meta_bound`] of
     /// its length). A refault of a discarded page is then admitted from
     /// `promised` as its first touch was, so it is declined for neither budget
-    /// nor RAM. A compressed chunk, which only an uncommitted region holds, frees
-    /// its store to the free pool and its pages' charge ([`Ledger::settle`]).
+    /// nor RAM. An evicted chunk frees its store to the free pool, and in an
+    /// uncommitted region its pages' charge ([`Ledger::settle`]); in a
+    /// committed region its pages are in `promised` already.
     /// A range that holds no run changes nothing, so a repeat is safe.
     /// Returns the pages that held data: those of the runs taken back and of
     /// the compressed chunks freed.
@@ -1609,7 +1672,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             self.set_commitment(reg, Commitment { meta_left, ..c });
             self.promised = self
                 .promised
-                .saturating_add(run_pages)
+                .saturating_add(released.run_pages)
                 .saturating_add(meta_left.saturating_sub(c.meta_left));
         }
         Ok(run_pages)
@@ -1912,11 +1975,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Whether the chunks of region `reg` of the record `rec` may be evicted:
-    /// the region is uncommitted and not registered no-evict, and the
-    /// record's budget node is not a reserve node, whose process frees memory
-    /// under exhaustion and must not wait on a restore to do so
-    /// (`services/memmgr/docs/memory-pool.md` § Eviction). A committed chunk is
-    /// not evicted: evicting it frees no page outside `promised`.
+    /// the region is not registered no-evict, it is uncommitted or the
+    /// overcommit allowance is above 0, and the record's budget node is not a
+    /// reserve node, whose process frees memory under exhaustion and must not
+    /// wait on a restore to do so (`services/memmgr/docs/memory-pool.md`
+    /// § Eviction). With an allowance of 0 a committed chunk is not evicted:
+    /// its restore would draw from `promised`, so evicting it frees no page
+    /// outside it and takes store pages ([`Ledger::evicting_frees`]).
     #[must_use]
     pub fn evictable(&self, rec: NodeIdx, reg: NodeIdx) -> bool
     {
@@ -1925,9 +1990,24 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return false;
         };
-        self.commit_at(node.commit).is_none()
+        (self.commit_at(node.commit).is_none() || self.allowance > 0)
             && node.region.evict == Evict::Allowed
             && budget::node(&self.arena, r.budget).is_some_and(|b| !b.reserve())
+    }
+
+    /// Whether evicting a chunk of the region `reg` raises the free pages
+    /// outside `promised` ([`Ledger::uncommitted_free`]). An uncommitted chunk's
+    /// eviction frees its runs less its store pages. A committed chunk's frees
+    /// them too, but its pages join `promised` again, since its restore draws
+    /// from it, so the pages a commitment may still promise fall by its store
+    /// pages: it raises the free pages outside `promised` only while the free
+    /// pool, not `promised`, bounds them, which a chunk's pages more in
+    /// `promised` leave so when they keep it within the allowance.
+    #[must_use]
+    pub fn evicting_frees(&self, reg: NodeIdx) -> bool
+    {
+        !self.is_committed(reg)
+            || self.promised.saturating_add(u64::from(DEMAND_CHUNK_PAGES)) <= self.allowance
     }
 
     /// The region node `reg` of `rec` and the chunk holding `page_base` in it:
@@ -2040,7 +2120,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// `quiescent` decides, charged to no node, since the record's budget node
     /// stays charged for the chunk's pages. `store_pages` rises by the store
     /// runs' pages, and `swapped_pages` and the record's swapped count by the
-    /// chunk's backed pages. Returns the pages of the runs taken back.
+    /// chunk's backed pages, and, for a chunk of a committed region, whose
+    /// restore draws from `promised` as its first touch did, so does
+    /// `promised`. Returns the pages of the runs taken back.
     ///
     /// # Errors
     /// [`SwapError::NoRegion`], [`SwapError::Stale`] when the chunk is not
@@ -2103,6 +2185,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
         self.put_chunk(reg, node, height, index, compressed);
         let pages = u64::from(entry.backed().count_ones());
+        if self.commit_at(node.commit).is_some()
+        {
+            self.promised = self.promised.saturating_add(pages);
+        }
         self.store_pages = self.store_pages.saturating_add(store_pages);
         self.swapped_pages = self.swapped_pages.saturating_add(pages);
         self.update_caps(rec, |c| c.swapped = c.swapped.saturating_add(pages));
@@ -2191,8 +2277,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// write is cancelled, its slot kept until the swap service ends the write
     /// ([`Ledger::finish_write`]); an on-disk chunk's slot is freed, and
     /// `disk_pages` falls. The runs are charged nothing: the budget node
-    /// stayed charged for the chunk's pages while they were evicted. Returns
-    /// the store pages freed.
+    /// stayed charged for the chunk's pages while they were evicted. A chunk of
+    /// a committed region takes its pages off `promised`, as a fault's run
+    /// does ([`Ledger::back_chunk`]). Returns the store pages freed.
     ///
     /// # Errors
     /// [`SwapError::NoRegion`], [`SwapError::Chunk`] for a chunk in another
@@ -2253,6 +2340,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             self.drop_disk(disk, pages);
         }
         self.put_chunk(reg, node, height, index, resident);
+        if self.commit_at(node.commit).is_some()
+        {
+            self.promised = self.promised.saturating_sub(pages);
+        }
         self.store_pages = self.store_pages.saturating_sub(store_pages);
         self.swapped_pages = self.swapped_pages.saturating_sub(pages);
         self.update_caps(rec, |c| c.swapped = c.swapped.saturating_sub(pages));
@@ -2876,14 +2967,20 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         if let Some(c) = self.commit_at(node.commit)
         {
             // The chunks lay in the region, so the pages that held data, in
-            // runs or in the store, are at most its own.
-            let unbacked = (node.region.len / PAGE_SIZE)
-                .saturating_sub(released.run_pages.saturating_add(released.swapped));
+            // runs or in the store, are at most its own. `promised` held every
+            // page that held no run, the evicted ones among them, whose charge
+            // went with them.
+            let pages = node.region.len / PAGE_SIZE;
+            let unbacked =
+                pages.saturating_sub(released.run_pages.saturating_add(released.swapped));
             let held = unbacked.saturating_add(c.pt_left);
             budget::uncharge(&mut self.arena, charged, held);
-            self.promised = self
-                .promised
-                .saturating_sub(held.saturating_add(c.meta_left));
+            self.promised = self.promised.saturating_sub(
+                pages
+                    .saturating_sub(released.run_pages)
+                    .saturating_add(c.pt_left)
+                    .saturating_add(c.meta_left),
+            );
             self.arena.free(node.commit);
         }
     }
@@ -4600,6 +4697,130 @@ mod tests
         assert_eq!(usage(&l, rec), (4, 4));
         assert_eq!(promised(&l), 0);
         assert_eq!(l.uncommitted_free(), 10_000);
+    }
+
+    #[test]
+    fn the_allowance_lets_a_commitment_promise_past_the_free_pool_and_no_other_charge()
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let need = commit::grow_need(0, 64 * CHUNK);
+        assert!(need.promised() > 1000);
+        // With no allowance a commitment is promised only free pages.
+        assert_eq!(l.allowance(), commit::OVERCOMMIT_ALLOWANCE_PAGES);
+        assert_eq!(l.allowance(), 0);
+        assert_eq!(l.admit_commit(rec, need, 0), Err(ChargeError::Reserve));
+        assert_eq!(l.draw_room(16), 1000);
+        // With one, past them by up to the allowance.
+        l.set_allowance(500);
+        assert_eq!(l.promise_free(), 1500);
+        assert_eq!(l.uncommitted_free(), 1000);
+        assert_eq!(l.admit_commit(rec, need, 0), Ok(()));
+        let reg = l
+            .add_region(rec, region(BASE, 64 * CHUNK), Commit::Committed)
+            .unwrap();
+        assert_eq!(promised(&l), need.promised());
+        // A charge that takes frames now reads the lesser of what a commitment
+        // may still promise and the free pool.
+        let left = 1500 - need.promised();
+        assert_eq!(l.promise_free(), left);
+        assert_eq!(l.uncommitted_free(), left);
+        assert_eq!(l.admit(rec, left + 1, 0, 0), Err(ChargeError::Reserve));
+        assert_eq!(l.admit(rec, left, 0, 0), Ok(()));
+        assert_eq!(l.admit_commit(rec, need, 0), Err(ChargeError::Reserve));
+        assert_eq!(l.admit_commit(rec, commit::grow_need(0, CHUNK), 0), Ok(()));
+        // The pool no longer covers `promised`, so a committed draw keeps off
+        // the reserve; a reserve node's draw takes every free page.
+        assert_eq!(l.draw_room(16), 1000 - 16);
+        assert_eq!(l.draw_room(0), 1000);
+        // A draw takes its pages off `promised` and the free pool alike, so
+        // what a commitment may still promise does not move.
+        back_whole(&mut l, rec, reg, 0);
+        assert_eq!(promised(&l), need.promised() - 16);
+        assert_eq!(l.promise_free(), left);
+        assert_eq!(l.draw_room(16), 1000 - 16 - 16);
+        // With the allowance above what the region promises, the free pool is
+        // the lesser.
+        l.set_allowance(10_000);
+        assert_eq!(l.uncommitted_free(), 1000 - 16);
+        assert_eq!(l.draw_room(16), 1000 - 16 - 16);
+        l.remove_region(rec, reg, pool_all).unwrap();
+        assert_eq!((promised(&l), l.pool.free_pages()), (0, 1000));
+        assert_eq!(l.draw_room(16), 1000);
+    }
+
+    #[test]
+    fn a_committed_chunk_is_evicted_only_under_an_allowance_and_its_pages_are_promised_again()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let len = 4 * CHUNK;
+        let reg = l
+            .add_region(rec, region(BASE, len), Commit::Committed)
+            .unwrap();
+        for c in 0..3
+        {
+            back_whole(&mut l, rec, reg, c);
+        }
+        let total = pool_pages(&l);
+        let charged = usage(&l, rec).0;
+        let held = promised(&l);
+        // With no allowance a committed chunk is not evicted.
+        assert!(!l.evictable(rec, reg));
+        assert_eq!(l.begin_evict(rec, reg, BASE, 1), Err(SwapError::Ineligible));
+        l.set_allowance(held + 16);
+        assert!(l.evictable(rec, reg));
+        // Its eviction raises the free pages outside `promised` only while a
+        // chunk's pages more in `promised` stay within the allowance.
+        assert!(l.evicting_frees(reg));
+        l.set_allowance(held + 15);
+        assert!(!l.evicting_frees(reg));
+        let plain = l
+            .add_region(rec, region(BASE + len, CHUNK), Commit::Uncommitted)
+            .unwrap();
+        assert!(l.evicting_frees(plain));
+        // An eviction returns the runs and promises the chunk's pages again:
+        // its restore draws from `promised`. The commitment's charge stands.
+        let free = l.pool.free_pages();
+        swap_out(&mut l, rec, reg, 0, 1, 2);
+        assert_eq!(promised(&l), held + 16);
+        assert_eq!(l.pool.free_pages(), free + 16 - 2);
+        assert_eq!(
+            l.promise_free(),
+            l.pool.free_pages() + l.allowance() - held - 16
+        );
+        assert_eq!((usage(&l, rec).0, pool_pages(&l)), (charged, total));
+        // A restore takes them off `promised` again, as a fault's run does.
+        let (cap, pages, phys) = take(&mut l, 16, crate::Fit::Contiguous);
+        assert_eq!(
+            l.restore_chunk(rec, reg, BASE, &[frame(cap, pages, phys, BASE)]),
+            Ok(2)
+        );
+        assert_eq!(promised(&l), held);
+        assert_eq!(l.pool.free_pages(), free);
+        assert_eq!((usage(&l, rec).0, pool_pages(&l)), (charged, total));
+        // A discard of an evicted chunk frees its store; its pages are in
+        // `promised` already, and a run's join it.
+        swap_out(&mut l, rec, reg, 0, 1, 3);
+        assert_eq!(l.discard_range(rec, BASE, 2 * CHUNK, pool_all), Ok(32));
+        assert_eq!(promised(&l), held + 32);
+        assert_eq!((l.store_pages(), l.swapped_pages()), (0, 0));
+        assert_eq!((usage(&l, rec).0, pool_pages(&l)), (charged, total));
+        // A cut of an evicted chunk, and the region's release with one, leave
+        // `promised` what the committed regions hold.
+        swap_out(&mut l, rec, reg, 2, 1, 1);
+        l.shrink_region(rec, reg, 2 * CHUNK, pool_all).unwrap();
+        promised(&l);
+        assert_eq!(l.swapped_pages(), 0);
+        assert_eq!(pool_pages(&l), total);
+        back_whole(&mut l, rec, reg, 1);
+        swap_out(&mut l, rec, reg, 1, 1, 4);
+        l.remove_region(rec, reg, pool_all).unwrap();
+        assert_eq!(promised(&l), 0);
+        assert_eq!((l.store_pages(), l.swapped_pages()), (0, 0));
+        l.remove_region(rec, plain, pool_all).unwrap();
+        assert_eq!(usage(&l, rec), (0, 0));
+        assert_eq!(l.pool.free_pages(), 10_000);
     }
 
     #[test]

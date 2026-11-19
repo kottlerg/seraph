@@ -10,15 +10,17 @@
 //! A refused request keeps none of the capabilities it carried, so the slots
 //! left, and the IPC receive reserve the next top-up's reply needs, stay
 //! free. Only the requests whose kept capabilities grow with requests are
-//! refused; the others keep none, or one for the boot.
+//! refused; the others keep none, or a fixed number that a repeat does not
+//! add to.
 
 use ipc::{devmgr_dma_errors, devmgr_dma_labels, devmgr_errors, devmgr_labels};
 
 /// The error devmgr's registry refuses `label` with while its `CSpace` is
 /// short: `OUT_OF_RESOURCES` for `WATCH_CLASS`, each of which keeps a
-/// Notification; `None` for every other label. `SET_DRIVERS_DIR` and
-/// `BIND_DRIVERS` keep one directory cap each at most, and the rest keep
-/// nothing past the reply.
+/// Notification; `None` for every other label. `SET_DRIVERS_DIR` keeps two
+/// directory caps at most, the drivers directory's and the platform tables',
+/// once per boot, `BIND_DRIVERS` one while its pass is pending, and the rest
+/// keep nothing past the reply.
 #[must_use]
 pub fn registry_refusal(label: u64) -> Option<u64>
 {

@@ -724,8 +724,10 @@ it would keep, so the slots left and the IPC receive reserve the next top-up's r
 free: a record's carves and a driver spawn fail, logged, and the record is not bound; the
 registry refuses `WATCH_CLASS`, whose watch keeps a Notification, with `OUT_OF_RESOURCES`; and
 the DMA thread refuses `DMA_MAP`, which keeps the mapped Memory cap, with `OUT_OF_RESOURCES`
-(`firmware::headroom`). Every other request keeps nothing past its reply, or one directory cap
-(`SET_DRIVERS_DIR`, `BIND_DRIVERS`), and is served.
+(`firmware::headroom`). Every other request keeps nothing past its reply, or a fixed number of
+directory caps that a repeat does not add to, and is served: `SET_DRIVERS_DIR` the drivers
+directory's and the platform tables' (`caps[1]`, which the drivers-directory job deletes), once
+per boot, and `BIND_DRIVERS` one while its pass is pending.
 
 ---
 

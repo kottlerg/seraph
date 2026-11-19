@@ -855,9 +855,11 @@ the withdrawal revokes the endpoint, `QUERY_DEVICE` answers `WITHDRAWN` at the d
 ordinal, and its `WATCH_CLASS` watch is signalled at the withdrawal and again when the new
 instance is served. A `QUERY_DEVICE` at the next ordinal (`first_device_from`) then waits for the
 restart's settle and names the new instance, or answers `NO_DEVICE` when the restart was refused or
-failed. A client re-registers with the new instance whatever it registered with the dead one. logd's
-sinks, entropyd and the terminal re-resolve this way on their class watches; `ipc::refresh_device`
-is the look a client makes at its class on a signal.
+failed. A client re-registers with the new instance whatever it registered with the dead one.
+`ipc::refresh_device` is the look a client makes at its class on a signal. The `std` clients that
+follow a class for their run (the terminal, gdbstub and debug-echo) do it through
+[shared/device-tracker](../../../shared/device-tracker/README.md), whose crate documentation states
+the contract they keep; logd's sinks and entropyd re-resolve this way in their own loops.
 
 ### Root disk
 

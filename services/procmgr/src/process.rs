@@ -545,6 +545,8 @@ pub struct CreateResult
     /// which the request's handler logs once it has replied (`log_spawn` in
     /// `main.rs`).
     pub image_bias: u64,
+    /// The child's name, its `argv[0]`, which the bias line names.
+    pub name: process_table::ProcessName,
 }
 
 /// Resolved placement for a child, produced by `crate::resolve_create_sched`
@@ -2170,6 +2172,7 @@ fn finalize_creation(
         memory_max,
         node_handle: 0,
         image_bias,
+        name: info_caps.name,
     })
 }
 

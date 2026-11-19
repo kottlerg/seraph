@@ -48,9 +48,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use object::{Object as _, ObjectSection as _, ObjectSymbol as _, SymbolKind};
-
 use crate::arch::Arch;
+use crate::breakpoint_kill;
 use crate::cli::{CoreDeathTarget, TestCoreDeathArgs};
 use crate::context::Context;
 use crate::debug_stub;
@@ -62,9 +61,8 @@ use crate::qemu::{
     GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
     X86ShadowStack, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
-use crate::qemu_gdb::{Stub, field_hex, function_path, le_hex, stop_thread};
+use crate::qemu_gdb::{Stub, field_hex};
 use crate::qmp;
-use crate::symbolize::store::Store;
 use crate::util::{require_tool, step};
 
 /// The terminal's line once the default boot is up. Kept in sync with
@@ -87,16 +85,8 @@ const POWER_OFF_TIMEOUT: Duration = Duration::from_mins(2);
 /// Budget for QEMU's exit once its serial stream has ended.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Budget for one reply of a gdbstub, and for the breakpoint's hit.
+/// Budget for one reply of the GDB stub service.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
-const HIT_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// Stops at the breakpoint's address whose code is not the target's (another
-/// process running at the same address) before the test gives up.
-const FOREIGN_HITS_MAX: u32 = 8;
-
-/// Bytes of code compared at the stop.
-const CODE_CHECK_BYTES: usize = 16;
 
 /// How the host reaches a target's thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -279,32 +269,15 @@ fn boot_once(ctx: &Context, args: &TestCoreDeathArgs, target: CoreDeathTarget) -
     }
 }
 
-/// A breakpoint's function, resolved in its binary.
-#[derive(Debug)]
-struct Function
-{
-    /// The function's link address.
-    address: u64,
-    /// Its first [`CODE_CHECK_BYTES`] bytes.
-    code: Vec<u8>,
-}
-
 fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Route) -> Result<()>
 {
     let function = match route
     {
-        Route::Hardware(bp) =>
-        {
-            // The installed image is stripped: its symbols, and its code,
-            // are read from the symbols store's file of its build id.
-            let path = Store::at(ctx.symbols_dir()).symbols_path(&ctx.sysroot.join(bp.binary))?;
-            let data =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            Some(
-                resolve(&data, bp.function)
-                    .with_context(|| format!("finding {} in {}", bp.function, path.display()))?,
-            )
-        }
+        Route::Hardware(bp) => Some(breakpoint_kill::resolve_installed(
+            ctx,
+            bp.binary,
+            bp.function,
+        )?),
         Route::Stub(..) => None,
     };
     let sock_dir = ctx.target_dir.join("xtask");
@@ -361,7 +334,21 @@ fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Rout
                     .with_context(|| {
                         format!("no `{}` line before the READY marker", bp.bias_line)
                     })?;
-                kill_at_breakpoint(args.arch, &gdb_sock, bias, &function, stdin)
+                let killed = breakpoint_kill::kill_at_breakpoint(
+                    args.arch,
+                    &gdb_sock,
+                    bias,
+                    &function,
+                    move || type_input(stdin),
+                )?;
+                step(&format!(
+                    "core-death test: moved the CPU at {:#x} to 0",
+                    killed.pc
+                ));
+                // The typist's stdin stays open until QEMU exits: its close
+                // is the serial line's end of input.
+                let _stdin = killed.triggered;
+                Ok(killed.resumed)
             }),
         _ => Err(crate::error::err!("the route's launch is incomplete")),
     };
@@ -566,69 +553,6 @@ fn kill_through_stub(
     Ok(Instant::now())
 }
 
-/// Over QEMU's gdbstub at `sock`, break on `function` at `bias`, type
-/// [`SERIAL_INPUT`] on `stdin`, and move the CPU stopped in the function's
-/// code to program counter 0. Returns the moment the VM resumes.
-fn kill_at_breakpoint(
-    arch: Arch,
-    sock: &Path,
-    bias: u64,
-    function: &Function,
-    stdin: ChildStdin,
-) -> Result<Instant>
-{
-    let pc_reg = debug_stub::rsp_arch(arch).pc_regnum();
-    let at = bias.wrapping_add(function.address);
-    let kind = breakpoint_kind(arch);
-    // Connecting stops the VM.
-    let mut stub = Stub::connect(sock, ANSWER_TIMEOUT)?;
-    stub.request(b"?")?;
-    stub.expect_ok(format!("Z1,{at:x},{kind:x}").as_bytes())?;
-    // Typed once the VM runs again, while the continue below waits.
-    let typist = thread::spawn(move || type_input(stdin));
-    let mut foreign: u32 = 0;
-    let moved = loop
-    {
-        stub.set_answer_timeout(HIT_TIMEOUT)?;
-        let reply = stub.request(b"c")?;
-        stub.set_answer_timeout(ANSWER_TIMEOUT)?;
-        let thread = stop_thread(&reply).with_context(|| {
-            format!(
-                "a stop reply naming no CPU: {}",
-                String::from_utf8_lossy(&reply)
-            )
-        })?;
-        stub.expect_ok(format!("Hg{thread:x}").as_bytes())?;
-        // Reading the whole register block has QEMU fetch the CPU's state
-        // from the accelerator and write it back on resume (`test-wedge`).
-        stub.request(b"g")?;
-        let pc = stub.read_register(pc_reg)?;
-        let code = stub.read_memory(pc, CODE_CHECK_BYTES)?;
-        if pc == at && code == function.code
-        {
-            stub.expect_ok(format!("P{pc_reg:x}={}", le_hex(0)).as_bytes())?;
-            break pc;
-        }
-        foreign = foreign.saturating_add(1);
-        if foreign >= FOREIGN_HITS_MAX
-        {
-            bail!("{FOREIGN_HITS_MAX} stops at {at:#x} ran other code than the target's");
-        }
-    };
-    stub.expect_ok(format!("z1,{at:x},{kind:x}").as_bytes())?;
-    stub.expect_ok(b"D")?;
-    let resumed = Instant::now();
-    // The typist's stdin stays open until QEMU exits: its close is the
-    // serial line's end of input.
-    let _stdin = typist
-        .join()
-        .map_err(|_| crate::error::Error::msg("the typing thread panicked"))?;
-    step(&format!(
-        "core-death test: moved the CPU at {moved:#x} to 0"
-    ));
-    Ok(resumed)
-}
-
 /// Type [`SERIAL_INPUT`] once the VM has had time to resume; returns the
 /// handle, kept open. Another request can reach the function first, and the
 /// kill's power-off can end QEMU before the input is typed, closing its
@@ -645,58 +569,6 @@ fn type_input(mut stdin: ChildStdin) -> Option<ChildStdin>
             None
         }
     }
-}
-
-/// The `kind` of a hardware breakpoint: the instruction's length, which
-/// QEMU does not need for a hardware breakpoint but GDB sends.
-fn breakpoint_kind(arch: Arch) -> u32
-{
-    match arch
-    {
-        Arch::X86_64 => 1,
-        Arch::Riscv64 => 4,
-    }
-}
-
-/// Find the function whose demangled path is `path` in the ELF `data`: its
-/// link address and its first code bytes.
-fn resolve(data: &[u8], path: &str) -> Result<Function>
-{
-    let file = object::File::parse(data).context("parsing the ELF")?;
-    let mut found = None;
-    for sym in file.symbols()
-    {
-        if sym.kind() != SymbolKind::Text || !sym.is_definition() || sym.size() == 0
-        {
-            continue;
-        }
-        let Ok(raw) = sym.name()
-        else
-        {
-            continue;
-        };
-        if function_path(&crate::symbolize::demangle(raw)) != path
-        {
-            continue;
-        }
-        if found
-            .replace(sym.address())
-            .is_some_and(|a| a != sym.address())
-        {
-            bail!("two symbols named {path}");
-        }
-    }
-    let address = found.with_context(|| format!("no symbol {path} (is it inlined?)"))?;
-    let code = file
-        .sections()
-        .find_map(|s| {
-            s.data_range(address, CODE_CHECK_BYTES as u64)
-                .ok()
-                .flatten()
-        })
-        .with_context(|| format!("no section holds {path}'s code"))?
-        .to_vec();
-    Ok(Function { address, code })
 }
 
 #[cfg(test)]
@@ -771,16 +643,5 @@ mod tests
             unreachable!()
         };
         assert_eq!(reaper.function, "procmgr::process::reap_dead");
-    }
-
-    // Defect caught: a breakpoint set on another function than the one
-    // named, or on a symbol the host's own binary resolves.
-    #[test]
-    fn a_function_is_resolved_by_its_path_with_its_code()
-    {
-        let exe = std::fs::read(std::env::current_exe().unwrap()).unwrap();
-        let f = resolve(&exe, "xtask::commands::test_core_death::resolve").unwrap();
-        assert_eq!(f.code.len(), CODE_CHECK_BYTES);
-        resolve(&exe, "xtask::commands::test_core_death::no_such_function").unwrap_err();
     }
 }

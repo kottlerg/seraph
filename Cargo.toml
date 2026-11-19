@@ -71,6 +71,7 @@ members = [
     "shared/crypto",
     "shared/crypto/testkit",
     "shared/death-set",
+    "shared/device-tracker",
     "shared/driver-binding",
     "shared/elf",
     "shared/objsig",

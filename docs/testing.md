@@ -556,7 +556,15 @@ No guest-side check can show that bytes cross it, since its far end is the host.
    must be refused with `-`, the interrupt byte, `QStartNoAckMode`, then in no-ack mode a binary
    echo of every byte value through the escapes and a packet past the fixture's buffer, which must
    be refused with `E02`.
-4. Kill QEMU, remove the recipe, and repack the images in that layout again, whatever the
+4. On the same connection, restart the port's driver under the fixture: kill the
+   `virtio-console` driver through QEMU's gdbstub, which the boot attaches, at a hardware
+   breakpoint in the function it runs on each of the fixture's reads, its bias taken from
+   procmgr's `spawn image bias=0x… (/services/drivers/virtio-console)` line (the driver declares
+   itself undebuggable, so no guest debugger reaches it); wait for the fixture's
+   `debug port driver at ordinal 1` line once devmgr has restarted the driver at the class's next
+   ordinal ([services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)
+   § Driver Restart); then echo through the restarted driver.
+5. Kill QEMU, remove the recipe, and repack the images in that layout again, whatever the
    outcome.
 
 The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
@@ -615,7 +623,13 @@ from a host GDB over the debug port, so its check is a host GDB session.
    and GDB's `[Inferior 1 (Remote target) detached]`.
 4. Wait up to 30 s for the stub's `[gdbstub] detached from gdb-target (crash bindings restored:
    true)` line: procmgr took the target's crash bindings back.
-5. Kill QEMU, remove both recipes, and repack the images in that layout again, whatever the
+5. Restart the port's driver under the stub: connect again, `qSupported` (the stub attaches to
+   the target anew), and kill the `virtio-console` driver through QEMU's gdbstub as
+   `test-debug-port` does, at the function the stub's reads reach; wait for the stub's
+   `[gdbstub] debug port driver at ordinal 1` line once devmgr has restarted the driver, and
+   require the session to go on through the restarted driver on the same connection: `?` a stop,
+   `Hg1`, the pointer read, and `D`.
+6. Kill QEMU, remove both recipes, and repack the images in that layout again, whatever the
    outcome.
 
 It needs a host GDB that debugs the guest architecture (`gdb` built with every target, or

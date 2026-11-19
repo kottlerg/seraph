@@ -21,11 +21,15 @@ debug-echo/
 
 ## Behaviour
 
-The fixture takes the debug port from devmgr, through its recipe's `devmgr.class.debug-port`
-seed, by waiting without a bound on a `WATCH_CLASS` watch until devmgr serves the class's first
-live driver (the virtio-console driver loads with devmgr's on-disk batch), registers an RX
-notification on it, and logs `READY on the debug port`. It exits, logging why, when the seed is
-absent; on a boot without `--debug-port` it waits.
+The fixture follows the debug port through a
+[`device_tracker::Device`](../../shared/device-tracker/README.md) on its recipe's
+`devmgr.class.debug-port` seed, waiting without a bound until devmgr serves the class's first live
+driver (the virtio-console driver loads with devmgr's on-disk batch), and logs
+`READY on the debug port`. It exits, logging why, when the seed is absent; on a boot without
+`--debug-port` it waits. The device's tracker keeps the port across devmgr's restart of its driver
+(logged `debug port driver at ordinal <n>`), and before each read or write the fixture registers
+its RX notification with a driver instance it has not registered with; `test-debug-port` kills
+the driver under it and echoes through the restarted one.
 
 It then frames the bytes it reads with `shared/gdb-rsp`
 ([shared/gdb-rsp/README.md](../../shared/gdb-rsp/README.md)), acknowledging each packet with `+`
@@ -63,6 +67,7 @@ The bootstrap round delivers the recipe's one seed:
 |---|---|
 | [docs/testing.md](../../docs/testing.md) | The debug-port cell this fixture's boot is, and the test-recipe gating |
 | [services/drivers/virtio/console/README.md](../drivers/virtio/console/README.md) | The debug port's driver and the serial protocol it serves |
+| [services/devmgr/docs/responsibilities.md](../devmgr/docs/responsibilities.md) | The driver restart the fixture follows (§ Driver Restart) |
 
 ---
 

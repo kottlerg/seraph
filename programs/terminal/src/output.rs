@@ -21,7 +21,7 @@
 use ansi::{AnsiParser, Event};
 use ipc::{IpcMessage, fb_errors, fb_labels, serial_errors, serial_labels};
 
-use crate::device::Device;
+use device_tracker::Device;
 
 /// Maximum payload bytes per `*_WRITE_BYTES` call (label bits 16-31, 0..=512).
 const PAYLOAD_MAX: usize = 512;

@@ -70,11 +70,15 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
    `devmgr.class.debug-port` seed, `caps[1]` the `DEBUG_AUTHORITY` SEND on procmgr. A declaration
    procmgr does not accept ends the stub, which logs why: the declaration is what makes procmgr
    refuse an attach to the stub, so no memory write of the stub's lands in its own address space.
-2. It takes the debug port from devmgr, waiting without a bound on a `WATCH_CLASS` watch until
-   devmgr serves the class's first live driver, since the port's driver loads with devmgr's
-   on-disk batch, and registers an RX notification on it. A missing seed or authority, or a
-   missing target name ends the stub, which logs why; a boot without `--debug-port` leaves it
-   waiting.
+2. It follows the debug port through a
+   [`device_tracker::Device`](../../shared/device-tracker/README.md) on the class, waiting without
+   a bound until devmgr serves the class's first live driver, since the port's driver loads with
+   devmgr's on-disk batch. The device's tracker keeps the port across devmgr's restart of its
+   driver (logged `debug port driver at ordinal <n>`), and before each read or write the stub
+   registers its RX notification with a driver instance it has not registered with. Bytes the stub
+   writes while the class serves no driver are dropped, as bytes written to a dead one are. A
+   missing seed or authority, or a missing target name ends the stub, which logs why; a boot
+   without `--debug-port` leaves it waiting.
 3. It walks procmgr's process list (`LIST_PROCESSES`) for the first process whose name is its
    `argv[1]`, retrying while there is none, since the target can start after the stub. A name is
    the `argv[0]` the target's creator passed; for a service, the first word of its recipe's
@@ -317,7 +321,9 @@ fixture (`programs/debugger --gdb-target`,
 GDB session over the debug port: it lists two threads, breaks on the fixture's tick function and
 continues to it, rewrites and reads back a variable and a register, single-steps, selects the
 second thread and reads its registers, and detaches, and the stub's detach line reports the crash
-bindings restored ([docs/testing.md](../../docs/testing.md) § GDB stub (`test-gdb`)). svctest's
+bindings restored; it then has the port's driver killed under the stub and requires the stub to
+answer through the restarted driver ([docs/testing.md](../../docs/testing.md) § GDB stub
+(`test-gdb`)). svctest's
 `debug_authority_refused` phase checks that `LIST_PROCESSES` and `DETACH_PROCESS` refuse a caller
 without the authority, and its `crash_endpoint` phase drives both for a holder of it, with the
 restore after a watch thread's exit.

@@ -202,6 +202,10 @@ const SETTLE_POLL: Duration = Duration::from_millis(50);
 /// its worker with the level held at `LOW`, or another restore's direct
 /// reclaim at `CRITICAL`.
 const RESIDENT_TRIES: u32 = 8;
+/// How long [`make_resident`] asks again after replies pending at chunks on
+/// disk before it fails the phase: swapd's restore of a chunk takes a slot's
+/// read and memmgr's open, a few milliseconds. A test wait bound.
+const PENDING_BOUND: Duration = Duration::from_secs(10);
 /// Time the phase holds the level at `CRITICAL` before the restores there and
 /// before the one direct reclaim pays for, so memmgr's clock runs a few slices
 /// (one each 10 ms) and ages the chunks it may take.
@@ -538,7 +542,7 @@ impl Hog
     /// come free between the refusal and the status read, such as a chunk's
     /// runs an eviction in flight returns, are taken too. Returns the status
     /// read then.
-    fn fill_to_floor(&mut self) -> Pool
+    pub(super) fn fill_to_floor(&mut self) -> Pool
     {
         let start = Instant::now();
         let mut want = HOG_BLOCK_PAGES;
@@ -584,7 +588,7 @@ impl Hog
 
     /// Give grants back, one by one, until the level reads `LOW` or
     /// `NORMAL`.
-    fn release_from_critical(&mut self)
+    pub(super) fn release_from_critical(&mut self)
     {
         while pool().level == memmgr_labels::PRESSURE_CRITICAL
         {
@@ -718,6 +722,20 @@ impl Fixture
                 {
                     panic!("{PHASE}: the fixture closed its stdout before its {what} line")
                 }
+            }
+        }
+    }
+
+    /// The fixture's next line if one arrives within `wait`, else `None`.
+    pub(super) fn try_line(&mut self, wait: Duration) -> Option<String>
+    {
+        match self.lines.recv_timeout(wait)
+        {
+            Ok(line) => Some(line),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) =>
+            {
+                panic!("{PHASE}: the fixture closed its stdout while a line was awaited")
             }
         }
     }
@@ -856,12 +874,17 @@ pub(super) fn detach(authority: u64, process: u64, threads: &[u64], what: &str)
 
 /// procmgr's label for `MAKE_RESIDENT` of `[va, va + len)` of `process`,
 /// asked again from where each success stopped until it reaches the range's
-/// end: memmgr makes a bounded part of a range resident per request. A
-/// success that stops where it started fails the phase.
+/// end: memmgr makes a bounded part of a range resident per request. A reply
+/// pending at a chunk on disk is asked again after `ipc::PENDING_PAUSE_MS`,
+/// once swapd has restored the chunk, for at most [`PENDING_BOUND`] in all:
+/// swapd restores every chunk on disk a request posts. A success that stops
+/// where it started, or a range still pending past the bound, fails the
+/// phase.
 pub(super) fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> u64
 {
     let end = va.saturating_add(len);
     let mut at = va;
+    let start = Instant::now();
     loop
     {
         let req = IpcMessage::builder(procmgr_labels::MAKE_RESIDENT)
@@ -870,6 +893,19 @@ pub(super) fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> 
             .word(2, end.saturating_sub(at))
             .build();
         let reply = procmgr_call(authority, &req, "MAKE_RESIDENT");
+        if reply.label == procmgr_errors::SUCCESS
+            && reply.word(1) == memmgr_labels::RESIDENT_PENDING
+        {
+            assert!(
+                start.elapsed() < PENDING_BOUND,
+                "{PHASE}: MAKE_RESIDENT from {at:#x} to {end:#x} still pending at {:#x} after \
+                 {PENDING_BOUND:?}: swapd did not restore the chunk on disk",
+                reply.word(0)
+            );
+            at = reply.word(0);
+            std::thread::sleep(Duration::from_millis(ipc::PENDING_PAUSE_MS));
+            continue;
+        }
         if reply.label != procmgr_errors::SUCCESS || reply.word(0) >= end
         {
             return reply.label;
@@ -881,6 +917,13 @@ pub(super) fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> 
         );
         at = reply.word(0);
     }
+}
+
+/// Whether the page at `va` of the fixture's main region at `base`, read
+/// through `thread`, holds its pattern.
+pub(super) fn chunk_reads_pattern(thread: u64, va: u64, base: u64) -> bool
+{
+    read_pattern(thread, va, base, MAIN_XOR) == Ok(true)
 }
 
 /// Whether the page at `va` of `thread`'s process holds the pattern of a region
@@ -932,31 +975,32 @@ pub(super) fn page_present(thread: u64, va: u64) -> bool
     syscall::thread_read_mem(thread, va, &mut probe).is_ok()
 }
 
-/// The pages of logd's stack the phase read.
-struct LogdStack
+/// The pages of a process's stack the phase read.
+pub(super) struct StackPages
 {
     process: u64,
     /// The pages that read.
     readable: Vec<u64>,
 }
 
-/// Attach to logd, read its main thread's stack pointer with the thread
-/// stopped, restart it, and record which of the [`LOGD_STACK_PAGES`] pages from
-/// the stack pointer's down read. Writes no log line while the thread is
-/// stopped.
-fn read_logd_stack(authority: u64) -> LogdStack
+/// Attach to the process named `name`, read its main thread's stack pointer
+/// with the thread stopped, restart it, and record which of the
+/// [`LOGD_STACK_PAGES`] pages from the stack pointer's down read. Writes no
+/// log line while the thread is stopped. `what` names the process in a
+/// failure.
+pub(super) fn read_stack(authority: u64, name: &[u8], what: &str) -> StackPages
 {
-    let process = super::crash::badge_named(authority, LOGD_NAME)
-        .unwrap_or_else(|| panic!("{PHASE}: LIST_PROCESSES lists no logd"));
-    let threads = attach(authority, process, "logd");
+    let process = super::crash::badge_named(authority, name)
+        .unwrap_or_else(|| panic!("{PHASE}: LIST_PROCESSES lists no {what}"));
+    let threads = attach(authority, process, what);
     let main = *threads.first().expect("the attach returned a thread");
     let stopped = syscall::thread_stop(main);
     let mut regs = [0u8; REGS_SIZE];
     let read = syscall::thread_read_regs(main, &mut regs);
     let started = syscall::thread_start(main);
-    stopped.unwrap_or_else(|e| panic!("{PHASE}: stopping logd's main thread ({e})"));
-    read.unwrap_or_else(|e| panic!("{PHASE}: reading logd's registers ({e})"));
-    started.unwrap_or_else(|e| panic!("{PHASE}: restarting logd's main thread ({e})"));
+    stopped.unwrap_or_else(|e| panic!("{PHASE}: stopping {what}'s main thread ({e})"));
+    read.unwrap_or_else(|e| panic!("{PHASE}: reading {what}'s registers ({e})"));
+    started.unwrap_or_else(|e| panic!("{PHASE}: restarting {what}'s main thread ({e})"));
     let sp = regs
         .get(sp_offset()..sp_offset().saturating_add(8))
         .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
@@ -967,14 +1011,15 @@ fn read_logd_stack(authority: u64) -> LogdStack
         .map(|k| top.saturating_sub(k.saturating_mul(PAGE_SIZE)))
         .filter(|&va| page_present(main, va))
         .collect();
-    detach(authority, process, &threads, "logd");
-    LogdStack { process, readable }
+    detach(authority, process, &threads, what);
+    StackPages { process, readable }
 }
 
-/// Require every page of `before` to read now.
-fn require_logd_stack(authority: u64, before: &LogdStack)
+/// Require every page of `before`, which the process `what` names, to read
+/// now.
+pub(super) fn require_stack(authority: u64, before: &StackPages, what: &str)
 {
-    let threads = attach(authority, before.process, "logd");
+    let threads = attach(authority, before.process, what);
     let main = *threads.first().expect("the attach returned a thread");
     let missing: Vec<u64> = before
         .readable
@@ -982,10 +1027,10 @@ fn require_logd_stack(authority: u64, before: &LogdStack)
         .copied()
         .filter(|&va| !page_present(main, va))
         .collect();
-    detach(authority, before.process, &threads, "logd");
+    detach(authority, before.process, &threads, what);
     assert!(
         missing.is_empty(),
-        "{PHASE}: pages of logd's stack read before the hog and not under it: {missing:#x?}"
+        "{PHASE}: pages of {what}'s stack read before the hog and not under it: {missing:#x?}"
     );
 }
 
@@ -1009,7 +1054,7 @@ fn swap_phase(caps: &Caps)
     let threads = attach(authority, process, "the fixture");
     let thread = *threads.first().expect("the attach returned a thread");
     read_before_hog(thread, &ready);
-    let logd = read_logd_stack(authority);
+    let logd = read_stack(authority, LOGD_NAME, "logd");
 
     hog.fill_to_low();
     // A restore from the headroom of at most the reserve takes nearly a chunk
@@ -1021,7 +1066,7 @@ fn swap_phase(caps: &Caps)
     let from_headroom = critical_restore(&mut hog, authority, process, thread, &ready);
     hog.fill_to_low();
     require_no_evict(thread, &ready);
-    require_logd_stack(authority, &logd);
+    require_stack(authority, &logd, "logd");
 
     // The fixture reads everything while the hog holds the level.
     fixture.send("verify");

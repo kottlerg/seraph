@@ -1685,6 +1685,7 @@ fn spawn_and_settle(
         dma_cap: None,
         held: true,
         phys_access: grants.phys_access,
+        reserve: grants.reserve,
         service_ep: client.ep,
         query_ep: batch.driver_ep(),
         watch,

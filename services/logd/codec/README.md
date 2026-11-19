@@ -4,8 +4,9 @@ Pure, host-tested handover-protocol and formatting logic shared by init-logd and
 
 The crate is the single definition of the init-logd → real-logd handover wire contract that
 [`docs/handover-protocol.md`](../docs/handover-protocol.md) specifies: the reply, chunk-kind, and
-release-status codes, `MAX_RELEASE_DEFERRALS`, and `RELEASE_RETRY_BUDGET_US`; the sender's chunk
-encoders, its captured-history byte ring (`HistoryRing`, which packs entries, text lines and log
+release-status codes, `MAX_RELEASE_DEFERRALS`, `RELEASE_RETRY_BUDGET_US`, and
+`HANDOVER_CALL_TIMEOUT_MS`; the sender's chunk encoders, its captured-history byte ring
+(`HistoryRing`, which packs entries, text lines and log
 records, by length and reads them back by absolute push sequence), and record of names to send
 again (`NameResend`), which init-logd
 (`services/init/src/logging.rs`) drives; and the receiver's chunk decoder and time-bounded release

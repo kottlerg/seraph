@@ -38,8 +38,7 @@ use svcmgr_endowment::SubstrateObserver;
 use crate::endowed_servers;
 use crate::restart::{DeathOutcome, RestartCtx, bind_fault_observer, handle_death};
 use crate::service::{
-    Bootstrap, POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry,
-    try_string,
+    POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
 };
 
 /// Entry in svcmgr's pending-registration table populated from init's
@@ -529,10 +528,6 @@ fn handle_definition(
     entry.provided_endpoint = launched.provided_endpoint;
     entry.node_handle = launched.node_handle;
     entry.launched = true;
-    if launched.died.is_none()
-    {
-        entry.bootstrap = Bootstrap::Served;
-    }
     table.install(idx, entry, recipe)?;
     if let Some(exit_reason) = launched.died
         && let Some(entry) = table.services.get_mut(idx)

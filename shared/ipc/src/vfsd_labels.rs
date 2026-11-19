@@ -81,9 +81,10 @@ pub const MOUNT_AUTHORITY: u64 = 1u64 << 63;
 /// Authority bit in the vfsd-service-endpoint badge gating
 /// [`GET_SWAP_PARTITION`]. init mints it, alone, onto a SEND it endows
 /// svcmgr with; svcmgr publishes that SEND seed-only as
-/// [`crate::published_names::VFSD_SWAP`], which only the swap service's
-/// recipe is to seed (svctest's recipe seeds it while no swap service
-/// exists). The cap is badged, so its holder cannot add another bit.
+/// [`crate::published_names::VFSD_SWAP`], which swapd's recipe seeds
+/// (svctest's recipe seeds it too, to drive only the stale-version refusal,
+/// which hands nothing out). The cap is badged, so its holder cannot add
+/// another bit.
 /// Disjoint position from [`MOUNT_AUTHORITY`] and [`SEED_AUTHORITY`].
 pub const SWAP_AUTHORITY: u64 = 1u64 << 61;
 

@@ -175,12 +175,17 @@ stub's endpoint.
   fault maps to: `SIGTRAP` for a breakpoint or a step, `SIGILL`, `SIGBUS`, `SIGFPE` for those
   exceptions, `SIGSEGV` for any other fault and a page fault the pager forwarded, and `SIGINT` for
   an interrupt. GDB's thread ids are the table's indices plus one; thread 1 is the main thread.
+  `Hg` of a thread GDB cannot select is answered `E04` when its bind failed, `E05` when it has
+  exited, and `E01` when the table has no such slot, and the stub logs the refusal, so the cause
+  reaches the host even when the line cannot, as when the target held is logd.
 - **Memory.** `m` reads and `M` and `X` write the target's memory through a live thread of it, in
-  the chunks the kernel copies at once. A chunk on a page memmgr evicted into its compressed store
-  is not present to the kernel's copy, so the stub asks procmgr, through its debug authority, to
-  make the chunk resident (`MAKE_RESIDENT`,
-  [memmgr Memory Pool](../memmgr/docs/memory-pool.md#eviction) § Eviction) and copies it again; a
-  page procmgr cannot make resident ends a read there, and fails a write.
+  the chunks the kernel copies at once. A chunk on a page memmgr evicted, into its compressed store
+  or to disk, is not present to the kernel's copy, so the stub asks procmgr, through its debug
+  authority, to make the chunk resident (`MAKE_RESIDENT`,
+  [memmgr Memory Pool](../memmgr/docs/memory-pool.md#eviction) § Eviction) and copies it again; for
+  a chunk on disk it asks again after a pause while the swap service restores it
+  (`ipc::make_resident`), and passes the chunk over after about a second; a page procmgr cannot
+  make resident ends a read there, and fails a write.
 - **Breakpoints.** `Z0` plants `int3` (kind 1) on x86-64, `c.ebreak` (kind 2) or `ebreak` (kind 4)
   on riscv64, through the kernel's text route (`THREAD_MEM_TEXT`) with every thread held, and keeps
   the bytes it replaced; `z0` writes them back. GDB itself sets the pointer back to the

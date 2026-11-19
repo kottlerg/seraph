@@ -932,7 +932,12 @@ pub const DETACH_PROCESS: u64 = 24;
 /// `data[2]` the length in bytes, nonzero. Replies `SUCCESS` with `data[0]`
 /// where memmgr stopped, which does a bounded part of the range per
 /// request: the range's end when it is all done, else the address to ask
-/// again from (`ipc::make_resident` asks until it is done);
+/// again from (`ipc::make_resident` asks until it is done), and `data[1]`
+/// memmgr's: `memmgr_labels::RESIDENT_PENDING` when that address is a chunk
+/// on disk the swap service was asked to restore, which the sender asks for
+/// again after a pause, else `0`; and `data[2]` memmgr's: where its walk
+/// stopped, past the chunks on disk it posted, from which a sender whose
+/// pauses are spent asks again, passing those chunks over;
 /// `UNAUTHORIZED` without the authority; `INVALID_BADGE` when no live
 /// process carries the badge; `INVALID_ARGUMENT` for a zero length or a
 /// range past the address space; `OUT_OF_MEMORY` when a chunk could not be

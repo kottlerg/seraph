@@ -359,8 +359,8 @@ pub(crate) fn in_flight() -> bool
 /// pressure level reads `LOW`. At `CRITICAL` the free pages above the
 /// growth floor are gone, so a frame background eviction frees goes to the next
 /// admission, which a process draining the pool makes first; there only a
-/// restore evicts, for itself ([`admit_restore`];
-/// services/memmgr/docs/memory-pool.md § Eviction, Selection).
+/// restore or a committed draw evicts, for itself ([`admit_restore`],
+/// [`draw_room`]; services/memmgr/docs/memory-pool.md § Eviction, Selection).
 pub(crate) fn reclaiming() -> bool
 {
     evictor().notify != 0 && current_pressure() == PressureLevel::Low
@@ -411,37 +411,65 @@ pub(crate) fn turn(l: &mut MemLedger)
         &mut victims,
         idle,
     );
-    let mut found = victims.get(..found).unwrap_or(&[]);
-    while background
-        && let Some((v, rest)) = found.split_first()
-        && let Some(slot) = STATE.iter().position(|s| s.load(Ordering::Relaxed) == FREE)
+    // While memmgr reclaims, each victim whose eviction raises the free pages
+    // outside `promised` takes a free job slot; the rest are kept.
+    let mut kept = [Victim::default(); JOB_SLOTS + VICTIM_CACHE];
+    let mut n: usize = 0;
+    for v in victims.get(..found).unwrap_or(&[])
     {
-        post(l, v, slot);
-        found = rest;
+        if background
+            && l.evicting_frees(v.reg)
+            && let Some(slot) = STATE.iter().position(|s| s.load(Ordering::Relaxed) == FREE)
+        {
+            post(l, v, slot);
+            continue;
+        }
+        if let Some(k) = kept.get_mut(n)
+        {
+            *k = *v;
+            n = n.saturating_add(1);
+        }
     }
-    keep_victims(l, found);
+    keep_victims(l, kept.get(..n).unwrap_or(&[]));
+}
+
+/// What a victim's eviction is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Need
+{
+    /// The free pages outside `promised`: background eviction and an
+    /// uncommitted restore's direct reclaim, whose victims must raise them.
+    Free,
+    /// Free pages alone: a committed draw, which takes any evictable victim.
+    Frames,
 }
 
 /// Whether the victim `v` may still be evicted, as a chunk idle for `idle`
-/// sweeps of an eligible region of a process memmgr can unmap.
-fn still_victim(l: &MemLedger, v: &Victim, idle: u8) -> bool
+/// sweeps of an eligible region of a process memmgr can unmap, and, unless
+/// `need` is [`Need::Frames`], whether evicting it raises the free pages
+/// outside `promised` ([`free_pool::Ledger::evicting_frees`]).
+fn still_victim(l: &MemLedger, v: &Victim, idle: u8, need: Need) -> bool
 {
     l.region_for(v.rec, v.page_base)
         .is_some_and(|(reg, _)| reg == v.reg)
         && l.evictable(v.rec, v.reg)
+        && (need == Need::Frames || l.evicting_frees(v.reg))
         && l.aspace_cap(v.rec) != 0
         && l.chunk_at(v.reg, v.page_base).is_idle(idle)
 }
 
 /// Keep `found` for direct reclaim: drop the kept victims that may no longer
 /// be evicted, then add each of `found` not kept already while there is
-/// room.
+/// room. A victim whose eviction raises the free pages outside `promised`
+/// ([`Need::Free`]) takes the place of a kept one only a committed draw may
+/// take when there is none, so committed victims never crowd out those an
+/// uncommitted restore needs.
 fn keep_victims(l: &MemLedger, found: &[Victim])
 {
     let cache = &mut evictor().cache;
     for kept in cache.iter_mut()
     {
-        if kept.is_some_and(|v| !still_victim(l, &v, RECLAIM_IDLE_SWEEPS))
+        if kept.is_some_and(|v| !still_victim(l, &v, RECLAIM_IDLE_SWEEPS, Need::Frames))
         {
             *kept = None;
         }
@@ -452,18 +480,27 @@ fn keep_victims(l: &MemLedger, found: &[Victim])
         {
             continue;
         }
-        let Some(free) = cache.iter_mut().find(|k| k.is_none())
-        else
+        let frees = l.evicting_frees(v.reg);
+        let slot = cache.iter().position(Option::is_none).or_else(|| {
+            frees
+                .then(|| {
+                    cache
+                        .iter()
+                        .position(|k| k.is_some_and(|k| !l.evicting_frees(k.reg)))
+                })
+                .flatten()
+        });
+        if let Some(k) = slot.and_then(|i| cache.get_mut(i))
         {
-            break;
-        };
-        *free = Some(*v);
+            *k = Some(*v);
+        }
     }
 }
 
 /// Take the kept victim of the greatest age that may still be evicted,
-/// dropping each that may not. `None` when none is left.
-fn take_victim(l: &MemLedger) -> Option<Victim>
+/// dropping each that may not, for `need` ([`still_victim`]); one that
+/// only a committed draw may take is kept for one. `None` when none is left.
+fn take_victim(l: &MemLedger, need: Need, spare: Option<(NodeIdx, u64)>) -> Option<Victim>
 {
     let cache = &mut evictor().cache;
     let mut best: Option<(usize, u8)> = None;
@@ -474,9 +511,13 @@ fn take_victim(l: &MemLedger) -> Option<Victim>
         {
             continue;
         };
-        if !still_victim(l, &v, RECLAIM_IDLE_SWEEPS)
+        if !still_victim(l, &v, RECLAIM_IDLE_SWEEPS, Need::Frames)
         {
             *kept = None;
+            continue;
+        }
+        if !still_victim(l, &v, RECLAIM_IDLE_SWEEPS, need) || spared(l, &v, spare)
+        {
             continue;
         }
         let age = l.chunk_at(v.reg, v.page_base).age();
@@ -487,6 +528,17 @@ fn take_victim(l: &MemLedger) -> Option<Victim>
     }
     best.and_then(|(i, _)| cache.get_mut(i))
         .and_then(Option::take)
+}
+
+/// Whether `v` is the chunk at `spare`, a region and the base of a chunk of
+/// it: the chunk a committed fault backs, which its own draw must not evict.
+fn spared(l: &MemLedger, v: &Victim, spare: Option<(NodeIdx, u64)>) -> bool
+{
+    spare.is_some_and(|(reg, base)| {
+        reg == v.reg
+            && l.region_for(v.rec, v.page_base)
+                .is_some_and(|(_, region)| chunk_for(&region, v.page_base).0 == base)
+    })
 }
 
 /// The runs of the resident or evicting chunk holding `page_base` in region
@@ -938,17 +990,19 @@ fn give_back(l: &mut MemLedger, runs: &[FrameDesc])
 /// (services/memmgr/docs/memory-pool.md § Eviction, States): admitted when the
 /// free pages outside `promised` cover its backed pages and, for a node outside
 /// it, the system reserve, once direct reclaim has made room when needed
-/// ([`admit_restore`]); then runs covering exactly its backed pages, each
-/// filled whole through the scrub window from the stream, mapped into the
-/// process, and the chunk resident on them, its store back in the pool. The
-/// chunk's pages are charged already.
+/// ([`admit_restore`]), or, for a chunk of a committed region, which draws
+/// from `promised`, when the draw finds its frames ([`draw_room`]); then runs
+/// covering exactly its backed pages, each filled whole through the scrub
+/// window from the stream, mapped into the process, and the chunk resident on
+/// them, its store back in the pool. The chunk's pages are charged already.
 ///
 /// # Errors
 /// [`FaultDecline::NoFreePage`] when the restore is not admitted or the pool
-/// runs out, [`FaultDecline::NoArenaSlot`] when the arena cannot grow for the
-/// runs' descriptors, [`FaultDecline::MapFailed`] when a map fails or the stream
-/// is malformed (detail 0), and [`FaultDecline::FrameRecord`] when the ledger
-/// refuses the runs. The chunk then stays as it was.
+/// runs out, [`FaultDecline::CommitOverrun`] when a committed chunk's draw
+/// finds too few free pages, [`FaultDecline::NoArenaSlot`] when the arena cannot grow
+/// for the runs' descriptors, [`FaultDecline::MapFailed`] when a map fails or
+/// the stream is malformed (detail 0), and [`FaultDecline::FrameRecord`] when
+/// the ledger refuses the runs. The chunk then stays as it was.
 pub(crate) fn restore(
     l: &mut MemLedger,
     rec: NodeIdx,
@@ -960,9 +1014,21 @@ pub(crate) fn restore(
 ) -> Result<(), (FaultDecline, u64)>
 {
     let backed = l.chunk_at(reg, page_base).backed();
-    if !admit_restore(l, rec, u64::from(backed.count_ones()))
+    let pages = u64::from(backed.count_ones());
+    let (admitted, short) = if l.is_committed(reg)
     {
-        return Err((FaultDecline::NoFreePage, 0));
+        (
+            draw_room(l, rec, pages, pages, None) >= pages,
+            FaultDecline::CommitOverrun,
+        )
+    }
+    else
+    {
+        (admit_restore(l, rec, pages), FaultDecline::NoFreePage)
+    };
+    if !admitted
+    {
+        return Err((short, 0));
     }
     // Read after the admission, whose direct reclaim changes the chunk
     // tables: the chunk itself stays compressed, since it is no victim.
@@ -1010,25 +1076,75 @@ pub(crate) fn restore(
     Ok(())
 }
 
-/// Whether a restore of `pages` pages for `rec` is admitted: the free pages
-/// outside `promised` cover them and, for a budget node outside the reserve,
-/// the system reserve, but not the restore headroom that growth leaves for
-/// restores (`free_pool::growth_floor`). When they do not, after the turn's deferred recheck,
-/// memmgr reclaims directly (services/memmgr/docs/memory-pool.md § Eviction,
-/// Direct reclaim): it evicts the kept victims of greatest age now, one by
-/// one ([`evict_now`]), until the restore is admitted or
-/// [`MAX_SYNC_VICTIMS`] have been tried.
+/// Whether a restore of `pages` pages of an uncommitted chunk for `rec` is
+/// admitted: the free pages outside `promised` cover them and, for a budget
+/// node outside the reserve, the system reserve, but not the restore headroom
+/// that growth leaves for restores (`free_pool::growth_floor`). When they do
+/// not, memmgr reclaims directly ([`reclaim`]).
 fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
 {
-    let reserve = if l.budget(rec).is_some_and(|b| b.reserve())
+    let reserve = reserve_of(l, rec);
+    reclaim(l, Need::Free, None, |l| {
+        l.uncommitted_free() >= pages.saturating_add(reserve)
+    })
+}
+
+/// The pages, up to `want`, a committed draw for `rec` takes from the free
+/// pool (a fault in a committed region, or a restore of a committed chunk,
+/// each drawing from `promised`): as many as
+/// [`free_pool::Ledger::draw_room`] gives under the system reserve, for a
+/// budget node outside it. When that is short of `least`, after the turn's
+/// deferred recheck, memmgr evicts victims in its turn as a restore's direct
+/// reclaim does, any evictable chunk among them, until the draw fits or
+/// [`MAX_SYNC_VICTIMS`] have been tried (services/memmgr/docs/memory-pool.md
+/// § Commit, Overcommit); `spare`, a region and the base of a chunk of it,
+/// names the chunk a fault backs, which is never taken. With an allowance of
+/// 0 the draw always fits while a page is free. 0: the draw is a commit
+/// overrun.
+pub(crate) fn draw_room(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    want: u64,
+    least: u64,
+    spare: Option<(NodeIdx, u64)>,
+) -> u64
+{
+    let reserve = reserve_of(l, rec);
+    if !reclaim(l, Need::Frames, spare, |l| l.draw_room(reserve) >= least)
+    {
+        return 0;
+    }
+    l.draw_room(reserve).min(want)
+}
+
+/// The system reserve a charge to the budget node of `rec` leaves: 0 for a
+/// reserve node.
+fn reserve_of(l: &MemLedger, rec: NodeIdx) -> u64
+{
+    if l.budget(rec).is_some_and(|b| b.reserve())
     {
         0
     }
     else
     {
         reserve_pages(pool_total_pages())
-    };
-    let fits = |l: &MemLedger| l.uncommitted_free() >= pages.saturating_add(reserve);
+    }
+}
+
+/// Whether `fits` holds, after the turn's deferred recheck and memmgr's
+/// direct reclaim when it does not (services/memmgr/docs/memory-pool.md
+/// § Eviction, Direct reclaim): the kept victims of greatest age evicted now,
+/// one by one ([`evict_now`]), each whose eviction raises the free pages
+/// outside `promised` or, for a committed draw ([`Need::Frames`]), any but the
+/// chunk at `spare` ([`draw_room`]), until `fits` holds or [`MAX_SYNC_VICTIMS`]
+/// have been tried.
+fn reclaim(
+    l: &mut MemLedger,
+    need: Need,
+    spare: Option<(NodeIdx, u64)>,
+    fits: impl Fn(&MemLedger) -> bool,
+) -> bool
+{
     if fits(l)
     {
         return true;
@@ -1040,7 +1156,7 @@ fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
     let mut tried: usize = 0;
     while !fits(l) && tried < MAX_SYNC_VICTIMS
     {
-        let Some(v) = take_victim(l)
+        let Some(v) = take_victim(l, need, spare)
         else
         {
             return false;

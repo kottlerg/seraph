@@ -77,7 +77,9 @@ not know is skipped.
 Userspace is built without frame pointers, so the walk is a scan: crashd reads up to 8 KiB of the
 stack from the stack pointer up, stopping at the first page that is not present and that procmgr
 cannot make resident (a page of a chunk memmgr evicted is restored through `MAKE_RESIDENT` and read
-again, [memmgr Memory Pool](../../memmgr/docs/memory-pool.md#eviction) § Eviction), and keeps each
+again, and one of a chunk on disk once the swap service has restored it, the walk asking again after
+a pause while procmgr replies the chunk pending, for about a second at most; [memmgr Memory
+Pool](../../memmgr/docs/memory-pool.md#eviction) § Eviction), and keeps each
 aligned word that lies inside the image's text, in stack order. A frame past `frame.0` is a
 candidate return address: a word a returned call left behind, or a function pointer held on the
 stack, is one too. A walk by frame pointers, for a build that keeps them, is design intent; not yet

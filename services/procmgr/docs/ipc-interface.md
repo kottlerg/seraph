@@ -319,10 +319,12 @@ creates on its mint source, and a create there would make a top-level reserve no
 which is what svcmgr's own node is. svctest's test phases set both flags, `CREATE_RESERVE` only to
 see procmgr refuse it; in the default image no process has a max of its own, and no default
 per-process max exists. svcmgr sets
-`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, oomd's, sessiond's, crashd's and
-logd's in the default image, and starts every other service outside the reserve
+`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, oomd's, sessiond's, crashd's,
+logd's and swapd's in the default image, and starts every other service outside the reserve
 ([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
-§ `reserve`).
+§ `reserve`). devmgr, a reserve node, sets it for each driver of the `block` device class and for
+the IOMMU driver, the storage path swapd calls
+([docs/driver-binding.md](../../../docs/driver-binding.md) § Driver Declarations).
 
 The label's bit 33 (`CREATE_NODE_HANDLE`) asks for a node handle to the child's budget node, the
 reply's last cap. procmgr registers the child with memmgr's `REGISTER_NODE_HANDLE` and passes on
@@ -971,6 +973,11 @@ reports `RELEASED` once the value rose, and returns the page to memmgr
 (`RELEASE_MEMORY_CAPS`); otherwise it reports `HELD` and keeps the page, which the
 endpoint still backs. svctest's `init_cspace_released` phase asserts `RELEASED`.
 
+Two callers read it. svctest's `init_cspace_released` phase reads both words. svcmgr calls it on
+every restart of the log sink and relies on `data[0] = 1` being reported only after the reap has
+run, which procmgr runs only once both init threads, init-logd among them, have exited; until then
+svcmgr mints the restarted logd the handover SEND.
+
 ---
 
 ## Crash Endpoint and Debug Authority
@@ -1406,19 +1413,25 @@ debugger that gets that failure on a page asks for its range here and retries: p
 target under the table lock and, after it, sends memmgr its `MAKE_RESIDENT` with the target's memmgr
 badge ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 21).
 memmgr restores the evicted chunks the range meets, a bounded number per request; a page no fault
-has backed stays not present, so the retry fails again on it, as does a page of a chunk on disk,
-which memmgr passes over since it waits on no swap service
+has backed stays not present, so the retry fails again on it. A chunk on disk memmgr asks the swap
+service to restore, and replies pending at it; a lost chunk, or one on disk with no swap service to
+ask, it passes over, and the retry fails on its pages too
 ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#disk-tier) § Disk tier). A
 process that declared itself undebuggable (Label 21) is served too: the request reads and writes
 nothing of the target, and only does what the target's own next touch of the pages would.
 
 Replies `SUCCESS` with `data[0]` the address memmgr stopped at, memmgr's reply word: the range's end
 when the whole range is done, else the address the caller asks again from, with the rest of the
-range. `ipc::make_resident` asks until it is done. Refusals, in order: `UNAUTHORIZED` without the
-authority; `INVALID_BADGE` when no live process carries the badge; then memmgr's: `INVALID_ARGUMENT`
-for a zero length or a range past the address space, and `OUT_OF_MEMORY` when memmgr could not
-restore a chunk of the range or the call to it failed. svctest's `memmgr_swap` phase reads a page of
-an evicted chunk this way.
+range; `data[1]`, memmgr's word 1: `memmgr_labels::RESIDENT_PENDING` when that address is a
+chunk on disk the swap service was asked to restore, else `0`; and `data[2]`, memmgr's word 2,
+where its walk stopped. `ipc::make_resident` asks until it is done, pausing
+`ipc::PENDING_PAUSE_MS` (2 ms) before each request after a pending reply; after
+`ipc::PENDING_TRIES` (500) pauses in all, about a second, it asks on from `data[2]` with no pause,
+the chunks on disk it passes over staying not present, and returns `false`. Refusals, in order:
+`UNAUTHORIZED` without the authority; `INVALID_BADGE` when no live process carries the badge;
+then memmgr's: `INVALID_ARGUMENT` for a zero length or a range past the address space, and
+`OUT_OF_MEMORY` when memmgr could not restore a chunk of the range or the call to it failed.
+svctest's `memmgr_swap` phase reads a page of an evicted chunk this way.
 
 ### Label 31: `READ_VERIFIED`
 

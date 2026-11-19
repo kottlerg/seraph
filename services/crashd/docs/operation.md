@@ -104,7 +104,8 @@ logs a warning and runs with no hold. It reads memmgr's level when the Notificat
 a change since its last read, and takes the level as `CRITICAL` while memmgr does not answer.
 
 A fault is holdable when it is a VM fault memmgr forwarded with decline code 7 (no free page can
-back it), 6 (the metadata arena cannot grow) or 8 (the region's chunk table cannot record the run)
+back it), 11 (a commit overrun: no free frame for a committed page, held as code 7 is), 6 (the
+metadata arena cannot grow) or 8 (the region's chunk table cannot record the run)
 ([memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) § Kernel-origin fault message). Code
 10, a budget node's max, is the process's own limit, and a holdable fault is never one of an
 exception class; crashd handles each such fault at once. A holdable fault that arrives:
@@ -201,14 +202,18 @@ A dump follows the block when the report attached and read the process within it
    is not listed (one that never registered), it writes no core.
 5. It asks procmgr to make resident (`MAKE_RESIDENT`) the range from the page of the fault's
    instruction and of each thread's stack pointer up, an equal share of the per-core budget each, so
-   memmgr restores each chunk it evicted there, the ones the layout keeps first, then lists the
-   address space's pages (`SYS_THREAD_LIST_PAGES`), reads the image's ELF header at the load bias
-   for the core's `NT_AUXV`, and lays the core out within the per-core budget.
+   memmgr restores each chunk it evicted there, the ones the layout keeps first (a chunk on disk the
+   swap service restores, crashd pausing and asking again after each pending reply, at most
+   `ipc::PENDING_TRIES` pauses, about a second, over the whole dump), then
+   lists the address space's pages (`SYS_THREAD_LIST_PAGES`), reads the image's ELF header at the
+   load bias for the core's `NT_AUXV`, and lays the core out within the per-core budget.
 6. It deletes the `.part` files earlier dumps left, and the oldest cores until the new one fits
    the directory budget.
 7. It writes the core under its `.part` name, reading the pages through the faulting thread's
    cap, and renames it. A page the read finds not present, one memmgr evicted since the list, is
-   made resident through procmgr and read again.
+   made resident through procmgr and read again, under the dump's bound of step 5: its pauses count
+   against the same `ipc::PENDING_TRIES`, and once the dump's generation has fired no page is asked
+   for (`ipc::read_mem_resident_bounded`).
 
 The threads it stopped stay stopped: the decline that follows ends the process, whose teardown ends
 every thread. The core's names, budgets and contents are in [core-format.md](core-format.md).
@@ -247,7 +252,9 @@ watchdog to have served its last upcall, and logs the rest of the block after th
 nothing waits on the faulting thread any more. So no cancellation of one fault reaches the next
 fault's handling, unless the watchdog has not served it within another 2 s; crashd then logs that
 and goes on, and the late upcall can cut one request of the next fault's handling short. The stack
-scan reads at most 8 KiB (`STACK_SCAN_BYTES`).
+scan reads at most 8 KiB (`STACK_SCAN_BYTES`); a stack page it asks procmgr to make resident waits
+on the swap service for at most `ipc::PENDING_TRIES` pauses, about a second, over the whole scan,
+and none is asked for once the fault's generation has fired.
 
 A dump runs under a bound of its own, 60 s (`DUMP_BOUND`), after the report's and outside it, as
 a new generation of the same watchdog. A request it waits in, an attach or a file-system call, is

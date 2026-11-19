@@ -97,7 +97,7 @@ Allocation Contract").
   never leaves memmgr, redirect a fault on a chunk on disk to it, and restore
   the chunk from the bytes it hands back once their tag checks (see
   [`docs/memory-pool.md`](docs/memory-pool.md#disk-tier) § Disk tier and
-  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 22 to 25).
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 22 to 26).
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments. Runs after every
@@ -126,7 +126,7 @@ Allocation Contract").
   as pager into a compressed store it keeps in RAM, and restores them on the
   next fault (see [`docs/memory-pool.md`](docs/memory-pool.md#eviction)
   § Eviction). Swap to
-  disk is that store's second tier: a separate swap service takes chunks memmgr
+  disk is that store's second tier: a separate swap service, swapd, takes chunks memmgr
   seals under a per-boot key it alone holds, writes them to its partition, and
   hands their bytes back on a fault memmgr redirects to it; memmgr reads and
   writes no slot and waits on no swap service (see

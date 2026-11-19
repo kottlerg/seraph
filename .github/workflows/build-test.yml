@@ -301,8 +301,10 @@ jobs:
             # devmgr's and procmgr's do not; the installed configuration and
             # the recorded harness's bundle are put back afterwards.
             budgeted cargo xtask test-log-level --arch ${{ matrix.arch }} --timeout "$budget"
-            # Third boot: the terminal interactive test (keyboard input
-            # through the terminal). It needs the QMP `test-terminal` runner
+            # Third boot: the terminal interactive test (keyboard and serial
+            # input through the terminal, and keyboard input again after a
+            # restart of the input driver, killed through the GDB stub the
+            # test stages and removes). It needs the QMP `test-terminal` runner
             # (host-side key injection) and so cannot ride run-parallel;
             # colocated here (both programs-surface) to avoid a separate
             # matrix dimension. Drop usertest.svc and repack with the rootfs

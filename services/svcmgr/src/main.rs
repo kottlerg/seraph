@@ -538,6 +538,7 @@ fn event_loop(
         deaths,
         master_log_source: caps.master_log_source,
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
+        entropy_source: caps.entropy_source,
         self_death_queue,
     };
 

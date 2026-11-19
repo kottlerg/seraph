@@ -196,6 +196,7 @@ dependencies = [
  "ns-client",
  "process-abi",
  "recv-pool",
+ "restart-budget",
  "syscall",
  "syscall-abi",
  "virtio-core",
@@ -681,6 +682,10 @@ name = "relrofault"
 version = "0.1.4"
 
 [[package]]
+name = "restart-budget"
+version = "0.1.4"
+
+[[package]]
 name = "riscv-step"
 version = "0.1.4"
 
@@ -819,6 +824,7 @@ dependencies = [
  "ipc",
  "namespace-protocol",
  "registry",
+ "restart-budget",
  "svcmgr-defs",
  "svcmgr-endowment",
  "syscall",
@@ -1070,7 +1076,7 @@ dependencies = [
  "logd-codec",
  "objsig",
  "procmgr-process-table",
- "svcmgr-defs",
+ "restart-budget",
  "syscall-abi",
  "vfsd-gpt",
 ]

@@ -112,6 +112,17 @@ impl Binary
         let _ = syscall::cap_delete(self.cap());
     }
 
+    /// The binary's name: a boot module's bundle entry name, a file's
+    /// install path. A boot module is named by its install path too
+    /// (docs/boot-media.md), so either is where the driver is installed.
+    pub fn name(&self) -> &[u8]
+    {
+        match self
+        {
+            Self::Module { name, .. } | Self::File { name, .. } => name,
+        }
+    }
+
     /// devmgr's cap on the binary.
     pub const fn cap(&self) -> u64
     {

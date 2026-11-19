@@ -45,7 +45,7 @@ use crate::partition::{self, DiskState};
 const CLASS_WATCH_BADGE: u64 = u64::MAX;
 
 /// The root mount's node in the tree (`VfsdRootBackend::find` of `/`).
-const ROOT_NODE: u32 = 0;
+pub const ROOT_NODE: u32 = 0;
 
 /// The process exit code vfsd ends with when its root filesystem is lost.
 const EXIT_ROOT_LOST: i32 = 1;

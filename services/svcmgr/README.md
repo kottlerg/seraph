@@ -77,8 +77,7 @@ svcmgr/
 │                                  # grammar of `shared/svc-grammar`), argv/env
 │                                  # wire-blob encoder (`build_blob`), the
 │                                  # `cwd_rights` / `handover_permitted`
-│                                  # decisions, the windowed
-│                                  # `RestartBudget`, the device class file
+│                                  # decisions, the device class file
 │                                  # parser, the death correlator and
 │                                  # cap decoding (`death_tag`, `death_caps`),
 │                                  # and the stop eligibility rule
@@ -291,10 +290,11 @@ tree.
 Each `.svc` carries `restart = never | on_failure | always`. Restarts
 are budgeted per window: three (`RESTART_BURST`) within one 60 s window
 (`RESTART_WINDOW_NS`), held per service in a `RestartBudget` from the
-`svc-defs` crate. A death once the open window's restarts are spent leaves
-the service permanently down — degraded, or a graceful shutdown for
-`critical = yes`; a service that crashes less often restarts every time.
-See [docs/restart-protocol.md](docs/restart-protocol.md).
+[`restart-budget`](../../shared/restart-budget/README.md) crate. A death
+once the open window's restarts are spent leaves the service permanently
+down — degraded, or a graceful shutdown for `critical = yes`; a service
+that crashes less often restarts every time. See
+[docs/restart-protocol.md](docs/restart-protocol.md).
 
 ---
 

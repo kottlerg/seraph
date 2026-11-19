@@ -147,6 +147,13 @@ impl<T> Classes<T>
         self.entries.get(slot).map(|e| &e.served)
     }
 
+    /// The served list of the class at `slot`, for the caller to change;
+    /// `None` past the table.
+    pub fn get_slot_mut(&mut self, slot: usize) -> Option<&mut Served<T>>
+    {
+        self.entries.get_mut(slot).map(|e| &mut e.served)
+    }
+
     /// Add the watcher `cap` to the class at `slot` ([`Watchers::add`],
     /// which drops the watchers `gone` holds for when the class is full),
     /// and return the ordinals the class has served

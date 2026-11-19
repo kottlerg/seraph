@@ -27,7 +27,7 @@
 //! the function's `VirtIO` register layout for the device configuration the
 //! declaration states).
 
-use driver_binding::decl::{DriverDecl, InterruptNeed, Reset};
+use driver_binding::decl::{DriverDecl, DriverName, Interrupt, InterruptNeed, Reset};
 use driver_binding::resources::{InterruptKind, Resource};
 use firmware::aml::CrsResource;
 use firmware::binding::{
@@ -39,7 +39,9 @@ use firmware::pci::{BarSpan, InterruptPlan, MessagesRefused, Msi, Msix};
 use firmware::pci_records::{PciRecords, RecordState};
 use firmware::records::{PlatformRecord, PlatformRecords};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
+use firmware::restart::{RecordId, Teardown};
 use firmware::roster::Roster;
+use restart_budget::RestartBudget;
 use syscall_abi::PAGE_SIZE;
 
 use ipc::procmgr_labels;
@@ -333,8 +335,197 @@ fn install_path(dir_path: &[u8], entry: &[u8]) -> Option<Box<[u8]>>
     Some(path.into_boxed_slice())
 }
 
-/// Add `decl`, read from `binary`, to `table` when it matches a record no
-/// driver is bound to; otherwise release `binary`.
+/// What devmgr restarts a served driver from when it dies
+/// (services/devmgr/docs/responsibilities.md § Driver Restart): its record,
+/// its declared name and interrupt, the path it was installed at, and its
+/// record's restart budget, carried from one instance of the driver to the
+/// next; and, for a platform record from the dead instance's withdrawal to
+/// the restart, the caps devmgr kept for the record, which the new instance
+/// is delivered again.
+pub struct RestartSource
+{
+    pub record: RecordId,
+    pub name: DriverName,
+    pub interrupt: Interrupt,
+    /// The install path of the binary it was started from: a drivers-directory
+    /// entry's, or a boot module's bundle entry name, which is its install
+    /// path.
+    pub path: Box<[u8]>,
+    pub budget: RestartBudget,
+    /// A platform record's caps, taken from the dead instance; `None` while
+    /// an instance holds them, and for a PCI record, whose caps a restart
+    /// carves again.
+    pub platform: Option<PlatformDeviceCaps>,
+}
+
+impl RestartSource
+{
+    /// The restart source of a start on `record` from `candidate`, charged
+    /// to `budget`; `None`, logged, when the path cannot be copied, and the
+    /// driver is then never restarted.
+    fn of(record: RecordId, candidate: &Candidate<Binary>, budget: RestartBudget) -> Option<Self>
+    {
+        let path = candidate.binary.name();
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(path.len()).is_err()
+        {
+            std::os::seraph::log!(
+                warn: "{}: no memory to keep its install path; it is not restarted",
+                candidate.decl.name.as_str()
+            );
+            return None;
+        }
+        copy.extend_from_slice(path);
+        Some(Self {
+            record,
+            name: candidate.decl.name,
+            interrupt: candidate.decl.interrupt,
+            path: copy.into_boxed_slice(),
+            budget,
+            platform: None,
+        })
+    }
+
+    /// Release the platform record's caps the source holds, when its
+    /// restart is not made.
+    pub fn release(&self)
+    {
+        if let Some(platform) = &self.platform
+        {
+            platform.release();
+        }
+    }
+}
+
+/// Restart the driver `source` describes, which died served and whose
+/// restart devmgr admitted ([`firmware::restart`]): read the declaration of
+/// its drivers-directory entry, through `dir_cap`, the directory at
+/// `dir_path`; check that it declares the dead driver and still matches the
+/// record, which stays bound ([`firmware::restart::same_driver`]); and bind
+/// the record to it ([`bind_pci`], [`bind_platform`]) into `pass`, the
+/// new instance carrying `source`'s budget, and a platform record's driver
+/// the caps devmgr kept. Returns whether the driver was started; `false`,
+/// logged, otherwise, the record then staying bound with no driver and the
+/// kept caps released.
+pub fn restart(
+    records: &Records,
+    source: RestartSource,
+    dir_cap: u64,
+    dir_path: &[u8],
+    carve: &mut Carve,
+    pass: &mut Pass,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let RestartSource {
+        record,
+        name,
+        interrupt,
+        path,
+        budget,
+        mut platform,
+    } = source;
+    let label = name.as_str();
+    let same = |decl: &DriverDecl, keys: &RecordKeys<'_>| {
+        firmware::restart::same_driver(&name, interrupt, decl, keys)
+    };
+    let started =
+        read_installed(label, dir_cap, dir_path, path, ipc_buf).is_some_and(|candidate| {
+            let started = match record
+            {
+                RecordId::Pci(at) => records
+                    .pci
+                    .devices()
+                    .get(at)
+                    .filter(|_| records.pci.state(at) == Some(RecordState::Bound))
+                    .filter(|d| same(&candidate.decl, &keys(d)))
+                    .is_some_and(|pci_dev| {
+                        let restart = RestartSource::of(record, &candidate, budget);
+                        bind_pci(pci_dev, &candidate, restart, carve, pass, ipc_buf)
+                    }),
+                RecordId::Platform(index) => records
+                    .platform
+                    .records()
+                    .get(index)
+                    .filter(|_| records.platform_states.get(index) == Some(&RecordState::Bound))
+                    .filter(|r| r.with_keys(|k| same(&candidate.decl, k)))
+                    .is_some_and(|found| {
+                        RestartSource::of(record, &candidate, budget).is_some_and(|mut restart| {
+                            restart.platform = platform.take();
+                            bind_platform(
+                                index,
+                                found,
+                                &candidate,
+                                Some(restart),
+                                carve,
+                                pass,
+                                ipc_buf,
+                            )
+                        })
+                    }),
+            };
+            candidate.binary.release();
+            started
+        });
+    if let Some(kept) = platform
+    {
+        kept.release();
+    }
+    if !started
+    {
+        std::os::seraph::log!(warn: "{}: not restarted", label);
+    }
+    started
+}
+
+/// The drivers-directory entry at `path`, the install path of the driver
+/// `label`, in the directory at `dir_path` whose cap is `dir_cap`: its
+/// declaration and its file, as a drivers-directory candidate. `None`,
+/// logged, when the path is no entry of the directory, the entry is not
+/// found, or its declaration is not read.
+fn read_installed(
+    label: &str,
+    dir_cap: u64,
+    dir_path: &[u8],
+    path: Box<[u8]>,
+    ipc_buf: *mut u64,
+) -> Option<Candidate<Binary>>
+{
+    let Some(entry) = firmware::restart::entry(dir_path, &path)
+    else
+    {
+        std::os::seraph::log!(warn: "{}: not installed in the drivers directory", label);
+        return None;
+    };
+    let requested_rights = u64::from(namespace_protocol::rights::READ);
+    // SAFETY: `ipc_buf` is devmgr's registered IPC buffer.
+    let walked = unsafe { ns_client::walk_to_file(dir_cap, entry, requested_rights, ipc_buf) };
+    let Some(walked) = walked
+    else
+    {
+        std::os::seraph::log!(warn: "{}: its installed binary is not found", label);
+        return None;
+    };
+    let Some(decl) = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf)
+    else
+    {
+        std::os::seraph::log!(warn: "{}: its installed declaration is not read", label);
+        let _ = syscall::cap_delete(walked.file_cap);
+        return None;
+    };
+    // `bound` reads only for a pass's instance limit; the record is the
+    // dead driver's, counted once.
+    Some(Candidate {
+        decl,
+        source: Source::DriversDir,
+        bound: 0,
+        binary: Binary::File {
+            cap: walked.file_cap,
+            size: walked.size,
+            name: path,
+        },
+    })
+}
 fn collect(
     table: &mut MatchTable<Binary>,
     records: &mut Records,
@@ -422,7 +613,9 @@ fn bind_records(
                 {
                     continue;
                 };
-                if bind_platform(index, record, candidate, carve, pass, ipc_buf)
+                let restart =
+                    RestartSource::of(RecordId::Platform(index), candidate, RestartBudget::new());
+                if bind_platform(index, record, candidate, restart, carve, pass, ipc_buf)
                 {
                     *state = RecordState::Bound;
                     table.note_bound(chosen);
@@ -480,7 +673,8 @@ fn bind_pci_records(
                 {
                     continue;
                 };
-                if bind_pci(pci_dev, candidate, carve, pass, ipc_buf)
+                let restart = RestartSource::of(RecordId::Pci(at), candidate, RestartBudget::new());
+                if bind_pci(pci_dev, candidate, restart, carve, pass, ipc_buf)
                 {
                     records.mark_bound(at);
                     table.note_bound(index);
@@ -501,33 +695,13 @@ fn bind_pci_records(
 
 // ── Binding one platform record ─────────────────────────────────────────────
 
-/// Bind platform record `index`, `record`, to the driver of `candidate`:
-/// carve its resources ([`carve_platform_device`]), start the driver from a
-/// copy of its binary at the tier its source allows, deliver it the
-/// resource list, and record it in the pass's roster to be served under its
-/// declared class. Returns whether the driver was started; `false`, logged,
-/// as for [`bind_pci`].
-fn bind_platform(
-    index: usize,
-    record: &PlatformRecord,
-    candidate: &Candidate<Binary>,
-    carve: &mut Carve,
-    pass: &mut Pass,
-    ipc_buf: *mut u64,
-) -> bool
+/// What `decl`, from `source`, is given for a record that is not an IOMMU
+/// record ([`firmware::binding::grants`]), each field it asked for and is
+/// not given logged.
+fn granted(decl: &DriverDecl, source: Source) -> firmware::binding::Grants
 {
-    let decl = &candidate.decl;
     let name = decl.name.as_str();
-    std::os::seraph::log!("{}: binds platform record {}", name, index);
-    let Some(class) = decl.class
-    else
-    {
-        std::os::seraph::log!(warn: "{}: declares no device class; not bound", name);
-        return false;
-    };
-    // No platform record is an IOMMU record, and none has a `Dma` resource:
-    // neither physical access nor a DMA capability is granted here.
-    let grants = firmware::binding::grants(decl, candidate.source, false);
+    let grants = firmware::binding::grants(decl, source, false);
     if grants.tier_ignored
     {
         std::os::seraph::log!(warn: "{}: boot tier not granted from the drivers directory", name);
@@ -536,6 +710,42 @@ fn bind_platform(
     {
         std::os::seraph::log!(warn: "{}: physical access not granted", name);
     }
+    grants
+}
+
+/// Bind platform record `index`, `record`, to the driver of `candidate`:
+/// carve its resources ([`carve_platform_device`]), start the driver from a
+/// copy of its binary at the tier its source allows, deliver it the
+/// resource list, and record it in the pass's roster to be served under its
+/// declared class, with `restart`, what devmgr restarts it from. A restart
+/// whose source holds the caps devmgr kept for the record delivers those
+/// again, under a new catalog entry ([`renew_platform_device`]), instead of
+/// carving them. Returns whether the driver was started; `false`, logged,
+/// as for [`bind_pci`], the caps released.
+fn bind_platform(
+    index: usize,
+    record: &PlatformRecord,
+    candidate: &Candidate<Binary>,
+    mut restart: Option<RestartSource>,
+    carve: &mut Carve,
+    pass: &mut Pass,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let decl = &candidate.decl;
+    let name = decl.name.as_str();
+    std::os::seraph::log!("{}: binds platform record {}", name, index);
+    let kept = restart.as_mut().and_then(|r| r.platform.take());
+    let Some(class) = decl.class
+    else
+    {
+        std::os::seraph::log!(warn: "{}: declares no device class; not bound", name);
+        release_kept(kept);
+        return false;
+    };
+    // No platform record is an IOMMU record, and none has a `Dma` resource:
+    // neither physical access nor a DMA capability is granted here.
+    let grants = granted(decl, candidate.source);
     if decl.dma
     {
         std::os::seraph::log!(warn: "{}: the record has no DMA resource; no DMA granted", name);
@@ -543,9 +753,15 @@ fn bind_platform(
     if pass.roster.try_reserve_one().is_err()
     {
         std::os::seraph::log!(warn: "{}: no memory to record the driver; not bound", name);
+        release_kept(kept);
         return false;
     }
-    let Some(dev_caps) = carve_platform_device(name, record, decl, carve)
+    let dev_caps = match kept
+    {
+        Some(kept) => renew_platform_device(name, record, kept, carve),
+        None => carve_platform_device(name, record, decl, carve),
+    };
+    let Some(dev_caps) = dev_caps
     else
     {
         return false;
@@ -594,6 +810,8 @@ fn bind_platform(
                     dev_caps: None,
                     platform_caps: Some(dev_caps),
                     process_handle: child.process_handle,
+                    restart,
+                    declined: false,
                 },
             };
             crate::record_spawned(pass.roster, spawned, &mut carve.caps.slot_bars, ipc_buf);
@@ -709,6 +927,22 @@ fn carve_platform_device(
         None =>
         {}
     }
+    renew_platform_device(name, record, dev, carve)
+}
+
+/// Give the caps `dev` holds for the platform record `record` a new catalog
+/// entry, carrying the record's device info, and so a new device badge: at a
+/// first bind, and at a restart, whose new instance is delivered the caps
+/// devmgr kept, so a late death post of the dead instance names no live
+/// driver. `None`, logged under `name` and `dev` released, when the entry
+/// cannot be added.
+fn renew_platform_device(
+    name: &str,
+    record: &PlatformRecord,
+    mut dev: PlatformDeviceCaps,
+    carve: &mut Carve,
+) -> Option<PlatformDeviceCaps>
+{
     let badge = match record.info()
     {
         Some(info) => carve.catalog.add(info.kind, info.version, info.bytes()),
@@ -723,6 +957,16 @@ fn carve_platform_device(
     };
     dev.device_badge = badge;
     Some(dev)
+}
+
+/// Release the caps a restart kept for a platform record, `kept`, when its
+/// new instance is not bound.
+fn release_kept(kept: Option<PlatformDeviceCaps>)
+{
+    if let Some(kept) = kept
+    {
+        kept.release();
+    }
 }
 
 /// The cap on the first interrupt line of `record`, carved exclusive, and
@@ -855,13 +1099,15 @@ fn push_bound(resources: &mut Vec<Resource>, resource: Resource) -> bool
 /// resources ([`carve_pci_device`]), start the driver from a copy of its
 /// binary at the tier its source allows, deliver it the resource list
 /// ([`spawn::spawn_bound_driver`]), and record it in the pass's roster to be
-/// served under its declared class when its batch settles. Returns whether
-/// the driver was started; `false`, logged, when the declaration names no
-/// class, a resource cannot be carved, a required interrupt cannot be had,
-/// or the spawn fails before the start.
+/// served under its declared class when its batch settles, with `restart`,
+/// what devmgr restarts it from. Returns whether the driver was started;
+/// `false`, logged, when the declaration names no class, a resource cannot
+/// be carved, a required interrupt cannot be had, or the spawn fails before
+/// the start.
 fn bind_pci(
     pci_dev: &pci::PciDevice,
     candidate: &Candidate<Binary>,
+    restart: Option<RestartSource>,
     carve: &mut Carve,
     pass: &mut Pass,
     ipc_buf: *mut u64,
@@ -887,15 +1133,7 @@ fn bind_pci(
     };
     // No PCI record is an IOMMU record: physical access is never granted
     // here.
-    let grants = firmware::binding::grants(decl, candidate.source, false);
-    if grants.tier_ignored
-    {
-        std::os::seraph::log!(warn: "{}: boot tier not granted from the drivers directory", name);
-    }
-    if grants.phys_access_ignored
-    {
-        std::os::seraph::log!(warn: "{}: physical access not granted", name);
-    }
+    let grants = granted(decl, candidate.source);
     if pass.roster.try_reserve_one().is_err()
     {
         std::os::seraph::log!(warn: "{}: no memory to record the driver; not bound", name);
@@ -956,6 +1194,8 @@ fn bind_pci(
                     dev_caps: Some(dev_caps),
                     platform_caps: None,
                     process_handle: child.process_handle,
+                    restart,
+                    declined: false,
                 },
             };
             crate::record_spawned(pass.roster, spawned, &mut carve.caps.slot_bars, ipc_buf);
@@ -2116,26 +2356,34 @@ impl PciDeviceCaps
     /// decides). `false`, logged, means the device may still be accessing the
     /// driver's memory and the mapped frames, and those caps stay for the
     /// boot ([`dma::Withdrawal::quarantine`]). A device with no DMA grant is
-    /// stopped and reset all the same, and its result returned.
-    fn take_from_driver(&self) -> bool
+    /// stopped and reset all the same, and its result returned. Returns that
+    /// first, then whether the device was confirmed quiet
+    /// ([`Self::stop_and_reset`]).
+    fn take_from_driver(&self) -> (bool, bool)
     {
         let Some(dma) = &self.dma
         else
         {
-            return self.stop_and_reset();
+            let quiet = self.stop_and_reset();
+            return (quiet, quiet);
         };
         let withdrawal = dma.withdraw();
-        match firmware::dma::settle_withdrawal(withdrawal.block(), || self.stop_and_reset())
+        let mut quiet = false;
+        let settled = firmware::dma::settle_withdrawal(withdrawal.block(), || {
+            quiet = self.stop_and_reset();
+            quiet
+        });
+        match settled
         {
             firmware::dma::WithdrawnMappings::Release =>
             {
                 withdrawal.release();
-                true
+                (true, quiet)
             }
             firmware::dma::WithdrawnMappings::Quarantine =>
             {
                 withdrawal.quarantine();
-                false
+                (false, quiet)
             }
         }
     }
@@ -2197,27 +2445,56 @@ impl PciDeviceCaps
 /// token ([`spawn::destroy_and_release`]) only when the device is confirmed
 /// quiet; otherwise it stays held for the rest of the boot
 /// ([`spawn::destroy_held`]), since the device may still be writing it. One
-/// reset per withdrawal; both caps of `child` are consumed.
-pub fn withdraw_device(dev_caps: &PciDeviceCaps, child: spawn::HeldChild, ipc_buf: *mut u64)
+/// reset per withdrawal; both caps of `child` are consumed. Returns what the
+/// withdrawal left: whether the device was confirmed quiet
+/// ([`PciDeviceCaps::stop_and_reset`]), which an IOMMU's block of the device
+/// does not stand in for, and whether the driver's DMA hold is released: it
+/// held none, or its held memory was released.
+pub fn withdraw_device(
+    dev_caps: &PciDeviceCaps,
+    child: spawn::HeldChild,
+    ipc_buf: *mut u64,
+) -> Teardown
 {
-    let quiet = dev_caps.take_from_driver();
+    let (unreachable, quiet) = dev_caps.take_from_driver();
+    let released = release_hold(dev_caps, child, unreachable, ipc_buf);
+    Teardown { quiet, released }
+}
+
+/// Destroy the driver `child` names and release its held memory when the
+/// device can no longer reach it (`unreachable`); whether its DMA hold is
+/// released (see [`withdraw_device`]).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`unreachable` is data: what taking the device from its driver confirmed"
+)]
+fn release_hold(
+    dev_caps: &PciDeviceCaps,
+    child: spawn::HeldChild,
+    unreachable: bool,
+    ipc_buf: *mut u64,
+) -> bool
+{
     if child.process_handle == 0
     {
-        return;
+        return child.release_token == 0;
     }
     if child.release_token == 0
     {
         spawn::destroy_child(child.process_handle, ipc_buf);
+        true
     }
-    else if quiet
+    else if unreachable
     {
-        if spawn::destroy_and_release(child, ipc_buf)
+        let released = spawn::destroy_and_release(child, ipc_buf);
+        if released
         {
             std::os::seraph::log!(
                 "device {}: driver withdrawn, its memory released",
                 dev_caps.device_badge
             );
         }
+        released
     }
     else
     {
@@ -2226,6 +2503,7 @@ pub fn withdraw_device(dev_caps: &PciDeviceCaps, child: spawn::HeldChild, ipc_bu
             dev_caps.device_badge
         );
         spawn::destroy_held(child, ipc_buf);
+        false
     }
 }
 

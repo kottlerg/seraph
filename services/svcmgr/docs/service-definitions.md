@@ -271,8 +271,8 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `devmgr.class.<stem>` | svcmgr (a `MINT_CLASS_SEND` reply, one per class file; `<stem>` is the class file's name without `.class`) | class SEND on devmgr's registry endpoint: the badge names the class's slot and the class file's verbs ([Device class files](service-definitions.md#device-class-files)) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest and the hotplug-check disk mode) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
-| `vfsd.swap` | svcmgr (endowed `SWAP_AUTHORITY` SEND) | `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, the `GET_SWAP_PARTITION` surface (seeded by the swap service's recipe; by svctest while no swap service exists) | no |
-| `memmgr.swap` | svcmgr (endowed `SWAP_AUTHORITY` `SEND\|GRANT`) | `SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint, the swap labels of memmgr's disk tier; its seeds keep `GRANT` (seeded by the swap service's recipe; by svctest while no swap service exists) | no |
+| `vfsd.swap` | svcmgr (endowed `SWAP_AUTHORITY` SEND) | `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, the `GET_SWAP_PARTITION` surface (seeded by swapd's recipe; by svctest's too, to drive only the stale-version refusal of `GET_SWAP_PARTITION`) | no |
+| `memmgr.swap` | svcmgr (endowed `SWAP_AUTHORITY` `SEND\|GRANT`) | `SWAP_AUTHORITY`-badged `SEND\|GRANT` on memmgr's endpoint, the swap labels of memmgr's disk tier; its seeds keep `GRANT` (seeded by swapd's recipe; by svctest's too, as a second swap client that registers nothing) | no |
 | `sessiond.operator` | svcmgr (`sessiond.svc` provider) | `:grant`-badged `SEND\|GRANT` on sessiond's service endpoint, the operator authority, which carries no stop bit (seeded by terminal and svctest) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 
@@ -577,13 +577,14 @@ free pool is at the reserve is declined and kills it, and svcmgr's create of its
 refused while the pool stays there. svcmgr makes that create once, so the service stays down, and a
 `critical = yes` one shuts the system down
 ([Restart Protocol § Decision tree](restart-protocol.md#decision-tree)).
-Four recipes of the default image set the key. oomd's lists and stops
+Five recipes of the default image set the key. oomd's lists and stops
 services ([services/oomd/docs/operation.md](../../oomd/docs/operation.md)), sessiond's lists and
 stops sessions and jobs ([docs/session-supervision.md](../../../docs/session-supervision.md)),
 crashd's reports, holds and dumps a fault memmgr declined for want of memory
 ([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold), and logd's
 receives the lines each of the three writes with a synchronous call
-([services/logd/README.md](../../logd/README.md)). With logd in the reserve, every
+([services/logd/README.md](../../logd/README.md)), and swapd's writes chunks out at `CRITICAL` and
+restores them ([services/swapd/README.md](../../swapd/README.md)). With logd in the reserve, every
 `critical = yes` service is a reserve node.
 
 ## Device class files

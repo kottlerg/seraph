@@ -291,10 +291,11 @@ At boot devmgr matches the IOMMU family record against the boot-module declarati
 the matched driver from its boot module, delivering it the units in its resource list
 ([driver-binding.md](driver-binding.md#matching) § Matching), before any DMA-capable driver, in
 a settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the units walk its table
-pages, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS`, since the units are programmed with physical
-addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it
-on every mapping). The driver programs each unit with empty tables and turns translation on, so from
-its ready report every function a unit translates reaches nothing until devmgr attaches it, the
+pages, `CREATE_DMA_HOLD`, `CREATE_PHYS_ACCESS`, since the units are programmed with physical
+addresses (§ Physical Addresses), and `CREATE_RESERVE`, since it is on the storage path the swap
+service calls to end a pressure episode, at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls
+it on every mapping). The driver programs each unit with empty tables and turns translation on, so
+from its ready report every function a unit translates reaches nothing until devmgr attaches it, the
 functions no driver binds included. devmgr never releases the driver's hold, and deletes its release
 token at the spawn: a unit may walk any of its table pages while translation is on, so they stay
 quarantined for the boot. For each DMA-capable device devmgr then decides, before it grants the

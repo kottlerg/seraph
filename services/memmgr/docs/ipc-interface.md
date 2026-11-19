@@ -1312,7 +1312,7 @@ code 12 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 | 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Label 7); a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
-| 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost |
+| 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim it and the all-RAM-accounted

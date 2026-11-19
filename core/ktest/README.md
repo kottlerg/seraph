@@ -134,7 +134,10 @@ of the initial `IoPort` caps on x86-64, and a bind whose thread's `CSpace` is de
 returns the binding table with the `CSpace`'s pages and leaves the thread refusing a bind;
 `NotSupported` on RISC-V), and its `sbi_call.rs` its
 `SYS_SBI_CALL` test: the call reaches the SBI firmware on RISC-V and returns `NotSupported` on
-x86-64.
+x86-64. `src/arch/riscv64/fp_refusal.rs` checks that an F/D instruction the hart refuses while the
+thread's F/D and V units are on (`fadd.d` with a reserved rounding mode) kills the thread with the
+illegal-instruction cause, rather than being taken as the lazy extended-state trap and re-executed
+for ever.
 
 ### Tier 2 — `src/integration/`
 

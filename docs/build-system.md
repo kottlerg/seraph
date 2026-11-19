@@ -501,6 +501,14 @@ regenerated only when stale, the vars template re-copied every launch); QEMU vir
 ≥ 9.0 requires exactly 32 MiB. `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS` override discovery;
 they are an all-or-nothing pair (setting only one is rejected).
 
+**TPM (opt-in):** `cargo xtask test-tpm` (x86-64) attaches a TPM 2.0 to the guest, QEMU's
+`tpm-tis` or `tpm-crb` device backed by `swtpm`, a software TPM 2.0 emulator, which it
+starts on a fresh state directory for each boot; it needs the `swtpm` package on the host. No
+other launch attaches a TPM, so the reference boot set and every other command need neither
+`swtpm` nor the device, and a TPM launch leaves `virtio-rng-pci` out so the TPM is the
+`hwrng` class's only member ([xtask/README.md](../xtask/README.md#cargo-xtask-test-tpm);
+[services/drivers/docs/tpm.md](../services/drivers/docs/tpm.md)).
+
 **Acceleration:** controlled by `SERAPH_ACCEL` (`auto` / `tcg` / `kvm` /
 `hvf` / `whpx` / `nvmm`). Default `auto` runs per-host detection: KVM on
 Linux (`/dev/kvm` opened O_RDWR), HVF on macOS, WHPX on Windows, NVMM on

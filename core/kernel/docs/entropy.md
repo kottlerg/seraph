@@ -305,7 +305,10 @@ The riscv64 *runtime* hardware-RNG path is a virtio-rng/hwrng device owned by a
 userspace driver, the mechanism the RISC-V design intends for lower privilege
 levels to obtain entropy. Its kernel side is the contributed source class
 (§ Sources); the driver is `virtio-rng` (`services/drivers/virtio/rng`), which devmgr binds to the
-device as the `hwrng` class. entropyd (`services/entropyd`), the one service holding an
+device as the `hwrng` class. On x86-64 a TPM 2.0 the firmware reports is a member of the same
+class, through the TPM driver (`services/drivers/tpm`;
+[services/drivers/docs/tpm.md](../../../services/drivers/docs/tpm.md)), a hardware source
+independent of RDSEED and RDRAND. entropyd (`services/entropyd`), the one service holding an
 `EntropyControl` capability, reads each driver of the class and contributes its bytes at its start
 and then on a fixed pace ([services/entropyd/README.md](../../../services/entropyd/README.md)).
 

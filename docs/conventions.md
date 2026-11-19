@@ -610,8 +610,8 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    cell (`--display framebuffer`, svctest, on both architectures), the
    debug-port cell (`test-debug-port` and `test-gdb`, on both architectures),
    the hotplug cell (`test-hotplug`, on both architectures),
-   and the CET cell (`test-cet`, on x86_64)
-   once each. A run at an earlier `master` commit that contains the bump
+   the CET cell (`test-cet`, on x86_64), and the TPM cell (`test-tpm`,
+   on x86_64) once each. A run at an earlier `master` commit that contains the bump
    stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)
    § Coverage tiers defines it.

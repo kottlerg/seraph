@@ -41,6 +41,7 @@ use crate::qemu::{
     GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
     X86ShadowStack, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
+use crate::symbolize::store::Store;
 use crate::util::{require_tool, step};
 
 /// The target's recipe and process name.
@@ -158,6 +159,10 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Re
     // Picked here, right before QEMU binds it, to keep the window in which
     // another process could take it short.
     let port = crate::util::debug_port_or_free(args.port)?;
+    // GDB reads the symbols of the stripped installed image from the symbols
+    // store's file of its build id.
+    let binary =
+        Store::at(ctx.symbols_dir()).symbols_path(&ctx.sysroot.join("programs/debugger"))?;
     let (firmware_code, firmware_vars) = match args.arch
     {
         Arch::X86_64 => (find_ovmf_code()?, None),
@@ -211,7 +216,6 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Re
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     let (tx, rx) = mpsc::channel::<Serial>();
     let reader = thread::spawn(move || forward_serial(stdout, &tx));
-    let binary = ctx.sysroot.join("programs/debugger");
     let ready = loop
     {
         match rx.recv_timeout(BOOT_TIMEOUT)

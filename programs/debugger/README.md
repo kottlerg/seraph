@@ -93,9 +93,10 @@ With `--gdb-target` the binary is the process the GDB stub's host test debugs
 recipe with no seeds, spawns a worker thread, which registers with procmgr as every `std` thread
 does, prints `gdb-target: running`, and runs for ever: the main thread calls `gdb_target_tick` and
 the worker `gdb_target_worker_step`, each every 5 ms, and each bumps an exported counter
-(`GDB_TARGET_COUNTER`, `GDB_TARGET_WORKER`). The functions and counters are unmangled, so a host
-GDB finds them in the binary's symbol table without debug information. It never exits; the host
-test kills QEMU.
+(`GDB_TARGET_COUNTER`, `GDB_TARGET_WORKER`). The functions and counters are unmangled, so a host GDB
+finds them in the binary's symbol table, which the symbols store keeps
+([docs/build-system.md](../../docs/build-system.md#symbols-store)), without debug information. It
+never exits; the host test kills QEMU.
 
 ---
 

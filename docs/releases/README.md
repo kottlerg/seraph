@@ -46,9 +46,11 @@ push matching `v*.*.*`, or on manual dispatch against such a tag ref (its
 jobs refuse branch refs). A `preflight` job first verifies that the
 workspace version matches the tag and that the notes file passes the check
 in [§ Source of Truth](#source-of-truth). The workflow then builds
-release-profile disk images per architecture, compresses them with zstd,
-generates `SHA256SUMS`, and creates a draft GitHub Release whose body is
-`docs/releases/<tag>.md`.
+release-profile disk images per architecture and archives each build's
+symbols store ([build-system.md](../build-system.md#symbols-store)
+§ Symbols Store), compresses the images and the archives with zstd,
+generates `SHA256SUMS` over all of them, and creates a draft GitHub Release
+whose body is `docs/releases/<tag>.md`.
 
 No workflow publishes the draft. It is published on the maintainer's
 approval, once the burn-in workflow at `.github/workflows/burnin.yml` has

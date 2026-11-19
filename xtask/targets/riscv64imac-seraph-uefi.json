@@ -21,6 +21,7 @@
     "pre-link-args": {
         "ld.lld": [
             "--gc-sections",
+            "--build-id=sha1",
             "-pie",
             "--no-dynamic-linker",
             "-z",

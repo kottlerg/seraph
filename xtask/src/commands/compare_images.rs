@@ -31,7 +31,10 @@
 //! its program headers and the bytes of its `PT_LOAD` segments, and its
 //! allocated and note sections; a PE image by its headers and sections, the
 //! link time stamps and the debug directory masked; the bootloader bundle by
-//! its entries; any other file by its bytes.
+//! its entries; any other file by its bytes. In an ELF or PE image the
+//! descriptor of each GNU build-id note is masked first
+//! (`without_build_ids`): the linker computes the id over the whole link
+//! output, its symbol tables and debug information included.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -87,6 +90,22 @@ const PE_DEBUG_SIZE_OFFSET: usize = 16;
 /// The name a file's part takes when the file is compared by its bytes.
 const CONTENTS: &str = "contents";
 
+/// `n_type` of a GNU build-id note (`NT_GNU_BUILD_ID`).
+const NT_GNU_BUILD_ID: u32 = 3;
+
+/// The owner name of a GNU note, NUL included, which follows the note's
+/// three header words.
+const GNU_NOTE_NAME: &[u8] = b"GNU\0";
+
+/// Bytes of a GNU note's header and owner name: `n_namesz`, `n_descsz`,
+/// `n_type`, and the four bytes of `GNU_NOTE_NAME`.
+const GNU_NOTE_HEADER_BYTES: usize = 16;
+
+/// The longest build-id descriptor masked: lld writes 8 bytes (`fast`), 16
+/// (`md5`, `uuid`) or 20 (`sha1`, which the targets select), and a
+/// `0x<hex>` id this long at most.
+const BUILD_ID_MAX_BYTES: usize = 64;
+
 // ── Image parts ───────────────────────────────────────────────────────────────
 
 /// One compared part of an image: a name the report gives it, and the bytes
@@ -116,11 +135,11 @@ pub fn image_parts(data: &[u8]) -> Vec<Part>
 {
     let parsed = if data.starts_with(ELF_MAGIC)
     {
-        elf_parts(data)
+        elf_parts(&without_build_ids(data))
     }
     else if data.starts_with(PE_DOS_MAGIC)
     {
-        pe_parts(data)
+        pe_parts(&without_build_ids(data))
     }
     else if data.starts_with(&bundle_fmt::MAGIC)
     {
@@ -131,6 +150,38 @@ pub fn image_parts(data: &[u8]) -> Vec<Part>
         None
     };
     parsed.unwrap_or_else(|| vec![Part::new(CONTENTS, data.to_vec())])
+}
+
+/// `data` with the descriptor of each GNU build-id note zeroed. The linker
+/// computes the id over the whole link output (`--build-id=sha1` in every
+/// target specification), the symbol tables, the debug information, and
+/// `.comment` included, and writes it into an allocated note that a
+/// `PT_LOAD` segment maps, and, in the riscv64 bootloader's flat binary, a
+/// PE section holds. No loader and no code of an image reads the id, so a
+/// change to those unloaded parts alone would otherwise differ there. A note
+/// is found by its header at a 4-byte-aligned file offset, as an ELF note's
+/// alignment and a PE section's file alignment place it: an owner name of 4
+/// bytes, `GNU\0`, the type `NT_GNU_BUILD_ID`, and a descriptor of 1 to
+/// `BUILD_ID_MAX_BYTES` bytes, little-endian as both architectures are.
+fn without_build_ids(data: &[u8]) -> Vec<u8>
+{
+    let mut out = data.to_vec();
+    let mut at = 0usize;
+    while let Some(header) = out.get(at..at.saturating_add(GNU_NOTE_HEADER_BYTES))
+    {
+        let is_build_id = read_u32(header, 0) == Some(4)
+            && read_u32(header, 8) == Some(NT_GNU_BUILD_ID)
+            && header.get(12..) == Some(GNU_NOTE_NAME);
+        let length = read_u32(header, 4)
+            .and_then(|size| usize::try_from(size).ok())
+            .filter(|size| (1..=BUILD_ID_MAX_BYTES).contains(size));
+        if is_build_id && let Some(length) = length
+        {
+            zero(&mut out, at.saturating_add(GNU_NOTE_HEADER_BYTES), length);
+        }
+        at = at.saturating_add(4);
+    }
+    out
 }
 
 /// An ELF64 image's parts: the header fields a loader reads, each program
@@ -1166,6 +1217,59 @@ mod tests
         assert_eq!(
             differences(&elf(0x100, &base), &elf(0x100, &head)),
             [".note.seraph.stack"]
+        );
+    }
+
+    /// A GNU note of `kind` holding `id`: its header, `GNU\0`, and the id.
+    fn build_id_note(kind: u32, id: &[u8]) -> Vec<u8>
+    {
+        let mut note = Vec::new();
+        note.extend_from_slice(&4u32.to_le_bytes());
+        note.extend_from_slice(&u32::try_from(id.len()).unwrap().to_le_bytes());
+        note.extend_from_slice(&kind.to_le_bytes());
+        note.extend_from_slice(b"GNU\0");
+        note.extend_from_slice(id);
+        note
+    }
+
+    /// An ELF fixture whose first allocated section is a GNU note of `kind`
+    /// holding `id`, so that the segment maps it.
+    fn elf_with_note(kind: u32, id: &[u8], comment: &[u8]) -> Vec<u8>
+    {
+        let mut sections = sample(b"\x90\xc3", comment);
+        sections.insert(
+            0,
+            Sec {
+                name: ".note.gnu.build-id",
+                kind: 7,
+                flags: 2,
+                data: build_id_note(kind, id),
+            },
+        );
+        elf(0x100, &sections)
+    }
+
+    #[test]
+    fn images_that_differ_only_in_their_build_id_are_no_difference()
+    {
+        let base = elf_with_note(3, &[1; 20], b"rustc 1");
+        let head = elf_with_note(3, &[2; 20], b"rustc 1, and a longer comment");
+        assert_ne!(base, head);
+        assert_eq!(differences(&base, &head), Vec::<String>::new());
+        let base = pe(1, &[1; 16], &build_id_note(3, &[1; 20]));
+        let head = pe(1, &[1; 16], &build_id_note(3, &[2; 20]));
+        assert_ne!(base, head);
+        assert_eq!(differences(&base, &head), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_gnu_note_of_another_type_is_compared()
+    {
+        let base = elf_with_note(1, &[1; 20], b"c");
+        let head = elf_with_note(1, &[2; 20], b"c");
+        assert_eq!(
+            differences(&base, &head),
+            ["segment 0", ".note.gnu.build-id"]
         );
     }
 

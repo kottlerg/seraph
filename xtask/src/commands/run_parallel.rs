@@ -267,6 +267,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let qemu_binary = qemu_binary.clone();
             let save_logs = args.save_logs.clone();
             let sysroot = ctx.sysroot.clone();
+            let symbols = ctx.symbols_dir();
 
             handles.push(thread::spawn(move || -> Result<RunOutcome> {
                 std::fs::create_dir_all(&slot_dir)
@@ -412,7 +413,8 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 // lose a kept log.
                 if !kept_logs.is_empty()
                 {
-                    let crash_report = symbolize_log(&log_text, &SysrootImages { sysroot });
+                    let crash_report =
+                        symbolize_log(&log_text, &SysrootImages { sysroot, symbols });
                     for log in &kept_logs
                     {
                         write_crash_report(log, run_id, crash_report.as_deref());

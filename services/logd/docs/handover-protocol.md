@@ -143,7 +143,7 @@ changed after the slot pass began (see
 The reply label's upper 16 bits carry the name length again (stream-
 protocol convention). Real-logd installs each slot into its own
 hash-keyed badge table via
-[`SlotTable::install_from_handover`](../src/slot.rs); installing a
+[`SlotTable::install_from_handover`](../slot-table/src/lib.rs); installing a
 badge again replaces its name. Word 2 is the peer's claim: real-logd
 takes at most the bytes the message carries, whatever length it
 declares, and skips a `SLOT` chunk that carries no name word (an empty
@@ -173,7 +173,7 @@ rides the reply label's level field (bits 32-34, a
 `ipc::stream_labels::LEVEL_*` code; a label without one reads as info).
 As for `SLOT`, real-logd takes at most the bytes the message carries,
 whatever length word 3 declares. Real-logd stores it, with its level, via
-[`SlotTable::install_history_line`](../src/slot.rs); the slot is
+[`SlotTable::install_history_line`](../slot-table/src/lib.rs); the slot is
 created lazily if no `SLOT` entry preceded it (a history entry may
 outlive its registering sender's slot in init-logd's small
 `MAX_SENDERS` table).
@@ -196,7 +196,7 @@ A record is at most `RECORD_MAX_BYTES` (480) bytes, which the 60 data words
 after word 3 hold whole. The level rides the reply label as on `LINE`, and
 real-logd takes at most the bytes the message carries, as for `LINE`. It
 stores a record that `ipc::log_record` decodes, with its level and field
-table, via [`SlotTable::install_history_record`](../src/slot.rs), creating
+table, via [`SlotTable::install_history_record`](../slot-table/src/lib.rs), creating
 the slot as for `LINE`, and skips one that does not decode.
 
 ## Name changes during the drain

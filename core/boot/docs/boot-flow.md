@@ -122,8 +122,8 @@ Each module is named by its install path: typically `/services/procmgr`, `/servi
 or `/services/drivers/iommu-riscv` on riscv64, the log-level configuration
 `/config/init/log-levels.conf`, and the text platform description tables of the architecture's
 machines (`/config/devmgr/platform/qemu-virt.platform` on riscv64) that devmgr reads (the
-authoritative lists are `xtask/src/bundle.rs::MODULES`, `ARCH_MODULES`, `ARCH_TABLES` and
-`LOG_LEVELS`).
+authoritative lists are the init harness's bundle lists, `init.x86_64.list` and
+`init.riscv64.list` in [`rootfs/config/bundle/`](../../../rootfs/config/bundle/)).
 
 Last, the bootloader copies the trust store into a page allocation of its own, the slack
 after it zeroed, and describes it as the boot module `trust-store` (`TRUST_STORE_MODULE`),

@@ -17,8 +17,11 @@
 //! interposed between the slot's parent cap and the caller-side child cap so
 //! per-cookie revocation is possible. Each open also keeps the parent of its
 //! liveness cap, whose sole remaining reference marks an open whose client is
-//! gone ([`OpenFile::client_gone`]).
+//! gone ([`OpenFile::client_gone`]), and where its memory-cap reads stand: the
+//! offset a sequential read takes next and a cursor into the file's cluster
+//! chain.
 
+use fat_parse::ChainCursor;
 use fat_parse::open_slab::OpenSlab;
 use namespace_protocol::NodeId;
 
@@ -79,6 +82,15 @@ pub struct OpenFile
     /// kills the client's copy and every copy still in this cap's derivation
     /// subtree, and deleted when the open is released.
     pub liveness_cap: u64,
+    /// The file offset an `FS_READ_MEMORY` on a sequential scan asks for
+    /// next: the end of the bytes the open's last one returned, 0 before
+    /// the first. A read at it that misses the cache fills a run of pages
+    /// (services/fs/fat/docs/storage-layout.md, Page cache).
+    pub next_read: u64,
+    /// Where the open's last `FS_READ_MEMORY` stood in the file's cluster
+    /// chain; the next one's walk starts there when it still serves
+    /// (`fat_parse::walk_start`). `None` before the first.
+    pub cursor: Option<ChainCursor>,
 }
 
 impl OpenFile
@@ -90,6 +102,8 @@ impl OpenFile
             outstanding: Vec::new(),
             release_endpoint_cap,
             liveness_cap,
+            next_read: 0,
+            cursor: None,
         }
     }
 

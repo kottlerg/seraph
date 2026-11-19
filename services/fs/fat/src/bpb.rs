@@ -75,6 +75,11 @@ pub struct FatState
     /// FAT32 advisory free-cluster count. `u32::MAX` sentinel means
     /// unknown. Maintained best-effort by the allocator.
     pub free_count_hint: u32,
+    /// The volume's chain epoch: moves on every FAT entry write
+    /// ([`crate::alloc::update_fat_entry`]), so a chain cursor an open took
+    /// (`fat_parse::ChainCursor`) serves a walk only while no link it passed
+    /// can have changed.
+    pub chain_epoch: u64,
 }
 
 impl FatState
@@ -104,6 +109,7 @@ impl FatState
             fsinfo_sector: u32::MAX,
             next_free_hint: u32::MAX,
             free_count_hint: u32::MAX,
+            chain_epoch: 0,
         }
     }
 

@@ -14,7 +14,7 @@
 //! with [`PageCache::set_sector_size`] before the first read. Slots are keyed
 //! on the page-aligned LBA-base; a single cache miss fills the whole page via
 //! one `BLK_READ_INTO_MEMORY` IPC, amortising the round-trip cost over the
-//! page. LRU eviction by monotonic sequence counter; only slots with
+//! page, or a run of pages (§ Run fills). LRU eviction by monotonic sequence counter; only slots with
 //! `refcount == 0` are eviction candidates.
 //!
 //! Fill path: issue `BLK_READ_INTO_MEMORY` with `data[0]` = page-base LBA
@@ -26,6 +26,27 @@
 //! `reply.caps()[0]`; the underlying `MemoryObject` identity is preserved
 //! through the move, and the existing AS mapping at the slot's VA
 //! continues to point at the same physical pages.
+//!
+//! ## Run fills
+//!
+//! A miss whose caller names a run of pages ([`PageCache::acquire_page_run`],
+//! a memory-cap read on a sequential scan of a file) reads up to
+//! `fat_parse::RUN_PAGES` consecutive pages in one `BLK_READ_INTO_MEMORY`,
+//! into the run buffer (`RUN_BUFFER`), and copies each page to a
+//! slot of its own. A block request carries a fixed cost (the driver's DMA
+//! mapping and unmapping through devmgr, the interrupt, the IPC round trips)
+//! that the run pays once. The slots are separate pages, so the device
+//! cannot write them in one request, and the cache gives a slot's page back
+//! by its own region id, so the run cannot be one multi-page grant split
+//! among slots: the copy is the price of one request per run. A run stops
+//! before the first page already cached, so a fill never overwrites a cached
+//! page, and the pages past the first take a slot only as a miss would (a
+//! slot with no sector run, a new slot, or the least recently used one),
+//! never marking the cache under pressure. A run read the device refuses
+//! falls back to the single-page fill of the first page; one whose reply
+//! loses the run buffer's cap also ends run fills for the rest of the mount,
+//! and the scratch page that single-sector writebacks and reloads use is a
+//! separate buffer, so they go on.
 //!
 //! The cache grows on demand: a slot takes its page from memmgr
 //! `REQUEST_MEMORY_CAPS` (`REQUIRE_CONTIGUOUS`, one IPC per slot) when a
@@ -97,31 +118,47 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use syscall_abi::{MAP_WRITABLE, MSG_DATA_WORDS_MAX, PAGE_SIZE, SyscallError};
 
 pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT, slot_ceiling};
-use fat_parse::{RELEASE_KEEP, VictimView};
+use fat_parse::{RELEASE_KEEP, RUN_PAGES, VictimView};
 
-/// Process-static scratch memory cap used for single-sector writeback in
-/// [`PageCache::write_sector`] and single-sector device reads in
+/// Process-static scratch page: the device side of single-sector writeback in
+/// [`PageCache::write_sector`] and of single-sector device reads in
 /// [`PageCache::reload_sector`].
 ///
 /// virtio-blk DMAs sector data starting at offset 0 of the supplied
 /// memory cap, so we cannot pass a cache page directly when only one of its
 /// sectors has been dirtied (the device would over-write the others on
-/// the disk side using whatever happened to be in the page). The scratch
-/// memory cap holds a single sector copy per write or device read and is
-/// reused across calls; [`PageCache::init`]
-/// allocates it, and it is held for the process lifetime.
-static SCRATCH_MEMORY: OnceLock<ScratchMemory> = OnceLock::new();
+/// the disk side using whatever happened to be in the page). The page holds
+/// one sector per write or device read and is reused across calls;
+/// [`PageCache::init`] allocates it, and it is held for the process lifetime.
+/// A block call that loses its cap leaves no writeback or reload for the rest
+/// of the mount, so no read of file data uses it: run fills have a buffer of
+/// their own ([`RUN_BUFFER`]).
+static SCRATCH_MEMORY: OnceLock<DeviceBuffer> = OnceLock::new();
 
-/// The scratch page's cap and the VA it is mapped at.
+/// Process-static buffer a run fill reads into
+/// ([`PageCache::acquire_page_run`], module docs § Run fills): one physically contiguous grant of
+/// `fat_parse::RUN_PAGES` pages, since virtio-blk DMAs a run into one memory
+/// cap from offset 0, not into the slots' separate pages. [`PageCache::init`]
+/// allocates it, and it is held for the process lifetime; when memmgr refuses
+/// that many contiguous pages at init, the cache has none and makes no run
+/// fills. A run read that loses its cap ends run fills for the rest of the
+/// mount ([`PageCache::run_capacity`]) and nothing else.
+static RUN_BUFFER: OnceLock<DeviceBuffer> = OnceLock::new();
+
+/// A device buffer's cap, the VA it is mapped at, and its length.
 ///
-/// The page is used by one thread only: the dispatch thread calls
-/// [`PageCache::write_sector`] and [`PageCache::reload_sector`], the two
-/// users of the page and its cap, and the eviction worker touches the cache
-/// only through [`PageCache::release_slot`].
-struct ScratchMemory
+/// Each buffer is used by one thread only: the dispatch thread calls
+/// [`PageCache::write_sector`], [`PageCache::reload_sector`] and
+/// [`PageCache::acquire_page_run`], the users of the buffers and their caps,
+/// and the eviction worker touches the cache only through
+/// [`PageCache::release_slot`].
+struct DeviceBuffer
 {
+    /// The buffer's Memory cap; 0 once a block call lost it.
     cap: AtomicU64,
     va: u64,
+    /// Pages the buffer maps from `va`.
+    pages: u64,
 }
 
 /// General capability slots the fs keeps free for the caps it takes at run
@@ -135,16 +172,25 @@ const RUN_TIME_CSPACE_HEADROOM: usize = 64;
 /// own `CSpace` before filling a cache of `slots` slots: one per slot page,
 /// one per page the quarantine may add, one per-read ancestor per slot (each
 /// outstanding `FS_READ_MEMORY` page holds one, and every slot can be
-/// outstanding at once), the scratch page, and [`RUN_TIME_CSPACE_HEADROOM`].
+/// outstanding at once), the scratch page, the run buffer, and
+/// [`RUN_TIME_CSPACE_HEADROOM`].
 fn cache_cspace_funding(slots: usize) -> u64
 {
     // A count of capability slots: past `usize` no CSpace holds them, and the
     // saturated request fails to fund as such.
     let total = slots
         .saturating_mul(2)
-        .saturating_add(QUARANTINE_MAX + 1 + RUN_TIME_CSPACE_HEADROOM);
+        .saturating_add(QUARANTINE_MAX + 2 + RUN_TIME_CSPACE_HEADROOM);
     u64::try_from(total).unwrap_or(u64::MAX)
 }
+
+/// [`PAGE_SIZE`] as a `usize`, the length of one page copy.
+#[expect(clippy::cast_possible_truncation, reason = "PAGE_SIZE is 4096")]
+const PAGE_BYTES: usize = PAGE_SIZE as usize;
+
+/// [`RUN_PAGES`] as a `usize`, the length of a run fill's slot list.
+#[expect(clippy::cast_possible_truncation, reason = "RUN_PAGES is 16")]
+const RUN_SLOTS: usize = RUN_PAGES as usize;
 
 /// Sector size before mount sets the device's ([`PageCache::set_sector_size`]).
 const DEFAULT_SECTOR_SIZE: u32 = 512;
@@ -251,7 +297,7 @@ pub enum InitError
     Reserve,
     /// The fs process's `CSpace` could not be funded for the cache's caps.
     CSpace,
-    /// The scratch page could not be mapped.
+    /// The scratch page or the run buffer could not be mapped.
     Map,
     /// The heap could not hold the slot table.
     Heap,
@@ -262,8 +308,8 @@ impl PageCache
     /// Size the cache to the machine ([`slot_ceiling`] of the RAM memmgr
     /// reports, [`SLOT_COUNT`] if it reports none), fund the fs process's own
     /// `cspace` for the cache's caps, reserve a contiguous VA window for the
-    /// slots, allocate and map the scratch page, and return the
-    /// process-static cache. Slot pages come later, one per slot when a miss
+    /// slots, allocate and map the scratch page and the run buffer, and return
+    /// the process-static cache. Slot pages come later, one per slot when a miss
     /// needs it.
     pub fn init(
         memmgr_ep: u64,
@@ -336,26 +382,23 @@ impl PageCache
             pressure: AtomicBool::new(false),
         }));
 
-        // Allocate and map the single-page scratch memory cap used for
-        // single-sector writeback in `write_sector` and single-sector reads
-        // in `reload_sector`. Lazy fallback would need to re-do the
-        // request/reserve/map dance under an Ordering discipline; doing it
-        // once at startup keeps both synchronous and free of init-time
-        // error paths.
-        let scratch_va = reserve_pages(1).map_err(|_| InitError::Reserve)?.va_start();
-        let scratch_cap = request_one_page(memmgr_ep, ipc_buf)
-            .ok_or(InitError::Memmgr)?
-            .cap;
-        // SAFETY: scratch_va is a fresh page reservation from the per-process
-        // arena, owned by the cache: VA no Rust object or IPC page occupies.
-        unsafe { mem_map_funded(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE) }
-            .map_err(|_| InitError::Map)?;
+        // Allocate and map the scratch page used for single-sector writeback
+        // in `write_sector` and single-sector reads in `reload_sector`,
+        // then the run buffer, which a refusal of
+        // `RUN_PAGES` contiguous pages leaves out (no run fills). Lazy
+        // fallback would need to re-do the request/reserve/map dance under an
+        // Ordering discipline; doing it once at startup keeps every user
+        // synchronous and free of init-time error paths.
+        let scratch = request_pages(memmgr_ep, 1, ipc_buf).ok_or(InitError::Memmgr)?;
         SCRATCH_MEMORY
-            .set(ScratchMemory {
-                cap: AtomicU64::new(scratch_cap),
-                va: scratch_va,
-            })
+            .set(map_device_buffer(scratch, 1, self_aspace)?)
             .ok();
+        if let Some(run) = request_pages(memmgr_ep, RUN_PAGES, ipc_buf)
+        {
+            RUN_BUFFER
+                .set(map_device_buffer(run, RUN_PAGES, self_aspace)?)
+                .ok();
+        }
 
         Ok(&*cache)
     }
@@ -429,12 +472,12 @@ impl PageCache
     /// cache can still take stays free: a page cap for each slot without a
     /// page, a per-read ancestor for every slot, the quarantine's
     /// replacements, and [`RUN_TIME_CSPACE_HEADROOM`] (the init funding,
-    /// less the slot pages and the scratch page already held). Called before
-    /// `FS_OPEN` records a release SEND and a liveness cap, which hold slots
-    /// for the open's lifetime, so the `CSpace` grows with the opens instead
-    /// of starving reads. A no-op
-    /// beyond reading the `CSpace`'s headroom while it suffices; `false`
-    /// when memmgr cannot fund it.
+    /// less the slot pages, the scratch page and the run buffer already held).
+    /// Called before `FS_OPEN` records a release SEND and a liveness cap,
+    /// which hold slots for the open's lifetime, so the `CSpace` grows with
+    /// the opens instead of starving reads. A no-op beyond reading the
+    /// `CSpace`'s headroom while it suffices; `false` when memmgr cannot
+    /// fund it.
     pub fn fund_run_time_headroom(&self, cspace: u64) -> bool
     {
         let ceiling = self.slot_ceiling();
@@ -617,7 +660,7 @@ impl PageCache
     /// Acquires the page covering `lba`, updates the affected sector in
     /// place within the cached page (so any outstanding `FS_READ_MEMORY`
     /// cap aliasing that page observes the new bytes immediately), then
-    /// copies the same sector into a process-static scratch memory cap and
+    /// copies the same sector into the scratch page and
     /// issues one `BLK_WRITE_FROM_MEMORY` against the block device. When the
     /// writeback fails, the cached sector is put back to its bytes before
     /// the call once the reply arrives, so a later read of the cache sees
@@ -630,7 +673,7 @@ impl PageCache
     ///
     /// Returns `false` when `data` is shorter than a sector, when no memory
     /// holds the sector's prior bytes, on cache acquire failure, missing
-    /// scratch memory cap (cache init never ran), or block-driver error.
+    /// scratch page (cache init never ran), or block-driver error.
     pub fn write_sector(&self, lba: u64, block_dev: u64, data: &[u8], ipc_buf: *mut u64) -> bool
     {
         let len = self.sector_bytes();
@@ -677,13 +720,21 @@ impl PageCache
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), sector_va as *mut u8, len);
         }
-        // SAFETY: the scratch memory-cap VA is process-static and mapped
-        // writable; `data` is at least `len` long (checked above).
+        // SAFETY: the scratch page's VA is process-static and mapped
+        // writable for one page; `data` is at least `len` long (checked
+        // above).
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.va as *mut u8, len);
         }
 
-        let ok = writeback_via_block_dev(scratch, lba, block_dev, ipc_buf);
+        let ok = transfer_via_block_dev(
+            scratch,
+            blk_labels::BLK_WRITE_FROM_MEMORY,
+            lba,
+            1,
+            block_dev,
+            ipc_buf,
+        );
         if !ok
         {
             // SAFETY: as above; the slot is still referenced.
@@ -702,11 +753,11 @@ impl PageCache
     /// The device copy is the one a failed write leaves in doubt: after
     /// [`Self::write_sector`] returns `false`, the cache holds the bytes
     /// before the write, and the device holds either those or the new ones.
-    /// One `BLK_READ_INTO_MEMORY` of one sector lands in the scratch memory
-    /// cap and is copied out from there.
+    /// One `BLK_READ_INTO_MEMORY` of one sector lands in the scratch page and
+    /// is copied out from there.
     ///
     /// Returns `false` when `buf` is shorter than a sector, the scratch
-    /// memory cap is missing, or the read fails; `buf` and the cache are then
+    /// page is missing, or the read fails; `buf` and the cache are then
     /// unchanged.
     pub fn reload_sector(&self, lba: u64, block_dev: u64, buf: &mut [u8], ipc_buf: *mut u64)
     -> bool
@@ -717,7 +768,15 @@ impl PageCache
         {
             return false;
         };
-        if buf.len() < len || !read_one_via_block_dev(scratch, lba, block_dev, ipc_buf)
+        if buf.len() < len
+            || !transfer_via_block_dev(
+                scratch,
+                blk_labels::BLK_READ_INTO_MEMORY,
+                lba,
+                1,
+                block_dev,
+                ipc_buf,
+            )
         {
             return false;
         }
@@ -795,8 +854,48 @@ impl PageCache
         ipc_buf: *mut u64,
     ) -> Option<usize>
     {
+        self.acquire_page_run(page_lba_base, 1, block_dev, ipc_buf)
+    }
+
+    /// [`Self::acquire_page`], filling a miss with up to `pages` consecutive
+    /// pages from `page_lba_base` in one block request (module docs § Run
+    /// fills): the slot returned holds the first, and the others are cached
+    /// unreferenced, as recently used. The run is cut to the run buffer's
+    /// length ([`Self::run_capacity`]) and stops before the first
+    /// page already cached; a run of one page, or a run read that fails, is
+    /// the single-page fill. The caller names a run only of sectors it
+    /// expects to read next: the pages past the first evict as a miss does.
+    pub fn acquire_page_run(
+        &self,
+        page_lba_base: u64,
+        pages: u64,
+        block_dev: u64,
+        ipc_buf: *mut u64,
+    ) -> Option<usize>
+    {
         debug_assert!(page_lba_base.is_multiple_of(self.sectors_per_page().get()));
-        self.get_or_fill(page_lba_base, block_dev, ipc_buf)
+        self.get_or_fill(page_lba_base, pages, block_dev, ipc_buf)
+    }
+
+    /// The most pages one fill reads ([`Self::acquire_page_run`]): the
+    /// run buffer's length while it holds its cap, else 1: the cache has no
+    /// run buffer, or a run read lost its cap.
+    pub fn run_capacity() -> u64
+    {
+        RUN_BUFFER
+            .get()
+            .filter(|run| run.cap.load(Ordering::Acquire) != 0)
+            .map_or(1, |run| run.pages)
+    }
+
+    /// Whether the page at `page_lba_base` is cached. Takes no reference:
+    /// only the dispatch thread fills or empties a slot, so the answer holds
+    /// until that thread next acquires a page.
+    pub fn contains_page(&self, page_lba_base: u64) -> bool
+    {
+        self.live_slots()
+            .iter()
+            .any(|slot| slot.page_lba_base.load(Ordering::Acquire) == page_lba_base)
     }
 
     /// Snapshot the Memory cap currently backing slot `idx`.
@@ -828,7 +927,13 @@ impl PageCache
         }
     }
 
-    fn get_or_fill(&self, page_lba_base: u64, block_dev: u64, ipc_buf: *mut u64) -> Option<usize>
+    fn get_or_fill(
+        &self,
+        page_lba_base: u64,
+        pages: u64,
+        block_dev: u64,
+        ipc_buf: *mut u64,
+    ) -> Option<usize>
     {
         if let Some(i) = self.lookup_cached(page_lba_base)
         {
@@ -850,13 +955,16 @@ impl PageCache
         // slot without correct contents, so it must not satisfy a hit
         // lookup even by stale page-base match.
         slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
-        if !fill_via_block_dev(
-            slot,
-            page_lba_base,
-            self.sectors_per_page().get(),
-            block_dev,
-            ipc_buf,
-        )
+        let run = self.uncached_run(page_lba_base, pages);
+        let filled = (run > 1 && self.fill_run(victim, page_lba_base, run, block_dev, ipc_buf))
+            || fill_via_block_dev(
+                slot,
+                page_lba_base,
+                self.sectors_per_page().get(),
+                block_dev,
+                ipc_buf,
+            );
+        if !filled
         {
             slot.refcount.fetch_sub(1, Ordering::AcqRel);
             return None;
@@ -864,6 +972,137 @@ impl PageCache
         slot.page_lba_base.store(page_lba_base, Ordering::Release);
         slot.lru_seq.store(self.bump_seq(), Ordering::Release);
         Some(victim)
+    }
+
+    /// Pages of a run fill from `page_lba_base`, whose page is not cached: at
+    /// most `pages` and [`Self::run_capacity`], ending before the first page
+    /// already cached; at least 1.
+    fn uncached_run(&self, page_lba_base: u64, pages: u64) -> u64
+    {
+        let spp = self.sectors_per_page().get();
+        let max = pages.min(Self::run_capacity());
+        let mut run = 1;
+        while run < max
+        {
+            let Some(base) = run
+                .checked_mul(spp)
+                .and_then(|off| page_lba_base.checked_add(off))
+            else
+            {
+                break;
+            };
+            if self.contains_page(base)
+            {
+                break;
+            }
+            // Below `max`, a `u64`.
+            run = run.saturating_add(1);
+        }
+        run
+    }
+
+    /// Read `run` pages from `page_lba_base` into the run buffer in one
+    /// `BLK_READ_INTO_MEMORY`, copy the first into slot `first`, which the
+    /// caller holds and fills, and cache each later page in a slot of its own
+    /// for as long as one is free or evictable (module docs § Run fills).
+    /// `false`, with no slot changed, when the read fails or the cache has
+    /// no run buffer. `run` is at most [`Self::run_capacity`], and no
+    /// page of the run is cached ([`Self::uncached_run`]).
+    fn fill_run(
+        &self,
+        first: usize,
+        page_lba_base: u64,
+        run: u64,
+        block_dev: u64,
+        ipc_buf: *mut u64,
+    ) -> bool
+    {
+        let spp = self.sectors_per_page().get();
+        let Some(transfer) = RUN_BUFFER.get().filter(|t| run <= t.pages)
+        else
+        {
+            return false;
+        };
+        let Some(sectors) = run.checked_mul(spp)
+        else
+        {
+            return false;
+        };
+        if !transfer_via_block_dev(
+            transfer,
+            blk_labels::BLK_READ_INTO_MEMORY,
+            page_lba_base,
+            sectors,
+            block_dev,
+            ipc_buf,
+        )
+        {
+            return false;
+        }
+        self.copy_from_transfer(transfer, 0, first);
+        // The later pages' slots, held until the run is cached so no pick
+        // within it takes one back.
+        let mut held = [0usize; RUN_SLOTS];
+        let mut held_count = 0;
+        for page in 1..run
+        {
+            let Some(base) = page
+                .checked_mul(spp)
+                .and_then(|off| page_lba_base.checked_add(off))
+            else
+            {
+                break;
+            };
+            let Some(idx) = self
+                .free_or_new_slot(ipc_buf)
+                .or_else(|| self.pick_victim(ipc_buf))
+            else
+            {
+                break;
+            };
+            let (Some(slot), Some(entry)) = (self.slots.get(idx), held.get_mut(held_count))
+            else
+            {
+                break;
+            };
+            slot.refcount.fetch_add(1, Ordering::AcqRel);
+            *entry = idx;
+            // At most `RUN_SLOTS`: `held` had room for this one.
+            held_count = held_count.saturating_add(1);
+            slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+            self.copy_from_transfer(transfer, page, idx);
+            slot.page_lba_base.store(base, Ordering::Release);
+            slot.lru_seq.store(self.bump_seq(), Ordering::Release);
+        }
+        for &idx in held.get(..held_count).unwrap_or_default()
+        {
+            self.release(idx);
+        }
+        true
+    }
+
+    /// Copy page `page` of the run buffer into slot `idx`'s page. The
+    /// caller holds a reference on the slot and has read at least `page + 1`
+    /// pages into the buffer.
+    fn copy_from_transfer(&self, transfer: &DeviceBuffer, page: u64, idx: usize)
+    {
+        let (Some(slot), Some(src)) = (
+            self.slots.get(idx),
+            page.checked_mul(PAGE_SIZE)
+                .and_then(|off| transfer.va.checked_add(off)),
+        )
+        else
+        {
+            return;
+        };
+        // SAFETY: `page` is below the pages the buffer maps (a run is at most
+        // its length), so `src` is one mapped page of the process-static
+        // buffer; slot.va maps the slot's page writable for this process, and a
+        // reference holds the slot, so no other user is inside it. The two are
+        // distinct pages.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src as *const u8, slot.va as *mut u8, PAGE_BYTES);
+        }
     }
 
     /// A slot with a page that holds no sector run and is unreferenced, else
@@ -1202,69 +1441,42 @@ fn fill_via_block_dev(
     reply.label == blk_errors::SUCCESS && returned != 0
 }
 
-/// Issue `BLK_WRITE_FROM_MEMORY` with the scratch memory cap as the source.
+/// Issue `label` (`BLK_READ_INTO_MEMORY` or `BLK_WRITE_FROM_MEMORY`) for
+/// `sectors` sectors from `lba`, with device buffer `transfer` (the scratch
+/// page or the run buffer) as the target or source, from its offset 0;
+/// `sectors` fit in the buffer.
 ///
-/// Mirrors [`fill_via_block_dev`] for the write direction. The scratch
-/// memory cap is moved out and back across the call; the returned cap
-/// (which may land at a different `CSpace` index) is restored in
-/// `scratch.cap`.
-fn writeback_via_block_dev(
-    scratch: &ScratchMemory,
+/// Mirrors [`fill_via_block_dev`]. The buffer's cap is moved out and back
+/// across the call; the returned cap (which may land at a different
+/// `CSpace` index) is restored in `transfer.cap`.
+fn transfer_via_block_dev(
+    transfer: &DeviceBuffer,
+    label: u64,
     lba: u64,
+    sectors: u64,
     block_dev: u64,
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let cap = scratch.cap.load(Ordering::Acquire);
+    let cap = transfer.cap.load(Ordering::Acquire);
     if cap == 0
     {
         return false;
     }
-    let msg = IpcMessage::builder(blk_labels::BLK_WRITE_FROM_MEMORY)
+    let msg = IpcMessage::builder(label)
         .word(0, lba)
-        .word(1, 1)
+        .word(1, sectors)
         .cap(cap)
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let Some(reply) = (unsafe { block_call(block_dev, &msg, ipc_buf) })
     else
     {
-        scratch.cap.store(0, Ordering::Release);
+        transfer.cap.store(0, Ordering::Release);
         return false;
     };
     let returned = reply.caps().first().copied().unwrap_or(0);
-    scratch.cap.store(returned, Ordering::Release);
-    reply.label == blk_errors::SUCCESS && returned != 0
-}
-
-/// Issue a one-sector `BLK_READ_INTO_MEMORY` at `lba` into the scratch
-/// memory cap. Mirrors [`writeback_via_block_dev`] for the read direction.
-fn read_one_via_block_dev(
-    scratch: &ScratchMemory,
-    lba: u64,
-    block_dev: u64,
-    ipc_buf: *mut u64,
-) -> bool
-{
-    let cap = scratch.cap.load(Ordering::Acquire);
-    if cap == 0
-    {
-        return false;
-    }
-    let msg = IpcMessage::builder(blk_labels::BLK_READ_INTO_MEMORY)
-        .word(0, lba)
-        .word(1, 1)
-        .cap(cap)
-        .build();
-    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let Some(reply) = (unsafe { block_call(block_dev, &msg, ipc_buf) })
-    else
-    {
-        scratch.cap.store(0, Ordering::Release);
-        return false;
-    };
-    let returned = reply.caps().first().copied().unwrap_or(0);
-    scratch.cap.store(returned, Ordering::Release);
+    transfer.cap.store(returned, Ordering::Release);
     reply.label == blk_errors::SUCCESS && returned != 0
 }
 
@@ -1328,11 +1540,37 @@ fn query_system_ram_pages(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
     (reply.label == memmgr_errors::SUCCESS).then(|| reply.word(0) / PAGE_SIZE)
 }
 
+/// Map `page`, a grant of `pages` pages, writable at a fresh reservation in
+/// the fs process's own address space `self_aspace`, as a device buffer.
+fn map_device_buffer(page: Page, pages: u64, self_aspace: u64) -> Result<DeviceBuffer, InitError>
+{
+    let va = reserve_pages(pages)
+        .map_err(|_| InitError::Reserve)?
+        .va_start();
+    // SAFETY: va is a fresh reservation of `pages` pages from the per-process
+    // arena, owned by the cache: VA no Rust object or IPC page occupies, and
+    // the grant covers `pages` pages.
+    unsafe { mem_map_funded(page.cap, self_aspace, va, 0, pages, MAP_WRITABLE) }
+        .map_err(|_| InitError::Map)?;
+    Ok(DeviceBuffer {
+        cap: AtomicU64::new(page.cap),
+        va,
+        pages,
+    })
+}
+
 /// Acquire one single-page Memory cap from memmgr, with the region id that
 /// gives it back.
 fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<Page>
 {
-    let arg = 1u64 | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
+    request_pages(memmgr_ep, 1, ipc_buf)
+}
+
+/// Acquire one Memory cap of `pages` physically contiguous pages from
+/// memmgr, with the region id that gives it back.
+fn request_pages(memmgr_ep: u64, pages: u64, ipc_buf: *mut u64) -> Option<Page>
+{
+    let arg = pages | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, arg)
         .build();
@@ -1341,7 +1579,7 @@ fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<Page>
     let cap = reply.caps().first().copied();
     let region_id = match ipc::memmgr_grant_layout(&reply)
     {
-        Some((&[1], &[id])) if id != 0 => id,
+        Some((&[count], &[id])) if count == pages && id != 0 => id,
         _ => 0,
     };
     match (cap, region_id)
@@ -1349,8 +1587,9 @@ fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<Page>
         (Some(cap), 1..) => Some(Page { cap, region_id }),
         (Some(cap), 0) =>
         {
-            // A grant that is not one page with an id cannot be given back
-            // by name; drop the cap and treat the request as refused.
+            // A grant that is not one cap of `pages` pages with an id cannot
+            // be given back by name; drop the cap and treat the request as
+            // refused.
             let _ = syscall::cap_delete(cap);
             None
         }

@@ -36,7 +36,8 @@ works from a long or summarized context. Three consequences hold throughout this
   workers nearly always are; such a stop has produced no notification at all. Every line this
   file sends to the supervisor goes by `SendMessage` to `main`, never left to the stop.
 - Your own agent id is your address. The supervisor's first message gives it to you; record it
-  with `cargo xtask orch orchestrator <id>` before any other step, since workers read the id
+  with `cargo xtask orch orchestrator <id>` as soon as the record exists (right after
+  `orch start` in a new batch, before any other step on a resume), since workers read the id
   they report to from the record. They report to it, never to `main`.
 
 The maintainer's words stay in the record, which is local and uncommitted. Everything tracked

@@ -38,10 +38,12 @@ only if that does not cure it.
    orchestrator and its local record; nothing tracked or outward-facing quotes them
    (docs/documentation-standards.md § Tone and Language; docs/conventions.md § Style).
 3. **Replace the orchestrator at about 250,000 tokens.** Its context size is the input of its
-   last turn, which the last `usage` entry of its output file records (`input_tokens`,
-   `cache_creation_input_tokens` and `cache_read_input_tokens` added up:
-   `tail -n 20 <file> | grep -o '"usage":{[^}]*}' | tail -1`), or the count a task
-   notification carries when one arrives. At that size, or when it asks, send `park`; when its
+   last turn, which the `usage` of its own last `assistant` entry in its output file records;
+   the file's other entries carry the usage of its children's notifications. This prints it as
+   one number:
+   `tail -n 20 <file> | jq 'select(.type=="assistant") | .message.usage | .input_tokens +
+   .cache_creation_input_tokens + .cache_read_input_tokens' | tail -1`. A task notification
+   that arrives carries the count as well. At that size, or when it asks, send `park`; when its
    `parked` message arrives, spawn a new one with "resume from the record" and give it its id.
    The old one stays idle and forwards you what still reaches it (step 4). Stop it only when no
    `parked` comes and § A silent orchestrator shows it is gone. When it asks because a merge
@@ -71,9 +73,11 @@ only if that does not cure it.
 The harness does not reliably notify you of the orchestrator's stop while a background child of
 its own is alive, and its workers nearly always are: such a stop has produced no notification at
 all. Silence is therefore no sign: an orchestrator that has sent nothing may be working,
-waiting on a worker, or idle. Before you replace or stop one, check it. Read the tail of its
-output file: a recent entry, or a tool call with no result yet, means it is working. When the
-file shows a turn that ended, send it one line asking for its state; it answers by message.
+waiting on a worker, or idle. Before you replace or stop one, check it. Read its output file's
+last entry, and only what the check needs:
+`tail -n 1 <file> | jq -c '{timestamp, type, stop: .message.stop_reason}'`. A recent entry, or
+an `assistant` entry that stopped on `tool_use`, means it is working. When the entry shows a
+turn that ended (`end_turn`), send it one line asking for its state; it answers by message.
 Treat it as gone only when a message to it is undeliverable, or when neither a reply nor a new
 entry in the file follows within ten minutes. Then spawn a new one with "resume from the
 record", as in step 3.
@@ -92,7 +96,8 @@ context, so it fills slowly and is never reset. Keep each turn to its one action
 compacted, this file is reloaded whole (it is well under the size a compaction keeps), and you
 lose nothing you need: the batch's state is the orchestrator's record, not yours. What you need
 is the current orchestrator's agent id, which is the last one you spawned; if the summary does
-not hold it, `cargo xtask orch orchestrator` prints it, and nothing else of the record.
+not hold it, `cargo xtask orch orchestrator` prints it, and nothing else of the record. Its
+output file follows from the id: `ls /tmp/claude-*/*/*/tasks/<id>.output` finds it.
 
 ## Supporting files
 

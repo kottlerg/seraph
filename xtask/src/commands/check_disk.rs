@@ -74,7 +74,8 @@ pub fn run(ctx: &BuildContext, _args: &CheckDiskArgs) -> Result<()>
 
 /// Check that every object on the ESP of the GPT image at `image` equals the installed file on
 /// its root partition that it copies ([`esp::check`]), the root partition's type giving the
-/// architecture and its `/config/bundle/` the bundle lists.
+/// architecture and its `/config/bundle/` the bundle lists. The firmware's `/NvVars`
+/// ([`FIRMWARE_VARIABLES`]) is set aside, so an image that has been booted passes.
 ///
 /// # Errors
 /// When the image's GPT does not parse, it has not one ESP and one Seraph root partition, a
@@ -105,7 +106,8 @@ fn check_esp_copies(image: &Path) -> Result<()>
             .with_context(|| format!("reading the {what} of {}", image.display()))?;
         Ok(files(tree))
     };
-    let esp_files = volume(esp_part, "ESP")?;
+    let mut esp_files = volume(esp_part, "ESP")?;
+    esp_files.remove(FIRMWARE_VARIABLES);
     let root_files = volume(root_part, "root partition")?;
     let lists = Harness::VARIANTS
         .iter()
@@ -121,6 +123,11 @@ fn check_esp_copies(image: &Path) -> Result<()>
         )
     })
 }
+
+/// The file in which OVMF keeps its variables on the ESP it boots from when it is given no
+/// variable store, as every x86_64 launcher gives it none: firmware state a boot of the image
+/// writes, which no pack copies from the sysroot, so it is set aside before the check.
+const FIRMWARE_VARIABLES: &str = "/NvVars";
 
 /// The one partition of `parts` whose type GUID `kind` maps to a value, and that value.
 ///
@@ -409,6 +416,8 @@ mod tests
             ],
         )
         .unwrap();
+        // The variables OVMF writes on the ESP of an image it boots are no object.
+        put(&esp, "NvVars", b"firmware variables");
         pack(&image, &esp, &root);
         check_esp_copies(&image).unwrap();
 

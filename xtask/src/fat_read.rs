@@ -52,8 +52,8 @@ struct Volume<'a, R>
 ///
 /// # Errors
 /// When the image cannot be read, the boot sector does not decode, the FAT copies differ, a
-/// chain is not a contiguous run of data clusters ending in an end-of-chain entry or crosses
-/// another, a subdirectory's `.` or `..` entry names the wrong cluster, a short name repeats
+/// chain holds a cluster that is not a data cluster, does not end in an end-of-chain entry or
+/// crosses another (itself included), a subdirectory's `.` or `..` entry names the wrong cluster, a short name repeats
 /// in its directory, a name is not UTF-8, a file's size is not its chain's, or an empty file
 /// has a cluster.
 pub fn read_volume<R: Read + Seek>(
@@ -158,8 +158,9 @@ impl<R: Read + Seek> Volume<'_, R>
             .with_context(|| format!("cluster {cluster} has no FAT entry"))
     }
 
-    /// The bytes of the chain from `first`, checked contiguous and claimed; `len` of them
-    /// for a file, every cluster's for a directory.
+    /// The bytes of the chain from `first`, its clusters claimed and read in chain order,
+    /// wherever they lie (a volume a booted guest or firmware wrote can hold a fragmented
+    /// chain); `len` of them for a file, every cluster's for a directory.
     fn chain_bytes(&mut self, first: u32, len: Option<u32>) -> Result<Vec<u8>>
     {
         let eoc = match self.geo.fat_type
@@ -167,7 +168,7 @@ impl<R: Read + Seek> Volume<'_, R>
             FatType::Fat16 => 0xFFF8,
             FatType::Fat32 => 0x0FFF_FFF8,
         };
-        let mut count = 0u32;
+        let mut clusters = Vec::new();
         let mut cluster = first;
         loop
         {
@@ -179,16 +180,12 @@ impl<R: Read + Seek> Volume<'_, R>
                 self.claimed.insert(cluster),
                 "cluster {cluster} is in two chains"
             );
-            count = count.saturating_add(1);
+            clusters.push(cluster);
             let next = self.entry(cluster)?;
             if next >= eoc
             {
                 break;
             }
-            ensure!(
-                Some(next) == cluster.checked_add(1),
-                "the chain from {first} is not contiguous"
-            );
             cluster = next;
         }
         let cluster_bytes = u32::from(self.geo.sectors_per_cluster)
@@ -197,20 +194,22 @@ impl<R: Read + Seek> Volume<'_, R>
             .context("the volume's cluster size is not a positive u32")?;
         if let Some(len) = len
         {
+            let count = clusters.len();
             ensure!(
-                count == len.div_ceil(cluster_bytes),
+                u32::try_from(count).ok() == Some(len.div_ceil(cluster_bytes)),
                 "the chain from {first} is not its file's: {count} clusters for {len} bytes"
             );
         }
-        let sector = fat_parse::cluster_to_sector(
-            self.geo.data_start_sector,
-            self.geo.sectors_per_cluster,
-            first,
-        );
-        let total = count
-            .checked_mul(cluster_bytes)
-            .context("the chain's size overflows")?;
-        let mut bytes = self.bytes(sector, usize::try_from(total)?)?;
+        let mut bytes = Vec::new();
+        for cluster in clusters
+        {
+            let sector = fat_parse::cluster_to_sector(
+                self.geo.data_start_sector,
+                self.geo.sectors_per_cluster,
+                cluster,
+            );
+            bytes.extend(self.bytes(sector, usize::try_from(cluster_bytes)?)?);
+        }
         if let Some(len) = len
         {
             bytes.truncate(usize::try_from(len)?);
@@ -415,10 +414,69 @@ mod tests
         bytes[entry + 32..entry + 64].copy_from_slice(&copy);
         bytes[entry + 32] = b'G';
         refused(bytes, "in two chains");
+        // A chain that comes back to its own first cluster.
+        let mut bytes = good.clone();
+        let first = usize::from(u16::from_le_bytes([bytes[entry + 26], bytes[entry + 27]]));
+        for copy in 0..usize::from(geo.num_fats)
+        {
+            let at = (usize::from(geo.reserved_sectors) + copy * geo.fat_size as usize) * 512
+                + (first + 1) * 2;
+            bytes[at..at + 2].copy_from_slice(&u16::try_from(first).unwrap().to_le_bytes());
+        }
+        refused(bytes, "in two chains");
         // A short name twice in one directory.
         let mut bytes = good;
         let copy: Vec<u8> = bytes[entry..entry + 32].to_vec();
         bytes[entry + 32..entry + 64].copy_from_slice(&copy);
         refused(bytes, "repeats");
+    }
+
+    // Defect caught: a fragmented chain, which a booted guest's or the firmware's writes leave
+    // on a volume, refused or read as the clusters that follow its first (check-disk failing,
+    // or comparing the wrong bytes, on an image that has been booted).
+    #[test]
+    fn a_fragmented_chain_reads_in_chain_order()
+    {
+        let (mut bytes, geo) = volume("fragmented");
+        assert!(matches!(geo.fat_type, FatType::Fat16));
+        let size = usize::from(geo.sectors_per_cluster) * 512;
+        let data = |cluster: u16| {
+            (geo.data_start_sector as usize + (usize::from(cluster) - 2) * (size / 512)) * 512
+        };
+        let fat = |copy: u32, cluster: u16| {
+            ((u32::from(geo.reserved_sectors) + copy * geo.fat_size) * 512) as usize
+                + usize::from(cluster) * 2
+        };
+        // FILE's chain: its first cluster from its entry, then one cluster per `size` bytes.
+        let entry = root_entry(&geo);
+        let first = u16::from_le_bytes([bytes[entry + 26], bytes[entry + 27]]);
+        let count = u16::try_from(5000usize.div_ceil(size)).unwrap();
+        assert!(count >= 2);
+        let last = first + count - 1;
+        let moved = last + 50;
+        // Mark each cluster's bytes so that a read of the wrong cluster shows, then move the
+        // chain's last cluster past a gap.
+        for (mark, cluster) in (first..=last).enumerate()
+        {
+            bytes[data(cluster)..data(cluster) + size].fill(u8::try_from(mark + 1).unwrap());
+        }
+        let tail: Vec<u8> = bytes[data(last)..data(last) + size].to_vec();
+        bytes[data(moved)..data(moved) + size].copy_from_slice(&tail);
+        bytes[data(last)..data(last) + size].fill(0);
+        for copy in 0..u32::from(geo.num_fats)
+        {
+            bytes[fat(copy, last - 1)..fat(copy, last - 1) + 2]
+                .copy_from_slice(&moved.to_le_bytes());
+            bytes[fat(copy, last)..fat(copy, last) + 2].copy_from_slice(&0u16.to_le_bytes());
+            bytes[fat(copy, moved)..fat(copy, moved) + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        }
+        let tree = read_volume(&mut Cursor::new(bytes), 0, 512).unwrap();
+        let mut want = Vec::new();
+        for mark in 1..=count
+        {
+            want.extend(vec![u8::try_from(mark).unwrap(); size]);
+        }
+        want.truncate(5000);
+        assert_eq!(tree.get("/FILE"), Some(&Node::File(want)));
     }
 }

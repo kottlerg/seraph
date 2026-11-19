@@ -424,8 +424,11 @@ makes of the ESP it composes (`src/esp.rs`): the bootloader at both of its paths
 `/boot/boot.efi`, the kernel `/boot/kernel`, and each entry of the bundle the installed file
 its bundle list names, the list read from the root partition's `/config/bundle/` and the
 harness chosen by the bundle's entries; the bundle holds every entry its list names and no other;
-and the ESP holds no other file than an empty presence-only knob in `\EFI\seraph\`. The
-architecture is the root partition's type. It fails naming every object that differs, is
+and the ESP holds no other file than an empty presence-only knob in `\EFI\seraph\`, the
+firmware's `\NvVars` aside: OVMF writes its variables there when an x86_64 launcher boots the
+image without a variable store, so an image that has been booted is checked as well as a fresh
+one, the reader following chains the guest or the firmware fragmented. The architecture is the
+root partition's type. It fails naming every object that differs, is
 missing, or copies a file the root partition does not install, so a repack that changed one side
 of the image alone is caught.
 

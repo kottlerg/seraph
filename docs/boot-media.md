@@ -87,8 +87,9 @@ one whose object is missing, differs from its installed file or copies one that 
 whose bundle holds an entry its list does not name or lacks one it names, or that holds any other
 file than an empty presence-only knob in `\EFI\seraph\`. `cargo xtask check-disk` makes the
 same check of a packed disk image, its ESP against the installed files of its root partition, so
-a repack that changed one side alone is caught
-([xtask/README.md](../xtask/README.md#cargo-xtask-check-disk)).
+a repack that changed one side alone is caught; it sets aside the firmware's variable file
+`\NvVars`, which OVMF writes to the ESP of an image it boots without a variable store, as no pack
+copies it ([xtask/README.md](../xtask/README.md#cargo-xtask-check-disk)).
 
 ---
 

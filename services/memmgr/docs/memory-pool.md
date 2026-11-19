@@ -1085,9 +1085,16 @@ only the chunks that have an entry, and one request makes at most a few chunks r
 at most a bounded number ([docs/limits.md](../../../docs/limits.md) § memmgr); its reply says where
 it stopped, and the reader asks again from there, so a request's turn delays the faults and grants
 behind it no more than a few restores would. The reader then retries its read. The request
-restores and backs nothing else: a page no fault has backed stays not present. A chunk on disk or
-lost is passed over, since memmgr reads no swap slot and waits on no swap service; a page of it
-stays not present ([Disk tier](#disk-tier)).
+restores and backs nothing else: a page no fault has backed stays not present. memmgr reads no
+swap slot and waits on no swap service, so a chunk on disk it asks the swap service for: when the
+swap service registered a want Notification, memmgr posts the chunk's slot word to a short list the
+swap service takes (`SWAP_WANTED`), sends on the Notification, and replies that the range is
+pending at that chunk; the swap service reads the slot and restores the chunk ahead of a fault, and
+the reader, after a pause, asks again. After about a second of pauses a reader asks on from where
+memmgr's walk stopped, past the chunks on disk, so a swap service that is down or cannot read the
+slot leaves their pages not present and the rest of the range resident. A lost
+chunk, and a chunk on disk with no swap service to ask, are passed over; a page of either stays not
+present ([Disk tier](#disk-tier)).
 
 ---
 
@@ -1096,7 +1103,7 @@ stays not present ([Disk tier](#disk-tier)).
 A compressed chunk can leave memmgr's store for a swap slot the swap service holds on disk
 ([#43](https://github.com/kottlerg/seraph/issues/43)). memmgr performs no device I/O and waits on no
 peer: the swap service drives every step over memmgr's swap labels, and a fault on a chunk on disk
-is redirected to it by a fault reply ([`ipc-interface.md`](ipc-interface.md) § Labels 22 to 25).
+is redirected to it by a fault reply ([`ipc-interface.md`](ipc-interface.md) § Labels 22 to 26).
 The labels are served only on the swap authority, a SEND on memmgr's endpoint badged
 `SWAP_AUTHORITY` alone, which init mints and svcmgr publishes seed-only as `memmgr.swap`.
 
@@ -1155,7 +1162,10 @@ reply carries the decline word of code 12 with detail 1, which the swap service 
 fault with, so the faulting thread is killed, as every later fault on the chunk is. A fault on a
 chunk on disk with no swap service registered is declined with code 12 and detail 0. `SWAP_RESTORE`
 names a slot word, which `SWAP_TAKE`'s reply also carries, not a fault, so the swap service may also
-restore ahead of one.
+restore ahead of one, as it does for a debugger's `MAKE_RESIDENT` of a chunk on disk: memmgr posts
+the chunk's slot word to a list of at most `SWAP_WANTED_WORDS` words, sends on the Notification the
+swap service registered for it, and the swap service takes the words with `SWAP_WANTED`
+([Eviction](#eviction), Debugger reads).
 
 **Read-back is serial.** virtio-blk keeps one request in flight
 ([virtio-blk README](../../drivers/virtio/blk/README.md)), and one driver instance serves the root,
@@ -1227,7 +1237,10 @@ terminal fault tears down the whole process (see
 [Process Lifecycle](../../../docs/process-lifecycle.md),
 [Userspace Memory Model](../../../docs/userspace-memory-model.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
+[Crash Block Format](../../crashd/docs/block-format.md),
+[Core Format](../../crashd/docs/core-format.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
 [Filesystem Driver Protocol](../../fs/docs/fs-driver-protocol.md),
+[services/gdbstub/README.md](../../gdbstub/README.md),
 [services/memmgr/README.md](../README.md),
 [memmgr IPC Interface](ipc-interface.md)

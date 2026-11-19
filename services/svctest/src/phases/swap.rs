@@ -857,7 +857,9 @@ pub(super) fn detach(authority: u64, process: u64, threads: &[u64], what: &str)
 /// procmgr's label for `MAKE_RESIDENT` of `[va, va + len)` of `process`,
 /// asked again from where each success stopped until it reaches the range's
 /// end: memmgr makes a bounded part of a range resident per request. A
-/// success that stops where it started fails the phase.
+/// success that stops where it started, or that is pending at a chunk on
+/// disk (the phases that call this hold none while a swap service could be
+/// asked for it), fails the phase.
 pub(super) fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> u64
 {
     let end = va.saturating_add(len);
@@ -870,6 +872,12 @@ pub(super) fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> 
             .word(2, end.saturating_sub(at))
             .build();
         let reply = procmgr_call(authority, &req, "MAKE_RESIDENT");
+        assert!(
+            reply.label != procmgr_errors::SUCCESS
+                || reply.word(1) != memmgr_labels::RESIDENT_PENDING,
+            "{PHASE}: MAKE_RESIDENT from {at:#x} to {end:#x} pending at {:#x}",
+            reply.word(0)
+        );
         if reply.label != procmgr_errors::SUCCESS || reply.word(0) >= end
         {
             return reply.label;
@@ -881,6 +889,13 @@ pub(super) fn make_resident(authority: u64, process: u64, va: u64, len: u64) -> 
         );
         at = reply.word(0);
     }
+}
+
+/// Whether the page at `va` of the fixture's main region at `base`, read
+/// through `thread`, holds its pattern.
+pub(super) fn chunk_reads_pattern(thread: u64, va: u64, base: u64) -> bool
+{
+    read_pattern(thread, va, base, MAIN_XOR) == Ok(true)
 }
 
 /// Whether the page at `va` of `thread`'s process holds the pattern of a region

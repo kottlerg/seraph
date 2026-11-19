@@ -201,9 +201,11 @@ A dump follows the block when the report attached and read the process within it
    is not listed (one that never registered), it writes no core.
 5. It asks procmgr to make resident (`MAKE_RESIDENT`) the range from the page of the fault's
    instruction and of each thread's stack pointer up, an equal share of the per-core budget each, so
-   memmgr restores each chunk it evicted there, the ones the layout keeps first, then lists the
-   address space's pages (`SYS_THREAD_LIST_PAGES`), reads the image's ELF header at the load bias
-   for the core's `NT_AUXV`, and lays the core out within the per-core budget.
+   memmgr restores each chunk it evicted there, the ones the layout keeps first (a chunk on disk the
+   swap service restores, crashd pausing and asking again after each pending reply, at most
+   `ipc::PENDING_TRIES` pauses, about a second, over the whole dump), then
+   lists the address space's pages (`SYS_THREAD_LIST_PAGES`), reads the image's ELF header at the
+   load bias for the core's `NT_AUXV`, and lays the core out within the per-core budget.
 6. It deletes the `.part` files earlier dumps left, and the oldest cores until the new one fits
    the directory budget.
 7. It writes the core under its `.part` name, reading the pages through the faulting thread's

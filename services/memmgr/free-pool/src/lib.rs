@@ -46,7 +46,10 @@ pub use budget::{
 pub use chunk::{COLD_SWEEPS, ChunkEntry, ChunkError, ChunkState};
 pub use commit::{CommitNeed, PT_DONATION_PAGES};
 pub use deferred::{DeferredList, RecheckBudget};
-pub use disk::{FaultPath, Registered, SlotError, SwapSlots, fault_path};
+pub use disk::{
+    FaultPath, Posted, Registered, ResidentPath, SlotError, SwapSlots, WANT_WORDS, WantList,
+    fault_path, pending_from, resident_path,
+};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
 pub use ledger::{
     BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SwapError,

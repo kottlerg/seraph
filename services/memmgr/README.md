@@ -97,7 +97,7 @@ Allocation Contract").
   never leaves memmgr, redirect a fault on a chunk on disk to it, and restore
   the chunk from the bytes it hands back once their tag checks (see
   [`docs/memory-pool.md`](docs/memory-pool.md#disk-tier) § Disk tier and
-  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 22 to 25).
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 22 to 26).
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments. Runs after every

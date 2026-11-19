@@ -130,7 +130,7 @@ pub const VFSD_SWAP: &[u8] = b"vfsd.swap";
 
 /// `SEND|GRANT` on memmgr's endpoint badged
 /// `memmgr_labels::SWAP_AUTHORITY` alone: the swap service's interface to
-/// memmgr's disk tier (`SWAP_REGISTER` to `SWAP_RESTORE`). Seed-only, its
+/// memmgr's disk tier (`SWAP_REGISTER` to `SWAP_WANTED`). Seed-only, its
 /// seeds keeping `GRANT`, since the swap labels move caps to memmgr; the swap
 /// service's recipe is to seed it, and svctest's recipe seeds it while no
 /// swap service exists, to act as the swap client.

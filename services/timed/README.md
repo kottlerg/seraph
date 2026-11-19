@@ -32,15 +32,19 @@ runs on every supported arch.
 
 Bootstrap caps from svcmgr (one round, `done=true`, carrying the two slots below with the
 presence word of [service-definitions.md § `seed`](../svcmgr/docs/service-definitions.md#seed);
-recipe `provides = timed`, `seed = devmgr.class.rtc`):
+recipe `provides = timed`, `seed = devmgr.class.rtc`; its `argv = timed` names the process
+for procmgr's `LIST_PROCESSES`):
 
 | Slot      | Cap                                                          |
 |-----------|--------------------------------------------------------------|
 | `caps[0]` | Service-endpoint RECV (timed receives on this)               |
 | `caps[1]` | `devmgr.class.rtc`: the `rtc` class SEND |
 
-No other caps are needed; the class SEND is used once for the
-`QUERY_DEVICE` resolve, at instance ordinal 0.
+No other caps are needed; the class SEND is used once, to resolve the class's
+first live driver (`ipc::first_device`), which passes an ordinal devmgr answers
+`WITHDRAWN`. devmgr serves a restarted driver at the class's next ordinal
+([Driver Restart](../devmgr/docs/responsibilities.md#driver-restart)), so a
+timed started after an RTC driver restart finds the new instance there.
 
 ---
 
@@ -65,8 +69,9 @@ through devmgr), timed enters a degraded state and replies
 
 1. Pull the service endpoint and `rtc` class SEND via the
    spawner's bootstrap round.
-2. `devmgr.QUERY_DEVICE` (ordinal 0) → `READ_AUTHORITY`-badged SEND on the
-   per-board RTC driver bound by devmgr.
+2. `devmgr.QUERY_DEVICE` from ordinal 0, past each `WITHDRAWN` ordinal
+   (`ipc::first_device`) → `READ_AUTHORITY`-badged SEND on the per-board RTC
+   driver bound by devmgr.
 3. `rtc_driver.RTC_GET_EPOCH_TIME` → `rtc_us` (Unix-epoch us).
 4. Bracket the RTC read with two `system_info(ElapsedUs)` samples; `kernel_us` is their
    midpoint.

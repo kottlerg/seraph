@@ -30,11 +30,13 @@ works from a long or summarized context. Three consequences hold throughout this
   it, a grant before you say `host free`). What exists only in your context is lost at the
   hand-over.
 - "The maintainer" below is reached through the supervisor: send to `main` by `SendMessage`
-  only what § Reporting to the maintainer allows, as text ready to show, and the supervisor
-  returns the answer verbatim. Ending your turn reports nothing: the harness does not reliably
-  notify the supervisor of your stop while a background child of yours is alive; such a stop
-  has produced no notification at all. Every line this file sends to the supervisor goes by
-  `SendMessage` to `main`, never left to the stop.
+  only what § Reporting to the maintainer allows, as text ready to show; the supervisor shows
+  it whole and returns the maintainer's words alone, as `Maintainer, verbatim: "<text>"`, after
+  at most one line `Answers: "<the question as shown>"` that names the question they answer
+  (`.claude/skills/orchestrate/SKILL.md`, step 2). Ending your turn reports nothing: the
+  harness does not reliably notify the supervisor of your stop while a background child of yours
+  is alive; such a stop has produced no notification at all. Every line this file sends to the
+  supervisor goes by `SendMessage` to `main`, never left to the stop.
 - Your own agent id is your address. The supervisor's first message gives it to you; record it
   with `cargo xtask orch orchestrator <id>` as soon as the record exists (right after
   `orch start` in a new batch, before any other step on a resume), since workers read the id

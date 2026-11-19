@@ -21,6 +21,7 @@ terminal/
 ├── README.md
 └── src/
     ├── main.rs            # Device resolution, the session loop, line discipline
+    ├── device.rs          # One class's current driver, followed across a driver restart
     ├── session.rs         # sessiond client: registration, open, stream handover
     ├── input.rs           # Keyboard and serial RX producer threads
     └── output.rs          # Output sink: framebuffer (SGR-parsed) and serial mirror
@@ -48,7 +49,22 @@ terminal/
   (`ESC[…m`) through [shared/ansi](../../shared/ansi/README.md) into
   `FB_SET_ATTRS` colour changes, so the driver never sees `ESC`, while the
   serial mirror receives the raw bytes. The framebuffer is optional: a headless
-  boot has none, and the terminal then mirrors to serial only.
+  boot has none, and the terminal then mirrors to serial only, until devmgr
+  serves one.
+- **Driver restart**: devmgr restarts a served driver that dies and serves the
+  new instance at the class's next ordinal
+  ([Driver Restart](../../services/devmgr/docs/responsibilities.md#driver-restart)).
+  Each class the terminal uses (input, framebuffer, serial) is followed by a
+  tracker (`device.rs`): it registers the class's `WATCH_CLASS` watch before
+  its first resolve and, on each signal, looks at the class again
+  (`ipc::refresh_device`), keeping the driver devmgr still serves and replacing
+  a withdrawn one with the first live driver past it. A thread whose call on a
+  driver fails waits up to a second for a newer one, then calls again; the
+  serial receive thread registers its notification with each new instance, and
+  the sink starts its SGR parser again with a new framebuffer instance, which
+  starts at the driver's default attributes. The terminal logs each driver it
+  holds (`terminal: <class> driver at ordinal <n>`) and the first write that
+  reaches a framebuffer instance after the first.
 - **Line discipline**:
   - local echo of each typed character to the output,
   - single-line backspace (`BS` erases the last byte of the current line and
@@ -115,12 +131,15 @@ and a further source would be just another producer.
 ## Testing
 
 Driven host-side by `cargo xtask test-terminal`, which boots with a QMP control
-socket, waits for the `terminal: READY for injection` marker, then exercises
-both input sources in one boot: a keyboard round (key sequence injected through
-the real virtio-input driver over QMP) and a serial round (the same sequence
-written to the guest UART via QEMU's bidirectional `-serial stdio`). Each round
-asserts the echoed input and the relayed leader output appear on the serial
-stream. It runs as a boot in the `usertest` cell. See
+socket and the GDB stub staged on the virtio-input driver, waits for the
+`terminal: READY for injection` marker, then exercises both input sources and a
+restart of the input driver in one boot: a keyboard round (key sequence
+injected through the real virtio-input driver over QMP), a serial round (the same
+sequence written to the guest UART via QEMU's bidirectional `-serial stdio`), and
+an input restart round (the host kills the virtio-input driver through the stub,
+the terminal must hold devmgr's restarted instance at ordinal 1, and the key
+sequence is injected again). Each round asserts the echoed input and the relayed
+leader output appear on the serial stream. It runs as a boot in the `usertest` cell. See
 [xtask/README.md](../../xtask/README.md#cargo-xtask-test-terminal) for the command and
 [docs/testing.md](../../docs/testing.md#interactive-input-test-terminal) for the test.
 

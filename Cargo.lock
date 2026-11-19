@@ -902,6 +902,7 @@ dependencies = [
  "ansi",
  "ipc",
  "syscall",
+ "syscall-abi",
 ]
 
 [[package]]

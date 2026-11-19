@@ -1197,10 +1197,11 @@ half a registry's worth of requests.
 
 The registry holds at most `procmgr_labels::REGISTERED_THREADS_MAX` (16384) threads per process
 ([docs/limits.md](../../../docs/limits.md) § Shared IPC and protocol crates); past it a thread runs
-unregistered, so no spawn fails for the bound. A thread refused there, or for procmgr's heap, that
-carries a binding under the debugger tag, a watched debugger's included, is bound back to the crash
-endpoint under the process badge at the refusal, with a debugger's upcall binding unbound, since no
-attach lists an unregistered thread and no restore reaches it. procmgr does not compare a
+unregistered, so no spawn fails for the bound. A thread refused there, for procmgr's heap, or while
+procmgr's own `CSpace` is short of its headroom, that carries a binding under the debugger tag, a
+watched debugger's included, is bound back to the crash endpoint under the process badge at the
+refusal, with a debugger's upcall binding unbound, since no attach lists an unregistered thread and
+no restore reaches it. procmgr does not compare a
 registration against the threads it holds: a thread registered twice takes two entries, both
 counting toward the bound, and the runtime registers each thread once: it does not repeat a call
 that failed, since the kernel can cancel a call with `Interrupted` after procmgr received it and

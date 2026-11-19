@@ -1571,21 +1571,31 @@ pub fn sender_refusal(opcode: u64, badge: u64) -> Option<u64>
     }
 }
 
-/// The error procmgr refuses `opcode` with while its own `CSpace` is short
-/// of its headroom and a top-up was refused (services/procmgr/README.md
-/// § `CSpace` headroom): `OUT_OF_MEMORY` for the labels whose capabilities
-/// procmgr keeps in a number that grows with requests, a child's caps
-/// (`CREATE_PROCESS`, `CREATE_FROM_FILE`) and a registered thread's cap
-/// (`REGISTER_THREAD`); `None` for every other label, which keeps no
+/// Whether procmgr's own `CSpace` held its headroom for the request being
+/// served (services/procmgr/README.md § `CSpace` headroom).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Headroom
+{
+    /// At or above the mark, or topped up to it.
+    Held,
+    /// Short of the mark, and the top-up was refused.
+    Short,
+}
+
+/// The error procmgr refuses `opcode` with, before it serves it, under
+/// [`Headroom::Short`]: `OUT_OF_MEMORY` for the create labels
+/// (`CREATE_PROCESS`, `CREATE_FROM_FILE`), each of whose children takes
+/// several capabilities procmgr keeps; `None` for every other label.
+/// `REGISTER_THREAD`, which keeps a Thread cap for each thread, is refused
+/// at its reservation instead, after its own checks
+/// ([`threads::ThreadRegistry::reserve_within`]); the rest keep no
 /// capability, or at most one per process or for the boot.
 #[must_use]
 pub fn headroom_refusal(opcode: u64) -> Option<u64>
 {
     matches!(
         opcode,
-        ipc::procmgr_labels::CREATE_PROCESS
-            | ipc::procmgr_labels::CREATE_FROM_FILE
-            | ipc::procmgr_labels::REGISTER_THREAD
+        ipc::procmgr_labels::CREATE_PROCESS | ipc::procmgr_labels::CREATE_FROM_FILE
     )
     .then_some(ipc::procmgr_errors::OUT_OF_MEMORY)
 }
@@ -2395,11 +2405,11 @@ mod tests
     }
 
     #[test]
-    fn headroom_refusal_refuses_only_the_labels_whose_caps_grow()
+    fn headroom_refusal_refuses_only_the_create_labels()
     {
         use ipc::procmgr_errors::OUT_OF_MEMORY;
-        use ipc::procmgr_labels::{CREATE_FROM_FILE, CREATE_PROCESS, REGISTER_THREAD};
-        for opcode in [CREATE_PROCESS, CREATE_FROM_FILE, REGISTER_THREAD]
+        use ipc::procmgr_labels::{CREATE_FROM_FILE, CREATE_PROCESS};
+        for opcode in [CREATE_PROCESS, CREATE_FROM_FILE]
         {
             assert_eq!(
                 headroom_refusal(opcode),
@@ -2407,9 +2417,10 @@ mod tests
                 "opcode {opcode}"
             );
         }
-        // Every other label, the ones that keep one cap per process or for
-        // the boot among them, and an unknown opcode, is served.
-        let refused = [CREATE_PROCESS, CREATE_FROM_FILE, REGISTER_THREAD];
+        // Every other label, `REGISTER_THREAD` (refused at its reservation)
+        // and the ones that keep one cap per process or for the boot among
+        // them, and an unknown opcode, is served.
+        let refused = [CREATE_PROCESS, CREATE_FROM_FILE];
         for opcode in (0..=64).filter(|op| !refused.contains(op))
         {
             assert_eq!(headroom_refusal(opcode), None, "opcode {opcode}");

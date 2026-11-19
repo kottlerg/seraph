@@ -78,8 +78,10 @@ const SESSION_STOP_LINE: &[u8] = b"stopped session ";
 /// than [`JOB_PAGES`] by far, so oomd stops it before `stopsrc`'s.
 const HOLD_PAGES: u64 = 512;
 
-/// The prefix of oomd's line for a stop of the fixture it advises.
-const ADVICE_LINE: &[u8] = b"would stop memhog: ";
+/// The prefix of oomd's line naming the candidate it would stop. In advice mode
+/// nothing is stopped, so each line names the first of oomd's stop order: the
+/// operator session while one is open.
+const ADVICE_LINE: &[u8] = b"would stop ";
 
 /// The part of crashd's line for a fault it holds.
 const HELD_LINE: &[u8] = b"held: memory critical";
@@ -182,7 +184,7 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 /// With `OOMD_STOP=no`, or no oomd (the no-stop case): the level stays
 /// `CRITICAL` past oomd's grace and cooldown with the same instance of the
 /// fixture running and no stop line logged, and, with oomd, at least one line
-/// naming the fixture it would stop; svctest then stops the fixture itself,
+/// naming a candidate it would stop; svctest then stops the fixture itself,
 /// through its stop authority, by the key svcmgr listed it under before the
 /// fill, and the level falls back to `NORMAL`.
 ///
@@ -446,19 +448,15 @@ fn probe(fixture: u64, phase: &str, what: &str) -> (u64, u64)
 /// itself, through its stop authority, `hold` after the fill. The fixture's
 /// next instance must then answer with a new nonce and no pages.
 ///
-/// Returns the last `ElapsedUs` reading taken before a read of the level that
-/// gave `CRITICAL`. From the fill to that reading the fixture holds the pool
-/// at the reserve, so a process outside the system reserve takes no free page,
-/// except the pages another process frees in the window, which the fixture
-/// takes back only at its next tick (`mem_fill::TICK_MS`). `during` and the
-/// wait must allocate nothing and write no log line; the stack they use is
-/// touched before the fill.
-pub(super) fn critical_window(
-    caps: &Caps,
-    phase: &str,
-    hold: Duration,
-    during: impl FnOnce(),
-) -> u64
+/// From the fill to the fixture's stop the fixture holds the pool at the
+/// reserve, so a process outside the system reserve takes no free page, except
+/// the pages another process frees in the window, which the fixture takes back
+/// only at its next tick (`mem_fill::TICK_MS`). Fails `phase` when the level
+/// does not read `CRITICAL` after the fill, or `NORMAL` after the window,
+/// within [`NORMAL_WAIT`]. `during`, the reads of the level and the stop must
+/// allocate nothing and write no log line; the stack they use is touched
+/// before the fill.
+pub(super) fn critical_window(caps: &Caps, phase: &str, hold: Duration, during: impl FnOnce())
 {
     let stops = oomd_config(phase).is_some_and(|config| config.mode == oomd_policy::Mode::Stop);
     await_level(MemoryPressure::Normal, phase, "before the fill");
@@ -485,6 +483,7 @@ pub(super) fn critical_window(
     });
     touch_stack();
     let _ = hog_call(fixture, phase);
+    await_level(MemoryPressure::Critical, phase, "after the fill");
     during();
     if let Some((cap, key)) = own_stop
     {
@@ -496,7 +495,7 @@ pub(super) fn critical_window(
             "{phase}: STOP_CANDIDATE(memhog) replied {label:#x}"
         );
     }
-    let critical_until = await_fall(phase);
+    await_level(MemoryPressure::Normal, phase, "after the window");
     let (next, pages) = probe(fixture, phase, "PROBE after the window");
     assert_ne!(next, first, "{phase}: the hogging instance still answered");
     assert_eq!(
@@ -504,38 +503,6 @@ pub(super) fn critical_window(
         "{phase}: memhog's next instance holds {pages} pages"
     );
     let _ = syscall::cap_delete(fixture);
-    critical_until
-}
-
-/// Wait up to [`NORMAL_WAIT`] for the level to read `NORMAL`: the last
-/// `ElapsedUs` reading taken before a read of the level that gave
-/// `CRITICAL`. Fails `phase` when no read before the fall gave `CRITICAL`.
-/// Allocates nothing until it fails.
-fn await_fall(phase: &str) -> u64
-{
-    let start = Instant::now();
-    let mut critical_until = None;
-    loop
-    {
-        let now = elapsed_us();
-        match std::os::seraph::memory_pressure()
-        {
-            Some(MemoryPressure::Critical) => critical_until = Some(now),
-            Some(MemoryPressure::Normal) =>
-            {
-                return critical_until.unwrap_or_else(|| {
-                    panic!("{phase}: the level never read CRITICAL after the fill")
-                });
-            }
-            _ =>
-            {}
-        }
-        assert!(
-            start.elapsed() < NORMAL_WAIT,
-            "{phase}: the level did not read NORMAL {NORMAL_WAIT:?} after the fill"
-        );
-        std::thread::sleep(LEVEL_POLL);
-    }
 }
 
 /// Microseconds since boot, the clock logd stamps each history entry with
@@ -604,7 +571,7 @@ struct Lines
     /// job, of `stopsrc`'s job and of the fixture, and the newest and the
     /// oldest stop of a session, sit.
     at: Positions,
-    /// oomd's advice to stop the fixture.
+    /// oomd's advice lines, each naming a candidate it would stop.
     advice: usize,
     /// crashd's held faults.
     held: usize,

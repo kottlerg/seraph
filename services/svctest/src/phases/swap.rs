@@ -20,7 +20,7 @@
 //! The phase then takes grants from memmgr until the pressure level reads
 //! `LOW` and keeps it there, taking more whenever the level falls to
 //! `NORMAL` and giving a block back at `CRITICAL`, until memmgr holds more of
-//! the child's pages swapped than the reserve. It requires:
+//! the child's main region swapped than the reserve. It requires:
 //!
 //! * a page of the main region that reads `InvalidAddress` reads its pattern
 //!   after procmgr's `MAKE_RESIDENT` of its chunk, and the hole stays not
@@ -288,15 +288,31 @@ fn pool() -> Pool
     }
 }
 
-/// The pages of the caller's own node that memmgr holds swapped
-/// (`QUERY_MEMORY_USAGE` `data[4]`); `None` when the call fails or is refused.
-fn own_swapped_pages() -> Option<u64>
+/// The pages charged to the caller's own node and the pages of them memmgr
+/// holds swapped (`QUERY_MEMORY_USAGE` `data[0]` and `data[4]`); `None` when
+/// the call fails or is refused.
+fn own_usage() -> Option<(u64, u64)>
 {
     let req = IpcMessage::new(memmgr_labels::QUERY_MEMORY_USAGE);
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
     let reply =
         unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, &req, current_ipc_buf()) }.ok()?;
-    (reply.label == memmgr_errors::SUCCESS).then(|| reply.word(4))
+    (reply.label == memmgr_errors::SUCCESS).then(|| (reply.word(0), reply.word(4)))
+}
+
+/// The pages of the fixture's main region of `main_pages` pages that memmgr
+/// holds swapped, at least: the node's swapped pages less every charged page
+/// outside the region's backed ones (all but the hole's chunk), which its
+/// stacks, heap and no-evict region hold. 0 when the call fails.
+fn main_swapped_pages(main_pages: u64) -> u64
+{
+    let Some((charged, swapped)) = own_usage()
+    else
+    {
+        return 0;
+    };
+    let backed = main_pages.saturating_sub(CHUNK_PAGES);
+    swapped.saturating_sub(charged.saturating_sub(backed))
 }
 
 /// The address of page `index` of the region at `base`.
@@ -692,7 +708,8 @@ fn parse_ready(line: &str) -> Ready
     }
 }
 
-/// The pages the fixture reports swapped, from its `swapped <n>` line.
+/// The pages of its main region the fixture reports swapped, at least, from its
+/// `swapped <n>` line.
 fn parse_swapped(line: &str) -> u64
 {
     line.trim()
@@ -1028,7 +1045,10 @@ fn read_before_hog(thread: u64, ready: &Ready)
 }
 
 /// With the hog holding the level, wait until the fixture reports at least
-/// `want` pages swapped and memmgr's store and swapped total are nonzero.
+/// `want` pages of its main region swapped and memmgr's store and swapped
+/// total are nonzero. Only the main region's chunks are restored at
+/// `CRITICAL` ([`critical_restore`]), and they must outnumber the restore
+/// headroom.
 fn await_swapped(hog: &mut Hog, fixture: &mut Fixture, want: u64)
 {
     let start = Instant::now();
@@ -1046,12 +1066,18 @@ fn await_swapped(hog: &mut Hog, fixture: &mut Fixture, want: u64)
         let status = pool();
         if swapped >= want && status.swapped > 0 && status.store > 0
         {
+            println!(
+                "{PHASE}: the fixture reports {swapped} pages of its main region swapped; memmgr \
+                 holds {} bytes swapped in a store of {} bytes",
+                status.swapped, status.store
+            );
             return;
         }
         assert!(
             start.elapsed() < SWAP_BOUND,
             "{PHASE}: after {SWAP_BOUND:?} at level {}, the fixture reports {swapped} pages \
-             swapped of the {want} awaited, memmgr's swapped total {} bytes and store {} bytes",
+             of its main region swapped of the {want} awaited, memmgr's swapped total {} \
+             bytes and store {} bytes",
             status.level,
             status.swapped,
             status.store
@@ -1343,7 +1369,7 @@ fn fixture_thread(index: u32)
     THREADS_READY.fetch_add(1, Ordering::AcqRel);
     while !VERIFY.load(Ordering::Acquire)
     {
-        let _ = own_swapped_pages();
+        let _ = own_usage();
         std::thread::sleep(THREAD_SLEEP);
     }
     let live = std::hint::black_box(&array);
@@ -1458,7 +1484,7 @@ fn fixture_main() -> !
         };
         match line.trim()
         {
-            "swapped" => println!("swapped {}", own_swapped_pages().unwrap_or(0)),
+            "swapped" => println!("swapped {}", main_swapped_pages(main_pages)),
             "verify" =>
             {
                 VERIFY.store(true, Ordering::Release);

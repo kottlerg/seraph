@@ -525,6 +525,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
 | data[12] | `disk_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
 | data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 26) |
+| data[14] | `allowance_bytes` — the overcommit allowance A: `promised` may exceed the free pool by it, `DEMAND_CHUNK_PAGES` pages a free swap slot less the pages compression freed from the evicted chunks not on disk; `0` while no swap service is registered ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -550,18 +551,20 @@ evicted or restored. `largest_free_bytes`
 backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
 (`data[6]`) is `pool_total / 64` pages. `growth_floor_bytes` (`data[11]`) is
 the reserve while nothing is swapped: a process outside the reserve has its
-grants refused, and its demand faults declined, once `data[3]` less
-`data[8]` less the request would fall below it, and the level is
-`PRESSURE_CRITICAL` at or below it. `pressure` (`data[7]`) is the
+grants refused, and its demand faults declined, once the free pages outside
+`promised`, the lesser of `data[3] + data[14] - data[8]` and `data[3]`, less
+the request would fall below it, and the level is `PRESSURE_CRITICAL` at or
+below it. `pressure` (`data[7]`) is the
 level memmgr last signalled to the `REGISTER_PRESSURE` registrants, so a
 registrant woken by its bit reads here the level the bit announced, or a later
-one. `promised_bytes` (`data[8]`) is held for the committed regions' faults:
-every admission reads `data[3]` less it, so a free page it counts is refused to
-every other charge. `store_bytes` (`data[9]`) and `swapped_bytes`
-(`data[10]`) rise as memmgr evicts cold chunks under pressure and fall as
-faults restore them or their regions go; their ratio is the store's
+one. `promised_bytes` (`data[8]`) is held for the committed regions' faults: a
+commitment is admitted against `data[3] + data[14]` less it and the growth
+floor, and every other admission reads the free pages outside it, so a free
+page it counts beyond the allowance is refused to every other charge.
+`store_bytes` (`data[9]`) and `swapped_bytes` (`data[10]`) rise as memmgr
+evicts cold chunks under pressure and fall as faults restore them or their regions go; their ratio is the store's
 compression; a chunk on disk leaves `data[9]` and stays in `data[10]`, and
-`data[12]` counts it. `data[3]` to `data[13]` are appended after the identity terms;
+`data[12]` counts it. `data[3]` to `data[14]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`

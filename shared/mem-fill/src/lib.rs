@@ -172,9 +172,10 @@ impl Fill
 }
 
 /// What memmgr can still promise a process outside the reserve, in pages: its
-/// free pages less `promised` and the growth floor (`QUERY_POOL_STATUS`'s
-/// `data[3]`, `data[8]` and `data[11]`); `None` when memmgr does not answer or
-/// refuses. Allocates nothing.
+/// free pages and its overcommit allowance less `promised` and the growth
+/// floor (`QUERY_POOL_STATUS`'s `data[3]`, `data[14]`, `data[8]` and
+/// `data[11]`); `None` when memmgr does not answer or refuses. Allocates
+/// nothing.
 fn available() -> Option<u64>
 {
     let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
@@ -189,6 +190,7 @@ fn available() -> Option<u64>
     .ok()?;
     (reply.label == memmgr_errors::SUCCESS).then(|| {
         (reply.word(3) / PAGE_SIZE)
+            .saturating_add(reply.word(14) / PAGE_SIZE)
             .saturating_sub(reply.word(8) / PAGE_SIZE)
             .saturating_sub(reply.word(11) / PAGE_SIZE)
     })

@@ -246,6 +246,8 @@ pub(super) struct Pool
     pub(super) on_disk: u64,
     /// `data[13]`: the swap slots free.
     pub(super) free_slots: u64,
+    /// `data[14]`: the overcommit allowance.
+    pub(super) allowance: u64,
 }
 
 impl Pool
@@ -257,10 +259,15 @@ impl Pool
     }
 
     /// The pages free outside what the committed regions can still take, the
-    /// quantity the pressure level reads.
+    /// quantity the pressure level reads: the lesser of the free pages and the
+    /// allowance less `promised`, and the free pages.
     fn available_pages(&self) -> u64
     {
-        self.free.saturating_sub(self.promised) / PAGE_SIZE
+        self.free
+            .saturating_add(self.allowance)
+            .saturating_sub(self.promised)
+            .min(self.free)
+            / PAGE_SIZE
     }
 
     /// The pages `available_pages` falls below at `LOW`: a sixteenth of the pool.
@@ -319,6 +326,7 @@ pub(super) fn pool() -> Pool
         floor: reply.word(11),
         on_disk: reply.word(12),
         free_slots: reply.word(13),
+        allowance: reply.word(14),
     }
 }
 

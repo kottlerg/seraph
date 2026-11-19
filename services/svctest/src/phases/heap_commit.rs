@@ -13,9 +13,10 @@
 //! `heap-commit-limited` child under a max of [`LIMITED_MAX_PAGES`]
 //! ([`limited_child_main`]), whose `try_reserve` past the max returns `Err`
 //! and which keeps running, and a `heap-commit-hog` ([`hog_main`]), which
-//! commits all but [`HOG_MARGIN_PAGES`] of what memmgr can still promise,
-//! sees a grant past that refused although free pages exist, and touches every
-//! page it committed with no fault declined. Each child's charge leaves
+//! commits all but [`HOG_MARGIN_PAGES`] of what memmgr can still promise, its
+//! overcommit allowance included, sees a grant past that refused although free
+//! pages exist, gives back what it committed past its free pages, and touches
+//! every page it still holds committed with no fault declined. Each child's charge leaves
 //! svctest's budget subtree before the phase goes on, memmgr's free total net
 //! of eviction and its promised total then return to their levels
 //! ([`PoolLevels`]), and the all-RAM-accounted identity holds.
@@ -619,10 +620,23 @@ fn limited_child_main() -> !
     exit(0);
 }
 
-/// What memmgr can still promise a node outside the reserve, in pages: its
-/// free pages and its overcommit allowance less `promised` and the growth
-/// floor (services/memmgr/docs/memory-pool.md § Commit, Overcommit).
+/// What memmgr can still promise a node outside the reserve and hold a free
+/// page for, in pages: its free pages less `promised` and the growth floor.
+/// A commitment past it is admitted only against the overcommit allowance
+/// ([`promise_room`]), whose pages a fault may find taken.
 pub(crate) fn uncommitted_available() -> u64
+{
+    let Some((free, promised, floor)) = pool_totals()
+    else
+    {
+        exit(HOG_STATUS_FAILED)
+    };
+    free.saturating_sub(promised).saturating_sub(floor)
+}
+
+/// What memmgr can still promise a node outside the reserve, in pages, its
+/// overcommit allowance included ([`promise_room`]).
+fn allowed_available() -> u64
 {
     promise_room().unwrap_or_else(|| exit(HOG_STATUS_FAILED))
 }
@@ -644,23 +658,12 @@ pub(crate) fn promise_room() -> Option<u64>
     )
 }
 
-/// The overcommit allowance a `QUERY_POOL_STATUS` reply shows, in pages:
-/// [`CHUNK_PAGES`] pages a free swap slot (`data[13]`), less the pages
-/// compression freed from the evicted chunks not on disk, their pages
-/// (`data[10]` less `data[12]`) less the store pages they hold (`data[9]`);
-/// 0 while no swap service is registered (services/memmgr/docs/memory-pool.md
-/// § Commit, Overcommit).
+/// The overcommit allowance a `QUERY_POOL_STATUS` reply shows (`data[14]`),
+/// in pages; 0 while no swap service is registered
+/// (services/memmgr/docs/memory-pool.md § Commit, Overcommit).
 pub(crate) fn allowance_pages(reply: &IpcMessage) -> u64
 {
-    let freed = reply
-        .word(10)
-        .saturating_sub(reply.word(12))
-        .saturating_sub(reply.word(9))
-        / PAGE_SIZE;
-    reply
-        .word(13)
-        .saturating_mul(CHUNK_PAGES)
-        .saturating_sub(freed)
+    reply.word(14) / PAGE_SIZE
 }
 
 /// memmgr's `QUERY_POOL_STATUS` reply; `None` when the call fails or is
@@ -681,12 +684,17 @@ pub(crate) fn pool_status() -> Option<IpcMessage>
 }
 
 /// Child role: commit, through `try_reserve` on the heap, all but at most
-/// [`HOG_MARGIN_PAGES`] of what memmgr can still promise, halving an attempt
-/// it refuses. A best-effort grant of one page more than is then left is
-/// refused with `OUT_OF_MEMORY_BEST_EFFORT`, and its reply counts more free
-/// pages than the grant asked: the pool holds them, promised to the hog. The
-/// hog then writes every page it committed, and exits 0; a fault memmgr
-/// declined would kill it instead.
+/// [`HOG_MARGIN_PAGES`] of what memmgr can hold free pages for
+/// ([`uncommitted_available`]), halving an attempt it refuses, then, in an
+/// extra set of blocks, all but the margin of what the overcommit allowance
+/// adds to that ([`allowed_available`]). A best-effort grant of one page more
+/// than is then left is refused with `OUT_OF_MEMORY_BEST_EFFORT`, and its
+/// reply counts more free pages than the grant asked: the pool holds them,
+/// promised to the hog. The hog then frees the extra blocks, the heap's top,
+/// whose trim gives their commitment back, writes every page of the rest, for
+/// which free pages are held, and exits 0; a fault memmgr declined would kill
+/// it instead. The allowance's pages are not written: a fault on one may find
+/// no free page, and is held only by crashd, which the boot may not stage.
 ///
 /// Other processes free pages while the hog runs (a file system gives back
 /// its cache when the hog's commitment raises memmgr's pressure level), so
@@ -713,8 +721,17 @@ fn hog_main() -> !
     let mut rounds = HOG_MAX_ROUNDS;
     for _ in 0..HOG_REFUSAL_ATTEMPTS
     {
-        let left = commit_to_margin(&mut held, &mut rounds);
-        if past_grant_refused(left)
+        let _ = commit_to_margin(&mut held, &mut rounds);
+        let mut extra: Vec<Vec<u8>> = Vec::with_capacity(HOG_MAX_ROUNDS);
+        let left = commit_to_margin_by(&mut extra, &mut rounds, allowed_available);
+        let refused = past_grant_refused(left);
+        // Newest first, so each block freed is the heap's top, which the heap
+        // trims.
+        while let Some(block) = extra.pop()
+        {
+            drop(block);
+        }
+        if refused
         {
             touch_committed(&mut held);
             exit(0);
@@ -723,16 +740,23 @@ fn hog_main() -> !
     exit(HOG_GRANT_NOT_REFUSED);
 }
 
-/// Commit blocks into `held` until what memmgr can still promise is at most
+/// Commit blocks into `held` until what memmgr can still promise and hold
+/// a free page for ([`uncommitted_available`]) is at most
 /// [`HOG_MARGIN_PAGES`], spending reservation attempts from `rounds`, and
 /// return what is then left; exit with [`HOG_NOT_COMMITTED`] when `rounds`
 /// runs out first.
 pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
 {
+    commit_to_margin_by(held, rounds, uncommitted_available)
+}
+
+/// [`commit_to_margin`], with `available` reading what is left.
+fn commit_to_margin_by(held: &mut Vec<Vec<u8>>, rounds: &mut usize, available: fn() -> u64) -> u64
+{
     let mut ask = u64::MAX;
     while *rounds > 0
     {
-        let available = uncommitted_available();
+        let available = available();
         if available <= HOG_MARGIN_PAGES
         {
             return available;

@@ -1912,6 +1912,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         )
         .word(12, l.disk_pages().saturating_mul(PAGE_SIZE))
         .word(13, disk::free_slots(l))
+        .word(14, l.allowance().saturating_mul(PAGE_SIZE))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

@@ -893,6 +893,7 @@ found, at least its faulting page. A draw still short is declined with code 11, 
 ([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message), which crashd holds as it holds
 code 7; with no slot registered that is a pool with no free page at all. The admission and draw
 rules are the host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free` and `draw_room`).
+`QUERY_POOL_STATUS` reports A in `data[14]` ([ipc-interface.md](ipc-interface.md) § Label 6).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops

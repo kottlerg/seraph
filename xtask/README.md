@@ -43,6 +43,7 @@ xtask/
 │   │                           #   store (§ Signing)
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
+│   │                           #   symbols store (store.rs: build ids, the manifest); the
 │   │                           #   tests' ELF and DWARF fixture writer (fixture.rs)
 │   ├── tasklist.rs             # GitHub task-list items, as the PR and Issue checks read them
 │   ├── sys.rs                  # Hand-declared host C library and Windows API bindings
@@ -86,6 +87,13 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 The sysroot is architecture-specific. Building for a different arch than the
 existing sysroot is an error — run `cargo xtask clean` first (per
 [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
+
+The build installs every image under `services/`, `programs/` and `tests/` stripped
+(`llvm-objcopy --strip-all`: no symbol table, no DWARF), and the kernel and the bootloader as
+linked. It keeps the unstripped link output of every installed image in the symbols store
+`symbols/`, beside `sysroot/`, as `<build-id>.elf` with a manifest, and the x86-64 bootloader's PDB
+as `<GUID><age>.pdb` ([docs/build-system.md](../docs/build-system.md#symbols-store) § Symbols
+Store).
 
 Every cargo command of the build runs with `CARGO_INCREMENTAL=0`, as CI's jobs build, so a local
 build of a commit orders its binaries' statics as CI's does (see
@@ -186,7 +194,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
 | `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own, and launch both disks with no MSI-X (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
-| `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the process's sysroot binary for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
+| `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
 | `--test-devices` | Attach the test devices (see Attached devices): `edu` and four `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
@@ -465,8 +473,8 @@ repack); see
 
 ### `cargo xtask clean`
 
-Remove the sysroot and the disk images `disk.img` and `disk-data.img` (and optionally
-`target/`).
+Remove the sysroot, the symbols store `symbols/`, and the disk images `disk.img` and
+`disk-data.img` (and optionally `target/`).
 
 ```
 cargo xtask clean [--all]
@@ -702,13 +710,13 @@ cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100 \
 
 **Output**: one line per completed run, plus a summary block. Logs for
 non-passing runs are preserved under `target/xtask/run-parallel/` as
-`OK-<run>.log`, `FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or
-`QEMU-CRASH-<run>.log`. PASS logs are discarded there (`--save-logs` keeps a copy of every
-log elsewhere). Beside each log it keeps, in either place, whose log holds a crash-report block, a
-run writes the block's symbolized report, `cargo xtask symbolize --log`'s output against the
-current sysroot, as `<name>.crash.txt` for `<name>.log`, and removes a stale `<name>.crash.txt` of
-a log without one; it symbolizes only for a run that keeps its log, and a failure writing the report
-is a warning that changes no outcome. Each invocation first removes the run logs and crash reports
+`OK-<run>.log`, `FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or `QEMU-CRASH-<run>.log`. PASS
+logs are discarded there (`--save-logs` keeps a copy of every log elsewhere). Beside each log it
+keeps, in either place, whose log holds a crash-report block, a run writes the block's symbolized
+report, `cargo xtask symbolize --log`'s output against the current sysroot and symbols store, as
+`<name>.crash.txt` for `<name>.log`, and removes a stale `<name>.crash.txt` of a log without one; it
+symbolizes only for a run that keeps its log, and a failure writing the report is a warning that
+changes no outcome. Each invocation first removes the run logs and crash reports
 an earlier one left under `target/xtask/run-parallel/`, so the preserved files are its own.
 
 **Outcome precedence**:
@@ -808,16 +816,17 @@ An address less the image's load bias is an address in the image's link-time add
 command resolves it from the image's DWARF, innermost inlined function first, each caller it is
 inlined into on its own line, and, where no DWARF covers it (a build without `--debug` for that
 component, or code compiled without debug information), from the image's symbol table, as the
-nearest function symbol and the offset into it. Installed binaries keep their symbol tables
-([docs/build-system.md](../docs/build-system.md) § Debuginfo is opt-in), so the fallback names
-the function in every build. With `--log`, the addresses are those of the crash reports in a
-serial log. Use cases are in [docs/testing.md](../docs/testing.md#troubleshooting)
-§ Troubleshooting.
+nearest function symbol and the offset into it. An installed image other than the kernel and the
+bootloader is stripped, so the command reads the image's own symbols when it has them (the
+kernel), and otherwise the symbols store's file of the image's build id, refused unless that file's
+build-id note matches the image's ([docs/build-system.md](../docs/build-system.md#symbols-store) §
+Symbols Store). With `--log`, the addresses are those of the crash reports in a serial log. Use
+cases are in [docs/testing.md](../docs/testing.md#troubleshooting) § Troubleshooting.
 
 ```
-cargo xtask symbolize --binary PATH [--bias HEX] ADDR...
+cargo xtask symbolize --binary PATH [--bias HEX] [--symbols DIR] ADDR...
 cargo xtask symbolize --kernel [--bias HEX] ADDR...
-cargo xtask symbolize --log FILE
+cargo xtask symbolize --log FILE [--symbols DIR]
 ```
 
 | Option | Default | Description |
@@ -827,6 +836,7 @@ cargo xtask symbolize --log FILE
 | `--bias` | `0` | The image's load bias in hex: for a userspace process its creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, and, for init itself, the kernel's `init: PIE bias=0x…`), for the kernel the KASLR slide from its serial-only `kaslr: slide=` line (`0` in a boot authored with `mkdisk --no-kaslr`) |
 | `ADDR...` | (required without `--log`) | Runtime addresses, in hex (`0x` optional) |
 | `--log` | | A serial log: symbolize every crash-report block in it (below) instead of `ADDR...` |
+| `--symbols` | the build's `symbols/` | The symbols store to read in place of the build's, such as a release's symbols archive unpacked. With `--log`, the images are the store's own files named by its manifest, and the sysroot is not read |
 
 Each address's first line is `<address> (image <address less bias>): <resolution> [<source>]`
 (the image address shown only when the bias is not `0`), where the source is the one used; a
@@ -839,10 +849,11 @@ Each address's first line is `<address> (image <address less bias>): <resolution
 | `unresolved` | `??`: neither source covers the address |
 
 Names are demangled. A frame prints only what its DWARF gives: `??` for an unnamed function, and
-`<function> at <file>` without a line, or a bare `<function>` without a file. An image with no
-DWARF at all prints a note naming the symbol-table fallback first. An address below the bias, an
-unreadable file, or a file that is not an ELF image fails the command; a compressed debug section
-is refused.
+`<function> at <file>` without a line, or a bare `<function>` without a file. An image with no DWARF
+at all prints a note naming the symbol-table fallback first. With `--binary` on a stripped image,
+the command first prints `<binary>: symbols from <store file> (by its build id)`. An address below
+the bias, an unreadable file, or a file that is not an ELF image fails the command; a compressed
+debug section is refused.
 
 **Log form.** `--log` reads the crash-report blocks crashd logs
 ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)) with
@@ -859,12 +870,19 @@ rather than resolved against. Each block prints as:
 ```
 crash report <id> (format version <v>): process <log name>
   image: sysroot/<dir>/<log name>
+  symbols: <the image's own | symbols/<build-id>.elf (by the image's build id)>
   <key>=<value>
   ip=<address>  <resolution> [<source>]
   frame.<n>=<address>  <resolution> [<source>]
   …
 end <id>
 ```
+
+The `symbols:` line reads `  symbols: the image's own` or
+`  symbols: symbols/<build-id>.elf (by the image's build id)`. When the symbols cannot be found, a
+`  not symbolized: <reason>` line takes its place: the image carries no symbols and no build-id
+note; the image carries no symbols, and the symbols store has no `<id>.elf`; or the store's
+`<id>.elf` has another build id, so it holds another image's symbols.
 
 Every field line follows in the block's order, as logged. `ip`, and each `frame.<n>` inside the
 block's `text`, carries its resolution in the address form's shape, the inlined-caller lines
@@ -1209,18 +1227,18 @@ The QMP socket is `target/xtask/powerbutton-test.sock`. CI runs the command in e
 
 ### `cargo xtask test-core-death`
 
-Check that the death of a core or critical service powers the system off, on either arch. Boots
-the current sysroot once per target, headless, with a QMP socket, and kills the target by moving
-one of its threads to program counter 0. svcmgr, devmgr, vfsd and logd are reached through the GDB
-stub service, which the command stages naming the target and boots with the debug port, as
+Check that the death of a core or critical service powers the system off, on either arch. Boots the
+current sysroot once per target, headless, with a QMP socket, and kills the target by moving one of
+its threads to program counter 0. svcmgr, devmgr, vfsd and logd are reached through the GDB stub
+service, which the command stages naming the target and boots with the debug port, as
 `run --debug-target` does, removing it again and repacking the disk images in the layout they had,
 whatever the outcome; logd is killed four times, once more than svcmgr's restart budget allows.
 memmgr and procmgr are reached through QEMU's own gdbstub, on a unix socket, with a hardware
-breakpoint on a function of the target's binary, hit by a `hello` the command types at the shell.
-It passes for a target when QMP's `SHUTDOWN` event, after the kill, gives reason
-`guest-shutdown`, and QEMU exits on its own within two minutes of the kill;
-[docs/testing.md](../docs/testing.md) § Core death (`test-core-death`) says when each target is
-killed and which path powers the system off. Every target is tried; the command fails naming each
+breakpoint on a function of the target's binary, read from the symbols store's file of its build id,
+hit by a `hello` the command types at the shell. It passes for a target when QMP's `SHUTDOWN` event,
+after the kill, gives reason `guest-shutdown`, and QEMU exits on its own within two minutes of the
+kill; [docs/testing.md](../docs/testing.md) § Core death (`test-core-death`) says when each target
+is killed and which path powers the system off. Every target is tried; the command fails naming each
 one that failed.
 
 A pure runner; requires a populated sysroot with the default boot set (terminal + shell):
@@ -1401,10 +1419,10 @@ on either arch. Stages the `gdb-target` recipe (`programs/debugger --gdb-target`
 `run --debug-target gdb-target` does, repacks the disk images in the layout they have, boots the
 current sysroot once with the debug port attached (headless), and waits for the stub's
 `[gdbstub] attached; serving the debug port` line on the serial stream. It then runs
-`gdb -nx -batch` against the port with the target's sysroot binary for symbols: the session lists
-the threads, breaks on the target's tick function and continues to it, rewrites a variable and a
-register and reads each back, single-steps, selects the second thread and reads its registers, and
-detaches; the test then waits up to 30 s for the stub's
+`gdb -nx -batch` against the port with the symbols store's file of the target binary's build id
+for symbols: the session lists the threads, breaks on the target's tick function and continues to
+it, rewrites a variable and a register and reads each back, single-steps, selects the second
+thread and reads its registers, and detaches; the test then waits up to 30 s for the stub's
 `[gdbstub] detached from gdb-target (crash bindings restored: ...)` line. It kills QEMU, removes
 both recipes, and repacks the images in that layout again, whatever the outcome, and passes when
 GDB's output shows each of those results and the stub's line reports the crash bindings restored;

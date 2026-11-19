@@ -500,14 +500,15 @@ terminal. Two routes reach the thread:
   `svcmgr: launching: logd` line has appeared, and the stub answers its first request once it
   holds logd.
 - **QEMU's own gdbstub**, for memmgr and procmgr, which init creates with raw syscalls, so no
-  debugger can attach to them. Once the terminal's READY line has appeared, the host sets a
-  hardware breakpoint on a function of the target's binary, at the image bias init logs for it
-  plus the function's address in the binary's symbol table, and types `hello` at the shell over
-  the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's one thread, in an
-  allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the create), and
-  `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main thread, in the
-  reap). On each stop it checks that the program counter is the function's and the code there is
-  the binary's, since another process can run code at the same address, moves that CPU's program
+  debugger can attach to them. Once the terminal's READY line has appeared, the host sets a hardware
+  breakpoint on a function of the target's binary, at the image bias init logs for it plus the
+  function's address in the binary's symbol table, read from the symbols store's file of its build
+  id ([docs/build-system.md](build-system.md#symbols-store) § Symbols Store), and types `hello` at
+  the shell over the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's one thread,
+  in an allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the create),
+  and `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main thread, in the
+  reap). On each stop it checks that the program counter is the function's and the code there is the
+  binary's, since another process can run code at the same address, moves that CPU's program
   counter, removes the breakpoint, and resumes the VM.
 
 A boot passes when, after the kill, QMP's `SHUTDOWN` event gives reason `guest-shutdown` and QEMU
@@ -1724,10 +1725,12 @@ at the instruction pointer, the load bias, and a stack walk
 [services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)). `cargo xtask
 symbolize --log <file>` ([xtask/README.md](../xtask/README.md#cargo-xtask-symbolize)) prints every
 block of a saved serial log with its instruction pointer and stack frames resolved to function,
-file, and line against the process's sysroot binary, or to the nearest function symbol in a build
-without debug information, and `run-parallel` writes that report beside each log it keeps that
-holds a block. A process crashd cannot cover (Crash reports above) leaves only the kernel's
-`USERSPACE FAULT` dump ([docs/fault-handling.md](fault-handling.md)), whose instruction pointer
+file, and line against the symbols of the process's sysroot binary, which the symbols store keeps
+under the binary's build id ([docs/build-system.md](build-system.md#symbols-store) § Symbols
+Store), or to the nearest function symbol in a build without debug information, and
+`run-parallel` writes that report beside each log it keeps that holds a block. A process crashd
+cannot cover (Crash reports above) leaves only the kernel's `USERSPACE FAULT` dump
+([docs/fault-handling.md](fault-handling.md)), whose instruction pointer
 (`rip=` on x86_64, `sepc=` on riscv64) is a runtime address in the process's image: with the load
 bias from the creator's spawn line
 ([docs/userspace-memory-model.md](userspace-memory-model.md#image-placement) § Image Placement),
@@ -1775,9 +1778,9 @@ its threads, then a detach that hands it back to the crash service. `cargo xtask
 <PORT> --debug-target <NAME>` stages the stub for the boot, naming the process by its `argv[0]`
 (for a service, the first word of its recipe's `argv`; for devmgr, vfsd and svcmgr, which init
 creates, the service's name; for a driver devmgr binds, its bundle entry name or install path), and
-prints the GDB command line, which
-loads the process's sysroot binary for symbols; the stub reports the image's load bias
-(`qOffsets`), so GDB relocates them itself
+prints the GDB command line, which loads the symbols store's file of the process binary's build id
+(`symbols/<build-id>.elf`) for symbols; the stub reports the image's load bias (`qOffsets`), so
+GDB relocates them itself
 ([xtask/README.md](../xtask/README.md#cargo-xtask-run)). A process that declared itself
 undebuggable (the debug port's virtio-console driver and every debug-authority holder) refuses
 the attach, and a process procmgr did not create (init,
@@ -1790,7 +1793,8 @@ cp sysroot/config/svcmgr/tests/gdb-target.svc sysroot/config/svcmgr/services/
 cargo xtask mkdisk --repack-only
 cargo xtask run --debug-port 4561 --debug-target gdb-target   # in one shell
 gdb -ex 'set architecture i386:x86-64' -ex 'set remotetimeout 30' \
-    -ex 'target remote localhost:4561' sysroot/programs/debugger  # in another
+    -ex 'target remote localhost:4561' \
+    "symbols/$(awk '$1 == "/programs/debugger" {print $2}' symbols/manifest)"  # in another
 ```
 
 ---

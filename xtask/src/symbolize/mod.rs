@@ -392,6 +392,8 @@ pub fn parse_hex(text: &str) -> Result<u64>
     u64::from_str_radix(digits, 16).with_context(|| format!("not a hex address: {text:?}"))
 }
 
+pub mod store;
+
 #[cfg(test)]
 pub(crate) mod fixture;
 

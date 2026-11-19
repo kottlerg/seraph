@@ -23,10 +23,10 @@ cargo xtask run
 
 Restore the default-init harness with `cargo xtask compose-bundle
 --harness init` (or any subsequent full `cargo xtask build`, which
-re-authors the default-init bundle; a `--component` build leaves the
-bundle unchanged). See
-[`xtask/README.md`](../../xtask/README.md) for the bundle-vs-mkdisk
-authoring discipline.
+records the init harness; a `--component` build leaves the recorded
+harness unchanged). Every pack, `mkdisk`'s included, composes the
+recorded harness's bundle; see
+[`xtask/README.md`](../../xtask/README.md) § `cargo xtask compose-bundle`.
 
 ## Source Layout
 
@@ -595,7 +595,7 @@ before recompiling is how a narrower-scope run is produced.
 |---|---|
 | [docs/testing.md](../../docs/testing.md) | Tier taxonomy, the `[ktest]` marker, sysroot layout, and gating |
 | [docs/build-system.md](../../docs/build-system.md) | Toolchain, the sysroot, and the `cargo xtask` commands that build and boot ktest |
-| [xtask/README.md](../../xtask/README.md) | `compose-bundle` harness selection and bundle-vs-mkdisk authoring |
+| [xtask/README.md](../../xtask/README.md) | `compose-bundle` harness selection and the bundle every pack composes |
 | [docs/bootstrap.md](../../docs/bootstrap.md) | The kernel's init handover ktest receives in place of init |
 | [core/boot/README.md](../boot/README.md) | Boot protocol that loads ktest as init; no kernel command line |
 | [abi/init-protocol/README.md](../../abi/init-protocol/README.md) | `InitInfo`: the page and initial capability set ktest reads at `_start` |

@@ -10,16 +10,17 @@
 //! init reads the `/config/init/log-levels.conf` boot module and gives each
 //! service it spawns its configured level, and devmgr and vfsd pass their own
 //! level on to the drivers they spawn (`services/init/docs/bootstrap.md`
-//! § Log levels). This command saves the staged bundle and the installed
-//! configuration, installs a configuration of its own that sets vfsd to
-//! debug, signs the sysroot and composes the default-init bundle from it,
-//! repacks the disk images in the layout they have, boots the current sysroot
-//! once through `run-parallel`, and always puts the saved files back and
-//! repacks again in that layout afterwards. It passes when the boot reaches its harness's pass
-//! marker, its log holds a debug line of vfsd and one of fatfs, which vfsd
-//! spawns, and none of devmgr or procmgr, which log at info. A boot whose
-//! `run-parallel` outcome is a `QEMU-CRASH` is skipped, not failed, as
-//! `run-parallel` itself tolerates it.
+//! § Log levels). This command saves the installed configuration, installs a
+//! configuration of its own that sets vfsd to debug, repacks the disk images
+//! in the layout they have with the default-init bundle, which the pack
+//! composes from the installed files, boots the current sysroot once through
+//! `run-parallel`, and always puts the saved configuration back and repacks
+//! again in that layout, with the recorded harness's bundle, afterwards. It
+//! passes when the boot reaches its harness's pass marker, its log holds a
+//! debug line of vfsd and one of fatfs, which vfsd spawns, and none of devmgr
+//! or procmgr, which log at info. A boot whose `run-parallel` outcome is a
+//! `QEMU-CRASH` is skipped, not failed, as `run-parallel` itself tolerates
+//! it.
 //!
 //! A pure runner: requires a populated sysroot with the default-init bundle's
 //! binaries (CI runs it in each `usertest` cell, on the usertest staging that
@@ -30,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Context as _, Result, bail};
 
-use crate::bundle::{Harness, LOG_LEVELS, compose};
+use crate::bundle::Harness;
 use crate::cli::{
     DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, RunParallelArgs,
     TestLogLevelArgs,
@@ -38,6 +39,7 @@ use crate::cli::{
 use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
 use crate::regex::Regex;
+use crate::sysroot::LOG_LEVELS;
 use crate::util::step;
 
 /// The configuration the test boots: vfsd at debug, every other service at
@@ -112,12 +114,8 @@ pub fn run(ctx: &Context, args: &TestLogLevelArgs) -> Result<()>
         {}
         Err(e) => return Err(e).with_context(|| format!("removing {}", log.display())),
     }
-    // The staged bundle, the installed configuration and the layout are read
-    // before anything changes, so a failed compose or repack cannot change
-    // what the restore writes.
-    let bundle = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
-    let staged = std::fs::read(&bundle)
-        .with_context(|| format!("reading the staged {}", bundle.display()))?;
+    // The installed configuration and the layout are read before anything
+    // changes, so a failed repack cannot change what the restore writes.
     let levels = ctx.sysroot.join(LOG_LEVELS.relative());
     let installed = std::fs::read(&levels).with_context(|| {
         format!(
@@ -128,26 +126,19 @@ pub fn run(ctx: &Context, args: &TestLogLevelArgs) -> Result<()>
     let layout = crate::disk::current_layout(ctx)?;
     let booted = std::fs::write(&levels, LEVELS)
         .with_context(|| format!("writing {}", levels.display()))
-        .and_then(|()| crate::signing::sign_for_harness(ctx, args.arch, Harness::Init))
-        .and_then(|()| compose(ctx, args.arch, Harness::Init))
-        .context("composing the bundle with vfsd at debug")
         .and_then(|()| {
-            crate::disk::create_disk_image(ctx, args.arch, layout)
+            crate::disk::create_disk_image_for(ctx, args.arch, layout, Harness::Init)
                 .context("repacking the disk images with the configured bundle")
         })
         .and_then(|()| boot(ctx, args, &dir, layout.second_image(ctx)));
     // Restore first, and surface its failure ahead of the boot's: a
-    // configured bundle or configuration left staged would boot vfsd at debug
-    // on every later boot of this sysroot. The repack signs the sysroot for
-    // the restored bundle's harness.
+    // configuration left installed would boot vfsd at debug on every later
+    // boot of this sysroot. The repack signs the sysroot for the recorded
+    // harness and composes its bundle from the restored configuration.
     std::fs::write(&levels, &installed)
         .with_context(|| format!("restoring {}", levels.display()))
-        .and_then(|()| {
-            std::fs::write(&bundle, &staged)
-                .with_context(|| format!("restoring {}", bundle.display()))
-        })
         .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, layout))
-        .context("restoring the staged bundle and configuration and repacking the disk images")?;
+        .context("restoring the configuration and repacking the disk images")?;
     booted?;
     step(&format!("log level test: reading {}", log.display()));
     let bytes = std::fs::read(&log).with_context(|| format!("reading {}", log.display()))?;

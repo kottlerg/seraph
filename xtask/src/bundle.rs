@@ -3,28 +3,20 @@
 
 // xtask/src/bundle.rs
 
-//! Compose the bootloader bundle (`sysroot/esp/EFI/seraph/bootstrap.bundle`)
-//! from the installed files of the sysroot. The format is defined by
+//! Compose the bootloader bundle, the ESP's `EFI/seraph/bootstrap.bundle`,
+//! from the installed files of the sysroot that the bundle list of its
+//! harness names (docs/boot-media.md § The ESP). The format is defined by
 //! [`boot_protocol::bundle`] and shared with the bootloader consumer side;
 //! this module is the only producer in the tree.
 //!
-//! Two flavours of bundle are produced, selected by [`Harness`]:
+//! Each [`Harness`] has a bundle list in configuration, installed under
+//! `/config/bundle/` from `rootfs/config/bundle/` ([`list_path`]): its
+//! `init` line names the object copied into the `init` slot, and every other
+//! line an entry, by its install path, which is also the entry's name
+//! ([`parse_list`]). xtask holds no list of its own.
 //!
-//! - [`Harness::Init`] — default. Copies `/services/init` into the `init`
-//!   slot, every image [`MODULES`] names, the IOMMU driver of the
-//!   architecture's IOMMU family ([`ARCH_MODULES`]: `iommu-vtd` on x86-64,
-//!   `iommu-riscv` on riscv64), and the data entries of the architecture
-//!   ([`data_entries`]): the log-level configuration init reads at boot and
-//!   the platform description tables of the architecture's machines
-//!   (`qemu-virt.platform` on riscv64).
-//! - [`Harness::Ktest`] — copies `/tests/ktest` into the `init` slot alone.
-//!   Zero module entries. The bootloader's `step4_parse_bundle` treats this
-//!   as a monolithic ktest boot per `boot_protocol::bundle::INIT_ENTRY_NAME`
-//!   semantics.
-//!
-//! Every entry but `init` is named by its install path, and every entry is
-//! its installed file byte for byte (docs/boot-media.md § The ESP). The
-//! composer signs nothing: the sysroot is signed first
+//! Every entry is its installed file byte for byte. The composer signs
+//! nothing and reads no key: the sysroot is signed first
 //! ([`crate::signing::sign_for_harness`]), and the composer verifies each
 //! entry as the bootloader will, under the trust store the installed
 //! bootloader embeds, before it writes the bundle.
@@ -33,233 +25,213 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::argparse::ValueEnum as _;
 use crate::error::{Context, Result, bail, err};
 use boot_protocol::bundle as fmt;
 use objsig::{Expectation, Role, RoleSet, TrustStore};
 
 use crate::arch::Arch;
 use crate::context::Context as BuildContext;
-use crate::signing::{INIT_SLOT, body_of, bootloader_images, check_installed_store, objsig_arch};
+use crate::signing::{INIT_SLOT, installed_store, objsig_arch};
 use crate::util::step;
 
 crate::argparse::value_enum! {
-    /// Which harness binary to bundle as the `"init"` entry.
+    /// Which harness's bundle list composes the bundle, and so which object
+    /// is its `"init"` entry.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Harness
     {
-        /// Regular userspace init at `sysroot/services/init`. Bundle includes
-        /// every service module the system needs to bootstrap userspace.
+        /// The userspace init, `/services/init`, with every module the
+        /// system needs to bootstrap userspace (`init.<arch>.list`).
         #[value(name = "init")]
         Init,
-        /// `sysroot/tests/ktest` as the `"init"` entry. Bundle is a single
-        /// entry; ktest is monolithic and does not spawn userspace modules.
+        /// The kernel-test harness, `/tests/ktest`, as the `"init"` entry
+        /// alone: ktest is monolithic and spawns no module (`ktest.list`).
         #[value(name = "ktest")]
         Ktest,
     }
 }
 
-impl Harness
+/// The sysroot-relative directory the bundle lists are installed in, and the
+/// `rootfs/`-relative one they are installed from.
+pub const LIST_DIR: &str = "config/bundle";
+
+/// A bundle list: the objects of one harness's bundle, by install path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleList
 {
-    /// Sysroot-relative source path of the harness binary that backs the
-    /// bundle's `"init"` entry. The bundle entry itself is always named
-    /// `"init"` regardless of source.
-    fn init_source(self) -> &'static str
+    /// The install path of the object copied into the `init` slot.
+    pub init: String,
+    /// The install path of every other entry, in bundle order, each also the
+    /// name of its entry.
+    pub entries: Vec<String>,
+}
+
+/// The installed bundle list of `harness` for `arch` ([`list_in`] of the
+/// sysroot's `config/bundle/`).
+///
+/// # Errors
+///
+/// Those of [`list_in`].
+pub fn list_path(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<PathBuf>
+{
+    list_in(&ctx.sysroot.join(LIST_DIR), arch, harness)
+}
+
+/// The bundle list of `harness` for `arch` in `dir`:
+/// `<harness>.<arch>.list` where the architectures' lists differ,
+/// `<harness>.list` where they do not.
+///
+/// # Errors
+///
+/// When `dir` holds neither, or both, so the list is not one file.
+fn list_in(dir: &Path, arch: Arch, harness: Harness) -> Result<PathBuf>
+{
+    let name = harness.name();
+    let own = dir.join(format!("{name}.{arch}.list"));
+    let shared = dir.join(format!("{name}.list"));
+    match (own.is_file(), shared.is_file())
     {
-        match self
+        (true, false) => Ok(own),
+        (false, true) => Ok(shared),
+        (true, true) => bail!(
+            "both {} and {} are installed: a harness has one bundle list for an architecture",
+            own.display(),
+            shared.display()
+        ),
+        (false, false) => bail!(
+            "no bundle list of the {name} harness for {arch} at {} or {} (run \
+             `cargo xtask build` or `cargo xtask mkdisk`)",
+            own.display(),
+            shared.display()
+        ),
+    }
+}
+
+/// The installed bundle list of `harness` for `arch` ([`list_path`]),
+/// parsed ([`parse_list`]).
+///
+/// # Errors
+///
+/// Those of [`list_path`] and [`parse_list`]; when the list cannot be read.
+pub fn read_list(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<BundleList>
+{
+    let path = list_path(ctx, arch, harness)?;
+    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    parse_list(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// The bundle list `text` holds. A line is blank, a comment (`#` first),
+/// `init <path>`, naming the object of the `init` slot, or `<path>`, naming
+/// an entry. Every path is an install path short enough to name an entry
+/// ([`fmt::ENTRY_NAME_LEN`]).
+///
+/// # Errors
+///
+/// When a line is none of these, a path is not an install path or is longer
+/// than an entry name holds, an object is named twice, or the list has no
+/// `init` line or more than one.
+pub fn parse_list(text: &str) -> Result<BundleList>
+{
+    let mut init: Option<String> = None;
+    let mut entries: Vec<String> = Vec::new();
+    for (index, raw) in text.lines().enumerate()
+    {
+        let number = index.saturating_add(1);
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#')
         {
-            Harness::Init => "services/init",
-            Harness::Ktest => "tests/ktest",
+            continue;
+        }
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let (slot, path) = match words.as_slice()
+        {
+            [keyword, path] if *keyword == INIT_SLOT => (true, *path),
+            [path] => (false, *path),
+            _ => bail!("line {number}: {line:?} is neither `init <path>` nor an install path"),
+        };
+        if !objsig::name_is_install_path(path.as_bytes())
+        {
+            bail!("line {number}: {path} is not an install path");
+        }
+        if path.len() > fmt::ENTRY_NAME_LEN
+        {
+            bail!(
+                "line {number}: {path} is longer than an entry name holds ({} bytes)",
+                fmt::ENTRY_NAME_LEN
+            );
+        }
+        if init.as_deref() == Some(path) || entries.iter().any(|entry| entry == path)
+        {
+            bail!("line {number}: {path} is named twice");
+        }
+        if !slot
+        {
+            entries.push(path.to_owned());
+        }
+        else if init.is_some()
+        {
+            bail!("line {number}: a second `init` line");
+        }
+        else
+        {
+            init = Some(path.to_owned());
         }
     }
+    let init = init.context("the list has no `init` line")?;
+    Ok(BundleList { init, entries })
 }
 
-/// Images that ship in a default-init bundle, by install path, which is also
-/// the name of each one's entry. init looks them up by the names here (in the
-/// `InitInfo` name table the kernel fills), so the order is free for the
-/// producer's convenience.
-///
-/// Only **bootstrap-essential** binaries belong here — things needed to
-/// read anything off the disk in the first place (`vfsd`, the block
-/// driver, the fs driver) and things needed before vfsd is up
-/// (`serial` + `framebuffer` for pre-vfsd console output, `memmgr` /
-/// `procmgr` / `devmgr` to even bring up userspace). Non-essential
-/// drivers live on the rootfs and are loaded by their managing service
-/// after vfsd-mount — the per-arch RTC, for example, is loaded by
-/// devmgr through its `SET_DRIVERS_DIR` subtree cap; growing the bundle
-/// with non-essentials directly wastes permanently-leaked
-/// post-`ExitBootServices` UEFI allocation
-/// (see `step9_populate_boot_info` in `core/boot/src/main.rs`).
-///
-/// All entries are mandatory; a missing installed image hard-errors.
-/// Order is preserved across builds to keep the disk-image byte-stable.
-const MODULES: &[&str] = &[
-    "/services/procmgr",
-    "/services/devmgr",
-    "/services/vfsd",
-    "/services/drivers/virtio-blk",
-    "/services/drivers/serial",
-    "/services/drivers/framebuffer",
-    "/services/fs/fatfs",
-    "/services/memmgr",
-];
-
-/// Images that ship in a default-init bundle on one architecture only, as
-/// `(architecture, install_path)`, under the same rules as [`MODULES`]: the
-/// IOMMU driver of the architecture's IOMMU family, which devmgr spawns
-/// before the first DMA-capable driver maps a ring, so before the root
-/// filesystem can be read.
-const ARCH_MODULES: &[(Arch, &str)] = &[
-    (Arch::X86_64, "/services/drivers/iommu-vtd"),
-    (Arch::Riscv64, "/services/drivers/iommu-riscv"),
-];
-
-/// A data entry of a default-init bundle: a file of the repository that the
-/// sysroot installs at `install`, signed there with the boot-module role
-/// ([`crate::signing::sign_sysroot`]), and that the bundle copies under that
-/// name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DataEntry
-{
-    /// The install path, and the name of the entry.
-    pub install: &'static str,
-    /// The repository-relative path of the file installed there.
-    pub source: &'static str,
-}
-
-impl DataEntry
-{
-    /// The sysroot-relative path of the installed file.
-    pub fn relative(&self) -> String
-    {
-        self.install.trim_start_matches('/').to_owned()
-    }
-}
-
-/// The log-level configuration init reads at boot
-/// (`services/init/docs/bootstrap.md` § Log levels), on every architecture.
-pub const LOG_LEVELS: DataEntry = DataEntry {
-    install: "/config/init/log-levels.conf",
-    source: "services/init/log-levels.conf",
-};
-
-/// Platform description tables that ship in a default-init bundle on one
-/// architecture only: the text tables of the machines of that architecture,
-/// which list the devices no firmware table describes. init forwards them to
-/// devmgr with the driver modules; devmgr uses the one whose `oem_table_id`
-/// equals the XSDT's (`services/devmgr/platform/`).
-const ARCH_TABLES: &[(Arch, DataEntry)] = &[(
-    Arch::Riscv64,
-    DataEntry {
-        install: "/config/devmgr/platform/qemu-virt.platform",
-        source: "services/devmgr/platform/qemu-virt.platform",
-    },
-)];
-
-/// The data entries of `arch`'s default-init bundle, in bundle order: the
-/// architecture's platform tables, then the log-level configuration. The
-/// sysroot installs each (`crate::sysroot::install_data_entries`).
-pub fn data_entries(arch: Arch) -> Vec<DataEntry>
-{
-    ARCH_TABLES
-        .iter()
-        .filter(|(a, _)| *a == arch)
-        .map(|(_, entry)| *entry)
-        .chain([LOG_LEVELS])
-        .collect()
-}
-
-/// The names of every entry of `arch`'s default-init bundle but `init`, in
-/// bundle order: the objects signed with the boot-module role
-/// (docs/signing.md § Signing).
-pub fn boot_modules(arch: Arch) -> Vec<&'static str>
-{
-    let arch_modules = ARCH_MODULES
-        .iter()
-        .filter(|(a, _)| *a == arch)
-        .map(|(_, install)| *install);
-    MODULES
-        .iter()
-        .copied()
-        .chain(arch_modules)
-        .chain(data_entries(arch).into_iter().map(|entry| entry.install))
-        .collect()
-}
-
-/// The harness of the staged bundle: [`Harness::Ktest`] when its `init`
-/// entry is a copy of the installed `/tests/ktest` (the two bodies are
-/// equal), [`Harness::Init`] otherwise, a missing ktest included. A pack signs
-/// the sysroot for it, so ktest is signed `init` only in an image whose
-/// bundle boots it.
+/// The install path of every entry but `init` that a bundle list of `arch`
+/// names, over every harness, each once, in list order: the objects signed
+/// with the boot-module role (docs/signing.md § Signing).
 ///
 /// # Errors
 ///
-/// When the staged bundle cannot be read, does not parse, or holds no
-/// `init` entry; when either object ends in a malformed trailer.
-pub fn staged_harness(ctx: &BuildContext) -> Result<Harness>
+/// Those of [`read_list`], for any harness.
+pub fn boot_modules(ctx: &BuildContext, arch: Arch) -> Result<Vec<String>>
 {
-    let path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
-    let bundle = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let init = init_entry(&bundle).with_context(|| format!("reading {}", path.display()))?;
-    let ktest_path = ctx.sysroot.join(Harness::Ktest.init_source());
-    let ktest = match fs::read(&ktest_path)
+    let mut names: Vec<String> = Vec::new();
+    for harness in Harness::VARIANTS
     {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Harness::Init),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", ktest_path.display())),
-    };
-    if body_of(init)? == body_of(&ktest)?
-    {
-        Ok(Harness::Ktest)
+        for entry in read_list(ctx, arch, *harness)?.entries
+        {
+            if !names.contains(&entry)
+            {
+                names.push(entry);
+            }
+        }
     }
-    else
-    {
-        Ok(Harness::Init)
-    }
+    Ok(names)
 }
 
-/// The object of `bundle`'s `init` entry.
-fn init_entry(bundle: &[u8]) -> Result<&[u8]>
+/// The path of the bundle on the ESP the sysroot stages,
+/// `sysroot/esp/EFI/seraph/bootstrap.bundle`.
+pub fn esp_path(ctx: &BuildContext) -> PathBuf
 {
-    let header =
-        fmt::parse_header(bundle).map_err(|e| err!("the bundle does not parse ({e:?})"))?;
-    let entry = (0..header.entry_count)
-        .filter_map(|index| fmt::entry_at(bundle, index))
-        .find(|entry| fmt::name_str(&entry.name) == fmt::INIT_ENTRY_NAME)
-        .context("the bundle holds no `init` entry")?;
-    let start = usize::try_from(entry.offset).context("entry offset past usize")?;
-    let end = usize::try_from(entry.size)
-        .ok()
-        .and_then(|size| start.checked_add(size))
-        .context("entry end past usize")?;
-    bundle
-        .get(start..end)
-        .context("the `init` entry runs past the bundle")
+    ctx.sysroot_efi_seraph().join("bootstrap.bundle")
 }
 
-/// Compose a bundle for the chosen harness and write it to
-/// `sysroot/esp/EFI/seraph/bootstrap.bundle`, overwriting any existing
-/// file. Each entry is copied from its installed file in the sysroot and
-/// verified first as the bootloader will verify it ([`check_entry`]), under
-/// the trust store the installed bootloader embeds; the sysroot must be
-/// signed for `harness` already ([`crate::signing::sign_for_harness`]).
-///
-/// `Harness::Init` bundles `/services/init` as `init` plus every entry of
-/// [`boot_modules`] for `arch`. `Harness::Ktest` bundles only
-/// `/tests/ktest` as the `init` entry.
+/// Compose the bundle of `harness` for `arch` and write it to `out`,
+/// overwriting any existing file. Each entry is copied from the installed
+/// file its bundle list names ([`read_list`]) and verified first as the
+/// bootloader will verify it ([`check_entry`]), under the trust store the
+/// installed bootloader embeds; the sysroot must be signed for `harness`
+/// already ([`crate::signing::sign_for_harness`]).
 ///
 /// # Errors
 ///
-/// When an installed file is missing or unreadable, when an entry does not
-/// verify as the bootloader will, when the installed bootloaders hold no
-/// common store, and on an I/O failure writing the bundle.
-pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<()>
+/// Those of [`read_list`]; when an installed file is missing or unreadable,
+/// when an entry does not verify as the bootloader will, when the installed
+/// bootloader holds no trust store, and on an I/O failure writing the bundle.
+pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness, out: &Path) -> Result<()>
 {
-    let out_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
-    let store = installed_store(ctx, arch)?;
-    let entries = entries(ctx, arch, harness)?;
+    let list = read_list(ctx, arch, harness)?;
+    let store = installed_store(ctx)?;
+    let entries = entries(ctx, &list)?;
     let bodies = bodies(&store, arch, &entries)?;
 
-    let parent = out_path
+    let parent = out
         .parent()
         .context("compose-bundle: bundle path has no parent")?;
     fs::create_dir_all(parent)
@@ -267,44 +239,15 @@ pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<()>
 
     let entry_count =
         u32::try_from(entries.len()).context("compose-bundle: too many entries for u32")?;
-    write_bundle(&out_path, entry_count, &bodies)?;
+    write_bundle(out, entry_count, &bodies)?;
 
     step(&format!(
-        "Bundle: {} ({} entries, harness={:?})",
-        out_path.display(),
+        "Bundle: {} ({} entries, harness={})",
+        out.display(),
         entries.len(),
-        harness
+        harness.name()
     ));
     Ok(())
-}
-
-/// The trust store every installed bootloader image of `arch` embeds: the
-/// one the boot verifies the bundle under.
-///
-/// # Errors
-///
-/// When an image cannot be read, embeds no store or more than one, or the
-/// images embed different stores.
-fn installed_store(ctx: &BuildContext, arch: Arch) -> Result<Vec<u8>>
-{
-    let images = bootloader_images(ctx, arch);
-    let first = &images[0];
-    let bytes = fs::read(first).with_context(|| {
-        format!(
-            "reading the installed bootloader {} (run `cargo xtask build`)",
-            first.display()
-        )
-    })?;
-    let store = objsig::embed::find(&bytes)
-        .map_err(|e| {
-            err!(
-                "the installed bootloader {} holds no trust store ({e:?}): run `cargo xtask build`",
-                first.display()
-            )
-        })?
-        .to_vec();
-    check_installed_store(&images, &store)?;
-    Ok(store)
 }
 
 /// One entry of a bundle: its name and the installed file it copies.
@@ -317,14 +260,6 @@ struct Entry
 
 impl Entry
 {
-    fn new(name: &str, source: PathBuf) -> Self
-    {
-        Self {
-            name: name.to_owned(),
-            source,
-        }
-    }
-
     /// The role the bootloader verifies the entry in: init for the `init`
     /// slot, boot module for every other entry.
     fn role(&self) -> Role
@@ -340,34 +275,27 @@ impl Entry
     }
 }
 
-/// The entries of `harness`'s bundle for `arch`, in bundle order. Fails
+/// The entries of `list`'s bundle, in bundle order, `init` first. Fails
 /// naming the first installed file that does not exist.
-fn entries(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<Vec<Entry>>
+fn entries(ctx: &BuildContext, list: &BundleList) -> Result<Vec<Entry>>
 {
-    let init_src = ctx.sysroot.join(harness.init_source());
-    if !init_src.exists()
+    let named = std::iter::once((INIT_SLOT, &list.init))
+        .chain(list.entries.iter().map(|path| (path.as_str(), path)));
+    let mut entries = Vec::new();
+    for (name, install) in named
     {
-        bail!(
-            "compose-bundle: harness binary missing at {} (run `cargo xtask build` first)",
-            init_src.display()
-        );
-    }
-
-    let mut entries = vec![Entry::new(INIT_SLOT, init_src)];
-    if harness == Harness::Init
-    {
-        for install in boot_modules(arch)
+        let source = ctx.sysroot.join(install.trim_start_matches('/'));
+        if !source.is_file()
         {
-            let p = ctx.sysroot.join(install.trim_start_matches('/'));
-            if !p.exists()
-            {
-                bail!(
-                    "compose-bundle: installed file missing at {} (run `cargo xtask build` first)",
-                    p.display()
-                );
-            }
-            entries.push(Entry::new(install, p));
+            bail!(
+                "compose-bundle: installed file missing at {} (run `cargo xtask build` first)",
+                source.display()
+            );
         }
+        entries.push(Entry {
+            name: name.to_owned(),
+            source,
+        });
     }
     Ok(entries)
 }
@@ -527,7 +455,7 @@ fn align_up(value: u64, alignment: u64) -> Option<u64>
 mod tests
 {
     use super::*;
-    use crate::signing::testing::{scratch, signer, work_tree};
+    use crate::signing::testing::{install_lists, scratch, signer, work_tree};
     use crate::signing::{Signer, sign_sysroot};
     use std::io::Read;
 
@@ -541,43 +469,114 @@ mod tests
         assert_eq!(align_up(u64::MAX, 4096), None);
     }
 
-    // Defect caught: an entry name the bootloader refuses (not an install
-    // path, or longer than the entry header holds), a data entry whose source
-    // the repository does not hold, or the two architectures' lists naming
-    // the other's IOMMU driver or platform table.
+    /// The bundle list of `harness` for `arch` that `rootfs/` holds.
+    fn repository_list(arch: Arch, harness: Harness) -> BundleList
+    {
+        let dir = work_tree().join("rootfs").join(LIST_DIR);
+        let path = list_in(&dir, arch, harness).unwrap();
+        parse_list(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    // Defect caught: a list that does not parse, names a file no build
+    // installs for its architecture (a mistyped path, the other
+    // architecture's IOMMU driver or platform table), or puts another object
+    // than the harness's in the `init` slot.
     #[test]
-    fn every_entry_is_named_by_an_install_path_that_fits_the_entry_header()
+    fn every_list_names_files_the_build_installs_for_its_architecture()
     {
         let root = work_tree();
         for arch in [Arch::X86_64, Arch::Riscv64]
         {
-            let names = boot_modules(arch);
-            for name in &names
+            let mut installed = crate::commands::build::install_names(arch);
+            installed.extend(
+                crate::sysroot::data_files(arch)
+                    .iter()
+                    .map(|file| file.install.to_owned()),
+            );
+            for harness in Harness::VARIANTS
             {
-                assert!(objsig::name_is_install_path(name.as_bytes()), "{name}");
-                assert!(name.len() <= fmt::ENTRY_NAME_LEN, "{name}");
+                let list = repository_list(arch, *harness);
+                for path in std::iter::once(&list.init).chain(&list.entries)
+                {
+                    let in_rootfs = root.join("rootfs").join(&path[1..]).is_file();
+                    assert!(
+                        in_rootfs || installed.contains(path),
+                        "{arch} {}: {path}",
+                        harness.name()
+                    );
+                }
             }
-            for entry in data_entries(arch)
-            {
-                assert!(names.contains(&entry.install), "{}", entry.install);
-                assert!(root.join(entry.source).is_file(), "{}", entry.source);
-                assert_eq!(entry.relative(), &entry.install[1..]);
-            }
+            assert_eq!(repository_list(arch, Harness::Init).init, "/services/init");
+            let ktest = repository_list(arch, Harness::Ktest);
+            assert_eq!(ktest.init, "/tests/ktest");
+            assert_eq!(ktest.entries, Vec::<String>::new());
         }
-        let x86 = boot_modules(Arch::X86_64);
-        let riscv = boot_modules(Arch::Riscv64);
-        assert!(x86.contains(&"/services/drivers/iommu-vtd"));
-        assert!(!x86.contains(&"/services/drivers/iommu-riscv"));
-        assert!(riscv.contains(&"/services/drivers/iommu-riscv"));
-        assert!(riscv.contains(&"/config/devmgr/platform/qemu-virt.platform"));
-        assert!(!x86.contains(&"/config/devmgr/platform/qemu-virt.platform"));
-        assert!(x86.contains(&LOG_LEVELS.install) && riscv.contains(&LOG_LEVELS.install));
+        let x86 = repository_list(Arch::X86_64, Harness::Init).entries;
+        let riscv = repository_list(Arch::Riscv64, Harness::Init).entries;
+        let has = |list: &[String], path: &str| list.iter().any(|entry| entry == path);
+        assert!(has(&x86, "/services/drivers/iommu-vtd"));
+        assert!(has(&riscv, "/services/drivers/iommu-riscv"));
+        assert!(has(&riscv, "/config/devmgr/platform/qemu-virt.platform"));
+        for list in [&x86, &riscv]
+        {
+            assert!(has(list, crate::sysroot::LOG_LEVELS.install));
+        }
     }
 
-    /// A build context in a scratch directory whose sysroot installs every
-    /// object of `arch`'s default-init bundle, ktest, and bootloader images
-    /// embedding the trust store of a throwaway identity; the sysroot is not
-    /// signed. Returns the scratch root, the context and the signer.
+    // Defect caught: a list line read as another than it is (a comment as an
+    // entry, a second path dropped), or a list the bootloader would refuse a
+    // bundle of (a name that is not an install path or does not fit the entry
+    // header, an object twice, no object or two in the `init` slot).
+    #[test]
+    fn a_list_is_read_line_by_line_and_a_malformed_one_refused()
+    {
+        let list = parse_list(
+            "# comment\n\n  init /services/init  \n/services/a\n\t/config/b.conf\n# init /x\n",
+        )
+        .unwrap();
+        assert_eq!(list.init, "/services/init");
+        assert_eq!(list.entries, ["/services/a", "/config/b.conf"]);
+        let long = format!("/services/{}", "x".repeat(fmt::ENTRY_NAME_LEN));
+        for text in [
+            "/services/a\n",
+            "init /services/init\ninit /tests/ktest\n",
+            "init /services/init\n/services/a /services/b\n",
+            "init /services/init\nkernel /services/a\n",
+            "init services/init\n",
+            "init /services/init\n/services/a\n/services/a\n",
+            "init /services/init\n/services/init\n",
+            "init /services/init\n/services/../a\n",
+            &format!("init /services/init\n{long}\n"),
+        ]
+        {
+            parse_list(text).expect_err(text);
+        }
+    }
+
+    // Defect caught: a harness whose list is taken from the other
+    // architecture's file, or one with two lists that picks either silently.
+    #[test]
+    fn a_harness_has_one_list_for_an_architecture()
+    {
+        let dir = scratch("lists");
+        let own = dir.join("init.riscv64.list");
+        let shared = dir.join("init.list");
+        list_in(&dir, Arch::Riscv64, Harness::Init).unwrap_err();
+        fs::write(&own, "").unwrap();
+        assert_eq!(list_in(&dir, Arch::Riscv64, Harness::Init).unwrap(), own);
+        list_in(&dir, Arch::X86_64, Harness::Init).unwrap_err();
+        fs::write(&shared, "").unwrap();
+        list_in(&dir, Arch::Riscv64, Harness::Init).unwrap_err();
+        assert_eq!(list_in(&dir, Arch::X86_64, Harness::Init).unwrap(), shared);
+        list_in(&dir, Arch::X86_64, Harness::Ktest).unwrap_err();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A build context in a scratch directory whose sysroot installs the
+    /// repository's bundle lists, every file they name for `arch`, and a
+    /// bootloader embedding the trust store of a throwaway identity; the
+    /// sysroot is not signed. Returns the scratch root, the context and the
+    /// signer.
     fn fixture(tag: &str, arch: Arch) -> (PathBuf, BuildContext, Signer)
     {
         let root = scratch(tag);
@@ -587,18 +586,19 @@ mod tests
             target_dir: root.join("target"),
         };
         let signer = signer(&root.join("keys"), arch);
-        let data: Vec<&str> = data_entries(arch)
-            .iter()
-            .map(|entry| entry.install)
-            .collect();
-        let installs = ["/services/init", "/tests/ktest"]
-            .into_iter()
-            .chain(boot_modules(arch));
+        install_lists(&ctx);
+        let mut installs = Vec::new();
+        for harness in Harness::VARIANTS
+        {
+            let list = read_list(&ctx, arch, *harness).unwrap();
+            installs.push(list.init);
+            installs.extend(list.entries);
+        }
         for install in installs
         {
             let path = ctx.sysroot.join(&install[1..]);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let body: Vec<u8> = if data.contains(&install)
+            let body: Vec<u8> = if install.starts_with("/config/")
             {
                 format!("data of {install}\n").into_bytes()
             }
@@ -614,18 +614,16 @@ mod tests
         image.extend_from_slice(&len.to_le_bytes());
         image.extend_from_slice(signer.store());
         image.extend_from_slice(b"more code");
-        for path in bootloader_images(&ctx, arch)
-        {
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, &image).unwrap();
-        }
+        let bootloader = ctx.installed_bootloader();
+        fs::create_dir_all(bootloader.parent().unwrap()).unwrap();
+        fs::write(&bootloader, &image).unwrap();
         (root, ctx, signer)
     }
 
-    /// The `(name, object)` of every entry of the staged bundle of `ctx`.
-    fn staged(ctx: &BuildContext) -> Vec<(String, Vec<u8>)>
+    /// The `(name, object)` of every entry of the bundle at `path`.
+    fn read_entries(path: &Path) -> Vec<(String, Vec<u8>)>
     {
-        let bundle = fs::read(ctx.sysroot_efi_seraph().join("bootstrap.bundle")).unwrap();
+        let bundle = fs::read(path).unwrap();
         let header = fmt::parse_header(&bundle).unwrap();
         (0..header.entry_count)
             .map(|index| {
@@ -641,20 +639,26 @@ mod tests
     }
 
     // Defect caught: an entry that is not its installed file byte for byte
-    // (a composer that signs, re-signs or renames), an entry missing from the
-    // default bundle or out of its order, or a ktest bundle that carries
-    // modules.
+    // (a composer that signs, re-signs or renames), an entry the list names
+    // missing from the bundle or out of its order, a ktest bundle that
+    // carries modules, or an installed file the composer changes.
     #[test]
-    fn a_bundle_copies_each_installed_object_under_its_install_path()
+    fn a_bundle_copies_each_file_its_list_names_under_its_install_path()
     {
         let arch = Arch::Riscv64;
         let (root, ctx, signer) = fixture("copies", arch);
+        let out = esp_path(&ctx);
         sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
-        compose(&ctx, arch, Harness::Init).unwrap();
-        let names: Vec<&str> = std::iter::once(INIT_SLOT)
-            .chain(boot_modules(arch))
+        let list = read_list(&ctx, arch, Harness::Init).unwrap();
+        let before: Vec<Vec<u8>> = std::iter::once(&list.init)
+            .chain(&list.entries)
+            .map(|install| fs::read(ctx.sysroot.join(&install[1..])).unwrap())
             .collect();
-        let entries = staged(&ctx);
+        compose(&ctx, arch, Harness::Init, &out).unwrap();
+        let entries = read_entries(&out);
+        let names: Vec<&str> = std::iter::once(INIT_SLOT)
+            .chain(list.entries.iter().map(String::as_str))
+            .collect();
         assert_eq!(
             entries
                 .iter()
@@ -662,55 +666,44 @@ mod tests
                 .collect::<Vec<_>>(),
             names
         );
-        for (name, object) in &entries
+        for ((name, object), installed) in entries.iter().zip(&before)
         {
-            let install = if name == INIT_SLOT
-            {
-                "services/init"
-            }
-            else
-            {
-                &name[1..]
-            };
-            assert_eq!(
-                *object,
-                fs::read(ctx.sysroot.join(install)).unwrap(),
-                "{name}"
-            );
+            assert_eq!(object, installed, "{name}");
         }
-        assert_eq!(staged_harness(&ctx).unwrap(), Harness::Init);
+        assert_eq!(boot_modules(&ctx, arch).unwrap(), list.entries);
 
         sign_sysroot(&ctx, &signer, arch, Harness::Ktest).unwrap();
-        compose(&ctx, arch, Harness::Ktest).unwrap();
-        let entries = staged(&ctx);
+        let other = root.join("elsewhere").join("bootstrap.bundle");
+        compose(&ctx, arch, Harness::Ktest, &other).unwrap();
+        let entries = read_entries(&other);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, INIT_SLOT);
         assert_eq!(
             entries[0].1,
             fs::read(ctx.sysroot.join("tests/ktest")).unwrap()
         );
-        assert_eq!(staged_harness(&ctx).unwrap(), Harness::Ktest);
         let _ = fs::remove_dir_all(&root);
     }
 
     // Defect caught: a bundle written with an entry the bootloader will
     // refuse, so the boot stops where the build could have: an object left
-    // unsigned, one signed without the role of its slot (an image the bundle
-    // names signed without the boot-module role, ktest in the `init` slot of
-    // a sysroot not signed for the ktest harness), one signed by a key the
-    // installed bootloader does not trust, or one whose name is not one the
-    // bootloader accepts.
+    // unsigned or not installed, one signed without the role of its slot (an
+    // image the bundle names signed without the boot-module role, ktest in
+    // the `init` slot of a sysroot not signed for the ktest harness), one
+    // signed by a key the installed bootloader does not trust, or one whose
+    // name is not one the bootloader accepts.
     #[test]
     fn an_entry_the_bootloader_would_refuse_fails_the_compose()
     {
         let arch = Arch::X86_64;
         let (root, ctx, signer) = fixture("refuses", arch);
+        let out = esp_path(&ctx);
         // Unsigned.
-        compose(&ctx, arch, Harness::Init).unwrap_err();
+        compose(&ctx, arch, Harness::Init, &out).unwrap_err();
         sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
-        compose(&ctx, arch, Harness::Init).unwrap();
+        compose(&ctx, arch, Harness::Init, &out).unwrap();
         // ktest is signed for the ktest harness only.
-        compose(&ctx, arch, Harness::Ktest).unwrap_err();
+        compose(&ctx, arch, Harness::Ktest, &out).unwrap_err();
 
         // An entry without the boot-module role.
         let vfsd = ctx.sysroot.join("services/vfsd");
@@ -718,9 +711,9 @@ mod tests
         signer
             .sign_file(&vfsd, RoleSet::of(&[Role::Service]), "/services/vfsd")
             .unwrap();
-        compose(&ctx, arch, Harness::Init).unwrap_err();
+        compose(&ctx, arch, Harness::Init, &out).unwrap_err();
         fs::write(&vfsd, &good).unwrap();
-        compose(&ctx, arch, Harness::Init).unwrap();
+        compose(&ctx, arch, Harness::Init, &out).unwrap();
 
         // An entry signed by a key the installed bootloader does not trust.
         let theirs = Signer::new(
@@ -737,7 +730,13 @@ mod tests
                 "/services/vfsd",
             )
             .unwrap();
-        compose(&ctx, arch, Harness::Init).unwrap_err();
+        compose(&ctx, arch, Harness::Init, &out).unwrap_err();
+        fs::write(&vfsd, &good).unwrap();
+        compose(&ctx, arch, Harness::Init, &out).unwrap();
+
+        // An entry its list names that the sysroot does not install.
+        fs::remove_file(&vfsd).unwrap();
+        compose(&ctx, arch, Harness::Init, &out).unwrap_err();
         fs::write(&vfsd, &good).unwrap();
 
         // Names the bootloader refuses.
@@ -753,28 +752,6 @@ mod tests
         check_entry(&store, arch, "/services/x", Role::BootModule, &object).unwrap();
         check_entry(&store, arch, &long, Role::BootModule, &object).unwrap_err();
         check_entry(&store, arch, "services/x", Role::BootModule, &object).unwrap_err();
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    // Defect caught: a pack that signs ktest as init in an image whose bundle
-    // does not boot it, or does not when it does.
-    #[test]
-    fn the_staged_harness_is_ktest_only_when_its_init_entry_is_ktest()
-    {
-        let arch = Arch::Riscv64;
-        let (root, ctx, signer) = fixture("harness", arch);
-        sign_sysroot(&ctx, &signer, arch, Harness::Ktest).unwrap();
-        compose(&ctx, arch, Harness::Ktest).unwrap();
-        assert_eq!(staged_harness(&ctx).unwrap(), Harness::Ktest);
-        // The init entry's body decides, not its trailer: ktest re-signed for
-        // the init harness is still the ktest bundle's init.
-        sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
-        assert_eq!(staged_harness(&ctx).unwrap(), Harness::Ktest);
-        compose(&ctx, arch, Harness::Init).unwrap();
-        assert_eq!(staged_harness(&ctx).unwrap(), Harness::Init);
-        // A sysroot without ktest packs the init harness.
-        fs::remove_file(ctx.sysroot.join("tests/ktest")).unwrap();
-        assert_eq!(staged_harness(&ctx).unwrap(), Harness::Init);
         let _ = fs::remove_dir_all(&root);
     }
 

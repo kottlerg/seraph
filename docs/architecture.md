@@ -187,14 +187,14 @@ live in the component scope:
 - init's userspace bootstrap — [`services/init/README.md`](../services/init/README.md) and
   [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md).
 
-Boot modules (the eight images of `xtask/src/bundle.rs::MODULES`: procmgr,
-memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs, and the
-`ARCH_MODULES` entry of the architecture's IOMMU driver, iommu-vtd on x86-64
-and iommu-riscv on riscv64, the log-level configuration, and on riscv64 the
-platform description table of the `ARCH_TABLES` entry), each named by its
-install path (`/services/drivers/virtio-blk`) and copied from its installed
-file, are packed into
-`\EFI\seraph\bootstrap.bundle` by `cargo xtask build` (see
+Boot modules (the files the init harness's bundle list of the architecture in
+[`rootfs/config/bundle/`](../rootfs/config/bundle/) names: procmgr, memmgr,
+devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs, the architecture's IOMMU
+driver, iommu-vtd on x86-64 and iommu-riscv on riscv64, the log-level
+configuration, and on riscv64 the platform description table of QEMU virt),
+each named by its install path (`/services/drivers/virtio-blk`) and copied
+from its installed file, are packed into
+`\EFI\seraph\bootstrap.bundle` by every pack of the disk image (see
 [`xtask/README.md`](../xtask/README.md) for the producer side and
 [`abi/boot-protocol`](../abi/boot-protocol/README.md)'s
 [`bundle.rs`](../abi/boot-protocol/src/bundle.rs) for the

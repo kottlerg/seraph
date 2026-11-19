@@ -96,6 +96,10 @@ pub struct ProcessCaps
     /// Each registration goes with the record
     /// ([`crate::Ledger::remove_process`]).
     pub limits: NodeIdx,
+    /// Pages of the process's demand chunks held in the compressed store,
+    /// which its budget node stays charged for
+    /// ([`crate::Ledger::finish_evict`]).
+    pub swapped: u64,
 }
 
 /// The handle state of one budget node: the badge its node handles carry,
@@ -191,6 +195,7 @@ const _: () = assert!(size_of::<RegionNode>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<Commitment>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<LimitReg>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
 
 /// The payload of one arena slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

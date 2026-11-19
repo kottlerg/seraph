@@ -52,10 +52,10 @@ Two privilege classes:
   `NODE_REGISTER_LIMIT`, `NODE_RELEASE`) are callable only over a node
   handle, and act on the budget node it names (§ Node Handles).
 - **Swap** labels (`SWAP_REGISTER`, `SWAP_TAKE`, `SWAP_DONE`,
-  `SWAP_RESTORE`) are callable only over the swap authority, a
+  `SWAP_RESTORE`, `SWAP_WANTED`) are callable only over the swap authority, a
   `SEND|GRANT` badged `SWAP_AUTHORITY` (bit 61) alone, which init mints on
   memmgr's endpoint and svcmgr publishes seed-only as `memmgr.swap`: the swap
-  service's interface to the disk tier (§ Labels 22 to 25).
+  service's interface to the disk tier (§ Labels 22 to 26).
 
 memmgr tells the classes apart by two verb bits, the node-handle bit
 `NODE_HANDLE_TAG` (bit 62) and the swap authority's `SWAP_AUTHORITY` (bit
@@ -146,7 +146,7 @@ replies `INVALID_ARGUMENT`, or `UNAUTHORIZED` over a node handle. Every
 label but the node labels also replies `UNAUTHORIZED` over a node handle, and
 every label but the swap labels over the swap authority (§ Badge
 Discipline); the node labels' tables list the refusal over any other badge, as
-§ Labels 22 to 25 does for the swap labels.
+§ Labels 22 to 26 does for the swap labels.
 
 ### Label 1: `REQUEST_MEMORY_CAPS`
 
@@ -524,7 +524,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[10] | `swapped_bytes` — the pages of every evicted chunk, in either tier (compressed in the store, being written, on disk, or lost), which their processes' budget nodes stay charged for |
 | data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
 | data[12] | `disk_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
-| data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 25) |
+| data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 26) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -1044,9 +1044,15 @@ run changes nothing, so an interrupted call is safe to repeat.
 Make a range of a process's demand regions resident for a debugger: memmgr
 restores each chunk of the range it holds in its store, compressed or writing,
 and maps back each it is evicting, so a `SYS_THREAD_READ_MEM` that failed on a
-page of it succeeds when the reader retries. A page no fault has backed stays
-not present, and so does a page of a chunk on disk or lost, which memmgr
-passes over: it reads no swap slot and waits on no swap service
+page of it succeeds when the reader retries. memmgr reads no swap slot and
+waits on no swap service, so a chunk on disk it asks the swap service for: when
+the registered swap service gave a want Notification (§ Label 22), memmgr posts
+the chunk's slot word to it, sends on the Notification, and replies pending
+(below); the swap service takes the word (`SWAP_WANTED`, § Label 26), reads the
+slot and restores the chunk ahead of a fault (`SWAP_RESTORE`, § Label 25), and
+the reader asks again. A page no fault has backed stays not present, and so
+does a page of a lost chunk, or of a chunk on disk with no swap service to ask,
+which memmgr passes over
 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 Privilege: procmgr only, which sends it for a holder of its debug authority
 (`services/procmgr/docs/ipc-interface.md` § `MAKE_RESIDENT`).
@@ -1074,6 +1080,17 @@ visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
 |---|---|
 | label | 0 |
 | data[0] | where memmgr stopped: `va + len_bytes` when the whole range is done, else the address to send the request again from, with the rest of the range |
+| data[1] | `RESIDENT_PENDING` (1) when memmgr posted a chunk on disk of the range to the swap service: `data[0]` is then the first such chunk's base (or `va`, when that is above it), and the reader asks again from there after a pause, once the swap service has had time to restore it; else `0` |
+
+memmgr walks on past a chunk it posts, posting each chunk on disk and restoring
+each chunk in RAM it meets within its bounds. A word stays posted until the swap
+service takes it, at most `SWAP_WANTED_WORDS` (8) at a time, a full list dropping
+its oldest word for a new one; a reader whose word was dropped posts it again when
+it asks again. `ipc::make_resident` pauses 2 ms (`ipc::PENDING_PAUSE_MS`) between
+requests that stay pending and gives the range up after 500 of them
+(`ipc::PENDING_TRIES`), about a second: a swap service that is down, restarting,
+or cannot read the slot leaves the pages not present, and the reader reads them as
+such.
 
 **Error codes:**
 
@@ -1083,7 +1100,7 @@ visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
 | 4 | `INVALID_ARGUMENT` | Unknown badge, zero length, or a range past the address space |
 | 5 | `UNAUTHORIZED` | The caller is not procmgr |
 
-### Labels 22 to 25: the swap labels
+### Labels 22 to 26: the swap labels
 
 The swap service's interface to memmgr's disk tier
 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier). Privilege: the
@@ -1103,19 +1120,24 @@ holds one chunk (`DEMAND_CHUNK_BYTES`).
 |---|---|
 | label | 22 |
 | data[0] | the slots the swap service's partition holds |
+| data[1] | with `caps[1]`, the bits memmgr sends on it; nonzero |
 | caps[0] | a SEND on the endpoint memmgr redirects each fault on a chunk on disk to, with any rights; memmgr keeps it |
+| caps[1] | optional: a Notification with the Notify right memmgr sends `data[1]` on when `MAKE_RESIDENT` posts a slot word for the swap service (§ Label 21, § Label 26); memmgr keeps it |
 
-A registration replaces the one before it, whose cap memmgr deletes, and ends
-every write in flight: each writing chunk is compressed again on its store runs,
+Without `caps[1]`, `MAKE_RESIDENT` passes the chunks on disk over, as a lost
+chunk. A registration replaces the one before it, whose caps memmgr deletes, and
+ends every write in flight: each writing chunk is compressed again on its store runs,
 and each slot whose write a restore or a teardown cancelled is freed. The
-chunks on disk stay. The reply's `data[0]` is the slots memmgr uses: the count,
+chunks on disk stay, and so do the slot words posted for the swap service: memmgr
+sends on the new Notification at once when any are posted, so a restarted swap
+service restores them. The reply's `data[0]` is the slots memmgr uses: the count,
 clamped to the slot map's window ([docs/limits.md](../../../docs/limits.md)
 § memmgr).
 
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | Registered; `data[0]` the slots memmgr uses |
-| 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Endpoint cap, or a cap on memmgr's own endpoint; the count below a slot ever taken, one on the free list included; or memmgr's key draw failed at start, so the disk tier is off. memmgr deletes the cap, and any earlier registration stays |
+| 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Endpoint cap, or a cap on memmgr's own endpoint; `caps[1]` present and no Notification with the Notify right, or `data[1]` zero with it; the count below a slot ever taken, one on the free list included; or memmgr's key draw failed at start, so the disk tier is off. memmgr deletes the caps, and any earlier registration stays |
 
 #### Label 23: `SWAP_TAKE`
 
@@ -1192,6 +1214,23 @@ lost and frees its slot.
 | 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Memory cap, smaller than the slot's bytes, or not mappable: a request the swap service corrects; the fault it holds stays held |
 | 11 | `RESTORE_DECLINED` | `data[0]` the fault decline word the swap service forwards the held fault with (`FAULT_REPLY_FORWARD`): code 12 with detail 1 when the tag failed and the chunk is lost, else the code of the restore memmgr could not make, the chunk staying on disk |
 | 12 | `RESTORE_STALE` | The word names no chunk on disk; nothing changed. The swap service resumes the held fault (`FAULT_REPLY_RESUME`): the thread faults again and memmgr serves the fault as the chunk now stands, mapped when another restore made it resident |
+
+#### Label 26: `SWAP_WANTED`
+
+Take the slot words of the chunks on disk `MAKE_RESIDENT` posted for the swap
+service since the last request (§ Label 21), oldest first, and empty memmgr's list
+of them. The swap service reads each slot and hands memmgr its bytes with
+`SWAP_RESTORE` (§ Label 25), ahead of a fault; a word whose use of its slot has
+ended since (the chunk restored by a fault, or torn down) replies `RESTORE_STALE`
+there and changes nothing.
+
+| Field | Value |
+|---|---|
+| label | 26 |
+
+| Code | Name | Meaning |
+|---|---|---|
+| 0 | `SUCCESS` | `data[0]` the count of words, at most `SWAP_WANTED_WORDS` (8); the words in `data[1]` on |
 
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
@@ -1301,18 +1340,20 @@ caller's cap.
 Only eight labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
 attached cap), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE` (`cap[0]`),
 `REGISTER_PROCESS` (`cap[0]`), `NODE_REGISTER_LIMIT` (`cap[0]` and
-`cap[1]`), and the swap labels `SWAP_REGISTER`, `SWAP_TAKE` and
+`cap[1]`), and the swap labels `SWAP_REGISTER` (`cap[0]` and `cap[1]`), `SWAP_TAKE` and
 `SWAP_RESTORE` (`cap[0]`). memmgr deletes every other cap a message carries before it
 handles the message, whatever the label, the caller, or the reply: the caps
 attached to any other label (a `FAULT_LABEL` message and an unknown label
 included), the caps after `cap[0]` on `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
-`REGISTER_PROCESS` and the swap labels, and the caps after `cap[1]` on
-`NODE_REGISTER_LIMIT`. It deletes the contract caps as well when a
+`REGISTER_PROCESS`, `SWAP_TAKE` and `SWAP_RESTORE`, every cap on `SWAP_DONE` and
+`SWAP_WANTED`, and the caps after `cap[1]` on `NODE_REGISTER_LIMIT` and
+`SWAP_REGISTER`. It deletes the contract caps as well when a
 procmgr-only label's caller is not procmgr, when a label's class does not
 match the badge (§ Badge Discipline), and in the error cases the labels'
 sections state. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's
-endpoint; `SWAP_TAKE` and `SWAP_RESTORE` move their `cap[0]` back on every
-reply, and delete it only when that reply cannot reach the caller. `REGISTER_PROCESS` reads the
+endpoint, and its `cap[1]`, when present, as the swap service's want Notification;
+`SWAP_TAKE` and `SWAP_RESTORE` move their `cap[0]` back on every reply, and delete it
+only when that reply cannot reach the caller. `REGISTER_PROCESS` reads the
 badge of its `cap[0]` and deletes it on every path, and `NODE_REGISTER_LIMIT` its `cap[1]`. An
 attached cap therefore never outlives the call that carried it unless memmgr takes ownership of it,
 so no client can fill memmgr's `CSpace` by attaching caps until its receive loop fails and memmgr

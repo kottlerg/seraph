@@ -4,7 +4,7 @@
 // services/svctest/src/phases/swap_client.rs
 
 //! memmgr's disk tier through its swap interface
-//! (services/memmgr/docs/ipc-interface.md § Labels 22 to 25), with svctest
+//! (services/memmgr/docs/ipc-interface.md § Labels 22 to 26), with svctest
 //! acting as the swap service over a RAM slot store, through the
 //! `memmgr.swap` seed.
 //!
@@ -31,10 +31,19 @@
 //!   (their byte counts' chi-square over 256 values below
 //!   [`CHI_SQUARE_BOUND`]), and a second `SWAP_REGISTER` ending the write,
 //!   so its `SWAP_DONE` is refused, and keeping the chunks on disk;
+//! * a second registration with a want Notification, and a fifth chunk taken
+//!   and written;
 //! * a write in flight that procmgr's `MAKE_RESIDENT` cancels, its
-//!   `SWAP_DONE` then freeing its slot, while `MAKE_RESIDENT` passes the two
-//!   chunks on disk over: they are the main region's only chunks not present
-//!   but the hole's;
+//!   `SWAP_DONE` then freeing its slot, while `MAKE_RESIDENT` of each chunk of
+//!   the main region replies pending at each of the three chunks on disk, the
+//!   Notification fires, and `SWAP_WANTED` hands over that chunk's slot word
+//!   alone, once: the three are the main region's only chunks not present but
+//!   the hole's;
+//! * `ipc::make_resident` of the fifth chunk returning once a thread of the
+//!   phase, woken by the Notification, restored it from `SWAP_WANTED`'s word,
+//!   and the chunk reading its pattern; and `ipc::make_resident` of another
+//!   chunk on disk, whose word that thread leaves alone, giving up after its
+//!   tries with the chunk still not present;
 //! * the fixture's read of a page of one of them redirected to the phase's
 //!   endpoint, restored, and reading its pattern;
 //! * the fixture's read of a page of the other, whose slot the phase hands
@@ -83,9 +92,15 @@ const SLOTS: u64 = 64;
 /// registered, and keeps its pages as memmgr's metadata
 /// (services/memmgr/docs/memory-pool.md § Disk tier).
 const SLOT_MAP_PAGES: u64 = SLOTS.div_ceil(free_pool::disk::SLOT_WORDS_PER_PAGE);
-/// Chunks of the main region the phase awaits swapped: four to disk, one in
+/// Chunks of the main region the phase awaits swapped: five to disk, one in
 /// flight, and one more for a chunk the clock's last slice did not reach.
-const SWAPPED_CHUNKS: u64 = 6;
+const SWAPPED_CHUNKS: u64 = 7;
+/// The bits memmgr sends on the phase's want Notification.
+const WANT_BITS: u64 = 1;
+/// How long the phase waits for the want Notification after a `MAKE_RESIDENT`
+/// replied pending: memmgr sends on it before it replies, so it has fired. A
+/// test wait bound.
+const WANT_FIRED_MS: u64 = 1000;
 /// `SWAP_TAKE`s the phase makes for one chunk at most: each walks a bounded
 /// part of memmgr's records, and successive ones cover them all.
 const TAKE_TRIES: u32 = 256;
@@ -133,6 +148,12 @@ struct Shared
     tamper: Mutex<Option<u32>>,
     served: Mutex<Vec<Served>>,
     stop: AtomicBool,
+    /// The slot word the want thread restores when `SWAP_WANTED` hands it
+    /// over; every other word it takes, it leaves on disk.
+    restore_wanted: Mutex<Option<u64>>,
+    /// The words the want thread took from `SWAP_WANTED`.
+    wanted: Mutex<Vec<u64>>,
+    want_stop: AtomicBool,
 }
 
 /// A buffer of [`BUF_PAGES`] pages: a contiguous grant mapped read-write in
@@ -206,15 +227,24 @@ fn swap_call(swap: u64, msg: &IpcMessage, what: &str) -> IpcMessage
         .unwrap_or_else(|e| panic!("{PHASE}: {what}: ipc_call failed ({e})"))
 }
 
-/// `SWAP_REGISTER` with a SEND on `endpoint` and [`SLOTS`] slots.
-fn register(swap: u64, endpoint: u64, what: &str)
+/// `SWAP_REGISTER` with a SEND on `endpoint` and [`SLOTS`] slots, and, when
+/// `want` names one, a Notify derivation of that Notification memmgr sends
+/// [`WANT_BITS`] on when `MAKE_RESIDENT` posts a slot word.
+fn register(swap: u64, endpoint: u64, want: Option<u64>, what: &str)
 {
     let send = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND)
         .unwrap_or_else(|e| panic!("{PHASE}: {what}: deriving the restore SEND ({e})"));
-    let msg = IpcMessage::builder(memmgr_labels::SWAP_REGISTER)
+    let mut msg = IpcMessage::builder(memmgr_labels::SWAP_REGISTER)
         .word(0, SLOTS)
-        .cap(send)
-        .build();
+        .word(1, WANT_BITS)
+        .cap(send);
+    if let Some(ntf) = want
+    {
+        let notify = syscall::cap_derive(ntf, syscall::RIGHTS_NTF_NOTIFY)
+            .unwrap_or_else(|e| panic!("{PHASE}: {what}: deriving the want Notify ({e})"));
+        msg = msg.cap(notify);
+    }
+    let msg = msg.build();
     let reply = swap_call(swap, &msg, what);
     assert_eq!(
         (reply.label, reply.word(0)),
@@ -316,6 +346,125 @@ fn restore(swap: u64, word: u64, bytes: &[u8], buf: &mut Buffer, what: &str) -> 
         .first()
         .unwrap_or_else(|| panic!("{PHASE}: {what}: SWAP_RESTORE moved no buffer back"));
     (reply.label, reply.word(0))
+}
+
+/// `SWAP_WANTED`: the slot words memmgr posted since the last request.
+fn wanted(swap: u64, what: &str) -> Vec<u64>
+{
+    let reply = swap_call(swap, &IpcMessage::new(memmgr_labels::SWAP_WANTED), what);
+    assert_eq!(
+        reply.label,
+        memmgr_errors::SUCCESS,
+        "{PHASE}: {what}: SWAP_WANTED replied {:#x}",
+        reply.label
+    );
+    let n = usize::try_from(reply.word(0)).unwrap_or(usize::MAX);
+    assert!(
+        n <= usize::try_from(memmgr_labels::SWAP_WANTED_WORDS).unwrap_or(0),
+        "{PHASE}: {what}: SWAP_WANTED replied {n} words"
+    );
+    (1..=n).map(|i| reply.word(i)).collect()
+}
+
+/// One `MAKE_RESIDENT` of `[va, va + len)` of `process`, through procmgr.
+fn resident_step(authority: u64, process: u64, va: u64, len: u64) -> ipc::ResidentStep
+{
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    unsafe {
+        ipc::make_resident_step(
+            authority,
+            process,
+            va,
+            va.saturating_add(len),
+            current_ipc_buf(),
+        )
+    }
+    .unwrap_or_else(|| panic!("{PHASE}: MAKE_RESIDENT of the chunk at {va:#x} failed"))
+}
+
+/// The want thread: wait on the want Notification `ntf`, take the words
+/// memmgr posted with `SWAP_WANTED`, and restore the one
+/// [`Shared::restore_wanted`] names from the slot store through `buf`, ahead
+/// of any fault. Returns the buffer once told to stop.
+fn want_server(swap: u64, ntf: u64, mut buf: Buffer, shared: &Shared) -> Buffer
+{
+    while !shared.want_stop.load(Ordering::Acquire)
+    {
+        if syscall::notification_wait_timeout(ntf, RESTORER_POLL_MS).is_err()
+        {
+            continue;
+        }
+        let words = wanted(swap, "the want thread's take");
+        let restore_word = *shared.restore_wanted.lock().expect("the want lock");
+        for &word in &words
+        {
+            if Some(word) == restore_word
+            {
+                let bytes = stored(shared, free_pool::disk::word_slot(word));
+                let (label, _) = restore(swap, word, &bytes, &mut buf, "a wanted restore");
+                assert_eq!(
+                    label,
+                    memmgr_errors::SUCCESS,
+                    "{PHASE}: the want thread's SWAP_RESTORE replied {label:#x}"
+                );
+            }
+        }
+        shared.wanted.lock().expect("the want lock").extend(words);
+    }
+    buf
+}
+
+/// `MAKE_RESIDENT` of each chunk of the fixture's main region but the hole's,
+/// one request each: a chunk in RAM is made resident, and a chunk on disk is
+/// replied pending at its own base, memmgr having sent on `want` and posted its
+/// slot word, which `SWAP_WANTED` hands over alone and once. The chunks found
+/// on disk, each with its slot word.
+fn want_each_chunk(
+    authority: u64,
+    process: u64,
+    swap: u64,
+    want: u64,
+    ready: &Ready,
+) -> Vec<(u64, u64)>
+{
+    let _ = syscall::notification_try_wait(want);
+    let hole_chunk = ready.hole.saturating_sub(ready.region) / CHUNK_LEN;
+    let mut on_disk = Vec::new();
+    for i in (0..ready.chunks).filter(|&i| i != hole_chunk)
+    {
+        let va = ready.region.saturating_add(i.saturating_mul(CHUNK_LEN));
+        let step = resident_step(authority, process, va, CHUNK_LEN);
+        if !step.pending
+        {
+            assert!(
+                step.reached >= va.saturating_add(CHUNK_LEN),
+                "{PHASE}: MAKE_RESIDENT of the chunk at {va:#x} stopped at {:#x}",
+                step.reached
+            );
+            continue;
+        }
+        assert_eq!(
+            step.reached, va,
+            "{PHASE}: MAKE_RESIDENT of the chunk at {va:#x} pending at another address"
+        );
+        let bits = syscall::notification_wait_timeout(want, WANT_FIRED_MS);
+        assert!(
+            bits.is_ok_and(|b| b & WANT_BITS != 0),
+            "{PHASE}: the want Notification did not fire for the chunk at {va:#x} ({bits:?})"
+        );
+        let words = wanted(swap, "SWAP_WANTED after a pending MAKE_RESIDENT");
+        let [word] = words[..]
+        else
+        {
+            panic!("{PHASE}: SWAP_WANTED for the chunk at {va:#x} handed over {words:#x?}")
+        };
+        assert!(
+            wanted(swap, "a second SWAP_WANTED").is_empty(),
+            "{PHASE}: SWAP_WANTED handed the chunk at {va:#x}'s word over twice"
+        );
+        on_disk.push((va, word));
+    }
+    on_disk
 }
 
 /// The pages memmgr holds on disk and the slots free, from its pool status.
@@ -573,7 +722,7 @@ fn swap_client_phase(caps: &Caps)
             syscall::cap_create_endpoint(slab).ok()
         })
         .unwrap_or_else(|| panic!("{PHASE}: a restore endpoint"));
-    register(swap, endpoint, "the first registration");
+    register(swap, endpoint, None, "the first registration");
     assert_eq!(
         disk_and_free(),
         (0, SLOTS),
@@ -591,9 +740,9 @@ fn swap_client_phase(caps: &Caps)
     let mut buf = Buffer::new();
     let (slot_a, word_a) = take(swap, &mut buf, &shared, "take a");
     assert_eq!(done(swap, slot_a, 0, "done a"), memmgr_errors::SUCCESS);
-    let (slot_b, _) = take(swap, &mut buf, &shared, "take b");
+    let (slot_b, word_b) = take(swap, &mut buf, &shared, "take b");
     assert_eq!(done(swap, slot_b, 0, "done b"), memmgr_errors::SUCCESS);
-    let (slot_t, _) = take(swap, &mut buf, &shared, "take t");
+    let (slot_t, word_t) = take(swap, &mut buf, &shared, "take t");
     assert_eq!(done(swap, slot_t, 0, "done t"), memmgr_errors::SUCCESS);
     assert_eq!(
         disk_and_free(),
@@ -657,9 +806,14 @@ fn swap_client_phase(caps: &Caps)
         sealed.len()
     );
 
-    // A second registration ends the write in flight and keeps the chunks on
-    // disk.
-    register(swap, endpoint, "the second registration");
+    // A second registration, with a want Notification, ends the write in
+    // flight and keeps the chunks on disk.
+    let want =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+        .unwrap_or_else(|| panic!("{PHASE}: a want Notification"));
+    register(swap, endpoint, Some(want), "the second registration");
     assert_eq!(
         done(swap, slot_x, 0, "done x after the registration"),
         memmgr_errors::INVALID_ARGUMENT
@@ -669,38 +823,109 @@ fn swap_client_phase(caps: &Caps)
         (2 * CHUNK_PAGES, SLOTS - 2),
         "{PHASE}: after the second registration"
     );
+    let (slot_e, word_e) = take(swap, &mut buf, &shared, "take e");
+    assert_eq!(done(swap, slot_e, 0, "done e"), memmgr_errors::SUCCESS);
 
     // A write in flight for MAKE_RESIDENT to cancel.
     let (slot_d, _) = take(swap, &mut buf, &shared, "take d");
 
-    // MAKE_RESIDENT restores the chunk in flight and passes the two on disk
+    // MAKE_RESIDENT of each chunk restores the chunk in flight and replies
+    // pending at each chunk on disk, whose word alone SWAP_WANTED then hands
     // over: they are the main region's only chunks not present but the hole's.
-    let len = ready.chunks.saturating_mul(CHUNK_LEN);
-    let label = make_resident(authority, process, ready.region, len);
-    assert_eq!(
-        label,
-        procmgr_errors::SUCCESS,
-        "{PHASE}: MAKE_RESIDENT of the main region replied {label:#x}"
-    );
+    let on_disk = want_each_chunk(authority, process, swap, want, &ready);
     assert_eq!(done(swap, slot_d, 0, "done d"), memmgr_errors::SUCCESS);
     assert_eq!(
         disk_and_free(),
-        (2 * CHUNK_PAGES, SLOTS - 2),
+        (3 * CHUNK_PAGES, SLOTS - 3),
         "{PHASE}: after the restores"
+    );
+    let mut words: Vec<u64> = on_disk.iter().map(|&(_, word)| word).collect();
+    words.sort_unstable();
+    let mut expected = vec![word_b, word_t, word_e];
+    expected.sort_unstable();
+    assert_eq!(
+        words, expected,
+        "{PHASE}: the words SWAP_WANTED handed over for the chunks MAKE_RESIDENT found on disk"
     );
     let threads = attach(authority, process, "the fixture");
     let thread = *threads.first().expect("the attach returned a thread");
     let hole_chunk = ready.hole.saturating_sub(ready.region) / CHUNK_LEN;
-    let absent: Vec<u64> = (0..ready.chunks)
-        .filter(|&i| i != hole_chunk)
-        .map(|i| ready.region.saturating_add(i.saturating_mul(CHUNK_LEN)))
-        .filter(|&va| !page_present(thread, va))
-        .collect();
+    let absent = |thread: u64| -> Vec<u64> {
+        (0..ready.chunks)
+            .filter(|&i| i != hole_chunk)
+            .map(|i| ready.region.saturating_add(i.saturating_mul(CHUNK_LEN)))
+            .filter(|&va| !page_present(thread, va))
+            .collect()
+    };
+    let mut want_vas: Vec<u64> = on_disk.iter().map(|&(va, _)| va).collect();
+    want_vas.sort_unstable();
+    assert_eq!(
+        absent(thread),
+        want_vas,
+        "{PHASE}: chunks of the main region not present, against those on disk"
+    );
+
+    // The want path end to end: ipc::make_resident of e's chunk returns once
+    // the want thread restored it, and of b's gives up, b staying on disk.
+    let va_of = |word: u64| {
+        on_disk
+            .iter()
+            .find(|&&(_, w)| w == word)
+            .map_or(0, |&(va, _)| va)
+    };
+    *shared.restore_wanted.lock().expect("the want lock") = Some(word_e);
+    let want_shared = Arc::clone(&shared);
+    let want_buf = Buffer::new();
+    let want_thread = std::thread::Builder::new()
+        .name("swap-want".into())
+        .spawn(move || want_server(swap, want, want_buf, &want_shared))
+        .unwrap_or_else(|e| panic!("{PHASE}: spawning the want thread: {e}"));
+    let va_e = va_of(word_e);
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let made =
+        unsafe { ipc::make_resident(authority, process, va_e, CHUNK_LEN, current_ipc_buf()) };
+    assert!(
+        made,
+        "{PHASE}: ipc::make_resident of e's chunk at {va_e:#x} failed"
+    );
+    let pattern = super::swap::chunk_reads_pattern(thread, va_e, ready.region);
+    assert!(
+        pattern,
+        "{PHASE}: e's chunk at {va_e:#x}, restored ahead, lacks its pattern"
+    );
+    let va_b = va_of(word_b);
+    // SAFETY: as above.
+    let made =
+        unsafe { ipc::make_resident(authority, process, va_b, CHUNK_LEN, current_ipc_buf()) };
+    assert!(
+        !made && !page_present(thread, va_b),
+        "{PHASE}: ipc::make_resident of b's chunk at {va_b:#x}, never restored, returned {made}"
+    );
+    shared.want_stop.store(true, Ordering::Release);
+    let want_buf = want_thread
+        .join()
+        .unwrap_or_else(|_| panic!("{PHASE}: the want thread panicked"));
+    want_buf.release();
+    assert!(
+        shared
+            .wanted
+            .lock()
+            .expect("the want lock")
+            .iter()
+            .all(|&w| w == word_e || w == word_b),
+        "{PHASE}: the want thread was handed a word no MAKE_RESIDENT asked for"
+    );
+    assert_eq!(
+        disk_and_free(),
+        (2 * CHUNK_PAGES, SLOTS - 2),
+        "{PHASE}: after e's restore ahead"
+    );
+    let remaining = absent(thread);
     detach(authority, process, &threads, "the fixture");
-    let [first, second] = absent[..]
+    let [first, second] = remaining[..]
     else
     {
-        panic!("{PHASE}: chunks of the main region not present: {absent:#x?}, two expected")
+        panic!("{PHASE}: chunks of the main region not present: {remaining:#x?}, two expected")
     };
 
     // A fault on a chunk on disk, redirected and restored.

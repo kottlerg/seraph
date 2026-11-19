@@ -95,8 +95,11 @@ services/svctest/
         │                      #   reserve stack; all-RAM-accounted identity
         ├── swap_client.rs     # memmgr's disk tier with svctest as the swap service over a
         │                      #   RAM slot store: register, take, done, stale restores, a
-        │                      #   fault redirected and restored, a re-registration, a
-        │                      #   tampered slot killing its faulting child;
+        │                      #   fault redirected and restored, a re-registration, a want
+        │                      #   Notification with `MAKE_RESIDENT` replying pending,
+        │                      #   `SWAP_WANTED` and `ipc::make_resident` restoring one chunk and
+        │                      #   giving up on another, a tampered slot killing its faulting
+        │                      #   child;
         │                      #   all-RAM-accounted identity
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
@@ -218,7 +221,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose shell runs the large job |
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
-| `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client` phase: memmgr's swap labels, as the swap service over a RAM slot store |
+| `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client` phase: memmgr's swap labels, as the swap service over a RAM slot store, with a want Notification of its own |
 | `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 

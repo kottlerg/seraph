@@ -413,6 +413,157 @@ pub const fn fault_path(entry: &ChunkEntry, registered: Registered) -> FaultPath
     }
 }
 
+/// What `MAKE_RESIDENT` does with a chunk of the range it walks, by the chunk's
+/// state, with a swap service that registered a want Notification or not
+/// (`services/memmgr/docs/memory-pool.md` § Eviction, Debugger reads).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentPath
+{
+    /// Nothing: the chunk is resident, or holds no page a fault backed.
+    Skip,
+    /// Made resident in the request's turn: its runs mapped back, or its pages
+    /// restored from the store.
+    Restore,
+    /// Posted to the swap service's want list: the swap service reads its slot
+    /// and restores it ahead of a fault, and the reader asks again.
+    Want,
+    /// Passed over: a lost chunk, or a chunk on disk with no swap service to
+    /// ask; its pages stay not present.
+    PassOver,
+}
+
+/// The path `MAKE_RESIDENT` takes for a chunk whose entry is `entry`, with
+/// `wants` saying whether a registered swap service can be asked for a chunk
+/// on disk.
+#[must_use]
+pub const fn resident_path(entry: &ChunkEntry, wants: Registered) -> ResidentPath
+{
+    match entry.state()
+    {
+        ChunkState::Unbacked | ChunkState::Resident => ResidentPath::Skip,
+        ChunkState::Evicting | ChunkState::Compressed | ChunkState::Writing =>
+        {
+            ResidentPath::Restore
+        }
+        ChunkState::OnDisk => match wants
+        {
+            Registered::Yes => ResidentPath::Want,
+            Registered::No => ResidentPath::PassOver,
+        },
+        ChunkState::Lost => ResidentPath::PassOver,
+    }
+}
+
+/// Words the want list holds at most, and so the most one `SWAP_WANTED` reply
+/// carries.
+pub const WANT_WORDS: usize = 8;
+
+/// Whether [`WantList::post`] added a word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Posted
+{
+    /// The word was added, the oldest one dropped when the list was full.
+    Added,
+    /// The word was already on the list, which is unchanged.
+    Already,
+}
+
+/// The slot words of chunks on disk a debugger's `MAKE_RESIDENT` met, in the
+/// order they were posted, which the swap service takes with `SWAP_WANTED`,
+/// reads and restores ahead of a fault. Bounded: a full list drops its oldest
+/// word for a new one, and the reader whose word was dropped posts it again
+/// when it asks again.
+pub struct WantList
+{
+    words: [u64; WANT_WORDS],
+    /// Index of the oldest word.
+    start: usize,
+    /// Words held.
+    len: usize,
+}
+
+impl WantList
+{
+    /// An empty list.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            words: [0; WANT_WORDS],
+            start: 0,
+            len: 0,
+        }
+    }
+
+    /// Words held.
+    #[must_use]
+    pub const fn len(&self) -> usize
+    {
+        self.len
+    }
+
+    /// Whether the list holds no word.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool
+    {
+        self.len == 0
+    }
+
+    /// The word at position `i` from the oldest.
+    fn at(&self, i: usize) -> u64
+    {
+        self.words
+            .get(self.start.wrapping_add(i) % WANT_WORDS)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Post `word`, unless the list holds it already.
+    pub fn post(&mut self, word: u64) -> Posted
+    {
+        if (0..self.len).any(|i| self.at(i) == word)
+        {
+            return Posted::Already;
+        }
+        let end = self.start.wrapping_add(self.len) % WANT_WORDS;
+        if let Some(w) = self.words.get_mut(end)
+        {
+            *w = word;
+        }
+        if self.len == WANT_WORDS
+        {
+            self.start = self.start.wrapping_add(1) % WANT_WORDS;
+        }
+        else
+        {
+            self.len = self.len.saturating_add(1);
+        }
+        Posted::Added
+    }
+
+    /// Move every word into `out`, oldest first, and empty the list: the count
+    /// moved.
+    pub fn take(&mut self, out: &mut [u64; WANT_WORDS]) -> usize
+    {
+        let n = self.len;
+        for (i, slot) in out.iter_mut().enumerate().take(n)
+        {
+            *slot = self.at(i);
+        }
+        self.start = 0;
+        self.len = 0;
+        n
+    }
+}
+
+impl Default for WantList
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
 /// Whether a swap service is registered to restore the chunks on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Registered
@@ -629,5 +780,66 @@ mod tests
             assert_eq!(fault_path(&entry, Registered::Yes), yes, "{entry:?}");
             assert_eq!(fault_path(&entry, Registered::No), no, "{entry:?}");
         }
+    }
+    #[test]
+    fn make_resident_restores_from_ram_wants_a_chunk_on_disk_and_passes_a_lost_one_over()
+    {
+        let resident = ChunkEntry::UNBACKED.back(0, 4, 7).unwrap();
+        let evicting = resident.begin_evict(1).unwrap();
+        let compressed = evicting.finish_evict(9).unwrap();
+        let writing = compressed.begin_write(5).unwrap();
+        let on_disk = writing.finish_write().unwrap();
+        let lost = on_disk.lose().unwrap();
+        for (entry, yes, no) in [
+            (ChunkEntry::UNBACKED, ResidentPath::Skip, ResidentPath::Skip),
+            (resident, ResidentPath::Skip, ResidentPath::Skip),
+            (evicting, ResidentPath::Restore, ResidentPath::Restore),
+            (compressed, ResidentPath::Restore, ResidentPath::Restore),
+            (writing, ResidentPath::Restore, ResidentPath::Restore),
+            (on_disk, ResidentPath::Want, ResidentPath::PassOver),
+            (lost, ResidentPath::PassOver, ResidentPath::PassOver),
+        ]
+        {
+            assert_eq!(resident_path(&entry, Registered::Yes), yes, "{entry:?}");
+            assert_eq!(resident_path(&entry, Registered::No), no, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn the_want_list_keeps_each_word_once_in_posting_order_and_empties_when_taken()
+    {
+        let mut wants = WantList::new();
+        assert_eq!(wants.post(3), Posted::Added);
+        assert_eq!(wants.post(1), Posted::Added);
+        assert_eq!(wants.post(3), Posted::Already);
+        let mut out = [0; WANT_WORDS];
+        assert_eq!(wants.take(&mut out), 2);
+        assert_eq!(out[..2], [3, 1]);
+        assert!(wants.is_empty());
+        assert_eq!(wants.take(&mut out), 0);
+        // A word taken can be posted again.
+        assert_eq!(wants.post(3), Posted::Added);
+        assert_eq!(wants.len(), 1);
+    }
+
+    #[test]
+    fn a_full_want_list_drops_its_oldest_word_for_a_new_one()
+    {
+        let mut wants = WantList::new();
+        let words = u64::try_from(WANT_WORDS).unwrap();
+        for word in 0..words
+        {
+            assert_eq!(wants.post(word), Posted::Added);
+        }
+        // Full: a word already held changes nothing, a new one replaces the
+        // oldest, and the rest keep their order.
+        assert_eq!(wants.post(words - 1), Posted::Already);
+        assert_eq!(wants.post(words), Posted::Added);
+        assert_eq!(wants.post(words + 1), Posted::Added);
+        assert_eq!(wants.len(), WANT_WORDS);
+        let mut out = [0; WANT_WORDS];
+        assert_eq!(wants.take(&mut out), WANT_WORDS);
+        let expected: Vec<u64> = (2..words + 2).collect();
+        assert_eq!(out.to_vec(), expected);
     }
 }

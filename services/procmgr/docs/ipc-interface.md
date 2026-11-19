@@ -1404,15 +1404,20 @@ debugger that gets that failure on a page asks for its range here and retries: p
 target under the table lock and, after it, sends memmgr its `MAKE_RESIDENT` with the target's memmgr
 badge ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 21).
 memmgr restores the evicted chunks the range meets, a bounded number per request; a page no fault
-has backed stays not present, so the retry fails again on it, as does a page of a chunk on disk,
-which memmgr passes over since it waits on no swap service
+has backed stays not present, so the retry fails again on it. A chunk on disk memmgr asks the swap
+service to restore, and replies pending at it; a lost chunk, or one on disk with no swap service to
+ask, it passes over, and the retry fails on its pages too
 ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#disk-tier) § Disk tier). A
 process that declared itself undebuggable (Label 21) is served too: the request reads and writes
 nothing of the target, and only does what the target's own next touch of the pages would.
 
 Replies `SUCCESS` with `data[0]` the address memmgr stopped at, memmgr's reply word: the range's end
 when the whole range is done, else the address the caller asks again from, with the rest of the
-range. `ipc::make_resident` asks until it is done. Refusals, in order: `UNAUTHORIZED` without the
+range; and `data[1]`, memmgr's word 1: `memmgr_labels::RESIDENT_PENDING` when that address is a
+chunk on disk the swap service was asked to restore, else `0`. `ipc::make_resident` asks until it
+is done, pausing `ipc::PENDING_PAUSE_MS` (2 ms) before each request after a pending reply, and
+gives the range up after `ipc::PENDING_TRIES` (500) pending replies in a row at one address, about
+a second, the pages then staying not present. Refusals, in order: `UNAUTHORIZED` without the
 authority; `INVALID_BADGE` when no live process carries the badge; then memmgr's: `INVALID_ARGUMENT`
 for a zero length or a range past the address space, and `OUT_OF_MEMORY` when memmgr could not
 restore a chunk of the range or the call to it failed. svctest's `memmgr_swap` phase reads a page of

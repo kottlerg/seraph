@@ -403,23 +403,39 @@ pub const DISCARD_RANGE: u64 = 20;
 /// * `data[2]` — `len_bytes` (nonzero).
 ///
 /// memmgr makes at most a few chunks resident per request and walks only
-/// the chunks that have an entry.
+/// the chunks that have an entry. A chunk on disk it cannot restore itself:
+/// with a swap service registered with a want Notification ([`SWAP_REGISTER`])
+/// it posts the chunk's slot word to the swap service, which restores it ahead
+/// of a fault ([`SWAP_WANTED`]), and the reply says the range is pending
+/// there; a lost chunk, or one on disk with no swap service to ask, is passed
+/// over.
 ///
 /// Reply: `memmgr_errors::SUCCESS` with `data[0]` where memmgr stopped:
 /// `va + len_bytes` when the whole range is done, else the address to send
-/// the request again from; `UNAUTHORIZED` (caller is not procmgr);
+/// the request again from, and `data[1]` [`RESIDENT_PENDING`] when that
+/// address is a chunk on disk the swap service was asked to restore, else
+/// `0`; `UNAUTHORIZED` (caller is not procmgr);
 /// `INVALID_ARGUMENT` (unknown badge, zero length, or a range
 /// past the address space); or `OUT_OF_MEMORY_BEST_EFFORT` (a chunk could
 /// not be restored, for want of free RAM or a map). Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 21: `MAKE_RESIDENT`.
 pub const MAKE_RESIDENT: u64 = 21;
+/// [`MAKE_RESIDENT`] reply `data[1]`: memmgr stopped at a chunk on disk whose
+/// slot word it posted to the swap service; the sender asks again from
+/// `data[0]` once the swap service has had time to restore it.
+pub const RESIDENT_PENDING: u64 = 1;
 /// Swap authority only ([`SWAP_AUTHORITY`]): register the swap service.
 /// `caps[0`] is a SEND on the endpoint memmgr redirects each fault on an
 /// on-disk chunk to; `data[0]` the swap slots the service's partition holds,
-/// each [`DEMAND_CHUNK_BYTES`]. A registration replaces the one before it
-/// and ends every write in flight, the chunks staying in memmgr's store.
+/// each [`DEMAND_CHUNK_BYTES`]; `caps[1]`, optional, a Notification with the
+/// Notify right memmgr sends `data[1]` (nonzero) on when [`MAKE_RESIDENT`]
+/// posts a slot word for the swap service to take with [`SWAP_WANTED`]. A
+/// registration replaces the one before it and ends every write in flight,
+/// the chunks staying in memmgr's store.
 /// Reply: `SUCCESS` with `data[0]` the slots memmgr uses; `INVALID_ARGUMENT`
-/// when `caps[0]` is no endpoint cap or the count is below a slot ever taken.
+/// when `caps[0]` is no endpoint cap, the count is below a slot ever taken,
+/// or `caps[1]` is present and no Notification with the Notify right or
+/// `data[1]` is zero.
 /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 22:
 /// `SWAP_REGISTER`.
 pub const SWAP_REGISTER: u64 = 22;
@@ -449,6 +465,18 @@ pub const SWAP_DONE: u64 = 24;
 /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 25:
 /// `SWAP_RESTORE`.
 pub const SWAP_RESTORE: u64 = 25;
+/// Swap authority only: take the slot words of the chunks on disk
+/// [`MAKE_RESIDENT`] asked for, which memmgr posted since the last request,
+/// oldest first, and empty memmgr's list of them. The swap service reads each
+/// slot and hands memmgr its bytes with [`SWAP_RESTORE`], ahead of a fault.
+/// Reply: `SUCCESS` with `data[0]` the count, at most
+/// [`SWAP_WANTED_WORDS`], and the words in `data[1]` on. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 26: `SWAP_WANTED`.
+pub const SWAP_WANTED: u64 = 26;
+/// The most slot words memmgr holds for the swap service, and so the most one
+/// [`SWAP_WANTED`] reply carries: a full list drops its oldest word for a new
+/// one, which the reader posts again when it asks again.
+pub const SWAP_WANTED_WORDS: u64 = 8;
 
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.

@@ -14,7 +14,72 @@ use core::prelude::rust_2024::*;
 
 use syscall_abi::SyscallError;
 
-use crate::{IpcMessage, ipc_call, procmgr_errors, procmgr_labels};
+use crate::{IpcMessage, ipc_call, memmgr_labels, procmgr_errors, procmgr_labels};
+
+/// How long a reader pauses before it asks again for a range memmgr replied
+/// pending on: the swap service is reading a chunk on disk, which takes a slot
+/// read (about 0.15 ms under KVM, 1.5 ms under TCG, measured) and a restore.
+pub const PENDING_PAUSE_MS: u64 = 2;
+
+/// How many times a reader asks again for a range that stays pending, so it
+/// waits about a second, [`PENDING_PAUSE_MS`] apart, before it gives the range
+/// up: a swap service that is down, or restarting, or whose disk has failed,
+/// leaves the pages not present, and the reader reads them as such.
+pub const PENDING_TRIES: u32 = 500;
+
+/// One `MAKE_RESIDENT` reply: where memmgr stopped, and whether it stopped
+/// at a chunk on disk the swap service was asked to restore.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentStep
+{
+    /// The address memmgr stopped at: the range's end when it is all done.
+    pub reached: u64,
+    /// `reached` is a chunk on disk memmgr posted to the swap service.
+    pub pending: bool,
+}
+
+/// What a reader making `[at, end)` resident does after a step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next
+{
+    /// The range is done.
+    Done,
+    /// Ask again from the address: memmgr bounded its work.
+    From(u64),
+    /// Pause [`PENDING_PAUSE_MS`] and ask again from the address: a chunk on
+    /// disk there is being read.
+    Pause(u64),
+    /// Give up: the reply made no progress, or the range stayed pending for
+    /// [`PENDING_TRIES`] tries.
+    GiveUp,
+}
+
+/// The next move of a reader at `at` of a range ending at `end`, after the
+/// step `step`, having paused `paused` times since its last progress.
+#[must_use]
+pub fn next(at: u64, end: u64, step: ResidentStep, paused: u32) -> Next
+{
+    if step.pending
+    {
+        if step.reached < at || step.reached >= end || paused >= PENDING_TRIES
+        {
+            return Next::GiveUp;
+        }
+        return Next::Pause(step.reached);
+    }
+    if step.reached >= end
+    {
+        Next::Done
+    }
+    else if step.reached <= at
+    {
+        Next::GiveUp
+    }
+    else
+    {
+        Next::From(step.reached)
+    }
+}
 
 /// Ask procmgr, through the debug-authority cap `authority`, to make the
 /// range of `len` bytes at `va` of the process whose process badge (as
@@ -23,12 +88,15 @@ use crate::{IpcMessage, ipc_call, procmgr_errors, procmgr_labels};
 /// range it evicted into its compressed store, so a `SYS_THREAD_READ_MEM` or
 /// `SYS_THREAD_WRITE_MEM` that failed with `InvalidAddress` on such a page
 /// succeeds when retried (`services/memmgr/docs/memory-pool.md` § Eviction,
-/// Debugger reads). A page no fault has backed stays not present. memmgr does
-/// a bounded part of the range per request and replies where it stopped, so
-/// this asks again from there until the whole range is done. Whether every
-/// request was served: `false` when a call failed, procmgr refused
-/// (`OUT_OF_MEMORY` when memmgr could not restore a chunk of the range), or
-/// a reply made no progress.
+/// Debugger reads), and asks the swap service to restore each chunk of it on
+/// disk. A page no fault has backed stays not present. memmgr does a bounded
+/// part of the range per request and replies where it stopped, so this asks
+/// again from there until the whole range is done ([`next`]); where memmgr
+/// stopped at a chunk on disk, it pauses [`PENDING_PAUSE_MS`] before it asks
+/// again, at most [`PENDING_TRIES`] times. Whether every request was served:
+/// `false` when a call failed, procmgr refused (`OUT_OF_MEMORY` when memmgr
+/// could not restore a chunk of the range), a reply made no progress, or a
+/// chunk on disk was not restored within the tries.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -46,32 +114,47 @@ pub unsafe fn make_resident(
         return false;
     };
     let mut at = va;
+    let mut paused: u32 = 0;
     loop
     {
         // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-        let Some(reached) = (unsafe { make_resident_step(authority, process, at, end, ipc_buf) })
+        let Some(step) = (unsafe { make_resident_step(authority, process, at, end, ipc_buf) })
         else
         {
             return false;
         };
-        if reached >= end
+        match next(at, end, step, paused)
         {
-            return true;
+            Next::Done => return true,
+            Next::GiveUp => return false,
+            Next::From(reached) =>
+            {
+                at = reached;
+                paused = 0;
+            }
+            Next::Pause(reached) =>
+            {
+                if reached > at
+                {
+                    paused = 0;
+                }
+                at = reached;
+                paused = paused.saturating_add(1);
+                // A sleep cut short only asks again sooner, which the tries
+                // bound as well.
+                let _ = syscall::thread_sleep(PENDING_PAUSE_MS);
+            }
         }
-        if reached <= at
-        {
-            return false;
-        }
-        at = reached;
     }
 }
 
 /// One `MAKE_RESIDENT` request for `[at, end)` of `process`, through the
 /// debug-authority cap `authority`: where procmgr replied that memmgr
-/// stopped, `end` when the range is done, or `None` when the call failed or
-/// procmgr refused. A caller that bounds its own requests, as crashd bounds a
-/// dump's, drives the loop of [`make_resident`] with this, one request per
-/// step.
+/// stopped, `end` when the range is done, and whether it stopped at a chunk
+/// on disk the swap service was asked to restore, or `None` when the call
+/// failed or procmgr refused. A caller that bounds its own requests, as crashd
+/// bounds a dump's, drives the loop of [`make_resident`] with this and
+/// [`next`], one request per step.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -86,7 +169,7 @@ pub unsafe fn make_resident_step(
     at: u64,
     end: u64,
     ipc_buf: *mut u64,
-) -> Option<u64>
+) -> Option<ResidentStep>
 {
     let request = IpcMessage::builder(procmgr_labels::MAKE_RESIDENT)
         .word(0, process)
@@ -97,7 +180,10 @@ pub unsafe fn make_resident_step(
     unsafe { ipc_call(authority, &request, ipc_buf) }
         .ok()
         .filter(|reply| reply.label == procmgr_errors::SUCCESS)
-        .map(|reply| reply.word(0))
+        .map(|reply| ResidentStep {
+            reached: reply.word(0),
+            pending: reply.word(1) == memmgr_labels::RESIDENT_PENDING,
+        })
 }
 
 /// Read `buf.len()` bytes at `va` of the address space of `thread`, a thread
@@ -114,7 +200,8 @@ pub unsafe fn make_resident_step(
 /// # Errors
 /// The error of the last `SYS_THREAD_READ_MEM`: the first read's when it
 /// failed with anything but `InvalidAddress`, or when procmgr did not make
-/// the range resident; else the second read's.
+/// the range resident (a chunk on disk the swap service did not restore
+/// within [`make_resident`]'s tries included); else the second read's.
 pub unsafe fn read_mem_resident(
     authority: u64,
     process: u64,
@@ -140,4 +227,65 @@ pub unsafe fn read_mem_resident(
         return Err(first);
     }
     syscall::thread_read_mem(thread, va, buf).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    /// A reply that stopped at `reached`, not pending.
+    const fn stopped(reached: u64) -> ResidentStep
+    {
+        ResidentStep {
+            reached,
+            pending: false,
+        }
+    }
+
+    /// A reply pending at `reached`.
+    const fn pending(reached: u64) -> ResidentStep
+    {
+        ResidentStep {
+            reached,
+            pending: true,
+        }
+    }
+
+    #[test]
+    fn a_reader_asks_again_from_where_memmgr_stopped_until_the_range_is_done()
+    {
+        assert_eq!(next(0x1000, 0x9000, stopped(0x5000), 0), Next::From(0x5000));
+        assert_eq!(next(0x5000, 0x9000, stopped(0x9000), 0), Next::Done);
+        // A reply past the range's end is done too.
+        assert_eq!(next(0x5000, 0x9000, stopped(0xa000), 0), Next::Done);
+        // A reply that made no progress ends the loop.
+        assert_eq!(next(0x5000, 0x9000, stopped(0x5000), 0), Next::GiveUp);
+        assert_eq!(next(0x5000, 0x9000, stopped(0x4000), 0), Next::GiveUp);
+    }
+
+    #[test]
+    fn a_reader_pauses_on_a_pending_chunk_until_the_tries_run_out()
+    {
+        // Pending at the reader's own address, or at a chunk past it.
+        assert_eq!(
+            next(0x1000, 0x9000, pending(0x1000), 0),
+            Next::Pause(0x1000)
+        );
+        assert_eq!(
+            next(0x1000, 0x9000, pending(0x3000), 7),
+            Next::Pause(0x3000)
+        );
+        assert_eq!(
+            next(0x1000, 0x9000, pending(0x1000), PENDING_TRIES - 1),
+            Next::Pause(0x1000)
+        );
+        assert_eq!(
+            next(0x1000, 0x9000, pending(0x1000), PENDING_TRIES),
+            Next::GiveUp
+        );
+        // A pending reply outside the range is malformed.
+        assert_eq!(next(0x1000, 0x9000, pending(0x0800), 0), Next::GiveUp);
+        assert_eq!(next(0x1000, 0x9000, pending(0x9000), 0), Next::GiveUp);
+    }
 }

@@ -652,9 +652,14 @@ neither can deadlock, since that request does not wait on the new thread:
   registration waits on procmgr exactly as its query would, while logd's receive workers, which
   serve procmgr's write, go on without it. Those workers, logd's first spawned threads, register
   before logd opens its receive pool, and logd waits for each to start (§ Receive pool there).
-  procmgr writes no line serving a registration, so it serves theirs without waiting on logd; a
-  line another of its workers writes meanwhile, while no logd receives (on a restart; on the first
-  launch init-logd still serves the endpoint), waits out its bound (`LOG_CALL_TIMEOUT_MS`).
+  procmgr writes a line serving a registration only on a failure: the line of a refused `CSpace`
+  top-up, which a worker writes before it serves any request, once per streak of refusals
+  ([services/procmgr/README.md](../../services/procmgr/README.md) § CSpace headroom), and the line
+  of a refused registration whose debugger binding it cannot bind back to the crash endpoint.
+  While no logd receives (on a restart; on the first launch init-logd still serves the endpoint),
+  such a line, and any line another of its workers writes meanwhile, waits out its bound
+  (`LOG_CALL_TIMEOUT_MS`), so a registration waits on logd that long at most; otherwise procmgr
+  serves theirs without waiting on logd.
 
 Two patterns would deadlock once they hold every one of procmgr's request workers, and no in-tree
 process follows either: a spawner that waits on its new thread without bound while procmgr waits on

@@ -2500,10 +2500,10 @@ enum FaultDecline
     /// A commit overrun: the faulting page lies in a committed region, or its
     /// chunk is an evicted chunk of one, whose pages `promised` holds, and the
     /// free pool has no frame for it even after memmgr evicted victims in its
-    /// turn ([`evict::draw_room`]). Only an overcommit allowance above 0, or
-    /// memmgr's own metadata taking the free pages `promised` counts, leaves
-    /// the pool short of `promised` (services/memmgr/docs/memory-pool.md
-    /// § Commit, Overcommit).
+    /// turn ([`evict::draw_room`]). Only the overcommit allowance a swap
+    /// service's slots give, or memmgr's own metadata taking the free pages
+    /// `promised` counts, leaves the pool short of `promised`
+    /// (services/memmgr/docs/memory-pool.md § Commit, Overcommit).
     CommitOverrun = 11,
     /// The faulting page's chunk is on disk, its pages in a swap slot only
     /// (services/memmgr/docs/memory-pool.md § Disk tier): detail

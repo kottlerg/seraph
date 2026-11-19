@@ -811,10 +811,10 @@ free pages outside it: a grant, a committed registration or growth, an uncommitt
 page-table donation are each admitted only when `free - promised - F >= want`, with F the growth
 floor (the system reserve and, while chunks are swapped, the restore headroom) for a charge to a
 node outside the reserve and 0 for a charge to a reserve node ([Distribution
-policy](#distribution-policy)). So no charge takes a free page a committed region's fault needs.
-The overcommit allowance (Overcommit below) is 0, which these tests show; above 0 it enters them.
-`QUERY_POOL_STATUS` reports `promised` in `data[8]`, and the pressure level is computed from the
-free pages outside it ([Memory pressure](#memory-pressure)).
+policy](#distribution-policy)). So no charge takes a free page a committed region's fault needs. The
+overcommit allowance (Overcommit below) is 0 while no swap service is registered, which these tests
+show; above 0 it enters them. `QUERY_POOL_STATUS` reports `promised` in `data[8]`, and the pressure
+level is computed from the free pages outside it ([Memory pressure](#memory-pressure)).
 
 **What a commitment holds.** A committed region of `pages` pages charges its budget node its
 pages and a page-table reservation: two pages (`PT_DONATION_PAGES`, the size of its page-table
@@ -868,21 +868,31 @@ what is left of the bound takes free pages outside `promised`, as an uncommitted
 which takes no frame when it is made, is admitted when `free + A - promised - F >= want`; every
 other admission takes its frames at once and reads the lesser of `free + A - promised` and `free`,
 so the growth floor stays one of free frames, and so does the pressure level ([Memory
-pressure](#memory-pressure)). A is a [docs/limits.md](../../../docs/limits.md) § memmgr constant,
-and it is 0: the tests are those above, and every committed page has a free page held for it, short
-only of what memmgr's own metadata, which takes free pages without admission, took. With A above 0
-a committed region's chunks are evictable ([Eviction](#eviction), Committed pages): evicting one
-returns its runs to the pool and adds its pages to `promised` again, since its restore draws from
-`promised` as its first touch did. A committed draw, a fault in a committed region or a restore of
-a committed chunk, takes any free page while A is 0 or the free pool covers `promised`, and
+pressure](#memory-pressure)). A is backed by the swap slots ([Disk tier](#disk-tier)): a free slot
+can take one chunk's pages out of RAM, so A is `DEMAND_CHUNK_PAGES` pages a free slot, less the
+pages compression already freed from the chunks evicted and not on disk (their pages less the store
+pages they hold), since such a chunk leaves RAM through a slot too and frees only its store pages
+then. A whole chunk's compression, write-out and restore so leave `free + A` as they found it, and
+only a commitment or memmgr's metadata moves what a commitment may still promise; a write in flight
+counts once for its slot and once for its store until it ends. With no swap service registered there
+is no slot and A is 0: the tests are those above, and every committed page has a free page held for
+it, short only of what memmgr's own metadata, which takes free pages without admission, took. A
+above 0 promises what the slots can hold only for whole chunks: a partly backed chunk takes a whole
+slot and frees only its backed pages, so each slot it holds frees up to 15 pages fewer than A
+counted, and the metadata's pages, the slot map's among them, are taken from the free pool with no
+admission. Either can leave a committed draw short of a page A promised. With A above 0 a committed
+region's chunks are evictable ([Eviction](#eviction), Committed pages): evicting one returns its
+runs to the pool and adds its pages to `promised` again, since its restore draws from `promised` as
+its first touch did. A committed draw, a fault in a committed region or a restore of a committed
+chunk, takes any free page while no swap slot is registered or the free pool covers `promised`, and
 otherwise only the pages above the system reserve, for a node outside it, so an overcommitted pool
 leaves the reserve to the reserve nodes. When the draw finds no page, memmgr evicts victims in its
 turn as a restore's direct reclaim does ([Eviction](#eviction), Direct reclaim), any evictable chunk
 but the one the fault backs, up to the same bound; a fault's span is then clamped to the pages
 found, at least its faulting page. A draw still short is declined with code 11, a commit overrun
 ([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message), which crashd holds as it holds
-code 7; with A at 0 that is a pool with no free page at all. The admission and draw rules are the
-host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free` and `draw_room`).
+code 7; with no slot registered that is a pool with no free page at all. The admission and draw
+rules are the host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free` and `draw_room`).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops

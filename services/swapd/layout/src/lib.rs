@@ -155,16 +155,14 @@ pub enum Transfer
     Done,
     /// The device failed this request; another may succeed.
     Failed,
-    /// The block driver fails every request from now on (`DEVICE_FAULT`):
-    /// the partition is gone for this boot. swapd also loses it when a call
-    /// fails with the partition cap gone (services/swapd/docs/operation.md
-    /// § Disk Failure).
+    /// The block driver fails every request from now on (`DEVICE_FAULT`),
+    /// or is gone ([`AfterFailedCall::Lose`]): the partition is lost for
+    /// this boot.
     Lost,
 }
 
 /// The meaning of a block request's reply `label`. A call that failed has
-/// no reply: swapd decides it from whether the partition cap is still live
-/// (services/swapd/docs/operation.md § Disk Failure).
+/// no reply: swapd probes the partition then ([`after_probe`]).
 #[must_use]
 pub const fn transfer(label: u64) -> Transfer
 {
@@ -173,6 +171,50 @@ pub const fn transfer(label: u64) -> Transfer
         blk_errors::SUCCESS => Transfer::Done,
         blk_errors::DEVICE_FAULT => Transfer::Lost,
         _ => Transfer::Failed,
+    }
+}
+
+/// What a probe of the partition showed, a call that lends no buffer
+/// (`BLK_GET_GEOMETRY`) made after a block request failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe
+{
+    /// The block driver replied: it lives.
+    Replied,
+    /// The partition cap is gone: the driver died and devmgr revoked its
+    /// endpoint, and with it the cap vfsd keeps for the partition.
+    CapGone,
+    /// The probe was interrupted with the cap still live: the thread was
+    /// stopped, or the driver died and devmgr has not yet revoked its
+    /// endpoint, which the probe, queued on it, then waits for.
+    Interrupted,
+    /// The probe failed otherwise with the cap still live.
+    Failed,
+}
+
+/// What swapd does after a block request failed and a probe showed a
+/// [`Probe`] (services/swapd/docs/operation.md § Disk Failure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterFailedCall
+{
+    /// End with a fault: the driver lives, and the request's buffer may be
+    /// its, so the next instance takes the partition and its buffers again.
+    Restart,
+    /// Mark the partition lost: no instance can take it again this boot.
+    Lose,
+    /// Probe again.
+    ProbeAgain,
+}
+
+/// swapd's move after a block request failed and a probe showed `probe`.
+#[must_use]
+pub const fn after_probe(probe: Probe) -> AfterFailedCall
+{
+    match probe
+    {
+        Probe::Replied | Probe::Failed => AfterFailedCall::Restart,
+        Probe::CapGone => AfterFailedCall::Lose,
+        Probe::Interrupted => AfterFailedCall::ProbeAgain,
     }
 }
 
@@ -327,6 +369,15 @@ mod tests
         assert_eq!(transfer(blk_errors::OUT_OF_BOUNDS), Transfer::Failed);
         assert_eq!(transfer(blk_errors::DEVICE_STATUS_UNSUPP), Transfer::Failed);
         assert_eq!(transfer(blk_errors::DEVICE_FAULT), Transfer::Lost);
+    }
+
+    #[test]
+    fn a_failed_call_restarts_with_the_driver_alive_and_loses_it_gone()
+    {
+        assert_eq!(after_probe(Probe::Replied), AfterFailedCall::Restart);
+        assert_eq!(after_probe(Probe::Failed), AfterFailedCall::Restart);
+        assert_eq!(after_probe(Probe::CapGone), AfterFailedCall::Lose);
+        assert_eq!(after_probe(Probe::Interrupted), AfterFailedCall::ProbeAgain);
     }
 
     #[test]

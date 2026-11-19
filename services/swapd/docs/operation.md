@@ -88,12 +88,19 @@ partition lost and logs it once: every fault on a chunk on disk is forwarded wit
 same failed driver.
 
 A call to the block driver that fails has no reply, and the buffer it lent may be the driver's.
-When the partition cap is gone, the driver died: devmgr revoked its endpoint, and with it the
-partition cap vfsd keeps and derives each hand-out from, so no instance can take the partition
-again. swapd then marks the partition lost as for `DEVICE_FAULT`. When the cap is still live, a
-debugger stopped the calling thread: swapd ends with a fault, as it does when a reply brings no
-buffer back, and the next instance takes the partition again from vfsd and registers again, keeping
-every chunk on disk.
+The driver died, or a debugger stopped the calling thread. swapd tells them apart with a probe, a
+`BLK_GET_GEOMETRY` that lends no buffer, made until it shows which:
+
+- the partition cap is gone: devmgr revoked the dead driver's endpoint, and with it the partition
+  cap vfsd keeps and derives each hand-out from, so no instance can take the partition again.
+  swapd marks the partition lost, as for `DEVICE_FAULT`. A driver that died holding the request
+  wakes the call before devmgr revokes its endpoint; the probe then waits on the endpoint, which
+  nothing receives on, until the revoke ends it;
+- the driver replies, or the probe fails otherwise with the cap live: the driver lives. swapd ends
+  with a fault, as it does when a reply brings no buffer back, and the next instance takes the
+  partition and its buffers again from vfsd and memmgr and registers again, keeping every chunk on
+  disk;
+- the probe is interrupted with the cap live: it is made again.
 
 ---
 

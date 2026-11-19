@@ -30,9 +30,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ipc::{IpcMessage, blk_labels, memmgr_errors, memmgr_labels, vfsd_errors, vfsd_labels};
-use layout::{AfterTake, Extent, FaultReply, Geometry, Transfer};
+use layout::{AfterFailedCall, AfterTake, Extent, FaultReply, Geometry, Probe, Transfer};
 use std::os::seraph::thread::BuilderExt;
-use syscall_abi::{FAULT_LABEL, FAULT_REDIRECT_WORD, FAULT_REPLY_FORWARD, FAULT_REPLY_RESUME};
+use syscall_abi::{
+    FAULT_LABEL, FAULT_REDIRECT_WORD, FAULT_REPLY_FORWARD, FAULT_REPLY_RESUME, SyscallError,
+};
 
 /// Pages of a buffer: a slot, the most bytes a chunk on disk takes.
 const BUF_PAGES: u64 = memmgr_labels::DEMAND_CHUNK_BYTES / syscall_abi::PAGE_SIZE;
@@ -272,13 +274,9 @@ fn call(ep: u64, msg: &IpcMessage, what: &str) -> IpcMessage
 
 /// Move `extent` between the partition and the buffer `buf` with the block
 /// label `label`, the reply moving the buffer back into `buf`. Its outcome;
-/// `DEVICE_FAULT` loses the partition, and so does a call that failed with
-/// the partition cap gone: the block driver died, its endpoint revoked, and
-/// vfsd's kept cap with it, so no instance can take the partition again. Any
-/// other failed call (the thread stopped by a debugger, the buffer then
-/// perhaps the driver's), or a reply without the buffer, ends swapd with a
-/// fault: the next instance takes the partition again and keeps every chunk
-/// on disk.
+/// `DEVICE_FAULT` loses the partition. A call that failed is decided by a
+/// probe ([`failed_call`]); a reply without the buffer ends swapd with a
+/// fault, the next instance taking the partition and its buffers again.
 fn transfer(swap: &Swap, label: u64, extent: Extent, buf: &mut u64) -> Transfer
 {
     let msg = IpcMessage::builder(label)
@@ -291,15 +289,7 @@ fn transfer(swap: &Swap, label: u64, extent: Extent, buf: &mut u64) -> Transfer
         match unsafe { ipc::ipc_call(swap.partition, &msg, std::os::seraph::current_ipc_buf()) }
         {
             Ok(reply) => reply,
-            Err(e) =>
-            {
-                if syscall::cap_info(swap.partition, syscall::CAP_INFO_TAG_RIGHTS).is_err()
-                {
-                    swap.lose();
-                    return Transfer::Lost;
-                }
-                fail(format_args!("a block request failed (err={e})"));
-            }
+            Err(e) => return failed_call(swap, e),
         };
     *buf = *reply
         .caps()
@@ -311,6 +301,47 @@ fn transfer(swap: &Swap, label: u64, extent: Extent, buf: &mut u64) -> Transfer
         swap.lose();
     }
     outcome
+}
+
+/// After a block request failed with `err`, its buffer perhaps the
+/// driver's: probe the partition with a call that lends no buffer
+/// (`BLK_GET_GEOMETRY`) until the probe shows whether the driver lives
+/// ([`layout::after_probe`]). A driver that died holding the request wakes
+/// it before devmgr revokes its endpoint; the probe then waits on the
+/// endpoint until the revoke ends it. A live driver ends swapd with a fault,
+/// and a gone one loses the partition.
+fn failed_call(swap: &Swap, err: i64) -> Transfer
+{
+    let probe = IpcMessage::builder(blk_labels::BLK_GET_GEOMETRY)
+        .word(0, u64::from(ipc::BLK_LABELS_VERSION))
+        .build();
+    loop
+    {
+        // SAFETY: `current_ipc_buf` is the calling thread's registered IPC buffer.
+        let outcome =
+            unsafe { ipc::ipc_call(swap.partition, &probe, std::os::seraph::current_ipc_buf()) };
+        let shown = match outcome
+        {
+            Ok(_) => Probe::Replied,
+            Err(_) if syscall::cap_info(swap.partition, syscall::CAP_INFO_TAG_RIGHTS).is_err() =>
+            {
+                Probe::CapGone
+            }
+            Err(e) if e == SyscallError::Interrupted as i64 => Probe::Interrupted,
+            Err(_) => Probe::Failed,
+        };
+        match layout::after_probe(shown)
+        {
+            AfterFailedCall::Restart => fail(format_args!("a block request failed (err={err})")),
+            AfterFailedCall::Lose =>
+            {
+                swap.lose();
+                return Transfer::Lost;
+            }
+            AfterFailedCall::ProbeAgain =>
+            {}
+        }
+    }
 }
 
 /// Read the bytes `word` names into `buf`, at most [`layout::READ_TRIES`]

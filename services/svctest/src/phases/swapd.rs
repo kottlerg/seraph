@@ -167,6 +167,29 @@ fn first_pending_chunk(authority: u64, process: u64, ready: &Ready) -> Option<u6
     None
 }
 
+/// Wait until no write is in flight, every slot taken holding a chunk on
+/// disk, within [`WRITE_BOUND`].
+fn await_writes_ended()
+{
+    let start = Instant::now();
+    loop
+    {
+        let status = pool();
+        let taken = SWAP_SLOTS.saturating_sub(status.free_slots);
+        if taken.saturating_mul(CHUNK_LEN) == status.on_disk
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < WRITE_BOUND,
+            "{PHASE}: {taken} slots taken and {} bytes on disk {WRITE_BOUND:?} after the \
+             level fell from CRITICAL",
+            status.on_disk
+        );
+        std::thread::sleep(HOG_TICK);
+    }
+}
+
 /// Kill the process `process` through an attach: stop its main thread, set its
 /// instruction pointer to the first page, which no process maps, and start it,
 /// so it takes a fault no handler resolves.
@@ -349,8 +372,10 @@ fn part_b(
     hog.release_from_critical();
     hog.release_all();
     await_normal();
-    // Every chunk on disk the fixture's: the others are restored.
+    // Every chunk on disk the fixture's: the others are restored. A write
+    // swapd began at CRITICAL may end after the level fell: wait for it.
     let _ = isolate(authority, process, ready, fixture);
+    await_writes_ended();
     let disk1 = pool().on_disk;
     assert!(
         disk1 >= CHUNK_LEN,

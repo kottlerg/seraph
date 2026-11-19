@@ -239,7 +239,7 @@ fn capture(
 /// this pauses and asks again, as `ipc::make_resident` does, at most
 /// `ipc::PENDING_TRIES` times over the whole dump (`ipc::resident_range`); a
 /// chunk the swap service does not restore by then is left out, as one not
-/// present. No more is restored: the core keeps at most [`CORE_BYTES_MAX`] of
+/// present, and the rest of each range is still restored. No more is restored: the core keeps at most [`CORE_BYTES_MAX`] of
 /// pages, and a restore for a process about to die spends the free pages, and other processes' idle chunks, that memmgr
 /// keeps for restores. A chunk memmgr cannot restore, for want of memory, is
 /// left out of the list, as it is not present. Each request is started only
@@ -261,9 +261,9 @@ fn restore_first(first: &[u64], process: u64, authority: u64, generation: u64, i
         let at = anchor & !(PAGE_SIZE - 1);
         let end = at.saturating_add(share);
         // memmgr does a bounded part of the range per request and replies
-        // where it stopped; a refusal, a reply that made no progress, a chunk
-        // on disk not restored within the dump's pauses, or a fired generation
-        // ends this range.
+        // where it stopped; a refusal, a reply that made no progress, or a
+        // fired generation ends this range, and once the dump's pauses are
+        // spent its chunks on disk are passed over.
         let _ = ipc::resident_range(
             at,
             end,

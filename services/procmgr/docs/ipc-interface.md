@@ -1413,15 +1413,16 @@ nothing of the target, and only does what the target's own next touch of the pag
 
 Replies `SUCCESS` with `data[0]` the address memmgr stopped at, memmgr's reply word: the range's end
 when the whole range is done, else the address the caller asks again from, with the rest of the
-range; and `data[1]`, memmgr's word 1: `memmgr_labels::RESIDENT_PENDING` when that address is a
-chunk on disk the swap service was asked to restore, else `0`. `ipc::make_resident` asks until it
-is done, pausing `ipc::PENDING_PAUSE_MS` (2 ms) before each request after a pending reply, and
-gives the range up after `ipc::PENDING_TRIES` (500) pauses in all, about a second, the pages
-then staying not present. Refusals, in order: `UNAUTHORIZED` without the
-authority; `INVALID_BADGE` when no live process carries the badge; then memmgr's: `INVALID_ARGUMENT`
-for a zero length or a range past the address space, and `OUT_OF_MEMORY` when memmgr could not
-restore a chunk of the range or the call to it failed. svctest's `memmgr_swap` phase reads a page of
-an evicted chunk this way.
+range; `data[1]`, memmgr's word 1: `memmgr_labels::RESIDENT_PENDING` when that address is a
+chunk on disk the swap service was asked to restore, else `0`; and `data[2]`, memmgr's word 2,
+where its walk stopped. `ipc::make_resident` asks until it is done, pausing
+`ipc::PENDING_PAUSE_MS` (2 ms) before each request after a pending reply; after
+`ipc::PENDING_TRIES` (500) pauses in all, about a second, it asks on from `data[2]` with no pause,
+the chunks on disk it passes over staying not present, and returns `false`. Refusals, in order:
+`UNAUTHORIZED` without the authority; `INVALID_BADGE` when no live process carries the badge;
+then memmgr's: `INVALID_ARGUMENT` for a zero length or a range past the address space, and
+`OUT_OF_MEMORY` when memmgr could not restore a chunk of the range or the call to it failed.
+svctest's `memmgr_swap` phase reads a page of an evicted chunk this way.
 
 ### Label 31: `READ_VERIFIED`
 

@@ -58,10 +58,10 @@ each thread's stack pointer up, an equal share of the per-core budget each, so a
 evicted there is mapped again and listed, one on disk once the swap service has restored it
 ([memmgr Memory Pool](../../memmgr/docs/memory-pool.md#eviction) § Eviction). A chunk memmgr cannot
 restore, for want of memory, is not listed, nor is a chunk on disk the swap service does not restore
-within the dump's bound, one lost, one on disk with no swap service registered to ask, or an
-evicted chunk outside those ranges. Adjacent pages of one
-protection joined into one run, in address order, at most 65 533 (`e_phnum` is 16 bits and the
-`PN_XNUM` extension is not written). Each `PT_LOAD` carries:
+within the dump's `ipc::PENDING_TRIES` pauses (about a second over the whole dump), one lost, one
+on disk with no swap service registered to ask, or an evicted chunk outside those ranges. Adjacent
+pages of one protection joined into one run, in address order, at most 65 533 (`e_phnum` is 16
+bits and the `PN_XNUM` extension is not written). Each `PT_LOAD` carries:
 
 | Field | Value |
 |---|---|

@@ -2263,7 +2263,9 @@ const MAKE_RESIDENT_VISITS: u32 = 64;
 /// `RESIDENT_PENDING` when a chunk on disk was posted: word 0 is then the
 /// first such chunk's base, or `va` when that is above it
 /// ([`free_pool::pending_from`]), from which the sender asks again once the
-/// swap service has had time to restore it.
+/// swap service has had time to restore it. Word 2 is where the walk stopped,
+/// past every chunk it posted, from which a sender that will wait no longer
+/// asks again, leaving the posted chunks not present.
 fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
@@ -2350,14 +2352,15 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     {
         at.min(end)
     };
-    let (reached, flag) = match pending
+    let (from, flag) = match pending
     {
         Some(base) => (pending_from(base, va), memmgr_labels::RESIDENT_PENDING),
         None => (reached, 0),
     };
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
-        .word(0, reached)
+        .word(0, from)
         .word(1, flag)
+        .word(2, reached)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

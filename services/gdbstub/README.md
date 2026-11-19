@@ -177,8 +177,8 @@ stub's endpoint.
   authority, to make the chunk resident (`MAKE_RESIDENT`,
   [memmgr Memory Pool](../memmgr/docs/memory-pool.md#eviction) § Eviction) and copies it again; for
   a chunk on disk it asks again after a pause while the swap service restores it
-  (`ipc::make_resident`), and gives the range up after about a second; a page procmgr cannot make
-  resident ends a read there, and fails a write.
+  (`ipc::make_resident`), and passes the chunk over after about a second; a page procmgr cannot
+  make resident ends a read there, and fails a write.
 - **Breakpoints.** `Z0` plants `int3` (kind 1) on x86-64, `c.ebreak` (kind 2) or `ebreak` (kind 4)
   on riscv64, through the kernel's text route (`THREAD_MEM_TEXT`) with every thread held, and keeps
   the bytes it replaced; `z0` writes them back. GDB itself sets the pointer back to the

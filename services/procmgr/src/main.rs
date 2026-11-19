@@ -1196,9 +1196,9 @@ fn handle_detach_process(req: &IpcMessage, ipc_buf: *mut u64, table: &mut proces
 /// too: making its pages resident reads and writes nothing of it, and only
 /// does what its own next touch of them would. The target is found under the
 /// table lock, and memmgr is called after it, as for `RELEASE_HOLD`. A
-/// success carries memmgr's words 0 and 1: where it stopped, which the sender
-/// asks again from until it is the range's end, and whether it stopped at a
-/// chunk on disk the swap service was asked to restore.
+/// success carries memmgr's words 0 to 2: where it stopped, which the sender
+/// asks again from until it is the range's end, whether it stopped at a chunk
+/// on disk the swap service was asked to restore, and where its walk stopped.
 fn handle_make_resident(
     req: &IpcMessage,
     ipc_buf: *mut u64,
@@ -1216,10 +1216,10 @@ fn handle_make_resident(
         .table
         .find_by_badge(req.word(0))
         .map(|e| e.memmgr_badge);
-    let (code, reached, pending) = match target
+    let (code, words) = match target
     {
         Some(badge) => process::make_resident(memmgr_ep, badge, req.word(1), req.word(2), ipc_buf),
-        None => (procmgr_errors::INVALID_BADGE, 0, 0),
+        None => (procmgr_errors::INVALID_BADGE, [0; 3]),
     };
     if code != procmgr_errors::SUCCESS
     {
@@ -1227,8 +1227,9 @@ fn handle_make_resident(
         return;
     }
     let reply = IpcMessage::builder(code)
-        .word(0, reached)
-        .word(1, pending)
+        .word(0, words[0])
+        .word(1, words[1])
+        .word(2, words[2])
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

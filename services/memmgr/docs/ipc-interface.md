@@ -1081,17 +1081,18 @@ visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
 | label | 0 |
 | data[0] | where memmgr stopped: `va + len_bytes` when the whole range is done, else the address to send the request again from, with the rest of the range |
 | data[1] | `RESIDENT_PENDING` (1) when memmgr posted a chunk on disk of the range to the swap service: `data[0]` is then the first such chunk's base (or `va`, when that is above it), and the reader asks again from there after a pause, once the swap service has had time to restore it; else `0` |
+| data[2] | where the walk stopped: `data[0]` when `data[1]` is `0`, else past every chunk on disk memmgr posted; a reader that will wait no longer asks again from there, passing those chunks over |
 
 memmgr walks on past a chunk it posts, posting each chunk on disk and restoring
 each chunk in RAM it meets within its bounds. A word stays posted until the swap
 service takes it, at most `SWAP_WANTED_WORDS` (8) at a time, a full list dropping
 its oldest word for a new one; a reader whose word was dropped posts it again when
 it asks again. `ipc::make_resident` pauses 2 ms (`ipc::PENDING_PAUSE_MS`) after
-each pending reply and gives the range up after 500 pauses in all
-(`ipc::PENDING_TRIES`), about a second, and crashd counts them over a whole
-dump: a swap service that is down, restarting,
-or cannot read the slot leaves the pages not present, and the reader reads them as
-such.
+each pending reply, and after 500 pauses in all (`ipc::PENDING_TRIES`), about a
+second, it asks on from `data[2]` with no pause, passing the chunks on disk over;
+crashd counts the pauses over a whole dump. A swap service that is down,
+restarting, or cannot read the slot leaves those pages not present, and the reader
+reads them as such, while the rest of the range is still made resident.
 
 **Error codes:**
 

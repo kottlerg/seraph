@@ -27,8 +27,9 @@ pub const PENDING_PAUSE_MS: u64 = 2;
 /// leaves the pages not present, and the reader reads them as such.
 pub const PENDING_TRIES: u32 = 500;
 
-/// One `MAKE_RESIDENT` reply: where memmgr stopped, and whether it stopped
-/// at a chunk on disk the swap service was asked to restore.
+/// One `MAKE_RESIDENT` reply: where memmgr stopped, whether it stopped at a
+/// chunk on disk the swap service was asked to restore, and where its walk
+/// stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResidentStep
 {
@@ -36,6 +37,9 @@ pub struct ResidentStep
     pub reached: u64,
     /// `reached` is a chunk on disk memmgr posted to the swap service.
     pub pending: bool,
+    /// Where memmgr's walk stopped: `reached` when not pending, else past
+    /// every chunk it posted.
+    pub walked: u64,
 }
 
 /// What a reader making `[at, end)` resident does after a step.
@@ -49,8 +53,11 @@ pub enum Next
     /// Pause [`PENDING_PAUSE_MS`] and ask again from the address: a chunk on
     /// disk there is being read.
     Pause(u64),
-    /// Give up: the reply made no progress or was malformed, or the reader
-    /// has paused [`PENDING_TRIES`] times.
+    /// The reader has paused [`PENDING_TRIES`] times: ask again, without a
+    /// pause, from where memmgr's walk stopped, past the chunks on disk it
+    /// posted, which stay not present.
+    PassOver(u64),
+    /// Give up: the reply made no progress or was malformed.
     GiveUp,
 }
 
@@ -61,11 +68,19 @@ pub fn next(at: u64, end: u64, step: ResidentStep, paused: u32) -> Next
 {
     if step.pending
     {
-        if step.reached < at || step.reached >= end || paused >= PENDING_TRIES
+        if step.reached < at || step.reached >= end
         {
             return Next::GiveUp;
         }
-        return Next::Pause(step.reached);
+        if paused < PENDING_TRIES
+        {
+            return Next::Pause(step.reached);
+        }
+        if step.walked > step.reached
+        {
+            return Next::PassOver(step.walked);
+        }
+        return Next::GiveUp;
     }
     if step.reached >= end
     {
@@ -93,7 +108,8 @@ pub fn next(at: u64, end: u64, step: ResidentStep, paused: u32) -> Next
 /// part of the range per request and replies where it stopped, so this asks
 /// again from there until the whole range is done ([`next`]); where memmgr
 /// stopped at a chunk on disk, it pauses [`PENDING_PAUSE_MS`] before it asks
-/// again, at most [`PENDING_TRIES`] times in all ([`resident_range`]).
+/// again, at most [`PENDING_TRIES`] times in all, and past them goes on
+/// past the chunks on disk ([`resident_range`]).
 /// Whether every request was served: `false` when a call failed, procmgr refused (`OUT_OF_MEMORY` when memmgr
 /// could not restore a chunk of the range), a reply made no progress, or a
 /// chunk on disk was not restored within the tries.
@@ -134,7 +150,10 @@ pub unsafe fn make_resident(
 /// after a pending reply. `pauses` counts the pauses spent against
 /// [`PENDING_TRIES`] and is never reset, so a caller that passes one count
 /// to several ranges, as crashd does for a dump's, bounds the wait on the swap
-/// service over all of them. Whether the range is done.
+/// service over all of them; once it is spent, a range still goes on past its
+/// chunks on disk, so the chunks memmgr restores from its store beyond them
+/// are restored. Whether the whole range is done: `false` when a request
+/// failed, a reply made no progress, or a chunk on disk was passed over.
 pub fn resident_range(
     va: u64,
     end: u64,
@@ -144,6 +163,7 @@ pub fn resident_range(
 ) -> bool
 {
     let mut at = va;
+    let mut passed = false;
     loop
     {
         let Some(reply) = step(at)
@@ -153,9 +173,18 @@ pub fn resident_range(
         };
         match next(at, end, reply, *pauses)
         {
-            Next::Done => return true,
+            Next::Done => return !passed,
             Next::GiveUp => return false,
             Next::From(reached) => at = reached,
+            Next::PassOver(walked) =>
+            {
+                passed = true;
+                if walked >= end
+                {
+                    return false;
+                }
+                at = walked;
+            }
             Next::Pause(reached) =>
             {
                 at = reached;
@@ -200,6 +229,7 @@ pub unsafe fn make_resident_step(
         .map(|reply| ResidentStep {
             reached: reply.word(0),
             pending: reply.word(1) == memmgr_labels::RESIDENT_PENDING,
+            walked: reply.word(2),
         })
 }
 
@@ -257,15 +287,23 @@ mod tests
         ResidentStep {
             reached,
             pending: false,
+            walked: reached,
         }
     }
 
-    /// A reply pending at `reached`.
+    /// A reply pending at `reached`, its walk stopped there too.
     const fn pending(reached: u64) -> ResidentStep
+    {
+        pending_past(reached, reached)
+    }
+
+    /// A reply pending at `reached`, its walk gone on to `walked`.
+    const fn pending_past(reached: u64, walked: u64) -> ResidentStep
     {
         ResidentStep {
             reached,
             pending: true,
+            walked,
         }
     }
 
@@ -393,5 +431,31 @@ mod tests
         assert!(!d.done && d.made == 0 && d.asks == 1);
         let d = drive(0x1000, 0x9000, &mut pauses, &[stopped(0x9000)]);
         assert!(d.done && d.made == 0);
+    }
+
+    #[test]
+    fn a_spent_pause_count_goes_on_past_the_chunks_on_disk()
+    {
+        let mut pauses = PENDING_TRIES;
+        assert_eq!(
+            next(0x1000, 0x9000, pending_past(0x1000, 0x5000), pauses),
+            Next::PassOver(0x5000)
+        );
+        // The rest of the range is still asked for, with no pause; the
+        // range is not done, a chunk on disk having been passed over.
+        let d = drive(
+            0x1000,
+            0x9000,
+            &mut pauses,
+            &[pending_past(0x1000, 0x5000), stopped(0x9000)],
+        );
+        assert!(!d.done);
+        assert_eq!(
+            (d.asks, d.first[0], d.first[1], d.made),
+            (2, 0x1000, 0x5000, 0)
+        );
+        // A walk that reached the range's end ends it.
+        let d = drive(0x1000, 0x9000, &mut pauses, &[pending_past(0x3000, 0x9000)]);
+        assert!(!d.done && d.asks == 1);
     }
 }

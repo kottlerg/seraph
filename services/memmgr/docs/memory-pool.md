@@ -1090,8 +1090,9 @@ swap slot and waits on no swap service, so a chunk on disk it asks the swap serv
 swap service registered a want Notification, memmgr posts the chunk's slot word to a short list the
 swap service takes (`SWAP_WANTED`), sends on the Notification, and replies that the range is
 pending at that chunk; the swap service reads the slot and restores the chunk ahead of a fault, and
-the reader, after a pause, asks again. A reader gives the range up after about a second of pending
-replies, so a swap service that is down or cannot read the slot leaves the page not present. A lost
+the reader, after a pause, asks again. After about a second of pauses a reader asks on from where
+memmgr's walk stopped, past the chunks on disk, so a swap service that is down or cannot read the
+slot leaves their pages not present and the rest of the range resident. A lost
 chunk, and a chunk on disk with no swap service to ask, are passed over; a page of either stays not
 present ([Disk tier](#disk-tier)).
 

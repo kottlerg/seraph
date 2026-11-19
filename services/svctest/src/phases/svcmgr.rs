@@ -41,6 +41,10 @@ pub fn phases() -> &'static [Phase]
             run: svcmgr_worker_fault_restart_phase,
         },
         Phase {
+            name: "svcmgr_boot_death",
+            run: svcmgr_boot_death_phase,
+        },
+        Phase {
             name: "svcmgr_stop_service",
             run: svcmgr_stop_service_phase,
         },
@@ -107,6 +111,93 @@ fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
     std::os::seraph::log!("svcmgr worker-fault-restart phase passed (restarted instance answered)");
 }
 
+/// The recipe that starts the fixture [`svcmgr_boot_death_phase`] drives,
+/// when it is staged for this boot.
+const BOOT_FAULT_RECIPE: &str = "/config/svcmgr/services/crasher-boot.svc";
+
+/// The boot-fault fixture's token, which an instance that finds it removes
+/// before it dies (`services/crasher/src/main.rs` `BOOT_FAULT_TOKEN`, there
+/// named in the fixture's own namespace).
+const BOOT_FAULT_TOKEN: &str = "/data/crasher-boot/die-early";
+
+/// The name the boot-fault fixture provides.
+const BOOT_FAULT_NAME: &[u8] = b"crasher.boot";
+
+/// End to end: svcmgr routes the death of a service that dies before its
+/// bootstrap request, on its first launch and on a restart, by its restart
+/// policy (`services/svcmgr/docs/restart-protocol.md` § Death detection). The
+/// `crasher` fixture's `boot-fault` role
+/// (`rootfs/config/svcmgr/tests/crasher-boot.svc`, `restart = on_failure`)
+/// removes the token [`BOOT_FAULT_TOKEN`] and faults before its request when
+/// it finds it, and otherwise serves `ipc::restart_probe_labels` on the name
+/// it provides. The data partition ships the token, so the first launch dies
+/// before its request: the phase reads an instance's nonce, which only an
+/// instance svcmgr started after routing that death can answer, and requires
+/// the token gone. It then writes the token, has a worker thread of the
+/// answering instance fault, and reads the nonce again: the restart svcmgr
+/// makes takes the token and dies before its request, and only the restart
+/// after that one answers, with a new nonce. Were either death left unrouted,
+/// svcmgr would wait for the request for good: the fixture is launched before
+/// svctest, which would then never run, and the second read would block until
+/// the run's timeout. The deaths take three restarts, inside svcmgr's restart
+/// budget. The phase writes the token again at its end, so a later boot of the
+/// same image takes the first-launch case again.
+///
+/// The phase runs when the fixture's recipe is staged in
+/// `/config/svcmgr/services/` and is skipped otherwise.
+fn svcmgr_boot_death_phase(_caps: &Caps)
+{
+    use ipc::restart_probe_labels as probe;
+
+    let phase = "svcmgr_boot_death";
+    if !recipe_staged(BOOT_FAULT_RECIPE, phase)
+    {
+        std::os::seraph::log!("svcmgr_boot_death phase skipped: crasher-boot.svc not staged");
+        return;
+    }
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let fixture = provided_endpoint(BOOT_FAULT_NAME, phase);
+    let nonce = |what: &str| probe_nonce(fixture, phase, what);
+    let write_token = || {
+        std::fs::write(BOOT_FAULT_TOKEN, b"")
+            .unwrap_or_else(|e| panic!("{phase}: writing {BOOT_FAULT_TOKEN}: {e}"));
+    };
+
+    let before = nonce("PROBE_INSTANCE after the first launch");
+    assert!(
+        !recipe_staged(BOOT_FAULT_TOKEN, phase),
+        "{phase}: the token is still there: no instance died before its bootstrap request"
+    );
+
+    write_token();
+    let msg = ipc::IpcMessage::new(probe::PROBE_FAULT_WORKER);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(fixture, &msg, ipc_buf) }
+        .expect("svcmgr_boot_death: PROBE_FAULT_WORKER call must return a reply");
+    assert_eq!(
+        reply.label,
+        probe::SUCCESS,
+        "{phase}: PROBE_FAULT_WORKER reply {:#x}",
+        reply.label
+    );
+    let after = nonce("PROBE_INSTANCE after the restart that died before its request");
+    assert_ne!(
+        before, after,
+        "{phase}: the same instance answered after its worker faulted"
+    );
+    assert!(
+        !recipe_staged(BOOT_FAULT_TOKEN, phase),
+        "{phase}: the token is still there: the restart did not die before its request"
+    );
+
+    write_token();
+    let _ = syscall::cap_delete(fixture);
+    std::os::seraph::log!(
+        "svcmgr boot-death phase passed (deaths before the bootstrap request routed on the \
+         first launch and a restart)"
+    );
+}
+
 /// Whether the worker-fault fixture's recipe is staged in
 /// `/config/svcmgr/services/`; a stat error other than "not found" fails
 /// `phase`.
@@ -115,8 +206,8 @@ fn worker_fixture_staged(phase: &str) -> bool
     recipe_staged(WORKER_FAULT_RECIPE, phase)
 }
 
-/// Whether the recipe at `path` is staged; a stat error other than "not
-/// found" fails `phase`.
+/// Whether the recipe (or any file) at `path` is there; a stat error other
+/// than "not found" fails `phase`.
 pub(super) fn recipe_staged(path: &str, phase: &str) -> bool
 {
     match std::fs::metadata(path)

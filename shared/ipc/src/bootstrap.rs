@@ -29,7 +29,7 @@
 use core::prelude::rust_2024::*;
 
 use crate::{IpcMessage, bootstrap_errors};
-use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
+use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SyscallError};
 
 // ── Protocol labels ─────────────────────────────────────────────────────────
 
@@ -539,7 +539,9 @@ pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
 /// embedded in the received cap does not match `expected_badge`, replies with
 /// [`bootstrap_errors::NO_CHILD`] and returns `Err`. If the label is not
 /// [`REQUEST`], replies with [`bootstrap_errors::INVALID`] and returns `Err`.
-/// Otherwise, replies with the round (caps + data + done flag).
+/// Otherwise, replies with the round (caps + data + done flag). A child that
+/// dies before its request leaves this wait without end; a creator that must
+/// go on then serves with [`serve_round_watched`].
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's registered IPC buffer page.
@@ -563,10 +565,127 @@ pub unsafe fn serve_round(
     // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
     let request =
         unsafe { crate::ipc_recv(bootstrap_ep, ipc_buf) }.map_err(|_| bootstrap_errors::INVALID)?;
+    // SAFETY: same invariant.
+    unsafe { answer_request(&request, expected_badge, ipc_buf, done, caps, data) }
+}
 
+/// Why [`serve_round_watched`] ended without its round delivered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ServeFailure
+{
+    /// The round failed as [`serve_round`] fails, the child still alive: the
+    /// [`bootstrap_errors`] code.
+    Refused(u64),
+    /// The child died before the round reached it: its exit reason, as the
+    /// caller's liveness check read it.
+    ChildDied(u64),
+}
+
+/// [`serve_round`] for a child that can die before its request: the wait for
+/// the request is a receive bounded at `poll_ms` milliseconds, and after each
+/// one that expires `child_death` is read, which gives the child's exit
+/// reason once it has died and `None` while it lives. A dead child ends the
+/// wait. A round that fails is read against `child_death` as well, so a child
+/// that died after its request, before the reply reached it, is a death and
+/// not a refusal. A live child that sends no request is waited for without
+/// end, `poll_ms` at a time.
+///
+/// `poll_ms` is taken between 1 and one below `syscall::WAIT_TRY_ONCE`, so
+/// the receive neither waits without bound (`0`) nor spins (`WAIT_TRY_ONCE`).
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
+///
+/// # Errors
+/// * `Err(ServeFailure::ChildDied(reason))` — the child died before the round
+///   reached it.
+/// * `Err(ServeFailure::Refused(code))` — the round failed as
+///   [`serve_round`]'s does, with its code, and the child lives.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`done` is the round's terminal flag, sent in the reply label"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "serve_round's six, and the poll interval and the liveness check the watch adds"
+)]
+pub unsafe fn serve_round_watched(
+    bootstrap_ep: u64,
+    expected_badge: u64,
+    ipc_buf: *mut u64,
+    done: bool,
+    caps: &[u64],
+    data: &[u64],
+    poll_ms: u64,
+    mut child_death: impl FnMut() -> Option<u64>,
+) -> Result<(), ServeFailure>
+{
+    let poll_ms = poll_ms.clamp(1, syscall::WAIT_TRY_ONCE.saturating_sub(1));
+    let request = await_request(
+        // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
+        || unsafe { crate::ipc_recv_timeout(bootstrap_ep, ipc_buf, poll_ms) },
+        &mut child_death,
+    )?;
+    // SAFETY: same invariant.
+    unsafe { answer_request(&request, expected_badge, ipc_buf, done, caps, data) }
+        .map_err(|code| failure(code, &mut child_death))
+}
+
+/// The request a watched serve answers: the first message `recv` gives,
+/// reading `child_death` after each `recv` that expires (`WouldBlock`). A
+/// dead child ends the wait with its exit reason. Any other error of `recv`
+/// is [`bootstrap_errors::INVALID`], or the child's death when it has died.
+fn await_request(
+    mut recv: impl FnMut() -> Result<IpcMessage, i64>,
+    child_death: &mut impl FnMut() -> Option<u64>,
+) -> Result<IpcMessage, ServeFailure>
+{
+    loop
+    {
+        match recv()
+        {
+            Ok(request) => return Ok(request),
+            Err(e) if e == SyscallError::WouldBlock as i64 =>
+            {
+                if let Some(reason) = child_death()
+                {
+                    return Err(ServeFailure::ChildDied(reason));
+                }
+            }
+            Err(_) => return Err(failure(bootstrap_errors::INVALID, child_death)),
+        }
+    }
+}
+
+/// A round that failed with `code`, as a [`ServeFailure`]: the child's death
+/// when `child_death` shows it dead, since no round reaches a dead child.
+fn failure(code: u64, child_death: &mut impl FnMut() -> Option<u64>) -> ServeFailure
+{
+    child_death().map_or(ServeFailure::Refused(code), ServeFailure::ChildDied)
+}
+
+/// Answer a received `request`: [`bootstrap_errors::NO_CHILD`] to a badge
+/// other than `expected_badge`, [`bootstrap_errors::INVALID`] to a label
+/// other than [`REQUEST`], and the round otherwise.
+///
+/// # Safety
+/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`done` is the round's terminal flag, sent in the reply label"
+)]
+unsafe fn answer_request(
+    request: &IpcMessage,
+    expected_badge: u64,
+    ipc_buf: *mut u64,
+    done: bool,
+    caps: &[u64],
+    data: &[u64],
+) -> Result<(), u64>
+{
     if request.badge != expected_badge
     {
-        // SAFETY: same invariant.
+        // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
         let _ = unsafe { reply_error(bootstrap_errors::NO_CHILD, ipc_buf) };
         return Err(bootstrap_errors::NO_CHILD);
     }
@@ -737,5 +856,67 @@ mod tests
         round.caps[1] = 0x42;
         round.data[0] = 0b1 | (1 << MSG_CAP_SLOTS_MAX);
         assert_eq!(unpack_slots(&round), Err(bootstrap_errors::INVALID));
+    }
+
+    /// A `recv` that gives each of `results` in turn, then panics.
+    fn script(results: &[Result<u64, i64>]) -> impl FnMut() -> Result<IpcMessage, i64> + '_
+    {
+        let mut next = results.iter();
+        move || (*next.next().expect("await_request received past its script")).map(IpcMessage::new)
+    }
+
+    const EXPIRED: i64 = SyscallError::WouldBlock as i64;
+    const INTERRUPTED: i64 = SyscallError::Interrupted as i64;
+
+    #[test]
+    fn a_request_after_expiries_is_answered_while_the_child_lives()
+    {
+        let mut reads = 0u32;
+        let mut alive = || {
+            reads += 1;
+            None
+        };
+        let got = await_request(
+            script(&[Err(EXPIRED), Err(EXPIRED), Ok(REQUEST)]),
+            &mut alive,
+        );
+        assert_eq!(got.map(|m| m.label), Ok(REQUEST));
+        assert_eq!(reads, 2, "the child is read once per expiry");
+    }
+
+    // The defect caught: a child that died before its request left the
+    // creator's receive waiting for good.
+    #[test]
+    fn a_child_dead_at_an_expiry_ends_the_wait_with_its_reason()
+    {
+        let mut deaths = [None, Some(0x100e)].into_iter();
+        let mut child = || deaths.next().flatten();
+        let got = await_request(script(&[Err(EXPIRED), Err(EXPIRED)]), &mut child);
+        assert_eq!(got.map(|m| m.label), Err(ServeFailure::ChildDied(0x100e)));
+    }
+
+    #[test]
+    fn a_failed_receive_is_a_refusal_unless_the_child_died()
+    {
+        let got = await_request(script(&[Err(INTERRUPTED)]), &mut || None);
+        assert_eq!(
+            got.map(|m| m.label),
+            Err(ServeFailure::Refused(bootstrap_errors::INVALID))
+        );
+        let got = await_request(script(&[Err(INTERRUPTED)]), &mut || Some(0x2000));
+        assert_eq!(got.map(|m| m.label), Err(ServeFailure::ChildDied(0x2000)));
+    }
+
+    #[test]
+    fn a_failed_round_to_a_dead_child_is_its_death()
+    {
+        assert_eq!(
+            failure(bootstrap_errors::NO_CHILD, &mut || None),
+            ServeFailure::Refused(bootstrap_errors::NO_CHILD)
+        );
+        assert_eq!(
+            failure(bootstrap_errors::INVALID, &mut || Some(0x1003)),
+            ServeFailure::ChildDied(0x1003)
+        );
     }
 }

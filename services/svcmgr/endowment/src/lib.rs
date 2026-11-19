@@ -63,11 +63,15 @@ pub mod caps_slot
     /// The `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service
     /// endpoint (`vfsd.swap`).
     pub const VFSD_SWAP: usize = 6;
+    /// The `EntropyControl` source carrying `Contribute`, derived from the
+    /// root capability the kernel mints into init. Never published: svcmgr
+    /// derives the `entropy_authority = yes` service's copy from it.
+    pub const ENTROPY_SOURCE: usize = 7;
 }
 
 /// Number of slots in the `CAPS` slot list: one per role in [`caps_slot`],
 /// whose roles are fixed, so the list cannot overflow.
-pub const CAPS_SLOTS: usize = 7;
+pub const CAPS_SLOTS: usize = 8;
 
 /// Number of `CAPS` rounds the slot list takes.
 pub const CAPS_ROUNDS: usize = slot_round_count(CAPS_SLOTS);
@@ -126,6 +130,8 @@ pub struct CapsRound
     pub vfsd_deny: u64,
     /// `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, or `0`.
     pub vfsd_swap: u64,
+    /// `EntropyControl` source carrying `Contribute`, or `0`.
+    pub entropy_source: u64,
 }
 
 impl CapsRound
@@ -141,6 +147,7 @@ impl CapsRound
         slots[caps_slot::VFSD_MOUNT] = self.vfsd_mount;
         slots[caps_slot::VFSD_DENY] = self.vfsd_deny;
         slots[caps_slot::VFSD_SWAP] = self.vfsd_swap;
+        slots[caps_slot::ENTROPY_SOURCE] = self.entropy_source;
         slots
     }
 
@@ -154,6 +161,7 @@ impl CapsRound
             vfsd_mount: slots[caps_slot::VFSD_MOUNT],
             vfsd_deny: slots[caps_slot::VFSD_DENY],
             vfsd_swap: slots[caps_slot::VFSD_SWAP],
+            entropy_source: slots[caps_slot::ENTROPY_SOURCE],
         }
     }
 }
@@ -611,6 +619,7 @@ mod tests
             vfsd_mount: 0,
             vfsd_deny: 0,
             vfsd_swap: 0,
+            entropy_source: 0,
         }
     }
 
@@ -630,18 +639,20 @@ mod tests
         last
     }
 
-    // The seven slots take two rounds; each optional source, in either
+    // The eight slots take two rounds; each optional source, in either
     // window, round-trips present or absent.
     #[test]
     fn caps_round_trips_with_every_source_present_or_absent()
     {
-        for mask in 0u32..32
+        assert_eq!(CAPS_ROUNDS, 2);
+        for mask in 0u32..64
         {
             let pick = |bit: u32, cap: u64| if mask & bit != 0 { cap } else { 0 };
             let sent = CapsRound {
                 vfsd_mount: pick(4, 0x23),
                 vfsd_deny: pick(8, 0x24),
                 vfsd_swap: pick(16, 0x25),
+                entropy_source: pick(32, 0x26),
                 ..caps_round(pick(1, 0x21), pick(2, 0x22))
             };
             assert_eq!(decode_all(&encode_caps(&sent)), Ok(Some(sent)));

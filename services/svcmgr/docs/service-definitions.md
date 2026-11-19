@@ -68,6 +68,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth` (not `:grant`). Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down, and serves it a receive-only derivation of svcmgr's own death queue in the bootstrap slot after its `seed` caps and its authority slots. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
+| `entropy_authority` | no | `yes` or `no` (default `no`). Endows the service with the kernel's entropy-contribution authority, an `EntropyControl` capability carrying `Contribute`, in the bootstrap slot after its `seed` caps and its debug- and stop-authority slots. One service holds it: the first recipe in launch order that sets it. Mutually exclusive with `log_sink`. A core role. See [`entropy_authority`](#entropy_authority). |
 | `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
 | `oom_stop` | no | `yes` or `no` (default `no`). Opts the service in to being stopped by a stop-authority holder. Refused, as a parser error, on a recipe the eligibility rule refuses. See [`oom_stop`](#oom_stop). |
 | `reserve` | no | `yes` or `no` (default `no`). Creates the service inside memmgr's system reserve. A core role: the eligibility rule never stops it. See [`reserve`](#reserve). |
@@ -394,7 +395,8 @@ svcmgr also serves the recognised actuator the means to observe svcmgr's own dea
 ([Supervision § Observing svcmgr](../../../docs/supervision.md#observing-svcmgr)): on its first
 launch and on every restart, a derivation carrying only the receive right of the event queue
 svcmgr's own main thread and address space post their death to, in the bootstrap slot after the
-`seed` caps and after any debug-authority and stop-authority slots (`cap[3]` for pwrmgr). A derive
+`seed` caps and after any debug-authority, stop-authority and entropy-authority slots (`cap[3]` for
+pwrmgr). A derive
 that fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the
 key but is not recognised gets no such slot.
 
@@ -452,6 +454,35 @@ path that mints the cap.
 holder has a core role, so no holder stops another or itself. A one-shot holder
 (`restart = never`) is allowed: svctest's recipe sets the key.
 
+## `entropy_authority`
+
+`yes` endows the service with the kernel's entropy-contribution authority: on its first launch
+and on every restart, svcmgr derives a copy of the `EntropyControl` source init endows it
+([ipc-interface.md § Handover endowment](ipc-interface.md#handover-endowment-bootstrap-rounds)),
+carrying `Contribute`, the type's one right, and delivers it in the bootstrap slot after the `seed`
+caps and, for a service that sets them, after the debug-authority and stop-authority slots. A
+source init could not endow, or a derive that fails, leaves the slot absent. The capability
+serves `SYS_ENTROPY_CONTRIBUTE`, which mixes bytes into the kernel pool with no entropy credit
+([docs/capability-model.md § `EntropyControl`](../../../docs/capability-model.md#entropycontrol));
+this key is the only path that delivers it, and svcmgr never publishes the source.
+
+One service holds the authority. svcmgr keeps the key on the first recipe that sets it in launch
+order (`svcmgr_defs::keep_one_entropy_holder`) and clears it on every later one, which it launches
+without the capability and logs (`<name> also declares entropy_authority; not given`). The
+default image's holder is entropyd ([services/entropyd/README.md](../../entropyd/README.md)).
+
+`entropy_authority = yes` alongside `log_sink = yes` is a parser error, as for `debug_authority`.
+The key is a core role, so the [`oom_stop`](#oom_stop) rule never stops the holder.
+
+```
+binary            = /services/entropyd
+restart           = on_failure
+critical          = no
+namespace         = none
+seed              = devmgr.class.hwrng
+entropy_authority = yes
+```
+
 ## `stop_source`
 
 `program` makes the service a stop source of the program class
@@ -502,7 +533,7 @@ refusing for the first row that applies:
 | 1 | was started by init (memmgr, procmgr, devmgr, vfsd), so svcmgr only binds it | not launched by svcmgr |
 | 2 | has `restart = never`, so svcmgr does not supervise it | one-shot |
 | 3 | has `critical = yes` | the system is not viable without it |
-| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping and shutdown rest on it |
+| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `entropy_authority`, `reserve`, `shutdown_actuator` or `stop_source` | the system's log, crash reporting, stopping, shutdown and entropy contribution rest on it |
 | 5 | does not set `oom_stop = yes` | not opted in |
 
 Eligibility is read from the recipe's keys alone, never from the service's name. The parser
@@ -586,6 +617,7 @@ The shipped classes:
 | `framebuffer` | 63 (framebuffer `WRITE`) |
 | `rtc` | 63 (rtc `READ`) |
 | `input` | 63 (input `READ`) |
+| `hwrng` | 63 (hwrng `READ`) |
 | `debug-port` | 63 62 (serial `WRITE`, `READ`) |
 
 init requests the `block` class SEND itself, for vfsd's root mount.
@@ -598,7 +630,7 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, `oom_stop` and `reserve` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop` and `reserve` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop` and `stop_source` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 

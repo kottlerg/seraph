@@ -175,7 +175,8 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// inconsistent combination (`cwd` with `namespace = none`, a `cwd` of the
 /// root under `namespace = universal`, a `cwd` outside a
 /// `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
-/// `log_sink` with `seed`/`provides`, `debug_authority` or `stop_authority`,
+/// `log_sink` with `seed`/`provides`, `debug_authority`, `stop_authority` or
+/// `entropy_authority`,
 /// a `shutdown_actuator` that names no `:auth` `provides` entry of the recipe
 /// or sits on a `restart = never` service, `oom_stop = yes` on a recipe the
 /// stop rule refuses (`super::stop::stop_refusal`), `stop_source` on a
@@ -225,6 +226,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut debug_authority: Option<bool> = None;
     let mut oom_stop: Option<bool> = None;
     let mut stop_authority: Option<bool> = None;
+    let mut entropy_authority: Option<bool> = None;
     let mut reserve: Option<bool> = None;
     let mut stop_source: Option<StopClass> = None;
     let mut shutdown_name: Option<String> = None;
@@ -478,6 +480,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     "stop_authority must be yes or no",
                 )?;
             }
+            "entropy_authority" =>
+            {
+                set_yes_no(
+                    &mut entropy_authority,
+                    lineno,
+                    value,
+                    "entropy_authority",
+                    "entropy_authority must be yes or no",
+                )?;
+            }
             "stop_source" =>
             {
                 if stop_source.is_some()
@@ -618,6 +630,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
+    let entropy_authority = entropy_authority.unwrap_or(false);
+    if log_sink && entropy_authority
+    {
+        // As for debug_authority: the log sink's round has no slot for it.
+        return Err(ParseError::InvalidValue(
+            0,
+            "log_sink is exclusive of entropy_authority",
+        ));
+    }
+
     let shutdown_actuator = match &shutdown_name
     {
         Some(name) => Some(check_shutdown_actuator(name, restart, &provides)?),
@@ -643,6 +665,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 log_sink,
                 debug_authority,
                 stop_authority,
+                entropy_authority,
                 reserve,
                 shutdown_actuator.is_some(),
                 stop_source.is_some(),
@@ -683,6 +706,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         shutdown_actuator,
         oom_stop,
         stop_authority,
+        entropy_authority,
         reserve,
         stop_source,
         priority,
@@ -758,8 +782,8 @@ const fn oom_stop_refusal(refusal: StopRefusal) -> &'static str
         StopRefusal::Critical => "oom_stop needs critical = no",
         StopRefusal::CoreRole =>
         {
-            "oom_stop is exclusive of log_sink, debug_authority, stop_authority, reserve, \
-             shutdown_actuator and stop_source"
+            "oom_stop is exclusive of log_sink, debug_authority, stop_authority, \
+             entropy_authority, reserve, shutdown_actuator and stop_source"
         }
         StopRefusal::NotLaunched | StopRefusal::NotOptedIn => "oom_stop refused by the stop rule",
     }
@@ -1111,6 +1135,7 @@ sched_max = 12\n";
             "log_sink = yes\n",
             "debug_authority = yes\n",
             "stop_authority = yes\n",
+            "entropy_authority = yes\n",
             "reserve = yes\n",
             "provides = p:auth\nshutdown_actuator = p\n",
         ]
@@ -1261,6 +1286,39 @@ sched_max = 12\n";
                 .expect("one-shot holder")
                 .stop_authority
         );
+    }
+
+    #[test]
+    fn entropy_authority_is_off_unless_the_recipe_sets_it()
+    {
+        assert!(!parse_with("").expect("default").entropy_authority);
+        assert!(
+            parse_with("entropy_authority = yes\n")
+                .expect("set")
+                .entropy_authority
+        );
+        assert!(
+            !parse_with("entropy_authority = no\n")
+                .expect("cleared")
+                .entropy_authority
+        );
+        assert!(matches!(
+            parse_with("entropy_authority = maybe\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
+        assert!(matches!(
+            parse_with("entropy_authority = yes\nentropy_authority = yes\n"),
+            Err(ParseError::DuplicateKey(_, "entropy_authority"))
+        ));
+    }
+
+    #[test]
+    fn the_log_sink_cannot_hold_the_entropy_authority()
+    {
+        assert!(matches!(
+            parse_with("log_sink = yes\nentropy_authority = yes\n"),
+            Err(ParseError::InvalidValue(0, _))
+        ));
     }
 
     #[test]

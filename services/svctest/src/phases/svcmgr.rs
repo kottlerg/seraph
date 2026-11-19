@@ -585,7 +585,7 @@ fn check_source_contained(authority: u64, phase: &str)
 /// with `NO_CANDIDATE` the first instance's key of every slot below
 /// [`UNLISTED_SLOTS`] it does not list: those slots hold the services the
 /// eligibility rule refuses (svctest itself, `restart = never`; the ones init
-/// started; logd, critical; pwrmgr and `stopsrc`, core roles; timed, no
+/// started; logd, critical; pwrmgr, entropyd and `stopsrc`, core roles; timed, no
 /// `oom_stop`), and past the table, none. The rule's every row is host-tested
 /// in `svcmgr-defs` (`svcmgr_defs::stop`).
 ///

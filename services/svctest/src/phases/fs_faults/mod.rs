@@ -974,18 +974,30 @@ impl OwnFatfs
             .expect("fs_block_faults: creator SEND derive failed");
         let deaths = new_death_queue();
         let process = spawn_fatfs(creator, deaths);
+        // The wait for fatfs's request reads the death queue bound on its main
+        // thread at every expiry, so a fatfs that dies before its request
+        // fails the phase with its exit reason instead of holding the boot to
+        // its deadline.
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
         unsafe {
-            ipc::bootstrap::serve_round(
+            ipc::bootstrap::serve_round_watched(
                 creator_ep,
                 CREATOR_BADGE,
                 ipc_buf,
                 true,
                 &[block_client, child_service],
                 &[],
+                ipc::bootstrap::WATCH_POLL_MS,
+                || {
+                    syscall::event_try_recv_death(deaths)
+                        .ok()
+                        .map(|death| death.exit_reason)
+                },
             )
         }
-        .expect("fs_block_faults: fatfs bootstrap round failed");
+        .unwrap_or_else(|failure| {
+            panic!("fs_block_faults: fatfs bootstrap round failed: {failure:?}")
+        });
         let _ = syscall::cap_delete(creator_ep);
 
         let send = syscall::cap_derive(service, syscall::RIGHTS_EP_SEND)

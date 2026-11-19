@@ -210,7 +210,9 @@ A dump follows the block when the report attached and read the process within it
    the directory budget.
 7. It writes the core under its `.part` name, reading the pages through the faulting thread's
    cap, and renames it. A page the read finds not present, one memmgr evicted since the list, is
-   made resident through procmgr and read again.
+   made resident through procmgr and read again, under the dump's bound of step 5: its pauses count
+   against the same `ipc::PENDING_TRIES`, and once the dump's generation has fired no page is asked
+   for (`ipc::read_mem_resident_bounded`).
 
 The threads it stopped stay stopped: the decline that follows ends the process, whose teardown ends
 every thread. The core's names, budgets and contents are in [core-format.md](core-format.md).
@@ -249,7 +251,9 @@ watchdog to have served its last upcall, and logs the rest of the block after th
 nothing waits on the faulting thread any more. So no cancellation of one fault reaches the next
 fault's handling, unless the watchdog has not served it within another 2 s; crashd then logs that
 and goes on, and the late upcall can cut one request of the next fault's handling short. The stack
-scan reads at most 8 KiB (`STACK_SCAN_BYTES`).
+scan reads at most 8 KiB (`STACK_SCAN_BYTES`); a stack page it asks procmgr to make resident waits
+on the swap service for at most `ipc::PENDING_TRIES` pauses, about a second, over the whole scan,
+and none is asked for once the fault's generation has fired.
 
 A dump runs under a bound of its own, 60 s (`DUMP_BOUND`), after the report's and outside it, as
 a new generation of the same watchdog. A request it waits in, an attach or a file-system call, is

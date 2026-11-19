@@ -130,7 +130,8 @@ pub fn extended_span(offset: u64, len: usize, size: u64) -> (u64, usize)
     (from, usize::try_from(n).unwrap_or(0))
 }
 
-/// Bytes of the per-thread save area's pages, which thread creation zeroes.
+/// Bytes of the per-thread save area's pages, into which thread creation
+/// writes the initial extended state (`arch::current::fpu::init_save_area`).
 /// Saturates as [`slot_bytes`] does; a slot that size is never retyped.
 pub fn extended_area_bytes() -> u64
 {

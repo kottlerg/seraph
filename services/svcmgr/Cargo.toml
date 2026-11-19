@@ -12,6 +12,8 @@ test = false
 [dependencies]
 ipc = { path = "../../shared/ipc" }
 svcmgr-defs = { path = "svc-defs" }
+# The windowed restart budget each service is charged (`RestartBudget`).
+restart-budget = { path = "../../shared/restart-budget" }
 # The death-queue set and main wait set (`DeathSet`).
 death-set = { path = "../../shared/death-set" }
 # The init → svcmgr handover endowment wire contract (svcmgr decodes it).

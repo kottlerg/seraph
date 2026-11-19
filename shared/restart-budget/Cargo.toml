@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "restart-budget"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `no_std`, no allocation, no dependency: the windowed restart budget svcmgr
+# charges per service (`svcmgr-defs`) and devmgr per device record.
+[lib]
+doctest = false
+
+[lints]
+workspace = true

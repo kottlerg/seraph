@@ -171,7 +171,7 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
    * `POLICY_ALWAYS` → restart unconditionally.
    * A missing restart source (an empty `vfs_path`) reports
      "no restart source" and returns false.
-   * The windowed restart budget (`svcmgr_defs::RestartBudget`) is
+   * The windowed restart budget (`restart_budget::RestartBudget`) is
      charged here: at most `RESTART_BURST` (3) restarts within one
      `RESTART_WINDOW_NS` (60 s) window, the window opening at the first
      restart after the previous one has passed. A spent window reports

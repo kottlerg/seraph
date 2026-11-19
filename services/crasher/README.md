@@ -29,6 +29,19 @@ stop, as the `memhog` fixture does ([memhog](../memhog/README.md)): svctest's `s
 phase lists it, has svcmgr stop it, and reads the restarted instance's nonce the same way. A role
 that lacks its endpoint or nonce, or cannot start the worker, logs `FATAL: worker-fault: ...`.
 
+A third role, selected by argv `crasher boot-fault`, checks that svcmgr routes the death of a
+service that dies before its bootstrap request. Its recipe,
+`rootfs/config/svcmgr/tests/crasher-boot.svc` (`restart = on_failure`, `critical = no`,
+`namespace = subtree:/data/crasher-boot:LOOKUP+STAT+MUTATE_DIR`, `provides = crasher.boot`), is
+co-staged with `svctest` wherever `crasher.svc` is. Before it asks for its bootstrap round, an
+instance removes the token `/die-early` of its namespace (`/data/crasher-boot/die-early`): when the
+removal succeeds it logs `boot-fault: token taken; faulting before the bootstrap request` and
+faults its main thread; when the token is not there it serves as the `worker-fault` role does, on
+`crasher.boot`. Any other failure of the removal logs `FATAL: boot-fault: ...`. The data partition
+ships the token (`rootfs/data/crasher-boot/die-early`), so the first launch dies so, and svctest's
+`svcmgr_boot_death` phase writes it again before it faults a serving instance's worker, so a
+restart dies so too.
+
 ---
 
 ## Source Layout
@@ -38,7 +51,8 @@ crasher/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Surface checks, then the deliberate fault; the worker-fault role
+    └── main.rs            # Surface checks, then the deliberate fault; the worker-fault and
+                           #   boot-fault roles
 ```
 
 ---
@@ -46,7 +60,8 @@ crasher/
 ## Capabilities
 
 The bootstrap round delivers the recipe's two seeds again on every spawn and respawn (the
-`worker-fault` role instead receives its provided service endpoint in `caps[0]`):
+`worker-fault` and `boot-fault` roles instead receive their provided service endpoint in
+`caps[0]`):
 
 | Slot      | Cap                       |
 |-----------|---------------------------|

@@ -1,0 +1,21 @@
+# /tests/crasher, boot-fault role — fixture for a service that dies before its
+# bootstrap request.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# Co-staged with svctest in CI and stageable by hand: copy this file into
+# /config/svcmgr/services/ between `cargo xtask build` and `cargo xtask
+# run`. See docs/testing.md.
+#
+# An instance that finds the token /data/crasher-boot/die-early (its
+# namespace's /die-early) removes it and faults before it asks svcmgr for its
+# bootstrap round; any other instance serves ipc::restart_probe_labels on
+# crasher.boot, as the worker-fault role does. The data partition ships the
+# token, so the first launch dies so, and svctest's svcmgr_boot_death phase
+# writes it again for a restart: svcmgr must route each such death under
+# `restart = on_failure`, so a later instance answers the phase.
+binary    = /tests/crasher
+argv      = crasher boot-fault
+restart   = on_failure
+critical  = no
+namespace = subtree:/data/crasher-boot:LOOKUP+STAT+MUTATE_DIR
+provides  = crasher.boot

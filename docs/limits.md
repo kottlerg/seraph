@@ -650,6 +650,7 @@ Every entry here is `correct as is`; none is tracked.
 | reconcile correlator (`ServiceTable::reserve`) | `services/svcmgr/src/definitions/reconcile.rs` | `DeathTag`, `(instance << 32) \| slot` | encoding artefact (slots are never reused; a stale post for a restarted instance is dropped on its instance) | none | correct as is | None |
 | endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 7 / `SUBSTRATE_HEADER_WORDS` + `NAME_WORDS` / derived | provably unreachable (enumerated roles; a round's name is bounded by the shared svcmgr name limit, `NAME_MAX`) | none | correct as is | None |
 | bootstrap badge | `services/svcmgr/src/restart.rs` | random `u64` | ABI width | none | correct as is | None |
+| `BOOTSTRAP_POLL_MS` | `services/svcmgr/src/definitions/launch.rs` | 50 ms per bounded receive of a child's bootstrap request, after which svcmgr reads the child's main thread through its own thread cap | tuning (how long a child that died before its request holds svcmgr; one `cap_info` per expiry while a live child is slow to ask) | none | correct as is | None: a live child that never asks still holds svcmgr |
 
 ### vfsd and namespace
 

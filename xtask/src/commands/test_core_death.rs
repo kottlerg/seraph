@@ -18,9 +18,11 @@
 //!   creates): the stub is staged naming the target, as `run --debug-target`
 //!   stages it (`crate::debug_stub`), and attaches to it during the boot; the
 //!   host connects over the debug port, moves the main thread, and detaches,
-//!   which gives the target its crash bindings back. logd restarts, so it is
-//!   killed again, through the stub's attach to each new instance, until
-//!   svcmgr's restart budget is spent.
+//!   which gives the target its crash bindings back. logd is killed at the
+//!   stub's first attach, which can fall before logd asks svcmgr for its
+//!   bootstrap round, and as it restarts, it is killed again, through the
+//!   stub's attach to each new instance, until svcmgr's restart budget is
+//!   spent.
 //! - **QEMU's own gdbstub** (memmgr and procmgr, which init creates with raw
 //!   syscalls, so no debugger can attach to them): once the default boot is
 //!   up, the host sets a hardware breakpoint on a function of the target's
@@ -124,11 +126,11 @@ enum KillPoint
     /// calls devmgr and vfsd during its launches, where a call to a server
     /// that died after svcmgr's check of it waits for good (#1185).
     SystemUp,
-    /// As [`KillPoint::SystemUp`], then again after each restart svcmgr
-    /// makes, until its restart budget is spent and the death is permanent.
-    /// Not at the stub's first attach: a service that dies before it asks
-    /// svcmgr for its bootstrap round leaves svcmgr waiting for the request
-    /// (#1297).
+    /// As [`KillPoint::Attach`], then again after each restart svcmgr makes,
+    /// until its restart budget is spent and the death is permanent. The
+    /// first kill can fall before the target asks svcmgr for its bootstrap
+    /// round, a death svcmgr routes as any other
+    /// (`services/svcmgr/docs/restart-protocol.md` § Death detection).
     RestartsSpent,
 }
 
@@ -158,6 +160,15 @@ const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_mins(2);
 /// The start of svcmgr's line once it has restarted a service. Kept in sync
 /// with `services/svcmgr/src/restart.rs`.
 const RESTARTED_MARKER: &str = "service restarted: ";
+
+/// The end of svcmgr's line when a service it launched from its recipe dies
+/// before its bootstrap request, after `svcmgr: <name>`. Kept in sync with
+/// `services/svcmgr/src/definitions/reconcile.rs`.
+const BOOT_DEATH_MARKER: &str = " died during its bootstrap";
+
+/// init-logd's last line, written once real-logd has pulled its history and
+/// released it. Kept in sync with `services/init/src/logging.rs`.
+const HANDOVER_MARKER: &str = "handover complete; init-logd thread exiting";
 
 /// The pause after a kill before the stub is asked to attach again, so its
 /// walk does not find the dying instance.
@@ -490,13 +501,11 @@ fn kill_through_stub(
     // for the target at its start; a stub that found none looks again here.
     stub.request(b"qSupported")?;
     stub.set_answer_timeout(ANSWER_TIMEOUT)?;
-    if matches!(point, KillPoint::SystemUp | KillPoint::RestartsSpent)
+    if point == KillPoint::SystemUp
     {
         // The attach holds every thread of the target, and the boot waits on
-        // devmgr, vfsd and logd (svcmgr waits for logd's bootstrap request,
-        // and a logd killed before it sends one leaves svcmgr waiting, #1297):
-        // released until the system is up, the target is held again by the
-        // next `qSupported`, which finds the stub detached.
+        // devmgr and vfsd: released until the system is up, the target is
+        // held again by the next `qSupported`, which finds the stub detached.
         stub.expect_ok(b"D")?;
         let awaited: Vec<&str> = [READY_MARKER, RECONCILED_MARKER]
             .into_iter()
@@ -517,11 +526,30 @@ fn kill_through_stub(
         if kill > 1
         {
             // The restart's line is written by the new logd once it runs.
-            guest
+            let lines = guest
                 .collect_until(&format!("{RESTARTED_MARKER}{name}"), BOOT_TIMEOUT)
                 .with_context(|| {
                     format!("{name}'s restart after kill {}", kill.saturating_sub(1))
                 })?;
+            // A first kill that fell before the log sink's bootstrap request
+            // left init-logd serving the log endpoint: the restarted instance
+            // must take the handover from it, as the first launch would have.
+            let died_early = format!("svcmgr: {name}{BOOT_DEATH_MARKER}");
+            if kill == 2 && lines.iter().any(|l| l.contains(&died_early))
+            {
+                if !lines.iter().any(|l| l.contains(HANDOVER_MARKER))
+                {
+                    guest
+                        .collect_until(HANDOVER_MARKER, BOOT_TIMEOUT)
+                        .with_context(|| {
+                            format!("the handover to {name}'s restart after its first launch died")
+                        })?;
+                }
+                step(&format!(
+                    "core-death test: {name}'s first launch died before its bootstrap request; \
+                     its restart took the handover"
+                ));
+            }
             stub.request(b"qSupported")?;
         }
         // A target the stub does not hold (it exited, or the walk found

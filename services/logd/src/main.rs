@@ -271,10 +271,11 @@ fn main() -> !
     }
     else
     {
-        // A svcmgr restart: there is no handover source (init-logd exited
-        // after the first launch). Serve a fresh table; in-flight history
-        // from the prior instance is not recoverable. No init-logd writes the
-        // UART, so nothing needs holding.
+        // A restart after an instance took its bootstrap rounds: there is
+        // no handover source (that instance held the handover; svcmgr serves
+        // `cap[1]` again to a restart before that). Serve a fresh table;
+        // in-flight history from the prior instance is not recoverable. No
+        // init-logd writes the UART, so nothing needs holding.
         open_self_log();
         self_log("started (restart); no handover source, serving fresh");
     }

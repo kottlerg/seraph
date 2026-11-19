@@ -631,20 +631,32 @@ fn dispatch_ipc(
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             std::os::seraph::log!("handover complete; scanning /config/svcmgr/services/");
-            if let Err(exit_reason) = definitions::reconcile::reconcile_and_launch(
+            let reconciled = match definitions::reconcile::reconcile_and_launch(
                 &mut state.pending,
                 &mut state.table,
                 ctx,
                 &mut state.registry,
             )
             {
-                route_namespace_server_death(state, ctx, exit_reason);
-                return;
-            }
+                Ok(reconciled) => reconciled,
+                Err(exit_reason) =>
+                {
+                    route_namespace_server_death(state, ctx, exit_reason);
+                    return;
+                }
+            };
             std::os::seraph::log!(
                 "monitoring {} service(s) after reconciliation",
                 state.table.services.len()
             );
+            // A critical service that died during its bootstrap rounds and
+            // that svcmgr could not recover: its death was routed during the
+            // reconciliation, and the shutdown waits for the actuator to be
+            // recorded.
+            if reconciled == definitions::reconcile::Reconciled::Unrecoverable
+            {
+                initiate_graceful_shutdown(state, ctx);
+            }
             // A devmgr that died before its bind is recorded with the caps
             // init endowed; route its death now.
             resync_deaths(state, ctx);

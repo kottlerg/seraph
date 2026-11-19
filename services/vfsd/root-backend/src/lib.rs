@@ -133,7 +133,7 @@ pub enum UnmountError
     Root,
     /// No mount is on the node, or the index is outside the pool.
     NotMounted,
-    /// The mount's removal has already begun.
+    /// The mount is restarting, or its removal has already begun.
     InProgress,
 }
 
@@ -252,7 +252,7 @@ pub struct VfsdRootBackend
     root: TreeNode,
     /// Every other node; pool index `i` (from 1) is `nodes[i - 1]`.
     nodes: Vec<TreeNode>,
-    /// Nodes holding a mount, mounted or being removed; at most
+    /// Nodes holding a mount, mounted, restarting, or being removed; at most
     /// [`MAX_MOUNTS`].
     mounts: usize,
 }
@@ -336,7 +336,7 @@ impl VfsdRootBackend
     ///
     /// Returns `None`, leaving the tree unchanged, on a component that
     /// fails [`validate_name`], an attempt to mount on a node that holds
-    /// a mount (one being removed included), a re-install of the root
+    /// a mount (one restarting or being removed included), a re-install of the root
     /// mount (see [`Self::can_install`]), a tree that already holds
     /// [`MAX_MOUNTS`] mounts, or a failure to allocate the new nodes.
     pub fn install(&mut self, path: &[u8], mount: Mount) -> Option<InstallResult>
@@ -666,8 +666,8 @@ impl VfsdRootBackend
     /// Whether [`Self::install`] would accept `path` against the current
     /// tree: the tree holds fewer than [`MAX_MOUNTS`] mounts, the root is
     /// not yet mounted (for `/`), every component passes
-    /// [`validate_name`], the final node holds no mount (one being removed
-    /// included), and the pool can index every node the install would
+    /// [`validate_name`], the final node holds no mount (one restarting or
+    /// being removed included), and the pool can index every node the install would
     /// create. The MOUNT path checks this before it registers a
     /// partition or spawns a driver, so a mount `install` would reject
     /// acquires nothing; only an allocation failure in `install` itself
@@ -712,7 +712,7 @@ impl VfsdRootBackend
         if let Some(last) = existing
             && !matches!(self.node(last)?.slot, Slot::Empty)
         {
-            // Path is already a mount point, or one being removed.
+            // Path is already a mount point, restarting or being removed.
             return None;
         }
         // Every index, the root's included, stays below `NONE`.

@@ -44,8 +44,9 @@ use worker_pool::WorkerPool;
 /// service-endpoint request waits on another one's IPC, so the count cannot
 /// deadlock: what a `MOUNT` handler blocks on (the worker pool, procmgr's
 /// `CREATE_FROM_FILE`, whose binary reads go to the fs driver that minted
-/// the file cap, the `NS_LOOKUP` walk the namespace thread serves, and the
-/// driver's `FS_MOUNT` probe) and what an `UNMOUNT` handler blocks on (the
+/// the file cap, the `NS_LOOKUP` walk the namespace thread serves, the
+/// driver's bootstrap round, which its death ends, and its `FS_MOUNT` probe,
+/// within `driver::PROBE_TIMEOUT_MS`) and what an `UNMOUNT` handler blocks on (the
 /// driver's `FS_UNMOUNT` and its death, each within a bound, procmgr's
 /// `DESTROY_PROCESS`, and the `NS_LOOKUP` walk for a fall-through cap)
 /// never calls the service endpoint, and neither does the discovery of new

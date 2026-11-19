@@ -599,23 +599,35 @@ fn await_restart(authority: u64, seen: &[u64], restart: u32) -> u64
 /// budget spent, the budget's window having opened at `first_kill` or
 /// later: once `/data` is not found, its fall-through to the root
 /// filesystem. A new driver listed instead, beside the earlier ones `seen`,
-/// is a restart past the budget. Returns how long the teardown took, in
-/// milliseconds.
+/// is a restart past the budget while the window since `first_kill` has not
+/// passed, and a phase that missed its precondition once it has. Returns how
+/// long the teardown took, in milliseconds.
 fn await_teardown(authority: u64, seen: &[u64], first_kill: Instant) -> u128
 {
     let start = Instant::now();
+    let window = Duration::from_nanos(restart_budget::RESTART_WINDOW_NS);
     while !matches!(
         std::fs::metadata("/data").map_err(|e| e.kind()),
         Err(std::io::ErrorKind::NotFound)
     )
     {
-        assert!(
-            new_data_driver(authority, seen).is_none(),
-            "vfsd_driver_death: vfsd restarted the /data driver past its budget, {:?} after \
-             the first kill (window {} s)",
-            first_kill.elapsed(),
-            restart_budget::RESTART_WINDOW_NS / 1_000_000_000
-        );
+        if new_data_driver(authority, seen).is_some()
+        {
+            // vfsd charged each restart after its kill, so every charge fell
+            // within the time since the first kill: inside the window, this
+            // restart is past the budget; past it, the window may have
+            // refilled, and the phase did not test the budget.
+            let since = first_kill.elapsed();
+            assert!(
+                since >= window,
+                "vfsd_driver_death: vfsd restarted the /data driver past its budget, {since:?} \
+                 after the first kill, within the {window:?} window"
+            );
+            panic!(
+                "vfsd_driver_death: the kills spanned {since:?}, past the budget's {window:?} \
+                 window, so the budget was not tested"
+            );
+        }
         assert!(
             start.elapsed() < DEATH_TIMEOUT,
             "vfsd_driver_death: /data still resolves {DEATH_TIMEOUT:?} after its driver died \

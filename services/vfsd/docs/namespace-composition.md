@@ -253,7 +253,9 @@ restarted: its driver's death ends vfsd (§ Driver death and device loss).
   from the record's `partition`, and starts a driver on a new service endpoint, with a new death
   queue, as a runtime `MOUNT` does: from the installed `/services/fs/fatfs`, through
   `CREATE_FROM_FILE`, never from the boot module, named `fatfs:` and the mount's path, and
-  probed with `FS_MOUNT`.
+  probed with `FS_MOUNT`. Every spawn, a `MOUNT`'s and a restart's, ends: the wait for the new
+  driver's bootstrap round ends at its death, and the probe at a bound (`PROBE_TIMEOUT_MS`,
+  10 s), after which a driver that did not answer is destroyed.
 - **End.** In one hold the new driver's death queue joins the set and its record replaces the dead
   one's (`VfsdRootBackend::finish_restart`); lookups cross into it from then on, so a client
   resolves the mount's path again and reaches the new driver. The thread then checks the disk again,
@@ -403,7 +405,8 @@ vfsd holds two un-badged endpoints:
   IPC, since what a `MOUNT` handler blocks on (the worker pool,
   procmgr's `CREATE_FROM_FILE`, whose `FS_READ_MEMORY`s go to the fs driver
   that minted the file cap, the `/services/fs/fatfs` walk the namespace
-  dispatcher serves, and the `FS_MOUNT` probe) and what an `UNMOUNT`
+  dispatcher serves, the new driver's bootstrap round, which its death ends, and the `FS_MOUNT`
+  probe, within a bound) and what an `UNMOUNT`
   handler blocks on (the driver's `FS_UNMOUNT` and its death, each
   within a bound, procmgr's `DESTROY_PROCESS`, and the root-mount walk
   for a fall-through cap) never calls the service endpoint, and neither

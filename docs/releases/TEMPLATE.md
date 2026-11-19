@@ -47,4 +47,11 @@ Disk images:
 - `seraph-v<X>.<Y>.<Z>-x86_64.img.zst`
 - `seraph-v<X>.<Y>.<Z>-riscv64.img.zst`
 
-Verify with `sha256sum -c SHA256SUMS` against the attached `SHA256SUMS` file.
+Symbols archives, the unstripped images of each build by build id, which
+`cargo xtask symbolize --symbols <dir>` reads once extracted:
+
+- `seraph-v<X>.<Y>.<Z>-x86_64-symbols.tar.zst`
+- `seraph-v<X>.<Y>.<Z>-riscv64-symbols.tar.zst`
+
+Verify the files you downloaded with `sha256sum -c --ignore-missing SHA256SUMS`
+against the attached `SHA256SUMS` file, which lists them all.

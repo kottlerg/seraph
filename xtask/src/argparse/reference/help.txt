@@ -18,7 +18,7 @@ Commands:
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
   ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
-  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
+  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes. Runs in CI's validate job; see xtask/README.md
   compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
@@ -67,7 +67,7 @@ Commands:
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
   ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
-  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
+  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes. Runs in CI's validate job; see xtask/README.md
   compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`
@@ -649,7 +649,7 @@ Options:
       --min-secs <MIN_SECS>    Flag a row only when its time exceeds the expected time (F times the base, or the baseline's) by at least this many seconds [default: 1.0]
   -h, --help                   Print help
 === xtask symbolize -h
-Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
+Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
 
 Usage: xtask symbolize [OPTIONS] [ADDR]...
 
@@ -657,13 +657,14 @@ Arguments:
   [ADDR]...  Runtime addresses to resolve, in hex (`0x` optional)
 
 Options:
-      --binary <PATH>  The ELF image the addresses fall in (a sysroot binary, or its build output under `target/`)
+      --binary <PATH>  The ELF image the addresses fall in (a sysroot binary, or its build output under `target/`). A stripped image's symbols are read from the symbols store's file of its build id
       --kernel         Resolve against the sysroot's kernel image (`sysroot/esp/EFI/seraph/kernel`)
       --bias <HEX>     Load bias, in hex: the runtime address of the image's link address 0 (a PIE's `image bias=` or, for init, `init: PIE bias=` log value; the kernel's `kaslr: slide=` value) [default: 0]
       --log <FILE>     A serial log: print every crash-report block in it with its code addresses resolved, each process's image found in the sysroot by the log name logd's `reclaim:` line gives its badge, or, for a process logd names none for, as the one binary whose text span matches
+      --symbols <DIR>  The symbols store to read in place of the build's `symbols/`, such as a release's symbols archive unpacked. With `--log`, the images are the store's own files, named by its manifest, and the sysroot is not read
   -h, --help           Print help
 === xtask symbolize --help
-Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
+Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
 
 Usage: xtask symbolize [OPTIONS] [ADDR]...
 
@@ -671,10 +672,11 @@ Arguments:
   [ADDR]...  Runtime addresses to resolve, in hex (`0x` optional)
 
 Options:
-      --binary <PATH>  The ELF image the addresses fall in (a sysroot binary, or its build output under `target/`)
+      --binary <PATH>  The ELF image the addresses fall in (a sysroot binary, or its build output under `target/`). A stripped image's symbols are read from the symbols store's file of its build id
       --kernel         Resolve against the sysroot's kernel image (`sysroot/esp/EFI/seraph/kernel`)
       --bias <HEX>     Load bias, in hex: the runtime address of the image's link address 0 (a PIE's `image bias=` or, for init, `init: PIE bias=` log value; the kernel's `kaslr: slide=` value) [default: 0]
       --log <FILE>     A serial log: print every crash-report block in it with its code addresses resolved, each process's image found in the sysroot by the log name logd's `reclaim:` line gives its badge, or, for a process logd names none for, as the one binary whose text span matches
+      --symbols <DIR>  The symbols store to read in place of the build's `symbols/`, such as a release's symbols archive unpacked. With `--log`, the images are the store's own files, named by its manifest, and the sysroot is not read
   -h, --help           Print help
 === xtask mkdisk -h
 Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
@@ -2460,7 +2462,7 @@ Commands:
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
   ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
-  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
+  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot as it stands. Every pack re-signs the sysroot's signed objects in place. Requires an arch-tagged sysroot from a prior `cargo xtask build`
   check-disk         Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with `fsck.fat -n` (dosfstools), an independent reader of the volumes mkdisk writes. Runs in CI's validate job; see xtask/README.md
   compose-bundle     Record the harness whose bundle every pack composes from the installed files its bundle list names, and repack `disk.img`. Use `--harness ktest` to run the kernel test harness; the default is `--harness init`. Requires a populated sysroot from a prior `cargo xtask build`

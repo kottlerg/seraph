@@ -3,8 +3,8 @@
 
 // xtask/src/commands/clean.rs
 
-//! Clean command: remove the sysroot and the disk images, and optionally the
-//! cargo target/ directory.
+//! Clean command: remove the sysroot, the symbols store and the disk images,
+//! and optionally the cargo target/ directory.
 
 use std::process::Command;
 
@@ -26,6 +26,14 @@ pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
     else
     {
         step("Sysroot already clean");
+    }
+
+    let symbols = ctx.symbols_dir();
+    if symbols.exists()
+    {
+        step(&format!("Removing symbols store: {}", symbols.display()));
+        std::fs::remove_dir_all(&symbols)
+            .map_err(|e| crate::error::err!("failed to remove {}: {}", symbols.display(), e))?;
     }
 
     for disk_img in [ctx.disk_image(), ctx.data_disk_image()]

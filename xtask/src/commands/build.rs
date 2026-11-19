@@ -16,6 +16,7 @@ use crate::cli::{BuildArgs, BuildComponent};
 use crate::context::{Context as BuildContext, Profile};
 use crate::rust_src;
 use crate::stack_sizes;
+use crate::symbolize::store::{self, Store};
 use crate::sysroot;
 use crate::util::{find_llvm_objcopy, run_cmd, step};
 
@@ -681,8 +682,40 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     let dst_boot = ctx.installed_bootloader();
     compile_boot(ctx, args, &store, &dst_boot)?;
     step(&format!("Bootloader: {}", dst_boot.display()));
+    keep_boot_symbols(ctx, args)
+}
+
+/// Keep the symbols of the bootloader `build_boot` installed in the symbols
+/// store, as `/boot/boot.efi`'s: on riscv64 the ELF the flat image is made
+/// from, keyed by its build id; on x86-64 the PDB of the PE image, keyed by
+/// the image's `CodeView` record (docs/build-system.md § Symbols Store).
+fn keep_boot_symbols(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
+{
+    let out = ctx.cargo_output_dir(args.arch.boot_target_triple(), args.profile());
+    let store = Store::at(ctx.symbols_dir());
+    let read = |path: &Path| fs::read(path).with_context(|| format!("reading {}", path.display()));
+    let kept = if args.arch == Arch::Riscv64
+    {
+        store.keep_elf(args.arch, BOOTLOADER_INSTALL, &read(&out.join("boot"))?)?
+    }
+    else
+    {
+        store.keep_pdb(
+            args.arch,
+            BOOTLOADER_INSTALL,
+            &read(&out.join("boot.efi"))?,
+            &read(&out.join("boot.pdb"))?,
+        )?
+    };
+    step(&format!(
+        "Bootloader symbols: {}",
+        ctx.symbols_dir().join(kept).display()
+    ));
     Ok(())
 }
+
+/// The bootloader's install path.
+const BOOTLOADER_INSTALL: &str = "/boot/boot.efi";
 
 /// Compile the bootloader for `args.arch` in `args`'s profile, embedding the
 /// trust store in the file `store`, and write its PE image to `out`; the
@@ -892,7 +925,7 @@ fn build_group(
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
-            copy_file(&cargo_out, &dst)?;
+            install(ctx, args.arch, spec, &cargo_out, &dst)?;
             step(&format!("{}: {}", spec.name, dst.display()));
         }
     }
@@ -1008,11 +1041,55 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        copy_file(&cargo_out, &dst)?;
+        install(ctx, args.arch, spec, &cargo_out, &dst)?;
         step(&format!("{}: {}", spec.name, dst.display()));
     }
 
     Ok(())
+}
+
+/// Install `spec`'s link output `cargo_out`, built for `arch`, at `dst`, and
+/// keep the link output in the symbols store as the symbols of its install
+/// path. Every image procmgr loads is installed stripped (`llvm-objcopy
+/// --strip-all`: no symbol table, no DWARF, no `.comment`; its segments, its
+/// notes and its section headers unchanged), since procmgr reads an image
+/// whole through the filesystem to load it; the kernel, under `/boot`, is
+/// installed as linked (docs/build-system.md § Symbols Store).
+///
+/// # Errors
+///
+/// The link output carries no build id, the strip fails or changes the
+/// build id, or a file cannot be read or written.
+fn install(ctx: &BuildContext, arch: Arch, spec: &Spec, cargo_out: &Path, dst: &Path)
+-> Result<()>
+{
+    let linked = fs::read(cargo_out).with_context(|| format!("reading {}", cargo_out.display()))?;
+    let install = format!("/{}", install_relative(spec).display());
+    let kept = Store::at(ctx.symbols_dir()).keep_elf(arch, &install, &linked)?;
+    if matches!(spec.dest, InstallDest::Boot)
+    {
+        return copy_file(cargo_out, dst);
+    }
+    strip(cargo_out, dst)?;
+    let installed = fs::read(dst).with_context(|| format!("reading {}", dst.display()))?;
+    let id = store::build_id(&installed);
+    if id.as_deref().map(store::elf_name).as_deref() != Some(kept.as_str())
+    {
+        bail!(
+            "stripping {} changed its build id: {kept} became {id:?}",
+            cargo_out.display()
+        );
+    }
+    Ok(())
+}
+
+/// Write `src` to `dst` with `llvm-objcopy --strip-all`, which removes the
+/// symbol table, the debug sections and `.comment`, and keeps the segments,
+/// the notes and the section headers.
+fn strip(src: &Path, dst: &Path) -> Result<()>
+{
+    let objcopy = find_llvm_objcopy()?;
+    run_cmd(Command::new(&objcopy).arg("--strip-all").arg(src).arg(dst))
 }
 
 /// `RUSTFLAGS` for the riscv64 kernel build and its lint pass: the
@@ -1317,6 +1394,28 @@ mod tests
             .find(|(key, _)| *key == "CARGO_INCREMENTAL")
             .and_then(|(_, value)| value);
         assert_eq!(incremental, Some(std::ffi::OsStr::new("0")));
+    }
+
+    /// The strip an installed image takes drops its symbol table and its
+    /// DWARF and keeps its build-id note, which finds its symbols again.
+    #[test]
+    fn a_stripped_image_keeps_its_build_id_and_loses_its_symbols()
+    {
+        use crate::symbolize::fixture::{Architecture, Debug, USER_BASE, fixture};
+        let dir = std::env::temp_dir().join(format!("seraph-strip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (linked, installed) = (dir.join("linked"), dir.join("installed"));
+        let image = fixture(Architecture::Riscv64, USER_BASE, Debug::Dwarf);
+        fs::write(&linked, &image).unwrap();
+        strip(&linked, &installed).unwrap();
+        let stripped = fs::read(&installed).unwrap();
+        assert!(store::has_symbols(&image));
+        assert!(!store::has_symbols(&stripped));
+        assert!(stripped.len() < image.len());
+        assert!(store::build_id(&image).is_some());
+        assert_eq!(store::build_id(&stripped), store::build_id(&image));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The crates only std depends on, which no component's lint pass

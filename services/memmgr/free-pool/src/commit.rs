@@ -33,8 +33,9 @@ use syscall_abi::PAGE_SIZE;
 /// no frame for, and a committed fault that then finds no frame evicts a
 /// victim in its turn or is declined as a commit overrun; committed chunks
 /// become evictable (`services/memmgr/docs/memory-pool.md` § Commit,
-/// Overcommit). 0: every commitment is backed by a free page, so a committed
-/// fault always finds one (docs/limits.md § memmgr).
+/// Overcommit). 0: every commitment is backed by a free page, short only of
+/// what memmgr's own metadata takes without admission, and a committed fault
+/// takes any free page (docs/limits.md § memmgr).
 pub const OVERCOMMIT_ALLOWANCE_PAGES: u64 = 0;
 
 /// Pages of each page-table donation a committed region's fault draws from

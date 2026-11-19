@@ -460,7 +460,10 @@ fn still_victim(l: &MemLedger, v: &Victim, idle: u8, need: Need) -> bool
 
 /// Keep `found` for direct reclaim: drop the kept victims that may no longer
 /// be evicted, then add each of `found` not kept already while there is
-/// room.
+/// room. A victim whose eviction raises the free pages outside `promised`
+/// ([`Need::Free`]) takes the place of a kept one only a committed draw may
+/// take when there is none, so committed victims never crowd out those an
+/// uncommitted restore needs.
 fn keep_victims(l: &MemLedger, found: &[Victim])
 {
     let cache = &mut evictor().cache;
@@ -477,12 +480,20 @@ fn keep_victims(l: &MemLedger, found: &[Victim])
         {
             continue;
         }
-        let Some(free) = cache.iter_mut().find(|k| k.is_none())
-        else
+        let frees = l.evicting_frees(v.reg);
+        let slot = cache.iter().position(Option::is_none).or_else(|| {
+            frees
+                .then(|| {
+                    cache
+                        .iter()
+                        .position(|k| k.is_some_and(|k| !l.evicting_frees(k.reg)))
+                })
+                .flatten()
+        });
+        if let Some(k) = slot.and_then(|i| cache.get_mut(i))
         {
-            break;
-        };
-        *free = Some(*v);
+            *k = Some(*v);
+        }
     }
 }
 
@@ -987,8 +998,8 @@ fn give_back(l: &mut MemLedger, runs: &[FrameDesc])
 ///
 /// # Errors
 /// [`FaultDecline::NoFreePage`] when the restore is not admitted or the pool
-/// runs out, [`FaultDecline::CommitOverrun`] instead for a chunk of a
-/// committed region, [`FaultDecline::NoArenaSlot`] when the arena cannot grow
+/// runs out, [`FaultDecline::CommitOverrun`] when a committed chunk's draw
+/// finds too few free pages, [`FaultDecline::NoArenaSlot`] when the arena cannot grow
 /// for the runs' descriptors, [`FaultDecline::MapFailed`] when a map fails or
 /// the stream is malformed (detail 0), and [`FaultDecline::FrameRecord`] when
 /// the ledger refuses the runs. The chunk then stays as it was.
@@ -1024,7 +1035,7 @@ pub(crate) fn restore(
     let entry = l.chunk_at(reg, page_base);
     let (chunk_base, _) = chunk_for(region, page_base);
     let mut runs = [FrameDesc::default(); CHUNK_RUNS];
-    let n = select_restore_runs(l, backed, chunk_base, &mut runs).map_err(|_| (short, 0))?;
+    let n = select_restore_runs(l, backed, chunk_base, &mut runs)?;
     let runs = runs.get(..n).unwrap_or(&[]);
     // The runs' descriptors on the chunk's entry.
     let held = u64::try_from(n).unwrap_or(u64::MAX);

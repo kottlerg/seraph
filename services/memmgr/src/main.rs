@@ -2552,8 +2552,8 @@ pub(crate) fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64
 /// fault-around preference, so the fault is declined only when not even the
 /// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
 /// [`FaultDecline::NoFreePage`] at the growth floor or when the selection
-/// fails, and [`FaultDecline::CommitOverrun`] for a committed draw that finds
-/// no frame.
+/// fails (a split, after a draw found a page), and
+/// [`FaultDecline::CommitOverrun`] for a committed draw that finds no frame.
 fn select_fault_run(
     l: &mut MemLedger,
     target: &FaultTarget,
@@ -2574,9 +2574,11 @@ fn select_fault_run(
         {
             return Err(FaultDecline::CommitOverrun);
         }
+        // The draw found a free page, so a selection can fail only to split a
+        // run, as an uncommitted fault's can.
         return select(l, pages, Fit::Contiguous)
             .or_else(|_| select(l, pages, Fit::UpTo))
-            .map_err(|_| FaultDecline::CommitOverrun);
+            .map_err(|_| FaultDecline::NoFreePage);
     }
     let admitted = admissible(l, target.rec, u64::from(span_pages));
     match admitted

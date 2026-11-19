@@ -354,16 +354,18 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// The most pages a committed draw (a fault in a committed region, or a
     /// restore of a committed chunk, each drawing from `promised`) may take
-    /// from the free pool: every free page while the pool covers `promised`,
-    /// else only those above `reserve`, the system reserve for a budget node
-    /// outside it and 0 for a reserve node. With an allowance of 0 the pool
-    /// always covers `promised`, so a draw is never short while a page is
-    /// free (`services/memmgr/docs/memory-pool.md` § Commit, Overcommit).
+    /// from the free pool: every free page while the allowance is 0 or the
+    /// pool covers `promised`, else only those above `reserve`, the system
+    /// reserve for a budget node outside it and 0 for a reserve node. With an
+    /// allowance of 0 the pool falls short of `promised` only by memmgr's own
+    /// metadata, so a draw takes any free page, as every committed fault did
+    /// before there was an allowance (`services/memmgr/docs/memory-pool.md`
+    /// § Commit, Overcommit).
     #[must_use]
     pub fn draw_room(&self, reserve: u64) -> u64
     {
         let free = self.pool.free_pages();
-        if free >= self.promised
+        if self.allowance == 0 || free >= self.promised
         {
             free
         }
@@ -4711,6 +4713,18 @@ mod tests
         assert_eq!(l.allowance(), 0);
         assert_eq!(l.admit_commit(rec, need, 0), Err(ChargeError::Reserve));
         assert_eq!(l.draw_room(16), 1000);
+        // Short of `promised` with no allowance, as memmgr's own metadata can
+        // leave the pool, a draw still takes every free page.
+        let tight = l
+            .add_region(
+                rec,
+                region(BASE + 128 * CHUNK, 1024 * PAGE_SIZE),
+                Commit::Committed,
+            )
+            .unwrap();
+        assert!(l.promised() > l.pool.free_pages());
+        assert_eq!(l.draw_room(16), 1000);
+        l.remove_region(rec, tight, pool_all).unwrap();
         // With one, past them by up to the allowance.
         l.set_allowance(500);
         assert_eq!(l.promise_free(), 1500);

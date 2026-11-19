@@ -869,21 +869,20 @@ which takes no frame when it is made, is admitted when `free + A - promised - F 
 other admission takes its frames at once and reads the lesser of `free + A - promised` and `free`,
 so the growth floor stays one of free frames, and so does the pressure level ([Memory
 pressure](#memory-pressure)). A is a [docs/limits.md](../../../docs/limits.md) § memmgr constant,
-and it is 0: every committed page then has a free page held for it, a committed fault always finds
-one, and the tests are those above. With A above 0 a committed region's chunks are evictable
-([Eviction](#eviction), Committed pages): evicting one returns its runs to the pool and adds its
-pages to `promised` again, since its restore draws from `promised` as its first touch did. A
-committed draw, a fault in a committed region or a restore of a committed chunk, takes any free
-page while the free pool covers `promised`, and while it does not, only the pages above the system
-reserve, for a node outside it, so an overcommitted pool leaves the reserve to the reserve nodes.
-When the draw finds no page, memmgr evicts victims in its turn as a restore's direct reclaim does
-([Eviction](#eviction), Direct reclaim), any evictable chunk but the one the fault backs, up to the
-same bound; a fault's span is then clamped to the pages found, at least its faulting page. A draw
-still short is declined with code 11, a commit overrun ([ipc-interface.md](ipc-interface.md)
-§ Kernel-origin fault message), which crashd holds as it holds code 7. With A at 0 only memmgr's
-own metadata, which takes free pages without admission, could leave the pool short of `promised`.
-The admission and draw rules are the host-tested `free-pool` ledger's (`promise_free`,
-`uncommitted_free` and `draw_room`).
+and it is 0: the tests are those above, and every committed page has a free page held for it, short
+only of what memmgr's own metadata, which takes free pages without admission, took. With A above 0
+a committed region's chunks are evictable ([Eviction](#eviction), Committed pages): evicting one
+returns its runs to the pool and adds its pages to `promised` again, since its restore draws from
+`promised` as its first touch did. A committed draw, a fault in a committed region or a restore of
+a committed chunk, takes any free page while A is 0 or the free pool covers `promised`, and
+otherwise only the pages above the system reserve, for a node outside it, so an overcommitted pool
+leaves the reserve to the reserve nodes. When the draw finds no page, memmgr evicts victims in its
+turn as a restore's direct reclaim does ([Eviction](#eviction), Direct reclaim), any evictable chunk
+but the one the fault backs, up to the same bound; a fault's span is then clamped to the pages
+found, at least its faulting page. A draw still short is declined with code 11, a commit overrun
+([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message), which crashd holds as it holds
+code 7; with A at 0 that is a pool with no free page at all. The admission and draw rules are the
+host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free` and `draw_room`).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
@@ -997,10 +996,11 @@ the accessed bits with one `SYS_ASPACE_HARVEST`, and ages each resident chunk of
 two-bit age ([Chunk table](#chunk-table)): a chunk with no accessed page in two sweeps is cold, and
 at `LOW` the slice posts one job for each cold chunk whose eviction raises the free pages outside
 `promised` (Committed pages, above), as many as the compression worker has free job slots. The
-victims a slice finds and posts no job for are kept, a bounded number, for direct reclaim; at
-`CRITICAL` a slice finds the chunks with no accessed page in one sweep. A slice ends at the end of a
-pass, so no slice ages a chunk twice. The granule is the chunk: one unmap and one restore fault per
-chunk, over every run on its run list.
+victims a slice finds and posts no job for are kept, a bounded number, for direct reclaim, one whose
+eviction raises the free pages outside `promised` taking the place of one only a committed draw may
+take when the list is full; at `CRITICAL` a slice finds the chunks with no accessed page in one
+sweep. A slice ends at the end of a pass, so no slice ages a chunk twice. The granule is the chunk:
+one unmap and one restore fault per chunk, over every run on its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, maps its
 runs into the job slot's input window of its own address space, and the chunk is evicting while

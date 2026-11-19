@@ -282,7 +282,7 @@ deletes any it carries. The reply labels are the stop labels' codes, not `svcmgr
 | label value | Meaning |
 |---|---|
 | `UNAUTHORIZED` (1) | Caller's badge lacks `STOP_AUTHORITY` |
-| `NO_CANDIDATE` (2) | The slot holds no service, the eligibility rule refuses the service (a `restart = never` service among them, which svcmgr does not supervise), no instance runs (it is restarting, or permanently down; a death the kernel shows that svcmgr has not yet routed is routed after the reply), or the key's instance is not the one that runs |
+| `NO_CANDIDATE` (2) | The slot holds no service, the eligibility rule refuses the service (a `restart = never` service among them, which svcmgr does not supervise), no instance runs (it is restarting, waits for memory, or is permanently down; a death the kernel shows that svcmgr has not yet routed is routed after the reply), or the key's instance is not the one that runs |
 | `UNAVAILABLE` (3) | memmgr or procmgr is dead, so a destroy would not be answered, or procmgr did not destroy the process |
 | `0` (`SUCCESS`) | The instance is destroyed; its death is routed after the reply |
 
@@ -437,8 +437,10 @@ svcmgr maintains a growable set of death EventQueues. At
 reconciliation time, every supervised service has its main thread
 bound to one of them, and its address space bound to one, each with the
 `DeathTag` correlator `(instance << 32) | slot`. The
-WaitSet holds the service endpoint (badge 0) and every death queue
-(badge 1).
+WaitSet holds the service endpoint (badge 0), every death queue
+(badge 1), and the memory-pressure Notification that wakes a restart
+waiting for memory (badge 2; [restart-protocol.md § Decision
+tree](restart-protocol.md#decision-tree)).
 
 When the main thread exits (clean or fault), or any thread takes the address space's first
 terminal fault, the kernel posts the death entry `(exit_reason, correlator)` to the queue its

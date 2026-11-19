@@ -31,6 +31,7 @@ use ipc::bootstrap::ServeFailure;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use std::os::seraph::process::ArgvEnvCap;
 use svcmgr_defs::DeathTag;
+use svcmgr_defs::memory_wait::{AfterCreateFailure, CreateFailure, after_create_failure};
 use syscall_abi::SyscallError;
 
 /// Outcome of [`handle_death`], routed by the caller (`dispatch_deaths`
@@ -47,6 +48,11 @@ pub enum DeathOutcome
     /// (restart not attempted, budget exhausted, or restart failed).
     /// Caller must ask the shutdown actuator to power the system off.
     Unrecoverable,
+    /// procmgr refused the restart's create for want of memory while
+    /// memmgr's level read `CRITICAL`: the service is inactive, holds no
+    /// instance, and is retried once the level reads below
+    /// ([`retry_memory_wait`]).
+    WaitingForMemory,
 }
 
 /// Result of a successful `CREATE_FROM_FILE` reply, shared by the
@@ -228,6 +234,21 @@ pub fn walk_and_create_from_file(
     ipc_buf: *mut u64,
 ) -> Option<CreatedProcess>
 {
+    create_from_file(path, blobs, label_bits, procmgr_ep, bootstrap_ep, ipc_buf).ok()
+}
+
+/// [`walk_and_create_from_file`], telling a create procmgr refused with
+/// `OUT_OF_MEMORY` ([`CreateFailure::OutOfMemory`]) from every other failure,
+/// which the restart path decides on ([`after_create_failure`]).
+fn create_from_file(
+    path: &str,
+    blobs: StartupBlobs<'_>,
+    label_bits: u64,
+    procmgr_ep: u64,
+    bootstrap_ep: u64,
+    ipc_buf: *mut u64,
+) -> Result<CreatedProcess, CreateFailure>
+{
     // The argv/env cap holds both blobs; `ArgvEnvCap::settle` once the
     // create call returns gives its run back to memmgr (procmgr has copied
     // the blobs by then, or refused the request), or withholds it on
@@ -238,7 +259,7 @@ pub fn walk_and_create_from_file(
         Err(e) =>
         {
             std::os::seraph::log!(warn: "create: {path:?} argv/env cap failed: {e}");
-            return None;
+            return Err(CreateFailure::Other);
         }
     };
 
@@ -246,7 +267,7 @@ pub fn walk_and_create_from_file(
     else
     {
         std::os::seraph::log!(warn: "create: bootstrap badge mint failed");
-        return None;
+        return Err(CreateFailure::Other);
     };
 
     let root_cap = std::os::seraph::root_dir_cap();
@@ -254,7 +275,7 @@ pub fn walk_and_create_from_file(
     {
         std::os::seraph::log!(warn: "create: no root_dir_cap configured");
         let _ = syscall::cap_delete(badged_creator);
-        return None;
+        return Err(CreateFailure::Other);
     }
     let (file_cap, file_size) = match std::os::seraph::namespace_lookup_file(root_cap, path)
     {
@@ -263,7 +284,7 @@ pub fn walk_and_create_from_file(
         {
             std::os::seraph::log!(warn: "create: NS_LOOKUP {path:?} failed: {e}");
             let _ = syscall::cap_delete(badged_creator);
-            return None;
+            return Err(CreateFailure::Other);
         }
     };
 
@@ -287,7 +308,7 @@ pub fn walk_and_create_from_file(
     {
         std::os::seraph::log!(warn: "create: {path:?} too long a name to verify");
         delete_caps(&[file_cap, badged_creator]);
-        return None;
+        return Err(CreateFailure::Other);
     };
 
     // A failed call may leave `file_cap` and `badged_creator` in svcmgr's
@@ -307,7 +328,7 @@ pub fn walk_and_create_from_file(
         {
             std::os::seraph::log!(warn: "create: CREATE_FROM_FILE ipc failed (err={e})");
             delete_caps(&[file_cap, badged_creator]);
-            return None;
+            return Err(CreateFailure::Other);
         }
     };
     if reply.label == ipc::procmgr_errors::SIGNATURE_REFUSED
@@ -315,14 +336,14 @@ pub fn walk_and_create_from_file(
         std::os::seraph::log!(warn: "create: {path:?} refused: its signature did not verify");
         delete_caps(&[file_cap, badged_creator]);
         delete_caps(reply.caps());
-        return None;
+        return Err(CreateFailure::Other);
     }
     if reply.label != 0
     {
         std::os::seraph::log!(warn: "create: CREATE_FROM_FILE returned {:#x}", reply.label);
         delete_caps(&[file_cap, badged_creator]);
         delete_caps(reply.caps());
-        return None;
+        return Err(create_refusal(reply.label));
     }
     let reply_caps = reply.caps();
     let &[process_handle, thread_cap, ..] = reply_caps
@@ -336,14 +357,27 @@ pub fn walk_and_create_from_file(
         {
             destroy_partial_child(process_handle, 0, ipc_buf);
         }
-        return None;
+        return Err(CreateFailure::Other);
     };
-    Some(CreatedProcess {
+    Ok(CreatedProcess {
         process_handle,
         thread_cap,
         child_badge,
         node_handle: reply_node_handle(path, label_bits, reply_caps),
     })
+}
+
+/// The failure a `CREATE_FROM_FILE` error reply labelled `label` is.
+fn create_refusal(label: u64) -> CreateFailure
+{
+    if label == procmgr_errors::OUT_OF_MEMORY
+    {
+        CreateFailure::OutOfMemory
+    }
+    else
+    {
+        CreateFailure::Other
+    }
 }
 
 /// The node handle a create reply carries as its last cap, after the process
@@ -437,6 +471,13 @@ pub struct RestartCtx
     /// the shutdown actuator's receive-only derivation on every launch
     /// ([`mint_self_death_recv`]). `0` when it could not be made.
     pub self_death_queue: u64,
+    /// The Notification memmgr signals on a change of its pressure level
+    /// (`std::os::seraph::memory_pressure_notification`), in svcmgr's main
+    /// wait set, which wakes a restart that waits for memory
+    /// ([`retry_memory_wait`]). `0` when svcmgr has none, or could not add it
+    /// to the wait set; a create refused for want of memory then ends the
+    /// service down.
+    pub pressure_notification: u64,
 }
 
 /// Handle a service death detected via event queue notification.
@@ -458,6 +499,11 @@ pub struct RestartCtx
 /// same way, its restart charged to the same budget, so the budget bounds the
 /// repeats. Its late posts carry an instance already routed and are dropped.
 ///
+/// A create procmgr refuses for want of memory is decided by
+/// [`after_create_failure`]: the restart waits for memmgr's level to leave
+/// `CRITICAL` ([`retry_memory_wait`]), is decided again at once when the level
+/// already has, or ends the service down as any other failure does.
+///
 /// Returns a [`DeathOutcome`] the caller routes:
 ///
 /// * `Restarted` — service is back up; supervision loop continues.
@@ -466,6 +512,8 @@ pub struct RestartCtx
 /// * `Unrecoverable` — `system_critical` service that restart cannot
 ///   recover. Caller must initiate the graceful-shutdown path (the
 ///   shutdown request through the shutdown actuator's declared name).
+/// * `WaitingForMemory` — the service is down until memmgr's level reads
+///   below `CRITICAL`; the caller does nothing more.
 pub fn handle_death(
     svc: &mut ServiceEntry,
     exit_reason: u64,
@@ -473,6 +521,53 @@ pub fn handle_death(
     tag: DeathTag,
     recipe: Option<&RestartRecipe>,
     registry: &mut registry::Registry,
+) -> DeathOutcome
+{
+    decide_restart(svc, exit_reason, ctx, tag.slot, recipe, registry, true)
+}
+
+/// Retry the restart of `svc`, in table slot `slot`, that waits for memory
+/// ([`ServiceEntry::memory_wait`]), once memmgr's level reads below
+/// `CRITICAL`: the death it waits on is decided again as [`handle_death`]
+/// decides it, the attempt charged to the budget, without the death's lines,
+/// which the death wrote. `None` when the service waits for nothing.
+pub fn retry_memory_wait(
+    svc: &mut ServiceEntry,
+    ctx: &RestartCtx,
+    slot: u32,
+    recipe: Option<&RestartRecipe>,
+    registry: &mut registry::Registry,
+) -> Option<DeathOutcome>
+{
+    let exit_reason = svc.memory_wait.take()?;
+    std::os::seraph::log!("memory freed; retrying the restart of {}", svc.name_str());
+    Some(decide_restart(
+        svc,
+        exit_reason,
+        ctx,
+        slot,
+        recipe,
+        registry,
+        false,
+    ))
+}
+
+/// The restart decision of [`handle_death`] and [`retry_memory_wait`] for
+/// the death of `svc`, in table slot `slot`, with `exit_reason`; `announce`
+/// is whether the death's lines are still to be written.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`announce` is whether the death's lines are still owed, which the retry of a \
+              memory wait has written"
+)]
+fn decide_restart(
+    svc: &mut ServiceEntry,
+    exit_reason: u64,
+    ctx: &RestartCtx,
+    slot: u32,
+    recipe: Option<&RestartRecipe>,
+    registry: &mut registry::Registry,
+    announce: bool,
 ) -> DeathOutcome
 {
     // The log sink's death leaves the master log endpoint with no receiver
@@ -498,14 +593,18 @@ pub fn handle_death(
     {
         DeathLines::Written
     };
+    // The log sink and a reserve service keep the permanent path when their
+    // create is refused (`svcmgr_defs::memory_wait::after_create_failure`).
+    let reserve_path = matches!(recipe, Some(r) if r.log_sink || r.reserve);
     // The routed death, and the deaths of the instances that died during
     // their bootstrap since, with the reason of the last.
     let routed_reason = exit_reason;
     let mut exit_reason = exit_reason;
     let mut bootstrap_deaths: u32 = 0;
+    let mut announce = announce;
     loop
     {
-        if lines == DeathLines::Written
+        if lines == DeathLines::Written && announce
         {
             log_death(svc, exit_reason);
         }
@@ -522,12 +621,50 @@ pub fn handle_death(
             std::os::seraph::log!("restarting (attempt {attempt:#018x})");
         }
 
-        let respawn = restart_process(svc, ctx, tag.slot, recipe, registry);
-        if respawn == Respawn::Failed
+        let respawn = restart_process(svc, ctx, slot, recipe, registry);
+        if let Respawn::Failed(failure) = respawn
         {
-            svc.active = false;
-            return permanent_death_outcome(svc, lines);
+            match after_create_failure(
+                failure,
+                reserve_path,
+                ctx.pressure_notification != 0,
+                pressure_level(),
+            )
+            {
+                AfterCreateFailure::Permanent =>
+                {
+                    svc.active = false;
+                    return permanent_death_outcome(svc, lines);
+                }
+                AfterCreateFailure::RetryNow =>
+                {
+                    // The level fell between procmgr's refusal and the read;
+                    // no later change need be signalled, so the restart is
+                    // decided again now, charged to the budget again, which
+                    // bounds the repeats.
+                    std::os::seraph::log!(
+                        "create refused for want of memory, and the level no longer reads \
+                         CRITICAL; deciding the restart again"
+                    );
+                    announce = false;
+                    continue;
+                }
+                AfterCreateFailure::WaitForMemory =>
+                {
+                    svc.active = false;
+                    svc.memory_wait = Some(exit_reason);
+                    std::os::seraph::log!(
+                        warn: "restart of {} waits for memory: create refused while the \
+                         level reads CRITICAL",
+                        svc.name_str()
+                    );
+                    return DeathOutcome::WaitingForMemory;
+                }
+            }
         }
+        // The entry names the new instance, which routes its deaths; a retry
+        // of a memory wait starts from an inactive entry.
+        svc.active = true;
         // A restart count cannot meaningfully exceed its type, so it
         // saturates; an instance that started counts, whether or not it lived
         // through its bootstrap.
@@ -543,6 +680,7 @@ pub fn handle_death(
         }
         bootstrap_deaths = bootstrap_deaths.saturating_add(1);
         exit_reason = reason;
+        announce = true;
     }
 
     if lines == DeathLines::Held
@@ -561,6 +699,20 @@ pub fn handle_death(
     }
     std::os::seraph::log!("service restarted: {}", svc.name_str());
     DeathOutcome::Restarted
+}
+
+/// memmgr's memory-pressure level (`memmgr_labels::PRESSURE_*`), or `None`
+/// when memmgr does not answer.
+pub(crate) fn pressure_level() -> Option<u64>
+{
+    use std::os::seraph::MemoryPressure;
+    match std::os::seraph::memory_pressure()?
+    {
+        MemoryPressure::Normal => Some(ipc::memmgr_labels::PRESSURE_NORMAL),
+        MemoryPressure::Low => Some(ipc::memmgr_labels::PRESSURE_LOW),
+        MemoryPressure::Critical => Some(ipc::memmgr_labels::PRESSURE_CRITICAL),
+        _ => None,
+    }
 }
 
 /// Whether [`handle_death`] writes a death's lines as it goes, or holds them
@@ -666,8 +818,10 @@ enum Respawn
     /// releases any dead instance.
     DiedInBootstrap(u64),
     /// A step failed: the new child, if one was created, is destroyed, and
-    /// the entry names no instance.
-    Failed,
+    /// the entry names no instance. [`CreateFailure::OutOfMemory`] when procmgr
+    /// refused the create for want of memory, [`CreateFailure::Other`] for
+    /// every other step.
+    Failed(CreateFailure),
 }
 
 /// Release the dead instance, create a new process via procmgr, bind its
@@ -720,15 +874,15 @@ fn restart_process(
         }
     }
 
-    let Some(CreatedProcess {
+    let CreatedProcess {
         process_handle,
         thread_cap: new_thread_cap,
         child_badge,
         node_handle,
-    }) = create_process(svc, recipe, ctx)
-    else
+    } = match create_process(svc, recipe, ctx)
     {
-        return Respawn::Failed;
+        Ok(created) => created,
+        Err(failure) => return Respawn::Failed(failure),
     };
 
     let instance = svc.instance.wrapping_add(1);
@@ -738,7 +892,7 @@ fn restart_process(
         std::os::seraph::log!(warn: "failed to bind the new instance's death observers");
         destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
         delete_caps(&[node_handle]);
-        return Respawn::Failed;
+        return Respawn::Failed(CreateFailure::Other);
     }
     svc.process_handle = process_handle;
     svc.thread_cap = new_thread_cap;
@@ -752,7 +906,7 @@ fn restart_process(
         svc.process_handle = 0;
         svc.thread_cap = 0;
         svc.node_handle = 0;
-        Respawn::Failed
+        Respawn::Failed(CreateFailure::Other)
     };
 
     if !start_process(process_handle, ctx.ipc_buf)
@@ -898,20 +1052,21 @@ fn init_reaped(ctx: &RestartCtx) -> Option<(u64, u64)>
 }
 
 /// Spawn a fresh instance of `svc` via procmgr from its recorded
-/// `vfs_path` ([`walk_and_create_from_file`]), with the recipe's create
+/// `vfs_path` ([`create_from_file`]), with the recipe's create
 /// flags. After create, applies the per-service namespace policy recorded at
 /// registration via `CONFIGURE_NAMESPACE`; on its failure the child is
-/// destroyed and its node handle released.
+/// destroyed and its node handle released. The error says why the create
+/// failed; every failure after it is [`CreateFailure::Other`].
 fn create_process(
     svc: &ServiceEntry,
     recipe: Option<&RestartRecipe>,
     ctx: &RestartCtx,
-) -> Option<CreatedProcess>
+) -> Result<CreatedProcess, CreateFailure>
 {
     if svc.vfs_path.is_empty()
     {
         std::os::seraph::log!(warn: "restart: no vfs_path source for {}", svc.name_str());
-        return None;
+        return Err(CreateFailure::Other);
     }
     let path_str = svc.vfs_path.as_str();
     // Replay argv/env from the stored recipe so the respawned child gets the
@@ -934,7 +1089,7 @@ fn create_process(
             r.stop_source.is_some(),
         )
     });
-    let created = walk_and_create_from_file(
+    let created = create_from_file(
         path_str,
         blobs,
         label_bits,
@@ -947,10 +1102,10 @@ fn create_process(
     if !apply_namespace_policy(svc, cwd, created.process_handle, created.thread_cap, ctx)
     {
         delete_caps(&[created.node_handle]);
-        return None;
+        return Err(CreateFailure::Other);
     }
 
-    Some(created)
+    Ok(created)
 }
 
 /// Apply the namespace policy recorded on `svc` to a freshly-created

@@ -77,6 +77,12 @@ pub struct ServiceEntry
     pub restart_budget: RestartBudget,
     /// Whether this service is currently active.
     pub active: bool,
+    /// The exit reason of the death whose restart waits for memory: procmgr
+    /// refused the create for want of memory while memmgr's level read
+    /// `CRITICAL`, and svcmgr retries it once the level reads below
+    /// (`services/svcmgr/docs/restart-protocol.md` § Decision tree). The entry
+    /// is inactive and holds no instance meanwhile. `None` otherwise.
+    pub memory_wait: Option<u64>,
     /// Whether svcmgr launched the service from its recipe, as against
     /// binding one init started (memmgr, procmgr, devmgr, vfsd). Only a
     /// service svcmgr launched may be stopped
@@ -138,6 +144,7 @@ impl ServiceEntry
             restart_count: 0,
             restart_budget: RestartBudget::new(),
             active: false,
+            memory_wait: None,
             launched: false,
             node_handle: 0,
             bootstrap_badge: 0,

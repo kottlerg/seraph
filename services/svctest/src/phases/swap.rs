@@ -153,6 +153,18 @@ const HOG_BLOCK_PAGES: u64 = 256;
 /// Grants the hog's list has room for, made before the phase's baseline so
 /// the list never grows while the hog holds memory.
 const HOG_MAX_GRANTS: usize = 32_768;
+/// The general slots of svctest's `CSpace` the hog holds free before each
+/// grant ([`HOG_HEADROOM`]): a grant's reply carries a cap for each run, up
+/// to `MSG_CAP_SLOTS_MAX`, and a pool cut into small runs by eviction makes
+/// the hog hold a cap for every few pages.
+const HOG_CSPACE_LOW_WATER: u64 = 64;
+/// The slots each top-up of [`HOG_HEADROOM`] funds.
+const HOG_CSPACE_TOPUP_SLOTS: u64 = 1024;
+/// The hold of svctest's `CSpace` above [`HOG_CSPACE_LOW_WATER`] general
+/// slots (runtime/ruststd/README.md § CSpace slot headroom): the hog's caps
+/// outgrow the slots procmgr seeded.
+static HOG_HEADROOM: std::os::seraph::CSpaceHeadroom =
+    std::os::seraph::CSpaceHeadroom::new(HOG_CSPACE_LOW_WATER, HOG_CSPACE_TOPUP_SLOTS);
 /// Grant region ids one `RELEASE_MEMORY_CAPS` of the hog's release names.
 const RELEASE_BATCH: usize = 32;
 /// How often the hog looks at the level once it holds it.
@@ -363,9 +375,11 @@ impl Hog
         }
     }
 
-    /// Take a grant of `pages` pages; whether memmgr granted it.
+    /// Take a grant of `pages` pages, holding svctest's `CSpace` headroom
+    /// first ([`HOG_HEADROOM`]); whether memmgr granted it.
     fn take(&mut self, pages: u64) -> bool
     {
+        HOG_HEADROOM.hold(startup_info().self_cspace);
         let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
             .word(0, pages)
             .build();

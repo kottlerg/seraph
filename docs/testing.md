@@ -958,7 +958,9 @@ hand. It builds the PR's merge base and its head in one scratch worktree and com
 installed file: an ELF image by its loader-relevant header fields, its program headers and the
 bytes of its `PT_LOAD` segments, and its allocated sections and note sections (the loaders read a
 `.note.seraph.*` section by name); a PE image by its headers and sections, its link time stamps and
-its debug directory aside; the bootloader bundle by its entries; and any other file by its bytes.
+its debug directory aside; in both, the descriptor of a GNU build-id note aside, since the linker
+computes the id over the symbol tables and debug information too; the bootloader bundle by its
+entries; and any other file by its bytes.
 Its verdict line names both commits and the four cells (x86_64 and riscv64, each debug and
 release), and only `IDENTICAL` over all four makes the lines inert. The host side is judged as the
 rest of this section judges it, verdict or not: every line under `xtask/`, and every line of a crate

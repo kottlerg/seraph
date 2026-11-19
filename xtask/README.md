@@ -592,8 +592,8 @@ Each file of a cell's two sysroots is compared by its format:
 
 | File | Compared parts |
 |---|---|
-| ELF image | The type, machine, flags, and entry of the file header; each program header but its file offset, with the bytes of each `PT_LOAD` segment past the file header (whose section-table fields locate data no loader maps); each section that is allocated or is a note, its type, flags, address, size, and bytes, since the loaders read `.note.seraph.*` sections by name |
-| PE image (`boot.efi`) | The headers, the COFF link time stamp and the checksum masked; each section, the debug directory and the data its entries point to masked: the linker writes the time of the link there, and no UEFI loader and no code of the image reads them |
+| ELF image | The type, machine, flags, and entry of the file header; each program header but its file offset, with the bytes of each `PT_LOAD` segment past the file header (whose section-table fields locate data no loader maps); each section that is allocated or is a note, its type, flags, address, size, and bytes, since the loaders read `.note.seraph.*` sections by name; the descriptor of each GNU build-id note masked first, since the linker computes the id over the symbol tables and debug information too and nothing reads it |
+| PE image (`boot.efi`) | The headers, the COFF link time stamp and the checksum masked; each section, the debug directory and the data its entries point to masked: the linker writes the time of the link there, and no UEFI loader and no code of the image reads them; the descriptor of a GNU build-id note is masked as in an ELF image (the riscv64 bootloader's flat binary carries one) |
 | The bootloader bundle | Its header, its entry names in order, and each entry's parts as an image, named `entry <name>: <part>`; an entry's offset and size move with bytes no loader maps and are not compared |
 | Any other file, or an image whose headers do not parse | Its bytes, as the part `contents` |
 

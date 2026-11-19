@@ -6,8 +6,8 @@
 //! Architecture dispatch module.
 //!
 //! This is the only file in svctest permitted to contain `#[cfg(target_arch)]`
-//! guards. A phase reaches the register-file layout through the
-//! `arch::current` re-export.
+//! guards. A phase reaches the register-file layout and the RTC driver's name
+//! through the `arch::current` re-export.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]

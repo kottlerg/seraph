@@ -25,6 +25,7 @@ vfsd/
 │   │                        # UNMOUNT and GET_SWAP_PARTITION handlers
 │   ├── driver.rs            # Spawning fatfs driver instances
 │   ├── partition.rs         # Disk and partition discovery: block I/O over the gpt crate
+│   ├── restart.rs           # Restart of a dead fs driver on its own thread
 │   ├── role_guids.rs        # Compile-time arch-conditional root, ESP, data and swap GUIDs
 │   ├── watch.rs             # The watch thread: fs-driver deaths and disk removals
 │   ├── worker.rs            # Worker thread implementation
@@ -113,10 +114,16 @@ vfsd/
   is `fatfs:` and its mount path (`fatfs:/`, `fatfs:/data`).
 - **Driver death and device loss** — vfsd's main thread, once the
   service threads run, waits on the death queue of every mount and on a
-  watch of devmgr's `block` class. A driver's death tears its mount
-  down and the path falls through to the root filesystem (no restart,
-  #1078); a disk devmgr withdrew is marked removed and each mount on it
-  torn down as a forced unmount; the loss of the root mount's driver or
+  watch of devmgr's `block` class. A driver's death restarts the driver
+  of its mount, revoke and re-resolve: every cap through the dead
+  instance fails closed, a new driver from the installed
+  `/services/fs/fatfs` serves the same partition at the same path, and
+  lookups into the mount are answered `IoError` meanwhile; once the
+  mount's restart budget (shared/restart-budget) is spent, a death tears
+  the mount down and the path falls through to the root filesystem (see
+  [`docs/namespace-composition.md`](docs/namespace-composition.md#driver-restart)).
+  A disk devmgr withdrew is marked removed and each mount on it torn down
+  as a forced unmount; the loss of the root mount's driver or
   disk ends vfsd, and svcmgr shuts the system down. Once the root is
   mounted, vfsd sends `DECLINE_RESTART` on the `block` class SEND for
   the root disk's ordinal, so devmgr does not restart that disk's driver.

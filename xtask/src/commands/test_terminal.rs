@@ -4,8 +4,9 @@
 // xtask/src/commands/test_terminal.rs
 
 //! Terminal interactive test (#111, #291). Launches QEMU (headless) with a QMP
-//! control socket, waits for the guest `terminal` to print its READY marker on
-//! the serial log, then exercises both input sources in one boot:
+//! control socket and the debug port, with the GDB stub staged on the
+//! virtio-input driver. Waits for the guest `terminal` to print its READY
+//! marker on the serial log, then runs three rounds in one boot:
 //!
 //! 1. **Keyboard round** — inject a known key sequence through the virtio-input
 //!    driver over QMP, assert the terminal's local echo and the child's relayed
@@ -14,6 +15,17 @@
 //!    the guest UART receive path (QEMU's `-serial stdio` is bidirectional, so
 //!    host stdin reaches the guest serial RX), assert the same echo + child
 //!    round-trip. This proves the serial-input source (#291).
+//! 3. **Input restart round** — the host kills the virtio-input driver
+//!    through the GDB stub (`debug_stub::kill_held`), devmgr restarts it at the
+//!    class's next ordinal, and the terminal must log that it holds the new
+//!    instance; on a cleared transcript the keyboard sequence is injected again,
+//!    and the round asserts the echo and the relayed child output, which only
+//!    a terminal reading the new instance shows
+//!    (services/devmgr/docs/responsibilities.md § Driver Restart).
+//!
+//! The stub holds every thread of the input driver when it attaches, so the
+//! host connects at once and detaches, which releases it, and attaches again
+//! for the kill.
 //!
 //! The verdict is computed here, not emitted by the guest: the terminal cannot
 //! know the expected sequence, so the host scans the post-READY serial
@@ -21,12 +33,15 @@
 //! exercises a built-in whose output and the shell's `$ ` prompt are asserted
 //! on serial.
 //!
-//! A pure runner: it neither builds nor stages. `terminal.svc` ships in the
-//! default boot set, so a plain `cargo xtask build` + `mkdisk` suffices; the CI
-//! cell re-stages to drop other harness recipes before this boot.
+//! A pure runner: it does not build, and stages only the GDB stub, which it
+//! removes again, repacking the disk images in the layout they had.
+//! `terminal.svc` ships in the default boot set, so a plain `cargo xtask build`
+//! and `mkdisk` suffice; the CI cell re-stages to drop other harness recipes
+//! before this boot.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,12 +51,14 @@ use crate::error::{Context as _, Result, bail};
 use crate::arch::Arch;
 use crate::cli::TestTerminalArgs;
 use crate::context::Context;
+use crate::debug_stub;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
     GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack, build_qemu_argv,
     prepare_riscv_firmware, validate_sysroot_for_launch,
 };
+use crate::qemu_gdb::Stub;
 use crate::qmp;
 use crate::util::{require_tool, step};
 
@@ -94,21 +111,73 @@ const PROMPT: &str = "$ ";
 /// line discipline erases the `x` before sending and translates CR→LF.
 const SERIAL_INPUT: &[u8] = b"helpx\x7f\r";
 
-/// Overall wall-clock budget for boot + inject + assert.
-const TIMEOUT: Duration = Duration::from_mins(3);
+/// The virtio-input driver's process name, which the GDB stub is staged on:
+/// its install path, which devmgr creates it with as its `argv[0]`.
+const INPUT_DRIVER: &str = "/services/drivers/virtio-input";
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "a linear QMP-driven test (boot, wait for READY, inject keys and serial RX, assert \
-              echoed markers). Splitting the sequential assertions would obscure the flow without \
-              reducing complexity"
-)]
+/// The terminal's line once it holds the input driver devmgr restarted at the
+/// class's next ordinal. Kept in sync with `programs/terminal/src/device.rs`.
+const INPUT_REPLACED: &str = "terminal: input driver at ordinal 1";
+
+/// Budget for the stub's answer to the host's first request: the stub
+/// answers once its look for the target at its start has ended
+/// (`services/gdbstub/src/main.rs`).
+const FIRST_ANSWER_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// Budget for any later answer of the stub.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Overall wall-clock budget for boot, the three rounds, and the restart.
+const TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Where the test stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Round
+{
+    /// Waiting for the READY marker.
+    Boot,
+    Keyboard,
+    SerialRx,
+    /// The input driver is killed; waiting for the terminal to hold the
+    /// restarted one.
+    Killed,
+    /// The keyboard sequence again, after the restart.
+    Restarted,
+    Passed,
+}
+
+impl Round
+{
+    /// The round's name in a failure.
+    fn name(self) -> &'static str
+    {
+        match self
+        {
+            Self::Boot => "boot (READY marker never seen)",
+            Self::Keyboard => "keyboard round",
+            Self::SerialRx => "serial round",
+            Self::Killed => "input restart (the terminal never held the restarted driver)",
+            Self::Restarted => "input restart round",
+            Self::Passed => "none",
+        }
+    }
+}
+
 pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
     // Held until the command returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
+    let layout = debug_stub::stage(ctx, args.arch, INPUT_DRIVER)?;
+    let tested = boot(ctx, args);
+    let unstaged = debug_stub::unstage(ctx, args.arch, layout);
+    tested?;
+    unstaged
+}
 
+/// Boot the staged images and run the rounds (see the module documentation).
+fn boot(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
+{
     let (firmware_code, firmware_vars) = match args.arch
     {
         Arch::X86_64 => (find_ovmf_code()?, None),
@@ -125,6 +194,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         .with_context(|| format!("creating {}", sock_dir.display()))?;
     let sock_path = sock_dir.join("terminal-test-qmp.sock");
     let _ = std::fs::remove_file(&sock_path);
+    let debug_port = crate::util::debug_port_or_free(None)?;
 
     let spec = QemuLaunchSpec {
         arch: args.arch,
@@ -146,7 +216,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         x86_paging: X86Paging::Four,
         x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
-        debug_port: None,
+        debug_port: Some(debug_port),
         test_devices: false,
         hotplug_port: None,
     };
@@ -165,7 +235,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     // QEMU stdin feeds the guest UART receive path (`-serial stdio` is
     // bidirectional); the serial round writes the input sequence here.
-    let mut qemu_stdin = child.stdin.take().context("QEMU stdin unavailable")?;
+    let qemu_stdin = child.stdin.take().context("QEMU stdin unavailable")?;
 
     // Read serial on a worker thread so the main thread can enforce the overall
     // timeout via recv_timeout (std pipes have no read deadline).
@@ -186,107 +256,168 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
         }
     });
 
-    let start = Instant::now();
-    // Two input rounds in one boot. `ready` gates the first injection on the
-    // READY marker; `kbd_pass` gates the keyboard→serial transition. The
-    // transcript is cleared between rounds so the serial round's assertions
-    // cannot be satisfied by leftover keyboard output.
-    let mut ready = false;
-    let mut kbd_pass = false;
-    let mut transcript = String::new();
-    let mut verdict: Option<bool> = None;
-    let mut inject_err: Option<crate::error::Error> = None;
-
-    loop
-    {
-        let remaining = TIMEOUT.saturating_sub(start.elapsed());
-        if remaining.is_zero()
-        {
-            break;
-        }
-        let Ok(line) = rx.recv_timeout(remaining)
-        else
-        {
-            break;
-        };
-        println!("{line}");
-
-        if !ready
-        {
-            if line.contains(READY_MARKER)
-            {
-                ready = true;
-                if let Err(e) = qmp::inject_events(&sock_path, EVENTS)
-                {
-                    inject_err = Some(e.context("QMP key injection failed"));
-                    break;
-                }
-            }
-            continue;
-        }
-
-        transcript.push_str(&line);
-        transcript.push('\n');
-        let round_done = transcript.contains(CHILD_LINE)
-            && transcript.contains(PROMPT)
-            && is_subsequence(&transcript, ECHO_SUBSEQUENCE);
-        if !round_done
-        {
-            continue;
-        }
-        if kbd_pass
-        {
-            // Serial round passed too: both input sources verified.
-            verdict = Some(true);
-            break;
-        }
-        // Keyboard round passed; start the serial round on a fresh transcript by
-        // writing the same sequence to the guest UART receive path.
-        kbd_pass = true;
-        transcript.clear();
-        if let Err(e) = qemu_stdin
-            .write_all(SERIAL_INPUT)
-            .and_then(|()| qemu_stdin.flush())
-        {
-            inject_err = Some(crate::error::Error::from(e).context("serial RX injection failed"));
-            break;
-        }
-    }
+    let mut test = Test {
+        arch: args.arch,
+        qmp: &sock_path,
+        debug_port,
+        qemu_stdin,
+        round: Round::Boot,
+        transcript: String::new(),
+        stub: None,
+    };
+    let driven = test.drive(&rx);
 
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
     let _ = std::fs::remove_file(&sock_path);
 
-    if let Some(e) = inject_err
+    driven?;
+    if test.round == Round::Passed
     {
-        return Err(e);
-    }
-    if verdict == Some(true)
-    {
-        step("terminal interactive test: PASS (keyboard + serial input)");
+        step("terminal interactive test: PASS (keyboard + serial input, input driver restart)");
         return Ok(());
     }
-    let phase = if !ready
-    {
-        "boot (READY marker never seen)"
-    }
-    else if !kbd_pass
-    {
-        "keyboard round"
-    }
-    else
-    {
-        "serial round"
-    };
-    let saw_child = transcript.contains(CHILD_LINE);
-    let saw_prompt = transcript.contains(PROMPT);
-    let saw_echo = is_subsequence(&transcript, ECHO_SUBSEQUENCE);
+    let saw_child = test.transcript.contains(CHILD_LINE);
+    let saw_prompt = test.transcript.contains(PROMPT);
+    let saw_echo = is_subsequence(&test.transcript, ECHO_SUBSEQUENCE);
     bail!(
-        "terminal interactive test: incomplete within {}s (failed at {phase}; \
+        "terminal interactive test: incomplete within {}s (failed at {}; \
          prompt={saw_prompt}, child output={saw_child}, local echo={saw_echo})",
-        TIMEOUT.as_secs()
+        TIMEOUT.as_secs(),
+        test.round.name()
     )
+}
+
+/// One boot's test: its inputs, and where it stands.
+struct Test<'a>
+{
+    arch: Arch,
+    /// The QMP socket the keys are injected through.
+    qmp: &'a Path,
+    /// The host port the debug port is attached on.
+    debug_port: u16,
+    /// The guest's serial receive line.
+    qemu_stdin: ChildStdin,
+    round: Round,
+    /// The serial lines since the current round started.
+    transcript: String,
+    /// The connection to the GDB stub, once it has attached.
+    stub: Option<Stub>,
+}
+
+impl Test<'_>
+{
+    /// Take serial lines from `rx` until the rounds pass, the stream ends, or
+    /// [`TIMEOUT`] passes. An error is a failed injection or stub request.
+    fn drive(&mut self, rx: &mpsc::Receiver<String>) -> Result<()>
+    {
+        let start = Instant::now();
+        let attached = format!("{} ({INPUT_DRIVER})", debug_stub::ATTACHED_MARKER);
+        while self.round != Round::Passed
+        {
+            let remaining = TIMEOUT.saturating_sub(start.elapsed());
+            let Ok(line) = rx.recv_timeout(remaining)
+            else
+            {
+                return Ok(());
+            };
+            println!("{line}");
+            if self.stub.is_none() && line.contains(&attached)
+            {
+                self.release_driver()?;
+            }
+            self.transcript.push_str(&line);
+            self.transcript.push('\n');
+            self.advance(&line)?;
+        }
+        Ok(())
+    }
+
+    /// Connect to the stub, which has attached to the input driver and
+    /// holds its threads, and detach, which releases them; the stub attaches
+    /// again at the next `qSupported`.
+    fn release_driver(&mut self) -> Result<()>
+    {
+        let mut stub = Stub::connect_tcp(
+            &format!("127.0.0.1:{}", self.debug_port),
+            FIRST_ANSWER_TIMEOUT,
+        )?;
+        stub.request(b"qSupported")?;
+        stub.set_answer_timeout(ANSWER_TIMEOUT)?;
+        stub.expect_ok(b"D")?;
+        self.stub = Some(stub);
+        Ok(())
+    }
+
+    /// Act on `line`, the latest, for the current round.
+    fn advance(&mut self, line: &str) -> Result<()>
+    {
+        let round_done = self.transcript.contains(CHILD_LINE)
+            && self.transcript.contains(PROMPT)
+            && is_subsequence(&self.transcript, ECHO_SUBSEQUENCE);
+        match self.round
+        {
+            Round::Boot if line.contains(READY_MARKER) =>
+            {
+                self.next(Round::Keyboard);
+                qmp::inject_events(self.qmp, EVENTS).context("QMP key injection failed")?;
+            }
+            Round::Keyboard if round_done =>
+            {
+                // On a fresh transcript, the same sequence on the guest UART.
+                self.next(Round::SerialRx);
+                self.qemu_stdin
+                    .write_all(SERIAL_INPUT)
+                    .and_then(|()| self.qemu_stdin.flush())
+                    .context("serial RX injection failed")?;
+            }
+            Round::SerialRx if round_done =>
+            {
+                let stub = self
+                    .stub
+                    .as_mut()
+                    .context("the GDB stub never attached to the input driver")?;
+                // The stub attaches again, holding the driver, for the kill.
+                stub.request(b"qSupported")?;
+                let pc = debug_stub::kill_held(stub, self.arch, INPUT_DRIVER)?;
+                step(&format!(
+                    "terminal interactive test: moved the input driver's main thread \
+                     from {pc:#x} to 0"
+                ));
+                self.next(Round::Killed);
+            }
+            Round::Killed if line.contains(INPUT_REPLACED) =>
+            {
+                self.next(Round::Restarted);
+                qmp::inject_events(self.qmp, EVENTS).context("QMP key injection failed")?;
+            }
+            // The shell's prompt came before the transcript was cleared, and the
+            // next one waits on a line no later output ends.
+            Round::Restarted
+                if self.transcript.contains(CHILD_LINE)
+                    && is_subsequence(&self.transcript, ECHO_SUBSEQUENCE) =>
+            {
+                self.round = Round::Passed;
+            }
+            Round::Boot
+            | Round::Keyboard
+            | Round::SerialRx
+            | Round::Killed
+            | Round::Restarted
+            | Round::Passed =>
+            {}
+        }
+        Ok(())
+    }
+
+    /// Start `round` on a cleared transcript, so its assertions cannot be
+    /// met by the output of an earlier one.
+    fn next(&mut self, round: Round)
+    {
+        self.round = round;
+        self.transcript.clear();
+    }
 }
 
 /// Whether `needle`'s characters appear in `haystack` in order, not

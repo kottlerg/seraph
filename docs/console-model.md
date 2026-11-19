@@ -131,7 +131,8 @@ direct console paths remain as fallbacks for the life of the system.
      screen when it starts (`FramebufferWriter::new`), so the kernel's console stays on it until
      then.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
-     framebuffer write cap via `QUERY_DEVICE` on its framebuffer class SEND and renders the
+     framebuffer write cap via `QUERY_DEVICE` on its framebuffer class SEND, again on the class
+     watch when devmgr restarts the driver, and renders the
      stdout of its session's leader — the shell (#112) and anything the shell runs — to the
      screen, mirrored to serial.
      This is the production console path: ordinary programs do not resolve the

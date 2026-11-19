@@ -236,7 +236,7 @@ may predate the merge, so it reads the file with `git show origin/master:<path>`
 `git fetch origin`. After such a merge:
 
 - Tell each live worker that reads a changed file to read it again that way. Respawn it instead
-  (§ Spawn) when the change is to how it works on a PR in flight.
+  (§ Spawn, once its task has ended) when the change is to how it works on a PR in flight.
 - Record the changed paths as a ruling (`orch ruling add spawns read from disk: <paths>`), and
   name them in the prompt of every later spawn (§ Spawn): the session's loaded copy of an agent
   file is the old one. The ruling stays in force until a new session starts (§ Failure modes),
@@ -271,9 +271,9 @@ or waiting on you. Two things send you nothing, and each has its own watch:
 - **A worker that is gone.** When a worker's notification says its session ended without a
   hand-back, or a message to it is undeliverable, it is dead: log it, send the stand-down
   message, ask the supervisor in one line to end its task (an agent cannot stop another's), and
-  respawn (§ Spawn). A worker that has handed back is idle, not dead, and silence alone proves
-  nothing: before you act on it, read the worker's status line and the time of the last entry
-  in its output file, the transcript the spawn result names.
+  respawn once it confirms the end (§ Spawn). A worker that has handed back is idle, not dead,
+  and silence alone proves nothing: before you act on it, read the worker's status line and the
+  time of the last entry in its output file, the transcript the spawn result names.
 
 ## Spawn
 
@@ -316,14 +316,17 @@ worker only as an exception that you or the maintainer state for that spawn with
 task that needs that level and that `opus` could not do. When a model falls short, add a check
 the worker can run before raising effort, and raise effort before changing model.
 
-A respawn prompt also carries the dead worker's classified item list, its mechanism choices and
-every answer already given, marked as decisions already made, and names its branch and PR for
-the new worker to continue. When the dead worker's worktree exists, the respawn works in it:
+A respawn prompt also carries the replaced worker's classified item list, its mechanism choices
+and every answer already given, marked as decisions already made, and names its branch and PR for
+the new worker to continue. When the replaced worker's worktree exists, the respawn works in it:
 spawn the worker without worktree isolation, and name the worktree in the prompt, in which the
 worker runs every command by absolute path. The harness does not remove such a worktree when its
-worker stops. Before or with the respawn, send the replaced worker the stand-down message and
-have its task ended (§ Liveness), so a worker presumed dead that wakes does not push over its
-replacement.
+worker stops. At most one agent works in a worktree, and a replaced worker must not wake and push
+over its replacement. So before the respawn, live or presumed dead alike, send the replaced
+worker the stand-down message and have its task ended (§ Liveness), and spawn the replacement
+only after the supervisor has confirmed that the task ended; a worker of an earlier session
+ended with that session (§ Hand-over). The replacement takes the worktree as its predecessor
+left it.
 
 ## Exclusive grant
 
@@ -529,7 +532,8 @@ with `cargo xtask orch end`.
   reason. The maintainer opens a new session and runs `/orchestrate resume`; you are then
   started from the record like any hand-over: run `cargo xtask orch state`, list what each
   worktree holds, and respawn the workers from their branches in their existing worktrees
-  (§ Spawn). Every agent id the record holds is stale in the new session (§ Hand-over).
+  (§ Spawn); the old session's end ended their tasks. Every agent id the record holds is stale in
+  the new session (§ Hand-over).
 - A worker's provider limit ends its session mid-run: complete the mechanical steps yourself in
   its worktree, then resume the worker with the results so it writes the body and runs the
   review with its own context.

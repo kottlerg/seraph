@@ -4,7 +4,7 @@
 // services/svctest/src/phases/oom.rs
 
 //! The out-of-memory policy end to end (services/oomd/docs/operation.md): the
-//! `memhog` fixture fills memmgr's pool up to the system reserve, and oomd
+//! `memhog` fixture fills memmgr's pool down to its growth floor, and oomd
 //! stops it once the level has read `CRITICAL` for its grace, or, with
 //! `OOMD_STOP=no` or no oomd, nothing stops it. With the `stopsrc` fixture
 //! staged, oomd first stops the job that stop source lists, since the program
@@ -90,13 +90,12 @@ const HELD_LINE: &[u8] = b"held: memory critical";
 const RESUMED_LINE: &[u8] = b"resumed after";
 
 /// The pages of the demand region the `oom-touch` child writes, one after
-/// another: twice the largest program the phase starts ([`HOLD_PAGES`]). A
-/// stop frees its candidate's pages above the reserve, where a process outside
-/// the reserve is granted them until memhog's next top-up
-/// (`mem_fill::TICK_MS`) takes them back, and the level stays `CRITICAL`
-/// meanwhile. The writes spend what the stop before them left there, so a
-/// later write is the one memmgr declines and crashd holds, wherever the
-/// first lands against the tick.
+/// another: twice the largest program the phase starts ([`HOLD_PAGES`]). A stop
+/// frees its candidate's pages above the growth floor, where a process outside
+/// the reserve is granted them until memhog's next top-up (`mem_fill::TICK_MS`)
+/// takes them back, and the level stays `CRITICAL` meanwhile. The writes spend
+/// what the stop before them left there, so a later write is the one memmgr
+/// declines and crashd holds, wherever the first lands against the tick.
 const TOUCH_PAGES: u64 = 2 * HOLD_PAGES;
 
 pub fn phases() -> &'static [Phase]
@@ -441,21 +440,21 @@ fn probe(fixture: u64, phase: &str, what: &str) -> (u64, u64)
 
 /// Hold the level at `CRITICAL` for `phase`, through the `memhog` fixture,
 /// which must be staged ([`MEMHOG_RECIPE`]): wait for `NORMAL`, have the
-/// fixture fill the pool up to the reserve, run `during` once the level reads
-/// `CRITICAL`, and wait for the level to fall back to `NORMAL`. oomd's stop of
-/// the fixture ends the window when oomd's recipe is staged in its stop mode,
-/// at least its grace after the fill; otherwise svctest stops the fixture
+/// fixture fill the pool down to the growth floor, run `during` once the level
+/// reads `CRITICAL`, and wait for the level to fall back to `NORMAL`. oomd's
+/// stop of the fixture ends the window when oomd's recipe is staged in its stop
+/// mode, at least its grace after the fill; otherwise svctest stops the fixture
 /// itself, through its stop authority, `hold` after the fill. The fixture's
 /// next instance must then answer with a new nonce and no pages.
 ///
-/// From the fill to the fixture's stop the fixture holds the pool at the
-/// reserve, so a process outside the system reserve takes no free page, except
+/// From the fill to the fixture's stop the fixture holds the pool at the growth
+/// floor, so a process outside the system reserve takes no free page, except
 /// the pages another process frees in the window, which the fixture takes back
 /// only at its next tick (`mem_fill::TICK_MS`). Fails `phase` when the level
 /// does not read `CRITICAL` after the fill, or `NORMAL` after the window,
 /// within [`NORMAL_WAIT`]. `during`, the reads of the level and the stop must
-/// allocate nothing and write no log line; the stack they use is touched
-/// before the fill.
+/// allocate nothing and write no log line; the stack they use is touched before
+/// the fill.
 pub(super) fn critical_window(caps: &Caps, phase: &str, hold: Duration, during: impl FnOnce())
 {
     let stops = oomd_config(phase).is_some_and(|config| config.mode == oomd_policy::Mode::Stop);
@@ -513,8 +512,8 @@ pub(super) fn elapsed_us() -> u64
         .unwrap_or_else(|e| panic!("system_info(ElapsedUs) failed ({e})"))
 }
 
-/// Have the fixture fill the pool up to the reserve: the pages it holds once
-/// the level has settled at `CRITICAL`. Allocates nothing.
+/// Have the fixture fill the pool down to the growth floor: the pages it holds
+/// once the level has settled at `CRITICAL`. Allocates nothing.
 fn hog_call(fixture: u64, phase: &str) -> u64
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();

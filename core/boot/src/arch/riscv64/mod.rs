@@ -274,6 +274,14 @@ pub fn default_pci_windows() -> &'static [(u64, u64)]
     ENTRIES
 }
 
+/// No TPM register window on riscv64: no platform profile the bootloader
+/// targets places a TPM at a fixed range, so a `TPM2` table seeds no
+/// aperture ([`crate::acpi::parse_aperture_seed`]).
+pub fn tpm_register_window() -> Option<(u64, u64)>
+{
+    None
+}
+
 /// Return the platform's maximum physical address width in bits.
 ///
 /// On RISC-V the Privileged spec caps physical addresses at 56 bits

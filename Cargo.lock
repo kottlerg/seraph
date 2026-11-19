@@ -955,6 +955,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tpm"
+version = "0.1.4"
+dependencies = [
+ "driver-binding",
+ "hwrng-protocol",
+ "ipc",
+ "mmio",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "usertest"
 version = "0.1.4"
 dependencies = [

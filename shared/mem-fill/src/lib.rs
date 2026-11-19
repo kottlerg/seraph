@@ -3,7 +3,8 @@
 
 // shared/mem-fill/src/lib.rs
 
-//! Filling memmgr's pool up to the system reserve, for the test fixtures that
+//! Filling memmgr's pool down to its growth floor (the system reserve and,
+//! while chunks are swapped, the restore headroom), for the test fixtures that
 //! drive the out-of-memory paths: the `memhog` fixture
 //! (services/memhog/README.md) and crashme's `oom-fill` mode
 //! (programs/crashme/README.md).
@@ -170,10 +171,10 @@ impl Fill
     }
 }
 
-/// What memmgr can still promise a process outside the reserve, in pages:
-/// its free pages less `promised` and the reserve (`QUERY_POOL_STATUS`'s
-/// `data[3]`, `data[8]` and `data[6]`); `None` when memmgr does not
-/// answer or refuses. Allocates nothing.
+/// What memmgr can still promise a process outside the reserve, in pages: its
+/// free pages less `promised` and the growth floor (`QUERY_POOL_STATUS`'s
+/// `data[3]`, `data[8]` and `data[11]`); `None` when memmgr does not answer or
+/// refuses. Allocates nothing.
 fn available() -> Option<u64>
 {
     let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
@@ -189,7 +190,7 @@ fn available() -> Option<u64>
     (reply.label == memmgr_errors::SUCCESS).then(|| {
         (reply.word(3) / PAGE_SIZE)
             .saturating_sub(reply.word(8) / PAGE_SIZE)
-            .saturating_sub(reply.word(6) / PAGE_SIZE)
+            .saturating_sub(reply.word(11) / PAGE_SIZE)
     })
 }
 

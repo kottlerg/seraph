@@ -106,8 +106,9 @@ unable to grow.
 
 `REQUEST_MEMORY_CAPS(want_pages, flags)` first admits `want_pages` against the caller's budget node
 (§ Distribution policy): a request over the max of the node or of an ancestor fails `LIMIT`, and one
-that would leave fewer free pages outside `promised` ([Commit](#commit)) than the system reserve,
-from a caller outside it, or than none, fails with the out-of-memory code of its flags, before any
+that would leave fewer free pages outside `promised` ([Commit](#commit)) than the growth floor (the
+system reserve and, while chunks are swapped, the restore headroom; § Distribution policy), from a
+caller outside the reserve, or than none, fails with the out-of-memory code of its flags, before any
 run leaves the pool. An admitted request then selects:
 
 1. **`REQUIRE_CONTIGUOUS` set.** Select the smallest run that covers
@@ -159,7 +160,7 @@ can be fewer than the admitted `want_pages`.
 ## Frame contents
 
 Every page memmgr hands out reads zero, or, for a chunk restored from the compressed store, reads
-the contents it was stored with ([Eviction](#eviction); design intent, not yet implemented): each
+the contents it was stored with ([Eviction](#eviction)): each
 run of a `REQUEST_MEMORY_CAPS` grant, and each run a demand fault maps (see [Demand
 faults](#demand-faults)). A pooled run can hold what its last owner
 wrote, and what the kernel left in it: the kernel zeroes a dead object's bytes when it frees them,
@@ -258,24 +259,25 @@ span, that is the whole chunk on its first fault, backed by one run.
 The span is a fault-around preference, and the process's budget node bounds it. memmgr first admits
 as much of the span as the node takes ([Distribution policy](#distribution-policy)): the span,
 clamped to what the max of the node and of every ancestor leaves, and to the free pages outside
-`promised` ([Commit](#commit)) above, for a node outside the system reserve, the reserve. A fault in
-a committed region skips this admission: its commitment carries the span's charge, and `promised`
-its pages ([Commit](#commit)). A fault is declined with code 7 when the reserve
-admits not even the faulting page. It is declined with code 10 only when the max admits not even the
-faulting page, or, when the map needs page-table funding, not the faulting page and the least
-donation beside it, and with code 9 when the reserve refuses that donation. A longer run whose
-funding is refused is shortened first ([Client page-table funding](#client-page-table-funding)). It
-then selects a run covering the admitted pages, as a `REQUIRE_CONTIGUOUS` request would, with the
-deferred recheck before it fails (see [Reclamation](#reclamation)). When no free run covers them, it
-takes the largest free run whole, which needs no split, and maps it over the part of the span around
-the faulting page: from the faulting page up, moved down only as far as needed to stay inside the
-span. A later fault on a page of the span the run did not cover is backed the same way, so the chunk
-fills in parts, each part one run and one frame record. A fault is therefore declined for want of
-RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the
-free pool holds no page, when every free page is in the system reserve and the process's node is
-outside it, or when the split of a run larger than the pages to back fails. A restore of a
-swapped chunk (design intent; not yet implemented) has its own admission
-([Eviction](#eviction)).
+`promised` ([Commit](#commit)) above, for a node outside the system reserve, the growth floor (the
+reserve and, while chunks are swapped, the restore headroom). A fault in a committed region skips
+this admission: its commitment carries the span's charge, and `promised` its pages
+([Commit](#commit)). A fault is declined with code 7 when the growth floor admits not even the
+faulting page. It is declined with code 10 only when the max admits not even the faulting page, or,
+when the map needs page-table funding, not the faulting page and the least donation beside it, and
+with code 9 when the growth floor refuses that donation. A longer run whose funding is refused is
+shortened first ([Client page-table funding](#client-page-table-funding)). It then selects a run
+covering the admitted pages, as a `REQUIRE_CONTIGUOUS` request would, with the deferred recheck
+before it fails (see [Reclamation](#reclamation)). When no free run covers them, it takes the
+largest free run whole, which needs no split, and maps it over the part of the span around the
+faulting page: from the faulting page up, moved down only as far as needed to stay inside the span.
+A later fault on a page of the span the run did not cover is backed the same way, so the chunk fills
+in parts, each part one run and one frame record. A fault is therefore declined for want of RAM
+(code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the free
+pool holds no page, when every free page is in the growth floor (the system reserve and, while
+chunks are swapped, the restore headroom) and the process's node is outside the reserve, or when the
+split of a run larger than the pages to back fails. A fault on an evicting or swapped chunk first
+makes the chunk resident, a restore with its own admission ([Eviction](#eviction)).
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
 protection, and recorded on its chunk's entry with its mapped VA and no region id, and charged to
@@ -300,9 +302,9 @@ entry records:
   of store runs its pages are stored in while it is swapped.
 
 The evicting and swapped states, the pin flag, and the age are the swap path's: memmgr reclaiming
-a cold chunk's runs under memory pressure and storing its pages, a fault restoring them. That path
-is design intent; not yet implemented ([Eviction](#eviction)).
-Today nothing evicts a chunk, so a fault finds its chunk unbacked or resident.
+a cold chunk's runs under memory pressure and storing its pages, a fault restoring them
+([Eviction](#eviction)). A fault on an evicting or swapped chunk makes the whole chunk resident
+before it backs anything, so a resident chunk's every backed page is mapped.
 
 The table is a radix tree of [Metadata Arena](#metadata-arena) slots rooted in the region's node.
 A directory node holds `DIR_FANOUT` (6) children: the slot indices that fit in the slot's largest
@@ -345,7 +347,7 @@ first. So memmgr does not depend on it. When the map of a run fails with `OutOfM
 funds the pool itself and maps the run again, at most four times:
 
 1. It admits four pages against the process's budget node, or two when four would take the
-   subtree of the node or of an ancestor over its max, or would take the system reserve. The demand
+   subtree of the node or of an ancestor over its max, or would take the growth floor. The demand
    run whose map needs the funding is charged only once it is recorded, so the donation is
    admitted against the max beside that run's pages. It then
    selects a contiguous run of the admitted size from the free pool, or of two when no four-page
@@ -366,19 +368,18 @@ run is quiescent by then, or waits on the deferred list until it is (see
 [Reclamation](#reclamation)). The pages move from a free run to the process's entry, so
 `pool_total` is unchanged.
 
-When the budget refuses the funding, because not even two pages fit under the max of the
-process's node or of an ancestor beside the run being mapped, or the reserve refuses it, and the
-run is longer than one page, memmgr returns the run to the free pool and backs the fault again with
-a run at least two pages shorter, down to one page, around the faulting page as before. So the
-funding a fault needs never spends the room its faulting page would fit in. A one-page run whose
-funding the budget refuses is declined with code 10, and one whose funding the reserve refuses with
-code 9. A fault whose map still fails, because the free pool cannot fund the pool or the map fails
-for another reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md)
-§ Kernel-origin fault message). A failed map can leave the first pages of the run mapped. memmgr
-unmaps the run's span, keeping its page tables ([Commit](#commit)), before it returns the run to the
-free pool, so no page of a pooled run stays
-mapped in the process. When that unmap fails, the run stays recorded on the process's entry until
-`PROCESS_DIED`.
+When the budget refuses the funding, because not even two pages fit under the max of the process's
+node or of an ancestor beside the run being mapped, or the growth floor refuses it, and the run is
+longer than one page, memmgr returns the run to the free pool and backs the fault again with a run
+at least two pages shorter, down to one page, around the faulting page as before. So the funding a
+fault needs never spends the room its faulting page would fit in. A one-page run whose funding the
+budget refuses is declined with code 10, and one whose funding the floor refuses with code 9. A
+fault whose map still fails, because the free pool cannot fund the pool or the map fails for another
+reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault
+message). A failed map can leave the first pages of the run mapped. memmgr unmaps the run's span,
+keeping its page tables ([Commit](#commit)), before it returns the run to the free pool, so no page
+of a pooled run stays mapped in the process. When that unmap fails, the run stays recorded on the
+process's entry until `PROCESS_DIED`.
 
 ---
 
@@ -446,9 +447,11 @@ the pages a growth takes are drawn from the region's metadata bound
 
 ## Concurrency
 
-memmgr is single-threaded today: one receive loop owns all bookkeeping. The
-compression worker of [Eviction](#eviction) (design intent; not yet
-implemented) is to be memmgr's second thread, and owns none of it. The
+One receive loop owns all of memmgr's bookkeeping. memmgr's second thread,
+the compression worker of [Eviction](#eviction), owns none of it: it reads
+the pages the loop mapped for its job and writes the job's own buffer, and a
+job slot's state word, written with release and read with acquire ordering,
+hands each slot between the two. The
 bookkeeping is shaped so the SMP pager
 ([#266](https://github.com/kottlerg/seraph/issues/266)), over per-thread IPC
 buffers ([IPC Design](../../../docs/ipc-design.md) § Multi-threaded servers),
@@ -721,23 +724,21 @@ else in the default image, sets a max, so no default per-process ceiling exists.
 
 **System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
 take: a charge to any other node fails as exhaustion when it would leave fewer free pages outside
-`promised` ([Commit](#commit)) than the reserve, and a demand fault of such a node in an
-uncommitted region backs only the free pages outside `promised` above the reserve, declined with
-code 7 when they hold not even the faulting page. A charge to a reserve node may take the reserve,
-but not a page `promised` holds. It is a floor for the core and a limit on no
-process: memmgr's self-funding, which is charged to no node, and the reserve nodes draw on it.
-Reserve membership is an attribute each node takes when it is created, not one its children
-inherit. The nodes of memmgr's boot records
-(procmgr's, and memmgr's and init's own) and of init's children (devmgr, vfsd and svcmgr) are
-reserve nodes, and so is the node of a process created with procmgr's reserve creation flag
-(`CREATE_RESERVE`), which procmgr honours only from a reserve creator, as it does
-`CREATE_PHYS_ACCESS`. A process a reserve
-creator creates without the flag is outside the reserve, so svcmgr's services are outside it
-unless the recipe's `reserve = yes` has svcmgr pass the flag, as oomd's, sessiond's, crashd's and
-logd's do
+`promised` ([Commit](#commit)) than the growth floor, which is the reserve and, while chunks are
+swapped, the restore headroom above it ([Eviction](#eviction), Restore headroom), and a demand fault
+of such a node in an uncommitted region backs only the free pages outside `promised` above the
+growth floor, declined with code 7 when they hold not even the faulting page. A charge to a reserve
+node may take the reserve, but not a page `promised` holds. It is a floor for the core and a limit
+on no process: memmgr's self-funding, which is charged to no node, and the reserve nodes draw on it.
+Reserve membership is an attribute each node takes when it is created, not one its children inherit.
+The nodes of memmgr's boot records (procmgr's, and memmgr's and init's own) and of init's children
+(devmgr, vfsd and svcmgr) are reserve nodes, and so is the node of a process created with procmgr's
+reserve creation flag (`CREATE_RESERVE`), which procmgr honours only from a reserve creator, as it
+does `CREATE_PHYS_ACCESS`. A process a reserve creator creates without the flag is outside the
+reserve, so svcmgr's services are outside it unless the recipe's `reserve = yes` has svcmgr pass the
+flag, as oomd's, sessiond's, crashd's and logd's do
 ([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
-§ `reserve`). The reserve is `pool_total / 64`
-([docs/limits.md](../../../docs/limits.md) § memmgr).
+§ `reserve`). The reserve is `pool_total / 64` ([docs/limits.md](../../../docs/limits.md) § memmgr).
 
 **Create-time ceiling.** procmgr registers each process with its creator's node as the parent (a
 child of init is a top-level node: init's own record holds only init's bootstrap arenas and parents
@@ -801,8 +802,9 @@ Heap](../../../docs/userspace-memory-model.md#byte-heap)).
 pool: for each, its pages that hold no frame yet, and what is left of its page-table reservation and
 of a bound on the metadata its chunk table and run descriptors can take. Every admission reads the
 free pages outside it: a grant, a committed registration or growth, an uncommitted demand run and a
-page-table donation are each admitted only when `free - promised - R >= want`, with R the system
-reserve for a charge to a node outside it and 0 for a charge to a reserve node ([Distribution
+page-table donation are each admitted only when `free - promised - F >= want`, with F the growth
+floor (the system reserve and, while chunks are swapped, the restore headroom) for a charge to a
+node outside the reserve and 0 for a charge to a reserve node ([Distribution
 policy](#distribution-policy)). So no charge takes a free page a committed region's fault needs.
 `QUERY_POOL_STATUS` reports `promised` in `data[8]`, and the pressure level is computed from the
 free pages outside it ([Memory pressure](#memory-pressure)).
@@ -844,8 +846,8 @@ two rounds of one map can take the donated pages first, which costs that map a r
 reservation a donation, and a table in the region's span that a reclaiming unmap the process made or
 asked for removed (its own unmap of pages in a span that shares the table, or its unregistering of a
 region that shares it) is built again. A donation the reservation no longer holds is admitted as any
-other, so the process's budget and the system reserve bound what it takes, and the fault is declined
-with code 10 when the max refuses even that donation, or with code 9 when the reserve does. A
+other, so the process's budget and the growth floor bound what it takes, and the fault is declined
+with code 10 when the max refuses even that donation, or with code 9 when the floor does. A
 committed fault is also declined, with code 9, when its map fails as any map can: no two contiguous
 pages are free for a donation, or a thread of the process maps between the rounds of one map and
 takes the donated pages faster than four rounds fund them. The arena's growth to record a committed
@@ -890,13 +892,14 @@ repeated finds no run in its range and succeeds.
 
 ## Memory pressure
 
-memmgr tells processes how close the free pool is to the system reserve, so a process holding
+memmgr tells processes how close the free pool is to the growth floor, so a process holding
 memory it can give back (a cache) gives it back before a grant is refused. It acts on the level in
 no other way: it only signals, and kills nothing.
 
 **Levels.** The level is computed from the free pool's pages outside `promised`
 ([Commit](#commit)), deferred pages excluded, against `pool_total`. It is `CRITICAL` at or below the
-system reserve (§ Distribution policy), where a grant to a process outside the reserve is refused;
+growth floor, the system reserve and, while chunks are swapped, the restore headroom (§ Distribution
+policy; § Eviction, Restore headroom), where a grant to a process outside the reserve is refused;
 `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A worse level applies
 at once. A better one applies only once the free pool clears that level's threshold by a hysteresis
 band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a pool that hovers at a
@@ -925,90 +928,156 @@ level.
 
 ## Eviction
 
-This section is design intent; not yet implemented
-([#230](https://github.com/kottlerg/seraph/issues/230)). Today memmgr evicts nothing: it fills
-every demand fault from RAM, and exhaustion surfaces as the out-of-memory errors and fault declines
-of [Failure Modes](#failure-modes) and [Demand faults](#demand-faults), and as refused commitments
-([Commit](#commit)).
-
-The ledger's side of eviction is in place in the `memmgr-free-pool` crate, and no memmgr path
-calls it yet: the page codec (`compress.rs`); the stream a chunk's pages are stored as
-(`store.rs`), which holds each backed page as a two-byte header and the page compressed, raw, or
-as nothing for an all-zero page, so a chunk whose every page is zero takes no store page; the
-chunk transitions and their accounting below; the teardown of a swapped chunk, whose store runs
-return to the free pool and whose pages' charge is released; and the clock's sweep, which ages the
-chunks of eligible regions from a harvest of their accessed bits and reports the cold ones.
+Under memory pressure memmgr evicts cold pages it mapped as pager into a compressed store it keeps
+in RAM, and restores them on the next fault on them. The store's pages are part of `pool_total`;
+memmgr performs no device I/O ([Non-Goals](#non-goals)).
 
 **Eligible pages.** memmgr evicts only pages it mapped as pager: the runs it backs on a demand
 fault. It never evicts a granted frame, since a client holding a Memory cap to it may have retyped,
 sent or DMA-mapped it; a page of a process whose budget node is a reserve node ([Distribution
 policy](#distribution-policy)), since those processes free memory under exhaustion and must not
-wait on a restore to do so; or a page of a region registered no-evict. A spawned thread's IPC
-buffer is a grant ([Userspace Memory Model § Page
+wait on a restore to do so; a page of a region registered with `REGION_NO_EVICT`
+([`ipc-interface.md`](ipc-interface.md) § Label 7); or a page of a process with no delegated
+address space, whose accessed bits memmgr cannot read. A spawned thread's IPC buffer is a grant
+([Userspace Memory Model § Page
 Reservations](../../../docs/userspace-memory-model.md#page-reservations)), and init, memmgr and
 procmgr have no pager, so eviction never reaches a page the kernel's non-restartable IPC-buffer
 copies use.
 
-**Overcommit allowance.** Every admission's test ([Commit](#commit)) gains an overcommit allowance
-A: `free - promised - R + A >= want`. With A = 0, a fault on a committed page draws from `promised`
-as today, so it is not declined for budget or RAM ([Commit](#commit)). With A = 0 memmgr evicts only
+**Overcommit allowance.** Every admission's test ([Commit](#commit)) is to gain an overcommit
+allowance A: `free - promised - R + A >= want`. A is 0, so a fault on a committed page draws from
+`promised`, and is not declined for budget or RAM ([Commit](#commit)), and memmgr evicts only
 uncommitted pages (thread stacks, heap floors, `register_demand_paged` regions): evicting an
 uncommitted chunk frees its frames less the store pages its contents take, while evicting a
-committed chunk only adds store pages against `promised`. A ships at 0. Above 0, heap pages are
-evictable too, and a committed fault that finds no frame compresses a victim within its turn or is
-declined as a commit overrun.
+committed chunk would only add store pages against `promised`. An allowance above 0 is design
+intent; not yet implemented ([#230](https://github.com/kottlerg/seraph/issues/230)): heap pages
+would be evictable too, and a committed fault that finds no frame would compress a victim within
+its turn or be declined as a commit overrun.
 
-**Selection.** While the pool's pressure level reads `LOW` or `CRITICAL`
-([Memory pressure](#memory-pressure)), memmgr reclaims until it reads `NORMAL`,
-and stops there. Each reclaiming turn reads and clears the accessed bits of a bounded slice of the
-eligible regions through the kernel's harvest syscall and ages each chunk with its two-bit age
-([Chunk table](#chunk-table)): a chunk with no accessed page in two sweeps is a victim. The granule
-is the chunk: one unmap and one restore fault per chunk, over every run on its run list.
+**Selection.** While the pool's pressure level reads `LOW` ([Memory pressure](#memory-pressure)),
+memmgr reclaims in the background until it reads `NORMAL`, and stops there. It does not reclaim in
+the background at `CRITICAL`: the free pages above the growth floor are gone, so every frame an
+eviction frees past the restore headroom goes to the next admission, which a process draining the
+pool makes before any victim faults. Eviction makes room for the processes that run while memory is
+low; at `CRITICAL` only a restore evicts, for itself (Direct reclaim, below), and the pool is
+otherwise left to the out-of-memory path (crashd's hold of a declined fault, oomd's stop of a job).
+While the level reads `LOW` or `CRITICAL`, the receive loop waits for a message a bounded time and,
+at most once per sweep interval, runs a slice of the clock: a hand walks the eligible regions of
+each process in turn, a bounded number of steps a slice ([docs/limits.md](../../../docs/limits.md)
+§ memmgr gives the interval and the bounds). For each span of up to 256 chunks it reads and clears
+the accessed bits with one `SYS_ASPACE_HARVEST`, and ages each resident chunk of the span with its
+two-bit age ([Chunk table](#chunk-table)): a chunk with no accessed page in two sweeps is cold, and
+at `LOW` the slice posts one job for each cold chunk, as many as the compression worker has free job
+slots. The victims a slice finds and posts no job for are kept, a bounded number, for direct
+reclaim; at `CRITICAL` a slice finds the chunks with no accessed page in one sweep. A slice ends at
+the end of a pass, so no slice ages a chunk twice. The granule is the chunk: one unmap and one
+restore fault per chunk, over every run on its run list.
 
-**States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, and the
-chunk is evicting while the compression worker stores its pages; a fault on an evicting chunk remaps
-the same frames and cancels the job. Once stored, the chunk is swapped: its runs return to the free
-pool and its entry's link holds the head of its store-run list. An all-zero page takes no store
-space. A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
+**States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, maps its
+runs into the job slot's input window of its own address space, and the chunk is evicting while
+the compression worker stores its pages. A fault on an evicting chunk maps the same runs back and
+cancels the eviction: the job's completion is then stale, since the chunk's entry names the job
+slot of the eviction in flight. Once stored, the chunk is swapped: its runs return to the free pool
+and its entry's link holds the head of its store-run list. An all-zero page takes no store space,
+and a chunk whose every page is zero takes no store page. A stream that would take as many pages as
+the chunk's backed pages gains nothing: memmgr maps the runs back, and the chunk stays resident.
+
+A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
 bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
-any ancestor, since the node stays charged for its evicted pages, so it is never declined with
-code 10. A restore of a committed chunk is a committed fault: it draws from `promised` as any
-committed fault does ([Commit](#commit)), and with A above 0 a restore that finds no frame
-compresses a victim within its turn or is declined as a commit overrun. A restore of an uncommitted
-chunk passes the RAM test of an uncommitted demand run, `free - promised - R + A >= want`, with want
-the chunk's backed pages and R the system reserve for a node outside it and 0 for a reserve node,
-after the deferred recheck ([Distribution policy](#distribution-policy), System reserve), and is
-otherwise declined with code 7, the chunk staying swapped and its store slot kept. The chunk is the
-granule, so a restore is never clamped to part of a chunk. memmgr takes runs covering exactly the
-chunk's backed pages (no run spans an unbacked page of a chunk backed in parts), selected as a
-demand fault selects ([Demand faults](#demand-faults), run selection only), maps them in a scratch
-window of its own, and writes every byte of every page of each run there before it maps the run into
-the process: it decompresses each stored page and zero-fills each all-zero page, which takes no
-store space. That full write replaces the hand-out clear of [Frame contents](#frame-contents), so no
-byte of a run's earlier owner reaches the process. It then frees the store slot and resumes the
-thread.
+any ancestor, since the node stays charged for its evicted pages, so it is never declined with code
+10. A restore of an uncommitted chunk passes the RAM test of an uncommitted demand run, `free -
+promised - R >= want`, with want the chunk's backed pages and R the system reserve for a node
+outside it and 0 for a reserve node, after the deferred recheck ([Distribution
+policy](#distribution-policy), System reserve): R, not the growth floor, so the restore draws on the
+restore headroom (below). When the free pages do not admit it, memmgr reclaims
+directly (Direct reclaim, below), and declines the restore with code 7 only when that does not make
+room, the chunk staying swapped and its store kept. With an allowance above 0, a restore of a
+committed chunk would be a committed fault, drawing from `promised` as any committed fault does
+([Commit](#commit)). The chunk is the granule, so a restore is never clamped to part of a chunk.
+memmgr takes runs covering exactly the chunk's backed pages (no run spans an unbacked page of a
+chunk backed in parts), selected as a demand fault selects ([Demand faults](#demand-faults), run
+selection only), maps the chunk's store runs at a stream window and each new run at the scrub window
+of its own address space ([Frame contents](#frame-contents)), and writes every byte of every page of
+each run there before it maps the run into the process: it decompresses each stored page and
+zero-fills each all-zero page. That full write replaces the hand-out clear of [Frame
+contents](#frame-contents), so no byte of a run's earlier owner reaches the process. It then returns
+the store runs to the free pool and resumes the thread. A stream that does not decode, which only a
+corruption of memmgr's memory makes, declines the fault with code 9 and detail 0, the chunk staying
+swapped.
 
-**Compression worker.** Compression runs in one raw `no_std` thread of memmgr below the receive
-loop's priority, which touches no ledger state: it takes a job from a single-producer ring,
-compresses the chunk into store pages the loop supplied, and posts the store handle to a completion
-ring, which the loop drains at the start of each turn. The compressor is LZ4-class, `no_std`, and
-written in the tree.
+**Direct reclaim.** A restore the free pages do not admit evicts victims itself, in its turn, before
+it is declined: the kept victim of the greatest age first, checked again as resident, eligible, and
+unaccessed for at least one sweep, and its pages' accessed bits read once more
+(`SYS_ASPACE_HARVEST`), since its age is the one the last sweep over it recorded: a set bit resets
+its age and passes it over. So a chunk accessed or restored since the last sweep is never taken and
+two processes cannot trade one chunk turn after turn. Any eligible process's chunk may be
+taken, the faulting process's own included. For each, memmgr unmaps the chunk, maps its runs at the
+input window of a synchronous slot of its own, compresses it into that slot's output buffer with a
+hash table of its own, so it shares nothing with the worker, unmaps the window, takes the store
+pages, writes the stream and swaps the chunk, whose runs return to the free pool in the same turn; a
+stream that gains nothing maps the chunk back. It stops when the restore is admitted, or after a
+bounded number of victims ([docs/limits.md](../../../docs/limits.md) § memmgr), and the restore is
+then declined with code 7. The store pages a victim takes can dip below the reserve for the rest of
+the turn, where no other admission runs, and each victim kept leaves more free pages than it took.
+Only a restore reclaims directly: a first touch of an unbacked page grows its node's charge, and at
+the growth floor that growth stays the out-of-memory path's, while a restore returns pages its node
+is charged for already. Compression in the loop costs a restore's turn at most that bound's
+compressions, on a fault that would otherwise be declined; background eviction compresses in the
+worker, so its latency lands on no fault or grant.
 
-**Accounting.** The identity `system_ram == kernel_reserved + pool_total` holds across eviction
-and restore, with `pool_total = free + deferred + Σ records + metadata + store`, where `store` is
-the pages the compressed store holds. A budget node stays charged for its evicted pages: a charge
-counts logical pages, resident and swapped. `QUERY_POOL_STATUS` reports the store's size and the
-swapped pages' size, and `QUERY_MEMORY_USAGE` a process's resident and swapped pages apart.
+**Restore headroom.** While chunks are swapped, a charge to a node outside the reserve leaves a
+restore headroom H free above the reserve R: the swapped pages, and at most R, so it is admitted
+when `free - promised - R - H >= want` with `H = min(swapped, R)`, and the level is `CRITICAL` at or
+below `R + H` ([Memory pressure](#memory-pressure)). A restore is admitted against R alone, so it
+draws on H. Without it, the frames background eviction frees at `LOW` go to a process draining the
+pool, whose grants are never victims, and by `CRITICAL` the evicted chunks of idle processes, a
+filesystem driver's thread stacks woken by the pressure signal among them, find neither a free page
+nor a victim, and their faults are declined. With it, the restores of up to R swapped pages find
+their frames whatever a drainer took, and direct reclaim covers the rest. The cost falls on growth:
+each chunk eviction swaps raises H by its pages and frees them less its store pages, so eviction
+gives growth no page until H reaches R. With nothing swapped H is 0, and every admission and level
+is as it is without eviction. H is at most R, a sixty-fourth of the pool, so `LOW`'s threshold stays
+above `CRITICAL`'s. `QUERY_POOL_STATUS` reports `R + H` as `growth_floor_bytes`
+([ipc-interface.md](ipc-interface.md) § Label 6). The computation is the host-tested `free-pool`
+function `budget::growth_floor`.
+
+**Compression worker.** Compression runs in one raw `no_std` thread of memmgr, at the top of the
+fair class (`ipc::sched_policy::MEMMGR_WORKER_PRIORITY`), below the receive loop's priority. It
+touches no ledger state: it waits on a Notification, takes each job the loop posted, compresses
+the chunk from the slot's input window into the slot's own output buffer in memmgr's image, and
+marks the slot done. A slot's state word, written with release and read with acquire ordering,
+hands the slot's buffer from one thread to the other. The loop drains the done slots at each turn:
+it unmaps the input window, takes exactly the store pages the stream needs from the free pool,
+writes the stream into them through the stream window, and swaps the chunk. No Notification can
+wake a receive on an endpoint, so while a job is in flight the loop's receive waits a bounded time
+([docs/limits.md](../../../docs/limits.md) § memmgr), and a receive with no job in flight and no
+reclaim waits for a message as before. The compressor is LZ4-class, `no_std`, and written in the
+tree (`memmgr-free-pool`'s `compress.rs`), as is the stream format (`store.rs`): each backed page
+as a two-byte header and the page compressed, raw, or, for an all-zero page, nothing. When memmgr
+cannot start the worker at boot it evicts nothing.
+
+**Accounting.** The identity `system_ram == kernel_reserved + pool_total` holds across eviction and
+restore, with `pool_total = free + deferred + Σ records + metadata + store`, where `store` is the
+pages the compressed store holds. The worker's thread and Notification are memmgr's metadata. A
+budget node stays charged for its evicted pages: a charge counts logical pages, resident and
+swapped. `QUERY_POOL_STATUS` reports the store's size and the swapped pages' size, and
+`QUERY_MEMORY_USAGE` a process's resident and swapped pages apart
+([`ipc-interface.md`](ipc-interface.md)).
 
 **Debugger reads.** `SYS_THREAD_READ_MEM` fails on a page that is not present and does not ask
 the pager
 ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_thread_read_mem-60)
 § `SYS_THREAD_READ_MEM`). A debugger or crash service that gets that failure on a page of an
-evicted chunk asks procmgr, through the debug authority, to make the range resident; only a holder
-of the debug authority may ask, and memmgr takes the request from procmgr alone. procmgr has
-memmgr restore each evicted chunk of the range, which counts as an access in the chunk's age, and
-the reader retries. The request restores and backs nothing else: a page no fault has backed stays
-not present.
+evicted chunk asks procmgr, through the debug authority, to make the range resident
+(`MAKE_RESIDENT`, [procmgr's IPC interface](../../procmgr/docs/ipc-interface.md)); only a holder of
+the debug authority may ask, and memmgr takes the request from procmgr alone
+([`ipc-interface.md`](ipc-interface.md) § Label 21). memmgr restores each swapped chunk of the
+range, and maps back each evicting one; either counts as an access in the chunk's age. It walks
+only the chunks that have an entry, and one request makes at most a few chunks resident and visits
+at most a bounded number ([docs/limits.md](../../../docs/limits.md) § memmgr); its reply says where
+it stopped, and the reader asks again from there, so a request's turn delays the faults and grants
+behind it no more than a few restores would. The reader then retries its read. The request
+restores and backs nothing else: a page no fault has backed stays not present.
 
 ---
 
@@ -1016,8 +1085,8 @@ not present.
 
 | Failure | Cause | Caller observation |
 |---|---|---|
-| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the system reserve from a caller outside it | Reply with error label; caller may retry without the flag, or fail |
-| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the system reserve from a caller outside it ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the growth floor from a caller outside the system reserve | Reply with error label; caller may retry without the flag, or fail |
+| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the growth floor from a caller outside the system reserve ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `LIMIT` | `want_pages`, or a committed registration's or growth's charge, would take the subtree of the caller's budget node, or of an ancestor, over its max | Reply with error label; caller treats as its own budget refusing, not as RAM exhaustion |
 | `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `TOO_MANY_PROCESSES` | A process record, its caps node or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
@@ -1033,8 +1102,8 @@ terminal fault tears down the whole process (see
 
 ## Non-Goals
 
-- **Disk swap.** The eviction store ([Eviction](#eviction); design intent, not
-  yet implemented) is compressed RAM inside `pool_total`. Its disk tier
+- **Disk swap.** The eviction store ([Eviction](#eviction)) is compressed
+  RAM inside `pool_total`. Its disk tier
   belongs to a separate swap service
   ([#43](https://github.com/kottlerg/seraph/issues/43)); memmgr performs no
   device I/O. memmgr evicts only pages it mapped as pager, never a grant, a

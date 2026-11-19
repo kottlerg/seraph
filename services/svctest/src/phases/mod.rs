@@ -48,6 +48,12 @@
 //!     first-contribution line, logged once at entropyd's start, from logd's
 //!     history, which a later phase's lines could evict and which the next
 //!     logd instance does not hold.
+//! 12. [`swap`] after every phase that uses the `memhog` fixture ([`svcmgr`],
+//!     [`oom`], [`logd_restart`]): it holds the level at `CRITICAL` while it
+//!     restores chunks from the restore headroom, which on a slow host outlasts
+//!     oomd's grace. oomd then stops memhog, and svcmgr's restart of it, made
+//!     while the level still reads `CRITICAL`, fails, which leaves memhog down
+//!     with its endpoint still published.
 
 use crate::runner::Phase;
 
@@ -85,6 +91,7 @@ pub mod sessiond;
 pub mod shmem;
 pub mod startup;
 pub mod svcmgr;
+pub mod swap;
 pub mod threading;
 pub mod timed;
 pub mod unmount;
@@ -135,6 +142,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(logd_restart::phases());
+    out.extend_from_slice(swap::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());

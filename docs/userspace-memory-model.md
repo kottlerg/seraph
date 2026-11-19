@@ -385,7 +385,10 @@ needs its own base reads the lld-synthesized `__ehdr_start` symbol's
 address; debugging correlates through the creator's spawn log line
 (procmgr: `spawn image bias=0x…`; init: `init: <svc> image bias=0x…`;
 kernel Phase 9: `init: PIE bias=0x…`) and loads symbols with
-`add-symbol-file <binary> -o <bias>` in GDB.
+`add-symbol-file symbols/<file> -o <bias>` in GDB, `<file>` being the
+store file `symbols/manifest` lists for the image's install path: the
+installed image is stripped
+([build-system.md](build-system.md#symbols-store) § Symbols Store).
 
 ### Growth Zones
 

@@ -28,6 +28,7 @@ xtask/
 │   ├── disk.rs                 # GPT disk-image construction from the sysroot
 │   ├── error.rs                # Error type with its context chain; Context, err!, bail!, ensure!
 │   ├── fat.rs                  # FAT16/FAT32 volume writer on fatfs-parse (mkdisk)
+│   ├── fat_read.rs             # FAT volume reader on fatfs-parse (check-disk, the disk tests)
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
@@ -56,7 +57,8 @@ xtask/
 │   │                           #   test, crypto_vectors, compare_images, test_crash_report,
 │   │                           #   test_core_death, test_debug_port, test_hotplug,
 │   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
-│   │                           #   test_reboot, test_terminal, test_vmgenid, test_wedge, lint_docs,
+│   │                           #   test_reboot, test_terminal, test_tpm, test_vmgenid, test_wedge,
+│   │                           #   lint_docs,
 │   │                           #   pr_check,
 │   │                           #   review, release_scope, issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
@@ -116,20 +118,23 @@ when the image has no such section. No other build has the check.
 Every object a build packs is signed once, in the sysroot, as [docs/signing.md](../docs/signing.md)
 § Signing specifies: each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every
 command that repacks) signs in place the kernel installed at `boot/kernel` (`kernel`, the kernel
-role), every ELF image under `services/`, `programs/` and `tests/` (under its install path with
-the role of its location, and the boot-module role when a bundle list names it as an entry;
+role), every ELF image under `services/`, `programs/` and `tests/` (under its install path with the
+role of its location, and the boot-module role when a bundle list names it as an entry;
 `/services/init` as `init` with the init role, and `/tests/ktest` too when the pack composes the
 ktest harness's bundle), and every other file a bundle list names, the data files installed under
 `/config/` (the boot-module role). A pack signs for the harness recorded in `sysroot/.harness`
-([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot), then composes the
-ESP (`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and composes the
-bundle by copying the installed files the harness's list in `config/bundle/` names
-(`src/bundle.rs`). The composition signs nothing and reads no key; it verifies the kernel and each
-bundle entry as the bootloader will before it writes them. Every signed object is verified under
-the build's trust store, with each of its roles, its name and the architecture its loaders expect,
-before it is written. Each command derives the store from the signing identity and the deployer's
-store its environment names. `cargo xtask build` passes the store's path to the bootloader's build
-in `SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader embeds it. Every pack
+([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot), then composes the ESP
+(`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and composes the bundle by
+copying the installed files the harness's list in `config/bundle/` names (`src/bundle.rs`). The
+composition signs nothing and reads no key; it verifies the kernel and each bundle entry as the
+bootloader will before it writes them, and once it has written the ESP, reads it back and refuses it
+unless every object on it equals its installed file and it holds no other file than a presence-only
+knob ([docs/boot-media.md](../docs/boot-media.md) § The ESP; [`check-disk`](#cargo-xtask-check-disk)
+makes the same check of a packed image). Every signed object is verified under the build's trust
+store, with each of its roles, its name and the architecture its loaders expect, before it is
+written. Each command derives the store from the signing identity and the deployer's store its
+environment names. `cargo xtask build` passes the store's path to the bootloader's build in
+`SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader embeds it. Every pack
 after that (the build's own, `compose-bundle`, `mkdisk` including `--repack-only`, and the harness
 commands that repack) reads the store out of the installed bootloader, `boot/boot.efi`, and refuses
 to sign when it is missing, holds no marker or two, or embeds another store; the error names the
@@ -179,7 +184,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | Option | Description |
 |---|---|
 | `--arch` | Target architecture (default: `x86_64`) |
-| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39; see [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) § Image Placement): take the bias from the creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file <binary> -o <bias>` |
+| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39; see [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) § Image Placement): take the bias from the creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file symbols/<file> -o <bias>`, `<file>` being the store file `symbols/manifest` lists for the image's install path: the installed image is stripped and carries no symbols ([docs/build-system.md](../docs/build-system.md#symbols-store) § Symbols Store) |
 | `--headless` | Run without a display window (`-display none`) |
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=8192`, `boot_protocol::MAX_CPUS`, the boot protocol's CPU ceiling) |
@@ -227,7 +232,9 @@ interrupt remapping makes a KVM launch's machine `q35,kernel-irqchip=split`, and
 in Bare mode on riscv64, with the disks, the keyboard, and the RNG behind it (`iommu_platform=on`).
 The firmware drives the RNG first (EDK2's `VirtioRngDxe` serves the bootloader's `EFI_RNG_PROTOCOL`
 draw on riscv64; OVMF binds it on x86-64, where its RDRAND driver answers the draw), and at run time
-devmgr binds the `virtio-rng` driver of the `hwrng` class to it. The riscv64 IOMMU is the first
+devmgr binds the `virtio-rng` driver of the `hwrng` class to it. A launch of `test-tpm` alone
+(x86-64) attaches a TPM 2.0, `tpm-tis` or `tpm-crb` on an `swtpm` socket, and leaves the RNG
+out ([§ `cargo xtask test-tpm`](#cargo-xtask-test-tpm)). The riscv64 IOMMU is the first
 device of the command line, pinned at 00:01.0, so every auto-placed device takes a slot above it:
 QEMU's ACPI RIMT describes the IOMMU as translating only the requester IDs above its own.
 `--test-devices` adds, on both architectures, `-device edu,dma_mask=0xffffffff`, QEMU's DMA test
@@ -399,9 +406,11 @@ contract.
 ### `cargo xtask check-disk`
 
 Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with
-`fsck.fat -n` from dosfstools, a reader independent of the writer in `src/fat.rs`. Runs in CI's
-`validate` job after each cell stages its image
-([docs/build-system.md](../docs/build-system.md) § Continuous Integration).
+`fsck.fat -n` from dosfstools, a reader independent of the writer in `src/fat.rs`, then check
+that every object on the ESP of `disk.img` equals the installed file on its root partition that
+it copies ([docs/boot-media.md](../docs/boot-media.md) § The ESP). Runs in CI's `validate` job
+after each cell stages its image ([docs/build-system.md](../docs/build-system.md) § Continuous
+Integration).
 
 ```
 cargo xtask check-disk
@@ -411,6 +420,20 @@ The command reads each image's GPT through vfsd's parser (`vfsd-gpt`), copies ev
 but the raw swap partition to `target/xtask/check-disk/`, and runs `fsck.fat -n`, which
 changes nothing, on the copy. It fails on the first volume `fsck.fat` does not pass, printing
 what `fsck.fat` printed, and when `fsck.fat` is not on `PATH`, naming the package to install.
+
+It then reads the ESP and the root partition of `disk.img` with xtask's FAT reader
+(`src/fat_read.rs`, built on the `fatfs` service's decoders) and makes the check every pack
+makes of the ESP it composes (`src/esp.rs`): the bootloader at both of its paths equals
+`/boot/boot.efi`, the kernel `/boot/kernel`, and each entry of the bundle the installed file
+its bundle list names, the list read from the root partition's `/config/bundle/` and the
+harness chosen by the bundle's entries; the bundle holds every entry its list names and no other;
+and the ESP holds no other file than an empty presence-only knob in `\EFI\seraph\`, the
+firmware's `\NvVars` aside: OVMF writes its variables there when an x86_64 launcher boots the
+image without a variable store, so an image that has been booted is checked as well as a fresh
+one, the reader following chains the guest or the firmware fragmented. The architecture is the
+root partition's type. It fails naming every object that differs, is
+missing, or copies a file the root partition does not install, so a repack that changed one side
+of the image alone is caught.
 
 ---
 
@@ -1041,6 +1064,42 @@ cargo xtask test-vmgenid [--cpus N] [--mem MIB]
 See [docs/testing.md](../docs/testing.md) for the harness model and
 [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) for the
 snapshot-detection design.
+
+---
+
+### `cargo xtask test-tpm`
+
+Check the TPM 2.0 driver, x86_64 only: QEMU's TPM devices sit in the PC Client TPM range, which
+the riscv64 `virt` machine does not decode
+([docs/testing.md](../docs/testing.md#tpm-test-tpm) § TPM). Boots the current sysroot headless
+twice, once with QEMU's `tpm-tis` device (the FIFO interface) and once with `tpm-crb` (the CRB
+interface), each backed by an `swtpm` emulator the command starts on a fresh state directory
+under `target/xtask/tpm/`, so each boot meets a TPM no firmware or earlier boot has used. A TPM
+launch leaves `virtio-rng-pci` out, so the TPM driver is the `hwrng` class's only member, and
+OVMF's own RDRAND-backed `EFI_RNG_PROTOCOL` answers the bootloader's draw. Each boot passes on the
+TPM driver's line naming the interface it found, its `first READ answered:` line, and
+entropyd's `entropy contribution accepted:` line naming `hwrng ordinal 0`, which can then only
+be the TPM's.
+
+A pure runner with the same boot requirements as `test-terminal`, and `swtpm` on the host
+(the `swtpm` package; the command names the install command of each common distribution when
+it is missing):
+
+```sh
+cargo xtask build --arch x86_64
+cargo xtask mkdisk
+cargo xtask test-tpm [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+Each boot is bounded by three minutes, and `swtpm` by ten seconds to create its control socket.
+The command fails, killing QEMU and the emulator, on either bound, on an emulator that exits
+early, and on a missing line. See
+[services/drivers/docs/tpm.md](../services/drivers/docs/tpm.md) for the driver's design.
 
 ---
 
@@ -1915,10 +1974,10 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
 `crypto-vectors`, `compare-images` and `test-signing` as builds (`CliCommand::build_host` in
-`src/cli.rs` names them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`,
-`test-reboot`, `test-powerbutton`, `test-core-death`, `test-cet`, `test-kaslr`, `test-map-redo`,
-`test-log-level`, `test-debug-port`, `test-hotplug`, `test-gdb`, `test-signing` and `capture-acpi`
-as boots.
+`src/cli.rs` names them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-tpm`,
+`test-wedge`, `test-reboot`, `test-powerbutton`, `test-core-death`, `test-cet`, `test-kaslr`,
+`test-map-redo`, `test-log-level`, `test-debug-port`, `test-hotplug`, `test-gdb`, `test-signing` and
+`capture-acpi` as boots.
 `test-signing`, which compiles a bootloader before it boots, is admitted as a build when it starts
 and as a boot before its first boot.
 

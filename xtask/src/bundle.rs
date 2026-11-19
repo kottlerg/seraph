@@ -78,33 +78,52 @@ pub fn list_path(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<Pat
     list_in(&ctx.sysroot.join(LIST_DIR), arch, harness)
 }
 
-/// The bundle list of `harness` for `arch` in `dir`:
+/// The bundle list of `harness` for `arch` in `dir` ([`list_name`]).
+///
+/// # Errors
+///
+/// When `dir` holds neither of the names, or both, so the list is not one
+/// file.
+fn list_in(dir: &Path, arch: Arch, harness: Harness) -> Result<PathBuf>
+{
+    let name = list_name(arch, harness, |name| dir.join(name).is_file()).with_context(|| {
+        format!(
+            "in {} (run `cargo xtask build` or `cargo xtask mkdisk`)",
+            dir.display()
+        )
+    })?;
+    Ok(dir.join(name))
+}
+
+/// The file name of the bundle list of `harness` for `arch` in a directory
+/// that holds a file of a name when `holds` says so:
 /// `<harness>.<arch>.list` where the architectures' lists differ,
 /// `<harness>.list` where they do not.
 ///
 /// # Errors
 ///
-/// When `dir` holds neither, or both, so the list is not one file.
-fn list_in(dir: &Path, arch: Arch, harness: Harness) -> Result<PathBuf>
+/// When the directory holds neither, or both, so the list is not one file.
+pub fn list_name(arch: Arch, harness: Harness, holds: impl Fn(&str) -> bool) -> Result<String>
 {
     let name = harness.name();
-    let own = dir.join(format!("{name}.{arch}.list"));
-    let shared = dir.join(format!("{name}.list"));
-    match (own.is_file(), shared.is_file())
+    let own = format!("{name}.{arch}.list");
+    let shared = format!("{name}.list");
+    match (holds(&own), holds(&shared))
     {
         (true, false) => Ok(own),
         (false, true) => Ok(shared),
-        (true, true) => bail!(
-            "both {} and {} are installed: a harness has one bundle list for an architecture",
-            own.display(),
-            shared.display()
-        ),
-        (false, false) => bail!(
-            "no bundle list of the {name} harness for {arch} at {} or {} (run \
-             `cargo xtask build` or `cargo xtask mkdisk`)",
-            own.display(),
-            shared.display()
-        ),
+        (true, true) =>
+        {
+            bail!(
+                "both {own} and {shared} are installed: a harness has one bundle list for an architecture"
+            )
+        }
+        (false, false) =>
+        {
+            bail!(
+                "no bundle list of the {name} harness for {arch}: neither {own} nor {shared} is installed"
+            )
+        }
     }
 }
 
@@ -205,11 +224,14 @@ pub fn boot_modules(ctx: &BuildContext, arch: Arch) -> Result<Vec<String>>
     Ok(names)
 }
 
+/// The path of the bundle from the ESP's root.
+pub const ESP_PATH: &str = "/EFI/seraph/bootstrap.bundle";
+
 /// The path of the bundle on the ESP the sysroot stages,
-/// `sysroot/esp/EFI/seraph/bootstrap.bundle`.
+/// `sysroot/esp/EFI/seraph/bootstrap.bundle` ([`ESP_PATH`]).
 pub fn esp_path(ctx: &BuildContext) -> PathBuf
 {
-    ctx.sysroot_efi_seraph().join("bootstrap.bundle")
+    ctx.sysroot_esp().join(ESP_PATH.trim_start_matches('/'))
 }
 
 /// Compose the bundle of `harness` for `arch` and write it to `out`,
@@ -361,7 +383,11 @@ fn check_entry(
 
 /// Write the bundle file of `(name, body)` entries: header, per-entry
 /// headers, then bodies aligned to [`fmt::BODY_ALIGNMENT`].
-fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, Vec<u8>)]) -> Result<()>
+pub(crate) fn write_bundle(
+    out: &Path,
+    entry_count: u32,
+    entries: &[(String, Vec<u8>)],
+) -> Result<()>
 {
     let mut out_file = fs::File::create(out)
         .with_context(|| format!("compose-bundle: create {}", out.display()))?;
@@ -440,6 +466,33 @@ fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, Vec<u8>)]) -> 
         .sync_all()
         .context("compose-bundle: sync bundle file")?;
     Ok(())
+}
+
+/// The `(name, body)` of every entry of the bundle `bundle`, in bundle order,
+/// read with the bootloader's parser ([`fmt::parse_header`]).
+///
+/// # Errors
+///
+/// When the bundle does not parse, or an entry's name is not UTF-8.
+pub fn parse_entries(bundle: &[u8]) -> Result<Vec<(String, &[u8])>>
+{
+    let header =
+        fmt::parse_header(bundle).map_err(|refusal| err!("it does not parse ({refusal:?})"))?;
+    (0..header.entry_count)
+        .map(|index| {
+            let entry =
+                fmt::entry_at(bundle, index).with_context(|| format!("it has no entry {index}"))?;
+            let name = std::str::from_utf8(fmt::name_str(&entry.name))
+                .with_context(|| format!("the name of its entry {index} is not UTF-8"))?;
+            let body = usize::try_from(entry.offset)
+                .ok()
+                .zip(usize::try_from(entry.size).ok())
+                .and_then(|(start, size)| Some(start..start.checked_add(size)?))
+                .and_then(|range| bundle.get(range))
+                .with_context(|| format!("the body of its entry {name} lies outside it"))?;
+            Ok((name.to_owned(), body))
+        })
+        .collect()
 }
 
 /// `value` rounded up to the power-of-two `alignment`, or `None` when the

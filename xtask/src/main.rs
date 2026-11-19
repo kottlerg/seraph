@@ -57,6 +57,7 @@ mod disk;
 mod error;
 mod esp;
 mod fat;
+mod fat_read;
 mod firmware;
 mod fs_compat;
 mod gh;
@@ -126,6 +127,7 @@ fn main()
         CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
         CliCommand::TestVmgenid(args) => commands::test_vmgenid::run(&ctx, args),
+        CliCommand::TestTpm(args) => commands::test_tpm::run(&ctx, args),
         CliCommand::TestKaslr(args) => commands::test_kaslr::run(&ctx, args),
         CliCommand::TestCrashReport(args) => commands::test_crash_report::run(args),
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),

@@ -88,6 +88,11 @@ services/svctest/
         ├── discard.rs         # DISCARD_RANGE and SHRINK_REGION return frames; discarded pages
         │                      #   refault zero-filled and, committed, cannot be declined;
         │                      #   the std heap's discard and trim; all-RAM-accounted identity
+        ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
+        │                      #   held `LOW` level and restores them: debugger reads and
+        │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
+        │                      #   headroom and by direct reclaim; a no-evict region, logd's
+        │                      #   reserve stack; all-RAM-accounted identity
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -162,7 +167,7 @@ svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd and vfsd unmo
 `logd_sinks`, and `entropyd_contribution` phases (`caps[6]`), the vfsd swap-partition phase
 (`caps[14]`), the `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]`
 and `caps[19]`), the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`,
-`vfsd_driver_death` phases, and the drivers hwrng restart phase (`caps[18]`), the
+`memmgr_swap`, and `vfsd_driver_death` phases, and the drivers hwrng restart phase (`caps[18]`), the
 `svcmgr_stop_service` phase (`caps[19]`, and `caps[18]` with `stopsrc` staged), and the no-stop
 cases of the `oom_policy` and `logd_reserve` phases (`caps[19]`), instead fail their assertions. The
 seed-only phase thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so
@@ -205,7 +210,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose shell runs the large job |
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
-| `caps[18]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[18]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[19]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -449,6 +454,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 | `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
 | `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
+| `swap-fixture`              | `swap`         | `memmgr_swap` (evicted regions, threads)    |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---

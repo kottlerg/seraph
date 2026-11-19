@@ -398,10 +398,10 @@ in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
-3000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The crashme
-tester fills memory up to the system reserve and has the fixture write a page it has not touched:
-once the filler gives the memory back within the stall, and the write completes after the hold;
-once the filler keeps it past the stall, and the fixture dies of the fault with no core written.
+3000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The crashme tester
+fills memory down to memmgr's growth floor and has the fixture write a page it has not touched: once
+the filler gives the memory back within the stall, and the write completes after the hold; once the
+filler keeps it past the stall, and the fixture dies of the fault with no core written.
 
 In CI the usertest cell keeps crashd and runs the first after its `run-parallel` boot; the svctest
 cell drops `crashd.svc` with `terminal.svc` and runs the second, while crasher's faults go
@@ -510,12 +510,12 @@ terminal. Two routes reach the thread:
   breakpoint on a function of the target's binary, at the image bias init logs for it plus the
   function's address in the binary's symbol table, read from the symbols store's file of its build
   id ([docs/build-system.md](build-system.md#symbols-store) § Symbols Store), and types `hello` at
-  the shell over the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's one thread,
-  in an allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the create),
-  and `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main thread, in the
-  reap). On each stop it checks that the program counter is the function's and the code there is the
-  binary's, since another process can run code at the same address, moves that CPU's program
-  counter, removes the breakpoint, and resumes the VM.
+  the shell over the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's receive
+  loop, in an allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the
+  create), and `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main
+  thread, in the reap). On each stop it checks that the program counter is the function's and the
+  code there is the binary's, since another process can run code at the same address, moves that
+  CPU's program counter, removes the breakpoint, and resumes the VM.
 
 A boot passes when, after the kill, QMP's `SHUTDOWN` event gives reason `guest-shutdown` and QEMU
 exits on its own within two minutes. The paths it covers are svcmgr's `critical service
@@ -770,6 +770,30 @@ shutdown, and the storage boots end in the shutdown svcmgr makes at vfsd's exit.
 command. No canonical CI cell attaches a hotplug port, so the boots are the `hotplug` device cell
 of the local and release host runs (Coverage tiers below).
 
+### TPM (`test-tpm`)
+
+The TPM 2.0 driver ([services/drivers/docs/tpm.md](../services/drivers/docs/tpm.md)) binds only
+on a machine whose firmware reports a TPM, and the reference boot set has none: the CI runners
+have no TPM emulator, and a TPM in every boot would make `swtpm` a requirement of every launch.
+`cargo xtask test-tpm` (x86_64; QEMU's TPM devices sit in the PC Client TPM range, which the
+riscv64 `virt` machine does not decode) boots the default boot set twice, each time with a TPM 2.0
+backed by an `swtpm` emulator the command starts on a fresh state directory:
+
+1. Boot with QEMU's `tpm-tis` device, the FIFO interface, and wait for the TPM driver's
+   `FIFO interface` line, its `first READ answered:` line, and entropyd's
+   `entropy contribution accepted:` line naming `hwrng ordinal 0`.
+2. Boot again with `tpm-crb`, the CRB interface, and wait for the same lines with
+   `CRB interface` in place of the first.
+
+A TPM launch leaves `virtio-rng-pci` out, so the TPM driver is the `hwrng` class's only member, and
+the contribution entropyd names can only be the TPM's. Each boot exercises the bootloader's `TPM2`
+table seed, devmgr's bind of the `MSFT0101` record, and `TPM2_GetRandom` over the interface, on a
+TPM the firmware or, failing it, the driver started. The host computes the verdict and kills QEMU
+and the emulator, as for `test-terminal`. See [xtask/README.md §
+test-tpm](../xtask/README.md#cargo-xtask-test-tpm) for the command. No canonical CI cell attaches a
+TPM, so the boots are the `tpm` device cell of the local and release host runs (Coverage tiers
+below).
+
 ### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
@@ -874,7 +898,7 @@ its own device surface, and variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` and `stopsrc` co-staged in the svctest cell, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, and the CET cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -929,7 +953,9 @@ surface.
   device, QEMU std VGA, is outside the main set because the canonical boots are headless; the
   framebuffer cell (Framebuffer cell below) boots it. The virtio-console driver's device, the debug
   port, is outside it because only a launch that asks for a debug port attaches it; the
-  debug-port cell (Debug-port cell below) boots it.
+  debug-port cell (Debug-port cell below) boots it. The TPM driver's device, a TPM 2.0 behind
+  QEMU's `tpm-tis` or `tpm-crb` and backed by `swtpm`, is outside it because only `test-tpm`
+  attaches it; the tpm cell (TPM cell below) boots it.
 - **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
   README documents a hardware test procedure, and it is exercised on real hardware by that
   procedure. No in-tree driver is in this tier.
@@ -1272,7 +1298,8 @@ architecture (4kn, the 4Kn disk; second-disk, the data partition on a second dis
 disk on the first disk's interrupt line; and oversize-block, the refused 8192-byte second disk),
 no-iommu, the no-IOMMU variant of Release host runs below, framebuffer, the boot of Framebuffer cell
 below, debug-port, the boot of Debug-port cell below, and hotplug, the boots of Hotplug cell below,
-each on each architecture, and cet, the boot pair of CET cell below, on x86_64 alone. A driver's
+each on each architecture, and cet, the boot pair of CET cell below, and tpm, the boot pair of TPM
+cell below, on x86_64 alone. A driver's
 device surface is that driver's code, with the harness check that drives that driver alone where its
 row names one; the storage-wide surface is the code every storage cell runs beside its drivers; and
 the shared surface is what every driver shares, the launchers' attachment of the IOMMU in front of
@@ -1287,7 +1314,8 @@ or writes one of the type's fields, calls one of its methods, or constructs or m
 names it in another use and stays on the surface. The exemption reaches no listed function
 or constant: each stays on a surface as the sentences above define. The listed
 types are `InterruptObject`, `Iommu`, `SecondDisk`, `DiskLine`, `BlockSize`, `FramebufferInfo`,
-`InitFramebufferInfo`, `QemuDisplay`, `BatchDisplay`, `HotplugControl`, and `BootEntropy`. A PR owes
+`InitFramebufferInfo`, `QemuDisplay`, `BatchDisplay`, `HotplugControl`, `BootEntropy`, `Tpm`, and
+`TpmInterface`. A PR owes
 the cells of every surface a non-inert line of its own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
@@ -1303,6 +1331,7 @@ the cells of every surface a non-inert line of its own diff is on.
 | PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
+| TPM 2.0, and the bootloader's seed of its registers | `services/drivers/tpm/`, the host test that drives it (`xtask/src/commands/test_tpm.rs`), and the launchers' TPM attachment (`Tpm`, `TpmInterface`, and `tpm_args`); and the bootloader's `TPM2` table seed, which only a boot with a TPM takes (`tpm2_register_window`, `tpm_register_window`, `TPM2_OFF_CONTROL_AREA`, `TPM2_OFF_START_METHOD`, `TPM2_MIN_LEN`, `TPM2_START_FIFO`, and `TPM2_START_CRB`) | tpm |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
 | The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); the code that runs on the supervisor shadow stack at every entry from user mode, or decides whether shadow stacks are on (`seraph_enter_from_user`, `__x86_indirect_thunk_r11`, `rewrites_returns`, and `RETURN_REWRITING`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
 
@@ -1343,7 +1372,8 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     shared/ipc/src/devmgr_dma_labels.rs shared/ipc/src/devmgr_dma_errors.rs \
     shared/ipc/src/device_info_kind.rs shared/ipc/src/vfsd_labels.rs shared/ipc/src/vfsd_errors.rs \
     shared/ipc/src/fs_labels.rs shared/ipc/src/fs_errors.rs shared/ipc/src/blk_labels.rs \
-    shared/ipc/src/blk_errors.rs shared/ipc/src/test_dma_labels.rs
+    shared/ipc/src/blk_errors.rs shared/ipc/src/test_dma_labels.rs services/drivers/tpm/ \
+    xtask/src/commands/test_tpm.rs
 D='sys_irq_(register|ack|split|msg_alloc|route|remap)|(un)?route_device_irq|irq_line_count'
 D="$D|dispatch_device_irq|set_remap|remap_entry|remap_handles"
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
@@ -1371,6 +1401,8 @@ D="$D|shadow_stack|shadow_page|shadow_offset|set_shadow_stack_pages|shadow_on_bo
 D="$D|make_cpu_shadow_pages|(idle|cpu)_shadow_pages|idle_saved_state|shadow_direct_map_page"
 D="$D|new_shadow_stack_page|kernel_write_fault_is_spurious"
 D="$D|seraph_enter_from_user|__x86_indirect_thunk_r11|rewrites_returns|RETURN_REWRITING"
+D="$D|Tpm|TpmInterface|tpm_args|tpm2?_register_window"
+D="$D|TPM2_(OFF_CONTROL_AREA|OFF_START_METHOD|MIN_LEN|START_FIFO|START_CRB)"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($D)\b"
 git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
     grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
@@ -1553,23 +1585,36 @@ cargo xtask compose-bundle --harness ktest
 cargo xtask test-cet
 ```
 
-**Release host runs.** Before each tag ([conventions.md](conventions.md#release-production)
-§ Release Production, step 4), these MUST be run on the commit to be tagged, or on an earlier commit
+**TPM cell.** One boot pair on x86_64, `cargo xtask test-tpm` (TPM (`test-tpm`) above), at 4
+vCPUs, on the default boot set of a debug-profile sysroot, each boot backed by `swtpm`: one with
+`tpm-tis` and one with `tpm-crb`. The command fails before the boots when `swtpm` is not
+installed, naming the package. Each boot is bounded by three minutes; it has no `run-parallel`
+budget. The pair is the tpm device cell (Device surfaces above).
+
+```sh
+# TPM cell, x86_64 only:
+cargo xtask build --arch x86_64
+cargo xtask mkdisk
+cargo xtask test-tpm
+```
+
+**Release host runs.** Before each tag ([conventions.md](conventions.md#release-production) §
+Release Production, step 4), these MUST be run on the commit to be tagged, or on an earlier commit
 that contains the version bump when the change from it to the commit to be tagged is documentation
 or comments only as this section defines that: the whole boundary set (riscv64 16 and 128 harts,
 x86_64 16 and 128 vCPUs) once each (`--runs 1`) in the debug profile and once each in the release
 profile (`cargo xtask build --release`, then the same `run-parallel` command, per the boundary
 commands above), and the memory variation and every device cell (the disk variations, the no-IOMMU
-variant, the framebuffer cell, the debug-port cell, the hotplug cell, and the CET cell) once each,
-so every tag boots at each boundary CPU count in both profiles (CI boots release builds only at 4
-CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, with a debug port, with a
-hot-added device, and on CET shadow stacks, and runs the timing report on the boundary logs, which
-is reported and blocks nothing. A tag's repeated-run check is the burn-in tier, which the tag push
-starts. The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture with
-the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest staged
-as `build-test.yml` stages it, on a debug-profile sysroot). A run whose outcome is not a pass, as
-When the runs are owed classifies outcomes, blocks the tag, MUST be filed as an Issue, and is
-bisected over the release's PRs.
+variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM
+cell) once each, so every tag boots at each boundary CPU count in both profiles (CI boots release
+builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, with a
+debug port, with a hot-added device, on CET shadow stacks, and with a TPM, and runs the timing
+report on the boundary logs, which is reported and blocks nothing. A tag's repeated-run check is the
+burn-in tier, which the tag push starts. The no-IOMMU variant, the no-iommu device cell, boots
+svctest once on each architecture with the machine's IOMMU detached, so devmgr's unconfined path
+still serves every driver (svctest staged as `build-test.yml` stages it, on a debug-profile
+sysroot). A run whose outcome is not a pass, as When the runs are owed classifies outcomes, blocks
+the tag, MUST be filed as an Issue, and is bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):

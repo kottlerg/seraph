@@ -1371,6 +1371,9 @@ pub struct SvcmgrEndowment
     /// `DENY_BADGE` SEND (published as `vfsd.deny`), and the
     /// `SWAP_AUTHORITY` SEND (published as `vfsd.swap`) from it.
     pub vfsd_service_ep: u64,
+    /// memmgr's un-badged service endpoint. init mints the endowed
+    /// `SWAP_AUTHORITY` `SEND|GRANT` (published as `memmgr.swap`) from it.
+    pub memmgr_service_ep: u64,
     /// Reserved master-log endpoint source (`cap_derive(log_ep, RIGHTS_ALL)`).
     /// svcmgr mints real-logd's master-log RECV from it on every (re)launch,
     /// plus the one-shot `HANDOVER_PULL` SEND on the first launch. Holding it
@@ -1404,7 +1407,7 @@ fn derive_or_absent(source: u64, rights: u64) -> u64
 /// Start svcmgr, then serve the handover endowment over the bootstrap
 /// protocol.
 ///
-/// The `CAPS` rounds (two rounds for the eight slots) deliver
+/// The `CAPS` rounds (three rounds for the nine slots) deliver
 /// svcmgr's service + bootstrap endpoints (full
 /// rights) and the publish-role source caps: a `SEND` on vfsd's synthetic
 /// root derived from the system-root cap (svcmgr publishes it as
@@ -1417,7 +1420,8 @@ fn derive_or_absent(source: u64, rights: u64) -> u64
 /// (`vfsd.mount`), `DENY_BADGE`-badged (`vfsd.deny`), and
 /// `SWAP_AUTHORITY`-badged (`vfsd.swap`), and an `EntropyControl` copy
 /// carrying `Contribute`, which svcmgr keeps as a source and never
-/// publishes. An absent source
+/// publishes, and a `SWAP_AUTHORITY`-badged `SEND|GRANT` on memmgr's
+/// endpoint, which svcmgr publishes seed-only as `memmgr.swap`. An absent source
 /// cap is left off its round and its presence bit clear (the
 /// `svcmgr_endowment` encoding), since the kernel refuses a null cap slot.
 ///
@@ -1504,12 +1508,29 @@ fn endow_svcmgr(
     let vfsd_mount = vfsd_send(ipc::vfsd_labels::MOUNT_AUTHORITY);
     let vfsd_deny = vfsd_send(ipc::vfsd_labels::DENY_BADGE);
     let vfsd_swap = vfsd_send(ipc::vfsd_labels::SWAP_AUTHORITY);
+    // memmgr's swap authority: a SEND badged SWAP_AUTHORITY alone, with
+    // GRANT, since each swap label but SWAP_DONE moves a cap to memmgr.
+    // Badged, so neither svcmgr nor a recipe seeding it can re-badge it into
+    // a process or node-handle badge.
+    let memmgr_swap = if endow.memmgr_service_ep == 0
+    {
+        0
+    }
+    else
+    {
+        syscall::cap_derive_badge(
+            endow.memmgr_service_ep,
+            syscall::RIGHTS_EP_SEND_GRANT,
+            ipc::memmgr_labels::SWAP_AUTHORITY,
+        )
+        .unwrap_or(0)
+    };
     // EntropyControl source: `Contribute`, the type's one right, so svcmgr
     // can derive the holder's copy and nothing more.
     let entropy_source = derive_or_absent(endow.entropy_root, syscall::RIGHTS_ENTROPY_CONTRIBUTE);
 
     // The CAPS rounds: the positional slot list [service, bootstrap, rootfs,
-    // devmgr_reg, vfsd_mount, vfsd_deny, vfsd_swap, entropy], split over as many
+    // devmgr_reg, vfsd_mount, vfsd_deny, vfsd_swap, entropy, memmgr_swap], split over as many
     // rounds as it needs, each carrying the present caps of its window, named
     // by its presence word, and the count of CAPS rounds after it. The
     // LOGD_SOURCES round is always terminal, so no earlier round is.
@@ -1522,6 +1543,7 @@ fn endow_svcmgr(
         vfsd_deny,
         vfsd_swap,
         entropy_source,
+        memmgr_swap,
     });
     for caps_round in &caps_rounds
     {
@@ -1692,6 +1714,7 @@ pub fn phase3_svcmgr_handover(
     svcmgr_service_ep: u64,
     devmgr_registry_ep: u64,
     vfsd_service_ep: u64,
+    memmgr_service_ep: u64,
     system_root_cap: u64,
     log_ep: u64,
     thread_caps: ServiceThreadCaps,
@@ -1731,7 +1754,7 @@ pub fn phase3_svcmgr_handover(
 
     // Serve svcmgr its handover endowment: the CAPS rounds carry svcmgr's own
     // endpoints plus the source caps (rootfs root, devmgr registry, the three
-    // vfsd SENDs, the EntropyControl source), then one round per
+    // vfsd SENDs, the EntropyControl source, memmgr's swap authority), then one round per
     // init-bootstrapped substrate service carries that service's (name,
     // thread_cap, observer) for death-supervision binding, and the terminal
     // round carries the reserved log-sink sources. svcmgr drains it all in `bootstrap_caps`, publishes
@@ -1757,6 +1780,7 @@ pub fn phase3_svcmgr_handover(
         rootfs_root_cap: system_root_cap,
         devmgr_registry_ep,
         vfsd_service_ep,
+        memmgr_service_ep,
         master_log_source,
         procmgr_death_auth_source,
         entropy_root: crate::find_cap_by_type(info, CapType::EntropyControl).unwrap_or(0),

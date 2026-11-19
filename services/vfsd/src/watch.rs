@@ -12,9 +12,11 @@
 //! holds vfsd's watch of devmgr's `block` class and the death queue of every
 //! mount lookups cross. It acts on two events:
 //!
-//! * A driver's death ([`driver_died`]): the mount is torn down without the
-//!   driver, its mount point falls through to the root filesystem, and the
-//!   disk under it is probed ([`partition::probe`]).
+//! * A driver's death ([`driver_died`]): the mount is restarted
+//!   ([`crate::restart`]) while its restart budget has room, and otherwise
+//!   torn down without the driver, its mount point falling through to the
+//!   root filesystem; either way the disk under it is probed
+//!   ([`partition::probe`]).
 //! * A change of the class ([`class_changed`]): every held disk is probed.
 //!
 //! A disk devmgr withdrew is marked removed and each mount on it torn down
@@ -22,10 +24,12 @@
 //! disk's removal, end vfsd ([`root_lost`]).
 //!
 //! Claim rule. Whoever begins a mount's removal (an `UNMOUNT`, a death, a
-//! loss) takes the mount's death queue out of the set in the same hold of
-//! the `root_backend` lock as `begin_unmount` ([`claim`]); a refused
-//! `UNMOUNT` puts the queue back in the hold that restores the mount, and a
-//! `MOUNT` adds it in the hold that installs the mount. So the set holds the
+//! loss) or its restart (a death) takes the mount's death queue out of the
+//! set in the same hold of the `root_backend` lock as `begin_unmount` or
+//! `begin_restart` ([`claim`], [`take_death`]); a refused `UNMOUNT` puts
+//! the queue back in the hold that restores the mount, a `MOUNT` adds it in
+//! the hold that installs the mount, and a restart adds the new driver's in
+//! the hold that ends the restart. So the set holds the
 //! queues of the mounts lookups cross and of no other, and the thread acts on
 //! a readiness only when, in one hold, the queue belongs to such a mount and
 //! yields a death entry: a readiness taken before another thread claimed the
@@ -33,7 +37,7 @@
 
 use std::sync::PoisonError;
 
-use root_backend::{MAX_MOUNTS, Mount, VfsdRootBackend};
+use root_backend::{MAX_MOUNTS, Mount, RestartError, VfsdRootBackend};
 use syscall_abi::WAIT_SET_MAX_MEMBERS;
 
 use crate::VfsdRuntime;
@@ -165,6 +169,15 @@ pub fn watch_loop(rt: &'static VfsdRuntime) -> !
     }
 }
 
+/// What the watch thread does with the mount whose driver died.
+enum AfterDeath
+{
+    /// Start a new driver for it: its restart began.
+    Restart,
+    /// Tear it down: its restart budget is spent and its removal began.
+    TearDown,
+}
+
 /// devmgr signalled a change of the `block` class: a driver served or
 /// withdrawn. Probe every held disk and handle each one withdrawn. A new
 /// driver changes nothing here: the discovery before the next role lookup
@@ -210,11 +223,12 @@ fn held_ordinal(rt: &VfsdRuntime, disk: usize) -> Option<u64>
 }
 
 /// The death queue `queue` is ready. When it belongs to a mount lookups
-/// cross and yields the driver's death, tear the mount down without the
-/// driver, which no longer answers, and probe its disk: a driver that died
-/// of its disk's removal leads to the disk's loss. The root mount's death
-/// ends vfsd.
-fn driver_died(rt: &VfsdRuntime, queue: u64, ipc_buf: *mut u64)
+/// cross and yields the driver's death, restart the driver
+/// ([`crate::restart::restart_mount`]), or, once the mount's restart budget
+/// is spent, tear the mount down without the driver, which no longer
+/// answers; then probe its disk: a driver that died of its disk's removal
+/// leads to the disk's loss. The root mount's death ends vfsd.
+fn driver_died(rt: &'static VfsdRuntime, queue: u64, ipc_buf: *mut u64)
 {
     let taken = take_death(
         rt,
@@ -224,30 +238,48 @@ fn driver_died(rt: &VfsdRuntime, queue: u64, ipc_buf: *mut u64)
             .unwrap_or_else(PoisonError::into_inner),
         queue,
     );
-    let Some((idx, mount, reason)) = taken
+    let Some((idx, mount, reason, after)) = taken
     else
     {
         return;
     };
-    std::os::seraph::log!(
-        warn: "fs driver of the mount on disk index {} died (reason={reason:#x}); \
-         tearing the mount down",
-        mount.disk
-    );
-    crate::teardown_dead_mount(&mount, ipc_buf);
-    crate::finish_unmount(rt, idx, ipc_buf);
+    match after
+    {
+        AfterDeath::Restart =>
+        {
+            std::os::seraph::log!(
+                warn: "fs driver of the mount on disk index {} died (reason={reason:#x}); \
+                 restarting it",
+                mount.disk
+            );
+            crate::restart::restart_mount(rt, idx, &mount, ipc_buf);
+        }
+        AfterDeath::TearDown =>
+        {
+            std::os::seraph::log!(
+                warn: "fs driver of the mount on disk index {} died (reason={reason:#x}); \
+                 restart budget spent, tearing the mount down",
+                mount.disk
+            );
+            crate::teardown_dead_mount(&mount, ipc_buf);
+            crate::finish_unmount(rt, idx, ipc_buf);
+        }
+    }
     probe_disk(rt, mount.disk, ipc_buf);
 }
 
 /// In the hold `backend`, take the death `queue` holds when it belongs to a
-/// mount lookups cross, and claim that mount ([`begin_claim`]); returns its
-/// node, its record and the death's reason. `None` for a readiness with no
-/// such mount or no death behind it. The root mount's death ends vfsd.
+/// mount lookups cross, and claim that mount: begin its restart, charged to
+/// its budget at the current time, or, with the budget spent, its removal
+/// ([`begin_claim`]); the mount's death queue leaves the set either way.
+/// Returns its node, its record, the death's reason and which claim was
+/// made. `None` for a readiness with no such mount or no death behind it.
+/// The root mount's death ends vfsd.
 fn take_death(
     rt: &VfsdRuntime,
     backend: &mut VfsdRootBackend,
     queue: u64,
-) -> Option<(u32, Mount, u64)>
+) -> Option<(u32, Mount, u64, AfterDeath)>
 {
     let idx = backend.find_mounted(|m| m.death_queue == queue)?;
     let reason = syscall::event_try_recv(queue).ok()?;
@@ -255,15 +287,27 @@ fn take_death(
     {
         root_lost(format_args!("its fs driver died (reason={reason:#x})"));
     }
-    begin_claim(rt, backend, idx)
-        .ok()
-        .map(|mount| (idx, mount, reason))
+    match backend.begin_restart(idx, crate::restart::now_ns())
+    {
+        Ok(mount) =>
+        {
+            rt.watch.remove(backend, mount.death_queue);
+            Some((idx, mount, reason, AfterDeath::Restart))
+        }
+        Err(RestartError::BudgetSpent) => begin_claim(rt, backend, idx)
+            .ok()
+            .map(|mount| (idx, mount, reason, AfterDeath::TearDown)),
+        // `find_mounted` found the mount crossed in this hold, below the root.
+        Err(RestartError::Root | RestartError::NotMounted | RestartError::InProgress) => None,
+    }
 }
 
 /// devmgr withdrew the held disk at `disk`: mark it removed
 /// ([`partition::Disk::remove`]) and tear down each mount on it as a forced
 /// unmount. A disk already removed is left as it is. The root mount on it
-/// ends vfsd.
+/// ends vfsd. A mount restarting is not claimed here: its restart checks the
+/// disk before it starts the new driver and after it ends
+/// ([`crate::restart`]).
 fn disk_lost(rt: &VfsdRuntime, disk: usize, ipc_buf: *mut u64)
 {
     let newly_removed = rt
@@ -292,8 +336,8 @@ fn disk_lost(rt: &VfsdRuntime, disk: usize, ipc_buf: *mut u64)
 /// it is.
 ///
 /// For a mount that became one lookups cross outside the claims of
-/// [`disk_lost`]: one a `MOUNT` installed, or one a refused `UNMOUNT`
-/// restored, after those claims passed it. The disk is marked removed
+/// [`disk_lost`]: one a `MOUNT` installed, one a refused `UNMOUNT`
+/// restored, or one a restart ended, after those claims passed it. The disk is marked removed
 /// before the claims, so the claims or this check, which follows the
 /// install or the restore, see the mount; when both do, the first claim
 /// wins and the other finds nothing to claim.
@@ -304,12 +348,7 @@ pub fn unmount_if_removed(
     ipc_buf: *mut u64,
 ) -> bool
 {
-    let removed = rt
-        .disks
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(disk)
-        .is_none_or(|d| d.removed);
+    let removed = disk_removed(rt, disk);
     // The disk is matched too: once another remover ended the mount, a later
     // mount's death queue may reuse the handle.
     if removed
@@ -318,6 +357,17 @@ pub fn unmount_if_removed(
         crate::force_unmount(rt, idx, &mount, ipc_buf);
     }
     removed
+}
+
+/// Whether the held disk at `disk` is marked removed (or no disk is held
+/// there).
+pub fn disk_removed(rt: &VfsdRuntime, disk: usize) -> bool
+{
+    rt.disks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(disk)
+        .is_none_or(|d| d.removed)
 }
 
 /// Claim the first mount lookups cross whose record `matches` ([`begin_claim`]

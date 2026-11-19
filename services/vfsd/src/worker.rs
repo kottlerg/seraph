@@ -133,7 +133,8 @@ fn take_next_active_job(active: &ActiveState) -> ActiveJob
 }
 
 /// Drive `CREATE_FROM_FILE` + `START_PROCESS` for one child, then wait for the
-/// bootstrap delivery the bootstrap worker performs in parallel.
+/// bootstrap delivery the bootstrap worker performs in parallel, or for the
+/// child's death, which ends the wait (`WorkHandle::wait_while_alive`).
 ///
 /// The child's main thread is bound to `order.death_queue` before it
 /// starts, and procmgr posts the child's end to a relay derived from it
@@ -218,14 +219,21 @@ fn handle_create_from_file(
         return None;
     };
 
-    if bootstrap_handle.wait()
+    match bootstrap_handle.wait_while_alive(death_queue)
     {
-        Some(process)
-    }
-    else
-    {
-        let _ = syscall::cap_delete(process);
-        None
+        Some(true) => Some(process),
+        Some(false) =>
+        {
+            let _ = syscall::cap_delete(process);
+            None
+        }
+        None =>
+        {
+            std::os::seraph::log!(warn: "active worker: the child died before its bootstrap round");
+            abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
+            let _ = syscall::cap_delete(process);
+            None
+        }
     }
 }
 

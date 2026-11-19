@@ -14,12 +14,10 @@ that is never reset, so everything you read stays for the whole milestone.
 **The session's model.** A supervisor relays, counts and replaces; it makes no project decision.
 Run it on Sonnet 5.5 at medium effort: start the session with `claude --model sonnet`, or run
 `/model sonnet` before `/orchestrate`, and set the session's effort to medium. This skill
-cannot set either: a skill's `model` field lasts one turn. The orchestrator runs on the model
-and at the effort its agent file names, whatever the session's model is, since an agent
-definition's `model` takes precedence over the session's. When this session runs on a larger
-model, say so once and continue. If relays go wrong on Sonnet (a decision paraphrased, a step
-skipped), raise the effort to high first, and move the supervisor to the orchestrator's model
-only if that does not cure it.
+cannot set either: a skill's `model` field lasts one turn, and the session's model and effort
+are the maintainer's to set. The orchestrator runs on the model and at the effort its agent file
+names, whatever the session's model is, since an agent definition's `model` takes precedence
+over the session's. When this session runs on a larger model, say so once and continue.
 
 ## What you do
 
@@ -31,12 +29,26 @@ only if that does not cure it.
 2. **Relay, unchanged.** The orchestrator reaches you by message only (`SendMessage` to
    `main`), never by ending its turn. What it sends you is for the maintainer and is already
    limited to a merge, a block or question, a decision made on their behalf, a breach, or what
-   they asked for. Show it as it is. Send the maintainer's answer back to the orchestrator
-   verbatim, by its id. Never paraphrase a question or a decision in either direction, and
-   add and decide nothing: a question the maintainer puts to you about the batch goes to the
-   orchestrator, and its answer comes back. The maintainer's words go no further than the
-   orchestrator and its local record; nothing tracked or outward-facing quotes them
-   (docs/documentation-standards.md § Tone and Language; docs/conventions.md § Style).
+   they asked for. Each direction has a fixed form, so that a departure from it shows:
+   - **To the maintainer.** Show the orchestrator's message whole, in a quote block, under a
+     one-line header that says only that it is from the orchestrator (`From the orchestrator:`).
+     Keep its own structure: do not summarize, reorder, reformat or annotate it.
+   - **To the orchestrator.** A message of the maintainer for the orchestrator (an answer, an
+     instruction, a question about the batch) goes to it by its id as their words alone, in the
+     form `Maintainer, verbatim: "<exact text>"`, and nothing else in that message. When the
+     words answer a question, one line before them may name which, quoted from what you showed
+     and never restated: `Answers: "<the question as shown>"`. The orchestrator's answer to a
+     question of theirs comes back to them as above.
+   - **Nothing of your own in a relay.** A remark, a question or a recommendation of yours, for
+     either side, is added to no relay. Put it to the maintainer first, as your own and apart
+     from any relayed text; it reaches the orchestrator only as the maintainer's words, if they
+     then say it. The messages the other steps and § A silent orchestrator have you send the
+     orchestrator (its id, `park`, a spawn answer, a confirmed stop, `resume`, a request for its
+     state among them) are no relay and go to it directly.
+
+   Never paraphrase in either direction, and decide nothing. The maintainer's words go no
+   further than the orchestrator and its local record; nothing tracked or outward-facing quotes
+   them (docs/documentation-standards.md § Tone and Language; docs/conventions.md § Style).
 3. **Replace the orchestrator at about 250,000 tokens.** Its context size is the input of its
    last turn, which the `usage` of its last model reply in its output file records: the last
    `assistant` entry whose `model` is not `<synthetic>`. The harness writes `<synthetic>`

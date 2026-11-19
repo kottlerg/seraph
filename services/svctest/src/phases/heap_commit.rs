@@ -146,23 +146,12 @@ fn heap_commit_phase(caps: &Caps)
 /// fails or is refused. Allocates nothing.
 pub(crate) fn pool_totals() -> Option<(u64, u64, u64)>
 {
-    let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
-    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe {
-        ipc::ipc_call(
-            startup_info().memmgr_endpoint,
-            &req,
-            std::os::seraph::current_ipc_buf(),
-        )
-    }
-    .ok()?;
-    (reply.label == memmgr_errors::SUCCESS).then(|| {
-        (
-            reply.word(3) / PAGE_SIZE,
-            reply.word(8) / PAGE_SIZE,
-            reply.word(11) / PAGE_SIZE,
-        )
-    })
+    let reply = pool_status()?;
+    Some((
+        reply.word(3) / PAGE_SIZE,
+        reply.word(8) / PAGE_SIZE,
+        reply.word(11) / PAGE_SIZE,
+    ))
 }
 
 /// memmgr's `QUERY_POOL_STATUS` totals a window compares, in pages: the free
@@ -631,15 +620,64 @@ fn limited_child_main() -> !
 }
 
 /// What memmgr can still promise a node outside the reserve, in pages: its
-/// free pages less `promised` and the growth floor.
+/// free pages and its overcommit allowance less `promised` and the growth
+/// floor (services/memmgr/docs/memory-pool.md § Commit, Overcommit).
 pub(crate) fn uncommitted_available() -> u64
 {
-    let Some((free, promised, floor)) = pool_totals()
-    else
-    {
-        exit(HOG_STATUS_FAILED)
-    };
-    free.saturating_sub(promised).saturating_sub(floor)
+    promise_room().unwrap_or_else(|| exit(HOG_STATUS_FAILED))
+}
+
+/// memmgr's room for a commitment, in pages: `free + A - promised - floor`
+/// from one `QUERY_POOL_STATUS`, `A` being the overcommit allowance its
+/// swap slots give ([`allowance_pages`]); `None` when the call fails or is
+/// refused. Allocates nothing.
+pub(crate) fn promise_room() -> Option<u64>
+{
+    let reply = pool_status()?;
+    let free = reply.word(3) / PAGE_SIZE;
+    let promised = reply.word(8) / PAGE_SIZE;
+    let floor = reply.word(11) / PAGE_SIZE;
+    Some(
+        free.saturating_add(allowance_pages(&reply))
+            .saturating_sub(promised)
+            .saturating_sub(floor),
+    )
+}
+
+/// The overcommit allowance a `QUERY_POOL_STATUS` reply shows, in pages:
+/// [`CHUNK_PAGES`] pages a free swap slot (`data[13]`), less the pages
+/// compression freed from the evicted chunks not on disk, their pages
+/// (`data[10]` less `data[12]`) less the store pages they hold (`data[9]`);
+/// 0 while no swap service is registered (services/memmgr/docs/memory-pool.md
+/// § Commit, Overcommit).
+pub(crate) fn allowance_pages(reply: &IpcMessage) -> u64
+{
+    let freed = reply
+        .word(10)
+        .saturating_sub(reply.word(12))
+        .saturating_sub(reply.word(9))
+        / PAGE_SIZE;
+    reply
+        .word(13)
+        .saturating_mul(CHUNK_PAGES)
+        .saturating_sub(freed)
+}
+
+/// memmgr's `QUERY_POOL_STATUS` reply; `None` when the call fails or is
+/// refused. Allocates nothing.
+pub(crate) fn pool_status() -> Option<IpcMessage>
+{
+    let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe {
+        ipc::ipc_call(
+            startup_info().memmgr_endpoint,
+            &req,
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .ok()?;
+    (reply.label == memmgr_errors::SUCCESS).then_some(reply)
 }
 
 /// Child role: commit, through `try_reserve` on the heap, all but at most

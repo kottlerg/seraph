@@ -944,7 +944,8 @@ surface.
     through the iommu-vtd and iommu-riscv drivers: svctest's DMA confinement phase, and, for the
     message writes the riscv-iommu translates, its MSI delivery and MSI forge phases;
   - clock: the machine's RTC (the CMOS RTC on `q35`, the Goldfish RTC on `virt`), through the
-    cmos-rtc and goldfish-rtc drivers: svctest's timed phase;
+    cmos-rtc and goldfish-rtc drivers: svctest's timed phases (the wall clock, and timed's
+    resolve of the RTC driver restarted);
   - filesystem: FAT16, through the fatfs driver, on the partitions `mkdisk` formats (the ESP, root
     and data partitions, each FAT16 at its size; the swap partition is raw and no fatfs serves
     it): svctest's filesystem phases;

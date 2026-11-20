@@ -3965,27 +3965,37 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    // The object's slot, or for the zero object the zero frame's.
-    let object = match handle
+    // The object's slot, or for the zero object the zero frame's, and
+    // whether this request took that zero frame.
+    let found = match handle
     {
         None => attach_zero_frame(l, len / PAGE_SIZE),
         Some(badge) => badge
             .filter(|b| b & memmgr_labels::OBJECT_HANDLE_TAG != 0)
             .and_then(|b| l.find_object(b))
+            .map(|object| (object, false))
             .ok_or(memmgr_errors::INVALID_ARGUMENT),
     };
-    let object = match object
+    let (object, fresh) = match found
     {
-        Ok(object) => object,
+        Ok(found) => found,
         Err(label) =>
         {
             reply_label(ipc_buf, label);
             return;
         }
     };
+    // A refused request gives back the zero frame it took.
+    let refuse = |l: &mut MemLedger, label: u64| {
+        if fresh
+        {
+            drop_zero_frame(l, object);
+        }
+        reply_label(ipc_buf, label);
+    };
     if let Err(e) = admit_attach(l, rec, len, share)
     {
-        reply_label(ipc_buf, commit_refusal(e));
+        refuse(l, commit_refusal(e));
         return;
     }
     let region = DemandRegion {
@@ -3999,33 +4009,12 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         first_page,
         share,
     };
-    let mut result = l.attach_object(rec, region, source);
-    // The region's slot and its commitment's.
-    if result == Err(RegionError::NoSlot) && ensure_slots(l, 2)
-    {
-        result = l.attach_object(rec, region, source);
-    }
-    let reg = match result
+    let reg = match attach_region(l, rec, region, source)
     {
         Ok(reg) => reg,
-        Err(RegionError::NoSlot) =>
+        Err(label) =>
         {
-            reply_label(ipc_buf, memmgr_errors::QUOTA);
-            return;
-        }
-        Err(RegionError::MapBound) =>
-        {
-            reply_label(ipc_buf, memmgr_errors::LIMIT);
-            return;
-        }
-        Err(
-            RegionError::Overlap
-            | RegionError::NoRecord
-            | RegionError::NoObject
-            | RegionError::OutsideObject,
-        ) =>
-        {
-            reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+            refuse(l, label);
             return;
         }
     };
@@ -4035,24 +4024,61 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
     {
         // As in [`handle_register_region`]: nothing faulted in it yet.
         let _ = l.remove_region(rec, reg, quiescent);
+        if fresh
+        {
+            drop_zero_frame(l, object);
+        }
     }
 }
 
-/// The zero frame a zero-object attachment of `pages` pages maps: the first
-/// whose span takes the pages ([`MemLedger::zero_frame_for`]), or else a new
-/// one, a page taken from the pool and zeroed, kept for memmgr's life and
-/// charged to no budget node, as the arena's pages are
+/// Record `region` of process `rec` as an attachment of `source`
+/// ([`MemLedger::attach_object`]), growing the arena once when it is full.
+///
+/// # Errors
+/// The label of the error reply: `QUOTA` when the arena cannot grow,
+/// `LIMIT` past the mapping bound, `INVALID_ARGUMENT` for an overlapping
+/// range or pages outside the object.
+fn attach_region(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    region: DemandRegion,
+    source: Attachment,
+) -> Result<NodeIdx, u64>
+{
+    let mut result = l.attach_object(rec, region, source);
+    // The region's slot and its commitment's.
+    if result == Err(RegionError::NoSlot) && ensure_slots(l, 2)
+    {
+        result = l.attach_object(rec, region, source);
+    }
+    result.map_err(|e| match e
+    {
+        RegionError::NoSlot => memmgr_errors::QUOTA,
+        RegionError::MapBound => memmgr_errors::LIMIT,
+        RegionError::Overlap
+        | RegionError::NoRecord
+        | RegionError::NoObject
+        | RegionError::OutsideObject => memmgr_errors::INVALID_ARGUMENT,
+    })
+}
+
+/// The zero frame a zero-object attachment of `pages` pages maps, and
+/// whether it was taken for this attachment: the fullest whose span still
+/// takes the pages ([`MemLedger::zero_frame_for`]), or else a new one, a page
+/// taken from the pool and zeroed, kept for memmgr's life and charged to no
+/// budget node, as the arena's pages are, unless the request that took it is
+/// refused ([`drop_zero_frame`])
 /// (services/memmgr/docs/memory-pool.md § Memory objects, Mapping bound).
 ///
 /// # Errors
 /// The label of the error reply: `LIMIT` for more pages than one zero frame
 /// backs, `OUT_OF_MEMORY_BEST_EFFORT` when the pool cannot spare the page or
 /// its scrub fails, `QUOTA` when the arena cannot grow for its record.
-fn attach_zero_frame(l: &mut MemLedger, pages: u64) -> Result<NodeIdx, u64>
+fn attach_zero_frame(l: &mut MemLedger, pages: u64) -> Result<(NodeIdx, bool), u64>
 {
     if let Some(zero) = l.zero_frame_for(pages)
     {
-        return Ok(zero);
+        return Ok((zero, false));
     }
     if pages > ZERO_FRAME_SPAN
     {
@@ -4073,10 +4099,21 @@ fn attach_zero_frame(l: &mut MemLedger, pages: u64) -> Result<NodeIdx, u64>
     }
     if let Ok(zero) = added
     {
-        return Ok(zero);
+        return Ok((zero, true));
     }
     return_taken(l, outer, taken, phys);
     Err(memmgr_errors::QUOTA)
+}
+
+/// Give zero frame `zero`'s page back to the pool once it backs no
+/// attachment ([`MemLedger::remove_zero_frame`]), for a request refused after
+/// it took the frame; a frame still backing one is kept.
+fn drop_zero_frame(l: &mut MemLedger, zero: NodeIdx)
+{
+    if let Some(z) = l.remove_zero_frame(zero)
+    {
+        return_taken(l, z.cap_slot, 1, z.phys_base);
+    }
 }
 
 /// Hand a memory-object label (`SEAL_OBJECT` to `OBJECT_RELEASE`) to its

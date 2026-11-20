@@ -1769,24 +1769,29 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
     }
 
-    /// The first zero frame whose span takes `pages` more zero-object
-    /// attachment pages, for [`Self::attach_object`]; `None` when none does,
-    /// and memmgr takes a new one ([`Self::add_zero_frame`]).
+    /// The fullest zero frame whose span still takes `pages` more
+    /// zero-object attachment pages, for [`Self::attach_object`]; `None` when
+    /// none does, and memmgr takes a new one ([`Self::add_zero_frame`]). An
+    /// emptier frame is chosen only when no fuller one has room, so a new
+    /// frame is taken only when every frame lacks room for the pages.
     #[must_use]
     pub fn zero_frame_for(&self, pages: u64) -> Option<NodeIdx>
     {
+        let mut best: Option<(NodeIdx, u64)> = None;
         let mut cur = self.zero_frames;
         while let Some(z) = self.zero_frame(cur)
         {
-            if z.span
+            let fits = z
+                .span
                 .checked_add(pages)
-                .is_some_and(|s| s <= ZERO_FRAME_SPAN)
+                .is_some_and(|s| s <= ZERO_FRAME_SPAN);
+            if fits && best.is_none_or(|(_, span)| z.span > span)
             {
-                return Some(cur);
+                best = Some((cur, z.span));
             }
             cur = self.arena.get(cur).next;
         }
-        None
+        best.map(|(idx, _)| idx)
     }
 
     /// Record the zeroed page `cap_slot` at `phys_base` as a new zero frame
@@ -1809,6 +1814,36 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             .ok_or(RegionError::NoSlot)?;
         self.zero_frames = idx;
         Ok(idx)
+    }
+
+    /// Remove the zero frame in slot `idx` when it backs no attachment, for
+    /// a request refused after it took the frame, and return its record, whose
+    /// page the caller gives back to the pool. `None`, changing nothing, for
+    /// a slot that holds no zero frame or one that backs an attachment.
+    pub fn remove_zero_frame(&mut self, idx: NodeIdx) -> Option<ZeroFrame>
+    {
+        let zero = self.zero_frame(idx).filter(|z| z.span == 0)?;
+        let next = self.arena.get(idx).next;
+        if self.zero_frames == idx
+        {
+            self.zero_frames = next;
+        }
+        else
+        {
+            let mut cur = self.zero_frames;
+            while self.zero_frame(cur).is_some()
+            {
+                let after = self.arena.get(cur).next;
+                if after == idx
+                {
+                    self.arena.set_next(cur, next);
+                    break;
+                }
+                cur = after;
+            }
+        }
+        self.arena.free(idx);
+        Some(zero)
     }
 
     /// The attachment of the region in slot `reg`: `None` for a region of the
@@ -7810,6 +7845,40 @@ mod tests
         l.remove_region(rec, other, pool_all).unwrap();
         assert_eq!(span(&l, first), ZERO_FRAME_SPAN - 2);
         assert_eq!(span(&l, second), 0);
-        assert_eq!(l.zero_frame_for(2), Some(second));
+        // The fuller frame with room, not the emptier newer one.
+        assert_eq!(l.zero_frame_for(1), Some(first));
+        assert_eq!(l.zero_frame_for(2), Some(first));
+        assert_eq!(l.zero_frame_for(3), Some(second));
+    }
+
+    // The defect caught: a refused zero-object request that leaves its new
+    // zero frame behind, or a removal that drops a frame still backing an
+    // attachment or breaks the list the frames are found on.
+    #[test]
+    fn only_an_unused_zero_frame_is_removed()
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let oldest = new_zero_frame(&mut l);
+        let middle = new_zero_frame(&mut l);
+        let newest = new_zero_frame(&mut l);
+        let reg = l
+            .attach_object(
+                rec,
+                region(BASE, PAGE_SIZE),
+                attachment(middle, 0, Share::Private),
+            )
+            .unwrap();
+        assert_eq!(l.remove_zero_frame(middle), None);
+        let before = l.arena.free_count();
+        let z = l.remove_zero_frame(newest).unwrap();
+        assert_eq!(z.span, 0);
+        assert_eq!(l.arena.free_count(), before + 1);
+        assert_eq!(l.remove_zero_frame(newest), None);
+        assert!(l.remove_zero_frame(oldest).is_some());
+        assert_eq!(l.zero_frame_for(1), Some(middle));
+        l.remove_region(rec, reg, pool_all).unwrap();
+        assert!(l.remove_zero_frame(middle).is_some());
+        assert_eq!(l.zero_frame_for(1), None);
     }
 }

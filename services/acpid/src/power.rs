@@ -7,7 +7,8 @@
 //! evaluation the sleep sequence needs (ACPI 6.5 § 7.4.2 and § 16.1.6): the
 //! state's `SLP_TYPa` from its `\_Sx_` package and `\_PTS`. The binary
 //! performs the register writes, whose values
-//! `ipc::acpid_labels::pm1_control_writes` gives.
+//! `ipc::acpid_labels::pm1_control_writes` gives, or, on a hardware-reduced
+//! platform, [`reduced_writes`].
 //!
 //! Only `PM1a_CNT` is written: devmgr serves no `PM1b` block, and no
 //! platform acpid runs on declares one.
@@ -75,6 +76,45 @@ pub fn decode(label: u64, badge: u64, version: u64, arg: u64) -> Result<Request,
         return Ok(Request::QuerySleep(5));
     }
     Ok(Request::Sleep(5))
+}
+
+/// A sleep register of a hardware-reduced platform (ACPI 6.5 § 4.8.3.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReducedRegister
+{
+    /// `SLEEP_STATUS_REG`.
+    Status,
+    /// `SLEEP_CONTROL_REG`.
+    Control,
+}
+
+/// The writes that enter the state of `SLP_TYPa` `slp_typ` on a
+/// hardware-reduced platform, in order: `WAK_STS` to `SLEEP_STATUS_REG`,
+/// which clears a wake status left from before, then
+/// [`acpid_labels::sleep_control_value`] to `SLEEP_CONTROL_REG`. A platform
+/// that declares no status register takes the second write alone.
+#[must_use]
+pub const fn reduced_writes(slp_typ: u16) -> [(ReducedRegister, u8); 2]
+{
+    [
+        (ReducedRegister::Status, acpid_labels::SLEEP_STATUS_WAK_STS),
+        (
+            ReducedRegister::Control,
+            acpid_labels::sleep_control_value(slp_typ),
+        ),
+    ]
+}
+
+/// What a `QUERY_SLEEP` hands its caller beside the `SLP_TYPa`: a
+/// derivation of acpid's capability over the register its `SLEEP` writes,
+/// which register (`acpid_labels::SLEEP_REGISTER_*`), and its port or
+/// physical address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Derived
+{
+    pub cap: u64,
+    pub register: u64,
+    pub address: u64,
 }
 
 /// The ASL path of sleep state `state`'s package, `\_S5_` for S5.
@@ -242,6 +282,22 @@ mod tests
             sleep_type(&mut Evaluator::new(&mut ns, &mut host), 5),
             Ok(None)
         );
+    }
+
+    // Defect caught: the control register written before the status one
+    // (a stale WAK_STS then left set as the platform enters the state), or a
+    // value other than the specification's.
+    #[test]
+    fn a_reduced_sleep_clears_wak_sts_then_writes_the_control_value()
+    {
+        assert_eq!(
+            reduced_writes(5),
+            [
+                (ReducedRegister::Status, 0x80),
+                (ReducedRegister::Control, 0x34)
+            ]
+        );
+        assert_eq!(reduced_writes(0)[1], (ReducedRegister::Control, 0x20));
     }
 
     #[test]

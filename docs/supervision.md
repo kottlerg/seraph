@@ -161,17 +161,23 @@ holds the requirement by construction. pwrmgr is pinned: svcmgr creates the shut
 `CREATE_PINNED`, so no page of it is demand-paged on memmgr or evicted by it ([Fault Handling
 § Default System Pager](fault-handling.md#default-system-pager)). Its power-off on an entry of the
 core-death queue allocates nothing, logs nothing and calls no service: on riscv64 the SBI SRST call,
-on x86-64 a write of the S5 sleep type to `PM1a_CNT` from pwrmgr itself, with the port block and
-the `SLP_TYPa` acpid hands it at its start (`acpid_labels::QUERY_SLEEP`). An allocation guard that
+on x86-64 a write of the S5 sleep type from pwrmgr itself to the register acpid's `SLEEP` writes,
+`PM1a_CNT` or, on a hardware-reduced platform, `SLEEP_CONTROL_REG`, which acpid hands it at its
+start with the `SLP_TYPa` (`acpid_labels::QUERY_SLEEP`); a port is bound to pwrmgr's main thread
+then, and a memory register's page mapped, so the write takes no fault. An allocation guard that
 fails every allocation of the thread running the power-off makes the property checkable: an
 allocation there ends pwrmgr and no power-off follows, which the test above detects, since it kills
-memmgr and procmgr once pwrmgr has logged `core-death power-off armed`. On x86-64 that power-off
-runs no `\_PTS(5)`. A requested shutdown, and the death of a critical service outside the core set,
-still take svcmgr's graceful shutdown through pwrmgr and acpid's `SLEEP(5)`, with `\_PTS`, whose
-path depends on no dead pager. Until pwrmgr holds its power-off (while acpid has not yet answered
-it at pwrmgr's start, or on a platform without `PM1a_CNT`, a hardware-reduced x86-64 one among
-them), a core death takes pwrmgr's ordinary shutdown, the path a `SHUTDOWN` request takes; and on
-a power-off that does not take effect pwrmgr logs the death and takes that path too.
+memmgr and procmgr once pwrmgr has logged `core-death power-off armed`. No QEMU machine boots the
+system on a hardware-reduced x86-64 platform, and no route kills a core member on real hardware,
+since no core service carries a hook that could make it die; there the write is covered by host
+tests and the boot by a hardware procedure ([testing.md § Hardware-reduced
+power-off](testing.md#hardware-reduced-power-off)). On x86-64 that power-off runs no `\_PTS(5)`. A
+requested shutdown, and the death of a critical service outside the core set, still take svcmgr's
+graceful shutdown through pwrmgr and acpid's `SLEEP(5)`, with `\_PTS`, whose path depends on no dead
+pager. Until pwrmgr holds its power-off (while acpid has not yet answered it at pwrmgr's start, or
+on a platform with neither register), a core death takes pwrmgr's ordinary shutdown, the path a
+`SHUTDOWN` request takes; and on a power-off that does not take effect pwrmgr logs the death and
+takes that path too.
 
 Before svcmgr's handover no supervisor runs, and init is the one process placed to see a death: it
 serves the bootstrap rounds of memmgr, procmgr, devmgr, vfsd and svcmgr, and reads the child's main

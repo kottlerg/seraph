@@ -39,7 +39,7 @@ const MAX_SSDTS: u64 = 64;
 pub fn run(devmgr: &Devmgr, aspace: u64, service: u64, ended: &Sender<&'static str>) -> !
 {
     let thread = std::os::seraph::thread::current_thread_cap();
-    let power = arch::current::Power::acquire(devmgr, thread);
+    let power = arch::current::Power::acquire(devmgr, aspace, thread);
     let events = arch::current::Events::acquire(devmgr, thread).map(|events| server::EventSource {
         events,
         power_button: fixed_power_button(devmgr, aspace),

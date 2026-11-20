@@ -4,8 +4,9 @@
 // services/acpid/src/arch/x86_64/mod.rs
 
 //! x86-64: the legacy-to-ACPI mode switch, the I/O-port accesses, the
-//! interrupt model acpid selects, the sleep and reset registers, and the
-//! event blocks and the SCI.
+//! interrupt model acpid selects, the sleep and reset registers (`PM1a_CNT`,
+//! or a hardware-reduced platform's sleep control and status registers),
+//! and the event blocks and the SCI.
 //!
 //! The firmware hands over in the PIC model, with `SCI_EN` possibly clear.
 //! acpid reads each host bridge's `_PRT` in that model first, whose link
@@ -13,8 +14,9 @@
 //! APIC model with `_PIC(1)` and reads the routes again.
 
 use acpid::events::{Layout, Registers, Start};
+use acpid::power::{Derived, ReducedRegister};
 use aml::host::Width;
-use ipc::devmgr_labels;
+use ipc::{acpid_labels, devmgr_labels};
 use std::time::Duration;
 
 use crate::devmgr::{CallError, Devmgr};
@@ -65,22 +67,171 @@ fn block(devmgr: &Devmgr, block: u64) -> Result<Block, CallError>
     })
 }
 
-/// The fixed register blocks of the power requests, acquired once from
-/// devmgr and bound to the evaluation thread, which serves the requests:
-/// `PM1a_CNT` for `SLEEP` (and the ACPI-mode check) and `RESET_REG` for
-/// `RESET`.
+/// A sleep register of a hardware-reduced platform, one byte, as devmgr
+/// served it (`devmgr_labels::ACPI_SLEEP_CONTROL`, `ACPI_SLEEP_STATUS`).
+#[derive(Clone, Copy)]
+enum Register
+{
+    /// A port, bound to the evaluation thread.
+    Port
+    {
+        cap: u64, port: u16
+    },
+    /// A byte of memory, at physical `address`, in the page mapped at
+    /// `page_va` for acpid's lifetime.
+    Memory
+    {
+        cap: u64,
+        address: u64,
+        page_va: u64,
+    },
+}
+
+impl Register
+{
+    /// The sleep register `which` (`devmgr_labels::ACPI_SLEEP_CONTROL` or
+    /// `ACPI_SLEEP_STATUS`), asked of devmgr through `devmgr`: a port bound
+    /// to `thread`, the calling thread, or a page mapped into `aspace`,
+    /// acpid's address space. `None`, logged as `name`, when devmgr serves
+    /// none, its answer is malformed, or the bind or the map fails.
+    fn acquire(devmgr: &Devmgr, aspace: u64, thread: u64, which: u64, name: &str) -> Option<Self>
+    {
+        let reply = match devmgr.call(devmgr_labels::QUERY_ACPI_RESOURCES, &[which])
+        {
+            Ok(reply) => reply,
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "no {name} ({e:?})");
+                return None;
+            }
+        };
+        let Some(&cap) = reply.caps().first()
+        else
+        {
+            std::os::seraph::log!(warn: "{name} served without its cap");
+            return None;
+        };
+        let address = reply.word(0);
+        let register = match reply.word(3)
+        {
+            devmgr_labels::ACPI_SPACE_IO => u16::try_from(address)
+                .ok()
+                .filter(|_| bind_ports(thread, cap))
+                .map(|port| Self::Port { cap, port }),
+            devmgr_labels::ACPI_SPACE_MEMORY =>
+            {
+                crate::platform::map_held(aspace, cap, 1).map(|page_va| Self::Memory {
+                    cap,
+                    address,
+                    page_va,
+                })
+            }
+            _ => None,
+        };
+        if let Some(register) = register
+        {
+            std::os::seraph::log!("{name}: {}", register.describe());
+            return Some(register);
+        }
+        // A refused map keeps its cap with the reserved VA.
+        if reply.word(3) == devmgr_labels::ACPI_SPACE_IO
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        std::os::seraph::log!(warn: "{name} {address:#x} not usable");
+        None
+    }
+
+    /// The register's space and address, for the log.
+    fn describe(&self) -> String
+    {
+        match *self
+        {
+            Self::Port { port, .. } => format!("port {port:#x}"),
+            Self::Memory { address, .. } => format!("memory {address:#x}"),
+        }
+    }
+
+    /// Write `value` to the register.
+    fn write(&self, value: u8)
+    {
+        match *self
+        {
+            Self::Port { port, .. } =>
+            {
+                // SAFETY: `port` is the register devmgr served, bound to the
+                // evaluation thread, which runs the sleep, at acquisition;
+                // writing it is the sleep sequence of ACPI 6.5 § 4.8.3.7.
+                unsafe { outb(port, value) };
+            }
+            Self::Memory {
+                address, page_va, ..
+            } =>
+            {
+                // `page_va` is page-aligned, so the OR adds the offset.
+                let register = (page_va | (address & (PAGE_SIZE - 1))) as *mut u8;
+                // SAFETY: `page_va` maps, for acpid's lifetime, the page devmgr
+                // served that holds the register, so `register` is that byte
+                // of device memory; the volatile store is the one access, and
+                // it is the sleep sequence of ACPI 6.5 § 4.8.3.7.
+                unsafe { register.write_volatile(value) };
+            }
+        }
+    }
+
+    /// A derivation of the register's capability for a caller that enters a
+    /// sleep state itself (`acpid_labels::QUERY_SLEEP`): `Use`-only over a
+    /// port, map and write over a page; `None` when the derivation fails.
+    fn derive(&self) -> Option<Derived>
+    {
+        let (cap, rights, register, address) = match *self
+        {
+            Self::Port { cap, port } => (
+                cap,
+                syscall::RIGHTS_IOPORT_USE,
+                acpid_labels::SLEEP_REGISTER_CONTROL_IO,
+                u64::from(port),
+            ),
+            Self::Memory { cap, address, .. } => (
+                cap,
+                syscall::RIGHTS_MMIO_MAP | syscall::RIGHTS_MMIO_WRITE,
+                acpid_labels::SLEEP_REGISTER_CONTROL_MEMORY,
+                address,
+            ),
+        };
+        let cap = syscall::cap_derive(cap, rights).ok()?;
+        Some(Derived {
+            cap,
+            register,
+            address,
+        })
+    }
+}
+
+/// The page size of a memory sleep register's mapping.
+const PAGE_SIZE: u64 = 0x1000;
+
+/// The registers of the power requests, acquired once from devmgr and bound
+/// to the evaluation thread, which serves the requests: `PM1a_CNT` for
+/// `SLEEP` (and the ACPI-mode check), or, on a hardware-reduced platform,
+/// which has none, `SLEEP_CONTROL_REG` and `SLEEP_STATUS_REG`; and
+/// `RESET_REG` for `RESET`.
 pub struct Power
 {
     pm1a: Option<Block>,
+    sleep_control: Option<Register>,
+    sleep_status: Option<Register>,
     reset: Option<Block>,
 }
 
 impl Power
 {
-    /// Acquire `PM1a_CNT` and `RESET_REG` through `devmgr` and bind them to
-    /// `thread`, the calling thread. A block the platform lacks, or that
-    /// cannot be bound, is logged and left absent.
-    pub fn acquire(devmgr: &Devmgr, thread: u64) -> Self
+    /// Acquire `PM1a_CNT`, or, when the platform has none, the sleep control
+    /// and status registers, and `RESET_REG`, through `devmgr`; bind each
+    /// port to `thread`, the calling thread, and map each memory register
+    /// into `aspace`, acpid's address space. A register the platform lacks,
+    /// or that cannot be bound or mapped, is logged and left absent.
+    pub fn acquire(devmgr: &Devmgr, aspace: u64, thread: u64) -> Self
     {
         let pm1a = match block(devmgr, devmgr_labels::ACPI_PM1A_CNT)
         {
@@ -92,9 +243,37 @@ impl Power
             }
             Err(e) =>
             {
-                std::os::seraph::log!(warn: "no PM1a control block ({e:?})");
+                std::os::seraph::log!("no PM1a control block ({e:?})");
                 None
             }
+        };
+        let (sleep_control, sleep_status) = if pm1a.is_some()
+        {
+            (None, None)
+        }
+        else
+        {
+            let control = Register::acquire(
+                devmgr,
+                aspace,
+                thread,
+                devmgr_labels::ACPI_SLEEP_CONTROL,
+                "SLEEP_CONTROL_REG",
+            );
+            let status = control.and_then(|_| {
+                Register::acquire(
+                    devmgr,
+                    aspace,
+                    thread,
+                    devmgr_labels::ACPI_SLEEP_STATUS,
+                    "SLEEP_STATUS_REG",
+                )
+            });
+            if control.is_none()
+            {
+                std::os::seraph::log!(warn: "no sleep register: SLEEP cannot run");
+            }
+            (control, status)
         };
         let reset = match block(devmgr, devmgr_labels::ACPI_RESET)
         {
@@ -110,25 +289,34 @@ impl Power
                 None
             }
         };
-        Self { pm1a, reset }
+        Self {
+            pm1a,
+            sleep_control,
+            sleep_status,
+            reset,
+        }
     }
 
-    /// Whether `PM1a_CNT` is held, so a sleep state can be entered.
+    /// Whether a sleep register is held, `PM1a_CNT` or `SLEEP_CONTROL_REG`,
+    /// so a sleep state can be entered.
     pub const fn can_sleep(&self) -> bool
     {
-        self.pm1a.is_some()
+        self.pm1a.is_some() || self.sleep_control.is_some()
     }
 
     /// Enter the sleep state of `SLP_TYPa` `slp_typ`: write
-    /// [`ipc::acpid_labels::pm1_control_writes`]'s two values to `PM1a_CNT`.
-    /// Returns, true, only when the platform keeps running; false without a
-    /// write when `PM1a_CNT` is not held.
+    /// [`ipc::acpid_labels::pm1_control_writes`]'s two values to `PM1a_CNT`,
+    /// or, on a hardware-reduced platform, [`acpid::power::reduced_writes`]
+    /// to the sleep status and control registers, the status write left out
+    /// when the platform has no status register. Returns, true, only when
+    /// the platform keeps running; false without a write when no sleep
+    /// register is held.
     pub fn sleep(&self, state: u8, slp_typ: u16) -> bool
     {
         let Some(pm1a) = self.pm1a
         else
         {
-            return false;
+            return self.reduced_sleep(state, slp_typ);
         };
         // SAFETY: `pm1a.port` starts the two-port control block bound to
         // this thread at acquisition; the read has no side effect.
@@ -147,17 +335,61 @@ impl Power
         true
     }
 
-    /// A `Use`-only derivation of the `IoPort` over `PM1a_CNT`, for a
-    /// caller that enters a sleep state itself
-    /// (`acpid_labels::QUERY_SLEEP`), and the block's first port; `None`
-    /// when the block is not held or the derivation fails. The derivation
-    /// is an object of its own, so acpid's death, which deletes its block,
-    /// leaves it standing.
-    pub fn derive_control(&self) -> Option<(u64, u16)>
+    /// [`Self::sleep`] on a hardware-reduced platform; false without a write
+    /// when `SLEEP_CONTROL_REG` is not held.
+    fn reduced_sleep(&self, state: u8, slp_typ: u16) -> bool
     {
-        let pm1a = self.pm1a?;
+        let Some(control) = self.sleep_control
+        else
+        {
+            return false;
+        };
+        let [(_, wak_sts), (_, value)] = acpid::power::reduced_writes(slp_typ);
+        std::os::seraph::log!(
+            "SLEEP({state}): SLEEP_CONTROL_REG {} <- {value:#x}, after WAK_STS {wak_sts:#x} to \
+             SLEEP_STATUS_REG {}",
+            control.describe(),
+            self.sleep_status
+                .map_or_else(|| "(none)".into(), |s| s.describe())
+        );
+        for (register, value) in acpid::power::reduced_writes(slp_typ)
+        {
+            match register
+            {
+                ReducedRegister::Status =>
+                {
+                    if let Some(status) = self.sleep_status
+                    {
+                        status.write(value);
+                    }
+                }
+                ReducedRegister::Control => control.write(value),
+            }
+        }
+        true
+    }
+
+    /// A derivation of acpid's capability over the register its `SLEEP`
+    /// writes, for a caller that enters a sleep state itself
+    /// (`acpid_labels::QUERY_SLEEP`): a `Use`-only `IoPort` over
+    /// `PM1a_CNT`, or the derivation of `SLEEP_CONTROL_REG`'s; which
+    /// register, and its port or physical address. `None` when no sleep
+    /// register is held or the derivation fails. The derivation is an object
+    /// of its own, so acpid's death, which deletes its capability, leaves it
+    /// standing.
+    pub fn derive_control(&self) -> Option<Derived>
+    {
+        let Some(pm1a) = self.pm1a
+        else
+        {
+            return self.sleep_control?.derive();
+        };
         let cap = syscall::cap_derive(pm1a.cap, syscall::RIGHTS_IOPORT_USE).ok()?;
-        Some((cap, pm1a.port))
+        Some(Derived {
+            cap,
+            register: acpid_labels::SLEEP_REGISTER_PM1A_CNT,
+            address: u64::from(pm1a.port),
+        })
     }
 
     /// Reset the platform: write `RESET_VALUE` to `RESET_REG`. Returns,

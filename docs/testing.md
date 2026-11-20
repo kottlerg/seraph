@@ -540,6 +540,39 @@ Same boot requirements as `test-terminal` (default boot set, terminal autostarte
 as a further boot set inside each `usertest` cell (both arches, both profiles), after
 `test-reboot`.
 
+### Hardware-reduced power-off
+
+On a hardware-reduced x86-64 platform, whose FADT sets `HW_REDUCED_ACPI` and has no `PM1a_CNT`,
+acpid's `SLEEP(5)` and pwrmgr's core-death power-off write the FADT's `SLEEP_CONTROL_REG`
+([acpid § Power requests](../services/acpid/README.md#power-requests);
+[supervision.md § Core Set and System Death](supervision.md#core-set-and-system-death)). No QEMU
+machine boots the system on such a platform. QEMU's one hardware-reduced x86-64 machine,
+`microvm` with `acpi=on`, decodes no port 0x61, so the 8254 gate the kernel calibrates its clock
+through reads all-ones and the calibration fails; it publishes no MCFG, so devmgr finds no ECAM
+window; and the boot loader's `Mmio` apertures do not cover the ECAM window its DSDT names. So the
+platform is tested by this procedure, on a machine that meets the system's requirements, the
+8254 PIT among them ([platform-requirements.md § Required](platform-requirements.md#required)),
+and publishes an MCFG ([services/devmgr/docs/pci-enumeration.md § ECAM Configuration
+Space](../services/devmgr/docs/pci-enumeration.md#ecam-configuration-space)):
+
+1. Build the x86-64 sysroot, stage the svctest recipe as § Gating describes (the test class files
+   too), repack `disk.img`, write it to a boot device of the machine, and read the log on its
+   serial line.
+2. Boot it. The log shows acpid's `SLEEP_CONTROL_REG: port ...` or `SLEEP_CONTROL_REG: memory ...`
+   line, its `QUERY_SLEEP(5): SLEEP_CONTROL_REG ...` line, and pwrmgr's
+   `core-death power-off armed`.
+3. svctest ends with `ALL TESTS PASSED` or, without the QEMU test devices, which no machine has,
+   `SOME TESTS FAILED`; either way it sends `SHUTDOWN`. The log shows acpid's
+   `SLEEP(5): SLEEP_CONTROL_REG ...` line, and the machine powers off.
+
+The procedure passes when all three hold. The core-death write itself, pwrmgr's store to
+`SLEEP_CONTROL_REG`, is not run: no route kills a core member on real hardware, since no core
+service carries a hook that could make it die (§ Core death), and `test-core-death` runs on q35.
+Host tests cover what the write depends on: devmgr's sleep registers read from a hardware-reduced
+FADT (`services/devmgr/firmware`), the value written (`ipc::acpid_labels::sleep_control_value`),
+acpid's writes (`acpid::power`) and pwrmgr's reading of the `QUERY_SLEEP` answer
+(`pwrmgr::power_off`).
+
 ### Debug port (`test-debug-port`)
 
 The debug port, the byte transport a debugger stub speaks to a host debugger over, is a

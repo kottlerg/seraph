@@ -5,9 +5,10 @@
 
 //! acpid's requests (services/acpid/README.md § Region grants and § Checks).
 //!
-//! `QUERY_ACPI_RESOURCES` of a register block is answered on the registry
-//! worker that receives it, from the FADT alone. Every other request, the
-//! SCI's `QUERY_ACPI_RESOURCES` among them, runs on the control thread,
+//! `QUERY_ACPI_RESOURCES` of a fixed register block is answered on the
+//! registry worker that receives it, from the FADT alone. Every other
+//! request, the `QUERY_ACPI_RESOURCES` of the SCI and of the sleep
+//! registers among them ([`on_control`]), runs on the control thread,
 //! which owns the device records, the apertures, the interrupt lines and
 //! the configuration space: the worker posts it as a [`Job`], signals the control thread, and
 //! replies with what it hands back, so a region grant, a configuration
@@ -25,6 +26,7 @@
 
 use std::sync::mpsc;
 
+use firmware::acpi::{FixedRegister, SleepRegister};
 use firmware::acpid::{
     Address, ConfigAccess, ConfigError, ConfigOp, Disagreement, Grants, Osc, PrtMode, PrtTable,
     Push, Range, Space, Window,
@@ -88,6 +90,9 @@ pub enum Request
     },
     /// `QUERY_ACPI_RESOURCES` of `ACPI_SCI`.
     Sci,
+    /// `QUERY_ACPI_RESOURCES` of `ACPI_SLEEP_CONTROL` or
+    /// `ACPI_SLEEP_STATUS`.
+    Sleep(SleepRegister),
     /// `ACPI_HOTPLUG`: `event` at the slot of the port at `port`.
     Hotplug
     {
@@ -247,10 +252,23 @@ pub fn decode(msg: &IpcMessage) -> Result<Request, u64>
         labels::QUERY_HOST_BRIDGE => Request::HostBridge {
             ordinal: msg.word(1),
         },
-        labels::QUERY_ACPI_RESOURCES if msg.word(1) == labels::ACPI_SCI => Request::Sci,
+        labels::QUERY_ACPI_RESOURCES => resources_request(msg.word(1)).ok_or(invalid)?,
         labels::ACPI_HOTPLUG => hotplug_request(msg)?,
         _ => return Err(errors::UNKNOWN_OPCODE),
     })
+}
+
+/// The `QUERY_ACPI_RESOURCES` the control thread serves, by its `data[1]`;
+/// `None` for one a registry worker answers or none.
+fn resources_request(which: u64) -> Option<Request>
+{
+    match which
+    {
+        labels::ACPI_SCI => Some(Request::Sci),
+        labels::ACPI_SLEEP_CONTROL => Some(Request::Sleep(SleepRegister::Control)),
+        labels::ACPI_SLEEP_STATUS => Some(Request::Sleep(SleepRegister::Status)),
+        _ => None,
+    }
 }
 
 /// `ACPI_HOTPLUG`, decoded; `Err(INVALID_REQUEST)` for an unknown event or
@@ -326,9 +344,23 @@ pub fn run_on_control(jobs: &Jobs, signal: impl FnOnce(), request: Request, ipc_
     }
 }
 
+/// Whether `QUERY_ACPI_RESOURCES` of `block` runs on the control thread: the
+/// SCI, whose line the control thread holds, and the sleep registers, whose
+/// memory page it keeps beside the region grants (`AcpiService::memory`),
+/// since one page can hold both. The worker answers every other block
+/// ([`query_resources`]).
+pub const fn on_control(block: u64) -> bool
+{
+    matches!(
+        block,
+        labels::ACPI_SCI | labels::ACPI_SLEEP_CONTROL | labels::ACPI_SLEEP_STATUS
+    )
+}
+
 /// `QUERY_ACPI_RESOURCES`, past its gate and version check: reply with a
 /// narrow `IoPort` over the FADT's fixed register block `msg` names, its
-/// first port, its port count and the value the FADT gives with it.
+/// first port, its port count, the value the FADT gives with it and its
+/// space, the I/O space.
 pub fn query_resources(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
 {
     use firmware::acpi::FadtBlock;
@@ -355,6 +387,7 @@ pub fn query_resources(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
         .word(0, u64::from(io.port))
         .word(1, u64::from(io.count))
         .word(2, u64::from(io.value))
+        .word(3, labels::ACPI_SPACE_IO)
         .cap(cap)
         .build();
     // SAFETY: ipc_buf is this worker's registered IPC buffer.
@@ -404,6 +437,10 @@ pub struct AcpiService
     /// Whether devmgr has served acpid the SCI in this boot, so a later
     /// request comes from a restarted acpid.
     sci_served: bool,
+    /// The FADT's `SLEEP_CONTROL_REG` and `SLEEP_STATUS_REG`, `None` each
+    /// when the FADT is not hardware-reduced or names no usable register
+    /// (`firmware::acpi::fadt_sleep_register`).
+    sleep: [Option<FixedRegister>; 2],
 }
 
 impl AcpiService
@@ -426,6 +463,13 @@ impl AcpiService
         });
         let sci_int = tables::locate_table_by_sig(firmware, *b"FACP")
             .and_then(|fadt| tables::with_acpi_table(firmware, fadt, firmware::acpi::fadt_sci_int));
+        let sleep = [SleepRegister::Control, SleepRegister::Status].map(|register| {
+            tables::locate_table_by_sig(firmware, *b"FACP").and_then(|fadt| {
+                tables::with_acpi_table(firmware, fadt, |bytes| {
+                    firmware::acpi::fadt_sleep_register(bytes, register)
+                })
+            })
+        });
         let facs = facs_phys.and_then(|base| {
             firmware::acpid::grant_range(Space::Memory, base, firmware::acpi::FACS_MIN_LEN)
         });
@@ -454,6 +498,7 @@ impl AcpiService
             facs,
             sci_int,
             sci_served: false,
+            sleep,
         }
     }
 
@@ -575,6 +620,7 @@ impl AcpiService
             }
             Request::HostBridge { ordinal } => self.host_bridge(ordinal),
             Request::Sci => self.sci(irq_range),
+            Request::Sleep(register) => self.sleep_register(register, records, caps),
             // `run` posts it to the hotplug slots.
             Request::Hotplug { .. } => Reply::status(errors::INVALID_REQUEST),
         }
@@ -612,6 +658,96 @@ impl AcpiService
         }
     }
 
+    /// `QUERY_ACPI_RESOURCES` of a sleep register: its range, the port or the
+    /// page that holds it, refused, logged, as a region grant is refused
+    /// ([`Self::refusal`]); then an `IoPort` over the port, or the kept
+    /// grant of the page ([`Self::memory_cap`]), with the register's address,
+    /// its byte count, 0, and its space.
+    fn sleep_register(
+        &mut self,
+        register: SleepRegister,
+        records: &bind::Records,
+        caps: &mut DevmgrCaps,
+    ) -> Reply
+    {
+        let [control, status] = self.sleep;
+        let fixed = match register
+        {
+            SleepRegister::Control => control,
+            SleepRegister::Status => status,
+        };
+        let Some(FixedRegister { space, address }) = fixed
+        else
+        {
+            return Reply::status(errors::NO_DEVICE);
+        };
+        let Some(range) = firmware::acpid::request_range(space, address, 1)
+        else
+        {
+            return Reply::status(errors::NO_DEVICE);
+        };
+        if self.refusal(&range, records)
+        {
+            return Reply::status(errors::REFUSED);
+        }
+        let cap = match space
+        {
+            Space::Io => u16::try_from(address)
+                .ok()
+                .and_then(|port| arch::current::carve_io_ports(caps, port, 1))
+                .ok_or(errors::NO_DEVICE),
+            Space::Memory => self.memory_cap(&range, caps).map(|(_, cap)| cap),
+        };
+        match cap
+        {
+            Ok(cap) =>
+            {
+                let space = match space
+                {
+                    Space::Io => labels::ACPI_SPACE_IO,
+                    Space::Memory => labels::ACPI_SPACE_MEMORY,
+                };
+                let mut reply = Reply::success(&[address, 1, 0, space]);
+                reply.cap = Some(cap);
+                reply
+            }
+            Err(status) =>
+            {
+                std::os::seraph::log!(
+                    warn: "acpid: {register:?} sleep register {space:?} {address:#x} not served"
+                );
+                Reply::status(status)
+            }
+        }
+    }
+
+    /// Whether a holder overlaps `range`: a device record's resource, a
+    /// range the kernel owns, the configuration-mechanism ports or the FACS
+    /// (`firmware::acpid::region_refusal`). A refusal is logged.
+    fn refusal(&self, range: &Range, records: &bind::Records) -> bool
+    {
+        let Some(refusal) = firmware::acpid::region_refusal(
+            range,
+            records.resource_ranges(),
+            &self.kernel,
+            self.facs,
+        )
+        else
+        {
+            return false;
+        };
+        std::os::seraph::log!(
+            warn: "acpid: region {:?} {:#x}..{:#x} refused: it overlaps {:?} {:#x}..{:#x}",
+            range.space,
+            range.base,
+            range.end,
+            refusal.holder,
+            refusal.range.base,
+            refusal.range.end
+        );
+        true
+    }
+
     /// `ACPI_REGION_GRANT`: refuse a range a holder overlaps; grant ports
     /// from devmgr's `IoPort`; grant a memory page from the kept grant of
     /// it, else carve it from the apertures and keep it.
@@ -629,23 +765,8 @@ impl AcpiService
         {
             return Reply::status(errors::INVALID_REQUEST);
         };
-        let refusal = firmware::acpid::region_refusal(
-            &range,
-            records.resource_ranges(),
-            &self.kernel,
-            self.facs,
-        );
-        if let Some(refusal) = refusal
+        if self.refusal(&range, records)
         {
-            std::os::seraph::log!(
-                warn: "acpid: region {:?} {:#x}..{:#x} refused: it overlaps {:?} {:#x}..{:#x}",
-                space,
-                range.base,
-                range.end,
-                refusal.holder,
-                refusal.range.base,
-                refusal.range.end
-            );
             return Reply::status(errors::REFUSED);
         }
         match space
@@ -661,24 +782,29 @@ impl AcpiService
                     |cap| Reply::granted(&range, cap),
                 )
             }
-            Space::Memory => self.memory(&range, caps),
+            Space::Memory => self
+                .memory_cap(&range, caps)
+                .map_or_else(Reply::status, |(kept, cap)| Reply::granted(&kept, cap)),
         }
     }
 
-    /// A memory grant of `range`, one page: a derivation of the kept grant
-    /// of it, or of the cap newly carved and kept for it. Grants are kept a
-    /// page at a time, so a page is either kept whole or not carved at all.
-    fn memory(&mut self, range: &Range, caps: &mut DevmgrCaps) -> Reply
+    /// A cap over `range`, one page, and the range of the grant it is over:
+    /// a derivation of the kept grant of it, or of the cap newly carved and
+    /// kept for it. Grants are kept a page at a
+    /// time, so a page is either kept whole or not carved at all, and a
+    /// region grant and a sleep register in the same page share its keep.
+    /// The status to reply otherwise: `REFUSED`, logged, when no aperture
+    /// devmgr holds covers the page, else `INVALID_REQUEST`.
+    fn memory_cap(&mut self, range: &Range, caps: &mut DevmgrCaps) -> Result<(Range, u64), u64>
     {
-        let derive = |kept: &Range, cap: u64| {
-            syscall::cap_derive(cap, syscall::RIGHTS_ALL).map_or_else(
-                |_| Reply::status(errors::INVALID_REQUEST),
-                |copy| Reply::granted(kept, copy),
-            )
+        let derive = |kept: Range, cap: u64| {
+            syscall::cap_derive(cap, syscall::RIGHTS_ALL)
+                .map(|copy| (kept, copy))
+                .map_err(|_| errors::INVALID_REQUEST)
         };
         if let Some((kept, cap)) = self.grants.within(range)
         {
-            return derive(&kept, cap);
+            return derive(kept, cap);
         }
         match crate::carve_aperture(caps, range.base, range.len())
         {
@@ -691,9 +817,9 @@ impl AcpiService
                         range.base,
                         range.end
                     );
-                    return Reply::granted(range, cap);
+                    return Ok((*range, cap));
                 }
-                derive(range, cap)
+                derive(*range, cap)
             }
             Err(CarveError::NotCovered) =>
             {
@@ -702,9 +828,9 @@ impl AcpiService
                     range.base,
                     range.end
                 );
-                Reply::status(errors::REFUSED)
+                Err(errors::REFUSED)
             }
-            Err(_) => Reply::status(errors::INVALID_REQUEST),
+            Err(_) => Err(errors::INVALID_REQUEST),
         }
     }
 

@@ -205,7 +205,7 @@ pub mod pwrmgr_errors;
 
 /// Wire-protocol version of [`acpid_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const ACPID_LABELS_VERSION: u32 = 3;
+pub const ACPID_LABELS_VERSION: u32 = 4;
 pub mod acpid_labels;
 
 pub mod acpid_errors;
@@ -227,7 +227,7 @@ pub mod fs_labels;
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 27;
+pub const DEVMGR_LABELS_VERSION: u32 = 28;
 pub mod devmgr_labels;
 
 pub mod test_fault_labels;

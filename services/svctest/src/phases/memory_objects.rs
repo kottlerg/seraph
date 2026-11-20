@@ -80,9 +80,9 @@ const WRITTEN: u64 = 0x7772_6974_7465_6E21;
 
 /// Label of the call a `memory-object-child` makes on its namespace cap, which
 /// carries SEND only, to fetch a copy of the object handle.
-const FETCH_LABEL: u64 = 0x6D6F_6266;
+pub(super) const FETCH_LABEL: u64 = 0x6D6F_6266;
 /// Badge of the SEND that stops [`serve_handle`].
-const STOP_BADGE: u64 = 0x5710;
+pub(super) const STOP_BADGE: u64 = 0x5710;
 
 /// Exit code: the fetch of the handle failed.
 const CHILD_FETCH_FAILED: i32 = 2;
@@ -177,7 +177,7 @@ fn write_first(va: u64)
 }
 
 /// memmgr's reply to `msg` over `target`.
-fn call(target: u64, msg: &IpcMessage, what: &str) -> IpcMessage
+pub(super) fn call(target: u64, msg: &IpcMessage, what: &str) -> IpcMessage
 {
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
     unsafe { ipc::ipc_call(target, msg, current_ipc_buf()) }
@@ -218,7 +218,7 @@ fn attach(va: u64, pages: u64, prot: u64, first_page: u64, flags: u64, handle: O
 }
 
 /// A copy of the object handle `handle`, carrying its badge.
-fn handle_copy(handle: u64) -> u64
+pub(super) fn handle_copy(handle: u64) -> u64
 {
     syscall::cap_copy(handle, startup_info().self_cspace, syscall::RIGHTS_EP_SEND)
         .expect("memory_objects: copying the object handle")
@@ -336,9 +336,9 @@ fn seal() -> (u64, u64)
     (handle, OBJECT_PAGES)
 }
 
-/// The refusals of the labels' contracts: an executable attachment, a
-/// writable shared one, one past the object's end, a zero-object one off
-/// page 0 ([`attach_refusals`]), `OBJECT_RELEASE` over a process badge,
+/// The refusals of the labels' contracts: a writable executable attachment,
+/// a writable shared one, one past the object's end, a zero-object one off
+/// page 0 or executable ([`attach_refusals`]), `OBJECT_RELEASE` over a process badge,
 /// `SEAL_OBJECT` and `ATTACH_OBJECT` over an object handle
 /// ([`class_refusals`]), and a resize or a discard of an attachment
 /// ([`resize_refusals`]).
@@ -362,11 +362,11 @@ fn attach_refusals(handle: u64, va: u64)
     for (pages, prot, first_page, flags, object, what) in [
         (
             1,
-            MAP_READ | MAP_EXECUTABLE,
+            MAP_READ | MAP_WRITABLE | MAP_EXECUTABLE,
             0,
-            0,
+            ATTACH_PRIVATE,
             Some(handle),
-            "an executable attachment",
+            "a writable executable attachment",
         ),
         (
             1,
@@ -391,6 +391,14 @@ fn attach_refusals(handle: u64, va: u64)
             0,
             None,
             "a zero-object attachment off page 0",
+        ),
+        (
+            1,
+            MAP_READ | MAP_EXECUTABLE,
+            0,
+            0,
+            None,
+            "an executable zero-object attachment",
         ),
     ]
     {
@@ -690,7 +698,7 @@ fn run_child(handle: u64, arg: Option<&str>) -> std::process::ExitStatus
 /// which the spawner sends once the child has exited: answer the first fetch
 /// with `handle`, and refuse any other call, deleting its caps. `handle` is
 /// deleted when no fetch took it.
-fn serve_handle(ep: u64, handle: u64)
+pub(super) fn serve_handle(ep: u64, handle: u64)
 {
     let ipc_buf = current_ipc_buf();
     let mut held = Some(handle);

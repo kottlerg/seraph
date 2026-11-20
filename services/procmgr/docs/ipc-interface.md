@@ -39,8 +39,8 @@ and refused on any other cap with `UNAUTHORIZED` (§ Label 25, § Process Tree).
 Labels 14–18 are specified in § `REGISTER_DEATH_EQ`, § `REGISTER_INIT_TEARDOWN`, §
 `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and § `QUERY_LIVE_PROCESSES` below, labels 19–24 and 26
 in § Crash Endpoint and Debug Authority, label 25 in § Label 25: `BIND_DEATH_OBSERVER`, labels
-27–29 in § Process Tree, label 30 in § Label 30: `MAKE_RESIDENT`, and label 31 in § Label 31:
-`READ_VERIFIED`.
+27–29 in § Process Tree, label 30 in § Label 30: `MAKE_RESIDENT`, label 31 in § Label 31:
+`READ_VERIFIED`, and label 32 in § Label 32: `MAKE_PRIVATE`.
 Labels 4–7 and 10 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see § Capability Transfer).
 
@@ -1007,13 +1007,13 @@ has with no handler bound, and the kernel's decline line for a forwarded fault i
 pager's own decline printed. The decliner shares nothing with procmgr's request workers but a wake
 notification, so a receive on the endpoint never waits behind a request.
 
-Labels 19–21, 23, 24 and 30 are the **debug authority**, label 22 the **thread registry** it reads,
-and label 26 the **core-path declaration** its `ATTACH_PROCESS` reply reports.
-`REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, and `MAKE_RESIDENT`
-are served only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the
-un-badged procmgr source init endows it, for a service whose definition sets `debug_authority = yes`
-([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)); no other path mints it, so
-an image that stages no such service has no attach path. The crash service
+Labels 19–21, 23, 24, 30 and 32 are the **debug authority**, label 22 the **thread registry** it
+reads, and label 26 the **core-path declaration** its `ATTACH_PROCESS` reply reports.
+`REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `MAKE_RESIDENT` and
+`MAKE_PRIVATE` are served only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr
+mints, from the un-badged procmgr source init endows it, for a service whose definition sets
+`debug_authority = yes` ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)); no
+other path mints it, so an image that stages no such service has no attach path. The crash service
 ([services/crashd/README.md](../../crashd/README.md)) and the GDB stub
 ([services/gdbstub/README.md](../../gdbstub/README.md)) are its consumers.
 
@@ -1495,6 +1495,40 @@ its own memmgr cap; its death releases the run with its record.
 svctest's `procmgr_read_verified` phase reads its data-role fixture back and checks the copy's
 charge, and the refusal of the fixture under another name, of a copy with a flipped byte, of an
 unsigned file, of a file past the bound and of a zero length.
+
+### Label 32: `MAKE_PRIVATE`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::MAKE_PRIVATE` (32) |
+| caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
+| `data[0]` | The target's process badge |
+| `data[1]` | The first address of the range |
+| `data[2]` | The range's length in bytes, nonzero |
+| caps | none; procmgr deletes any cap the message carried |
+
+A text write of `SYS_THREAD_WRITE_MEM` fails with `InvalidState` on a read-only page whose frame
+another leaf maps too ([docs/fault-handling.md](../../../docs/fault-handling.md) § Debugging), as
+every page of a memory-object attachment that still maps its object's frame does: memmgr keeps its
+own view of every object frame, so a process cannot patch text others map
+([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#memory-objects) § Memory
+objects). A debugger that gets that failure asks for the page's range here and writes again: procmgr
+finds the target under the table lock and, after it, sends memmgr its `MAKE_PRIVATE` with the
+target's memmgr badge ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) §
+Label 30), which gives each such page of the range a copy of its own, a bounded number per request;
+the write then patches the target alone. A page outside every attachment, or with a copy already, is
+passed over.
+
+Replies `SUCCESS` with `data[0]` the address memmgr stopped at, memmgr's reply word: the range's end
+when the whole range is done, else the address the caller asks again from, with the rest of the
+range. `ipc::make_private` asks until it is done. Refusals, in order: `UNAUTHORIZED` without the
+authority; `INVALID_BADGE` when no live process carries the badge; `NOT_ATTACHABLE` for a process
+that declared itself undebuggable (Label 21), whose memory no debugger may write, so a copy would
+only cost it pages; then memmgr's: `INVALID_ARGUMENT` for a zero length or a range past the address
+space, and `OUT_OF_MEMORY` when memmgr could not make a copy or the call to it failed.
+svctest's `memmgr_memory_object_text` phase makes a child's executable attachment private this way
+before it writes a breakpoint into it, and checks the refusals without the authority and for
+svctest itself.
 
 ---
 

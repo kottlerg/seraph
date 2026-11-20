@@ -101,9 +101,11 @@ Allocation Contract").
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 22 to 26).
 - **Memory objects** — seal a process's grants into an immutable memory object, and attach
   it, or the zero object, as a region of any process holding its handle, shared read-only or
-  private, a write then copying the page, each attacher charged for what it maps (see
+  private, a write then copying the page, executable for an object, each attacher charged for what
+  it maps; keep a read-only view of every object's frames, so no text write patches a frame others
+  map, and give a debugged process's pages copies of their own on procmgr's `MAKE_PRIVATE` (see
   [`docs/memory-pool.md`](docs/memory-pool.md#memory-objects) § Memory objects and
-  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 27 to 29).
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 27 to 29 and § Label 30).
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments. Runs after every
@@ -179,6 +181,8 @@ The full memmgr IPC specification is in
 - `ATTACH_OBJECT(va, len, prot, first_page, flags[, object_handle])` — attach an object, or the
   zero object without a handle, as a region of the caller, shared or `ATTACH_PRIVATE`
 - Over an object handle only: `OBJECT_RELEASE` — drop the object's handle state
+- `MAKE_PRIVATE(badge, va, len) → reached` — give each page of a range of a process's attachments
+  that maps its origin a copy of its own, for a debugger (procmgr-only)
 - Over a node handle only: `NODE_SET_MAX(max) → max`, `NODE_CREATE(max) → max, node_handle`,
   `NODE_QUERY_USAGE`, `NODE_REGISTER_LIMIT(bits, notification_cap, registrant_send)` and
   `NODE_RELEASE` — set, divide, read and watch the budget node the handle names, and drop a

@@ -429,10 +429,11 @@ carved from its own pool:
   page (see [Free-Pool Data Structure](#free-pool-data-structure)).
 
 Arena pages lie in two zones of memmgr's address space. The low zone runs from
-a per-boot drawn base (ASLR) up to the lowest bootstrap window
-`shared/process-layout` draws, past the std heap and reservation-arena zones,
-which memmgr, having no std runtime, does not use. The high zone continues
-above the shared 2^38 layout ceiling and exists only where the boot's paging
+a per-boot drawn base (ASLR) up to the object zone, the 64 GiB below the lowest
+bootstrap window `shared/process-layout` draws where memmgr maps its own view of
+the memory objects' frames ([Memory objects](#memory-objects)), past the std heap
+and reservation-arena zones, which memmgr, having no std runtime, does not use.
+The high zone continues above the shared 2^38 layout ceiling and exists only where the boot's paging
 mode has a wider user half (x86-64 4- or 5-level paging, Sv48, Sv57); under Sv39 the
 kernel refuses the map and the arena ends with the low zone, which outlasts any
 RAM such a machine holds. Growth stops when neither zone has a page left or RAM
@@ -965,17 +966,40 @@ memory object of any length whose every page reads zero.
 frame nodes off the record's frame list onto the object's, in the order the request names them,
 which is the order of the object's pages. It seals only grants that pass the quiescence check
 ([Reclamation](#reclamation)), so no capability but memmgr's own reaches a sealed frame, no byte of
-it is retyped and no address space maps it: no process can write a frame once it is sealed. A
+it is retyped and no address space maps it: no process can write a frame once it is sealed. memmgr
+then maps its own view of the frames (Own view) before it records the seal. A
 phys-class caller is refused, since a device it programmed may still write the frames. The frames
 stay charged to the sealer's budget node, which the object names, until the object is freed. The
 object is an arena node, found through the record index by the key of its handle
 ([ipc-interface.md](ipc-interface.md) § Object Handles) and listed on the sealer's record with its
 node handle states ([Per-Process Tracking](#per-process-tracking)). A seal whose reply does not
-reach the caller is undone: the frames go back onto the record's frame list under their region ids.
+reach the caller is undone: memmgr unmaps its view, and the frames go back onto the record's frame
+list under their region ids.
+
+**Own view.** From the seal until the object is freed, memmgr maps each frame of the object
+read-only into its own address space, at a span of its object zone that holds the object's pages in
+their order, and records each page's address there in the frame's descriptor. The object zone is 64
+GiB of memmgr's address space just below the lowest bootstrap window `shared/process-layout` draws,
+so it exists under every paging mode, Sv39 included ([Metadata Arena](#metadata-arena)). Its spans
+come from a free pool of their own, which takes the smallest free span that holds an object's pages
+and merges a span given back with its free neighbours. A seal that finds no span is refused with
+`QUOTA`, and one whose map fails with `OUT_OF_MEMORY_BEST_EFFORT`, the part already mapped unmapped
+and its span given back. The view serves two ends. memmgr copies an object page for a private write,
+or for `MAKE_PRIVATE`, from it (Faults). And it is a leaf of each object frame that no process
+holds, so every object frame a process maps has at least two leaves: the kernel refuses a text write
+of `SYS_THREAD_WRITE_MEM` with `InvalidState` on a read-only page whose frame is mapped more than
+once ([docs/fault-handling.md](../../../docs/fault-handling.md) § Debugging), which keeps a holder
+of a process's thread from patching, through an executable attachment, a frame other processes map
+(Attach, Make private). The view's page tables are memmgr's own, taken as an arena page's are
+([Metadata Arena](#metadata-arena)), about one page per 512 pages sealed at once, and kept for reuse
+when a view is unmapped.
 
 **Release.** `OBJECT_RELEASE`, or the sealer's `PROCESS_DIED`, drops the object's handle state:
 its key leaves the index, so every handle is refused from then on. Each attachment holds a
-reference on the object, and the object is freed when it has neither: each frame retires through
+reference on the object, and the object is freed when it has neither. The request whose turn takes
+the last of them away, whichever it is, queues the object, and memmgr frees every queued object
+after the turn's handler returns: it unmaps its own view, gives the span back to the object zone,
+and then each frame retires through
 the quiescence check as a reclaimed frame does, pooled and uncharged from the sealer's budget node,
 or deferred and still charged to it ([Reclamation](#reclamation)). A charge keeps a budget node
 alive, so the node outlives the sealer while the object's frames are charged to it.
@@ -985,35 +1009,42 @@ page on, or the zero object's. An attachment is a committed region whose commitm
 origin ([Commit](#commit)), and is charged as a committed region of its length is, its pages and
 its page-table reservation, so a process pays for every page it maps however many others map it.
 A private attachment is admitted and promised as a committed region is, since a write to each of
-its pages can take a page. A shared one is never writable and takes no page but its page tables:
-its pages count against the max of the budget node and its ancestors, and only its page-table
-reservation against the free pages outside `promised`, so `promised` holds that reservation and
-no data page or metadata bound for it. An attachment is never evicted, and is never resized or
+its pages can take a page. A shared one is never writable and takes no page but its page tables
+and the copies `MAKE_PRIVATE` gives it (Make private): its pages count against the max of the
+budget node and its ancestors, and only its page-table reservation against the free pages outside
+`promised`, so `promised` holds that reservation and no data page or metadata bound for it but
+those copies. An attachment is never evicted, and is never resized or
 discarded, since its pages are its object's; `UNREGISTER_REGION` and `PROCESS_DIED` detach it
 and release its commitment as a committed region's (Commit, Shrink and release), a shared one's
-holding no data page. memmgr refuses an executable attachment: an executable map needs a capability
-with the execute right, and a leaf mapped through one lets a text write of `SYS_THREAD_WRITE_MEM`
-change its frame while one address space maps it
+holding no data page. An object's attachment may be executable, but never writable and executable
+both, as a region may not be. An executable map needs a capability with the execute right, and a
+leaf mapped through one lets a text write of `SYS_THREAD_WRITE_MEM` change its frame while no other
+leaf maps it
 ([core/kernel/docs/memory-internals.md](../../../core/kernel/docs/memory-internals.md#leaf-grant)
-§ Leaf Grant).
+§ Leaf Grant): memmgr's own view is that other leaf for every object frame (Own view), so the write
+is refused while the page maps the object's frame. A zero-object attachment is never executable,
+since no view of memmgr's maps a zero frame.
 
-**Faults.** A read fault in an attachment maps its origin read-only over the part of the faulting
-page's chunk that no write has given a page of its own ([Chunk table](#chunk-table)): the object's
-pages there that the frame holding the faulting page holds, in one map, or its zero frame at each
-page. memmgr maps them through a capability it derives from its own with the map right alone and
-deletes after the map; the kernel keeps the mapping. A leaf records the write and execute rights of
-the capability it was mapped through as its grant (§ Leaf Grant), so no leaf of an origin carries
-either, and neither `SYS_MEM_PROTECT` nor a text write can make a frame others map writable. A
-write to a private attachment gives the faulting page a page of its own, drawn from the commitment
-as a committed region's fault draws its run (Commit, Faults) and recorded on its chunk as any run
-is. For an object it is one page: memmgr copies the object page into it through its scrub window
-([Frame contents](#frame-contents)), the source mapped read-only beside it, which leaves no byte to
-clear, unmaps the page's read-only leaf from the process, and maps the copy with the region's
-protection. For the zero object it is the span a committed region's fault backs, zeroed, mapped once
-memmgr has unmapped the span's leaves of its zero frame. The unmap invalidates each leaf on every
-CPU before it returns, so no thread of the process reads the origin through a stale entry at a page
-that is then mapped writable. A write to a shared attachment, and a fetch from any, is declined as
-its protection refuses it ([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message).
+**Faults.** A read fault in an attachment, or a fetch fault in an executable one, maps its origin
+read-only, and executable in an executable attachment, over the part of the faulting page's chunk
+that no write has given a page of its own ([Chunk table](#chunk-table)): the object's pages there
+that the frame holding the faulting page holds, in one map, or its zero frame at each page. memmgr
+maps them through a capability it derives from its own with the map right alone, and the execute
+right for an executable attachment, and deletes after the map; the kernel keeps the mapping. A leaf
+records the write and execute rights of the capability it was mapped through as its grant (§ Leaf
+Grant), so no leaf of an origin carries write, and `SYS_MEM_PROTECT` cannot make a frame others map
+writable; a text write, which an executable leaf's grant admits, the frame's other leaves refuse
+(Own view). A write to a private attachment gives the faulting page a page of its own, drawn from
+the commitment as a committed region's fault draws its run (Commit, Faults) and recorded on its
+chunk as any run is. For an object it is one page: memmgr maps the page at its scrub window ([Frame
+contents](#frame-contents)) and copies the object page into it from its own view, which leaves no
+byte to clear, unmaps the page's read-only leaf from the process, and maps the copy with the
+region's protection. For the zero object it is the span a committed region's fault backs, zeroed,
+mapped once memmgr has unmapped the span's leaves of its zero frame. The unmap invalidates each leaf
+on every CPU before it returns, so no thread of the process reads the origin through a stale entry
+at a page that is then mapped writable. A write to a shared attachment, and a fetch from one that is
+not executable, is declined as its protection refuses it ([ipc-interface.md](ipc-interface.md) §
+Kernel-origin fault message).
 
 **Mapping bound.** The kernel counts the leaves that map each frame in a `u32` and refuses a map
 that would take the count past it (core/kernel/docs/memory-internals.md §
@@ -1021,13 +1052,29 @@ that would take the count past it (core/kernel/docs/memory-internals.md §
 so a frame many address spaces map must stay under that count, or one attacher could make
 another's read fail. Each attachment maps a page of its origin at most once. An object takes at
 most `OBJECT_MAX_ATTACHMENTS` (2^31) attachments at once, and memmgr maps an object frame itself
-only in its scrub window while it copies the frame. Each zero-object attachment maps one zero
+once, in its own view (Own view), so an object frame carries at most 2^31 + 1 leaves. Each
+zero-object attachment maps one zero
 frame, which backs at most `ZERO_FRAME_SPAN` (2^31) pages of the attachments it is chosen for:
 memmgr chooses the fullest whose span still takes the attachment's pages, and takes a new one only
 when none does; a detach gives its pages back to the span. An attachment past either bound, an
 object attached `OBJECT_MAX_ATTACHMENTS` times or a zero-object attachment longer than
 `ZERO_FRAME_SPAN` pages, is refused with `LIMIT` ([ipc-interface.md](ipc-interface.md)
 § Label 28); a longer zero region is attached in several attachments.
+
+**Make private.** `MAKE_PRIVATE` ([ipc-interface.md](ipc-interface.md) § Label 30), which procmgr
+sends for a holder of its debug authority, gives each page of a range of a process's attachments
+that still maps its origin a page of its own: the page a write fault in a private attachment
+gives it (Faults), a copy of the object page or a zeroed page for the zero object, mapped with the
+region's protection and recorded on its chunk. A debugger asks for it before it writes a
+breakpoint into text the process maps from an object: the write is refused while the page maps the
+object's frame (Own view), and once the page is the process's own it patches the process alone. A
+private attachment promised its pages when it attached, and the copy draws one of them. A shared
+one promised none, so each copy first promises a page, admitted as a committed region's pages are
+against the free pages and the overcommit allowance outside `promised`, less the growth floor
+outside the system reserve ([Commit](#commit)), and the copy then draws that page, so `promised`
+and the attachment's release stay exact. The charge does not move, since the copy lies inside the
+pages the attachment is charged for. A copy is never evicted, as no page of an attachment is, and
+is freed with its attachment.
 
 **Zero frames.** A zero frame is a page taken from the free pool when no zero frame's span takes a
 new zero-object attachment, which is refused when the pool cannot spare it, zeroed, and recorded

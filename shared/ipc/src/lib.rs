@@ -137,22 +137,22 @@ pub fn name_block(req: &IpcMessage, at: usize, max: usize) -> Option<&[u8]>
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 23;
+pub const PROCMGR_LABELS_VERSION: u32 = 24;
 pub mod procmgr_labels;
 
 mod procmgr_debug_client;
 
 pub use procmgr_debug_client::{
-    PENDING_PAUSE_MS, PENDING_TRIES, ResidentBound, ResidentStep, make_resident,
-    make_resident_bounded, make_resident_step, read_mem_resident, read_mem_resident_bounded,
-    resident_range,
+    PENDING_PAUSE_MS, PENDING_TRIES, ResidentBound, ResidentStep, make_private, make_resident,
+    make_resident_bounded, make_resident_step, private_range, read_mem_resident,
+    read_mem_resident_bounded, resident_range,
 };
 
 pub mod sched_policy;
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 20;
+pub const MEMMGR_LABELS_VERSION: u32 = 21;
 pub mod memmgr_labels;
 
 mod memmgr_grant;

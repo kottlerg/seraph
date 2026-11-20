@@ -975,6 +975,26 @@ pub const MAKE_RESIDENT: u64 = 30;
 /// Specified in `services/procmgr/docs/ipc-interface.md` § `READ_VERIFIED`.
 pub const READ_VERIFIED: u64 = 31;
 
+/// Give each page of a range of a process's memory-object attachments that
+/// maps its object's frame a copy of its own, for a debugger about to
+/// patch it: a `SYS_THREAD_WRITE_MEM` text write to such a page fails with
+/// `InvalidState` while the page maps a frame the object's other attachers
+/// map too, and succeeds once the page holds the copy. Served only on a
+/// badge carrying [`DEBUG_AUTHORITY`]. `data[0]` is the target's process
+/// badge, `data[1]` the address and `data[2]` the length in bytes, nonzero.
+/// Pages outside every attachment, and pages that hold a copy already, are
+/// passed over. Replies `SUCCESS` with `data[0]` where memmgr stopped,
+/// which makes a bounded number of copies per request: the range's end when
+/// it is all done, else the address to ask again from (`ipc::make_private`
+/// asks until it is done); `UNAUTHORIZED` without the authority;
+/// `INVALID_BADGE` when no live process carries the badge;
+/// `NOT_ATTACHABLE` for a process that declared itself undebuggable
+/// ([`DECLARE_NO_DEBUG`]), whose memory no debugger may write;
+/// `INVALID_ARGUMENT` for a zero length or a range past the address space;
+/// `OUT_OF_MEMORY` when a copy could not be made.
+/// Specified in `services/procmgr/docs/ipc-interface.md` § `MAKE_PRIVATE`.
+pub const MAKE_PRIVATE: u64 = 32;
+
 /// The most bytes a [`READ_VERIFIED`] file may hold, its trailer included:
 /// 32 KiB, room for a platform description table
 /// (`MAX_TABLE_BYTES`, 8 KiB) and the other policy-bearing configuration
@@ -997,7 +1017,7 @@ pub fn read_verified_name(req: &crate::IpcMessage) -> Option<&[u8]>
 
 /// Badge bit on procmgr service caps that authorises
 /// [`REGISTER_CRASH_SERVICE`], [`ATTACH_PROCESS`], [`LIST_PROCESSES`],
-/// and [`DETACH_PROCESS`]. svcmgr mints it for
+/// [`DETACH_PROCESS`], [`MAKE_RESIDENT`] and [`MAKE_PRIVATE`]. svcmgr mints it for
 /// a service whose definition sets `debug_authority = yes`; no other
 /// path mints it. Who holds it is in
 /// `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.

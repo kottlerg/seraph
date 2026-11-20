@@ -35,7 +35,8 @@ table (see [`memory-pool.md`](memory-pool.md) §"Per-Process Tracking").
 Two privilege classes:
 
 - **Procmgr-only** labels (`REGISTER_PROCESS`, `PROCESS_DIED`,
-  `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`) are callable only over the cap
+  `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`, `MAKE_RESIDENT`,
+  `MAKE_PRIVATE`) are callable only over the cap
   that init transfers to procmgr at procmgr's bootstrap round. memmgr
   identifies this cap by badge and rejects procmgr-only calls received over
   any other badged cap, replying `UNAUTHORIZED`.
@@ -1325,7 +1326,11 @@ memmgr seals only grants that pass the quiescence check
 to the frame but memmgr's own, no byte of it retyped, and no address space
 mapping a page of it, so no process can write a frame once it is sealed. The
 caller unmaps each grant and hands its cap back with the request. A grant that
-fails the check refuses the seal whole, and the caller keeps its grants. A
+fails the check refuses the seal whole, and the caller keeps its grants. memmgr
+then maps its own read-only view of the frames at a span of its object zone,
+which it keeps until the object is freed: the view is the frames' second leaf
+that makes the kernel refuse a text write to an attachment's page
+([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects, Own view). A
 sealed grant is no longer the caller's, and its region id names nothing; its
 frames stay charged to the caller's budget node until the object is freed
 (§ Label 29). A reply that does not reach the caller undoes the seal, so a
@@ -1338,7 +1343,8 @@ object handle to it.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 3 | `QUOTA` | memmgr's metadata arena could not grow, or the handle could not be derived |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | memmgr could not map its own view of the frames |
+| 3 | `QUOTA` | memmgr's metadata arena could not grow, its object zone holds no span of the object's pages, or the handle could not be derived |
 | 4 | `INVALID_ARGUMENT` | Unknown badge, a count out of range or past the words sent, an id that names no grant of the caller or is named twice, or a grant that fails the quiescence check |
 | 5 | `UNAUTHORIZED` | A phys-class caller, or a badge that is a handle or the swap authority |
 
@@ -1355,7 +1361,7 @@ object handle is the authority to attach its object.
 | label | 28 |
 | data[0] | `va_base` (page-aligned virtual address) |
 | data[1] | `len_bytes` (page-multiple, nonzero) |
-| data[2] | `prot`: `MAP_READ`, and `MAP_WRITABLE` for a private attachment only; `MAP_EXECUTABLE` is refused |
+| data[2] | `prot`: `MAP_READ`; `MAP_WRITABLE` for a private attachment only; `MAP_EXECUTABLE` for an object's attachment that is not writable |
 | data[3] | `first_page`: the object page the region starts at; 0 for the zero object |
 | data[4] | flags: bit 0 `ATTACH_PRIVATE`; 0 for none |
 | cap[0] | The object handle (§ Object Handles), whose badge memmgr reads before it deletes it; none for the zero object |
@@ -1378,11 +1384,17 @@ attachment is never evicted, `EXTEND_REGION`, `SHRINK_REGION` and
 `PROCESS_DIED` detach it, releasing its commitment. An object lives while a
 region attaches it, whatever became of its handle state.
 
-No attachment is executable. An executable map needs a capability with the
-execute right, and a leaf mapped through one lets a text write of
-`SYS_THREAD_WRITE_MEM` change its frame while one address space maps it
+An object's attachment may be executable, never writable and executable both.
+An executable map needs a capability with the execute right, and a leaf mapped
+through one lets a text write of `SYS_THREAD_WRITE_MEM` change its frame while
+no other leaf maps it
 ([core/kernel/docs/memory-internals.md](../../../core/kernel/docs/memory-internals.md#leaf-grant)
-§ Leaf Grant), so a process could patch a page others attach.
+§ Leaf Grant). memmgr's own view maps every object frame (§ Label 27), so the
+kernel refuses that write with `InvalidState` while the page maps the object's
+frame, and a process cannot patch a page others attach; `MAKE_PRIVATE`
+(§ Label 30) gives the page a copy of its own first, which the write then
+patches alone. A zero-object attachment is never executable, since no view of
+memmgr's maps a zero frame.
 
 A reply that does not reach the caller detaches the region again, so a caller
 whose call was interrupted makes it again.
@@ -1395,7 +1407,7 @@ whose call was interrupted makes it again.
 |---|---|---|
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The attachment's share of `promised` would leave fewer of the free pages and the overcommit allowance outside `promised` than the growth floor, for a caller outside the system reserve, or than none ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit), or the zero frame of a zero-object attachment could not be taken |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), for the region or for a new zero frame's record |
-| 4 | `INVALID_ARGUMENT` | Unknown badge, bad alignment, zero length, an unknown prot or flag bit, `MAP_EXECUTABLE`, `MAP_WRITABLE` without `ATTACH_PRIVATE`, a cap that is no live object handle, pages past the object's end, a `first_page` other than 0 for the zero object, or overlap |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, bad alignment, zero length, an unknown prot or flag bit, `MAP_EXECUTABLE` with `MAP_WRITABLE` or for the zero object, `MAP_WRITABLE` without `ATTACH_PRIVATE`, a cap that is no live object handle, pages past the object's end, a `first_page` other than 0 for the zero object, or overlap |
 | 5 | `UNAUTHORIZED` | The badge is a handle or the swap authority |
 | 8 | `LIMIT` | The attachment's charge would take the subtree of the caller's budget node, or of an ancestor, over its max; or it would map a frame past the bound memmgr keeps its mappings under: the object is attached `OBJECT_MAX_ATTACHMENTS` times, or a zero-object attachment is longer than `ZERO_FRAME_SPAN` pages, the most one zero frame backs ([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects, Mapping bound) |
 
@@ -1409,7 +1421,8 @@ handle (§ Object Handles).
 memmgr drops the state, so every handle carrying its key is refused from then
 on; the sealer's `PROCESS_DIED` does the same for each object it sealed. An
 object no region attaches is freed then, and an attached one when its last
-attachment goes: each of its frames is pooled, its charge on the sealer's
+attachment goes, once the request that took the last name away is handled:
+memmgr unmaps its own view of the frames, and each frame is pooled, its charge on the sealer's
 budget node released, or held on the deferred list, still charged, while a
 mapping or a capability other than memmgr's still reaches it
 ([`memory-pool.md`](memory-pool.md#reclamation) § Reclamation).
@@ -1422,6 +1435,53 @@ mapping or a capability other than memmgr's still reaches it
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | The handle's key names no live object |
 | 5 | `UNAUTHORIZED` | The badge is not an object handle |
+
+### Label 30: `MAKE_PRIVATE`
+
+Give each page of a range of a process's attachments (§ Label 28) that maps
+its origin a page of its own, for a debugger about to write a breakpoint into
+it: a text write of `SYS_THREAD_WRITE_MEM` to such a page is refused while the
+page maps the object's frame, and once the page is the process's own the write
+patches the process alone
+([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects, Make
+private). Privilege: procmgr only, which sends it for a holder of its debug
+authority (`services/procmgr/docs/ipc-interface.md` § `MAKE_PRIVATE`).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 30 |
+| data[0] | the process's memmgr badge (from its `REGISTER_PROCESS` reply) |
+| data[1] | `va` |
+| data[2] | `len_bytes` (nonzero) |
+
+Each page gets what a write fault in a private attachment gives it: a copy of
+its object page, or a zeroed page for the zero object, mapped with the region's
+protection and recorded on its chunk. A page outside every attachment, and a
+page that has a page of its own already, is passed over, and so is every page
+of a process with no delegated address space, which no fault has mapped. A
+private attachment's copy draws a page its attach promised; a shared one's
+first promises a page, admitted as a committed region's pages are (§ Label 7).
+memmgr walks the regions the range meets in address order and stops after
+`MAKE_PRIVATE_PAGES` (16) copies or `MAKE_PRIVATE_VISITS` (1024) pages and
+regions visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 |
+| data[0] | where memmgr stopped: `va + len_bytes` when the whole range is done, else the address to send the request again from, with the rest of the range |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A shared attachment's copy was refused its page as a committed `REGISTER_REGION` is, or a copy could not be made, mapped or recorded; the pages before it are the process's own |
+| 3 | `QUOTA` | memmgr's metadata arena could not grow |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, zero length, or a range past the address space |
+| 5 | `UNAUTHORIZED` | The caller is not procmgr |
 
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
@@ -1491,18 +1551,20 @@ both threads resume onto the mapped chunk. A fault on a chunk on disk with no sw
 registered, and one on a lost chunk, are declined with code 12
 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 
-A fault in an attachment (§ Label 28) maps its origin read-only over the part of
-the faulting page's chunk that no write has copied: the object's pages there
-that the frame holding the faulting page holds, or its zero frame at each page,
-through a capability derived with the map right alone, so no leaf of an origin
-carries a write or execute grant. A write to a private attachment gives the
-faulting page a copy of its object page, a page drawn as a committed region's
-fault draws it and copied through memmgr's scrub window, mapped once memmgr has
+A fault in an attachment (§ Label 28) maps its origin read-only, and executable
+in an executable attachment, over the part of the faulting page's chunk that no
+write has copied: the object's pages there that the frame holding the faulting
+page holds, or its zero frame at each page, through a capability derived with
+the map right alone, and the execute right for an executable attachment, so no
+leaf of an origin carries a write grant. A write to a private attachment gives
+the faulting page a copy of its object page, a page drawn as a committed
+region's fault draws it, mapped at memmgr's scrub window and copied from
+memmgr's own view of the object, mapped once memmgr has
 unmapped the page's read-only leaf; in a zero-object attachment it backs the
 span as a committed region's fault does, once memmgr has unmapped the span's
 leaves of its zero frame ([`memory-pool.md`](memory-pool.md#memory-objects)
-§ Memory objects). A write to a shared attachment, and a fetch from any, is
-declined with code 4.
+§ Memory objects). A write to a shared attachment, and a fetch from one that is
+not executable, is declined with code 4.
 
 | Code | Decline |
 |---|---|
@@ -1575,7 +1637,7 @@ it evicted restores the chunk; either is declined only:
 
 An attachment (§ Label 28) is a committed region here, never evicted. A write to a private one is
 declined as a first touch above; one that copies an object page also with code 9 when the map of
-the object page or of its copy into memmgr's scrub window fails, or the unmap of the page's
+its copy into memmgr's scrub window fails, or the unmap of the page's
 read-only leaf from the process does. A read of either kind takes no page but the page-table
 donations its map needs, so it is declined only with code 10 or 9 for a donation as above, with
 code 9 when the derivation of its map capability or the map fails as any map can, and with code 6

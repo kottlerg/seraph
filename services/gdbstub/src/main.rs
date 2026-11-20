@@ -367,6 +367,42 @@ struct Sys
 
 impl Sys
 {
+    /// Write `bytes` at `addr` of the target's text, through the kernel's
+    /// text route (`THREAD_MEM_TEXT`), with every thread of the target held
+    /// on `cap`'s process. A page that maps a frame of a memory object other
+    /// processes may map too refuses it (`InvalidState`): procmgr then gives
+    /// the range copies of its own ([`ipc::make_private`]) and the write is
+    /// made again, so it patches the target alone
+    /// (services/memmgr/docs/memory-pool.md § Memory objects, Make private).
+    fn text_write(&self, cap: u64, addr: u64, bytes: &[u8]) -> bool
+    {
+        // SAFETY: the write lands in the target's address space, not the
+        // stub's own (module doc, § The target is never the stub), and every
+        // thread of the target is held, as a text write requires
+        // (docs/fault-handling.md § Debugging).
+        let write =
+            || unsafe { syscall::thread_write_mem(cap, addr, bytes, syscall_abi::THREAD_MEM_TEXT) };
+        match write()
+        {
+            Ok(()) => true,
+            Err(e) if e == syscall_abi::SyscallError::InvalidState as i64 =>
+            {
+                // SAFETY: `self.ipc_buf` is the registered IPC buffer.
+                let private = unsafe {
+                    ipc::make_private(
+                        self.debug,
+                        self.target,
+                        addr,
+                        bytes.len() as u64,
+                        self.ipc_buf,
+                    )
+                };
+                private && write().is_ok()
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Start receiver `index` when it is not running yet.
     fn ensure_receiver(&mut self, index: usize) -> bool
     {
@@ -598,7 +634,7 @@ impl Kernel for Sys
 
     fn write_text(&mut self, cap: u64, addr: u64, bytes: &[u8]) -> bool
     {
-        write_text(cap, addr, bytes)
+        self.text_write(cap, addr, bytes)
     }
 
     fn breakpoint_at(&mut self, cap: u64, addr: u64) -> bool
@@ -1245,7 +1281,7 @@ impl Stub
     /// Write target memory: a plain write, the same after procmgr made the
     /// range resident when the page is one memmgr evicted
     /// ([`ipc::make_resident`]), or through the text route when the page is
-    /// read-only text.
+    /// read-only text ([`Sys::text_write`]).
     fn write_memory(&self, addr: u64, bytes: &[u8]) -> bool
     {
         let Some(cap) = self.any_thread()
@@ -1281,7 +1317,7 @@ impl Stub
                 };
                 first.is_ok()
                     || (evicted && resident() && write().is_ok())
-                    || write_text(cap, at, chunk)
+                    || self.sys.text_write(cap, at, chunk)
             })
     }
 
@@ -1314,7 +1350,8 @@ impl Stub
         {
             return false;
         };
-        if syscall::thread_read_mem(cap, addr, saved).is_err() || !write_text(cap, addr, insn)
+        if syscall::thread_read_mem(cap, addr, saved).is_err()
+            || !self.sys.text_write(cap, addr, insn)
         {
             return false;
         }
@@ -1337,7 +1374,7 @@ impl Stub
         };
         match session.breakpoints.remove(addr)
         {
-            Some(bp) => write_text(cap, bp.addr, bp.original()),
+            Some(bp) => self.sys.text_write(cap, bp.addr, bp.original()),
             None => true,
         }
     }
@@ -1350,17 +1387,6 @@ enum EventKind
     Interrupt,
     Nack,
     Overflow,
-}
-
-/// Write `bytes` at `addr` of the target's text, through the kernel's text
-/// route (`THREAD_MEM_TEXT`), with every thread of the target held.
-fn write_text(cap: u64, addr: u64, bytes: &[u8]) -> bool
-{
-    // SAFETY: the write lands in the target's address space, not the stub's
-    // own (module doc, § The target is never the stub), and every thread of
-    // the target is held, as a text write requires
-    // (docs/fault-handling.md § Debugging).
-    unsafe { syscall::thread_write_mem(cap, addr, bytes, syscall_abi::THREAD_MEM_TEXT) }.is_ok()
 }
 
 /// The badge of the live process named `name` in procmgr's list

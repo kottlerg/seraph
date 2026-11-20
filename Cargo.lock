@@ -153,6 +153,7 @@ dependencies = [
 name = "debug-echo"
 version = "0.1.4"
 dependencies = [
+ "device-tracker",
  "gdb-rsp",
  "ipc",
  "syscall",
@@ -175,6 +176,15 @@ version = "0.1.4"
 
 [[package]]
 name = "demandpaged"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "device-tracker"
 version = "0.1.4"
 dependencies = [
  "ipc",
@@ -293,6 +303,7 @@ version = "0.1.4"
 name = "gdbstub"
 version = "0.1.4"
 dependencies = [
+ "device-tracker",
  "gdb-rsp",
  "ipc",
  "riscv-step",
@@ -918,6 +929,7 @@ name = "terminal"
 version = "0.0.1"
 dependencies = [
  "ansi",
+ "device-tracker",
  "ipc",
  "syscall",
  "syscall-abi",

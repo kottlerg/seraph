@@ -7,11 +7,17 @@
 //! the debug port, so `cargo xtask test-debug-port` proves the transport from
 //! the host to a guest service and back without a debugger stub.
 //!
+//! It follows the debug port across devmgr's restart of its driver
+//! (`device_tracker`), so the test's kill of the driver proves the follow
+//! too.
+//!
 //! The packets it answers, and the markers it logs, are specified in
 //! `services/debug-echo/README.md`.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
+
+use device_tracker::Device;
 
 use gdb_rsp::command::Command;
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
@@ -50,20 +56,18 @@ fn main()
         std::os::seraph::log!("no devmgr.class.debug-port seed; exiting");
         return;
     };
-    let Some(port) = query_debug_port(debug_port_class, ipc_buf)
+    let Some(port) = Port::open(debug_port_class, ipc_buf)
     else
     {
         std::os::seraph::log!("no debug port served; exiting");
         return;
     };
-    let rx_notify = register_rx_notify(port, ipc_buf);
     std::os::seraph::log!("{READY_MARKER}");
     // The guard, a temporary of this statement, lives as long as `serve`,
     // which never returns.
     serve(
         &mut BUFFERS.lock().unwrap_or_else(PoisonError::into_inner),
         port,
-        rx_notify,
         ipc_buf,
     );
 }
@@ -81,37 +85,83 @@ fn bootstrap_seed(creator_ep: u64, ipc_buf: *mut u64) -> Option<u64>
     (cap != 0).then_some(cap)
 }
 
-/// Ask devmgr for the debug port through `debug_port_class`, the
-/// `debug-port` class SEND: the class's first live driver, waited for on a
-/// `WATCH_CLASS` watch while devmgr serves none (`ipc::await_device`).
-fn query_debug_port(debug_port_class: u64, ipc_buf: *mut u64) -> Option<u64>
+/// The debug port: the `debug-port` class's current driver, followed across
+/// devmgr's restart of it, and the RX notification registered with each new
+/// instance.
+struct Port
 {
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let found = unsafe { ipc::await_device(debug_port_class, 0, ipc_buf, || {}) };
-    found
-        .inspect_err(|e| {
-            std::os::seraph::log!("QUERY_DEVICE on the debug-port class refused ({e:?})");
-        })
-        .ok()
+    device: Device,
+    /// The notification the driver signals on receive; `0` when none could
+    /// be made, and the reads then poll on the bounded wait.
+    rx: u64,
+    /// The generation of the driver `rx` was last registered with.
+    registered: Option<u64>,
 }
 
-/// Register a notification the port's driver signals on receive; `0` when
-/// none could be registered, and the reads then poll on the bounded wait.
-fn register_rx_notify(port: u64, ipc_buf: *mut u64) -> u64
+impl Port
 {
-    let Some(notif) =
-        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
-            syscall::cap_create_notification(slab).ok()
-        })
-    else
+    /// Follow the debug port through `debug_port_class`, the `debug-port`
+    /// class SEND, and take its first live driver, waited for without a bound
+    /// while devmgr serves none. `None` when the class cannot be followed
+    /// and serves none.
+    fn open(debug_port_class: u64, ipc_buf: *mut u64) -> Option<Self>
     {
-        return 0;
-    };
-    // IPC moves caps: send a derived copy and keep the original to wait on.
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let device = unsafe { Device::start(debug_port_class, "debug port", ipc_buf) };
+        device.await_first("debug port")?;
+        let rx = std::os::seraph::object_slab_retype(
+            std::os::seraph::NOTIFICATION_RETYPE_BYTES,
+            |slab| syscall::cap_create_notification(slab).ok(),
+        )
+        .unwrap_or(0);
+        Some(Self {
+            device,
+            rx,
+            registered: None,
+        })
+    }
+
+    /// The current driver's SEND, after registering the RX notification with
+    /// it when it is an instance the notification was not registered with.
+    /// `None` while the class serves none.
+    fn driver(&mut self, ipc_buf: *mut u64) -> Option<u64>
+    {
+        let driver = self.device.current()?;
+        if self.registered != Some(driver.generation)
+        {
+            self.registered = Some(driver.generation);
+            if self.rx != 0
+            {
+                register_rx_notify(driver.cap, self.rx, ipc_buf);
+            }
+        }
+        Some(driver.cap)
+    }
+
+    /// Wait for received bytes, at most [`RX_WAIT_MS`].
+    fn wait(&self)
+    {
+        if self.rx == 0
+        {
+            std::thread::sleep(Duration::from_millis(RX_WAIT_MS));
+        }
+        else
+        {
+            let _ = syscall::notification_wait_timeout(self.rx, RX_WAIT_MS);
+        }
+    }
+}
+
+/// Register `notif` as the notification `port`'s driver signals on receive,
+/// sending a derived copy, since IPC moves caps; a refusal is logged, and the
+/// reads then find the bytes on the bounded wait.
+fn register_rx_notify(port: u64, notif: u64, ipc_buf: *mut u64)
+{
     let Ok(copy) = syscall::cap_derive(notif, syscall::RIGHTS_ALL)
     else
     {
-        return notif;
+        std::os::seraph::log!("RX notification not registered; polling");
+        return;
     };
     let req = IpcMessage::builder(serial_labels::SERIAL_REGISTER_RX_NOTIFY)
         .cap(copy)
@@ -123,15 +173,19 @@ fn register_rx_notify(port: u64, ipc_buf: *mut u64) -> u64
         {}
         _ => std::os::seraph::log!("RX notification not registered; polling"),
     }
-    notif
 }
 
 /// Read the bytes the port holds into `buf`; returns the count, 0 when none.
-fn read(port: u64, buf: &mut [u8; MAX_MESSAGE_BYTES], ipc_buf: *mut u64) -> usize
+fn read(port: &mut Port, buf: &mut [u8; MAX_MESSAGE_BYTES], ipc_buf: *mut u64) -> usize
 {
+    let Some(cap) = port.driver(ipc_buf)
+    else
+    {
+        return 0;
+    };
     let req = IpcMessage::new(serial_labels::SERIAL_READ_BYTES);
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(port, &req, ipc_buf) })
+    let Ok(reply) = (unsafe { ipc::ipc_call(cap, &req, ipc_buf) })
     else
     {
         return 0;
@@ -153,9 +207,15 @@ fn read(port: u64, buf: &mut [u8; MAX_MESSAGE_BYTES], ipc_buf: *mut u64) -> usiz
     n
 }
 
-/// Write `bytes` to the port, one message's worth per call.
-fn write(port: u64, bytes: &[u8], ipc_buf: *mut u64)
+/// Write `bytes` to the port, one message's worth per call; dropped while
+/// the class serves no driver.
+fn write(port: &mut Port, bytes: &[u8], ipc_buf: *mut u64)
 {
+    let Some(cap) = port.driver(ipc_buf)
+    else
+    {
+        return;
+    };
     for chunk in bytes.chunks(MAX_MESSAGE_BYTES)
     {
         let req =
@@ -163,7 +223,7 @@ fn write(port: u64, bytes: &[u8], ipc_buf: *mut u64)
                 .bytes(0, chunk)
                 .build();
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_call(port, &req, ipc_buf) };
+        let _ = unsafe { ipc::ipc_call(cap, &req, ipc_buf) };
     }
 }
 
@@ -197,7 +257,7 @@ struct Session<'a>
 }
 
 /// Serve packets on the port forever, with the packet buffers `buffers`.
-fn serve(buffers: &mut Buffers, port: u64, rx_notify: u64, ipc_buf: *mut u64) -> !
+fn serve(buffers: &mut Buffers, mut port: Port, ipc_buf: *mut u64) -> !
 {
     let mut session = Session {
         buffers,
@@ -207,22 +267,15 @@ fn serve(buffers: &mut Buffers, port: u64, rx_notify: u64, ipc_buf: *mut u64) ->
     let mut buf = [0u8; MAX_MESSAGE_BYTES];
     loop
     {
-        let n = read(port, &mut buf, ipc_buf);
+        let n = read(&mut port, &mut buf, ipc_buf);
         if n == 0
         {
-            if rx_notify == 0
-            {
-                std::thread::sleep(Duration::from_millis(RX_WAIT_MS));
-            }
-            else
-            {
-                let _ = syscall::notification_wait_timeout(rx_notify, RX_WAIT_MS);
-            }
+            port.wait();
             continue;
         }
         for &byte in buf.iter().take(n)
         {
-            session.take(byte, port, ipc_buf);
+            session.take(byte, &mut port, ipc_buf);
         }
     }
 }
@@ -230,7 +283,7 @@ fn serve(buffers: &mut Buffers, port: u64, rx_notify: u64, ipc_buf: *mut u64) ->
 impl Session<'_>
 {
     /// Take one received byte; acknowledge and answer what it completes.
-    fn take(&mut self, byte: u8, port: u64, ipc_buf: *mut u64)
+    fn take(&mut self, byte: u8, port: &mut Port, ipc_buf: *mut u64)
     {
         let Buffers {
             reader,

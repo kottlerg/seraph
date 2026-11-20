@@ -385,7 +385,7 @@ and the in-image TLS template — are mapped read-only (svctest's
 The bias is deliberately not a `ProcessInfo` field. A process that
 needs its own base reads the lld-synthesized `__ehdr_start` symbol's
 address; debugging correlates through the creator's spawn log line
-(procmgr: `spawn image bias=0x…`; init: `init: <svc> image bias=0x…`;
+(procmgr: `spawn image bias=0x… (<argv0>)`; init: `init: <svc> image bias=0x…`;
 kernel Phase 9: `init: PIE bias=0x…`) and loads symbols with
 `add-symbol-file symbols/<file> -o <bias>` in GDB, `<file>` being the
 store file `symbols/manifest` lists for the image's install path: the

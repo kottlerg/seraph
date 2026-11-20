@@ -32,6 +32,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use arch::{ARCH, BREAKPOINT_PC_ADVANCE, StepUndo};
+use device_tracker::Device;
 use gdb_rsp::PACKET_SIZE;
 use gdb_rsp::command::{BreakpointType, Command, ThreadId, ThreadOp, VContActions};
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
@@ -171,48 +172,76 @@ fn main()
 
 // ── The debug port ───────────────────────────────────────────────────────────
 
-/// The debug port: the serial-protocol cap devmgr serves through the
-/// `debug-port` class SEND, and the notification its driver signals on receive (`0` with
-/// none registered).
+/// The debug port: the `debug-port` class's current driver, followed across
+/// devmgr's restart of it (`device_tracker`), and the notification its driver
+/// signals on receive (`0` with none), registered with each new instance.
 struct Port
 {
-    cap: u64,
+    device: Device,
     rx: u64,
+    /// The generation of the driver `rx` was last registered with.
+    registered: Option<u64>,
 }
 
 impl Port
 {
-    /// Take the port from devmgr through `debug_port_class`, the
-    /// `debug-port` class SEND: the class's first live driver, waited for on
-    /// a `WATCH_CLASS` watch while devmgr serves none
-    /// (`ipc::await_device`). Then register an RX notification on it.
+    /// Follow the debug port through `debug_port_class`, the `debug-port`
+    /// class SEND, and take its first live driver, waited for without a bound
+    /// while devmgr serves none. `None` when the class cannot be followed
+    /// and serves none.
     fn open(debug_port_class: u64, ipc_buf: *mut u64) -> Option<Self>
     {
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let cap = unsafe { ipc::await_device(debug_port_class, 0, ipc_buf, || {}) }.ok()?;
+        let device = unsafe { Device::start(debug_port_class, "debug port", ipc_buf) };
+        device.await_first("debug port")?;
         let rx = std::os::seraph::object_slab_retype(
             std::os::seraph::NOTIFICATION_RETYPE_BYTES,
             |slab| syscall::cap_create_notification(slab).ok(),
         )
         .unwrap_or(0);
-        if rx != 0
-            && let Ok(copy) = syscall::cap_derive(rx, syscall::RIGHTS_ALL)
+        Some(Self {
+            device,
+            rx,
+            registered: None,
+        })
+    }
+
+    /// The current driver's SEND, after registering the RX notification with
+    /// it when it is an instance the notification was not registered with:
+    /// a restarted driver knows nothing of the dead one's registration.
+    /// `None` while the class serves none.
+    fn driver(&mut self, ipc_buf: *mut u64) -> Option<u64>
+    {
+        let driver = self.device.current()?;
+        if self.registered != Some(driver.generation)
         {
-            let req = IpcMessage::builder(serial_labels::SERIAL_REGISTER_RX_NOTIFY)
-                .cap(copy)
-                .build();
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            let _ = unsafe { ipc::ipc_call(cap, &req, ipc_buf) };
+            // Once per instance: a refused registration leaves the bounded
+            // wait to find the bytes.
+            self.registered = Some(driver.generation);
+            if self.rx != 0
+                && let Ok(copy) = syscall::cap_derive(self.rx, syscall::RIGHTS_ALL)
+            {
+                let req = IpcMessage::builder(serial_labels::SERIAL_REGISTER_RX_NOTIFY)
+                    .cap(copy)
+                    .build();
+                // SAFETY: ipc_buf is the registered IPC buffer.
+                let _ = unsafe { ipc::ipc_call(driver.cap, &req, ipc_buf) };
+            }
         }
-        Some(Self { cap, rx })
+        Some(driver.cap)
     }
 
     /// Read the bytes the port holds into `buf`; returns the count.
-    fn read(&self, buf: &mut [u8; MAX_MESSAGE_BYTES], ipc_buf: *mut u64) -> usize
+    fn read(&mut self, buf: &mut [u8; MAX_MESSAGE_BYTES], ipc_buf: *mut u64) -> usize
     {
+        let Some(cap) = self.driver(ipc_buf)
+        else
+        {
+            return 0;
+        };
         let req = IpcMessage::new(serial_labels::SERIAL_READ_BYTES);
         // SAFETY: ipc_buf is the registered IPC buffer.
-        let Ok(reply) = (unsafe { ipc::ipc_call(self.cap, &req, ipc_buf) })
+        let Ok(reply) = (unsafe { ipc::ipc_call(cap, &req, ipc_buf) })
         else
         {
             return 0;
@@ -233,15 +262,21 @@ impl Port
         n
     }
 
-    /// Write `bytes`, one message's worth per call.
-    fn write(&self, bytes: &[u8], ipc_buf: *mut u64)
+    /// Write `bytes`, one message's worth per call. Dropped while the class
+    /// serves no driver, as bytes written to a dead one are.
+    fn write(&mut self, bytes: &[u8], ipc_buf: *mut u64)
     {
+        let Some(cap) = self.driver(ipc_buf)
+        else
+        {
+            return;
+        };
         for chunk in bytes.chunks(MAX_MESSAGE_BYTES)
         {
             let label = serial_labels::SERIAL_WRITE_BYTES | ((chunk.len() as u64) << 16);
             let req = IpcMessage::builder(label).bytes(0, chunk).build();
             // SAFETY: ipc_buf is the registered IPC buffer.
-            let _ = unsafe { ipc::ipc_call(self.cap, &req, ipc_buf) };
+            let _ = unsafe { ipc::ipc_call(cap, &req, ipc_buf) };
         }
     }
 

@@ -13,6 +13,7 @@ test = false
 
 [dependencies]
 ansi = { workspace = true }
+device-tracker = { path = "../../shared/device-tracker" }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }

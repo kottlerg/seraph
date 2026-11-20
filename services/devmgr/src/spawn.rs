@@ -413,9 +413,29 @@ pub enum DriverSpawn
     /// withdraws the driver from the device and destroys it as a live
     /// driver.
     Unbootstrapped(HeldChild),
-    /// The spawn failed before the driver started; the child, if created,
-    /// is torn down and its pages returned.
+    /// procmgr refused the create with this reply label: it created
+    /// nothing. The caller retries a refusal a later create can outlive
+    /// (`firmware::restart::create_retryable`).
+    Refused(u64),
+    /// The spawn failed before the driver started, other than by a refusal
+    /// of the create; the child, if created, is torn down and its pages
+    /// returned.
     Failed,
+}
+
+impl DriverSpawn
+{
+    /// procmgr's reply label for a [`DriverSpawn::Refused`] create; `None`
+    /// for any other outcome.
+    #[must_use]
+    pub fn refusal(&self) -> Option<u64>
+    {
+        match *self
+        {
+            Self::Refused(label) => Some(label),
+            Self::Bootstrapped(_) | Self::Unbootstrapped(_) | Self::Failed => None,
+        }
+    }
 }
 
 /// Delete every cap in `caps` that is not 0.
@@ -536,8 +556,10 @@ fn serve_list_round(
 /// caller keeps to withdraw the driver through;
 /// [`DriverSpawn::Unbootstrapped`] with them when a round or the death
 /// observer's bind failed after the start, the driver's death before one of
-/// its requests among the round failures ([`serve_list_round`]); and [`DriverSpawn::Failed`], the
-/// child torn down, on any failure before the start.
+/// its requests among the round failures ([`serve_list_round`]);
+/// [`DriverSpawn::Refused`] with procmgr's reply label when it refused the
+/// create; and [`DriverSpawn::Failed`], the child torn down, on any other
+/// failure before the start.
 #[expect(
     clippy::too_many_lines,
     reason = "one spawn transaction: derive the per-child caps, create and start the child, and \
@@ -669,6 +691,10 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     {
         env.settle(reply.as_ref().map_or(0, |r| r.label));
     }
+    // A failed call is no refusal, and is never retried: the call can end
+    // after procmgr acted on it (a debugger's all-stop interrupting devmgr,
+    // #1383), so devmgr cannot tell whether a child was created, and a
+    // retry could create a second one.
     let Ok(reply) = reply
     else
     {
@@ -684,12 +710,12 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
             warn: "{}: signature refused; not started",
             core::str::from_utf8(name).unwrap_or("driver")
         );
-        return DriverSpawn::Failed;
+        return DriverSpawn::Refused(reply.label);
     }
     if reply.label != 0
     {
         std::os::seraph::log!(warn: "driver create failed ({:#x})", reply.label);
-        return DriverSpawn::Failed;
+        return DriverSpawn::Refused(reply.label);
     }
 
     // [process handle, thread], and the release token of a held child.

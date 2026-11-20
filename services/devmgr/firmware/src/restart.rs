@@ -17,10 +17,20 @@
 //! was confirmed quiet and the driver's DMA hold released, and then the
 //! record's restart budget, which only a restart that passes every other
 //! check is charged.
+//!
+//! A create procmgr refuses with an error a later create can outlive is
+//! retried, for a start and a restart alike ([`create_retryable`]): after
+//! the delays [`retry_delay_ms`] gives, at most [`CREATE_RETRY_LIMIT`]
+//! times, each pending retry held in [`Retries`] until it is due.
 
+extern crate alloc;
+
+use alloc::collections::TryReserveError;
+use alloc::vec::Vec;
 use core::fmt;
 
 use driver_binding::decl::{DriverDecl, DriverName, Interrupt};
+use ipc::procmgr_errors;
 use syscall_abi::EXIT_FAULT_BASE;
 
 use crate::binding::{RecordKeys, Source, decl_rank};
@@ -176,6 +186,149 @@ pub fn same_driver(
     decl.name == *name
         && decl.interrupt == interrupt
         && decl_rank(decl, Source::DriversDir, record).is_some()
+}
+
+/// Retries devmgr makes of one driver start whose create procmgr refuses
+/// with an error a later create can outlive ([`create_retryable`]), before
+/// it gives the start up (services/devmgr/docs/responsibilities.md § Create
+/// retry). With the delays of [`retry_delay_ms`] the retries span 63 s, the
+/// order of svcmgr's memory wait (`MEMORY_RETRY_LIMIT` retries a second
+/// apart) at a tenth of its attempts, and past the root filesystem's stalls
+/// of #1363, each of whose refusals itself takes procmgr's file-call timeout.
+pub const CREATE_RETRY_LIMIT: u32 = 6;
+
+/// The delay before a start's first create retry, in milliseconds; each
+/// later retry waits twice the one before it ([`retry_delay_ms`]).
+pub const CREATE_RETRY_FIRST_MS: u64 = 1000;
+
+/// Whether procmgr's refusal `label` of a driver's create is one a later
+/// create can outlive, so devmgr retries it: `IO_ERROR`, the binary's
+/// file not opened or read (the file system stalled or refused), and
+/// `OUT_OF_MEMORY`, memory short for the child or procmgr. Every other
+/// refusal (a signature refused, an ELF or argument rejected, a mapping or
+/// derivation failed, the argv and env still mapped) holds for any later
+/// create of the same binary, and is final. A label is a reply procmgr gave,
+/// so nothing was created; a failed call is no refusal, and is never retried.
+#[must_use]
+pub fn create_retryable(label: u64) -> bool
+{
+    matches!(
+        label,
+        procmgr_errors::IO_ERROR | procmgr_errors::OUT_OF_MEMORY
+    )
+}
+
+/// The delay before create retry `retry` of a start, counted from 1, in
+/// milliseconds: [`CREATE_RETRY_FIRST_MS`], doubled for each retry before
+/// it. `None` past [`CREATE_RETRY_LIMIT`] (or for 0): the start is given up.
+#[must_use]
+pub fn retry_delay_ms(retry: u32) -> Option<u64>
+{
+    let doublings = retry.checked_sub(1)?;
+    if retry > CREATE_RETRY_LIMIT
+    {
+        return None;
+    }
+    CREATE_RETRY_FIRST_MS.checked_shl(doublings)
+}
+
+/// The create retries pending, each with the monotonic time, in
+/// nanoseconds, it falls due at. A record has at most one start pending, so
+/// the list holds at most one retry per device record.
+#[derive(Debug)]
+pub struct Retries<T>
+{
+    pending: Vec<(u64, T)>,
+}
+
+impl<T> Default for Retries<T>
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
+}
+
+impl<T> Retries<T>
+{
+    /// No retry pending.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            pending: Vec::new(),
+        }
+    }
+
+    /// Hold `retry`, due at `due_ns`.
+    ///
+    /// # Errors
+    /// The allocation error, `retry` handed back, when the list cannot grow.
+    pub fn push(&mut self, due_ns: u64, retry: T) -> Result<(), (TryReserveError, T)>
+    {
+        if let Err(e) = self.pending.try_reserve(1)
+        {
+            return Err((e, retry));
+        }
+        self.pending.push((due_ns, retry));
+        Ok(())
+    }
+
+    /// Move every retry `other` holds into this list, `other` left empty.
+    ///
+    /// # Errors
+    /// The allocation error when the list cannot grow by them; both lists are
+    /// then as they were.
+    pub fn append(&mut self, other: &mut Self) -> Result<(), TryReserveError>
+    {
+        self.pending.try_reserve(other.pending.len())?;
+        self.pending.append(&mut other.pending);
+        Ok(())
+    }
+
+    /// The earliest time a retry falls due at; `None` with none pending.
+    #[must_use]
+    pub fn next_due(&self) -> Option<u64>
+    {
+        self.pending.iter().map(|&(due, _)| due).min()
+    }
+
+    /// How long a wait from `now_ns` may last before the earliest retry
+    /// falls due, in whole milliseconds rounded up, so the wait ends no
+    /// earlier than the retry is due: `Some(0)` when one is due already,
+    /// `None` with none pending.
+    #[must_use]
+    pub fn wait_ms(&self, now_ns: u64) -> Option<u64>
+    {
+        self.next_due()
+            .map(|due| due.saturating_sub(now_ns).div_ceil(1_000_000))
+    }
+
+    /// Take the retry due earliest, when it is due at `now_ns`; ties in the
+    /// order they were held.
+    pub fn take_due(&mut self, now_ns: u64) -> Option<T>
+    {
+        let (at, _) = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, (due, _))| *due <= now_ns)
+            .min_by_key(|(_, (due, _))| *due)?;
+        Some(self.pending.remove(at).1)
+    }
+
+    /// Take every retry held, due or not.
+    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_
+    {
+        self.pending.drain(..).map(|(_, retry)| retry)
+    }
+
+    /// Whether no retry is pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool
+    {
+        self.pending.is_empty()
+    }
 }
 
 /// The outcome of a `DECLINE_RESTART` request ([`decline`]).
@@ -472,5 +625,92 @@ mod tests
         assert_eq!(decline(&mut s, Some(1), false, never), Decline::Withdrawn);
         assert_eq!(decline(&mut s, Some(2), false, never), Decline::Absent);
         assert_eq!(decline(&mut s, None, false, never), Decline::Absent);
+    }
+
+    #[test]
+    fn only_a_refusal_a_later_create_can_outlive_is_retried()
+    {
+        use ipc::procmgr_errors as e;
+        assert!(create_retryable(e::IO_ERROR));
+        assert!(create_retryable(e::OUT_OF_MEMORY));
+        for label in [
+            e::SUCCESS,
+            e::INVALID_ELF,
+            e::THREAD_CONFIGURE_FAILED,
+            e::INVALID_BADGE,
+            e::ALREADY_STARTED,
+            e::THREAD_START_FAILED,
+            e::INVALID_ARGUMENT,
+            e::FILE_NOT_FOUND,
+            e::MAP_FAILED,
+            e::INSUFFICIENT_RIGHTS,
+            e::UNAUTHORIZED,
+            e::ARGV_ENV_STILL_MAPPED,
+            e::NOT_ATTACHABLE,
+            e::CRASH_SERVICE_PRESENT,
+            e::THREAD_LIMIT,
+            e::SIGNATURE_REFUSED,
+            e::END_QUEUE_PRESENT,
+            e::UNKNOWN_OPCODE,
+        ]
+        {
+            assert!(!create_retryable(label), "label {label:#x} is final");
+        }
+    }
+
+    #[test]
+    fn the_retries_double_from_a_second_and_stop_at_the_limit()
+    {
+        let delays: Vec<u64> = (1..=CREATE_RETRY_LIMIT)
+            .map(|retry| retry_delay_ms(retry).unwrap())
+            .collect();
+        assert_eq!(delays, [1000, 2000, 4000, 8000, 16_000, 32_000]);
+        assert_eq!(delays.iter().sum::<u64>(), 63_000);
+        assert_eq!(retry_delay_ms(CREATE_RETRY_LIMIT + 1), None, "given up");
+        assert_eq!(retry_delay_ms(0), None);
+        assert_eq!(retry_delay_ms(u32::MAX), None);
+    }
+
+    #[test]
+    fn a_retry_is_taken_only_once_due_and_the_earliest_first()
+    {
+        let mut retries = Retries::new();
+        assert_eq!(retries.wait_ms(0), None, "no retry: an untimed wait");
+        assert_eq!(retries.take_due(u64::MAX), None);
+        retries.push(3_000_000_000, 'b').unwrap();
+        retries.push(1_000_000_000, 'a').unwrap();
+        retries.push(3_000_000_000, 'c').unwrap();
+        assert_eq!(retries.next_due(), Some(1_000_000_000));
+        assert_eq!(retries.wait_ms(0), Some(1000));
+        // Rounded up, so the wait does not end before the retry is due.
+        assert_eq!(retries.wait_ms(999_999_999), Some(1));
+        assert_eq!(retries.take_due(999_999_999), None, "not yet due");
+        assert_eq!(retries.take_due(1_000_000_000), Some('a'));
+        assert_eq!(retries.wait_ms(4_000_000_000), Some(0), "overdue: no wait");
+        assert_eq!(retries.take_due(2_999_999_999), None);
+        assert_eq!(
+            retries.take_due(5_000_000_000),
+            Some('b'),
+            "ties in push order"
+        );
+        assert_eq!(retries.take_due(5_000_000_000), Some('c'));
+        assert!(retries.is_empty());
+    }
+
+    #[test]
+    fn appended_retries_join_the_list_and_drain_whole()
+    {
+        let mut held = Retries::new();
+        held.push(5, 1).unwrap();
+        let mut batch = Retries::new();
+        batch.push(2, 2).unwrap();
+        held.append(&mut batch).unwrap();
+        assert!(batch.is_empty());
+        assert_eq!(held.take_due(10), Some(2));
+        held.push(1, 3).unwrap();
+        let mut left: Vec<i32> = held.drain().collect();
+        left.sort_unstable();
+        assert_eq!(left, [1, 3]);
+        assert!(held.is_empty());
     }
 }

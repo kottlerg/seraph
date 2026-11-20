@@ -49,7 +49,7 @@
 //!     history, which a later phase's lines could evict and which the next
 //!     logd instance does not hold.
 //! 12. [`swap`] after every phase that uses the `memhog` fixture ([`svcmgr`],
-//!     [`oom`], [`logd_restart`]): it holds the level at `CRITICAL` while it
+//!     [`oom`], [`timed`], [`logd_restart`]): it holds the level at `CRITICAL` while it
 //!     restores chunks from the restore headroom, which on a slow host outlasts
 //!     oomd's grace. oomd then stops memhog, and svcmgr's restart of it, made
 //!     while the level still reads `CRITICAL`, fails, which leaves memhog down

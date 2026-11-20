@@ -137,15 +137,16 @@ svctest reads it on every boot.
 ## Hotplug events
 
 acpid posts each hotplug event of a slot the firmware drives with `ACPI_HOTPLUG`: the event,
-`HOTPLUG_ADDED` or `HOTPLUG_REMOVED`, and the port above the slot
-([README.md](../README.md#hotplug) § Hotplug). devmgr runs it as a job of that slot on its control
-thread, after the jobs posted before it, and replies when the job has ended, with the number of
-functions it recorded or removed; the registry worker that received the call waits for that reply.
-It replies `NO_DEVICE` to a port that is no hotplug slot of its boot scan, and `REFUSED` to a slot
-it does not leave to the firmware: one it manages, one whose grant has not come, and one it could
-not hold. A removal's reply comes once the drivers are withdrawn and the records removed, so the
-`_EJ0` acpid runs on it lets go of a card that nothing uses
-([services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#acpi-hotplug) § ACPI Hotplug).
+`HOTPLUG_ADDED` or `HOTPLUG_REMOVED`, and the port above the slot ([README.md](../README.md#hotplug)
+§ Hotplug). devmgr runs it as a job of that slot on its control thread, after the jobs posted before
+it, and replies when the job has ended, with the number of functions it recorded or removed; the
+registry worker that received the call waits for that reply. It replies `NO_DEVICE` to a port that
+is no hotplug slot of its boot scan, and `REFUSED` to a slot it does not leave to the firmware: one
+it manages, one whose grant has not come, and one it could not hold. It replies `OUT_OF_RESOURCES`
+to an add while its `CSpace` headroom is short, which records nothing. A removal's reply comes once
+the drivers are withdrawn and the records removed, so the `_EJ0` acpid runs on it lets go of a card
+that nothing uses ([services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#acpi-hotplug) §
+ACPI Hotplug).
 
 ---
 

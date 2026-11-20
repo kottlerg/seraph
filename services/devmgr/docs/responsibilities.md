@@ -730,21 +730,28 @@ serve meanwhile: about 450 slots. The page `CSpaceHeadroom` holds beyond the mar
 of those arena pages funded.
 
 devmgr holds it before each turn of the control thread's loop (acpid's requests, hotplug jobs,
-withdrawals, and the bind passes they start), before each record's carves (PCI and platform),
-before each driver spawn (the IOMMU driver's included), before each registry request a worker
-serves, and before each DMA request. A failed top-up is retried at the next hold; the control
-thread logs a run of them once, since a registry worker or the DMA thread may be serving logd, or
-a driver logd writes through, and must not log.
+withdrawals, and the bind passes they start), before each record's carves (PCI and platform), before
+each driver spawn (the IOMMU driver's included), before each hotplug slot's grant and each hotplug
+add job, before each registry request a worker serves, and before each DMA request. A failed top-up
+is retried at the next hold; the control thread logs a run of them once, since a registry worker or
+the DMA thread may be serving logd, or a driver logd writes through, and must not log.
 
-While the headroom is short of the mark and its top-up was refused, devmgr takes no capability
-it would keep, so the slots left and the IPC receive reserve the next top-up's reply needs stay
-free: a record's carves and a driver spawn fail, logged, and the record is not bound; the
-registry refuses `WATCH_CLASS`, whose watch keeps a Notification, with `OUT_OF_RESOURCES`; and
-the DMA thread refuses `DMA_MAP`, which keeps the mapped Memory cap, with `OUT_OF_RESOURCES`
-(`firmware::headroom`). Every other request keeps nothing past its reply, or a fixed number of
-directory caps that a repeat does not add to, and is served: `SET_DRIVERS_DIR` the drivers
-directory's and the platform tables' (`caps[1]`, which the drivers-directory job deletes), once
-per boot, and `BIND_DRIVERS` one while its pass is pending.
+While the headroom is short of the mark and its top-up was refused, devmgr takes no capability it
+would keep, so the slots left and the IPC receive reserve the next top-up's reply needs stay free: a
+record's carves and a driver spawn fail, logged, and the record is not bound; a hotplug slot whose
+grant has come waits, logged once, and a later turn manages it or leaves it to the firmware, either
+of which keeps capabilities (`firmware::hotplug::held_grant`); a hotplug add job, which keeps the
+configuration page of each function it reads and the held pages of its BARs, is refused, logged, and
+records nothing, acpid's answered `OUT_OF_RESOURCES` (`firmware::headroom::hotplug_refusal`;
+[hotplug.md](hotplug.md#grant) § Grant and § Add Job); the registry refuses `WATCH_CLASS`, whose
+watch keeps a Notification, with `OUT_OF_RESOURCES`; and the DMA thread refuses `DMA_MAP`, which
+keeps the mapped Memory cap, with `OUT_OF_RESOURCES` (`firmware::headroom`). A hotplug removal job
+runs, since its card is leaving: it frees the capabilities of each driver it withdraws, and keeps at
+most the configuration page of each function it quiesces, which devmgr keeps once per function for
+the boot, so a repeat adds none. Every other request keeps nothing past its reply, or a fixed number
+of directory caps that a repeat does not add to, and is served: `SET_DRIVERS_DIR` the drivers
+directory's and the platform tables' (`caps[1]`, which the drivers-directory job deletes), once per
+boot, and `BIND_DRIVERS` one while its pass is pending.
 
 ---
 

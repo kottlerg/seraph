@@ -14,7 +14,7 @@
 //! APIC model with `_PIC(1)` and reads the routes again.
 
 use acpid::events::{Layout, Registers, Start};
-use acpid::power::{Derived, ReducedRegister};
+use acpid::power::{Derived, Place, ReducedRegister};
 use aml::host::Width;
 use ipc::{acpid_labels, devmgr_labels};
 use std::time::Duration;
@@ -67,8 +67,9 @@ fn block(devmgr: &Devmgr, block: u64) -> Result<Block, CallError>
     })
 }
 
-/// A sleep register of a hardware-reduced platform, one byte, as devmgr
-/// served it (`devmgr_labels::ACPI_SLEEP_CONTROL`, `ACPI_SLEEP_STATUS`).
+/// A byte register as devmgr served it: `RESET_REG`
+/// (`devmgr_labels::ACPI_RESET`), or a sleep register of a hardware-reduced
+/// platform (`ACPI_SLEEP_CONTROL`, `ACPI_SLEEP_STATUS`).
 #[derive(Clone, Copy)]
 enum Register
 {
@@ -89,12 +90,20 @@ enum Register
 
 impl Register
 {
-    /// The sleep register `which` (`devmgr_labels::ACPI_SLEEP_CONTROL` or
-    /// `ACPI_SLEEP_STATUS`), asked of devmgr through `devmgr`: a port bound
-    /// to `thread`, the calling thread, or a page mapped into `aspace`,
-    /// acpid's address space. `None`, logged as `name`, when devmgr serves
-    /// none, its answer is malformed, or the bind or the map fails.
-    fn acquire(devmgr: &Devmgr, aspace: u64, thread: u64, which: u64, name: &str) -> Option<Self>
+    /// The register `which` (`devmgr_labels::ACPI_RESET`,
+    /// `ACPI_SLEEP_CONTROL` or `ACPI_SLEEP_STATUS`), asked of devmgr through
+    /// `devmgr`: a port bound to `thread`, the calling thread, or a page
+    /// mapped into `aspace`, acpid's address space; with the value devmgr
+    /// gives with it (`acpid::power::served_register`). `None`, logged as
+    /// `name`, when devmgr serves none, its answer is malformed, or the bind
+    /// or the map fails.
+    fn acquire(
+        devmgr: &Devmgr,
+        aspace: u64,
+        thread: u64,
+        which: u64,
+        name: &str,
+    ) -> Option<(Self, u8)>
     {
         let reply = match devmgr.call(devmgr_labels::QUERY_ACPI_RESOURCES, &[which])
         {
@@ -111,14 +120,11 @@ impl Register
             std::os::seraph::log!(warn: "{name} served without its cap");
             return None;
         };
-        let address = reply.word(0);
-        let register = match reply.word(3)
+        let served = acpid::power::served_register(reply.word(3), reply.word(0), reply.word(2));
+        let register = served.and_then(|served| match served.place
         {
-            devmgr_labels::ACPI_SPACE_IO => u16::try_from(address)
-                .ok()
-                .filter(|_| bind_ports(thread, cap))
-                .map(|port| Self::Port { cap, port }),
-            devmgr_labels::ACPI_SPACE_MEMORY =>
+            Place::Port(port) => bind_ports(thread, cap).then_some(Self::Port { cap, port }),
+            Place::Memory(address) =>
             {
                 crate::platform::map_held(aspace, cap, 1).map(|page_va| Self::Memory {
                     cap,
@@ -126,19 +132,18 @@ impl Register
                     page_va,
                 })
             }
-            _ => None,
-        };
-        if let Some(register) = register
+        });
+        if let Some((register, served)) = register.zip(served)
         {
             std::os::seraph::log!("{name}: {}", register.describe());
-            return Some(register);
+            return Some((register, served.value));
         }
         // A refused map keeps its cap with the reserved VA.
-        if reply.word(3) == devmgr_labels::ACPI_SPACE_IO
+        if !served.is_some_and(|s| matches!(s.place, Place::Memory(_)))
         {
             let _ = syscall::cap_delete(cap);
         }
-        std::os::seraph::log!(warn: "{name} {address:#x} not usable");
+        std::os::seraph::log!(warn: "{name} {:#x} not usable", reply.word(0));
         None
     }
 
@@ -159,9 +164,10 @@ impl Register
         {
             Self::Port { port, .. } =>
             {
-                // SAFETY: `port` is the register devmgr served, bound to the
-                // evaluation thread, which runs the sleep, at acquisition;
-                // writing it is the sleep sequence of ACPI 6.5 § 4.8.3.7.
+                // SAFETY: `port` is the register devmgr served, bound at
+                // acquisition to the evaluation thread, which serves the power
+                // requests; writing it is the request's step of the sleep
+                // sequence of ACPI 6.5 § 4.8.3.7 or the reset of § 4.8.4.6.
                 unsafe { outb(port, value) };
             }
             Self::Memory {
@@ -173,7 +179,8 @@ impl Register
                 // SAFETY: `page_va` maps, for acpid's lifetime, the page devmgr
                 // served that holds the register, so `register` is that byte
                 // of device memory; the volatile store is the one access, and
-                // it is the sleep sequence of ACPI 6.5 § 4.8.3.7.
+                // it is the request's step of the sleep sequence of ACPI 6.5
+                // § 4.8.3.7 or the reset of § 4.8.4.6.
                 unsafe { register.write_volatile(value) };
             }
         }
@@ -208,7 +215,7 @@ impl Register
     }
 }
 
-/// The page size of a memory sleep register's mapping.
+/// The page size of a memory register's mapping.
 const PAGE_SIZE: u64 = 0x1000;
 
 /// The registers of the power requests, acquired once from devmgr and bound
@@ -221,7 +228,8 @@ pub struct Power
     pm1a: Option<Block>,
     sleep_control: Option<Register>,
     sleep_status: Option<Register>,
-    reset: Option<Block>,
+    /// `RESET_REG` and its `RESET_VALUE`.
+    reset: Option<(Register, u8)>,
 }
 
 impl Power
@@ -259,7 +267,8 @@ impl Power
                 thread,
                 devmgr_labels::ACPI_SLEEP_CONTROL,
                 "SLEEP_CONTROL_REG",
-            );
+            )
+            .map(|(register, _)| register);
             let status = control.and_then(|_| {
                 Register::acquire(
                     devmgr,
@@ -268,6 +277,7 @@ impl Power
                     devmgr_labels::ACPI_SLEEP_STATUS,
                     "SLEEP_STATUS_REG",
                 )
+                .map(|(register, _)| register)
             });
             if control.is_none()
             {
@@ -284,20 +294,13 @@ impl Power
             }
             (control, status)
         };
-        let reset = match block(devmgr, devmgr_labels::ACPI_RESET)
-        {
-            Ok(reset) if reset.count >= 1 && bind_ports(thread, reset.cap) => Some(reset),
-            Ok(_) =>
-            {
-                std::os::seraph::log!(warn: "RESET_REG not usable");
-                None
-            }
-            Err(e) =>
-            {
-                std::os::seraph::log!(warn: "no RESET_REG ({e:?})");
-                None
-            }
-        };
+        let reset = Register::acquire(
+            devmgr,
+            aspace,
+            thread,
+            devmgr_labels::ACPI_RESET,
+            "RESET_REG",
+        );
         Self {
             pm1a,
             sleep_control,
@@ -401,26 +404,18 @@ impl Power
         })
     }
 
-    /// Reset the platform: write `RESET_VALUE` to `RESET_REG`. Returns,
-    /// true, only when the platform keeps running; false without a write
-    /// when `RESET_REG` is not held.
+    /// Reset the platform: write `RESET_VALUE` to `RESET_REG`, a port or a
+    /// byte of memory. Returns, true, only when the platform keeps running;
+    /// false without a write when `RESET_REG` is not held.
     pub fn reset(&self) -> bool
     {
-        let Some(reset) = self.reset
+        let Some((register, value)) = self.reset
         else
         {
             return false;
         };
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "RESET_VALUE is the FADT's one-byte field"
-        )]
-        let value = reset.value as u8;
-        std::os::seraph::log!("RESET: RESET_REG {:#x} <- {value:#x}", reset.port);
-        // SAFETY: `reset.port` is the FADT's `RESET_REG`, bound to this
-        // thread at acquisition; writing `RESET_VALUE` to it is the reset the
-        // ACPI specification defines.
-        unsafe { outb(reset.port, value) };
+        std::os::seraph::log!("RESET: RESET_REG {} <- {value:#x}", register.describe());
+        register.write(value);
         true
     }
 }

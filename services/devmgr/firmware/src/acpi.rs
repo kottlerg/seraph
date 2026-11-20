@@ -4,8 +4,9 @@
 // services/devmgr/firmware/src/acpi.rs
 
 //! Narrow ACPI walk: RSDP → XSDT → MCFG, FADT (`PM1a_CNT_BLK`, `CENTURY`,
-//! the DSDT, the fixed register blocks acpid is served, the sleep control
-//! and status registers of a hardware-reduced FADT, and the FACS), and
+//! the DSDT, the fixed register blocks acpid is served, `RESET_REG`, the
+//! sleep control and status registers of a hardware-reduced FADT, and the
+//! FACS), and
 //! MADT (its Interrupt Source Overrides and I/O APICs).
 //!
 //! Operates on byte-slice views of ACPI tables — the caller is responsible
@@ -264,14 +265,10 @@ pub enum FadtBlock
     Gpe0,
     /// `SMI_CMD`, one port, with `ACPI_ENABLE`.
     SmiCmd,
-    /// `RESET_REG`, when `RESET_REG_SUP` is set and it lies in the I/O
-    /// space, with `RESET_VALUE`.
-    Reset,
 }
 
 /// Where a [`FadtBlock`] lies: its first port, its port count, and the value
-/// the FADT gives with it (`ACPI_ENABLE` for [`FadtBlock::SmiCmd`],
-/// `RESET_VALUE` for [`FadtBlock::Reset`], else 0).
+/// the FADT gives with it (`ACPI_ENABLE` for [`FadtBlock::SmiCmd`], else 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IoBlock
 {
@@ -284,11 +281,9 @@ pub struct IoBlock
 ///
 /// Returns `None` if the signature isn't `FACP`, the table (bounded by its
 /// reported length and the slice) does not reach the fields, the port is
-/// zero or past 0xFFFF, the block's length is zero or runs past 0xFFFF, the
-/// FADT sets `HW_REDUCED_ACPI` and `block` is not [`FadtBlock::Reset`]
-/// (OSPM ignores the fixed-hardware fields then, ACPI 6.5 § 5.2.9), or, for
-/// [`FadtBlock::Reset`], `RESET_REG_SUP` is clear or the register is not in
-/// the I/O space.
+/// zero or past 0xFFFF, the block's length is zero or runs past 0xFFFF, or
+/// the FADT sets `HW_REDUCED_ACPI` (OSPM ignores the fixed-hardware fields
+/// then, ACPI 6.5 § 5.2.9).
 #[must_use]
 pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
 {
@@ -304,8 +299,7 @@ pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
             .get(off..off.checked_add(4)?)
             .map(|_| read_u32(table, off))
     };
-    if block != FadtBlock::Reset
-        && dword(FADT_OFF_FLAGS).is_some_and(|flags| flags & FADT_FLAG_HW_REDUCED_ACPI != 0)
+    if dword(FADT_OFF_FLAGS).is_some_and(|flags| flags & FADT_FLAG_HW_REDUCED_ACPI != 0)
     {
         return None;
     }
@@ -331,20 +325,6 @@ pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
             1,
             byte(FADT_OFF_ACPI_ENABLE)?,
         ),
-        FadtBlock::Reset =>
-        {
-            let value = byte(FADT_OFF_RESET_VALUE)?;
-            if dword(FADT_OFF_FLAGS)? & FADT_FLAG_RESET_REG_SUP == 0
-                || byte(FADT_OFF_RESET_REG)? != GAS_SPACE_IO
-            {
-                return None;
-            }
-            let width = byte(FADT_OFF_RESET_REG + 1)?;
-            let address = table
-                .get(FADT_OFF_RESET_REG + 4..FADT_OFF_RESET_REG + 12)
-                .map(|_| read_u64(table, FADT_OFF_RESET_REG + 4))?;
-            (address, (width / 8).max(1), value)
-        }
     };
     let port = u16::try_from(port).ok().filter(|&p| p != 0)?;
     let count = u16::from(count);
@@ -367,9 +347,9 @@ pub enum SleepRegister
     Status,
 }
 
-/// Where a [`SleepRegister`] lies: its space and its address, a port in the
-/// I/O space or a physical address in the memory space. The register is one
-/// byte.
+/// Where a byte register of the FADT lies, a [`SleepRegister`] or
+/// `RESET_REG`: its space and its address, a port in the I/O space or a
+/// physical address in the memory space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FixedRegister
 {
@@ -407,7 +387,51 @@ pub fn fadt_sleep_register(fadt_bytes: &[u8], register: SleepRegister) -> Option
         SleepRegister::Control => FADT_OFF_SLEEP_CONTROL_REG,
         SleepRegister::Status => FADT_OFF_SLEEP_STATUS_REG,
     };
-    let gas = table.get(off..)?.first_chunk::<GAS_LEN>()?;
+    byte_register(table.get(off..)?.first_chunk::<GAS_LEN>()?)
+}
+
+/// The FADT's `RESET_REG` and the `RESET_VALUE` written to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResetRegister
+{
+    pub register: FixedRegister,
+    pub value: u8,
+}
+
+/// Read the FADT's `RESET_REG` and `RESET_VALUE` (ACPI 6.5 § 5.2.9 and
+/// § 4.8.4.6), in the memory or the I/O space, on a platform that is
+/// hardware-reduced or not.
+///
+/// Returns `None` if the signature isn't `FACP`, the table (bounded by its
+/// reported length and the slice) does not reach `RESET_VALUE`,
+/// `RESET_REG_SUP` is clear, or the structure is not the 8-bit register the
+/// specification defines, as [`fadt_sleep_register`] refuses one: a
+/// `RESET_REG` in the PCI configuration space, which the specification also
+/// allows, among them.
+#[must_use]
+pub fn fadt_reset_register(fadt_bytes: &[u8]) -> Option<ResetRegister>
+{
+    if sdt_signature(fadt_bytes) != *b"FACP"
+    {
+        return None;
+    }
+    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
+    let table = fadt_bytes.get(..total_len)?;
+    let value = *table.get(FADT_OFF_RESET_VALUE)?;
+    if read_u32(table, FADT_OFF_FLAGS) & FADT_FLAG_RESET_REG_SUP == 0
+    {
+        return None;
+    }
+    let register = byte_register(table.get(FADT_OFF_RESET_REG..)?.first_chunk::<GAS_LEN>()?)?;
+    Some(ResetRegister { register, value })
+}
+
+/// The register a Generic Address Structure `gas` places, when it is a byte
+/// register: the memory or the I/O space, a bit width of 8, a bit offset of
+/// 0, an access size undefined or byte, a non-zero address, and a port no
+/// higher than 0xFFFF.
+fn byte_register(gas: &[u8; GAS_LEN]) -> Option<FixedRegister>
+{
     let &[space_id, bit_width, bit_offset, access, ..] = gas;
     let space = match space_id
     {
@@ -1572,7 +1596,6 @@ mod tests
         assert_eq!(fadt_io_block(&t, FadtBlock::Pm1aCnt), block(0x604, 2, 0));
         assert_eq!(fadt_io_block(&t, FadtBlock::Gpe0), block(0x620, 16, 0));
         assert_eq!(fadt_io_block(&t, FadtBlock::SmiCmd), block(0xB2, 1, 0xF1));
-        assert_eq!(fadt_io_block(&t, FadtBlock::Reset), block(0xCF9, 1, 6));
         assert_eq!(fadt_facs_phys(&t), Some(0x7FEB_1000));
     }
 
@@ -1760,12 +1783,6 @@ mod tests
         t[FADT_OFF_PM1A_EVT_BLK..FADT_OFF_PM1A_EVT_BLK + 4]
             .copy_from_slice(&0xFFFEu32.to_le_bytes());
         assert_eq!(fadt_io_block(&t, FadtBlock::Pm1aEvt), None);
-        // RESET_REG in memory, then unsupported.
-        t[FADT_OFF_RESET_REG] = 0;
-        assert_eq!(fadt_io_block(&t, FadtBlock::Reset), None);
-        t[FADT_OFF_RESET_REG] = GAS_SPACE_IO;
-        t[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
-        assert_eq!(fadt_io_block(&t, FadtBlock::Reset), None);
         // Both FACS fields zero: no FACS.
         assert_eq!(fadt_facs_phys(&t), None);
         // An ACPI 1.0 FADT: no RESET_REG, the 32-bit FACS field.
@@ -1773,7 +1790,7 @@ mod tests
         old[FADT_OFF_FIRMWARE_CTRL..FADT_OFF_FIRMWARE_CTRL + 4]
             .copy_from_slice(&0x7FEB_1000u32.to_le_bytes());
         old[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&116u32.to_le_bytes());
-        assert_eq!(fadt_io_block(&old, FadtBlock::Reset), None);
+        assert_eq!(fadt_reset_register(&old), None);
         assert_eq!(
             fadt_io_block(&old, FadtBlock::Pm1aCnt).map(|b| b.port),
             Some(0x604)
@@ -1782,6 +1799,115 @@ mod tests
         old[..4].copy_from_slice(b"APIC");
         assert_eq!(fadt_io_block(&old, FadtBlock::Pm1aCnt), None);
         assert_eq!(fadt_facs_phys(&old), None);
+    }
+
+    /// `fadt` with `RESET_REG_SUP` set and its `RESET_REG` the 8-bit register
+    /// of `space` at `address`, with `RESET_VALUE` `value`.
+    fn with_reset(mut fadt: Vec<u8>, space: u8, address: u64, value: u8) -> Vec<u8>
+    {
+        let flags = read_u32(&fadt, FADT_OFF_FLAGS) | FADT_FLAG_RESET_REG_SUP;
+        fadt[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+        fadt[FADT_OFF_RESET_REG..FADT_OFF_RESET_REG + GAS_LEN].fill(0);
+        fadt[FADT_OFF_RESET_REG] = space;
+        fadt[FADT_OFF_RESET_REG + 1] = 8;
+        fadt[FADT_OFF_RESET_REG + 4..FADT_OFF_RESET_REG + 12]
+            .copy_from_slice(&address.to_le_bytes());
+        fadt[FADT_OFF_RESET_VALUE] = value;
+        fadt
+    }
+
+    // Defect caught: a RESET_REG in the memory space withheld (a
+    // hardware-reduced platform, such as QEMU's microvm, places it there
+    // beside its sleep registers), or one read from the wrong offset, in the
+    // wrong space, or with the wrong value.
+    #[test]
+    fn fadt_gives_its_reset_register_in_either_space()
+    {
+        use crate::acpid::Space;
+        let reset = |space, address, value| {
+            Some(ResetRegister {
+                register: FixedRegister { space, address },
+                value,
+            })
+        };
+        // q35: port 0xCF9, value 6.
+        assert_eq!(
+            fadt_reset_register(&q35_fadt(0)),
+            reset(Space::Io, 0xCF9, 6)
+        );
+        // A hardware-reduced FADT whose RESET_REG is a byte of memory, as
+        // microvm's generic event device places it, value 0x42.
+        let reduced = with_reset(
+            reduced_fadt(GAS_SPACE_MEMORY, 0xFEA0_0200, 0xFEA0_0201),
+            GAS_SPACE_MEMORY,
+            0xFEA0_0202,
+            0x42,
+        );
+        assert_eq!(
+            fadt_reset_register(&reduced),
+            reset(Space::Memory, 0xFEA0_0202, 0x42)
+        );
+        // A memory RESET_REG on a platform that is not hardware-reduced.
+        let legacy = with_reset(q35_fadt(0), GAS_SPACE_MEMORY, 0xFED0_0000, 1);
+        assert_eq!(
+            fadt_reset_register(&legacy),
+            reset(Space::Memory, 0xFED0_0000, 1)
+        );
+        // The byte access size is accepted as the undefined one is.
+        let mut t = reduced.clone();
+        t[FADT_OFF_RESET_REG + 3] = GAS_ACCESS_BYTE;
+        assert_eq!(
+            fadt_reset_register(&t),
+            reset(Space::Memory, 0xFEA0_0202, 0x42)
+        );
+        // An ACPI 2.0 FADT of 129 bytes reaches RESET_VALUE.
+        let mut t = reduced;
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&129u32.to_le_bytes());
+        assert!(fadt_reset_register(&t).is_some());
+    }
+
+    // Defect caught: a RESET_REG served when the FADT does not support it,
+    // from a field the table does not reach, or one that is not the
+    // specification's 8-bit register.
+    #[test]
+    fn a_reset_register_is_withheld_unless_supported_reached_and_well_formed()
+    {
+        let good = with_reset(q35_fadt(0), GAS_SPACE_MEMORY, 0xFEA0_0202, 0x42);
+        assert!(fadt_reset_register(&good).is_some());
+        // RESET_REG_SUP clear.
+        let mut t = good.clone();
+        let flags = read_u32(&t, FADT_OFF_FLAGS) & !FADT_FLAG_RESET_REG_SUP;
+        t[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+        assert_eq!(fadt_reset_register(&t), None);
+        // The reported length, or the slice, stops before RESET_VALUE.
+        let mut t = good.clone();
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&128u32.to_le_bytes());
+        assert_eq!(fadt_reset_register(&t), None);
+        assert_eq!(fadt_reset_register(&good[..128]), None);
+        // Each malformed field of the structure.
+        let field = |off: usize, v: u8| {
+            let mut t = good.clone();
+            t[FADT_OFF_RESET_REG + off] = v;
+            fadt_reset_register(&t)
+        };
+        assert_eq!(field(0, 2), None, "PCI configuration space");
+        assert_eq!(field(1, 16), None, "a 16-bit register");
+        assert_eq!(field(1, 0), None, "no bit width");
+        assert_eq!(field(2, 1), None, "a bit offset");
+        assert_eq!(field(3, 2), None, "a word access");
+        assert_eq!(
+            fadt_reset_register(&with_reset(q35_fadt(0), GAS_SPACE_MEMORY, 0, 0x42)),
+            None,
+            "a zero address"
+        );
+        assert_eq!(
+            fadt_reset_register(&with_reset(q35_fadt(0), GAS_SPACE_IO, 0x1_0000, 6)),
+            None,
+            "a port past 0xFFFF"
+        );
+        let mut t = good;
+        t[..4].copy_from_slice(b"APIC");
+        assert_eq!(fadt_reset_register(&t), None);
     }
 
     #[test]

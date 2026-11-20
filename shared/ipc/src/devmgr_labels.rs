@@ -256,32 +256,34 @@ pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 ///
 /// Reply ([`super::devmgr_errors::SUCCESS`]) for a register block:
 /// `caps[0]` = a narrow `IoPort` over the block, derived from devmgr's
-/// full-rights `IoPort` on every call, or, for a sleep register in the
-/// memory space, an `Mmio` over the page that holds it, a derivation of
-/// the grant of that page devmgr keeps for acpid, as [`ACPI_REGION_GRANT`]
-/// keeps it; `data[0]` = its first port, or the register's physical
-/// address; `data[1]` = its port or byte count; `data[2]` = the FADT's
-/// `ACPI_ENABLE` value for [`ACPI_SMI_CMD`], its `RESET_VALUE` for
-/// [`ACPI_RESET`], and 0 for the others; `data[3]` = its space,
-/// [`ACPI_SPACE_IO`], or [`ACPI_SPACE_MEMORY`] for a sleep register in
-/// the memory space. The sleep registers, served only for a FADT that sets
-/// `HW_REDUCED_ACPI`, are checked as [`ACPI_REGION_GRANT`] checks a
-/// range, and a register a holder overlaps is refused, logged, with
-/// [`super::devmgr_errors::REFUSED`]. For [`ACPI_SCI`]: `caps[0]` = an `Interrupt` cap carrying
-/// `RIGHTS_IRQ_NOTIFY` on the SCI's line, a derivation of the line devmgr
-/// holds for the boot, made on every call; `data[0]` = the line's GSI;
-/// `data[1]` = the `SYS_IRQ_REGISTER` mode it is routed in; `data[2]` =
-/// 1 when devmgr served the SCI earlier in this boot (the caller is a
-/// restarted acpid), else 0. Replies [`super::devmgr_errors::NO_DEVICE`]
-/// when the platform has no such block or SCI (every one on RISC-V, a
-/// zero FADT field, a `RESET_REG` outside the I/O space, a
-/// hardware-reduced FADT for the fixed blocks and the SCI, a FADT that is
-/// not hardware-reduced or names no usable 8-bit register for the sleep
-/// registers), the FADT cannot be read, or the carve or the derivation
-/// fails, and [`super::devmgr_errors::INVALID_REQUEST`] for an unknown
-/// block. The SCI and the sleep registers are answered on devmgr's
-/// control thread, the other blocks on the registry worker that receives
-/// the request.
+/// full-rights `IoPort` on every call, or, for `RESET_REG` or a sleep
+/// register in the memory space, an `Mmio` over the page that holds it, a
+/// derivation of the grant of that page devmgr keeps for acpid, as
+/// [`ACPI_REGION_GRANT`] keeps it; `data[0]` = its first port, or the
+/// register's physical address; `data[1]` = its port or byte count;
+/// `data[2]` = the FADT's `ACPI_ENABLE` value for [`ACPI_SMI_CMD`], its
+/// `RESET_VALUE` for [`ACPI_RESET`], and 0 for the others; `data[3]` =
+/// its space, [`ACPI_SPACE_IO`], or [`ACPI_SPACE_MEMORY`] for a register
+/// in the memory space. The sleep registers, served only for a FADT that
+/// sets `HW_REDUCED_ACPI`, and a `RESET_REG` in the memory space are checked
+/// as [`ACPI_REGION_GRANT`] checks a range, and a register a holder overlaps
+/// is refused, logged, with [`super::devmgr_errors::REFUSED`]. For
+/// [`ACPI_SCI`]: `caps[0]` = an `Interrupt` cap carrying `RIGHTS_IRQ_NOTIFY`
+/// on the SCI's line, a derivation of the line devmgr holds for the boot,
+/// made on every call; `data[0]` = the line's GSI; `data[1]` = the
+/// `SYS_IRQ_REGISTER` mode it is routed in; `data[2]` = 1 when devmgr served
+/// the SCI earlier in this boot (the caller is a restarted acpid), else 0.
+/// Replies [`super::devmgr_errors::NO_DEVICE`] when the platform has no such
+/// block or SCI (on RISC-V, which has no I/O space and no SCI, all but a
+/// register in the memory space; a zero FADT field, a hardware-reduced FADT
+/// for the fixed blocks and the SCI, a FADT that is not hardware-reduced or
+/// names no usable 8-bit register for the sleep registers, a clear
+/// `RESET_REG_SUP` or no usable 8-bit register in the memory or the I/O space
+/// for `RESET_REG`), the FADT cannot be read, or the carve or the derivation
+/// fails, and [`super::devmgr_errors::INVALID_REQUEST`] for an unknown block.
+/// The SCI, `RESET_REG` and the sleep registers are answered on devmgr's
+/// control thread, the other blocks on the registry worker that receives the
+/// request.
 pub const QUERY_ACPI_RESOURCES: u64 = 24;
 /// [`QUERY_ACPI_RESOURCES`] block: `PM1a_EVT_BLK`, `PM1_EVT_LEN` ports.
 pub const ACPI_PM1A_EVT: u64 = 1;
@@ -291,8 +293,8 @@ pub const ACPI_PM1A_CNT: u64 = 2;
 pub const ACPI_GPE0: u64 = 3;
 /// [`QUERY_ACPI_RESOURCES`] block: the `SMI_CMD` port.
 pub const ACPI_SMI_CMD: u64 = 4;
-/// [`QUERY_ACPI_RESOURCES`] block: the `RESET_REG` port, when the FADT
-/// places it in the I/O space.
+/// [`QUERY_ACPI_RESOURCES`] block: the FADT's `RESET_REG`, one byte in the
+/// memory or the I/O space, with its `RESET_VALUE`.
 pub const ACPI_RESET: u64 = 5;
 /// [`QUERY_ACPI_RESOURCES`] resource: the SCI, the FADT's `SCI_INT` line.
 pub const ACPI_SCI: u64 = 6;

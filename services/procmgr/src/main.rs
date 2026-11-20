@@ -1646,7 +1646,11 @@ fn handle_query_live_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &proc
 /// as EXITED even before procmgr's own death-event drain has reaped the
 /// entry (`process_table::QueryEntry::state`). Without this, the userspace
 /// death-eq drain races a parent's "wait then `QUERY_PROCESS`" sequence and
-/// produces a transient ALIVE answer for an already-dead child.
+/// produces a transient ALIVE answer for an already-dead child. The first
+/// `EXITED` answer for a live entry fixes its reason
+/// (`ProcessTable::latch_end`), which later answers and its reap or destroy
+/// carry, so an end of the address space after a main-thread exit the query
+/// already reported changes no answer.
 fn resolve_query_state(badge: u64, state: &mut process::TableState) -> (u64, u64)
 {
     use ipc::procmgr_process_state;
@@ -1658,7 +1662,10 @@ fn resolve_query_state(badge: u64, state: &mut process::TableState) -> (u64, u64
         let aspace_end = syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_END).ok();
         match entry.state(main_thread, syscall_abi::THREAD_STATE_EXITED, aspace_end)
         {
-            process::QueryState::Exited(reason) => (procmgr_process_state::EXITED, reason),
+            process::QueryState::Exited(reason) => (
+                procmgr_process_state::EXITED,
+                table.latch_end(badge, reason),
+            ),
             process::QueryState::Alive => (procmgr_process_state::ALIVE, 0u64),
             process::QueryState::Created => (procmgr_process_state::CREATED, 0u64),
         }

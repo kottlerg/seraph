@@ -235,6 +235,7 @@ mod tests
             unanswered: false,
             end_queue: 0,
             end_correlator: 0,
+            ended_with: None,
         }
     }
 

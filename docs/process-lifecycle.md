@@ -512,9 +512,10 @@ recorded the end, without touching the address space, and the address space's te
 the calling thread runs on no CPU, so procmgr's reap on the first post cannot free what the later
 post reads. procmgr folds the two posts of a main thread's end into one reap, and gives the process
 one reason whichever post it takes first: the address space's end once the space has ended, else the
-main thread's (a `sys_thread_exit` of the main thread ends no address space). Its reap,
-`QUERY_PROCESS`, a destroy, the death relay, the end queue and logd all read it so. The kernel only
-*notifies*; it does not enumerate or stop sibling threads at that point — they are stopped when
+main thread's (a `sys_thread_exit` of the main thread ends no address space), read at the first
+`QUERY_PROCESS` that finds the process ended, which fixes it, or else at the reap or destroy. Its
+reap, `QUERY_PROCESS`, a destroy, the death relay, the end queue and logd all carry it. The kernel
+only *notifies*; it does not enumerate or stop sibling threads at that point — they are stopped when
 procmgr's cap-revoke teardown below deletes the process's `CSpace` (every thread bound to it is
 stopped before its storage is reclaimed, wherever their thread caps are held) and reaped through
 their own thread caps. `sys_thread_exit` ends the calling thread alone and posts only its thread

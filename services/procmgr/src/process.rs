@@ -2152,6 +2152,7 @@ fn finalize_creation(
         unanswered: true,
         end_queue: 0,
         end_correlator: 0,
+        ended_with: None,
     });
     if let Err(e) = inserted
     {
@@ -3467,12 +3468,18 @@ fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
 }
 
 /// The reason `entry`'s process ended with when it has ended before procmgr
-/// reaped it: its address space's terminal end, the first terminal fault or
-/// process exit of any of its threads, or else, when the space has not
-/// ended, the reason the kernel retained for its exited main thread
-/// ([`resync_exit_reason`]); `None` while it runs. Reads kernel state only.
+/// reaped it: the reason an earlier `QUERY_PROCESS` answer fixed
+/// ([`ProcessEntry::ended_with`]), or else its address space's terminal end,
+/// the first terminal fault or process exit of any of its threads, or else,
+/// when the space has not ended, the reason the kernel retained for its
+/// exited main thread ([`resync_exit_reason`]); `None` while it runs.
+/// Reads the entry and kernel state only.
 fn ended_exit_reason(entry: &ProcessEntry) -> Option<u64>
 {
+    if entry.ended_with.is_some()
+    {
+        return entry.ended_with;
+    }
     let main_thread = syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
     let aspace_end = syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_END).ok();
     resync_exit_reason(main_thread, syscall_abi::THREAD_STATE_EXITED, aspace_end)

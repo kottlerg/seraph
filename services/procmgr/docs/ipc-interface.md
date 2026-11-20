@@ -493,8 +493,11 @@ handle with no data words or caps.
 A live entry any of whose threads ended its address space (its recorded end), or whose main thread
 the kernel reports as exited, answers `EXITED` before procmgr reaps it, with the end's reason, the
 process's first end by a fault or a `sys_aspace_exit` whichever thread made it, or else, when the
-space has not ended, the main thread's. procmgr reaps with the same reading, whichever death post
-arrives first, so the relay, the end queue, logd and this answer agree. After the reap, or after a
+space has not ended, the main thread's. The first such answer fixes the reason: later answers repeat
+it, and procmgr tears the process down with it, so a worker's end of the address space after a
+main-thread `sys_thread_exit` this answer reported changes nothing. Without an earlier answer,
+procmgr reaps with the same reading, made at the reap, whichever death post arrives first. Either
+way the relay, the end queue, logd and this answer agree. After the reap, or after a
 `DESTROY_PROCESS` teardown, the badge answers `EXITED` for `RECENT_EXIT_RETENTION_NS` (30 s) of
 monotonic time, however many other processes die in the window, while procmgr's heap can hold their
 records, and `UNKNOWN` after that. Retention is best-effort: when the heap cannot hold a new record,

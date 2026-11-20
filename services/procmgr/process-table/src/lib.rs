@@ -239,6 +239,12 @@ pub struct ProcessEntry
     /// The correlator posted with the child's end to its end queue, as the
     /// tag word.
     pub end_correlator: u64,
+    /// The exit reason procmgr first answered `QUERY_PROCESS` with for the
+    /// child before its reap ([`ProcessTable::latch_end`]); `None` until a
+    /// query found it ended. Its reap or destroy tears it down with this
+    /// reason, so every answer and post procmgr makes for one process carries
+    /// one reason, whatever ended the process after the query read it.
+    pub ended_with: Option<u64>,
 }
 
 /// Where the loader placed a child's image: the load bias it drew and the
@@ -1246,7 +1252,21 @@ impl ProcessTable
             started: e.started,
             thread_cap: e.thread_cap,
             aspace_cap: e.aspace_cap,
+            ended_with: e.ended_with,
         })
+    }
+
+    /// Fix `reason` as the exit reason of the live entry `badge` names, unless
+    /// an earlier answer fixed one ([`ProcessEntry::ended_with`]), and return
+    /// the reason fixed. `QUERY_PROCESS` calls it on each `EXITED` answer for a
+    /// live entry; `reason` when no live entry holds `badge`.
+    pub fn latch_end(&mut self, badge: u64, reason: u64) -> u64
+    {
+        match self.find_mut_by_badge(badge)
+        {
+            Some(entry) => *entry.ended_with.get_or_insert(reason),
+            None => reason,
+        }
     }
 
     /// The creator a create request badged `badge` comes from: the
@@ -1798,6 +1818,9 @@ pub struct QueryEntry
     /// procmgr's slot for the child's address space, for the kernel's
     /// `CAP_INFO_ASPACE_END`.
     pub aspace_cap: u64,
+    /// The reason an earlier `QUERY_PROCESS` answer fixed
+    /// ([`ProcessEntry::ended_with`]).
+    pub ended_with: Option<u64>,
 }
 
 /// A live entry's state as `QUERY_PROCESS` answers it ([`QueryEntry::state`]).
@@ -1820,7 +1843,8 @@ impl QueryEntry
     /// space ended (a terminal fault or a process exit of any of its threads),
     /// is exited though procmgr has not
     /// reaped it yet, so a caller whose wait returned on its death never sees
-    /// it alive.
+    /// it alive. A reason an earlier answer fixed is the answer's, whatever
+    /// the kernel's records show since.
     #[must_use]
     pub fn state(
         &self,
@@ -1829,7 +1853,9 @@ impl QueryEntry
         aspace_end: Option<u64>,
     ) -> QueryState
     {
-        if let Some(reason) = resync_exit_reason(main_thread, exited, aspace_end)
+        if let Some(reason) = self
+            .ended_with
+            .or_else(|| resync_exit_reason(main_thread, exited, aspace_end))
         {
             QueryState::Exited(reason)
         }
@@ -2026,6 +2052,7 @@ mod tests
             unanswered: false,
             end_queue: 0,
             end_correlator: 0,
+            ended_with: None,
         }
     }
 
@@ -2975,6 +3002,7 @@ mod tests
             started: false,
             thread_cap: 7,
             aspace_cap: 8,
+            ended_with: None,
         };
         assert_eq!(table.query_by_badge(16), Some(created));
         table.find_mut_by_badge(16).expect("entry present").started = true;
@@ -3000,6 +3028,7 @@ mod tests
             started: true,
             thread_cap: 7,
             aspace_cap: 8,
+            ended_with: None,
         };
         assert_eq!(
             started.state(Some(running), EXITED, Some(0)),
@@ -3022,6 +3051,27 @@ mod tests
             ..started
         };
         assert_eq!(created.state(None, EXITED, None), QueryState::Created);
+    }
+
+    // Defect caught: each reader re-read the kernel, so a main thread's
+    // `SYS_THREAD_EXIT` (5) answered 5, and a worker's later end of the
+    // address space (`0x100E`) changed the answer and the reap to `0x100E`.
+    #[test]
+    fn the_first_exited_answer_fixes_the_reason_for_every_later_reader()
+    {
+        const EXITED: u32 = 3;
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(0x77)).unwrap();
+        assert_eq!(table.latch_end(0x77, 5), 5);
+        assert_eq!(table.latch_end(0x77, 0x100E), 5);
+        let query = table.query_by_badge(0x77).unwrap();
+        assert_eq!(
+            query.state(Some(u64::from(EXITED) << 32), EXITED, Some(ended(0x100E))),
+            QueryState::Exited(5)
+        );
+        assert_eq!(table.take_ended(0x77, |_| {}).unwrap().ended_with, Some(5));
+        // No live entry: nothing to fix.
+        assert_eq!(table.latch_end(0x77, 9), 9);
     }
 
     #[test]

@@ -710,21 +710,18 @@ impl AcpiService
         {
             return self.checked_register(register, value, "RESET_REG", records, caps);
         }
-        let cap = u16::try_from(register.address)
+        let Some(cap) = u16::try_from(register.address)
             .ok()
-            .and_then(|port| arch::current::carve_io_ports(caps, port, 1));
-        match cap
+            .and_then(|port| arch::current::carve_io_ports(caps, port, 1))
+        else
         {
-            Some(cap) => register_reply(register, value, cap),
-            None =>
-            {
-                std::os::seraph::log!(
-                    warn: "acpid: RESET_REG port {:#x} not served",
-                    register.address
-                );
-                Reply::status(errors::NO_DEVICE)
-            }
-        }
+            std::os::seraph::log!(
+                warn: "acpid: RESET_REG port {:#x} not served",
+                register.address
+            );
+            return Reply::status(errors::NO_DEVICE);
+        };
+        register_reply(register, value, cap)
     }
 
     /// A byte register of the FADT, `name`, with `value` the FADT gives with

@@ -191,7 +191,9 @@ A boot module runs only during bootstrap: devmgr starts its driver modules in it
 passes and vfsd its `fatfs` module for the root mount, each deletes its copy of a module once it
 has started the process, and init donates the modules' sources at its reap (below). Every later
 start of a process, a further instance of one that booted included, is from its installed path on
-the root filesystem ([boot-media.md](boot-media.md) § Bootstrap-Only Boot Copies).
+the root filesystem, apart from a restart of the IOMMU driver, which devmgr starts from the copy of
+the driver's image it keeps for the boot ([boot-media.md](boot-media.md) § Bootstrap-Only Boot
+Copies).
 
 ### Init reap
 

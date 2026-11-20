@@ -70,8 +70,9 @@ pub const STOP_WAIT: u64 = 2000;
 pub const START_POLL: u64 = 10;
 
 /// The error number a register read or write of a thread held in a call
-/// answers ([`Session::register_refusal`]): the kernel reads the registers
-/// of a thread only while it is stopped or fault-blocked.
+/// answers ([`Session::register_refusal`]) until the call returns and its
+/// upcall is held ([`Session::await_call`]): the kernel reads the registers
+/// of a thread only while it is stopped or fault-blocked (#1405).
 pub const IN_CALL_CODE: u8 = 6;
 
 /// How long a detach keeps answering the stops that arrive after its
@@ -545,7 +546,13 @@ impl Session
         }
         for t in &mut self.threads
         {
-            t.upcall = Upcall::Unposted;
+            // A thread held in a call stays marked so: its upcall arrives
+            // at the call's return, while the target is stopped or once it
+            // runs ([`Self::take_late`], [`Self::poll`]).
+            if t.upcall != Upcall::InCall || t.held.is_some()
+            {
+                t.upcall = Upcall::Unposted;
+            }
             if let Some(h) = &mut t.held
             {
                 h.reported = true;
@@ -553,6 +560,79 @@ impl Session
         }
         self.undo_step(k, Unheld::Pending);
         self.running = false;
+    }
+
+    /// Let the target run: a thread held in a call is posted again at the
+    /// next all-stop, since the upcall it awaited arrives while it runs
+    /// and is resumed ([`Self::poll`]).
+    fn run(&mut self)
+    {
+        for t in &mut self.threads
+        {
+            if t.upcall == Upcall::InCall
+            {
+                t.upcall = Upcall::Unposted;
+            }
+        }
+        self.running = true;
+    }
+
+    /// Take the stops that arrive while the target is stopped, until
+    /// `until`: the upcall of a thread the all-stop counted held in a call,
+    /// which arrives at the call's return, and any stop taken with it. Each
+    /// is held as the all-stop holds one, a breakpoint hit set back, and is
+    /// one GDB has been told of, since the all-stop reported its thread
+    /// stopped.
+    fn take_late(&mut self, k: &mut impl Kernel, until: u64)
+    {
+        if self.running
+        {
+            return;
+        }
+        while let Some(stop) = self.next_stop(k, until)
+        {
+            let Some(index) = self.hold(k, stop)
+            else
+            {
+                continue;
+            };
+            self.cancel_hit(k, index);
+            if let Some(t) = self.threads.get_mut(index)
+            {
+                t.upcall = Upcall::Unposted;
+                if let Some(h) = &mut t.held
+                {
+                    h.reported = true;
+                }
+            }
+            if until <= k.now()
+            {
+                continue;
+            }
+            // A wait ends once its thread is held.
+            return;
+        }
+    }
+
+    /// Before a register read or write of slot `index` while the target is
+    /// stopped: take the stops already arrived, and, when the call that
+    /// held the thread has returned since, wait up to [`STOP_WAIT`] for its
+    /// upcall, which the kernel delivers at the return, so that its
+    /// registers read. A thread still in its call stays unheld.
+    pub fn await_call(&mut self, k: &mut impl Kernel, index: usize)
+    {
+        let now = k.now();
+        self.take_late(k, now);
+        let deadline = now.saturating_add(STOP_WAIT);
+        while self
+            .threads
+            .get(index)
+            .is_some_and(|t| t.upcall == Upcall::InCall && t.held.is_none() && t.live())
+            && !self.threads.get(index).is_some_and(|t| k.in_call(t.cap))
+            && k.now() < deadline
+        {
+            self.take_late(k, deadline);
+        }
     }
 
     /// The next stop a receiver passes on, waiting until `until` at most,
@@ -877,6 +957,8 @@ impl Session
     {
         if !self.running
         {
+            let now = k.now();
+            self.take_late(k, now);
             return None;
         }
         let now = k.now();
@@ -896,7 +978,7 @@ impl Session
             held(index).or_else(|| (0..self.threads.len()).find_map(held))
         else
         {
-            self.running = true;
+            self.run();
             return None;
         };
         // The stop reported is its thread's last: one the all-stop took
@@ -955,7 +1037,7 @@ impl Session
                 }
             }
         }
-        self.running = true;
+        self.run();
     }
 
     /// Carry out a resume packet's `plan`, after moving the planned
@@ -1030,7 +1112,7 @@ impl Session
         {
             k.reply(b.receiver, syscall_abi::FAULT_REPLY_RESUME);
         }
-        self.running = true;
+        self.run();
         true
     }
 
@@ -1088,7 +1170,7 @@ impl Session
         if self.stepping.is_some()
         {
             // The stepped thread runs on: one more all-stop for its stop.
-            self.running = true;
+            self.run();
             self.stop_all(k);
         }
         // A thread registered since the last all-stop is bound, so a stop
@@ -2780,6 +2862,61 @@ mod tests
             "the thread in a call was not read again"
         );
         assert_eq!(s.describe(&mut sim, a), b"held in a call");
+        assert!(s.detach(&mut sim));
+        sim.assert_sound();
+    }
+
+    // Defect caught: the upcall of a thread held in a call, arriving at the
+    // call's return while the target stayed stopped, was never taken, so
+    // the thread's registers stayed unreadable until GDB resumed the target.
+    #[test]
+    fn a_thread_held_in_a_call_is_held_once_its_call_returns()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        let reply = STOP_WAIT * 3;
+        sim.calls.push((a, 0, reply));
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(!s.is_held(a));
+        // Still in its call: nothing to wait for.
+        sim.time = reply - 1;
+        s.await_call(&mut sim, a);
+        assert!(!s.is_held(a));
+        assert_eq!(sim.time, reply - 1, "a register read waited on a call");
+        assert_eq!(s.register_refusal(&mut sim, a), IN_CALL_CODE);
+        // The reply: the upcall arrives and is held, already reported.
+        sim.time = reply;
+        s.await_call(&mut sim, a);
+        assert!(s.is_held(a));
+        assert_eq!(s.describe(&mut sim, a), b"stopped");
+        assert!(s.threads[a].held.unwrap().reported);
+        assert!(sim.held_live(&s));
+        assert!(s.detach(&mut sim));
+        sim.assert_sound();
+    }
+
+    // Defect caught: as above, through the serve loop's poll while the
+    // target is stopped; and a thread held in a call stayed marked so once
+    // the target ran, so the next all-stop never posted it.
+    #[test]
+    fn a_stopped_target_takes_a_late_upcall_and_a_resume_posts_again()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        sim.calls.push((a, 0, STOP_WAIT));
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        sim.time = STOP_WAIT;
+        assert_eq!(s.poll(&mut sim), None);
+        assert!(s.is_held(a));
+        resume(&mut sim, &mut s);
+        assert!(s.interrupt(&mut sim));
+        assert!(s.is_held(0));
+        assert!(
+            s.is_held(a),
+            "the all-stop after a resume left the thread unposted"
+        );
         assert!(s.detach(&mut sim));
         sim.assert_sound();
     }

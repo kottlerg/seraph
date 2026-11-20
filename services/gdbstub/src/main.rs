@@ -1216,9 +1216,21 @@ impl Stub
         }
     }
 
+    /// Hold the current thread once the call that held it has returned
+    /// ([`Session::await_call`]), so that its registers read.
+    fn await_call(&mut self)
+    {
+        if let Some(s) = &mut self.session
+        {
+            let current = s.current;
+            s.await_call(&mut self.sys, current);
+        }
+    }
+
     /// `g` (every register, `regnum` `None`) or `p` (one).
     fn read_registers(&mut self, regnum: Option<usize>, ipc_buf: *mut u64)
     {
+        self.await_call();
         let Some((_, file)) = self.read_file()
         else
         {
@@ -1240,6 +1252,7 @@ impl Stub
     /// `G` (every register, `regnum` `None`) or `P` (one).
     fn write_registers(&mut self, regnum: Option<usize>, hex: &[u8], ipc_buf: *mut u64)
     {
+        self.await_call();
         let Some((cap, mut file)) = self.read_file()
         else
         {

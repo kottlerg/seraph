@@ -135,7 +135,9 @@ stub's endpoint.
   with the reply in its registers ([docs/fault-handling.md](../../docs/fault-handling.md)
   § Asynchronous Upcalls, Blocking syscalls), and runs no instruction before it. The stub reads
   each posted thread's upcall state (`CAP_INFO_THREAD_UPCALL`) as often, and counts a thread held
-  in a call, its upcall pending and not masked, as stopped at once. Once none is awaited, it
+  in a call, its upcall pending and not masked, as stopped at once; its upcall, when it arrives
+  while the target is still stopped, is held as any stop, so a register request of the thread
+  waits up to `STOP_WAIT` for it once the call has returned. Once none is awaited, it
   refreshes its table once (below), posts an upcall to each thread the refresh adds,
   and restarts every held breakpoint hit or fault GDB has not been told of, since any of them can
   be a new thread's (below). A thread whose upcall does not arrive in time runs on and is not
@@ -202,8 +204,9 @@ stub's endpoint.
   `Hg` of a thread GDB cannot select is answered `E04` when its bind failed, `E05` when it has
   exited, and `E01` when the table has no such slot, and the stub logs the refusal, so the cause
   reaches the host even when the line cannot, as when the target held is logd. A register read or
-  write of a thread held in a call is answered `E06`, since the kernel reads a thread's registers
-  only while it is stopped or fault-blocked, and `qThreadExtraInfo` shows it as `held in a call`.
+  write of a thread still held in a call is answered `E06`, since the kernel reads a thread's
+  registers only while it is stopped or fault-blocked (#1405 asks for a read of a blocked thread's
+  saved frame), and `qThreadExtraInfo` shows it as `held in a call`.
 - **Memory.** `m` reads and `M` and `X` write the target's memory through a live thread of it, in
   the chunks the kernel copies at once. A chunk on a page memmgr evicted, into its compressed store
   or to disk, is not present to the kernel's copy, so the stub asks procmgr, through its debug

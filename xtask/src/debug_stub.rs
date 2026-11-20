@@ -15,17 +15,31 @@
 //! repacks again in that layout.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::context::Context;
 use crate::disk::DiskLayout;
-use crate::qemu_gdb::{Stub, le_hex};
+use crate::qemu_gdb::{Stub, le_hex, le_u64};
 
 /// The stub's line once it holds its target, followed by ` (<target>)`. Kept
 /// in sync with `services/gdbstub/src/main.rs`.
 pub const ATTACHED_MARKER: &str = "[gdbstub] attached; serving the debug port";
+
+/// The stub's answer to a register request of a thread held in a call, whose
+/// registers the kernel does not read until the call returns. Kept in sync
+/// with `IN_CALL_CODE` in `services/gdbstub/src/session.rs`.
+const HELD_IN_CALL: &[u8] = b"E06";
+
+/// How long a kill reads again the program counter of a main thread held in
+/// a call: a server can answer late, as a file-system read stalled 43 s on a
+/// loaded riscv64 host (#1382).
+const IN_CALL_WAIT: Duration = Duration::from_secs(60);
+
+/// The pause between two reads of a thread held in a call.
+const IN_CALL_PAUSE: Duration = Duration::from_millis(100);
 
 /// The stub's recipe file name, in the template directory and once staged.
 const RECIPE: &str = "gdbstub.svc";
@@ -213,7 +227,9 @@ pub fn rsp_arch(arch: Arch) -> gdb_rsp::target::Arch
 /// stub's list, to program counter 0, an address no process maps, and
 /// detach, which resumes it there. Returns the program counter it moved the
 /// thread from. A stub that holds no process (it exited, or the stub's walk
-/// found none) answers `?` as exited, which fails the kill.
+/// found none) answers `?` as exited, which fails the kill. A main thread
+/// the stub reports held in a call is read again until the call returns
+/// ([`read_held_register`]).
 pub fn kill_held(stub: &mut Stub, arch: Arch, name: &str) -> Result<u64>
 {
     let pc_reg = rsp_arch(arch).pc_regnum();
@@ -226,15 +242,103 @@ pub fn kill_held(stub: &mut Stub, arch: Arch, name: &str) -> Result<u64>
         );
     }
     stub.expect_ok(b"Hg1")?;
-    let pc = stub.read_register(pc_reg)?;
+    let pc = read_held_register(stub, pc_reg, IN_CALL_WAIT, IN_CALL_PAUSE)?;
     stub.expect_ok(format!("P{pc_reg:x}={}", le_hex(0)).as_bytes())?;
     stub.expect_ok(b"D")?;
     Ok(pc)
 }
+/// Register `regnum` of the selected thread, read again every `pause` for
+/// up to `wait` while the stub answers that the thread is held in a call
+/// ([`HELD_IN_CALL`]): the stub counts such a thread stopped, and holds it
+/// once its call returns.
+fn read_held_register(
+    stub: &mut Stub,
+    regnum: usize,
+    wait: Duration,
+    pause: Duration,
+) -> Result<u64>
+{
+    let start = Instant::now();
+    let request = format!("p{regnum:x}");
+    loop
+    {
+        let reply = stub.exchange(request.as_bytes())?;
+        if reply == HELD_IN_CALL && start.elapsed() < wait
+        {
+            std::thread::sleep(pause);
+            continue;
+        }
+        if reply.first() == Some(&b'E') && reply.len() == 3
+        {
+            bail!(
+                "the gdbstub refused `{request}`: {}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        return le_u64(&reply).with_context(|| format!("register {regnum}"));
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    /// Serve `replies` over the far end of a socket pair, one per request,
+    /// as a stub in the acknowledged mode does.
+    fn fake_stub(replies: Vec<&'static [u8]>) -> Stub
+    {
+        use std::io::{Read as _, Write as _};
+
+        use gdb_rsp::frame::{Event, PacketReader, PacketWriter};
+
+        let (near, mut far) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut reader = PacketReader::<{ gdb_rsp::PACKET_SIZE }>::new();
+            let mut replies = replies.into_iter();
+            let mut byte = [0u8; 1];
+            while far.read(&mut byte).is_ok_and(|n| n == 1)
+            {
+                if let Some(Event::Packet(_)) = reader.push(byte[0])
+                {
+                    let Some(body) = replies.next()
+                    else
+                    {
+                        return;
+                    };
+                    let mut buf = vec![0u8; 2 * gdb_rsp::PACKET_SIZE];
+                    let mut w = PacketWriter::new(&mut buf);
+                    w.bytes(body);
+                    let len = w.finish().unwrap();
+                    far.write_all(b"+").unwrap();
+                    far.write_all(&buf[..len]).unwrap();
+                }
+            }
+        });
+        Stub::over_unix(near, Duration::from_secs(5)).unwrap()
+    }
+
+    // Defect caught: a kill whose target's main thread was held in a call
+    // failed on the stub's first `E06` instead of reading again once the
+    // call returned.
+    #[test]
+    fn a_register_read_waits_out_a_thread_held_in_a_call()
+    {
+        let value = le_hex(0x1234);
+        let value: &'static [u8] = value.leak().as_bytes();
+        let mut stub = fake_stub(vec![HELD_IN_CALL, HELD_IN_CALL, value]);
+        let pc = read_held_register(&mut stub, 16, Duration::from_secs(5), Duration::ZERO);
+        assert_eq!(pc.unwrap(), 0x1234);
+
+        // Past the wait, the refusal stands; any other refusal at once.
+        let mut stub = fake_stub(vec![HELD_IN_CALL]);
+        let err = read_held_register(&mut stub, 16, Duration::ZERO, Duration::ZERO).unwrap_err();
+        assert!(err.to_string().contains("E06"), "{err}");
+        let mut stub = fake_stub(vec![b"E01"]);
+        let err =
+            read_held_register(&mut stub, 16, Duration::from_secs(5), Duration::ZERO).unwrap_err();
+        assert!(err.to_string().contains("E01"), "{err}");
+    }
 
     #[test]
     fn staging_appends_the_target_to_the_argv_line_alone()

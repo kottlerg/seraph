@@ -207,8 +207,32 @@ impl Stub
             .context("setting the reply timeout")
     }
 
-    /// Send `body` and return the reply's body, acknowledging it.
+    /// A stub over `stream`, one end of a socket pair a test serves.
+    #[cfg(test)]
+    pub fn over_unix(stream: UnixStream, answer_timeout: Duration) -> Result<Self>
+    {
+        Self::over(Stream::Unix(stream), answer_timeout)
+    }
+
+    /// Send `body` and return the reply's body, acknowledging it; an error
+    /// reply (`E<nn>`) fails the request.
     pub fn request(&mut self, body: &[u8]) -> Result<Vec<u8>>
+    {
+        let reply = self.exchange(body)?;
+        if reply.first() == Some(&b'E') && reply.len() == 3
+        {
+            bail!(
+                "the gdbstub refused `{}`: {}",
+                String::from_utf8_lossy(body),
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        Ok(reply)
+    }
+
+    /// Send `body` and return the reply's body, an error reply included,
+    /// acknowledging it.
+    pub fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>>
     {
         let mut buf = vec![0u8; 2 * PACKET_SIZE];
         let mut w = PacketWriter::new(&mut buf);
@@ -241,13 +265,6 @@ impl Stub
                 {
                     let reply = reply.to_vec();
                     self.stream.write_all(b"+")?;
-                    if reply.first() == Some(&b'E') && reply.len() == 3
-                    {
-                        bail!(
-                            "the gdbstub refused `{what}`: {}",
-                            String::from_utf8_lossy(&reply)
-                        );
-                    }
                     return Ok(reply);
                 }
                 Some(other) => bail!("unexpected {other:?} replying to `{what}`"),

@@ -607,7 +607,9 @@ debugger counts it stopped at once: `SYS_CAP_INFO`'s `CAP_INFO_THREAD_UPCALL` re
 thread is in a call with an upcall pending
 ([syscalls.md § SYS_CAP_INFO](../core/kernel/docs/syscalls.md#sys_cap_info-36)). A server that
 answers late holds the upcall until its reply. `SYS_THREAD_STOP` cancels a call in either phase,
-which then returns `Interrupted`, as for any blocking syscall.
+which then returns `Interrupted`, as for any blocking syscall. An upcall therefore bounds no
+request: a program that bounds the time a call may take gives the call a deadline, its timeout,
+which ends it in either phase (`WouldBlock`); the request may then have been received.
 
 A fault-blocked thread's fault, or an upcall delivery in progress, is never cancelled for an upcall:
 the upcall waits for it to resolve. The protocol that keeps a post from missing a thread that is

@@ -120,11 +120,15 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   multiples. memmgr charges each in full, budget and RAM, when it accepts
   it and backs chunks on first touch, so a grow is refused as an
   allocation error (null from `alloc`, `Err` from `try_reserve`), and
-  a touch of a grown page is declined as a fault only in the cases
-  [memmgr's interface](../services/memmgr/docs/ipc-interface.md) § Label 7
-  gives for a committed region: a failed split of a run, a commit overrun,
-  or a page-table reservation the process's own mappings and unmaps spent
-  early. The heap holds no Memory caps
+  a touch of a grown page is declined as a fault only in these cases:
+  code 7 when the split of a run fails, code 11 for a commit overrun,
+  code 10 or 9 when the process's own mappings and unmaps spent its
+  page-table reservation early, code 9 when a map fails as any map can,
+  and code 6 or 8 when memmgr's metadata arena cannot grow for the run or
+  record it ([memmgr's interface](../services/memmgr/docs/ipc-interface.md)
+  § Kernel-origin fault message gives each code;
+  [memmgr Memory Pool § Commit](../services/memmgr/docs/memory-pool.md#commit),
+  Faults). The heap holds no Memory caps
   ([memmgr Memory Pool § Commit](../services/memmgr/docs/memory-pool.md#commit)).
   A process with no pager keeps requesting Memory caps with
   `REQUEST_MEMORY_CAPS` and mapping them.

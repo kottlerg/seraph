@@ -35,7 +35,10 @@
 //!   9. **IPC arms.** A call queued on an endpoint no one receives on returns
 //!      `Interrupted` and takes the upcall. So does a call whose message the
 //!      controller received and has not replied to: the post claims the
-//!      pending reply, so the controller's reply then fails.
+//!      pending reply, so the controller's reply then fails. A masked call
+//!      awaiting its reply (`ipc::ipc_call_masked`) is not cut short: the
+//!      reply stays pending, the controller's reply completes the call, and
+//!      the upcall is delivered at the unmask.
 //!  10. **Refused park.** A thread that a post reaches while it spins with no
 //!      syscall has its next blocking syscall, a notification wait, refused:
 //!      the wait returns `Interrupted` at once, and the upcall is delivered at
@@ -96,14 +99,21 @@ const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
 /// Children: 0 yields (syscall delivery, nesting, stop, rights), 1 spins with
 /// a pending syscall-point upcall, 2 spins for the any-instruction delivery,
 /// 3 masks, 4 waits on a notification, 5 sleeps, 6 faults (recursion), 7 is
-/// never started, 8 and 9 call (queued, and awaiting a reply), and 10 spins
-/// and then waits (refused park).
-const CHILDREN: usize = 11;
+/// never started, 8, 9 and 11 call (queued, awaiting a reply, and masked
+/// awaiting a reply), and 10 spins and then waits (refused park).
+const CHILDREN: usize = 12;
+
+/// The child index of each calling child, by its arm of phase 9.
+const CALLERS: [usize; 3] = [8, 9, 11];
 
 static mut STACKS: [ChildStack; CHILDREN] = [ChildStack::ZERO; CHILDREN];
 
-/// The IPC buffer pages of the calling children 8 and 9.
-static mut CALL_PAGES: [crate::IpcPage; 2] = [crate::IpcPage::ZERO, crate::IpcPage::ZERO];
+/// The IPC buffer pages of the calling children, by arm ([`CALLERS`]).
+static mut CALL_PAGES: [crate::IpcPage; 3] = [
+    crate::IpcPage::ZERO,
+    crate::IpcPage::ZERO,
+    crate::IpcPage::ZERO,
+];
 
 /// How long, in milliseconds, the controller lets a calling child reach its
 /// park before posting. A child slower than this has its park refused
@@ -119,15 +129,15 @@ static WAIT_RESULT: AtomicU64 = AtomicU64::new(0);
 static SLEEP_STAGE: AtomicU64 = AtomicU64::new(0);
 static SLEEP_RESULT: AtomicU64 = AtomicU64::new(0);
 static FAULT_YIELDS: AtomicU64 = AtomicU64::new(0);
-static CALL_STAGE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-static CALL_RESULT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static CALL_STAGE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static CALL_RESULT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static REFUSE_STAGE: AtomicU64 = AtomicU64::new(0);
 static REFUSE_GO: AtomicU64 = AtomicU64::new(0);
 static REFUSE_RESULT: AtomicU64 = AtomicU64::new(0);
 
 /// Child cap slots of the endpoints the calling children call, and of the
 /// notification the refused-park child waits on.
-static CALL_EP: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static CALL_EP: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static REFUSE_NEVER: AtomicU64 = AtomicU64::new(0);
 
 /// Child cap slot of the report notification, read by [`recovery_entry`].
@@ -146,6 +156,7 @@ struct Parts
     ep_vm: Option<u64>,
     ep_queued: Option<u64>,
     ep_held: Option<u64>,
+    ep_masked: Option<u64>,
     sig: Option<u64>,
     never: Option<u64>,
     children: [Option<spawn::SpawnedChild>; CHILDREN],
@@ -166,6 +177,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         parts.ep_vm,
         parts.ep_queued,
         parts.ep_held,
+        parts.ep_masked,
         parts.sig,
         parts.never,
     ]
@@ -219,7 +231,10 @@ fn phases(ctx: &TestContext, parts: &mut Parts) -> TestResult
     let ep_held = *parts
         .ep_held
         .insert(cap_create_endpoint(ctx.memory_base).map_err(fail)?);
-    ipc_arms(ctx, parts, ep_up, [ep_queued, ep_held])?;
+    let ep_masked = *parts
+        .ep_masked
+        .insert(cap_create_endpoint(ctx.memory_base).map_err(fail)?);
+    ipc_arms(ctx, parts, ep_up, [ep_queued, ep_held, ep_masked])?;
     refused_park(ctx, parts, ep_up, never)?;
     rights(ctx, yielder, ep_up)
 }
@@ -448,19 +463,20 @@ fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> Te
     reply_resume(ctx)
 }
 
-/// Phase 9: a call queued on an endpoint (`eps[0]`), and a call awaiting its
-/// reply (`eps[1]`, whose message the controller receives).
+/// Phase 9: a call queued on an endpoint (`eps[0]`), a call awaiting its
+/// reply (`eps[1]`, whose message the controller receives), and a masked
+/// call awaiting its reply (`eps[2]`, received the same way).
 #[expect(
     clippy::large_stack_frames,
     reason = "the received message and the reply `IpcMessage` (568 B each) and the `Result` \
               temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
 )]
-fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 2]) -> TestResult
+fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 3]) -> TestResult
 {
     for (k, ep) in eps.into_iter().enumerate()
     {
-        let (Some(index), Some(cookie), Some(call_ep), Some(stage), Some(result)) = (
-            k.checked_add(8),
+        let (Some(&index), Some(cookie), Some(call_ep), Some(stage), Some(result)) = (
+            CALLERS.get(k),
             0x5150_0020u64.checked_add(k as u64),
             CALL_EP.get(k),
             CALL_STAGE.get(k),
@@ -477,29 +493,60 @@ fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 2]) -> 
         call_ep.store(slot, Ordering::Release);
         start_child(parts, index, call_entry, k as u64)?;
         wait_for(stage, 1)?;
-        if k == 1
+        if k == 0
+        {
+            let _ = thread_sleep(SETTLE_MS);
+        }
+        else
         {
             // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
             unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
                 .map_err(|_| "integration::thread_upcall: ipc_recv (call) failed")?;
         }
-        else
-        {
-            let _ = thread_sleep(SETTLE_MS);
-        }
         thread_post_upcall(th, cookie, 0)
             .map_err(|_| "integration::thread_upcall: post (caller) failed")?;
-        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-        if k == 1 && unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }.is_ok()
+        let masked = k == 2;
+        if k > 0
         {
-            return Err("integration::thread_upcall: the post left the call's reply pending");
+            // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+            let replied = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }.is_ok();
+            if replied != masked
+            {
+                return Err(
+                    if masked
+                    {
+                        "integration::thread_upcall: the post cut a masked call short"
+                    }
+                    else
+                    {
+                        "integration::thread_upcall: the post left the call's reply pending"
+                    },
+                );
+            }
         }
         expect_upcall(ctx, ep_up, cookie, UPCALL_POINT_SYSCALL)?;
         reply_resume(ctx)?;
         wait_for(stage, 2)?;
-        if result.load(Ordering::Acquire) != RESULT_INTERRUPTED
+        let expected = if masked
         {
-            return Err("integration::thread_upcall: an interrupted call did not fail Interrupted");
+            RESULT_OK
+        }
+        else
+        {
+            RESULT_INTERRUPTED
+        };
+        if result.load(Ordering::Acquire) != expected
+        {
+            return Err(
+                if masked
+                {
+                    "integration::thread_upcall: a masked call did not return its reply"
+                }
+                else
+                {
+                    "integration::thread_upcall: an interrupted call did not fail Interrupted"
+                },
+            );
         }
     }
     Ok(())
@@ -693,12 +740,13 @@ extern "C" fn yield_entry(_arg: u64) -> !
 }
 
 /// Child entry: register IPC page `k` and call the endpoint published for
-/// child `8 + k`, recording the result.
+/// arm `k` of phase 9 ([`CALLERS`]), with upcalls masked for arm 2,
+/// recording the result.
 extern "C" fn call_entry(k: u64) -> !
 {
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "k is 0 or 1, the index start_child passed"
+        reason = "k is 0, 1, or 2, the index start_child passed"
     )]
     let k = k as usize;
     let (Some(page), Some(stage), Some(result), Some(call_ep)) = (
@@ -723,8 +771,18 @@ extern "C" fn call_entry(k: u64) -> !
     }
     stage.store(1, Ordering::Release);
     let ep = call_ep.load(Ordering::Acquire);
+    let msg = IpcMessage::new(0);
     // SAFETY: `buf` was registered as this thread's IPC buffer above.
-    let called = unsafe { ipc::ipc_call(ep, &IpcMessage::new(0), buf) };
+    let called = unsafe {
+        if k == 2
+        {
+            ipc::ipc_call_masked(ep, &msg, buf)
+        }
+        else
+        {
+            ipc::ipc_call(ep, &msg, buf)
+        }
+    };
     result.store(result_word(called.map(|_| 0)), Ordering::Release);
     stage.store(2, Ordering::Release);
     loop

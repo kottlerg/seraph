@@ -262,50 +262,82 @@ pub fn std_bulk_write_phase(_: &Caps)
     std::os::seraph::log!("std_bulk_write phase passed");
 }
 
-/// Each frame-path write (over 504 bytes) returns its source page to memmgr
-/// when it ends, so repeated writes leave memmgr's free pool where it was.
+/// Frame-path writes (over 504 bytes) [`std_frame_write_pool_phase`] makes.
+const FRAME_WRITES: u64 = 64;
+
+/// Recheck rounds [`std_frame_write_pool_phase`] gives the charge to return
+/// to its baseline, or below it, after the writes.
+const FRAME_POOL_RECHECKS: u32 = 16;
+
+/// Each frame-path write returns its source page to memmgr when it ends, so
+/// repeated writes leave svctest's own charge where it was.
+///
+/// The measure is svctest's own budget charge (`QUERY_MEMORY_USAGE`
+/// `data[0]`), which no other process's allocation raises: memmgr charges the
+/// source page to svctest when it grants it and uncharges the run only when
+/// the run rejoins the free pool (services/memmgr/docs/ipc-interface.md
+/// § Label 10).
 /// The writes go to one offset, so the fs driver's cache does not grow, and a
-/// first write before the baseline settles this process's heap and the
-/// driver's cache page. A leak of one page per write drops the pool by
-/// `FRAME_WRITES` pages, four times the slack, on every attempt; the pool
-/// is system-wide, so another process's allocation can perturb one
-/// attempt, and the phase passes when any of `ATTEMPTS` stays in slack.
+/// first write and a first recheck (below) before the baseline settle this
+/// process's heap, stack and `CSpace` slots, the page tables the frame's
+/// mapping funds, and the driver's cache page. A leak of one page per write
+/// leaves the charge [`FRAME_WRITES`] pages up.
+///
+/// A released run that some mapping or capability still reaches waits on
+/// memmgr's deferred list, charged, until a recheck pools it, and memmgr
+/// rechecks before each `RELEASE_MEMORY_CAPS`
+/// (services/memmgr/docs/memory-pool.md § Reclamation). Each write's release
+/// rechecks the runs before it; for the last ones the phase takes and releases
+/// a one-page grant of its own, which pools at once, up to
+/// [`FRAME_POOL_RECHECKS`] times, until the charge is back at its baseline.
+/// The check fails only a charge above the baseline: an earlier released run
+/// of svctest's that a recheck pools during the measure (the warm-up's among
+/// them) lowers the charge below the baseline, which no leak does.
 pub fn std_frame_write_pool_phase(_: &Caps)
 {
     use std::io::{Seek, SeekFrom, Write};
-    const FRAME_WRITES: u64 = 64;
-    const SLACK_BYTES: u64 = (FRAME_WRITES / 4) * 4096;
-    const ATTEMPTS: usize = 3;
 
     let path = "/data/svctest/std_frame_pool.bin";
     let _ = std::fs::remove_file(path);
     let chunk = vec![0x5Au8; 2048];
     let mut f = std::fs::File::create(path).expect("create frame-pool file");
     f.write_all(&chunk).expect("warm-up frame write");
-    let mut drops = Vec::with_capacity(ATTEMPTS);
-    for _ in 0..ATTEMPTS
+    let recheck = || {
+        let (grant, region_id) = super::memmgr::try_request_contiguous(1)
+            .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
+        super::memmgr::release_grant(grant, region_id);
+    };
+    recheck();
+    let (base, _, _) = super::memmgr::memory_usage();
+    for _ in 0..FRAME_WRITES
     {
-        let before = std::os::seraph::memmgr_pool_free_bytes().expect("memmgr pool query");
-        for _ in 0..FRAME_WRITES
-        {
-            f.seek(SeekFrom::Start(0)).expect("seek to start");
-            f.write_all(&chunk).expect("frame write");
-        }
-        let after = std::os::seraph::memmgr_pool_free_bytes().expect("memmgr pool query");
-        drops.push(before.saturating_sub(after));
-        if drops.last().is_some_and(|&d| d <= SLACK_BYTES)
+        f.seek(SeekFrom::Start(0)).expect("seek to start");
+        f.write_all(&chunk).expect("frame write");
+    }
+    let (written, _, _) = super::memmgr::memory_usage();
+    let mut now = written;
+    let mut rechecks = 0;
+    for round in 1..=FRAME_POOL_RECHECKS
+    {
+        if now <= base
         {
             break;
         }
+        recheck();
+        rechecks = round;
+        (now, _, _) = super::memmgr::memory_usage();
     }
     drop(f);
     std::fs::remove_file(path).expect("cleanup");
     assert!(
-        drops.iter().any(|&d| d <= SLACK_BYTES),
-        "frame writes dropped memmgr's free pool past {SLACK_BYTES} bytes on every attempt: \
-         {drops:?}"
+        now <= base,
+        "std_frame_write_pool: charge {now} pages after {FRAME_WRITES} frame writes and \
+         {rechecks} rechecks, above the baseline {base} (right after the writes: {written} pages)"
     );
-    std::os::seraph::log!("std_frame_write_pool phase passed (pool drops {drops:?})");
+    std::os::seraph::log!(
+        "std_frame_write_pool phase passed (charge {base} pages, {written} after the writes, \
+         {rechecks} rechecks)"
+    );
 }
 
 pub fn std_read_dir_phase(_: &Caps)

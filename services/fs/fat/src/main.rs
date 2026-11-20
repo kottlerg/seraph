@@ -464,14 +464,14 @@ fn service_loop(
         let opcode = msg.label & 0xFFFF;
         // Logs the request when the turn ends, after its reply, if it was
         // held too long (`held` module).
-        let _held = held::HeldRequest::start(opcode);
+        let held = held::HeldRequest::start(opcode);
 
         // Unbadged service-level requests: FS_MOUNT and FS_UNMOUNT. Neither
         // carries caps, so none a request carried is kept.
         if msg.badge == 0 && opcode == fs_labels::FS_UNMOUNT
         {
             drop_caps(msg.caps());
-            handle_unmount(
+            let unmounted = handle_unmount(
                 &msg,
                 state,
                 files,
@@ -480,6 +480,13 @@ fn service_loop(
                 caps.block_dev,
                 ipc_buf,
             );
+            if unmounted
+            {
+                // The turn ends with the process, which runs no destructor:
+                // the held-request check runs first.
+                drop(held);
+                std::process::exit(fs_labels::EXIT_UNMOUNTED.cast_signed());
+            }
             continue;
         }
         if msg.badge == 0
@@ -1386,9 +1393,11 @@ fn sweep_dead_opens(files: &mut OpenTable, sweeps: &mut SweepSchedule, cache: &P
 /// live opens, unless none is left or the request carries `UNMOUNT_FORCE`.
 /// Otherwise release every open as `FS_CLOSE` would, which revokes the
 /// client's liveness and page caps, write the `FSInfo` hints of a mounted
-/// volume, reply, and exit the process. The single dispatch thread runs this
-/// between requests, so no request of this driver is in flight; the eviction
-/// worker finds the opens gone when it next takes the table's lock.
+/// volume, reply, and return `true`, after which the caller ends its turn
+/// and exits the process; a refused unmount returns `false`. The single
+/// dispatch thread runs this between requests, so no request of this driver
+/// is in flight; the eviction worker finds the opens gone when it next takes
+/// the table's lock.
 fn handle_unmount(
     msg: &IpcMessage,
     state: &mut FatState,
@@ -1397,12 +1406,12 @@ fn handle_unmount(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
-)
+) -> bool
 {
     if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
     {
         reply_err(ipc::fs_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-        return;
+        return false;
     }
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
     sweep_dead_opens(&mut files_g, sweeps, cache);
@@ -1415,7 +1424,7 @@ fn handle_unmount(
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
+        return false;
     }
     files_g.remove_where(|_| true, |f| release_open_file(&f, cache));
     drop(files_g);
@@ -1426,7 +1435,7 @@ fn handle_unmount(
     std::os::seraph::log!("unmounted ({live} opens released); exiting");
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(ipc::fs_errors::SUCCESS), ipc_buf) };
-    std::process::exit(fs_labels::EXIT_UNMOUNTED.cast_signed());
+    true
 }
 
 /// `FS_READ_MEMORY` against an open cap: the page is tracked on that open

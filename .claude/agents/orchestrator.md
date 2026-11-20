@@ -275,7 +275,8 @@ waiting on CI, or waiting on you. Two things send you nothing, and each has its 
 - **A grant holder that stalls.** While an exclusive grant is outstanding, ask the supervisor
   to schedule one tick every two hours and forward it to you. A background task dies with the
   agent that owns it, so you own no tick and no CI watch: a tick is the supervisor's, a CI
-  watch the worker's. The tick's prompt, for the supervisor: "Send the orchestrator the words
+  watch the worker's, the wait for a pending run at `master`'s tip included (§ Merge order and
+  the gate). The tick's prompt, for the supervisor: "Send the orchestrator the words
   `grant watch`. Do nothing else." On it, run `cargo xtask orch state` and
   `cargo xtask host status`. If the host is idle and the holder has not reported for longer
   than its runs should take, ask the holder for a status line, which it records in its entry and
@@ -414,9 +415,12 @@ cost, prune the state (§ Plan, steps 6 and 7), and tell each open PR's worker w
 merge touched what moved and which of its files. That message is information: `master quiet`
 is the only instruction to sync. You hold no CI watch (§ Liveness), so read the CI run of
 `master`'s tip before each merge (`gh run list --workflow build-test.yml --branch master
---event push --limit 1`). A red `master` is a composition defect, fixed before anything else
-merges (docs/conventions.md § CI Gating): put its fix first, and until it lands merge only a PR
-whose head contains `master`, as the gate requires.
+--event push --limit 1`). When the gate refuses a PR only because that run has not finished
+(`gate-base-green`), hold the merge, send the PR's worker `master pending <run id>`, and end
+your turn: the worker awaits the run, runs the gate again and hands back its gate report again
+(`.claude/agents/worker.md` § Gate). A red `master` is a composition defect, fixed before
+anything else merges (docs/conventions.md § CI Gating): put its fix first, and until it lands
+merge only a PR whose head contains `master`, as the gate requires.
 
 After each merge that shares a file with another merge since the previous release tag, send the
 merged PR's worker `composition check <merge>` (docs/conventions.md § Composition check;

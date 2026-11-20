@@ -340,8 +340,8 @@ Orchestrated:
   conditions of docs/conventions.md § Syncing with `master` hold too: one merge base, GitHub's
   `MERGEABLE`, and a green CI run at `master`'s tip. The gate names the condition that fails.
   A gate refused for several merge bases or a conflict needs a sync, so report it to the
-  orchestrator, which says `master quiet`. A run at `master`'s tip that has not finished
-  needs only a wait.
+  orchestrator, which says `master quiet`. A gate refused only because the CI run at
+  `master`'s tip has not finished needs only a wait (§ Gate).
 
 Standalone, there is no grant: the commands' launch rules are the whole protocol, and you sync
 yourself before the validation runs.
@@ -401,12 +401,14 @@ use them.
 
 You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the head includes
 `master` or meets the conditions to merge without it (docs/conventions.md § Syncing with
-`master`), and a run record for the head has `AUDIT PASS`, no failed agent,
-and a verdict of `READY TO MERGE` (docs/conventions.md § Pre-merge review). Hand back the gate
-report with the merge command `gh pr merge <N> --merge --delete-branch`. The merge is the
-orchestrator's, on a gate it has verified; standalone, it is made on the maintainer's
-instruction. The release PR, which the command names with `gate-release-approval`, also needs
-the maintainer's approval of its merge; say so in the gate report.
+`master`), and a run record for the head has `AUDIT PASS`, no failed agent, and a verdict of
+`READY TO MERGE` (docs/conventions.md § Pre-merge review). When the gate fails only because the
+CI run at `master`'s tip has not finished, or the orchestrator sends `master pending <run id>`,
+await that run inside one script (`gh run watch <run id> --exit-status`) and run the gate again.
+Hand back the gate report with the merge command `gh pr merge <N> --merge --delete-branch`. The
+merge is the orchestrator's, on a gate it has verified; standalone, it is made on the
+maintainer's instruction. The release PR, which the command names with `gate-release-approval`,
+also needs the maintainer's approval of its merge; say so in the gate report.
 
 ## Composition check
 

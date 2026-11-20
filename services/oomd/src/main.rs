@@ -163,7 +163,8 @@ fn serve(config: Config, pressure: u64, authority: u64, ipc_buf: *mut u64) -> !
             .map_or(0, |at| at.saturating_sub(now_ms()).max(1));
         match syscall::notification_wait_timeout(pressure, timeout)
         {
-            // A change, or the deadline (no bits): the level is read below.
+            // A change of level, an opening of the draw room, or the deadline
+            // (no bits): the level is read below.
             Ok(_) =>
             {}
             Err(e)

@@ -30,10 +30,12 @@
 //! swept out of the table (`sweep_dead_opens`). Write-side metadata patching
 //! uses the node's cached `DirEntryLocation`.
 //!
-//! Memory pressure: a pressure thread waits on the runtime's memory-pressure
-//! Notification (`std::os::seraph::wait_memory_pressure`). When memmgr's
-//! level changes to `Low` or `Critical`, it marks a release pending and wakes
-//! the dispatch loop with an unbadged call on the service endpoint. The loop,
+//! Memory pressure: a pressure thread waits for a change of memmgr's level
+//! (`std::os::seraph::wait_memory_pressure`). Each wake at which the level
+//! reads `Low` or `Critical` begins or continues a shortage, whatever the
+//! level the last wake read, since a wake can carry a return to `Normal` and
+//! a new fall; the thread then marks a release pending and wakes the dispatch
+//! loop with an unbadged call on the service endpoint. The loop,
 //! at the top of its next turn, gives memmgr back the pages the cache holds
 //! idle but the few most recently used, which a miss evicts when memmgr
 //! refuses a page ([`cache::PageCache::release_idle_pages`]), and goes on
@@ -57,6 +59,7 @@ mod dir;
 mod eviction;
 mod fat;
 mod file;
+mod held;
 
 use core::num::NonZeroU64;
 use std::os::seraph::{MemoryPressure, StartupInfo, startup_info};
@@ -222,8 +225,10 @@ fn spawn_pressure_thread(service: u64)
     }
 }
 
-/// Wait for memmgr's level to change; at `Low` or `Critical` mark a
-/// release pending and wake the dispatch loop with a call on `wake`. A call
+/// Wait for memmgr's level to change; at `Low` or `Critical`, mark a release
+/// pending and wake the dispatch loop with a call on `wake`. A wake at the
+/// level the last one read is acted on too, since the changes it carries
+/// can have passed through `Normal`, the cache growing again meanwhile. A call
 /// that a stop or an upcall interrupts is made again, since a second wake
 /// costs the loop one more refused request. Ends when the wait fails, or
 /// when the call fails otherwise, as it does once vfsd has revoked the
@@ -237,6 +242,7 @@ fn pressure_thread(wake: u64)
         {
             Ok(MemoryPressure::Low | MemoryPressure::Critical) =>
             {}
+            // `Normal`: no shortage to act on.
             Ok(_) => continue,
             Err(e) =>
             {
@@ -397,7 +403,9 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///
 /// A release under memory pressure runs at the top of a turn, once the
 /// pressure thread has marked one pending and woken the loop
-/// ([`release_under_pressure`]).
+/// ([`release_under_pressure`]). A request held `held::SLOW_REQUEST` or
+/// longer, from its receipt to the end of its turn, is logged
+/// ([`held::HeldRequest`]).
 ///
 /// The open table is shared with the eviction worker via a `Mutex`. Main
 /// takes the lock to resolve an open cap, `FS_OPEN` takes it only around a
@@ -459,13 +467,16 @@ fn service_loop(
         guard.on_success();
 
         let opcode = msg.label & 0xFFFF;
+        // Logs the request when the turn ends, after its reply, if it was
+        // held too long (`held` module).
+        let held = held::HeldRequest::start(opcode);
 
         // Unbadged service-level requests: FS_MOUNT and FS_UNMOUNT. Neither
         // carries caps, so none a request carried is kept.
         if msg.badge == 0 && opcode == fs_labels::FS_UNMOUNT
         {
             drop_caps(msg.caps());
-            handle_unmount(
+            let unmounted = handle_unmount(
                 &msg,
                 state,
                 files,
@@ -474,6 +485,13 @@ fn service_loop(
                 caps.block_dev,
                 ipc_buf,
             );
+            if unmounted
+            {
+                // The turn ends with the process, which runs no destructor:
+                // the held-request check runs first.
+                drop(held);
+                std::process::exit(fs_labels::EXIT_UNMOUNTED.cast_signed());
+            }
             continue;
         }
         if msg.badge == 0
@@ -1380,9 +1398,11 @@ fn sweep_dead_opens(files: &mut OpenTable, sweeps: &mut SweepSchedule, cache: &P
 /// live opens, unless none is left or the request carries `UNMOUNT_FORCE`.
 /// Otherwise release every open as `FS_CLOSE` would, which revokes the
 /// client's liveness and page caps, write the `FSInfo` hints of a mounted
-/// volume, reply, and exit the process. The single dispatch thread runs this
-/// between requests, so no request of this driver is in flight; the eviction
-/// worker finds the opens gone when it next takes the table's lock.
+/// volume, reply, and return `true`, after which the caller ends its turn
+/// and exits the process; a refused unmount returns `false`. The single
+/// dispatch thread runs this between requests, so no request of this driver
+/// is in flight; the eviction worker finds the opens gone when it next takes
+/// the table's lock.
 fn handle_unmount(
     msg: &IpcMessage,
     state: &mut FatState,
@@ -1391,12 +1411,12 @@ fn handle_unmount(
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
-)
+) -> bool
 {
     if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
     {
         reply_err(ipc::fs_errors::LABEL_VERSION_MISMATCH, ipc_buf);
-        return;
+        return false;
     }
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
     sweep_dead_opens(&mut files_g, sweeps, cache);
@@ -1409,7 +1429,7 @@ fn handle_unmount(
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-        return;
+        return false;
     }
     files_g.remove_where(|_| true, |f| release_open_file(&f, cache));
     drop(files_g);
@@ -1420,7 +1440,7 @@ fn handle_unmount(
     std::os::seraph::log!("unmounted ({live} opens released); exiting");
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(ipc::fs_errors::SUCCESS), ipc_buf) };
-    std::process::exit(fs_labels::EXIT_UNMOUNTED.cast_signed());
+    true
 }
 
 /// `FS_READ_MEMORY` against an open cap: the page is tracked on that open

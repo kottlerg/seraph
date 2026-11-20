@@ -716,7 +716,8 @@ under contention. The backends are under `src/sys/sync/`.
 
 `_start` registers each process that has a memmgr endpoint for memmgr's memory-pressure signal
 (`src/sys/alloc/seraph.rs`, `register_pressure`): it retypes a Notification, and hands memmgr a
-Notify-only derivation of it with `REGISTER_PRESSURE`
+Notify-only derivation of it with `REGISTER_PRESSURE`, asking for one bit on a change of level and
+another on an opening of the draw room
 ([services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) § Label 11).
 A call cancelled with `Interrupted` is made again with a fresh derivation, which replaces any that
 reached memmgr. A failure leaves the process unregistered, and nothing else depends on it.
@@ -727,11 +728,19 @@ pressure):
 
 - `memory_pressure()` reads the level (`MemoryPressure::Normal`, `Low` or `Critical`) from
   `QUERY_POOL_STATUS`.
+- `commit_draw_room_bytes()` reads memmgr's draw room, the free bytes a fault on a committed page
+  may take, from `QUERY_POOL_STATUS`; it is open at a demand chunk's bytes or more
+  ([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md#commit) § Commit,
+  Overcommit).
 - `memory_pressure_notification()` is the registered Notification, with every right, which memmgr
-  sends `MEMORY_PRESSURE_BIT` on at each change of level; a server adds it to its wait set.
-- `wait_memory_pressure(timeout)` waits for the bit and returns the level then. Each change wakes
-  one waiter of the process. A wait cancelled with `Interrupted` (a stop of the thread, or an
-  upcall to it) waits again for what is left of `timeout`.
+  sends `MEMORY_PRESSURE_BIT` on at each change of level, and `COMMIT_DRAW_ROOM_BIT` at each
+  opening of the draw room, not at its closing; a server adds it to its wait set. Sends coalesce,
+  so a wake's `MEMORY_PRESSURE_BIT` says that the level changed at least once, perhaps back to
+  where it was.
+- `wait_memory_pressure(timeout)` waits for `MEMORY_PRESSURE_BIT` and returns the level then; a
+  wake that carries only `COMMIT_DRAW_ROOM_BIT` is taken and waited past. Each signal wakes one
+  waiter of the process. A wait cancelled with `Interrupted` (a stop of the
+  thread, or an upcall to it) waits again for what is left of `timeout`.
 
 A process that registers another Notification itself replaces the runtime's, which memmgr then
 signals no more.

@@ -16,8 +16,8 @@
 //! commits all but [`HOG_MARGIN_PAGES`] of what memmgr can still promise,
 //! sees a grant past that refused although free pages exist, and touches every
 //! page it committed with no fault declined. Each child's charge leaves
-//! svctest's budget subtree before the phase goes on, memmgr's free total net
-//! of eviction and its promised total then return to their levels
+//! svctest's budget subtree before the phase goes on, memmgr's free and
+//! promised totals, each net of eviction, then return to their levels
 //! ([`PoolLevels`]), and the all-RAM-accounted identity holds.
 
 use std::os::seraph::startup_info;
@@ -166,9 +166,11 @@ pub(crate) fn pool_totals() -> Option<(u64, u64, u64)>
 }
 
 /// memmgr's `QUERY_POOL_STATUS` totals a window compares, in pages: the free
-/// total (`data[3]`), the promised total (`data[8]`), and the store and
-/// swapped totals (`data[9]` and `data[10]`) that net eviction out of the
-/// free total ([`Self::net_free`]).
+/// total (`data[3]`), the promised total (`data[8]`), the store and swapped
+/// totals (`data[9]` and `data[10]`) that net eviction out of the free total
+/// ([`Self::net_free`]), and the part of `promised` evicted committed chunks
+/// hold (`data[18]`), which nets it out of the promised total
+/// ([`Self::net_promised`]).
 #[derive(Clone, Copy)]
 struct PoolLevels
 {
@@ -176,6 +178,7 @@ struct PoolLevels
     promised: u64,
     store: u64,
     swapped: u64,
+    committed_swapped: u64,
 }
 
 impl PoolLevels
@@ -204,6 +207,7 @@ impl PoolLevels
             promised: reply.word(8) / PAGE_SIZE,
             store: reply.word(9) / PAGE_SIZE,
             swapped: reply.word(10) / PAGE_SIZE,
+            committed_swapped: reply.word(18) / PAGE_SIZE,
         }
     }
 
@@ -228,11 +232,25 @@ impl PoolLevels
             .wrapping_sub(i128::from(self.swapped))
     }
 
-    /// What a window compares: the free total net of eviction and the
-    /// promised total.
-    fn level(&self) -> (i128, u64)
+    /// The promised total net of eviction: `promised` less the pages of it
+    /// that evicted committed chunks hold, `promised - committed_swapped`.
+    /// While a swap service has registered slots memmgr evicts committed
+    /// chunks too, any process's, and each one's `b` backed pages join
+    /// `promised` for its restore once it holds no frame of its own, and
+    /// leave it at the restore (services/memmgr/docs/memory-pool.md § Commit,
+    /// Overcommit); `committed_swapped` moves with them, so neither moves this
+    /// difference, which a commitment's registration, its faults and its
+    /// release move.
+    fn net_promised(&self) -> i128
     {
-        (self.net_free(), self.promised)
+        i128::from(self.promised).wrapping_sub(i128::from(self.committed_swapped))
+    }
+
+    /// What a window compares: the free and promised totals net of
+    /// eviction.
+    fn level(&self) -> (i128, i128)
+    {
+        (self.net_free(), self.net_promised())
     }
 }
 
@@ -242,12 +260,15 @@ impl std::fmt::Display for PoolLevels
     {
         write!(
             f,
-            "{} free net of eviction ({} free, {} in the store, {} swapped) and {} promised",
+            "{} free net of eviction ({} free, {} in the store, {} swapped) and {} promised net \
+             of eviction ({} promised, {} of it for evicted committed chunks)",
             self.net_free(),
             self.free,
             self.store,
             self.swapped,
-            self.promised
+            self.net_promised(),
+            self.promised,
+            self.committed_swapped
         )
     }
 }
@@ -279,9 +300,9 @@ fn levels_settle_to(before: PoolLevels) -> Result<(), PoolLevels>
     Err(last)
 }
 
-/// Run `window` in up to [`POOL_WINDOWS`] windows, until memmgr's free
-/// total net of eviction and its promised total return after one to the
-/// levels they read before it ([`PoolLevels`], [`settled_levels`],
+/// Run `window` in up to [`POOL_WINDOWS`] windows, until memmgr's free and
+/// promised totals net of eviction return after one to the levels they read
+/// before it ([`PoolLevels`], [`settled_levels`],
 /// [`levels_settle_to`]). `window` takes what memmgr charged svctest's
 /// descendants before it ([`children_charge`]). Panics, naming `what`,
 /// when no window settles, stating the last window's levels and the totals it
@@ -305,9 +326,9 @@ pub(crate) fn windows_settle(what: &str, mut window: impl FnMut(u64))
         panic!(
             "memmgr's levels did not return after {what} in any of {POOL_WINDOWS} windows: \
              the last window's levels were {before}, and it read last {last}, {:+} free net of \
-             eviction and {:+} promised",
+             eviction and {:+} promised net of eviction",
             last.net_free().wrapping_sub(before.net_free()),
-            i128::from(last.promised).wrapping_sub(i128::from(before.promised))
+            last.net_promised().wrapping_sub(before.net_promised())
         );
     }
 }
@@ -633,8 +654,12 @@ fn limited_child_main() -> !
     exit(0);
 }
 
-/// What memmgr can still promise a node outside the reserve, in pages: its
-/// free pages less `promised` and the growth floor.
+/// What the free frames can still back of a commitment of a node outside the
+/// reserve, in pages: memmgr's free pages less `promised` and the growth
+/// floor. While a swap service has registered swap slots memmgr promises past
+/// them (services/memmgr/docs/memory-pool.md § Commit, Overcommit), and a
+/// fault past the free frames waits on eviction; a commitment within them has every
+/// fault backed by a free frame.
 pub(crate) fn uncommitted_available() -> u64
 {
     let Some((free, promised, floor)) = pool_totals()
@@ -646,16 +671,17 @@ pub(crate) fn uncommitted_available() -> u64
 }
 
 /// Child role: commit, through `try_reserve` on the heap, all but at most
-/// [`HOG_MARGIN_PAGES`] of what memmgr can still promise, halving an attempt
-/// it refuses. A best-effort grant of one page more than is then left is
-/// refused with `OUT_OF_MEMORY_BEST_EFFORT`, and its reply counts more free
-/// pages than the grant asked: the pool holds them, promised to the hog. The
-/// hog then writes every page it committed, and exits 0; a fault memmgr
-/// declined would kill it instead.
+/// [`HOG_MARGIN_PAGES`] of what the free frames can still back
+/// ([`uncommitted_available`]), halving an attempt it refuses. A best-effort
+/// grant of one page more than memmgr may then grant it is refused with
+/// `OUT_OF_MEMORY_BEST_EFFORT`, and its reply counts more free pages than the
+/// grant asked: the pool holds them, promised to the hog or kept as the growth
+/// floor. The hog then writes every page it committed, and exits 0; a fault
+/// memmgr declined would kill it instead.
 ///
 /// Other processes free pages while the hog runs (a file system gives back
 /// its cache when the hog's commitment raises memmgr's pressure level), so
-/// what is left can grow between the hog's read of it and its grant. memmgr
+/// what memmgr may grant can grow between the hog's read of it and its grant. memmgr
 /// then admits the grant; the hog gives it back, commits down to its margin
 /// again and asks again, up to [`HOG_REFUSAL_ATTEMPTS`] times. A memmgr that
 /// admits past what is left, by any number of pages, admits every attempt,
@@ -678,8 +704,8 @@ fn hog_main() -> !
     let mut rounds = HOG_MAX_ROUNDS;
     for _ in 0..HOG_REFUSAL_ATTEMPTS
     {
-        let left = commit_to_margin(&mut held, &mut rounds);
-        if past_grant_refused(left)
+        let _ = commit_to_margin(&mut held, &mut rounds);
+        if past_grant_refused()
         {
             touch_committed(&mut held);
             exit(0);
@@ -688,10 +714,35 @@ fn hog_main() -> !
     exit(HOG_GRANT_NOT_REFUSED);
 }
 
-/// Commit blocks into `held` until what memmgr can still promise is at most
-/// [`HOG_MARGIN_PAGES`], spending reservation attempts from `rounds`, and
-/// return what is then left; exit with [`HOG_NOT_COMMITTED`] when `rounds`
-/// runs out first.
+/// memmgr's free pages outside `promised` less its growth floor
+/// (`QUERY_POOL_STATUS` `data[17]` less `data[11]`), in pages: what it may
+/// grant a node outside the reserve. Exits with [`HOG_STATUS_FAILED`] when
+/// the call fails or is refused.
+fn grant_room() -> u64
+{
+    let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe {
+        ipc::ipc_call(
+            startup_info().memmgr_endpoint,
+            &req,
+            std::os::seraph::current_ipc_buf(),
+        )
+    };
+    match reply
+    {
+        Ok(r) if r.label == memmgr_errors::SUCCESS =>
+        {
+            r.word(17).saturating_sub(r.word(11)) / PAGE_SIZE
+        }
+        _ => exit(HOG_STATUS_FAILED),
+    }
+}
+
+/// Commit blocks into `held` until what the free frames can still back
+/// ([`uncommitted_available`]) is at most [`HOG_MARGIN_PAGES`], spending
+/// reservation attempts from `rounds`, and return what is then left; exit with
+/// [`HOG_NOT_COMMITTED`] when `rounds` runs out first.
 pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
 {
     let mut ask = u64::MAX;
@@ -717,15 +768,17 @@ pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u
     exit(HOG_NOT_COMMITTED)
 }
 
-/// Ask memmgr for a best-effort grant of one page more than `left`. Returns
+/// Ask memmgr for a best-effort grant of one page more than it may grant a
+/// node outside the reserve: the free pages outside `promised` less the
+/// growth floor (`QUERY_POOL_STATUS` `data[17]` less `data[11]`). Returns
 /// `true` when memmgr refuses it with `OUT_OF_MEMORY_BEST_EFFORT` and counts
 /// more free pages than the grant asked, and `false` when it grants it, once
 /// the grant is given back ([`give_back`]). Exits with [`HOG_NO_FREE_PAGES`] on a refusal that
 /// counts no more free pages than asked, and with [`HOG_GRANT_NOT_REFUSED`] on
 /// any other reply.
-fn past_grant_refused(left: u64) -> bool
+fn past_grant_refused() -> bool
 {
-    let past = left.saturating_add(1);
+    let past = grant_room().saturating_add(1);
     let grant = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, past)
         .build();

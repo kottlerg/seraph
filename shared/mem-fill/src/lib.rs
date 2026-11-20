@@ -171,9 +171,9 @@ impl Fill
     }
 }
 
-/// What memmgr can still promise a process outside the reserve, in pages: its
-/// free pages less `promised` and the growth floor (`QUERY_POOL_STATUS`'s
-/// `data[3]`, `data[8]` and `data[11]`); `None` when memmgr does not answer or
+/// What memmgr can still grant a process outside the reserve, in pages: its
+/// free pages outside `promised` less the growth floor (`QUERY_POOL_STATUS`'s
+/// `data[17]` and `data[11]`); `None` when memmgr does not answer or
 /// refuses. Allocates nothing.
 fn available() -> Option<u64>
 {
@@ -187,11 +187,8 @@ fn available() -> Option<u64>
         )
     }
     .ok()?;
-    (reply.label == memmgr_errors::SUCCESS).then(|| {
-        (reply.word(3) / PAGE_SIZE)
-            .saturating_sub(reply.word(8) / PAGE_SIZE)
-            .saturating_sub(reply.word(11) / PAGE_SIZE)
-    })
+    (reply.label == memmgr_errors::SUCCESS)
+        .then(|| (reply.word(17) / PAGE_SIZE).saturating_sub(reply.word(11) / PAGE_SIZE))
 }
 
 /// Take one page by a `REQUEST_MEMORY_CAPS` grant, keeping its cap; `false`

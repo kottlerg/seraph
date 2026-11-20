@@ -250,15 +250,15 @@ or below that floor and leaves it only once the free pool clears it by a hystere
 the level reads `CRITICAL`, as when oomd stops a service that is not the one holding the memory,
 has its create refused with `OUT_OF_MEMORY`, and so does one that needs more than the margin above
 the floor below `CRITICAL`. Only memory coming free ends such a refusal, and memmgr signals a
-change of level but not memory coming free within one. The wait is one state machine,
-`svcmgr_defs::memory_wait` (host-tested over every transition), which `restart.rs` and the main
-loop drive:
+change of level, and an opening of its draw room, but not memory coming free otherwise. The
+wait is one state machine, `svcmgr_defs::memory_wait` (host-tested over every transition), which
+`restart.rs` and the main loop drive:
 
 | State | Event | Next state |
 |---|---|---|
 | decided (step 1 charged the death's restart to the budget) | create refused `OUT_OF_MEMORY`, the service outside the reserve and not the log sink, svcmgr holding the pressure Notification | waiting |
 | decided | any other create failure, or one of a reserve service, of the log sink, or with no Notification | down |
-| waiting, level read `CRITICAL` or unread | a signal of a change of level read below `CRITICAL` | retry (on a signal) |
+| waiting, level read `CRITICAL` or unread | a signal (a change of level, or an opening of the draw room) read below `CRITICAL` | retry (on a signal) |
 | waiting, level read `CRITICAL` or unread | a signal read at `CRITICAL`, or unread | waiting; no timer |
 | waiting, level read below `CRITICAL` | the retry deadline, armed `MEMORY_RETRY_MS` (1 s) ahead and moved by no other event, passes, whatever woke the main loop | retry (timed); the next deadline armed |
 | waiting, level read below `CRITICAL` | a signal read at `CRITICAL` | waiting; deadline cleared |

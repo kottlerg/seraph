@@ -12,7 +12,12 @@
 //! count asks for, the partition table that scopes a partition badge, and
 //! the reply label a request's outcome maps to. Each is a wire-contract
 //! decision (`shared/ipc::blk_labels`, `shared/ipc::blk_errors`), so they
-//! live where a host test can pin them.
+//! live where a host test can pin them. It also holds the record of a
+//! request's time ([`RequestTiming`]), from which the driver logs a request
+//! slower than [`SLOW_REQUEST`].
+
+use core::fmt;
+use core::time::Duration;
 
 use ipc::blk_errors;
 
@@ -252,6 +257,143 @@ impl IoOutcome
     }
 }
 
+/// A request that takes this long or longer, from the start of its data
+/// segment's map for the device to the end of its unmap, is logged with
+/// where the time went ([`RequestTiming`]).
+///
+/// A fifth of vfsd's `FS_UNMOUNT_TIMEOUT_MS` (5 s,
+/// `services/vfsd/src/main.rs`), the tightest bound a client puts on a call
+/// that waits on a filesystem driver and so on this driver: a filesystem
+/// request makes several block calls, so one block request this slow already
+/// spends a fifth of that bound. A request takes milliseconds otherwise, so
+/// the line is quiet unless a layer of the request path stalls. A diagnostic
+/// bound that bounds no capacity: it decides only which requests are logged.
+pub const SLOW_REQUEST: Duration = Duration::from_secs(1);
+
+/// What ended the last completion wait before the poll that found a
+/// request's completion, or before the request's bound ran out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionWake
+{
+    /// No wait: the first poll after the submission found the completion.
+    FirstPoll,
+    /// The completion notification was signalled: the interrupt-service
+    /// thread relayed an interrupt.
+    Interrupt,
+    /// The wait ran to its bound with no signal.
+    WaitEnd,
+    /// The wait failed on the cap path.
+    WaitFailed,
+}
+
+impl fmt::Display for CompletionWake
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+    {
+        f.write_str(match self
+        {
+            CompletionWake::FirstPoll => "the first poll",
+            CompletionWake::Interrupt => "interrupt",
+            CompletionWake::WaitEnd => "the wait's end",
+            CompletionWake::WaitFailed => "a failed wait",
+        })
+    }
+}
+
+/// The completion waits of one request: how many it made, and what ended
+/// the last of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitTrace
+{
+    /// Completion waits made.
+    pub waits: u32,
+    /// What ended the last one ([`CompletionWake::FirstPoll`] before any).
+    pub last: CompletionWake,
+}
+
+impl Default for WaitTrace
+{
+    fn default() -> Self
+    {
+        Self {
+            waits: 0,
+            last: CompletionWake::FirstPoll,
+        }
+    }
+}
+
+impl WaitTrace
+{
+    /// Record one completion wait's result as `SYS_NOTIFICATION_WAIT` with a
+    /// timeout returns it: `Ok(0)` when the bound passed (a send carries at
+    /// least one bit), `Ok(bits)` when the notification was signalled, `Err`
+    /// when the wait failed.
+    pub fn record(&mut self, result: Result<u64, i64>)
+    {
+        self.waits = self.waits.saturating_add(1);
+        self.last = match result
+        {
+            Ok(0) => CompletionWake::WaitEnd,
+            Ok(_) => CompletionWake::Interrupt,
+            Err(_) => CompletionWake::WaitFailed,
+        };
+    }
+}
+
+/// Where one request's time went: the map of its data segment for the
+/// device, the device's work from the submission to the completion (or to
+/// the bound, for a lost request), and the unmap. A lost request's device
+/// reset falls between the device wait and the unmap and is in none of them;
+/// it logs its own line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestTiming
+{
+    /// The `DMA_MAP` call on devmgr's DMA thread.
+    pub map: Duration,
+    /// From the submission to the poll that ended the request.
+    pub device: Duration,
+    /// The `DMA_UNMAP` call on devmgr's DMA thread.
+    pub unmap: Duration,
+    /// The completion waits made during `device`.
+    pub waits: WaitTrace,
+}
+
+impl RequestTiming
+{
+    /// The request's time: its map, its device wait and its unmap.
+    #[must_use]
+    pub fn total(&self) -> Duration
+    {
+        self.map
+            .saturating_add(self.device)
+            .saturating_add(self.unmap)
+    }
+
+    /// Whether the request took [`SLOW_REQUEST`] or longer, and is logged.
+    #[must_use]
+    pub fn is_slow(&self) -> bool
+    {
+        self.total() >= SLOW_REQUEST
+    }
+}
+
+impl fmt::Display for RequestTiming
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+    {
+        write!(
+            f,
+            "{} ms: map {} ms, device {} ms (completion by {}, wait count {}), unmap {} ms",
+            self.total().as_millis(),
+            self.map.as_millis(),
+            self.device.as_millis(),
+            self.waits.last,
+            self.waits.waits,
+            self.unmap.as_millis(),
+        )
+    }
+}
+
 /// How long, in milliseconds, a request's completion is waited for once
 /// `elapsed` of its `timeout` has passed: what is left of it, rounded up, so
 /// the wait never ends before the bound. Never 0, which waits with no bound,
@@ -271,6 +413,34 @@ pub fn completion_wait_ms(
 #[cfg(test)]
 mod tests
 {
+    #[test]
+    fn a_wait_trace_names_what_ended_the_last_wait_and_counts_the_waits()
+    {
+        let mut trace = WaitTrace::default();
+        assert_eq!(trace.last, CompletionWake::FirstPoll);
+        trace.record(Ok(0));
+        assert_eq!((trace.waits, trace.last), (1, CompletionWake::WaitEnd));
+        trace.record(Ok(1));
+        assert_eq!((trace.waits, trace.last), (2, CompletionWake::Interrupt));
+        trace.record(Err(-3));
+        assert_eq!((trace.waits, trace.last), (3, CompletionWake::WaitFailed));
+    }
+
+    #[test]
+    fn a_request_is_slow_once_its_map_device_and_unmap_reach_the_bound()
+    {
+        use core::time::Duration;
+        let timing = |unmap| RequestTiming {
+            map: Duration::from_millis(300),
+            device: Duration::from_millis(300),
+            unmap,
+            waits: WaitTrace::default(),
+        };
+        // Each part alone is under the bound; their sum decides.
+        assert!(!timing(Duration::from_micros(399_999)).is_slow());
+        assert!(timing(Duration::from_millis(400)).is_slow());
+    }
+
     #[test]
     fn a_completion_wait_lasts_what_is_left_of_the_bound()
     {

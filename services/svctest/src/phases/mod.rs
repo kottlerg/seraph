@@ -49,7 +49,7 @@
 //!     history, which a later phase's lines could evict and which the next
 //!     logd instance does not hold.
 //! 12. [`swap`] after every phase that uses the `memhog` fixture ([`svcmgr`],
-//!     [`oom`], [`logd_restart`]): it holds the level at `CRITICAL` while it
+//!     [`oom`], [`timed`], [`logd_restart`]): it holds the level at `CRITICAL` while it
 //!     restores chunks from the restore headroom, which on a slow host outlasts
 //!     oomd's grace. oomd then stops memhog, and svcmgr's restart of it, made
 //!     while the level still reads `CRITICAL`, fails, which leaves memhog down
@@ -57,6 +57,9 @@
 //! 13. [`swapd`] after [`swap`], [`swap_client`] and [`swap_raw`]: it reuses
 //!     their fixture and hog, and kills swapd, which no phase after it needs
 //!     for a restore.
+//! 14. [`swap_commit`] after [`swapd`]: its allowance is derived from the
+//!     slots the swap service registered, and its write part needs a swap
+//!     service that writes chunks to disk.
 
 use crate::runner::Phase;
 
@@ -97,6 +100,7 @@ pub mod startup;
 pub mod svcmgr;
 pub mod swap;
 pub mod swap_client;
+pub mod swap_commit;
 pub mod swap_raw;
 pub mod swapd;
 pub mod threading;
@@ -155,6 +159,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(swap_client::phases());
     out.extend_from_slice(swap_raw::phases());
     out.extend_from_slice(swapd::phases());
+    out.extend_from_slice(swap_commit::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());

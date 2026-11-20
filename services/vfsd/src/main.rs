@@ -1329,6 +1329,11 @@ fn handle_unmount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime
 /// dispatch thread answers it after the operation in flight, whose block
 /// I/O is bounded only by the device; a driver that has not answered by
 /// then is torn down without its cooperation.
+///
+/// The tightest bound a client puts on a call to a filesystem driver, so
+/// fatfs logs a request it held this long (`SLOW_REQUEST` in
+/// `services/fs/fat/src/held.rs`, which states the same value): a change
+/// here changes that threshold too.
 const FS_UNMOUNT_TIMEOUT_MS: u32 = 5000;
 
 /// Bound on the wait for a torn-down driver's death to post. A driver that

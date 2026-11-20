@@ -78,7 +78,9 @@ pub enum CreateFailure
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Wake
 {
-    /// A signal of the pressure Notification: the level changed.
+    /// A signal of the pressure Notification: the level changed, or memmgr's
+    /// draw room opened, which write-out to swap brings about as it frees
+    /// pages; svcmgr reads the level at either.
     Signal,
     /// The retry deadline has passed ([`MemoryWaits::poll_timer`] returned
     /// [`Timer::Due`]), whatever woke the main loop; an expiry of its wait
@@ -91,8 +93,8 @@ pub enum Wake
 pub struct Retry
 {
     /// Whether the timer made it; only a timed retry counts against
-    /// [`MEMORY_RETRY_LIMIT`], since signals are bounded by the changes of
-    /// level.
+    /// [`MEMORY_RETRY_LIMIT`], since signals are bounded by memmgr's changes
+    /// of level and openings of its draw room.
     pub timed: bool,
 }
 

@@ -116,6 +116,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{mem_map_funded, reserve_pages};
 use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 use syscall_abi::{MAP_WRITABLE, MSG_DATA_WORDS_MAX, PAGE_SIZE, SyscallError};
 
 pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT, slot_ceiling};
@@ -1495,8 +1496,27 @@ pub fn device_gone() -> bool
     DEVICE_GONE.load(Ordering::Acquire)
 }
 
+/// Nanoseconds the block calls have taken since the driver started
+/// ([`block_call`]), and how many there were: the dispatch loop reads them
+/// around a request, so a slow request's line says how much of its time the
+/// block device took (`held` module).
+static BLOCK_CALL_NANOS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// The time the block calls have taken since the driver started, and their
+/// count. Only the dispatch thread makes block calls, so the difference of
+/// two reads around a request is that request's own.
+pub fn block_call_totals() -> (Duration, u64)
+{
+    (
+        Duration::from_nanos(BLOCK_CALL_NANOS.load(Ordering::Relaxed)),
+        BLOCK_CALLS.load(Ordering::Relaxed),
+    )
+}
+
 /// Every request fatfs sends its block device: `msg` on `block_dev`, or
 /// `None` when the call fails or the device is gone ([`device_gone`]).
+/// The call's time goes into [`block_call_totals`].
 ///
 /// A failed call is told apart by the block capability itself. Once it
 /// names nothing (`InvalidCapability` from `SYS_CAP_INFO`), its holder
@@ -1515,9 +1535,14 @@ pub unsafe fn block_call(block_dev: u64, msg: &IpcMessage, ipc_buf: *mut u64)
     {
         return None;
     }
+    let start = Instant::now();
     // SAFETY: the caller guarantees `ipc_buf` is this thread's registered IPC
     // buffer page.
-    let err = match unsafe { ipc::ipc_call(block_dev, msg, ipc_buf) }
+    let result = unsafe { ipc::ipc_call(block_dev, msg, ipc_buf) };
+    let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    BLOCK_CALL_NANOS.fetch_add(nanos, Ordering::Relaxed);
+    BLOCK_CALLS.fetch_add(1, Ordering::Relaxed);
+    let err = match result
     {
         Ok(reply) => return Some(reply),
         Err(err) => err,

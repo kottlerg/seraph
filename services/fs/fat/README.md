@@ -18,6 +18,7 @@ fat/
 │   └── storage-layout.md       # Allocator, directory mutation, page cache, NodeTable, eviction
 └── src/
     ├── main.rs                 # Dispatch loop, pressure thread, FS_* handlers, write engine
+    ├── held.rs                 # Slow-request line of the dispatch loop
     ├── bpb.rs                  # BPB parser, FatState fields
     ├── alloc.rs                # Cluster allocator, FAT-mirror writes, FSInfo flush
     ├── dir.rs                  # Directory walks and mutation (insert/remove/rename)
@@ -88,6 +89,31 @@ node table that dedupes by on-disk slot and recycles the nodes of removed or ren
 (`src/backend.rs`), and a cooperative-release eviction worker (`src/eviction.rs`). Sectors are the
 device's logical blocks, 512 to 4096 bytes. Each component's behavior is specified in
 [docs/storage-layout.md](docs/storage-layout.md).
+
+---
+
+## Slow requests
+
+One thread serves every request of a mount, so a request it holds delays every request queued
+behind it. A request held 5 seconds or longer, from its receipt to the end of its dispatch after
+the reply, is logged once that turn ends, as a warning naming its label and saying how much of
+its time its block calls took and how many it made:
+
+```text
+slow request: FS_REMOVE (label 14) held 12034 ms, 11870 ms of it in 2311 block calls
+```
+
+The bound is vfsd's bound on the driver's answer to `FS_UNMOUNT` (`FS_UNMOUNT_TIMEOUT_MS`,
+[docs/limits.md](../../../docs/limits.md)), the tightest a client puts on a call to this driver: a
+request held that long has outlasted the bound of any such call queued behind it, and an unmount
+queued behind it has timed out, so vfsd tears the mount down without the driver's cooperation.
+The other bounds on a call to this driver, procmgr's on a call on a file cap and vfsd's on a
+fall-through call and on the mount probe, are 10 seconds.
+A request whose block calls took most of its time stalled in the block path, which the
+virtio-blk driver's own slow-request line splits further
+([virtio/blk § Slow requests](../../drivers/virtio/blk/README.md#slow-requests)); one whose
+block calls took little stalled in fatfs or in another service it called. A request held less
+costs two clock reads, and each block call two more.
 
 ---
 

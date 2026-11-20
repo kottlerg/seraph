@@ -15,7 +15,11 @@
 //!    or one kept beside it, by a resume, a step, a detach, or the drop of
 //!    the session; any other at once.
 //! 2. Between two resumes GDB is told of, every live bound thread is held,
-//!    or was posted an upcall that has not arrived within [`STOP_WAIT`]. A
+//!    or was posted an upcall that has not arrived within [`STOP_WAIT`] of
+//!    the all-stop's start, or of the post when its creator started it
+//!    during the all-stop, or is not yet started, read again meanwhile; an all-stop
+//!    that ends with one unstarted at its last read records it
+//!    ([`Session::awaits_start`]), and the attach then detaches. A
 //!    held stop GDB has been told of is never restarted: it is answered by
 //!    a resume, a step, a detach, or the drop, or replaced by an upcall or
 //!    `#DB` under its badge, which a thread held on its own stop cannot
@@ -58,6 +62,10 @@ pub const MAX_RECEIVERS: usize = 2 * MAX_THREADS;
 /// milliseconds.
 pub const STOP_WAIT: u64 = 2000;
 
+/// How often, in milliseconds, an all-stop posts again to a thread its
+/// creator has not started, which takes no upcall until it is.
+pub const START_POLL: u64 = 10;
+
 /// How long a detach keeps answering the stops that arrive after its
 /// resume, in milliseconds, ended early once none has come for
 /// [`DRAIN_QUIET`].
@@ -67,8 +75,8 @@ pub const DRAIN_WAIT: u64 = 500;
 /// before it ends, within [`DRAIN_WAIT`].
 pub const DRAIN_QUIET: u64 = 50;
 
-/// How many thread-list pages a refresh takes when a thread of the table
-/// exits during one.
+/// How many times a refresh, or the attach, takes procmgr's thread list
+/// when a thread it lists exits during the walk of its pages.
 pub const REFRESH_TRIES: u32 = 3;
 
 /// A fault or upcall message one receiver took off the endpoint, which that
@@ -122,8 +130,12 @@ pub trait Kernel
     fn set_pc(&mut self, cap: u64, pc: u64) -> bool;
     /// Whether the thread has not exited.
     fn alive(&mut self, cap: u64) -> bool;
+    /// Whether the thread's creator has started it: a thread procmgr lists
+    /// between its process's creation and its start has not been.
+    fn started(&mut self, cap: u64) -> bool;
     /// Post the thread an `UPCALL_ANY_INSTRUCTION` upcall; `false` when the
-    /// kernel refuses it (the thread has exited, or has an upcall pending).
+    /// kernel refuses it (the thread has exited or has not been started, or
+    /// has an upcall pending).
     fn post_upcall(&mut self, cap: u64) -> bool;
     /// Bind the thread's exception and upcall classes to the stub's
     /// endpoint under the badge of table slot `slot`, with a receiver for it;
@@ -134,7 +146,10 @@ pub trait Kernel
     fn unbind_upcall(&mut self, cap: u64);
     /// Delete the cap.
     fn delete(&mut self, cap: u64);
-    /// The page of procmgr's thread list from `first`, at most `room` caps.
+    /// The page of procmgr's thread list from `first`, at most `room` caps,
+    /// walked in procmgr's replies of `ATTACH_THREADS_PAGE` caps from the
+    /// index past the last reply's, until one reaches the end of the list
+    /// or the room.
     fn list(&mut self, first: u64, room: usize) -> Option<Page>;
     /// Arm one instruction's step on the held thread, keeping its undo;
     /// `false` when the step cannot be armed, which leaves the thread as it
@@ -210,11 +225,14 @@ struct Slot
     /// it lives and is not shown to GDB.
     bound: bool,
     held: Option<Held>,
+    /// The target's main thread: procmgr's index 0, which procmgr lists
+    /// there whether or not it has exited.
+    main: bool,
     /// Repeats of the held stop, kept beside it once GDB has been told of
     /// it ([`Unclaimed::Keep`]), and answered with it.
     beside: Vec<Stop>,
-    /// An all-stop posted it an upcall that has not arrived.
-    posted: bool,
+    /// Where this all-stop's upcall to it stands.
+    upcall: Upcall,
     gone: bool,
 }
 
@@ -237,6 +255,28 @@ enum Unheld
     Abandon,
 }
 
+/// Where an all-stop's upcall to a thread stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Upcall
+{
+    /// Not posted yet.
+    Unposted,
+    /// Not posted: a read found its creator had not started it.
+    Unstarted,
+    /// Posted, and not arrived.
+    Posted,
+}
+
+/// What one read of an all-stop's posts found.
+#[derive(Clone, Copy, Debug)]
+struct Posted
+{
+    /// A live thread its creator has not started stays unposted.
+    unstarted: bool,
+    /// A thread an earlier read of the all-stop found unstarted was posted.
+    started: bool,
+}
+
 /// How a resume packet ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resumed
@@ -255,7 +295,7 @@ pub struct Session
 {
     threads: Vec<Slot>,
     /// The table holds every thread procmgr listed, so a refresh can page
-    /// on from the count of threads still alive.
+    /// on from the first index the table does not hold.
     complete: bool,
     /// How far past a software breakpoint the architecture reports the
     /// pointer.
@@ -263,6 +303,9 @@ pub struct Session
     stepping: Option<usize>,
     /// The target was resumed and no stop has been reported since.
     running: bool,
+    /// The last all-stop ended with a live thread its creator had not
+    /// started at its last read, so neither held nor posted.
+    unstarted: bool,
     /// The thread register and memory commands act on, by slot.
     pub current: usize,
     /// The breakpoints planted in the target's text.
@@ -272,21 +315,55 @@ pub struct Session
 impl Session
 {
     /// Attach to the threads of `page`, procmgr's list from its start, and
-    /// stop them all.
+    /// stop them all. A list whose walk a thread's exit can have torn
+    /// ([`walk_torn`]) is taken again, [`REFRESH_TRIES`] times in all;
+    /// one still torn then is attached as incomplete, so no refresh pages
+    /// on from it.
     pub fn attach(k: &mut impl Kernel, advance: u64, page: Page) -> Self
     {
+        let mut page = page;
+        let mut tries = 1;
+        while walk_torn(k, 0, &page.caps)
+        {
+            let again = if tries < REFRESH_TRIES
+            {
+                k.list(0, MAX_THREADS)
+            }
+            else
+            {
+                None
+            };
+            let Some(again) = again
+            else
+            {
+                page.complete = false;
+                break;
+            };
+            tries = tries.saturating_add(1);
+            for &cap in &page.caps
+            {
+                k.delete(cap);
+            }
+            page = again;
+        }
         let mut s = Self {
             threads: Vec::new(),
             complete: page.complete,
             advance,
             stepping: None,
             running: true,
+            unstarted: false,
             current: 0,
             breakpoints: Breakpoints::new(),
         };
-        for cap in page.caps
+        for (index, cap) in page.caps.into_iter().enumerate()
         {
-            s.add_thread(k, cap);
+            let slot = s.add_thread(k, cap);
+            if index == 0
+                && let Some(t) = s.threads.get_mut(slot)
+            {
+                t.main = true;
+            }
         }
         s.stop_all(k);
         s
@@ -295,8 +372,9 @@ impl Session
     // ── The table ────────────────────────────────────────────────────────
 
     /// Store `cap` in the slot of an exited thread with no stop held, or
-    /// after the last, and bind it under that slot's badge.
-    fn add_thread(&mut self, k: &mut impl Kernel, cap: u64)
+    /// after the last, and bind it under that slot's badge; returns the
+    /// slot.
+    fn add_thread(&mut self, k: &mut impl Kernel, cap: u64) -> usize
     {
         let free = control::free_slot(self.threads.iter().map(|t| (t.gone, t.held.is_some())));
         let index = free.unwrap_or(self.threads.len());
@@ -309,8 +387,9 @@ impl Session
             cap,
             bound,
             held: None,
+            main: false,
             beside: Vec::new(),
-            posted: false,
+            upcall: Upcall::Unposted,
             gone: !bound && !k.alive(cap),
         };
         if let Some(entry) = self.threads.get_mut(index)
@@ -322,6 +401,7 @@ impl Session
         {
             self.threads.push(slot);
         }
+        index
     }
 
     /// Mark the exited threads gone; returns how many are alive.
@@ -338,9 +418,13 @@ impl Session
     }
 
     /// Take the threads the target registered since the attach from
-    /// procmgr's list and bind them; returns whether one was added. procmgr
-    /// lists the threads still alive first and in the same order, so the
-    /// new ones start at the count of the table's live threads.
+    /// procmgr's list and bind them; returns whether one was added.
+    /// procmgr lists the main thread at index 0 whether or not it has
+    /// exited, then each registered thread still alive in registration
+    /// order, so the new ones start after the main thread and the table's
+    /// live registered threads. The list is taken again when a thread of
+    /// the table, or one the list took, exits during its walk
+    /// ([`walk_torn`]).
     fn refresh(&mut self, k: &mut impl Kernel) -> bool
     {
         if !self.complete
@@ -350,12 +434,13 @@ impl Session
         for _ in 0..REFRESH_TRIES
         {
             let alive = self.alive_count(k);
-            let Some(page) = k.list(alive as u64, MAX_THREADS.saturating_sub(alive))
+            let first = self.unlisted_index();
+            let Some(page) = k.list(first, MAX_THREADS.saturating_sub(alive))
             else
             {
                 return false;
             };
-            if self.alive_count(k) != alive || page.count < alive as u64
+            if self.alive_count(k) != alive || page.count < first || walk_torn(k, first, &page.caps)
             {
                 for cap in page.caps
                 {
@@ -367,18 +452,29 @@ impl Session
             let added = !page.caps.is_empty();
             for cap in page.caps
             {
-                self.add_thread(k, cap);
+                let _ = self.add_thread(k, cap);
             }
             return added;
         }
         false
     }
 
+    /// The index in procmgr's list of the first thread the table does not
+    /// hold: one for the main thread, held or exited, and one for each live
+    /// registered thread of the table. Read after [`Self::alive_count`].
+    fn unlisted_index(&self) -> u64
+    {
+        let registered = self.threads.iter().filter(|t| !t.gone && !t.main).count();
+        (registered as u64).saturating_add(1)
+    }
+
     // ── Stops ────────────────────────────────────────────────────────────
 
     /// Stop every running thread with an upcall and wait, bounded by
-    /// [`STOP_WAIT`], for each stop; a breakpoint another thread hits
-    /// meanwhile is held unreported and set back ([`Self::cancel_hit`]).
+    /// [`STOP_WAIT`], for each stop. A thread its creator has not started
+    /// yet is read again every [`START_POLL`] and posted once started, with
+    /// a whole [`STOP_WAIT`] from that post. A breakpoint another thread
+    /// hits meanwhile is held unreported and set back ([`Self::cancel_hit`]).
     /// Once every thread is held the table is refreshed: a thread the
     /// target spawned since the last refresh, under its spawner's badge,
     /// can have had its stop taken for its spawner's, so every unreported
@@ -388,16 +484,24 @@ impl Session
     /// its thread is held.
     pub fn stop_all(&mut self, k: &mut impl Kernel)
     {
-        let deadline = k.now().saturating_add(STOP_WAIT);
+        let mut deadline = k.now().saturating_add(STOP_WAIT);
         let mut refreshed = false;
         loop
         {
-            self.post_upcalls(k);
+            let Posted { unstarted, started } = self.post_upcalls(k);
+            // A thread its creator started since an earlier read was posted
+            // just now: its upcall gets a whole wait from the post, not what
+            // is left of the all-stop's.
+            if started
+            {
+                deadline = deadline.max(k.now().saturating_add(STOP_WAIT));
+            }
+            self.unstarted = unstarted;
             let waiting = self
                 .threads
                 .iter()
-                .any(|t| t.live() && t.held.is_none() && t.posted);
-            if !waiting
+                .any(|t| t.live() && t.held.is_none() && t.upcall == Upcall::Posted);
+            if !waiting && !unstarted
             {
                 if refreshed || !self.refresh(k)
                 {
@@ -407,9 +511,22 @@ impl Session
                 self.restart_unreported(k, None);
                 continue;
             }
-            let Some(stop) = self.next_stop(k, deadline)
+            // A thread not started yet is read again once this wait ends.
+            let until = if unstarted
+            {
+                k.now().saturating_add(START_POLL).min(deadline)
+            }
             else
             {
+                deadline
+            };
+            let Some(stop) = self.next_stop(k, until)
+            else
+            {
+                if unstarted && k.now() < deadline
+                {
+                    continue;
+                }
                 break;
             };
             if let Some(index) = self.hold(k, stop)
@@ -419,7 +536,7 @@ impl Session
         }
         for t in &mut self.threads
         {
-            t.posted = false;
+            t.upcall = Upcall::Unposted;
             if let Some(h) = &mut t.held
             {
                 h.reported = true;
@@ -444,25 +561,41 @@ impl Session
         k.next_stop(until)
     }
 
-    /// Post an upcall to every live thread not held and not yet posted.
-    fn post_upcalls(&mut self, k: &mut impl Kernel)
+    /// Post an upcall to every live thread not held and not yet posted,
+    /// except one its creator has not started, which the kernel posts
+    /// nothing to until it is, so it stays unposted.
+    fn post_upcalls(&mut self, k: &mut impl Kernel) -> Posted
     {
+        let mut posted = Posted {
+            unstarted: false,
+            started: false,
+        };
         for t in self
             .threads
             .iter_mut()
-            .filter(|t| t.live() && t.held.is_none() && !t.posted)
+            .filter(|t| t.live() && t.held.is_none() && t.upcall != Upcall::Posted)
         {
-            // A refused post to a live thread finds an upcall pending, which
-            // arrives as well.
-            if !k.post_upcall(t.cap) && !k.alive(t.cap)
+            // Read before the post, since a thread its creator starts
+            // between a refused post and a later read would be taken for
+            // one with an upcall pending.
+            if !k.started(t.cap) && k.alive(t.cap)
+            {
+                t.upcall = Upcall::Unstarted;
+                posted.unstarted = true;
+            }
+            else if !k.post_upcall(t.cap) && !k.alive(t.cap)
             {
                 t.gone = true;
             }
             else
             {
-                t.posted = true;
+                // A refused post to a started live thread finds an upcall
+                // pending, which arrives as well.
+                posted.started |= t.upcall == Upcall::Unstarted;
+                t.upcall = Upcall::Posted;
             }
         }
+        posted
     }
 
     /// Take `stop` as its thread's held stop and return the thread's slot,
@@ -605,7 +738,7 @@ impl Session
             stop,
             reported: false,
         });
-        t.posted = false;
+        t.upcall = Upcall::Unposted;
         true
     }
 
@@ -618,7 +751,7 @@ impl Session
     {
         let cap = self.threads.get_mut(index).map(|t| {
             t.held = None;
-            t.posted = false;
+            t.upcall = Upcall::Unposted;
             t.cap
         });
         if let Some(cap) = cap
@@ -656,7 +789,7 @@ impl Session
                 continue;
             };
             t.held = None;
-            t.posted = false;
+            t.upcall = Upcall::Unposted;
             let cap = t.cap;
             self.rewind_hit(k, cap, &[h.stop]);
             k.reply(h.stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
@@ -1071,6 +1204,36 @@ impl Session
     {
         self.threads.get(index).is_some_and(|t| t.held.is_some())
     }
+
+    /// Whether the last all-stop ended with a live thread its creator had
+    /// not started at the all-stop's last read of it: that thread is neither
+    /// held nor posted and, once started, runs on, so the session has no
+    /// stop of it to report. The record is the all-stop's, not a new read: a
+    /// thread started after that read is unposted all the same.
+    #[must_use]
+    pub fn awaits_start(&self) -> bool
+    {
+        self.unstarted
+    }
+}
+
+/// Whether a walk of procmgr's list that took `caps` from index `first`
+/// ([`Kernel::list`]) can have skipped a thread: one taken from a reply
+/// before the last, past the main thread at index 0, has exited. procmgr
+/// drops an exited thread from the list before each reply, so an exit
+/// between two replies moves every later thread one index down, past the
+/// next reply's first index. The main thread stays listed after its exit,
+/// and an exit of a thread of the last reply moves none the walk takes.
+fn walk_torn(k: &mut impl Kernel, first: u64, caps: &[u64]) -> bool
+{
+    const REPLY: usize = ipc::procmgr_labels::ATTACH_THREADS_PAGE;
+    // Every reply but the last is full, so the last starts at the last
+    // multiple of a reply below the count.
+    let last = (caps.len().saturating_sub(1) / REPLY).saturating_mul(REPLY);
+    caps.iter()
+        .take(last)
+        .zip(first..)
+        .any(|(&cap, index)| index != 0 && !k.alive(cap))
 }
 
 /// [`control::settle`] of `stop`, a delivery under the badge of a thread
@@ -1213,6 +1376,19 @@ mod tests
         busy: usize,
         /// Threads whose bind the kernel refuses.
         refuse_bind: Vec<usize>,
+        /// Threads their creator starts only at the given time, before which
+        /// the kernel refuses them an upcall.
+        unstarted: Vec<(usize, u64)>,
+        /// Threads whose upcall arrives the given time after its post.
+        late: Vec<(usize, u64)>,
+        /// The late upcalls posted, by thread and time due.
+        due: Vec<(usize, u64)>,
+        /// At the given time the given thread registers a thread its creator
+        /// never starts, and a thread it spawned stops under its badge.
+        spawn_at: Vec<(u64, usize)>,
+        /// Threads that exit between the first two replies of the next walk
+        /// of procmgr's list.
+        exit_mid_list: Vec<usize>,
     }
 
     fn cap_of(t: usize) -> u64
@@ -1246,6 +1422,11 @@ mod tests
                 receivers: 0,
                 busy: 0,
                 refuse_bind: Vec::new(),
+                unstarted: Vec::new(),
+                late: Vec::new(),
+                due: Vec::new(),
+                spawn_at: Vec::new(),
+                exit_mid_list: Vec::new(),
             };
             sim.spawn(None, true);
             sim
@@ -1401,6 +1582,29 @@ mod tests
 
         fn next_stop(&mut self, until: u64) -> Option<Stop>
         {
+            // A late upcall arrives at its time, within the wait.
+            if self.queue.is_empty()
+                && let Some(i) = (0..self.due.len())
+                    .filter(|&i| self.due[i].1 <= until)
+                    .min_by_key(|&i| self.due[i].1)
+            {
+                let (t, at) = self.due.remove(i);
+                self.time = self.time.max(at);
+                if self.threads[t].run == Run::Running
+                {
+                    self.deliver(t, UPCALL, 0);
+                }
+            }
+            if self.queue.is_empty()
+                && let Some(i) = self.spawn_at.iter().position(|&(at, _)| at <= until)
+            {
+                let (at, parent) = self.spawn_at.remove(i);
+                self.time = self.time.max(at);
+                let u = self.spawn(Some(parent), true);
+                self.unstarted.push((u, u64::MAX));
+                let n = self.spawn(Some(parent), true);
+                self.deliver(n, UPCALL, 0);
+            }
             // A delivery waits on the endpoint while every receiver holds one.
             let taken = if self.busy < self.receivers
             {
@@ -1523,12 +1727,31 @@ mod tests
             self.threads[thread_of(cap)].run != Run::Exited
         }
 
+        fn started(&mut self, cap: u64) -> bool
+        {
+            let t = thread_of(cap);
+            !self
+                .unstarted
+                .iter()
+                .any(|&(u, at)| u == t && self.time < at)
+        }
+
         fn post_upcall(&mut self, cap: u64) -> bool
         {
             let t = thread_of(cap);
+            if !self.started(cap)
+            {
+                return false;
+            }
             if self.deaf.contains(&t)
             {
                 return self.threads[t].run != Run::Exited;
+            }
+            if let Some(&(_, after)) = self.late.iter().find(|&&(u, _)| u == t)
+                && self.threads[t].run == Run::Running
+            {
+                self.due.push((t, self.time + after));
+                return true;
             }
             match self.threads[t].run
             {
@@ -1579,17 +1802,42 @@ mod tests
 
         fn list(&mut self, first: u64, room: usize) -> Option<Page>
         {
-            let listed: Vec<u64> = (0..self.threads.len())
-                .filter(|&t| self.threads[t].registered && self.threads[t].run != Run::Exited)
-                .map(cap_of)
-                .collect();
+            // As the service walks procmgr's list: a reply of at most
+            // `ATTACH_THREADS_PAGE` caps from the next index, each reply's
+            // list the main thread, thread 0, at index 0 whether or not it
+            // has exited, then each registered thread still alive.
             let first = usize::try_from(first).unwrap();
-            let caps: Vec<u64> = listed.iter().skip(first).take(room).copied().collect();
-            Some(Page {
-                count: listed.len() as u64,
-                complete: first + caps.len() >= listed.len(),
-                caps,
-            })
+            let mut caps = Vec::new();
+            let mut next = first;
+            loop
+            {
+                let listed: Vec<u64> = (0..self.threads.len())
+                    .filter(|&t| {
+                        t == 0 || (self.threads[t].registered && self.threads[t].run != Run::Exited)
+                    })
+                    .map(cap_of)
+                    .collect();
+                let reply: Vec<u64> = listed
+                    .iter()
+                    .skip(next)
+                    .take(ipc::procmgr_labels::ATTACH_THREADS_PAGE)
+                    .copied()
+                    .collect();
+                caps.extend(reply.iter().take(room.saturating_sub(caps.len())));
+                next += reply.len();
+                if reply.is_empty() || next >= listed.len() || caps.len() >= room
+                {
+                    return Some(Page {
+                        count: listed.len() as u64,
+                        complete: first + caps.len() >= listed.len(),
+                        caps,
+                    });
+                }
+                for t in core::mem::take(&mut self.exit_mid_list)
+                {
+                    self.exit(t);
+                }
+            }
         }
 
         fn prepare_step(&mut self, cap: u64) -> bool
@@ -2112,8 +2360,9 @@ mod tests
                     cap: cap_of(0),
                     bound: false,
                     held: Some(held),
+                    main: false,
                     beside: Vec::new(),
-                    posted: false,
+                    upcall: Upcall::Unposted,
                     gone: true,
                 });
             }
@@ -2131,6 +2380,93 @@ mod tests
         hold_more(&mut s, 1);
         let _ = s.next_stop(&mut sim, 0);
         assert_eq!(sim.receivers, MAX_RECEIVERS, "no more past the bound");
+    }
+
+    // Defect caught: a refresh after the main thread's exit paged procmgr's
+    // list from the count of the table's live threads, which procmgr's
+    // index 0, the exited main thread, put one short: it added a held
+    // thread a second time, rebinding it under the new slot's badge.
+    #[test]
+    fn a_refresh_after_the_main_thread_s_exit_adds_each_thread_once()
+    {
+        let mut sim = Sim::new();
+        let worker = sim.spawn(Some(0), true);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        resume(&mut sim, &mut s);
+        sim.exit(0);
+        let n = sim.spawn(Some(worker), true);
+        assert!(s.interrupt(&mut sim));
+        assert_eq!(slots_of(&s, worker), 1, "the worker takes one slot");
+        assert_eq!(slots_of(&s, n), 1, "the new thread is added once");
+        assert_eq!(s.live_ids().len(), 2);
+        assert_eq!(
+            sim.threads[worker].badge,
+            Some(control::thread_badge(1)),
+            "the worker stays bound under its own slot's badge"
+        );
+        assert!(s.is_held(1), "the worker is held");
+        assert!(sim.held_live(&s));
+        sim.assert_sound();
+    }
+
+    /// How many live slots of the table hold simulated thread `t`.
+    fn slots_of(s: &Session, t: usize) -> usize
+    {
+        s.threads
+            .iter()
+            .filter(|slot| slot.cap == cap_of(t) && !slot.gone)
+            .count()
+    }
+
+    // Defect caught: a thread that exited between two replies of a
+    // refresh's walk of procmgr's list moved the later ones an index down,
+    // so the walk skipped one and, taken for complete, the next refresh
+    // added a thread the table held.
+    #[test]
+    fn a_refresh_whose_walk_a_thread_s_exit_tore_takes_the_list_again()
+    {
+        let (mut sim, mut s) = attached();
+        resume(&mut sim, &mut s);
+        let new: Vec<usize> = (0..6).map(|_| sim.spawn(Some(0), true)).collect();
+        sim.exit_mid_list.push(new[1]);
+        assert!(s.interrupt(&mut sim));
+        for &t in new.iter().filter(|&&t| t != new[1])
+        {
+            assert_eq!(slots_of(&s, t), 1, "thread {t} is in one slot");
+        }
+        resume(&mut sim, &mut s);
+        assert!(s.interrupt(&mut sim));
+        for &t in new.iter().filter(|&&t| t != new[1])
+        {
+            assert_eq!(slots_of(&s, t), 1, "thread {t} is in one slot");
+        }
+        assert!(sim.held_live(&s));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread that exited between two replies of the
+    // attach's walk of procmgr's list left a later thread out of the table,
+    // never stopped, which a refresh then took for one the table held.
+    #[test]
+    fn an_attach_whose_walk_a_thread_s_exit_tore_takes_the_list_again()
+    {
+        let mut sim = Sim::new();
+        let workers: Vec<usize> = (0..5).map(|_| sim.spawn(Some(0), true)).collect();
+        sim.exit_mid_list.push(workers[0]);
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.complete);
+        for &t in [0].iter().chain(&workers[1..])
+        {
+            assert_eq!(slots_of(&s, t), 1, "thread {t} is in one slot");
+            assert!(
+                matches!(sim.threads[t].run, Run::Blocked(_)),
+                "thread {t} is held"
+            );
+        }
+        assert!(sim.held_live(&s));
+        sim.assert_sound();
     }
 
     // Defect caught: a simulation that misses a resume past a breakpoint,
@@ -2180,5 +2516,99 @@ mod tests
         assert_eq!(SlotState::Absent.refusal_code(), 1);
         assert_eq!(SlotState::Unbound.refusal_code(), 4);
         assert_eq!(SlotState::Gone.refusal_code(), 5);
+    }
+
+    // Defect caught: an attach between the target's creation and its start
+    // took the kernel's refusal of an upcall to the unstarted main thread
+    // for one pending, never posted again, and left the thread to run on
+    // once started, while GDB took it for stopped.
+    #[test]
+    fn an_attach_before_the_targets_start_holds_its_main_thread_once_started()
+    {
+        let mut sim = Sim::new();
+        sim.unstarted.push((0, STOP_WAIT / 4));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.is_held(0), "the main thread runs unheld");
+        assert!(!s.awaits_start());
+        assert!(sim.time < STOP_WAIT, "the all-stop waited out its bound");
+        assert!(s.detach(&mut sim));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a target its creator had not started by the end of the
+    // attach's all-stop was attached holding nothing, so GDB would take a
+    // target that then runs for stopped.
+    #[test]
+    fn a_target_unstarted_past_the_all_stop_awaits_its_start_and_detaches()
+    {
+        let mut sim = Sim::new();
+        sim.unstarted.push((0, STOP_WAIT + START_POLL));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert_eq!(sim.time, STOP_WAIT, "the all-stop ends at its bound");
+        assert!(!s.is_held(0));
+        assert_eq!(s.slot_state(ThreadId::Id(1)).0, SlotState::Live);
+        assert!(s.awaits_start());
+        assert!(s.detach(&mut sim));
+        assert!(sim.detached);
+        sim.assert_sound();
+    }
+
+    // Defect caught: a target its creator started in the all-stop's last
+    // `START_POLL` before its bound, before its last read, was posted with
+    // what was left of the wait, and attached holding nothing when its
+    // upcall came later, while it ran.
+    #[test]
+    fn a_target_started_late_in_the_all_stop_gets_a_whole_wait()
+    {
+        let mut sim = Sim::new();
+        sim.unstarted.push((0, STOP_WAIT - START_POLL));
+        sim.late.push((0, 2 * START_POLL));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.is_held(0), "the main thread runs unheld");
+        assert!(!s.awaits_start());
+        assert_eq!(sim.time, STOP_WAIT + START_POLL, "the upcall came at once");
+        assert!(s.detach(&mut sim));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a start read beside a thread a refresh had just added
+    // unstarted left the count of unstarted threads as it was, so the
+    // started thread was posted with what was left of the wait, and was
+    // neither held nor recorded when its upcall came later.
+    #[test]
+    fn a_start_beside_a_new_unstarted_thread_gets_a_whole_wait()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        sim.unstarted.push((a, STOP_WAIT - 2 * START_POLL + 3));
+        sim.late.push((a, 2 * START_POLL));
+        sim.spawn_at.push((STOP_WAIT - 2 * START_POLL + 5, 0));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.is_held(1), "the started thread runs unheld");
+        assert!(s.awaits_start(), "the thread never started is not recorded");
+        assert!(s.detach(&mut sim));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a target its creator started after the all-stop's last
+    // read, in its last `START_POLL`, was read again as started once the
+    // all-stop had ended, and attached holding nothing while it ran.
+    #[test]
+    fn a_target_started_after_the_all_stops_last_read_detaches()
+    {
+        let mut sim = Sim::new();
+        sim.unstarted.push((0, STOP_WAIT - START_POLL / 2));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert_eq!(sim.time, STOP_WAIT, "the all-stop ends at its bound");
+        assert!(!s.is_held(0));
+        assert!(s.awaits_start(), "a target running unheld is attached");
+        assert!(s.detach(&mut sim));
+        assert!(sim.detached);
+        sim.assert_sound();
     }
 }

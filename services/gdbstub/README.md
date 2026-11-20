@@ -91,9 +91,17 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
    ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`). A
    thread whose bind fails keeps its place in the table, so the indices after it stay those of
    procmgr's list, and is not shown to GDB. A refused or failed page deletes the caps already
-   taken and has procmgr drop the watch again (`DETACH_PROCESS`).
+   taken and has procmgr drop the watch again (`DETACH_PROCESS`). A list whose walk a thread's
+   exit can have torn ([Stop Model](#stop-model), Crediting a stop) is taken again,
+   `REFRESH_TRIES` walks in all; the attach keeps a list still torn then and refreshes its table
+   no more.
 5. It stops every thread ([Stop Model](#stop-model)) and logs
-   `attached; serving the debug port (<name>)`.
+   `attached; serving the debug port (<name>)`. A target its creator had not started at that
+   all-stop's last read of it, at most `START_POLL` before its end, holds no stop, and once
+   started it would run while GDB took it for stopped. The stub detaches from such a target
+   instead, logs
+   `<name> not started within the attach's wait; detached (crash bindings restored: <bool>)`, and
+   counts the attach as failed.
 
 When the walk or the attach fails, the stub serves the port detached: `?` reports the target
 exited, and the next `qSupported`, a new GDB connection, tries the walk and the attach again,
@@ -119,13 +127,16 @@ stub's endpoint.
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Reply).
 - **Stopping.** To stop the target (the attach, GDB's interrupt byte `0x03`, and the stop of every
   other thread when one stops) the stub posts each running thread an `UPCALL_ANY_INSTRUCTION`
-  upcall and waits up to `STOP_WAIT` (2 s) for each to arrive. Once none is awaited, it refreshes
-  its table once (below), posts an upcall to each thread the refresh adds, and restarts every held
-  breakpoint hit or fault GDB has not been told of, since any of them can be a new thread's
-  (below). A thread whose upcall does not arrive in time runs on and is not reported held. The
-  all-stop's end makes every held stop one GDB has been told of. An upcall that arrives while the
-  target runs was posted to a thread that had stopped on a fault first; its stop is over, and the
-  stub resumes it at once. A thread the upcall
+  upcall and waits up to `STOP_WAIT` (2 s) for each to arrive. The kernel refuses an upcall to a
+  thread its creator has not started, as procmgr lists a process's main thread between its creation
+  and its start, so the stub reads such a thread's state again every `START_POLL` (10 ms), posts
+  its upcall once it has started, and waits up to `STOP_WAIT` from that post for it. Once none is
+  awaited, it refreshes its table once (below), posts an upcall to each thread the refresh adds,
+  and restarts every held breakpoint hit or fault GDB has not been told of, since any of them can
+  be a new thread's (below). A thread whose upcall does not arrive in time runs on and is not
+  reported held. The all-stop's end makes every held stop one GDB has been told of. An upcall that
+  arrives while the target runs was posted to a thread that had stopped on a fault first; its stop
+  is over, and the stub resumes it at once. A thread the upcall
   finds blocked in an interruptible syscall returns from it with `Interrupted`
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Asynchronous Upcalls, Blocking
   syscalls), so each all-stop can end a sleep, a wait, or an IPC call of the target early, as any
@@ -136,12 +147,19 @@ stub's endpoint.
   the stub's badge among them, so its stops arrive under its spawner's badge. The stub credits a
   stop to the thread its badge names only when that thread is not already held and its register
   file reads at the pointer the message carries. Any other stop makes it refresh its table: it
-  pages procmgr's thread list (`ATTACH_PROCESS`) from the count of the table's threads still
-  alive, since procmgr lists those first and in the same order, retaking the page when one of them
-  exits meanwhile (`REFRESH_TRIES` times), and binds each new thread under its own badge, in the
-  slot of an exited thread or after the last. A bind to a new badge delivers the new thread's stop
-  again under it ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and
-  Kill, Rebind), and cancels the first delivery, which ignores the stub's answer. A new thread
+  pages procmgr's thread list (`ATTACH_PROCESS`) from the index of the first thread the table
+  does not hold, one past the main thread and the table's live registered threads, since procmgr
+  lists the main thread at index 0 whether or not it has exited, then each registered thread still
+  alive in registration order
+  ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`). It
+  takes the list again, `REFRESH_TRIES` walks in all, when a thread of the table exits meanwhile,
+  or one taken from a reply of the walk before its last does: procmgr pages the list in replies of
+  `ATTACH_THREADS_PAGE` caps and drops an exited thread before each, so such an exit moves every
+  later thread an index down and the walk skips one. It binds each new thread under its own badge,
+  in the slot of an exited thread or after the last. A bind to a new badge delivers the new
+  thread's stop again under it
+  ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and Kill, Rebind),
+  and cancels the first delivery, which ignores the stub's answer. A new thread
   stored in the slot of the exited spawner whose badge it copied keeps its binding, which cancels
   nothing, so the stub credits the stop to that thread when it is the one blocked at its pointer.
   When a refresh adds a thread, every held breakpoint hit or fault GDB has not been told of is
@@ -288,10 +306,11 @@ still attached.
 |---|---|---|
 | `MAX_THREADS` | 32 live threads per attach, refreshes included; an exited thread's slot is taken again | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, and its stops are settled as [Crediting a stop](#stop-model) says |
 | `MAX_RECEIVERS` | 64 receiver threads, twice `MAX_THREADS` | a stop waits on the stub's endpoint until a held one is answered |
-| `STOP_WAIT` | 2 s per all-stop | a thread whose upcall has not arrived runs on |
+| `STOP_WAIT` | 2 s per all-stop, and from the post to a thread its creator starts during it | a thread whose upcall has not arrived runs on; an attach whose target is unstarted at the all-stop's last read detaches |
+| `START_POLL` | 10 ms | the all-stop's interval between reads of a thread its creator has not started |
 | `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the target at startup | the stub serves detached (no target) |
 | `REATTACH_ATTEMPTS` × `FIND_INTERVAL` | 50 × 100 ms, for the target at a `qSupported` that finds the stub detached | the stub stays detached; `?` reports the target exited |
-| `REFRESH_TRIES` | 3 pages per refresh | the stop is settled as no new thread's, and the next stop that is not its thread's own refreshes again |
+| `REFRESH_TRIES` | 3 walks of the thread list per refresh or attach | a refresh's stop is settled as no new thread's, and the next stop that is not its thread's own refreshes again; the attach keeps its last list and refreshes no more |
 | `DRAIN_WAIT`, `DRAIN_QUIET` | 500 ms, ended early by 50 ms with no stop, per detach | a stop that reaches the stub's endpoint after procmgr's rebind is a thread's procmgr did not rebind, and the stub declines it |
 | `POLL_MS` | 10 ms | the serve loop's wait for port bytes between looks at the threads' stops |
 
@@ -319,10 +338,11 @@ attach at one breakpoint, in either order and with the spawner's stop late; a fa
 the stub cannot bind; a new thread in its exited spawner's slot; stops during a step; a repeat of
 a stop GDB knows of, and the kernel's second delivery of one; a restart at a breakpoint built into
 the target; a thread's own upcall beside a stop that was not its; stops racing a resume or an
-all-stop, and an all-stop that holds no thread; a continue that ends every thread; and a detach
-with a stop pending, with every thread exited, and with the step's thread exited or never
-stopped. `cargo xtask test-gdb`
-boots the `gdb-target`
+all-stop, and an all-stop that holds no thread; an attach before the target's start, holding its
+main thread once started, and one whose target is not started within the all-stop, or starts after
+its last read; a start late in the all-stop, alone or beside a thread a refresh adds unstarted;
+a continue that ends every thread; and a detach with a stop pending, with every thread exited, and
+with the step's thread exited or never stopped. `cargo xtask test-gdb` boots the `gdb-target`
 fixture (`programs/debugger --gdb-target`,
 [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch
 GDB session over the debug port: it lists two threads, breaks on the fixture's tick function and

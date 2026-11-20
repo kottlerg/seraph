@@ -1446,24 +1446,46 @@ pub fn memmgr_query_pressure() -> Option<u64> {
     (reply.label == 0).then(|| reply.word(7))
 }
 
+/// memmgr's draw room in bytes (`QUERY_POOL_STATUS`, reply `data[16]`): what
+/// a committed page's fault may take from the free pool now. `None` if
+/// memmgr is unreachable. Made again for as long as the call is interrupted,
+/// as a read-only query may be.
+pub fn memmgr_query_draw_room() -> Option<u64> {
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    let ipc_buf = current_ipc_buf();
+    if ep == 0 || ipc_buf.is_null() {
+        return None;
+    }
+    let msg = ipc::IpcMessage::builder(QUERY_POOL_STATUS).build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    (reply.label == 0).then(|| reply.word(16))
+}
+
 /// The bit memmgr sends on [`pressure_notification`] when the pressure level
 /// changes.
 pub const PRESSURE_BIT: u64 = 1;
+
+/// The bit memmgr sends on [`pressure_notification`] when its draw room
+/// opens ([`memmgr_query_draw_room`]).
+pub const DRAW_ROOM_BIT: u64 = 2;
 
 /// The Notification [`register_pressure`] registered with memmgr, with every
 /// right, or `0` when the process holds no registration.
 static PRESSURE_SIG: AtomicU64 = AtomicU64::new(0);
 
 /// The Notification memmgr signals with [`PRESSURE_BIT`] on a change of the
-/// pressure level, or `None` when `_start` could not register one.
+/// pressure level and with [`DRAW_ROOM_BIT`] on an opening of its draw room,
+/// or `None` when `_start` could not register one.
 pub fn pressure_notification() -> Option<u64> {
     Some(PRESSURE_SIG.load(Ordering::Acquire)).filter(|&sig| sig != 0)
 }
 
 /// Register this process for memmgr's memory-pressure signal
 /// (`REGISTER_PRESSURE`): retype a Notification, and hand memmgr a Notify-only
-/// derivation of it with [`PRESSURE_BIT`]. `_start` calls it once, after the
-/// heap bootstrap, so every std process is registered with no call of its own.
+/// derivation of it with [`PRESSURE_BIT`] and [`DRAW_ROOM_BIT`]. `_start` calls
+/// it once, after the heap bootstrap, so every std process is registered with
+/// no call of its own.
 /// A failure leaves the process unregistered and [`pressure_notification`]
 /// `None`; nothing else depends on it.
 ///
@@ -1488,6 +1510,7 @@ pub fn register_pressure() {
         };
         let msg = ipc::IpcMessage::builder(REGISTER_PRESSURE)
             .word(0, PRESSURE_BIT)
+            .word(1, DRAW_ROOM_BIT)
             .cap(notify)
             .build();
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer.

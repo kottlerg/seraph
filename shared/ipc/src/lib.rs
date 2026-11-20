@@ -901,13 +901,17 @@ pub unsafe fn ipc_call_timeout(
 /// returned snapshot. A thread that already masks upcalls keeps its mask, and
 /// a mask the kernel refuses leaves the call an [`ipc_call`].
 ///
-/// The call still ends early when the caller is stopped (`SYS_THREAD_STOP`)
-/// or the server's thread is destroyed before it replies, so a call to a
-/// server that dies does not wait for good. The cost falls on a debugger: it
-/// cannot hold a thread blocked in the call until the server replies, so a
-/// server that never replies leaves the thread out of every all-stop, and
-/// only `SYS_THREAD_STOP` ends its wait. Use it only for a call whose
-/// outcome the caller records.
+/// The call still ends early when the caller is stopped (`SYS_THREAD_STOP`),
+/// and, once the server has received the request, when the server's thread
+/// is destroyed before it replies. A call still waiting for a receiver waits
+/// until one receives it, the caller is stopped, or the endpoint's last
+/// capability is deleted, which the caller's own capability prevents
+/// (#1185): a post, which ends a plain [`ipc_call`]'s wait there, does not
+/// end this one. The cost falls on a debugger: it cannot hold a thread
+/// blocked in the call until the server replies, so a server that never
+/// replies leaves the thread out of every all-stop, and only
+/// `SYS_THREAD_STOP` ends its wait. Use it only for a call whose outcome the
+/// caller records.
 ///
 /// # Safety
 /// As [`ipc_call`].

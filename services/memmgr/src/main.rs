@@ -24,7 +24,7 @@ use free_pool::{
     NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError,
     ResidentPath, ResizeError, SelectError, SlotStore, WordStore, arena::Slot, chunk::table_height,
     chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pending_from,
-    pressure_level, region_grants, reserve_pages,
+    region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -1877,8 +1877,9 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 /// deferred totals and the largest free run (all in bytes): `system_ram`,
 /// `kernel_reserved`, `pool_total`, `free`, `deferred`, `largest_free`,
 /// then the reserve, the pressure level, `promised`, the store, the swapped
-/// pages, the growth floor, the pages on disk, the free swap slots and the
-/// evictions begun (services/memmgr/docs/ipc-interface.md § Label 6).
+/// pages, the growth floor, the pages on disk, the free swap slots, the
+/// evictions begun, the overcommit allowance, the draw room and the free
+/// pages outside `promised` (services/memmgr/docs/ipc-interface.md § Label 6).
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
 /// the subset currently in free runs (lent to no process), which falls on
@@ -1913,6 +1914,9 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         .word(12, l.disk_pages().saturating_mul(PAGE_SIZE))
         .word(13, disk::free_slots(l))
         .word(14, l.evictions())
+        .word(15, l.allowance().saturating_mul(PAGE_SIZE))
+        .word(16, draw_room_pages(l).saturating_mul(PAGE_SIZE))
+        .word(17, l.uncommitted_free().saturating_mul(PAGE_SIZE))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -2498,14 +2502,15 @@ enum FaultDecline
     /// page-table funding its map needs ([`back_span`]), would take the
     /// subtree of the process's budget node, or of an ancestor, over its max;
     /// or, for a chunk memmgr is evicting, holds raw or evicted, the page-table
-    /// funding the map of its runs needs would (`evict::map_runs`)
+    /// funding the map of its runs needs would, past what a committed region's
+    /// page-table reservation still holds (`evict::map_runs`)
     /// (services/memmgr/docs/memory-pool.md § Distribution policy).
     BudgetLimit = 10,
     /// A commit overrun: the faulting page lies in a committed region, or its
     /// chunk is an evicted chunk of one, whose pages `promised` holds, and the
     /// free pool has no frame for it even after memmgr evicted victims in its
-    /// turn ([`evict::draw_room`]). Only an overcommit allowance above 0, or
-    /// memmgr's own metadata taking the free pages `promised` counts, leaves
+    /// turn ([`evict::draw_room`]). Only registered swap slots, or
+    /// memmgr's own metadata taking the free pages `promised` counts, leave
     /// the pool short of `promised` (services/memmgr/docs/memory-pool.md
     /// § Commit, Overcommit).
     CommitOverrun = 11,
@@ -3172,24 +3177,48 @@ const fn pressure_wire(level: PressureLevel) -> u64
     }
 }
 
-/// Recompute the pressure level from the free pages outside `promised` after a
-/// turn of the receive loop and, when it changed, send every registrant its
+/// Whether the draw room memmgr last read was open ([`draw_open`]). Only the
+/// receive loop's thread reaches it, so a plain static suffices.
+static mut DRAW_OPEN: bool = true;
+
+/// The pages a committed draw for a budget node outside the system reserve may
+/// take from the free pool now, those above the growth floor while the pool
+/// does not cover `promised` (`QUERY_POOL_STATUS` `data[16]`;
+/// services/memmgr/docs/memory-pool.md § Commit, Overcommit).
+fn draw_room_pages(l: &MemLedger) -> u64
+{
+    l.draw_room(l.growth_floor(pool_total_pages()))
+}
+
+/// Whether the draw room is open: [`free_pool::DEMAND_CHUNK_PAGES`] pages or
+/// more, room for any one committed draw, a fault's or a committed chunk's
+/// restore, so a fault declined as a commit overrun that crashd resumes on the
+/// opening finds its draw there (`ipc::memmgr_labels::QUERY_POOL_STATUS`
+/// `data[16]`).
+fn draw_open(l: &MemLedger) -> bool
+{
+    draw_room_pages(l) >= u64::from(free_pool::DEMAND_CHUNK_PAGES)
+}
+
+/// Recompute the pressure level from the free pages outside `promised`, and
+/// the draw room, after a turn of the receive loop, and, when the level
+/// changed or the draw room opened ([`draw_open`]), send every registrant its
 /// bits
 /// (services/memmgr/docs/memory-pool.md § Memory pressure). A Notification
 /// send never blocks, so no client can hold memmgr here; a send that fails (a
 /// cap the client revoked) is dropped. The walk visits every record, which
-/// costs a turn only on a change of level.
+/// costs a turn only on such a change.
 fn signal_pressure()
 {
     let l = ledger_mut();
     let prev = current_pressure();
-    let level = pressure_level(
-        prev,
-        l.uncommitted_free(),
-        pool_total_pages(),
-        l.swapped_pages(),
-    );
-    if level == prev
+    let level = l.pressure_level(prev, pool_total_pages());
+    let open = draw_open(l);
+    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
+    let opened = open && !unsafe { DRAW_OPEN };
+    // SAFETY: as above.
+    unsafe { DRAW_OPEN = open };
+    if level == prev && !opened
     {
         return;
     }

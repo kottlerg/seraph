@@ -325,7 +325,9 @@ fn unmap_window(pages: u64)
 /// it is a Notification with the Notify right and `data[1]` is nonzero). memmgr refuses a cap that is no Endpoint cap or names its own
 /// endpoint `service_ep` (a fault redirected there would reach memmgr with the
 /// badge of the cap, a process's, and be served in the wrong address space),
-/// and a count below a slot ever taken (one on the free list included). A
+/// and a count of 0 or below a slot ever taken (one on the free list
+/// included): a registration is never withdrawn
+/// ([`free_pool::Ledger::overcommits`]). A
 /// registration replaces the one before it, whose cap is deleted, and ends
 /// every write in flight ([`free_pool::Ledger::end_writes`]): a new swap
 /// service knows nothing of its predecessor's. The reply's `data[0]` is the

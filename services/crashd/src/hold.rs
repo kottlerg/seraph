@@ -9,22 +9,27 @@
 //! With a stall set (`CRASHD_OOM_STALL_MS`), crashd's thread waits on a wait
 //! set of procmgr's crash endpoint and the runtime's memory-pressure
 //! Notification, with a timeout of the earliest hold's deadline. A fault that
-//! memmgr declined with code 6, 7, 8 or 11 while the level is `CRITICAL` is
-//! redirected (`FAULT_REPLY_REDIRECT`) to one of [`SLOTS`] endpoints crashd
-//! made at start, where it waits queued, its thread fault-blocked, and no
-//! thread of crashd's waits on it. The fault reaches that endpoint only when
-//! its thread next runs, so the endpoint is in the wait set from the redirect
-//! until the fault arrives, and out of it while the fault waits there. When
-//! the level falls below `CRITICAL`, crashd receives each held fault that
-//! has arrived from its endpoint and resumes it; when a hold's deadline
+//! memmgr declined with code 6, 7 or 8 while the level is `CRITICAL`, or with
+//! code 11 while memmgr's draw room is short of a demand chunk, is redirected
+//! (`FAULT_REPLY_REDIRECT`) to one of [`SLOTS`] endpoints crashd made at
+//! start, where it waits queued, its thread fault-blocked, and no thread of
+//! crashd's waits on it. The fault reaches that endpoint only when its thread
+//! next runs, so the endpoint is in the wait set from the redirect until the
+//! fault arrives, and out of it while the fault waits there. When the memory a
+//! held fault waits for is there (the level below `CRITICAL`, or for code 11
+//! the draw room open, at a demand chunk's bytes or more, each of which
+//! memmgr signals on the Notification), crashd receives each such held fault
+//! that has arrived from its endpoint and resumes it; when a hold's deadline
 //! passes first, it receives that fault and reports and declines it as any
 //! other, or, when it has not arrived, replaces the slot's endpoint, so a
-//! slot's endpoint only ever queues the one fault crashd holds there. The
-//! decisions are [`oom_hold`]'s, host-tested.
+//! slot's endpoint only ever queues the one fault crashd holds there. memmgr
+//! signals the draw room's opening and not its closing, so crashd reads the
+//! draw room again for each code-11 fault that reaches it. The decisions are
+//! [`oom_hold`]'s, host-tested.
 
 use core_file::policy::Policy;
 use ipc::IpcMessage;
-use oom_hold::{Admit, Ended, Found, Held, Holds, Key, Level, Refusal, SLOTS, Why};
+use oom_hold::{Admit, Ended, Found, Held, Holds, Key, Refusal, Room, Rooms, SLOTS, Waits, Why};
 use syscall_abi::{
     FAULT_FORWARD_REASON_WORD, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_KILL, FAULT_REPLY_REDIRECT,
     FAULT_REPLY_RESUME, PAGE_SIZE, SyscallError,
@@ -118,9 +123,12 @@ struct Hold
     wait_set: u64,
     /// The runtime's memory-pressure Notification, in the wait set.
     pressure: u64,
-    /// The level the last read gave; memmgr signals `pressure` on every
-    /// change, so it holds until the Notification carries a bit.
-    level: Level,
+    /// memmgr's level and draw room as the last read gave them; memmgr
+    /// signals `pressure` on every change of the level and every opening of
+    /// the draw room, so the level holds until the Notification carries a
+    /// bit, and the draw room only while it reads short: a commit overrun
+    /// that arrives reads it again ([`Hold::dispatch`]).
+    rooms: Rooms,
 }
 
 /// Serve the crash endpoint `endpoint` with the hold of faults for at most
@@ -144,7 +152,7 @@ pub fn serve(stall_ms: u64, endpoint: u64, policy: &Policy, authority: u64, ipc_
 impl Hold
 {
     /// Make the slots' endpoints and the wait set of the crash endpoint
-    /// `endpoint` and the pressure Notification, and read the level; `None`,
+    /// `endpoint` and the pressure Notification, and read memmgr's memory; `None`,
     /// logged, with nothing left made, when the process has no pressure
     /// registration or an object cannot be made.
     fn start(stall_ms: u64, endpoint: u64) -> Option<Self>
@@ -187,7 +195,7 @@ impl Hold
             std::os::seraph::log!(warn: "hold wait set not made; no fault held");
             return None;
         }
-        // A change signalled before now is in the level read here.
+        // A change signalled before now is in the read made here.
         let _ = syscall::notification_try_wait(pressure);
         Some(Self {
             holds: Holds::new(stall_ms),
@@ -195,22 +203,19 @@ impl Hold
             messages: [None; SLOTS],
             wait_set,
             pressure,
-            level: read_level(),
+            rooms: read_rooms(),
         })
     }
 
     /// Serve the crash endpoint `endpoint` with the hold: end each hold whose
-    /// level fell or whose deadline passed, then wait for a fault, a change of
-    /// the level, or the next deadline.
+    /// memory is there or whose deadline passed, then wait for a fault, a
+    /// signal from memmgr, or the next deadline.
     fn serve(mut self, endpoint: u64, policy: &Policy, authority: u64, ipc_buf: *mut u64) -> !
     {
         loop
         {
-            self.refresh_level();
-            if self.level == Level::BelowCritical
-            {
-                self.end_all(policy, authority, ipc_buf);
-            }
+            self.refresh_rooms();
+            self.end_opened(policy, authority, ipc_buf);
             while let Some(slot) = self.holds.due(now_ms())
             {
                 self.end(slot, Why::Due, policy, authority, ipc_buf);
@@ -231,15 +236,15 @@ impl Hold
                         self.dispatch(&msg, policy, authority, ipc_buf);
                     }
                 }
-                // A held fault reached its slot's endpoint; a fall of the
-                // level is acted on at the loop's top.
+                // A held fault reached its slot's endpoint; memory that came
+                // back for it is acted on at the loop's top.
                 Ok(badge) if (WAKE_SLOT..WAKE_SLOT_END).contains(&badge) =>
                 {
                     let slot =
                         usize::try_from(badge.saturating_sub(WAKE_SLOT)).unwrap_or(usize::MAX);
                     self.arrived(slot);
                 }
-                // A change of the level, read at the loop's top; then a
+                // A signal from memmgr, read at the loop's top; then a
                 // deadline, or a late upcall of the watchdog's.
                 Ok(_) =>
                 {}
@@ -256,12 +261,12 @@ impl Hold
         }
     }
 
-    /// Take a signalled change of the level and read the level.
-    fn refresh_level(&mut self)
+    /// Take a signal from memmgr and read its level and draw room.
+    fn refresh_rooms(&mut self)
     {
         if syscall::notification_try_wait(self.pressure).is_ok()
         {
-            self.level = read_level();
+            self.rooms = read_rooms();
         }
     }
 
@@ -269,16 +274,16 @@ impl Hold
     /// `CRITICAL`.
     fn dump(&self) -> Dump
     {
-        match self.level
+        match self.rooms.level
         {
-            Level::Critical => Dump::MemoryCritical,
-            Level::BelowCritical => Dump::Allowed,
+            Room::Short => Dump::MemoryCritical,
+            Room::Open => Dump::Allowed,
         }
     }
 
     /// Answer the fault `msg` from the crash endpoint: hold a holdable one,
-    /// or resume it at once when the level has fallen since memmgr declined
-    /// it; report and decline every other.
+    /// or resume it at once when the memory it waits for came back since
+    /// memmgr declined it; report and decline every other.
     fn dispatch(&mut self, msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut u64)
     {
         if msg.label != FAULT_LABEL
@@ -289,7 +294,7 @@ impl Hold
             let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_KILL), ipc_buf) };
             return;
         }
-        self.refresh_level();
+        self.refresh_rooms();
         let Some(key) = holdable(msg)
         else
         {
@@ -298,7 +303,16 @@ impl Hold
         };
         let now = now_ms();
         let fault = Message::of(msg);
-        match self.holds.admit(now, key, self.level)
+        let waits = oom_hold::waits_on(fault.code());
+        if waits == Waits::DrawRoom
+        {
+            // memmgr does not signal the draw room's closing, and its decline
+            // of this fault may have closed it since the last read; a stale
+            // open would resume the fault into the same decline, which then
+            // repeats it.
+            self.rooms = read_rooms();
+        }
+        match self.holds.admit(now, key, waits, self.rooms)
         {
             Admit::Hold { slot, deadline } =>
             {
@@ -310,9 +324,10 @@ impl Hold
                 let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf) };
                 bounded(|| {
                     std::os::seraph::log!(
-                        "fault badge={} addr={:#x} resumed at once: memory no longer critical",
+                        "fault badge={} addr={:#x} resumed at once: {}",
                         fault.badge,
-                        fault.addr()
+                        fault.addr(),
+                        came_back(waits)
                     );
                 });
             }
@@ -368,7 +383,7 @@ impl Hold
         {
             *cell = Some(fault);
         }
-        // Until the fault arrives, a fall of the level does not end the hold;
+        // Until the fault arrives, memory coming back does not end the hold;
         // without the membership its arrival goes unseen, and the hold ends
         // at its deadline.
         let badge = WAKE_SLOT.saturating_add(u64::try_from(slot).unwrap_or(u64::MAX));
@@ -380,28 +395,36 @@ impl Hold
         }
         bounded(|| {
             std::os::seraph::log!(
-                "fault badge={} addr={:#x} held: memory critical (reason={}), up to {stall_ms} ms",
+                "fault badge={} addr={:#x} held: {} (reason={}), up to {stall_ms} ms",
                 fault.badge,
                 fault.addr(),
+                short_of(oom_hold::waits_on(fault.code())),
                 fault.code()
             );
         });
     }
 
-    /// End every hold whose fault has arrived: the level fell below
-    /// `CRITICAL`.
-    fn end_all(&mut self, policy: &Policy, authority: u64, ipc_buf: *mut u64)
+    /// End every hold whose memory is there and whose fault has arrived.
+    fn end_opened(&mut self, policy: &Policy, authority: u64, ipc_buf: *mut u64)
     {
-        for slot in 0..SLOTS
+        let mut opened = [false; SLOTS];
+        for slot in self.holds.opened(self.rooms)
         {
-            self.end(slot, Why::LevelFell, policy, authority, ipc_buf);
+            if let Some(cell) = opened.get_mut(slot)
+            {
+                *cell = true;
+            }
+        }
+        for (slot, _) in opened.iter().enumerate().filter(|(_, open)| **open)
+        {
+            self.end(slot, Why::RoomOpened, policy, authority, ipc_buf);
         }
     }
 
     /// End the hold in `slot` because `why`: receive its fault from the slot's
     /// endpoint, and resume it, or report and decline it, or, when it is no
     /// longer queued there, free the slot, or, when it has not arrived by its
-    /// deadline, replace the slot's endpoint. A fall of the level before the
+    /// deadline, replace the slot's endpoint. Memory that came back before the
     /// fault arrived leaves the hold as it is.
     fn end(&mut self, slot: usize, why: Why, policy: &Policy, authority: u64, ipc_buf: *mut u64)
     {
@@ -440,10 +463,11 @@ impl Hold
                 let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf) };
                 bounded(|| {
                     std::os::seraph::log!(
-                        "fault badge={} addr={:#x} resumed after {} ms: memory no longer critical",
+                        "fault badge={} addr={:#x} resumed after {} ms: {}",
                         fault.badge,
                         fault.addr(),
-                        held_ms(&held)
+                        held_ms(&held),
+                        came_back(held.waits)
                     );
                 });
             }
@@ -543,14 +567,45 @@ fn holdable(msg: &IpcMessage) -> Option<Key>
     })
 }
 
-/// memmgr's level; `CRITICAL` when it cannot be read, so a held fault is
-/// declined at its deadline rather than resumed into another decline.
-fn read_level() -> Level
+/// memmgr's memory: the level, short at `CRITICAL`, and the draw room, short
+/// below a demand chunk's bytes (`ipc::memmgr_labels::DEMAND_CHUNK_BYTES`),
+/// the most one committed draw takes; each short when it cannot be read, so a
+/// held fault is declined at its deadline rather than resumed into another
+/// decline.
+fn read_rooms() -> Rooms
 {
-    match std::os::seraph::memory_pressure()
+    let level = match std::os::seraph::memory_pressure()
     {
-        Some(std::os::seraph::MemoryPressure::Critical) | None => Level::Critical,
-        Some(_) => Level::BelowCritical,
+        Some(std::os::seraph::MemoryPressure::Critical) | None => Room::Short,
+        Some(_) => Room::Open,
+    };
+    let draw = match std::os::seraph::commit_draw_room_bytes()
+    {
+        Some(bytes) if bytes >= ipc::memmgr_labels::DEMAND_CHUNK_BYTES => Room::Open,
+        Some(_) | None => Room::Short,
+    };
+    Rooms { level, draw }
+}
+
+/// What a held fault that waits for `waits` is short of, as its hold's line
+/// names it.
+const fn short_of(waits: Waits) -> &'static str
+{
+    match waits
+    {
+        Waits::Level => "memory critical",
+        Waits::DrawRoom => "no commit draw room",
+    }
+}
+
+/// What came back for a fault that waits for `waits`, as its resume's line
+/// names it.
+const fn came_back(waits: Waits) -> &'static str
+{
+    match waits
+    {
+        Waits::Level => "memory no longer critical",
+        Waits::DrawRoom => "commit draw room open",
     }
 }
 

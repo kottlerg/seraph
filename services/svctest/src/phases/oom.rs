@@ -128,7 +128,7 @@ fn oomd_config(phase: &str) -> Option<oomd_policy::Config>
 
 /// crashd's stall, when crashd runs and holds a fault declined for want of
 /// memory: its recipe is staged and sets a non-zero `CRASHD_OOM_STALL_MS`.
-fn crashd_stall(phase: &str) -> Option<u64>
+pub(super) fn crashd_stall(phase: &str) -> Option<u64>
 {
     recipe_text(CRASHD_RECIPE, phase).and_then(|recipe| {
         env_value(&recipe, "CRASHD_OOM_STALL_MS")

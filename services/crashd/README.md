@@ -17,9 +17,9 @@ with no handler ([docs/fault-handling.md](../../docs/fault-handling.md) § Crash
 
 A page fault memmgr declined for want of memory crashd may hold instead, when its recipe sets a
 stall (`CRASHD_OOM_STALL_MS`; the shipped recipe sets 10 000 ms): the fault waits queued on one
-of 16 endpoints crashd made at start, no thread of crashd waiting on it, until memmgr's pressure
-level falls below `CRITICAL`, when crashd resumes it, or the stall passes, when crashd reports and
-declines it.
+of 16 endpoints crashd made at start, no thread of crashd waiting on it, until the memory it waits
+for is there, memmgr's pressure level below `CRITICAL` or, for a commit overrun, memmgr's draw room
+open, when crashd resumes it, or the stall passes, when crashd reports and declines it.
 
 Before the decline, when the `CORE_DUMP` entry of its recipe's environment names the process,
 crashd writes an ELF core of it to `/crash` on the root filesystem, which host `gdb` reads, under

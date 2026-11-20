@@ -108,6 +108,10 @@ services/svctest/
         │                      #   `CRITICAL`, the storage path's stacks never evicted, the want
         │                      #   path, swapd killed and restarted, the fault path through the
         │                      #   next instance; all-RAM-accounted identity
+        ├── swap_commit.rs     # Commitment backed by swap slots: admitted past the free pages by
+        │                      #   the overcommit allowance and refused past it; with crashd's
+        │                      #   hold, a child writes a commitment past the free frames, its
+        │                      #   commit overruns held until write-out opens the draw room
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -484,6 +488,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
 | `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
+| `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the free frames) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---

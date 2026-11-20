@@ -1715,8 +1715,8 @@ const PRESSURE_WAITER_STOPS: u32 = 3;
 const PRESSURE_WAITER_STOP_GAP: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// memmgr's `QUERY_POOL_STATUS` pool total, the free pages outside
-/// `promised`, and the pressure level (`data[2]`, `data[3]` less `data[8]`,
-/// and `data[7]`), the totals in pages. The level is computed from the free
+/// `promised`, and the pressure level (`data[2]`, `data[17]` and
+/// `data[7]`), the totals in pages. The level is computed from the free
 /// pages outside `promised`, and a grant is admitted only from them, so a
 /// phase that drives the level sizes its grants against them.
 pub(crate) fn pool_pressure_status() -> (u64, u64, u64)
@@ -1729,11 +1729,7 @@ pub(crate) fn pool_pressure_status() -> (u64, u64, u64)
         "QUERY_POOL_STATUS status"
     );
     let page = syscall_abi::PAGE_SIZE;
-    (
-        reply.word(2) / page,
-        reply.word(3).saturating_sub(reply.word(8)) / page,
-        reply.word(7),
-    )
+    (reply.word(2) / page, reply.word(17) / page, reply.word(7))
 }
 
 /// memmgr's reply label to a `REGISTER_PRESSURE` of `bits` carrying `cap`, or

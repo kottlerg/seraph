@@ -425,9 +425,9 @@ derivation, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver 
 port range (see
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)). devmgr's
 `QUERY_SHUTDOWN_DEVICE` serves a Reset-only `SbiControl` derivation on RISC-V (it replies
-`NO_DEVICE` on x86-64, where pwrmgr holds no port), only to a caller whose badge carries
-`SHUTDOWN_DEVICE_AUTHORITY`: the seed-only `devmgr.shutdown` cap, which pwrmgr alone seeds and
-svcmgr's `QUERY_ENDPOINT` refuses. The
+`NO_DEVICE` on x86-64, where pwrmgr reaches the sleep and reset registers through acpid), only to
+a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only `devmgr.shutdown` cap,
+which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses. The
 `ACPI_AUTHORITY` badge bit, carried only by the seed-only `devmgr.acpi` cap that acpid's recipe
 alone seeds, gates the labels acpid calls. acpid's `IoPort` and `Mmio` region grants, and on
 x86-64 its `Interrupt` cap on the SCI's line, are derivations devmgr makes of caps it holds

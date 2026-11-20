@@ -120,7 +120,7 @@ impl Power
     }
 
     /// Enter the sleep state of `SLP_TYPa` `slp_typ`: write
-    /// [`acpid::power::pm1_control_writes`]'s two values to `PM1a_CNT`.
+    /// [`ipc::acpid_labels::pm1_control_writes`]'s two values to `PM1a_CNT`.
     /// Returns, true, only when the platform keeps running; false without a
     /// write when `PM1a_CNT` is not held.
     pub fn sleep(&self, state: u8, slp_typ: u16) -> bool
@@ -133,7 +133,7 @@ impl Power
         // SAFETY: `pm1a.port` starts the two-port control block bound to
         // this thread at acquisition; the read has no side effect.
         let current = unsafe { inw(pm1a.port) };
-        let [typed, enter] = acpid::power::pm1_control_writes(current, slp_typ);
+        let [typed, enter] = ipc::acpid_labels::pm1_control_writes(current, slp_typ);
         std::os::seraph::log!(
             "SLEEP({state}): PM1a_CNT {:#x} <- {typed:#x}, then {enter:#x}",
             pm1a.port
@@ -145,6 +145,19 @@ impl Power
         // sleep state, the ACPI specification's second step.
         unsafe { outw(pm1a.port, enter) };
         true
+    }
+
+    /// A `Use`-only derivation of the `IoPort` over `PM1a_CNT`, for a
+    /// caller that enters a sleep state itself
+    /// (`acpid_labels::QUERY_SLEEP`), and the block's first port; `None`
+    /// when the block is not held or the derivation fails. The derivation
+    /// is an object of its own, so acpid's death, which deletes its block,
+    /// leaves it standing.
+    pub fn derive_control(&self) -> Option<(u64, u16)>
+    {
+        let pm1a = self.pm1a?;
+        let cap = syscall::cap_derive(pm1a.cap, syscall::RIGHTS_IOPORT_USE).ok()?;
+        Some((cap, pm1a.port))
     }
 
     /// Reset the platform: write `RESET_VALUE` to `RESET_REG`. Returns,

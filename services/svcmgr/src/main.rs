@@ -154,69 +154,110 @@ fn main() -> !
     );
     install_drivers_dir(&caps, &state.pending, ipc_buf);
 
-    let self_death_queue = observe_own_death(info);
+    let core_death_queue = observe_core_deaths(info, &state.pending);
 
     std::os::seraph::log!("endowed; waiting for handover");
 
-    event_loop(info, &caps, deaths, self_death_queue, ipc_buf, &mut state);
+    event_loop(info, &caps, deaths, core_death_queue, ipc_buf, &mut state);
 }
 
-/// Entries the queue svcmgr's own death posts to holds: one from the
-/// main-thread observer and one from the address-space observer.
-const SELF_DEATH_CAPACITY: u32 = 2;
+/// Entries and observers of the core-death queue: one main-thread and one
+/// address-space observer each for svcmgr, memmgr and procmgr, each posting
+/// once in its life.
+const CORE_DEATH_CAPACITY: u32 = 6;
 
-/// Create the event queue svcmgr's own death posts to, and bind svcmgr's main
-/// thread and address space to it (docs/supervision.md § Observing svcmgr):
-/// the main thread's exit and the first terminal fault of any svcmgr thread
-/// each post an entry. Both binds need Control, which svcmgr holds on itself
-/// alone, so svcmgr makes them and hands the shutdown actuator only a
-/// receive-only derivation of the queue ([`restart::mint_self_death_recv`]).
-/// Returns the queue, or `0`, logged, when it cannot be created or neither
-/// observer binds; a queue with one observer bound is kept, its missing
-/// observer logged.
-fn observe_own_death(info: &StartupInfo) -> u64
+/// Create the core-death queue and bind on it the death observers of the core
+/// set (docs/supervision.md § Core Set and System Death): svcmgr's own main
+/// thread and address space, under `pwrmgr_labels::CORE_DEATH_SVCMGR`, and
+/// memmgr's and procmgr's, through the thread and `Control`-only
+/// address-space caps init endowed in their `SUBSTRATE` rounds (`pending`),
+/// under their own correlators (`svcmgr_defs::core_death_correlator`). Each
+/// main thread's exit and the first terminal fault of any thread of each
+/// member post an entry, and a member already dead posts its retained reason
+/// as the bind lands. The binds need Control, which svcmgr alone holds, so
+/// svcmgr makes them and hands the shutdown actuator only a receive-only
+/// derivation of the queue ([`restart::mint_core_death_recv`]); svcmgr routes
+/// no core death itself. Returns the queue, or `0`, logged, when it cannot
+/// be created or no observer binds; each observer that does not bind is
+/// logged.
+fn observe_core_deaths(info: &StartupInfo, pending: &[PendingRegistration]) -> u64
 {
     let Some(queue) = std::os::seraph::object_slab_retype(
         std::os::seraph::event_queue_retype_bytes(
-            u64::from(SELF_DEATH_CAPACITY),
-            u64::from(SELF_DEATH_CAPACITY),
+            u64::from(CORE_DEATH_CAPACITY),
+            u64::from(CORE_DEATH_CAPACITY),
         ),
         |slab| {
-            syscall::event_queue_create_observed(slab, SELF_DEATH_CAPACITY, SELF_DEATH_CAPACITY)
+            syscall::event_queue_create_observed(slab, CORE_DEATH_CAPACITY, CORE_DEATH_CAPACITY)
                 .ok()
         },
     )
     else
     {
-        std::os::seraph::log!(error: "own death queue not created; svcmgr's death is unobserved");
+        std::os::seraph::log!(error: "core-death queue not created; a core death is unobserved");
         return 0;
     };
-    let thread = syscall::thread_bind_notification(info.self_thread, queue, 0).is_ok();
-    let aspace = syscall::aspace_bind_notification(info.self_aspace, queue, 0).is_ok();
-    match (thread, aspace)
+    let mut bound = bind_core_member(
+        queue,
+        "svcmgr",
+        info.self_thread,
+        info.self_aspace,
+        ipc::pwrmgr_labels::CORE_DEATH_SVCMGR,
+    );
+    for registration in pending
     {
-        (true, true) => queue,
-        (false, false) =>
+        let Some(correlator) = svcmgr_defs::core_death_correlator(registration.name_str())
+        else
         {
-            std::os::seraph::log!(error: "own death observers not bound; svcmgr's death is unobserved");
-            let _ = syscall::cap_delete(queue);
-            0
-        }
-        (true, false) =>
+            continue;
+        };
+        let aspace = match registration.observer
         {
-            std::os::seraph::log!(
-                error: "own address-space observer not bound; a worker fault of svcmgr is unobserved"
-            );
-            queue
-        }
-        (false, true) =>
-        {
-            std::os::seraph::log!(
-                error: "own main-thread observer not bound; svcmgr's main-thread exit is unobserved"
-            );
-            queue
-        }
+            svcmgr_endowment::SubstrateObserver::AddressSpace(cap) => cap,
+            svcmgr_endowment::SubstrateObserver::ProcessHandle(_)
+            | svcmgr_endowment::SubstrateObserver::None => 0,
+        };
+        bound |= bind_core_member(
+            queue,
+            registration.name_str(),
+            registration.thread_cap,
+            aspace,
+            correlator,
+        );
     }
+    if !bound
+    {
+        std::os::seraph::log!(error: "no core-death observer bound; a core death is unobserved");
+        let _ = syscall::cap_delete(queue);
+        return 0;
+    }
+    queue
+}
+
+/// Bind the core member `name`'s main-thread observer through `thread` and
+/// its address-space observer through `aspace` (`0`: none endowed) on
+/// `queue`, both under `correlator`. Each observer that does not bind is
+/// logged at error level; whether either bound.
+fn bind_core_member(queue: u64, name: &str, thread: u64, aspace: u64, correlator: u64) -> bool
+{
+    let thread_bound = syscall::thread_bind_notification(thread, queue, correlator).is_ok();
+    if !thread_bound
+    {
+        std::os::seraph::log!(
+            error: "{name}'s main-thread core-death observer not bound; its main-thread exit is \
+             unobserved"
+        );
+    }
+    let aspace_bound =
+        aspace != 0 && syscall::aspace_bind_notification(aspace, queue, correlator).is_ok();
+    if !aspace_bound
+    {
+        std::os::seraph::log!(
+            error: "{name}'s address-space core-death observer not bound; a worker fault of {name} \
+             is unobserved"
+        );
+    }
+    thread_bound || aspace_bound
 }
 
 /// Publish the well-known names svcmgr owns into its own discovery
@@ -621,7 +662,7 @@ fn event_loop(
     info: &StartupInfo,
     caps: &service::SvcmgrCaps,
     deaths: death_set::DeathSet,
-    self_death_queue: u64,
+    core_death_queue: u64,
     ipc_buf: *mut u64,
     state: &mut SvcmgrState,
 ) -> !
@@ -636,7 +677,7 @@ fn event_loop(
         master_log_source: caps.master_log_source,
         procmgr_death_auth_source: caps.procmgr_death_auth_source,
         entropy_source: caps.entropy_source,
-        self_death_queue,
+        core_death_queue,
         pressure_notification,
         memory_waits: core::cell::Cell::new(MemoryWaits::new(pressure_notification != 0)),
     };
@@ -1045,6 +1086,14 @@ fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 /// post under its own instance, so a post of an instance already routed (the
 /// second of the two posts a main-thread fault that is the address space's
 /// first terminal fault makes, or a post a resync overtook) is dropped.
+///
+/// The death of a core member (memmgr, procmgr), which only the resync finds
+/// here since its observers are on the core-death queue, is not svcmgr's to
+/// route: the shutdown actuator powers the system off on that queue's entry
+/// (docs/supervision.md § Core Set and System Death). The entry is marked
+/// inactive, so svcmgr calls the dead member no more, and nothing else runs:
+/// no line, no restart decision, and no graceful shutdown, each of which
+/// could wait on the dead member.
 pub(crate) fn route_death(
     tag: DeathTag,
     exit_reason: u64,
@@ -1061,6 +1110,14 @@ pub(crate) fn route_death(
     };
     if !svcmgr_defs::death_tag::routes(tag, svc.active, svc.instance)
     {
+        return;
+    }
+    if svc.aspace_cap != 0
+    {
+        if let Some(svc) = state.table.services.get_mut(idx)
+        {
+            svc.active = false;
+        }
         return;
     }
 

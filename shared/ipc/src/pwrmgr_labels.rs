@@ -13,6 +13,11 @@
 //! shutdown receive a badged SEND on pwrmgr's service endpoint with the
 //! [`pwrmgr_labels::SHUTDOWN_AUTHORITY`](crate::pwrmgr_labels::SHUTDOWN_AUTHORITY) verb bit set.
 //!
+//! The module also names the correlators of the core-death queue's entries
+//! ([`CORE_DEATH_SVCMGR`], [`CORE_DEATH_MEMMGR`], [`CORE_DEATH_PROCMGR`]),
+//! which svcmgr binds the death observers of the core set under and pwrmgr
+//! reads.
+//!
 //! See `services/pwrmgr/README.md` for the authoritative description.
 
 /// Power off the platform.
@@ -30,6 +35,18 @@ pub const SHUTDOWN: u64 = 1;
 /// Same authorization gate as [`SHUTDOWN`]. On the success path the
 /// machine cold-boots back through the bootloader.
 pub const REBOOT: u64 = 2;
+
+/// The correlator of the death observers on svcmgr's own main thread and
+/// address space, which post to the core-death queue svcmgr serves pwrmgr,
+/// the shutdown actuator, a receive-only derivation of
+/// (`docs/supervision.md` § Core Set and System Death).
+pub const CORE_DEATH_SVCMGR: u64 = 0;
+/// The correlator of the death observers svcmgr binds on memmgr's main
+/// thread and address space, on the same queue.
+pub const CORE_DEATH_MEMMGR: u64 = 1;
+/// The correlator of the death observers svcmgr binds on procmgr's main
+/// thread and address space, on the same queue.
+pub const CORE_DEATH_PROCMGR: u64 = 2;
 
 /// Authority bit in the pwrmgr-service-endpoint badge's high u64
 /// bit. Set on caps minted for consumers permitted to call

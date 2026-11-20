@@ -359,8 +359,8 @@ Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
 reply to `SHUTDOWN`. The public `acpid.deny` is resolved the same way and drives the
-`acpid_power_deny` phase, which requires an `UNAUTHORIZED` reply to `SLEEP(5)`, to `RESET` and to
-`WAIT_EVENT`.
+`acpid_power_deny` phase, which requires an `UNAUTHORIZED` reply carrying no cap to `SLEEP(5)`,
+to `QUERY_SLEEP(5)`, to `RESET` and to `WAIT_EVENT`.
 
 The `svcmgr_worker_fault_restart` phase runs when the `crasher-worker.svc` recipe is staged
 beside `svctest.svc` and is skipped otherwise; staged, it fails if `crasher.worker` is not

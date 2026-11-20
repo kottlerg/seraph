@@ -18,8 +18,9 @@
 //! on it ([`death_caps`]), the eligibility rule of a stop ([`stop`]), the order of
 //! the `SET_DRIVERS_DIR` step and its liveness reads ([`drivers_dir`]), what
 //! follows a restart whose create failed and when one that waits for memory is
-//! retried ([`memory_wait`]), and the create flags a recipe asks procmgr for
-//! ([`create_flags`]). Nothing here touches a syscall, IPC, or `std::os::seraph` surface, so the whole crate
+//! retried ([`memory_wait`]), the create flags a recipe asks procmgr for
+//! ([`create_flags`]), and the correlator of a core member's death observers
+//! ([`core_death_correlator`]). Nothing here touches a syscall, IPC, or `std::os::seraph` surface, so the whole crate
 //! is host-reachable and host-tested — the `.svc` and class files are
 //! external input and their parsers carry unit tests per
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
@@ -98,15 +99,28 @@ pub fn log_sink_handover_owed(reap_reply: Option<(u64, u64)>) -> bool
 /// [`CREATE_CONTAIN`](ipc::procmgr_labels::CREATE_CONTAIN) for one that sets
 /// `stop_source` ([`Definition::stop_source`]), so no process the source
 /// started outlives it: a candidate it lists ends with it, and a restarted
-/// source starts with none.
+/// source starts with none; and
+/// [`CREATE_PINNED`](ipc::procmgr_labels::CREATE_PINNED) for the recognised
+/// shutdown actuator (`shutdown_actuator`, [`shutdown_actuator`]), which
+/// powers the system off on a core death and so may take no page fault on
+/// memmgr (docs/fault-handling.md § Default System Pager).
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
-    reason = "each argument is the recipe key that asks for one flag"
+    reason = "each argument is the recipe key or role that asks for one flag"
 )]
-pub const fn create_flags(reserve: bool, oom_stop: bool, stop_source: bool) -> u64
+pub const fn create_flags(
+    reserve: bool,
+    oom_stop: bool,
+    stop_source: bool,
+    shutdown_actuator: bool,
+) -> u64
 {
     let mut flags = 0;
+    if shutdown_actuator
+    {
+        flags |= ipc::procmgr_labels::CREATE_PINNED;
+    }
     if reserve
     {
         flags |= ipc::procmgr_labels::CREATE_RESERVE;
@@ -120,6 +134,23 @@ pub const fn create_flags(reserve: bool, oom_stop: bool, stop_source: bool) -> u
         flags |= ipc::procmgr_labels::CREATE_CONTAIN;
     }
     flags
+}
+
+/// The correlator under which svcmgr binds the death observers of the core
+/// member init registered as `name` on the core-death queue, whose
+/// receive-only derivation the shutdown actuator waits on
+/// (`ipc::pwrmgr_labels::CORE_DEATH_*`); `None` for a name that is no core
+/// member svcmgr binds there. svcmgr's own observers post
+/// `CORE_DEATH_SVCMGR`.
+#[must_use]
+pub fn core_death_correlator(name: &str) -> Option<u64>
+{
+    match name
+    {
+        "memmgr" => Some(ipc::pwrmgr_labels::CORE_DEATH_MEMMGR),
+        "procmgr" => Some(ipc::pwrmgr_labels::CORE_DEATH_PROCMGR),
+        _ => None,
+    }
 }
 
 /// The byte length of the blob [`build_blob`] packs from `tokens`: each token
@@ -672,21 +703,43 @@ mod tests
     #[test]
     fn each_recipe_key_asks_for_its_own_create_flag()
     {
-        use ipc::procmgr_labels::{CREATE_CONTAIN, CREATE_NODE_HANDLE, CREATE_RESERVE};
-        assert_eq!(create_flags(false, false, false), 0);
-        assert_eq!(create_flags(true, false, false), CREATE_RESERVE);
-        assert_eq!(create_flags(false, true, false), CREATE_NODE_HANDLE);
-        assert_eq!(create_flags(false, false, true), CREATE_CONTAIN);
+        use ipc::procmgr_labels::{
+            CREATE_CONTAIN, CREATE_NODE_HANDLE, CREATE_PINNED, CREATE_RESERVE,
+        };
+        assert_eq!(create_flags(false, false, false, false), 0);
+        assert_eq!(create_flags(true, false, false, false), CREATE_RESERVE);
+        assert_eq!(create_flags(false, true, false, false), CREATE_NODE_HANDLE);
+        assert_eq!(create_flags(false, false, true, false), CREATE_CONTAIN);
+        // Defect caught: a shutdown actuator created demand-paged, whose
+        // core-death power-off can then fault on a dead memmgr.
+        assert_eq!(create_flags(false, false, false, true), CREATE_PINNED);
         assert_eq!(
-            create_flags(true, true, true),
-            CREATE_RESERVE | CREATE_NODE_HANDLE | CREATE_CONTAIN
+            create_flags(true, true, true, true),
+            CREATE_RESERVE | CREATE_NODE_HANDLE | CREATE_CONTAIN | CREATE_PINNED
         );
         // Never a flag procmgr refuses from svcmgr: the charge-node flag, with
         // which procmgr refuses CREATE_RESERVE.
         assert_eq!(
-            create_flags(true, true, true) & ipc::procmgr_labels::CREATE_CHARGE_NODE,
+            create_flags(true, true, true, true) & ipc::procmgr_labels::CREATE_CHARGE_NODE,
             0
         );
+    }
+
+    // Defect caught: a core member bound under another's correlator, or a
+    // service that is no core member bound on the core-death queue.
+    #[test]
+    fn only_memmgr_and_procmgr_take_a_core_death_correlator()
+    {
+        use ipc::pwrmgr_labels::{CORE_DEATH_MEMMGR, CORE_DEATH_PROCMGR, CORE_DEATH_SVCMGR};
+        assert_eq!(core_death_correlator("memmgr"), Some(CORE_DEATH_MEMMGR));
+        assert_eq!(core_death_correlator("procmgr"), Some(CORE_DEATH_PROCMGR));
+        assert_ne!(CORE_DEATH_MEMMGR, CORE_DEATH_SVCMGR);
+        assert_ne!(CORE_DEATH_PROCMGR, CORE_DEATH_SVCMGR);
+        assert_ne!(CORE_DEATH_MEMMGR, CORE_DEATH_PROCMGR);
+        for name in ["svcmgr", "devmgr", "vfsd", "logd", "memmgr2", ""]
+        {
+            assert_eq!(core_death_correlator(name), None, "{name}");
+        }
     }
 
     #[test]

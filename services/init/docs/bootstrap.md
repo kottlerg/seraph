@@ -196,8 +196,10 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   - **`SUBSTRATE` rounds** (after the `CAPS` rounds) — one `(name, thread_cap, observer)` per
     init-bootstrapped substrate service: `memmgr`, `procmgr`, `devmgr`,
     `vfsd`. The observer is a Control-only address-space cap for memmgr and procmgr, and the
-    process handle for devmgr and vfsd. svcmgr parks them and binds both death observers on
-    each at reconciliation, pairing against the matching `<name>.svc`
+    process handle for devmgr and vfsd. svcmgr parks them; it binds memmgr's and procmgr's
+    death observers at its start on the core-death queue pwrmgr receives on
+    ([Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)),
+    and devmgr's and vfsd's at reconciliation, pairing against the matching `<name>.svc`
     recipe in `/config/svcmgr/services/` — see
     [`../../svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)
     and [Death notification](../../svcmgr/docs/ipc-interface.md#death-notification).

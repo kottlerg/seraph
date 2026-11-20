@@ -57,8 +57,50 @@ pub const RESET: u64 = 2;
 /// declares no fixed power button (always on RISC-V).
 pub const WAIT_EVENT: u64 = 3;
 
-/// [`SLEEP`]'s state argument for S5, soft-off.
+/// Hand the caller what it needs to enter a sleep state itself, with no
+/// further call on acpid: a derivation of the `IoPort` over `PM1a_CNT`,
+/// and the state's `SLP_TYPa`, read from its `\_Sx_` package at this
+/// request. The caller writes [`pm1_control_writes`]'s two values to
+/// `PM1a_CNT`, without the `\_PTS` and the quiescing of the events that
+/// [`SLEEP`] runs first: pwrmgr's power-off on the death of a core
+/// service, which may call no service (`docs/supervision.md` § Core Set
+/// and System Death).
+///
+/// Request: `data[0]` = the version; `data[1]` = the state, of which
+/// only [`STATE_S5`] is served. Reply ([`super::acpid_errors::SUCCESS`]):
+/// `caps[0]` = an `IoPort` over the `PM1a_CNT` block, derived from
+/// acpid's on every call; `data[0]` = the block's first port; `data[1]` =
+/// the state's `SLP_TYPa`, at most [`SLP_TYP_MAX`]. Replies
+/// [`super::acpid_errors::INVALID_REQUEST`] for another state, and
+/// [`super::acpid_errors::NO_DEVICE`] when [`SLEEP`] would, or when the
+/// derivation fails.
+pub const QUERY_SLEEP: u64 = 4;
+
+/// [`SLEEP`]'s and [`QUERY_SLEEP`]'s state argument for S5, soft-off.
 pub const STATE_S5: u64 = 5;
+
+/// `PM1_CNT` bit 13, `SLP_EN`: the write that sets it enters the state
+/// `SLP_TYP` names.
+pub const SLP_EN: u16 = 1 << 13;
+
+/// The position of `PM1_CNT`'s three-bit `SLP_TYP` field (bits 12:10).
+const SLP_TYP_SHIFT: u16 = 10;
+
+/// The largest `SLP_TYP`, the field being three bits wide.
+pub const SLP_TYP_MAX: u64 = 7;
+
+/// The two values written to `PM1a_CNT`, which reads `current`, to enter
+/// the state of `SLP_TYPa` `slp_typ`: `SLP_TYP` with
+/// `SLP_EN` clear, then with it set, every other bit kept. `slp_typ` is at
+/// most [`SLP_TYP_MAX`]; higher bits are dropped. acpid's [`SLEEP`] and
+/// the holder of a [`QUERY_SLEEP`] answer both write them.
+#[must_use]
+pub const fn pm1_control_writes(current: u16, slp_typ: u16) -> [u16; 2]
+{
+    let field = 0b111 << SLP_TYP_SHIFT;
+    let typed = (current & !(field | SLP_EN)) | ((slp_typ << SLP_TYP_SHIFT) & field);
+    [typed, typed | SLP_EN]
+}
 
 /// [`WAIT_EVENT`]'s event bit: the fixed power button was pressed
 /// (`PWRBTN_STS`).
@@ -68,3 +110,22 @@ pub const EVENT_POWER_BUTTON: u64 = 1;
 /// on `acpid.power`. Without it [`SLEEP`], [`RESET`] and [`WAIT_EVENT`]
 /// reply [`super::acpid_errors::UNAUTHORIZED`].
 pub const POWER_AUTHORITY: u64 = 1u64 << 63;
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    // Defect caught: a write that loses SCI_EN or another bit, keeps a stale
+    // SLP_TYP or SLP_EN, or lets an oversized type spill out of its field.
+    #[test]
+    fn pm1_writes_set_slp_typ_then_slp_en_and_keep_the_other_bits()
+    {
+        // SCI_EN (bit 0) and a stale SLP_TYP and SLP_EN.
+        assert_eq!(pm1_control_writes(0x3C01, 0), [0x0001, 0x2001]);
+        assert_eq!(pm1_control_writes(0x0001, 5), [0x1401, 0x3401]);
+        assert_eq!(pm1_control_writes(0x0000, 7), [0x1C00, 0x3C00]);
+        // A value past the field is cut to it.
+        assert_eq!(pm1_control_writes(0x0000, 0xF), [0x1C00, 0x3C00]);
+    }
+}

@@ -1022,7 +1022,8 @@ enum ChunkError
     /// The call was interrupted, or its deadline ended it, after the driver
     /// received it, so the driver may still copy from the frame.
     Call(io::Error),
-    /// The frame was not lent, or the driver replied: the frame is idle.
+    /// The driver never received the frame, or it replied: the frame is
+    /// idle.
     Settled(io::Error),
 }
 

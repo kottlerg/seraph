@@ -312,11 +312,11 @@ core of crashme's `worker` mode took 8 s to 12 s on debug builds of both archite
 - **Debugged threads.** A debugger that binds a thread's exception class takes its faults; crashd
   sees none of them.
 - **Cores.** A process whose faulting thread never registered gets no core, and a core records at
-  most 256 threads ([Core Dump](#core-dump)). A file write the dump's bound cancels leaves its page
-  frame mapped in crashd until crashd exits, since the FAT driver may still be copying from it
-  (`write_memory_chunks` in
-  [`runtime/ruststd/src/sys/fs/seraph.rs`](../../../runtime/ruststd/src/sys/fs/seraph.rs)); each
-  cancelled dump costs one page so.
+  most 256 threads ([Core Dump](#core-dump)). A file write the dump's bound ends after the FAT
+  driver received it leaves its page frame mapped in crashd until crashd exits, since the driver may
+  still be copying from it; one the bound ends before then returns the frame (`write_memory_chunks`
+  in [`runtime/ruststd/src/sys/fs/seraph.rs`](../../../runtime/ruststd/src/sys/fs/seraph.rs)). An
+  abandoned dump costs at most one page so.
 
 Persistence of the reports through logd's disk and network sinks, and holding a crashed process
 stopped for a debugger, are design intent; not yet implemented

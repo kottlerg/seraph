@@ -1290,13 +1290,18 @@ Either way the fault takes the decline's outcome unless that handler resumes it,
 no handler it forwards to.
 
 A fault on a chunk memmgr is evicting, or holds raw on its own runs, maps the
-chunk's runs back and resumes, a raw chunk's write cancelled; a
+chunk's runs back and resumes, a raw chunk's write cancelled, declined with code
+10 or 9 when a page-table donation the map needs is refused at the max or the
+growth floor, and with code 9 when the map fails; a
 fault on a chunk it evicted restores the whole chunk from its compressed store
 before it resumes, declined with code 7 when the free pages outside
 `promised` and, for a process outside it, the system reserve do not cover the
-chunk's backed pages (code 11 when the chunk is a committed region's and the
-draw finds no frame), and with code 9 when a map fails or, with detail 0, the
-stored chunk does not decode; the chunk then stays evicted
+chunk's backed pages or the runs covering them cannot be taken, with code 6 or 8
+when the runs cannot be recorded, with code 10 or 9 when a page-table donation
+its map needs is refused at the max or the growth floor, and with code 9 when a
+map fails or, with detail 0, the store runs cannot be mapped or the stored chunk
+does not decode (a committed region's chunk: § Committed fault declines); the
+chunk then stays evicted
 ([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a writing
 compressed chunk is restored from its store runs as a compressed chunk's, and
 its write cancelled. A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming
@@ -1339,18 +1344,18 @@ admits as much of the span as the node takes, at least the faulting page,
 before it selects the run, and each donation, beside the run whose map needs
 it, before it makes it ([`memory-pool.md`](memory-pool.md) § Demand faults).
 
----
-
 #### Committed fault declines
 
 This is the one full statement of when memmgr declines a fault in a committed region (§ Label 7),
 and with which code; every other statement refers here. It covers the first touch of a page, the
 refault of a page `DISCARD_RANGE` discarded (§ Label 20), which is admitted as its first touch
-was, and the restore of an evicted chunk of the region. Such a fault is admitted without the budget
+was, and a fault on a chunk of the region that memmgr is evicting, holds raw or evicted. Such a
+fault is admitted without the budget
 and RAM tests of an uncommitted one: the commitment carries its charge, and `promised` holds a free
 page for each of the region's pages that holds no frame
 ([`memory-pool.md`](memory-pool.md#commit) § Commit). Besides codes 1 to 5, which a fault outside
-its process's or its region's contract takes whatever the region, it is declined only:
+its process's or its region's contract takes whatever the region, a first touch or a refault is
+declined only:
 
 - with code 7, when the split of a run larger than the pages to back fails;
 - with code 11, a commit overrun, when its draw finds no free page even after memmgr evicted
@@ -1365,13 +1370,28 @@ its process's or its region's contract takes whatever the region, it is declined
   the map into the process when no two contiguous free pages remain for a donation, or when a
   thread of the process takes the donated pages faster than four rounds fund them;
 - with code 6 or 8, when memmgr's metadata arena cannot grow, past what is left of the region's
-  metadata bound, for the slots that record the run, or the run cannot be recorded on its chunk;
-- with an overcommit allowance above 0 only, under which a committed region's chunks are
-  evictable: with code 9 and detail 0 when a stored chunk does not decode, and with code 12 when
-  its chunk is on disk and cannot be restored.
+  metadata bound, for the slots that record the run, or the run cannot be recorded on its chunk.
+
+Only an overcommit allowance above 0 makes a committed region's chunks evictable. A fault on one
+memmgr is evicting, or holds raw, maps the chunk's own runs back, and a fault on one it evicted
+restores the chunk; either is declined only:
+
+- with code 11, when a restore's draw finds too few free pages for the chunk's backed pages even
+  after memmgr evicted victims in its turn, and with code 7 when the runs covering them cannot then
+  be taken from the pool;
+- with code 10 or 9, when a page-table donation the map needs is refused at the max of the
+  process's budget node or an ancestor (10) or at the growth floor (9): either admits its
+  donations as any other, whatever is left of the region's page-table reservation;
+- with code 9, when a map fails as any map can, and with detail 0 when a restore's store runs
+  cannot be mapped at the stream window or its stored bytes do not decode;
+- with code 6 or 8, when memmgr's metadata arena cannot grow for a restore's run descriptors, or
+  the runs cannot be recorded on the chunk;
+- with code 12, when the chunk is on disk and cannot be restored.
 
 A refusal of a commitment itself, at a registration or a growth, is the error reply of that call,
 never a fault.
+
+---
 
 ## Capability Transfer
 

@@ -1070,10 +1070,12 @@ fn give_back(l: &mut MemLedger, runs: &[FrameDesc])
 /// # Errors
 /// [`FaultDecline::NoFreePage`] when the restore is not admitted or the pool
 /// runs out, [`FaultDecline::CommitOverrun`] when a committed chunk's draw
-/// finds too few free pages, [`FaultDecline::NoArenaSlot`] when the arena cannot grow
-/// for the runs' descriptors, [`FaultDecline::MapFailed`] when a map fails or
-/// the source is malformed (detail 0), and [`FaultDecline::FrameRecord`] when
-/// the ledger refuses the runs. The chunk then stays as it was.
+/// finds too few free pages, [`FaultDecline::NoArenaSlot`] when the arena
+/// cannot grow for the runs' descriptors, [`FaultDecline::BudgetLimit`] when a
+/// page-table donation the map needs is refused at a max,
+/// [`FaultDecline::MapFailed`] when a map fails, the floor refuses that
+/// donation, or the source is malformed (detail 0), and
+/// [`FaultDecline::FrameRecord`] when the ledger refuses the runs. The chunk then stays as it was.
 pub(crate) fn restore(
     l: &mut MemLedger,
     rec: NodeIdx,

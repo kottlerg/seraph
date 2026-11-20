@@ -1029,8 +1029,10 @@ again or a fault maps it back.
 
 A fault on a compressed chunk is restored in the fault arm within the turn, since the restore is
 bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
-any ancestor, since the node stays charged for its evicted pages, so it is never declined with code
-10. A restore of an uncommitted chunk passes the RAM test of an uncommitted demand run, `free -
+any ancestor for its pages, since the node stays charged for its evicted pages; a page-table
+donation its map needs is admitted as any other ([Client page-table
+funding](#client-page-table-funding)), and declined with code 10 at the max or 9 at the growth
+floor. A restore of an uncommitted chunk passes the RAM test of an uncommitted demand run, `free -
 promised - R >= want`, with want the chunk's backed pages and R the system reserve for a node
 outside it and 0 for a reserve node, after the deferred recheck ([Distribution
 policy](#distribution-policy), System reserve): R, not the growth floor, so the restore draws on the

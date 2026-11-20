@@ -181,8 +181,10 @@ pub enum SwapError
     /// The record slot named holds no record, the region slot no region of
     /// it, or the page lies outside the region.
     NoRegion,
-    /// The chunk may not be evicted: its region is committed or registered
-    /// no-evict, or its process's budget node is a reserve node.
+    /// The chunk may not be evicted ([`Ledger::evictable`]): its region is
+    /// registered no-evict, committed while no swap service has registered
+    /// slots, or a memory-object attachment, or its process's budget node is a
+    /// reserve node.
     Ineligible,
     /// The chunk's entry refused the transition ([`ChunkEntry`]).
     Chunk(ChunkError),

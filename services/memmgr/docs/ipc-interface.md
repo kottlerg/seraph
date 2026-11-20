@@ -597,7 +597,8 @@ raw, compressed or being written at the second read, whatever was in flight
 at the first; a chunk held raw counts in no other word until it is written.
 A chunk on disk or lost can remain: `data[10]` counts both, `data[12]` only a
 chunk on disk. While a swap service has registered slots memmgr evicts the
-chunks of committed regions too, each moving `data[8]` by its backed pages
+chunks of committed regions too, other than an attachment's (§ Label 28),
+each moving `data[8]` by its backed pages
 once it holds no frame of its own, and back at its restore, and `data[18]`
 with it, so a caller asserting that a commitment was released compares
 `data[8] - data[18]`, the promised total net of eviction, beside the free

@@ -9,7 +9,9 @@ watch of a death-queue drain.
 
 A service that binds kernel death observers (procmgr, svcmgr and devmgr) holds a `DeathSet`: its
 death `EventQueue`s and the wait set that holds them. In the form svcmgr holds (`DeathSet::new`),
-the queues share that wait set with the service endpoint, as its main wait set; in the death-only
+the queues share that wait set with the service endpoint and the members of the service's own it
+reserves room for (`add_member`; svcmgr's memory-pressure Notification), as its main wait set; in
+the death-only
 form procmgr's reaper waits on (`DeathSet::new_death_only`), the wait set holds the queues alone,
 and the growth policy still counts one member for a service endpoint. Each bind takes
 one node from its queue's pool, fixed when the queue is created, so when every queue is out of

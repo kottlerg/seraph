@@ -16,9 +16,10 @@
 //! death-observer correlator and the rule that routes a death post by it
 //! ([`death_tag`]), the reading of a service's death from the caps svcmgr holds
 //! on it ([`death_caps`]), the eligibility rule of a stop ([`stop`]), the order of
-//! the `SET_DRIVERS_DIR` step and its liveness reads ([`drivers_dir`]), and
-//! the create flags a recipe asks procmgr for ([`create_flags`]). Nothing here
-//! touches a syscall, IPC, or `std::os::seraph` surface, so the whole crate
+//! the `SET_DRIVERS_DIR` step and its liveness reads ([`drivers_dir`]), what
+//! follows a restart whose create failed and when one that waits for memory is
+//! retried ([`memory_wait`]), and the create flags a recipe asks procmgr for
+//! ([`create_flags`]). Nothing here touches a syscall, IPC, or `std::os::seraph` surface, so the whole crate
 //! is host-reachable and host-tested — the `.svc` and class files are
 //! external input and their parsers carry unit tests per
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
@@ -29,6 +30,7 @@ pub mod class;
 pub mod death_caps;
 pub mod death_tag;
 pub mod drivers_dir;
+pub mod memory_wait;
 pub mod parse;
 pub mod stop;
 

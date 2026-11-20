@@ -34,7 +34,9 @@ death of every process it created, and reaps each one
 and no shutdown.
 
 ```
-init            launches the bootstrap substrate, endows svcmgr, exits; supervises nothing
+init            launches the bootstrap substrate, endows svcmgr, exits; supervises nothing, and
+                halts the boot on a child's death during its bootstrap rounds (§ Core Set and
+                System Death)
 svcmgr          supervises the substrate (memmgr, procmgr, devmgr, vfsd) and every service it
    │            launches from a recipe (logd, timed, pwrmgr, crashd, ...)
    ├── devmgr   observes each driver's death, withdraws a dead driver, restarts a served one
@@ -94,7 +96,8 @@ Bootstrap Stages](../services/init/docs/bootstrap.md).
 ## Core Set and System Death
 
 memmgr, procmgr and svcmgr are the core set. None of them restarts, and the death of any of them is
-system death: the system powers off.
+system death: the system powers off, except for a death init sees before svcmgr's handover, which is
+init's logged halt (below).
 
 - **memmgr** holds every RAM frame and is the pager of nearly every process
   ([Fault Handling § Default System Pager](fault-handling.md#default-system-pager)).
@@ -155,6 +158,22 @@ construction, per [Fault Handling § Default System Pager](fault-handling.md#def
 so a fault on a page not yet resident, or a call to memmgr, on the path after memmgr's death waits
 for good. A power-off path that neither faults nor calls memmgr after a core death is design
 intent; not yet implemented (#1290).
+
+Before svcmgr's handover no supervisor runs, and init is the one process placed to see a death: it
+serves the bootstrap rounds of memmgr, procmgr, devmgr, vfsd and svcmgr, and reads the child's main
+thread while it waits for each request ([init Bootstrap Stages § A death during the
+bootstrap](../services/init/docs/bootstrap.md#a-death-during-the-bootstrap)). A death init sees
+there is system death, and before the handover system death is a logged halt, not a power-off:
+init logs `init: FATAL: <service> died during its bootstrap (exit reason 0x<reason>)`, serves
+nothing more and its main thread exits, and the system stays up, halted, until an operator or a
+watchdog acts. No power-off is reachable there on x86-64: S5 needs the `\_S5_` sleep value, which
+only acpid evaluates, and acpid is a driver launched after the handover. One halt on both
+architectures keeps the window to the rule every other bootstrap failure of init follows. The
+halted system keeps the FATAL line on the serial console, which init-logd writes until real-logd
+takes over, and a test boot fails at that line, which the `FATAL:` marker of the run's fail
+pattern matches, rather than at its deadline. init reads only the child whose request it waits for:
+a core death outside that wait, memmgr's or procmgr's after its own rounds, is not seen, and init's
+next call that reaches the dead service waits for good (#1185), so the boot hangs with no line.
 
 ---
 

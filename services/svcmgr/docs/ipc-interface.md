@@ -96,7 +96,7 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 | Field | Value |
 |---|---|
 | caps[..] | the present slots, in slot order |
-| slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch and the first-launch handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`; see [`log_sink`](service-definitions.md#log_sink)), and the `LOG_QUERY_AUTHORITY` SEND it publishes as `logd.query`; holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
+| slot 0 | `master_log_source`: `RIGHTS_ALL` source on init's master log endpoint; svcmgr mints real-logd's master-log RECV from it on every (re)launch, and the handover SEND (the `HANDOVER_PULL` drain then `HANDOVER_RELEASE`) on the first launch and on a restart until procmgr reports init reaped (see [`log_sink`](service-definitions.md#log_sink)), and the `LOG_QUERY_AUTHORITY` SEND it publishes as `logd.query`; holding it keeps the log endpoint alive across a logd crash (absent if its derive fails) |
 | slot 1 | `procmgr_death_auth_source`: badge-0 `SEND\|GRANT` source on procmgr's service endpoint; svcmgr mints real-logd's `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap from it per launch (absent if its derive fails), and the `DEBUG_AUTHORITY` `SEND\|GRANT` cap of a `debug_authority = yes` service |
 | data[0] | `3` (`LOGD_SOURCES`) |
 | data[1] | presence word: bit 0 `MASTER_LOG`, bit 1 `PROCMGR_DEATH_AUTH` |
@@ -282,7 +282,7 @@ deletes any it carries. The reply labels are the stop labels' codes, not `svcmgr
 | label value | Meaning |
 |---|---|
 | `UNAUTHORIZED` (1) | Caller's badge lacks `STOP_AUTHORITY` |
-| `NO_CANDIDATE` (2) | The slot holds no service, the eligibility rule refuses the service (a `restart = never` service among them, which svcmgr does not supervise), no instance runs (it is restarting, or permanently down; a death the kernel shows that svcmgr has not yet routed is routed after the reply), or the key's instance is not the one that runs |
+| `NO_CANDIDATE` (2) | The slot holds no service, the eligibility rule refuses the service (a `restart = never` service among them, which svcmgr does not supervise), no instance runs (it is restarting, waits for memory, or is permanently down; a death the kernel shows that svcmgr has not yet routed is routed after the reply), or the key's instance is not the one that runs |
 | `UNAVAILABLE` (3) | memmgr or procmgr is dead, so a destroy would not be answered, or procmgr did not destroy the process |
 | `0` (`SUCCESS`) | The instance is destroyed; its death is routed after the reply |
 
@@ -437,8 +437,10 @@ svcmgr maintains a growable set of death EventQueues. At
 reconciliation time, every supervised service has its main thread
 bound to one of them, and its address space bound to one, each with the
 `DeathTag` correlator `(instance << 32) | slot`. The
-WaitSet holds the service endpoint (badge 0) and every death queue
-(badge 1).
+WaitSet holds the service endpoint (badge 0), every death queue
+(badge 1), and the memory-pressure Notification that wakes a restart
+waiting for memory (badge 2; [restart-protocol.md § Decision
+tree](restart-protocol.md#decision-tree)).
 
 When the main thread exits (clean or fault), or any thread takes the address space's first
 terminal fault, the kernel posts the death entry `(exit_reason, correlator)` to the queue its

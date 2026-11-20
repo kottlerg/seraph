@@ -145,6 +145,83 @@ pub(crate) fn start_thread(thread_cap: u64) -> Result<(), i64>
     }
 }
 
+// ── Bootstrap rounds ─────────────────────────────────────────────────────────
+
+/// A child init serves bootstrap rounds to: the name its death is logged
+/// under, the badge its requests carry, and the cap on its main thread, whose
+/// state shows its death.
+#[derive(Clone, Copy)]
+pub(crate) struct BootChild
+{
+    pub(crate) name: &'static [u8],
+    pub(crate) badge: u64,
+    pub(crate) thread: u64,
+}
+
+/// Serve `child` one bootstrap round on `bootstrap_ep` through
+/// `ipc::bootstrap::serve_round_watched`, reading the child's main thread
+/// (`ipc::bootstrap::thread_cap_death`) each time the wait for its request
+/// passes `ipc::bootstrap::WATCH_POLL_MS`. A child that dies before the round
+/// reaches it is system death before svcmgr's handover, init's logged halt
+/// ([`bootstrap_death`]), so the call does not return then.
+///
+/// # Safety
+/// `ipc_buf` must be init's registered IPC buffer.
+///
+/// # Errors
+/// The round's `bootstrap_errors` code when it fails with the child alive
+/// (`ipc::bootstrap::ServeFailure::Refused`).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`done` is the round's done flag, which the reply encodes for the child"
+)]
+pub(crate) unsafe fn serve_child(
+    bootstrap_ep: u64,
+    child: &BootChild,
+    ipc_buf: *mut u64,
+    done: bool,
+    caps: &[u64],
+    data: &[u64],
+) -> Result<(), u64>
+{
+    // SAFETY: the caller's contract: `ipc_buf` is init's registered IPC buffer.
+    let served = unsafe {
+        ipc::bootstrap::serve_round_watched(
+            bootstrap_ep,
+            child.badge,
+            ipc_buf,
+            done,
+            caps,
+            data,
+            ipc::bootstrap::WATCH_POLL_MS,
+            || ipc::bootstrap::thread_cap_death(child.thread),
+        )
+    };
+    match served
+    {
+        Ok(()) => Ok(()),
+        Err(ipc::bootstrap::ServeFailure::Refused(code)) => Err(code),
+        Err(ipc::bootstrap::ServeFailure::ChildDied(reason)) => bootstrap_death(child.name, reason),
+    }
+}
+
+/// System death before svcmgr's handover (docs/supervision.md § Core Set and
+/// System Death): `name`, a child init was serving its bootstrap, died with
+/// exit reason `reason`. init logs the FATAL line, serves nothing more, and
+/// its main thread exits, a logged halt with no power-off; init-logd keeps
+/// serving the master log endpoint, so the line reaches the console.
+pub(crate) fn bootstrap_death(name: &[u8], reason: u64) -> !
+{
+    logging::log_parts(&[
+        b"init: FATAL: ",
+        name,
+        b" died during its bootstrap (exit reason ",
+        bootstrap::HexText::new(reason).as_bytes(),
+        b")",
+    ]);
+    syscall::thread_exit();
+}
+
 // ── Cap descriptor helpers ───────────────────────────────────────────────────
 
 /// The `CapDescriptor` array the kernel wrote into the `InitInfo` region.
@@ -850,11 +927,16 @@ fn run(info_ptr: u64) -> !
         mm_final.mm_memory_count,
         mm.procmgr_badge,
     ];
+    let memmgr_child = BootChild {
+        name: b"memmgr",
+        badge: mm.bootstrap_badge,
+        thread: mm.mm_thread,
+    };
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe {
-        ipc::bootstrap::serve_round(
+        serve_child(
             init_bootstrap_ep,
-            mm.bootstrap_badge,
+            &memmgr_child,
             ipc_buf,
             true,
             &[mm_service_cap_for_mm, phys_table_ro_cap],
@@ -919,11 +1001,16 @@ fn run(info_ptr: u64) -> !
     {
         (pm_caps.get(..3).unwrap_or_default(), &[])
     };
+    let procmgr_child = BootChild {
+        name: b"procmgr",
+        badge: pm.bootstrap_badge,
+        thread: pm.thread,
+    };
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe {
-        ipc::bootstrap::serve_round(
+        serve_child(
             init_bootstrap_ep,
-            pm.bootstrap_badge,
+            &procmgr_child,
             ipc_buf,
             true,
             round_caps,

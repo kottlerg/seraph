@@ -252,14 +252,19 @@ pub const EDU_DMA_MASK: u64 = 0xFFFF_FFFF;
 /// The QEMU `pci-testdev` functions (PCI `1b36:0005`) a test launch attaches
 /// (`--test-devices`) for the test-only `test-fault` fixture, which takes its
 /// role from the function's BAR 2 (`ipc::test_fault_labels`): two with no
-/// BAR 2, which the fixture serves, one whose BAR 2 is `HANG_BAR_BYTES`
-/// (`membar=4K`), on which it never reports ready, and one whose BAR 2 is
-/// `ORPHAN_BAR_BYTES` (`membar=8K`), on which it refuses its bootstrap.
+/// BAR 2, which the fixture serves, one whose BAR 2 is `DIE_BAR_BYTES`
+/// (`membar=16K`), on which it exits before its next bootstrap request, one
+/// whose BAR 2 is `HANG_BAR_BYTES` (`membar=4K`), on which it never reports
+/// ready, and one whose BAR 2 is `ORPHAN_BAR_BYTES` (`membar=8K`), on which
+/// it refuses its bootstrap. The dying function is function 1 of the first
+/// serving function's slot, so devmgr binds it between the two serving ones
+/// and a bind that stopped at its death would leave the second unbound.
 /// Pinned past the disks' slots ([`FIRST_DISK_SLOT`]), below 25, where q35
 /// routes every slot to one line, and clear of q35's slot 0x1f; the fixture
 /// takes no interrupt, so the lines they share are unused.
-const TEST_FAULT_DEVICES: [&str; 4] = [
-    "pci-testdev,addr=0x15",
+const TEST_FAULT_DEVICES: [&str; 5] = [
+    "pci-testdev,addr=0x15,multifunction=on",
+    "pci-testdev,addr=0x15.1,membar=16K",
     "pci-testdev,addr=0x16",
     "pci-testdev,addr=0x17,membar=4K",
     "pci-testdev,addr=0x18,membar=8K",
@@ -2130,7 +2135,8 @@ mod tests
                         .split(',')
                         .find_map(|p| p.strip_prefix("addr=0x"))
                         .unwrap();
-                    let slot = u8::from_str_radix(addr, 16).unwrap();
+                    let slot = addr.split('.').next().unwrap();
+                    let slot = u8::from_str_radix(slot, 16).unwrap();
                     assert!(slot > SHARED_LINE_SECOND_DISK_SLOT && slot < 25, "{d}");
                 }
             }
@@ -2284,7 +2290,7 @@ mod tests
     #[test]
     fn the_test_fault_bars_match_the_fixture_roles()
     {
-        use ipc::test_fault_labels::{HANG_BAR_BYTES, ORPHAN_BAR_BYTES};
+        use ipc::test_fault_labels::{DIE_BAR_BYTES, HANG_BAR_BYTES, ORPHAN_BAR_BYTES};
         let bar = |d: &str| {
             d.split(',')
                 .find_map(|p| p.strip_prefix("membar="))
@@ -2293,7 +2299,13 @@ mod tests
         let bars: Vec<Option<u64>> = TEST_FAULT_DEVICES.iter().map(|d| bar(d)).collect();
         assert_eq!(
             bars,
-            [None, None, Some(HANG_BAR_BYTES), Some(ORPHAN_BAR_BYTES)]
+            [
+                None,
+                Some(DIE_BAR_BYTES),
+                None,
+                Some(HANG_BAR_BYTES),
+                Some(ORPHAN_BAR_BYTES)
+            ]
         );
     }
 

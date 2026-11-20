@@ -579,7 +579,9 @@ fn consumed_total() -> u32
 /// or parked where no delivery wakes it makes no progress, and the next stop
 /// would cancel that park and hide it. The sender is paused first, as before
 /// the final check, so the probe's restarted counters show the stranded
-/// wait's own result and no delivery the sender makes after the restart.
+/// wait's own result and no delivery the sender makes after the restart; a
+/// pause that times out is logged before the probe, whose restarted counters
+/// may then include the sender's deliveries.
 fn require_consumed(waiter: u64, consumed: u32) -> TestResult
 {
     if super::await_within(crate::scaled_bound(DELIVERY_WAIT_US), || {
@@ -588,9 +590,12 @@ fn require_consumed(waiter: u64, consumed: u32) -> TestResult
     {
         return Ok(());
     }
-    // A sender that did not pause is reported by the phase, which pauses it
-    // again before its final check.
-    let _ = pause_sender();
+    // The round's failure is what the phase returns, so a pause that timed
+    // out is logged here, before the probe whose reading it weakens.
+    if let Err(e) = pause_sender()
+    {
+        crate::log_args(format_args!("ktest: {CELL} probe pause failed: {e}"));
+    }
     probe_waiter(waiter);
     Err(
         "stress::stop_repark: the waiter consumed no delivery after a checked round's restart (a \

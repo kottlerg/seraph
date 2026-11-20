@@ -872,10 +872,11 @@ type SleepEvents<'a> = (&'a Armed, &'a Mailbox, &'a Sender<Work>);
 /// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then, with the
 /// events `armed`, [`events::quiesce`], which hands on each event it takes,
 /// then the sleep register writes (`Power::sleep`). When
-/// the writes return, the events stay quiesced for [`SLEEP_GRACE`]; when the
-/// platform still runs then, the GPEs are enabled again
-/// ([`events::resume`]) and what latched is handed on, each event once. The
-/// reply status when the platform keeps running.
+/// the writes return, acpid waits [`SLEEP_GRACE`], the events staying
+/// quiesced; when the platform still runs then, the GPEs are enabled again
+/// ([`events::resume`]) and what latched is handed on, each event once. A
+/// platform without armed events, a hardware-reduced one among them, waits
+/// the same grace. The reply status when the platform keeps running.
 fn sleep(
     state: u8,
     ns: Option<&mut Namespace>,
@@ -900,16 +901,26 @@ fn sleep(
         quiesced
     });
     let entered = power.sleep(state, slp_typ);
-    if let (Some((armed, mailbox, work)), Some(quiesced)) = (armed, quiesced)
+    if entered
     {
-        if entered
+        std::thread::sleep(SLEEP_GRACE);
+        if quiesced.is_some()
         {
-            std::thread::sleep(SLEEP_GRACE);
             std::os::seraph::log!(
                 warn: "SLEEP({state}): still running {} s after the writes; GPEs enabled again",
                 SLEEP_GRACE.as_secs()
             );
         }
+        else
+        {
+            std::os::seraph::log!(
+                warn: "SLEEP({state}): still running {} s after the writes",
+                SLEEP_GRACE.as_secs()
+            );
+        }
+    }
+    if let (Some((armed, mailbox, work)), Some(quiesced)) = (armed, quiesced)
+    {
         let fired = events::resume(
             &mut *lock(&armed.regs),
             &armed.layout,

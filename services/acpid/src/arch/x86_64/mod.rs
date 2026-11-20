@@ -273,6 +273,15 @@ impl Power
             {
                 std::os::seraph::log!(warn: "no sleep register: SLEEP cannot run");
             }
+            // Clear the WAK_STS the platform's wake left set, as a legacy
+            // platform's acpid clears it with every PM1 status at its start,
+            // so a write of SLP_EN by pwrmgr on a core death, which clears
+            // nothing first, finds it clear (ACPI 6.5 § 4.8.3.7). It is
+            // write-1-to-clear: the write changes no other bit.
+            if let Some(status) = status
+            {
+                status.write(acpid_labels::SLEEP_STATUS_WAK_STS);
+            }
             (control, status)
         };
         let reset = match block(devmgr, devmgr_labels::ACPI_RESET)

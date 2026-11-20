@@ -88,15 +88,17 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   writes `WAK_STS` (bit 7) to the FADT's `SLEEP_STATUS_REG`, when devmgr serves it, then
   `SLP_TYPa` in bits 4:2 with `SLP_EN` (bit 5) to its `SLEEP_CONTROL_REG` in one byte
   (`ipc::acpid_labels::sleep_control_value`; ACPI 6.5 § 4.8.3.7), and logs
-  `SLEEP(5): SLEEP_CONTROL_REG ...` before the writes. When the writes
-  return, acpid keeps the events quiesced for 10 s (`SLEEP_GRACE`), the wait after which ACPICA
-  takes an S5 write as not taken; when the platform still runs then, acpid enables the GPEs
-  again, logs `SLEEP(5): still running 10 s after the writes; GPEs enabled again`, and
-  dispatches each GPE that was enabled before the sleep and latched meanwhile. A GPE that had
-  fired before the sleep, or that the quiesce took, is left disabled for its queued method,
-  which enables it again, and the power button is left as the quiesce left it: a press taken
-  before or during the sleep is delivered once, by the `WAIT_EVENT` it is posted to, which
-  enables the button again. So each event is handled once.
+  `SLEEP(5): SLEEP_CONTROL_REG ...` before the writes. When the writes return, acpid waits 10 s
+  (`SLEEP_GRACE`), the wait after which ACPICA takes an S5 write as not taken, the events kept
+  quiesced; when the platform still runs then, acpid logs
+  `SLEEP(5): still running 10 s after the writes` without armed events, as on a hardware-reduced
+  platform, or, with them, enables the GPEs again, logs
+  `SLEEP(5): still running 10 s after the writes; GPEs enabled again`, and dispatches each GPE
+  that was enabled before the sleep and latched meanwhile. A GPE that had fired before the sleep, or
+  that the quiesce took, is left disabled for its queued method, which enables it again, and the
+  power button is left as the quiesce left it: a press taken before or during the sleep is delivered
+  once, by the `WAIT_EVENT` it is posted to, which enables the button again. So each event is
+  handled once.
 - `QUERY_SLEEP`, with the state in `data[1]`, of which only S5 is served (`INVALID_REQUEST` for
   another): acpid evaluates `\_S5_` for `SLP_TYPa` as `SLEEP` does and replies `SUCCESS` with a
   derivation of its capability over the register `SLEEP` writes in `caps[0]`, that register's

@@ -284,9 +284,11 @@ pub struct IoBlock
 ///
 /// Returns `None` if the signature isn't `FACP`, the table (bounded by its
 /// reported length and the slice) does not reach the fields, the port is
-/// zero or past 0xFFFF, the block's length is zero or runs past 0xFFFF, or,
-/// for [`FadtBlock::Reset`], `RESET_REG_SUP` is clear or the register is
-/// not in the I/O space.
+/// zero or past 0xFFFF, the block's length is zero or runs past 0xFFFF, the
+/// FADT sets `HW_REDUCED_ACPI` and `block` is not [`FadtBlock::Reset`]
+/// (OSPM ignores the fixed-hardware fields then, ACPI 6.5 § 5.2.9), or, for
+/// [`FadtBlock::Reset`], `RESET_REG_SUP` is clear or the register is not in
+/// the I/O space.
 #[must_use]
 pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
 {
@@ -302,6 +304,11 @@ pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
             .get(off..off.checked_add(4)?)
             .map(|_| read_u32(table, off))
     };
+    if block != FadtBlock::Reset
+        && dword(FADT_OFF_FLAGS).is_some_and(|flags| flags & FADT_FLAG_HW_REDUCED_ACPI != 0)
+    {
+        return None;
+    }
     let (port, count, value) = match block
     {
         FadtBlock::Pm1aEvt => (
@@ -1611,12 +1618,20 @@ mod tests
         assert_eq!(sci_gsi([over(9, 20, 0)], 0x109), 0x109);
     }
 
-    /// A hardware-reduced FADT of 276 bytes, with no fixed block, whose
-    /// `SLEEP_CONTROL_REG` and `SLEEP_STATUS_REG` are the 8-bit registers
-    /// of `space` at `control` and `status`.
+    /// A hardware-reduced FADT of 276 bytes whose `SLEEP_CONTROL_REG` and
+    /// `SLEEP_STATUS_REG` are the 8-bit registers of `space` at `control`
+    /// and `status`. Its fixed blocks and `SMI_CMD` are left as q35's, as
+    /// stale fields a hardware-reduced platform's OSPM ignores.
     fn reduced_fadt(space: u8, control: u64, status: u64) -> Vec<u8>
     {
-        let mut b = fadt(276, 0);
+        let mut b = fadt(276, 0x604);
+        b[FADT_OFF_PM1A_EVT_BLK..FADT_OFF_PM1A_EVT_BLK + 4]
+            .copy_from_slice(&0x600u32.to_le_bytes());
+        b[FADT_OFF_GPE0_BLK..FADT_OFF_GPE0_BLK + 4].copy_from_slice(&0x620u32.to_le_bytes());
+        b[FADT_OFF_SMI_CMD..FADT_OFF_SMI_CMD + 4].copy_from_slice(&0xB2u32.to_le_bytes());
+        b[FADT_OFF_PM1_EVT_LEN] = 4;
+        b[FADT_OFF_PM1_CNT_LEN] = 2;
+        b[FADT_OFF_GPE0_BLK_LEN] = 16;
         b[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4]
             .copy_from_slice(&FADT_FLAG_HW_REDUCED_ACPI.to_le_bytes());
         for (off, address) in [
@@ -1647,8 +1662,22 @@ mod tests
             fadt_sleep_register(&t, SleepRegister::Status),
             reg(Space::Memory, 0xFEA0_0201)
         );
-        assert_eq!(fadt_io_block(&t, FadtBlock::Pm1aCnt), None);
+        for block in [
+            FadtBlock::Pm1aEvt,
+            FadtBlock::Pm1aCnt,
+            FadtBlock::Gpe0,
+            FadtBlock::SmiCmd,
+        ]
+        {
+            assert_eq!(fadt_io_block(&t, block), None, "{block:?}");
+        }
         assert_eq!(fadt_sci_int(&t), None);
+        // The same fields serve the blocks once the flag is clear, so the
+        // refusals above are the flag's.
+        let mut legacy = t.clone();
+        legacy[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(fadt_io_block(&legacy, FadtBlock::Pm1aCnt).is_some());
+        assert!(fadt_io_block(&legacy, FadtBlock::SmiCmd).is_some());
         let t = reduced_fadt(GAS_SPACE_IO, 0x404, 0x405);
         assert_eq!(
             fadt_sleep_register(&t, SleepRegister::Control),

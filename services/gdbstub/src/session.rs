@@ -15,7 +15,8 @@
 //!    or one kept beside it, by a resume, a step, a detach, or the drop of
 //!    the session; any other at once.
 //! 2. Between two resumes GDB is told of, every live bound thread is held,
-//!    or was posted an upcall that has not arrived within [`STOP_WAIT`]. A
+//!    or was posted an upcall that has not arrived within [`STOP_WAIT`], or
+//!    was not started by its creator within it, posted again meanwhile. A
 //!    held stop GDB has been told of is never restarted: it is answered by
 //!    a resume, a step, a detach, or the drop, or replaced by an upcall or
 //!    `#DB` under its badge, which a thread held on its own stop cannot
@@ -57,6 +58,10 @@ pub const MAX_RECEIVERS: usize = 2 * MAX_THREADS;
 /// How long an all-stop waits for every thread's upcall to arrive, in
 /// milliseconds.
 pub const STOP_WAIT: u64 = 2000;
+
+/// How often, in milliseconds, an all-stop posts again to a thread its
+/// creator has not started, which takes no upcall until it is.
+pub const START_POLL: u64 = 10;
 
 /// How long a detach keeps answering the stops that arrive after its
 /// resume, in milliseconds, ended early once none has come for
@@ -122,8 +127,12 @@ pub trait Kernel
     fn set_pc(&mut self, cap: u64, pc: u64) -> bool;
     /// Whether the thread has not exited.
     fn alive(&mut self, cap: u64) -> bool;
+    /// Whether the thread's creator has started it: a thread procmgr lists
+    /// between its process's creation and its start has not been.
+    fn started(&mut self, cap: u64) -> bool;
     /// Post the thread an `UPCALL_ANY_INSTRUCTION` upcall; `false` when the
-    /// kernel refuses it (the thread has exited, or has an upcall pending).
+    /// kernel refuses it (the thread has exited or has not been started, or
+    /// has an upcall pending).
     fn post_upcall(&mut self, cap: u64) -> bool;
     /// Bind the thread's exception and upcall classes to the stub's
     /// endpoint under the badge of table slot `slot`, with a receiver for it;
@@ -377,7 +386,8 @@ impl Session
     // ── Stops ────────────────────────────────────────────────────────────
 
     /// Stop every running thread with an upcall and wait, bounded by
-    /// [`STOP_WAIT`], for each stop; a breakpoint another thread hits
+    /// [`STOP_WAIT`], for each stop, posting again every [`START_POLL`] to a
+    /// thread its creator has not started yet; a breakpoint another thread hits
     /// meanwhile is held unreported and set back ([`Self::cancel_hit`]).
     /// Once every thread is held the table is refreshed: a thread the
     /// target spawned since the last refresh, under its spawner's badge,
@@ -392,12 +402,12 @@ impl Session
         let mut refreshed = false;
         loop
         {
-            self.post_upcalls(k);
+            let unstarted = self.post_upcalls(k);
             let waiting = self
                 .threads
                 .iter()
                 .any(|t| t.live() && t.held.is_none() && t.posted);
-            if !waiting
+            if !waiting && !unstarted
             {
                 if refreshed || !self.refresh(k)
                 {
@@ -407,9 +417,22 @@ impl Session
                 self.restart_unreported(k, None);
                 continue;
             }
-            let Some(stop) = self.next_stop(k, deadline)
+            // A thread not started yet is posted again once this wait ends.
+            let until = if unstarted
+            {
+                k.now().saturating_add(START_POLL).min(deadline)
+            }
             else
             {
+                deadline
+            };
+            let Some(stop) = self.next_stop(k, until)
+            else
+            {
+                if unstarted && k.now() < deadline
+                {
+                    continue;
+                }
                 break;
             };
             if let Some(index) = self.hold(k, stop)
@@ -444,25 +467,36 @@ impl Session
         k.next_stop(until)
     }
 
-    /// Post an upcall to every live thread not held and not yet posted.
-    fn post_upcalls(&mut self, k: &mut impl Kernel)
+    /// Post an upcall to every live thread not held and not yet posted;
+    /// returns whether one of them has not been started by its creator,
+    /// which the kernel posts nothing to until it is, so it stays unposted.
+    fn post_upcalls(&mut self, k: &mut impl Kernel) -> bool
     {
+        let mut unstarted = false;
         for t in self
             .threads
             .iter_mut()
             .filter(|t| t.live() && t.held.is_none() && !t.posted)
         {
-            // A refused post to a live thread finds an upcall pending, which
-            // arrives as well.
-            if !k.post_upcall(t.cap) && !k.alive(t.cap)
+            // Read before the post, since a thread its creator starts
+            // between a refused post and a later read would be taken for
+            // one with an upcall pending.
+            if !k.started(t.cap) && k.alive(t.cap)
+            {
+                unstarted = true;
+            }
+            else if !k.post_upcall(t.cap) && !k.alive(t.cap)
             {
                 t.gone = true;
             }
             else
             {
+                // A refused post to a started live thread finds an upcall
+                // pending, which arrives as well.
                 t.posted = true;
             }
         }
+        unstarted
     }
 
     /// Take `stop` as its thread's held stop and return the thread's slot,
@@ -1071,6 +1105,16 @@ impl Session
     {
         self.threads.get(index).is_some_and(|t| t.held.is_some())
     }
+
+    /// Whether the session holds no stop while a live thread of it has not
+    /// been started by its creator: the target has run nothing yet and,
+    /// once started, runs on, so the session has no stop to report.
+    #[must_use]
+    pub fn awaits_start(&self, k: &mut impl Kernel) -> bool
+    {
+        self.threads.iter().all(|t| t.held.is_none())
+            && self.threads.iter().any(|t| t.live() && !k.started(t.cap))
+    }
 }
 
 /// [`control::settle`] of `stop`, a delivery under the badge of a thread
@@ -1213,6 +1257,9 @@ mod tests
         busy: usize,
         /// Threads whose bind the kernel refuses.
         refuse_bind: Vec<usize>,
+        /// Threads their creator starts only at the given time, before which
+        /// the kernel refuses them an upcall.
+        unstarted: Vec<(usize, u64)>,
     }
 
     fn cap_of(t: usize) -> u64
@@ -1246,6 +1293,7 @@ mod tests
                 receivers: 0,
                 busy: 0,
                 refuse_bind: Vec::new(),
+                unstarted: Vec::new(),
             };
             sim.spawn(None, true);
             sim
@@ -1523,9 +1571,22 @@ mod tests
             self.threads[thread_of(cap)].run != Run::Exited
         }
 
+        fn started(&mut self, cap: u64) -> bool
+        {
+            let t = thread_of(cap);
+            !self
+                .unstarted
+                .iter()
+                .any(|&(u, at)| u == t && self.time < at)
+        }
+
         fn post_upcall(&mut self, cap: u64) -> bool
         {
             let t = thread_of(cap);
+            if !self.started(cap)
+            {
+                return false;
+            }
             if self.deaf.contains(&t)
             {
                 return self.threads[t].run != Run::Exited;
@@ -2180,5 +2241,42 @@ mod tests
         assert_eq!(SlotState::Absent.refusal_code(), 1);
         assert_eq!(SlotState::Unbound.refusal_code(), 4);
         assert_eq!(SlotState::Gone.refusal_code(), 5);
+    }
+
+    // Defect caught: an attach between the target's creation and its start
+    // took the kernel's refusal of an upcall to the unstarted main thread
+    // for one pending, never posted again, and left the thread to run on
+    // once started, while GDB took it for stopped.
+    #[test]
+    fn an_attach_before_the_targets_start_holds_its_main_thread_once_started()
+    {
+        let mut sim = Sim::new();
+        sim.unstarted.push((0, STOP_WAIT / 4));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.is_held(0), "the main thread runs unheld");
+        assert!(!s.awaits_start(&mut sim));
+        assert!(sim.time < STOP_WAIT, "the all-stop waited out its bound");
+        assert!(s.detach(&mut sim));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a target its creator had not started by the end of the
+    // attach's all-stop was attached holding nothing, so GDB would take a
+    // target that then runs for stopped.
+    #[test]
+    fn a_target_unstarted_past_the_all_stop_awaits_its_start_and_detaches()
+    {
+        let mut sim = Sim::new();
+        sim.unstarted.push((0, STOP_WAIT + START_POLL));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert_eq!(sim.time, STOP_WAIT, "the all-stop ends at its bound");
+        assert!(!s.is_held(0));
+        assert_eq!(s.slot_state(ThreadId::Id(1)).0, SlotState::Live);
+        assert!(s.awaits_start(&mut sim));
+        assert!(s.detach(&mut sim));
+        assert!(sim.detached);
+        sim.assert_sound();
     }
 }

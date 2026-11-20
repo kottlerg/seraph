@@ -93,7 +93,11 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
    procmgr's list, and is not shown to GDB. A refused or failed page deletes the caps already
    taken and has procmgr drop the watch again (`DETACH_PROCESS`).
 5. It stops every thread ([Stop Model](#stop-model)) and logs
-   `attached; serving the debug port (<name>)`.
+   `attached; serving the debug port (<name>)`. A target its creator has not started by the end
+   of that all-stop holds no stop, and once started it would run while GDB took it for stopped: the
+   stub detaches from it again, logs
+   `<name> not started within the attach's wait; detached (crash bindings restored: <bool>)`, and
+   counts the attach as failed.
 
 When the walk or the attach fails, the stub serves the port detached: `?` reports the target
 exited, and the next `qSupported`, a new GDB connection, tries the walk and the attach again,
@@ -119,8 +123,11 @@ stub's endpoint.
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Reply).
 - **Stopping.** To stop the target (the attach, GDB's interrupt byte `0x03`, and the stop of every
   other thread when one stops) the stub posts each running thread an `UPCALL_ANY_INSTRUCTION`
-  upcall and waits up to `STOP_WAIT` (2 s) for each to arrive. Once none is awaited, it refreshes
-  its table once (below), posts an upcall to each thread the refresh adds, and restarts every held
+  upcall and waits up to `STOP_WAIT` (2 s) for each to arrive. The kernel refuses an upcall to a
+  thread its creator has not started, as procmgr lists a process's main thread between its creation
+  and its start, so the stub reads such a thread's state again every `START_POLL` (10 ms) and
+  posts its upcall once it has started. Once none is awaited, it refreshes its table once (below),
+  posts an upcall to each thread the refresh adds, and restarts every held
   breakpoint hit or fault GDB has not been told of, since any of them can be a new thread's
   (below). A thread whose upcall does not arrive in time runs on and is not reported held. The
   all-stop's end makes every held stop one GDB has been told of. An upcall that arrives while the
@@ -286,7 +293,8 @@ still attached.
 |---|---|---|
 | `MAX_THREADS` | 32 live threads per attach, refreshes included; an exited thread's slot is taken again | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, and its stops are settled as [Crediting a stop](#stop-model) says |
 | `MAX_RECEIVERS` | 64 receiver threads, twice `MAX_THREADS` | a stop waits on the stub's endpoint until a held one is answered |
-| `STOP_WAIT` | 2 s per all-stop | a thread whose upcall has not arrived runs on |
+| `STOP_WAIT` | 2 s per all-stop | a thread whose upcall has not arrived runs on; an attach whose target has not been started holds nothing and detaches |
+| `START_POLL` | 10 ms | the all-stop's interval between reads of a thread its creator has not started |
 | `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the target at startup | the stub serves detached (no target) |
 | `REATTACH_ATTEMPTS` × `FIND_INTERVAL` | 50 × 100 ms, for the target at a `qSupported` that finds the stub detached | the stub stays detached; `?` reports the target exited |
 | `REFRESH_TRIES` | 3 pages per refresh | the stop is settled as no new thread's, and the next stop that is not its thread's own refreshes again |
@@ -317,11 +325,11 @@ attach at one breakpoint, in either order and with the spawner's stop late; a fa
 the stub cannot bind; a new thread in its exited spawner's slot; stops during a step; a repeat of
 a stop GDB knows of, and the kernel's second delivery of one; a restart at a breakpoint built into
 the target; a thread's own upcall beside a stop that was not its; stops racing a resume or an
-all-stop, and an all-stop that holds no thread; a continue that ends every thread; and a detach
-with a stop pending, with every thread exited, and with the step's thread exited or never
-stopped. `cargo xtask test-gdb`
-boots the `gdb-target`
-fixture (`programs/debugger --gdb-target`,
+all-stop, and an all-stop that holds no thread; an attach before the target's start, holding its
+main thread once started, and one whose target is not started within the all-stop; a continue
+that ends every thread; and a detach with a stop pending, with every thread exited, and with
+the step's thread exited or never stopped. `cargo xtask test-gdb` boots the `gdb-target` fixture
+(`programs/debugger --gdb-target`,
 [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch
 GDB session over the debug port: it lists two threads, breaks on the fixture's tick function and
 continues to it, rewrites and reads back a variable and a register, single-steps, selects the

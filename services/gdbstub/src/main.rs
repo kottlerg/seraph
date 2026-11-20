@@ -462,6 +462,14 @@ impl Kernel for Sys
             .is_ok_and(|packed| (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED)
     }
 
+    fn started(&mut self, cap: u64) -> bool
+    {
+        // A thread whose state cannot be read is taken as started: the
+        // all-stop then waits for it no longer than for any other.
+        !syscall::cap_info(cap, syscall_abi::CAP_INFO_THREAD_STATE)
+            .is_ok_and(|packed| (packed >> 32) as u32 == syscall_abi::THREAD_STATE_CREATED)
+    }
+
     fn post_upcall(&mut self, cap: u64) -> bool
     {
         syscall::thread_post_upcall(cap, 0, syscall_abi::UPCALL_ANY_INSTRUCTION).is_ok()
@@ -694,11 +702,21 @@ impl Stub
         };
         self.sys.target = badge;
         self.bias = attached.bias;
-        self.session = Some(Session::attach(
-            &mut self.sys,
-            BREAKPOINT_PC_ADVANCE,
-            attached.page,
-        ));
+        let session = Session::attach(&mut self.sys, BREAKPOINT_PC_ADVANCE, attached.page);
+        if session.awaits_start(&mut self.sys)
+        {
+            // Its creator has not started it within the all-stop's wait: no
+            // stop is held, and the started target would run on while GDB
+            // took it for stopped. Serve detached; GDB's next connection
+            // attaches again.
+            let restored = session.detach(&mut self.sys);
+            std::os::seraph::log!(
+                warn: "{} not started within the attach's wait; detached (crash bindings restored: {restored})",
+                self.name
+            );
+            return;
+        }
+        self.session = Some(session);
         std::os::seraph::log!("{READY_MARKER} ({})", self.name);
     }
 

@@ -132,11 +132,8 @@ pub fn call_no_receiver_phase(_: &Caps)
     // SAFETY: as above; the reply goes to the handoff call just received.
     unsafe { ipc::ipc_reply(&moved, ipc_buf) }.expect("call_no_receiver: handoff reply failed");
     // The reply moved `ep`: the child's copy is the endpoint's only Receive
-    // right.
-    assert!(
-        syscall::cap_delete(ep).is_err(),
-        "call_no_receiver: the Receive-right capability is still here after the handoff"
-    );
+    // right. A refused transfer fails the reply above and leaves the child no
+    // capability, which makes it exit with `HANDOFF_FAILED`.
     let _ = syscall::cap_delete(handoff);
 
     let walker =

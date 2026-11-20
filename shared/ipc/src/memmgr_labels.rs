@@ -160,8 +160,10 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 /// * `data[14]` — `evictions`: the evictions memmgr has begun, a count, not
 ///   bytes, that only moves up, wrapping. An eviction is the one way a chunk
 ///   leaves the resident state, so a reader that finds the same count
-///   before and after making a range resident knows no chunk of it was
-///   evicted, held raw or being evicted at the second read.
+///   before and after a `MAKE_RESIDENT` walk over a range that completed
+///   with no reply pending knows no chunk of the range was being evicted,
+///   held raw, compressed or being written at the second read. A chunk on
+///   disk or lost can remain; `data[10]` and `data[12]` count it.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no

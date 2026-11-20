@@ -33,10 +33,11 @@
 //! per boot, apart from devmgr's restart of a served driver that dies, which
 //! it serves at the class's next ordinal
 //! (`services/devmgr/docs/responsibilities.md` § Driver Restart): the RTC
-//! at ordinal 0 need not last the boot. A spawn that fails, or a driver that
-//! dies before it reports ready, is sticky: clients see
-//! [`devmgr_errors::NO_DEVICE`](crate::devmgr_errors::NO_DEVICE) for the rest
-//! of the boot. RTC drivers are **not** carried in the boot bundle.
+//! at ordinal 0 need not last the boot. While no RTC driver is served, an
+//! `rtc` query replies
+//! [`devmgr_errors::NO_DEVICE`](crate::devmgr_errors::NO_DEVICE), whose retry
+//! rule (a later bind pass may serve the class) is `NO_DEVICE`'s. RTC drivers
+//! are **not** carried in the boot bundle.
 //!
 //! Adding a new RTC chip is a matter of writing a driver crate that
 //! answers this single label and binding it through devmgr's per-board

@@ -87,22 +87,27 @@ pub struct DeathSet
 impl DeathSet
 {
     /// Create the main wait set, add `service_ep` to it under
-    /// `service_badge`, and create the first death queue, of `entries` ring
-    /// entries and `first_observers` observer nodes, under `death_badge`.
-    /// Each further queue has `entries` entries and twice the last one's
-    /// nodes. `None` if any of them cannot be funded, created, or added.
+    /// `service_badge`, with room for `members` more members of the caller's,
+    /// which it adds with [`Self::add_member`], and for at least one queue (the
+    /// set's members a power of two, as every replacement doubles them), and
+    /// create the first death queue, of `entries` ring entries and
+    /// `first_observers` observer nodes, under `death_badge`. Each further
+    /// queue has `entries` entries and twice the last one's nodes. `None` if
+    /// any of them cannot be funded, created, or added.
     #[must_use]
     pub fn new(
         service_ep: u64,
         service_badge: u64,
+        members: u32,
         death_badge: u64,
         entries: u32,
         first_observers: u32,
     ) -> Option<Self>
     {
+        let reserved = members.checked_add(1)?;
         Self::create(
-            1,
-            FIRST_WAIT_SET_MEMBERS,
+            reserved,
+            FIRST_WAIT_SET_MEMBERS.max(reserved.checked_add(1)?.next_power_of_two()),
             Some((service_ep, service_badge)),
             death_badge,
             Ring::Fixed(entries),
@@ -205,8 +210,9 @@ impl DeathSet
         Some(set)
     }
 
-    /// Add `cap` to the main wait set under `badge`, as one of the members a
-    /// counted set reserves room for; a replacement of the set moves it.
+    /// Add `cap` to the main wait set under `badge`, as one of the members the
+    /// set reserves room for ([`Self::new`]'s `members`, a counted set's
+    /// `reserved`); a replacement of the set moves it.
     ///
     /// # Errors
     /// `InvalidArgument` when every reserved member is in the set; the

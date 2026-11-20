@@ -41,8 +41,10 @@ use syscall_abi::{EVENT_QUEUE_MAX_CAPACITY, SyscallError, WAIT_SET_MAX_MEMBERS};
 
 /// Members of a service's first main wait set: its service endpoint and the
 /// first death queue. Each replacement doubles it. A set that reserves room
-/// for other members (`DeathQueues::with_members`) starts at those and the
-/// first queue instead.
+/// for other members (`DeathQueues::with_members`) starts larger instead: the
+/// `death-set` crate's counted set at those and the first queue, and its set
+/// with a service endpoint (`DeathSet::new`) at the endpoint, those and one
+/// queue, rounded up to a power of two.
 pub const FIRST_WAIT_SET_MEMBERS: u32 = 2;
 
 /// The error a bind or a create returns when no node or no memory is left.

@@ -22,15 +22,18 @@ use crate::cache;
 /// A request held this long or longer, from its receipt to the end of its
 /// dispatch, is logged.
 ///
-/// procmgr's `FILE_CAP_CALL_TIMEOUT_MS` (10 s,
-/// `services/procmgr/src/image.rs`), the tightest bound a client puts on a
-/// call to a filesystem driver: a request held this long has outlasted the
-/// bound of any such call queued behind it, since one thread serves them all.
-/// A request that removes a large file can take seconds, below the bound; one
-/// that reaches it starves procmgr's calls too, and its line names it. A
-/// diagnostic bound that bounds no capacity: it decides only which requests
-/// are logged.
-pub const SLOW_REQUEST: Duration = Duration::from_secs(10);
+/// vfsd's `FS_UNMOUNT_TIMEOUT_MS` (5 s, `services/vfsd/src/main.rs`), the
+/// tightest bound a client puts on a call to a filesystem driver: a request
+/// held this long has outlasted the bound of any such call queued behind it,
+/// since one thread serves them all. The other bounds on such a call, procmgr's
+/// `FILE_CAP_CALL_TIMEOUT_MS` and vfsd's `FALLTHROUGH_TIMEOUT_MS` and
+/// `PROBE_TIMEOUT_MS`, are 10 s. The constants are private to their crates,
+/// so vfsd's names this one as depending on it. A request that removes a large
+/// file can take seconds; one that reaches the bound makes an unmount queued
+/// behind it time out, so vfsd tears the mount down without the driver's
+/// cooperation, and its line names the request. A diagnostic bound that bounds
+/// no capacity: it decides only which requests are logged.
+pub const SLOW_REQUEST: Duration = Duration::from_secs(5);
 
 /// One request's receipt: its opcode, the time, and the block-call totals.
 pub struct HeldRequest

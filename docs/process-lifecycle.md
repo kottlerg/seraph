@@ -602,14 +602,18 @@ Death](supervision.md#core-set-and-system-death)).
 
 ## Out of Scope
 
-Seraph does not implement `fork()`, and the kernel implements no copy-on-write.
-Process creation is always from-scratch via `CREATE_PROCESS` or
-`CREATE_FROM_FILE`. memmgr, as pager, backs pages of several address spaces
-from one immutable memory object, and gives a process its own copy of such a
-page when it first writes it in a private attachment
+Seraph has no `fork()`. A process is always created from an image by `CREATE_PROCESS` or
+`CREATE_FROM_FILE`, with the capabilities its creator gives it and none inherited. The kernel
+implements no copy-on-write. memmgr, as pager, may back pages of several address spaces from
+one immutable memory object and gives a process its own copy of such a page when it first
+writes it; the pages of an image that no relocation touches are shared this way between the
+instances of one binary. An attachment to a memory object conveys bytes, never capabilities.
+Buffer handoff between processes moves or shares Memory capabilities over IPC.
+
+The memory objects, the attachments and the copies are memmgr's
 ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#memory-objects)
-§ Memory objects); an attachment conveys bytes, never capabilities. Zero-copy
-buffer handoff between processes moves or shares Memory capabilities over IPC.
+§ Memory objects), and the image sharing procmgr's
+([services/procmgr/README.md](../services/procmgr/README.md#image-sharing) § Image Sharing).
 
 Userspace fault handling is specified as the pager protocol in [Fault Handling](fault-handling.md).
 An unresolved fault is delivered to the thread's bound handler (for a page fault memmgr, the

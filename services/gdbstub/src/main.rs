@@ -385,7 +385,13 @@ impl Sys
         match write()
         {
             Ok(()) => true,
-            Err(e) if e == syscall_abi::SyscallError::InvalidState as i64 =>
+            // A page others map refuses the write (InvalidState), and a page
+            // the target has not touched is not present (InvalidAddress):
+            // memmgr gives the target a present copy of its own of either
+            // (services/memmgr/docs/ipc-interface.md § Label 30).
+            Err(e)
+                if e == syscall_abi::SyscallError::InvalidState as i64
+                    || e == syscall_abi::SyscallError::InvalidAddress as i64 =>
             {
                 // SAFETY: `self.ipc_buf` is the registered IPC buffer.
                 let private = unsafe {
@@ -1350,8 +1356,21 @@ impl Stub
         {
             return false;
         };
-        if syscall::thread_read_mem(cap, addr, saved).is_err()
-            || !self.sys.text_write(cap, addr, insn)
+        // The saved bytes may lie on text the target has not run, which is
+        // not present until memmgr maps it (§ Label 21 of memmgr's IPC
+        // interface).
+        // SAFETY: `self.sys.ipc_buf` is the registered IPC buffer.
+        let read = unsafe {
+            ipc::read_mem_resident(
+                self.sys.debug,
+                self.sys.target,
+                cap,
+                addr,
+                saved,
+                self.sys.ipc_buf,
+            )
+        };
+        if read.is_err() || !self.sys.text_write(cap, addr, insn)
         {
             return false;
         }

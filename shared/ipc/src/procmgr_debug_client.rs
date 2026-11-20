@@ -174,12 +174,14 @@ pub unsafe fn make_resident(
 /// range of `len` bytes at `va` of the process whose process badge (as
 /// `procmgr_labels::LIST_PROCESSES` lists it) is `process` resident
 /// (`procmgr_labels::MAKE_RESIDENT`): memmgr restores each chunk of the
-/// range it evicted into its compressed store, so a `SYS_THREAD_READ_MEM` or
-/// `SYS_THREAD_WRITE_MEM` that failed with `InvalidAddress` on such a page
+/// range it evicted into its compressed store, and maps each page of an
+/// attachment with no copy of its own to its origin, read-only, so a
+/// `SYS_THREAD_READ_MEM` that failed with `InvalidAddress` on such a page
 /// succeeds when retried (`services/memmgr/docs/memory-pool.md` § Eviction,
 /// Debugger reads), and asks the swap service to restore each chunk of it on
-/// disk. A page no fault has backed stays not present. memmgr does a bounded
-/// part of the range per request and replies where it stopped, so this asks
+/// disk. A page of an ordinary region no fault has backed stays not present.
+/// memmgr does a bounded part of the range per request and replies where it
+/// stopped, so this asks
 /// again from there until the whole range is done ([`next`]); where memmgr
 /// stopped at a chunk on disk, it pauses [`PENDING_PAUSE_MS`] before it asks
 /// again, while `bound` has pauses left, and past them goes on past the

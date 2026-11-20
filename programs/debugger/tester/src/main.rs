@@ -19,6 +19,7 @@
 )]
 
 use std::io::Read;
+use std::os::seraph::process::CommandExt;
 use std::process::{Command, Stdio};
 
 fn fail(msg: &str) -> !
@@ -29,7 +30,11 @@ fn fail(msg: &str) -> !
 
 fn main()
 {
+    // A private image: the fixture writes breakpoints in its own text, which
+    // needs text frames it alone maps (the fixture's README.md § Private
+    // images).
     let mut child = Command::new("/programs/debugger")
+        .private_image(true)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn /programs/debugger");

@@ -736,15 +736,19 @@ itself (§ Label 20: `ATTACH_PROCESS` there). The pieces are:
   `MAX_THREAD_MEM_COPY` bytes: on x86-64 the XSAVE area, on riscv64 the layout the
   `EXT_REGS_RISCV64_*` offsets of `abi/syscall` give
   ([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_THREAD_READ_EXT_REGS` (68)).
-- **Memory.** A debugger reads and writes the memory of the address space a thread executes in
-  with `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`, at most `MAX_THREAD_MEM_COPY` bytes a
-  call, all or nothing, under `CONTROL` on the thread's cap
-  ([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_THREAD_READ_MEM` (60)). Only pages
-  present in the space are reached: the kernel does not fault a page in for the copy, so a
-  demand-paged page the debuggee has not touched is refused until it has. The calls do not need
-  the thread stopped, since they act on the space and not the thread, but the space's other
-  threads keep running and storing; a debugger stops every thread of the space for a coherent
-  view. A debugger thread of the debuggee's own process can also reach the memory directly.
+- **Memory.** A debugger reads and writes the memory of the address space a thread executes in with
+  `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`, at most `MAX_THREAD_MEM_COPY` bytes a call, all
+  or nothing, under `CONTROL` on the thread's cap ([syscalls.md](../core/kernel/docs/syscalls.md) §
+  `SYS_THREAD_READ_MEM` (60)). Only pages present in the space are reached: the kernel does not
+  fault a page in for the copy, so a demand-paged page the debuggee has not touched is refused until
+  it has. A holder of procmgr's debug authority has memmgr make present first what a read fault
+  would map without taking a page (`MAKE_RESIDENT`,
+  [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md) § Label 21): an
+  evicted page, and a page of a memory-object attachment, such as a process's shared text, which
+  maps its object's page. The calls do not need the thread stopped, since they act on the space and
+  not the thread, but the space's other threads keep running and storing; a debugger stops every
+  thread of the space for a coherent view. A debugger thread of the debuggee's own process can also
+  reach the memory directly.
 - **Layout.** A debugger, or a core writer, lists the mapped pages of the address space a thread
   executes in with `SYS_THREAD_LIST_PAGES`, under `CONTROL` on the thread's cap, as runs of pages
   of one protection, at most `MAX_PAGE_RUNS` runs a call, each call returning the address the
@@ -760,12 +764,14 @@ itself (§ Label 20: `ATTACH_PROCESS` there). The pieces are:
   write with `InsufficientRights` when the page was mapped through a capability carrying neither
   Write nor Execute (firmware tables, a page lent read-only, a loaded process's read-only data),
   and with `InvalidState` when the page's frame is mapped more than once, since the frame would
-  then be text or data of another mapping, possibly another process's; procmgr's loader gives each
-  process its own image frames ([services/procmgr/README.md](../services/procmgr/README.md)
-  § Responsibilities), so a process's text takes it. A page of a memory-object attachment that
-  maps its object's frame is refused, since memmgr's own view maps every object frame; the
-  debugger asks procmgr's `MAKE_PRIVATE` to give the page a copy of its own first, and the write
-  then patches the process alone
+  then be text or data of another mapping, possibly another process's. A process created with a
+  private image, or pinned, has image frames of its own, so its text takes it; a demand-paged
+  process's text is otherwise an attachment of its binary's image object, which the binary's other
+  instances share ([services/procmgr/README.md](../services/procmgr/README.md#image-sharing)
+  § Image Sharing). A page of a memory-object attachment that maps its object's frame is refused,
+  since memmgr's own view maps every object frame, and one the process has not touched is not
+  present and refused with `InvalidAddress`; the debugger asks procmgr's `MAKE_PRIVATE` to give
+  the page a copy of its own first, which maps it, and the write then patches the process alone
   ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#memory-objects)
   § Memory objects, Make private). Every write synchronises instruction fetch on every CPU before it
   returns

@@ -208,12 +208,16 @@ stub's endpoint.
   make resident ends a read there, and fails a write.
 - **Breakpoints.** `Z0` plants `int3` (kind 1) on x86-64, `c.ebreak` (kind 2) or `ebreak` (kind 4)
   on riscv64, through the kernel's text route (`THREAD_MEM_TEXT`) with every thread held, and keeps
-  the bytes it replaced; `z0` writes them back. GDB itself sets the pointer back to the
-  breakpoint after an x86-64 stop it is told of, and steps over a breakpoint it resumes from by
-  removing it for the step. A breakpoint another thread hits during an all-stop is held
-  unreported; on x86-64, whose `int3` leaves the pointer past it, the stub sets that thread's
-  pointer back to the breakpoint, so its resume runs the breakpoint again and the hit is reported
-  then.
+  the bytes it replaced, read as **Memory** reads them; `z0` writes them back. Text the target
+  shares with the other instances of its binary ([procmgr](../procmgr/README.md#image-sharing) §
+  Image Sharing) refuses the write, a page the target has run because another mapping holds its
+  frame and one it has not because it is not present; the stub then asks procmgr, through its debug
+  authority, to give the page a copy of the target's own (`MAKE_PRIVATE`), and writes again, so the
+  breakpoint patches the target alone. GDB itself sets the pointer back to the breakpoint after an
+  x86-64 stop it is told of, and steps over a breakpoint it resumes from by removing it for the
+  step. A breakpoint another thread hits during an all-stop is held unreported; on x86-64, whose
+  `int3` leaves the pointer past it, the stub sets that thread's pointer back to the breakpoint, so
+  its resume runs the breakpoint again and the hit is reported then.
 - **Single-step.** `s`, or a `vCont` step action, runs one instruction of one thread, the others
   held: on x86-64 by the trap flag, on riscv64 by a `c.ebreak` planted at the successor the
   instruction's decode gives and removed at the step's stop, with the hazards

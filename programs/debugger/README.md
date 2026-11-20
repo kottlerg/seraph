@@ -13,7 +13,8 @@ The fixture's per-program tester, `debugger-tester`, runs it once, and the `user
 orchestrator discovers and runs that tester. The fixture installs at `/programs/debugger` and the
 tester at `/tests/programs/debugger`, per
 [docs/testing.md § Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
-The fixture handles Seraph capabilities directly; the tester uses idiomatic `std` only.
+The fixture handles Seraph capabilities directly; the tester uses idiomatic `std` apart from the
+one Seraph extension that asks for a private image (§ Private images).
 
 ---
 
@@ -74,9 +75,17 @@ endpoint of the debugger's
    moves the pointer back to it, and resumes the child, which prints the rewritten word and exits.
    The debugger then prints `PASS`.
 
-The text writes, of step 5 and of the riscv64 steps of step 2, succeed only because procmgr's
-loader gives each process its own text frames: the kernel refuses a text write to a frame mapped
-more than once.
+### Private images
+
+The text writes, of step 5 and of the riscv64 steps of step 2, succeed only because the fixture and
+its debuggee process have text frames of their own. procmgr shares a demand-paged process's text and
+read-only data with the other instances of its binary unless its creator asks for a private image
+([services/procmgr/README.md § Image Sharing](../../services/procmgr/README.md#image-sharing)), and
+the kernel refuses a text write to a frame mapped more than once. So the tester creates the fixture,
+and the fixture its debuggee, with `CommandExt::private_image`
+(`procmgr_labels::CREATE_PRIVATE_IMAGE`). The GDB stub's target (`--gdb-target`) keeps the default,
+as a debugger meets most processes: the stub gives a page a copy of its own (`MAKE_PRIVATE`) before
+it writes a breakpoint there.
 
 The tester passes when the fixture prints `PASS` and exits cleanly; a failed step panics the
 fixture, a non-clean exit.

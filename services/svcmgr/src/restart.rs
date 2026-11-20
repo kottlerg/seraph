@@ -405,13 +405,13 @@ fn reply_node_handle(path: &str, label_bits: u64, reply_caps: &[u64]) -> u64
 /// The create label's fields beyond the opcode and `CREATE_ARGV_ENV` for a
 /// recipe: its scheduling fields (`priority` and `sched_max`, `0` for
 /// unspecified, when procmgr applies its defaults against svcmgr's band) and
-/// the create flags its `reserve`, `oom_stop` and `stop_source` keys and
-/// the shutdown actuator's role ask for (`svcmgr_defs::create_flags`).
+/// the create flags its `reserve`, `oom_stop`, `stop_source` and `private_image`
+/// keys and the shutdown actuator's role ask for (`svcmgr_defs::create_flags`).
 /// Shared by the launch and restart paths.
 #[expect(
     clippy::fn_params_excessive_bools,
-    reason = "`reserve`, `oom_stop` and `stop_source` are whether the recipe sets the keys \
-              of those names, and `shutdown_actuator` whether it holds that role"
+    reason = "`reserve`, `oom_stop`, `stop_source` and `private_image` are whether the recipe \
+              sets the keys of those names, and `shutdown_actuator` whether it holds that role"
 )]
 pub(crate) fn create_label_bits(
     priority: u8,
@@ -420,10 +420,17 @@ pub(crate) fn create_label_bits(
     oom_stop: bool,
     stop_source: bool,
     shutdown_actuator: bool,
+    private_image: bool,
 ) -> u64
 {
     procmgr_labels::create_sched_bits(priority, sched_max)
-        | svcmgr_defs::create_flags(reserve, oom_stop, stop_source, shutdown_actuator)
+        | svcmgr_defs::create_flags(
+            reserve,
+            oom_stop,
+            stop_source,
+            shutdown_actuator,
+            private_image,
+        )
 }
 
 /// Send `START_PROCESS` via the badged process handle. Shared by the
@@ -1110,6 +1117,7 @@ fn create_process(
             r.oom_stop,
             r.stop_source.is_some(),
             r.shutdown_actuator,
+            r.private_image,
         )
     });
     let created = create_from_file(

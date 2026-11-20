@@ -72,6 +72,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
 | `oom_stop` | no | `yes` or `no` (default `no`). Opts the service in to being stopped by a stop-authority holder. Refused, as a parser error, on a recipe the eligibility rule refuses. See [`oom_stop`](#oom_stop). |
 | `reserve` | no | `yes` or `no` (default `no`). Creates the service inside memmgr's system reserve. A core role: the eligibility rule never stops it. See [`reserve`](#reserve). |
+| `private_image` | no | `yes` or `no` (default `no`). Loads the service's image private, so its text and read-only data are not shared with the binary's other instances. Not a core role. See [`private_image`](#private_image). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
 | `sched_max` | no | Band ceiling (`1..=30`): the service's `SchedControl` covers `[1, sched_max]`. Must be ≥ `priority` when both are set. Unset: the service inherits a copy of svcmgr's own band. |
 
@@ -593,6 +594,15 @@ receives the lines each of the three writes with a synchronous call
 restores them ([services/swapd/README.md](../../swapd/README.md)). With logd in the reserve, every
 `critical = yes` service is a reserve node.
 
+## `private_image`
+
+`yes` loads the service's image private: svcmgr sets procmgr's `CREATE_PRIVATE_IMAGE` on each
+create ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 1
+(**Private image**)). Without the key a demand-paged service attaches its text and read-only data
+shared with the binary's other instances, and a process that maps that text can observe by cache
+timing which of its code runs. A service that holds keys sets it. The key is not a core role: it
+does not affect whether a stop-authority holder may stop the service.
+
 ## Device class files
 
 devmgr's device classes are configured from class files, not from source. svcmgr reads every
@@ -640,8 +650,8 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop` and `reserve` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
-| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop` and `stop_source` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and `private_image` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`, `CREATE_PRIVATE_IMAGE`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 svcmgr launches the **launching** entries in launch order, which

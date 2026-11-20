@@ -85,7 +85,7 @@ use firmware::dma::{
 };
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::iommu_restart::{
-    self, Domain, Domains, Holds, Refusal, RemapEntry, RemapTable, Remaps,
+    self, Domain, Domains, Holds, Refusal, RemapEntry, RemapTable, Remaps, Replay,
 };
 use firmware::rimt;
 use ipc::{IpcMessage, iommu_errors, iommu_labels, memmgr_errors, memmgr_labels};
@@ -2617,18 +2617,18 @@ impl Iommu
         for device in &plan
         {
             let domain = self.client.domains().get(device.handle);
-            let rebuilt = domain.map_or(
-                Err(ReplayFailed::Device(iommu_errors::INVALID_REQUEST)),
-                |domain| replay_device(ep, domain, device),
-            );
-            match rebuilt
+            let replay = iommu_restart::replay_device(domain, &mut ReplayOn { ep, device });
+            // An absent domain is forgotten: a withdrawal finds its function
+            // blocked (`IommuClient::block_withdrawn`).
+            self.client.domains().settle(device.handle, replay);
+            match replay
             {
-                Ok(mappings) =>
+                Replay::Rebuilt(mappings) =>
                 {
                     replayed.domains = replayed.domains.saturating_add(1);
                     replayed.mappings = replayed.mappings.saturating_add(mappings);
                 }
-                Err(ReplayFailed::Unblocked) =>
+                Replay::Unblocked =>
                 {
                     std::os::seraph::log!(
                         warn: "IOMMU restart: device {}'s domain neither rebuilt nor blocked",
@@ -2636,11 +2636,8 @@ impl Iommu
                     );
                     return Err(());
                 }
-                Err(ReplayFailed::Device(code)) =>
+                Replay::Absent(code) =>
                 {
-                    // Absent from the instance's tables: a withdrawal finds the
-                    // function blocked (`IommuClient::block_withdrawn`).
-                    self.client.domains().forget(device.handle);
                     std::os::seraph::log!(
                         warn: "IOMMU restart: device {}'s domain not rebuilt ({})",
                         device.badge,
@@ -2688,76 +2685,48 @@ impl Iommu
     }
 }
 
-/// Why a device's replay failed.
-enum ReplayFailed
+/// A restarted instance's side of one device's replay
+/// ([`iommu_restart::replay_device`]): calls on its endpoint `ep` for the
+/// device `device`.
+struct ReplayOn<'a>
 {
-    /// A refusal, with its error label: the device's domain is absent from
-    /// the instance's staged tables, so the units block the device from the
-    /// commit on.
-    Device(u64),
-    /// A refusal after the `ATTACH`, whose `BLOCK` the instance refused too:
-    /// the staged tables hold the device's domain with only part of its
-    /// mappings.
-    Unblocked,
+    ep: u64,
+    device: &'a DeviceReplay,
 }
 
-/// Rebuild `device`'s domain, `domain`, in the instance whose endpoint is
-/// `ep`; the mappings installed. A refusal after the `ATTACH` blocks the
-/// domain again, so the device is absent from the staged tables whichever
-/// step was refused.
-///
-/// # Errors
-/// [`ReplayFailed`].
-fn replay_device(ep: u64, domain: Domain, device: &DeviceReplay) -> Result<usize, ReplayFailed>
+impl iommu_restart::ReplayCalls for ReplayOn<'_>
 {
-    let reply = call_on(
-        ep,
-        &attach_msg(domain.unit, domain.rid, domain.handle, domain.did),
-    )
-    .map_err(ReplayFailed::Device)?;
-    if reply.word(0) != domain.handle || reply.word(1) != domain.did
+    fn attach(&mut self, domain: &Domain) -> Result<(u64, u64), u64>
     {
-        // The reply names another domain, which the instance attached: block
-        // it, as for a refusal after the attach.
-        let handle = reply.word(0);
-        return Err(block_on(ep, handle, iommu_errors::INVALID_REQUEST));
+        let reply = call_on(
+            self.ep,
+            &attach_msg(domain.unit, domain.rid, domain.handle, domain.did),
+        )?;
+        Ok((reply.word(0), reply.word(1)))
     }
-    fill_domain(ep, domain, device).map_err(|code| block_on(ep, domain.handle, code))
-}
 
-/// Block the domain `handle` the instance whose endpoint is `ep` attached,
-/// after the replay of its device was refused with `code`.
-fn block_on(ep: u64, handle: u64, code: u64) -> ReplayFailed
-{
-    let msg = request(iommu_labels::BLOCK).word(1, handle).build();
-    match call_on(ep, &msg)
+    fn fill(&mut self, domain: &Domain) -> Result<usize, u64>
     {
-        Ok(_) => ReplayFailed::Device(code),
-        Err(_) => ReplayFailed::Unblocked,
+        for r in &self.device.reserved
+        {
+            send(self.ep, &map_reserved_msg(domain.handle, r.base, r.len))?;
+        }
+        for file in &self.device.files
+        {
+            send(self.ep, &map_msi_msg(domain.handle, file.base))?;
+        }
+        for m in &self.device.mappings
+        {
+            IommuClient::map_on(self.ep, domain.handle, m.device_addr, m.access, m.cap)?;
+        }
+        Ok(self.device.mappings.len())
     }
-}
 
-/// Install `device`'s reserved ranges, interrupt files and mappings in its
-/// domain `domain`, attached in the instance whose endpoint is `ep`; the
-/// mappings installed.
-///
-/// # Errors
-/// The first refusal's error label.
-fn fill_domain(ep: u64, domain: Domain, device: &DeviceReplay) -> Result<usize, u64>
-{
-    for r in &device.reserved
+    fn block(&mut self, handle: u64) -> bool
     {
-        send(ep, &map_reserved_msg(domain.handle, r.base, r.len))?;
+        let msg = request(iommu_labels::BLOCK).word(1, handle).build();
+        call_on(self.ep, &msg).is_ok()
     }
-    for file in &device.files
-    {
-        send(ep, &map_msi_msg(domain.handle, file.base))?;
-    }
-    for m in &device.mappings
-    {
-        IommuClient::map_on(ep, domain.handle, m.device_addr, m.access, m.cap)?;
-    }
-    Ok(device.mappings.len())
 }
 
 /// Start devmgr's fault-log thread: every [`FAULT_LOG_MS`] it takes the

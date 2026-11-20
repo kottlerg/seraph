@@ -17,7 +17,10 @@
 //! between the first entry the commit swaps and the invalidation that ends
 //! it. A dead instance's DMA hold is released only once a new instance has
 //! committed its tables ([`Holds`]): until then the units may walk the dead
-//! instance's pages.
+//! instance's pages. How one device's replay ends ([`replay_device`]): its
+//! domain rebuilt, absent from the new tables, or attached and not blocked
+//! again, which ends the attempt, is decided here over the calls devmgr's
+//! control thread makes on the new instance ([`ReplayCalls`]).
 
 extern crate alloc;
 
@@ -139,6 +142,18 @@ impl Domains
         Ok(())
     }
 
+    /// Settle the ledger after the replay of the device whose domain is
+    /// `handle` ended in `replay`: a domain absent from the restarted
+    /// instance's tables is forgotten, so a withdrawal finds its function
+    /// blocked and a later restart does not replay it.
+    pub fn settle(&mut self, handle: u64, replay: Replay)
+    {
+        if matches!(replay, Replay::Absent(_))
+        {
+            self.forget(handle);
+        }
+    }
+
     /// Forget the domain `handle`, blocked or never attached.
     pub fn forget(&mut self, handle: u64)
     {
@@ -150,6 +165,89 @@ impl Domains
     pub fn get(&self, handle: u64) -> Option<Domain>
     {
         self.domains.iter().find(|d| d.handle == handle).copied()
+    }
+}
+
+/// The calls a device's replay makes on a restarted instance of the IOMMU
+/// driver; devmgr's control thread implements them over the instance's
+/// endpoint.
+pub trait ReplayCalls
+{
+    /// `ATTACH` the function of `domain` on its unit, naming its handle and
+    /// domain ID; the handle and domain ID the instance replied.
+    ///
+    /// # Errors
+    /// The instance's error label.
+    fn attach(&mut self, domain: &Domain) -> Result<(u64, u64), u64>;
+
+    /// Install the device's reserved ranges, interrupt files and mappings in
+    /// the attached domain `domain` (`MAP_RESERVED`, `MAP_MSI`, `MAP`); the
+    /// mappings installed.
+    ///
+    /// # Errors
+    /// The first refusal's error label.
+    fn fill(&mut self, domain: &Domain) -> Result<usize, u64>;
+
+    /// `BLOCK` the domain `handle`; whether the instance accepted it.
+    fn block(&mut self, handle: u64) -> bool;
+}
+
+/// What the replay of one confined device into a restarted instance left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replay
+{
+    /// Its domain is rebuilt, with this many mappings.
+    Rebuilt(usize),
+    /// It was refused, with this error label, and its domain is absent from
+    /// the instance's staged tables: either the `ATTACH` was refused or the
+    /// domain was blocked again, so the units block the device from the
+    /// commit on. devmgr forgets the domain ([`Domains::settle`]) and
+    /// withdraws the device's driver.
+    Absent(u64),
+    /// A step after the `ATTACH` was refused and so was the `BLOCK` that
+    /// would undo it: the staged tables hold the domain with part of its
+    /// mappings, so the attempt must not commit.
+    Unblocked,
+}
+
+/// Replay one confined device, whose recorded domain is `domain` (`None`
+/// when devmgr holds no record of it), through `calls`: `ATTACH` it under
+/// its recorded handle and domain ID, then install what it may reach. A
+/// refusal after the `ATTACH`, or a reply naming another handle or domain
+/// ID, blocks the domain the instance attached, so the device is absent from
+/// the staged tables whichever step was refused.
+pub fn replay_device(domain: Option<Domain>, calls: &mut impl ReplayCalls) -> Replay
+{
+    use ipc::iommu_errors::INVALID_REQUEST;
+    let Some(domain) = domain
+    else
+    {
+        return Replay::Absent(INVALID_REQUEST);
+    };
+    let (handle, did) = match calls.attach(&domain)
+    {
+        Ok(reply) => reply,
+        Err(code) => return Replay::Absent(code),
+    };
+    let refused = if handle == domain.handle && did == domain.did
+    {
+        match calls.fill(&domain)
+        {
+            Ok(mappings) => return Replay::Rebuilt(mappings),
+            Err(code) => code,
+        }
+    }
+    else
+    {
+        INVALID_REQUEST
+    };
+    if calls.block(handle)
+    {
+        Replay::Absent(refused)
+    }
+    else
+    {
+        Replay::Unblocked
     }
 }
 
@@ -318,6 +416,147 @@ impl<T> Holds<T>
 mod tests
 {
     use super::*;
+
+    /// A fake restarted instance: the replies it gives and the calls it saw.
+    struct Fake
+    {
+        attach: Result<(u64, u64), u64>,
+        fill: Result<usize, u64>,
+        block: bool,
+        filled: bool,
+        blocked: Vec<u64>,
+    }
+
+    impl Fake
+    {
+        fn serving(domain: Domain) -> Self
+        {
+            Self {
+                attach: Ok((domain.handle, domain.did)),
+                fill: Ok(3),
+                block: true,
+                filled: false,
+                blocked: Vec::new(),
+            }
+        }
+    }
+
+    impl ReplayCalls for Fake
+    {
+        fn attach(&mut self, _domain: &Domain) -> Result<(u64, u64), u64>
+        {
+            self.attach
+        }
+
+        fn fill(&mut self, _domain: &Domain) -> Result<usize, u64>
+        {
+            self.filled = true;
+            self.fill
+        }
+
+        fn block(&mut self, handle: u64) -> bool
+        {
+            self.blocked.push(handle);
+            self.block
+        }
+    }
+
+    const REPLAYED: Domain = Domain {
+        handle: 7,
+        unit: 0,
+        rid: 0x18,
+        did: 3,
+    };
+    const OUT_OF_RESOURCES: u64 = ipc::iommu_errors::OUT_OF_RESOURCES;
+
+    fn ledger() -> Domains
+    {
+        let mut domains = Domains::new();
+        domains.record(REPLAYED).unwrap();
+        domains
+    }
+
+    #[test]
+    fn a_replayed_device_is_rebuilt_and_kept_in_the_ledger()
+    {
+        let mut fake = Fake::serving(REPLAYED);
+        let replay = replay_device(Some(REPLAYED), &mut fake);
+        assert_eq!(replay, Replay::Rebuilt(3));
+        assert_eq!(fake.blocked, []);
+        let mut domains = ledger();
+        domains.settle(REPLAYED.handle, replay);
+        assert_eq!(domains.get(REPLAYED.handle), Some(REPLAYED));
+    }
+
+    #[test]
+    fn a_refused_attach_leaves_the_device_absent_and_forgotten()
+    {
+        let mut fake = Fake::serving(REPLAYED);
+        fake.attach = Err(OUT_OF_RESOURCES);
+        let replay = replay_device(Some(REPLAYED), &mut fake);
+        assert_eq!(replay, Replay::Absent(OUT_OF_RESOURCES));
+        assert!(
+            !fake.filled,
+            "nothing is installed in a domain not attached"
+        );
+        assert_eq!(fake.blocked, [], "a domain not attached needs no block");
+        let mut domains = ledger();
+        domains.settle(REPLAYED.handle, replay);
+        assert_eq!(domains.get(REPLAYED.handle), None);
+    }
+
+    #[test]
+    fn a_refusal_after_the_attach_blocks_the_domain_before_the_commit()
+    {
+        let mut fake = Fake::serving(REPLAYED);
+        fake.fill = Err(OUT_OF_RESOURCES);
+        let replay = replay_device(Some(REPLAYED), &mut fake);
+        assert_eq!(replay, Replay::Absent(OUT_OF_RESOURCES));
+        assert_eq!(fake.blocked, [REPLAYED.handle]);
+        let mut domains = ledger();
+        domains.settle(REPLAYED.handle, replay);
+        assert_eq!(domains.get(REPLAYED.handle), None);
+    }
+
+    #[test]
+    fn an_attach_naming_another_domain_is_blocked_again()
+    {
+        let mut fake = Fake::serving(REPLAYED);
+        fake.attach = Ok((REPLAYED.handle + 1, REPLAYED.did));
+        let replay = replay_device(Some(REPLAYED), &mut fake);
+        assert_eq!(replay, Replay::Absent(ipc::iommu_errors::INVALID_REQUEST));
+        assert!(
+            !fake.filled,
+            "nothing is installed in a domain the replay did not ask for"
+        );
+        assert_eq!(fake.blocked, [REPLAYED.handle + 1]);
+    }
+
+    #[test]
+    fn a_refused_block_after_a_refusal_ends_the_attempt_and_keeps_the_ledger()
+    {
+        let mut fake = Fake::serving(REPLAYED);
+        fake.fill = Err(OUT_OF_RESOURCES);
+        fake.block = false;
+        let replay = replay_device(Some(REPLAYED), &mut fake);
+        assert_eq!(replay, Replay::Unblocked);
+        let mut domains = ledger();
+        domains.settle(REPLAYED.handle, replay);
+        assert_eq!(domains.get(REPLAYED.handle), Some(REPLAYED));
+    }
+
+    #[test]
+    fn a_device_with_no_recorded_domain_makes_no_call()
+    {
+        let mut fake = Fake::serving(REPLAYED);
+        fake.attach = Err(OUT_OF_RESOURCES);
+        assert_eq!(
+            replay_device(None, &mut fake),
+            Replay::Absent(ipc::iommu_errors::INVALID_REQUEST)
+        );
+        assert!(!fake.filled);
+        assert_eq!(fake.blocked, []);
+    }
 
     #[test]
     fn only_a_fault_or_a_kill_is_followed_by_a_restart()

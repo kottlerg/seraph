@@ -348,7 +348,7 @@ A PR's head MUST contain `master` when it merges, unless all of these hold at th
   master`, so a rename names both its paths) names no file that the PR's own change from it
   names;
 - GitHub reports the PR mergeable without conflict;
-- `master`'s CI is green (§ CI Gating).
+- the CI run of `master`'s tip has finished green (§ CI Gating).
 
 The PR's green CI at its head and its run record for the head are owed as for any merge. When
 `master`'s change names a file the PR changes, comment-only or not, the PR syncs before it
@@ -575,9 +575,10 @@ among them the merge of a PR that was not built with the commits
 `master` gained after its merge base (§ Syncing with `master`); the
 composition check (§ Composition check) is the other backstop. A red
 `master` is a composition defect, and it is fixed before anything else
-merges: while `master`'s latest concluded CI run is red, a PR merges only
-at a head that contains `master`, whose own green CI shows the red fixed,
-and `cargo xtask pr-check <N> --gate` refuses any other. A release is cut
+merges: while the CI run of `master`'s tip is red, or has not finished, a
+PR merges only at a head that contains `master`, whose own green CI shows
+the combination green, and `cargo xtask pr-check <N> --gate` refuses any
+other. A release is cut
 only from a green `master` (§ Release Production).
 
 ## Release Production

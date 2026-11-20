@@ -322,9 +322,12 @@ Orchestrated:
   diff touches a file your PR touches and is not comment-only (docs/testing.md § Coverage
   tiers), or the merge has a conflict. Otherwise the validated head stands, and the body says
   that the incoming diff touches none of the PR's files, or that it is comment-only. A PR whose
-  files `master` has not changed since its merge base needs no sync to merge
-  (docs/conventions.md § Syncing with `master`); the gate needs the head to include `master`
-  only when `master` changed one of them.
+  files `master` has not changed since its merge base merges without a sync when the other
+  conditions of docs/conventions.md § Syncing with `master` hold too: one merge base, GitHub's
+  `MERGEABLE`, and a green CI run at `master`'s tip. The gate names the condition that fails.
+  A gate refused for several merge bases or a conflict needs a sync, so report it to the
+  orchestrator, which says `master quiet`. A run at `master`'s tip that has not finished
+  needs only a wait.
 
 Standalone, there is no grant: the commands' launch rules are the whole protocol, and you sync
 yourself before the validation runs.
@@ -383,8 +386,8 @@ use them.
 ## Gate
 
 You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the head includes
-`master` or `master`'s change since the merge base touches none of the PR's files (and
-`master`'s CI is green), and a run record for the head has `AUDIT PASS`, no failed agent,
+`master` or meets the conditions to merge without it (docs/conventions.md § Syncing with
+`master`), and a run record for the head has `AUDIT PASS`, no failed agent,
 and a verdict of `READY TO MERGE` (docs/conventions.md § Pre-merge review). Hand back the gate
 report with the merge command `gh pr merge <N> --merge --delete-branch`. The merge is the
 orchestrator's, on a gate it has verified; standalone, it is made on the maintainer's

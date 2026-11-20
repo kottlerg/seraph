@@ -365,9 +365,11 @@ vCPUs and any timing-sensitive measurement take the exclusive grant:
 - Grant a speculative set (a run at a head that a sync still owed will change) only when the
   host is otherwise idle.
 - `master quiet` tells a worker to sync now, right before its validation runs, so one run
-  covers the sync. Say it only to a worker whose files `master` has changed since its merge
-  base, since any other merges without a sync, and only when no merge that changes its files
-  will land before its gate; otherwise hold the worker and let the pending merge land first.
+  covers the sync. Say it to a worker whose files `master` has changed since its merge base,
+  or whose gate refuses a merge without a sync for several merge bases or a conflict
+  (docs/conventions.md § Syncing with `master`); any other merges without one. Say it only
+  when no merge that changes its files will land before its gate; otherwise hold the worker
+  and let the pending merge land first.
 - You MAY run a boundary set, or direct a worker to, for a PR that does not owe one, when you
   judge that the change warrants it (docs/testing.md § Coverage tiers, Boundary surface).
   Nothing schedules such a run; the release host runs are the backstop. The PR body reports it
@@ -401,10 +403,11 @@ Then merge with `gh pr merge <N> --merge --delete-branch`, and tell the maintain
 (§ Reporting to the maintainer). Fast-forward your own checkout, record the merge and its
 cost, prune the state (§ Plan, steps 6 and 7), and tell each open PR's worker whose files the
 merge touched what moved and which of its files. That message is information: `master quiet`
-is the only instruction to sync. Watch `master`'s CI run on the merge: a red `master` is a
-composition defect, fixed before anything else merges (docs/conventions.md § CI Gating), so
-put its fix first and merge nothing else until it lands; the gate refuses a PR that does not
-contain `master` meanwhile.
+is the only instruction to sync. You hold no CI watch (§ Liveness), so read the CI run of
+`master`'s tip before each merge (`gh run list --workflow build-test.yml --branch master
+--event push --limit 1`). A red `master` is a composition defect, fixed before anything else
+merges (docs/conventions.md § CI Gating): put its fix first, and until it lands merge only a PR
+whose head contains `master`, as the gate requires.
 
 After each merge that shares a file with another merge since the previous release tag, send the
 merged PR's worker `composition check <merge>` (docs/conventions.md § Composition check;

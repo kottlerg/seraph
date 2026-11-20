@@ -1837,55 +1837,75 @@ fn master_case(root: &Path, base: &str, head: &str) -> Result<MasterCase>
     })
 }
 
-/// The base branch's CI state: that of its latest concluded run of
-/// `BASE_WORKFLOW` on a push, a cancelled or skipped run aside.
+/// The base branch's CI state at its tip: that of the `BASE_WORKFLOW` run on
+/// the push of the tip commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BaseCi
 {
-    /// The run at this commit succeeded.
-    Green(String),
-    /// The run at this commit concluded otherwise.
-    Red(String, String),
-    /// No concluded run was found, or the runs could not be read: why.
+    /// The tip's run succeeded.
+    Green,
+    /// The tip's run has not finished.
+    Pending,
+    /// The tip's run concluded otherwise: its conclusion.
+    Red(String),
+    /// The tip has no run, or its runs could not be read: why.
     Unknown(String),
 }
 
-/// The CI state of the runs `gh run list --json headSha,status,conclusion`
-/// returns, newest first.
+/// The CI state of the tip from the runs `gh run list --commit <tip> --json
+/// status,conclusion` returns for it, newest first: the newest decides, so a
+/// re-run that succeeded turns a red tip green.
 pub fn base_ci(runs: &Value) -> BaseCi
 {
-    let concluded = runs
-        .as_array()
-        .map_or(&[][..], Vec::as_slice)
-        .iter()
-        .find(|run| {
-            run["status"].as_str() == Some("completed")
-                && !matches!(
-                    run["conclusion"].as_str().unwrap_or(""),
-                    "" | "cancelled" | "skipped"
-                )
-        });
-    match concluded
+    let Some(run) = runs.as_array().and_then(|runs| runs.first())
+    else
     {
-        None => BaseCi::Unknown("no concluded run on a push".to_owned()),
-        Some(run) =>
+        return BaseCi::Unknown("the tip has no run on a push".to_owned());
+    };
+    if run["status"].as_str() != Some("completed")
+    {
+        return BaseCi::Pending;
+    }
+    match run["conclusion"].as_str().unwrap_or("")
+    {
+        "success" => BaseCi::Green,
+        conclusion @ ("cancelled" | "skipped" | "") =>
         {
-            let sha = short(run["headSha"].as_str().unwrap_or("?")).to_owned();
-            match run["conclusion"].as_str().unwrap_or("")
-            {
-                "success" => BaseCi::Green(sha),
-                other => BaseCi::Red(sha, other.to_owned()),
-            }
+            BaseCi::Unknown(format!("the tip's run concluded {conclusion:?}; re-run it"))
         }
+        other => BaseCi::Red(other.to_owned()),
+    }
+}
+
+/// The finding when the clone's base ref is not the base branch's tip on
+/// GitHub (`remote`): every check against the base reads that ref.
+pub fn check_base_fresh(base: &str, local: &str, remote: &str) -> Vec<Diag>
+{
+    if local == remote
+    {
+        Vec::new()
+    }
+    else
+    {
+        vec![Diag::error(
+            "gate-base-fresh",
+            base.to_owned(),
+            format!(
+                "{base} is {} in this clone but {} on GitHub; run `git fetch origin`",
+                short(local),
+                short(remote)
+            ),
+        )]
     }
 }
 
 /// The `gate-includes-master` and `gate-base-green` findings. A head that
 /// contains the base branch's tip passes. One that does not passes only when
 /// the base branch's change since the merge base is disjoint from the PR's
-/// files, GitHub reports the PR `MERGEABLE`, and the base branch's CI is
-/// green (`ci`, read for that case alone): while it is red, only a head that
-/// contains the tip merges, whose own green CI shows the red fixed.
+/// files, GitHub reports the PR `MERGEABLE`, and the tip's own CI run has
+/// succeeded (`ci`, read for that case alone): while it is pending or red,
+/// only a head that contains the tip merges, whose own green CI shows the
+/// combination green.
 pub fn check_master(
     case: &MasterCase,
     mergeable: &str,
@@ -1930,47 +1950,53 @@ pub fn check_master(
         MasterCase::Disjoint { .. } =>
         {
             let mut out = Vec::new();
-            if mergeable != "MERGEABLE"
+            match mergeable
             {
-                out.push(Diag::error(
+                "MERGEABLE" =>
+                {}
+                "UNKNOWN" => out.push(Diag::error(
+                    "gate-includes-master",
+                    at,
+                    "GitHub has not computed whether the PR merges without conflict yet; run \
+                     the gate again",
+                )),
+                other => out.push(Diag::error(
                     "gate-includes-master",
                     at,
                     format!(
                         "{base} is not an ancestor of the PR head, and GitHub reports the PR \
-                         {mergeable}, not MERGEABLE; sync the branch"
+                         {other}, not MERGEABLE; sync the branch"
                     ),
-                ));
+                )),
             }
-            match ci
+            let why = match ci
             {
-                Some(BaseCi::Green(_)) =>
-                {}
-                Some(BaseCi::Red(sha, conclusion)) => out.push(Diag::error(
-                    "gate-base-green",
-                    format!("{base} {sha}"),
-                    format!(
-                        "{base}'s CI concluded {conclusion}: while it is red only a head that \
-                         contains {base} merges; sync the branch, or fix {base} first"
-                    ),
+                Some(BaseCi::Green) => None,
+                Some(BaseCi::Pending) => Some(format!(
+                    "the CI run of {base}'s tip has not finished; wait for it, or sync the branch"
                 )),
-                Some(BaseCi::Unknown(why)) => out.push(Diag::error(
-                    "gate-base-green",
-                    base.to_owned(),
-                    format!("{base}'s CI state could not be read ({why}); sync the branch"),
+                Some(BaseCi::Red(conclusion)) => Some(format!(
+                    "the CI run of {base}'s tip concluded {conclusion}: a red {base} is fixed \
+                     before anything else merges, and meanwhile only a head that contains it \
+                     merges"
                 )),
-                None => out.push(Diag::error(
-                    "gate-base-green",
-                    base.to_owned(),
-                    format!("{base}'s CI state was not read"),
+                Some(BaseCi::Unknown(why)) => Some(format!(
+                    "{base}'s CI state could not be read ({why}); sync the branch, or read it \
+                     again"
                 )),
+                None => Some(format!("{base}'s CI state was not read")),
+            };
+            if let Some(why) = why
+            {
+                out.push(Diag::error("gate-base-green", base.to_owned(), why));
             }
             out
         }
     }
 }
 
-/// Read the base branch's CI state with `gh run list`.
-fn read_base_ci(root: &Path, branch: &str) -> BaseCi
+/// Read the CI state of the base branch's tip `tip` with `gh run list`.
+fn read_base_ci(root: &Path, branch: &str, tip: &str) -> BaseCi
 {
     match gh::json(
         root,
@@ -1981,12 +2007,12 @@ fn read_base_ci(root: &Path, branch: &str) -> BaseCi
             BASE_WORKFLOW,
             "--branch",
             branch,
+            "--commit",
+            tip,
             "--event",
             "push",
-            "--limit",
-            "20",
             "--json",
-            "headSha,status,conclusion",
+            "status,conclusion",
         ],
     )
     {
@@ -2018,13 +2044,37 @@ fn gate(
             format!("the files the PR adds could not be read: {err:#}"),
         )),
     }
+    let branch = base.strip_prefix("origin/").unwrap_or(base);
+    let tip = git(&ctx.root, &["rev-parse", base]).map(|t| t.trim().to_owned());
+    let remote = gh::run(
+        &ctx.root,
+        &[
+            "api",
+            &format!("repos/{{owner}}/{{repo}}/git/ref/heads/{branch}"),
+            "--jq",
+            ".object.sha",
+        ],
+    )
+    .map(|t| t.trim().to_owned());
+    match (&tip, &remote)
+    {
+        (Ok(tip), Ok(remote)) => out.extend(check_base_fresh(base, tip, remote)),
+        (Err(err), _) | (_, Err(err)) => out.push(Diag::error(
+            "gate-base-fresh",
+            base.to_owned(),
+            format!("the tip of {base} could not be compared with GitHub's: {err:#}"),
+        )),
+    }
     match master_case(&ctx.root, base, head)
     {
         Ok(case) =>
         {
             println!("    master: {}", case.describe(base));
-            let ci = matches!(case, MasterCase::Disjoint { .. })
-                .then(|| read_base_ci(&ctx.root, base.strip_prefix("origin/").unwrap_or(base)));
+            let ci = matches!(case, MasterCase::Disjoint { .. }).then(|| match &tip
+            {
+                Ok(tip) => read_base_ci(&ctx.root, branch, tip),
+                Err(err) => BaseCi::Unknown(format!("{err:#}")),
+            });
             let mergeable = pr["mergeable"].as_str().unwrap_or("UNKNOWN");
             out.extend(check_master(&case, mergeable, ci.as_ref(), base, head));
         }
@@ -3495,35 +3545,38 @@ mod tests
             behind: 1,
             files: 1,
         };
-        let green = BaseCi::Green("abc1234".to_owned());
-        let red = BaseCi::Red("abc1234".to_owned(), "failure".to_owned());
-        let unknown = BaseCi::Unknown("no run".to_owned());
         let check = |case: &MasterCase, mergeable: &str, ci: Option<&BaseCi>| {
             check_master(case, mergeable, ci, "origin/master", "0123456789")
         };
+        let green = Some(&BaseCi::Green);
         assert_eq!(
             check(&MasterCase::Contained, "UNKNOWN", None),
             [] as [Diag; 0]
         );
-        assert_eq!(check(&disjoint, "MERGEABLE", Some(&green)), [] as [Diag; 0]);
-        assert_eq!(
-            rules(&check(&disjoint, "CONFLICTING", Some(&green))),
-            ["gate-includes-master"]
-        );
-        assert_eq!(
-            rules(&check(&disjoint, "MERGEABLE", Some(&red))),
-            ["gate-base-green"]
-        );
-        assert_eq!(
-            rules(&check(&disjoint, "MERGEABLE", Some(&unknown))),
-            ["gate-base-green"]
-        );
+        assert_eq!(check(&disjoint, "MERGEABLE", green), [] as [Diag; 0]);
+        for mergeable in ["CONFLICTING", "UNKNOWN"]
+        {
+            let found = check(&disjoint, mergeable, green);
+            assert_eq!(rules(&found), ["gate-includes-master"]);
+            assert_eq!(found[0].message.contains("again"), mergeable == "UNKNOWN");
+        }
+        for ci in [
+            BaseCi::Pending,
+            BaseCi::Red("failure".to_owned()),
+            BaseCi::Unknown("no run".to_owned()),
+        ]
+        {
+            assert_eq!(
+                rules(&check(&disjoint, "MERGEABLE", Some(&ci))),
+                ["gate-base-green"]
+            );
+        }
         assert_eq!(
             rules(&check(&disjoint, "MERGEABLE", None)),
             ["gate-base-green"]
         );
         let overlap = MasterCase::Overlap((0..7).map(|i| format!("f{i}.rs")).collect());
-        let found = check(&overlap, "MERGEABLE", Some(&green));
+        let found = check(&overlap, "MERGEABLE", green);
         assert_eq!(rules(&found), ["gate-includes-master"]);
         assert!(
             found[0].message.contains("f4.rs, ..."),
@@ -3532,35 +3585,49 @@ mod tests
         );
         assert!(!found[0].message.contains("f5.rs"), "{}", found[0].message);
         assert_eq!(
-            rules(&check(
-                &MasterCase::MergeBases(2),
-                "MERGEABLE",
-                Some(&green)
-            )),
+            rules(&check(&MasterCase::MergeBases(2), "MERGEABLE", green)),
             ["gate-includes-master"]
         );
     }
 
     #[test]
-    fn the_base_ci_is_its_latest_concluded_run()
+    fn the_base_ci_is_the_newest_run_of_the_tip()
     {
-        let runs: Value = json::parse(
-            r#"[{"headSha":"cccccccccc","status":"in_progress","conclusion":""},
-                {"headSha":"bbbbbbbbbb","status":"completed","conclusion":"cancelled"},
-                {"headSha":"aaaaaaaaaa","status":"completed","conclusion":"failure"},
-                {"headSha":"9999999999","status":"completed","conclusion":"success"}]"#,
-        )
-        .unwrap();
+        let parse = |text: &str| -> Value { json::parse(text).unwrap() };
         assert_eq!(
-            base_ci(&runs),
-            BaseCi::Red("aaaaaaaa".to_owned(), "failure".to_owned())
+            base_ci(&parse(
+                r#"[{"status":"completed","conclusion":"success"},
+                    {"status":"completed","conclusion":"failure"}]"#
+            )),
+            BaseCi::Green
         );
-        let green: Value = json::parse(
-            r#"[{"headSha":"9999999999","status":"completed","conclusion":"success"}]"#,
-        )
-        .unwrap();
-        assert_eq!(base_ci(&green), BaseCi::Green("99999999".to_owned()));
-        let none: Value = json::parse("[]").unwrap();
-        assert!(matches!(base_ci(&none), BaseCi::Unknown(_)));
+        assert_eq!(
+            base_ci(&parse(r#"[{"status":"completed","conclusion":"failure"}]"#)),
+            BaseCi::Red("failure".to_owned())
+        );
+        assert_eq!(
+            base_ci(&parse(r#"[{"status":"in_progress","conclusion":""}]"#)),
+            BaseCi::Pending
+        );
+        assert!(matches!(
+            base_ci(&parse(
+                r#"[{"status":"completed","conclusion":"cancelled"}]"#
+            )),
+            BaseCi::Unknown(_)
+        ));
+        assert!(matches!(base_ci(&parse("[]")), BaseCi::Unknown(_)));
+    }
+
+    #[test]
+    fn a_stale_base_ref_is_an_error()
+    {
+        assert_eq!(
+            check_base_fresh("origin/master", "abc", "abc"),
+            [] as [Diag; 0]
+        );
+        assert_eq!(
+            rules(&check_base_fresh("origin/master", "abc", "def")),
+            ["gate-base-fresh"]
+        );
     }
 }

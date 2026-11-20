@@ -30,7 +30,8 @@ Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these
   approval in the conversation.
 - Sync onto `master` yourself right before the validation run when `master` has changed a
   file the PR changes since its merge base, and again if `master` changes one before the
-  merge; a PR whose files `master` has not changed merges without a sync.
+  merge, or the gate refuses a merge without a sync for several merge bases or a conflict; any
+  other PR merges without a sync once the CI run at `master`'s tip is green.
   docs/conventions.md § Syncing with `master` says when a sync is needed and what each owes.
 - The worker file is a file this session read, not its system prompt, so a compaction drops it.
   After one, read `.claude/agents/worker.md` again before the next step, and take the state of

@@ -655,7 +655,7 @@ const ZERO_SLOT_WEDGES: usize = 2;
 const ZERO_SLOT_GRANTS_MAX: usize = 2 * MSG_CAP_SLOTS_MAX;
 
 /// A `CSpace` with no free slot is topped up while memmgr can grant, with no
-/// cap deleted first (runtime/ruststd/README.md § CSpace slot headroom).
+/// cap deleted first (`runtime/ruststd/README.md` § `CSpace` slot headroom).
 /// svctest derives copies of an endpoint cap until a general allocation fails,
 /// then takes one-page grants by raw IPC until the IPC receive reserve is spent
 /// and a grant's reply arrives as `IPC_REPLY_TRANSFER_FAILED`: no slot is

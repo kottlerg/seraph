@@ -762,7 +762,9 @@ devmgr loads driver binaries from one of two places:
   replies SUCCESS before doing any spawn work so svcmgr never blocks on driver bring-up; the actual
   walk + `CREATE_FROM_FILE` + bootstrap rounds, and the settle of those drivers, run on devmgr's
   control thread after `ipc_reply`, while its registry workers go on serving; a query that would
-  find no driver waits until the settle has ended. The spawn is at-most-once per boot; on failure
+  find no driver waits until the settle has ended. The spawn is at-most-once per boot, apart from
+  the restart of a served driver that dies, which devmgr serves at the class's next ordinal
+  ([Driver Restart](../services/devmgr/docs/responsibilities.md#driver-restart)); on failure
   (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did not report
   ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
   `QUERY_DEVICE` calls on the rtc, input, hwrng, and debug-port classes and clients

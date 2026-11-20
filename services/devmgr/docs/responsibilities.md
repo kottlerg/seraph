@@ -199,7 +199,10 @@ devmgr's responsibilities are:
   states (`devmgr_firmware::dma::iova_limit`), and the thread has the IOMMU
   driver install the mapping (`MAP`, moving it a derivation of the cap) before it
   replies, and remove it (`UNMAP`) before it deletes the cap; a refused or
-  failed IOMMU call replies `IOMMU_FAILED`. The thread serves it apart from the registry
+  failed IOMMU call replies `IOMMU_FAILED`. Every call devmgr makes to the IOMMU driver is made
+  with the calling thread's upcalls masked (`ipc::ipc_call_masked`), so a debugger's stop of
+  devmgr waits for the driver's reply rather than cutting the call short, which would leave a
+  mapping the driver installed unknown to devmgr. The thread serves it apart from the registry
   and the control thread (below) because the control thread makes nested calls and settles
   batches during which drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary through
   virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
@@ -530,8 +533,10 @@ devmgr's responsibilities are:
     binary with no declaration note is passed over unlogged, one whose
     declaration matches no unbound device is not loaded, and the pass is
     skipped when every device is bound. Each spawn is
-    at-most-once per boot; failure, including an on-disk driver's death, or
-    its overrun of the settle bound, before it reports ready, is sticky and
+    at-most-once per boot, apart from the restart of a served driver that
+    dies, which devmgr serves at the class's next ordinal
+    ([Driver Restart](#driver-restart)); failure, including an on-disk
+    driver's death, or its overrun of the settle bound, before it reports ready, is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
     the rtc, input, hwrng, and debug-port classes, the same reply
     as before `SET_DRIVERS_DIR` arrives, so a client that needs the class waits on a `WATCH_CLASS`

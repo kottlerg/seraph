@@ -598,7 +598,12 @@ whose result is already available return their own result. The kernel restarts n
 to retry is the program's choice. For `SYS_IPC_CALL`,
 `Interrupted` does not mean that the request went undelivered: a server that already received the
 message finds no reply pending, so a program that retries a call may repeat its request, as after
-a stop.
+a stop. A program that records a call's outcome, and so can neither repeat the call nor learn the
+outcome again, masks upcalls across it ([Mask](#mask); `ipc::ipc_call_masked`), as devmgr does for
+its calls to the IOMMU driver: a post then cancels neither wait and is delivered at the unmask after
+the reply. The cost falls on a debugger, which cannot hold the thread until the server replies: a
+server that never replies leaves the thread out of every all-stop, and only `SYS_THREAD_STOP` ends
+its wait. The mask is therefore kept to such calls.
 
 A fault-blocked thread's fault, or an upcall delivery in progress, is never cancelled for an upcall:
 the upcall waits for it to resolve. The protocol that keeps a post from missing a thread that is

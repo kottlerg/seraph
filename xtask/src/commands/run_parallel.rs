@@ -11,7 +11,9 @@
 //! Mode-agnostic by design: xtask does not know about ktest, svctest, or
 //! any other rootfs configuration. The caller supplies success and failure
 //! regexes (`--pass`, `--fail`); xtask only classifies outcomes by matching
-//! those patterns against per-run logs, plus exit-code and watchdog state.
+//! those patterns against per-run logs, plus exit-code and watchdog state, and
+//! one fact of every userspace boot: the console's output after init-logd's
+//! handover line (`console_lost_after_handover`).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -43,6 +45,10 @@ use crate::util::{require_tool, step};
 /// The label of a `Status::QemuCrash` run, first in its summary line and its
 /// `--save-logs` trailer's `outcome=` field (`QEMU-CRASH_rc=<code>`).
 pub(crate) const QEMU_CRASH_LABEL: &str = "QEMU-CRASH";
+
+/// init-logd's last line, written once real-logd has pulled its history and
+/// released it. Kept in sync with `services/init/src/logging.rs`.
+pub(crate) const HANDOVER_MARKER: &str = "handover complete; init-logd thread exiting";
 
 /// How often the watchdog poll loop checks child exit status.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -819,6 +825,16 @@ fn classify(
     {
         return (Status::Pass, Some(line_containing(log, m.start())));
     }
+    // A boot whose userspace console ended at the logd handover fails with
+    // that named, rather than as the opaque timeout or clean exit its end
+    // would otherwise read as. A QEMU crash is left to its own branch below:
+    // the emulator's abort message after the handover line is no userspace
+    // line, and the crash is the host's, whatever the console did.
+    let qemu_crashed = !hung && (exit_rc == RC_SIGSEGV || exit_rc == RC_SIGABRT);
+    if !qemu_crashed && let Some(reason) = console_lost_after_handover(log)
+    {
+        return (Status::Fail, Some(reason));
+    }
     if hung
     {
         let last = log
@@ -847,6 +863,45 @@ fn classify(
         return (Status::QemuCrash(exit_rc), last);
     }
     (Status::Err(exit_rc), None)
+}
+
+/// The reason a run without its pass marker lost its userspace console at the
+/// logd handover: its log has init-logd's last line ([`HANDOVER_MARKER`]) and
+/// no userspace line after it, so real-logd, which owns the console from
+/// then on, wrote nothing to it. Each userspace line, logd's own included,
+/// reaches the console through logd from then on, so none at all means its
+/// output was lost, not that userspace was idle. `None` when the log has no
+/// such line, a userspace line follows it, or nothing does: a run cut off
+/// right at the handover reads as the hang or exit it was, not as a lost
+/// console, since the kernel lines after the line are what show the guest
+/// ran on.
+fn console_lost_after_handover(log: &str) -> Option<String>
+{
+    let at = log.rfind(HANDOVER_MARKER)?;
+    let rest = log.get(at..)?.split_once('\n').map_or("", |(_, rest)| rest);
+    if rest.lines().any(is_userspace_line)
+    {
+        return None;
+    }
+    if rest.lines().all(|l| l.trim().is_empty())
+    {
+        return None;
+    }
+    Some(format!(
+        "no userspace line after {:?}: the console output after the logd handover was lost",
+        line_containing(log, at)
+    ))
+}
+
+/// Whether `line` is a userspace log line as init-logd and logd write it,
+/// `[<seconds>] [<name>] <text>`, rather than a kernel line
+/// (`[<seconds>] kernel: <text>`).
+fn is_userspace_line(line: &str) -> bool
+{
+    line.trim_start()
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .is_some_and(|(_, rest)| rest.trim_start().starts_with('['))
 }
 
 fn line_containing(text: &str, byte_offset: usize) -> String
@@ -1249,6 +1304,68 @@ mod tests
                    [2.17] kernel:   rip=0x0000000000012bf8  fs_base=0x0000000000000000\n\
                    [4.27] [svctest] ALL TESTS PASSED\n";
         assert!(matches!(classify_log(log), Status::Pass));
+    }
+
+    // The shape of CI run 44654644495's riscv64 svctest boot (#1363): the
+    // serial driver never came up, so after init-logd's last line only the
+    // kernel wrote to the console until the guest powered off.
+    #[test]
+    fn console_lost_after_the_handover_classifies_fail()
+    {
+        let log = "[46.520887] [svcmgr] svcmgr: launching: svctest\n\
+                   [46.540540] [init-logd] handover complete; init-logd thread exiting\n\
+                   [47.331494] kernel: USERSPACE FAULT: tid=2589005658 cpu=0 cause=store/AMO page fault (scause=0xf)\n\
+                   [47.332085] kernel:   sepc=0x0000003133369ef0  stval=0x0000000000000000\n";
+        let (pass, fail) = default_regexes();
+        for hung in [false, true]
+        {
+            let (status, reason) = classify(0, hung, log, &pass, &fail);
+            assert!(matches!(status, Status::Fail), "hung={hung}: {status:?}");
+            assert!(reason.unwrap().contains("[init-logd] handover complete"));
+        }
+    }
+
+    // Defect caught: a QEMU abort after the handover line, whose own message
+    // is no userspace line, gating as FAIL instead of the tolerated
+    // QEMU-CRASH.
+    #[test]
+    fn a_qemu_crash_after_the_handover_stays_a_qemu_crash()
+    {
+        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n\
+                   qemu-system-riscv64: ../tcg/tcg.c:1234: tcg_gen_code: Assertion failed.\n";
+        let (pass, fail) = default_regexes();
+        for rc in [RC_SIGABRT, RC_SIGSEGV]
+        {
+            assert!(matches!(
+                classify(rc, false, log, &pass, &fail).0,
+                Status::QemuCrash(code) if code == rc
+            ));
+        }
+    }
+
+    #[test]
+    fn a_userspace_line_after_the_handover_keeps_the_console()
+    {
+        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n\
+                   [47.331494] kernel: USERSPACE FAULT: tid=2589005658 cpu=0\n\
+                   [47.500000] [logd] resolved the serial driver\n";
+        assert!(matches!(classify_log(log), Status::Ok));
+    }
+
+    #[test]
+    fn a_hang_right_at_the_handover_stays_a_hang()
+    {
+        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n";
+        let (pass, fail) = default_regexes();
+        assert!(matches!(
+            classify(0, true, log, &pass, &fail).0,
+            Status::Hang
+        ));
+        // A boot with no handover (ktest) is not judged by it.
+        assert!(matches!(
+            classify(0, true, "[1.0] kernel: ktest starting\n", &pass, &fail).0,
+            Status::Hang
+        ));
     }
 
     #[test]

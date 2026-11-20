@@ -25,10 +25,17 @@ as follows:
 - For a service svcmgr launches or restarts, procmgr binds it:
   `BIND_DEATH_OBSERVER` (procmgr label 25) on the process handle, with a `POST`
   copy of a svcmgr death queue. Both binds happen before `START_PROCESS`.
-- For memmgr and procmgr, which init creates by raw syscalls, svcmgr binds it
-  itself with `SYS_ASPACE_BIND_NOTIFICATION` (`DeathSet::bind_aspace`), through a
-  Control-only address-space cap the handover endowment delivers, which the
-  entry keeps (`ServiceEntry.aspace_cap`).
+- For memmgr and procmgr, which init creates by raw syscalls, svcmgr binds
+  neither observer on its death queues. At its start it binds both, with
+  `SYS_THREAD_BIND_NOTIFICATION` and `SYS_ASPACE_BIND_NOTIFICATION`, on the
+  core-death queue the shutdown actuator receives on ([Supervision § Observing
+  the Core Set](../../../docs/supervision.md#observing-the-core-set)), through
+  the thread cap and the Control-only address-space cap the handover endowment
+  delivers. The entry keeps both (`ServiceEntry.thread_cap`,
+  `ServiceEntry.aspace_cap`) for the liveness reads of a resync and of the
+  check made before each call into procmgr, the stop paths' included, and a
+  non-zero `aspace_cap`, which no other entry holds, marks the entry as a core
+  member's, whose death `route_death` leaves to pwrmgr (§ Decision tree).
 - For devmgr and vfsd, which init creates through procmgr, svcmgr sends
   `BIND_DEATH_OBSERVER` on the process handle the handover endowment delivers,
   which the entry keeps (`ServiceEntry.process_handle`).
@@ -165,6 +172,13 @@ decided **solely** by the restart policy + budget; `system_critical`
 permanently down. The two concerns are orthogonal — `restart` owns
 *whether/when to respawn*, `critical` owns *can the system survive its
 permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
+
+A core member's death is not decided here. The observers of memmgr and procmgr are on the
+core-death queue, whose entries the shutdown actuator acts on, so svcmgr's death queues carry none
+of their posts, and only a resync finds such a death (§ Death detection): `route_death` then marks
+the entry inactive and returns, with no line, no restart decision and no graceful shutdown, each of
+which could wait on the dead member; pwrmgr powers the system off ([Supervision § Core Set and
+System Death](../../../docs/supervision.md#core-set-and-system-death)).
 
 1. **`should_restart(svc, exit_reason)`** evaluates the restart policy:
    * `POLICY_NEVER` → no restart.
@@ -499,9 +513,10 @@ waits on none of them. svctest's
 `logd_restart` phase kills logd and checks both
 ([services/svctest/README.md](../../svctest/README.md)).
 
-svcmgr's own death is not routed here: svcmgr is in the core set, and
-pwrmgr observes it and powers the system off
-([Supervision § Observing svcmgr](../../../docs/supervision.md#observing-svcmgr)).
+svcmgr's own death is not routed here, nor memmgr's or procmgr's: they
+are the core set, and pwrmgr observes their deaths on the core-death queue
+and powers the system off
+([Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)).
 
 ---
 

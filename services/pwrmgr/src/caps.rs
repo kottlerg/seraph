@@ -17,13 +17,15 @@
 //! * `caps[2]` = `POWER_AUTHORITY`-badged SEND on acpid's service endpoint
 //!   (the `acpid.power` seed), through which the x86-64 arch module reaches
 //!   the ACPI sleep and reset registers and waits for the power button.
-//! * `caps[3]` = a receive-only derivation of the event queue svcmgr's own
-//!   death posts to, which svcmgr serves the shutdown actuator after its
-//!   seeds; an entry on it is svcmgr's death (docs/supervision.md § Observing
-//!   svcmgr).
+//! * `caps[3]` = a receive-only derivation of the core-death queue, which
+//!   the death observers of svcmgr's, memmgr's and procmgr's main threads and
+//!   address spaces post to and which svcmgr serves the shutdown actuator
+//!   after its seeds; an entry on it is a core death (docs/supervision.md
+//!   § Core Set and System Death).
 //!
-//! pwrmgr owns no hardware caps directly. The target's arch module
-//! ([`crate::arch::current`]) keeps the cap it uses and deletes the other.
+//! The target's arch module ([`crate::arch::current`]) keeps the seed it
+//! uses and deletes the other; the hardware cap it holds for the core-death
+//! power-off is one it acquires through that seed.
 
 use std::os::seraph::StartupInfo;
 
@@ -36,9 +38,8 @@ pub struct Bootstrap
     pub devmgr_shutdown: u64,
     /// The `acpid.power` seed. Zero if absent.
     pub acpid_power: u64,
-    /// The receive-only derivation of svcmgr's own death queue. Zero if
-    /// absent.
-    pub svcmgr_death: u64,
+    /// The receive-only derivation of the core-death queue. Zero if absent.
+    pub core_death: u64,
 }
 
 /// Drain the provider bootstrap rounds from `creator_endpoint`.
@@ -52,13 +53,13 @@ pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Bootst
     // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
     // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`.
-    let [service_ep, devmgr_shutdown, acpid_power, svcmgr_death] =
+    let [service_ep, devmgr_shutdown, acpid_power, core_death] =
         unsafe { ipc::bootstrap::request_slots::<4>(creator, ipc_buf) }.ok()?;
     Some(Bootstrap {
         service_ep,
         devmgr_shutdown,
         acpid_power,
-        svcmgr_death,
+        core_death,
     })
 }
 

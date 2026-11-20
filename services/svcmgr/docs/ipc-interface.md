@@ -115,9 +115,11 @@ for the master-log source, exits at startup.
 
 svcmgr parks each substrate `(name, thread, observer)` triple in its pending-registration
 table. memmgr and procmgr carry an address-space cap, devmgr and vfsd a process handle; svcmgr
-keeps the cap as the entry's `aspace_cap` or `process_handle` and binds the second death observer
-through it ([restart-protocol.md](restart-protocol.md#death-detection)). It does **not**
-bind death-notification at endowment time — the matching `.svc`
+keeps the cap as the entry's `aspace_cap` or `process_handle`. Through devmgr's and vfsd's it
+binds the second death observer at reconciliation; through memmgr's and procmgr's, with their
+thread caps, it binds both of theirs at its start on the core-death queue, not on its own death
+queues ([restart-protocol.md](restart-protocol.md#death-detection)). It does **not**
+bind devmgr's or vfsd's death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
@@ -158,7 +160,9 @@ to teardown), then runs
    [`Definition`](../src/definitions/mod.rs).
 2. Reconcile against the pending-registration table (the substrate triples
    parked from the endowment):
-   * **parked AND defined** — bind death-notification, record the
+   * **parked AND defined** — bind death-notification (devmgr and vfsd;
+     memmgr's and procmgr's observers are already on the core-death
+     queue), record the
      recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
      log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop` and `reserve`
      flags, `stop_source` class, and scheduling fields in the parallel

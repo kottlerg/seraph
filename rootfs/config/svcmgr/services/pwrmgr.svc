@@ -18,8 +18,10 @@
 #     and waits in its WAIT_EVENT for the power button
 #     (services/acpid/README.md § Power requests). svcmgr launches acpid
 #     before pwrmgr because of this seed.
-# Each architecture deletes the seed it does not use. pwrmgr owns no hardware
-# caps: devmgr is the hardware authority, and acpid holds the ACPI registers.
+# Each architecture deletes the seed it does not use. devmgr is the hardware
+# authority and acpid holds the ACPI registers; on x86-64 pwrmgr also holds a
+# Use-only PM1a_CNT port block derived from acpid's QUERY_SLEEP, for its
+# core-death power-off.
 #
 # `restart = on_failure`: svcmgr re-creates pwrmgr from /services/pwrmgr and
 # re-serves a fresh RECV on the persistent endpoint, so a SHUTDOWN_AUTHORITY
@@ -29,8 +31,9 @@
 # shutdown actuator: when a `critical = yes` service is permanently down,
 # svcmgr calls SHUTDOWN through a SEND it derives from pwrmgr's endpoint
 # with the `pwrmgr.shutdown` entry's SHUTDOWN_AUTHORITY badge, and serves
-# pwrmgr as cap[3] the RECV-only derivation of svcmgr's own death queue, on
-# which pwrmgr observes svcmgr's death and powers the platform off.
+# pwrmgr as cap[3] the RECV-only derivation of the core-death queue, on
+# which pwrmgr observes the death of svcmgr, memmgr and procmgr and powers
+# the platform off. svcmgr creates pwrmgr pinned (CREATE_PINNED) for this role.
 # `critical = no`: a permanently-dead pwrmgr cannot power the system off,
 # so a graceful shutdown on its death is impossible; the honest terminal
 # state is logged-and-continue, matching timed.

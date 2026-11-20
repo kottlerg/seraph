@@ -9,8 +9,14 @@
 //! fixed register blocks and runs the AML (`services/acpid/README.md`
 //! § Power requests): pwrmgr calls [`acpid_labels::SLEEP`] with
 //! [`acpid_labels::STATE_S5`] to power off and [`acpid_labels::RESET`] to
-//! reboot, through the `acpid.power` seed. It holds no port of its own and
-//! reads no table.
+//! reboot, through the `acpid.power` seed. It reads no table.
+//!
+//! For the death of a core service it holds one port block of its own:
+//! at startup it asks acpid for `PM1a_CNT` and the S5 `SLP_TYPa`
+//! ([`acpid_labels::QUERY_SLEEP`]), binds the block to its main thread, and
+//! on a core death writes the S5 sleep type itself ([`power_off_now`]),
+//! with no call on acpid, which may be stuck on the dead member, and without
+//! the `\_PTS` and the event quiescing that acpid's `SLEEP` runs first.
 //!
 //! Each call is bounded by [`ACPID_CALL_TIMEOUT_MS`], so an acpid that is
 //! down, or blocked, fails the request instead of holding pwrmgr and its
@@ -85,6 +91,152 @@ pub fn shutdown(act: &Actuator, ipc_buf: *mut u64)
 pub fn reboot(act: &Actuator, ipc_buf: *mut u64)
 {
     call(act, acpid_labels::RESET, 0, "reboot", ipc_buf);
+}
+
+/// The core-death power-off: `PM1a_CNT`, bound to pwrmgr's main thread,
+/// and the S5 `SLP_TYPa`, both from acpid's [`acpid_labels::QUERY_SLEEP`].
+pub struct PowerOff
+{
+    /// The block's first port, `PM1a_CNT`.
+    port: u16,
+    /// The S5 sleep type, at most `acpid_labels::SLP_TYP_MAX`.
+    slp_typ: u16,
+}
+
+/// The core-death power-off: acpid's [`acpid_labels::QUERY_SLEEP`] of S5,
+/// bounded by [`ACPID_CALL_TIMEOUT_MS`], through `actuator`, with the
+/// block it serves bound to the calling thread, pwrmgr's main thread, which
+/// runs [`power_off_now`]. `None`, logged, without an actuator, when acpid
+/// refuses (no `PM1a_CNT`, as on a hardware-reduced platform, or no usable
+/// `\_S5_`) or does not answer, or when the block cannot be bound.
+pub fn resolve_power_off(actuator: Option<&Actuator>, ipc_buf: *mut u64) -> Option<PowerOff>
+{
+    let act = actuator?;
+    let msg = IpcMessage::builder(acpid_labels::QUERY_SLEEP)
+        .word(0, u64::from(ipc::ACPID_LABELS_VERSION))
+        .word(1, acpid_labels::STATE_S5)
+        .build();
+    // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
+    let reply =
+        match unsafe { ipc::ipc_call_timeout(act.acpid, &msg, ipc_buf, ACPID_CALL_TIMEOUT_MS) }
+        {
+            Ok(reply) => reply,
+            Err(e) =>
+            {
+                std::os::seraph::log!(error: "QUERY_SLEEP failed (acpid call err={e})");
+                return None;
+            }
+        };
+    let cap = reply.caps().first().copied();
+    if reply.label != acpid_errors::SUCCESS
+    {
+        std::os::seraph::log!(error: "QUERY_SLEEP refused (acpid replied {:#x})", reply.label);
+        return None;
+    }
+    let (Some(cap), Ok(port), Ok(slp_typ)) = (
+        cap,
+        u16::try_from(reply.word(0)),
+        u16::try_from(reply.word(1)),
+    )
+    else
+    {
+        if let Some(cap) = cap
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        std::os::seraph::log!(error: "QUERY_SLEEP answer malformed");
+        return None;
+    };
+    if u64::from(slp_typ) > acpid_labels::SLP_TYP_MAX || !bind_ports(cap)
+    {
+        let _ = syscall::cap_delete(cap);
+        std::os::seraph::log!(error: "PM1a control block {port:#x} not usable");
+        return None;
+    }
+    Some(PowerOff { port, slp_typ })
+}
+
+/// Power off at once: write the S5 sleep type to `PM1a_CNT`, then with
+/// `SLP_EN`, keeping the register's other bits
+/// ([`acpid_labels::pm1_control_writes`]). Port I/O alone: allocates, logs
+/// and calls nothing. Runs on pwrmgr's main thread, to which
+/// [`resolve_power_off`] bound the block; returns only when the platform
+/// keeps running.
+pub fn power_off_now(power_off: &PowerOff)
+{
+    // SAFETY: `power_off.port` is `PM1a_CNT`, the first port of the block
+    // acpid served for it and `resolve_power_off` bound to this thread; a
+    // read of it has no side effect.
+    let current = unsafe { inw(power_off.port) };
+    let [typed, enter] = acpid_labels::pm1_control_writes(current, power_off.slp_typ);
+    // SAFETY: as the read; writing `SLP_TYP` with `SLP_EN` clear is the
+    // first step of the ACPI sleep sequence.
+    unsafe { outw(power_off.port, typed) };
+    // SAFETY: as the read; writing `SLP_TYP | SLP_EN` enters the state.
+    unsafe { outw(power_off.port, enter) };
+}
+
+/// Bind the `IoPort` `cap` to pwrmgr's main thread. Its first bind takes the
+/// thread's port-binding table from pwrmgr's `CSpace` budget
+/// (`syscall_abi::IOPORT_BINDING_TABLE_PAGES` pages), so a bind refused with
+/// `OutOfMemory` is made again once after [`fund_binding_table`]. Whether
+/// the block is bound.
+fn bind_ports(cap: u64) -> bool
+{
+    // pwrmgr's main thread, which calls this and runs `power_off_now`.
+    let thread = std::os::seraph::startup_info().self_thread;
+    match syscall::ioport_bind(thread, cap)
+    {
+        Err(e) if e == syscall_abi::SyscallError::OutOfMemory as i64 && fund_binding_table() =>
+        {
+            syscall::ioport_bind(thread, cap).is_ok()
+        }
+        result => result.is_ok(),
+    }
+}
+
+/// Donate one port-binding table's pages, and one more, to pwrmgr's own
+/// `CSpace` (augment-mode `cap_create_cspace`), from memmgr through the
+/// object slab; the page beyond the table covers the bookkeeping a donation
+/// keeps in its own pages. Whether the donation was made.
+fn fund_binding_table() -> bool
+{
+    let cspace = std::os::seraph::startup_info().self_cspace;
+    let pages = syscall_abi::IOPORT_BINDING_TABLE_PAGES + 1;
+    std::os::seraph::object_slab_retype(pages * syscall_abi::PAGE_SIZE, |frame| {
+        syscall::cap_create_cspace(frame, cspace, pages).ok()
+    })
+    .is_some()
+}
+
+/// `in ax, dx`.
+///
+/// # Safety
+///
+/// `port` lies in an `IoPort` block bound to the calling thread, and
+/// reading it has no effect the caller does not intend.
+unsafe fn inw(port: u16) -> u16
+{
+    let value: u16;
+    // SAFETY: the caller's contract.
+    unsafe {
+        core::arch::asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack));
+    };
+    value
+}
+
+/// `out dx, ax`.
+///
+/// # Safety
+///
+/// `port` lies in an `IoPort` block bound to the calling thread, and
+/// writing `value` to it has the effect the caller intends.
+unsafe fn outw(port: u16, value: u16)
+{
+    // SAFETY: the caller's contract.
+    unsafe {
+        core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack));
+    };
 }
 
 /// Watch the power button: spawn the event thread, which waits in acpid's

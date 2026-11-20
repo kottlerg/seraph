@@ -22,8 +22,8 @@ use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::registry_lookup_derived;
 use crate::restart::{
     CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, caps_death,
-    create_label_bits, destroy_partial_child, mint_debug_authority, mint_entropy_authority,
-    mint_self_death_recv, mint_stop_authority, start_process, walk_and_create_from_file,
+    create_label_bits, destroy_partial_child, mint_core_death_recv, mint_debug_authority,
+    mint_entropy_authority, mint_stop_authority, start_process, walk_and_create_from_file,
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
@@ -46,9 +46,10 @@ pub struct Launched
     pub died: Option<u64>,
 }
 
-/// Whether a launch is of the recognised shutdown actuator, which observes
-/// svcmgr: its bootstrap round carries a receive-only derivation of svcmgr's
-/// own death queue (docs/supervision.md § Observing svcmgr).
+/// Whether a launch is of the recognised shutdown actuator, which owns the
+/// core set's death: it is created pinned, and its bootstrap round carries a
+/// receive-only derivation of the core-death queue (docs/supervision.md
+/// § Core Set and System Death).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role
 {
@@ -308,7 +309,7 @@ fn publish_provided(
 /// consumer. Runs after namespace + death bind and before `START_PROCESS`, so
 /// any failure destroys the partial child and returns `None`. The recognised
 /// shutdown actuator ([`Role::ShutdownActuator`]) also receives a receive-only
-/// derivation of svcmgr's own death queue, in the slot after its seeds and
+/// derivation of the core-death queue, in the slot after its seeds and
 /// authority caps.
 fn assemble_provided_boot_caps(
     def: &Definition,
@@ -357,7 +358,7 @@ fn assemble_provided_boot_caps(
     }
     if role == Role::ShutdownActuator
     {
-        seed_caps.push(mint_self_death_recv(ctx));
+        seed_caps.push(mint_core_death_recv(ctx));
     }
 
     // A provider's own service-endpoint RECV is cap[0], ahead of the positional
@@ -413,9 +414,9 @@ fn assemble_provided_boot_caps(
 /// (`restart = never`, e.g. `svctest`) the caller passes `None` and forgoes
 /// supervision binding.
 ///
-/// `role` marks the recognised shutdown actuator, whose round carries a
-/// receive-only derivation of svcmgr's own death queue (docs/supervision.md
-/// § Observing svcmgr).
+/// `role` marks the recognised shutdown actuator, which is created pinned and
+/// whose round carries a receive-only derivation of the core-death queue
+/// (docs/supervision.md § Core Set and System Death).
 pub fn launch(
     def: &Definition,
     ctx: &RestartCtx,
@@ -442,6 +443,7 @@ pub fn launch(
             def.reserve,
             def.oom_stop,
             def.stop_source.is_some(),
+            role == Role::ShutdownActuator,
         ),
         ctx.procmgr_ep,
         ctx.bootstrap_ep,

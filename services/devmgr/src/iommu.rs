@@ -2366,7 +2366,9 @@ fn spawn_and_settle(
             spawn::send_destroy(child.process_handle, ipc_buf);
             return Settled::NotReady(Some(child));
         }
-        spawn::DriverSpawn::Failed => return Settled::NotStarted,
+        // The IOMMU driver's create is not retried: its restart is its own
+        // policy's (docs/device-management.md § IOMMU Driver Restart).
+        spawn::DriverSpawn::Refused(_) | spawn::DriverSpawn::Failed => return Settled::NotStarted,
     };
     // devmgr keeps a copy of the process handle for the instance's life
     // ([`Kit::serving`]); the registry's record releases the one it holds

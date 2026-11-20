@@ -535,7 +535,8 @@ devmgr's responsibilities are:
     skipped when every device is bound. Each spawn is
     at-most-once per boot, apart from the restart of a served driver that
     dies, which devmgr serves at the class's next ordinal
-    ([Driver Restart](#driver-restart)); failure, including an on-disk
+    ([Driver Restart](#driver-restart)), and the retries of a create procmgr refuses with an
+    error a later create can outlive ([Create retry](#create-retry)); failure, including an on-disk
     driver's death, or its overrun of the settle bound, before it reports ready, is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
     the rtc, input, hwrng, and debug-port classes, the same reply
@@ -879,8 +880,55 @@ post of the dead instance names no live driver.
 The record stays bound throughout, so no drivers-directory, `BIND_DRIVERS` or hotplug pass takes
 it, and the new instance replaces the dead one in its driver's instance count. A restart whose entry
 is missing or unreadable, whose declaration differs, or whose bind fails is logged, and the record
-stays bound with no driver. A new instance that dies or does not report ready before its batch
+stays bound with no driver; a create procmgr refuses with an error a later create can outlive is
+retried first (§ Create retry), and the record stays bound with no driver once its retries are
+given up. A new instance that dies or does not report ready before its batch
 settles is withdrawn and not served, as any batch's driver is, and its death is not restarted.
+
+### Create retry
+
+A driver's start, a restart's included, whose create procmgr refuses with an error a later create
+can outlive is retried within a bound, beside the restart rules above. The policy is
+`services/devmgr/firmware/src/restart.rs`, host-tested there: `create_retryable` and
+`retry_delay_ms`, and `Retries`, the list of pending retries.
+
+- **What is retried.** A create procmgr answered with the reply label `IO_ERROR` (the file the
+  create reads from failed or did not answer in time, as a file server under load does) or
+  `OUT_OF_MEMORY` (memory pressure). Any other reply label is final: a refused signature, an image
+  that is no valid ELF, a malformed request. So is devmgr's own failure before the call, and a
+  driver that started and failed its bootstrap. A create call that fails, rather than being
+  answered, is never retried: the call can end after procmgr acted on it (a debugger's all-stop
+  interrupting devmgr), so devmgr cannot tell whether a child exists, and a retry could create a
+  second one. Only a reply label proves that procmgr answered and created nothing.
+- **The bound.** `CREATE_RETRY_LIMIT` retries, the first `CREATE_RETRY_FIRST_MS` after the
+  refusal and each later one after twice the delay before it
+  ([docs/limits.md](../../../docs/limits.md)). The restart budget is charged nothing: it bounds a
+  driver's deaths, as svcmgr's memory wait charges a service's restart budget nothing for its
+  retries ([services/svcmgr/docs/restart-protocol.md](../../svcmgr/docs/restart-protocol.md)). A
+  restart's retries carry its budget unchanged. Each retry is logged with its count and delay, and
+  the last refusal with the retries given up.
+- **What delays it.** The control thread holds the pending retries and waits on its wait set no
+  longer than the earliest is due. On every wake it runs each retry that is due, whatever woke it,
+  so no stream of jobs or deaths holds one off. With none pending it waits untimed.
+- **What a retry repeats.** The same create, on the same record, from the same binary: at the
+  refusal devmgr keeps a copy of the file cap the create was made from, the driver's declaration,
+  and what the driver is restarted from. A platform record's caps, which devmgr cannot carve again
+  once released, are kept with it; a PCI record's are released and carved again by the retry's
+  bind, as a restart's are. The declaration is not read again: a retry repeats a start already
+  matched. Each retry runs as a restart runs, in a settle batch of its own on the control thread,
+  counted a registry job while it runs, so a `QUERY_DEVICE` that would find no driver waits for
+  its settle, and its instance is served at the class's next ordinal.
+- **The record.** A start's record is bound at its first refusal, so no drivers-directory,
+  `BIND_DRIVERS` or hotplug pass takes it while its retry is pending; a restart's is bound
+  throughout. A retry whose record was removed meanwhile (a hotplug removal) is not made, and its
+  caps are released. Once the retries are given up the record stays bound with no driver.
+- **Which starts.** Every start from a drivers directory: the drivers-directory pass, a
+  `BIND_DRIVERS` pass, a hot-added function's bind (the hotplug add job binds through the
+  drivers-directory pass), and every restart. A boot-pass start is not retried: its binary is a
+  boot module, whose cap pins init's donated pool run until the boot pass releases it, and
+  procmgr's only refusal of it a later create could outlive is for want of memory, which nothing
+  frees while only the bootstrap substrate runs. Its record stays unbound for the drivers-directory
+  pass.
 
 ### Clients
 
@@ -889,11 +937,13 @@ the withdrawal revokes the endpoint, `QUERY_DEVICE` answers `WITHDRAWN` at the d
 ordinal, and its `WATCH_CLASS` watch is signalled at the withdrawal and again when the new
 instance is served. A `QUERY_DEVICE` at the next ordinal (`first_device_from`) then waits for the
 restart's settle and names the new instance, or answers `NO_DEVICE` when the restart was refused or
-failed. A client re-registers with the new instance whatever it registered with the dead one.
-`ipc::refresh_device` is the look a client makes at its class on a signal. The `std` clients that
-follow a class for their run (the terminal, gdbstub and debug-echo) do it through
-[shared/device-tracker](../../../shared/device-tracker/README.md), whose crate documentation states
-the contract they keep; logd's sinks and entropyd re-resolve this way in their own loops.
+failed, and between the retries of a refused create (§ Create retry), whose served instance
+signals the watch as any new instance does. A client re-registers with the new instance whatever
+it registered with the dead one. `ipc::refresh_device` is the look a client makes at its class on
+a signal. The `std` clients that follow a class for their run (the terminal, gdbstub and
+debug-echo) do it through [shared/device-tracker](../../../shared/device-tracker/README.md), whose
+crate documentation states the contract they keep; logd's sinks and entropyd re-resolve this way
+in their own loops.
 
 ### Root disk
 

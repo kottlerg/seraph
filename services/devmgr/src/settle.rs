@@ -91,6 +91,8 @@ pub enum ControlWake
     Job,
     /// A death queue holds at least one post.
     Death,
+    /// The wait's timeout passed with nothing ready.
+    Timeout,
     /// Any other wake; the loop waits again.
     Other,
 }
@@ -206,14 +208,31 @@ impl DriverWatch
     }
 
     /// Block until the job notification is signalled or a death post is
-    /// queued. A signalled notification stays ready on the set until its
-    /// bits are taken, so a job wake takes them.
+    /// queued, or, with `timeout_ms`, until that many milliseconds have
+    /// passed (at least one, so a timeout of 0 does not wait untimed). A
+    /// signalled notification stays ready on the set until its bits are
+    /// taken, so a job wake takes them.
     ///
     /// # Errors
     /// Returns the wait's failure.
-    pub fn wait(&self) -> Result<ControlWake, i64>
+    pub fn wait(&self, timeout_ms: Option<u64>) -> Result<ControlWake, i64>
     {
-        Ok(match syscall::wait_set_wait(self.deaths.ws_cap())?
+        let ws = self.deaths.ws_cap();
+        let woke = match timeout_ms
+        {
+            None => syscall::wait_set_wait(ws),
+            Some(ms) => syscall::wait_set_wait_timeout(ws, ms.max(1)),
+        };
+        let badge = match woke
+        {
+            Ok(badge) => badge,
+            Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 =>
+            {
+                return Ok(ControlWake::Timeout);
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(match badge
         {
             WS_BADGE_JOB =>
             {

@@ -1185,28 +1185,34 @@ pub fn memory_pressure() -> Option<MemoryPressure> {
 /// § Commit, Overcommit). A fault memmgr declined as a commit overrun can be
 /// backed once it is open, at a demand chunk's bytes or more, which write-out
 /// to swap brings about while the level stays `Critical`; memmgr signals its
-/// opening and not its closing. `None` if memmgr is unreachable.
+/// opening ([`COMMIT_DRAW_ROOM_BIT`]) and not its closing. `None` if memmgr
+/// is unreachable.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn commit_draw_room_bytes() -> Option<u64> {
     pal_alloc::memmgr_query_draw_room()
 }
 
 /// The bit memmgr sends on [`memory_pressure_notification`] when the
-/// memory-pressure level changes, or its draw room opens
-/// ([`commit_draw_room_bytes`]).
+/// memory-pressure level changes.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub const MEMORY_PRESSURE_BIT: u64 = pal_alloc::PRESSURE_BIT;
 
+/// The bit memmgr sends on [`memory_pressure_notification`] when its draw
+/// room opens ([`commit_draw_room_bytes`]).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub const COMMIT_DRAW_ROOM_BIT: u64 = pal_alloc::DRAW_ROOM_BIT;
+
 /// The Notification memmgr sends [`MEMORY_PRESSURE_BIT`] on when the
-/// memory-pressure level changes, or its draw room opens, with every
-/// right, so a server can add it to its wait set; `None` when the process is
-/// not registered (a process with no memmgr endpoint, or one whose
-/// registration at start failed).
+/// memory-pressure level changes, and [`COMMIT_DRAW_ROOM_BIT`] when its draw
+/// room opens, with every right, so a server can add it to its wait set;
+/// `None` when the process is not registered (a process with no memmgr
+/// endpoint, or one whose registration at start failed).
 ///
 /// `_start` registers it, so the process makes no call of its own. A send
-/// coalesces with one not yet taken, so a wake says the level changed, or
-/// the draw room opened, at least once since the last; [`memory_pressure`] and
-/// [`commit_draw_room_bytes`] then read them.
+/// coalesces with one not yet taken, so each bit a wake carries says that
+/// its event happened at least once since the last wake: the level changed
+/// at least once, perhaps back to where it was, or the draw room opened;
+/// [`memory_pressure`] and [`commit_draw_room_bytes`] then read them.
 /// A process that registers another Notification with memmgr itself
 /// (`memmgr_labels::REGISTER_PRESSURE`) replaces this one, which is then
 /// signalled no more.
@@ -1216,14 +1222,15 @@ pub fn memory_pressure_notification() -> Option<u64> {
 }
 
 /// Block until memmgr sends [`MEMORY_PRESSURE_BIT`], at a change of the
-/// memory-pressure level or an opening of its draw room, or `timeout`
-/// passes, and return the level then, which a wake for the draw room leaves
-/// as it was: a caller that acts on a change of level compares it with the
-/// level it last acted on. `None` waits without bound; `Some(Duration::ZERO)`
-/// takes a signal already sent without blocking.
+/// memory-pressure level, or `timeout` passes, and return the level then. A
+/// wake that carries only [`COMMIT_DRAW_ROOM_BIT`] is taken and waited past,
+/// so a return says that the level changed at least once since the bit was
+/// last taken; since the signals coalesce, the level it returns can be the
+/// one before, changed and changed back. `None` waits without bound;
+/// `Some(Duration::ZERO)` takes a signal already sent without blocking.
 ///
 /// Each signal wakes one waiter of the process: a thread that waits here
-/// takes the bit from every other. A stop of the waiting thread, or an
+/// takes both bits from every other. A stop of the waiting thread, or an
 /// upcall to it, does not end the wait: it waits again for what is left of
 /// `timeout` (`docs/fault-handling.md` § Asynchronous Upcalls).
 ///
@@ -1266,7 +1273,9 @@ pub fn wait_memory_pressure(
             // has none of.
             Ok(0) if timeout.is_none() => {}
             Ok(0) => return Err(timed_out()),
-            Ok(_) => break,
+            Ok(bits) if bits & MEMORY_PRESSURE_BIT != 0 => break,
+            // An opening of the draw room alone: no change of the level.
+            Ok(_) => {}
             Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => {
                 return Err(timed_out());
             }

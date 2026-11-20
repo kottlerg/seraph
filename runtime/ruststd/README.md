@@ -716,7 +716,8 @@ under contention. The backends are under `src/sys/sync/`.
 
 `_start` registers each process that has a memmgr endpoint for memmgr's memory-pressure signal
 (`src/sys/alloc/seraph.rs`, `register_pressure`): it retypes a Notification, and hands memmgr a
-Notify-only derivation of it with `REGISTER_PRESSURE`
+Notify-only derivation of it with `REGISTER_PRESSURE`, asking for one bit on a change of level and
+another on an opening of the draw room
 ([services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) § Label 11).
 A call cancelled with `Interrupted` is made again with a fresh derivation, which replaces any that
 reached memmgr. A failure leaves the process unregistered, and nothing else depends on it.
@@ -732,11 +733,13 @@ pressure):
   ([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md#commit) § Commit,
   Overcommit).
 - `memory_pressure_notification()` is the registered Notification, with every right, which memmgr
-  sends `MEMORY_PRESSURE_BIT` on at each change of level and each opening of the draw room, not at
-  its closing; a server adds it to its wait set.
-- `wait_memory_pressure(timeout)` waits for the bit and returns the level then, unchanged after a
-  wake for the draw room, so a caller acting on a change of level compares it with the last. Each
-  signal wakes one waiter of the process. A wait cancelled with `Interrupted` (a stop of the
+  sends `MEMORY_PRESSURE_BIT` on at each change of level, and `COMMIT_DRAW_ROOM_BIT` at each
+  opening of the draw room, not at its closing; a server adds it to its wait set. Sends coalesce,
+  so a wake's `MEMORY_PRESSURE_BIT` says that the level changed at least once, perhaps back to
+  where it was.
+- `wait_memory_pressure(timeout)` waits for `MEMORY_PRESSURE_BIT` and returns the level then; a
+  wake that carries only `COMMIT_DRAW_ROOM_BIT` is taken and waited past. Each signal wakes one
+  waiter of the process. A wait cancelled with `Interrupted` (a stop of the
   thread, or an upcall to it) waits again for what is left of `timeout`.
 
 A process that registers another Notification itself replaces the runtime's, which memmgr then

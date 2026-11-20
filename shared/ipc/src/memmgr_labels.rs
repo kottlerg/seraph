@@ -136,7 +136,7 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   charge to a reserve node may take.
 /// * `data[7]` — the memory-pressure level: [`PRESSURE_NORMAL`],
 ///   [`PRESSURE_LOW`] or [`PRESSURE_CRITICAL`]. A [`REGISTER_PRESSURE`]
-///   bit says it changed; this read is the level.
+///   level bit says it changed; this read is the level.
 /// * `data[8]` — `promised_bytes`: what the committed regions
 ///   ([`REGION_COMMIT`]) can still take from the free runs: their pages
 ///   that hold no frame yet, with bounds on the page tables and metadata
@@ -183,17 +183,22 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   fault as a commit overrun (decline code 11) when it finds none. The
 ///   draw room is open at [`DEMAND_CHUNK_BYTES`] or more, room for any one
 ///   committed draw (a fault's, or the restore of a committed chunk), and a
-///   [`REGISTER_PRESSURE`] bit says it opened.
+///   [`REGISTER_PRESSURE`] draw-room bit says it opened.
 /// * `data[17]` — `uncommitted_free_bytes`: the free pages outside
 ///   `promised`, which a charge that takes frames now may take and the
 ///   pressure level reads: `data[3]` plus `data[15]` less `data[8]`, and
 ///   at most `data[3]`. While `data[15]` is `0` it is `data[3]` less
 ///   `data[8]`; with an allowance it can be all of `data[3]`.
+/// * `data[18]` — `committed_swapped_bytes`: the part of `data[8]` the
+///   evicted chunks of committed regions hold for their restores, the subset
+///   of `data[10]` in committed regions. An eviction or a restore of such a
+///   chunk moves `data[8]` and this alike, so `data[8]` less this is the
+///   promised total net of eviction.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[17]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[18]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.
@@ -294,19 +299,23 @@ pub const QUERY_MEMORY_USAGE: u64 = 10;
 /// Universal label, attributed by `recv.badge`.
 ///
 /// Wire format:
-/// * `data[0]` — the bits to send; nonzero.
+/// * `data[0]` — the bits to send on a change of the pressure level;
+///   nonzero, within the low 32 bits.
+/// * `data[1]` — the bits to send on an opening of the draw room
+///   (`QUERY_POOL_STATUS` `data[16]`), within the low 32 bits; `0` for
+///   none.
 /// * `caps[0]` — a Notification cap with Notify rights; ownership
 ///   transfers to memmgr.
 ///
-/// On every change of the pressure level, and every opening of the draw room
-/// (`QUERY_POOL_STATUS` `data[16]`), memmgr sends the bits on the cap, without blocking; the
-/// receiver reads the level from [`QUERY_POOL_STATUS`] `data[7]` and the
-/// draw room from `data[16]`. A process holds one registration: a
+/// memmgr sends the level bits on the cap on every change of the pressure
+/// level and the draw-room bits on every opening of the draw room, without
+/// blocking; the receiver reads the level from [`QUERY_POOL_STATUS`]
+/// `data[7]` and the draw room from `data[16]`. A process holds one registration: a
 /// second replaces the first, and `PROCESS_DIED` drops it. The std runtime
 /// registers every process at start.
 ///
 /// Reply: `memmgr_errors::SUCCESS`; or `INVALID_ARGUMENT` (unknown badge,
-/// zero bits, or `caps[0]` missing or not a Notification with Notify; the
+/// zero level bits, a bit of either mask above the low 32, or `caps[0]` missing or not a Notification with Notify; the
 /// cap is deleted). Specified in `services/memmgr/docs/ipc-interface.md`
 /// § Label 11: `REGISTER_PRESSURE`.
 pub const REGISTER_PRESSURE: u64 = 11;

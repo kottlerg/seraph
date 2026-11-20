@@ -46,6 +46,53 @@ pub enum PressureLevel
     Critical,
 }
 
+/// The bits a `REGISTER_PRESSURE` registrant asked memmgr to send
+/// (`services/memmgr/docs/ipc-interface.md` § Label 11): `level` on a change
+/// of the level, `draw_room` on an opening of the draw room, `0` for none.
+/// Each mask lies in the low 32 bits of the Notification word, so the pair
+/// fits the process's caps slot beside its other caps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PressureBits
+{
+    pub level: u32,
+    pub draw_room: u32,
+}
+
+/// What one turn of memmgr's receive loop signals to the registrants: a
+/// change of the level, an opening of the draw room, or both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PressureSignal
+{
+    pub level: bool,
+    pub draw_room: bool,
+}
+
+impl PressureBits
+{
+    /// The registration `REGISTER_PRESSURE`'s `data[0]` and `data[1]` ask
+    /// for, the level bits and the draw-room bits; `None`, refused, when the
+    /// level bits are `0` or either mask has a bit above the low 32.
+    #[must_use]
+    pub fn from_words(level: u64, draw_room: u64) -> Option<Self>
+    {
+        let level = u32::try_from(level).ok().filter(|&bits| bits != 0)?;
+        let draw_room = u32::try_from(draw_room).ok()?;
+        Some(Self { level, draw_room })
+    }
+
+    /// The bits to send for `signal`: the level bits on a change of level and
+    /// the draw-room bits on an opening of the draw room, so a registrant
+    /// whose two masks differ tells from a wake which happened; `0` sends
+    /// nothing.
+    #[must_use]
+    pub fn for_signal(self, signal: PressureSignal) -> u64
+    {
+        let level = if signal.level { self.level } else { 0 };
+        let draw_room = if signal.draw_room { self.draw_room } else { 0 };
+        u64::from(level) | u64::from(draw_room)
+    }
+}
+
 /// The level `free` pages give against `pool_total`, `swapped` of whose
 /// pages are swapped chunks of uncommitted regions, which the restore headroom
 /// counts ([`growth_floor`]), with no hysteresis.
@@ -199,5 +246,49 @@ mod tests
         assert_eq!(pressure_level(Normal, 2 * RESERVE, TOTAL, TOTAL), Critical);
         assert_eq!(pressure_level(Normal, 2 * RESERVE + 1, TOTAL, TOTAL), Low);
         assert_eq!(pressure_level(Normal, LOW, TOTAL, TOTAL), Normal);
+    }
+
+    #[test]
+    fn a_registration_takes_nonzero_level_bits_and_two_32_bit_masks()
+    {
+        assert_eq!(
+            PressureBits::from_words(1, 2),
+            Some(PressureBits {
+                level: 1,
+                draw_room: 2
+            })
+        );
+        // No draw-room bits: openings are not signalled.
+        assert_eq!(
+            PressureBits::from_words(1 << 31, 0),
+            Some(PressureBits {
+                level: 1 << 31,
+                draw_room: 0
+            })
+        );
+        assert_eq!(PressureBits::from_words(0, 2), None);
+        assert_eq!(PressureBits::from_words(1 << 32, 0), None);
+        assert_eq!(PressureBits::from_words(1, 1 << 32), None);
+    }
+
+    #[test]
+    fn a_level_wake_carries_the_level_bits_and_an_opening_the_draw_room_bits()
+    {
+        let bits = PressureBits {
+            level: 0b01,
+            draw_room: 0b10,
+        };
+        let signal = |level, draw_room| PressureSignal { level, draw_room };
+        assert_eq!(bits.for_signal(signal(true, false)), 0b01);
+        assert_eq!(bits.for_signal(signal(false, true)), 0b10);
+        assert_eq!(bits.for_signal(signal(true, true)), 0b11);
+        assert_eq!(bits.for_signal(signal(false, false)), 0);
+        // A registrant with no draw-room bits is sent nothing on an opening.
+        let level_only = PressureBits {
+            level: 0b100,
+            draw_room: 0,
+        };
+        assert_eq!(level_only.for_signal(signal(false, true)), 0);
+        assert_eq!(level_only.for_signal(signal(true, true)), 0b100);
     }
 }

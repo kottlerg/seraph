@@ -59,8 +59,8 @@ use crate::disk::SwapSlots;
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
 use crate::{
-    CHUNK_BYTES, DEMAND_CHUNK_PAGES, DemandRegion, Evict, FreeRun, PressureLevel, chunk_count,
-    chunk_for, chunk_index, region_contains, regions_overlap,
+    CHUNK_BYTES, DEMAND_CHUNK_PAGES, DemandRegion, Evict, FreeRun, PressureBits, PressureLevel,
+    PressureSignal, chunk_count, chunk_for, chunk_index, region_contains, regions_overlap,
 };
 
 use syscall_abi::{MAX_HARVEST_PAGES, PAGE_SIZE};
@@ -327,6 +327,16 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     pub const fn swapped_pages(&self) -> u64
     {
         self.swapped_pages
+    }
+
+    /// The subset of [`Self::swapped_pages`] in the chunks of committed
+    /// regions, which `promised` holds again for their restores: the part of
+    /// `promised` evicted committed chunks hold, the rest being committed
+    /// pages never backed or discarded, and page-table and metadata bounds.
+    #[must_use]
+    pub const fn committed_swapped(&self) -> u64
+    {
+        self.committed_swapped
     }
 
     /// Evictions begun since the ledger was made, wrapping: the one way a
@@ -677,7 +687,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         let no_caps = Node::Caps(ProcessCaps {
             aspace: 0,
             pressure: 0,
-            pressure_bits: 0,
+            pressure_bits: PressureBits::default(),
             handles: NODE_NULL,
             limits: NODE_NULL,
             swapped: 0,
@@ -1237,7 +1247,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// Register `cap` as the pressure Notification of `rec`, signalled with
     /// `bits`, in place of any earlier one. Returns the cap it replaces, `0`
     /// for none, for the caller to delete; `None` when `rec` holds no record.
-    pub fn set_pressure(&mut self, rec: NodeIdx, cap: u64, bits: u64) -> Option<u64>
+    pub fn set_pressure(&mut self, rec: NodeIdx, cap: u64, bits: PressureBits) -> Option<u64>
     {
         let prior = self.caps(rec)?.pressure;
         self.update_caps(rec, |c| {
@@ -1254,19 +1264,24 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         let prior = self.caps(rec).map_or(0, |c| c.pressure);
         self.update_caps(rec, |c| {
             c.pressure = 0;
-            c.pressure_bits = 0;
+            c.pressure_bits = PressureBits::default();
         });
         prior
     }
 
-    /// Call `f` with the cap and bits of every pressure registration.
-    pub fn for_each_pressure(&self, mut f: impl FnMut(u64, u64))
+    /// Call `f` with the cap of every pressure registration that `signal`
+    /// sends bits to, and those bits ([`PressureBits::for_signal`]).
+    pub fn for_each_pressure(&self, signal: PressureSignal, mut f: impl FnMut(u64, u64))
     {
         self.index.for_each(&self.arena, |rec| {
             if let Some(c) = self.caps(rec)
                 && c.pressure != 0
             {
-                f(c.pressure, c.pressure_bits);
+                let bits = c.pressure_bits.for_signal(signal);
+                if bits != 0
+                {
+                    f(c.pressure, bits);
+                }
             }
         });
     }
@@ -3686,14 +3701,18 @@ mod tests
         l.add_region(rec, region(0x40_0000, 0x10_0000), Commit::Uncommitted)
             .unwrap();
         l.set_aspace_cap(rec, 9);
-        assert_eq!(l.set_pressure(rec, 11, 1), Some(0));
+        let bits = PressureBits {
+            level: 1,
+            draw_room: 2,
+        };
+        assert_eq!(l.set_pressure(rec, 11, bits), Some(0));
         let (_, caps) = l.remove_process(42, pool_all, |_| {}).unwrap();
         assert_eq!(
             caps,
             ProcessCaps {
                 aspace: 9,
                 pressure: 11,
-                pressure_bits: 1,
+                pressure_bits: bits,
                 handles: NODE_NULL,
                 limits: NODE_NULL,
                 swapped: 0,
@@ -3731,16 +3750,20 @@ mod tests
         let mut l = ledger();
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         l.set_aspace_cap(rec, 5);
-        assert_eq!(l.set_pressure(rec, 20, 0b10), Some(0));
+        let level = |bits| PressureBits {
+            level: bits,
+            draw_room: 0,
+        };
+        assert_eq!(l.set_pressure(rec, 20, level(0b10)), Some(0));
         // The first cap comes back for the caller to delete.
-        assert_eq!(l.set_pressure(rec, 21, 0b100), Some(20));
+        assert_eq!(l.set_pressure(rec, 21, level(0b100)), Some(20));
         let mut seen = Vec::new();
-        l.for_each_pressure(|cap, bits| seen.push((cap, bits)));
+        l.for_each_pressure(LEVEL, |cap, bits| seen.push((cap, bits)));
         assert_eq!(seen, [(21, 0b100)]);
         // The address-space cap beside it is untouched.
         assert_eq!(l.aspace_cap(rec), 5);
         // An index that names no record registers nothing.
-        assert_eq!(l.set_pressure(NODE_NULL, 22, 1), None);
+        assert_eq!(l.set_pressure(NODE_NULL, 22, level(1)), None);
     }
 
     #[test]
@@ -3750,13 +3773,58 @@ mod tests
         let a = l.insert_process(1, NodeSpec::TOP).unwrap();
         let b = l.insert_process(2, NodeSpec::TOP).unwrap();
         l.insert_process(3, NodeSpec::TOP).unwrap();
-        l.set_pressure(a, 30, 1).unwrap();
-        l.set_pressure(b, 31, 1).unwrap();
+        let bits = PressureBits {
+            level: 1,
+            draw_room: 2,
+        };
+        l.set_pressure(a, 30, bits).unwrap();
+        l.set_pressure(b, 31, bits).unwrap();
         assert_eq!(l.take_pressure(a), 30);
         assert_eq!(l.take_pressure(a), 0);
         let mut seen = Vec::new();
-        l.for_each_pressure(|cap, _| seen.push(cap));
+        l.for_each_pressure(LEVEL, |cap, _| seen.push(cap));
         assert_eq!(seen, [31]);
+    }
+
+    /// A change of level alone.
+    const LEVEL: PressureSignal = PressureSignal {
+        level: true,
+        draw_room: false,
+    };
+
+    #[test]
+    fn an_opening_of_the_draw_room_signals_only_the_registrations_that_asked_for_it()
+    {
+        let mut l = ledger();
+        let a = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let b = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let both = PressureBits {
+            level: 0b01,
+            draw_room: 0b10,
+        };
+        let level_only = PressureBits {
+            level: 0b100,
+            draw_room: 0,
+        };
+        l.set_pressure(a, 40, both).unwrap();
+        l.set_pressure(b, 41, level_only).unwrap();
+        let sent = |l: &Ledger<VecStore, VecWords>, signal| {
+            let mut seen = Vec::new();
+            l.for_each_pressure(signal, |cap, bits| seen.push((cap, bits)));
+            seen.sort_unstable();
+            seen
+        };
+        assert_eq!(sent(&l, LEVEL), [(40, 0b01), (41, 0b100)]);
+        let opened = PressureSignal {
+            level: false,
+            draw_room: true,
+        };
+        assert_eq!(sent(&l, opened), [(40, 0b10)]);
+        let both_changed = PressureSignal {
+            level: true,
+            draw_room: true,
+        };
+        assert_eq!(sent(&l, both_changed), [(40, 0b11), (41, 0b100)]);
     }
 
     #[test]

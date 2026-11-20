@@ -30,12 +30,12 @@
 //! swept out of the table (`sweep_dead_opens`). Write-side metadata patching
 //! uses the node's cached `DirEntryLocation`.
 //!
-//! Memory pressure: a pressure thread waits on the runtime's memory-pressure
-//! Notification (`std::os::seraph::wait_memory_pressure`), whose wakes include
-//! the openings of memmgr's draw room, which leave the level as it was. When
-//! memmgr's level reads `Low` or `Critical` and differs from the level its
-//! last wake read, it marks a release pending and wakes the dispatch loop with
-//! an unbadged call on the service endpoint. The loop,
+//! Memory pressure: a pressure thread waits for a change of memmgr's level
+//! (`std::os::seraph::wait_memory_pressure`). Each wake at which the level
+//! reads `Low` or `Critical` begins or continues a shortage, whatever the
+//! level the last wake read, since a wake can carry a return to `Normal` and
+//! a new fall; the thread then marks a release pending and wakes the dispatch
+//! loop with an unbadged call on the service endpoint. The loop,
 //! at the top of its next turn, gives memmgr back the pages the cache holds
 //! idle but the few most recently used, which a miss evicts when memmgr
 //! refuses a page ([`cache::PageCache::release_idle_pages`]), and goes on
@@ -225,10 +225,10 @@ fn spawn_pressure_thread(service: u64)
     }
 }
 
-/// Wait for memmgr's level to change; at `Low` or `Critical`, other than the
-/// level the last wake read, mark a release pending and wake the dispatch
-/// loop with a call on `wake`. A wake that leaves the level as it was (an opening of
-/// memmgr's draw room) is not a change, and acts on nothing. A call
+/// Wait for memmgr's level to change; at `Low` or `Critical`, mark a release
+/// pending and wake the dispatch loop with a call on `wake`. A wake at the
+/// level the last one read is acted on too, since the changes it carries
+/// can have passed through `Normal`, the cache growing again meanwhile. A call
 /// that a stop or an upcall interrupts is made again, since a second wake
 /// costs the loop one more refused request. Ends when the wait fails, or
 /// when the call fails otherwise, as it does once vfsd has revoked the
@@ -236,18 +236,14 @@ fn spawn_pressure_thread(service: u64)
 /// driver.
 fn pressure_thread(wake: u64)
 {
-    let mut last = MemoryPressure::Normal;
     loop
     {
         match std::os::seraph::wait_memory_pressure(None)
         {
-            Ok(level) if level == last => continue,
-            Ok(level @ (MemoryPressure::Low | MemoryPressure::Critical)) => last = level,
-            Ok(level) =>
-            {
-                last = level;
-                continue;
-            }
+            Ok(MemoryPressure::Low | MemoryPressure::Critical) =>
+            {}
+            // `Normal`: no shortage to act on.
+            Ok(_) => continue,
             Err(e) =>
             {
                 std::os::seraph::log!(warn: "memory-pressure wait failed ({e}); cache kept under pressure");

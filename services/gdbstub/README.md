@@ -130,19 +130,25 @@ stub's endpoint.
   upcall and waits up to `STOP_WAIT` (2 s) for each to arrive. The kernel refuses an upcall to a
   thread its creator has not started, as procmgr lists a process's main thread between its creation
   and its start, so the stub reads such a thread's state again every `START_POLL` (10 ms), posts
-  its upcall once it has started, and waits up to `STOP_WAIT` from that post for it. Once none is
-  awaited, it refreshes its table once (below), posts an upcall to each thread the refresh adds,
+  its upcall once it has started, and waits up to `STOP_WAIT` from that post for it. A thread
+  blocked in an IPC call, queued or awaiting its reply, takes its upcall only at the call's return,
+  with the reply in its registers ([docs/fault-handling.md](../../docs/fault-handling.md)
+  § Asynchronous Upcalls, Blocking syscalls), and runs no instruction before it. The stub reads
+  each posted thread's upcall state (`CAP_INFO_THREAD_UPCALL`) as often, and counts a thread held
+  in a call, its upcall pending and not masked, as stopped at once; its upcall, when it arrives
+  while the target is still stopped, is held as any stop, so a register request of the thread
+  waits up to `STOP_WAIT` for it once the call has returned. Once none is awaited, it
+  refreshes its table once (below), posts an upcall to each thread the refresh adds,
   and restarts every held breakpoint hit or fault GDB has not been told of, since any of them can
   be a new thread's (below). A thread whose upcall does not arrive in time runs on and is not
   reported held. The all-stop's end makes every held stop one GDB has been told of. An upcall that
-  arrives while the target runs was posted to a thread that had stopped on a fault first; its stop
-  is over, and the stub resumes it at once. A thread the upcall
-  finds blocked in an interruptible syscall returns from it with `Interrupted`
+  arrives while the target runs was posted to a thread that had stopped on a fault first, or that
+  was held in a call; its stop is over, and the stub resumes it at once. A thread the upcall finds
+  blocked in any other interruptible syscall returns from it with `Interrupted`
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Asynchronous Upcalls, Blocking
-  syscalls), so each all-stop can end a sleep, a wait, or an IPC call of the target early, as any
-  stop can. A thread that masks upcalls across a call (`ipc::ipc_call_masked`, as devmgr's calls
-  to the IOMMU driver are made) is not interrupted: its upcall arrives once the server replies,
-  and a reply later than `STOP_WAIT` leaves the thread running, unheld.
+  syscalls), so each all-stop can end a sleep or a wait of the target early, as any stop can. A
+  thread that masks upcalls takes its upcall when it unmasks, and one still masked past
+  `STOP_WAIT` runs on, unheld.
 - **Crediting a stop.** A thread the target spawns after the attach copies its spawner's bindings,
   the stub's badge among them, so its stops arrive under its spawner's badge. The stub credits a
   stop to the thread its badge names only when that thread is not already held and its register
@@ -197,7 +203,10 @@ stub's endpoint.
   an interrupt. GDB's thread ids are the table's indices plus one; thread 1 is the main thread.
   `Hg` of a thread GDB cannot select is answered `E04` when its bind failed, `E05` when it has
   exited, and `E01` when the table has no such slot, and the stub logs the refusal, so the cause
-  reaches the host even when the line cannot, as when the target held is logd.
+  reaches the host even when the line cannot, as when the target held is logd. A register read or
+  write of a thread still held in a call is answered `E06`, since the kernel reads a thread's
+  registers only while it is stopped or fault-blocked (#1405 asks for a read of a blocked thread's
+  saved frame), and `qThreadExtraInfo` shows it as `held in a call`.
 - **Memory.** `m` reads and `M` and `X` write the target's memory through a live thread of it, in
   the chunks the kernel copies at once. A chunk on a page memmgr evicted, into its compressed store
   or to disk, is not present to the kernel's copy, so the stub asks procmgr, through its debug
@@ -258,7 +267,8 @@ stub's endpoint.
 | `qOffsets` | the image's load bias, so GDB relocates the host binary's symbols |
 | `qXfer:features:read:target.xml` | the architecture's target description |
 | `qfThreadInfo`, `qsThreadInfo`, `qC`, `Hg`, `Hc`, `T` | the live threads, the current one, its selection |
-| `g`, `G`, `p`, `P` | the current thread's registers, read and written through its register file |
+| `qThreadExtraInfo` | what the thread does: `stopped`, `held in a call`, or `running` ([Stop Model](#stop-model)) |
+| `g`, `G`, `p`, `P` | the current thread's registers, read and written through its register file; `E06` for a thread held in a call |
 | `m`, `M`, `X` | target memory |
 | `Z0`, `z0` | software breakpoints |
 | `c`, `C`, `s`, `S`, `vCont?`, `vCont` | resume and step, as above |
@@ -317,7 +327,7 @@ still attached.
 | `MAX_THREADS` | 32 live threads per attach, refreshes included; an exited thread's slot is taken again | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, and its stops are settled as [Crediting a stop](#stop-model) says |
 | `MAX_RECEIVERS` | 64 receiver threads, twice `MAX_THREADS` | a stop waits on the stub's endpoint until a held one is answered |
 | `STOP_WAIT` | 2 s per all-stop, and from the post to a thread its creator starts during it | a thread whose upcall has not arrived runs on; an attach whose target is unstarted at the all-stop's last read detaches |
-| `START_POLL` | 10 ms | the all-stop's interval between reads of a thread its creator has not started |
+| `START_POLL` | 10 ms | the all-stop's interval between reads of a thread its creator has not started, and of a posted thread's upcall state |
 | `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the target at startup | the stub serves detached (no target) |
 | `REATTACH_ATTEMPTS` × `FIND_INTERVAL` | 50 × 100 ms, for the target at a `qSupported` that finds the stub detached | the stub stays detached; `?` reports the target exited |
 | `REFRESH_TRIES` | 3 walks of the thread list per refresh or attach | a refresh's stop is settled as no new thread's, and the next stop that is not its thread's own refreshes again; the attach keeps its last list and refreshes no more |

@@ -199,10 +199,7 @@ devmgr's responsibilities are:
   states (`devmgr_firmware::dma::iova_limit`), and the thread has the IOMMU
   driver install the mapping (`MAP`, moving it a derivation of the cap) before it
   replies, and remove it (`UNMAP`) before it deletes the cap; a refused or
-  failed IOMMU call replies `IOMMU_FAILED`. Every call devmgr makes to the IOMMU driver is made
-  with the calling thread's upcalls masked (`ipc::ipc_call_masked`), so a debugger's stop of
-  devmgr waits for the driver's reply rather than cutting the call short, which would leave a
-  mapping the driver installed unknown to devmgr. The thread serves it apart from the registry
+  failed IOMMU call replies `IOMMU_FAILED`. The thread serves it apart from the registry
   and the control thread (below) because the control thread makes nested calls and settles
   batches during which drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary through
   virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
@@ -899,9 +896,9 @@ can outlive is retried within a bound, beside the restart rules above. The polic
   `OUT_OF_MEMORY` (memory pressure). Any other reply label is final: a refused signature, an image
   that is no valid ELF, a malformed request. So is devmgr's own failure before the call, and a
   driver that started and failed its bootstrap. A create call that fails, rather than being
-  answered, is never retried: the call can end after procmgr acted on it (a debugger's all-stop
-  interrupting devmgr), so devmgr cannot tell whether a child exists, and a retry could create a
-  second one. Only a reply label proves that procmgr answered and created nothing.
+  answered, is never retried: the call can end after procmgr acted on it (a stop of devmgr's thread
+  interrupting it), so devmgr cannot tell whether a child exists, and a retry could create a second
+  one. Only a reply label proves that procmgr answered and created nothing.
 - **The bound.** `CREATE_RETRY_LIMIT` retries, the first `CREATE_RETRY_FIRST_MS` after the
   refusal and each later one after twice the delay before it
   ([docs/limits.md](../../../docs/limits.md)). The restart budget is charged nothing: it bounds a

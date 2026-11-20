@@ -1060,7 +1060,7 @@ fn cap_is(cap: u64, tag: u8, rights: u64) -> bool
 }
 
 /// Send `DESTROY_PROCESS` on `handle`, retrying a call a stop of this
-/// thread, or an upcall to it, interrupted.
+/// thread interrupted.
 #[inline(never)]
 fn destroy_process(handle: u64, ipc_buf: *mut u64)
 {

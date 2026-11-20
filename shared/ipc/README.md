@@ -5,13 +5,12 @@ Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot t
 `ipc_recv_timeout`, and `ipc_try_recv`, and `ipc_call_within`, a call bounded by the time left to a
 deadline (`call_timeout`; `WouldBlock` without a call once none is left;
 [runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Call deadline), that keep the
-kernel's per-thread IPC buffer as scratch at the syscall boundary, the masked call
-`ipc_call_masked`, which a post does not cut short, for a request whose outcome the caller records,
-the generic bootstrap protocol, the `RecvGuard` receive-failure policy for blocking receive loops,
-the per-service IPC label and error-code modules, the shared policy tables (`sched_policy`,
-`published_names`, `log_badges`), the `keysym` codes and event packing, the `memmgr_bootstrap`,
-`device_info_kind`, and `procmgr_process_state` constants, the create requests' argv/env header
-codec (`procmgr_labels::ArgvEnvHeader`), the crate-level limits and masks (`VERB_BIT_MASK`,
+kernel's per-thread IPC buffer as scratch at the syscall boundary, the generic bootstrap protocol,
+the `RecvGuard` receive-failure policy for blocking receive loops, the per-service IPC label and
+error-code modules, the shared policy tables (`sched_policy`, `published_names`, `log_badges`), the
+`keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`, and
+`procmgr_process_state` constants, the create requests' argv/env header codec
+(`procmgr_labels::ArgvEnvHeader`), the crate-level limits and masks (`VERB_BIT_MASK`,
 `MAX_PATH_LEN`), the svcmgr name limit and codec (`svcmgr_labels::NAME_MAX`, `pack_name`,
 `unpack_name`), reply-shape decoders (today `memmgr_grant_layout`), the driver-side `DMA_MAP` and
 `DMA_UNMAP` calls (`dma_map`, `dma_unmap`), and the log record codec (`log_record`: the

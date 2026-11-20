@@ -517,6 +517,11 @@ impl Kernel for Sys
         syscall::thread_post_upcall(cap, 0, syscall_abi::UPCALL_ANY_INSTRUCTION).is_ok()
     }
 
+    fn in_call(&mut self, cap: u64) -> bool
+    {
+        syscall::cap_info(cap, syscall_abi::CAP_INFO_THREAD_UPCALL).is_ok_and(session::held_in_call)
+    }
+
     fn bind(&mut self, slot: usize, cap: u64) -> bool
     {
         if !self.ensure_receiver(slot)
@@ -1066,6 +1071,17 @@ impl Stub
                 Some(_) => self.ok(ipc_buf),
                 None => self.error(ipc_buf, 1),
             },
+            Command::ThreadExtraInfo(thread) =>
+            {
+                let text = match (&self.session, self.select(thread))
+                {
+                    (Some(s), Some(i)) => s.describe(&mut self.sys, i),
+                    _ => b"",
+                };
+                self.send(ipc_buf, |w| {
+                    w.hex(text);
+                });
+            }
             Command::ReadRegisters => self.read_registers(None, ipc_buf),
             Command::ReadRegister(n) => self.read_registers(usize::try_from(n).ok(), ipc_buf),
             Command::WriteRegisters(hex) => self.write_registers(None, hex, ipc_buf),
@@ -1204,13 +1220,37 @@ impl Stub
         Some((cap, file))
     }
 
+    /// The error number a failed read of the current thread's register file
+    /// answers ([`Session::register_refusal`]).
+    fn register_refusal(&mut self) -> u8
+    {
+        match &self.session
+        {
+            Some(s) => s.register_refusal(&mut self.sys, s.current),
+            None => 1,
+        }
+    }
+
+    /// Hold the current thread once the call that held it has returned
+    /// ([`Session::await_call`]), so that its registers read.
+    fn await_call(&mut self)
+    {
+        if let Some(s) = &mut self.session
+        {
+            let current = s.current;
+            s.await_call(&mut self.sys, current);
+        }
+    }
+
     /// `g` (every register, `regnum` `None`) or `p` (one).
     fn read_registers(&mut self, regnum: Option<usize>, ipc_buf: *mut u64)
     {
+        self.await_call();
         let Some((_, file)) = self.read_file()
         else
         {
-            self.error(ipc_buf, 1);
+            let code = self.register_refusal();
+            self.error(ipc_buf, code);
             return;
         };
         match regnum
@@ -1227,10 +1267,12 @@ impl Stub
     /// `G` (every register, `regnum` `None`) or `P` (one).
     fn write_registers(&mut self, regnum: Option<usize>, hex: &[u8], ipc_buf: *mut u64)
     {
+        self.await_call();
         let Some((cap, mut file)) = self.read_file()
         else
         {
-            self.error(ipc_buf, 1);
+            let code = self.register_refusal();
+            self.error(ipc_buf, code);
             return;
         };
         let Some(part) = file.get_mut(..regs::file_size(ARCH))

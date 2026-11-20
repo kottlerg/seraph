@@ -229,8 +229,8 @@ fn spawn_pressure_thread(service: u64)
 /// pending and wake the dispatch loop with a call on `wake`. A wake at the
 /// level the last one read is acted on too, since the changes it carries
 /// can have passed through `Normal`, the cache growing again meanwhile. A call
-/// that a stop or an upcall interrupts is made again, since a second wake
-/// costs the loop one more refused request. Ends when the wait fails, or
+/// that a stop interrupts is made again, since a second wake costs the loop
+/// one more refused request. Ends when the wait fails, or
 /// when the call fails otherwise, as it does once vfsd has revoked the
 /// service endpoint: the dispatch loop's receive then fails too and ends the
 /// driver.

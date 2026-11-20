@@ -692,9 +692,9 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         env.settle(reply.as_ref().map_or(0, |r| r.label));
     }
     // A failed call is no refusal, and is never retried: the call can end
-    // after procmgr acted on it (a debugger's all-stop interrupting devmgr,
-    // #1383), so devmgr cannot tell whether a child was created, and a
-    // retry could create a second one.
+    // after procmgr acted on it (a stop of devmgr's thread interrupting it),
+    // so devmgr cannot tell whether a child was created, and a retry could
+    // create a second one.
     let Ok(reply) = reply
     else
     {

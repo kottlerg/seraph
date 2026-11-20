@@ -1301,8 +1301,8 @@ fn bridge_main(h: BridgeHandles) {
 
 /// `Child::kill`'s `DESTROY_PROCESS` on `process_handle`, under the thread's
 /// call deadline (`deadline_call`), retrying a call that a stop and restart of
-/// this thread, or an upcall to it, interrupted: `TimedOut` when the deadline
-/// passed first, and the child may then still run.
+/// this thread interrupted: `TimedOut` when the deadline passed first, and
+/// the child may then still run.
 fn kill_child(process_handle: u64) -> io::Result<()> {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null() {
@@ -1323,8 +1323,7 @@ fn kill_child(process_handle: u64) -> io::Result<()> {
 /// deadline (`destroy_process_call`): the teardown of a child a spawn could
 /// not finish, or of one its `Child` was dropped without a wait, which
 /// nothing else releases. Retries a call that a stop and restart of this
-/// thread, or an upcall to it, interrupted, and reports whether procmgr
-/// replied.
+/// thread interrupted, and reports whether procmgr replied.
 fn destroy_child(process_handle: u64) -> bool {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null() {

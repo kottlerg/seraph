@@ -7,7 +7,8 @@
 //!
 //! [`Command::parse`] recognises the packet set `target remote` needs for one
 //! process: the halt reason, registers, memory, continue and step (plain and
-//! `vCont`), breakpoints and watchpoints, thread selection and listing, the
+//! `vCont`), breakpoints and watchpoints, thread selection, listing and
+//! description, the
 //! queries of the connection's start (`qSupported`, `qAttached`, `qOffsets`,
 //! `QStartNoAckMode`, the target description), attach, detach, and kill.
 //! Every other body is [`Command::Unknown`], which a stub answers with an
@@ -185,6 +186,9 @@ pub enum Command<'a>
     ThreadInfoNext,
     /// `qC`: the current thread.
     CurrentThread,
+    /// `qThreadExtraInfo,<thread>`: a description of the thread, which the
+    /// stub answers as hex-encoded text and GDB shows in `info threads`.
+    ThreadExtraInfo(ThreadId),
     /// `qSupported[:features]`: GDB's features, `;`-separated, and a request
     /// for the stub's.
     Supported(&'a [u8]),
@@ -326,6 +330,10 @@ fn parse_query(body: &[u8]) -> Result<Command<'_>, Error>
             if let Some(features) = body.strip_prefix(b"qSupported:")
             {
                 Command::Supported(features)
+            }
+            else if let Some(thread) = body.strip_prefix(b"qThreadExtraInfo,")
+            {
+                Command::ThreadExtraInfo(parse_thread(thread)?)
             }
             else if let Some(pid) = body.strip_prefix(b"qAttached:")
             {
@@ -720,6 +728,11 @@ mod tests
             })
         );
         assert_eq!(parse(b"T1f"), Ok(Command::ThreadAlive(ThreadId::Id(0x1f))));
+        assert_eq!(
+            parse(b"qThreadExtraInfo,2a"),
+            Ok(Command::ThreadExtraInfo(ThreadId::Id(0x2a)))
+        );
+        assert_eq!(parse(b"qThreadExtraInfo,"), Err(Error::Malformed));
         assert_eq!(parse(b"Hx1"), Err(Error::Malformed));
         assert_eq!(parse(b"H"), Err(Error::Malformed));
     }

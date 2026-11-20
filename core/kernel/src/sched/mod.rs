@@ -4710,11 +4710,11 @@ pub enum ParkCommit
     /// untouched.
     RefusedWake,
     /// A concurrent stop/exit already moved the thread off `Running`/`Ready`,
-    /// or an upcall is pending that the thread does not mask outside a fault
-    /// or upcall delivery; the park is refused and the caller's rollback owns
-    /// the episode (no waker ever saw the registration), stamping it
-    /// interrupted as for a stop, so the syscall returns `Interrupted` and the
-    /// upcall is delivered at its return.
+    /// or an upcall is pending that may end the park
+    /// (`syscall::thread::upcall_may_cancel`: never a call's); the park is
+    /// refused and the caller's rollback owns the episode (no waker ever saw
+    /// the registration), stamping it interrupted as for a stop, so the
+    /// syscall returns `Interrupted` and the upcall is delivered at its return.
     RefusedStop,
 }
 
@@ -4727,10 +4727,13 @@ pub enum ParkCommit
 /// core/kernel/docs/sched-ipc-redesign.md § 2.1):
 /// - [`ParkCommit::RefusedStop`]: a concurrent stop/exit already won (`state`
 ///   is `Stopped`/`Exited`/…), and the thread is then drained by
-///   `schedule()`; or an unmasked upcall is pending on a thread in no fault
-///   or upcall delivery (`upcall_pending`, written by the post under this
-///   lock), and the thread stays `Running`, its `schedule()` a requeue, so a
-///   post that finds the thread not yet `Blocked` loses no wake
+///   `schedule()`; or a pending upcall may end the park `ipc`
+///   (`syscall::thread::upcall_may_cancel`, reading `upcall_pending`, which
+///   the post writes under this lock), and the thread stays `Running`, its
+///   `schedule()` a requeue, so a post that finds the thread not yet
+///   `Blocked` loses no wake. A call's park (`BlockedOnSend`,
+///   `BlockedOnReply`) is never refused for an upcall: it commits, and the
+///   upcall is delivered at the call's return
 ///   (core/kernel/docs/thread-lifecycle-and-sleep.md § Upcall Cancel-and-Wake
 ///   Protocol).
 /// - [`ParkCommit::RefusedWake`]: `wake_pending` is set — a waker raced ahead,
@@ -4786,21 +4789,13 @@ pub unsafe fn commit_blocked_under_local_lock(
                     (*tcb).wake_pending = false;
                     ParkCommit::RefusedWake
                 }
-                else if !(*tcb).in_fault_delivery
-                    && (*tcb)
-                        .upcall_pending
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                    && !(*tcb)
-                        .upcall_masked
-                        .load(core::sync::atomic::Ordering::Relaxed)
+                else if crate::syscall::thread::upcall_may_cancel(tcb, ipc)
                 {
                     // A posted upcall interrupts the block before it begins,
                     // as its cancel would interrupt it after (the post wrote
                     // upcall_pending under this lock, before its cancel read
-                    // the state). The predicate is
-                    // syscall::thread::upcall_may_cancel's, restated here, and
-                    // MUST stay identical to it: the post's retry ends because
-                    // a park the thread commits is refused under it.
+                    // the state); the cancel decides by the same predicate,
+                    // so a call's park, which the upcall waits out, commits.
                     ParkCommit::RefusedStop
                 }
                 else

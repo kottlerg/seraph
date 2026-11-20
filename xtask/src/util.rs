@@ -57,6 +57,43 @@ pub fn run_cmd_capture(cmd: &mut Command) -> Result<String>
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// ── Formatting ────────────────────────────────────────────────────────────────
+
+/// Check that the Rust source of the cargo workspace at `root` is formatted as
+/// `cargo fmt` formats it under the workspace's `rustfmt.toml`, rewriting
+/// nothing (`docs/coding-standards.md` § Formatters). `selection` is the
+/// package selection `cargo fmt` takes: `--all` for every workspace member, or
+/// `-p <crate>` pairs.
+///
+/// On unformatted source the error carries rustfmt's diff, each hunk headed
+/// by `Diff in <file>:<line>:`, and the command that formats the tree; any
+/// other failure (rustfmt missing, a file it cannot parse) carries cargo's
+/// error output.
+pub fn check_formatting(root: &Path, selection: &[&str]) -> Result<()>
+{
+    let output = Command::new("cargo")
+        .current_dir(root)
+        .arg("fmt")
+        .args(selection)
+        .arg("--check")
+        .output()
+        .context("failed to launch cargo fmt")?;
+    if output.status.success()
+    {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stdout.contains("Diff in ")
+    {
+        bail!(
+            "Rust source is not formatted (docs/coding-standards.md § Formatters); run \
+             `cargo fmt --all` and commit the result:\n{stdout}{stderr}"
+        );
+    }
+    bail!("cargo fmt --check exited with {}:\n{stderr}", output.status);
+}
+
 // ── Cargo environment ─────────────────────────────────────────────────────────
 
 /// The environment every cargo command of the build runs with, so a local
@@ -425,6 +462,51 @@ mod tests
             with_extension(Path::new("gdb.bat"), "exe"),
             Path::new("gdb.bat.exe")
         );
+    }
+
+    // Defect guarded: unformatted Rust that no check reads, as a build that
+    // formatted in place let a pushed head's unformatted lines pass CI.
+    #[test]
+    fn unformatted_source_fails_the_check_naming_its_file_and_line()
+    {
+        let root = scratch_dir("fmt");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fmt-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+             [workspace]\n",
+        )
+        .unwrap();
+        // The tree's own formatter configuration and toolchain, so the probe
+        // is held to the rules the workspace is.
+        let tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for config in ["rustfmt.toml", "rust-toolchain.toml"]
+        {
+            std::fs::copy(tree.join(config), root.join(config)).unwrap();
+        }
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src").join("lib.rs"),
+            "pub fn probe( ) -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        let text = format!("{:#}", check_formatting(&root, &["--all"]).unwrap_err());
+        assert!(text.contains("lib.rs:1:"), "{text}");
+        assert!(text.contains("cargo fmt --all"), "{text}");
+        let lib = std::fs::read_to_string(root.join("src").join("lib.rs")).unwrap();
+        assert_eq!(
+            lib, "pub fn probe( ) -> u32 { 1 }\n",
+            "the check rewrote the file"
+        );
+
+        run_cmd(
+            Command::new("cargo")
+                .current_dir(&root)
+                .args(["fmt", "--all"]),
+        )
+        .unwrap();
+        check_formatting(&root, &["--all"]).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

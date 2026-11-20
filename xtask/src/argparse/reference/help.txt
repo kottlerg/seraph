@@ -14,7 +14,7 @@ Commands:
   build              Build Seraph components and populate the sysroot
   run                Launch Seraph under QEMU. Requires a populated sysroot — run `cargo xtask build` first
   clean              Remove the sysroot (and optionally cargo target/)
-  test               Lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
+  test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
   ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
@@ -64,7 +64,7 @@ Commands:
   build              Build Seraph components and populate the sysroot
   run                Launch Seraph under QEMU. Requires a populated sysroot — run `cargo xtask build` first
   clean              Remove the sysroot (and optionally cargo target/)
-  test               Lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
+  test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
   ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
@@ -349,7 +349,7 @@ Options:
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
 === xtask test -h
-Lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
+Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
 
 Usage: xtask test [OPTIONS]
 
@@ -359,7 +359,7 @@ Options:
       --host-override          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help                   Print help
 === xtask test --help
-Lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
+Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
 
 Usage: xtask test [OPTIONS]
 
@@ -2488,7 +2488,7 @@ Commands:
   build              Build Seraph components and populate the sysroot
   run                Launch Seraph under QEMU. Requires a populated sysroot — run `cargo xtask build` first
   clean              Remove the sysroot (and optionally cargo target/)
-  test               Lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
+  test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
   crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
   run-parallel       Launch N QEMU instances in parallel against an already-built image, classifying each run's outcome via user-supplied pass/fail regexes. Requires a populated sysroot — run `cargo xtask build` first
   ktest-timing       Read preserved ktest boot logs (from `run-parallel --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format

@@ -930,8 +930,9 @@ pub(crate) unsafe fn cancel_ipc_block(tcb: *mut crate::sched::thread::ThreadCont
 /// the claim's hold, and the caller MUST then wake the thread
 /// (`enqueue_and_wake`), whose interrupted syscall returns `Interrupted`.
 /// Nothing is cancelled, and false is returned, when the thread is not
-/// `Blocked`, is in a fault or upcall delivery (`in_fault_delivery`: the
-/// upcall waits for it to resolve), has masked upcalls, or has no upcall
+/// `Blocked` or [`upcall_may_cancel`] refuses its park: a call's (the upcall
+/// waits for the call's return), a fault or upcall delivery's (the upcall
+/// waits for it to resolve), a masked thread's, or one with no upcall
 /// pending, each read under its `sched_lock` with the park's snapshot
 /// (core/kernel/docs/thread-lifecycle-and-sleep.md § Upcall Cancel-and-Wake
 /// Protocol).
@@ -1068,16 +1069,35 @@ impl CancelMode
     }
 }
 
-/// Whether a posted upcall may cancel `tcb`'s block now: one is pending, the
-/// thread does not mask upcalls, and it is in no fault or upcall delivery.
-/// `sched::commit_blocked_under_local_lock` refuses a park under the same
-/// predicate, restated there, which MUST stay identical to this one.
+/// Whether a posted upcall may end `tcb`'s park `ipc` now: one is pending,
+/// the thread does not mask upcalls, it is in no fault or upcall delivery, and
+/// the park is not a call's. A call, queued on the endpoint (`BlockedOnSend`
+/// outside a delivery) or awaiting its reply (`BlockedOnReply`), is atomic
+/// with respect to upcalls: the upcall stays pending and is delivered at the
+/// call's own return (`docs/fault-handling.md` § Asynchronous Upcalls).
+///
+/// The one predicate decides both an upcall's cancel of a committed park
+/// ([`cancel_for_upcall`], with the snapshotted `ipc_state`) and the refusal
+/// of a park being committed (`sched::commit_blocked_under_local_lock`, with
+/// the park it commits), so the two cannot disagree on a park.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB whose `sched_lock` the caller holds.
 #[cfg(not(test))]
-pub(crate) unsafe fn upcall_may_cancel(tcb: *mut crate::sched::thread::ThreadControlBlock) -> bool
+pub(crate) unsafe fn upcall_may_cancel(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    ipc: crate::sched::thread::IpcThreadState,
+) -> bool
 {
+    use crate::sched::thread::IpcThreadState;
+
+    if matches!(
+        ipc,
+        IpcThreadState::BlockedOnSend | IpcThreadState::BlockedOnReply
+    )
+    {
+        return false;
+    }
     // SAFETY: tcb is valid and the caller holds its sched_lock, under which
     // in_fault_delivery is written.
     if unsafe { (*tcb).in_fault_delivery }
@@ -1168,11 +1188,13 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
     // lock, so a pop that won leaves the episode to its wake. Its claim deposits
     // nothing, so a cancellation stamp is the only deposit.
     //
-    // An upcall's cancel also requires, in the same hold, a pending upcall, no
-    // mask, and no fault or upcall delivery: a fault park is never cancelled
-    // for an upcall, which waits for the fault to resolve, and the mask is
-    // written under this lock, so a thread that masked before it parked keeps
-    // its block. The timer's expiry requires the park it popped (for a call,
+    // An upcall's cancel also requires, in the same hold, that
+    // upcall_may_cancel admits the snapshotted park: a pending upcall, no
+    // mask, no fault or upcall delivery, and a park that is not a call's. A
+    // call or a fault park is never cancelled for an upcall, which waits for
+    // the call's return or the fault's resolution, and the mask is written
+    // under this lock, so a thread that masked before it parked keeps its
+    // block. The timer's expiry requires the park it popped (for a call,
     // the call episode it popped) and no fault delivery; it never targets a
     // plain sleeper, which the timer claims at its pop.
     let mut claimed = false;
@@ -1203,7 +1225,7 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
         CancelMode::Upcall =>
         {
             // SAFETY: tcb is valid and its sched_lock is held.
-            !unsafe { upcall_may_cancel(tcb) }
+            !unsafe { upcall_may_cancel(tcb, snap.0) }
         }
         CancelMode::Timeout { popped, park_seq } =>
         {
@@ -1435,23 +1457,17 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                 // SAFETY: no lock is held (contract); paired with the
                 // unlock_raw below on every path.
                 let saved = unsafe { lock.lock_raw() };
-                // An upcall's cancel claims only the snapshotted park, and
-                // only while the upcall may still cancel it: the thread
-                // may since have run, taken the upcall, masked, and called
-                // the same server again, a park this cancel must leave.
-                // The timer's expiry, too, claims only the snapshotted
-                // park, which its first hold matched to the popped call.
+                // An upcall never cancels a call, and its snapshot hold
+                // refused this park. The timer's expiry claims only the
+                // snapshotted park, which its first hold matched to the
+                // popped call.
                 // SAFETY: tcb is valid; park_seq is atomic.
                 let seq = unsafe { (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) };
                 let same_park = seq == park_seq;
                 let may_cancel = match mode
                 {
                     CancelMode::Stop => true,
-                    CancelMode::Upcall =>
-                    {
-                        // SAFETY: tcb is valid and its sched_lock is held.
-                        same_park && unsafe { upcall_may_cancel(tcb) }
-                    }
+                    CancelMode::Upcall => false,
                     CancelMode::Timeout { .. } =>
                     {
                         // SAFETY: tcb is valid and its sched_lock, under which
@@ -1504,10 +1520,9 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
                         }
                         // SAFETY: tcb is valid and its sched_lock is held.
                         unsafe { clear_park_binding(tcb) };
-                        // An upcall's or the timer's cancel keeps the
-                        // claim the reply binding set, for the wake its
-                        // caller makes.
-                        claimed = mode != CancelMode::Stop;
+                        // The timer's cancel keeps the claim the reply
+                        // binding set, for the wake its caller makes.
+                        claimed = matches!(mode, CancelMode::Timeout { .. });
                         if !claimed
                         {
                             // SAFETY: tcb is valid; wake_in_flight is atomic,

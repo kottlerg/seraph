@@ -185,9 +185,9 @@ unsafe fn dequeue(
 // ── Endpoint operations ───────────────────────────────────────────────────────
 
 /// Tear down a rendezvous reply linkage whose park commit was refused
-/// (`ParkCommit::RefusedStop`: a concurrent stop or exit, or a pending upcall; or
-/// `ParkCommit::RefusedWake`: a coalesced wake; either refusal cancels the
-/// call): CAS the server's `reply_tcb` back to null (the caller's own dealloc
+/// (`ParkCommit::RefusedStop`: a concurrent stop or exit, never a pending
+/// upcall, which a call's park waits out; or `ParkCommit::RefusedWake`: a
+/// coalesced wake; either refusal cancels the call): CAS the server's `reply_tcb` back to null (the caller's own dealloc
 /// may have beaten us; if so it owns the teardown). On the CAS win (the
 /// episode claim), stamp the cancelled disposition so the caller's resume
 /// takes the error path, clear a timed call's deadline, which its sleep-list
@@ -403,9 +403,9 @@ pub unsafe fn endpoint_call(
         };
         if committed != crate::sched::ParkCommit::Committed
         {
-            // Refused park (stop won, a pending upcall, or a stray coalesced
-            // wake); tear down the reply linkage. Every refusal cancels the
-            // call.
+            // Refused park (a stop won, or a stray coalesced wake; a pending
+            // upcall refuses neither a call's park nor a fault delivery's);
+            // tear down the reply linkage. Every refusal cancels the call.
             // SAFETY: caller / server validated; ep.lock held.
             unsafe { rollback_uncommitted_call(server, caller, parked_state) };
         }
@@ -455,8 +455,9 @@ pub unsafe fn endpoint_call(
     };
     if committed != crate::sched::ParkCommit::Committed
     {
-        // Refused park (stop won, a pending upcall, or a stray coalesced wake
-        // — each cancels the call); unlink from the send queue.
+        // Refused park (a stop won, or a stray coalesced wake — each cancels
+        // the call; a pending upcall refuses neither a call's park nor a fault
+        // delivery's); unlink from the send queue.
         // SAFETY: ep.lock held; caller is a valid TCB.
         unsafe {
             let _ = unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);

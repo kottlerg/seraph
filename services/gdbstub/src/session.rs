@@ -15,7 +15,9 @@
 //!    or one kept beside it, by a resume, a step, a detach, or the drop of
 //!    the session; any other at once.
 //! 2. Between two resumes GDB is told of, every live bound thread is held,
-//!    or was posted an upcall that has not arrived within [`STOP_WAIT`] of
+//!    or is held in a call, its upcall pending until the call's return
+//!    ([`Kernel::in_call`]), or was posted an upcall that has not arrived
+//!    within [`STOP_WAIT`] of
 //!    the all-stop's start, or of the post when its creator started it
 //!    during the all-stop, or is not yet started, read again meanwhile; an all-stop
 //!    that ends with one unstarted at its last read records it
@@ -62,9 +64,15 @@ pub const MAX_RECEIVERS: usize = 2 * MAX_THREADS;
 /// milliseconds.
 pub const STOP_WAIT: u64 = 2000;
 
-/// How often, in milliseconds, an all-stop posts again to a thread its
-/// creator has not started, which takes no upcall until it is.
+/// How often, in milliseconds, an all-stop reads again a thread it waits
+/// for: one its creator has not started, which takes no upcall until it is,
+/// and one posted, which a call it enters holds until the call returns.
 pub const START_POLL: u64 = 10;
+
+/// The error number a register read or write of a thread held in a call
+/// answers ([`Session::register_refusal`]): the kernel reads the registers
+/// of a thread only while it is stopped or fault-blocked.
+pub const IN_CALL_CODE: u8 = 6;
 
 /// How long a detach keeps answering the stops that arrive after its
 /// resume, in milliseconds, ended early once none has come for
@@ -137,6 +145,11 @@ pub trait Kernel
     /// kernel refuses it (the thread has exited or has not been started, or
     /// has an upcall pending).
     fn post_upcall(&mut self, cap: u64) -> bool;
+    /// Whether the thread is held in a call ([`held_in_call`]): blocked in
+    /// `SYS_IPC_CALL` with an upcall pending and not masked, which the
+    /// kernel delivers at the call's return, so the thread runs no
+    /// instruction before it stops.
+    fn in_call(&mut self, cap: u64) -> bool;
     /// Bind the thread's exception and upcall classes to the stub's
     /// endpoint under the badge of table slot `slot`, with a receiver for it;
     /// `false` when the bind or the receiver fails, which leaves the thread's
@@ -265,6 +278,9 @@ enum Upcall
     Unstarted,
     /// Posted, and not arrived.
     Posted,
+    /// Posted, and held in a call until its upcall arrives at the call's
+    /// return ([`Kernel::in_call`]).
+    InCall,
 }
 
 /// What one read of an all-stop's posts found.
@@ -473,7 +489,9 @@ impl Session
     /// Stop every running thread with an upcall and wait, bounded by
     /// [`STOP_WAIT`], for each stop. A thread its creator has not started
     /// yet is read again every [`START_POLL`] and posted once started, with
-    /// a whole [`STOP_WAIT`] from that post. A breakpoint another thread
+    /// a whole [`STOP_WAIT`] from that post. A posted thread is read as often,
+    /// and one held in a call is not waited for, since it runs no
+    /// instruction before its upcall arrives ([`Self::read_calls`]). A breakpoint another thread
     /// hits meanwhile is held unreported and set back ([`Self::cancel_hit`]).
     /// Once every thread is held the table is refreshed: a thread the
     /// target spawned since the last refresh, under its spawner's badge,
@@ -497,10 +515,7 @@ impl Session
                 deadline = deadline.max(k.now().saturating_add(STOP_WAIT));
             }
             self.unstarted = unstarted;
-            let waiting = self
-                .threads
-                .iter()
-                .any(|t| t.live() && t.held.is_none() && t.upcall == Upcall::Posted);
+            let waiting = self.read_calls(k);
             if !waiting && !unstarted
             {
                 if refreshed || !self.refresh(k)
@@ -511,19 +526,13 @@ impl Session
                 self.restart_unreported(k, None);
                 continue;
             }
-            // A thread not started yet is read again once this wait ends.
-            let until = if unstarted
-            {
-                k.now().saturating_add(START_POLL).min(deadline)
-            }
-            else
-            {
-                deadline
-            };
+            // A thread not started yet, or posted and not yet held in a
+            // call, is read again once this wait ends.
+            let until = k.now().saturating_add(START_POLL).min(deadline);
             let Some(stop) = self.next_stop(k, until)
             else
             {
-                if unstarted && k.now() < deadline
+                if k.now() < deadline
                 {
                     continue;
                 }
@@ -570,10 +579,9 @@ impl Session
             unstarted: false,
             started: false,
         };
-        for t in self
-            .threads
-            .iter_mut()
-            .filter(|t| t.live() && t.held.is_none() && t.upcall != Upcall::Posted)
+        for t in self.threads.iter_mut().filter(|t| {
+            t.live() && t.held.is_none() && !matches!(t.upcall, Upcall::Posted | Upcall::InCall)
+        })
         {
             // Read before the post, since a thread its creator starts
             // between a refused post and a later read would be taken for
@@ -596,6 +604,31 @@ impl Session
             }
         }
         posted
+    }
+
+    /// Mark each posted thread the kernel holds in a call
+    /// ([`Kernel::in_call`]) as such: it runs no instruction before its
+    /// upcall arrives, at the call's return, which a server can answer
+    /// later than any wait. Returns whether a posted thread not held in a
+    /// call is still awaited.
+    fn read_calls(&mut self, k: &mut impl Kernel) -> bool
+    {
+        let mut waiting = false;
+        for t in self
+            .threads
+            .iter_mut()
+            .filter(|t| t.live() && t.held.is_none() && t.upcall == Upcall::Posted)
+        {
+            if k.in_call(t.cap)
+            {
+                t.upcall = Upcall::InCall;
+            }
+            else
+            {
+                waiting = true;
+            }
+        }
+        waiting
     }
 
     /// Take `stop` as its thread's held stop and return the thread's slot,
@@ -1205,6 +1238,32 @@ impl Session
         self.threads.get(index).is_some_and(|t| t.held.is_some())
     }
 
+    /// What slot `index`'s thread is doing, as `qThreadExtraInfo` shows
+    /// it: stopped, held in a call ([`Kernel::in_call`]), or running, as a
+    /// thread whose upcall has not arrived does.
+    pub fn describe(&self, k: &mut impl Kernel, index: usize) -> &'static [u8]
+    {
+        match self.threads.get(index)
+        {
+            Some(t) if t.held.is_some() => b"stopped",
+            Some(t) if k.in_call(t.cap) => b"held in a call",
+            _ => b"running",
+        }
+    }
+
+    /// The error number a refused register read or write of slot `index`
+    /// answers: [`IN_CALL_CODE`] for a thread held in a call, whose
+    /// registers the kernel does not read until the call returns, `E01`
+    /// otherwise.
+    pub fn register_refusal(&self, k: &mut impl Kernel, index: usize) -> u8
+    {
+        match self.threads.get(index)
+        {
+            Some(t) if t.held.is_none() && k.in_call(t.cap) => IN_CALL_CODE,
+            _ => 1,
+        }
+    }
+
     /// Whether the last all-stop ended with a live thread its creator had
     /// not started at the all-stop's last read of it: that thread is neither
     /// held nor posted and, once started, runs on, so the session has no
@@ -1215,6 +1274,18 @@ impl Session
     {
         self.unstarted
     }
+}
+
+/// Whether the `CAP_INFO_THREAD_UPCALL` word `flags` holds its thread in a
+/// call: blocked in `SYS_IPC_CALL`, queued or awaiting the reply, with an
+/// upcall pending and not masked. The kernel delivers that upcall at the
+/// call's return, so the thread runs no instruction before it stops; a
+/// masked one runs on after the call until it unmasks.
+#[must_use]
+pub fn held_in_call(flags: u64) -> bool
+{
+    let held = syscall_abi::THREAD_UPCALL_IN_CALL | syscall_abi::THREAD_UPCALL_PENDING;
+    flags & (held | syscall_abi::THREAD_UPCALL_MASKED) == held
 }
 
 /// Whether a walk of procmgr's list that took `caps` from index `first`
@@ -1383,6 +1454,9 @@ mod tests
         late: Vec<(usize, u64)>,
         /// The late upcalls posted, by thread and time due.
         due: Vec<(usize, u64)>,
+        /// Threads blocked in a call from the first time to the second, its
+        /// reply: an upcall posted to one is due at the reply.
+        calls: Vec<(usize, u64, u64)>,
         /// At the given time the given thread registers a thread its creator
         /// never starts, and a thread it spawned stops under its badge.
         spawn_at: Vec<(u64, usize)>,
@@ -1425,6 +1499,7 @@ mod tests
                 unstarted: Vec::new(),
                 late: Vec::new(),
                 due: Vec::new(),
+                calls: Vec::new(),
                 spawn_at: Vec::new(),
                 exit_mid_list: Vec::new(),
             };
@@ -1747,11 +1822,34 @@ mod tests
             {
                 return self.threads[t].run != Run::Exited;
             }
-            if let Some(&(_, after)) = self.late.iter().find(|&&(u, _)| u == t)
-                && self.threads[t].run == Run::Running
+            // An upcall pending refuses another.
+            if self.due.iter().any(|&(u, _)| u == t)
             {
-                self.due.push((t, self.time + after));
-                return true;
+                return false;
+            }
+            if self.threads[t].run == Run::Running
+            {
+                let after = self
+                    .late
+                    .iter()
+                    .find(|&&(u, _)| u == t)
+                    .map_or(0, |&(_, after)| after);
+                let at = self.time + after;
+                // A call the thread is in, or enters before the upcall
+                // reaches it, holds the upcall until its reply.
+                if let Some(&(_, _, reply)) = self
+                    .calls
+                    .iter()
+                    .find(|&&(u, from, reply)| u == t && from <= at && at < reply)
+                {
+                    self.due.push((t, reply));
+                    return true;
+                }
+                if after != 0
+                {
+                    self.due.push((t, at));
+                    return true;
+                }
             }
             match self.threads[t].run
             {
@@ -1767,6 +1865,16 @@ mod tests
                     true
                 }
             }
+        }
+
+        fn in_call(&mut self, cap: u64) -> bool
+        {
+            let t = thread_of(cap);
+            self.due.iter().any(|&(u, _)| u == t)
+                && self
+                    .calls
+                    .iter()
+                    .any(|&(u, from, reply)| u == t && from <= self.time && self.time < reply)
         }
 
         fn bind(&mut self, slot: usize, cap: u64) -> bool
@@ -2609,6 +2717,70 @@ mod tests
         assert!(s.awaits_start(), "a target running unheld is attached");
         assert!(s.detach(&mut sim));
         assert!(sim.detached);
+        sim.assert_sound();
+    }
+
+    // Defect caught: a read of the upcall word that took a masked upcall,
+    // or one with no call, for a thread held in a call.
+    #[test]
+    fn held_in_call_needs_the_call_and_an_unmasked_upcall_pending()
+    {
+        let pending = syscall_abi::THREAD_UPCALL_PENDING;
+        let masked = syscall_abi::THREAD_UPCALL_MASKED;
+        let call = syscall_abi::THREAD_UPCALL_IN_CALL;
+        assert!(held_in_call(call | pending));
+        for flags in [0, pending, masked, call, pending | masked, call | masked]
+        {
+            assert!(!held_in_call(flags), "{flags:#x}");
+        }
+        assert!(!held_in_call(call | pending | masked));
+    }
+
+    // Defect caught: an all-stop waited `STOP_WAIT` for a thread blocked in
+    // a call, whose upcall the kernel holds until the reply, and reported it
+    // running; its register reads answered as for any refusal.
+    #[test]
+    fn a_thread_held_in_a_call_is_counted_at_once_and_resumed_at_its_reply()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        sim.calls.push((a, 0, STOP_WAIT * 3));
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.is_held(0));
+        assert!(!s.is_held(a));
+        assert_eq!(sim.time, 0, "the all-stop waited for the thread in a call");
+        assert_eq!(s.describe(&mut sim, 0), b"stopped");
+        assert_eq!(s.describe(&mut sim, a), b"held in a call");
+        assert_eq!(s.register_refusal(&mut sim, a), IN_CALL_CODE);
+        assert_eq!(s.register_refusal(&mut sim, 0), 1);
+        // The reply comes while the target runs: the upcall stops nothing.
+        resume(&mut sim, &mut s);
+        sim.time = STOP_WAIT * 3;
+        assert_eq!(s.poll(&mut sim), None);
+        assert!(s.running);
+        assert_eq!(s.describe(&mut sim, a), b"running");
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread that entered a call between its post and the
+    // upcall was waited for until `STOP_WAIT`, as one whose upcall is lost.
+    #[test]
+    fn a_thread_that_enters_a_call_after_its_post_is_counted_at_the_next_read()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        sim.late.push((a, 5 * START_POLL));
+        sim.calls.push((a, START_POLL / 2, u64::MAX));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.is_held(0));
+        assert_eq!(
+            sim.time, START_POLL,
+            "the thread in a call was not read again"
+        );
+        assert_eq!(s.describe(&mut sim, a), b"held in a call");
+        assert!(s.detach(&mut sim));
         sim.assert_sound();
     }
 }

@@ -1270,8 +1270,7 @@ fn bridge_main(h: BridgeHandles) {
 }
 
 /// Send `DESTROY_PROCESS` on `process_handle`, retrying a call that a stop and
-/// restart of this thread, or an upcall to it, interrupted, and report whether
-/// procmgr replied.
+/// restart of this thread interrupted, and report whether procmgr replied.
 fn destroy_child(process_handle: u64) -> bool {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null() {

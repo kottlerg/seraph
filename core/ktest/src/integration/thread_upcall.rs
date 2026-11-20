@@ -18,12 +18,14 @@
 //!      stopped thread is kept (a second is `QueueFull`) and delivered once
 //!      the thread is started.
 //!   4. **Pending.** A thread that makes no syscall keeps a syscall-point
-//!      upcall pending, so a second post is refused with `QueueFull`.
+//!      upcall pending, so a second post is refused with `QueueFull`;
+//!      `CAP_INFO_THREAD_UPCALL` reads it pending alone.
 //!   5. **Any-instruction delivery.** A thread spinning with no syscall takes
 //!      an `UPCALL_ANY_INSTRUCTION` upcall at an interrupt's return; the
 //!      handler redirects it into a recovery routine, which reports.
 //!   6. **Mask.** A thread that masks upcalls sleeps through a post
-//!      uninterrupted and takes the upcall at its unmask's return.
+//!      uninterrupted and takes the upcall at its unmask's return;
+//!      `CAP_INFO_THREAD_UPCALL` reads it pending and masked, not in a call.
 //!   7. **Cancel during block.** A thread blocked in a notification wait, and
 //!      one in a sleep, has the wait return `Interrupted` and takes the upcall
 //!      at that return.
@@ -32,13 +34,12 @@
 //!      thread's next syscall. A stop of the thread during an upcall delivery
 //!      drops the upcall: the handler's late reply finds no pending reply, and
 //!      after a restart the thread takes a new post.
-//!   9. **IPC arms.** A call queued on an endpoint no one receives on returns
-//!      `Interrupted` and takes the upcall. So does a call whose message the
-//!      controller received and has not replied to: the post claims the
-//!      pending reply, so the controller's reply then fails. A masked call
-//!      awaiting its reply (`ipc::ipc_call_masked`) is not cut short: the
-//!      reply stays pending, the controller's reply completes the call, and
-//!      the upcall is delivered at the unmask.
+//!   9. **Calls.** An upcall never cuts a call: a call posted while queued on
+//!      an endpoint, one posted while awaiting the reply to a message the
+//!      controller received, and one entered with the upcall already pending
+//!      each park, read in a call (`CAP_INFO_THREAD_UPCALL`), and return the
+//!      controller's reply; the upcall is delivered at that return, before
+//!      the thread runs on, and the reply is intact after it.
 //!  10. **Refused park.** A thread that a post reaches while it spins with no
 //!      syscall has its next blocking syscall, a notification wait, refused:
 //!      the wait returns `Interrupted` at once, and the upcall is delivered at
@@ -59,9 +60,10 @@ use syscall::{
     thread_write_regs, thread_yield,
 };
 use syscall_abi::{
-    FAULT_CLASS_UPCALL, FAULT_CLASS_VM, FAULT_KIND_UPCALL, FAULT_KIND_VM, FAULT_LABEL,
-    FAULT_REPLY_RESUME, RIGHTS_EP_SEND, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_THREAD_CONTROL,
-    RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL, SYS_THREAD_SET_UPCALL_MASK, SyscallError,
+    CAP_INFO_THREAD_UPCALL, FAULT_CLASS_UPCALL, FAULT_CLASS_VM, FAULT_KIND_UPCALL, FAULT_KIND_VM,
+    FAULT_LABEL, FAULT_REPLY_RESUME, RIGHTS_EP_SEND, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT,
+    RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL, SYS_THREAD_SET_UPCALL_MASK,
+    SyscallError, THREAD_UPCALL_IN_CALL, THREAD_UPCALL_MASKED, THREAD_UPCALL_PENDING,
     UPCALL_ANY_INSTRUCTION, UPCALL_POINT_INTERRUPT, UPCALL_POINT_SYSCALL,
 };
 
@@ -99,8 +101,8 @@ const _: () = assert!(BUF as u64 >= crate::arch::TRAP_FRAME_BYTES);
 /// Children: 0 yields (syscall delivery, nesting, stop, rights), 1 spins with
 /// a pending syscall-point upcall, 2 spins for the any-instruction delivery,
 /// 3 masks, 4 waits on a notification, 5 sleeps, 6 faults (recursion), 7 is
-/// never started, 8, 9 and 11 call (queued, awaiting a reply, and masked
-/// awaiting a reply), and 10 spins and then waits (refused park).
+/// never started, 8, 9 and 11 call (posted while queued, while awaiting a
+/// reply, and before the call), and 10 spins and then waits (refused park).
 const CHILDREN: usize = 12;
 
 /// The child index of each calling child, by its arm of phase 9.
@@ -115,10 +117,9 @@ static mut CALL_PAGES: [crate::IpcPage; 3] = [
     crate::IpcPage::ZERO,
 ];
 
-/// How long, in milliseconds, the controller lets a calling child reach its
-/// park before posting. A child slower than this has its park refused
-/// instead, with the same outcome.
-const SETTLE_MS: u64 = 20;
+/// The reply word the controller answers arm `k` of phase 9 with, `k` in its
+/// low bits.
+const CALL_REPLY_WORD: u64 = 0x5150_0C00;
 
 /// Child-side progress words, one per child that reports through memory.
 static YIELDS: AtomicU64 = AtomicU64::new(0);
@@ -131,6 +132,8 @@ static SLEEP_RESULT: AtomicU64 = AtomicU64::new(0);
 static FAULT_YIELDS: AtomicU64 = AtomicU64::new(0);
 static CALL_STAGE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static CALL_RESULT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static CALL_REPLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static CALL_GO: AtomicU64 = AtomicU64::new(0);
 static REFUSE_STAGE: AtomicU64 = AtomicU64::new(0);
 static REFUSE_GO: AtomicU64 = AtomicU64::new(0);
 static REFUSE_RESULT: AtomicU64 = AtomicU64::new(0);
@@ -156,7 +159,7 @@ struct Parts
     ep_vm: Option<u64>,
     ep_queued: Option<u64>,
     ep_held: Option<u64>,
-    ep_masked: Option<u64>,
+    ep_parked: Option<u64>,
     sig: Option<u64>,
     never: Option<u64>,
     children: [Option<spawn::SpawnedChild>; CHILDREN],
@@ -177,7 +180,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         parts.ep_vm,
         parts.ep_queued,
         parts.ep_held,
-        parts.ep_masked,
+        parts.ep_parked,
         parts.sig,
         parts.never,
     ]
@@ -231,10 +234,10 @@ fn phases(ctx: &TestContext, parts: &mut Parts) -> TestResult
     let ep_held = *parts
         .ep_held
         .insert(cap_create_endpoint(ctx.memory_base).map_err(fail)?);
-    let ep_masked = *parts
-        .ep_masked
+    let ep_parked = *parts
+        .ep_parked
         .insert(cap_create_endpoint(ctx.memory_base).map_err(fail)?);
-    ipc_arms(ctx, parts, ep_up, [ep_queued, ep_held, ep_masked])?;
+    ipc_arms(ctx, parts, ep_up, [ep_queued, ep_held, ep_parked])?;
     refused_park(ctx, parts, ep_up, never)?;
     rights(ctx, yielder, ep_up)
 }
@@ -312,7 +315,11 @@ fn pending(ctx: &TestContext, parts: &mut Parts, ep_up: u64) -> TestResult
     {
         return Err("integration::thread_upcall: a second pending post was accepted");
     }
-    Ok(())
+    expect_flags(
+        th,
+        THREAD_UPCALL_PENDING,
+        "integration::thread_upcall: a spinning thread did not read its upcall pending",
+    )
 }
 
 /// Phase 5: delivery at an interrupt's return to a thread that spins, and a
@@ -358,6 +365,14 @@ fn mask(ctx: &TestContext, parts: &mut Parts, ep_up: u64) -> TestResult
     wait_for(&MASK_STAGE, 1)?;
     thread_post_upcall(th, 0x5150_0005, 0)
         .map_err(|_| "integration::thread_upcall: post (masked) failed")?;
+    // The post lands inside the MASKED_SLEEP_MS sleep, as the stage check
+    // below requires too, so the thread reads masked with the upcall pending,
+    // and in no call.
+    expect_flags(
+        th,
+        THREAD_UPCALL_PENDING | THREAD_UPCALL_MASKED,
+        "integration::thread_upcall: a masked thread did not read pending and masked",
+    )?;
     expect_upcall(ctx, ep_up, 0x5150_0005, UPCALL_POINT_SYSCALL)?;
     if MASK_STAGE.load(Ordering::Acquire) != 2 || MASK_SLEEP.load(Ordering::Acquire) != RESULT_OK
     {
@@ -463,9 +478,14 @@ fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> Te
     reply_resume(ctx)
 }
 
-/// Phase 9: a call queued on an endpoint (`eps[0]`), a call awaiting its
-/// reply (`eps[1]`, whose message the controller receives), and a masked
-/// call awaiting its reply (`eps[2]`, received the same way).
+/// Phase 9: an upcall never cuts a call. Arm 0 calls an endpoint no one
+/// receives on and is posted while queued; arm 1 is posted while its call,
+/// which the controller received, awaits the reply; arm 2 is posted while it
+/// spins with no syscall and then calls, so it parks with the upcall pending.
+/// Each arm's call parks, the controller receives it (arm 1 before the post)
+/// and replies, and the upcall is delivered at the call's return, before the
+/// child runs on, with the reply intact. `CAP_INFO_THREAD_UPCALL` reads the
+/// call and the pending upcall at each step.
 #[expect(
     clippy::large_stack_frames,
     reason = "the received message and the reply `IpcMessage` (568 B each) and the `Result` \
@@ -473,14 +493,17 @@ fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> Te
 )]
 fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 3]) -> TestResult
 {
+    const IN_CALL: u64 = THREAD_UPCALL_IN_CALL;
+    const IN_CALL_PENDING: u64 = THREAD_UPCALL_IN_CALL | THREAD_UPCALL_PENDING;
     for (k, ep) in eps.into_iter().enumerate()
     {
-        let (Some(&index), Some(cookie), Some(call_ep), Some(stage), Some(result)) = (
+        let (Some(&index), Some(cookie), Some(call_ep), Some(stage), Some(result), Some(reply)) = (
             CALLERS.get(k),
             0x5150_0020u64.checked_add(k as u64),
             CALL_EP.get(k),
             CALL_STAGE.get(k),
             CALL_RESULT.get(k),
+            CALL_REPLY.get(k),
         )
         else
         {
@@ -493,63 +516,76 @@ fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 3]) -> 
         call_ep.store(slot, Ordering::Release);
         start_child(parts, index, call_entry, k as u64)?;
         wait_for(stage, 1)?;
-        if k == 0
+        if k == 2
         {
-            let _ = thread_sleep(SETTLE_MS);
+            post_caller(th, cookie, THREAD_UPCALL_PENDING)?;
+            CALL_GO.store(1, Ordering::Release);
+            // The call parks with the upcall pending: a refused park would
+            // return Interrupted and take the upcall, and never read in a call.
+            wait_flags(th, IN_CALL_PENDING)?;
         }
         else
         {
-            // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-            unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
-                .map_err(|_| "integration::thread_upcall: ipc_recv (call) failed")?;
-        }
-        thread_post_upcall(th, cookie, 0)
-            .map_err(|_| "integration::thread_upcall: post (caller) failed")?;
-        let masked = k == 2;
-        if k > 0
-        {
-            // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
-            let replied = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ctx.ipc_buf) }.is_ok();
-            if replied != masked
+            wait_flags(th, IN_CALL)?;
+            if k == 1
             {
-                return Err(
-                    if masked
-                    {
-                        "integration::thread_upcall: the post cut a masked call short"
-                    }
-                    else
-                    {
-                        "integration::thread_upcall: the post left the call's reply pending"
-                    },
-                );
+                recv_call(ctx, ep)?;
+                expect_flags(
+                    th,
+                    IN_CALL,
+                    "integration::thread_upcall: a call awaiting its reply did not read in a call",
+                )?;
             }
+            post_caller(th, cookie, IN_CALL_PENDING)?;
         }
+        if k != 1
+        {
+            // The post left the call queued: the controller receives it.
+            recv_call(ctx, ep)?;
+        }
+        let word = CALL_REPLY_WORD | k as u64;
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+        unsafe { ipc::ipc_reply(&IpcMessage::builder(0).word(0, word).build(), ctx.ipc_buf) }
+            .map_err(|_| "integration::thread_upcall: the post cut a call short")?;
         expect_upcall(ctx, ep_up, cookie, UPCALL_POINT_SYSCALL)?;
+        if stage.load(Ordering::Acquire) != 1
+        {
+            return Err("integration::thread_upcall: a caller ran on before its upcall");
+        }
         reply_resume(ctx)?;
         wait_for(stage, 2)?;
-        let expected = if masked
+        if result.load(Ordering::Acquire) != RESULT_OK
         {
-            RESULT_OK
+            return Err("integration::thread_upcall: a posted call did not return its reply");
         }
-        else
+        if reply.load(Ordering::Acquire) != word
         {
-            RESULT_INTERRUPTED
-        };
-        if result.load(Ordering::Acquire) != expected
-        {
-            return Err(
-                if masked
-                {
-                    "integration::thread_upcall: a masked call did not return its reply"
-                }
-                else
-                {
-                    "integration::thread_upcall: an interrupted call did not fail Interrupted"
-                },
-            );
+            return Err("integration::thread_upcall: a call's reply changed across its upcall");
         }
     }
     Ok(())
+}
+
+/// Post `cookie` to the calling child `th` at the syscall point, and check
+/// that its `CAP_INFO_THREAD_UPCALL` word then reads `want`.
+fn post_caller(th: u64, cookie: u64, want: u64) -> TestResult
+{
+    thread_post_upcall(th, cookie, 0)
+        .map_err(|_| "integration::thread_upcall: post (caller) failed")?;
+    expect_flags(
+        th,
+        want,
+        "integration::thread_upcall: a posted caller read the wrong upcall state",
+    )
+}
+
+/// Receive a calling child's call on `ep`, leaving its reply pending.
+fn recv_call(ctx: &TestContext, ep: u64) -> TestResult
+{
+    // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
+    unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
+        .map(|_| ())
+        .map_err(|_| "integration::thread_upcall: ipc_recv (call) failed")
 }
 
 /// Phase 10: a post that finds the thread running refuses its next park.
@@ -704,6 +740,40 @@ fn reply_resume(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::thread_upcall: reply failed")
 }
 
+/// The `CAP_INFO_THREAD_UPCALL` word of the thread `th` names.
+fn upcall_flags(th: u64) -> Result<u64, &'static str>
+{
+    syscall::cap_info(th, CAP_INFO_THREAD_UPCALL)
+        .map_err(|_| "integration::thread_upcall: cap_info (upcall state) failed")
+}
+
+/// Fail with `what` unless `th`'s `CAP_INFO_THREAD_UPCALL` word is `want`.
+fn expect_flags(th: u64, want: u64, what: &'static str) -> TestResult
+{
+    if upcall_flags(th)? == want
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(what)
+    }
+}
+
+/// Wait, in 1 ms sleeps, until `th`'s `CAP_INFO_THREAD_UPCALL` word is `want`.
+fn wait_flags(th: u64, want: u64) -> TestResult
+{
+    for _ in 0..crate::scaled_polls(PROGRESS_POLLS)
+    {
+        if upcall_flags(th)? == want
+        {
+            return Ok(());
+        }
+        let _ = thread_sleep(1);
+    }
+    Err("integration::thread_upcall: a calling child never read the expected upcall state")
+}
+
 /// Wait, in 1 ms sleeps, until `word` reaches at least `value`.
 fn wait_for(word: &AtomicU64, value: u64) -> TestResult
 {
@@ -740,8 +810,8 @@ extern "C" fn yield_entry(_arg: u64) -> !
 }
 
 /// Child entry: register IPC page `k` and call the endpoint published for
-/// arm `k` of phase 9 ([`CALLERS`]), with upcalls masked for arm 2,
-/// recording the result.
+/// arm `k` of phase 9 ([`CALLERS`]), arm 2 first spinning with no syscall
+/// until released, recording the result and the reply's first word.
 extern "C" fn call_entry(k: u64) -> !
 {
     #[expect(
@@ -749,10 +819,11 @@ extern "C" fn call_entry(k: u64) -> !
         reason = "k is 0, 1, or 2, the index start_child passed"
     )]
     let k = k as usize;
-    let (Some(page), Some(stage), Some(result), Some(call_ep)) = (
+    let (Some(page), Some(stage), Some(result), Some(reply), Some(call_ep)) = (
         crate::elem_ptr_mut(core::ptr::addr_of_mut!(CALL_PAGES), k),
         CALL_STAGE.get(k),
         CALL_RESULT.get(k),
+        CALL_REPLY.get(k),
         CALL_EP.get(k),
     )
     else
@@ -770,18 +841,20 @@ extern "C" fn call_entry(k: u64) -> !
         syscall::thread_exit()
     }
     stage.store(1, Ordering::Release);
-    let ep = call_ep.load(Ordering::Acquire);
-    let msg = IpcMessage::new(0);
-    let called = if k == 2
+    if k == 2
     {
-        // SAFETY: `buf` was registered as this thread's IPC buffer above.
-        unsafe { ipc::ipc_call_masked(ep, &msg, buf) }
+        while CALL_GO.load(Ordering::Acquire) == 0
+        {
+            core::hint::spin_loop();
+        }
     }
-    else
+    let ep = call_ep.load(Ordering::Acquire);
+    // SAFETY: `buf` was registered as this thread's IPC buffer above.
+    let called = unsafe { ipc::ipc_call(ep, &IpcMessage::new(0), buf) };
+    if let Ok(r) = &called
     {
-        // SAFETY: `buf` was registered as this thread's IPC buffer above.
-        unsafe { ipc::ipc_call(ep, &msg, buf) }
-    };
+        reply.store(r.word(0), Ordering::Release);
+    }
     result.store(result_word(called.map(|_| 0)), Ordering::Release);
     stage.store(2, Ordering::Release);
     loop

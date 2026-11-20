@@ -3009,7 +3009,7 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
 /// One past the highest `syscall::CAP_INFO_*` selector `sys_cap_info`
 /// answers; raise it when a new selector is at or above it. A selector at or
 /// past it is refused before the dispatch.
-const CAP_INFO_FIELD_BOUND: u64 = syscall::CAP_INFO_IRQ_REMAP_HANDLES + 1;
+const CAP_INFO_FIELD_BOUND: u64 = syscall::CAP_INFO_THREAD_UPCALL + 1;
 
 /// `SYS_CAP_INFO` (36): read-only inspection of a capability slot's runtime state.
 ///
@@ -3049,8 +3049,9 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
         CAP_INFO_IRQ_MSG_DATA, CAP_INFO_IRQ_REMAP_ENTRY, CAP_INFO_IRQ_REMAP_HANDLES,
         CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS,
         CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE, CAP_INFO_MEMORY_SIZE,
-        CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE, CAP_INFO_TLB_ELIDED,
-        CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED, THREAD_STATE_EXITED,
+        CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_INFO_THREAD_STATE,
+        CAP_INFO_THREAD_UPCALL, CAP_INFO_TLB_ELIDED, CAP_INFO_TLB_PERFORMED, THREAD_STATE_ALIVE,
+        THREAD_STATE_CREATED, THREAD_STATE_EXITED,
     };
 
     use crate::cap::object::{
@@ -3302,6 +3303,23 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             };
             let reason_low = exit_reason & 0xFFFF_FFFF;
             Ok((u64::from(state_code) << 32) | reason_low)
+        }
+        CAP_INFO_THREAD_UPCALL =>
+        {
+            if tag != CapTag::Thread
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            // SAFETY: tag confirmed Thread; header at offset 0 of ThreadObject.
+            let thr_obj = unsafe { &*(slot.object_of(CapTag::Thread).cast::<ThreadObject>()) };
+            let target_tcb = thr_obj.tcb;
+            if target_tcb.is_null()
+            {
+                return Err(SyscallError::InvalidCapability);
+            }
+            // SAFETY: target_tcb is the TCB of the Thread object `slot` pins
+            // for the call; no lock is held.
+            Ok(unsafe { crate::ipc::upcall::info(target_tcb) })
         }
         CAP_INFO_ASPACE_PT_BUDGET =>
         {
@@ -3717,6 +3735,7 @@ mod tests
             syscall::CAP_INFO_IRQ_MSG_DATA,
             syscall::CAP_INFO_IRQ_REMAP_ENTRY,
             syscall::CAP_INFO_IRQ_REMAP_HANDLES,
+            syscall::CAP_INFO_THREAD_UPCALL,
         ];
         assert!(selectors.iter().all(|&s| s < CAP_INFO_FIELD_BOUND));
         assert_eq!(

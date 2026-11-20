@@ -1228,6 +1228,16 @@ can use, every handle below it: `min(cpu_count, 302) * 217`, 302 being the CPUs 
 vectors each fit the 16-bit handle. A remapping table needs that many entries. Both answer
 `NotSupported` on RISC-V, whose IMSIC files the IOMMU confines without remapping.
 
+`CAP_INFO_THREAD_UPCALL` (19) returns, for a Thread cap, the thread's upcall state as flags, read
+in one hold of its scheduling lock: `THREAD_UPCALL_PENDING` (1) while an upcall is posted and not
+yet delivered, `THREAD_UPCALL_MASKED` (2) while the thread masks upcalls
+(`SYS_THREAD_SET_UPCALL_MASK`), and `THREAD_UPCALL_IN_CALL` (4) while it is `Blocked` in a
+`SYS_IPC_CALL`, queued on the endpoint or awaiting the reply. An upcall waits out a call
+([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous Upcalls,
+Blocking syscalls), so a thread read with `IN_CALL` and `PENDING` and not `MASKED` runs no user
+instruction before its upcall is delivered at the call's return; a debugger counts it stopped. The
+flags are a snapshot: the next post, unmask, delivery or return can change them.
+
 **Capability requirement:** None for every selector but `CAP_INFO_MEMORY_PHYS_BASE`, which
 needs the Memory `Phys` right on the queried cap or the credential; `cap_info` otherwise reads
 the slot without a rights check.
@@ -2399,12 +2409,14 @@ binding at the thread's next delivery point (see
 
 The post makes the upcall pending on the thread, written under the thread's `sched_lock` with its
 cookie and flag. Unless the thread masks upcalls (§ `SYS_THREAD_SET_UPCALL_MASK`), a block of the
-thread in a blocking syscall is cancelled as `SYS_THREAD_STOP` cancels it, and the thread is woken:
-the syscall returns `Interrupted` and the upcall is delivered at its return. A park the thread
-commits after the post is refused the same way, and a fault or upcall delivery in progress is left
-to resolve (see [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall
-Cancel-and-Wake Protocol). Otherwise an `UPCALL_ANY_INSTRUCTION` post prods a CPU that runs the
-thread, so the thread reaches an interrupt's return. The delivery is a fault delivery of
+thread in a blocking syscall other than `SYS_IPC_CALL` is cancelled as `SYS_THREAD_STOP` cancels
+it, and the thread is woken: the syscall returns `Interrupted` and the upcall is delivered at its
+return. A park the thread commits after the post is refused the same way, and a call's park in
+either phase is neither cancelled nor refused, so the upcall is delivered at the call's return. A
+fault or upcall delivery in progress is left to resolve (see
+[thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall Cancel-and-Wake
+Protocol). Otherwise an `UPCALL_ANY_INSTRUCTION` post prods a CPU that runs the thread, so the
+thread reaches an interrupt's return. The delivery is a fault delivery of
 `FAULT_KIND_UPCALL`, data words `[kind, cookie, point, ip]`, with `point` `UPCALL_POINT_SYSCALL` or
 `UPCALL_POINT_INTERRUPT`; any reply resumes the thread, and a decline or a cancellation drops the
 upcall.
@@ -3621,8 +3633,14 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 - **Blocking syscalls are interruptible.** Any syscall that can block (`SYS_IPC_CALL`,
   `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`,
   `SYS_THREAD_SLEEP`) returns `Interrupted` if the calling thread is stopped via `SYS_THREAD_STOP`,
-  or is posted an upcall it does not mask (`SYS_THREAD_POST_UPCALL`), unless its wake (a delivery,
-  or the elapsed deadline of a sleep or a timed wait) was claimed first. `SYS_IPC_CALL` and
+  or, `SYS_IPC_CALL` apart, is posted an upcall it does not mask (`SYS_THREAD_POST_UPCALL`),
+  unless its wake (a delivery, or the elapsed deadline of a sleep or a timed wait) was claimed
+  first. `SYS_IPC_CALL` is atomic with respect to upcalls: an upcall posted to a thread queued on
+  the endpoint or awaiting its reply, or pending when the call begins, ends neither wait, and is
+  delivered at the call's own return with the call's result in the registers
+  ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
+  Upcalls, Blocking syscalls; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
+  § Upcall Cancel-and-Wake Protocol). `SYS_IPC_CALL` and
   `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
   `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
   caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or

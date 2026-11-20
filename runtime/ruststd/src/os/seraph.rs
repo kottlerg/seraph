@@ -1617,10 +1617,10 @@ fn unregister_then_unreserve(range: ReservedRange, va: u64, len: u64) -> bool {
 }
 
 /// `ipc::ipc_call`, made again for as long as it returns `Interrupted`, so the
-/// result is the server's reply or an error no stop or upcall caused.
+/// result is the server's reply or an error no stop caused.
 ///
-/// A stop or an upcall post cancels a blocked call with `Interrupted`, which
-/// does not mean the request went undelivered (docs/fault-handling.md
+/// A stop cancels a blocked call with `Interrupted`, which does not mean the
+/// request went undelivered (docs/fault-handling.md
 /// § Asynchronous Upcalls › Blocking syscalls): a caller of this helper sends
 /// only a request that is safe to repeat once the server may have carried it
 /// out. Allocates nothing.

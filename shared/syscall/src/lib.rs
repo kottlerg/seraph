@@ -2799,15 +2799,16 @@ pub fn thread_inherit_fault_handler(
 /// or, with `flags` = `UPCALL_ANY_INSTRUCTION`, at any return to user mode.
 ///
 /// Unless the thread masks upcalls, a block of it in one of the blocking
-/// syscalls (`SYS_IPC_CALL`, `SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`,
-/// `SYS_EVENT_RECV`, `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns
-/// `Interrupted`, unless its wake (a delivery, or the elapsed deadline of a
-/// sleep or a timed wait) was claimed first, and the upcall is delivered at
-/// that return; a blocking syscall it enters with the upcall pending returns
-/// `Interrupted` at once instead of blocking, while a try-once
-/// (`WAIT_TRY_ONCE`), or a call whose result is already available, returns
-/// its own result. A fault or upcall delivery in progress is left to resolve,
-/// never cancelled for the post. See `docs/fault-handling.md`
+/// syscalls (`SYS_IPC_RECV`, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`,
+/// `SYS_WAIT_SET_WAIT`, `SYS_THREAD_SLEEP`) returns `Interrupted`, unless
+/// its wake (a delivery, or the elapsed deadline of a sleep or a timed wait)
+/// was claimed first, and the upcall is delivered at that return; such a
+/// syscall it enters with the upcall pending returns `Interrupted` at once
+/// instead of blocking, while a try-once (`WAIT_TRY_ONCE`), or a syscall
+/// whose result is already available, returns its own result. A call
+/// (`SYS_IPC_CALL`) is atomic with respect to the upcall: it ends with its
+/// own result, and the upcall is delivered there. A fault or upcall delivery
+/// in progress is left to resolve, never cancelled for the post. See `docs/fault-handling.md`
 /// § Asynchronous Upcalls and `core/kernel/docs/syscalls.md`
 /// § Atomicity and Preemption Guarantees.
 ///

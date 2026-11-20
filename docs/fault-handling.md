@@ -586,24 +586,28 @@ binding, as for a fault. The [Liveness](#liveness) rules hold unchanged.
 
 ### Blocking syscalls
 
-A post to a thread blocked in a syscall that can block cancels the block as a stop cancels it, and
-wakes the thread. Those syscalls are listed in
+A post to a thread blocked in a syscall that can block, other than `SYS_IPC_CALL`, cancels the
+block as a stop cancels it, and wakes the thread. Those syscalls are listed in
 [syscalls.md § Atomicity and Preemption Guarantees](../core/kernel/docs/syscalls.md#atomicity-and-preemption-guarantees)
 (Blocking syscalls are interruptible).
 The syscall returns `Interrupted`, unless a genuine wake or the elapsed deadline of a sleep or a
-timed wait claimed it first, and the upcall is delivered at that return. A blocking syscall that
-the thread enters with an upcall pending returns `Interrupted` at once instead of blocking: the
-pending upcall refuses the park, so a try-once (`WAIT_TRY_ONCE`), which never parks, and a call
+timed wait claimed it first, and the upcall is delivered at that return. Such a syscall that the
+thread enters with an upcall pending returns `Interrupted` at once instead of blocking: the
+pending upcall refuses the park, so a try-once (`WAIT_TRY_ONCE`), which never parks, and a syscall
 whose result is already available return their own result. The kernel restarts nothing; whether
-to retry is the program's choice. For `SYS_IPC_CALL`,
-`Interrupted` does not mean that the request went undelivered: a server that already received the
-message finds no reply pending, so a program that retries a call may repeat its request, as after
-a stop. A program that records a call's outcome, and so can neither repeat the call nor learn the
-outcome again, masks upcalls across it ([Mask](#mask); `ipc::ipc_call_masked`), as devmgr does for
-its calls to the IOMMU driver: a post then cancels neither wait and is delivered at the unmask after
-the reply. The cost falls on a debugger, which cannot hold the thread until the server replies: a
-server that never replies leaves the thread out of every all-stop, and only `SYS_THREAD_STOP` ends
-its wait. The mask is therefore kept to such calls.
+to retry is the program's choice.
+
+A call is atomic with respect to upcalls. A post to a thread in `SYS_IPC_CALL`, queued on the
+endpoint or awaiting its reply, cancels neither wait, and a call entered with an upcall pending
+blocks as any call does. The call runs to its own return (the reply, a failure, or its timeout),
+and the upcall is delivered there, with the call's result in the registers. A server that received
+the request therefore always finds its caller awaiting the reply, and no program masks upcalls or
+retries a call for an upcall's sake. A thread in a call runs no instruction before that return, so a
+debugger counts it stopped at once: `SYS_CAP_INFO`'s `CAP_INFO_THREAD_UPCALL` reads whether a
+thread is in a call with an upcall pending
+([syscalls.md § SYS_CAP_INFO](../core/kernel/docs/syscalls.md#sys_cap_info-36)). A server that
+answers late holds the upcall until its reply. `SYS_THREAD_STOP` cancels a call in either phase,
+which then returns `Interrupted`, as for any blocking syscall.
 
 A fault-blocked thread's fault, or an upcall delivery in progress, is never cancelled for an upcall:
 the upcall waits for it to resolve. The protocol that keeps a post from missing a thread that is

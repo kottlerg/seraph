@@ -489,6 +489,26 @@ pub const CAP_INFO_IRQ_REMAP_ENTRY: u64 = 17;
 /// capability type.
 pub const CAP_INFO_IRQ_REMAP_HANDLES: u64 = 18;
 
+/// Thread only — the thread's upcall state, read in one hold of its scheduler
+/// lock: the [`THREAD_UPCALL_PENDING`], [`THREAD_UPCALL_MASKED`], and
+/// [`THREAD_UPCALL_IN_CALL`] bits, every other bit zero. A thread in a call
+/// with an upcall pending and unmasked runs no user instruction before the
+/// upcall is delivered at the call's return (docs/fault-handling.md
+/// § Asynchronous Upcalls), so a debugger counts it stopped. Holding the slot
+/// suffices, as for [`CAP_INFO_THREAD_STATE`]. Calling on a non-Thread slot
+/// returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_THREAD_UPCALL: u64 = 19;
+
+/// [`CAP_INFO_THREAD_UPCALL`] bit: an upcall is pending on the thread.
+pub const THREAD_UPCALL_PENDING: u64 = 1 << 0;
+/// [`CAP_INFO_THREAD_UPCALL`] bit: the thread masks upcalls
+/// (`SYS_THREAD_SET_UPCALL_MASK`).
+pub const THREAD_UPCALL_MASKED: u64 = 1 << 1;
+/// [`CAP_INFO_THREAD_UPCALL`] bit: the thread is blocked in `SYS_IPC_CALL`,
+/// queued on the endpoint or awaiting the reply, where an upcall waits for the
+/// call's return.
+pub const THREAD_UPCALL_IN_CALL: u64 = 1 << 2;
+
 /// The word [`CAP_INFO_IRQ_REMAP_ENTRY`] answers, from a remapping entry's
 /// handle, the vector it delivers, and its destination APIC id.
 #[must_use]

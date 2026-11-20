@@ -20,7 +20,10 @@
 //! cancels it, and is woken: its syscall returns `Interrupted`, and the upcall
 //! is delivered at that return. A park committed after the post is refused for
 //! the same reason (`sched::commit_blocked_under_local_lock`), so no post finds
-//! a thread between its check and its park
+//! a thread between its check and its park. A call (`SYS_IPC_CALL`) is the
+//! exception: it is atomic with respect to upcalls, so its park is neither
+//! cancelled nor refused, and the upcall is delivered at the call's own
+//! return, with the call's result in the registers
 //! (core/kernel/docs/thread-lifecycle-and-sleep.md § Upcall Cancel-and-Wake
 //! Protocol).
 
@@ -37,9 +40,9 @@ use syscall::SyscallError;
 /// no handler bound for the upcall class (a right with no handler is inert),
 /// and with `QueueFull` when an upcall is already pending on it; nothing is
 /// then changed. Otherwise the upcall is pending, and, unless `target` masks
-/// upcalls, its block is cancelled and it is woken, or, for an
-/// `any_instruction` post, a CPU running it is interrupted so it reaches an
-/// interrupt's return.
+/// upcalls, its block is cancelled and it is woken (a call's block is left to
+/// the call's return), or, for an `any_instruction` post, a CPU running it is
+/// interrupted so it reaches an interrupt's return.
 ///
 /// # Safety
 /// `target` must be a valid TCB the caller pins (its capability lookup); the
@@ -101,31 +104,22 @@ pub unsafe fn post(
         return Ok(());
     }
 
-    // Cancel the target's block. A pass whose claim is lost to a rebind of the
-    // park (a server's receive moves a queued caller to reply-wait under a new
-    // park_seq) leaves the thread blocked with the upcall pending, so the pass
-    // is repeated while the park it found changed and the upcall may still
-    // cancel it; a park the thread commits itself is refused while the upcall
-    // is pending, so only such rebinds repeat it.
-    // SAFETY: target valid and pinned; no lock held.
-    let mut seen = unsafe { cancellable_park(target) };
-    while let Some(park_seq) = seen
+    // Cancel the target's block, in one pass. A lost claim leaves nothing to
+    // repeat: a waker or a concurrent cancel owns the episode, or the thread
+    // left the snapshotted park, and any park it commits while the upcall is
+    // pending is refused but a call's, which the upcall waits out. A source
+    // lock's contention is retried inside the cancel (ipc::lock_bound_source).
+    // SAFETY: target valid and pinned; no lock held. A won cancel owes the
+    // wake, which wake_in_flight (set inside the claim) keeps for this call.
+    if unsafe { crate::syscall::thread::cancel_for_upcall(target) }
     {
-        // SAFETY: target valid and pinned; no lock held. A won cancel owes
-        // the wake, which wake_in_flight (set inside the claim) keeps for this
-        // call.
-        if unsafe { crate::syscall::thread::cancel_for_upcall(target) }
-        {
-            // SAFETY: target valid; its park was claimed by the cancel above,
-            // whose wake_in_flight keeps it allocated.
-            let cpu = unsafe { crate::sched::select_target_cpu(target) };
-            // SAFETY: target valid and claimed, cpu came from
-            // select_target_cpu, and no lock is held.
-            unsafe { crate::sched::enqueue_and_wake(target, cpu) };
-            return Ok(());
-        }
-        // SAFETY: as above.
-        seen = unsafe { cancellable_park(target) }.filter(|&now| now != park_seq);
+        // SAFETY: target valid; its park was claimed by the cancel above,
+        // whose wake_in_flight keeps it allocated.
+        let cpu = unsafe { crate::sched::select_target_cpu(target) };
+        // SAFETY: target valid and claimed, cpu came from select_target_cpu,
+        // and no lock is held.
+        unsafe { crate::sched::enqueue_and_wake(target, cpu) };
+        return Ok(());
     }
 
     if any_instruction
@@ -143,30 +137,6 @@ pub unsafe fn post(
         }
     }
     Ok(())
-}
-
-/// The `park_seq` of `tcb`'s park when it is `Blocked` and a pending upcall may
-/// cancel the block (`syscall::thread::upcall_may_cancel`), read under its
-/// `sched_lock`; `None` otherwise.
-///
-/// # Safety
-/// `tcb` must be a valid TCB; no lock is held.
-#[cfg(not(test))]
-unsafe fn cancellable_park(tcb: *mut ThreadControlBlock) -> Option<u32>
-{
-    // SAFETY: tcb valid (contract).
-    let sched_lock = unsafe { &(*tcb).sched_lock };
-    // SAFETY: lock_raw paired with the unlock_raw below.
-    let saved = unsafe { sched_lock.lock_raw() };
-    // SAFETY: tcb valid; state is read under its sched_lock.
-    let blocked = unsafe { (*tcb).state == ThreadState::Blocked };
-    // SAFETY: tcb is valid and its sched_lock is held.
-    let cancellable = blocked && unsafe { crate::syscall::thread::upcall_may_cancel(tcb) };
-    // SAFETY: tcb valid; park_seq is read under its sched_lock.
-    let park = cancellable.then(|| unsafe { (*tcb).park_seq.load(Ordering::Relaxed) });
-    // SAFETY: paired with the lock_raw above.
-    unsafe { sched_lock.unlock_raw(saved) };
-    park
 }
 
 /// The CPU `tcb` is `current` on at the scan, if any. A snapshot: the thread
@@ -189,6 +159,57 @@ unsafe fn running_cpu(tcb: *mut ThreadControlBlock) -> Option<usize>
         unsafe { s.lock.unlock_raw(f) };
         is_cur
     })
+}
+
+/// The `CAP_INFO_THREAD_UPCALL` word of `tcb`: its pending, masked, and
+/// in-a-call bits, read in one hold of its `sched_lock`, under which the post,
+/// the mask, and the park commit write them. In a call means `Blocked` in a
+/// call's park (`BlockedOnSend` outside a fault or upcall delivery, or
+/// `BlockedOnReply`), the parks an upcall waits out
+/// (`syscall::thread::upcall_may_cancel`).
+///
+/// # Safety
+/// `tcb` must be a valid TCB the caller pins; no lock is held.
+#[cfg(not(test))]
+pub unsafe fn info(tcb: *mut ThreadControlBlock) -> u64
+{
+    use crate::sched::thread::IpcThreadState;
+
+    // SAFETY: tcb valid (contract).
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reads a field of tcb that the held sched_lock serialises"
+    )]
+    // SAFETY: tcb valid; the state, the binding, in_fault_delivery and the
+    // upcall fields are written under the held sched_lock.
+    let (pending, masked, in_call) = unsafe {
+        let in_call = (*tcb).state == ThreadState::Blocked
+            && match (*tcb).ipc_state
+            {
+                IpcThreadState::BlockedOnReply => true,
+                IpcThreadState::BlockedOnSend => !(*tcb).in_fault_delivery,
+                IpcThreadState::None
+                | IpcThreadState::BlockedOnRecv
+                | IpcThreadState::BlockedOnFault
+                | IpcThreadState::BlockedOnNotification
+                | IpcThreadState::BlockedOnEventQueue
+                | IpcThreadState::BlockedOnWaitSet => false,
+            };
+        (
+            (*tcb).upcall_pending.load(Ordering::Relaxed),
+            (*tcb).upcall_masked.load(Ordering::Relaxed),
+            in_call,
+        )
+    };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    let bit = |set: bool, b: u64| if set { b } else { 0 };
+    bit(pending, syscall::THREAD_UPCALL_PENDING)
+        | bit(masked, syscall::THREAD_UPCALL_MASKED)
+        | bit(in_call, syscall::THREAD_UPCALL_IN_CALL)
 }
 
 /// Set or clear the calling thread's upcall mask; returns the previous mask.

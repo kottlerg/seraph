@@ -88,8 +88,8 @@ partition lost and logs it once: every fault on a chunk on disk is forwarded wit
 same failed driver.
 
 A call to the block driver that fails has no reply, and the buffer it lent may be the driver's.
-The driver died, or a debugger stopped the calling thread. swapd tells them apart with a probe, a
-`BLK_GET_GEOMETRY` that lends no buffer, made until it shows which:
+The driver died, or a stop of the calling thread interrupted the call. swapd tells them apart with
+a probe, a `BLK_GET_GEOMETRY` that lends no buffer, made until it shows which:
 
 - the partition cap is gone: devmgr revoked the dead driver's endpoint, and with it the partition
   cap vfsd keeps and derives each hand-out from, so no instance can take the partition again.

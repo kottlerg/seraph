@@ -844,9 +844,13 @@ impl IpcMessageBuilder
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
 /// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
 /// (`InvalidState`), a cap's object has its reference count at its 2^31
-/// ceiling (`QuotaExceeded`), or the call is interrupted. Cap-slot problems are
-/// rejected before blocking; a refusal arising only afterwards delivers the
-/// message with zero caps (the caller keeps its capabilities).
+/// ceiling (`QuotaExceeded`), or the call is interrupted (`Interrupted`: the
+/// caller is stopped, or the endpoint, or the server's thread before it
+/// replies, is destroyed). Cap-slot problems are rejected before blocking; a
+/// refusal arising only afterwards delivers the message with zero caps (the
+/// caller keeps its capabilities). An upcall never interrupts a call: it is
+/// delivered at the call's return, with the reply in hand
+/// (`docs/fault-handling.md` § Asynchronous Upcalls).
 #[inline]
 pub unsafe fn ipc_call(ep: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
 {
@@ -888,51 +892,6 @@ pub unsafe fn ipc_call_timeout(
     // reply (data + cap metadata) into it before return. `reply_word_count`
     // is already clamped to MSG_DATA_WORDS_MAX by `raw_ipc_call`.
     Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, reply_label, 0, reply_word_count) })
-}
-
-/// [`ipc_call`] with the calling thread's upcalls masked across the call
-/// (`SYS_THREAD_SET_UPCALL_MASK`), for a request whose outcome the caller
-/// records and cannot learn again: an [`ipc_call`] that a post cuts short
-/// returns `Interrupted` whether or not the server received the request and
-/// acted on it (`docs/fault-handling.md` § Asynchronous Upcalls, Blocking
-/// syscalls). Masked, a post (a debugger's stop among them) cancels neither
-/// the wait for a receiver nor the wait for the reply; it stays pending and
-/// is delivered at the unmask after the call, once the reply is in the
-/// returned snapshot. A thread that already masks upcalls keeps its mask, and
-/// a mask the kernel refuses leaves the call an [`ipc_call`].
-///
-/// The call still ends early when the caller is stopped (`SYS_THREAD_STOP`),
-/// and, once the server has received the request, when the server's thread
-/// is destroyed before it replies. A call still waiting for a receiver waits
-/// until one receives it, the caller is stopped, or the endpoint's last
-/// capability is deleted, which the caller's own capability prevents
-/// (#1185): a post, which ends a plain [`ipc_call`]'s wait there, does not
-/// end this one. The cost falls on a debugger: it cannot hold a thread
-/// blocked in the call until the server replies, so a server that never
-/// replies leaves the thread out of every all-stop, and only
-/// `SYS_THREAD_STOP` ends its wait. Use it only for a call whose outcome the
-/// caller records.
-///
-/// # Safety
-/// As [`ipc_call`].
-///
-/// # Errors
-/// As [`ipc_call`].
-#[inline]
-pub unsafe fn ipc_call_masked(
-    ep: u64,
-    msg: &IpcMessage,
-    ipc_buf: *mut u64,
-) -> Result<IpcMessage, i64>
-{
-    let before = syscall::thread_set_upcall_mask(true);
-    // SAFETY: this fn's contract is ipc_call's.
-    let reply = unsafe { ipc_call(ep, msg, ipc_buf) };
-    if before == Ok(false)
-    {
-        let _ = syscall::thread_set_upcall_mask(false);
-    }
-    reply
 }
 
 /// Receive on an endpoint cap, returning a stack-owned message snapshot.

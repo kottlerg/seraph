@@ -25,10 +25,14 @@ as follows:
 - For a service svcmgr launches or restarts, procmgr binds it:
   `BIND_DEATH_OBSERVER` (procmgr label 25) on the process handle, with a `POST`
   copy of a svcmgr death queue. Both binds happen before `START_PROCESS`.
-- For memmgr and procmgr, which init creates by raw syscalls, svcmgr binds it
-  itself with `SYS_ASPACE_BIND_NOTIFICATION` (`DeathSet::bind_aspace`), through a
-  Control-only address-space cap the handover endowment delivers, which the
-  entry keeps (`ServiceEntry.aspace_cap`).
+- For memmgr and procmgr, which init creates by raw syscalls, svcmgr binds
+  neither observer on its death queues. At its start it binds both, with
+  `SYS_THREAD_BIND_NOTIFICATION` and `SYS_ASPACE_BIND_NOTIFICATION`, on the
+  core-death queue the shutdown actuator receives on ([Supervision § Observing
+  the Core Set](../../../docs/supervision.md#observing-the-core-set)), through
+  the thread cap and the Control-only address-space cap the handover endowment
+  delivers. The entry keeps both (`ServiceEntry.thread_cap`,
+  `ServiceEntry.aspace_cap`) only for a resync's liveness reads.
 - For devmgr and vfsd, which init creates through procmgr, svcmgr sends
   `BIND_DEATH_OBSERVER` on the process handle the handover endowment delivers,
   which the entry keeps (`ServiceEntry.process_handle`).

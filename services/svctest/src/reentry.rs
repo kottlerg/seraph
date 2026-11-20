@@ -48,6 +48,7 @@ pub fn dispatch(role: &str)
     phases::fs_opens::reentry_main(role);
     phases::exit_code::reentry_main(role);
     phases::recv_guard::reentry_main(role);
+    phases::no_receiver::reentry_main(role);
     phases::random::reentry_main(role);
     phases::memmgr::reentry_main(role);
     phases::budget::reentry_main(role);

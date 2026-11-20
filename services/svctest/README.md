@@ -64,6 +64,8 @@ services/svctest/
         ├── recv_guard.rs      # Shared `RecvGuard` recv-loop failure policy
         ├── recv_pool.rs       # Worker-pool receive helper under concurrent nested IPC;
         │                      #   concurrent logging through logd
+        ├── no_receiver.rs     # A call queued on an endpoint whose last Receive right dies,
+        │                      #   and the call after it, fail with `NoReceiver`
         ├── devmgr.rs          # Block, shutdown, bind deny; input ordinal; on-demand
         │                      #   driver bind; DMA confinement; MSI delivery, forge,
         │                      #   churn, and release
@@ -480,8 +482,9 @@ a second session stopped whole gives `EXIT_KILLED` ([sessiond](../sessiond/READM
 
 Several phases respawn `/tests/svctest` with a role token as `argv[1]`. `main` hands the token
 to `reentry::dispatch`, which tries each owning module's `reentry_main`; a matching role runs
-its child body and exits (`park-child`, `reclaim-child`, and `open-reclaim-child` park until their
-spawner tears them down), and an unmatched token falls through to the normal run.
+its child body and exits (`park-child`, `reclaim-child`, `open-reclaim-child`, and
+`no-receiver-child` park until their spawner tears them down), and an unmatched token falls
+through to the normal run.
 
 | Role                        | Owning module  | Spawned by                                  |
 |-----------------------------|----------------|---------------------------------------------|
@@ -504,6 +507,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `exit-code-thread`          | `exit_code`    | `exit_code_thread` (exit off main)          |
 | `recv-wedge-thread`         | `recv_guard`   | `recv_wedge_thread` (wedge off main)        |
+| `no-receiver-child`         | `no_receiver`  | `call_no_receiver` (killed, call queued)    |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |
 | `aslr-layout-diverge-child` | `random`       | `aslr-layout` (per-process layout tuple)    |
 | `stale-map-child`           | `unmount`      | `vfsd_unmount_stale_mapping` (mapped page)  |

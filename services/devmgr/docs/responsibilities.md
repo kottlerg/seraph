@@ -533,8 +533,10 @@ devmgr's responsibilities are:
     binary with no declaration note is passed over unlogged, one whose
     declaration matches no unbound device is not loaded, and the pass is
     skipped when every device is bound. Each spawn is
-    at-most-once per boot; failure, including an on-disk driver's death, or
-    its overrun of the settle bound, before it reports ready, is sticky and
+    at-most-once per boot, apart from the restart of a served driver that
+    dies, which devmgr serves at the class's next ordinal
+    ([Driver Restart](#driver-restart)); failure, including an on-disk
+    driver's death, or its overrun of the settle bound, before it reports ready, is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
     the rtc, input, hwrng, and debug-port classes, the same reply
     as before `SET_DRIVERS_DIR` arrives, so a client that needs the class waits on a `WATCH_CLASS`

@@ -210,7 +210,7 @@ the appended ones among them, under the bounds of the `SET_DRIVERS_DIR` pass, as
 batch, the hotplug batch ([docs/driver-binding.md](../../../docs/driver-binding.md#hotplug) §
 Hotplug). Before `SET_DRIVERS_DIR` the record is only appended, and the directory's pass binds it. A
 hot-added function therefore binds from `/services/drivers/` at the auxiliary tier whatever its
-class, a disk included: a boot-bundle copy of a driver runs only for the bootstrap
+class, a disk included: a boot-bundle copy of a driver binds no device after the bootstrap
 ([docs/driver-binding.md](../../../docs/driver-binding.md#declaration-bounds) § Declaration Bounds).
 It takes the next ordinal of its class, and a bound driver signals the class's watches.
 

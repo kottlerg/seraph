@@ -409,19 +409,34 @@ mod tests
 {
     use super::*;
 
-    /// Create a unique scratch directory under the system temp dir.
+    /// A new, empty directory under the system temp dir, unique to this
+    /// process and call. The tests run in parallel threads of one process,
+    /// so the name carries a per-process sequence number rather than a clock
+    /// reading two calls can share; a directory an earlier process of the
+    /// same id left behind is removed first.
     fn scratch(tag: &str) -> PathBuf
     {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let p = std::env::temp_dir().join(format!(
             "seraph-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
+        let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Two calls with one tag, which a clock reading of the same value used
+    /// to give one directory, give two distinct directories, each present.
+    #[test]
+    fn scratch_gives_each_call_its_own_directory()
+    {
+        let (first, second) = (scratch("scratch-twice"), scratch("scratch-twice"));
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
     }
 
     /// `prune_stale` deletes files with no source, keeps those in `keep`

@@ -13,7 +13,7 @@
 //!
 //! All subsequent services are created through procmgr IPC.
 
-use crate::logging::log;
+use crate::logging::{log, log_parts};
 use crate::{MemoryAlloc, PAGE_SIZE, TEMP_MAP_BASE, arch};
 use init_protocol::{CapDescriptor, InitInfo};
 use process_abi::PROCESS_ABI_VERSION;
@@ -85,55 +85,70 @@ fn choose_image_bias_or_default() -> u64
     process_layout::IMAGE_WINDOW.base
 }
 
-/// Log `prefix` followed by a lowercase hex value (init's `log` takes only
-/// plain `&str`; no `core::fmt` in the `no_std` bootstrap path). The 96-byte
-/// buffer is a diagnostic output cap: a longer prefix truncates and nothing
-/// else is bounded.
-pub(crate) fn log_hex(prefix: &str, value: u64)
+/// A `u64` as `0x` and its lowercase hex digits, without leading zeros:
+/// init's `log` takes only bytes, and the `no_std` bootstrap path has no
+/// `core::fmt`.
+pub(crate) struct HexText
 {
-    let mut buf = [0u8; 96];
-    // The buffer is 96 bytes, so the prefix cap is positive.
-    let prefix_len = prefix.len().min(buf.len().saturating_sub(18));
-    let mut pos = 0usize;
-    let mut push = |b: u8| {
-        if let Some(slot) = buf.get_mut(pos)
+    buf: [u8; 18],
+    len: usize,
+}
+
+impl HexText
+{
+    pub(crate) fn new(value: u64) -> Self
+    {
+        let mut text = Self {
+            buf: [0; 18],
+            len: 0,
+        };
+        text.push(b'0');
+        text.push(b'x');
+        let mut started = false;
+        for nibble in (0..16u32).rev()
+        {
+            // `nibble` is below 16, so the shift is below 64 and `checked_shr` never refuses.
+            let digit = ((value.checked_shr(nibble.saturating_mul(4)).unwrap_or(0)) & 0xF) as u8;
+            if digit != 0 || started || nibble == 0
+            {
+                text.push(
+                    if digit < 10
+                    {
+                        b'0'.saturating_add(digit)
+                    }
+                    else
+                    {
+                        // `digit` is at most 15.
+                        b'a'.saturating_add(digit.saturating_sub(10))
+                    },
+                );
+                started = true;
+            }
+        }
+        text
+    }
+
+    /// Append `b`; the 18 bytes hold `0x` and the 16 digits of any `u64`.
+    fn push(&mut self, b: u8)
+    {
+        if let Some(slot) = self.buf.get_mut(self.len)
         {
             *slot = b;
-            // `pos` indexed a slot, so it is below the buffer length.
-            pos = pos.saturating_add(1);
-        }
-    };
-    for &b in prefix.as_bytes().iter().take(prefix_len)
-    {
-        push(b);
-    }
-    push(b'0');
-    push(b'x');
-    let mut started = false;
-    for nibble in (0..16u32).rev()
-    {
-        // `nibble` is below 16, so the shift is below 64 and `checked_shr` never refuses.
-        let digit = ((value.checked_shr(nibble.saturating_mul(4)).unwrap_or(0)) & 0xF) as u8;
-        if digit != 0 || started || nibble == 0
-        {
-            push(
-                if digit < 10
-                {
-                    b'0'.saturating_add(digit)
-                }
-                else
-                {
-                    // `digit` is at most 15.
-                    b'a'.saturating_add(digit.saturating_sub(10))
-                },
-            );
-            started = true;
+            // `len` indexed a slot, so it is below the buffer length.
+            self.len = self.len.saturating_add(1);
         }
     }
-    if let Ok(s) = core::str::from_utf8(buf.get(..pos).unwrap_or_default())
+
+    pub(crate) fn as_bytes(&self) -> &[u8]
     {
-        log(s);
+        self.buf.get(..self.len).unwrap_or_default()
     }
+}
+
+/// Log `prefix` followed by `value` in hex ([`HexText`]).
+pub(crate) fn log_hex(prefix: &str, value: u64)
+{
+    log_parts(&[prefix.as_bytes(), HexText::new(value).as_bytes()]);
 }
 
 // ── Bootstrap arena ────────────────────────────────────────────────────────────

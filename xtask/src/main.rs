@@ -46,6 +46,7 @@ extern crate rustc_demangle;
 mod accel;
 mod arch;
 mod argparse;
+mod breakpoint_kill;
 mod bundle;
 mod cli;
 mod commands;

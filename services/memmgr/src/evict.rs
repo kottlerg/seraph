@@ -359,8 +359,8 @@ pub(crate) fn in_flight() -> bool
 /// pressure level reads `LOW`. At `CRITICAL` the free pages above the
 /// growth floor are gone, so a frame background eviction frees goes to the next
 /// admission, which a process draining the pool makes first; there only a
-/// restore evicts, for itself ([`admit_restore`];
-/// services/memmgr/docs/memory-pool.md § Eviction, Selection).
+/// restore or a committed draw evicts, for itself ([`admit_restore`],
+/// [`draw_room`]; services/memmgr/docs/memory-pool.md § Eviction, Selection).
 pub(crate) fn reclaiming() -> bool
 {
     evictor().notify != 0 && current_pressure() == PressureLevel::Low

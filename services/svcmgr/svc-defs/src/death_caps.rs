@@ -12,8 +12,6 @@
 //! drain that may have followed a full death queue. The specification is
 //! `services/svcmgr/docs/restart-protocol.md` § Death detection.
 
-use syscall_abi::{EXIT_KILLED, THREAD_STATE_EXITED};
-
 use crate::death_tag::DeathTag;
 
 /// The exit reason of a service its caps show dead, else `None`.
@@ -21,27 +19,22 @@ use crate::death_tag::DeathTag;
 /// `thread_state` is the result of `cap_info(CAP_INFO_THREAD_STATE)` on its
 /// main-thread cap, and `aspace_fault` that of
 /// `cap_info(CAP_INFO_ASPACE_TERMINAL_FAULT)` on its address-space cap; `None`
-/// for a cap svcmgr does not hold. An exited thread gives the reason the kernel
-/// recorded, the low half of the packed state. A thread cap that no longer
-/// resolves gives `EXIT_KILLED`, since procmgr's teardown of the process
-/// revokes it. A non-zero retained fault gives that fault's reason. A thread
-/// that runs or has not started, a space with no retained fault, and a failed
-/// read of the space show nothing.
+/// for a cap svcmgr does not hold. The thread reading decodes as every creator
+/// decodes it (`ipc::bootstrap::thread_death`): an exited thread gives the
+/// reason the kernel recorded, and a thread cap that no longer resolves gives
+/// `EXIT_KILLED`, since procmgr's teardown of the process revokes it. A
+/// non-zero retained fault gives that fault's reason. A thread that runs or has
+/// not started, a space with no retained fault, and a failed read of the space
+/// show nothing.
 #[must_use]
 pub fn caps_death(
     thread_state: Option<Result<u64, i64>>,
     aspace_fault: Option<Result<u64, i64>>,
 ) -> Option<u64>
 {
-    match thread_state
+    if let Some(reason) = thread_state.and_then(ipc::bootstrap::thread_death)
     {
-        Some(Ok(packed)) if packed >> 32 == u64::from(THREAD_STATE_EXITED) =>
-        {
-            return Some(packed & 0xFFFF_FFFF);
-        }
-        Some(Err(_)) => return Some(EXIT_KILLED),
-        Some(Ok(_)) | None =>
-        {}
+        return Some(reason);
     }
     match aspace_fault
     {
@@ -173,7 +166,9 @@ pub fn resync<T: ResyncTable>(table: &mut T)
 mod tests
 {
     use super::*;
-    use syscall_abi::{EXIT_FAULT_BASE, THREAD_STATE_ALIVE, THREAD_STATE_CREATED};
+    use syscall_abi::{
+        EXIT_FAULT_BASE, EXIT_KILLED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED, THREAD_STATE_EXITED,
+    };
 
     /// A thread cap's `CAP_INFO_THREAD_STATE` reading: the state code in the
     /// high half, the exit reason in the low.

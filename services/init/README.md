@@ -61,7 +61,10 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    endpoints, spawn init-logd, read the log-level configuration, bring up
    memmgr and procmgr via raw syscalls, then drive procmgr IPC to create
    devmgr and vfsd, each spawned service with its configured log level (see
-   [docs/bootstrap.md § Log levels](docs/bootstrap.md#log-levels)).
+   [docs/bootstrap.md § Log levels](docs/bootstrap.md#log-levels)). A
+   service that dies before the bootstrap round init owes it, here or in
+   the Handover stage, halts the boot with a FATAL line (see
+   [docs/bootstrap.md § A death during the bootstrap](docs/bootstrap.md#a-death-during-the-bootstrap)).
 2. **Root acquisition** — vfsd self-mounts the Seraph root partition at `/`
    on its own startup; init issues no `MOUNT` (see
    [vfsd service interface](../vfsd/docs/vfs-ipc-interface.md)). Pull the seed

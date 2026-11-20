@@ -589,7 +589,9 @@ reclamation step inserts back into the free pool.
 
 memmgr and procmgr are in the core set: neither is restarted, and the
 death of either is system death, which svcmgr turns into a graceful
-shutdown (see [Supervision § Core Set and System
+shutdown. Before svcmgr's handover, a death during the service's own
+bootstrap rounds is init's logged halt, and a later one hangs the boot
+with no line (see [Supervision § Core Set and System
 Death](supervision.md#core-set-and-system-death)).
 
 ---

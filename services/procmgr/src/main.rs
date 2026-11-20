@@ -2491,7 +2491,8 @@ fn create_child(
 /// receives, whose creator, svcmgr, would otherwise wait out the line's bound
 /// (`LOG_CALL_TIMEOUT_MS`) before it can start it. The bias line is the one a
 /// debugger reads the image's placement from
-/// (`docs/userspace-memory-model.md` § Image Placement); no `ProcessInfo`
+/// (`docs/userspace-memory-model.md` § Image Placement), and names the child,
+/// since concurrent creates interleave their lines; no `ProcessInfo`
 /// field carries the bias, and an `ET_EXEC` image, at bias 0, has none. The
 /// scheduling line evidences every process's level and band in the boot log,
 /// since no syscall reads a priority back.
@@ -2499,7 +2500,11 @@ fn log_spawn(result: &process::CreateResult, sched: process::ChildSched)
 {
     if result.image_bias != 0
     {
-        std::os::seraph::log!("spawn image bias=0x{:x}", result.image_bias);
+        std::os::seraph::log!(
+            "spawn image bias=0x{:x} ({})",
+            result.image_bias,
+            String::from_utf8_lossy(result.name.as_bytes())
+        );
     }
     std::os::seraph::log!(
         debug: "spawn priority={} band=[1,{}]",

@@ -186,7 +186,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | Option | Description |
 |---|---|
 | `--arch` | Target architecture (default: `x86_64`) |
-| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39; see [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) § Image Placement): take the bias from the creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file symbols/<file> -o <bias>`, `<file>` being the store file `symbols/manifest` lists for the image's install path: the installed image is stripped and carries no symbols ([docs/build-system.md](../docs/build-system.md#symbols-store) § Symbols Store) |
+| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39; see [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) § Image Placement): take the bias from the creator's log line (procmgr `spawn image bias=0x… (<argv0>)`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file symbols/<file> -o <bias>`, `<file>` being the store file `symbols/manifest` lists for the image's install path: the installed image is stripped and carries no symbols ([docs/build-system.md](../docs/build-system.md#symbols-store) § Symbols Store) |
 | `--headless` | Run without a display window (`-display none`) |
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=8192`, `boot_protocol::MAX_CPUS`, the boot protocol's CPU ceiling) |
@@ -202,7 +202,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--second-disk-shared-line` | Place the second disk's device on the first disk's `INTx` line instead of a line of its own, and launch both disks with no MSI-X (see Attached devices), staging the boot in which two virtio-blk devices share one line. Requires `--second-disk` |
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 | `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
-| `--test-devices` | Attach the test devices (see Attached devices): `edu` and four `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
+| `--test-devices` | Attach the test devices (see Attached devices): `edu` and five `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -243,12 +243,12 @@ QEMU's ACPI RIMT describes the IOMMU as translating only the requester IDs above
 device (PCI `1234:11e8`) with a 32-bit DMA mask so its engine reaches the interrupt addresses the
 forged-message phase writes, behind the IOMMU when one is attached, which only svctest's DMA
 confinement and MSI phases drive
-([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)), and four QEMU
-`pci-testdev` functions (PCI `1b36:0005`) at pinned slots 0x15, 0x16, 0x17 (`membar=4K`) and 0x18
-(`membar=8K`), which the test-only `test-fault` driver binds
-([services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md)). No other launch
-attaches them, and no production driver binds them. On x86-64 a launch also attaches `-device
-vmgenid,guid=auto`, the VMGENID generation-ID device
+([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)), and five QEMU
+`pci-testdev` functions (PCI `1b36:0005`) at pinned addresses 0x15 (`multifunction=on`), 0x15.1
+(`membar=16K`), 0x16, 0x17 (`membar=4K`) and 0x18 (`membar=8K`), which the test-only `test-fault`
+driver binds ([services/drivers/test-fault/README.md](../services/drivers/test-fault/README.md)). No
+other launch attaches them, and no production driver binds them. On x86-64 a launch also attaches
+`-device vmgenid,guid=auto`, the VMGENID generation-ID device
 ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Whole-VM-snapshot detection
 (VMGENID)); QEMU's riscv64 `virt` machine has no VMGENID. A non-headless run adds QEMU std VGA: the
 q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair, added
@@ -857,7 +857,7 @@ cargo xtask symbolize --log FILE [--symbols DIR]
 |---|---|---|
 | `--binary` | | The ELF image the addresses fall in: a sysroot binary, or its build output under `target/` |
 | `--kernel` | | Resolve against the sysroot's kernel image, `sysroot/esp/EFI/seraph/kernel` |
-| `--bias` | `0` | The image's load bias in hex: for a userspace process its creator's log line (procmgr `spawn image bias=0x…`, init `init: <svc> image bias=0x…`, and, for init itself, the kernel's `init: PIE bias=0x…`), for the kernel the KASLR slide from its serial-only `kaslr: slide=` line (`0` in a boot authored with `mkdisk --no-kaslr`) |
+| `--bias` | `0` | The image's load bias in hex: for a userspace process its creator's log line (procmgr `spawn image bias=0x… (<argv0>)`, init `init: <svc> image bias=0x…`, and, for init itself, the kernel's `init: PIE bias=0x…`), for the kernel the KASLR slide from its serial-only `kaslr: slide=` line (`0` in a boot authored with `mkdisk --no-kaslr`) |
 | `ADDR...` | (required without `--log`) | Runtime addresses, in hex (`0x` optional) |
 | `--log` | | A serial log: symbolize every crash-report block in it (below) instead of `ADDR...` |
 | `--symbols` | the build's `symbols/` | The symbols store to read in place of the build's, such as a release's symbols archive unpacked. With `--log`, the images are the store's own files named by its manifest, and the sysroot is not read |
@@ -951,7 +951,7 @@ sequence is written to the guest UART over QEMU's bidirectional `-serial stdio`,
 with the same echo, prompt, and `shell built-ins:` assertions (the serial RX
 round, #291). It then kills the virtio-input driver through the stub, moving its
 main thread to program counter 0, waits for the terminal's
-`terminal: input driver at ordinal 1` line once devmgr has restarted it, and
+`[terminal] input driver at ordinal 1` line once devmgr has restarted it, and
 injects the key sequence again on a cleared transcript, with the echo and
 `shell built-ins:` assertions (the input restart round). The stub's recipe is
 removed and the disk images repacked in the layout they had afterwards. Exits
@@ -1339,10 +1339,15 @@ Check the debug port's transport, on either arch. Stages the `debug-echo` fixtur
 sysroot once with the debug port attached (as `run --debug-port` attaches it, headless), waits for
 the fixture's `[debug-echo] READY on the debug port` line on the serial stream, connects to the
 port, and drives one GDB remote serial protocol exchange with the fixture, framed at both ends by
-`shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)). It then kills QEMU,
-removes the recipe, and repacks the images in that layout again, whatever the outcome. It passes
-when every answer of the exchange arrives as expected; [docs/testing.md](../docs/testing.md) § Debug
-port (`test-debug-port`) lists the exchange.
+`shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)), then a restart round
+on the same connection: through QEMU's gdbstub, which the boot attaches on a socket under
+`target/xtask/`, the host kills the port's `virtio-console` driver at a hardware breakpoint in its
+code, its bias taken from procmgr's `spawn image bias=0x… (/services/drivers/virtio-console)`
+line, waits for the fixture's `[debug-echo] debug port driver at ordinal 1` line, and echoes
+through the restarted driver. It then kills QEMU, removes the recipe, and repacks the images in
+that layout again, whatever the outcome. It passes when every answer of the exchange and of the
+restart round arrives as expected;
+[docs/testing.md](../docs/testing.md) § Debug port (`test-debug-port`) lists the exchange.
 
 A pure runner; requires a populated sysroot:
 
@@ -1497,9 +1502,13 @@ current sysroot once with the debug port attached (headless), and waits for the 
 for symbols: the session lists the threads, breaks on the target's tick function and continues to
 it, rewrites a variable and a register and reads each back, single-steps, selects the second
 thread and reads its registers, and detaches; the test then waits up to 30 s for the stub's
-`[gdbstub] detached from gdb-target (crash bindings restored: ...)` line. It kills QEMU, removes
-both recipes, and repacks the images in that layout again, whatever the outcome, and passes when
-GDB's output shows each of those results and the stub's line reports the crash bindings restored;
+`[gdbstub] detached from gdb-target (crash bindings restored: ...)` line. A restart round
+follows: the test connects to the stub, which attaches to the target anew, kills the port's
+driver through QEMU's gdbstub as `test-debug-port` does, waits for the stub's
+`[gdbstub] debug port driver at ordinal 1` line, and requires the session to go on on the same
+connection (`?`, `Hg1`, the pointer read, `D`). It kills QEMU, removes both recipes, and repacks the
+images in that layout again, whatever the outcome, and passes when GDB's output shows each of
+those results, the stub's line reports the crash bindings restored, and the restart round passes;
 [docs/testing.md](../docs/testing.md) § GDB stub (`test-gdb`) lists them.
 
 A pure runner; requires a populated sysroot and a host GDB that debugs the architecture:

@@ -9,7 +9,7 @@
 //! With a stall set (`CRASHD_OOM_STALL_MS`), crashd's thread waits on a wait
 //! set of procmgr's crash endpoint and the runtime's memory-pressure
 //! Notification, with a timeout of the earliest hold's deadline. A fault that
-//! memmgr declined with code 6, 7 or 8 while the level is `CRITICAL` is
+//! memmgr declined with code 6, 7, 8 or 11 while the level is `CRITICAL` is
 //! redirected (`FAULT_REPLY_REDIRECT`) to one of [`SLOTS`] endpoints crashd
 //! made at start, where it waits queued, its thread fault-blocked, and no
 //! thread of crashd's waits on it. The fault reaches that endpoint only when

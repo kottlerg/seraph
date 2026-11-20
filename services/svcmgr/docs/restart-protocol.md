@@ -95,12 +95,12 @@ scan, with the thread cap init endowed, and a resync right after reconciliation 
 A child that dies after `START_PROCESS` and before its bootstrap request sends none, so svcmgr does
 not wait for a request without bound. Its wait for each of a child's requests
 ([`serve_boot_slots`](../src/definitions/launch.rs), through
-`ipc::bootstrap::serve_round_watched`) is a receive bounded at `BOOTSTRAP_POLL_MS` (50 ms), and
-after each one that expires svcmgr reads the child's main thread through its own thread cap, as a
-resync does (the kernel's reason for an exited thread, `EXIT_KILLED` for a revoked cap); a round
-that fails is read the same way. A dead child ends the serve: svcmgr releases the caps of the
-rounds it did not serve and routes the death at once through `restart::handle_death`, under the
-instance's tag, as any other death:
+`ipc::bootstrap::serve_round_watched`) is a receive bounded at `ipc::bootstrap::WATCH_POLL_MS`
+(50 ms), and after each one that expires svcmgr reads the child's main thread through its own
+thread cap, as a resync does (the kernel's reason for an exited thread, `EXIT_KILLED` for a
+revoked cap); a round that fails is read the same way. A dead child ends the serve: svcmgr releases
+the caps of the rounds it did not serve and routes the death at once through
+`restart::handle_death`, under the instance's tag, as any other death:
 
 - On the first launch the service is recorded as launched, and its provided names published, as
   for a child that took its rounds, since the endpoint outlives the instance; its death is routed
@@ -117,7 +117,7 @@ instance's tag, as any other death:
 
 The posts the dead instance's observers make arrive later and are dropped, its instance already
 routed. A child that is alive and sends no request, one a debugger holds stopped among them, is
-still waited for, `BOOTSTRAP_POLL_MS` at a time.
+still waited for, `WATCH_POLL_MS` at a time.
 
 svcmgr calls vfsd and devmgr before reconciliation records them. vfsd serves svcmgr's namespace
 root: before the handover svcmgr reads the device class files and walks the drivers and platform

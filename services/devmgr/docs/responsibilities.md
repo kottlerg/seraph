@@ -324,9 +324,15 @@ devmgr's responsibilities are:
   the same way, its Bus Master Enable cleared before its BAR caps are taken.
   A driver that dies on its own is withdrawn when devmgr takes its death from
   the death queues; procmgr may reap it first, and holds its memory until
-  devmgr's release. devmgr binds no driver to a PCI device whose
-  configuration page it cannot carve or map, since it could not clear that
-  function's Bus Master Enable. Then the driver's service endpoint is revoked
+  devmgr's release. A driver that dies after its start and before one of its bootstrap requests
+  sends none, and its death observers are bound only after its rounds, so devmgr does not wait for a
+  request without bound: each wait is a receive bounded at `ipc::bootstrap::WATCH_POLL_MS` (50 ms),
+  after each expiry of which devmgr reads the driver's main thread through the thread cap of its
+  create reply (`ipc::bootstrap::serve_round_watched`). A dead driver ends its rounds as a failed
+  bootstrap does: devmgr logs the death, withdraws the device, leaves it without a driver, and goes
+  on with the bind's next device. A live driver that sends no request is still waited for. devmgr
+  binds no driver to a PCI device whose configuration page it cannot carve or map, since it could
+  not clear that function's Bus Master Enable. Then the driver's service endpoint is revoked
   and deleted and its BAR, DMA, configuration-page, and IRQ caps released: each
   BAR cap (an `Mmio` resource's, and the MSI-X table's) goes back to devmgr's
   held BAR pages over the range it covers, from which a later bind carves it
@@ -340,14 +346,13 @@ devmgr's responsibilities are:
   created `CREATE_DMA_HOLD`.
 
   Every svctest boot runs this order on PCI functions without DMA: its
-  `devmgr_on_demand_bind` phase has devmgr withdraw three `test-fault`
-  fixtures bound to QEMU `pci-testdev` functions, one on its death after
-  `FAULT_EXIT`, one still pending at its settle's bound, and one whose
-  bootstrap fails, so the Bus Master Enable and Interrupt Disable writes, the
-  endpoint revocation, and the BAR and configuration-page releases run; the
-  fixture declares no reset and no DMA, so neither a reset nor a DMA release
-  runs there. Every `--test-devices` boot runs it on one DMA-capable
-  PCI-bound driver: svctest's `devmgr_msi_release` phase has the `test-dma`
+  `devmgr_on_demand_bind` phase has devmgr withdraw four `test-fault` fixtures bound to QEMU
+  `pci-testdev` functions, one on its death after `FAULT_EXIT`, one still pending at its settle's
+  bound, one whose bootstrap fails, and one that dies before its next bootstrap request, so the Bus
+  Master Enable and Interrupt Disable writes, the endpoint revocation, and the BAR and
+  configuration-page releases run; the fixture declares no reset and no DMA, so neither a reset nor
+  a DMA release runs there. Every `--test-devices` boot runs it on one DMA-capable PCI-bound driver:
+  svctest's `devmgr_msi_release` phase has the `test-dma`
   fixture, bound to QEMU's `edu` device and declaring no reset, exit
   (`ipc::test_dma_labels::FIXTURE_EXIT`), and devmgr withdraws it on its
   death, so step 0 and the hold of step 5 run: behind an IOMMU the block lets
@@ -430,7 +435,9 @@ devmgr's responsibilities are:
   `pci-testdev` functions (PCI `1b36:0005`) only through `BIND_DRIVERS`, its
   role taken from its resource list (no BAR 2 serves, a 4 KiB BAR 2 never
   reports ready, an 8 KiB BAR 2 fails its bootstrap's terminal round so devmgr
-  withdraws the device and destroys the fixture mid-bootstrap).
+  withdraws the device and destroys the fixture mid-bootstrap, a 16 KiB BAR 2
+  exits before its next bootstrap request so devmgr abandons the bind and goes
+  on binding).
 
   The instance ordinals of a class count its served drivers in spawn order
   and are fixed once its batch settles. devmgr observes the death of every
@@ -859,9 +866,11 @@ the withdrawal revokes the endpoint, `QUERY_DEVICE` answers `WITHDRAWN` at the d
 ordinal, and its `WATCH_CLASS` watch is signalled at the withdrawal and again when the new
 instance is served. A `QUERY_DEVICE` at the next ordinal (`first_device_from`) then waits for the
 restart's settle and names the new instance, or answers `NO_DEVICE` when the restart was refused or
-failed. A client re-registers with the new instance whatever it registered with the dead one. logd's
-sinks, entropyd and the terminal re-resolve this way on their class watches; `ipc::refresh_device`
-is the look a client makes at its class on a signal.
+failed. A client re-registers with the new instance whatever it registered with the dead one.
+`ipc::refresh_device` is the look a client makes at its class on a signal. The `std` clients that
+follow a class for their run (the terminal, gdbstub and debug-echo) do it through
+[shared/device-tracker](../../../shared/device-tracker/README.md), whose crate documentation states
+the contract they keep; logd's sinks and entropyd re-resolve this way in their own loops.
 
 ### Root disk
 

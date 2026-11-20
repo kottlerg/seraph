@@ -214,7 +214,7 @@ cargo xtask run --test-devices
 
 The svctest recipe also stages the test class files of `sysroot/config/devmgr/tests/` into
 `sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and boots with
-`--test-devices`, which attaches `edu` and four QEMU `pci-testdev` functions that no other launch
+`--test-devices`, which attaches `edu` and five QEMU `pci-testdev` functions that no other launch
 attaches and no production driver binds. svctest fails, naming the flag, when they are missing.
 
 The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
@@ -557,7 +557,15 @@ No guest-side check can show that bytes cross it, since its far end is the host.
    must be refused with `-`, the interrupt byte, `QStartNoAckMode`, then in no-ack mode a binary
    echo of every byte value through the escapes and a packet past the fixture's buffer, which must
    be refused with `E02`.
-4. Kill QEMU, remove the recipe, and repack the images in that layout again, whatever the
+4. On the same connection, restart the port's driver under the fixture: kill the
+   `virtio-console` driver through QEMU's gdbstub, which the boot attaches, at a hardware
+   breakpoint in the function it runs on each of the fixture's reads, its bias taken from
+   procmgr's `spawn image bias=0x… (/services/drivers/virtio-console)` line (the driver declares
+   itself undebuggable, so no guest debugger reaches it); wait for the fixture's
+   `debug port driver at ordinal 1` line once devmgr has restarted the driver at the class's next
+   ordinal ([services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)
+   § Driver Restart); then echo through the restarted driver.
+5. Kill QEMU, remove the recipe, and repack the images in that layout again, whatever the
    outcome.
 
 The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
@@ -616,7 +624,13 @@ from a host GDB over the debug port, so its check is a host GDB session.
    and GDB's `[Inferior 1 (Remote target) detached]`.
 4. Wait up to 30 s for the stub's `[gdbstub] detached from gdb-target (crash bindings restored:
    true)` line: procmgr took the target's crash bindings back.
-5. Kill QEMU, remove both recipes, and repack the images in that layout again, whatever the
+5. Restart the port's driver under the stub: connect again, `qSupported` (the stub attaches to
+   the target anew), and kill the `virtio-console` driver through QEMU's gdbstub as
+   `test-debug-port` does, at the function the stub's reads reach; wait for the stub's
+   `[gdbstub] debug port driver at ordinal 1` line once devmgr has restarted the driver, and
+   require the session to go on through the restarted driver on the same connection: `?` a stop,
+   `Hg1`, the pointer read, and `D`.
+6. Kill QEMU, remove both recipes, and repack the images in that layout again, whatever the
    outcome.
 
 It needs a host GDB that debugs the guest architecture (`gdb` built with every target, or
@@ -879,7 +893,7 @@ Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 with the virtio-blk, virtio-keyboard, and virtio-rng devices behind it — `intel-iommu` on x86_64,
 `riscv-iommu-pci` at 00:01.0 on riscv64 — and, on x86_64, `vmgenid,guid=auto`; the svctest cells
 also attach the test devices (`--test-devices`): QEMU's `edu` DMA test device, which svctest's DMA
-confinement and MSI forge phases drive, and four `pci-testdev` functions, which its
+confinement and MSI forge phases drive, and five `pci-testdev` functions, which its
 on-demand-bind phase drives through the test-only test-fault driver; CI boots headless, so no
 framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
 the framebuffer boot, `--display framebuffer`, and the debug-port boots, `test-debug-port` and
@@ -955,7 +969,7 @@ surface.
     it): svctest's filesystem phases;
   - and the devices the harnesses drive, which only the svctest launches attach
     (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
-    confinement and MSI delivery, forge, churn, and release phases, four `pci-testdev` functions,
+    confinement and MSI delivery, forge, churn, and release phases, five `pci-testdev` functions,
     which the test-only test-fault driver serves in svctest's on-demand-bind phase, and, on x86_64,
     `vmgenid`, the generation source the kernel's snapshot detection reads: `test-vmgenid`.
 

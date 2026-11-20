@@ -15,7 +15,12 @@
 //! selects the second thread and reads its registers, and detaches. The
 //! output is checked against [`expect`], and the stub's own detach line
 //! against [`expect_restored`]: procmgr gave the target its crash bindings
-//! back. The recipes are always removed and the disk images repacked in the
+//! back. A restart round follows ([`restart_round`]): the host connects to
+//! the stub again, which attaches to the target anew, kills the debug port's
+//! driver through QEMU's gdbstub at a hardware breakpoint in its code
+//! (`breakpoint_kill`), and once the stub logs [`FOLLOWED_MARKER`], holding
+//! the driver devmgr restarted at the class's next ordinal, requires the
+//! session to go on through it on the same connection. The recipes are always removed and the disk images repacked in the
 //! layout they had afterwards; the host kills QEMU.
 //!
 //! A pure runner: requires a populated sysroot from `cargo xtask build` and a
@@ -27,11 +32,12 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
+use crate::breakpoint_kill;
 use crate::cli::TestGdbArgs;
 use crate::context::Context;
 use crate::debug_stub;
@@ -41,6 +47,7 @@ use crate::qemu::{
     GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
     X86ShadowStack, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
+use crate::qemu_gdb::Stub;
 use crate::symbolize::store::Store;
 use crate::util::{require_tool, step};
 
@@ -56,6 +63,24 @@ const READY_MARKER: &str = "[gdbstub] attached; serving the debug port";
 /// whether procmgr restored the target's crash bindings. Kept in sync with
 /// `services/gdbstub/src/main.rs`.
 const DETACHED_MARKER: &str = "[gdbstub] detached from gdb-target (crash bindings restored: ";
+
+/// The stub's line once it holds the driver devmgr restarted at the class's
+/// next ordinal. Kept in sync with `shared/device-tracker`.
+const FOLLOWED_MARKER: &str = "[gdbstub] debug port driver at ordinal 1";
+
+/// The debug port's driver: its process name, its binary under the sysroot,
+/// and the function the kill breaks on, which the driver runs on every
+/// `SERIAL_READ_BYTES`, so the stub's reads reach it. Kept in sync with
+/// `services/drivers/virtio/console/src/main.rs`.
+const PORT_DRIVER_NAME: &str = "/services/drivers/virtio-console";
+const PORT_DRIVER_BINARY: &str = "services/drivers/virtio-console";
+const PORT_DRIVER_FUNCTION: &str = "<virtio_console::Console>::drain_rx";
+
+/// Budget for each of the stub's answers in the restart round.
+const RESTART_ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Budget for the restart, from the kill to [`FOLLOWED_MARKER`].
+const RESTART_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Budget for the boot to reach [`READY_MARKER`].
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
@@ -131,7 +156,11 @@ pub fn run(ctx: &Context, args: &TestGdbArgs) -> Result<()>
     let session = booted.context("the boot did not run")??;
     expect(&session.gdb)?;
     expect_restored(session.detached.as_deref())?;
-    step("gdb stub test: PASS (break, memory and register write, step, second thread, detach)");
+    session.restarted.context("the restart round")?;
+    step(
+        "gdb stub test: PASS (break, memory and register write, step, second thread, detach, \
+         the session across a restart of the port's driver)",
+    );
     Ok(())
 }
 
@@ -143,6 +172,8 @@ struct Session
     /// The stub's [`DETACHED_MARKER`] line, when it appeared within
     /// [`DETACH_TIMEOUT`] of GDB's exit.
     detached: Option<String>,
+    /// The restart round's outcome.
+    restarted: Result<()>,
 }
 
 /// A line of the guest's serial output the test waits on.
@@ -150,6 +181,9 @@ enum Serial
 {
     Ready,
     Detached(String),
+    /// procmgr's bias line for the debug port's driver: the bias.
+    DriverBias(u64),
+    Followed,
 }
 
 /// Boot the images of `layout` with the debug port, wait for the stub, run
@@ -159,6 +193,12 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Re
     // Picked here, right before QEMU binds it, to keep the window in which
     // another process could take it short.
     let port = crate::util::debug_port_or_free(args.port)?;
+    let driver = breakpoint_kill::resolve_installed(ctx, PORT_DRIVER_BINARY, PORT_DRIVER_FUNCTION)?;
+    let sock_dir = ctx.target_dir.join("xtask");
+    std::fs::create_dir_all(&sock_dir)
+        .with_context(|| format!("creating {}", sock_dir.display()))?;
+    let gdb_sock = sock_dir.join(format!("gdb-{}.gdb", std::process::id()));
+    let _ = std::fs::remove_file(&gdb_sock);
     // GDB reads the symbols of the stripped installed image from the symbols
     // store's file of its build id.
     let binary =
@@ -188,7 +228,7 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Re
         threads_per_core: 1,
         mem_mib: args.mem,
         display: QemuDisplay::Headless,
-        gdb: GdbMode::Off,
+        gdb: GdbMode::Unix(&gdb_sock),
         qmp_socket: None,
         vmgenid_guid: Some("auto"),
         incoming: None,
@@ -216,12 +256,14 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Re
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     let (tx, rx) = mpsc::channel::<Serial>();
     let reader = thread::spawn(move || forward_serial(stdout, &tx));
+    let mut bias = None;
     let ready = loop
     {
         match rx.recv_timeout(BOOT_TIMEOUT)
         {
             Ok(Serial::Ready) => break Ok(()),
-            Ok(Serial::Detached(_)) =>
+            Ok(Serial::DriverBias(b)) => bias = bias.or(Some(b)),
+            Ok(Serial::Detached(_) | Serial::Followed) =>
             {}
             Err(_) =>
             {
@@ -234,22 +276,11 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Re
     };
     let result = ready
         .and_then(|()| run_gdb(gdb, args.arch, port, &binary))
-        .map(|output| Session {
-            gdb: output,
-            detached: loop
-            {
-                match rx.recv_timeout(DETACH_TIMEOUT)
-                {
-                    Ok(Serial::Detached(line)) => break Some(line),
-                    Ok(Serial::Ready) =>
-                    {}
-                    Err(_) => break None,
-                }
-            },
-        });
+        .map(|output| after_gdb(output, args.arch, port, &gdb_sock, bias, &driver, &rx));
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
+    let _ = std::fs::remove_file(&gdb_sock);
     result
 }
 
@@ -269,6 +300,14 @@ fn forward_serial(stdout: std::process::ChildStdout, tx: &mpsc::Sender<Serial>)
         {
             Serial::Ready
         }
+        else if let Some(bias) = breakpoint_kill::spawn_bias(&[l.as_str()], PORT_DRIVER_NAME)
+        {
+            Serial::DriverBias(bias)
+        }
+        else if l.contains(FOLLOWED_MARKER)
+        {
+            Serial::Followed
+        }
         else if l.contains(DETACHED_MARKER)
         {
             Serial::Detached(l)
@@ -279,6 +318,93 @@ fn forward_serial(stdout: std::process::ChildStdout, tx: &mpsc::Sender<Serial>)
         };
         let _ = tx.send(event);
     }
+}
+
+/// What is left once GDB has run, given its `output`: the stub's detach
+/// line, and the restart round, given the driver's `bias` when procmgr's line
+/// named it.
+fn after_gdb(
+    output: String,
+    arch: Arch,
+    port: u16,
+    gdb_sock: &Path,
+    bias: Option<u64>,
+    driver: &breakpoint_kill::Function,
+    rx: &mpsc::Receiver<Serial>,
+) -> Session
+{
+    let detached = loop
+    {
+        match rx.recv_timeout(DETACH_TIMEOUT)
+        {
+            Ok(Serial::Detached(line)) => break Some(line),
+            Ok(Serial::Ready | Serial::DriverBias(_) | Serial::Followed) =>
+            {}
+            Err(_) => break None,
+        }
+    };
+    let restarted = bias
+        .with_context(|| {
+            format!("no procmgr bias line for {PORT_DRIVER_NAME} before the stub's READY")
+        })
+        .and_then(|bias| restart_round(arch, port, gdb_sock, bias, driver, rx));
+    Session {
+        gdb: output,
+        detached,
+        restarted,
+    }
+}
+
+/// The restart round: connect to the stub, which attaches to the target
+/// again at `qSupported` and holds its threads; kill the debug port's driver
+/// at [`PORT_DRIVER_FUNCTION`], which the stub's reads reach, so no trigger is
+/// needed; wait for the stub to hold the driver devmgr restarted; and on the
+/// same connection select the target's first thread, read its pointer, and
+/// detach, each answered through the restarted driver.
+fn restart_round(
+    arch: Arch,
+    port: u16,
+    gdb_sock: &Path,
+    bias: u64,
+    driver: &breakpoint_kill::Function,
+    rx: &mpsc::Receiver<Serial>,
+) -> Result<()>
+{
+    let mut stub = Stub::connect_tcp(&format!("127.0.0.1:{port}"), RESTART_ANSWER_TIMEOUT)?;
+    stub.request(b"qSupported")?;
+    let killed = breakpoint_kill::kill_at_breakpoint(arch, gdb_sock, bias, driver, || ())?;
+    step(&format!(
+        "gdb stub test: moved the port's driver at {:#x} to 0",
+        killed.pc
+    ));
+    let deadline = Instant::now()
+        .checked_add(RESTART_TIMEOUT)
+        .context("the restart's deadline")?;
+    loop
+    {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(Serial::Followed) => break,
+            Ok(Serial::Ready | Serial::Detached(_) | Serial::DriverBias(_)) =>
+            {}
+            Err(_) => bail!(
+                "the stub's {FOLLOWED_MARKER:?} did not appear within {}s of the kill",
+                RESTART_TIMEOUT.as_secs()
+            ),
+        }
+    }
+    let halt = stub.request(b"?")?;
+    if !halt.starts_with(b"T")
+    {
+        bail!(
+            "? after the restart answered {:?}, not a stop",
+            String::from_utf8_lossy(&halt)
+        );
+    }
+    stub.expect_ok(b"Hg1")?;
+    stub.read_register(debug_stub::rsp_arch(arch).pc_regnum())?;
+    stub.expect_ok(b"D")?;
+    Ok(())
 }
 
 /// Run the batch session, bounded by [`GDB_TIMEOUT`]; returns its output.

@@ -10,6 +10,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`crash-report/`](crash-report/README.md) | Crash-report block emitter and parser, shared by crashd and xtask |
 | [`crypto/`](crypto/README.md) | In-OS crypto primitives — SHA-512 hashing, Ed25519 signature verification, Ed25519 key generation and signing for the host signer, and ChaCha20-Poly1305 AEAD, `no_std`, zero-dependency |
 | [`death-set/`](death-set/README.md) | Growable death-queue set and main wait set used by supervisor services, and the overflow watch of a death-queue drain |
+| [`device-tracker/`](device-tracker/README.md) | A device class's current driver, followed across a driver restart, for `std` clients (terminal, gdbstub, debug-echo) |
 | [`driver-binding/`](driver-binding/README.md) | Driver declarations in the ELF note `.note.seraph.driver` (`driver_declaration!`) and the resource list devmgr delivers a bound driver |
 | [`elf/`](elf/README.md) | ELF64 parser — header validation, segment enumeration |
 | [`font/`](font/README.md) | Embedded 9×20 bitmap font shared by every framebuffer console |

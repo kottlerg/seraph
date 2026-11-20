@@ -19,6 +19,20 @@
 //! the head register write that frees their slots after the record reads
 //! (`fence r,o`).
 //!
+//! Each IOMMU's device directory is rooted at its anchor, the page devmgr
+//! keeps for the boot. A driver devmgr restarts adopts the IOMMUs: it
+//! requires each translating through a directory rooted at its anchor, in
+//! the mode the dead instance chose, waits for the dead instance's commands
+//! to complete, replaces both queues with its own, the mode left as it
+//! stands, and builds devmgr's replayed devices under a staging root page of
+//! the same depth. [`Backend::commit`] copies each staged root entry into
+//! the anchor by the [`anchor`] write rule (a non-leaf entry is one word; a
+//! one-level directory's entry is a whole device context, rewritten as the
+//! rule's fifth case says when more than one of its words changed), then
+//! invalidates every cached directory entry and translation, ordering the
+//! device accesses before it. Faults the dead instance had not read are
+//! dropped with its fault queue.
+//!
 //! The IOMMU reads the device directory, the page tables, and the queues
 //! from memory coherently with the processor caches, as the platform's PCI
 //! host declares (`dma-coherent`) and QEMU's `riscv-iommu-pci` does; the
@@ -26,10 +40,12 @@
 //! past the caches would need its table writes cleaned from them, which the
 //! store does not do on riscv64.
 
+use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
 
+use iommu_core::anchor::{self, Step};
 use iommu_core::table::TableStore;
-use iommu_core::{Access, Backend, BackendError, Fault, RemapEntry, UnitInfo};
+use iommu_core::{Access, Backend, BackendError, Fault, RemapEntry, Start, UnitInfo};
 use iommu_riscv::regs::{
     self, COMMAND_WORDS, CQ_ENTRIES, Capability, Command, DdtMode, Directory, FAULT_RECORD_WORDS,
     FQ_ENTRIES, Fence, FirstStageMode, Translations,
@@ -62,17 +78,24 @@ pub struct Unit
     cq_tail: u32,
     /// Physical address of the fault queue's page; 0 before setup.
     fq: u64,
-    /// The device directory, once the IOMMU translates through it.
+    /// Physical address of the IOMMU's anchor, the device directory's root
+    /// page it translates through.
+    anchor: u64,
+    /// The device directory attaches write, once the IOMMU translates: the
+    /// anchor's, or an adopting driver's staging directory until its
+    /// commit.
     ddt: Option<DeviceDirectory>,
 }
 
 impl Unit
 {
-    /// An IOMMU whose register page is mapped at `regs`.
-    pub fn new(regs: u64) -> Self
+    /// An IOMMU whose register page is mapped at `regs`, with its anchor at
+    /// the physical address `anchor`, a page of the backend's store.
+    pub fn new(regs: u64, anchor: u64) -> Self
     {
         Self {
             regs,
+            anchor,
             cap: Capability::decode(0),
             mode: FirstStageMode::Sv39,
             cq: 0,
@@ -194,14 +217,13 @@ impl Unit
     }
 }
 
-/// One attached device: its IOMMU, device ID, context, domain ID, and
-/// first-stage tables.
+/// One attached device: its IOMMU, device ID, domain ID, and first-stage
+/// tables. Its context is looked up in the directory when it is blocked,
+/// since a commit moves a one-level directory's contexts into the anchor.
 pub struct RiscvDomain
 {
     unit: usize,
     device_id: u32,
-    /// The device context's leaf page and the index of its first word.
-    context: (u64, usize),
     pscid: u32,
     tables: FirstStage,
 }
@@ -211,6 +233,10 @@ pub struct Riscv
 {
     units: Vec<Unit>,
     store: Store,
+    /// How the units are set up: a restarted instance adopts them.
+    start: Start,
+    /// The adopted units translate through this instance's tables alone.
+    committed: bool,
 }
 
 /// The backend error for a table operation's failure.
@@ -225,10 +251,16 @@ fn table_error(e: TableError) -> BackendError
 
 impl Riscv
 {
-    /// A backend over `units`, building their structures in `store`.
-    pub fn new(units: Vec<Unit>, store: Store) -> Self
+    /// A backend over `units`, building their structures in `store`,
+    /// setting the units up as `start` says.
+    pub fn new(units: Vec<Unit>, store: Store, start: Start) -> Self
     {
-        Self { units, store }
+        Self {
+            units,
+            store,
+            start,
+            committed: false,
+        }
     }
 
     /// Store `value` volatile at word `index` of the table page `page`, then
@@ -295,8 +327,7 @@ impl Riscv
         Ok(())
     }
 
-    /// Set unit `unit` up with empty queues and an empty device directory,
-    /// then turn translation on.
+    /// Set unit `unit` up as the backend's `start` says.
     fn setup(&mut self, unit: usize) -> Result<(), BackendError>
     {
         let u = self.unit_mut(unit)?;
@@ -306,11 +337,68 @@ impl Riscv
             return Err(BackendError::Invalid);
         }
         u.mode = u.cap.first_stage().ok_or(BackendError::Invalid)?;
-        u.quiesce()?;
         let cq = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
         let fq = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
-        let root = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
-        self.unit_mut(unit)?.start_queues(cq, fq)?;
+        match self.start
+        {
+            Start::Reset => self.reset_unit(unit, cq, fq),
+            Start::Adopt => self.adopt_unit(unit, cq, fq),
+        }
+    }
+
+    /// Adopt unit `unit` from a dead instance: require it translating
+    /// through a directory rooted at its anchor with the features the
+    /// driver needs clear and no command error recorded, wait for the dead
+    /// instance's commands to complete, and replace both queues with ones
+    /// in the pages `cq` and `fq`, the mode left as it stands. Later
+    /// attaches build under a staging root of the same depth until
+    /// [`Backend::commit`].
+    fn adopt_unit(&mut self, unit: usize, cq: u64, fq: u64) -> Result<(), BackendError>
+    {
+        let staging = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
+        let u = self.unit(unit)?;
+        let levels = regs::directory_at(u.read64(regs::DDTP), u.anchor);
+        if levels.is_none()
+            || u.read32(regs::FCTL) & (regs::FCTL_BE | regs::FCTL_GXL) != 0
+            || u.read32(regs::CQCSR) & regs::CQCSR_ERRORS != 0
+        {
+            return Err(BackendError::Invalid);
+        }
+        let ddt = levels
+            .and_then(|levels| DeviceDirectory::new(staging, levels, u.cap.context_format))
+            .ok_or(BackendError::Invalid)?;
+        u.wait(|u| {
+            u.read32(regs::CQH) == u.read32(regs::CQT)
+                || u.read32(regs::CQCSR) & regs::CQCSR_ERRORS != 0
+        })?;
+        if u.read32(regs::CQCSR) & regs::CQCSR_ERRORS != 0
+        {
+            return Err(BackendError::Timeout);
+        }
+        u.stop_queue(regs::CQCSR, regs::CQCSR_CQON)?;
+        u.stop_queue(regs::FQCSR, regs::FQCSR_FQON)?;
+        // No interrupt-pending bit the dead instance's queues left survives
+        // into this instance's queues.
+        u.write32(regs::IPSR, u.read32(regs::IPSR));
+        let u = self.unit_mut(unit)?;
+        u.start_queues(cq, fq)?;
+        u.ddt = Some(ddt);
+        Ok(())
+    }
+
+    /// Bring unit `unit` to a state it may be changed in, start empty
+    /// queues in the pages `cq` and `fq`, and turn translation on through
+    /// an empty directory rooted at its anchor.
+    fn reset_unit(&mut self, unit: usize, cq: u64, fq: u64) -> Result<(), BackendError>
+    {
+        let u = self.unit_mut(unit)?;
+        u.quiesce()?;
+        let root = u.anchor;
+        u.start_queues(cq, fq)?;
+        // The IOMMU is Off or Bare, so it reads no entry of the anchor.
+        *self.store.table(root) = [0; iommu_core::table::TABLE_WORDS];
+        fence(Ordering::SeqCst);
+        self.store.flush(root, 0, PAGE);
         // Whatever the IOMMU cached under an earlier mode is dropped before
         // the new directory is used.
         self.submit(
@@ -322,6 +410,48 @@ impl Riscv
             ],
         )?;
         self.unit_mut(unit)?.select_directory(root)
+    }
+
+    /// Copy unit `unit`'s staged root page into its anchor by the
+    /// [`anchor`] write rule, then invalidate every cached directory entry
+    /// and translation, ordering the device accesses before it, so it
+    /// translates through this instance's tables alone.
+    fn commit_unit(&mut self, unit: usize) -> Result<(), BackendError>
+    {
+        let u = self.unit(unit)?;
+        let (anchor, ddt) = (u.anchor, u.ddt.ok_or(BackendError::Invalid)?);
+        let staged = self.store.table(ddt.root()).to_vec();
+        let width = ddt.root_entry_words();
+        for (entry, step) in anchor::table_steps(self.store.table(anchor), &staged, width)
+        {
+            match step
+            {
+                Step::Store { word, value } => self.write_word(anchor, word, value)?,
+                // Only a device context, a one-level directory's entry, has
+                // more than one word, and its index is its device ID.
+                Step::Invalidate =>
+                {
+                    let id = u32::try_from(entry).map_err(|_| BackendError::Invalid)?;
+                    self.submit(
+                        unit,
+                        &[
+                            regs::iodir_inval_ddt(Directory::Device(id)),
+                            regs::iofence_c(Fence::Commands),
+                        ],
+                    )?;
+                }
+            }
+        }
+        self.submit(
+            unit,
+            &[
+                regs::iodir_inval_ddt(Directory::All),
+                regs::iotinval_vma(Translations::All),
+                regs::iofence_c(Fence::DeviceAccesses),
+            ],
+        )?;
+        self.unit_mut(unit)?.ddt = Some(ddt.rooted_at(anchor));
+        Ok(())
     }
 }
 
@@ -403,7 +533,9 @@ impl Backend for Riscv
     fn init_unit(&mut self, unit: usize) -> Result<(), BackendError>
     {
         let set_up = self.setup(unit);
+        // An adopted unit keeps translating through the tables it holds.
         if set_up.is_err()
+            && self.start == Start::Reset
             && let Ok(u) = self.unit_mut(unit)
         {
             u.ddt = None;
@@ -414,6 +546,10 @@ impl Backend for Riscv
 
     fn disable_all(&mut self)
     {
+        if self.start == Start::Adopt
+        {
+            return;
+        }
         for u in &mut self.units
         {
             if u.ddt.take().is_some()
@@ -461,10 +597,23 @@ impl Backend for Riscv
         Ok(RiscvDomain {
             unit,
             device_id,
-            context: (page, first),
             pscid: did,
             tables,
         })
+    }
+
+    fn commit(&mut self) -> Result<(), BackendError>
+    {
+        if self.start != Start::Adopt || self.committed
+        {
+            return Err(BackendError::Invalid);
+        }
+        for unit in 0..self.units.len()
+        {
+            self.commit_unit(unit)?;
+        }
+        self.committed = true;
+        Ok(())
     }
 
     fn map(
@@ -532,7 +681,12 @@ impl Backend for Riscv
 
     fn block(&mut self, domain: &mut RiscvDomain) -> Result<(), BackendError>
     {
-        let (page, first) = domain.context;
+        let ddt = self.unit(domain.unit)?.ddt.ok_or(BackendError::Invalid)?;
+        // The device's attach linked every directory page on the way, so
+        // the lookup takes no page.
+        let (page, first) = ddt
+            .context(&mut self.store, domain.device_id)
+            .map_err(table_error)?;
         // Clearing `tc` clears the valid bit; the other words are then
         // don't-care.
         self.write_word(page, first, 0)?;
@@ -565,7 +719,7 @@ impl Backend for Riscv
 
     fn poll_faults(&mut self, record: &mut dyn FnMut(Fault))
     {
-        let Self { units, store } = self;
+        let Self { units, store, .. } = self;
         for (index, u) in units.iter().enumerate()
         {
             if u.ddt.is_none()
@@ -625,10 +779,17 @@ impl Backend for Riscv
         }
     }
 
-    /// Refused: the RISC-V IOMMU reaches a device's MSIs through its DMA
-    /// translation ([`Self::map_msi`]), not through a remapping table.
-    fn remap_enable(&mut self, _entries: u32, _extended: bool) -> Result<bool, BackendError>
+    /// Refused, the table's cap deleted: the RISC-V IOMMU reaches a
+    /// device's MSIs through its DMA translation ([`Self::map_msi`]), not
+    /// through a remapping table.
+    fn remap_enable(
+        &mut self,
+        _entries: u32,
+        _extended: bool,
+        table: u64,
+    ) -> Result<bool, BackendError>
     {
+        let _ = syscall::cap_delete(table);
         Err(BackendError::Invalid)
     }
 

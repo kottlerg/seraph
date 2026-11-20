@@ -14,7 +14,8 @@ endpoint, the devmgr query cap, and the device's DMA capability.
 
 The driver checks the device's identification register, binds its interrupt to a notification of its
 own (`SYS_IRQ_REGISTER`), reports ready, and answers `ipc::test_dma_labels::INTERRUPT_PROBE`,
-`INTERRUPT_CHURN`, `FIXTURE_EXIT`, `DMA_PROBE` and `MSI_FORGE`. The interrupt probe has the device
+`INTERRUPT_CHURN`, `FIXTURE_EXIT`, `DMA_PROBE`, `MSI_FORGE`, `DMA_STREAM_START`,
+`DMA_STREAM_COUNT` and `DMA_STREAM_STOP`. The interrupt probe has the device
 raise its interrupt (register `0x60`), waits for the notification for at most
 `test_dma_labels::INTERRUPT_WAIT_MS`, acknowledges it at the device (register `0x64`) and with
 `SYS_IRQ_ACK`, and reports whether it was delivered and the kind of interrupt the driver holds.
@@ -46,10 +47,19 @@ the fault for the device at that page, which the driver waits for through `DMA_F
 the message must be remappable (address bit 4) and the forged address is a remappable message naming
 handle `0xFFFF`, which no remapping table entry holds; QEMU records no requester id for a fault the
 DMA engine's write raises, so devmgr cannot attribute it and the check is non-delivery. An
-unconfined device makes no forged write.
+unconfined device makes no forged write. `ipc::test_dma_labels::DMA_STREAM_START` maps one page of
+the driver's memory for the device, which stays mapped, and starts a thread that loops: it writes a
+fresh pattern, derived from the round number, to the page's first half, has the device copy it into
+its buffer and back to the page's second half, and checks it; a round whose copy does not arrive or
+whose transfer does not complete counts as failed. It replies with whether the stream started (not
+when the page's device address lies past the device's 28-bit reach), the device address, whether an
+IOMMU confines the device, and the faults devmgr has taken for it. `DMA_STREAM_COUNT` reports the
+rounds that arrived and failed so far; `DMA_STREAM_STOP` ends the thread after its round, unmaps the
+page, and reports the rounds, the device address, and the faults. While a stream runs the driver
+refuses `DMA_PROBE`, `INTERRUPT_PROBE`, `INTERRUPT_CHURN` and `MSI_FORGE`.
 
-[svctest](../../svctest/README.md)'s DMA confinement and MSI delivery, forge, churn, and release
-phases reach it through the `test-dma` class (`QUERY_DEVICE`) and drive it.
+[svctest](../../svctest/README.md)'s DMA confinement, MSI delivery, forge, and churn, IOMMU driver
+restart, and MSI release phases reach it through the `test-dma` class (`QUERY_DEVICE`) and drive it.
 
 ---
 

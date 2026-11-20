@@ -127,28 +127,7 @@ pub fn relative_only() -> &'static [Phase]
 
 pub fn fs_open_phase(_: &Caps)
 {
-    use std::io::Read;
-
-    // Read the bootstrap bundle header (the first 16 bytes carry
-    // `SRPHBNDL` magic + u32 version + u32 entry count) to exercise the
-    // vfsd/fatfs std::fs path on a small read without pulling tens of MiB
-    // into a userspace Vec.
-    let mut file = match std::fs::File::open("/esp/EFI/seraph/bootstrap.bundle")
-    {
-        Ok(f) => f,
-        Err(e) => panic!("fs_open: open /esp/EFI/seraph/bootstrap.bundle failed: {e}"),
-    };
-    let mut header = [0u8; 16];
-    let n = file
-        .read(&mut header)
-        .expect("fs_open: read(bundle header) failed");
-    assert_eq!(n, 16, "fs_open: short read on bundle header (got {n})");
-    assert_eq!(
-        &header[0..8],
-        b"SRPHBNDL",
-        "fs_open: bootstrap.bundle magic mismatch (got {:?})",
-        &header[0..8]
-    );
+    assert_bootstrap_bundle_header("fs_open");
     std::os::seraph::log!("fs_open: read bundle header magic+version+entry_count");
 
     match std::fs::File::open("/esp/no_such_directory/missing.txt")
@@ -162,6 +141,32 @@ pub fn fs_open_phase(_: &Caps)
     }
     std::os::seraph::log!("fs_open: nonexistent path → NotFound");
     std::os::seraph::log!("fs_open phase passed");
+}
+
+/// Read the bootstrap bundle header (the first 16 bytes carry `SRPHBNDL`
+/// magic + u32 version + u32 entry count) to exercise the vfsd/fatfs `std::fs`
+/// path on a small read without pulling tens of MiB into a userspace Vec, and
+/// assert its magic; `phase` names the caller in a failure.
+pub(crate) fn assert_bootstrap_bundle_header(phase: &str)
+{
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open("/esp/EFI/seraph/bootstrap.bundle")
+    {
+        Ok(f) => f,
+        Err(e) => panic!("{phase}: open /esp/EFI/seraph/bootstrap.bundle failed: {e}"),
+    };
+    let mut header = [0u8; 16];
+    let n = file
+        .read(&mut header)
+        .unwrap_or_else(|e| panic!("{phase}: read(bundle header) failed: {e}"));
+    assert_eq!(n, 16, "{phase}: short read on bundle header (got {n})");
+    assert_eq!(
+        &header[0..8],
+        b"SRPHBNDL",
+        "{phase}: bootstrap.bundle magic mismatch (got {:?})",
+        &header[0..8]
+    );
 }
 
 pub fn fs_release_on_close_phase(_: &Caps)

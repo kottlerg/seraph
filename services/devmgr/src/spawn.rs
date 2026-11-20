@@ -229,9 +229,9 @@ pub fn destroy_and_release(child: HeldChild, ipc_buf: *mut u64) -> bool
     released
 }
 
-/// Send `DESTROY_PROCESS` on `process_handle`; procmgr replies success
-/// whatever the child's state.
-fn send_destroy(process_handle: u64, ipc_buf: *mut u64)
+/// Send `DESTROY_PROCESS` on `process_handle`, keeping the handle; procmgr
+/// replies success whatever the child's state.
+pub fn send_destroy(process_handle: u64, ipc_buf: *mut u64)
 {
     let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
     // SAFETY: ipc_buf is the registered IPC buffer.
@@ -360,8 +360,9 @@ pub struct BoundSpawnConfig<'a>
     /// The remapping units of an IOMMU record, each with the index in
     /// `resources` of the first resource of its group: its unit round is
     /// served before that resource's round, or before the end round for an
-    /// index of `resources.len()`. At most `MAX_IOMMU_UNITS`, the indices in
-    /// order; empty for every record but the IOMMU record.
+    /// index of `resources.len()`, carrying a copy of the unit's anchor,
+    /// which devmgr keeps. At most `MAX_IOMMU_UNITS`, the indices in order;
+    /// empty for every record but the IOMMU record.
     pub units: &'a [(usize, IommuUnit)],
     /// devmgr's copy of the device's DMA capability
     /// ([`crate::dma::DmaGrant::cap`]) for a DMA declaration; `None` for a
@@ -802,8 +803,17 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         {
             for (_, unit) in config.units.iter().filter(|(first, _)| *first == at)
             {
-                if !serve(Round::iommu_unit(unit))
+                // devmgr keeps each unit's anchor for the boot; the driver
+                // is given a copy.
+                let Ok(anchor) = syscall::cap_derive(unit.anchor, syscall::RIGHTS_ALL)
+                else
                 {
+                    std::os::seraph::log!(warn: "IOMMU unit anchor derivation failed");
+                    break 'rounds false;
+                };
+                if !serve(Round::iommu_unit_carrying(unit, anchor))
+                {
+                    let _ = syscall::cap_delete(anchor);
                     break 'rounds false;
                 }
             }

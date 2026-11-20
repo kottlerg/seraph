@@ -4,7 +4,8 @@ The RISC-V IOMMU driver (`iommu-riscv`): the separate driver process that progra
 (RISC-V IOMMU Architecture Specification v1.0) for devmgr. devmgr discovers each IOMMU that is a PCI
 function through the ACPI RIMT, turns on the function's memory decode and bus mastering, delivers
 the first page of its BAR 0, which holds every register, to this driver in its resource list,
-keeping no copy, and drives it over `ipc::iommu_labels` from behind its DMA endpoint, so device
+with the IOMMU's anchor page, keeping its own register cap for a restart, and drives it
+over `ipc::iommu_labels` from behind its DMA endpoint, so device
 drivers keep the `devmgr_dma_labels` contract whichever IOMMU sits behind it
 ([docs/device-management.md](../../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming). It is riscv64 only, and ships as a boot module, since it must
@@ -21,9 +22,10 @@ system runs no guests:
   their interrupts left disabled, and a device directory deep enough for every 16-bit PCI
   requester ID (two levels with 32-byte device contexts, three with the 64-byte ones an IOMMU
   offering `MSI_FLAT` uses), tried in that order and kept at the first depth the IOMMU retains;
-- at setup an IOMMU left translating goes Off first, the queues are stopped and reprogrammed, every
-  cached directory and translation entry is invalidated, and only then does `ddtp` select the empty
-  directory, from which on every device the IOMMU translates reaches nothing until it is attached;
+- at a boot instance's setup an IOMMU left translating goes Off first, the queues are stopped and
+  reprogrammed, every cached directory and translation entry is invalidated, and only then does
+  `ddtp` select the empty directory, from which on every device the IOMMU translates reaches nothing
+  until it is attached;
 - each domain gets Sv48 page tables where the IOMMU offers them and Sv39 otherwise; a device may
   issue IOVAs one bit narrower than the format (47 or 38 bits), since a zero-extended address with
   the format's top bit set is not a valid virtual address;
@@ -47,6 +49,16 @@ system runs no guests:
   and the faulting page;
 - a setup that fails, or a driver that cannot report ready, returns every IOMMU to Bare, passing
   DMA through untranslated, so devmgr runs it unconfined.
+
+Restart. A driver devmgr restarts adopts each IOMMU (`FLAG_ADOPT`): the IOMMU must be translating
+through a directory rooted at its anchor, in the mode the dead instance chose; the backend waits for
+the dead instance's commands to complete, replaces both queues with its own, leaving the mode as it
+stands, and builds devmgr's replayed devices under a staging root page of the same depth. `COMMIT`
+copies each staged root entry into the anchor (a non-leaf entry is one word; a one-level directory's
+entry is a whole device context, made not valid and invalidated first when more than one of its
+words changed), then invalidates every cached directory entry and translation, ordering the device
+accesses before it. The faults the dead instance had not read are dropped with its fault queue. A
+boot instance builds directly beneath the anchor.
 
 The IOMMU reads its directory, tables, and queues coherently with the processor caches, as the
 platform's PCI host declares (`dma-coherent`) and QEMU's `riscv-iommu-pci` does; the specification

@@ -8,8 +8,10 @@
 //! carries.
 //!
 //! The IOMMU record's list is one group per remapping unit, in unit-index
-//! order: the unit's `IOMMU_UNIT` round (its PCI segment, whether it
-//! translates every function of its segment no other unit names, and its
+//! order: the unit's `IOMMU_UNIT` round (its anchor, the root page devmgr
+//! keeps for it; its PCI segment; whether it translates every function of
+//! its segment no other unit names; whether the driver is a restarted
+//! instance that adopts the unit translating from its anchor; and its
 //! scope), then the unit's register `Mmio` range and, when devmgr gives it
 //! one, its fault interrupt; then the end round, with the driver's service
 //! endpoint and its devmgr query cap. devmgr parses the firmware's
@@ -24,12 +26,38 @@ use driver_binding::resources::{
 };
 use syscall_abi::PAGE_SIZE;
 
+use crate::Start;
+
 /// Every unit the list delivered, in unit-index order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Units(pub Vec<IommuUnit>);
 
 impl Units
 {
+    /// Whether the driver is a restarted instance that adopts its units
+    /// translating from their anchors ([`IommuUnit::adopt`]); the delivery
+    /// refuses a list whose units disagree.
+    #[must_use]
+    pub fn adopting(&self) -> bool
+    {
+        self.0.iter().any(|u| u.adopt)
+    }
+
+    /// How the backend sets the units up: [`Start::Adopt`] when the driver
+    /// adopts them ([`Self::adopting`]).
+    #[must_use]
+    pub fn start(&self) -> Start
+    {
+        if self.adopting()
+        {
+            Start::Adopt
+        }
+        else
+        {
+            Start::Reset
+        }
+    }
+
     /// The index of the unit that translates function `bdf` of `segment`:
     /// the first unit of the segment whose scope names it, else the
     /// segment's first include-all unit. `None` when no unit translates it.
@@ -89,9 +117,10 @@ pub enum DeliveryError
 {
     /// The list has no end round, lacks the service or devmgr query
     /// endpoint, or carries a DMA capability; it holds no unit or more than
-    /// [`MAX_IOMMU_UNITS`]; a resource comes before the first unit; or a
+    /// [`MAX_IOMMU_UNITS`]; a resource comes before the first unit; a
     /// unit's group is not one register `Mmio` range of 1 to
-    /// [`MAX_UNIT_REGISTER_PAGES`] whole pages and at most one interrupt.
+    /// [`MAX_UNIT_REGISTER_PAGES`] whole pages and at most one interrupt;
+    /// or some units are to be adopted and others not.
     Malformed,
     /// The unit tables could not be allocated.
     OutOfMemory,
@@ -141,6 +170,7 @@ impl Delivery
             || endpoints.dma != 0
             || !list.ungrouped().is_empty()
             || !(1..=MAX_IOMMU_UNITS).contains(&count)
+            || list.iommu_units().any(|(u, _)| u.adopt) && list.iommu_units().any(|(u, _)| !u.adopt)
         {
             return Err(DeliveryError::Malformed);
         }
@@ -166,11 +196,7 @@ impl Delivery
             scopes.extend_from_slice(&unit.scopes);
             registers.push(register);
             faults.push(fault);
-            units.push(IommuUnit {
-                segment: unit.segment,
-                include_pci_all: unit.include_pci_all,
-                scopes,
-            });
+            units.push(IommuUnit { scopes, ..*unit });
         }
         Ok(Self {
             registers,
@@ -215,26 +241,50 @@ mod tests
         list
     }
 
+    /// A unit of `segment`, translating every function no other unit names
+    /// when `include_pci_all`, and the functions `scopes` names, with the
+    /// anchor cap 60 and not to be adopted.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`include_pci_all` is the unit's field of that name"
+    )]
+    fn iommu_unit(segment: u16, include_pci_all: bool, scopes: &[Scope]) -> IommuUnit
+    {
+        IommuUnit {
+            segment,
+            include_pci_all,
+            scopes: scopes.to_vec(),
+            anchor: 60,
+            adopt: false,
+        }
+    }
+
     /// The round of a unit of `segment` that translates the functions
     /// `scopes` names.
     fn unit(segment: u16, scopes: &[Scope]) -> Round
     {
-        Round::iommu_unit(&IommuUnit {
-            segment,
-            include_pci_all: false,
-            scopes: scopes.to_vec(),
-        })
-        .expect("the scopes fit")
+        Round::iommu_unit(&iommu_unit(segment, false, scopes)).expect("the scopes fit")
     }
 
     /// The round of a unit of segment 0 that translates every function no
     /// other unit names.
     fn catch_all() -> Round
     {
+        Round::iommu_unit(&iommu_unit(0, true, &[])).expect("no scopes fit")
+    }
+
+    /// The round of a unit of segment 0 that translates every function,
+    /// with the anchor cap `anchor`, adopted when `adopt`.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`adopt` is the unit's field of that name"
+    )]
+    fn anchored(anchor: u64, adopt: bool) -> Round
+    {
         Round::iommu_unit(&IommuUnit {
-            segment: 0,
-            include_pci_all: true,
-            scopes: Vec::new(),
+            anchor,
+            adopt,
+            ..iommu_unit(0, true, &[])
         })
         .expect("no scopes fit")
     }
@@ -257,21 +307,9 @@ mod tests
     fn a_function_named_by_a_scope_goes_to_that_unit_before_the_catch_all()
     {
         let units = Units(vec![
-            IommuUnit {
-                segment: 0,
-                include_pci_all: true,
-                scopes: vec![],
-            },
-            IommuUnit {
-                segment: 0,
-                include_pci_all: false,
-                scopes: vec![Scope::Function(0x0010)],
-            },
-            IommuUnit {
-                segment: 1,
-                include_pci_all: false,
-                scopes: vec![Scope::Function(0x0018)],
-            },
+            iommu_unit(0, true, &[]),
+            iommu_unit(0, false, &[Scope::Function(0x0010)]),
+            iommu_unit(1, false, &[Scope::Function(0x0018)]),
         ]);
         assert_eq!(units.unit_for(0, 0x0010), Some(1));
         assert_eq!(units.unit_for(0, 0x0018), Some(0));
@@ -310,6 +348,38 @@ mod tests
         assert_eq!(d.units.0[0].scopes, scopes);
         assert!(d.units.0[1].include_pci_all);
         assert_eq!((d.service_ep, d.devmgr_query), (70, 71));
+        assert!(!d.units.adopting());
+    }
+
+    #[test]
+    fn each_units_anchor_and_a_restart_are_taken()
+    {
+        let d = Delivery::from_list(&list(&[
+            anchored(80, true),
+            registers(50, 1),
+            anchored(81, true),
+            registers(51, 1),
+            end(0),
+        ]))
+        .expect("an IOMMU delivery");
+        assert_eq!(
+            d.units.0.iter().map(|u| u.anchor).collect::<Vec<_>>(),
+            [80, 81]
+        );
+        assert!(d.units.adopting());
+    }
+
+    #[test]
+    fn units_that_disagree_on_a_restart_are_refused()
+    {
+        let l = list(&[
+            anchored(80, true),
+            registers(50, 1),
+            anchored(81, false),
+            registers(51, 1),
+            end(0),
+        ]);
+        assert_eq!(Delivery::from_list(&l), Err(DeliveryError::Malformed));
     }
 
     #[test]

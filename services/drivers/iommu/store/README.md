@@ -10,10 +10,10 @@ driver's `iommu_core::TableStore`, used by [`iommu-vtd`](../vtd/README.md) and
   addresses: the IOMMU driver is the one driver class that reads them. devmgr spawns it
   phys-class, so its grants carry the Memory `Phys` right the read needs
   ([docs/device-management.md](../../../../docs/device-management.md#physical-addresses)
-  § Physical Addresses). A structure a unit reads whole from its first page's address (VT-d's
-  interrupt remapping table) takes a contiguous chunk of its own size (`Store::alloc_contiguous`),
-  every page of it handed out at once, so the chunk single pages are drawn from stays the current
-  one.
+  § Physical Addresses).
+- **Adopted pages.** Pages devmgr allocates and keeps for the boot (each unit's anchor, the
+  interrupt remapping table) join the store whole through `Store::adopt`, with every page
+  handed out and their contents as they stand; the store keeps the cap for the driver's life.
 - **Ordering.** A zeroed page is fenced before it is handed out, and every table store before the
   next one, so a unit never sees an entry before the table it points at. The driver's register
   write that makes a unit read them supplies the memory-to-device barrier (`mmio` on riscv64; the
@@ -28,9 +28,10 @@ driver's `iommu_core::TableStore`, used by [`iommu-vtd`](../vtd/README.md) and
   barriers ordering the writes.
 - **Lifetime.** No page is ever returned: a unit may walk any of them while translation stays on,
   so they stay with the driver for the boot, and past its death, since devmgr spawns the driver
-  `CREATE_DMA_HOLD` and never releases the hold, deleting its release token at the spawn
-  (docs/device-management.md
-  [§ IOMMU Discovery and Programming](../../../../docs/device-management.md#iommu-discovery-and-programming)).
+  `CREATE_DMA_HOLD`; devmgr releases a dead instance's hold only once a restarted instance has
+  committed tables of its own and no unit walks the dead one's pages
+  ([docs/device-management.md](../../../../docs/device-management.md#iommu-driver-restart)
+  § IOMMU Driver Restart).
 
 The crate calls memmgr and maps pages through the Seraph std runtime, so it builds only for the
 Seraph targets, as a dependency of the driver binaries, and has no host tests; the walks over a

@@ -84,6 +84,7 @@ pub mod oom;
 pub mod pager;
 pub mod pipes;
 pub mod process_faults;
+pub mod process_kill;
 pub mod process_tree;
 pub mod procmgr;
 pub mod pwrmgr;

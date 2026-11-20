@@ -63,6 +63,10 @@ pub const FSTS_PFO: u32 = 1 << 0;
 /// process), cleared by writing 1.
 pub const FSTS_IQE: u32 = 1 << 4;
 
+/// `FSTS`: an invalidation time-out error (ITE), a device-TLB invalidation
+/// that did not complete, which stops the queue as `FSTS_IQE` does.
+pub const FSTS_ITE: u32 = 1 << 6;
+
 /// `ECAP`: queued invalidation supported (bit 1).
 pub const ECAP_QI: u64 = 1 << 1;
 /// `ECAP`: interrupt remapping supported (bit 3).

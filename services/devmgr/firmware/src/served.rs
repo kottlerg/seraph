@@ -132,6 +132,15 @@ impl<T> Served<T>
         self.slots.len()
     }
 
+    /// Whether a driver is served under `badge`, not withdrawn.
+    #[must_use]
+    pub fn serves(&self, badge: u64) -> bool
+    {
+        self.slots
+            .iter()
+            .any(|s| s.badge == badge && s.driver.is_some())
+    }
+
     /// The served driver at the lowest ordinal that is not withdrawn, if
     /// any.
     #[must_use]
@@ -211,6 +220,17 @@ mod tests
         assert_eq!(s.withdraw(2), Some(2));
         assert_eq!(s.withdraw(3), Some(3));
         assert_eq!(s.first_live(), None);
+    }
+
+    #[test]
+    fn a_badge_is_served_until_its_driver_is_withdrawn()
+    {
+        let mut s = serving(&[1, 2]);
+        assert!(s.serves(1) && s.serves(2));
+        assert!(!s.serves(3));
+        s.withdraw(1);
+        assert!(!s.serves(1));
+        assert!(s.serves(2));
     }
 
     #[test]

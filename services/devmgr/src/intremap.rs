@@ -7,9 +7,12 @@
 //! remapping entry of each interrupt source before a device can raise it.
 //!
 //! Once the IOMMU driver reports ready on a platform whose DMAR offers
-//! interrupt remapping, [`enable`] has the driver set up the remapping table
-//! every unit shares (`iommu_labels::REMAP_SETUP`), sized to the handles the
-//! kernel can hand out (`CAP_INFO_IRQ_REMAP_HANDLES`), and switches the
+//! interrupt remapping, [`enable`] allocates the remapping table every unit
+//! shares, sized to the handles the kernel can hand out
+//! (`CAP_INFO_IRQ_REMAP_HANDLES`), keeps it for the boot, and has the driver
+//! set it up (`iommu_labels::REMAP_SETUP`); the client records the table
+//! and every entry written, which a restarted driver is given again
+//! (`crate::iommu`). It then switches the
 //! kernel to the remappable formats (`SYS_IRQ_REMAP`), before any line is
 //! routed or any message target minted. From then on an interrupt message
 //! reaches a CPU only through an entry the driver wrote, for the one
@@ -36,11 +39,15 @@ use firmware::acpi::IoApic;
 use ipc::iommu_labels;
 use syscall_abi::{
     CAP_INFO_IRQ_REMAP_ENTRY, CAP_INFO_IRQ_REMAP_HANDLES, IRQ_MODE_LEVEL, IRQ_REMAP_ON,
-    IRQ_REMAP_ON_EXTENDED, remap_entry_unpack,
+    IRQ_REMAP_ON_EXTENDED, PAGE_SIZE, remap_entry_unpack,
 };
 
 use crate::iommu::{Iommu, IommuClient};
 use crate::tables::{locate_table_by_sig, with_acpi_table};
+
+/// Bytes one remapping table entry takes (Intel VT-d specification
+/// § 9.10), from which devmgr sizes the table it allocates.
+const REMAP_ENTRY_BYTES: u64 = 16;
 
 /// Interrupt remapping, on: the IOMMU driver devmgr has write each entry, and
 /// the source ID of every I/O APIC.
@@ -205,11 +212,24 @@ pub fn enable(
         return None;
     };
     let client = Arc::clone(iommu.client());
-    let extended = match client.remap_setup(entries, !flags.x2apic_opt_out)
+    // devmgr keeps the table for the boot, so a restarted driver takes it
+    // over as it stands, its entries still delivering
+    // (`docs/device-management.md` § IOMMU Driver Restart).
+    let pages = entries
+        .saturating_mul(REMAP_ENTRY_BYTES)
+        .div_ceil(PAGE_SIZE);
+    let Some(table) = crate::iommu::kept_pages(pages, "interrupt remapping table")
+    else
+    {
+        off("no memory for the table");
+        return None;
+    };
+    let extended = match client.remap_setup(entries, !flags.x2apic_opt_out, table)
     {
         Ok(extended) => extended,
         Err(code) =>
         {
+            let _ = syscall::cap_delete(table);
             std::os::seraph::log!(
                 warn: "interrupt remapping off (table not set up: {}): device messages unchecked",
                 code
@@ -227,7 +247,7 @@ pub fn enable(
     };
     if let Err(e) = syscall::irq_remap(authority, setting)
     {
-        let _ = client.remap_setup(0, false);
+        client.remap_off();
         std::os::seraph::log!(
             warn: "interrupt remapping off (kernel refused the switch: {}): device messages unchecked",
             e

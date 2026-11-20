@@ -406,6 +406,11 @@ fn run_jobs(
             state.bind_dir_path,
         )
     };
+    if jobs.iommu
+    {
+        restart_iommu(registry, tables, watch, ipc_buf);
+        registry.finish_job(|_| ());
+    }
     if jobs.drivers_dir
     {
         let tables_dir_cap = core::mem::take(&mut registry.lock().tables_dir_cap);
@@ -473,9 +478,47 @@ fn run_jobs(
     }
 }
 
+/// Restart the IOMMU driver ([`iommu::Iommu::restart`]), and withdraw,
+/// without a restart, the driver of each device whose domain the restarted
+/// instance did not rebuild, which it now blocks. A refused or failed restart
+/// fails the driver closed ([`Registry::fail_iommu`]).
+fn restart_iommu(
+    registry: &Registry,
+    tables: &mut bind::Carve,
+    watch: &mut settle::DriverWatch,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(iommu) = tables.caps.iommu.clone()
+    else
+    {
+        return;
+    };
+    match iommu.restart(tables.caps, watch, tables.catalog, registry, ipc_buf)
+    {
+        Ok(replayed) =>
+        {
+            for badge in replayed.failed
+            {
+                registry.withdraw_unconfined(badge, &mut tables.caps.slot_bars, ipc_buf);
+            }
+        }
+        Err(why) =>
+        {
+            std::os::seraph::log!(warn: "IOMMU driver not restarted: {}", why);
+            registry.fail_iommu(&mut tables.caps.slot_bars, ipc_buf);
+        }
+    }
+}
+
 /// Work a registry request leaves for the control thread, each due at most
 /// once at a time.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one job's due state, posted and taken on its own; no two combine into \
+              a state"
+)]
 struct Jobs
 {
     /// The drivers-directory pass and the on-disk batch's settle.
@@ -486,6 +529,10 @@ struct Jobs
     /// ([`RegistryState::restarts`]) and their batches' settles; posted in
     /// the hold that takes each death.
     restart: bool,
+    /// The restart of the IOMMU driver, whose serving instance died
+    /// ([`Registry::iommu_died`]); run before every other job, whose binds
+    /// and withdrawals call the driver.
+    iommu: bool,
 }
 
 /// The absolute path of a directory a request names, as a name block of the
@@ -758,10 +805,20 @@ impl Registry
         self.lock().served.iommu_client = Some(client);
     }
 
-    /// Whether the IOMMU driver's batch served it: it reported ready.
-    fn iommu_served(&self) -> bool
+    /// Whether the IOMMU driver instance of device badge `badge` is served:
+    /// its batch settled with it ready, and it has not died since.
+    fn iommu_serves(&self, badge: u64) -> bool
     {
-        self.lock().served.iommu.first_live().is_some()
+        self.lock().served.iommu.serves(badge)
+    }
+
+    /// Stop serving the IOMMU driver instance of device badge `badge`, a
+    /// restart's candidate that failed its replay or commit and is being
+    /// destroyed, so its death is not taken for the serving instance's. Its
+    /// record holds nothing to release.
+    fn forget_iommu_instance(&self, badge: u64)
+    {
+        let _ = self.lock().served.iommu.withdraw(badge);
     }
 
     /// Serve a settled batch: append every driver that reported its device
@@ -847,7 +904,7 @@ impl Registry
                     post.badge,
                     post.reason
                 );
-                self.fail_iommu(held, ipc_buf);
+                self.iommu_died(post, held, ipc_buf);
             }
             Some((Some(class), mut driver)) =>
             {
@@ -934,11 +991,59 @@ impl Registry
         Err(firmware::restart::Refusal::NoMemory)
     }
 
-    /// The IOMMU driver died after it enabled translation: fail its client
-    /// closed ([`iommu::IommuClient::fail`]; its death watch usually has
-    /// already) and, once, withdraw every served driver of a device it
-    /// confines, whose mappings can no longer change, one per hold of the
-    /// lock.
+    /// The served IOMMU driver instance the death `post` names died: post
+    /// the restart job ([`Jobs::iommu`]) when the client takes it for the
+    /// instance it serves ([`iommu::IommuClient::begin_restart`]) and the
+    /// death admits one ([`firmware::iommu_restart::after_death`]), else,
+    /// for an exit of its own, fail the driver closed. A restart candidate's
+    /// death is the restart's own to handle.
+    fn iommu_died(&self, post: DeathPost, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
+    {
+        let client = self.lock().served.iommu_client.clone();
+        let Some(client) = client.filter(|c| c.is_instance(post.badge))
+        else
+        {
+            return;
+        };
+        if let Err(why) = firmware::iommu_restart::after_death(post.reason)
+        {
+            std::os::seraph::log!(warn: "IOMMU driver not restarted: {}", why);
+            self.fail_iommu(held, ipc_buf);
+            return;
+        }
+        if client.begin_restart(post.badge)
+        {
+            let posted = Self::post(&mut self.lock(), |j| &mut j.iommu);
+            if posted
+            {
+                self.signal_jobs();
+            }
+        }
+    }
+
+    /// Withdraw, without a restart, the served driver of the device `badge`,
+    /// whose domain a restarted IOMMU driver did not rebuild, so the device
+    /// is blocked.
+    fn withdraw_unconfined(&self, badge: u64, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
+    {
+        let taken = self.lock().served.take_dead(badge);
+        if let Some((Some(class), driver)) = taken
+        {
+            std::os::seraph::log!(
+                warn: "{}: device {}'s domain not rebuilt by the restarted IOMMU driver; \
+                       its driver withdrawn",
+                class.as_str(),
+                badge
+            );
+            driver.withdraw(held, ipc_buf);
+        }
+    }
+
+    /// The IOMMU driver is not served with translation on (its death admits
+    /// no restart, or its restart failed): fail its client closed
+    /// ([`iommu::IommuClient::fail`]) and, once, withdraw every served
+    /// driver of a device it confines, whose mappings can no longer change,
+    /// one per hold of the lock.
     fn fail_iommu(&self, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
     {
         let failed = self.lock().served.note_iommu_failed();
@@ -947,7 +1052,6 @@ impl Registry
         {
             return;
         };
-        // Outside the lock: a first failure starts a drain thread.
         client.fail();
         if !first
         {
@@ -2292,9 +2396,10 @@ enum Serves
 struct ServedDriver
 {
     /// The driver's service endpoint, which [`Self::release`] revokes and
-    /// deletes; 0 for the IOMMU driver, whose endpoint is the IOMMU client's
-    /// (`iommu::IommuClient`) and never deleted, so no withdrawal of the
-    /// driver frees a slot the client's death watch would drain.
+    /// deletes; 0 for the IOMMU driver, whose endpoints are the IOMMU
+    /// client's (`iommu::IommuClient`), deleted only once a restarted
+    /// instance commits, so no withdrawal of the driver deletes one a thread
+    /// still drains.
     ep: u64,
     dev_caps: Option<bind::PciDeviceCaps>,
     /// For a driver bound to a platform record, the caps devmgr carved for
@@ -2307,7 +2412,9 @@ struct ServedDriver
     /// driver performs DMA (`CREATE_DMA_HOLD`); 0 once released.
     process_handle: u64,
     /// What devmgr restarts the driver from when it dies; `None` for the
-    /// IOMMU driver, and for a driver whose install path could not be kept.
+    /// IOMMU driver, which devmgr restarts from what it keeps itself
+    /// (`iommu::Iommu::restart`), and for a driver whose install path could
+    /// not be kept.
     restart: Option<bind::RestartSource>,
     /// Its consumer declined its restart (`DECLINE_RESTART`).
     declined: bool,
@@ -2419,14 +2526,16 @@ fn record_spawned(
 struct ServedDrivers
 {
     classes: Classes<ServedDriver>,
-    /// The IOMMU driver once its batch settles, at ordinal 0. Its record
-    /// holds no service endpoint (the client's is never deleted) and, once
-    /// served, no process handle: a death fails the client closed
-    /// ([`Registry::withdraw_dead`]).
+    /// The IOMMU driver's instances, each once its batch settles, in spawn
+    /// order: the boot instance at ordinal 0, each restarted one after. A
+    /// record holds no service endpoint (the endpoints are the client's)
+    /// and, once served, no process handle, which devmgr keeps itself
+    /// (`iommu::Iommu`): the serving instance's death restarts the driver
+    /// ([`Registry::iommu_died`]).
     iommu: Served<ServedDriver>,
     /// The client the IOMMU driver is called through, once it is ready.
     iommu_client: Option<Arc<iommu::IommuClient>>,
-    /// Whether the IOMMU driver's death has withdrawn the confined
+    /// Whether the IOMMU driver's failure has withdrawn the confined
     /// devices' drivers.
     iommu_dependants_withdrawn: bool,
 }

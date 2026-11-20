@@ -827,8 +827,12 @@ fn classify(
     }
     // A boot whose userspace console ended at the logd handover fails with
     // that named, rather than as the opaque timeout or clean exit its end
-    // would otherwise read as.
-    if let Some(reason) = console_lost_after_handover(log)
+    // would otherwise read as. A QEMU crash is left to its own branch below:
+    // the emulator's abort message after the handover line is no userspace
+    // line, and the crash is the host's, whatever the console did.
+    let qemu_crashed = !hung && (exit_rc == RC_SIGSEGV || exit_rc == RC_SIGABRT);
+    if !qemu_crashed
+        && let Some(reason) = console_lost_after_handover(log)
     {
         return (Status::Fail, Some(reason));
     }
@@ -1319,6 +1323,24 @@ mod tests
             let (status, reason) = classify(0, hung, log, &pass, &fail);
             assert!(matches!(status, Status::Fail), "hung={hung}: {status:?}");
             assert!(reason.unwrap().contains("[init-logd] handover complete"));
+        }
+    }
+
+    // Defect caught: a QEMU abort after the handover line, whose own message
+    // is no userspace line, gating as FAIL instead of the tolerated
+    // QEMU-CRASH.
+    #[test]
+    fn a_qemu_crash_after_the_handover_stays_a_qemu_crash()
+    {
+        let log = "[46.540540] [init-logd] handover complete; init-logd thread exiting\n\
+                   qemu-system-riscv64: ../tcg/tcg.c:1234: tcg_gen_code: Assertion failed.\n";
+        let (pass, fail) = default_regexes();
+        for rc in [RC_SIGABRT, RC_SIGSEGV]
+        {
+            assert!(matches!(
+                classify(rc, false, log, &pass, &fail).0,
+                Status::QemuCrash(code) if code == rc
+            ));
         }
     }
 

@@ -187,8 +187,9 @@ fn main() -> !
     // endpoint: after the release the endpoint has no reader until the
     // receive pool's gate opens, and devmgr may then be logging
     // (`services/devmgr/docs/responsibilities.md`, the on-disk settle).
-    // Until a driver is resolved its output is dropped (init-logd covered
-    // the pre-driver window) while history still accrues; the main thread
+    // Until a driver is resolved its sink queues the lines, up to its queue,
+    // counts those past it, and writes both to the driver resolved next
+    // (`Sink::offer`), while history still accrues; the main thread
     // resolves it again when devmgr signals its class's watch.
     let watches = resolve_output_drivers(caps.serial_class, caps.fb_class, ipc_buf);
     let Some(resync_note) = create_resync_note()
@@ -1542,8 +1543,9 @@ impl Sink
 
 /// The serial driver logd writes every line to.
 static SERIAL: Sink = Sink::new(ipc::serial_labels::SERIAL_WRITE_BYTES, "serial");
-/// The framebuffer driver logd mirrors every line to; none on a headless
-/// boot, and the mirror is then a no-op.
+/// The framebuffer driver logd mirrors every line to. A headless boot runs
+/// none, so the sink stays unserved: it queues lines up to its queue and
+/// counts the rest, and nothing is written to a screen ([`Sink::offer`]).
 static FB: Sink = Sink::new(ipc::fb_labels::FB_WRITE_BYTES, "framebuffer");
 
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` or `FB_WRITE_BYTES` (one

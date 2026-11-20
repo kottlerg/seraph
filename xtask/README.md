@@ -751,8 +751,8 @@ an earlier one left under `target/xtask/run-parallel/`, so the preserved files a
 3. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
    (`[<seconds>] [<name>] ...`) after it → `FAIL`, its reason naming the lost console: real-logd,
    which owns the console from the handover on, wrote nothing to it. A run with nothing at all
-   after that line, as one the watchdog cut off there, is not judged by it, nor is a boot with no
-   handover (ktest)
+   after that line, as one the watchdog cut off there, is not judged by it, nor is a run killed by
+   SIGSEGV or SIGABRT (rule 6), nor a boot with no handover (ktest)
 4. Watchdog timeout → `HANG`
 5. Exit code 0 with no marker → `OK`
 6. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator

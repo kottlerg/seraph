@@ -129,7 +129,8 @@ direct console paths remain as fallbacks for the life of the system.
      in devmgr's drivers-directory pass, which svcmgr posts with `SET_DRIVERS_DIR` before it
      launches logd, and a `QUERY_DEVICE` of logd's that would find no driver waits for that pass;
      logd's emit path never calls devmgr and, while no framebuffer driver is resolved (headless
-     boot), skips the mirror, so serial stays the authoritative channel. The driver clears the
+     boot), writes the mirror nowhere: its sink queues lines up to its queue and counts the rest
+     for the driver resolved next, so serial stays the authoritative channel. The driver clears the
      screen when it starts (`FramebufferWriter::new`), so the kernel's console stays on it until
      then.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
@@ -246,7 +247,7 @@ different routes:
   harness-specific framebuffer path exists.
 
 Serial remains the authoritative marker channel: CI scrapes serial and
-runs the harnesses headless, where the framebuffer mirrors are no-ops (see
+runs the harnesses headless, where the framebuffer mirrors write nothing (see
 [docs/testing.md](testing.md)).
 
 Every framebuffer renderer — the bootloader, kernel, and ktest direct

@@ -76,9 +76,10 @@ under its sender's name, the first after the restart included
   so the steady-state userspace log stream reaches the screen as well as
   the UART (matching the early-kernel console). The mirror is a sink of its own, with its own
   queue and writer, so a framebuffer driver that does not answer holds neither the log stream nor
-  the serial output beyond `SINK_STALL_MS`. The mirror soft-degrades
-  to a no-op when no framebuffer driver is present (headless boot),
-  leaving serial the authoritative channel; the emit path never queries devmgr.
+  the serial output beyond `SINK_STALL_MS`. When no framebuffer driver is present (headless
+  boot) the mirror writes nothing: its sink queues lines up to its queue and counts the rest for a
+  driver that may come up later, leaving serial the authoritative channel; the emit path never
+  queries devmgr.
   See [docs/console-model.md](../../docs/console-model.md).
 
 * **Log records.** Beside the text stream, a sender can send a log record,

@@ -831,8 +831,7 @@ fn classify(
     // the emulator's abort message after the handover line is no userspace
     // line, and the crash is the host's, whatever the console did.
     let qemu_crashed = !hung && (exit_rc == RC_SIGSEGV || exit_rc == RC_SIGABRT);
-    if !qemu_crashed
-        && let Some(reason) = console_lost_after_handover(log)
+    if !qemu_crashed && let Some(reason) = console_lost_after_handover(log)
     {
         return (Status::Fail, Some(reason));
     }

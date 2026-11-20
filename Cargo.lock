@@ -656,6 +656,7 @@ dependencies = [
  "death-set",
  "ipc",
  "objsig",
+ "syscall-abi",
 ]
 
 [[package]]

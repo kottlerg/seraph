@@ -44,7 +44,7 @@ pub struct ServiceEntry
     /// A `Control`-only cap on the address space of a service init created by
     /// raw syscalls (memmgr, procmgr), from its endowment round: svcmgr bound
     /// the service's address-space observer on the core-death queue with it,
-    /// and reads the space's retained terminal fault back through it in a
+    /// and reads the space's retained end back through it in a
     /// resync. Zero
     /// for every other service, whose address space procmgr observes for
     /// svcmgr through [`Self::process_handle`].

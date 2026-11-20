@@ -9,7 +9,8 @@
 //! (some roles take further arguments after it, e.g. `blobs-large-child`'s
 //! long argv token) to exercise child-side behaviour: namespace and
 //! `/programs`-subtree attenuation, cwd-cap delivery, argv/env delivery,
-//! exit-code propagation, per-process randomness and ASLR divergence,
+//! exit-code propagation (from the main thread and from a spawned one), a
+//! receive loop's fatal exit on a spawned thread, per-process randomness and ASLR divergence,
 //! `Child` kill and drop teardown, procmgr's teardown of a child whose create
 //! reply it cannot deliver, procmgr's death forward to logd, procmgr's post
 //! of a process's end to its end queue and, once, to its death relay, the fs
@@ -46,6 +47,7 @@ pub fn dispatch(role: &str)
     phases::fs_std::reentry_main(role);
     phases::fs_opens::reentry_main(role);
     phases::exit_code::reentry_main(role);
+    phases::recv_guard::reentry_main(role);
     phases::random::reentry_main(role);
     phases::memmgr::reentry_main(role);
     phases::budget::reentry_main(role);

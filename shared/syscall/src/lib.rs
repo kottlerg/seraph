@@ -44,16 +44,16 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
-    MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_HARVEST,
-    SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
-    SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
-    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENDPOINT_BADGE,
-    SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
-    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
-    SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP,
-    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT,
+    MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_EXIT,
+    SYS_ASPACE_HARVEST, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
+    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
+    SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
+    SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
+    SYS_ENDPOINT_BADGE, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM,
+    SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV,
+    SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE,
+    SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT,
+    SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
     SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
     SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
     SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL,
@@ -65,7 +65,7 @@ use syscall_abi::{
 };
 
 pub use syscall_abi::{
-    CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_ASPACE_TERMINAL_FAULT, CAP_INFO_CSPACE_BUDGET,
+    CAP_INFO_ASPACE_END, CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET,
     CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_IRQ_MSG_ADDRESS,
     CAP_INFO_IRQ_MSG_DATA, CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE,
     CAP_INFO_MEMORY_MAPPINGS, CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES, CAP_INFO_MEMORY_PHYS_BASE,
@@ -182,19 +182,22 @@ pub fn thread_exit() -> !
     }
 }
 
-/// Exit the whole process with the voluntary exit `code`. Never returns.
+/// Exit the whole process with the voluntary exit `code`, from any of its
+/// threads. Never returns.
 ///
-/// The kernel records `syscall_abi::encode_exit_code(code)` as the exit reason
-/// and posts it to the calling thread's death observers, so a waiting parent's
-/// `ExitStatus` carries the code. Like [`thread_exit`] this stops only the
-/// calling thread — it does not post to the address-space death surface, which
-/// is reserved for terminal faults. Whole-process teardown (reaping any sibling
-/// threads) is procmgr-driven via cap revocation once it observes the death.
+/// Issues `SYS_ASPACE_EXIT`: the kernel records
+/// `syscall_abi::encode_exit_code(code)` as the address space's terminal end
+/// (unless a fault or exit of another thread ended it first) and as the calling
+/// thread's exit reason, and posts it to the calling thread's death observers
+/// and the address space's, so procmgr reaps the process with it and a
+/// waiting parent's `ExitStatus` carries the code. The kernel stops only the
+/// calling thread; procmgr's teardown stops the sibling threads once it
+/// observes the end.
 #[inline]
 pub fn process_exit(code: u32) -> !
 {
     // SAFETY: syscall2 issues raw syscall instruction; no pointer arguments; never returns.
-    unsafe { syscall2(SYS_PROCESS_EXIT, u64::from(code), 0) };
+    unsafe { syscall2(SYS_ASPACE_EXIT, u64::from(code), 0) };
     // The syscall never returns; loop to satisfy the diverging type.
     loop
     {
@@ -1326,8 +1329,8 @@ pub unsafe fn thread_configure_with_tls(
 /// with no exception handler bound, or of the fault of a restartable syscall's
 /// user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), is not
 /// resumed: starting it kills it as an unhandled fault, which posts its death
-/// observers and, when the fault is its address space's first terminal fault,
-/// the space's observers, or, for the fault of a restartable syscall's user
+/// observers and, when the fault is its address space's terminal end (the
+/// first fault or exit of any of its threads), the space's observers, or, for the fault of a restartable syscall's user
 /// copy, fails that syscall with `InvalidAddress` (docs/fault-handling.md
 /// § Delivery, Resume, and Kill). Starting one whose claiming reply was a
 /// `FAULT_REPLY_REDIRECT` that named an endpoint delivers the fault there. An
@@ -3451,16 +3454,17 @@ pub fn thread_bind_notification(
     if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
-/// Register a terminal-fault death-notification observer on an address space.
+/// Register a terminal-end death-notification observer on an address space.
 ///
-/// When a thread in the target address space takes the space's first
-/// *terminal* fault, the kernel posts the two-word entry
-/// `(exit_reason, correlator)` to `event_queue_cap` (see [`DeathEvent`]), where
-/// `exit_reason` is the fault class (`EXIT_FAULT_BASE + vector` on x86-64,
-/// `EXIT_FAULT_BASE + cause` on riscv64). The space dies once: a later
-/// terminal fault of another of its threads posts nothing, so a binding
-/// receives one entry. A fault of a thread's own access is terminal on any kill
-/// outcome of the fault protocol:
+/// At the space's terminal end, the first `SYS_ASPACE_EXIT` ([`process_exit`])
+/// or *terminal* fault of any of its threads, the kernel posts the two-word
+/// entry `(exit_reason, correlator)` to `event_queue_cap` (see
+/// [`DeathEvent`]), where `exit_reason` is the encoded exit code for an exit
+/// and the fault class for a fault (`EXIT_FAULT_BASE + vector` on x86-64,
+/// `EXIT_FAULT_BASE + cause` on riscv64). The space ends once: a later fault
+/// or exit of another of its threads posts nothing, so a binding receives one
+/// entry. A fault of a thread's own access is terminal on any kill outcome of
+/// the fault protocol:
 ///
 /// - no fault handler bound;
 /// - a `KILL` reply;
@@ -3479,21 +3483,21 @@ pub fn thread_bind_notification(
 /// these cases it fails that syscall with `InvalidAddress` and posts nothing
 /// (docs/fault-handling.md § Kernel Copies).
 ///
-/// Normal `thread_exit` does NOT post to these observers. If the address
-/// space has already faulted terminally, the kernel
+/// [`thread_exit`] does NOT post to these observers. If the address
+/// space has already ended, the kernel
 /// posts the retained reason to `event_queue_cap` at once and the call still
 /// succeeds.
 ///
 /// `aspace_cap` requires the `CONTROL` right; `event_queue_cap` requires the
 /// `POST` right. Multiple observers can be registered; each binding takes one
 /// death-observer node from `event_queue_cap`'s pool until the address space
-/// is destroyed (a bind after the fault takes none). The kernel only
+/// is destroyed (a bind after the end takes none). The kernel only
 /// notifies; it never enumerates or terminates threads.
 ///
 /// `correlator` is opaque to the kernel. Its meaning is scoped to one
 /// `(event queue, binder)` pair — not a system-wide identifier, not a
 /// process id. Typical use: procmgr stashes its `ProcessTable` badge so the
-/// terminal-fault event routes into its teardown bookkeeping.
+/// terminal-end event routes into its teardown bookkeeping.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability`,

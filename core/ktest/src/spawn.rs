@@ -5,6 +5,9 @@
 
 //! Child-thread spawn helper.
 //!
+//! It also installs the machine-code stubs (`crate::arch::code_stub`) a test
+//! runs a thread of a fresh address space from ([`install_stub`]).
+//!
 //! Most ktest scenarios spawn a child thread in a fresh `CSpace`, copy one
 //! or two caps into that `CSpace`, then configure-and-start the thread. The
 //! `cap_create_cspace + cap_create_thread + thread_configure + thread_start`
@@ -459,5 +462,91 @@ pub fn wait_memory_baseline(memory: u64, baseline: u64, max_polls: u32)
             return Err("spawn::wait_memory_baseline: memory did not return to baseline");
         }
         syscall::thread_sleep(1).ok();
+    }
+}
+
+/// Scratch VA in ktest's own address space through which
+/// [`install_stub`] writes a stub (crate docs § Scratch VAs).
+const STUB_SCRATCH_VA: u64 = 0x3E_6100_0000;
+
+/// Write the machine-code stub `code` into a fresh frame-pool page and map it
+/// executable at `va` in `aspace`, an address space the test created, not
+/// ktest's own. Returns the frame's Memory cap, which the caller frees to the
+/// pool once `aspace` is deleted.
+///
+/// The page is written through a temporary writable mapping in ktest's own
+/// address space and unmapped before the executable mapping is made (W^X).
+/// The executable `mem_map` synchronises instruction fetch with the write
+/// (docs/memory-model.md § Instruction-Fetch Coherence), and the stub's
+/// callers then run it. Under QEMU a missing synchronisation does not fail,
+/// so the `SYS_SYSTEM_INFO(InstructionCacheSyncs)` count must rise across
+/// the map: the check that the path was taken.
+pub fn install_stub(
+    ctx: &TestContext,
+    aspace: u64,
+    va: u64,
+    code: &[u8],
+) -> Result<u64, &'static str>
+{
+    if u64::try_from(code.len()).map_or(true, |len| len > syscall_abi::PAGE_SIZE)
+    {
+        return Err("spawn::install_stub: stub larger than a page");
+    }
+    let frame =
+        crate::frame_pool::alloc().ok_or("spawn::install_stub: frame_pool::alloc returned None")?;
+    // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe {
+        syscall::mem_map(
+            frame,
+            ctx.aspace_cap,
+            STUB_SCRATCH_VA,
+            0,
+            1,
+            syscall::MAP_WRITABLE,
+        )
+    }
+    .is_err()
+    {
+        // SAFETY: `frame` came from `alloc` above and the failed map left it
+        // mapped nowhere.
+        unsafe { crate::frame_pool::free(frame) };
+        return Err("spawn::install_stub: scratch mem_map failed");
+    }
+    for (i, b) in code.iter().enumerate()
+    {
+        // SAFETY: i is below the stub's length, which the check above keeps
+        // within a page, so the byte lies in STUB_SCRATCH_VA..+PAGE.
+        let dst = unsafe { (STUB_SCRATCH_VA as *mut u8).add(i) };
+        // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above, and
+        // `dst` is a byte of it.
+        unsafe { dst.write_volatile(*b) };
+    }
+    // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    if unsafe { syscall::mem_unmap(ctx.aspace_cap, STUB_SCRATCH_VA, 1) }.is_err()
+    {
+        // The frame is still mapped at STUB_SCRATCH_VA, and `free` requires
+        // it unmapped, so it stays allocated rather than re-enter the pool.
+        return Err("spawn::install_stub: scratch mem_unmap failed");
+    }
+    let syncs =
+        || syscall::system_info(syscall_abi::SystemInfoType::InstructionCacheSyncs as u64).ok();
+    let before = syncs();
+    // SAFETY: `aspace` is not ktest's own (the caller's contract above), so
+    // the mapping touches nothing ktest runs on.
+    if unsafe { syscall::mem_map(frame, aspace, va, 0, 1, syscall::MAP_EXECUTABLE) }.is_err()
+    {
+        // SAFETY: `frame` came from `alloc` above; the scratch mapping is
+        // gone and the failed map left it mapped nowhere.
+        unsafe { crate::frame_pool::free(frame) };
+        return Err("spawn::install_stub: executable mem_map failed");
+    }
+    // The frame stays mapped in `aspace` on this failure, so it is not freed;
+    // the caller's teardown of `aspace` unmaps it.
+    match (before, syncs())
+    {
+        (Some(b), Some(a)) if a > b => Ok(frame),
+        _ => Err("spawn::install_stub: the executable map did not sync instruction fetch"),
     }
 }

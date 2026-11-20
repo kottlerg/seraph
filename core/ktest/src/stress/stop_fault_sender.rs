@@ -943,8 +943,9 @@ extern "C" fn handler_entry(arg: u64) -> !
             // The endpoint goes only after this thread is deleted, so its
             // loss ends the loop. The guard retries any other failure: with
             // backoff, and, once a streak proves the failure persistent, a
-            // `SYS_PROCESS_EXIT` with `EXIT_RECV_WEDGE` that ends this thread
-            // alone (ktest has no procmgr to reap its siblings). Every
+            // `SYS_ASPACE_EXIT` with `EXIT_RECV_WEDGE` that ends this thread
+            // alone (the kernel stops no sibling, and ktest has no procmgr to
+            // reap them). Every
             // controller wait, the wait for a sync answer included, polls
             // this thread's exit and fails the round; a syncer call left
             // queued blocks only the syncer, which the release deletes.

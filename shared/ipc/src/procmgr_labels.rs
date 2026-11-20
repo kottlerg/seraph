@@ -115,7 +115,8 @@ pub const CREATE_PINNED: u64 = 1 << 16;
 /// procmgr keeps the relay for the child's life and posts the child's end
 /// to it once, as the entry `(reason, 0)`: the fault class at the reap of
 /// a terminal fault in any of the child's threads, the exit reason at the
-/// reap of its main thread's exit, or the reason a destroy tore it down
+/// reap of its main thread's exit or of a process exit (`SYS_ASPACE_EXIT`)
+/// of any of its threads, or the reason a destroy tore it down
 /// with (`EXIT_KILLED` for a running child), so `Child::wait()` returns
 /// whoever ended the child. procmgr deletes its copy once it has posted,
 /// and when the child is re-parented, its creator having ended
@@ -416,13 +417,13 @@ pub const DESTROY_PROCESS: u64 = 8;
 /// tools and `std::process::Child::try_wait`-style probes that want to
 /// peek without blocking on a death event.
 pub const QUERY_PROCESS: u64 = 9;
-/// Bind the caller's event queue as a terminal-fault death observer on
+/// Bind the caller's event queue as a terminal-end death observer on
 /// a child's address space, sent on the child's badged
 /// `process_handle` only: `caps[0]` a `POST` cap on the queue,
-/// `data[0]` the correlator the post carries. The first terminal fault
-/// in any of the child's threads then posts `(fault class, correlator)`
-/// to the queue, once; a child that has already faulted posts its retained fault
-/// class at once. procmgr keeps the address space's `Control` right
+/// `data[0]` the correlator the post carries. The first terminal end (a
+/// fault or an exit) of any of the child's threads then posts
+/// `(exit reason, correlator)` to the queue, once; a child that has already
+/// ended posts its retained reason at once. procmgr keeps the address space's `Control` right
 /// and deletes its copy of the cap whatever the outcome. Replies
 /// `SUCCESS`; `UNAUTHORIZED` on a cap other than a process handle;
 /// `INVALID_BADGE` when the handle names no live process;

@@ -1179,7 +1179,7 @@ pub struct ThreadControlBlock
     /// `Exited`, under the same all-locks hold as that commit
     /// (`exit_under_all_locks`, or `commit_cancelling_park` for object
     /// teardown): by `sys_exit` (`SYS_THREAD_EXIT`, clean exit, value `0`),
-    /// by `sys_process_exit` (`encode_exit_code(arg0)`, a voluntary code in
+    /// by `sys_aspace_exit` (`encode_exit_code(arg0)`, a voluntary code in
     /// `[0, EXIT_FAULT_BASE)`), by the architecture fault handlers (value
     /// `EXIT_FAULT_BASE + vector`) before they call `post_death_notification`,
     /// and by object teardown (`syscall::EXIT_KILLED`; that stop posts

@@ -84,7 +84,7 @@ program opt in or skip; absence is the default.
 - The tester binary MUST exit `0` on pass and non-zero on fail.
 - The tester binary's exit code is the authoritative verdict. Seraph propagates
   it natively, without POSIX 8-bit truncation (see
-  [syscalls.md § `SYS_PROCESS_EXIT`](../core/kernel/docs/syscalls.md#sys_process_exit-54));
+  [syscalls.md § `SYS_ASPACE_EXIT`](../core/kernel/docs/syscalls.md#sys_aspace_exit-54));
   the orchestrator reads it through `ExitStatus::success()`/`code()`.
 - The tester SHOULD emit a final stdout line `[<name>-tester] PASS` or
   `[<name>-tester] FAIL` for log readability. The orchestrator does not

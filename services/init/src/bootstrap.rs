@@ -778,7 +778,7 @@ pub struct MemmgrBootstrap
     pub mm_thread: u64,
     /// Memmgr's `AddressSpace` cap (in init's `CSpace`). Init endows svcmgr
     /// a `Control`-only derivation of it, through which svcmgr observes a
-    /// terminal fault of any memmgr thread (`SUBSTRATE` round).
+    /// terminal end of any memmgr thread (`SUBSTRATE` round).
     pub mm_aspace: u64,
     /// Memmgr's contiguous backing arena Memory cap (in init's `CSpace`).
     /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
@@ -1744,7 +1744,7 @@ pub struct ProcmgrBootstrap
     pub thread: u64,
     /// Procmgr's `AddressSpace` cap (in init's `CSpace`). Init endows svcmgr
     /// a `Control`-only derivation of it, through which svcmgr observes a
-    /// terminal fault of any procmgr thread (`SUBSTRATE` round).
+    /// terminal end of any procmgr thread (`SUBSTRATE` round).
     pub aspace: u64,
     /// Procmgr's contiguous backing arena Memory cap (in init's `CSpace`).
     /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it

@@ -12,6 +12,7 @@
 //! example `crate::arch::fpu`, `crate::arch::IP_OFFSET`) through it.
 
 pub mod arena_reclaim;
+pub mod aspace_exit_notification;
 pub mod aspace_fault_notification_late_bind;
 pub mod aspace_fault_notification_once;
 pub mod aspace_harvest_no_fault;
@@ -111,6 +112,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::aspace_fault_notification_once",
         aspace_fault_notification_once::run(ctx)
+    );
+    run_integration_test!(
+        "integration::aspace_exit_notification",
+        aspace_exit_notification::run(ctx)
     );
     run_integration_test!(
         "integration::death_observer_outlives_queue_caps",

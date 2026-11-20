@@ -284,19 +284,19 @@ pub struct AddressSpace
     pt_lock: AtomicBool,
 
     // ... hardware tag state (`tag`, `tag_gen`, `tlb_gen`) and the
-    // terminal-fault observer state (`death_observers`, `death_lock`, ...)
+    // terminal-end observer state (`death_observers`, `death_lock`, ...)
 }
 ```
 
-The terminal-fault observer state (the `death_observers` chain of observer nodes,
-`terminal_faulted`, `terminal_fault_reason`) changes and is read only under `death_lock`: the bind
+The terminal-end observer state (the `death_observers` chain of observer nodes,
+`ended`, `end_reason`) changes and is read only under `death_lock`: the bind
 (`sys_aspace_bind_notification`) pushes a node, drawn from the observing queue's pool, under it, and
-the terminal-fault path records the first fault and, on that fault alone, reads the chain head
-under it before the faulting thread's `Exited` commit (`record_aspace_terminal_fault`; a later
-fault reads none, so the space's observers are posted once), then walks the chain and posts
+the terminal-fault path and `sys_aspace_exit` record the first end and, on that end alone, read the
+chain head under it before the ending thread's `Exited` commit (`record_aspace_end`; a later
+end reads none, so the space's observers are posted once), then walk the chain and post
 outside it after the commit (`post_aspace_death_notification`; a linked node's links never change
-until the teardown takes the chain), and `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT` reads
-the retained reason under it (`AddressSpace::retained_terminal_fault`).
+until the teardown takes the chain), and `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_END` reads
+the retained reason under it (`AddressSpace::retained_end`).
 
 ### Lifecycle
 

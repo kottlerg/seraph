@@ -436,16 +436,38 @@ pub const CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES: u64 = 512;
 /// frame to its pool (services/memmgr/docs/memory-pool.md § Reclamation).
 pub const CAP_INFO_SOLE_REFERENCE: u64 = 13;
 
-/// `AddressSpace` only — the retained terminal-fault reason, or `0`.
+/// `AddressSpace` only — the address space's retained terminal end, or `0`.
 ///
-/// Returns `0` while no thread of the address space has taken a terminal
-/// fault, and otherwise the reason of the first one
-/// ([`EXIT_FAULT_BASE`] + vector or cause; never `0`), which later faults do
-/// not overwrite. It is the reason an `SYS_ASPACE_BIND_NOTIFICATION` observer
-/// receives, so a holder that missed the event post reads it back here.
-/// Calling on a non-`AddressSpace` slot returns
-/// [`SyscallError::InvalidArgument`].
-pub const CAP_INFO_ASPACE_TERMINAL_FAULT: u64 = 14;
+/// Returns `0` while the address space has not ended, and otherwise
+/// [`ASPACE_ENDED`] `|` the reason of its first terminal end, which a later
+/// end does not overwrite: a terminal fault of any of its threads
+/// ([`EXIT_FAULT_BASE`] + vector or cause) or a `SYS_ASPACE_EXIT` by any of
+/// them (the encoded exit code, `0` for a clean exit, so the flag, not the
+/// reason, tells an ended space from a running one). [`aspace_end_reason`]
+/// decodes the answer. The reason is the one an
+/// `SYS_ASPACE_BIND_NOTIFICATION` observer receives, so a holder that missed
+/// the event post reads it back here. Calling on a non-`AddressSpace` slot
+/// returns [`SyscallError::InvalidArgument`].
+pub const CAP_INFO_ASPACE_END: u64 = 14;
+
+/// The flag a [`CAP_INFO_ASPACE_END`] answer carries above the reason once the
+/// address space has ended. Every exit reason fits the 32 bits below it.
+pub const ASPACE_ENDED: u64 = 1 << 32;
+
+/// The reason of an address space's terminal end, decoded from a
+/// [`CAP_INFO_ASPACE_END`] answer: `None` while the space has not ended.
+#[must_use]
+pub const fn aspace_end_reason(answer: u64) -> Option<u64>
+{
+    if answer & ASPACE_ENDED == 0
+    {
+        None
+    }
+    else
+    {
+        Some(answer & 0xFFFF_FFFF)
+    }
+}
 
 /// Interrupt only — the message address a device writes to raise the
 /// message-signaled interrupt the capability names (one minted by
@@ -560,10 +582,13 @@ pub const SYS_MEMORY_MERGE: u64 = 50;
 pub const SYS_IOPORT_SPLIT: u64 = 51;
 /// Split a `SchedControl` cap into two children covering disjoint priority bands.
 pub const SYS_SCHED_SPLIT: u64 = 52;
-/// Bind a death notification `EventQueue` to an address space (terminal fault).
+/// Bind a death notification `EventQueue` to an address space (its terminal
+/// end: the first terminal fault or `SYS_ASPACE_EXIT` of any of its threads).
 pub const SYS_ASPACE_BIND_NOTIFICATION: u64 = 53;
-/// Exit the whole process with a caller-chosen exit code.
-pub const SYS_PROCESS_EXIT: u64 = 54;
+/// End the caller's address space with a caller-chosen exit code: the calling
+/// thread exits, and the code becomes the space's terminal end
+/// (`core/kernel/docs/syscalls.md` § `SYS_ASPACE_EXIT` (54)).
+pub const SYS_ASPACE_EXIT: u64 = 54;
 /// Fill a user buffer with CSPRNG-quality bytes from the kernel entropy pool
 /// (ambient; no capability). See `core/kernel/docs/syscalls.md` § `SYS_GETRANDOM` (55) and
 /// `core/kernel/docs/entropy.md`.
@@ -1200,15 +1225,15 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 // ── Exit reason constants ─────────────────────────────────────────────────────
 //
 // The exit reason is the value a death notification delivers (the payload word
-// of its two-word entry) when a thread or process dies. It is a single flat
+// of its two-word entry) when a thread dies or an address space ends. It is a single flat
 // space partitioned into disjoint ranges, kernel-owned so userspace can never
 // forge a fault or kill reason:
 //
 //   | Reason            | Class               | Meaning                            |
 //   |-------------------|---------------------|------------------------------------|
 //   | `0`               | Voluntary, clean    | success (`SYS_THREAD_EXIT`, or     |
-//   |                   |                     | `SYS_PROCESS_EXIT(0)`)             |
-//   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_PROCESS_EXIT(code)`, where    |
+//   |                   |                     | `SYS_ASPACE_EXIT(0)`)              |
+//   | `1 ..= 0x0FFF`    | Voluntary, code     | `SYS_ASPACE_EXIT(code)`, where     |
 //   |                   |                     | reason == `encode_exit_code(code)` |
 //   | `0x1000 ..0x2000` | Fault               | `EXIT_FAULT_BASE + vector/cause`   |
 //   | `0x2000`          | Killed              | `EXIT_KILLED`: recorded by         |
@@ -1218,7 +1243,7 @@ const _: () = assert!(MAP_EXECUTABLE == RIGHTS_MEM_EXECUTE);
 // This is a Seraph-native encoding, not POSIX: exit codes are not 8-bit
 // `WEXITSTATUS`-truncated, and faults are native fault classes, not signals.
 
-/// Clean voluntary exit (success): `SYS_THREAD_EXIT`, or `SYS_PROCESS_EXIT(0)`.
+/// Clean voluntary exit (success): `SYS_THREAD_EXIT`, or `SYS_ASPACE_EXIT(0)`.
 pub const EXIT_VOLUNTARY: u64 = 0;
 
 /// Base value for fault-induced exits. The kernel adds the architecture-specific
@@ -1240,6 +1265,10 @@ pub const EXIT_FAULT_BASE: u64 = 0x1000;
 /// status. Sits just above the fault range so consumers tell a kill from a
 /// hardware fault.
 pub const EXIT_KILLED: u64 = 0x2000;
+
+// Every exit reason fits below the flag a `CAP_INFO_ASPACE_END` answer sets
+// above it.
+const _: () = assert!(EXIT_KILLED < ASPACE_ENDED);
 
 /// Encode a voluntary process exit `code` into the flat exit-reason space.
 ///
@@ -1904,6 +1933,20 @@ mod tests
             9,
             "count bits never reach the timeout"
         );
+    }
+
+    // Defects guarded: an address space ended by a clean exit (reason `0`)
+    // read back as one that has not ended, or a reason cut or widened by the
+    // flag.
+    #[test]
+    fn an_aspace_end_answer_tells_a_clean_exit_from_no_end()
+    {
+        assert_eq!(aspace_end_reason(0), None, "a running space has not ended");
+        assert_eq!(aspace_end_reason(ASPACE_ENDED), Some(EXIT_VOLUNTARY));
+        for reason in [1, EXIT_FAULT_BASE - 1, EXIT_FAULT_BASE + 14, EXIT_KILLED]
+        {
+            assert_eq!(aspace_end_reason(ASPACE_ENDED | reason), Some(reason));
+        }
     }
 
     // Defects guarded: a version parse that drops a component, reads past the

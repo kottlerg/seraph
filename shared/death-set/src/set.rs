@@ -274,7 +274,7 @@ impl DeathSet
         self.bind_with(|q| syscall::thread_bind_notification(thread_cap, q, correlator))
     }
 
-    /// Bind a terminal-fault observer on `aspace_cap`, posting `correlator`,
+    /// Bind a terminal-end observer on `aspace_cap`, posting `correlator`,
     /// growing the set as [`Self::bind_thread`] does.
     ///
     /// # Errors

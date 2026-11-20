@@ -111,10 +111,11 @@ pub fn log_error(label: &str, error: i64)
 
 /// Diagnostic hook for a cell's `RecvGuard`: log the stage and the error
 /// word. ktest logs each cell's name before running it, so the line names
-/// none. At the fatal stage the guard then calls `SYS_PROCESS_EXIT` with
-/// `EXIT_RECV_WEDGE`, which ends the calling thread alone, with that exit
-/// reason, since ktest has no procmgr to reap the rest of the process
-/// (core/kernel/docs/syscalls.md § `SYS_PROCESS_EXIT`). Every cell wait
+/// none. At the fatal stage the guard then calls `SYS_ASPACE_EXIT` with
+/// `EXIT_RECV_WEDGE`, which records the end of ktest's address space and
+/// ends the calling thread alone, with that exit reason: the kernel stops no
+/// other thread, and ktest has no procmgr to reap the rest of the process
+/// (core/kernel/docs/syscalls.md § `SYS_ASPACE_EXIT`). Every cell wait
 /// that depends on the receiver is bounded or polls its exit, so the dead
 /// receiver fails the cell's round rather than hanging the harness.
 pub fn recv_diag(stage: RecvFailureStage, error: i64)

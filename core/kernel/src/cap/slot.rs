@@ -405,7 +405,7 @@ define_typed_rights! {
         MAP = syscall::RIGHTS_AS_MAP;
         /// May read/inspect mappings (`SYS_ASPACE_QUERY`).
         READ = syscall::RIGHTS_AS_READ;
-        /// May register terminal-fault death observers
+        /// May register terminal-end death observers
         /// (`aspace_bind_notification`).
         CONTROL = syscall::RIGHTS_AS_CONTROL;
     }

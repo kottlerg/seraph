@@ -1052,7 +1052,7 @@ fn apply_exit_overlay(rust_src: &Path) -> Result<()>
         "sys/exit.rs",
         "        target_os = \"xous\" => crate::os::xous::ffi::exit(code as u32),\n",
         "        target_os = \"xous\" => crate::os::xous::ffi::exit(code as u32),\n        \
-         // seraph-overlay: exit the process via SYS_PROCESS_EXIT, forwarding the code\n        \
+         // seraph-overlay: exit the process via SYS_ASPACE_EXIT, forwarding the code\n        \
          target_os = \"seraph\" => {\n            \
          crate::sys::fs::close_open_files();\n            \
          crate::sys::stdio::seraph::close_all();\n            \

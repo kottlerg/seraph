@@ -566,7 +566,10 @@ fn log_boot_death(def: &Definition, exit_reason: u64)
 /// `Control`-only address-space cap: their observers are on the core-death
 /// queue, bound at svcmgr's start (`observe_core_deaths` in `main.rs`), whose
 /// entries the shutdown actuator acts on, so svcmgr binds neither here and
-/// only records both caps, for the resync's liveness reads.
+/// records both caps: for the liveness reads of the resync and of the check
+/// made before each call into procmgr (`substrate_alive`), and with the
+/// non-zero `aspace_cap`, which no other entry holds, as the mark by which
+/// `route_death` leaves a core member's death to pwrmgr.
 ///
 /// Binding after the thread was started loses no death: the kernel retains a
 /// thread's `exit_reason` past death and `thread_bind_notification`

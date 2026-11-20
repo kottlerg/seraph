@@ -32,7 +32,10 @@ as follows:
   the Core Set](../../../docs/supervision.md#observing-the-core-set)), through
   the thread cap and the Control-only address-space cap the handover endowment
   delivers. The entry keeps both (`ServiceEntry.thread_cap`,
-  `ServiceEntry.aspace_cap`) only for a resync's liveness reads.
+  `ServiceEntry.aspace_cap`) for the liveness reads of a resync and of the
+  check made before each call into procmgr, the stop paths' included, and a
+  non-zero `aspace_cap`, which no other entry holds, marks the entry as a core
+  member's, whose death `route_death` leaves to pwrmgr (§ Decision tree).
 - For devmgr and vfsd, which init creates through procmgr, svcmgr sends
   `BIND_DEATH_OBSERVER` on the process handle the handover endowment delivers,
   which the entry keeps (`ServiceEntry.process_handle`).

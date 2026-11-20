@@ -246,8 +246,8 @@ loop drive:
 | decided | any other create failure, or one of a reserve service, of the log sink, or with no Notification | down |
 | waiting, level read `CRITICAL` or unread | a signal of a change of level read below `CRITICAL` | retry (on a signal) |
 | waiting, level read `CRITICAL` or unread | a signal read at `CRITICAL`, or unread | waiting; no timer |
-| waiting, level read below `CRITICAL` | the main loop's wait times out after `MEMORY_RETRY_MS` (1 s) | retry (timed) |
-| waiting, level read below `CRITICAL` | a signal read at `CRITICAL` | waiting; timer disarmed |
+| waiting, level read below `CRITICAL` | the retry deadline, armed `MEMORY_RETRY_MS` (1 s) ahead and moved by no other event, passes, whatever woke the main loop | retry (timed); the next deadline armed |
+| waiting, level read below `CRITICAL` | a signal read at `CRITICAL` | waiting; deadline cleared |
 | retry | the new instance runs | restarted |
 | retry | the new instance dies during its bootstrap | a new death: step 1, charged |
 | retry | create refused `OUT_OF_MEMORY` | waiting, a timed retry counted; down once the timed retries reach `MEMORY_RETRY_LIMIT` (60) |
@@ -257,9 +257,12 @@ loop drive:
   its timed retries (`ServiceEntry::memory_wait`); `handle_death` returns `WaitingForMemory`, on
   which the caller does nothing more, `critical = yes` or not. svcmgr logs `restart of <name>
   waits for memory`. svcmgr records memmgr's level after each refusal for want of memory and on
-  each wake. The main loop waits with no timeout unless a restart waits and the level last read is
-  below `CRITICAL`, so it makes no idle wake-up; at `CRITICAL` every such create is refused, and
-  memmgr signals the change.
+  each wake. While a restart waits and the level last read is below `CRITICAL`, a retry deadline
+  `MEMORY_RETRY_MS` ahead is armed once and kept (`MemoryWaits::poll_timer`): the main loop waits at
+  most the time left to it and retries once it has passed, whatever woke it, so no stream of
+  requests on svcmgr's endpoint holds a timed retry off. Otherwise the deadline is cleared and the
+  wait has no timeout, so svcmgr makes no idle wake-up; at `CRITICAL` every such create is refused,
+  and memmgr signals the change.
 - **Retry.** Every waiting service is retried on the wake that makes a retry due: its create is made
   again (`restart::retry_memory_wait`), charging the budget nothing, since the budget bounds deaths
   and step 1 charged this one; a retry on a signal is logged `memory level fell; retrying the

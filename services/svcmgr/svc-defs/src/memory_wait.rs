@@ -33,9 +33,10 @@
 //!   so no death post routes to it and no reader reports it running). svcmgr's
 //!   level ([`MemoryWaits::record_level`]) decides the wake: at `CRITICAL`, or
 //!   unread, nothing retries it and the main loop waits with no timeout; below
-//!   `CRITICAL` a signal of a change of level retries it at once, and the main
-//!   loop waits at most [`MEMORY_RETRY_MS`], whose expiry retries it
-//!   ([`MemoryWaits::wake`], [`MemoryWaits::wait_timeout_ms`]).
+//!   `CRITICAL` a signal of a change of level retries it at once, and a
+//!   deadline [`MEMORY_RETRY_MS`] ahead, which no other event moves, retries
+//!   it when it passes, whatever woke the main loop
+//!   ([`MemoryWaits::wake`], [`MemoryWaits::poll_timer`]).
 //! - **Retry**: the create is made again, charging the budget nothing: the
 //!   death it restarts was charged. Success leaves the wait: the service runs.
 //!   A new instance that dies during its bootstrap is a new death, decided
@@ -121,13 +122,39 @@ pub struct MemoryWait
 }
 
 /// svcmgr's side of the memory wait: whether it has the pressure
-/// Notification, and memmgr's level as it last read it.
+/// Notification, memmgr's level as it last read it, and the retry timer's
+/// deadline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MemoryWaits
 {
     registered: bool,
     level: Option<u64>,
+    /// The deadline of the next timed retry on svcmgr's monotonic clock, in
+    /// nanoseconds, while the timer runs.
+    deadline_ns: Option<u64>,
 }
+
+/// Where the retry timer stands ([`MemoryWaits::poll_timer`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Timer
+{
+    /// No timer: the main loop waits with no timeout.
+    Off,
+    /// The main loop waits at most `ms` milliseconds.
+    Wait
+    {
+        ms: u64
+    },
+    /// The deadline has passed: retry the waiting restarts as
+    /// [`Wake::Timer`] now.
+    Due,
+}
+
+/// Nanoseconds per millisecond.
+const NS_PER_MS: u64 = 1_000_000;
+
+/// [`MEMORY_RETRY_MS`] in nanoseconds.
+const RETRY_NS: u64 = MEMORY_RETRY_MS * NS_PER_MS;
 
 impl MemoryWaits
 {
@@ -143,6 +170,7 @@ impl MemoryWaits
         Self {
             registered,
             level: None,
+            deadline_ns: None,
         }
     }
 
@@ -154,24 +182,37 @@ impl MemoryWaits
         self.level = level;
     }
 
-    /// The timeout of the main loop's wait, in milliseconds, `0` for none:
-    /// [`MEMORY_RETRY_MS`] while a restart waits (`waiting`) and the level
-    /// last read is below `CRITICAL`, and none otherwise, so svcmgr makes no
-    /// idle wake-up.
+    /// Where the retry timer stands at `now_ns` (svcmgr's monotonic clock),
+    /// which the main loop asks before every wait. While a restart waits
+    /// (`waiting`) and the level last read is below `CRITICAL`, a deadline
+    /// [`MEMORY_RETRY_MS`] ahead is armed once and kept: no event before it
+    /// moves it, so a stream of requests cannot hold the timed retry off.
+    /// [`Timer::Wait`] gives the time left to it, at least 1 ms;
+    /// [`Timer::Due`] says it has passed and arms the next one. Otherwise the
+    /// deadline is cleared and the timer is [`Timer::Off`]: the wait has no
+    /// timeout, so svcmgr makes no idle wake-up.
     #[must_use]
     #[expect(
         clippy::fn_params_excessive_bools,
         reason = "`waiting` is whether any restart waits for memory, which the timer needs"
     )]
-    pub fn wait_timeout_ms(&self, waiting: bool) -> u64
+    pub fn poll_timer(&mut self, waiting: bool, now_ns: u64) -> Timer
     {
-        if waiting && self.below_critical()
+        if !(waiting && self.below_critical())
         {
-            MEMORY_RETRY_MS
+            self.deadline_ns = None;
+            return Timer::Off;
         }
-        else
+        let deadline = *self
+            .deadline_ns
+            .get_or_insert_with(|| now_ns.saturating_add(RETRY_NS));
+        if now_ns >= deadline
         {
-            0
+            self.deadline_ns = Some(now_ns.saturating_add(RETRY_NS));
+            return Timer::Due;
+        }
+        Timer::Wait {
+            ms: deadline.saturating_sub(now_ns).div_ceil(NS_PER_MS).max(1),
         }
     }
 
@@ -239,7 +280,7 @@ mod tests
 
     use super::CreateFailure::{Other, OutOfMemory};
     use super::{
-        MEMORY_RETRY_LIMIT, MEMORY_RETRY_MS, MemoryWait, MemoryWaits, Refused, Retry, Wake,
+        MEMORY_RETRY_LIMIT, MEMORY_RETRY_MS, MemoryWait, MemoryWaits, Refused, Retry, Timer, Wake,
     };
     use crate::DeathTag;
     use crate::death_tag::routes;
@@ -343,31 +384,54 @@ mod tests
     {
         for level in LEVELS
         {
-            assert_eq!(at(level).wait_timeout_ms(false), 0);
+            assert_eq!(at(level).poll_timer(false, 0), Timer::Off);
         }
-        assert_eq!(at(None).wait_timeout_ms(true), 0);
-        assert_eq!(at(Some(PRESSURE_CRITICAL)).wait_timeout_ms(true), 0);
-        assert_eq!(
-            at(Some(PRESSURE_LOW)).wait_timeout_ms(true),
-            MEMORY_RETRY_MS
-        );
-        assert_eq!(
-            at(Some(PRESSURE_NORMAL)).wait_timeout_ms(true),
-            MEMORY_RETRY_MS
-        );
+        assert_eq!(at(None).poll_timer(true, 0), Timer::Off);
+        assert_eq!(at(Some(PRESSURE_CRITICAL)).poll_timer(true, 0), Timer::Off);
+        let full = Timer::Wait {
+            ms: MEMORY_RETRY_MS,
+        };
+        assert_eq!(at(Some(PRESSURE_LOW)).poll_timer(true, 0), full);
+        assert_eq!(at(Some(PRESSURE_NORMAL)).poll_timer(true, 0), full);
     }
 
-    // The level moves the arming both ways: a fall below CRITICAL arms it, a
-    // rise to CRITICAL disarms it.
+    // The deadline is armed once and kept: events that wake the main loop
+    // before it (a request on svcmgr's endpoint, a death) only shorten the
+    // next wait, so no stream of them holds the timed retry off. Once due it
+    // is re-armed a full interval ahead.
     #[test]
-    fn a_change_of_level_arms_and_disarms_the_timer()
+    fn events_before_the_deadline_do_not_push_it_back()
     {
-        let mut waits = at(Some(PRESSURE_CRITICAL));
-        assert_eq!(waits.wait_timeout_ms(true), 0);
-        waits.record_level(Some(PRESSURE_LOW));
-        assert_eq!(waits.wait_timeout_ms(true), MEMORY_RETRY_MS);
+        let ms = 1_000_000;
+        let mut waits = at(Some(PRESSURE_LOW));
+        assert_eq!(waits.poll_timer(true, 0), Timer::Wait { ms: 1000 });
+        for t in (100..1000).step_by(100)
+        {
+            assert_eq!(waits.poll_timer(true, t * ms), Timer::Wait { ms: 1000 - t });
+        }
+        assert_eq!(waits.poll_timer(true, 999 * ms + 1), Timer::Wait { ms: 1 });
+        assert_eq!(waits.poll_timer(true, 1000 * ms), Timer::Due);
+        assert_eq!(waits.poll_timer(true, 1200 * ms), Timer::Wait { ms: 800 });
+        // A loop that came back late finds it due at once.
+        assert_eq!(waits.poll_timer(true, 5000 * ms), Timer::Due);
+        assert_eq!(waits.poll_timer(true, 5000 * ms), Timer::Wait { ms: 1000 });
+    }
+
+    // The level moves the arming both ways: a rise to CRITICAL clears the
+    // deadline, and a fall below arms a fresh one; so does the end of every
+    // wait.
+    #[test]
+    fn a_change_of_level_or_the_end_of_the_waits_clears_the_deadline()
+    {
+        let ms = 1_000_000;
+        let mut waits = at(Some(PRESSURE_LOW));
+        assert_eq!(waits.poll_timer(true, 0), Timer::Wait { ms: 1000 });
         waits.record_level(Some(PRESSURE_CRITICAL));
-        assert_eq!(waits.wait_timeout_ms(true), 0);
+        assert_eq!(waits.poll_timer(true, 500 * ms), Timer::Off);
+        waits.record_level(Some(PRESSURE_LOW));
+        assert_eq!(waits.poll_timer(true, 700 * ms), Timer::Wait { ms: 1000 });
+        assert_eq!(waits.poll_timer(false, 800 * ms), Timer::Off);
+        assert_eq!(waits.poll_timer(true, 900 * ms), Timer::Wait { ms: 1000 });
     }
 
     // Retry -> waiting: a retry on a signal refused for want of memory waits

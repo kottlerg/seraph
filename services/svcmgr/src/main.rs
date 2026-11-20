@@ -43,7 +43,7 @@ use service::bootstrap_caps;
 use std::os::seraph::{StartupInfo, startup_info};
 use svcmgr_defs::DeathTag;
 use svcmgr_defs::drivers_dir;
-use svcmgr_defs::memory_wait::{MemoryWaits, Wake};
+use svcmgr_defs::memory_wait::{MemoryWaits, Timer, Wake};
 use syscall_abi::SyscallError;
 
 /// Monotonic time since the first call, in nanoseconds, for the windowed
@@ -647,24 +647,36 @@ fn event_loop(
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
-        // No timeout unless a restart waits for memory below CRITICAL
-        // (`MemoryWaits::wait_timeout_ms`), so svcmgr makes no idle wake-up.
+        // The retry timer of the restarts that wait for memory
+        // (`MemoryWaits::poll_timer`): its deadline is kept across every
+        // wake, so no stream of requests holds a timed retry off, and with no
+        // restart waiting below CRITICAL the wait has no timeout, so svcmgr
+        // makes no idle wake-up.
         let waiting = state
             .table
             .services
             .iter()
             .any(|svc| svc.memory_wait.is_some());
-        let timeout_ms = restart_ctx.memory_waits.get().wait_timeout_ms(waiting);
+        let mut waits = restart_ctx.memory_waits.get();
+        let timer = waits.poll_timer(waiting, now_ns());
+        restart_ctx.memory_waits.set(waits);
+        let timeout_ms = match timer
+        {
+            Timer::Off => 0,
+            Timer::Wait { ms } => ms,
+            Timer::Due =>
+            {
+                retry_memory_waits(state, &restart_ctx, Wake::Timer);
+                continue;
+            }
+        };
         // Read every time: a bind that grows the death queues may have
         // replaced the wait set.
         let badge = match syscall::wait_set_wait_timeout(restart_ctx.deaths.ws_cap(), timeout_ms)
         {
             Ok(badge) => badge,
-            Err(e) if timeout_ms != 0 && e == SyscallError::WouldBlock as i64 =>
-            {
-                retry_memory_waits(state, &restart_ctx, Wake::Timer);
-                continue;
-            }
+            // The timeout expired: the next pass finds the deadline due.
+            Err(e) if timeout_ms != 0 && e == SyscallError::WouldBlock as i64 => continue,
             Err(e) =>
             {
                 guard.on_failure(e);

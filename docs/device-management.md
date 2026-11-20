@@ -728,9 +728,11 @@ devmgr loads driver binaries from one of two places:
   valid UTF-8 text as a platform description table, and logs and releases anything else. It binds
   the PCI and platform records those declarations match in the boot settle batch (the IOMMU family
   record in a batch of its own before it), and spawns every driver via
-  `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only for that boot pass; a device added
-  later, a disk included, binds the copy under `/services/drivers/` at the auxiliary tier
-  ([driver-binding.md](driver-binding.md) § Declaration Bounds).
+  `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only in the pass that binds it, apart from
+  devmgr's copy of the IOMMU driver's image, from which every restart of that driver starts
+  (§ IOMMU Driver Restart); a device added later, a disk included, binds the copy under
+  `/services/drivers/` at the auxiliary tier ([driver-binding.md](driver-binding.md) § Declaration
+  Bounds).
 - **On-disk rootfs** — non-essentials (the serial and framebuffer drivers of the consoles, the
   per-arch RTC, bound to its platform record, the
   [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's
@@ -760,7 +762,9 @@ devmgr loads driver binaries from one of two places:
   replies SUCCESS before doing any spawn work so svcmgr never blocks on driver bring-up; the actual
   walk + `CREATE_FROM_FILE` + bootstrap rounds, and the settle of those drivers, run on devmgr's
   control thread after `ipc_reply`, while its registry workers go on serving; a query that would
-  find no driver waits until the settle has ended. The spawn is at-most-once per boot; on failure
+  find no driver waits until the settle has ended. The spawn is at-most-once per boot, apart from
+  the restart of a served driver that dies, which devmgr serves at the class's next ordinal
+  ([Driver Restart](../services/devmgr/docs/responsibilities.md#driver-restart)); on failure
   (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did not report
   ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
   `QUERY_DEVICE` calls on the rtc, input, hwrng, and debug-port classes and clients

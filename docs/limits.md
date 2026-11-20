@@ -892,6 +892,7 @@ Every entry here is `correct as is`; none is tracked.
 | `MAX_BLOCK_SIZE` | `services/drivers/virtio/blk/src/lib.rs` | 4096 | hardware spec (one page, the unit clients read into) | none | correct as is | None |
 | `transfer_len` bound | `services/drivers/virtio/blk/src/lib.rs` | `u32::MAX / block_size` blocks | hardware spec (VirtIO descriptor length) | none | correct as is | None |
 | `REQUEST_TIMEOUT` | `services/drivers/virtio/blk/src/io.rs` | 50 s | tuning | none | correct as is | None |
+| virtio-blk `SLOW_REQUEST` | `services/drivers/virtio/blk/src/lib.rs` | 1 s from a request's map to its unmap | diagnostic threshold (a tenth of procmgr's `FILE_CAP_CALL_TIMEOUT_MS`; a request past it is logged with its map, device and unmap times) | none | correct as is | None |
 | `EVENT_QUEUE_SIZE` | `services/drivers/virtio/input/src/input.rs` | 64 | BSS budget (64 x 8 B buffers in one DMA page) | one DMA page | correct as is | None |
 | `POLL_INTERVAL_MS` | `services/drivers/virtio/input/src/main.rs` | 20 | tuning (human input rate) | none | correct as is | None |
 | virtio-console `RX_BUFFERS`, `RX_BUFFER_LEN` | `services/drivers/virtio/console/src/main.rs` | 8 buffers of 512 B, fewer when the device's queue is smaller | fixed allocation (the buffers fill one memmgr DMA page) and ABI width (`RX_BUFFER_LEN` is asserted equal to one read reply, `MSG_DATA_WORDS_MAX * 8`) | one DMA page | correct as is | None |
@@ -930,6 +931,7 @@ Every entry here is `correct as is`; none is tracked.
 | `track_outstanding` limit | `services/fs/fat/src/file.rs` | the cache's slot ceiling, pages per open, the table grown on demand | follows the cache | none | correct as is | None |
 | eviction queue | `services/fs/fat/src/eviction.rs` | heap `VecDeque`, one entry per outstanding page at most | provably unreachable (each page is queued at most once) | none | correct as is | None |
 | `RELEASE_TIMEOUT_MS` | `services/fs/fat/src/eviction.rs` | 100 ms | tuning | none | correct as is | None |
+| fatfs `SLOW_REQUEST` | `services/fs/fat/src/held.rs` | 10 s from a request's receipt to the end of its dispatch | diagnostic threshold (procmgr's `FILE_CAP_CALL_TIMEOUT_MS`; a request past it is logged with its label and its block calls' time) | none | correct as is | None |
 | `MAX_WATCHDOGS` | `services/fs/fat/src/eviction.rs` | 4 watchdog threads alive at once | tuning (past it a release skips the advisory round trip) | none | correct as is | Cancel a blocked call (#31) |
 | `SLOT_COUNT`, `SLOT_RAM_DIVISOR`, `slot_ceiling` (`PageCache.slots`) | `services/fs/fat/fat-parse/src/lib.rs` | one slot per 512 pages of RAM, at least 256, fixed at init; each page taken from memmgr when a miss needs its slot, and given back idle when memmgr's level turns `Low` or `Critical` | per-instance, RAM-scaled | a slot table entry per slot, and the slots filled | correct as is | None |
 | `QUARANTINE_MAX` | `services/fs/fat/fat-parse/src/lib.rs` | 32 | tuning (bounds what non-unmapping clients cost) | 256 B | correct as is | None (#52) |

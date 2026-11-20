@@ -137,7 +137,9 @@ stub's endpoint.
   finds blocked in an interruptible syscall returns from it with `Interrupted`
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Asynchronous Upcalls, Blocking
   syscalls), so each all-stop can end a sleep, a wait, or an IPC call of the target early, as any
-  stop can.
+  stop can. A thread that masks upcalls across a call (`ipc::ipc_call_masked`, as devmgr's calls
+  to the IOMMU driver are made) is not interrupted: its upcall arrives once the server replies,
+  and a reply later than `STOP_WAIT` leaves the thread running, unheld.
 - **Crediting a stop.** A thread the target spawns after the attach copies its spawner's bindings,
   the stub's badge among them, so its stops arrive under its spawner's badge. The stub credits a
   stop to the thread its badge names only when that thread is not already held and its register

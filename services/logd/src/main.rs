@@ -187,8 +187,9 @@ fn main() -> !
     // endpoint: after the release the endpoint has no reader until the
     // receive pool's gate opens, and devmgr may then be logging
     // (`services/devmgr/docs/responsibilities.md`, the on-disk settle).
-    // Until a driver is resolved its output is dropped (init-logd covered
-    // the pre-driver window) while history still accrues; the main thread
+    // Until a driver is resolved its sink queues the lines, up to its queue,
+    // counts those past it, and writes both to the driver resolved next
+    // (`Sink::offer`), while history still accrues; the main thread
     // resolves it again when devmgr signals its class's watch.
     let watches = resolve_output_drivers(caps.serial_class, caps.fb_class, ipc_buf);
     let Some(resync_note) = create_resync_note()
@@ -1051,11 +1052,18 @@ struct OutputDriver
     /// carried none.
     class: AtomicU64,
     /// The SEND on the driver's service endpoint; 0 while none is resolved,
-    /// and the emit path then drops the bytes.
+    /// and the sink then queues its lines for the driver resolved next
+    /// ([`Sink::offer`]).
     cap: AtomicU64,
     /// The driver's instance ordinal in its class, while `cap` is nonzero.
     /// Only the main thread reads it.
     ordinal: AtomicU64,
+    /// Taken around the writer's look at `cap` and its wait, and by
+    /// [`Self::resolve`] before it signals [`Self::served`], so a driver
+    /// resolved between the look and the wait is not missed.
+    serving: Mutex<()>,
+    /// Signalled when [`Self::resolve`] has stored a driver.
+    served: Condvar,
 }
 
 impl OutputDriver
@@ -1066,6 +1074,8 @@ impl OutputDriver
             class: AtomicU64::new(0),
             cap: AtomicU64::new(0),
             ordinal: AtomicU64::new(0),
+            serving: Mutex::new(()),
+            served: Condvar::new(),
         }
     }
 
@@ -1073,6 +1083,32 @@ impl OutputDriver
     fn cap(&self) -> u64
     {
         self.cap.load(Ordering::Acquire)
+    }
+
+    /// The class SEND the bootstrap carried; 0 when it carried none, and no
+    /// driver of the class is ever resolved.
+    fn class(&self) -> u64
+    {
+        self.class.load(Ordering::Acquire)
+    }
+
+    /// The driver's SEND, waiting while none is resolved: the writer's wait
+    /// for a driver to write its next line to.
+    fn await_cap(&self) -> u64
+    {
+        let mut serving = self.serving.lock().unwrap_or_else(PoisonError::into_inner);
+        loop
+        {
+            let cap = self.cap();
+            if cap != 0
+            {
+                return cap;
+            }
+            serving = self
+                .served
+                .wait(serving)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     /// Record `class`, register the class watch, then resolve the driver,
@@ -1151,6 +1187,13 @@ impl OutputDriver
         if old != 0
         {
             let _ = syscall::cap_delete(old);
+        }
+        if cap != 0
+        {
+            // A writer that looked at `cap` before the store waits under the
+            // lock, so taking it here orders this signal after its wait began.
+            drop(self.serving.lock().unwrap_or_else(PoisonError::into_inner));
+            self.served.notify_all();
         }
     }
 }
@@ -1247,13 +1290,19 @@ impl Sink
     /// Hand `line` to the sink: queue it for the writer, waiting while the
     /// queue is full and the writer frees space until `deadline` at most, or
     /// drop it, counted, once the sink is stalled
-    /// ([`logd_codec::sink::SinkQueue::offer`]). The line's number when it is
-    /// queued and the sink is not stalled, for [`Self::await_written`]; `None`
+    /// ([`logd_codec::sink::SinkQueue::offer`]). While no driver is resolved
+    /// the sink is unserved: the line is queued for the driver resolved next
+    /// without a wait, or dropped and counted when the queue is full
+    /// ([`logd_codec::sink::SinkQueue::offer_unserved`]), so a driver that
+    /// comes up late, or a restarted one, is written the lines its absence
+    /// held back, then their count. The line's number when it is queued to a
+    /// served sink that is not stalled, for [`Self::await_written`]; `None`
     /// otherwise. Written here by [`Self::write_inline`], by `deadline`,
-    /// while no writer runs; dropped while no driver is resolved.
+    /// while no writer runs. Dropped uncounted when the bootstrap carried no
+    /// class SEND, so no driver can ever be resolved.
     fn offer(&self, line: &[u8], deadline: Instant) -> Option<u64>
     {
-        if self.driver.cap() == 0
+        if self.driver.class() == 0
         {
             return None;
         }
@@ -1265,15 +1314,24 @@ impl Sink
         let mut queue = self.lock();
         loop
         {
+            let unserved = self.driver.cap() == 0;
             let left = deadline.saturating_duration_since(Instant::now());
-            match queue.offer(line, left.is_zero())
+            let offered = if unserved
+            {
+                queue.offer_unserved(line)
+            }
+            else
+            {
+                queue.offer(line, left.is_zero())
+            };
+            match offered
             {
                 Offer::Queued(number) =>
                 {
                     let stalled = queue.is_stalled();
                     drop(queue);
                     self.queued.notify_one();
-                    return (!stalled).then_some(number);
+                    return (!stalled && !unserved).then_some(number);
                 }
                 Offer::Dropped =>
                 {
@@ -1329,13 +1387,15 @@ impl Sink
     /// that turn and every call end by `deadline`, so the caller waits on
     /// the sink for [`SINK_STALL_MS`] at most. A line not written whole by
     /// then is counted, and the count is written ahead of the next line an
-    /// inline write starts.
+    /// inline write starts. A line with no driver resolved to write it to is
+    /// counted the same way.
     fn write_inline(&self, line: &[u8], deadline: Instant)
     {
         let ipc_buf = emit_ipc_buf();
         let cap = self.driver.cap();
         if ipc_buf.is_null() || cap == 0
         {
+            self.inline_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         }
         {
@@ -1412,9 +1472,11 @@ impl Sink
     /// The writer thread: take each line in order and write it to the driver
     /// with calls that have no bound, so a line is written once, when the
     /// driver answers, however long it is stopped; report lines the sink
-    /// dropped where they were dropped ([`Self::report_drops`]). A call that
+    /// dropped where they were dropped ([`Self::report_drops`]). While no
+    /// driver is resolved it waits for one with the line it took, so the lines
+    /// queued meanwhile are written to the next driver resolved. A call that
     /// fails ends the line, and the next line goes to the driver resolved
-    /// then, if any; a call to a dead driver fails only once devmgr withdraws
+    /// then; a call to a dead driver fails only once devmgr withdraws
     /// it and revokes its endpoint. Each completed
     /// write releases the producers waiting for it and ends a stall.
     /// `other` is the sink the drop reports are also written to.
@@ -1441,12 +1503,13 @@ impl Sink
         }
     }
 
-    /// The writer's write of `bytes` to the driver resolved now, unbounded.
+    /// The writer's write of `bytes` to the driver resolved now, or to the
+    /// next one resolved while none is, unbounded.
     fn write_driver(&self, bytes: &[u8], ipc_buf: *mut u64)
     {
-        let cap = self.driver.cap();
-        if cap != 0 && !ipc_buf.is_null()
+        if !ipc_buf.is_null()
         {
+            let cap = self.driver.await_cap();
             write_chunks(cap, self.op, bytes, ipc_buf, 0);
         }
     }
@@ -1468,8 +1531,8 @@ impl Sink
         let mut text = SerialFmt::new();
         let _ = write!(
             text,
-            "{dropped} lines dropped from the {} output: its driver took none within \
-             {SINK_STALL_MS} ms",
+            "{dropped} lines dropped from the {} output: it had no driver, or its driver \
+             took none within {SINK_STALL_MS} ms",
             self.what
         );
         let mut line = LineBuf::new();
@@ -1480,8 +1543,9 @@ impl Sink
 
 /// The serial driver logd writes every line to.
 static SERIAL: Sink = Sink::new(ipc::serial_labels::SERIAL_WRITE_BYTES, "serial");
-/// The framebuffer driver logd mirrors every line to; none on a headless
-/// boot, and the mirror is then a no-op.
+/// The framebuffer driver logd mirrors every line to. A headless boot runs
+/// none, so the sink stays unserved: it queues lines up to its queue and
+/// counts the rest, and nothing is written to a screen ([`Sink::offer`]).
 static FB: Sink = Sink::new(ipc::fb_labels::FB_WRITE_BYTES, "framebuffer");
 
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` or `FB_WRITE_BYTES` (one

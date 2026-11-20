@@ -21,7 +21,7 @@
 
 use std::time::{Duration, Instant};
 
-use virtio_blk::IoOutcome;
+use virtio_blk::{IoOutcome, WaitTrace};
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::SplitVirtqueue;
 
@@ -38,6 +38,19 @@ pub enum IoDirection
     Read,
     /// Sector write: device DMAs data out of the caller-supplied memory cap.
     Write,
+}
+
+impl IoDirection
+{
+    /// The direction's name in a log line.
+    pub fn name(self) -> &'static str
+    {
+        match self
+        {
+            IoDirection::Read => "read",
+            IoDirection::Write => "write",
+        }
+    }
 }
 
 /// Block request header (`VirtIO` 1.2 section 5.2.6).
@@ -169,7 +182,8 @@ impl IoLayout
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 
 /// Submit a read or write request and wait for its completion via the
-/// completion notification, returning how the request ended.
+/// completion notification, returning how the request ended and the trace of
+/// its completion waits.
 ///
 /// [`IoOutcome::Completed`] carries the status byte of the completion of the
 /// submitted chain. [`IoOutcome::NotQueued`] means the chain never reached
@@ -190,7 +204,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 /// interrupt-service thread signals an interrupt (it has already read the
 /// ISR and acknowledged a wired line's delivery), and polls again. The
 /// notification keeps a signal sent before the wait, so a completion that
-/// lands between the poll and the wait ends the wait at once.
+/// lands between the poll and the wait ends the wait at once. Each wait's
+/// result goes into the returned [`WaitTrace`], which names what ended the
+/// last one.
 #[expect(
     clippy::too_many_arguments,
     reason = "layout + direction + sector + data_addr + data_len + three hardware handles \
@@ -208,8 +224,9 @@ pub fn submit_and_wait(
     transport: &PciTransport,
     queue_notify_off: u16,
     completion: u64,
-) -> IoOutcome
+) -> (IoOutcome, WaitTrace)
 {
+    let mut trace = WaitTrace::default();
     layout.prepare(dir, sector);
 
     let chain = match dir
@@ -220,7 +237,7 @@ pub fn submit_and_wait(
     let Some(head) = vq.add_chain(&chain)
     else
     {
-        return IoOutcome::NotQueued;
+        return (IoOutcome::NotQueued, trace);
     };
 
     // VirtIO 1.2 §2.9.3 "Driver Notifications": a full memory barrier is
@@ -239,19 +256,19 @@ pub fn submit_and_wait(
     {
         if let Some(outcome) = completed(vq, head, layout)
         {
-            return outcome;
+            return (outcome, trace);
         }
         let Some(wait_ms) = virtio_blk::completion_wait_ms(REQUEST_TIMEOUT, start.elapsed())
         else
         {
             // No completion within the bound: the request may still be in
             // flight.
-            return IoOutcome::Lost;
+            return (IoOutcome::Lost, trace);
         };
         // Ok(0) is a timeout, after which the next poll and the bound decide;
         // Err means the cap path failed, and polling until the bound is all
-        // that is left.
-        let _ = syscall::notification_wait_timeout(completion, wait_ms);
+        // that is left. Either way the trace records it.
+        trace.record(syscall::notification_wait_timeout(completion, wait_ms));
     }
 }
 

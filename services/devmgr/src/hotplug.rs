@@ -30,6 +30,7 @@ use crate::acpi::Reply;
 use crate::bind::{self, ConfigRegs};
 use crate::{Registry, caps, settle};
 use ipc::devmgr_errors as errors;
+use ipc::devmgr_labels;
 
 /// The step of the poller's waits for a Slot Control command and for a
 /// link, in milliseconds.
@@ -41,7 +42,9 @@ enum Grant
 {
     /// No grant is known yet ([`hp::SlotGrant::Wait`]): the host bridge's
     /// `_OSC` result has not arrived, or withholds native control while
-    /// devmgr does not know its platform description tables yet.
+    /// devmgr does not know its platform description tables yet. Or a grant
+    /// has come while devmgr's `CSpace` headroom is short
+    /// ([`hp::held_grant`]), and a later turn settles it.
     Waiting,
     /// devmgr manages the slot: the poller watches it.
     Managed,
@@ -60,6 +63,9 @@ struct Candidate
 {
     slot: Slot,
     grant: Grant,
+    /// Whether the slot's grant has waited for devmgr's `CSpace` headroom,
+    /// which is logged once.
+    held_back: bool,
 }
 
 /// A job the poller or acpid posts to the control thread, which runs the
@@ -234,6 +240,7 @@ impl Hotplug
             candidates.push(Candidate {
                 slot,
                 grant: Grant::Waiting,
+                held_back: false,
             });
         }
         let (posted, jobs) = mpsc::channel();
@@ -278,7 +285,10 @@ impl Hotplug
     /// bridge's `_OSC` result withholds it, or failed, is left to the
     /// firmware ([`Grant::Firmware`]), logged, once the platform description
     /// tables are known and grant none; until then it waits, as does a slot
-    /// with no `_OSC` result.
+    /// with no `_OSC` result. Either keeps capabilities, so a slot whose grant
+    /// has come waits while devmgr's `CSpace` headroom is short and its
+    /// top-up refused ([`hp::held_grant`]), logged once, and a later turn
+    /// settles it.
     pub fn grant(
         &mut self,
         bridges: &Bridges,
@@ -300,7 +310,26 @@ impl Hotplug
             let slot = candidate.slot;
             let (s, b, _, _) = slot.port;
             let osc = hp::host_bridge(bridges, s, b).and_then(|bridge| bridge.osc);
-            let grant = match (hp::slot_grant(osc, self.platform_grant), osc)
+            let decided = hp::slot_grant(osc, self.platform_grant);
+            let settled = hp::held_grant(decided, crate::headroom::hold);
+            if settled != decided
+            {
+                if !candidate.held_back
+                {
+                    let (_, _, d, f) = slot.port;
+                    std::os::seraph::log!(
+                        warn: "hotplug: slot {}:{}:{}.{}: CSpace short of its headroom; its grant \
+                               waits",
+                        s, b, d, f
+                    );
+                }
+                if let Some(candidate) = self.candidates.get_mut(index)
+                {
+                    candidate.held_back = true;
+                }
+                continue;
+            }
+            let grant = match (settled, osc)
             {
                 (hp::SlotGrant::Manage(by), _) =>
                 {
@@ -436,6 +465,12 @@ impl Hotplug
     /// lie behind the slot, as a device check of a card already recorded
     /// does. Each acpid job ends with its reply: the functions recorded or
     /// removed.
+    ///
+    /// An add job keeps capabilities, so while devmgr's `CSpace` headroom
+    /// is short and its top-up refused it is refused, logged, and records
+    /// nothing (`firmware::headroom::hotplug_refusal`): acpid's is answered
+    /// `OUT_OF_RESOURCES`, and a managed slot's card stays unrecorded until
+    /// its removal. A removal job runs whatever the headroom.
     pub fn run(
         &self,
         registry: &Registry,
@@ -514,37 +549,68 @@ impl Hotplug
                 }
                 continue;
             }
-            if matches!(owner, Owner::Acpi(_))
-            {
-                if records.live_pci().any(|r| slot.holds(address(r)))
-                {
-                    std::os::seraph::log!(
-                        "hotplug: slot {}:{}:{}.{}: the firmware reports a card, whose functions \
-                         are recorded; nothing added",
-                        s,
-                        b,
-                        d,
-                        f
-                    );
-                    owner.reply(Reply::success(&[0]));
-                    continue;
-                }
-                std::os::seraph::log!(
-                    "hotplug: slot {}:{}:{}.{}: card added (the firmware's device check)",
-                    s,
-                    b,
-                    d,
-                    f
-                );
-            }
-            let added = add(&slot, records, carve.caps);
-            if added > 0
-            {
-                bind_added(registry, records, carve, watch, ipc_buf);
-            }
-            owner.reply(Reply::success(&[u64::try_from(added).unwrap_or(u64::MAX)]));
+            run_add(&slot, &owner, registry, records, carve, watch, ipc_buf);
         }
     }
+}
+
+/// Run the add job of `slot`, posted by `owner`, to its reply
+/// ([`Hotplug::run`]): an acpid job records nothing while live records lie
+/// behind the slot, and any add job is refused, recording nothing, while
+/// devmgr's `CSpace` headroom is short and its top-up refused
+/// (`firmware::headroom::hotplug_refusal`); else [`add`], then
+/// [`bind_added`] when it recorded a function.
+fn run_add(
+    slot: &Slot,
+    owner: &Owner,
+    registry: &Registry,
+    records: &mut bind::Records,
+    carve: &mut bind::Carve,
+    watch: &mut settle::DriverWatch,
+    ipc_buf: *mut u64,
+)
+{
+    let (s, b, d, f) = slot.port;
+    if matches!(owner, Owner::Acpi(_))
+    {
+        if records.live_pci().any(|r| slot.holds(address(r)))
+        {
+            std::os::seraph::log!(
+                "hotplug: slot {}:{}:{}.{}: the firmware reports a card, whose functions \
+                 are recorded; nothing added",
+                s,
+                b,
+                d,
+                f
+            );
+            owner.reply(Reply::success(&[0]));
+            return;
+        }
+        std::os::seraph::log!(
+            "hotplug: slot {}:{}:{}.{}: card added (the firmware's device check)",
+            s,
+            b,
+            d,
+            f
+        );
+    }
+    if let Some(code) = firmware::headroom::hotplug_refusal(devmgr_labels::HOTPLUG_ADDED)
+        && !crate::headroom::hold()
+    {
+        std::os::seraph::log!(
+            warn: "hotplug: slot {}:{}:{}.{}: CSpace short of its headroom; card not \
+                   added, nothing recorded",
+            s, b, d, f
+        );
+        owner.reply(Reply::status(code));
+        return;
+    }
+    let added = add(slot, records, carve.caps);
+    if added > 0
+    {
+        bind_added(registry, records, carve, watch, ipc_buf);
+    }
+    owner.reply(Reply::success(&[u64::try_from(added).unwrap_or(u64::MAX)]));
 }
 
 /// Bind the functions an add job recorded, in a drivers-directory pass of

@@ -78,7 +78,9 @@ lock, so a line of each written at once interleaves byte by byte, and a reader o
 sees neither line whole. logd therefore writes nothing to the serial driver of its own before the
 release. It resolves the serial and framebuffer drivers through devmgr before the pull, writing
 nothing, so that its first write after the release does not call devmgr while the log endpoint has
-no reader; and it holds each line it self-logs, at most `SELF_LOG_HELD_MAX` (8) of them, and writes
+no reader. A driver devmgr does not serve by then is resolved later on its class watch, and its
+sink queues the lines meanwhile ([`ipc-interface.md`](ipc-interface.md) § Output sinks). It also
+holds each line it self-logs, at most `SELF_LOG_HELD_MAX` (8) of them, and writes
 them in order, with the time each was logged, once `handover::transfer` returns. A line past that
 bound is dropped and counted, and logd writes the count in one line after the held ones. Init-logd
 writes its last line, `handover complete; init-logd thread exiting`, before it acknowledges the

@@ -23,7 +23,10 @@
 //! mapping, and the thread has the IOMMU driver install the mapping (`MAP`,
 //! with a derivation of the carried Memory cap) before it replies, and
 //! withdraw it (`UNMAP`) before it deletes the cap; an unconfined device's
-//! device address is its frames' physical address. The table is shared with
+//! device address is its frames' physical address. Each IOMMU call is made
+//! with the thread's upcalls masked (`crate::iommu`'s `call_on`), so a
+//! debugger's stop of devmgr waits for the driver's reply rather than cutting
+//! the call short. The table is shared with
 //! the control thread, which withdraws a device's grant
 //! ([`DmaGrant::withdraw`], which blocks a confined device in the IOMMU and
 //! hands back the Memory caps of the device's standing mappings, deleted only

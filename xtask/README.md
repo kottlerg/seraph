@@ -748,16 +748,21 @@ an earlier one left under `target/xtask/run-parallel/`, so the preserved files a
    after `--fail-grace-secs`, bounded by `--timeout`; the verdict is unchanged)
 2. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
    which is the normal case for kernels that idle after success)
-3. Watchdog timeout → `HANG`
-4. Exit code 0 with no marker → `OK`
-5. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator
+3. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
+   (`[<seconds>] [<name>] ...`) after it → `FAIL`, its reason naming the lost console: real-logd,
+   which owns the console from the handover on, wrote nothing to it. A run with nothing at all
+   after that line, as one the watchdog cut off there, is not judged by it, nor is a run killed by
+   SIGSEGV or SIGABRT (rule 6), nor a boot with no handover (ktest)
+4. Watchdog timeout → `HANG`
+5. Exit code 0 with no marker → `OK`
+6. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator
    crashed, not the guest. Tallied in the summary and preserved as
    `QEMU-CRASH-<run>.log`, but does **not** fail the run (infrastructure flake,
    not a regression in the OS under test; the recurring case is the QEMU 8.2.x
    multi-threaded-TCG segfault,
    [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
    SIGKILL is excluded (the `--timeout` kill, or an OOM).
-6. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
+7. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
    e.g. `139` for SIGSEGV)
 
 ---

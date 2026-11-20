@@ -1896,29 +1896,31 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
     let deferred_bytes = l.deferred.pages().saturating_mul(PAGE_SIZE);
     let largest_bytes = l.pool.largest_pages(&l.arena).saturating_mul(PAGE_SIZE);
     let reserve_bytes = reserve_pages(pool_total_pages()).saturating_mul(PAGE_SIZE);
+    // One `words` call: a chain of `word` calls copies the builder once per
+    // word, past the stack-frame bound.
+    let words = [
+        boot.system_ram_bytes,
+        boot.kernel_reserved_bytes,
+        pool_total_bytes,
+        free_bytes,
+        deferred_bytes,
+        largest_bytes,
+        reserve_bytes,
+        pressure_wire(current_pressure()),
+        l.promised().saturating_mul(PAGE_SIZE),
+        l.store_pages().saturating_mul(PAGE_SIZE),
+        l.swapped_pages().saturating_mul(PAGE_SIZE),
+        l.growth_floor(pool_total_pages()).saturating_mul(PAGE_SIZE),
+        l.disk_pages().saturating_mul(PAGE_SIZE),
+        disk::free_slots(l),
+        l.evictions(),
+        l.allowance().saturating_mul(PAGE_SIZE),
+        draw_room_pages(l).saturating_mul(PAGE_SIZE),
+        l.uncommitted_free().saturating_mul(PAGE_SIZE),
+        l.committed_swapped().saturating_mul(PAGE_SIZE),
+    ];
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
-        .word(0, boot.system_ram_bytes)
-        .word(1, boot.kernel_reserved_bytes)
-        .word(2, pool_total_bytes)
-        .word(3, free_bytes)
-        .word(4, deferred_bytes)
-        .word(5, largest_bytes)
-        .word(6, reserve_bytes)
-        .word(7, pressure_wire(current_pressure()))
-        .word(8, l.promised().saturating_mul(PAGE_SIZE))
-        .word(9, l.store_pages().saturating_mul(PAGE_SIZE))
-        .word(10, l.swapped_pages().saturating_mul(PAGE_SIZE))
-        .word(
-            11,
-            l.growth_floor(pool_total_pages()).saturating_mul(PAGE_SIZE),
-        )
-        .word(12, l.disk_pages().saturating_mul(PAGE_SIZE))
-        .word(13, disk::free_slots(l))
-        .word(14, l.evictions())
-        .word(15, l.allowance().saturating_mul(PAGE_SIZE))
-        .word(16, draw_room_pages(l).saturating_mul(PAGE_SIZE))
-        .word(17, l.uncommitted_free().saturating_mul(PAGE_SIZE))
-        .word(18, l.committed_swapped().saturating_mul(PAGE_SIZE))
+        .words(0, &words)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

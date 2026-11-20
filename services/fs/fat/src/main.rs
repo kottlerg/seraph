@@ -242,7 +242,8 @@ fn pressure_thread(wake: u64)
         {
             Ok(MemoryPressure::Low | MemoryPressure::Critical) =>
             {}
-            Ok(MemoryPressure::Normal) => continue,
+            // `Normal`: no shortage to act on.
+            Ok(_) => continue,
             Err(e) =>
             {
                 std::os::seraph::log!(warn: "memory-pressure wait failed ({e}); cache kept under pressure");

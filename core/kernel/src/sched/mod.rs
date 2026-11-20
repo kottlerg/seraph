@@ -17,6 +17,7 @@
 )]
 
 pub mod deadline_heap;
+pub mod hold;
 pub mod run_queue;
 pub mod thread;
 #[cfg(not(test))]
@@ -2896,6 +2897,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     park_started_tick: 0,
                     park_seq: core::sync::atomic::AtomicU32::new(0),
                     start_seq: 0,
+                    hold: crate::sched::hold::HoldMark::None,
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),

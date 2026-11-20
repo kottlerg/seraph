@@ -1624,6 +1624,7 @@ unsafe fn kernel_entry_post_rebase(
                         park_started_tick: 0,
                         park_seq: core::sync::atomic::AtomicU32::new(0),
                         start_seq: 0,
+                        hold: crate::sched::hold::HoldMark::None,
                         ipc_state: sched::thread::IpcThreadState::None,
                         ipc_msg: ipc::message::Message::default(),
                         reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),

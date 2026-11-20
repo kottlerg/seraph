@@ -829,6 +829,17 @@ pub struct ThreadControlBlock
     /// 2^32 starts.
     pub start_seq: u32,
 
+    /// What an address-space hold has done to this thread
+    /// ([`HoldMark`](crate::sched::hold::HoldMark)): `Pending` while the hold
+    /// waits for it to leave `Running` or `Blocked`, whose next passage toward
+    /// `Ready` commits `Stopped` instead (`enqueue_and_wake`, `schedule()`'s
+    /// requeue), `Stopped` once the hold has stopped it or deferred its start,
+    /// so that the release starts it. Owned by [`sched_lock`](Self::sched_lock):
+    /// every read and write holds it (the bare-field exception of
+    /// docs/coding-standards.md § Concurrency); see
+    /// core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space Hold.
+    pub hold: crate::sched::hold::HoldMark,
+
     // === IPC state ===
     /// Current IPC blocking reason (None when not blocked on IPC). Owned, with
     /// [`blocked_on_object`](Self::blocked_on_object), by two locks: the park

@@ -76,6 +76,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     mm::bench_aspace_harvest(ctx, iters);
     thread::bench_thread_lifecycle(ctx, iters);
     thread::bench_context_switch(ctx, iters);
+    thread::bench_thread_read_mem(ctx, iters);
     event::bench_event_post_recv(ctx, iters);
     wait_set::bench_wait_set(ctx, iters);
     tlb::bench_tlb_shootdown(ctx, iters);

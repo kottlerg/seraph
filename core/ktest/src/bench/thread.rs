@@ -202,3 +202,72 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     crate::log_u64("ktest: bench  ctxsw_flush_elided_total=", elided);
     crate::log_u64("ktest: bench  ctxsw_flush_performed_total=", performed);
 }
+
+// ── SYS_THREAD_READ_MEM throughput ────────────────────────────────────────────
+
+/// Pages [`bench_thread_read_mem`] reads, cycled through in order.
+const READ_MEM_PAGES: usize = 16;
+
+/// The page-aligned buffer [`bench_thread_read_mem`] reads through a thread
+/// of ktest's own address space.
+#[repr(C, align(4096))]
+struct ReadMemSource([u8; READ_MEM_PAGES * 4096]);
+
+static BENCH_READ_MEM_SOURCE: ReadMemSource = ReadMemSource([0x5A; READ_MEM_PAGES * 4096]);
+
+/// The page-aligned buffer each read copies into.
+#[repr(C, align(4096))]
+struct ReadMemSink([u8; 4096]);
+
+static mut BENCH_READ_MEM_SINK: ReadMemSink = ReadMemSink([0; 4096]);
+
+/// Benchmark: `SYS_THREAD_READ_MEM` of one whole page (`MAX_THREAD_MEM_COPY`)
+/// through a never-started thread of ktest's own address space, cycling over
+/// [`READ_MEM_PAGES`] resident pages: the per-page cost a debugger pays to
+/// copy a process's memory (docs/fault-handling.md § Debugging).
+pub(super) fn bench_thread_read_mem(ctx: &crate::TestContext, iters: u32)
+{
+    use crate::spawn;
+
+    let Ok(mut child) = spawn::new_child(ctx)
+    else
+    {
+        return;
+    };
+    let base = core::ptr::addr_of!(BENCH_READ_MEM_SOURCE) as u64;
+    // SAFETY: `BENCH_READ_MEM_SINK` is reached only here, on ktest's one
+    // thread, and the reference is the only one alive while the loop runs.
+    let sink = unsafe { &mut (*core::ptr::addr_of_mut!(BENCH_READ_MEM_SINK)).0 };
+
+    let mut min = u64::MAX;
+    let mut max = 0u64;
+    let mut total = 0u64;
+    let mut completed: u64 = 0;
+    for i in 0..iters
+    {
+        let page = (i as usize) % READ_MEM_PAGES;
+        let va = base.wrapping_add((page as u64).wrapping_mul(4096));
+        let t0 = cycles_now();
+        let read = syscall::thread_read_mem(child.th, va, sink);
+        let t1 = cycles_now();
+        if read != Ok(4096)
+        {
+            break;
+        }
+        let delta = t1.saturating_sub(t0);
+        min = min.min(delta);
+        max = max.max(delta);
+        total = total.saturating_add(delta);
+        completed = completed.saturating_add(1);
+    }
+    child.delete_thread().ok();
+    child.delete_cspace().ok();
+
+    log_bench_header("thread_read_mem_page", iters);
+    if let Some(mean) = total.checked_div(completed)
+    {
+        crate::log_u64("ktest: bench  cycles_min=", min);
+        crate::log_u64("ktest: bench  cycles_mean=", mean);
+        crate::log_u64("ktest: bench  cycles_max=", max);
+    }
+}

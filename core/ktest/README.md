@@ -443,6 +443,7 @@ thread,event,wait_set,tlb}.rs`). Benchmarks log min/mean/max cycle counts
 | `aspace_harvest_none_accessed` | `SYS_ASPACE_HARVEST` of 32 pages nothing touches between calls; logs cycles per harvested page |
 | `thread_lifecycle` | Full thread create → start → exit → cleanup |
 | `context_switch` | Parent/child `thread_yield` ping-pong on one CPU; reports cycles per switch |
+| `thread_read_mem_page` | `SYS_THREAD_READ_MEM` of one whole page through a never-started thread of ktest's own address space, cycling over 16 resident pages |
 | `event_post_recv` | `event_post` + `event_recv` on a pre-created queue |
 | `wait_set_cycle` | Wait set create → add → wait → remove → delete |
 | `tlb_shootdown_unmap` | `mem_unmap` cost when ktest's aspace is `current` on every CPU (spinners pinned per CPU); logs `cpus=N` |

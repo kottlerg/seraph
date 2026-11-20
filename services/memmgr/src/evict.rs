@@ -375,14 +375,20 @@ fn reclaiming(l: &MemLedger) -> bool
 /// `data[16]`). The frames then go to the committed draws, which
 /// `promised` keeps them for, and to the restores, and not to the next
 /// admission, so eviction runs at `CRITICAL` too, and any evictable idle
-/// chunk is a victim.
+/// chunk whose eviction frees a page above the growth floor is a victim
+/// ([`free_pool::Ledger::evicting_opens`]).
 fn frames_short(l: &MemLedger) -> bool
 {
     let total = pool_total_pages();
-    l.frames_short(
-        l.growth_floor(total),
-        band(total).max(u64::from(DEMAND_CHUNK_PAGES)),
-    )
+    l.frames_short(l.growth_floor(total), short_band(total))
+}
+
+/// The band above the growth floor within which free frames short of
+/// `promised` make memmgr evict for frames: the hysteresis band, or a demand
+/// chunk's pages when the band is less.
+fn short_band(total: u64) -> u64
+{
+    band(total).max(u64::from(DEMAND_CHUNK_PAGES))
 }
 
 /// Whether the clock runs: the worker runs and the pressure level reads
@@ -397,8 +403,8 @@ pub(crate) fn clocking() -> bool
 /// jobs, then, while the clock runs and the interval since the last slice has
 /// passed, run a slice of it. While memmgr reclaims, the slice finds the cold
 /// chunks and posts a job for each whose eviction raises the free pages
-/// outside `promised`, or for each while it evicts for frames, as many as
-/// there are free slots;
+/// outside `promised`, or, while it evicts for frames, those above the
+/// growth floor, as many as there are free slots;
 /// otherwise it finds the chunks idle for [`RECLAIM_IDLE_SWEEPS`]. The rest
 /// it finds are kept for direct reclaim ([`keep_victims`]).
 pub(crate) fn turn(l: &mut MemLedger)
@@ -426,22 +432,28 @@ pub(crate) fn turn(l: &mut MemLedger)
         RECLAIM_IDLE_SWEEPS
     };
     let mut victims = [Victim::default(); JOB_SLOTS + VICTIM_CACHE];
-    let found = l.sweep(
+    // While memmgr evicts for frames, the victims whose eviction opens the
+    // draw room take the place of others the slice found first.
+    let total = pool_total_pages();
+    let opens = |l: &MemLedger, reg: NodeIdx| frames && l.evicting_opens(reg, total);
+    let found = l.sweep_preferring(
         &mut ev.hand,
         SWEEP_SLICE_STEPS,
         |aspace, va, pages, bitmap| syscall::aspace_harvest(aspace, va, pages, bitmap).is_ok(),
         &mut victims,
         idle,
+        opens,
     );
-    // While memmgr reclaims, each victim whose eviction raises the free pages
-    // outside `promised`, or any while it evicts for frames, takes a free job
-    // slot; the rest are kept.
+    // While memmgr reclaims, each victim background eviction takes
+    // ([`free_pool::Ledger::evicts_in_background`]) takes a free job slot; the
+    // rest are kept.
+    let level = current_pressure();
+    let short_band = short_band(total);
     let mut kept = [Victim::default(); JOB_SLOTS + VICTIM_CACHE];
     let mut n: usize = 0;
     for v in victims.get(..found).unwrap_or(&[])
     {
-        if background
-            && (frames || l.evicting_frees(v.reg))
+        if l.evicts_in_background(v.reg, total, level, short_band)
             && let Some(slot) = STATE.iter().position(|s| s.load(Ordering::Relaxed) == FREE)
         {
             post(l, v, slot);
@@ -453,7 +465,7 @@ pub(crate) fn turn(l: &mut MemLedger)
             n = n.saturating_add(1);
         }
     }
-    keep_victims(l, kept.get(..n).unwrap_or(&[]));
+    keep_victims(l, kept.get(..n).unwrap_or(&[]), opens);
 }
 
 /// What a victim's eviction is for.
@@ -463,31 +475,44 @@ enum Need
     /// The free pages outside `promised`: background eviction and an
     /// uncommitted restore's direct reclaim, whose victims must raise them.
     Free,
-    /// Free pages alone: a committed draw, which takes any evictable victim.
+    /// The free pages above the growth floor: a committed draw of a process
+    /// outside the system reserve ([`free_pool::Ledger::evicting_opens`]).
+    Draw,
+    /// Free pages alone: a committed draw of a reserve node, which takes any
+    /// evictable victim.
     Frames,
 }
 
 /// Whether the victim `v` may still be evicted, as a chunk idle for `idle`
-/// sweeps of an eligible region of a process memmgr can unmap, and, unless
-/// `need` is [`Need::Frames`], whether evicting it raises the free pages
-/// outside `promised` ([`free_pool::Ledger::evicting_frees`]).
+/// sweeps of an eligible region of a process memmgr can unmap, and whether
+/// evicting it gives what `need` asks: the free pages outside `promised`
+/// ([`free_pool::Ledger::evicting_frees`]) for [`Need::Free`], those above
+/// the growth floor ([`free_pool::Ledger::evicting_opens`]) for
+/// [`Need::Draw`], any for [`Need::Frames`].
 fn still_victim(l: &MemLedger, v: &Victim, idle: u8, need: Need) -> bool
 {
     l.region_for(v.rec, v.page_base)
         .is_some_and(|(reg, _)| reg == v.reg)
         && l.evictable(v.rec, v.reg)
-        && (need == Need::Frames || l.evicting_frees(v.reg))
+        && match need
+        {
+            Need::Free => l.evicting_frees(v.reg),
+            Need::Draw => l.evicting_opens(v.reg, pool_total_pages()),
+            Need::Frames => true,
+        }
         && l.aspace_cap(v.rec) != 0
         && l.chunk_at(v.reg, v.page_base).is_idle(idle)
 }
 
 /// Keep `found` for direct reclaim: drop the kept victims that may no longer
 /// be evicted, then add each of `found` not kept already while there is
-/// room. A victim whose eviction raises the free pages outside `promised`
-/// ([`Need::Free`]) takes the place of a kept one only a committed draw may
-/// take when there is none, so committed victims never crowd out those an
-/// uncommitted restore needs.
-fn keep_victims(l: &MemLedger, found: &[Victim])
+/// room. When there is none, a victim `opens` names (one whose eviction opens
+/// the draw room while memmgr evicts for frames, [`Need::Draw`]) takes the
+/// place of a kept one it does not name, and otherwise a victim whose eviction
+/// raises the free pages outside `promised` ([`Need::Free`]) takes the place
+/// of a kept one only a committed draw may take, so neither need's victims
+/// crowd out the other's.
+fn keep_victims(l: &MemLedger, found: &[Victim], opens: impl Fn(&MemLedger, NodeIdx) -> bool)
 {
     let cache = &mut evictor().cache;
     for kept in cache.iter_mut()
@@ -503,16 +528,16 @@ fn keep_victims(l: &MemLedger, found: &[Victim])
         {
             continue;
         }
-        let frees = l.evicting_frees(v.reg);
-        let slot = cache.iter().position(Option::is_none).or_else(|| {
-            frees
-                .then(|| {
-                    cache
-                        .iter()
-                        .position(|k| k.is_some_and(|k| !l.evicting_frees(k.reg)))
-                })
+        let replaces = |better: &dyn Fn(NodeIdx) -> bool| {
+            better(v.reg)
+                .then(|| cache.iter().position(|k| k.is_some_and(|k| !better(k.reg))))
                 .flatten()
-        });
+        };
+        let slot = cache
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| replaces(&|reg| opens(l, reg)))
+            .or_else(|| replaces(&|reg| l.evicting_frees(reg)));
         if let Some(k) = slot.and_then(|i| cache.get_mut(i))
         {
             *k = Some(*v);
@@ -1194,9 +1219,11 @@ fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
 /// pool (a fault in a committed region, or a restore of a committed chunk,
 /// each drawing from `promised`): as many as
 /// [`free_pool::Ledger::draw_room`] gives above [`draw_floor`]. When that is
-/// short of `least`, after the turn's
-/// deferred recheck, memmgr evicts victims in its turn as a restore's direct
-/// reclaim does, any evictable chunk among them, until the draw fits or
+/// short of `least`, after the turn's deferred recheck, memmgr evicts victims
+/// in its turn as a restore's direct reclaim does, each whose eviction frees a
+/// page above the floor ([`Need::Draw`]: a committed chunk, or an uncommitted
+/// one once the restore headroom is full), any for a reserve node, until the
+/// draw fits or
 /// [`MAX_SYNC_VICTIMS`] have been tried (services/memmgr/docs/memory-pool.md
 /// § Commit, Overcommit); `spare`, a region and the base of a chunk of it,
 /// names the chunk a fault backs, which is never taken. With no swap slot
@@ -1211,7 +1238,8 @@ pub(crate) fn draw_room(
 ) -> u64
 {
     let floor = draw_floor(l, rec);
-    if !reclaim(l, Need::Frames, spare, |l| l.draw_room(floor) >= least)
+    let need = if floor == 0 { Need::Frames } else { Need::Draw };
+    if !reclaim(l, need, spare, |l| l.draw_room(floor) >= least)
     {
         return 0;
     }
@@ -1251,9 +1279,9 @@ fn reserve_of(l: &MemLedger, rec: NodeIdx) -> u64
 /// Whether `fits` holds, after the turn's deferred recheck and memmgr's
 /// direct reclaim when it does not (services/memmgr/docs/memory-pool.md
 /// § Eviction, Direct reclaim): the kept victims of greatest age evicted now,
-/// one by one ([`evict_now`]), each whose eviction raises the free pages
-/// outside `promised` or, for a committed draw ([`Need::Frames`]), any but the
-/// chunk at `spare` ([`draw_room`]), until `fits` holds or [`MAX_SYNC_VICTIMS`]
+/// one by one ([`evict_now`]), each whose eviction gives what `need` asks
+/// ([`still_victim`]) but the chunk at `spare`, which a committed draw
+/// ([`draw_room`]) never takes, until `fits` holds or [`MAX_SYNC_VICTIMS`]
 /// have been tried.
 fn reclaim(
     l: &mut MemLedger,

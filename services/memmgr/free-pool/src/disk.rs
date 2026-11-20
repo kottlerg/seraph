@@ -104,11 +104,14 @@ impl<W: WordStore> SwapSlots<W>
     }
 
     /// Set the registered slot count to `total`. Returns `false`, changing
-    /// nothing, when `total` is below a slot ever taken: a slot on the free
-    /// list or in use would then lie past the swap service's partition.
+    /// nothing, when `total` is 0, or below a slot ever taken: a slot on the
+    /// free list or in use would then lie past the swap service's partition.
+    /// A count once registered is never withdrawn, so the commitments promised
+    /// past the free pool on its slots keep their committed draws off the
+    /// growth floor (`crate::Ledger::overcommits`).
     pub fn set_total(&mut self, total: u64) -> bool
     {
-        if total < self.high || total > u64::from(u32::MAX)
+        if total == 0 || total < self.high || total > u64::from(u32::MAX)
         {
             return false;
         }
@@ -763,7 +766,12 @@ mod tests
         s.take(2).unwrap();
         assert!(s.release(1));
         assert!(!s.set_total(1));
+        assert!(!s.set_total(0));
         assert_eq!(s.total(), 4);
+        // No registration is of no slot, so none withdraws the slots before it.
+        let mut fresh = SwapSlots::new(VecWords::default());
+        assert!(!fresh.set_total(0));
+        assert_eq!(fresh.total(), 0);
         assert!(s.set_total(2));
         assert!(!s.set_total(u64::from(u32::MAX) + 1));
         assert_eq!(s.next_taken(0), Some((0, 1)));

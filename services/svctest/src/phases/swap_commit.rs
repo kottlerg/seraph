@@ -20,14 +20,16 @@
 //! commits [`WRITE_PAGES`] pages; svctest then takes the free pool down to the
 //! growth floor with grants ([`super::swap::Hog`]), so the commitment lies
 //! past the free frames, and the child writes every page of it with an
-//! incompressible pattern. A fault memmgr cannot back at once is declined as a
-//! commit overrun (code 11) and held by crashd, and resumed once write-out
-//! frees frames above the floor. svctest then returns its grants, and the child
-//! reads every page back. The phase requires the child's exit 0 (every page
-//! read back as written), crashd's log since the phase began holding at least
-//! one hold for want of commit draw room and one resume on it, and no hold that
-//! timed out, no fault crashd did not hold, and no crash report: no process
-//! was killed.
+//! incompressible pattern, [`STEP_PAGES`] at a time. A fault memmgr cannot
+//! back at once is declined as a commit overrun (code 11) and held by crashd,
+//! and resumed once write-out frees frames above the floor. After each step
+//! svctest counts crashd's new lines in logd's history before the child goes
+//! on, so none leaves the history uncounted. svctest then returns its grants,
+//! and the child reads every page back. The phase requires the child's exit 0
+//! (every page read back as written), crashd's lines since the phase began
+//! holding at least one hold for want of commit draw room and one resume on
+//! it, and no hold that timed out, no fault crashd did not hold, and no crash
+//! report: no process was killed.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::seraph::{reserve_pages, unreserve_pages};
@@ -48,6 +50,12 @@ const WRITER_ROLE: &str = "swap-commit-writer";
 /// Pages the child commits and writes: 16 MiB past the free frames, which
 /// memmgr backs by writing chunks to the swap slots.
 const WRITE_PAGES: u64 = 4096;
+/// Pages the child writes between svctest's counts of crashd's lines: four
+/// demand chunks, each at most one commit overrun, a hold and a resume, so a
+/// step's lines stay within the 16 entries logd keeps of one sender
+/// (services/logd/README.md § History buffer).
+const STEP_PAGES: u64 = 64;
+const _: () = assert!(WRITE_PAGES.is_multiple_of(STEP_PAGES));
 /// Pages past what memmgr may still promise the refused commitment asks:
 /// more than other processes free between the phase's read and its call.
 const PAST_MARGIN_PAGES: u64 = 256;
@@ -229,7 +237,8 @@ fn register(base: u64, len: u64) -> u64
 
 // ── The write part, parent side ──────────────────────────────────────────────
 
-/// crashd's lines since the phase began, counted.
+/// crashd's lines since the phase began, counted, and the newest history
+/// entry counted.
 #[derive(Default)]
 struct Lines
 {
@@ -238,29 +247,45 @@ struct Lines
     timed_out: usize,
     not_held: usize,
     crashes: usize,
+    last: u64,
 }
 
 impl Lines
 {
-    /// The lines logd's history holds after `seq`, read through `query`.
-    fn since(query: u64, seq: u64) -> Self
+    /// No lines counted, with the history entries up to sequence number `seq`
+    /// taken as counted.
+    fn after(seq: u64) -> Self
     {
-        let history = super::procmgr::logd_history_with(query, None, |e| (e.seq, e.bytes.to_vec()));
-        let mut lines = Self::default();
-        for (_, bytes) in history.iter().filter(|(s, _)| *s > seq)
-        {
-            let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        Self {
+            last: seq,
+            ..Self::default()
+        }
+    }
+
+    /// Count the entries logd's history holds past the newest counted, read
+    /// through `query`. It allocates nothing.
+    fn read(&mut self, query: u64)
+    {
+        let mut newest = self.last;
+        super::procmgr::logd_history_each(query, None, |e| {
+            if e.seq <= self.last
+            {
+                return false;
+            }
+            newest = newest.max(e.seq);
+            let has = |needle: &[u8]| e.bytes.windows(needle.len()).any(|w| w == needle);
             let count = |n: &mut usize, hit: bool| *n = n.saturating_add(usize::from(hit));
-            count(&mut lines.held, has(HELD_LINE));
-            count(&mut lines.resumed, has(RESUMED_LINE));
-            count(&mut lines.timed_out, has(TIMED_OUT_LINE));
+            count(&mut self.held, has(HELD_LINE));
+            count(&mut self.resumed, has(RESUMED_LINE));
+            count(&mut self.timed_out, has(TIMED_OUT_LINE));
             count(
-                &mut lines.not_held,
+                &mut self.not_held,
                 has(NOT_HELD_LINE) || has(NOT_DELIVERED_LINE),
             );
-            count(&mut lines.crashes, has(CRASH_LINE));
-        }
-        lines
+            count(&mut self.crashes, has(CRASH_LINE));
+            true
+        });
+        self.last = newest;
     }
 }
 
@@ -314,6 +339,28 @@ impl Writer
             .unwrap_or_else(|e| panic!("{PHASE}: write to the writer: {e:?}"));
     }
 
+    /// Read the child's next line during the write: `true` for `written`,
+    /// `false` for `step`, the end of a step.
+    fn written(&mut self) -> bool
+    {
+        self.line.clear();
+        let _ = self.stdout.read_line(&mut self.line);
+        match self.line.trim()
+        {
+            "written" => true,
+            "step" => false,
+            _ =>
+            {
+                let status = self.child.wait().ok();
+                panic!(
+                    "{PHASE}: the writer printed {:?} during the write and exited {status:?} (a \
+                     fault=it was killed)",
+                    self.line
+                );
+            }
+        }
+    }
+
     /// Read the child's next line and require it to be `want`.
     fn expect(&mut self, want: &str)
     {
@@ -337,7 +384,7 @@ impl Writer
 /// svctest's grants are returned. Returns crashd's lines.
 fn write_past_frames(query: u64) -> Lines
 {
-    let start = newest_seq(query);
+    let mut lines = Lines::after(newest_seq(query));
     let mut writer = Writer::start();
     let (_, promised, _, allowance) = status_pages();
     assert!(
@@ -352,7 +399,12 @@ fn write_past_frames(query: u64) -> Lines
     // svctest allocates nothing new.
     let filled = hog.fill_to_floor();
     writer.send(b"go\n");
-    writer.expect("written");
+    while !writer.written()
+    {
+        lines.read(query);
+        writer.send(b"next\n");
+    }
+    lines.read(query);
     hog.release_all();
     writer.send(b"check\n");
     let status = writer
@@ -365,15 +417,15 @@ fn write_past_frames(query: u64) -> Lines
          back other than written, {WRITER_BAD_LINE}=a line from svctest was not the one expected)"
     );
     let waited = Instant::now();
-    let lines = loop
+    loop
     {
-        let lines = Lines::since(query, start);
+        lines.read(query);
         if (lines.held > 0 && lines.resumed >= lines.held) || waited.elapsed() > LOG_WAIT
         {
-            break lines;
+            break;
         }
         std::thread::sleep(LOG_POLL);
-    };
+    }
     assert!(
         lines.held > 0 && lines.resumed > 0,
         "{PHASE}: crashd logged {} holds and {} resumes for want of commit draw room: no write \
@@ -422,7 +474,9 @@ const fn pattern(index: u64) -> u64
 const PAGE_WORDS: u64 = PAGE_SIZE / 8;
 
 /// Child role: commit [`WRITE_PAGES`] pages and print `ready`; on `go`, write
-/// every word of them with [`pattern`] and print `written`; on `check`, read
+/// every word of them with [`pattern`], [`STEP_PAGES`] at a time, printing
+/// `step` after each step but the last and waiting for `next`, and print
+/// `written`; on `check`, read
 /// every word back and exit 0, or [`WRITER_CORRUPT`] at the first that
 /// differs.
 fn writer_main() -> !
@@ -452,8 +506,13 @@ fn writer_main() -> !
         }
     };
     step(&mut out, b"ready\n", "go");
+    let step_words = STEP_PAGES * PAGE_WORDS;
     for i in 0..words
     {
+        if i != 0 && i.is_multiple_of(step_words)
+        {
+            step(&mut out, b"step\n", "next");
+        }
         let va = base.saturating_add(i.saturating_mul(8));
         // SAFETY: `va` is 8-aligned inside the range this process reserved
         // and registered with memmgr as a writable committed region, which no

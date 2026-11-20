@@ -59,8 +59,8 @@ use crate::disk::SwapSlots;
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
 use crate::{
-    CHUNK_BYTES, DEMAND_CHUNK_PAGES, DemandRegion, Evict, FreeRun, chunk_count, chunk_for,
-    chunk_index, region_contains, regions_overlap,
+    CHUNK_BYTES, DEMAND_CHUNK_PAGES, DemandRegion, Evict, FreeRun, PressureLevel, chunk_count,
+    chunk_for, chunk_index, region_contains, regions_overlap,
 };
 
 use syscall_abi::{MAX_HARVEST_PAGES, PAGE_SIZE};
@@ -210,9 +210,10 @@ pub struct Victim
 /// The state of one [`Ledger::sweep`]: the harvest, the victims written, the
 /// steps left of its budget, and the sweeps without an access that make a
 /// victim.
-struct Sweep<'a, H>
+struct Sweep<'a, H, P>
 {
     harvest: H,
+    prefer: P,
     victims: &'a mut [Victim],
     found: usize,
     left: u64,
@@ -457,12 +458,23 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// The free pages outside `promised` that a charge to a node outside the
     /// system reserve must leave in a pool of `pool_total` pages: the reserve,
-    /// and the restore headroom while chunks are evicted, compressed, writing
-    /// or on disk ([`budget::growth_floor`]).
+    /// and the restore headroom while chunks of uncommitted regions are
+    /// evicted, compressed, writing or on disk ([`Self::uncommitted_swapped`];
+    /// [`budget::growth_floor`]). A committed chunk's restore is a committed
+    /// draw, from `promised`, so its pages take no headroom.
     #[must_use]
     pub const fn growth_floor(&self, pool_total: u64) -> u64
     {
-        budget::growth_floor(pool_total, self.swapped_pages)
+        budget::growth_floor(pool_total, self.uncommitted_swapped())
+    }
+
+    /// The pages of the evicted chunks of uncommitted regions, compressed,
+    /// writing or on disk, whose restores the restore headroom keeps free
+    /// pages for: the swapped pages less those of committed regions.
+    #[must_use]
+    pub const fn uncommitted_swapped(&self) -> u64
+    {
+        self.swapped_pages.saturating_sub(self.committed_swapped)
     }
 
     /// The record slot keyed by `badge`, the badge of a process.
@@ -2063,9 +2075,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// service registered slots ([`Self::overcommits`]), and the record's
     /// budget node is not a reserve node, whose process frees memory under
     /// exhaustion and must not wait on a restore to do so
-    /// (`services/memmgr/docs/memory-pool.md` § Eviction). With no slot registered a committed chunk is not evicted:
-    /// its restore would draw from `promised`, so evicting it frees no page
-    /// outside it and takes store pages ([`Ledger::evicting_frees`]).
+    /// (`services/memmgr/docs/memory-pool.md` § Eviction). With no slot
+    /// registered a committed chunk is not evicted: its restore would draw from
+    /// `promised`, so evicting it frees no page outside it and takes store
+    /// pages ([`Ledger::evicting_frees`]).
     #[must_use]
     pub fn evictable(&self, rec: NodeIdx, reg: NodeIdx) -> bool
     {
@@ -2093,6 +2106,44 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     {
         !self.is_committed(reg)
             || self.promised.saturating_add(u64::from(DEMAND_CHUNK_PAGES)) <= self.allowance()
+    }
+
+    /// Whether evicting a chunk of region `reg` raises the free pages above
+    /// the growth floor of a pool of `pool_total` pages, which a committed
+    /// draw outside the system reserve takes ([`Self::draw_room`]). A
+    /// committed chunk's eviction frees its frames and moves no floor. An
+    /// uncommitted one's raises the restore headroom by its pages, at least
+    /// what it frees, until the headroom reaches the reserve, so only past
+    /// that does it free a page above the floor.
+    #[must_use]
+    pub fn evicting_opens(&self, reg: NodeIdx, pool_total: u64) -> bool
+    {
+        self.is_committed(reg)
+            || budget::restore_headroom(pool_total, self.uncommitted_swapped())
+                >= budget::reserve_pages(pool_total)
+    }
+
+    /// Whether background eviction in a pool of `pool_total` pages at pressure
+    /// `level` takes a victim of region `reg`: at `LOW` one whose eviction
+    /// raises the free pages outside `promised` ([`Self::evicting_frees`]),
+    /// and while it evicts for frames ([`Self::frames_short`] with the growth
+    /// floor and `band`) one whose eviction raises those above the growth
+    /// floor ([`Self::evicting_opens`]). At `CRITICAL` an uncommitted chunk's
+    /// eviction short of a full restore headroom opens no draw room and leaves
+    /// the free pages its own restore needs short, so it waits for a direct
+    /// reclaim.
+    #[must_use]
+    pub fn evicts_in_background(
+        &self,
+        reg: NodeIdx,
+        pool_total: u64,
+        level: PressureLevel,
+        band: u64,
+    ) -> bool
+    {
+        (level == PressureLevel::Low && self.evicting_frees(reg))
+            || (self.frames_short(self.growth_floor(pool_total), band)
+                && self.evicting_opens(reg, pool_total))
     }
 
     /// The region node `reg` of `rec` and the chunk holding `page_base` in it:
@@ -2898,7 +2949,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// of every process with a delegated address space, in record order and,
     /// within a record, in address order, and write each chunk found idle for
     /// `idle_sweeps` sweeps ([`ChunkEntry::is_idle`]) into `victims` until it
-    /// is full. A step is a chunk swept, or a region or
+    /// is full ([`Ledger::sweep_preferring`] with no region preferred). A step
+    /// is a chunk swept, or a region or
     /// record passed; a span read is swept whole, so a slice passes `budget`
     /// by at most one span's chunks. Each span of up to [`SWEEP_SPAN_CHUNKS`] chunks from a
     /// chunk that has an entry is read with one call of `harvest(aspace, va,
@@ -2919,6 +2971,23 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         idle_sweeps: u8,
     ) -> usize
     {
+        self.sweep_preferring(hand, budget, harvest, victims, idle_sweeps, |_, _| false)
+    }
+
+    /// [`Ledger::sweep`], where once `victims` is full a victim of a region
+    /// `prefer(self, region)` names takes the place of one of a region it does
+    /// not, so the victims a caller needs are not crowded out by those found
+    /// before them in the slice.
+    pub fn sweep_preferring(
+        &mut self,
+        hand: &mut ClockHand,
+        budget: u64,
+        harvest: impl FnMut(u64, u64, u64, &mut [u8]) -> bool,
+        victims: &mut [Victim],
+        idle_sweeps: u8,
+        prefer: impl Fn(&Self, NodeIdx) -> bool,
+    ) -> usize
+    {
         let found = hand.badge.and_then(|b| self.find(b)).or_else(|| {
             hand.va = 0;
             self.next_record(None)
@@ -2931,6 +3000,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         };
         let mut s = Sweep {
             harvest,
+            prefer,
             victims,
             found: 0,
             left: budget,
@@ -2971,9 +3041,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// evicted or none from `va` has an entry, else harvest the span from the
     /// first that has one through `aspace` and sweep each of its chunks.
     /// Returns where the sweep goes on: past the span, or past the region.
-    fn sweep_region<H: FnMut(u64, u64, u64, &mut [u8]) -> bool>(
+    fn sweep_region<H: FnMut(u64, u64, u64, &mut [u8]) -> bool, P: Fn(&Self, NodeIdx) -> bool>(
         &mut self,
-        s: &mut Sweep<'_, H>,
+        s: &mut Sweep<'_, H, P>,
         rec: NodeIdx,
         aspace: u64,
         reg: NodeIdx,
@@ -3036,14 +3106,22 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 chunk::set_entry(&mut self.arena, &mut table, height, i, swept);
             }
             if swept.is_idle(s.idle_sweeps)
-                && let Some(v) = s.victims.get_mut(s.found)
             {
-                *v = Victim {
+                let victim = Victim {
                     rec,
                     reg,
                     page_base: chunk_va(i),
                 };
-                s.found = s.found.saturating_add(1);
+                if let Some(v) = s.victims.get_mut(s.found)
+                {
+                    *v = victim;
+                    s.found = s.found.saturating_add(1);
+                }
+                else if (s.prefer)(self, reg)
+                    && let Some(v) = s.victims.iter_mut().find(|v| !(s.prefer)(self, v.reg))
+                {
+                    *v = victim;
+                }
             }
             index = i.saturating_add(1);
         }
@@ -4777,6 +4855,44 @@ mod tests
     }
 
     #[test]
+    fn a_full_sweep_gives_a_victim_of_a_preferred_region_the_place_of_another()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        l.set_aspace_cap(rec, 7);
+        register_slots(&mut l, 64);
+        let open = l
+            .add_region(rec, region(BASE, 2 * CHUNK), Commit::Uncommitted)
+            .unwrap();
+        let com = l
+            .add_region(rec, region(BASE + 4 * CHUNK, 2 * CHUNK), Commit::Committed)
+            .unwrap();
+        for c in 0..2
+        {
+            back_whole(&mut l, rec, open, c);
+        }
+        back_whole(&mut l, rec, com, 4);
+        let mut harvest = |_: u64, _: u64, _: u64, _: &mut [u8]| true;
+        let mut victims = [Victim::default(); 1];
+        // In address order the uncommitted region's first chunk fills the
+        // array.
+        let mut hand = ClockHand::default();
+        assert_eq!(l.sweep(&mut hand, 1000, &mut harvest, &mut victims, 0), 1);
+        assert_eq!((victims[0].reg, victims[0].page_base), (open, BASE));
+        // Preferring the committed region, its chunk takes that place.
+        let mut hand = ClockHand::default();
+        let prefer = |_: &Ledger<VecStore, VecWords>, reg: NodeIdx| reg == com;
+        assert_eq!(
+            l.sweep_preferring(&mut hand, 1000, &mut harvest, &mut victims, 0, prefer),
+            1
+        );
+        assert_eq!(
+            (victims[0].reg, victims[0].page_base),
+            (com, BASE + 4 * CHUNK)
+        );
+    }
+
+    #[test]
     fn a_sweep_reports_the_chunks_idle_for_the_sweeps_it_is_given()
     {
         let mut l = roomy_ledger(10_000);
@@ -5087,8 +5203,16 @@ mod tests
         assert!(l.evicting_frees(plain));
         // An eviction returns the runs and promises the chunk's pages again:
         // its restore draws from `promised`. The commitment's charge stands.
+        // A committed chunk's eviction opens the draw room; an uncommitted
+        // one's raises the restore headroom as far as it frees, short of the
+        // reserve.
+        assert!(l.evicting_opens(reg, total));
+        assert!(!l.evicting_opens(plain, total));
         let free = l.pool.free_pages();
+        let floor = l.growth_floor(total);
         swap_out(&mut l, rec, reg, 0, 1, 2);
+        // Its restore draws from `promised`, so it takes no restore headroom.
+        assert_eq!((l.uncommitted_swapped(), l.growth_floor(total)), (0, floor));
         assert_eq!(promised(&l), held + 16);
         assert_eq!(l.pool.free_pages(), free + 16 - 2);
         assert_eq!(
@@ -6422,6 +6546,23 @@ mod tests
         assert!(l.frames_short(990, 10));
         assert!(!l.frames_short(989, 10));
         assert!(!l.frames_short(100, 10));
+        // Background eviction takes, while it evicts for frames at `CRITICAL`,
+        // a committed chunk and no uncommitted one, whose eviction would raise
+        // the restore headroom by what it frees; at `LOW` it takes that one
+        // too. With the free frames above the floor and the band, it takes
+        // neither at `CRITICAL`.
+        let plain = l
+            .add_region(rec, region(BASE + 128 * CHUNK, CHUNK), Commit::Uncommitted)
+            .unwrap();
+        let total = pool_pages(&l);
+        let (crit, low) = (PressureLevel::Critical, PressureLevel::Low);
+        assert!(l.frames_short(l.growth_floor(total), total));
+        assert!(l.evicts_in_background(reg, total, crit, total));
+        assert!(!l.evicts_in_background(plain, total, crit, total));
+        assert!(l.evicts_in_background(plain, total, low, total));
+        assert!(!l.frames_short(l.growth_floor(total), 0));
+        assert!(!l.evicts_in_background(reg, total, crit, 0));
+        l.remove_region(rec, plain, pool_all).unwrap();
         l.remove_region(rec, reg, pool_all).unwrap();
         assert!(!l.frames_short(990, 10));
     }

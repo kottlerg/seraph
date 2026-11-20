@@ -151,8 +151,10 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   written), which their processes' budget nodes stay charged for.
 /// * `data[11]` — `growth_floor_bytes`: the free pages outside
 ///   `promised` a charge to a budget node outside the reserve may not take:
-///   the system reserve and, while chunks are swapped, the restore headroom
-///   above it, `data[6]` plus the lesser of `data[10]` and `data[6]`. What
+///   the system reserve and, while chunks of uncommitted regions are
+///   swapped, the restore headroom above it, `data[6]` plus the lesser of
+///   their swapped pages (`data[10]` less those of committed regions) and
+///   `data[6]`. What
 ///   such a node can still be granted is the free pages outside `promised`
 ///   (`data[17]`) less this; the level is [`PRESSURE_CRITICAL`] at or below
 ///   it.
@@ -469,8 +471,8 @@ pub const RESIDENT_PENDING: u64 = 1;
 /// each writing chunk staying in memmgr, compressed on its store runs or raw
 /// on its runs.
 /// Reply: `SUCCESS` with `data[0]` the slots memmgr uses; `INVALID_ARGUMENT`
-/// when `caps[0]` is no endpoint cap, the count is below a slot ever taken,
-/// or `caps[1]` is present and no Notification with the Notify right or
+/// when `caps[0]` is no endpoint cap, the count is 0 or below a slot ever
+/// taken, or `caps[1]` is present and no Notification with the Notify right or
 /// `data[1]` is zero.
 /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 22:
 /// `SWAP_REGISTER`.

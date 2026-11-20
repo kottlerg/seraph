@@ -522,7 +522,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[8] | `promised_bytes` — what the committed regions can still take from the free runs: their pages that hold no frame yet, and bounds on the page tables and metadata they can need ([`memory-pool.md`](memory-pool.md) § Commit) |
 | data[9] | `store_bytes` — subset of `pool_total_bytes` the compressed store holds: the stored pages of every evicted chunk ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
 | data[10] | `swapped_bytes` — the pages of every evicted chunk, in either tier (compressed in the store, being written, on disk, or lost; a chunk held raw on its own frames for a swap slot counts once written), which their processes' budget nodes stay charged for |
-| data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
+| data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks of uncommitted regions are swapped, the restore headroom, `data[6]` plus the lesser of their swapped pages (`data[10]` less those of committed regions) and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
 | data[12] | `disk_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
 | data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 26) |
 | data[14] | `evictions` — the evictions memmgr has begun, background or direct, a count (not bytes) that only moves up, wrapping ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
@@ -1141,7 +1141,7 @@ holds one chunk (`DEMAND_CHUNK_BYTES`).
 | Field | Value |
 |---|---|
 | label | 22 |
-| data[0] | the slots the swap service's partition holds |
+| data[0] | the slots the swap service's partition holds; nonzero |
 | data[1] | with `caps[1]`, the bits memmgr sends on it; nonzero |
 | caps[0] | a SEND on the endpoint memmgr redirects each fault on a chunk on disk to, with any rights; memmgr keeps it |
 | caps[1] | optional: a Notification with the Notify right memmgr sends `data[1]` on when `MAKE_RESIDENT` posts a slot word for the swap service (§ Label 21, § Label 26); memmgr keeps it |
@@ -1160,7 +1160,7 @@ clamped to the slot map's window ([docs/limits.md](../../../docs/limits.md)
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | Registered; `data[0]` the slots memmgr uses |
-| 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Endpoint cap, or a cap on memmgr's own endpoint; `caps[1]` present and no Notification with the Notify right, or `data[1]` zero with it; the count below a slot ever taken, one on the free list included; or memmgr's key draw failed at start, so the disk tier is off. memmgr deletes the caps, and any earlier registration stays |
+| 4 | `INVALID_ARGUMENT` | `caps[0]` missing, no Endpoint cap, or a cap on memmgr's own endpoint; `caps[1]` present and no Notification with the Notify right, or `data[1]` zero with it; the count 0, or below a slot ever taken, one on the free list included; or memmgr's key draw failed at start, so the disk tier is off. memmgr deletes the caps, and any earlier registration stays |
 
 #### Label 23: `SWAP_TAKE`
 

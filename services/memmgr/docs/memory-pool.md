@@ -903,8 +903,10 @@ to the restores of uncommitted chunks. While the free pool does not cover `promi
 frames stand at or below the growth floor and the hysteresis band, memmgr evicts for frames in the
 background ([Eviction](#eviction), Selection), so write-out to swap brings the draw room back while
 the level stays `CRITICAL`. When a draw finds no page, memmgr also evicts victims in its turn as a
-restore's direct reclaim does ([Eviction](#eviction), Direct reclaim), any evictable chunk but the
-one the fault backs, up to the same bound; a fault's span is then clamped to the pages found, at
+restore's direct reclaim does ([Eviction](#eviction), Direct reclaim), each evictable chunk whose
+eviction frees a page above the growth floor (a committed chunk, or an uncommitted one once H
+reaches R) for a node outside the reserve, any for a reserve node, never the one the fault backs, up
+to the same bound; a fault's span is then clamped to the pages found, at
 least its faulting page. A draw still short is declined with code 11, a commit overrun
 ([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message); with no swap slot registered
 that is a pool with no free page at all. The draw room is open at a demand chunk's pages or more,
@@ -1017,28 +1019,34 @@ frames (Selection, below) and a committed draw take any victim, since they need 
 memmgr reclaims in the background until it reads `NORMAL`, and stops there. It also evicts for
 frames: while the free pool does not cover `promised` and its free frames stand at or below the
 growth floor and the hysteresis band (or a demand chunk's pages, when the band is less), it evicts
-in the background at either level, any evictable idle chunk a victim, committed chunks included,
-since the frames go to the committed draws, which `promised` keeps them for, and to the restores,
-and not to the next admission ([Commit](#commit), Overcommit). Otherwise it does not reclaim in the
-background at `CRITICAL`: the free pages above the growth floor are gone, so every frame an eviction
-frees past the restore headroom goes to the next admission, which a process draining the pool makes
-before any victim faults. Eviction makes room for the processes that run while memory is low; at
-`CRITICAL` only a restore or a committed draw evicts, for itself (Direct reclaim, below), and the
-pool is otherwise left to the out-of-memory path (crashd's hold of a declined fault, oomd's stop of
-a job). While the level reads `LOW` or `CRITICAL`, the receive loop waits for a message a bounded
-time and, at most once per sweep interval, runs a slice of the clock: a hand walks the eligible
-regions of each process in turn, a bounded number of steps a slice
+in the background at either level, each evictable idle chunk whose eviction frees a page above the
+growth floor a victim (a committed chunk, or an uncommitted one once the restore headroom has
+reached the reserve), since the frames go to the committed draws, which `promised` keeps them for,
+and to the restores, and not to the next admission ([Commit](#commit), Overcommit). Otherwise it
+does not reclaim in the background at `CRITICAL`: the free pages above the growth floor are gone, so
+every frame an eviction frees past the restore headroom goes to the next admission, which a process
+draining the pool makes before any victim faults. Eviction makes room for the processes that run
+while memory is low; at `CRITICAL` only a restore or a committed draw evicts, for itself (Direct
+reclaim, below), and the pool is otherwise left to the out-of-memory path (crashd's hold of a
+declined fault, oomd's stop of a job). While the level reads `LOW` or `CRITICAL`, the receive loop
+waits for a message a bounded time and, at most once per sweep interval, runs a slice of the clock:
+a hand walks the eligible regions of each process in turn, a bounded number of steps a slice
 ([docs/limits.md](../../../docs/limits.md) § memmgr gives the interval and the bounds). For each
 span of up to 256 chunks it reads and clears the accessed bits with one `SYS_ASPACE_HARVEST`, and
 ages each resident chunk of the span with its two-bit age ([Chunk table](#chunk-table)): a chunk
-with no accessed page in two sweeps is cold, and at `LOW` the slice posts one job for each cold
-chunk whose eviction raises the free pages outside `promised` (Committed pages, above), or for each
-cold chunk while memmgr evicts for frames, as many as the compression worker has free job slots. The
-victims a slice finds and posts no job for are kept, a bounded number, for direct reclaim, one whose
-eviction raises the free pages outside `promised` taking the place of one only a committed draw may
-take when the list is full; at `CRITICAL` a slice finds the chunks with no accessed page in one
-sweep. A slice ends at the end of a pass, so no slice ages a chunk twice. The granule is the chunk:
-one unmap and one restore fault per chunk, over every run on its run list.
+with no accessed page in two sweeps is cold, and the slice posts one job for each cold chunk whose
+eviction raises the free pages outside `promised` at `LOW` (Committed pages, above), and for each
+whose eviction frees a page above the growth floor while memmgr evicts for frames (Selection,
+above), as many as the compression worker has free job slots. While memmgr evicts for frames, a
+victim of that kind takes the place of one the slice found before it once the slice's list is full,
+so the chunks a committed draw needs are not crowded out by those it does not. The victims a slice
+finds and posts no job for are kept, a bounded number, for direct reclaim; when the list is full,
+one whose eviction frees a page above the growth floor while memmgr evicts for frames takes the
+place of one whose eviction does not, and otherwise one whose eviction raises the free pages outside
+`promised` takes the place of one only a committed draw may take; at `CRITICAL` a slice finds the
+chunks with no accessed page in one sweep. A slice ends at the end of a pass, so no slice ages a
+chunk twice. The granule is the chunk: one unmap and one restore fault per chunk, over every run on
+its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, maps its
 runs into the job slot's input window of its own address space, and the chunk is evicting while the
@@ -1106,22 +1114,24 @@ charged and promised. Compression in the loop costs a restore's turn at most tha
 compressions, on a fault that would otherwise be declined; background eviction compresses in the
 worker, so its latency lands on no fault or grant.
 
-**Restore headroom.** While chunks are swapped, a charge to a node outside the reserve leaves a
-restore headroom H free above the reserve R: the swapped pages, and at most R, so it is admitted
-when `U - R - H >= want` with `H = min(swapped, R)`, and the level is `CRITICAL` at or
-below `R + H` ([Memory pressure](#memory-pressure)). A restore is admitted against R alone, so it
-draws on H. Without it, the frames background eviction frees at `LOW` go to a process draining the
-pool, whose grants are never victims, and by `CRITICAL` the evicted chunks of idle processes, a
-filesystem driver's thread stacks woken by the pressure signal among them, find neither a free page
-nor a victim, and their faults are declined. With it, the restores of up to R swapped pages find
-their frames whatever a drainer took, and direct reclaim covers the rest. The cost falls on growth:
-each chunk eviction swaps raises H by its pages and frees them less its store pages, so eviction
-gives growth no page until H reaches R. A raw chunk moves neither H nor the free pages until its
-write ends: mapping its own frames back needs none. With nothing swapped H is 0, and every admission
-and level is as it is without eviction. H is at most R, a sixty-fourth of the pool, so `LOW`'s
-threshold stays above `CRITICAL`'s. `QUERY_POOL_STATUS` reports `R + H` as `growth_floor_bytes`
-([ipc-interface.md](ipc-interface.md) § Label 6). The computation is the host-tested `free-pool`
-function `budget::growth_floor`.
+**Restore headroom.** While chunks of uncommitted regions are swapped, a charge to a node outside
+the reserve leaves a restore headroom H free above the reserve R: their swapped pages, and at most
+R, so it is admitted when `U - R - H >= want` with `H = min(swapped - committed_swapped, R)`, and
+the level is `CRITICAL` at or below `R + H` ([Memory pressure](#memory-pressure)). A restore of an
+uncommitted chunk is admitted against R alone, so it draws on H. A committed chunk's restore is a
+committed draw, from `promised` ([Commit](#commit), Overcommit), so its pages raise no H. Without H,
+the frames background eviction frees at `LOW` go to a process draining the pool, whose grants are
+never victims, and by `CRITICAL` the evicted chunks of idle processes, a filesystem driver's thread
+stacks woken by the pressure signal among them, find neither a free page nor a victim, and their
+faults are declined. With H, the restores of up to R swapped pages find their frames whatever a
+drainer took, and direct reclaim covers the rest. The cost falls on growth: each uncommitted chunk's
+eviction raises H by its pages and frees them less its store pages, so eviction gives growth, and a
+committed draw, no page until H reaches R; a committed chunk's eviction moves no H. A raw chunk
+moves neither H nor the free pages until its write ends: mapping its own frames back needs none.
+With nothing swapped H is 0, and every admission and level is as it is without eviction. H is at
+most R, a sixty-fourth of the pool, so `LOW`'s threshold stays above `CRITICAL`'s.
+`QUERY_POOL_STATUS` reports `R + H` as `growth_floor_bytes` ([ipc-interface.md](ipc-interface.md) §
+Label 6). The computation is the host-tested `free-pool` function `budget::growth_floor`.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr, at the top of the
 fair class (`ipc::sched_policy::MEMMGR_WORKER_PRIORITY`), below the receive loop's priority. It

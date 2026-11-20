@@ -719,9 +719,9 @@ fn grant_room() -> u64
 }
 
 /// Commit blocks into `held` until what the free frames can still back
-/// ([`uncommitted_available`]) is at most [`HOG_MARGIN_PAGES`], spending reservation attempts from `rounds`, and
-/// return what is then left; exit with [`HOG_NOT_COMMITTED`] when `rounds`
-/// runs out first.
+/// ([`uncommitted_available`]) is at most [`HOG_MARGIN_PAGES`], spending
+/// reservation attempts from `rounds`, and return what is then left; exit with
+/// [`HOG_NOT_COMMITTED`] when `rounds` runs out first.
 pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
 {
     let mut ask = u64::MAX;

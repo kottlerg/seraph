@@ -318,9 +318,26 @@ pub(crate) fn logd_history_with<T>(
     map: impl Fn(&ipc::log_query::HistoryEntryView<'_>) -> T,
 ) -> Vec<T>
 {
+    let mut history = Vec::new();
+    logd_history_each(query, badge, |entry| {
+        history.push(map(entry));
+        true
+    });
+    history
+}
+
+/// Give each entry of the history of `badge`, or of every badge for `None`,
+/// newest first, to `each`, across the `QUERY_HISTORY` pages, until `each`
+/// returns `false` or the history ends. It allocates nothing, so a phase may
+/// read the history while the pool stands at the growth floor.
+pub(crate) fn logd_history_each(
+    query: u64,
+    badge: Option<u64>,
+    mut each: impl FnMut(&ipc::log_query::HistoryEntryView<'_>) -> bool,
+)
+{
     use ipc::log_query::{HistoryEntries, HistoryRequest, QUERY_OK, reply_more, reply_status};
 
-    let mut history = Vec::new();
     let mut req = HistoryRequest {
         badge,
         before: None,
@@ -334,22 +351,26 @@ pub(crate) fn logd_history_with<T>(
             "logd_death_forward: QUERY_HISTORY refused ({:#x})",
             reply.label
         );
-        let read_before = history.len();
+        let mut read = false;
         for entry in HistoryEntries::new(&reply)
         {
             assert!(
                 badge.is_none_or(|b| b == entry.badge),
                 "logd_death_forward: another badge's entry"
             );
-            history.push(map(&entry));
+            if !each(&entry)
+            {
+                return;
+            }
+            read = true;
             req.before = Some(entry.seq);
         }
         if !reply_more(reply.label)
         {
-            return history;
+            return;
         }
         assert!(
-            history.len() > read_before,
+            read,
             "logd_death_forward: QUERY_HISTORY page empty but more"
         );
     }

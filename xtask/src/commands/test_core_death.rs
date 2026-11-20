@@ -116,9 +116,7 @@ enum KillPoint
     /// its target, and the boot waits on svcmgr's launches to come up.
     Attach,
     /// Once the boot is up and svcmgr has reconciled its recipes: the death
-    /// of a supervised service, after the window in which svcmgr still
-    /// calls devmgr and vfsd during its launches, where a call to a server
-    /// that died after svcmgr's check of it waits for good (#1185).
+    /// of a supervised service.
     SystemUp,
     /// As [`KillPoint::Attach`], then again after each restart svcmgr makes,
     /// until its restart budget is spent and the death is permanent. The
@@ -646,10 +644,10 @@ mod tests
             assert!(matches!(route(target), Route::Hardware(_)), "{target:?}");
         }
         // svcmgr is killed held, since the boot waits on it; devmgr and vfsd
-        // once svcmgr no longer calls them unchecked, and logd once it has
-        // taken its bootstrap round. Defect caught too: the stub's attach to
-        // logd, the log sink, awaited by its marker, which logd itself
-        // carries, so a stub holding logd never shows it.
+        // once the system is up, and logd once it has taken its bootstrap
+        // round. Defect caught too: the stub's attach to logd, the log sink,
+        // awaited by its marker, which logd itself carries, so a stub holding
+        // logd never shows it.
         for (target, name, point, contact) in [
             (
                 CoreDeathTarget::Svcmgr,

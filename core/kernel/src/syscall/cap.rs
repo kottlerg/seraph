@@ -152,7 +152,7 @@ fn slot_field<T>(block_virt: u64, offset: u64) -> *mut T
 ///
 /// arg0 = Memory capability handle in the caller's `CSpace` (generation-checked). The Memory cap
 /// MUST carry `MemRights::RETYPE` and have at least the size class of
-/// `dispatch_for(Endpoint, 0).raw_bytes` (80 B = 24 wrapper + 56
+/// `dispatch_for(Endpoint, 0).raw_bytes` (88 B = 24 wrapper + 64
 /// `EndpointState`, debited as the 128 B `BIN_128` class) of `available_bytes`.
 ///
 /// On success, the wrapper + `EndpointState` are constructed in place inside
@@ -205,7 +205,7 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     let block_virt = crate::mm::paging::phys_to_virt(block_phys);
 
     // Layout: EndpointObject at offset 0; EndpointState at offset
-    // size_of::<EndpointObject>() (24). Total 24 + 56 = 80 B, rounds to 128 B.
+    // size_of::<EndpointObject>() (24). Total 24 + 64 = 88 B, rounds to 128 B.
     let ep_obj_ptr = block_virt as *mut EndpointObject;
     let state_offset = core::mem::size_of::<EndpointObject>() as u64;
     let ep_state_ptr = slot_field::<EndpointState>(block_virt, state_offset);
@@ -2311,6 +2311,11 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
         break obj_ptr;
     };
 
+    // An endpoint the free left with no receiver has its waiters released
+    // before the slot's reference goes.
+    // SAFETY: the freed slot's reference is still held; no lock is held.
+    unsafe { crate::ipc::endpoint::release_if_unreceivable(obj_ptr) };
+
     // Dec-ref outside the lock — dealloc_object may take other locks.
     // SAFETY: obj_ptr captured under DERIVATION_LOCK while the slot was live;
     // unlink_node + free_slot above ensure no other CSpace path can re-dec_ref
@@ -2545,8 +2550,10 @@ unsafe fn unpin_slot(cspace: *mut crate::cap::cspace::CSpace, slot_idx: u32)
 }
 
 /// Dec-ref each collected object and deallocate those that reach refcount
-/// zero. Must run outside `DERIVATION_LOCK` — `dealloc_object` may acquire
-/// the frame allocator and other inner locks.
+/// zero, first releasing the waiters of an endpoint the revoke left with no
+/// receiver. Must run outside `DERIVATION_LOCK` — `dealloc_object` may
+/// acquire the frame allocator and other inner locks, and the endpoint drain
+/// takes `ep.lock`.
 #[cfg(not(test))]
 fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>])
 {
@@ -2557,6 +2564,9 @@ fn dealloc_revoked(snapshot: &[Option<core::ptr::NonNull<crate::cap::object::Ker
         {
             continue;
         };
+        // SAFETY: the freed slot's reference, collected by
+        // revoke_subtree_batch, is still held; no lock is held.
+        unsafe { crate::ipc::endpoint::release_if_unreceivable(obj_ptr) };
         // SAFETY: obj_ptr from revoke_subtree_batch; was a live capability object.
         let remaining = unsafe { (*obj_ptr.as_ptr()).dec_ref() };
         if remaining == 0

@@ -27,6 +27,18 @@ calls on it.
 Endpoints are rendezvous points: they buffer no messages, only FIFO queues of blocked callers
 and blocked receivers.
 
+An endpoint counts the capabilities that carry its Receive right, in every CSpace; a wait-set
+membership and a fault-handler binding are not among them. Receive is derived only from a
+capability that has it, so once the count reaches zero no thread can receive on the endpoint
+again, and nothing waits on it for a receiver: every caller in its send queue returns
+`NoReceiver`, as does every thread parked in a receive on it (its capability deleted or revoked
+under it), and every later call fails at once with `NoReceiver`. A call a server has already
+received is not affected: it ends by the reply, or by the server thread's teardown with
+`Interrupted`. A Receive-right capability that no thread uses still counts, so a supervisor that
+holds the source of a persistent endpoint keeps its callers waiting across a restart of the
+server, while an endpoint whose only Receive-right capabilities die with the server fails its
+callers when they do.
+
 ### The Call/Reply Model
 
 Synchronous IPC follows a strict call/reply pattern:
@@ -238,12 +250,14 @@ restartable syscall's user copy faulted), or, on a virtual-memory handler's
 `FAULT_REPLY_FORWARD`, delivering it to the thread's exception handler (a forward of a kernel
 copy's fault is a decline, failing the syscall with `InvalidAddress`), or, on
 `FAULT_REPLY_REDIRECT`, delivering it to the endpoint the reply names — or the binding is severed
-and the fault is unhandled in the same way. A change of the binding of the fault's class before a
-reply claims the fault cancels the delivery, and the fault is delivered again under the binding
-current then, unhandled when none is bound. A stop of the thread before any reply claims the fault
-cancels the episode, and a stop after a reply claims it leaves that reply's disposition; in both
-cases the thread is resumed, or its fault left unhandled, only if it is started again. This reuses
-the call/reply machinery above — the suspended thread occupies the caller's role and the handler
+and the fault is unhandled in the same way. A fault delivered to an endpoint with no Receive-right
+capability left ([§ Endpoints](#endpoints)) is unhandled at once, and so is one queued there when
+the last such capability goes. A change of the binding of the fault's class before a reply claims
+the fault cancels the delivery, and the fault is delivered again under the binding current then,
+unhandled when none is bound. A stop of the thread before any reply claims the fault cancels the
+episode, and a stop after a reply claims it leaves that reply's disposition; in both cases the
+thread is resumed, or its fault left unhandled, only if it is started again. This reuses the
+call/reply machinery above — the suspended thread occupies the caller's role and the handler
 services it with the ordinary receive/reply cycle. See [Fault Handling](fault-handling.md).
 
 ---

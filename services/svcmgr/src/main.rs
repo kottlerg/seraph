@@ -456,7 +456,8 @@ const DRIVERS_DIR_PATH: &str = "/services/drivers";
 /// The walks go through vfsd and the call goes to devmgr, so the step reads
 /// each one's liveness before it and after every call to it that fails, and
 /// ends at a dead one (`svcmgr_defs::drivers_dir::run`,
-/// `endowed_servers::death`): a call to a dead server would wait for good.
+/// `endowed_servers::death`): a call to a dead server fails with
+/// `NoReceiver`, which does not itself say that the server died.
 ///
 /// Best-effort: any other failure leaves devmgr without a drivers dir, so
 /// none of its drivers starts (the consoles and the RTC among them); timed

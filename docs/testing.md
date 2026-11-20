@@ -501,10 +501,9 @@ terminal. Two routes reach the thread:
   into the fault. A main thread blocked in an IPC call takes the stub's stop only at the call's
   return, so the host reads its program counter again until the stub holds it. svcmgr is killed
   at the attach, while the boot waits on it. devmgr and vfsd are released at the attach and held
-  again once the terminal's READY line and svcmgr's reconciliation line have appeared: svcmgr's
-  launches still call them, and a call to one that died after svcmgr's check of it waits for good
-  (#1185). logd is killed at the attach, as svcmgr is, which can fall before logd asks svcmgr for
-  its bootstrap round, a death svcmgr routes as any other ([Restart Protocol § Death
+  again once the terminal's READY line and svcmgr's reconciliation line have appeared, as
+  supervised services. logd is killed at the attach, as svcmgr is, which can fall before logd asks
+  svcmgr for its bootstrap round, a death svcmgr routes as any other ([Restart Protocol § Death
   detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). When init-logd's
   `handover complete; init-logd thread exiting` line has not appeared before the first kill,
   whether the first instance died before its bootstrap request or after it (before its release),

@@ -452,6 +452,11 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
 #[cfg(not(test))]
 pub unsafe fn release_moved_object(obj: NonNull<KernelObjectHeader>)
 {
+    // The source slot's free can leave an endpoint with no receiver, when a
+    // revoke took the destination meanwhile.
+    // SAFETY: the freed source slot's reference is still held; the lock
+    // preconditions are the caller's.
+    unsafe { crate::ipc::endpoint::release_if_unreceivable(obj) };
     // SAFETY: forwarded caller contract; the freed source slot's reference
     // is the one released.
     unsafe { super::object::release_ref(obj) };

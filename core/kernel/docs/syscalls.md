@@ -285,11 +285,12 @@ pub enum SyscallError
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped or
-    /// interrupted by an upcall, the object it was blocked on was destroyed,
-    /// or, for a call, the server received again, or was destroyed, before
-    /// replying. The thread sees this as the return value of its blocked
-    /// syscall. `SYS_THREAD_START` also returns it when its caller is stopped
-    /// while the start waits for the target to settle (nothing is started).
+    /// interrupted by an upcall, the notification, event queue, or wait set it
+    /// was blocked on was destroyed, or, for a call, the server received
+    /// again, or was destroyed, before replying. The thread sees this as the
+    /// return value of its blocked syscall. `SYS_THREAD_START` also returns
+    /// it when its caller is stopped while the start waits for the target to
+    /// settle (nothing is started).
     /// Batched capability operations (revoke, delete, move, a range split)
     /// also return it at their liveness backstop; each syscall's entry in
     /// core/kernel/docs/syscalls.md gives the state the backstop leaves.
@@ -299,6 +300,12 @@ pub enum SyscallError
     /// reference already holds 2^31 references). Unlike `OutOfMemory`,
     /// donating memory (augment mode) cannot satisfy the request.
     QuotaExceeded = -17,
+    /// No capability with the Receive right on the endpoint is left, so no
+    /// thread can receive on it again. A call on such an endpoint fails with
+    /// it at once, and a call queued on the endpoint, or a receive parked on
+    /// it, when its last such capability goes is released with it. A call a
+    /// server had already received is not affected.
+    NoReceiver = -18,
 }
 ```
 
@@ -361,6 +368,8 @@ or `cap_count` above its maximum is clamped, not refused),
 `InvalidAddress` (registered IPC buffer page unmapped), `InvalidState` (a cap
 slot is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability
 transfer), `QuotaExceeded` (a cap's object has its reference count at its 2^31 ceiling),
+`NoReceiver` (no capability with the Receive right on the endpoint exists when the call
+begins, or the last one goes while the call is queued and not yet received),
 `Interrupted` (the call was cancelled while blocked, including by the receiving thread
 receiving again before it replied; see `SYS_IPC_RECV`), `WouldBlock` (the timeout elapsed
 before the reply). Cap-slot
@@ -503,7 +512,9 @@ receive reserve that general allocations leave free
 ([capability-internals.md](capability-internals.md) § IPC Receive Reserve), so only received
 caps that have spent the reserve fail a receive
 (see [ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure Policy),
-`Interrupted`, `WouldBlock` (a try-once found no caller, or a bounded wait elapsed). If an
+`NoReceiver` (the last capability with the Receive right on the endpoint went while the
+receive was parked, in any timeout mode), `Interrupted`, `WouldBlock` (a try-once found no
+caller, or a bounded wait elapsed). If an
 already-queued sender's cap transfer is refused (a source slot went stale
 or is pinned by an in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer, a
 cap's object has its reference count at its 2^31 ceiling, or the server's CSpace cannot supply the
@@ -3649,12 +3660,13 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
   delivered at the call's own return with the call's result in the registers
   ([fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
   Upcalls, Blocking syscalls; [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md)
-  § Upcall Cancel-and-Wake Protocol). `SYS_IPC_CALL` and
-  `SYS_IPC_RECV` queued on an endpoint, `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
+  § Upcall Cancel-and-Wake Protocol). `SYS_NOTIFICATION_WAIT`, `SYS_EVENT_RECV`, and
   `SYS_WAIT_SET_WAIT` also return `Interrupted` when the object waited on is destroyed under the
   caller, and `SYS_IPC_CALL` returns it when the receiving thread receives again before replying or
-  is destroyed before replying. `SYS_THREAD_START` returns `Interrupted` when its caller is stopped
-  while the start waits for the target to settle; nothing is started.
+  is destroyed before replying. `SYS_IPC_CALL` and `SYS_IPC_RECV` queued on an endpoint return
+  `NoReceiver`, not `Interrupted`, when the last capability with the Receive right goes or the
+  endpoint is destroyed under them. `SYS_THREAD_START` returns `Interrupted` when its caller is
+  stopped while the start waits for the target to settle; nothing is started.
 
 ---
 

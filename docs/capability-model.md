@@ -1072,9 +1072,9 @@ terminal when:
 - no fault handler is bound;
 - the handler replies `KILL`;
 - the fault episode is cancelled: by destruction of the handler thread (deletion of its last
-  Thread capability), by destruction of the handler endpoint while the fault is still queued on it,
-  or by a later receive on the handler thread that passes its capability and headroom checks while
-  the fault reply is pending; or
+  Thread capability), by the loss of the handler endpoint's last Receive-right capability, or its
+  destruction, while the fault is still queued on it, or by a later receive on the handler thread
+  that passes its capability and headroom checks while the fault reply is pending; or
 - the faulting thread is stopped before any reply claims the fault, which cancels the episode.
 
 On the first terminal end of the address space, a terminal fault or a `SYS_ASPACE_EXIT` by any

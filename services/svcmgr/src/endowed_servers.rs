@@ -10,19 +10,17 @@
 //! vfsd serves every `std::fs` and namespace call svcmgr makes: the device
 //! class files and the drivers directory before the handover, and the recipe
 //! directory at it. devmgr serves the class mints and `SET_DRIVERS_DIR`
-//! before the handover, through the endowed devmgr-registry source. A call on
-//! an endpoint none of whose receivers is left waits for good, since svcmgr's
-//! own capability keeps the endpoint alive, and a death of either server
-//! before reconciliation has recorded it would then leave svcmgr blocked with
-//! the death unrouted. So svcmgr reads a server's liveness ([`death`]) before
-//! each step that calls it and after every call to it that fails, and a dead
-//! server ends the step. At the handover a dead vfsd's death is routed as
-//! system death (`route_namespace_server_death` in `main.rs`); a dead
-//! devmgr is recorded by reconciliation with the caps init endowed, and the
-//! resync after it routes the death. A server that dies after a check, while
-//! svcmgr's next call to it waits unreceived, still leaves svcmgr blocked
-//! (#1185). The specification is `services/svcmgr/docs/restart-protocol.md`
-//! § Death detection.
+//! before the handover, through the endowed devmgr-registry source. Neither
+//! svcmgr nor init holds a capability with the Receive right on either
+//! server's endpoints, so once a dead server's process is torn down the
+//! kernel fails a call to it, queued or new, with `NoReceiver`. A failed call
+//! does not itself say that the server died, so svcmgr reads a server's
+//! liveness ([`death`]) before each step that calls it and after every call
+//! to it that fails, and a dead server ends the step. At the handover a dead
+//! vfsd's death is routed as system death (`route_namespace_server_death` in
+//! `main.rs`); a dead devmgr is recorded by reconciliation with the caps init
+//! endowed, and the resync after it routes the death. The specification is
+//! `services/svcmgr/docs/restart-protocol.md` § Death detection.
 
 use svcmgr_endowment::SubstrateObserver;
 

@@ -70,11 +70,21 @@ pub struct EndpointState
     /// Serialises the send/recv queues and the call/recv rendezvous; reply is
     /// serialised by the `reply_tcb` claim, not this lock.
     pub lock: crate::sync::Spinlock,
+    /// Number of capability slots, in every `CSpace`, that name this endpoint
+    /// with the Receive right: raised when such a slot is filled and lowered
+    /// when it is freed or its dying `CSpace` releases it
+    /// (`cap::object::note_slot_filled`, `cap::object::note_slot_released`).
+    /// Zero is final: a slot with the Receive right is filled only from
+    /// another one (a derive, copy, or move) or at creation, so once none is
+    /// left no thread can receive on the endpoint again. A call or receive
+    /// reads it under `lock` and fails with `NoReceiver` at zero; the release
+    /// that made it zero then drains the queues ([`release_if_unreceivable`]).
+    pub receivers: core::sync::atomic::AtomicU32,
 }
 
 // SAFETY: every mutation of the raw queue pointers (`send_*`, `recv_*`) and of
 // the wait-set back-pointer fields happens under `EndpointState::lock`, and
-// `send_nonempty` is an atomic, so moving the state between CPUs exposes no
+// `send_nonempty` and `receivers` are atomics, so moving the state between CPUs exposes no
 // unsynchronised write.
 unsafe impl Send for EndpointState {}
 // SAFETY: concurrent shared access writes the raw-pointer fields only under
@@ -103,7 +113,35 @@ impl EndpointState
             wait_set: core::ptr::null_mut(),
             wait_set_member_idx: 0,
             lock: crate::sync::Spinlock::new(),
+            receivers: core::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// Count a capability slot just filled with this endpoint and the Receive
+    /// right ([`EndpointState::receivers`]).
+    pub fn note_receiver_filled(&self)
+    {
+        self.receivers
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Uncount a slot with the Receive right on this endpoint that is being
+    /// freed, or whose dying `CSpace` releases it
+    /// ([`EndpointState::receivers`]).
+    pub fn note_receiver_released(&self)
+    {
+        let before = self
+            .receivers
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        debug_assert!(before > 0, "EndpointState receivers underflow");
+    }
+
+    /// Whether a capability slot with the Receive right on this endpoint is
+    /// left ([`EndpointState::receivers`]). Read under `lock` by a call or a
+    /// receive, which then fails at zero.
+    pub fn has_receiver(&self) -> bool
+    {
+        self.receivers.load(core::sync::atomic::Ordering::Acquire) != 0
     }
 
     /// Republish the `send_nonempty` shadow from the current `send_head`.
@@ -246,16 +284,32 @@ unsafe fn rollback_uncommitted_call(
     }
 }
 
+/// What [`endpoint_call`] did with a call.
+#[cfg(not(test))]
+pub enum CallRendezvous
+{
+    /// A receiver was waiting: it is dequeued and bound, and its wake is
+    /// claimed by `wake_in_flight`. The caller MUST wake it with
+    /// `enqueue_and_wake` after moving any caps.
+    Bound(*mut ThreadControlBlock),
+    /// No receiver was waiting: the call is queued on the send queue.
+    Queued,
+    /// The endpoint has no receiver left ([`EndpointState::receivers`]): the
+    /// call is refused, and nothing of the caller changed.
+    NoReceiver,
+}
+
 /// Attempt an IPC call on `ep` from `caller` with `msg`.
 ///
-/// Returns `Ok(server)` if a receiver was waiting. The server is dequeued and
-/// bound, and its wake is claimed by `wake_in_flight`. The caller MUST wake it
-/// with `enqueue_and_wake` after moving any caps. The calling thread is
-/// committed to `parked_state`, unless the park is refused, in which case the
-/// reply linkage is rolled back. Returns `Err(())` if no receiver was
-/// available: the calling thread is committed `BlockedOnSend` on the send
-/// queue, unless the park is refused, in which case it is unlinked and the
-/// call is stamped cancelled.
+/// Returns [`CallRendezvous::Bound`] if a receiver was waiting: the calling
+/// thread is committed to `parked_state`, unless the park is refused, in
+/// which case the reply linkage is rolled back. Returns
+/// [`CallRendezvous::Queued`] if no receiver was waiting: the calling thread
+/// is committed `BlockedOnSend` on the send queue, unless the park is
+/// refused, in which case it is unlinked and the call is stamped cancelled.
+/// Returns [`CallRendezvous::NoReceiver`], before touching the caller or
+/// either queue, when no capability with the Receive right on the endpoint is
+/// left.
 ///
 /// `parked_state` is the blocked state the caller commits when a receiver was
 /// waiting: [`IpcThreadState::BlockedOnReply`] for a normal `SYS_IPC_CALL`, or
@@ -288,7 +342,7 @@ pub unsafe fn endpoint_call(
     msg: &Message,
     parked_state: IpcThreadState,
     deadline: u64,
-) -> Result<*mut ThreadControlBlock, ()>
+) -> CallRendezvous
 {
     // SAFETY: ep validated by caller.
     let ep = unsafe { &mut *ep };
@@ -296,6 +350,16 @@ pub unsafe fn endpoint_call(
     // SAFETY: lock serialises the send/recv queues and the call/recv rendezvous
     // (reply is serialised by the `reply_tcb` claim); paired with unlock_raw below.
     let saved = unsafe { ep.lock.lock_raw() };
+
+    // Read under ep.lock: the release that took the count to zero takes this
+    // lock after its decrement to drain the queues, so a call either sees zero
+    // here or queues before that drain, which releases it.
+    if !ep.has_receiver()
+    {
+        // SAFETY: paired with lock_raw above.
+        unsafe { ep.lock.unlock_raw(saved) };
+        return CallRendezvous::NoReceiver;
+    }
 
     // Is a server waiting?
     // SAFETY: recv_head/recv_tail maintained by enqueue/dequeue operations.
@@ -420,7 +484,7 @@ pub unsafe fn endpoint_call(
         }
         // SAFETY: paired with lock_raw above.
         unsafe { ep.lock.unlock_raw(saved) };
-        return Ok(server);
+        return CallRendezvous::Bound(server);
     }
 
     // No server available — block caller on send queue.
@@ -497,7 +561,7 @@ pub unsafe fn endpoint_call(
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ep.lock.unlock_raw(saved) };
-    Err(())
+    CallRendezvous::Queued
 }
 
 /// Release the caller still bound to `server` by an earlier receive that was
@@ -693,16 +757,29 @@ unsafe fn bind_next_sender(
     }
 }
 
+/// Why a receive bound no sender.
+#[cfg(not(test))]
+pub enum RecvMiss
+{
+    /// No sender was waiting.
+    NoSender,
+    /// The endpoint has no receiver left ([`EndpointState::receivers`]): the
+    /// receive's own capability was freed after its lookup. Nothing of the
+    /// server changed under `ep.lock`.
+    NoReceiver,
+}
+
 /// Attempt to receive on `ep` as `server`.
 ///
 /// First releases a caller still bound from an earlier unreplied receive
 /// (`release_unreplied_caller`). Returns `Ok(bound)` if a sender was waiting
 /// (server continues running; sender remains blocked on reply, and
 /// [`BoundSender`] holds what the receive keeps of it).
-/// Returns `Err(())` if no sender was available (the server is committed
-/// `BlockedOnRecv` on the recv queue, unless the park is refused, in which case
-/// it is unlinked and, on a stop-won or upcall refusal, its park is stamped
-/// INTERRUPTED).
+/// Returns [`RecvMiss::NoSender`] if no sender was available (the server is
+/// committed `BlockedOnRecv` on the recv queue, unless the park is refused, in
+/// which case it is unlinked and, on a stop-won or upcall refusal, its park is
+/// stamped INTERRUPTED). Returns [`RecvMiss::NoReceiver`], without parking,
+/// when no capability with the Receive right on the endpoint is left.
 ///
 /// `deadline` is the tick at which a timed receive's park expires, or `0` for
 /// an untimed one.
@@ -715,7 +792,7 @@ pub unsafe fn endpoint_recv(
     ep: *mut EndpointState,
     server: *mut ThreadControlBlock,
     deadline: u64,
-) -> Result<BoundSender, ()>
+) -> Result<BoundSender, RecvMiss>
 {
     // SAFETY: server is the running thread; no lock held (contract).
     unsafe { release_unreplied_caller(server) };
@@ -726,6 +803,15 @@ pub unsafe fn endpoint_recv(
     // SAFETY: lock serialises the send/recv queues and the call/recv rendezvous
     // (reply is serialised by the `reply_tcb` claim); paired with unlock_raw below.
     let saved = unsafe { ep.lock.lock_raw() };
+
+    // Read under ep.lock, as `endpoint_call` reads it: a receiver parked after
+    // the drain that followed the count's last decrement would never be woken.
+    if !ep.has_receiver()
+    {
+        // SAFETY: paired with lock_raw above.
+        unsafe { ep.lock.unlock_raw(saved) };
+        return Err(RecvMiss::NoReceiver);
+    }
 
     // SAFETY: server is the running thread; ep.lock held.
     if let Some((bound, displaced)) = unsafe { bind_next_sender(ep, server) }
@@ -800,17 +886,18 @@ pub unsafe fn endpoint_recv(
     }
     // SAFETY: paired with lock_raw above.
     unsafe { ep.lock.unlock_raw(saved) };
-    Err(())
+    Err(RecvMiss::NoSender)
 }
 
 /// Receive on `ep` as `server` without parking (`SYS_IPC_RECV` try-once).
 ///
-/// Returns `Some(bound)` when a sender was waiting, bound as
+/// Returns `Ok(bound)` when a sender was waiting, bound as
 /// [`endpoint_recv`] binds it; the caller this binding displaced (one still
 /// bound from an earlier unreplied receive) is released only then, after
-/// `ep.lock` drops. Returns `None` when no sender was waiting, and leaves
-/// `server`'s earlier binding in place, so a later `SYS_IPC_REPLY` still
-/// reaches that caller.
+/// `ep.lock` drops. Returns [`RecvMiss::NoSender`] when no sender was
+/// waiting, and [`RecvMiss::NoReceiver`] when no capability with the Receive
+/// right on the endpoint is left; either leaves `server`'s earlier binding in
+/// place, so a later `SYS_IPC_REPLY` still reaches that caller.
 ///
 /// # Safety
 /// `ep` and `server` must be valid, and `server` must be the running thread.
@@ -825,20 +912,27 @@ pub unsafe fn endpoint_recv(
 pub unsafe fn endpoint_try_recv(
     ep: *mut EndpointState,
     server: *mut ThreadControlBlock,
-) -> Option<BoundSender>
+) -> Result<BoundSender, RecvMiss>
 {
     // SAFETY: ep validated by caller.
     let ep = unsafe { &mut *ep };
     // SAFETY: paired with unlock_raw below.
     let saved = unsafe { ep.lock.lock_raw() };
-    // SAFETY: server is the running thread; ep.lock held.
-    let bound = unsafe { bind_next_sender(ep, server) };
+    let bound = if ep.has_receiver()
+    {
+        // SAFETY: server is the running thread; ep.lock held.
+        unsafe { bind_next_sender(ep, server) }.ok_or(RecvMiss::NoSender)
+    }
+    else
+    {
+        Err(RecvMiss::NoReceiver)
+    };
     // SAFETY: paired with lock_raw above.
     unsafe { ep.lock.unlock_raw(saved) };
     let (bound, displaced) = bound?;
     // SAFETY: the rebind's swap claimed `displaced`; no lock held.
     unsafe { release_displaced_caller(displaced) };
-    Some(bound)
+    Ok(bound)
 }
 
 /// Claim the caller bound in `server.reply_tcb` for a reply.
@@ -908,6 +1002,136 @@ pub unsafe fn endpoint_reply(server: *mut ThreadControlBlock) -> Option<*mut Thr
     // for that wake. See core/kernel/docs/scheduling-internals.md § Cross-CPU
     // TCB Ownership.
     Some(caller)
+}
+
+// ── Release when no receiver is left ─────────────────────────────────────────
+
+/// Release the waiters of the endpoint `obj` when no capability with the
+/// Receive right on it is left ([`EndpointState::receivers`]); a no-op for
+/// any other object, or an endpoint that still has one.
+///
+/// Called before the release of the reference a freed capability slot held
+/// (`SYS_CAP_DELETE`, a revoke's `dealloc_revoked`, a move's source release,
+/// and a dying `CSpace`'s release of its slots), after the slot was uncounted.
+/// The release whose decrement made the count zero reads it here, after its
+/// own decrement, so it drains the queues ([`release_waiters`]); a later one
+/// finds them empty, since a call or receive that reads zero under `ep.lock`
+/// queues nothing.
+///
+/// # Safety
+/// `obj` must carry a reference the caller owns. Call with no
+/// `DERIVATION_LOCK`, `CSpace`, IPC, scheduler, or sleep-list lock held.
+#[cfg(not(test))]
+pub unsafe fn release_if_unreceivable(
+    obj: core::ptr::NonNull<crate::cap::object::KernelObjectHeader>,
+)
+{
+    // SAFETY: the caller's reference keeps obj live.
+    if unsafe { obj.as_ref() }.obj_type != crate::cap::object::ObjectType::Endpoint
+    {
+        return;
+    }
+    // SAFETY: an Endpoint header is at offset 0 of its EndpointObject, live by
+    // the caller's reference.
+    let state = unsafe { (*obj.as_ptr().cast::<crate::cap::object::EndpointObject>()).state };
+    // SAFETY: a non-null state is the endpoint's, live with it.
+    if state.is_null() || unsafe { (*state).has_receiver() }
+    {
+        return;
+    }
+    // SAFETY: state is live (above); the lock preconditions are the caller's.
+    unsafe { release_waiters(state) };
+}
+
+/// Release every thread queued on `ep`, which no thread can receive on
+/// again: each queued caller with its park stamped
+/// [`PARK_DISPOSITION_NO_RECEIVER`](crate::sched::thread::PARK_DISPOSITION_NO_RECEIVER)
+/// (a queued fault delivery with `FAULT_OUTCOME_NO_RECEIVER`, so the fault is
+/// unhandled), and each parked receiver the same way; a timed park's sleep-list
+/// entry goes with it, and `send_nonempty` is republished.
+///
+/// Run by [`release_if_unreceivable`] and by the endpoint's dealloc, where no
+/// slot names the endpoint, so none with the Receive right does.
+///
+/// The drain runs under `ep.lock`: a concurrent `dealloc_object(Thread)`
+/// `BlockedOnSend` / `BlockedOnRecv` unlink takes the same lock, so it cannot
+/// change these queues or free a waiter mid-walk, and the per-waiter
+/// `wake_in_flight = 1` set here (the #160 discipline) makes a
+/// `dealloc_object(Thread)` that already left the queue wait at its
+/// wake-in-flight gate for this drain's `enqueue_and_wake` rather than free
+/// the TCB under it. Holding `ep.lock` across `enqueue_and_wake` follows
+/// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 1.
+///
+/// # Safety
+/// `ep` must be a live `EndpointState` with no receiver left. Call with no
+/// `DERIVATION_LOCK`, `CSpace`, IPC, scheduler, or sleep-list lock held.
+#[cfg(not(test))]
+pub unsafe fn release_waiters(ep: *mut EndpointState)
+{
+    // SAFETY: ep is live (contract).
+    let ep = unsafe { &mut *ep };
+    debug_assert!(
+        !ep.has_receiver(),
+        "release_waiters: the endpoint still has a receiver"
+    );
+    // SAFETY: the returned flags are passed verbatim to the unlock_raw below.
+    let saved = unsafe { ep.lock.lock_raw() };
+    // The whole-queue detach under ep.lock is each episode's claim.
+    let senders = core::mem::replace(&mut ep.send_head, core::ptr::null_mut());
+    ep.send_tail = core::ptr::null_mut();
+    // SAFETY: ep.lock is held, serialising with all send_head writers.
+    unsafe { ep.refresh_send_ready() };
+    let receivers = core::mem::replace(&mut ep.recv_head, core::ptr::null_mut());
+    ep.recv_tail = core::ptr::null_mut();
+    // A queued fault sender (its handler never received) takes the
+    // no-receiver kill outcome when woken (its copy fault fails the syscall,
+    // its upcall is dropped): its resume runs the fault helper, which reads
+    // `fault_outcome`. A caller or a receiver gets NO_RECEIVER, so its
+    // syscall's resume returns the error instead of reading the deposit.
+    for (head, sender) in [(senders, true), (receivers, false)]
+    {
+        let mut tcb = head;
+        while !tcb.is_null()
+        {
+            // SAFETY: tcb was queued on ep, kept live by the held ep.lock,
+            // which a concurrent dealloc(waiter) unlink also takes.
+            let next = unsafe { (*tcb).ipc_wait_next };
+            // SAFETY: as above.
+            unsafe { (*tcb).ipc_wait_next = None };
+            let kind = if sender
+            {
+                // SAFETY: tcb is a valid TCB whose park claim this drain
+                // holds: it was detached from the queue under ep.lock.
+                unsafe { crate::sched::thread::ParkKind::of_sender(tcb) }
+            }
+            else
+            {
+                crate::sched::thread::ParkKind::Call
+            };
+            // SAFETY: tcb is a valid TCB whose park episode this drain has
+            // claimed under ep.lock; exactly one stamp per episode.
+            unsafe { crate::sched::thread::stamp_no_receiver_deposit(tcb, kind) };
+            // A timed park's entry ends with its episode.
+            // SAFETY: tcb's park episode was just claimed under ep.lock and is
+            // not yet woken; no sleep-list lock is held.
+            unsafe { crate::ipc::cancel_timed_entry(tcb) };
+            // Claim for wake under ep.lock (#160); cleared by enqueue_and_wake.
+            // SAFETY: tcb is a valid TCB; ep.lock held.
+            unsafe {
+                (*tcb)
+                    .wake_in_flight
+                    .store(1, core::sync::atomic::Ordering::Release);
+            }
+            // SAFETY: tcb is a valid, initialised TCB.
+            let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+            // SAFETY: tcb is a valid TCB; target_cpu came from
+            // select_target_cpu.
+            unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
+            tcb = next.unwrap_or(core::ptr::null_mut());
+        }
+    }
+    // SAFETY: `saved` is the value lock_raw returned for this lock above.
+    unsafe { ep.lock.unlock_raw(saved) };
 }
 
 // ── IPC block cancellation helper ────────────────────────────────────────────

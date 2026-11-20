@@ -725,6 +725,16 @@ drop runs outside it but only lowers the count. `SYS_MEMORY_SPLIT` and `SYS_MEMO
 to refuse an object another slot names
 ([syscalls.md](syscalls.md#sys_memory_split-33) § `SYS_MEMORY_SPLIT`).
 
+An Endpoint counts the slots that name it with the Receive right
+(`EndpointState::receivers`) through the same hooks: `CSpace::fill_slot` calls `note_slot_filled`,
+and `CSpace::free_slot` and a dying `CSpace`'s object drop call `note_slot_released`, each of which
+dispatches on the slot's tag and rights (a Memory slot to `slot_count`, an Endpoint slot with the
+Receive right to `receivers`). A slot without the Receive right, a wait-set membership, and a
+fault-handler binding are not counted. Where a release leaves the count at zero (`SYS_CAP_DELETE`,
+a revoke's `dealloc_revoked`, `release_moved_object`, and a dying `CSpace`'s drop),
+`release_if_unreceivable` releases the endpoint's queued callers and parked receivers before the
+reference goes ([ipc-internals.md](ipc-internals.md) § Endpoint).
+
 The count is 32 bits wide and cannot wrap. The references userspace can multiply without a bound of
 their own, new capability slots, retype leases, death-observer bindings, and interrupt bindings, are
 refused at
@@ -788,7 +798,8 @@ The principal kernel-internal owners:
   hold, while the binding's reference still holds it. It releases that reference after the
   delivery and before its park (the pin-before-park rule), so a concurrent rebind or unbind
   cannot free the endpoint mid-delivery; a release that drops the last reference runs the
-  endpoint's teardown, whose send-queue drain kills the faulter if it is still queued there.
+  endpoint's teardown, whose send-queue drain kills the faulter if it is still queued there; the
+  drain also runs when no capability with the Receive right on the endpoint is left.
 - **Fault redirect.** A `FAULT_REPLY_REDIRECT` reply takes a reference on the Endpoint it names
   into the faulting thread's `fault_redirect` field (one per thread), held until the thread's next
   delivery takes it (as a fault delivery does a binding's) or the thread's destruction releases

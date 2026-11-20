@@ -180,7 +180,8 @@ fn is_recipe_name(name: &str) -> bool
 ///
 /// The scan reads through vfsd, so vfsd's liveness is read before it and
 /// after every read that fails ([`endowed_servers::death`]): a later call
-/// through a dead vfsd would wait for good. `Err` carries the exit reason of a
+/// through a dead vfsd fails with `NoReceiver`, which does not itself say
+/// that vfsd died. `Err` carries the exit reason of a
 /// vfsd found dead; nothing is then recorded or launched, and `pending` is
 /// left as it was, for the caller to route the death.
 ///

@@ -85,6 +85,7 @@ pub mod memmgr;
 pub mod memory_object_text;
 pub mod memory_objects;
 pub mod namespace;
+pub mod no_receiver;
 pub mod node_handle;
 pub mod oom;
 pub mod pager;
@@ -129,6 +130,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(entropyd::phases());
     out.extend_from_slice(recv_guard::phases());
     out.extend_from_slice(recv_pool::phases());
+    out.extend_from_slice(no_receiver::phases());
     out.extend_from_slice(devmgr::phases());
     out.extend_from_slice(pager::phases());
     out.extend_from_slice(budget::phases());

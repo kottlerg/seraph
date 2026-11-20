@@ -1390,7 +1390,8 @@ pub struct SvcmgrEndowment
     /// svcmgr publishes that SEND as received.
     pub rootfs_root_cap: u64,
     pub devmgr_registry_ep: u64,
-    /// vfsd's un-badged service endpoint. init mints the endowed
+    /// init's un-badged `SEND` on vfsd's service endpoint (vfsd holds the
+    /// endpoint's only Receive right). init mints the endowed
     /// `MOUNT_AUTHORITY` SEND (published as `vfsd.mount`), the
     /// `DENY_BADGE` SEND (published as `vfsd.deny`), and the
     /// `SWAP_AUTHORITY` SEND (published as `vfsd.swap`) from it.

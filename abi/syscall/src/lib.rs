@@ -134,7 +134,7 @@ pub const fn cap_handle_gen(handle: u64) -> u32
 // an ABI-visible change by design.
 
 /// Raw retype debit of one `Endpoint`, in bytes.
-pub const ENDPOINT_RETYPE_BYTES: u64 = 80;
+pub const ENDPOINT_RETYPE_BYTES: u64 = 88;
 
 /// Raw retype debit of one `Notification`, in bytes.
 pub const NOTIFICATION_RETYPE_BYTES: u64 = 64;
@@ -752,11 +752,12 @@ pub enum SyscallError
     /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped or
-    /// interrupted by an upcall, the object it was blocked on was destroyed,
-    /// or, for a call, the server received again, or was destroyed, before
-    /// replying. The thread sees this as the return value of its blocked
-    /// syscall. `SYS_THREAD_START` also returns it when its caller is stopped
-    /// while the start waits for the target to settle (nothing is started).
+    /// interrupted by an upcall, the notification, event queue, or wait set it
+    /// was blocked on was destroyed, or, for a call, the server received
+    /// again, or was destroyed, before replying. The thread sees this as the
+    /// return value of its blocked syscall. `SYS_THREAD_START` also returns
+    /// it when its caller is stopped while the start waits for the target to
+    /// settle (nothing is started).
     /// Batched capability operations (revoke, delete, move, a range split)
     /// also return it at their liveness backstop; each syscall's entry in
     /// core/kernel/docs/syscalls.md gives the state the backstop leaves.
@@ -766,6 +767,12 @@ pub enum SyscallError
     /// reference already holds 2^31 references). Unlike `OutOfMemory`,
     /// donating memory (augment mode) cannot satisfy the request.
     QuotaExceeded = -17,
+    /// No capability with the Receive right on the endpoint is left, so no
+    /// thread can receive on it again. A call on such an endpoint fails with
+    /// it at once, and a call queued on the endpoint, or a receive parked on
+    /// it, when its last such capability goes is released with it. A call a
+    /// server had already received is not affected.
+    NoReceiver = -18,
 }
 
 // ── Scheduling constants ──────────────────────────────────────────────────────

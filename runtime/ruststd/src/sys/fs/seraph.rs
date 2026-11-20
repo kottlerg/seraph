@@ -1152,10 +1152,11 @@ fn write_frame_chunk(
     let lent_kept = syscall::cap_delete(lent).is_ok();
     // `Interrupted` and `WouldBlock` (the thread's call deadline passed) are
     // the errors a call can return after the driver received the message;
-    // every other one is a refusal before the call blocked (`ipc::ipc_call`
-    // and `ipc::ipc_call_timeout` # Errors). Either of the two leaves the
-    // frame idle when the derivation never left (a call ended while queued,
-    // or not sent under a deadline already passed).
+    // every other one ends the call before the driver received it: a refusal
+    // before the call blocked, or `NoReceiver`, which also releases a queued
+    // call (`ipc::ipc_call` and `ipc::ipc_call_timeout` # Errors). Either of
+    // the two leaves the frame idle when the derivation never left (a call
+    // ended while queued, or not sent under a deadline already passed).
     let reply = reply.map_err(|e| {
         let err = call_error(file_cap, e, "seraph fs: FS_WRITE_MEMORY ipc_call failed");
         if !lent_kept
@@ -2095,13 +2096,20 @@ fn call_failed(cap: u64, what: &'static str) -> io::Error
 
 /// The error for an `ipc_call` on `cap` that failed with `code`, `what`
 /// naming the call: `TimedOut` when the thread's call deadline passed first
-/// (`WouldBlock`, `std::os::seraph::with_call_deadline`), else as
-/// [`call_failed`] reads the cap. Called before the caller deletes `cap`.
+/// (`WouldBlock`, `std::os::seraph::with_call_deadline`),
+/// `StaleNetworkFileHandle` when no thread can receive on the server's
+/// endpoint again (`NoReceiver`: the server is gone, though the cap is still
+/// live), else as [`call_failed`] reads the cap. Called before the caller
+/// deletes `cap`.
 fn call_error(cap: u64, code: i64, what: &'static str) -> io::Error
 {
     if code == syscall_abi::SyscallError::WouldBlock as i64
     {
         return io::Error::new(io::ErrorKind::TimedOut, what);
+    }
+    if code == syscall_abi::SyscallError::NoReceiver as i64
+    {
+        return io::Error::new(io::ErrorKind::StaleNetworkFileHandle, what);
     }
     call_failed(cap, what)
 }

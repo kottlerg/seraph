@@ -385,10 +385,14 @@ pub(crate) unsafe fn deadline_call(
 
 /// The error for a runtime IPC call that failed with `code`, `what` naming
 /// the call: `TimedOut` when the thread's call deadline passed first
-/// (`WouldBlock`, [`deadline_call`]), `Other` otherwise.
+/// (`WouldBlock`, [`deadline_call`]), `BrokenPipe` when no thread can
+/// receive on the endpoint again (`NoReceiver`: the server is gone), `Other`
+/// otherwise.
 pub(crate) fn call_failed(code: i64, what: &'static str) -> crate::io::Error {
     let kind = if code == syscall_abi::SyscallError::WouldBlock as i64 {
         crate::io::ErrorKind::TimedOut
+    } else if code == syscall_abi::SyscallError::NoReceiver as i64 {
+        crate::io::ErrorKind::BrokenPipe
     } else {
         crate::io::ErrorKind::Other
     };

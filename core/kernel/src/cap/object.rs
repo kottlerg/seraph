@@ -417,6 +417,86 @@ pub struct MemoryObject
     pub slot_count: AtomicU32,
 }
 
+/// Count a capability slot just filled with `object` under `tag` and
+/// `rights` on the counts kept of the slots that name an object: a Memory
+/// object's [`MemoryObject::slot_count`], and an Endpoint's
+/// [`EndpointState::receivers`](crate::ipc::endpoint::EndpointState::receivers)
+/// when the slot carries the Receive right. Called by every fill
+/// (`CSpace::fill_slot`).
+///
+/// # Safety
+/// `object` must be the header of the live object of the type `tag` names,
+/// which the filled slot now names.
+pub unsafe fn note_slot_filled(
+    tag: crate::cap::slot::CapTag,
+    rights: crate::cap::slot::Rights,
+    object: NonNull<KernelObjectHeader>,
+)
+{
+    if tag == crate::cap::slot::CapTag::Memory
+    {
+        // SAFETY: caller contract; a Memory tag names a MemoryObject.
+        unsafe { MemoryObject::note_slot_filled(object) };
+        return;
+    }
+    // SAFETY: caller contract.
+    if let Some(state) = unsafe { receiving_endpoint(tag, rights, object) }
+    {
+        state.note_receiver_filled();
+    }
+}
+
+/// Uncount a capability slot that names `object` under `tag` and `rights`
+/// and is being freed (`CSpace::free_slot`) or released by its dying
+/// `CSpace` (`dealloc_object(CSpaceObj)`), on the counts
+/// [`note_slot_filled`] raised.
+///
+/// # Safety
+/// `object` must be the header of the live object of the type `tag` names,
+/// which the released slot names, counted by [`note_slot_filled`] when it
+/// was filled.
+pub unsafe fn note_slot_released(
+    tag: crate::cap::slot::CapTag,
+    rights: crate::cap::slot::Rights,
+    object: NonNull<KernelObjectHeader>,
+)
+{
+    if tag == crate::cap::slot::CapTag::Memory
+    {
+        // SAFETY: caller contract; a Memory tag names a MemoryObject.
+        unsafe { MemoryObject::note_slot_released(object) };
+        return;
+    }
+    // SAFETY: caller contract.
+    if let Some(state) = unsafe { receiving_endpoint(tag, rights, object) }
+    {
+        state.note_receiver_released();
+    }
+}
+
+/// The state of the endpoint `object` when a slot of `tag` and `rights` on
+/// it carries the Receive right, else `None`.
+///
+/// # Safety
+/// `object` must be the header of the live object of the type `tag` names.
+unsafe fn receiving_endpoint<'a>(
+    tag: crate::cap::slot::CapTag,
+    rights: crate::cap::slot::Rights,
+    object: NonNull<KernelObjectHeader>,
+) -> Option<&'a crate::ipc::endpoint::EndpointState>
+{
+    if tag != crate::cap::slot::CapTag::Endpoint
+        || !rights.contains(crate::cap::slot::EpRights::RECEIVE.erase())
+    {
+        return None;
+    }
+    // SAFETY: caller contract; an Endpoint tag names an EndpointObject, whose
+    // header is at offset 0.
+    let state = unsafe { (*object.as_ptr().cast::<EndpointObject>()).state };
+    // SAFETY: a non-null state is the live endpoint's, allocated with it.
+    unsafe { state.as_ref() }
+}
+
 /// Sentinel encoding a held write lock in [`MemoryObject::lock`]. Matches
 /// `DerivationLock`'s convention. A reader count cannot reach it: a holder is
 /// never descheduled (core/kernel/docs/scheduling-internals.md § Lock
@@ -4255,19 +4335,21 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // included, on the cascade stack: a chain of CSpaces each
                 // holding the last reference to the next is torn down
                 // iteratively, not one recursion per level.
-                let release = |obj_ptr: NonNull<KernelObjectHeader>| {
-                    // SAFETY: for_each_object yields only live objects, each live until
-                    // its reference is released below.
-                    let obj_type = unsafe { obj_ptr.as_ref() }.obj_type;
+                let release = |tag, rights, obj_ptr: NonNull<KernelObjectHeader>| {
                     // The slot stops naming its object here, as a freed
                     // slot does in `CSpace::free_slot`.
-                    if obj_type == ObjectType::Memory
-                    {
-                        // SAFETY: the object is a live Memory object that the released slot
-                        // names, so it is uncounted while live and once, as its fill
-                        // counted it.
-                        unsafe { MemoryObject::note_slot_released(obj_ptr) };
-                    }
+                    // SAFETY: for_each_object yields only live objects, each live until
+                    // its reference is released below, with the tag and rights of the
+                    // slot that names it; it is uncounted while live and once, as its
+                    // fill counted it.
+                    unsafe { note_slot_released(tag, rights, obj_ptr) };
+                    // An endpoint this slot's release leaves with no receiver
+                    // has its waiters released before the reference goes.
+                    // SAFETY: the slot's reference is still held; DERIVATION_LOCK
+                    // and the CSpace lock were released above, and no IPC,
+                    // scheduler, or sleep-list lock is held (dealloc_object's
+                    // preconditions).
+                    unsafe { crate::ipc::endpoint::release_if_unreceivable(obj_ptr) };
                     // SAFETY: the object is live until this reference is released.
                     if unsafe { obj_ptr.as_ref() }.dec_ref() == 0
                     {
@@ -4343,120 +4425,17 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                      refcount invariant broken"
                 );
 
-                // Drain blocked senders and receivers, each woken with its park
-                // stamped cancelled (INTERRUPTED; KILL for a queued faulter), so
-                // sys_ipc_call / sys_ipc_recv return Interrupted.
-                // The drain runs under ep.lock: a concurrent dealloc(waiter)
-                // BlockedOnSend/Recv unlink takes the same lock, so it cannot
-                // mutate these queues or free a waiter mid-walk, and the
-                // per-waiter wake_in_flight = 1 set here (the #160 discipline)
-                // makes any dealloc(waiter) that already left the queue wait at
-                // its wake-in-flight gate for our enqueue_and_wake rather than
-                // free the TCB under it. Holding ep.lock across
-                // enqueue_and_wake follows core/kernel/docs/scheduling-internals.md § Lock
-                // Hierarchy rule 1.
-                {
-                    // SAFETY: state validated non-null; EndpointState live.
-                    let ep = unsafe { &mut *state };
-                    // SAFETY: the returned flags are passed verbatim to the `unlock_raw` below.
-                    let saved = unsafe { ep.lock.lock_raw() };
-                    // Wake senders. enqueue_and_wake commits the state
-                    // transitions under sched_lock; we only detach the
-                    // intrusive list pointers here.
-                    let mut tcb = ep.send_head;
-                    while !tcb.is_null()
-                    {
-                        // SAFETY: tcb is a queued sender, kept live by ep.lock (held), which a
-                        // concurrent dealloc(waiter) unlink also takes.
-                        let next = unsafe { (*tcb).ipc_wait_next };
-                        // SAFETY: as above; ep.lock held.
-                        unsafe { (*tcb).ipc_wait_next = None };
-                        // The whole-queue detach under ep.lock is the episode
-                        // claim. A queued fault sender (its handler never
-                        // received) takes the kill outcome, not a resume, when
-                        // woken (its copy fault fails the syscall, its upcall
-                        // is dropped): its resume runs the fault helper, which
-                        // reads `fault_outcome`. A normal caller gets INTERRUPTED so
-                        // its `sys_ipc_call` resume takes the error path
-                        // instead of failing the no-deposit episode tripwire.
-                        // Covers the unbind-drops-last-ref liveness case
-                        // (fault-handling.md § Liveness rule 3).
-                        // SAFETY: tcb is a valid TCB whose park claim this drain holds: it was
-                        // detached from the queue under ep.lock.
-                        let kind = unsafe { crate::sched::thread::ParkKind::of_sender(tcb) };
-                        // SAFETY: tcb is a valid TCB whose park episode this drain has claimed
-                        // under ep.lock; exactly one stamp per episode.
-                        unsafe { crate::sched::thread::stamp_cancelled_deposit(tcb, kind) };
-                        // A timed call's entry ends with its episode.
-                        // SAFETY: tcb is a valid TCB whose park episode was just claimed under
-                        // ep.lock and is not yet woken; no sleep-list lock is held.
-                        unsafe { crate::ipc::cancel_timed_entry(tcb) };
-                        // Claim for wake under ep.lock (#160). Cleared by
-                        // enqueue_and_wake.
-                        // SAFETY: tcb is a valid TCB; ep.lock held.
-                        unsafe {
-                            (*tcb)
-                                .wake_in_flight
-                                .store(1, core::sync::atomic::Ordering::Release);
-                        }
-                        // SAFETY: tcb is a valid, initialised TCB.
-                        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
-                        // SAFETY: tcb is a valid TCB; target_cpu came from select_target_cpu,
-                        // so it is below CPU_COUNT and initialised by sched::init.
-                        unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
-                        tcb = next.unwrap_or(core::ptr::null_mut());
-                    }
-                    ep.send_head = core::ptr::null_mut();
-                    ep.send_tail = core::ptr::null_mut();
-                    // Keep the send-ready shadow consistent with send_head even
-                    // on the dealloc drain path (#285-adjacent).
-                    // SAFETY: ep.lock is held, serialising with all send_head writers.
-                    unsafe { ep.refresh_send_ready() };
-                    // Wake receivers.
-                    let mut tcb = ep.recv_head;
-                    while !tcb.is_null()
-                    {
-                        // SAFETY: tcb is a queued receiver, kept live by ep.lock (held), which a
-                        // concurrent dealloc(waiter) unlink also takes.
-                        let next = unsafe { (*tcb).ipc_wait_next };
-                        // SAFETY: as above; ep.lock held.
-                        unsafe { (*tcb).ipc_wait_next = None };
-                        // The queue detach under ep.lock is the episode claim:
-                        // stamp INTERRUPTED so the woken server's recv resume
-                        // returns the error instead of publishing a stale
-                        // ipc_msg into its userspace buffer as a success.
-                        // SAFETY: tcb is a valid TCB whose park episode this drain has claimed
-                        // under ep.lock; exactly one stamp per episode.
-                        unsafe {
-                            crate::sched::thread::stamp_park_deposit(
-                                tcb,
-                                crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                            );
-                        }
-                        // A timed receive's entry goes with the waiter.
-                        // SAFETY: tcb is a valid TCB whose park episode was just claimed under
-                        // ep.lock and is not yet woken; no sleep-list lock is held.
-                        unsafe { crate::ipc::cancel_timed_entry(tcb) };
-                        // Claim for wake under ep.lock (#160). Cleared by
-                        // enqueue_and_wake.
-                        // SAFETY: tcb is a valid TCB; ep.lock held.
-                        unsafe {
-                            (*tcb)
-                                .wake_in_flight
-                                .store(1, core::sync::atomic::Ordering::Release);
-                        }
-                        // SAFETY: tcb is a valid, initialised TCB.
-                        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
-                        // SAFETY: tcb is a valid TCB; target_cpu came from select_target_cpu,
-                        // so it is below CPU_COUNT and initialised by sched::init.
-                        unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
-                        tcb = next.unwrap_or(core::ptr::null_mut());
-                    }
-                    ep.recv_head = core::ptr::null_mut();
-                    ep.recv_tail = core::ptr::null_mut();
-                    // SAFETY: `saved` is the value `lock_raw` returned for this lock above.
-                    unsafe { ep.lock.unlock_raw(saved) };
-                }
+                // Release the threads still queued on it: no slot names it, so
+                // none with the Receive right does, and each queued call and
+                // parked receive fails with NoReceiver (a queued fault
+                // delivery is unhandled), as when the last such slot went
+                // while the endpoint stayed referenced
+                // (`ipc::endpoint::release_if_unreceivable`). This also covers
+                // the unbind that drops the last reference
+                // (fault-handling.md § Liveness rule 3).
+                // SAFETY: state validated non-null; EndpointState live; no
+                // lock held (dealloc_object's preconditions).
+                unsafe { crate::ipc::endpoint::release_waiters(state) };
             }
 
             debug_assert!(

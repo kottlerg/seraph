@@ -346,9 +346,10 @@ pub const PARK_DISPOSITION_NONE: u8 = 0;
 /// for reply-bound (`sys_ipc_call`) episodes.
 pub const PARK_DISPOSITION_REPLY: u8 = 1;
 
-/// The park was cancelled (thread stop, source/server dealloc, or a stop that
-/// won against the park commit); the resume returns `Interrupted` and must
-/// not read the wake deposit (`ipc_msg`/`wakeup_value`/`timed_out`).
+/// The park was cancelled (thread stop, the dealloc of its notification,
+/// event queue, wait set, or server thread, or a stop that won against the
+/// park commit); the resume returns `Interrupted` and must not read the wake
+/// deposit (`ipc_msg`/`wakeup_value`/`timed_out`).
 pub const PARK_DISPOSITION_INTERRUPTED: u8 = 2;
 
 /// The park's timeout expired: the sleep-list timer claimed it through
@@ -356,6 +357,13 @@ pub const PARK_DISPOSITION_INTERRUPTED: u8 = 2;
 /// wait-set parks (`SYS_IPC_CALL`, `SYS_IPC_RECV`, `SYS_WAIT_SET_WAIT`); the
 /// resume returns `WouldBlock` and must not read the wake deposit.
 pub const PARK_DISPOSITION_TIMED_OUT: u8 = 3;
+
+/// The park's endpoint has no receiver left: the last capability with the
+/// Receive right on it went while the thread was queued in `SYS_IPC_CALL` or
+/// parked in `SYS_IPC_RECV`, and the endpoint's drain claimed the park
+/// (`ipc::endpoint::release_waiters`). The resume returns `NoReceiver` and
+/// must not read the wake deposit.
+pub const PARK_DISPOSITION_NO_RECEIVER: u8 = 4;
 
 /// The call episode a `park_seq` value belongs to. A park commit
 /// (`commit_blocked_under_local_lock`) advances `park_seq` to the next even
@@ -437,7 +445,7 @@ pub unsafe fn stamp_deposit_episode(tcb: *mut ThreadControlBlock)
 }
 
 /// The kind of park episode a cancellation tears down, which selects what
-/// [`stamp_cancelled_deposit`] stamps.
+/// [`stamp_cancelled_deposit`] and [`stamp_no_receiver_deposit`] stamp.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ParkKind
 {
@@ -497,16 +505,60 @@ impl ParkKind
 #[inline]
 pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, kind: ParkKind)
 {
+    // SAFETY: the caller's exclusive-claim contract is this callee's.
+    unsafe {
+        stamp_ended_deposit(
+            tcb,
+            kind,
+            crate::ipc::fault::FAULT_OUTCOME_KILL,
+            PARK_DISPOSITION_INTERRUPTED,
+        );
+    }
+}
+
+/// Stamp a park episode on an endpoint that has no receiver left, claimed by
+/// the endpoint's drain (`ipc::endpoint::release_waiters`): a fault episode
+/// gets `FAULT_OUTCOME_NO_RECEIVER` plus the episode stamp, so the fault is
+/// unhandled; any other park gets [`PARK_DISPOSITION_NO_RECEIVER`].
+///
+/// # Safety
+/// Same exclusive-claim contract as [`stamp_park_deposit`].
+#[inline]
+pub unsafe fn stamp_no_receiver_deposit(tcb: *mut ThreadControlBlock, kind: ParkKind)
+{
+    // SAFETY: the caller's exclusive-claim contract is this callee's.
+    unsafe {
+        stamp_ended_deposit(
+            tcb,
+            kind,
+            crate::ipc::fault::FAULT_OUTCOME_NO_RECEIVER,
+            PARK_DISPOSITION_NO_RECEIVER,
+        );
+    }
+}
+
+/// Stamp an episode that ended without a reply: `fault_outcome` and the
+/// episode stamp for a fault episode, `disposition` for any other.
+///
+/// # Safety
+/// Same exclusive-claim contract as [`stamp_park_deposit`].
+#[inline]
+unsafe fn stamp_ended_deposit(
+    tcb: *mut ThreadControlBlock,
+    kind: ParkKind,
+    fault_outcome: u8,
+    disposition: u8,
+)
+{
     match kind
     {
         ParkKind::Fault =>
         {
             // SAFETY: tcb valid and claim won per caller contract.
             unsafe {
-                (*tcb).fault_outcome.store(
-                    crate::ipc::fault::FAULT_OUTCOME_KILL,
-                    core::sync::atomic::Ordering::Release,
-                );
+                (*tcb)
+                    .fault_outcome
+                    .store(fault_outcome, core::sync::atomic::Ordering::Release);
             }
             // SAFETY: the caller's exclusive-claim contract is this callee's.
             unsafe { stamp_deposit_episode(tcb) };
@@ -514,7 +566,7 @@ pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, kind: ParkKi
         ParkKind::Call =>
         {
             // SAFETY: the caller's exclusive-claim contract is this callee's.
-            unsafe { stamp_park_deposit(tcb, PARK_DISPOSITION_INTERRUPTED) }
+            unsafe { stamp_park_deposit(tcb, disposition) }
         }
     }
 }
@@ -577,6 +629,12 @@ pub unsafe fn consume_park_interrupted(tcb: *mut ThreadControlBlock) -> bool
         disposition != PARK_DISPOSITION_TIMED_OUT,
         "park resume with TIMED_OUT disposition outside consume_park_cancel",
     );
+    // NO_RECEIVER is stamped only on endpoint parks, which resume through
+    // consume_park_cancel (a receive) or the call's own disposition read.
+    debug_assert!(
+        disposition != PARK_DISPOSITION_NO_RECEIVER,
+        "park resume with NO_RECEIVER disposition outside consume_park_cancel",
+    );
     disposition == PARK_DISPOSITION_INTERRUPTED
 }
 
@@ -592,11 +650,15 @@ pub enum ParkCancel
     Interrupted,
     /// The timer claim stamped [`PARK_DISPOSITION_TIMED_OUT`].
     TimedOut,
+    /// The endpoint's drain stamped [`PARK_DISPOSITION_NO_RECEIVER`]: only on
+    /// a `SYS_IPC_RECV` park.
+    NoReceiver,
 }
 
 /// [`consume_park_interrupted`] for the non-call parks whose timeout the
 /// timer claims as a cancel (`SYS_IPC_RECV`, `SYS_WAIT_SET_WAIT`): it also
-/// reports a [`PARK_DISPOSITION_TIMED_OUT`] stamp. The Acquire pairs with the
+/// reports a [`PARK_DISPOSITION_TIMED_OUT`] stamp, and, for a receive, a
+/// [`PARK_DISPOSITION_NO_RECEIVER`] one. The Acquire pairs with the
 /// stamp's Release.
 ///
 /// # Safety
@@ -619,6 +681,7 @@ pub unsafe fn consume_park_cancel(tcb: *mut ThreadControlBlock) -> ParkCancel
     {
         PARK_DISPOSITION_INTERRUPTED => ParkCancel::Interrupted,
         PARK_DISPOSITION_TIMED_OUT => ParkCancel::TimedOut,
+        PARK_DISPOSITION_NO_RECEIVER => ParkCancel::NoReceiver,
         _ => ParkCancel::None,
     }
 }

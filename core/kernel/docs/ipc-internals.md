@@ -42,9 +42,23 @@ pub struct EndpointState
     /// the two queues, the call/recv rendezvous, and the wait-set
     /// back-pointer pair.
     lock: Spinlock,
+
+    /// Number of capability slots, in every CSpace, that name this endpoint
+    /// with the Receive right. A call or receive reads it under `lock` and
+    /// fails with NoReceiver at zero.
+    receivers: AtomicU32,
 }
 ```
 
+`receivers` is raised when a slot with the Receive right on the endpoint is filled and lowered
+when one is freed or its dying CSpace releases it (`note_receiver_filled` and
+`note_receiver_released`, called from the generic slot hooks `note_slot_filled` and
+`note_slot_released` that `fill_slot` and `free_slot` call; see
+[capability-internals.md](capability-internals.md)). Increments and decrements are `AcqRel`, the
+read (`has_receiver`) `Acquire`. Zero is final: a slot with the Receive right is filled only from
+another one (a derive, copy, or move) or at creation, so once none is left no thread can receive on
+the endpoint again. A wait-set membership and a fault-handler binding hold references to the
+endpoint, not capability slots, and are not counted.
 The endpoint keeps no state field: the pseudo-code below tests the queues directly (a waiting
 receiver is a non-empty receive queue, a waiting sender a non-empty send queue).
 
@@ -62,6 +76,17 @@ one set of links suffices). No separate allocation. Threads are served in arriva
   queue, so push, pop, removal of any waiter, and the membership test are O(1) and touch only the
   TCBs they link or unlink.
 
+**Release when no receiver is left.** `release_if_unreceivable` runs where a slot's reference is
+released after the slot was uncounted: `sys_cap_delete`, a revoke's `dealloc_revoked`
+(`syscall/cap.rs`), `release_moved_object` (`cap/transfer.rs`), and a dying CSpace's teardown
+(`cap/object.rs`). When the endpoint's `receivers` is zero it runs `release_waiters`, which under
+`ep.lock` detaches both queues, stamps each queued caller and parked receiver
+`PARK_DISPOSITION_NO_RECEIVER` (a queued fault delivery `FAULT_OUTCOME_NO_RECEIVER`), removes a
+timed park's sleep-list entry, sets `wake_in_flight`, wakes each waiter with `enqueue_and_wake`,
+and republishes `send_nonempty`. The Endpoint's dealloc runs the same drain. A call or receive that
+reads zero under `ep.lock` queues nothing, so the release whose decrement made the count zero finds
+every earlier waiter and a later one finds the queues empty.
+
 ### Call Path (Sender)
 
 `SYS_IPC_CALL` execution on the sender's thread:
@@ -71,7 +96,9 @@ one set of links suffices). No separate allocation. Threads are served in arriva
 2. Read the data words from the sender's IPC buffer page (data_count > 0),
    pre-validate the cap slots, open the park episode (open_call_episode);
    a non-zero timeout_ms (arg 2's high half) gives the call's deadline
-3. Acquire endpoint lock
+3. Acquire endpoint lock; if receivers == 0, release it and return NoReceiver
+   (endpoint_call returns CallRendezvous::NoReceiver before touching the caller or
+   either queue)
 4. if the recv queue is non-empty:
    // Fast path: receiver is already waiting
    a. recv_tcb = head of the endpoint's recv queue (dequeued); the dequeue
@@ -147,7 +174,8 @@ syscall on either side. Nothing is allocated on the path.
    cancelled (INTERRUPTED, or KILL for a fault-blocked caller) and
    enqueue_and_wake it. The binding published below therefore never
    overwrites another.
-3. Acquire endpoint lock
+3. Acquire endpoint lock; if receivers == 0, release it and return NoReceiver
+   (RecvMiss::NoReceiver), leaving any earlier binding in place
 4. if the send queue is non-empty (bind_next_sender):
    // Fast path: a sender is waiting
    a. sender_tcb = head of the send queue (dequeued); copy its staged
@@ -183,7 +211,8 @@ syscall on either side. Nothing is allocated on the path.
    d. Call the scheduler whether the park committed or was refused (a
       refused park that left the thread runnable is requeued), then
       return through the disposition (consume_park_cancel: TIMED_OUT
-      returns WouldBlock, INTERRUPTED returns Interrupted)
+      returns WouldBlock, INTERRUPTED returns Interrupted, NO_RECEIVER
+      returns NoReceiver)
 ```
 
 **Try-once receive** (`timeout_ms == WAIT_TRY_ONCE`, `endpoint_try_recv`). Step 1 runs as above;
@@ -239,8 +268,9 @@ released.
 ### Park Dispositions and Episodes
 
 Every park is an **episode**. The TCB carries `park_disposition`
-(`NONE`/`REPLY`/`INTERRUPTED`/`TIMED_OUT`, the last stamped only by the
-sleep-list timer's expiry of a timed endpoint or wait-set park); debug builds add
+(`NONE`/`REPLY`/`INTERRUPTED`/`TIMED_OUT`/`NO_RECEIVER`, `TIMED_OUT` stamped only by the
+sleep-list timer's expiry of a timed endpoint or wait-set park, `NO_RECEIVER` (= 4) only by the
+endpoint's drain); debug builds add
 `park_episode`/`deposit_episode` counters for the call/fault protocol's
 tripwire. A `sys_ipc_call` episode has exactly one deposit (fail-closed,
 below); the non-call parking surfaces (`sys_notification_wait`,
@@ -282,36 +312,37 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 | `cancel_ipc_block` BlockedOnReply / BlockedOnFault arms | `reply_tcb` CAS | episode + INTERRUPTED / episode + KILL |
 | `ipc::fault::claim_fault_park` (a fault-handler binding change, `redeliver_in_flight`), received arm | `reply_tcb` CAS under the faulter's `sched_lock` behind a `blocked_on_object` re-read | episode only (`fault_outcome` carries REDELIVER) |
 | `ipc::fault::claim_fault_park`, queued arm | send-queue unlink of the snapshotted park (`park_seq` equal to the binder's snapshot) under `ep.lock` | episode only (`fault_outcome` carries REDELIVER) |
-| `cancel_ipc_block` BlockedOnSend arm | send-queue unlink of the snapshotted park (`park_seq` equal to the cancel's snapshot) under `ep.lock` (a lost unlink hands the episode to the racing rebind chain, to the endpoint's dealloc drain, or to a concurrent cancel that already claimed it; or the thread's own `dealloc_object(Thread)` unlinked it, unstamped, as it dies) | episode + INTERRUPTED (faulter: episode + KILL) |
+| `cancel_ipc_block` BlockedOnSend arm | send-queue unlink of the snapshotted park (`park_seq` equal to the cancel's snapshot) under `ep.lock` (a lost unlink hands the episode to the racing rebind chain, to the endpoint's drain, or to a concurrent cancel that already claimed it; or the thread's own `dealloc_object(Thread)` unlinked it, unstamped, as it dies) | episode + INTERRUPTED (faulter: episode + KILL) |
 | `dealloc_object(Thread)` reply-bound wake | `reply_tcb` CAS under all-CPU locks | episode + INTERRUPTED (faulter: episode + KILL) |
 | `endpoint_call` rendezvous commit-fail teardown | teardown `reply_tcb` CAS win | episode + INTERRUPTED / KILL — without it a legitimate stop→start resume has no deposit |
 | `endpoint_call` send-queue commit-fail teardown | `ep.lock` held continuously from link to unlink | episode + INTERRUPTED / KILL |
 | `bind_next_sender` refused-rebind teardown (`endpoint_recv`, `endpoint_try_recv`) | the send-queue dequeue under `ep.lock`; the refused rebind published nothing (stamped before the wake-in-flight release — a dying caller's dealloc may free the TCB after it) | episode + INTERRUPTED / KILL |
 | `dealloc_object(Thread)` dying-client detach arms | `reply_tcb` CAS | **no stamp** — the claimed thread is the one being freed; it never resumes |
-| `cancel_ipc_block` BlockedOnRecv arm | recv-queue unlink of the snapshotted park (`park_seq` equal to the cancel's snapshot) under `ep.lock` (a lost unlink means one of: a caller already deposited into `ipc_msg` (its delivery stands); the endpoint's dealloc drain stamped the park `INTERRUPTED`; a concurrent cancel already claimed it; or the thread's own `dealloc_object(Thread)` unlinked it, unstamped, as it dies) | INTERRUPTED |
+| `cancel_ipc_block` BlockedOnRecv arm | recv-queue unlink of the snapshotted park (`park_seq` equal to the cancel's snapshot) under `ep.lock` (a lost unlink means one of: a caller already deposited into `ipc_msg` (its delivery stands); the endpoint's drain stamped the park `NO_RECEIVER`; a concurrent cancel already claimed it; or the thread's own `dealloc_object(Thread)` unlinked it, unstamped, as it dies) | INTERRUPTED |
 | `cancel_ipc_block` BlockedOnNotification / EventQueue / WaitSet arms | removal of the snapshotted park (`park_seq` equal to the cancel's snapshot) from the source's waiter queue under the source lock (every genuine waker claims under the same lock) | INTERRUPTED |
 | `cancel_ipc_block` plain-sleep cleanup | `sleep_list_remove` returning `true` under the target's `sched_lock` (the deadline was still pending; the timer pop clears it under the same `SLEEP_LIST_LOCK`, and a commit→add window cancel makes the later add refuse) | INTERRUPTED |
 | `cancel_for_upcall` (a posted upcall, `ipc::upcall::post`): the `cancel_ipc_block` arms but BlockedOnFault, BlockedOnSend and BlockedOnReply (a fault sender's or a call's park), which its snapshot refuses, as does a masked or delivering thread | the claim of the same arm; the BlockedOnReply arm also refuses an upcall's claim in its own hold | episode + INTERRUPTED, with `wake_in_flight = 1` set in the claim's hold for the poster's own `enqueue_and_wake`; the woken syscall returns `Interrupted` ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Upcall Cancel-and-Wake Protocol) |
 | `dealloc_object(Notification)` wake of every waiter (`interrupt_all_waiters`) | removal from the waiter queue under `sig.lock` | INTERRUPTED |
 | `event_queue_drop` (`dealloc_object(EventQueue)`) wake of every waiter | removal from the waiter queue under `eq.lock` | INTERRUPTED |
 | `wait_set_drop` (`dealloc_object(WaitSet)`) wake of every waiter | removal from the waiter queue under `ws.lock` | INTERRUPTED |
-| `dealloc_object(Endpoint)` send-queue drain | whole-queue detach under `ep.lock` | episode + INTERRUPTED (faulter: episode + KILL) |
-| `dealloc_object(Endpoint)` recv-queue drain | whole-queue detach under `ep.lock` | INTERRUPTED |
+| the endpoint's send-queue drain (`release_waiters`, run by `release_if_unreceivable` and by `dealloc_object(Endpoint)`) | whole-queue detach under `ep.lock` | episode + NO_RECEIVER (faulter: episode, `fault_outcome` = `FAULT_OUTCOME_NO_RECEIVER` (8)) |
+| the endpoint's recv-queue drain (`release_waiters`) | whole-queue detach under `ep.lock` | NO_RECEIVER |
 | park-helper refused-commit rollbacks (`notification_wait`, `event_queue_recv`, `waitset_wait`, `endpoint_recv`) | source lock held continuously from publish to rollback — no waker ever saw the queued entry | INTERRUPTED on `ParkCommit::RefusedStop` only; a `RefusedWake` rollback must leave the coalesced deposit deliverable |
 
 **Resume (call/fault episodes — fail-closed).** `sys_ipc_call` consumes the
-disposition: REPLY reads `ipc_msg`; INTERRUPTED returns `Interrupted` and
-TIMED_OUT returns `WouldBlock`, neither touching `ipc_msg`; NONE is a protocol
-violation: debug builds assert (naming tid/park-episode/deposit-episode — the
+disposition: REPLY reads `ipc_msg`; INTERRUPTED returns `Interrupted`,
+TIMED_OUT returns `WouldBlock`, and NO_RECEIVER returns `NoReceiver`, none touching `ipc_msg`;
+NONE is a protocol violation: debug builds assert (naming tid/park-episode/deposit-episode — the
 #352-class spurious-resume tripwire, also checked in `fault_dispatch`'s
 resume), release builds fail closed with
 `Interrupted` rather than surfacing stale `ipc_msg` bytes as a success.
 `fault_dispatch`'s resume fails closed the same way: REDELIVER makes the delivery again under the
 binding current then, FORWARDED makes it again through the exception class (a decline for a
 kernel copy's fault), REDIRECTED makes it again to the endpoint in `fault_redirect`, and any other
-`fault_outcome` than RESUME, a PENDING left by an unstamped wake included, is the unhandled outcome:
-it kills the thread, or, for the fault of a restartable syscall's user copy
-(`copy_fault_dispatch`), fails that syscall with `InvalidAddress`, or, for an upcall
+`fault_outcome` than RESUME, a PENDING left by an unstamped wake included, is the unhandled outcome
+(`FAULT_OUTCOME_NO_RECEIVER` takes the declined cause of a forwarded fault, else
+`KillCause::NoReceiver`): it kills the thread, or, for the fault of a restartable syscall's user
+copy (`copy_fault_dispatch`), fails that syscall with `InvalidAddress`, or, for an upcall
 delivery, drops the upcall and resumes the thread (the `fault_outcome` row of
 [scheduling-internals.md § Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
@@ -319,7 +350,8 @@ delivery, drops the upcall and resumes the thread (the `fault_outcome` row of
 consumes the disposition before reading its wake deposit, via
 `consume_park_interrupted`, or `consume_park_cancel` for the parks the timer
 expires as a cancel (`sys_ipc_recv`, `sys_wait_set_wait`): INTERRUPTED returns
-`Interrupted`, and TIMED_OUT `WouldBlock`, without reading
+`Interrupted`, TIMED_OUT `WouldBlock`, and, for `sys_ipc_recv`, NO_RECEIVER `NoReceiver`,
+without reading
 `wakeup_value`/`timed_out`/`ipc_msg` (it clears the per-surface leftovers instead);
 NONE proceeds on the normal deposit-read path. Fail-open is required, not a
 convenience: genuine wakers for these surfaces do not stamp, because a
@@ -1013,7 +1045,7 @@ delivery, consumer-side atomic check-and-halt — is specified in
 The wake-one primitives invoke `enqueue_and_wake` after releasing their source IPC lock;
 `waitset_notify` and `waitset_add`'s ready-at-add wake release `ws.lock` but wake while the
 notifying or registering source's lock is still held. The multi-waiter drains — the endpoint
-dealloc drain and the Notification, EventQueue, and WaitSet destroy wakes
+drain (`release_waiters`) and the Notification, EventQueue, and WaitSet destroy wakes
 (`interrupt_all_waiters`) — hold the source lock across their walks. All are per rule 5 of
 [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy).
 

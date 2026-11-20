@@ -846,9 +846,11 @@ impl IpcMessageBuilder
 /// repeated in the message (`InvalidArgument`), a cap slot is pinned by an
 /// in-flight `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer
 /// (`InvalidState`), a cap's object has its reference count at its 2^31
-/// ceiling (`QuotaExceeded`), or the call is interrupted (`Interrupted`: the
-/// caller is stopped, or the endpoint, or the server's thread before it
-/// replies, is destroyed). Cap-slot problems are rejected before blocking; a
+/// ceiling (`QuotaExceeded`), no capability with the Receive right on the
+/// endpoint is left, at the call or while it was queued (`NoReceiver`), or the
+/// call is interrupted (`Interrupted`: the caller is stopped, or the server
+/// received again, or its thread is destroyed, before it replies).
+/// Cap-slot problems are rejected before blocking; a
 /// refusal arising only afterwards delivers the message with zero caps (the
 /// caller keeps its capabilities). An upcall never interrupts a call: it is
 /// delivered at the call's return, with the reply in hand
@@ -988,8 +990,10 @@ pub unsafe fn ipc_call_within(
 ///   refused because this thread's `CSpace` directory is structurally full.
 /// - `OutOfMemory` — the cap-slot pre-allocation was refused because the
 ///   `CSpace`'s slot-page pool is exhausted.
-/// - `Interrupted` — this thread was stopped or interrupted by an upcall, or
-///   the endpoint was destroyed, while the receive was blocked.
+/// - `NoReceiver` — no capability with the Receive right on the endpoint is
+///   left, at the receive or while it was blocked.
+/// - `Interrupted` — this thread was stopped or interrupted by an upcall while
+///   the receive was blocked.
 ///
 /// The first four refuse the receive before any pending reply is released,
 /// so a pending caller stays bound.

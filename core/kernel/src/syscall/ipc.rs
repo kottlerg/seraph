@@ -578,7 +578,9 @@ unsafe fn open_call_episode(tcb: *mut crate::sched::thread::ThreadControlBlock)
 
 /// Consume the reply disposition the park episode's wake-claim winner
 /// stamped. `Ok(())` means a REPLY deposit is present and `ipc_msg` is
-/// readable; `Err(WouldBlock)` means a timed call expired; `Err(Interrupted)`
+/// readable; `Err(WouldBlock)` means a timed call expired; `Err(NoReceiver)`
+/// means the endpoint's last capability with the Receive right went while the
+/// call was queued; `Err(Interrupted)`
 /// covers a cancelled episode (stop, server dealloc, teardown) and —
 /// fail-closed — a spurious resume with no deposit at all. The Acquire pairs with the stamp's Release, ordering the deposit
 /// payload before the caller's `ipc_msg` reads. Reading `ipc_msg` without
@@ -627,6 +629,11 @@ unsafe fn consume_call_disposition(
     {
         return Err(SyscallError::WouldBlock);
     }
+    // The endpoint's drain released the queued call: no receiver is left.
+    if disposition == crate::sched::thread::PARK_DISPOSITION_NO_RECEIVER
+    {
+        return Err(SyscallError::NoReceiver);
+    }
     // INTERRUPTED, or NONE (no deposit at all — spurious resume; the debug
     // tripwire above has already named it). Fail closed: Interrupted is
     // strictly better than surfacing stale ipc_msg bytes as a success.
@@ -635,6 +642,21 @@ unsafe fn consume_call_disposition(
         "sys_ipc_call: resume with disposition={disposition} (no deposit)",
     );
     Err(SyscallError::Interrupted)
+}
+
+/// The scheduler deadline of a call bounded by `timeout_ms`: `0`, no
+/// bound, for a `timeout_ms` of `0`.
+#[cfg(not(test))]
+fn call_deadline(timeout_ms: u32) -> u64
+{
+    if timeout_ms == 0
+    {
+        0
+    }
+    else
+    {
+        crate::sched::sleep_deadline_after_ms(u64::from(timeout_ms))
+    }
 }
 
 /// `SYS_IPC_CALL` (0): synchronous call on an endpoint.
@@ -656,6 +678,10 @@ unsafe fn consume_call_disposition(
 /// transfer) are rejected before blocking; a refusal that arises only after the
 /// caller has blocked degrades to delivery with zero caps (the caller keeps its
 /// capabilities).
+///
+/// Fails with `NoReceiver`, at once or when queued, once no capability with
+/// the Receive right on the endpoint is left
+/// (`ipc::endpoint::EndpointState::receivers`).
 ///
 /// Blocks caller until a server replies. On return, label and data words are
 /// in the return registers and IPC buffer. Reply-direction cap handles are
@@ -740,14 +766,7 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller.
     unsafe { open_call_episode(tcb) };
 
-    let deadline = if timeout_ms == 0
-    {
-        0
-    }
-    else
-    {
-        crate::sched::sleep_deadline_after_ms(u64::from(timeout_ms))
-    };
+    let deadline = call_deadline(timeout_ms);
 
     // SAFETY: ep_state is the state of the Endpoint `slot` pins until the
     // drop below; tcb is the running thread (current_tcb above); no scheduler
@@ -762,7 +781,7 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
         )
     };
 
-    if let Ok(woken_server) = result
+    if let crate::ipc::endpoint::CallRendezvous::Bound(woken_server) = result
     {
         // The server was already blocked in recv: endpoint_call completed the
         // rendezvous. Move any caps in this caller's context before waking the
@@ -789,11 +808,17 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
         // select_target_cpu.
         unsafe { crate::sched::enqueue_and_wake(woken_server, target_cpu) };
     }
-    // else: No server; caller is blocked on send queue. Yield to another thread.
+    else if let crate::ipc::endpoint::CallRendezvous::NoReceiver = result
+    {
+        // No thread can receive on the endpoint again; nothing was queued or
+        // parked, and `slot`'s pin drops on return.
+        return Err(SyscallError::NoReceiver);
+    }
 
     // Release the endpoint pin before parking (the pin-before-park rule of
     // `PinnedCap`): the park's binding now keeps this thread reachable, and
-    // the endpoint's dealloc drain claims it if this was the last reference.
+    // the endpoint's drain claims it if no capability with the Receive right
+    // is left.
     drop(slot);
 
     // Yield CPU — the current thread is now Blocked.
@@ -883,6 +908,50 @@ fn log_recv_preallocate_failure(
     );
 }
 
+/// The receive step of `SYS_IPC_RECV` on `ep_state`: `Ok(Some(bound))` when a
+/// caller was waiting, `Ok(None)` when `tcb` parked on the recv queue (or
+/// its park was refused), `Err(WouldBlock)` for an empty try-once, and
+/// `Err(NoReceiver)` when no capability with the Receive right on the
+/// endpoint is left.
+///
+/// # Safety
+/// `ep_state` must be a pinned Endpoint's state and `tcb` the running thread,
+/// with no scheduler lock and no `ep.lock` held.
+#[cfg(not(test))]
+unsafe fn receive_on(
+    ep_state: *mut crate::ipc::endpoint::EndpointState,
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    timeout_ms: u64,
+) -> Result<Option<crate::ipc::endpoint::BoundSender>, SyscallError>
+{
+    let try_once = timeout_ms == syscall::WAIT_TRY_ONCE;
+    let received = if try_once
+    {
+        // SAFETY: the caller's contract.
+        unsafe { crate::ipc::endpoint::endpoint_try_recv(ep_state, tcb) }
+    }
+    else
+    {
+        let deadline = if timeout_ms == 0
+        {
+            0
+        }
+        else
+        {
+            crate::sched::sleep_deadline_after_ms(timeout_ms)
+        };
+        // SAFETY: the caller's contract.
+        unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb, deadline) }
+    };
+    match received
+    {
+        Ok(bound) => Ok(Some(bound)),
+        Err(crate::ipc::endpoint::RecvMiss::NoSender) if try_once => Err(SyscallError::WouldBlock),
+        Err(crate::ipc::endpoint::RecvMiss::NoSender) => Ok(None),
+        Err(crate::ipc::endpoint::RecvMiss::NoReceiver) => Err(SyscallError::NoReceiver),
+    }
+}
+
 /// `SYS_IPC_RECV` (2): receive the next message on an endpoint.
 ///
 /// arg0 = endpoint cap index, arg1 = `timeout_ms`: `0` waits without bound,
@@ -896,6 +965,9 @@ fn log_recv_preallocate_failure(
 /// has the upcall dropped and resumes), once the capability check and the
 /// cap-slot pre-allocation pass. A try-once receive releases it only when it
 /// binds the next caller, and an empty one leaves it bound.
+/// Fails with `NoReceiver`, at once or when parked, once no capability with
+/// the Receive right on the endpoint is left (the caller's own was freed
+/// after its lookup).
 /// Blocks server until a caller sends. On return, the message label and data
 /// words are available in return registers and the server's IPC buffer.
 /// If the message carried capabilities, their delivered handles in the server's
@@ -966,29 +1038,11 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb is the running caller, not yet claimable.
     unsafe { crate::sched::thread::open_park_episode(tcb) };
 
-    // SAFETY (both arms): ep_state is the state of the Endpoint `slot` pins
-    // until the drop before the park below (or the return of the immediate
-    // delivery); tcb is the running thread (current_tcb above); no scheduler
-    // lock and no ep.lock held.
-    let result = if timeout_ms == syscall::WAIT_TRY_ONCE
-    {
-        // SAFETY: see above.
-        let bound = unsafe { crate::ipc::endpoint::endpoint_try_recv(ep_state, tcb) };
-        Some(bound.ok_or(SyscallError::WouldBlock)?)
-    }
-    else
-    {
-        let deadline = if timeout_ms == 0
-        {
-            0
-        }
-        else
-        {
-            crate::sched::sleep_deadline_after_ms(timeout_ms)
-        };
-        // SAFETY: see above.
-        unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb, deadline) }.ok()
-    };
+    // SAFETY: ep_state is the state of the Endpoint `slot` pins until the drop
+    // before the park below (or the return of the immediate delivery); tcb is
+    // the running thread (current_tcb above); no scheduler lock and no ep.lock
+    // held.
+    let result = unsafe { receive_on(ep_state, tcb, timeout_ms) }?;
 
     if let Some(bound) = result
     {
@@ -1052,8 +1106,8 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // else: No caller; server is now Blocked on recv queue. Yield.
 
     // Release the endpoint pin before parking (the pin-before-park rule of
-    // `PinnedCap`); the endpoint's dealloc drain claims this receiver from its
-    // recv queue if this was the last reference.
+    // `PinnedCap`); the endpoint's drain claims this receiver from its recv
+    // queue once no capability with the Receive right is left.
     drop(slot);
 
     // SAFETY: scheduler initialized; called from syscall context.
@@ -1061,9 +1115,10 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
         crate::sched::schedule(crate::sched::Requeue::IfRunnable);
     }
 
-    // A cancellation claim (stop while parked, endpoint dealloc's recv-queue
-    // drain, or a stop that won against the park commit) stamped the episode
-    // INTERRUPTED, and a timed receive's expiry TIMED_OUT; consume it before
+    // A cancellation claim (stop while parked, or a stop that won against the
+    // park commit) stamped the episode INTERRUPTED, the endpoint's recv-queue
+    // drain (no receiver left) NO_RECEIVER, and a timed receive's expiry
+    // TIMED_OUT; consume it before
     // the ipc_msg read — publishing the stale message into the server's
     // userspace buffer as a success was the #363 recv surface.
     // SAFETY: tcb still valid after resume.
@@ -1073,6 +1128,7 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
         {}
         crate::sched::thread::ParkCancel::Interrupted => return Err(SyscallError::Interrupted),
         crate::sched::thread::ParkCancel::TimedOut => return Err(SyscallError::WouldBlock),
+        crate::sched::thread::ParkCancel::NoReceiver => return Err(SyscallError::NoReceiver),
     }
 
     // On resume, deliver the message the waking caller copied into ipc_msg.

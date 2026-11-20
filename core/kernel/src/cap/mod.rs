@@ -377,7 +377,7 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
 {
     use core::sync::atomic::Ordering;
     let mut sum: u64 = 0;
-    cspace.for_each_object(|obj_nn| {
+    cspace.for_each_object(|_, _, obj_nn| {
         // SAFETY: for_each_object yields live KernelObjectHeader pointers.
         let obj_type = unsafe { obj_nn.as_ref().obj_type };
         if obj_type == object::ObjectType::Memory

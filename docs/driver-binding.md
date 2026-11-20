@@ -256,10 +256,12 @@ never claims more than its device and the system's policy give it:
   boot-bundle declaration. Physical access is accepted only from a boot-bundle declaration that
   matches an IOMMU record. A drivers-directory declaration of any of them is logged and
   ignored, and a drivers-directory driver runs at the auxiliary tier. A boot-bundle copy of a
-  driver runs only for the bootstrap, in the boot pass; every later start of a driver, a
-  device's bind after a hot-add included, is from its canonical path under
+  driver runs only for the bootstrap, in the IOMMU pass or the boot pass; every later start of a
+  driver, a device's bind after a hot-add included, is from its canonical path under
   `/services/drivers/`, as vfsd starts fatfs from the bundle for the root mount alone and from
-  `/services/fs/fatfs` for every later mount.
+  `/services/fs/fatfs` for every later mount. The one exception is a restart of the IOMMU driver,
+  which devmgr starts from the copy of the driver's image it keeps for the boot
+  ([boot-media.md](boot-media.md) § Bootstrap-Only Boot Copies).
 - **Withdrawal.** devmgr shares a wired line only among PCI functions; it carves the line of
   any other record exclusive, as it carves the console UART's. Whatever reset a declaration
   names, withdrawing the driver of a PCI function disables the function's wired interrupt

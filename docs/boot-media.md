@@ -39,9 +39,10 @@ checks, once it has composed the ESP, that each object on it equals its installe
 root partition (§ The ESP); the
 bootloader refuses an entry without the boot-module role; the default bundle is the bootstrap
 closure, the consoles' drivers and the platform description tables loaded from the root
-filesystem (§ The Bootstrap Closure); the bundle is used during bootstrap alone
-(§ Bootstrap-Only Boot Copies); the loss of the root filesystem's driver or of its disk is system
-death; and the ESP holds no secret.
+filesystem (§ The Bootstrap Closure); the bundle is used during bootstrap alone, apart from the
+IOMMU driver's image, which devmgr keeps for the driver's restart (§ Bootstrap-Only Boot Copies);
+the loss of the root filesystem's driver or of its disk is system death; and the ESP holds no
+secret.
 
 Design intent, not yet implemented: procmgr's verification of the policy-bearing configuration
 files other than the platform description tables
@@ -128,14 +129,16 @@ Tables); none in the tree does.
 
 ## Bootstrap-Only Boot Copies
 
-A bundle copy runs only during bootstrap, and its memory is returned when bootstrap ends: each
-consumer deletes its copy of a module once it has started the process (vfsd its `fatfs` copy after
-the root mount, devmgr each driver module after its IOMMU and boot passes), and init donates the
-modules' sources to memmgr at its reap ([process-lifecycle.md](process-lifecycle.md) § Init reap).
+A bundle copy runs only during bootstrap, the IOMMU driver's aside (below), and its memory is
+returned when bootstrap ends: each consumer deletes its copy of a module once it has started the
+process (vfsd its `fatfs` copy after the root mount, devmgr each driver module after its IOMMU and
+boot passes), and init donates the modules' sources to memmgr at its reap
+([process-lifecycle.md](process-lifecycle.md) § Init reap).
 
-Every later start of an object is from its installed path, a further instance of a driver that also
-booted included: vfsd starts `fatfs` from the bundle for the root mount alone and from
-`/services/fs/fatfs` for every later mount ([storage.md](storage.md) § First-mount structural
+Every later start of an object, a restart of the IOMMU driver aside (below), is from its installed
+path, a further instance of a driver that also booted included: vfsd starts `fatfs` from the
+bundle for the root mount alone and from `/services/fs/fatfs` for every later mount
+([storage.md](storage.md) § First-mount structural
 constraint), and devmgr starts a driver from its bundle copy in its IOMMU and boot passes alone, and
 from the root filesystem in every later pass, a hot-added device's included
 ([driver-binding.md](driver-binding.md) § Declaration Bounds, Source). A
@@ -144,11 +147,19 @@ Restart](../services/devmgr/docs/responsibilities.md#driver-restart)) or of a fi
 ([namespace composition § Driver
 restart](../services/vfsd/docs/namespace-composition.md#driver-restart)) is a later start.
 
+The IOMMU driver is the one exception. devmgr copies the driver's boot-module image into pages it
+allocates before it releases the module, keeps the copy for the boot, and starts every restart of
+the driver from it ([device-management.md](device-management.md#iommu-driver-restart) § IOMMU
+Driver Restart): a read of the driver's installed file needs a `DMA_MAP` of the block driver's
+buffer, which needs the IOMMU driver. The copy is a second real copy, the image rounded up to whole
+pages ([limits.md](limits.md)), kept in memory for the life of the system, and an update of the
+installed file does not reach a restarted IOMMU driver before the next boot.
+
 Loss of what the root filesystem stands on is fatal: the root filesystem's driver and the driver
 of the disk under it are never restarted, and the root is not remounted in a running system. No
-image is kept from boot for a restart, since a copy kept for that purpose would be a second real
-copy, kept in memory for the life of the system, that no update of the installed file reaches.
-vfsd ends on the death of the root mount's driver or the loss of its disk, and its death is
+other image is kept from boot for a restart, since a copy kept for that purpose would be a second
+real copy, kept in memory for the life of the system, that no update of the installed file
+reaches. vfsd ends on the death of the root mount's driver or the loss of its disk, and its death is
 system death ([storage.md](storage.md) § Failure and Revocation Invariants;
 [supervision.md](supervision.md) § Core Set and System Death); devmgr's restart of a driver
 (vfsd declines it for the root disk's driver) and vfsd's restart of a mount's driver

@@ -598,7 +598,8 @@ raw, compressed or being written at the second read, whatever was in flight
 at the first; a chunk held raw counts in no other word until it is written.
 A chunk on disk or lost can remain: `data[10]` counts both, `data[12]` only a
 chunk on disk. While a swap service has registered slots memmgr evicts the
-chunks of committed regions too, each moving `data[8]` by its backed pages
+chunks of committed regions too, other than an attachment's (§ Label 28),
+each moving `data[8]` by its backed pages
 once it holds no frame of its own, and back at its restore, and `data[18]`
 with it, so a caller asserting that a commitment was released compares
 `data[8] - data[18]`, the promised total net of eviction, beside the free
@@ -1618,9 +1619,9 @@ declined only:
 - with code 6 or 8, when memmgr's metadata arena cannot grow, past what is left of the region's
   metadata bound, for the slots that record the run, or the run cannot be recorded on its chunk.
 
-Only registered swap slots make a committed region's chunks evictable. A fault on one
-memmgr is evicting, or holds raw, maps the chunk's own runs back, and a fault on one it evicted
-restores the chunk; either is declined only:
+Only registered swap slots make a committed region's chunks evictable, and never an attachment's.
+A fault on one memmgr is evicting, or holds raw, maps the chunk's own runs back, and a fault on one
+it evicted restores the chunk; either is declined only:
 
 - with code 11, when a restore's draw finds too few free pages for the chunk's backed pages even
   after memmgr evicted victims in its turn, and with code 7 when the runs covering them cannot then

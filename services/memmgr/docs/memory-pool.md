@@ -895,34 +895,35 @@ the frames they freed or the slots they hold back: `A = 16 * free_slots - (swapp
 committed_swapped`. So an eviction moves a committed chunk's pages between tiers and leaves `free +
 A - promised` as it was; a write spends what its chunk's slot holds no frame for, at most a chunk's
 pages less one, so a partly backed chunk spends some of what A promised. `QUERY_POOL_STATUS` reports
-A in `data[15]`. With no swap service registered no slot is free and no chunk is evicted, A is 0,
-and every committed page has a free page held for it, short only of what memmgr's own metadata,
-which takes free pages without admission, took. While a swap service has registered swap slots
-(`Ledger::overcommits`; a registration is never withdrawn) a committed region's chunks are
-evictable, and A can be spent to 0 (every slot taken, writes of partly backed chunks) with the pool
-still short of `promised` ([Eviction](#eviction), Committed pages): evicting one returns its runs to
-the pool and adds its pages to `promised` again, since its restore draws from `promised` as its
-first touch did. A committed draw, a fault in a committed region or a restore of a committed chunk,
-takes any free page with no swap slot registered or while the free pool covers `promised`, and
-otherwise only the pages above the growth floor for a node outside the reserve, and any for a
-reserve node: the draw room, which `QUERY_POOL_STATUS` reports in `data[16]` for a node outside the
-reserve. So an overcommitted pool leaves the reserve to the reserve nodes and the restore headroom
-to the restores of uncommitted chunks. While the free pool does not cover `promised` and its free
-frames stand at or below the growth floor and the hysteresis band, memmgr evicts for frames in the
-background ([Eviction](#eviction), Selection), so write-out to swap brings the draw room back while
-the level stays `CRITICAL`. When a draw finds no page, memmgr also evicts victims in its turn as a
-restore's direct reclaim does ([Eviction](#eviction), Direct reclaim), each evictable chunk whose
-eviction frees a page above the growth floor (a committed chunk, or an uncommitted one once H
-reaches R) for a node outside the reserve, any for a reserve node, never the one the fault backs, up
-to the same bound; a fault's span is then clamped to the pages found, at
-least its faulting page. A draw still short is declined with code 11, a commit overrun
-([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message); with no swap slot registered
-that is a pool with no free page at all. The draw room is open at a demand chunk's pages or more,
-room for any one committed draw, and memmgr signals its opening to every `REGISTER_PRESSURE`
-registrant that gave bits for it ([Memory pressure](#memory-pressure), Signal); crashd holds a
-commit overrun until then ([crashd Operation § Hold](../../crashd/docs/operation.md#hold)). The
-admission and draw rules and A are the host-tested `free-pool` ledger's (`promise_free`,
-`uncommitted_free`, `draw_room`, `frames_short` and `allowance`).
+A in `data[15]`. With no swap service registered no slot is free and no committed chunk is evicted,
+A is 0, and every committed page has a free page held for it, short only of what memmgr's own
+metadata, which takes free pages without admission, took. While a swap service has registered swap
+slots (`Ledger::overcommits`; a registration is never withdrawn) a committed region's chunks, other
+than an attachment's ([Memory objects](#memory-objects)), are evictable, and A can be spent to 0
+(every slot taken, writes of partly backed chunks) with the pool still short of `promised`
+([Eviction](#eviction), Committed pages): evicting one returns its runs to the pool and adds its
+pages to `promised` again, since its restore draws from `promised` as its first touch did. A
+committed draw, a fault in a committed region or a restore of a committed chunk, takes any free page
+with no swap slot registered or while the free pool covers `promised`, and otherwise only the pages
+above the growth floor for a node outside the reserve, and any for a reserve node: the draw room,
+which `QUERY_POOL_STATUS` reports in `data[16]` for a node outside the reserve. So an overcommitted
+pool leaves the reserve to the reserve nodes and the restore headroom to the restores of uncommitted
+chunks. While the free pool does not cover `promised` and its free frames stand at or below the
+growth floor and the hysteresis band, memmgr evicts for frames in the background
+([Eviction](#eviction), Selection), so write-out to swap brings the draw room back while the level
+stays `CRITICAL`. When a draw finds no page, memmgr also evicts victims in its turn as a restore's
+direct reclaim does ([Eviction](#eviction), Direct reclaim), each evictable chunk whose eviction
+frees a page above the growth floor (a committed chunk, or an uncommitted one once H reaches R) for
+a node outside the reserve, any for a reserve node, never the one the fault backs, up to the same
+bound; a fault's span is then clamped to the pages found, at least its faulting page. A draw still
+short is declined with code 11, a commit overrun ([ipc-interface.md](ipc-interface.md) §
+Kernel-origin fault message); with no swap slot registered that is a pool with no free page at all.
+The draw room is open at a demand chunk's pages or more, room for any one committed draw, and memmgr
+signals its opening to every `REGISTER_PRESSURE` registrant that gave bits for it ([Memory
+pressure](#memory-pressure), Signal); crashd holds a commit overrun until then ([crashd Operation §
+Hold](../../crashd/docs/operation.md#hold)). The admission and draw rules and A are the host-tested
+`free-pool` ledger's (`promise_free`, `uncommitted_free`, `draw_room`, `frames_short` and
+`allowance`).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
@@ -1137,8 +1138,10 @@ fault. It never evicts a granted frame, since a client holding a Memory cap to i
 sent or DMA-mapped it; a page of a process whose budget node is a reserve node ([Distribution
 policy](#distribution-policy)), since those processes free memory under exhaustion and must not
 wait on a restore to do so; a page of a region registered with `REGION_NO_EVICT`
-([`ipc-interface.md`](ipc-interface.md) § Label 7); or a page of a process with no delegated
-address space, whose accessed bits memmgr cannot read. A spawned thread's IPC buffer is a grant
+([`ipc-interface.md`](ipc-interface.md) § Label 7); a page of a memory-object attachment
+([Memory objects](#memory-objects)), since its pages are its object's or a zero frame's, which
+other address spaces may map; or a page of a process with no delegated address space, whose
+accessed bits memmgr cannot read. A spawned thread's IPC buffer is a grant
 ([Userspace Memory Model § Page
 Reservations](../../../docs/userspace-memory-model.md#page-reservations)), and init, memmgr and
 procmgr have no pager, so eviction never reaches a page the kernel's non-restartable IPC-buffer
@@ -1449,7 +1452,7 @@ terminal fault tears down the whole process (see
   separate swap service's, which reads and writes the slots; memmgr performs
   no device I/O and waits on no swap service. memmgr evicts only pages it
   mapped as pager, never a grant, a page of a process whose budget node is a
-  reserve node, or a no-evict region.
+  reserve node, a no-evict region, or a memory-object attachment.
 - **Live migration.** memmgr does not relocate pages held by a live
   process to defragment the pool. Defragmentation depends on processes
   exiting (or calling `RELEASE_MEMORY_CAPS`) and the resulting coalesce.

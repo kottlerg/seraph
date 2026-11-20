@@ -42,8 +42,9 @@ pub const SLEEP: u64 = 1;
 /// Request: `data[0]` = the version. On the success path the machine
 /// resets and no reply arrives; a [`super::acpid_errors::SUCCESS`]
 /// reply means the write returned and the platform still runs. Replies
-/// [`super::acpid_errors::NO_DEVICE`] when the FADT places no
-/// `RESET_REG` in the I/O space (always on RISC-V).
+/// [`super::acpid_errors::NO_DEVICE`] when acpid holds no `RESET_REG`:
+/// devmgr serves none, in the memory or the I/O space, or acpid cannot bind
+/// its port or map its page (always on RISC-V).
 pub const RESET: u64 = 2;
 /// Wait for a power event: acpid holds the call until one is pending,
 /// with no bound, then replies with every event pending.

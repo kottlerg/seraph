@@ -14,7 +14,7 @@
 //! platform acpid runs on declares one.
 
 use aml::{Data, Evaluator, Fault};
-use ipc::{acpid_errors, acpid_labels};
+use ipc::{acpid_errors, acpid_labels, devmgr_labels};
 
 use crate::Why;
 
@@ -103,6 +103,43 @@ pub const fn reduced_writes(slp_typ: u16) -> [(ReducedRegister, u8); 2]
             acpid_labels::sleep_control_value(slp_typ),
         ),
     ]
+}
+
+/// Where a byte register devmgr served lies: a port, or a physical address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place
+{
+    Port(u16),
+    Memory(u64),
+}
+
+/// A byte register devmgr served (`devmgr_labels::QUERY_ACPI_RESOURCES` of
+/// `ACPI_RESET`, `ACPI_SLEEP_CONTROL` or `ACPI_SLEEP_STATUS`): where it
+/// lies, and the value the FADT gives with it (`RESET_VALUE`, else 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Served
+{
+    pub place: Place,
+    pub value: u8,
+}
+
+/// The byte register of a `QUERY_ACPI_RESOURCES` reply whose `data[3]` is
+/// `space`, `data[0]` `address` and `data[2]` `value`: a port in the I/O
+/// space, a physical address in the memory space. `None` for another
+/// space, a port past 0xFFFF, or a value wider than a byte.
+#[must_use]
+pub fn served_register(space: u64, address: u64, value: u64) -> Option<Served>
+{
+    let place = match space
+    {
+        devmgr_labels::ACPI_SPACE_IO => Place::Port(u16::try_from(address).ok()?),
+        devmgr_labels::ACPI_SPACE_MEMORY => Place::Memory(address),
+        _ => return None,
+    };
+    Some(Served {
+        place,
+        value: u8::try_from(value).ok()?,
+    })
 }
 
 /// What a `QUERY_SLEEP` hands its caller beside the `SLP_TYPa`: a
@@ -337,5 +374,37 @@ mod tests
         let mut ns = sim::namespace(&[sim::table(&pts(&[0x78, 0x01, 0x00, 0x00, 0x60]))]);
         let mut ev = Evaluator::new(&mut ns, &mut host);
         assert!(matches!(prepare(&mut ev, 5), Some(f) if f.kind == FaultKind::DivideByZero));
+    }
+
+    // Defect caught: a register devmgr serves in the memory space taken for
+    // a port, or the reset value dropped, so a RESET to a memory-space
+    // RESET_REG writes nothing or writes the wrong byte.
+    #[test]
+    fn a_served_register_decodes_to_its_port_or_its_memory_byte_and_value()
+    {
+        let served = |place, value| Some(Served { place, value });
+        assert_eq!(
+            served_register(devmgr_labels::ACPI_SPACE_IO, 0xCF9, 6),
+            served(Place::Port(0xCF9), 6)
+        );
+        assert_eq!(
+            served_register(devmgr_labels::ACPI_SPACE_MEMORY, 0xFEA0_0202, 0x42),
+            served(Place::Memory(0xFEA0_0202), 0x42)
+        );
+        // A memory address above the port range stays an address.
+        assert_eq!(
+            served_register(devmgr_labels::ACPI_SPACE_MEMORY, 0x1_0000_0000, 0),
+            served(Place::Memory(0x1_0000_0000), 0)
+        );
+        // A port past 0xFFFF, a value wider than a byte, another space.
+        assert_eq!(
+            served_register(devmgr_labels::ACPI_SPACE_IO, 0x1_0000, 6),
+            None
+        );
+        assert_eq!(
+            served_register(devmgr_labels::ACPI_SPACE_IO, 0xCF9, 0x100),
+            None
+        );
+        assert_eq!(served_register(7, 0xCF9, 6), None);
     }
 }

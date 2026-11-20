@@ -32,11 +32,11 @@ no endpoint parks it.
 ## Sequence
 
 1. **Power registers and events** (x86-64). acpid acquires the `PM1a_CNT` block, or, on a
-   hardware-reduced platform, which has none, the sleep control and status registers (a port bound
-   to the evaluation thread, or a page mapped), writing `WAK_STS` to the status register to clear
-   the wake's, and `RESET_REG`, then the PM1a event block, the GPE0 block and the SCI, from devmgr
-   (`QUERY_ACPI_RESOURCES`), binding the event blocks to the evaluation thread before it asks for
-   the SCI; a missing one is logged, and the request or the events that need it go without:
+   hardware-reduced platform, which has none, the sleep control and status registers, writing
+   `WAK_STS` to the status register to clear the wake's, and `RESET_REG` (each a port bound to the
+   evaluation thread, or a page mapped), then the PM1a event block, the GPE0 block and the SCI, from
+   devmgr (`QUERY_ACPI_RESOURCES`), binding the event blocks to the evaluation thread before it asks
+   for the SCI; a missing one is logged, and the request or the events that need it go without:
    `NO_DEVICE` for the request, no events without the PM1a event block or the SCI, no GPEs without
    GPE0. devmgr's answer for the SCI says whether an acpid took it earlier in the boot. On any other
    answer, a failed one included (devmgr records the SCI as served even when its reply does not

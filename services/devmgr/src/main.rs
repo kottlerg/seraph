@@ -1297,9 +1297,9 @@ impl Registry
                     acpi::query_resources(&self.firmware, msg, ipc_buf);
                 }
             }
-            // The `QUERY_ACPI_RESOURCES` of the SCI and of the sleep
-            // registers goes to the control thread, which owns the interrupt
-            // lines and the kept memory grants.
+            // The `QUERY_ACPI_RESOURCES` of the SCI, of `RESET_REG` and of
+            // the sleep registers goes to the control thread, which owns the
+            // interrupt lines and the kept memory grants.
             ipc::devmgr_labels::QUERY_ACPI_RESOURCES
             | ipc::devmgr_labels::ACPI_REGION_GRANT
             | ipc::devmgr_labels::ACPI_PCI_CONFIG

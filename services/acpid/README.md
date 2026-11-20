@@ -112,8 +112,8 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   and the clearing of `WAK_STS`. pwrmgr calls it once at its start, for its power-off on the death
   of a core service ([pwrmgr](../pwrmgr/README.md#responsibilities)). The derivation is an object
   of its own, so acpid's death, which deletes acpid's capability, leaves the caller's standing.
-- `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG` port and logs
-  `RESET: RESET_REG ...` before the write.
+- `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG`, a port, or a byte of memory
+  with a volatile byte store, and logs `RESET: RESET_REG ...` before the write.
 - `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and
   replies `SUCCESS` with the pending events in `data[0]` (`EVENT_POWER_BUTTON`) (§ Events). One
   call waits at a time: a later `WAIT_EVENT` takes its place and the earlier one is replied
@@ -122,22 +122,21 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   acpid has no event to wait for: no SCI, no PM1a event block, or a FADT that declares no fixed
   power button, and always on RISC-V.
 
-On the success path of `SLEEP` and `RESET` the platform powers off or resets and no reply
-arrives. A `SUCCESS` reply to `SLEEP` means the platform still runs 10 s after the writes, and
-to `RESET` that the write returned and the platform still runs; the caller decides how long to
-wait.
-`NO_DEVICE` means the platform lacks what the request needs: `PM1a_CNT` or `SLEEP_CONTROL_REG`,
-a usable `\_S5_` or loaded AML for `SLEEP` and `QUERY_SLEEP` (and, for `QUERY_SLEEP`, a
-derivation that succeeds), an I/O-space `RESET_REG` for `RESET`, and always on RISC-V, whose
-platforms power off and reset through SBI. acpid acquires `PM1a_CNT`, or, when devmgr serves
-none, `SLEEP_CONTROL_REG` and `SLEEP_STATUS_REG`, and `RESET_REG` from devmgr
-(`QUERY_ACPI_RESOURCES`) at the start of its start-up: it binds each port to the evaluation thread
-and maps a memory register's page for its lifetime. The endpoint is served even when the DSDT did
-not load, and, with every request that passes the checks answered `NO_DEVICE`, when the bootstrap
-round delivered the endpoint without the `devmgr.acpi` seed. A receive that keeps failing exits
-acpid (`ipc::recv_guard`), and svcmgr restarts it on the same endpoint. pwrmgr bounds each call at
-30 s ([pwrmgr](../pwrmgr/README.md#responsibilities)), so a request that acpid, down or blocked,
-does not answer fails rather than holding the shutdown.
+On the success path of `SLEEP` and `RESET` the platform powers off or resets and no reply arrives. A
+`SUCCESS` reply to `SLEEP` means the platform still runs 10 s after the writes, and to `RESET` that
+the write returned and the platform still runs; the caller decides how long to wait. `NO_DEVICE`
+means the platform lacks what the request needs: `PM1a_CNT` or `SLEEP_CONTROL_REG`, a usable `\_S5_`
+or loaded AML for `SLEEP` and `QUERY_SLEEP` (and, for `QUERY_SLEEP`, a derivation that succeeds), a
+`RESET_REG` in the memory or the I/O space for `RESET`, and always on RISC-V, whose platforms power
+off and reset through SBI. acpid acquires `PM1a_CNT`, or, when devmgr serves none,
+`SLEEP_CONTROL_REG` and `SLEEP_STATUS_REG`, and `RESET_REG` from devmgr (`QUERY_ACPI_RESOURCES`) at
+the start of its start-up: it binds each port to the evaluation thread and maps a memory register's
+page for its lifetime. The endpoint is served even when the DSDT did not load, and, with every
+request that passes the checks answered `NO_DEVICE`, when the bootstrap round delivered the endpoint
+without the `devmgr.acpi` seed. A receive that keeps failing exits acpid (`ipc::recv_guard`), and
+svcmgr restarts it on the same endpoint. pwrmgr bounds each call at 30 s
+([pwrmgr](../pwrmgr/README.md#responsibilities)), so a request that acpid, down or blocked, does not
+answer fails rather than holding the shutdown.
 
 ---
 

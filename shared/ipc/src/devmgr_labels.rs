@@ -278,9 +278,10 @@ pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 /// register in the memory space; a zero FADT field, a hardware-reduced FADT
 /// for the fixed blocks and the SCI, a FADT that is not hardware-reduced or
 /// names no usable 8-bit register for the sleep registers, a clear
-/// `RESET_REG_SUP` or no usable 8-bit register in the memory or the I/O space
-/// for `RESET_REG`), the FADT cannot be read, or the carve or the derivation
-/// fails, and [`super::devmgr_errors::INVALID_REQUEST`] for an unknown block.
+/// `RESET_REG_SUP`, a zero port or one past 0xFFFF in the I/O space, or no
+/// usable 8-bit register in the memory space for `RESET_REG`), the FADT
+/// cannot be read, or the carve or the derivation fails, and
+/// [`super::devmgr_errors::INVALID_REQUEST`] for an unknown block.
 /// The SCI, `RESET_REG` and the sleep registers are answered on devmgr's
 /// control thread, the other blocks on the registry worker that receives the
 /// request.

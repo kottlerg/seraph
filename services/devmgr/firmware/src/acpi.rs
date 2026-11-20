@@ -404,10 +404,15 @@ pub struct ResetRegister
 ///
 /// Returns `None` if the signature isn't `FACP`, the table (bounded by its
 /// reported length and the slice) does not reach `RESET_VALUE`,
-/// `RESET_REG_SUP` is clear, or the structure is not the 8-bit register the
-/// specification defines, as [`fadt_sleep_register`] refuses one: a
-/// `RESET_REG` in the PCI configuration space, which the specification also
-/// allows, among them.
+/// `RESET_REG_SUP` is clear, or the structure names no register acpid can
+/// write one byte to. In the I/O space that is a zero port or one past
+/// 0xFFFF: the bit width, the bit offset and the access size are not read,
+/// as ACPICA's `AcpiReset` writes an I/O `RESET_REG` as one byte whatever
+/// they say, since firmware is known to give them wrong. In the memory space
+/// it is a structure that is not the 8-bit register the specification
+/// defines, as [`fadt_sleep_register`] refuses one. A `RESET_REG` in any
+/// other space, the PCI configuration space among them, which the
+/// specification also allows, is refused.
 #[must_use]
 pub fn fadt_reset_register(fadt_bytes: &[u8]) -> Option<ResetRegister>
 {
@@ -422,7 +427,23 @@ pub fn fadt_reset_register(fadt_bytes: &[u8]) -> Option<ResetRegister>
     {
         return None;
     }
-    let register = byte_register(table.get(FADT_OFF_RESET_REG..)?.first_chunk::<GAS_LEN>()?)?;
+    let gas = table.get(FADT_OFF_RESET_REG..)?.first_chunk::<GAS_LEN>()?;
+    let register = if gas[0] == GAS_SPACE_IO
+    {
+        let address = read_u64(gas, 4);
+        if address == 0 || address >= IO_PORT_END
+        {
+            return None;
+        }
+        FixedRegister {
+            space: crate::acpid::Space::Io,
+            address,
+        }
+    }
+    else
+    {
+        byte_register(gas)?
+    };
     Some(ResetRegister { register, value })
 }
 
@@ -1860,6 +1881,18 @@ mod tests
             fadt_reset_register(&t),
             reset(Space::Memory, 0xFEA0_0202, 0x42)
         );
+        // An I/O RESET_REG is a port whatever its bit width, bit offset and
+        // access size, which firmware is known to give wrong.
+        for (off, v) in [(1, 16), (1, 0), (2, 1), (3, 2)]
+        {
+            let mut t = q35_fadt(0);
+            t[FADT_OFF_RESET_REG + off] = v;
+            assert_eq!(
+                fadt_reset_register(&t),
+                reset(Space::Io, 0xCF9, 6),
+                "field {off} = {v}"
+            );
+        }
         // An ACPI 2.0 FADT of 129 bytes reaches RESET_VALUE.
         let mut t = reduced;
         t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&129u32.to_le_bytes());
@@ -1867,8 +1900,8 @@ mod tests
     }
 
     // Defect caught: a RESET_REG served when the FADT does not support it,
-    // from a field the table does not reach, or one that is not the
-    // specification's 8-bit register.
+    // from a field the table does not reach, at a zero or out-of-range port,
+    // or in memory when it is not the specification's 8-bit register.
     #[test]
     fn a_reset_register_is_withheld_unless_supported_reached_and_well_formed()
     {
@@ -1904,6 +1937,11 @@ mod tests
             fadt_reset_register(&with_reset(q35_fadt(0), GAS_SPACE_IO, 0x1_0000, 6)),
             None,
             "a port past 0xFFFF"
+        );
+        assert_eq!(
+            fadt_reset_register(&with_reset(q35_fadt(0), GAS_SPACE_IO, 0, 6)),
+            None,
+            "a zero port"
         );
         let mut t = good;
         t[..4].copy_from_slice(b"APIC");

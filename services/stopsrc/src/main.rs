@@ -105,13 +105,22 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
         stopped: false,
     };
     let mut next_key = 1u64;
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        let Ok(msg) = (unsafe { ipc::ipc_recv(service, ipc_buf) })
-        else
+        let msg = match unsafe { ipc::ipc_recv(service, ipc_buf) }
         {
-            continue;
+            Ok(msg) =>
+            {
+                guard.on_success();
+                msg
+            }
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
         for &cap in msg.caps()
         {
@@ -151,6 +160,23 @@ fn serve(service: u64, nonce: u64, ipc_buf: *mut u64) -> !
         };
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    }
+}
+
+/// [`ipc::recv_guard::RecvGuard`] hook of stopsrc's receive loop: log the first
+/// failure of a streak and the fatal one.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
+        }
     }
 }
 

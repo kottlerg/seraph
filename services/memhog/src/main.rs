@@ -51,11 +51,29 @@ fn main() -> !
     serve(service, nonce, &mut fill, ipc_buf)
 }
 
+/// [`ipc::recv_guard::RecvGuard`] hook of memhog's receive loop: log the first
+/// failure of a streak and the fatal one.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
+        }
+    }
+}
+
 /// Serve [`hog`]'s labels on `service`, and once hogging, take back what
 /// other processes free every `mem_fill::TICK_MS` between requests.
 fn serve(service: u64, nonce: u64, fill: &mut Fill, ipc_buf: *mut u64) -> !
 {
     let mut hogging = false;
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
         // 0 waits without bound.
@@ -63,13 +81,23 @@ fn serve(service: u64, nonce: u64, fill: &mut Fill, ipc_buf: *mut u64) -> !
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let msg = match unsafe { ipc::ipc_recv_timeout(service, ipc_buf, timeout) }
         {
-            Ok(msg) => msg,
-            Err(e) if e == SyscallError::WouldBlock as i64 =>
+            Ok(msg) =>
             {
+                guard.on_success();
+                msg
+            }
+            // The tick of a bounded wait, not a failure.
+            Err(e) if hogging && e == SyscallError::WouldBlock as i64 =>
+            {
+                guard.on_success();
                 fill.top_up();
                 continue;
             }
-            Err(_) => continue,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
         for &cap in msg.caps()
         {

@@ -53,6 +53,10 @@ pub fn phases() -> &'static [Phase]
             run: cspace_headroom_phase,
         },
         Phase {
+            name: "cspace_zero_slots",
+            run: cspace_zero_slots_phase,
+        },
+        Phase {
             name: "object_slab_release",
             run: object_slab_release_phase,
         },
@@ -638,6 +642,141 @@ pub fn cspace_headroom_phase(_: &Caps)
         "CSpace held past its start: {copies} copies from headroom {start_headroom}, capacity \
          {before} -> {after}"
     );
+}
+
+/// Times the [`cspace_zero_slots_phase`] wedges svctest's `CSpace`: the first
+/// recovery spends the slot reserve svctest took at start, the second the
+/// reserve the first took again.
+const ZERO_SLOT_WEDGES: usize = 2;
+
+/// Grants one wedge of the [`cspace_zero_slots_phase`] may take before it
+/// counts the `CSpace` as never filling: twice the IPC receive reserve, which
+/// is all a `CSpace` with no general headroom has left for them.
+const ZERO_SLOT_GRANTS_MAX: usize = 2 * MSG_CAP_SLOTS_MAX;
+
+/// A `CSpace` with no free slot is topped up while memmgr can grant, with no
+/// cap deleted first (`runtime/ruststd/README.md` § `CSpace` slot headroom).
+/// svctest derives copies of an endpoint cap until a general allocation fails,
+/// then takes one-page grants by raw IPC until the IPC receive reserve is spent
+/// and a grant's reply arrives as `IPC_REPLY_TRANSFER_FAILED`: no slot is
+/// free. `fund_cspace_slot_budget` must then succeed and leave general
+/// headroom that a derivation takes. Done twice, so the second funding runs on
+/// the slot reserve the first took again. Releases every grant and deletes
+/// every copy.
+pub fn cspace_zero_slots_phase(_: &Caps)
+{
+    let cspace = startup_info().self_cspace;
+    let mut copies = Vec::new();
+    let mut grants = Vec::new();
+    let mut failure = None;
+    for wedge in 0..ZERO_SLOT_WEDGES
+    {
+        match wedge_and_fund(cspace, &mut copies, &mut grants)
+        {
+            Ok(headroom) =>
+            {
+                std::os::seraph::log!(
+                    "CSpace wedge {wedge}: funded from zero free slots to headroom {headroom}, \
+                     {} copies and {} grants held",
+                    copies.len(),
+                    grants.len()
+                );
+            }
+            Err(e) =>
+            {
+                failure = Some(format!("CSpace wedge {wedge}: {e}"));
+                break;
+            }
+        }
+    }
+    for (grant, region_id) in grants
+    {
+        release_grant(grant, region_id);
+    }
+    for copy in copies
+    {
+        let _ = syscall::cap_delete(copy);
+    }
+    if let Some(failure) = failure
+    {
+        panic!("{failure}");
+    }
+}
+
+/// One wedge of the [`cspace_zero_slots_phase`]: fill `cspace` to no free
+/// slot, keeping the copies and grants that fill it, then fund it. Returns the
+/// general headroom after the funding, or what failed. Nothing between the
+/// first derivation and the funding allocates, so no heap growth takes a slot
+/// first: both lists are reserved before.
+fn wedge_and_fund(
+    cspace: u64,
+    copies: &mut Vec<u64>,
+    grants: &mut Vec<(u64, u64)>,
+) -> Result<u64, String>
+{
+    let free = syscall::cap_info(cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY)
+        .and_then(|capacity| {
+            syscall::cap_info(cspace, syscall_abi::CAP_INFO_CSPACE_USED)
+                .map(|used| capacity.saturating_sub(used))
+        })
+        .map_err(|e| format!("cap_info of the CSpace failed: {e}"))?;
+    let room = usize::try_from(free).map_err(|_| format!("{free} free slots overflow usize"))?;
+    copies
+        .try_reserve(room)
+        .map_err(|_| format!("no memory for {room} copies"))?;
+    grants
+        .try_reserve(ZERO_SLOT_GRANTS_MAX)
+        .map_err(|_| "no memory for the grants".to_string())?;
+    let endpoint = startup_info().memmgr_endpoint;
+    let refusal = loop
+    {
+        match syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND)
+        {
+            Ok(copy) if copies.len() < copies.capacity() => copies.push(copy),
+            Ok(copy) =>
+            {
+                let _ = syscall::cap_delete(copy);
+                return Err(format!("derivations outran the {free} free slots read"));
+            }
+            Err(e) => break e,
+        }
+    };
+    if refusal != syscall_abi::SyscallError::OutOfMemory as i64
+    {
+        return Err(format!(
+            "the derivation that met the full CSpace failed with {refusal}"
+        ));
+    }
+    let wedged = loop
+    {
+        if grants.len() == grants.capacity()
+        {
+            break false;
+        }
+        match try_request_contiguous(1)
+        {
+            Ok(grant) => grants.push(grant),
+            Err(syscall_abi::IPC_REPLY_TRANSFER_FAILED) => break true,
+            Err(label) => return Err(format!("REQUEST_MEMORY_CAPS status {label:#x}")),
+        }
+    };
+    if !wedged
+    {
+        return Err(format!(
+            "{} grants landed without filling the CSpace",
+            grants.len()
+        ));
+    }
+    if !std::os::seraph::fund_cspace_slot_budget(cspace, 0)
+    {
+        return Err("fund_cspace_slot_budget failed at zero free slots".to_string());
+    }
+    let headroom = std::os::seraph::cspace_slot_headroom(cspace);
+    let copy = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND).map_err(|e| {
+        format!("a derivation after the funding to headroom {headroom} failed: {e}")
+    })?;
+    copies.push(copy);
+    Ok(headroom)
 }
 
 /// One stray-cap flood case: a message memmgr refuses or answers with no

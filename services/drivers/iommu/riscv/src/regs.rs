@@ -34,6 +34,9 @@ pub const FQT: usize = 0x34;
 pub const CQCSR: usize = 0x48;
 /// `fqcsr`, the fault-queue control and status register (32-bit).
 pub const FQCSR: usize = 0x4c;
+/// `ipsr`, the interrupt-pending status register (32-bit, write 1 to
+/// clear).
+pub const IPSR: usize = 0x54;
 /// Bytes of the register set: every register lies in one naturally aligned
 /// 4 KiB page.
 pub const REGISTER_BYTES: u64 = 0x1000;
@@ -280,6 +283,32 @@ pub const fn ddtp_off(ddtp: u64) -> u64
     ddtp & !DDTP_MODE_MASK & !DDTP_BUSY
 }
 
+/// `ddtp.PPN`'s field, from bit 10.
+const DDTP_PPN_MASK: u64 = (1 << 44) - 1;
+
+/// The depth of the device directory a `ddtp` value translates through
+/// when that directory is rooted at the page `root_phys`; `None` for Off,
+/// Bare, a reserved mode, or a directory rooted elsewhere.
+#[must_use]
+pub const fn directory_at(ddtp: u64, root_phys: u64) -> Option<u32>
+{
+    let levels = match ddtp_mode(ddtp)
+    {
+        2 => 1,
+        3 => 2,
+        4 => 3,
+        _ => return None,
+    };
+    if (ddtp >> 10) & DDTP_PPN_MASK == root_phys >> 12
+    {
+        Some(levels)
+    }
+    else
+    {
+        None
+    }
+}
+
 /// The width of the device IDs a device directory `levels` (1 to 3) deep
 /// holds, in bits, for contexts of `format`: the leaf index, then 9 bits a
 /// level, up to the 24-bit device ID.
@@ -488,6 +517,31 @@ pub const fn decode_fault(words: [u64; FAULT_RECORD_WORDS]) -> Option<FaultRecor
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_directory_is_found_at_its_root_in_a_translating_mode_only()
+    {
+        let root = 0x8765_4000;
+        for (mode, levels) in [
+            (DdtMode::OneLevel, 1),
+            (DdtMode::TwoLevel, 2),
+            (DdtMode::ThreeLevel, 3),
+        ]
+        {
+            assert_eq!(directory_at(ddtp(mode, root), root), Some(levels));
+            // Busy set while the IOMMU acts on the write.
+            assert_eq!(
+                directory_at(ddtp(mode, root) | DDTP_BUSY, root),
+                Some(levels)
+            );
+            assert_eq!(directory_at(ddtp(mode, root), root + 0x1000), None);
+        }
+        for mode in [DdtMode::Off, DdtMode::Bare]
+        {
+            assert_eq!(directory_at(ddtp(mode, root), root), None);
+        }
+        assert_eq!(directory_at(ddtp(DdtMode::OneLevel, root) | 5, root), None);
+    }
 
     #[test]
     fn capabilities_decode_the_version_formats_and_context_size()

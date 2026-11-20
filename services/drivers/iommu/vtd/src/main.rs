@@ -8,21 +8,27 @@
 //! devmgr spawns it first at boot, before any DMA-capable driver, and
 //! delivers it in its resource list one register range per VT-d remapping
 //! unit it found in the ACPI DMAR, with the functions the unit translates
-//! (`iommu_core::delivery`). The driver maps each unit's registers,
-//! programs every unit with an empty root table and turns translation on
+//! (`iommu_core::delivery`), and the anchor page devmgr keeps for each. The
+//! driver maps each unit's registers and anchor, programs every unit with
+//! its anchor as an empty root table and turns translation on
 //! ([`backend::Vtd`]), so every function a unit translates reaches nothing
 //! until devmgr attaches it; then it reports ready and serves
 //! `ipc::iommu_labels` for devmgr ([`iommu_core::service`]), with a second
 //! thread polling the units' fault records. A unit that cannot be set up
 //! turns every unit off again and the driver exits without reporting ready,
-//! so devmgr runs DMA unconfined. See `docs/device-management.md`
-//! § IOMMU Discovery and Programming.
+//! so devmgr runs DMA unconfined. A driver devmgr restarts after a death
+//! adopts the units instead, translating from their anchors through the dead
+//! instance's tables until devmgr's replay commits, and one that cannot
+//! adopt them exits leaving them as they stand, for devmgr to fail the
+//! IOMMU. See `docs/device-management.md` § IOMMU Discovery and Programming
+//! and § IOMMU Driver Restart.
 
 mod arch;
 mod backend;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use iommu_core::Start;
 use iommu_core::delivery::{Delivery, Registers};
 use iommu_core::service::{self, KernelCaps, Lock, Service};
 use iommu_store::{Flush, Store};
@@ -126,6 +132,16 @@ fn faults_dropped(count: u64)
     std::os::seraph::log!(warn: "fault queue full: {} faults dropped", count);
 }
 
+/// Log that `units` units translate, set up or adopted as `start` says.
+fn log_started(start: Start, units: u64)
+{
+    match start
+    {
+        Start::Reset => std::os::seraph::log!("{} units translating", units),
+        Start::Adopt => std::os::seraph::log!("{} units adopted", units),
+    }
+}
+
 fn main() -> !
 {
     std::os::seraph::log::register_name(b"iommu-vtd");
@@ -178,15 +194,21 @@ fn main() -> !
         };
         mapped.push(va);
     }
-    let units = boot
-        .registers
-        .iter()
-        .zip(&mapped)
+    let mut store = Store::new(info.memmgr_endpoint, info.self_aspace, table_flush(&mapped));
+    let mut units = Vec::new();
+    for ((r, &va), unit) in boot.registers.iter().zip(&mapped).zip(&boot.units.0)
+    {
+        let Some(anchor) = store.adopt(unit.anchor, 1)
+        else
+        {
+            std::os::seraph::log!(error: "anchor not mapped");
+            syscall::thread_exit();
+        };
         // The delivery bounds `pages` to `MAX_UNIT_REGISTER_PAGES`, so the
         // product does not saturate.
-        .map(|(r, &va)| Unit::new(va, r.pages.saturating_mul(PAGE_SIZE)))
-        .collect();
-    let store = Store::new(info.memmgr_endpoint, info.self_aspace, table_flush(&mapped));
+        units.push(Unit::new(va, r.pages.saturating_mul(PAGE_SIZE), anchor));
+    }
+    let start = boot.units.start();
     // SAFETY: ipc_buf is this thread's registered IPC buffer.
     let Some(caps) = (unsafe { KernelCaps::new(info.memmgr_endpoint, ipc_buf) })
     else
@@ -194,7 +216,7 @@ fn main() -> !
         std::os::seraph::log!(error: "no physical-address credential");
         syscall::thread_exit();
     };
-    let Some(mut svc) = Service::new(Vtd::new(units, store), caps, boot.units)
+    let Some(mut svc) = Service::new(Vtd::new(units, store, start), caps, boot.units)
     else
     {
         std::os::seraph::log!(error: "no memory for the service");
@@ -202,10 +224,18 @@ fn main() -> !
     };
     if let Err((unit, e)) = svc.init()
     {
-        std::os::seraph::log!(error: "unit {} not set up ({:?}); translation left off", unit, e);
+        match start
+        {
+            Start::Reset => std::os::seraph::log!(error:
+                "unit {} not set up ({:?}); translation left off", unit, e
+            ),
+            Start::Adopt => std::os::seraph::log!(error:
+                "unit {} not adopted ({:?}); units left as they stand", unit, e
+            ),
+        }
         syscall::thread_exit();
     }
-    std::os::seraph::log!("{} units translating", mapped.len() as u64);
+    log_started(start, mapped.len() as u64);
 
     let shared = Arc::new(Shared(Mutex::new(svc)));
     let poller = Arc::clone(&shared);
@@ -222,7 +252,7 @@ fn main() -> !
     // SAFETY: ipc_buf is this thread's registered IPC buffer.
     if let Err(e) = unsafe { ipc::report_driver_ready(boot.devmgr_query, ipc_buf) }
     {
-        std::os::seraph::log!(error: "DRIVER_READY failed ({:?}); translation left off", e);
+        std::os::seraph::log!(error: "DRIVER_READY failed ({:?}); driver exiting", e);
         shared.with(Service::disable);
         syscall::thread_exit();
     }

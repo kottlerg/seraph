@@ -60,9 +60,11 @@ under its sender's name, the first after the restart included
   stopped by a debugger or dead does not hold the log stream; a sink whose writer could not be
   spawned is written by each line's producer, and a stopped driver then costs every line up to that
   bound (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Output sinks). The panic sink calls
-  the driver directly, each call bounded by the same bound. The emit path never calls devmgr: while
-  no driver is resolved, serial output is dropped while history still accrues; early-boot output is
-  covered by init-logd's direct-UART fallback. logd holds its own diagnostics until init-logd, which
+  the driver directly, each call bounded by the same bound, and drops its output while no driver is
+  resolved. The emit path never calls devmgr: while devmgr serves no driver of a sink's class, the
+  sink queues its lines without a wait, counts those past its queue, and writes both to the driver
+  its class watch resolves next, while history still accrues; early-boot output is covered by
+  init-logd's direct-UART fallback. logd holds its own diagnostics until init-logd, which
   writes the UART directly, has acknowledged the handover release, so the two never write a line at
   once (see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering). See
   [docs/console-model.md](../../docs/console-model.md).
@@ -74,9 +76,10 @@ under its sender's name, the first after the restart included
   so the steady-state userspace log stream reaches the screen as well as
   the UART (matching the early-kernel console). The mirror is a sink of its own, with its own
   queue and writer, so a framebuffer driver that does not answer holds neither the log stream nor
-  the serial output beyond `SINK_STALL_MS`. The mirror soft-degrades
-  to a no-op when no framebuffer driver is present (headless boot),
-  leaving serial the authoritative channel; the emit path never queries devmgr.
+  the serial output beyond `SINK_STALL_MS`. When no framebuffer driver is present (headless
+  boot) the mirror writes nothing: its sink queues lines up to its queue and counts the rest for a
+  driver that may come up later, leaving serial the authoritative channel; the emit path never
+  queries devmgr.
   See [docs/console-model.md](../../docs/console-model.md).
 
 * **Log records.** Beside the text stream, a sender can send a log record,

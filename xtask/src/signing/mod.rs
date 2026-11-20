@@ -795,18 +795,20 @@ pub mod testing
             .to_path_buf()
     }
 
-    /// A new directory outside the work tree, unique to this process and
-    /// call.
+    /// A new, empty directory outside the work tree, unique to this process
+    /// and call. The tests run in parallel threads of one process, so the
+    /// name carries a per-process sequence number rather than a clock
+    /// reading two calls can share; a directory an earlier process of the
+    /// same id left behind is removed first.
     pub fn scratch(tag: &str) -> PathBuf
     {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "seraph-signing-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -849,6 +851,19 @@ mod tests
 
     use super::testing::{config, counter, scratch, signer, work_tree};
     use super::*;
+
+    /// Two calls of `testing::scratch` with one tag, which a clock reading of
+    /// the same value used to give one directory, give two distinct
+    /// directories, each present.
+    #[test]
+    fn scratch_gives_each_call_its_own_directory()
+    {
+        let (first, second) = (scratch("scratch-twice"), scratch("scratch-twice"));
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+        std::fs::remove_dir_all(first).unwrap();
+        std::fs::remove_dir_all(second).unwrap();
+    }
 
     /// `object` verified under `signer`'s store for a loader of `role`
     /// named `name` on riscv64.

@@ -256,10 +256,12 @@ never claims more than its device and the system's policy give it:
   boot-bundle declaration. Physical access is accepted only from a boot-bundle declaration that
   matches an IOMMU record. A drivers-directory declaration of any of them is logged and
   ignored, and a drivers-directory driver runs at the auxiliary tier. A boot-bundle copy of a
-  driver runs only for the bootstrap, in the boot pass; every later start of a driver, a
-  device's bind after a hot-add included, is from its canonical path under
+  driver runs only for the bootstrap, in the IOMMU pass or the boot pass; every later start of a
+  driver, a device's bind after a hot-add included, is from its canonical path under
   `/services/drivers/`, as vfsd starts fatfs from the bundle for the root mount alone and from
-  `/services/fs/fatfs` for every later mount.
+  `/services/fs/fatfs` for every later mount. The one exception is a restart of the IOMMU driver,
+  which devmgr starts from the copy of the driver's image it keeps for the boot
+  ([boot-media.md](boot-media.md) § Bootstrap-Only Boot Copies).
 - **Withdrawal.** devmgr shares a wired line only among PCI functions; it carves the line of
   any other record exclusive, as it carves the console UART's. Whatever reset a declaration
   names, withdrawing the driver of a PCI function disables the function's wired interrupt
@@ -322,20 +324,23 @@ record again once its driver is withdrawn.
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process
 serves every unit of its family. Its resource list is one group per unit (§ Binding): the
-unit's round, carrying its PCI segment and its scope, then the unit's register `Mmio` range,
+unit's round, carrying its PCI segment, its scope, its anchor (one `Memory` cap) and whether
+the instance adopts the unit (a restart), then the unit's register `Mmio` range,
 and its fault interrupt when devmgr gives it one. Its binding keeps what
 [device-management.md](device-management.md#iommu-discovery-and-programming) § IOMMU Discovery
 and Programming specifies:
 
 - it is bound in a pass and settle batch of its own, before the boot pass over every other
   boot-module driver;
-- every unit's register `Mmio` capability is delivered to it, and devmgr deletes its own once
-  the spawn returns, keeping no copy;
+- every unit's register `Mmio` capability and anchor are delivered to it, and devmgr keeps its
+  own register capability and the anchor for the boot, for a restart
+  ([device-management.md](device-management.md#iommu-driver-restart) § IOMMU Driver Restart);
 - it is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS` at the boot tier,
   from its declaration's DMA and physical-access fields, and `CREATE_RESERVE`, inside memmgr's
   system reserve;
 - it is given no DMA capability;
-- devmgr deletes its hold's release token at the spawn.
+- devmgr keeps its hold's release token, and releases the hold of a dead instance once a
+  restarted instance has committed.
 
 devmgr is its only consumer, over `ipc::iommu_labels`; it serves no device class.
 
@@ -371,8 +376,9 @@ at `BIND_DRIVERS`, and for a hot-added device:
 5. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
    each capability with its resource kind and its fields, then the service endpoint, the
    devmgr query capability, and the DMA capability. One delivery shape serves every driver.
-   The IOMMU record's list also carries one unit round before each unit's resources, naming
-   the unit's segment and scope; a driver bound to any other record refuses a list that
+   The IOMMU record's list also carries one unit round before each unit's resources, carrying
+   the unit's segment, scope, anchor and adopt flag; a driver bound to any other record refuses a
+   list that
    carries one (`driver_binding::resources`).
 6. Record the driver in the pass's settle batch; the settle, the serving of ready drivers, and
    the withdrawal of the rest are unchanged

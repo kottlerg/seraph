@@ -52,18 +52,20 @@ static HEADROOM: CSpaceHeadroom = CSpaceHeadroom::new(CSPACE_LOW_WATER, CSPACE_T
 
 /// Hold devmgr's `CSpace` above [`CSPACE_LOW_WATER`] before an operation
 /// that allocates slots, on any devmgr thread: each control-loop turn, each
-/// record's bind before its carves, each driver spawn, each registry request,
-/// and each DMA request. Logs nothing, so a registry
+/// record's bind before its carves, each driver spawn, each hotplug slot's
+/// grant and add job, each registry request, and each DMA request. Logs
+/// nothing, so a registry
 /// worker or the DMA thread may call it while logd, or a driver logd writes
 /// through, waits on its reply; the control thread reports a failed top-up
 /// ([`hold_and_report`]).
 ///
 /// Returns `false` when the `CSpace` was short of the mark and its top-up
 /// was refused. The operation then takes no capability it would keep: a
-/// record's bind and a driver spawn fail, and the registry's `WATCH_CLASS`
-/// and the DMA thread's `DMA_MAP` are refused (`firmware::headroom`), so
-/// the slots left, and the IPC receive reserve the next top-up's reply needs,
-/// stay free.
+/// record's bind and a driver spawn fail, a hotplug slot's grant waits
+/// (`firmware::hotplug::held_grant`), and a hotplug add job, the registry's
+/// `WATCH_CLASS` and the DMA thread's `DMA_MAP` are refused
+/// (`firmware::headroom`), so the slots left, and the IPC receive reserve
+/// the next top-up's reply needs, stay free.
 #[must_use]
 pub fn hold() -> bool
 {

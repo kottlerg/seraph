@@ -49,7 +49,7 @@ devmgr/
 │   ├── hotplug.rs                  # PCI Express hotplug: managed slots, poller, acpid's jobs,
 │   │                               #   add and removal jobs
 │   ├── intremap.rs                 # VT-d interrupt remapping: enable, per-source remapping entries
-│   ├── iommu.rs                    # IOMMU units, driver spawn, device attach, fail-closed client
+│   ├── iommu.rs                    # IOMMU units, driver spawn/restart, attach, fail-closed client
 │   ├── pci.rs                      # ECAM configuration-space accessor for the PCI scan
 │   ├── phys.rs                     # Physical-address credential (a memmgr page with `Phys`)
 │   ├── platform.rs                 # Platform enumerators: boot framebuffer, ACPI namespace, SPCR,

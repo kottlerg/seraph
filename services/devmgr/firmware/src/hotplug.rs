@@ -387,6 +387,28 @@ pub const fn slot_grant(osc: Option<Osc>, tables: Option<bool>) -> SlotGrant
     SlotGrant::Wait
 }
 
+/// What devmgr settles a slot to on this turn, its grant being `grant`
+/// ([`slot_grant`]) and `hold` holding devmgr's `CSpace` headroom, `false`
+/// when the headroom is short of its mark and its top-up was refused
+/// (`services/devmgr/docs/responsibilities.md` § `CSpace` headroom). A
+/// grant that settles the slot keeps capabilities: a managed slot a
+/// derivation of its port's configuration page, and a managed slot and one
+/// left to the firmware the held BAR pages of the functions behind it. Such
+/// a grant waits while `hold` is refused, and a later turn settles it;
+/// `hold` is called for no other grant.
+#[must_use]
+pub fn held_grant(grant: SlotGrant, hold: impl FnOnce() -> bool) -> SlotGrant
+{
+    if matches!(grant, SlotGrant::Wait) || hold()
+    {
+        grant
+    }
+    else
+    {
+        SlotGrant::Wait
+    }
+}
+
 /// The host bridge bus `bus` of `segment` lies below: the one whose bus
 /// window holds the bus, else, when no bridge's bus window does, the one
 /// whose root bus it is.
@@ -1769,6 +1791,31 @@ mod tests
         // No _OSC result yet: nothing is decided but a table's grant.
         assert_eq!(slot_grant(None, None), SlotGrant::Wait);
         assert_eq!(slot_grant(None, Some(false)), SlotGrant::Wait);
+    }
+
+    #[test]
+    fn a_grant_waits_while_the_cspace_headroom_is_refused()
+    {
+        let settling = [
+            SlotGrant::Manage(GrantBy::Osc),
+            SlotGrant::Manage(GrantBy::PlatformTable),
+            SlotGrant::Firmware,
+        ];
+        for grant in settling
+        {
+            // Managing a slot, or leaving it to the firmware, keeps
+            // capabilities, so neither is settled after a refused top-up.
+            assert_eq!(held_grant(grant, || false), SlotGrant::Wait, "{grant:?}");
+            assert_eq!(held_grant(grant, || true), grant, "{grant:?}");
+        }
+        // A slot with no grant yet keeps nothing and asks for no top-up.
+        let asked = core::cell::Cell::new(false);
+        let hold = || {
+            asked.set(true);
+            false
+        };
+        assert_eq!(held_grant(SlotGrant::Wait, hold), SlotGrant::Wait);
+        assert!(!asked.get());
     }
 
     #[test]

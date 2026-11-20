@@ -87,6 +87,14 @@ hot-added BAR lands on them. A slot whose pages cannot be held is neither manage
 firmware, logged `not managed`: devmgr acts on none of its events, and the pages moved before the
 failure go back to the apertures.
 
+Managing a slot and leaving it to the firmware each keep capabilities: the held BAR pages, and for
+a managed slot the derivation of the port's configuration page the poller holds. While devmgr's
+`CSpace` headroom is short of its mark and its top-up was refused
+([responsibilities.md](responsibilities.md#cspace-headroom) § `CSpace` headroom), a slot whose
+grant has come therefore waits (`firmware::hotplug::held_grant`), logged `its grant waits` once,
+and a later turn settles it. Until then the poller does not watch the slot, and acpid's jobs for it
+are refused as for any slot still waiting (§ ACPI Hotplug).
+
 ---
 
 ## Native Hotplug
@@ -151,7 +159,8 @@ control thread runs it in order with the others, each to its end before the next
   firmware does not drive (managed, waiting for its grant, or not managed) `REFUSED`, each logged;
 - an add job runs the add path (§ Add Job), logged `card added (the firmware's device check)`. One
   for a slot behind which live records lie already, a repeat of the firmware's for a card already
-  recorded, records nothing, logged;
+  recorded, records nothing, logged; one the `CSpace` headroom refuses is answered
+  `OUT_OF_RESOURCES` (§ Add Job);
 - a removal job runs the removal path (§ Removal), logged `removing its functions (the firmware's
   eject request)`.
 
@@ -195,6 +204,14 @@ bound to it, and the apertures are as they were. Pages that cannot be held, and 
 records refuse (a live record already holds the address, or no memory to grow them), are logged
 with the reason; the held pages go back to the apertures and the records are as they were.
 
+An add job keeps capabilities: the configuration page of each function it reads and the held pages
+of its BARs. While devmgr's `CSpace` headroom is short of its mark and its top-up was refused
+([responsibilities.md](responsibilities.md#cspace-headroom) § `CSpace` headroom), the job is
+refused before it reads a function (`firmware::headroom::hotplug_refusal`), logged `card not
+added, nothing recorded`: acpid's is answered `OUT_OF_RESOURCES`, and a managed slot's card stays
+powered and unrecorded until its removal, after which a press or a new insertion adds it again
+(§ Removal). A removal job runs whatever the headroom.
+
 The aperture table is the one record of what is free. A page devmgr granted acpid
 ([acpid's devmgr.md](../../acpid/docs/devmgr.md) § Region grants), carved for itself or a driver,
 or holds for a function behind a managed slot is not in it, so no placement lands on it; a held
@@ -210,7 +227,7 @@ the appended ones among them, under the bounds of the `SET_DRIVERS_DIR` pass, as
 batch, the hotplug batch ([docs/driver-binding.md](../../../docs/driver-binding.md#hotplug) §
 Hotplug). Before `SET_DRIVERS_DIR` the record is only appended, and the directory's pass binds it. A
 hot-added function therefore binds from `/services/drivers/` at the auxiliary tier whatever its
-class, a disk included: a boot-bundle copy of a driver runs only for the bootstrap
+class, a disk included: a boot-bundle copy of a driver binds no device after the bootstrap
 ([docs/driver-binding.md](../../../docs/driver-binding.md#declaration-bounds) § Declaration Bounds).
 It takes the next ordinal of its class, and a bound driver signals the class's watches.
 

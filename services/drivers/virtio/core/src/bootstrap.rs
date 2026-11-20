@@ -357,6 +357,8 @@ mod tests
             segment: 0,
             include_pci_all: true,
             scopes: Vec::new(),
+            anchor: 40,
+            adopt: false,
         })
         .expect("no scopes");
         assert!(DeliveredDevice::from_list(&list(&[unit, bar(), end(20)])).is_none());

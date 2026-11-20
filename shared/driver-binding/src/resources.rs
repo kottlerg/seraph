@@ -14,7 +14,7 @@
 //! | [`kind::IO_PORT`] | 1 `IoPort` cap | base port, port count (non-zero) | no |
 //! | [`kind::INTERRUPT`] | 1 to `MSG_CAP_SLOTS_MAX` `Interrupt` caps, one per vector | [`InterruptKind`], first vector, `SYS_IRQ_REGISTER` mode | no |
 //! | [`kind::END`] | the present endpoint slots | presence word of the slots ([`SLOT_SERVICE`], [`SLOT_DEVMGR_QUERY`], [`SLOT_DMA`]), packed by `ipc::bootstrap::pack_slots` | yes |
-//! | [`kind::IOMMU_UNIT`] | none | PCI segment, flags ([`FLAG_INCLUDE_PCI_ALL`]), then one [`Scope`] word per function or bus range the unit names, at most [`MAX_UNIT_SCOPES`] | no |
+//! | [`kind::IOMMU_UNIT`] | 1 `Memory` cap, the unit's anchor | PCI segment, flags ([`FLAG_INCLUDE_PCI_ALL`], [`FLAG_ADOPT`]), then one [`Scope`] word per function or bus range the unit names, at most [`MAX_UNIT_SCOPES`] | no |
 //!
 //! Resource rounds come first, in the device record's order, then the one
 //! terminal end round. A wired interrupt is one cap, vector 0; a
@@ -26,7 +26,10 @@
 //! An IOMMU record's list is one group per remapping unit: the unit's
 //! `IOMMU_UNIT` round, then its resources (its register `Mmio` range, and its
 //! fault interrupt when it is given one), each group's resources ending at the
-//! next unit round or the end round. Only an IOMMU record's list carries unit
+//! next unit round or the end round. A unit round carries the unit's anchor:
+//! the page devmgr allocates and keeps for the boot that holds the unit's root
+//! translation structure, which every instance of the IOMMU driver builds
+//! beneath (docs/device-management.md § IOMMU Driver Restart). Only an IOMMU record's list carries unit
 //! rounds, and a delivery decode for any other record refuses a list that
 //! holds one ([`PlatformDelivery::from_list`]).
 
@@ -93,6 +96,10 @@ pub const MAX_IOMMU_UNITS: usize = 16;
 /// `IOMMU_UNIT` flag: the unit translates every function of its segment that
 /// no other unit's scope names.
 pub const FLAG_INCLUDE_PCI_ALL: u64 = 1 << 0;
+/// `IOMMU_UNIT` flag: the driver is a restarted instance, and the unit is
+/// translating from its anchor; the driver adopts it in place rather than
+/// resetting it.
+pub const FLAG_ADOPT: u64 = 1 << 1;
 /// Data words of an `IOMMU_UNIT` round before its scope words: the kind, the
 /// segment, and the flags.
 const UNIT_HEADER_WORDS: usize = 3;
@@ -189,6 +196,13 @@ pub struct IommuUnit
     /// The functions and bus ranges the unit names explicitly, at most
     /// [`MAX_UNIT_SCOPES`].
     pub scopes: Vec<Scope>,
+    /// The unit's anchor: a cap on the one zeroed page devmgr keeps for the
+    /// unit's root structure (the VT-d root table, the RISC-V device
+    /// directory's root).
+    pub anchor: u64,
+    /// Whether the driver adopts the unit translating from its anchor
+    /// ([`FLAG_ADOPT`]).
+    pub adopt: bool,
 }
 
 /// An interrupt resource's kind.
@@ -363,25 +377,36 @@ impl Round
         ))
     }
 
-    /// The `IOMMU_UNIT` round of `unit`, opening its group. Returns `None`
-    /// when its scopes number more than [`MAX_UNIT_SCOPES`].
+    /// The `IOMMU_UNIT` round of `unit`, opening its group, carrying its
+    /// anchor. Returns `None` when its scopes number more than
+    /// [`MAX_UNIT_SCOPES`].
     #[must_use]
     pub fn iommu_unit(unit: &IommuUnit) -> Option<Self>
+    {
+        Self::iommu_unit_carrying(unit, unit.anchor)
+    }
+
+    /// The `IOMMU_UNIT` round of `unit` carrying `anchor` in place of
+    /// `unit.anchor`: the sender's copy for the receiver, when the sender
+    /// keeps the anchor itself. Returns `None` as [`Self::iommu_unit`] does.
+    #[must_use]
+    pub fn iommu_unit_carrying(unit: &IommuUnit, anchor: u64) -> Option<Self>
     {
         if unit.scopes.len() > MAX_UNIT_SCOPES
         {
             return None;
         }
-        let flags = if unit.include_pci_all
+        let mut flags = 0;
+        if unit.include_pci_all
         {
-            FLAG_INCLUDE_PCI_ALL
+            flags |= FLAG_INCLUDE_PCI_ALL;
         }
-        else
+        if unit.adopt
         {
-            0
-        };
+            flags |= FLAG_ADOPT;
+        }
         let mut round = Self::new(
-            &[],
+            &[anchor],
             &[kind::IOMMU_UNIT, u64::from(unit.segment), flags],
             false,
         );
@@ -596,9 +621,9 @@ impl ResourceList
                 let decoded = decode_interrupts(caps, irq_kind, first, mode, &mut batch);
                 self.push(batch.get(..decoded.ok_or(bad)?).ok_or(bad)?)
             }
-            (kind::IOMMU_UNIT, &[], &[_, segment, flags, ref scopes @ ..]) =>
+            (kind::IOMMU_UNIT, &[anchor], &[_, segment, flags, ref scopes @ ..]) =>
             {
-                self.push_unit(segment, flags, scopes, bad)
+                self.push_unit(anchor, segment, flags, scopes, bad)
             }
             (kind::END | kind::MMIO | kind::IO_PORT | kind::INTERRUPT | kind::IOMMU_UNIT, _, _) =>
             {
@@ -627,11 +652,12 @@ impl ResourceList
         Ok(false)
     }
 
-    /// Record an `IOMMU_UNIT` round's unit, its group starting at the next
-    /// resource; `bad` for a segment past 16 bits, an unknown flag, or a
-    /// scope word that does not decode.
+    /// Record an `IOMMU_UNIT` round's unit with its anchor cap `anchor`, its
+    /// group starting at the next resource; `bad` for a segment past 16 bits,
+    /// an unknown flag, or a scope word that does not decode.
     fn push_unit(
         &mut self,
+        anchor: u64,
         segment: u64,
         flags: u64,
         words: &[u64],
@@ -639,7 +665,7 @@ impl ResourceList
     ) -> Result<bool, ListError>
     {
         let segment = u16::try_from(segment).map_err(|_| bad)?;
-        if flags & !FLAG_INCLUDE_PCI_ALL != 0 || words.len() > MAX_UNIT_SCOPES
+        if flags & !(FLAG_INCLUDE_PCI_ALL | FLAG_ADOPT) != 0 || words.len() > MAX_UNIT_SCOPES
         {
             return Err(bad);
         }
@@ -663,6 +689,8 @@ impl ResourceList
                 segment,
                 include_pci_all: flags & FLAG_INCLUDE_PCI_ALL != 0,
                 scopes,
+                anchor,
+                adopt: flags & FLAG_ADOPT != 0,
             },
             first: self.resources.len(),
         });
@@ -716,13 +744,15 @@ impl ResourceList
         self.endpoints
     }
 
-    /// Every cap the list holds, resources and present endpoints.
+    /// Every cap the list holds: resources, units' anchors, and present
+    /// endpoints.
     pub fn caps(&self) -> impl Iterator<Item = u64> + '_
     {
         let eps = self.endpoints.unwrap_or_default();
         self.resources()
             .iter()
             .map(Resource::cap)
+            .chain(self.units.iter().map(|g| g.unit.anchor))
             .chain([eps.service, eps.devmgr_query, eps.dma])
             .filter(|&cap| cap != 0)
     }
@@ -1232,12 +1262,15 @@ mod tests
     }
 
     /// A unit of `segment` that translates the functions `scopes` names.
+    /// Its anchor is cap `40 + segment`.
     fn unit(segment: u16, scopes: &[Scope]) -> IommuUnit
     {
         IommuUnit {
             segment,
             include_pci_all: false,
             scopes: scopes.to_vec(),
+            anchor: 40 + u64::from(segment),
+            adopt: false,
         }
     }
 
@@ -1311,7 +1344,10 @@ mod tests
         assert!(matches!(units[0].1[1], Resource::Interrupt { cap: 11, .. }));
         assert_eq!(units[1].0, &second);
         assert_eq!(units[1].1, &list.resources()[2..]);
-        assert_eq!(list.caps().collect::<Vec<_>>(), [10, 11, 12, 20, 21]);
+        assert_eq!(
+            list.caps().collect::<Vec<_>>(),
+            [10, 11, 12, 43, 40, 20, 21]
+        );
     }
 
     #[test]
@@ -1357,14 +1393,15 @@ mod tests
         let u = kind::IOMMU_UNIT;
         let bad_scope = SCOPE_BUSES | 9 | (2 << 8);
         let cases: &[(bool, &[u64], &[u64])] = &[
-            // A cap, terminal, a word short, a segment past 16 bits, an
-            // unknown flag, a scope word that does not decode.
-            (false, &[1], &[u, 0, 0]),
-            (true, &[], &[u, 0, 0]),
-            (false, &[], &[u, 0]),
-            (false, &[], &[u, 1 << 16, 0]),
-            (false, &[], &[u, 0, 2]),
-            (false, &[], &[u, 0, 0, bad_scope]),
+            // No anchor, two caps, terminal, a word short, a segment past 16
+            // bits, an unknown flag, a scope word that does not decode.
+            (false, &[], &[u, 0, 0]),
+            (false, &[1, 2], &[u, 0, 0]),
+            (true, &[1], &[u, 0, 0]),
+            (false, &[1], &[u, 0]),
+            (false, &[1], &[u, 1 << 16, 0]),
+            (false, &[1], &[u, 0, 4]),
+            (false, &[1], &[u, 0, 0, bad_scope]),
         ];
         for &(done, caps, data) in cases
         {

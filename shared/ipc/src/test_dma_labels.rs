@@ -108,3 +108,37 @@ pub const EXIT_DELAY_MS: u64 = 100;
 /// `data[7]` the IOVA of the latest. Any other reply label is a setup
 /// failure.
 pub const MSI_FORGE: u64 = 5;
+/// Start the DMA stream: map one page of the fixture's memory for the
+/// device (`devmgr_dma_labels::DMA_MAP`, as [`DMA_PROBE`] maps its page),
+/// which stays mapped, and start a thread of the fixture that copies in a
+/// loop through it. Each round writes a fresh pattern, derived from the
+/// round number, to the page's first half, has the device copy it into its
+/// buffer and back to the page's second half (as the mapped copies of the
+/// [`DMA_PROBE`] do), and checks the second half; a round whose copy does
+/// not arrive, or whose transfer does not complete within the driver's
+/// bound, counts as failed. The reply comes once the stream started.
+/// Request: no data. Reply: `SUCCESS` with `data[0]` = 1 when the stream
+/// started, or 0 when the page's device address lies past the device's
+/// 28-bit DMA reach (no transfer made, nothing started, the page
+/// unmapped); `data[1]` = the device address of the page; `data[2]` =
+/// whether an IOMMU confines the device
+/// (`devmgr_dma_labels::DMA_CONFINED`) or not (0); `data[3]` = the IOMMU
+/// faults devmgr has taken for the device (`devmgr_dma_labels::DMA_FAULTS`,
+/// one request, no waiting). A second start while a stream runs, or any
+/// setup failure, replies another label. While a stream runs the fixture
+/// refuses [`DMA_PROBE`], [`INTERRUPT_PROBE`], [`INTERRUPT_CHURN`] and
+/// [`MSI_FORGE`] with a label other than `SUCCESS`, so only the stream
+/// thread drives the device's DMA engine.
+pub const DMA_STREAM_START: u64 = 6;
+/// The stream's rounds so far. Request: no data. Reply: `SUCCESS` with
+/// `data[0]` = the rounds whose copy arrived and `data[1]` = the rounds
+/// that failed. Another label when no stream runs.
+pub const DMA_STREAM_COUNT: u64 = 7;
+/// Stop the stream: wait for its thread to end its round, unmap the page
+/// (`devmgr_dma_labels::DMA_UNMAP`), and reply. Request: no data. Reply:
+/// `SUCCESS` with `data[0]` = the rounds whose copy arrived, `data[1]` =
+/// the rounds that failed, `data[2]` = the device address of the page, and
+/// `data[3]` = the IOMMU faults devmgr has taken for the device
+/// (`devmgr_dma_labels::DMA_FAULTS`, one request). Another label when no
+/// stream runs.
+pub const DMA_STREAM_STOP: u64 = 8;

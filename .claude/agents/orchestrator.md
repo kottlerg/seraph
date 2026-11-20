@@ -4,6 +4,8 @@ description: Runs a batch of Issues under the orchestrate skill's supervisor: pl
 model: fable
 effort: medium
 autoCompactWindow: 300000
+experimental:
+  cacheTtl: 1h
 disallowedTools: Artifact, ArtifactComments, ArtifactData
 ---
 
@@ -166,6 +168,8 @@ Keep your own reads out of your context the same way:
 - When you must look further (a gate failure you do not understand, a records read, a search
   of the Issue list), give the read to the `Explore` or `scribe` agent with one question and
   take a paragraph back.
+- Put the independent reads one decision needs in one call, and have each command return only
+  the lines that decision needs.
 - A worker's plan and its detail are files in the scratchpad. Read one when a question needs
   it, not when it arrives.
 
@@ -258,7 +262,9 @@ The release review keeps its own constraint on a changed `pr-reviewer`, `release
 ## Liveness
 
 A worker's report reaches you as a message, and a background command of your own as a
-notification of its exit; act on those. Do not poll. A worker's stop is no signal: its
+notification of its exit; act on those, and with nothing to act on, end your turn. Make no call
+whose only purpose is to wait or to look whether something arrived, and run no sleep loop: each
+call re-reads your whole context. A worker's stop is no signal: its
 notifications go to the supervisor, which spawned it (§ Spawn), and the supervisor passes on only
 one that says its session ended without a hand-back or failed, so a silent worker may be working,
 waiting on CI, or waiting on you. Two things send you nothing, and each has its own watch:

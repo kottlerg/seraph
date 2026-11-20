@@ -440,9 +440,7 @@ impl Session
             {
                 return false;
             };
-            if self.alive_count(k) != alive
-                || page.count < first
-                || walk_torn(k, first, &page.caps)
+            if self.alive_count(k) != alive || page.count < first || walk_torn(k, first, &page.caps)
             {
                 for cap in page.caps
                 {
@@ -1815,8 +1813,7 @@ mod tests
             {
                 let listed: Vec<u64> = (0..self.threads.len())
                     .filter(|&t| {
-                        t == 0
-                            || (self.threads[t].registered && self.threads[t].run != Run::Exited)
+                        t == 0 || (self.threads[t].registered && self.threads[t].run != Run::Exited)
                     })
                     .map(cap_of)
                     .collect();
@@ -2463,7 +2460,10 @@ mod tests
         for &t in [0].iter().chain(&workers[1..])
         {
             assert_eq!(slots_of(&s, t), 1, "thread {t} is in one slot");
-            assert!(matches!(sim.threads[t].run, Run::Blocked(_)), "thread {t} is held");
+            assert!(
+                matches!(sim.threads[t].run, Run::Blocked(_)),
+                "thread {t} is held"
+            );
         }
         assert!(sim.held_live(&s));
         sim.assert_sound();

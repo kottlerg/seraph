@@ -17,7 +17,7 @@ virtio/blk/
 ├── README.md
 └── src/
     ├── lib.rs                 # Geometry, transfer-length bound, partition table,
-    │                          #   outcome-to-reply mapping (host-tested)
+    │                          #   outcome-to-reply mapping, request timing (host-tested)
     ├── main.rs                # Driver entry, IPC service loop, interrupt-service thread, fail-stop
     └── io.rs                  # IoLayout (header + status DMA), descriptor chain submission
 ```
@@ -262,6 +262,32 @@ frame out of memmgr's pool until devmgr has confirmed the device stopped
 The notify-after-avail-update memory-ordering pair (release fence on the
 producer, the device's implicit load-acquire on the doorbell MMIO)
 matches the VirtIO 1.2 §2.9.3 driver-notification contract.
+
+---
+
+## Slow requests
+
+A request that takes one second or longer, from the start of its data segment's map to the end
+of its unmap, is logged before its reply as a warning saying where the time went: the map and
+the unmap (each a call to devmgr's DMA thread, which programs the IOMMU when one confines the
+device), and the device's work from the submission to the completion, with what ended the last
+completion wait before the completion was found (an interrupt the interrupt-service thread
+relayed, the wait's end with no signal, a failed wait, or no wait at all) and how many waits there
+were (one line, wrapped here):
+
+```text
+slow request: read of 8 blocks at sector 34816 (badge 0x2) took 43512 ms:
+    map 43497 ms, device 12 ms (completion by interrupt, wait count 1), unmap 3 ms
+```
+
+The badge is the client's partition badge, or one with `MOUNT_AUTHORITY` set. A request lost
+after 50 seconds logs this line besides its own. A request takes milliseconds otherwise; the
+bound is a tenth of procmgr's bound on a call on a file cap (`FILE_CAP_CALL_TIMEOUT_MS`, 10 s,
+[services/procmgr/README.md](../../../procmgr/README.md)), the tightest bound a client puts on a
+call that waits on a filesystem driver and so on this driver, since a filesystem request makes
+several block calls. The fatfs driver logs a request it held too long, with the time its block
+calls took ([fat § Slow requests](../../../fs/fat/README.md#slow-requests)). The line adds four
+clock reads to a request and nothing else to its path.
 
 ---
 

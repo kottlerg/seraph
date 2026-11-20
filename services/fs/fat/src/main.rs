@@ -57,6 +57,7 @@ mod dir;
 mod eviction;
 mod fat;
 mod file;
+mod held;
 
 use core::num::NonZeroU64;
 use std::os::seraph::{MemoryPressure, StartupInfo, startup_info};
@@ -397,7 +398,9 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///
 /// A release under memory pressure runs at the top of a turn, once the
 /// pressure thread has marked one pending and woken the loop
-/// ([`release_under_pressure`]).
+/// ([`release_under_pressure`]). A request held `held::SLOW_REQUEST` or
+/// longer, from its receipt to the end of its turn, is logged
+/// ([`held::HeldRequest`]).
 ///
 /// The open table is shared with the eviction worker via a `Mutex`. Main
 /// takes the lock to resolve an open cap, `FS_OPEN` takes it only around a
@@ -459,6 +462,9 @@ fn service_loop(
         guard.on_success();
 
         let opcode = msg.label & 0xFFFF;
+        // Logs the request when the turn ends, after its reply, if it was
+        // held too long (`held` module).
+        let _held = held::HeldRequest::start(opcode);
 
         // Unbadged service-level requests: FS_MOUNT and FS_UNMOUNT. Neither
         // carries caps, so none a request carried is kept.

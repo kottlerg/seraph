@@ -1462,9 +1462,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// the record's frame list under the region ids they had, still charged,
     /// each with `va` the caller-owned-mapping marker a grant carries, so the
     /// sealer holds its grants as before the seal and a repeat of the call
-    /// finds them. Its span of memmgr's object zone is given back
-    /// ([`Self::give_object_va`]); memmgr unmapped its own view there first.
-    /// Returns `false`, changing nothing, when `obj` holds no live object of
+    /// finds them. memmgr unmaps its own view of them first, and gives its span
+    /// back to the object zone ([`Self::give_object_va`]) once that unmap
+    /// holds. Returns `false`, changing nothing, when `obj` holds no live object of
     /// `rec` or one a region attaches.
     pub fn unseal_object(&mut self, rec: NodeIdx, obj: NodeIdx, va: u64) -> bool
     {
@@ -1477,8 +1477,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return false;
         }
-        let pages = self.object_pages(obj);
-        let own_va = self.object_va(obj);
         let _ = self.index.remove(&mut self.arena, o.key);
         self.unlink_owned(rec, obj, o.owned_next);
         let Some(mut r) = self.record(rec)
@@ -1497,7 +1495,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
         self.set_record(rec, r);
         self.arena.free(obj);
-        let _ = self.give_object_va(own_va, pages);
         true
     }
 
@@ -1647,8 +1644,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// The first memory object nothing names any more, with the span of
     /// memmgr's own view of its frames, `(slot, own_va, pages)`: memmgr
     /// unmaps that span from its address space, so no mapping of its own
-    /// keeps a frame from the quiescence check, and then retires the object
-    /// ([`Self::retire_object`]). `None` when no object waits.
+    /// keeps a frame from the quiescence check, then retires the object
+    /// ([`Self::retire_object`]) and gives the span back
+    /// ([`Self::give_object_va`]). `None` when no object waits.
     #[must_use]
     pub fn retiring_object(&self) -> Option<(NodeIdx, u64, u64)>
     {
@@ -1676,9 +1674,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// ([`Self::retiring_object`]), once memmgr has unmapped its own view of
     /// it: each of its frames moves to the free pool, its charge on the
     /// object's budget node released, when `quiescent` accepts it, else to
-    /// the deferred list, still charged ([`retire`]), and its span of the
-    /// object zone is given back ([`Self::give_object_va`]). Returns `false`,
-    /// changing nothing, when `obj` is not the first object to retire.
+    /// the deferred list, still charged ([`retire`]). Giving its span back to
+    /// the object zone ([`Self::give_object_va`]) is memmgr's, once its unmap
+    /// of the span holds. Returns `false`, changing nothing, when `obj` is not
+    /// the first object to retire.
     pub fn retire_object(
         &mut self,
         obj: NodeIdx,
@@ -1690,8 +1689,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return false;
         };
-        let pages = self.object_pages(obj);
-        let own_va = self.object_va(obj);
         self.retiring = o.owned_next;
         let mut cur = o.runs;
         while let Node::Frame(frame) = self.arena.get(cur).node
@@ -1709,14 +1706,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             cur = next;
         }
         self.arena.free(obj);
-        let _ = self.give_object_va(own_va, pages);
         true
     }
 
     /// Add the span of `pages` pages at `va` to the free spans of memmgr's
     /// object zone, where it maps its own read-only view of each object's
     /// frames ([`MemObject::runs`]): the zone itself when memmgr starts, and
-    /// an object's span when it is freed or a seal is refused. `false` when
+    /// an object's span once memmgr has unmapped it, when the object retires,
+    /// its seal is undone, or the seal is refused. `false` when
     /// the arena has no slot for it at all, which loses the span to the zone
     /// ([`ObjectVa::give`]).
     pub fn give_object_va(&mut self, va: u64, pages: u64) -> bool
@@ -7752,9 +7749,10 @@ mod tests
     ) -> usize
     {
         let mut n = 0;
-        while let Some((obj, _, _)) = l.retiring_object()
+        while let Some((obj, va, pages)) = l.retiring_object()
         {
             assert!(l.retire_object(obj, &mut quiescent));
+            assert!(l.give_object_va(va, pages));
             n += 1;
         }
         n

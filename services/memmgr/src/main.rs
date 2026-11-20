@@ -151,6 +151,9 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 //   phys-table scratch  [PHYS_TABLE_TEMP_VA, + 8 GiB)      one page, per-boot drawn
 //   process index       [PROCESS_INDEX_VA, PROCESS_INDEX_END)  bucket heads
 //   metadata arena      [drawn base, META_ARENA_LOW_END)    arena pages, then
+//   object zone         [OBJECT_ZONE_VA, OBJECT_ZONE_END)   memmgr's own view
+//                                                            of each memory
+//                                                            object's frames
 //   arena high zone     [META_ARENA_HIGH_BASE, ...)          above the shared
 //                                                            layout ceiling
 //
@@ -199,9 +202,21 @@ const META_ARENA_BASE_DEFAULT: u64 = PROCESS_INDEX_END;
 /// sizes only the ASLR window, not the arena.
 const META_ARENA_SLOTS_LOG2: u32 = 21;
 
-/// Exclusive end of the arena's low zone: the lowest bootstrap window
+/// Exclusive end of the arena's low zone: the object zone's base.
+const META_ARENA_LOW_END: u64 = OBJECT_ZONE_VA;
+
+/// Base of the object zone (64 GiB), where memmgr maps its own read-only view
+/// of every memory object's frames, one span per object, from the seal until
+/// the object retires (services/memmgr/docs/memory-pool.md § Memory objects,
+/// Own mapping). Its spans are handed out and taken back by the ledger
+/// (`free_pool::Ledger::take_object_va`). Below the shared layout ceiling,
+/// so it exists under every paging mode, Sv39 included; deterministic, since
+/// nothing but memmgr can read memmgr's address space.
+const OBJECT_ZONE_VA: u64 = OBJECT_ZONE_END - (1 << 36);
+
+/// Exclusive end of the object zone: the lowest bootstrap window
 /// `process-layout` draws in memmgr's address space.
-const META_ARENA_LOW_END: u64 = process_layout::MAIN_TLS_WINDOW.base;
+const OBJECT_ZONE_END: u64 = process_layout::MAIN_TLS_WINDOW.base;
 
 /// Base of the arena's high zone: the shared layout ceiling, above which
 /// memmgr's address space holds no `process-layout` surface (memmgr is
@@ -224,7 +239,9 @@ const _: () = {
     assert!(PHYS_TABLE_TEMP_VA + (1 << (PHYS_TABLE_TEMP_SLOTS_LOG2 + 12)) <= PROCESS_INDEX_VA);
     assert!(PROCESS_INDEX_END <= META_ARENA_BASE_DEFAULT);
     assert!(META_ARENA_BASE_DEFAULT + (1 << (META_ARENA_SLOTS_LOG2 + 12)) < META_ARENA_LOW_END);
-    assert!(META_ARENA_LOW_END <= META_ARENA_HIGH_BASE);
+    assert!(META_ARENA_LOW_END <= OBJECT_ZONE_VA);
+    assert!(OBJECT_ZONE_VA.is_multiple_of(PAGE_SIZE) && OBJECT_ZONE_VA < OBJECT_ZONE_END);
+    assert!(OBJECT_ZONE_END <= META_ARENA_HIGH_BASE);
 };
 
 /// Arena slot storage: the arena's mapped pages at the boot's [`ArenaLayout`].
@@ -2404,6 +2421,173 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Pages one `MAKE_PRIVATE` request copies at most: a tuning value that
+/// bounds the request's turn to as many copies as a few write faults make, so
+/// a debugger's request delays the faults and grants behind it no more than
+/// those would.
+const MAKE_PRIVATE_PAGES: u32 = 16;
+
+/// Pages of attachments, and regions that are none, one `MAKE_PRIVATE`
+/// request visits at most: a tuning value that bounds the turn's walk over
+/// pages that need nothing.
+const MAKE_PRIVATE_VISITS: u32 = 1024;
+
+/// Give each page of a range of a process's attachments that maps its
+/// object's frame, or its zero frame, a copy of its own, for a debugger about
+/// to patch it (services/memmgr/docs/ipc-interface.md § Label 30): the copy a
+/// write fault in a private attachment makes ([`make_page_private`]), mapped
+/// with the region's protection. A text write of `SYS_THREAD_WRITE_MEM` to an
+/// object page is refused while the page maps the object's frame, which
+/// memmgr's own view maps too (services/memmgr/docs/memory-pool.md § Memory
+/// objects, Make private); the copy is the process's alone, so the write then
+/// patches it alone. procmgr alone sends it, for a holder of its debug
+/// authority. Words are `[badge, va, len]`, the process named by its memmgr
+/// badge. Regions that are no attachment, and pages with a copy already, are
+/// passed over. The walk stops after [`MAKE_PRIVATE_PAGES`] copies or
+/// [`MAKE_PRIVATE_VISITS`] visits; the reply's word 0 is where it stopped, the
+/// range's end when it is all done, and the sender asks again from there.
+fn handle_make_private(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
+{
+    if req.badge != procmgr_badge
+    {
+        reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
+        return;
+    }
+    let (va, len) = (req.word(1), req.word(2));
+    let l = ledger_mut();
+    let (Some(rec), Some(end)) = (l.find(req.word(0)), va.checked_add(len))
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    if len == 0
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    // With no delegated address space no fault mapped anything to copy.
+    let aspace = l.aspace_cap(rec);
+    let mut at = va & !(PAGE_SIZE - 1);
+    let (mut made, mut visits) = (0u32, 0u32);
+    // Each pass takes the next region the range meets, in address order, and
+    // walks its pages in the range when it is an attachment.
+    while at < end
+        && aspace != 0
+        && made < MAKE_PRIVATE_PAGES
+        && visits < MAKE_PRIVATE_VISITS
+        && let Some((reg, node)) = l.region_from(rec, at)
+        && node.region.va_base < end
+    {
+        visits = visits.saturating_add(1);
+        let region_end = node.region.va_base.saturating_add(node.region.len);
+        let Some(att) = l.attachment(reg)
+        else
+        {
+            at = region_end;
+            continue;
+        };
+        let stop = region_end.min(end);
+        at = at.max(node.region.va_base);
+        while at < stop && made < MAKE_PRIVATE_PAGES && visits < MAKE_PRIVATE_VISITS
+        {
+            match make_page_private(l, rec, aspace, reg, &node.region, att, at)
+            {
+                Ok(true) => made = made.saturating_add(1),
+                Ok(false) =>
+                {}
+                Err(label) =>
+                {
+                    reply_label(ipc_buf, label);
+                    return;
+                }
+            }
+            visits = visits.saturating_add(1);
+            at = at.saturating_add(PAGE_SIZE);
+        }
+    }
+    // A walk that ran out of regions, or of the range, is done; one the
+    // bounds stopped resumes at `at`.
+    let reached = if made < MAKE_PRIVATE_PAGES && visits < MAKE_PRIVATE_VISITS
+    {
+        end
+    }
+    else
+    {
+        at.min(end)
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, reached)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Give the page `page_base` of the attachment `att`, region `reg` of `rec`,
+/// a copy of its own unless it holds one already: the write path of
+/// [`attachment_fault`] over that one page, recorded on its chunk as a fault's
+/// run is. A shared attachment promised no data page, so the copy's page is
+/// promised first (`free_pool::Ledger::promise_copy`), against the free
+/// pages a commitment may still promise less the growth floor; the copy then
+/// draws it, as a private attachment's copy draws the page its attach
+/// promised. Whether a copy was made.
+///
+/// # Errors
+/// The label of the error reply: as a committed `REGISTER_REGION`'s refusal
+/// for a page the promise refuses, `QUOTA` when the arena cannot grow, and
+/// `OUT_OF_MEMORY_BEST_EFFORT` when the copy could not be made, mapped or
+/// recorded.
+fn make_page_private(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    aspace_cap: u64,
+    reg: NodeIdx,
+    region: &DemandRegion,
+    att: Attachment,
+    page_base: u64,
+) -> Result<bool, u64>
+{
+    let (chunk_base, chunk_pages) = chunk_for(region, page_base);
+    // The page lies in its chunk, below `DEMAND_CHUNK_PAGES`.
+    let page = u32::try_from(page_base.saturating_sub(chunk_base) / PAGE_SIZE).unwrap_or(0);
+    if l.chunk_at(reg, page_base)
+        .unbacked_span(page, chunk_pages)
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let need = l.back_slots(reg, page_base);
+    if !ensure_committed_slots(l, need, Some(reg))
+    {
+        return Err(memmgr_errors::QUOTA);
+    }
+    let reserve = l.growth_floor(pool_total_pages());
+    l.promise_copy(rec, reg, reserve).map_err(commit_refusal)?;
+    let target = FaultTarget {
+        rec,
+        aspace_cap,
+        prot: region.prot,
+        span: (page_base, page_base.saturating_add(PAGE_SIZE)),
+        page_base,
+        held: need,
+        committed: Some(reg),
+        charged: false,
+    };
+    let Ok(Some(frame)) = attachment_fault(l, &target, region, att, FAULT_ACCESS_WRITE, 1)
+    else
+    {
+        l.unpromise_copy(reg);
+        return Err(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+    };
+    if !ensure_committed_slots(l, need, Some(reg)) || l.back_chunk(rec, reg, frame).is_err()
+    {
+        release_unmapped_chunk(l, rec, aspace_cap, frame);
+        l.unpromise_copy(reg);
+        return Err(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+    }
+    Ok(true)
+}
+
 /// Unregister a demand-paged region for the calling process, reclaiming every
 /// frame memmgr mapped inside it.
 ///
@@ -3243,12 +3427,16 @@ fn attachment_fault(
 /// that the object frame holding the faulting page holds, in one map, or the
 /// attachment's zero frame at each of its pages for the zero object. The map
 /// goes through a cap derived from memmgr's with the map right alone, deleted
-/// after it. A leaf records the write and execute rights of the cap it was
-/// mapped through as its grant, so no leaf of an attachment's origin carries
-/// either, and neither
-/// `SYS_MEM_PROTECT` nor a text write of `SYS_THREAD_WRITE_MEM` can make a
-/// page other processes map writable (services/memmgr/docs/memory-pool.md
-/// § Memory objects). The kernel keeps the mapping after the cap goes.
+/// after it, and for an executable attachment the execute right too, mapped
+/// readable and executable. A leaf records the write and execute rights of the
+/// cap it was mapped through as its grant, so no leaf of an attachment's
+/// origin carries the write right, and `SYS_MEM_PROTECT` cannot make a page
+/// other processes map writable. An executable attachment's leaf carries the
+/// execute right, which lets a text write of `SYS_THREAD_WRITE_MEM` patch a
+/// read-only page whose frame no other leaf maps; memmgr's own view of every
+/// object frame is that other leaf, so the write is refused
+/// (services/memmgr/docs/memory-pool.md § Memory objects, Own mapping). The
+/// kernel keeps the mapping after the cap goes.
 ///
 /// # Errors
 /// The [`FaultDecline`] and its detail word ([`decline_fault`]).
@@ -3285,7 +3473,17 @@ fn map_origin(
             .saturating_sub(before.saturating_mul(PAGE_SIZE));
         (frame.cap_slot, off.saturating_sub(before), va, pages, pages)
     };
-    let map_cap = syscall::cap_derive(cap, syscall::RIGHTS_MEM_MAP)
+    // Only an object attachment is executable: `ATTACH_OBJECT` refuses an
+    // executable zero-object one, whose frame no view of memmgr's maps.
+    let (rights, prot) = if region.prot & MAP_EXECUTABLE == 0
+    {
+        (syscall::RIGHTS_MEM_MAP, MAP_READ)
+    }
+    else
+    {
+        (syscall::RIGHTS_MEM_MAP_RX, MAP_READ | MAP_EXECUTABLE)
+    };
+    let map_cap = syscall::cap_derive(cap, rights)
         .map_err(|e| (FaultDecline::MapFailed, e.unsigned_abs()))?;
     let mut mapped = Ok(());
     let mut done: u64 = 0;
@@ -3299,7 +3497,7 @@ fn map_origin(
             va: va.saturating_add(done.saturating_mul(PAGE_SIZE)),
             region_id: NO_REGION_ID,
         };
-        mapped = map_client(l, target, &frame, offset, MAP_READ).map_err(|r| r.decline());
+        mapped = map_client(l, target, &frame, offset, prot).map_err(|r| r.decline());
         done = done.saturating_add(step);
     }
     let _ = syscall::cap_delete(map_cap);
@@ -3337,7 +3535,12 @@ fn copy_object_page(
         phys_base: phys,
     };
     // The copy writes the whole page, so it needs no scrub.
-    if let Err(e) = copy_page(l, source.cap_slot, off, outer)
+    let src_va = source.va.saturating_add(off.saturating_mul(PAGE_SIZE));
+    // SAFETY: `source` is a frame of the object the attachment holds, whose
+    // `va` is its first page in memmgr's own view and `off` is below its page
+    // count, so `src_va` is a page of the view, mapped until the object
+    // retires, which no attached object does this turn.
+    if let Err(e) = unsafe { copy_page(l, src_va, outer) }
     {
         insert_run(l, run);
         return Err((FaultDecline::MapFailed, e.unsigned_abs()));
@@ -3365,27 +3568,26 @@ fn copy_object_page(
     Ok(frame)
 }
 
-/// Copy page `src_offset` of the Memory cap `src` into the first page of
-/// `dst` through memmgr's scrub window: `dst` mapped read-write at
-/// [`SCRUB_VA`], `src` read-only on the page after it, both unmapped again
-/// after the copy, as every pass through the window leaves it.
-fn copy_page(l: &mut MemLedger, src: u64, src_offset: u64, dst: u64) -> Result<(), i64>
+/// Copy the object page memmgr's own view maps at `src_va` into the first
+/// page of `dst`, mapped read-write at [`SCRUB_VA`] and unmapped again after
+/// the copy, as every pass through the window leaves it.
+///
+/// # Safety
+/// `src_va` MUST be a page of the object zone that memmgr's own view of a
+/// memory object's frames maps (`free_pool::Ledger::object_frame`), of an
+/// object that stays until the turn ends: an attachment holds it, and an
+/// object retires only between turns ([`retire_objects`]).
+unsafe fn copy_page(l: &mut MemLedger, src_va: u64, dst: u64) -> Result<(), i64>
 {
-    let src_va = SCRUB_VA.saturating_add(PAGE_SIZE);
     // SAFETY: the scrub window is memmgr's own zone (the zone map above),
     // which every pass leaves unmapped, so the map changes nothing memmgr runs
     // on.
     unsafe { map_self(l, dst, SCRUB_VA, 0, 1) }?;
-    // SAFETY: as for the map above, on the window's second page.
-    if let Err(e) = unsafe { map_self_with(l, src, src_va, src_offset, 1, MAP_READ) }
-    {
-        // SAFETY: the span is the window page mapped above.
-        let _ = unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, 1) };
-        return Err(e);
-    }
-    // SAFETY: both pages were mapped just above, apart, and nothing else refers
-    // to them. The unmap below is inline assembly without `nomem`, which the
-    // compiler must assume reads memory, so the stores are made before it.
+    // SAFETY: the window page was mapped just above and nothing else refers
+    // to it; the caller's contract maps `src_va` readable, in the object zone,
+    // apart from the window. The unmap below is inline assembly without
+    // `nomem`, which the compiler must assume reads memory, so the stores are
+    // made before it.
     unsafe {
         core::ptr::copy_nonoverlapping(
             src_va as *const u8,
@@ -3393,8 +3595,8 @@ fn copy_page(l: &mut MemLedger, src: u64, src_offset: u64, dst: u64) -> Result<(
             PAGE_SIZE as usize,
         );
     }
-    // SAFETY: the span is the two window pages mapped above.
-    unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, 2) }
+    // SAFETY: the span is the window page mapped above.
+    unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, 1) }
 }
 
 /// Total pages of RAM memmgr owns: every page it has taken ownership of since
@@ -3842,9 +4044,11 @@ fn admit_attach(l: &mut MemLedger, rec: NodeIdx, len: u64, share: Share)
 /// cap to it, a mapping or a retype; one that does not refuses the seal whole,
 /// since a process that can still write a frame could change an object others
 /// map. A phys-class caller is refused: a device it programmed may write the
-/// frames. A reply that does not reach the caller undoes the seal
-/// (`free_pool::Ledger::unseal_object`), so a caller whose call was
-/// interrupted repeats it.
+/// frames. Once the grants pass, memmgr maps its own read-only view of their
+/// frames in a span of its object zone ([`map_object_view`]), which it keeps
+/// until the object retires ([`retire_objects`]). A reply that does not reach
+/// the caller undoes the seal (`free_pool::Ledger::unseal_object`), so a
+/// caller whose call was interrupted repeats it.
 fn handle_seal_object(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
 {
     if req.badge & PHYS_CLASS_BADGE_BIT != 0
@@ -3890,31 +4094,52 @@ fn handle_seal_object(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
         reply_label(ipc_buf, memmgr_errors::QUOTA);
         return;
     };
-    ensure_index(l);
-    if !ensure_slots(l, 1)
+    // The grants are distinct and each names a frame of `rec` (checked
+    // above), so their pages are the object's.
+    let pages = ids
+        .iter()
+        .filter_map(|&id| l.granted_frame(rec, id))
+        .fold(0u64, |n, (_, f)| n.saturating_add(u64::from(f.page_count)));
+    let Some(own_va) = l.take_object_va(pages)
+    else
     {
         reply_label(ipc_buf, memmgr_errors::QUOTA);
         return;
+    };
+    if map_object_view(l, rec, ids, own_va).is_err()
+    {
+        reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+        return;
     }
-    let obj = match l.seal_object(rec, ids, key)
+    ensure_index(l);
+    let sealed = if ensure_slots(l, 1)
+    {
+        l.seal_object(rec, ids, key, own_va)
+    }
+    else
+    {
+        Err(SealError::NoSlot)
+    };
+    let obj = match sealed
     {
         Ok(obj) => obj,
-        Err(SealError::NoSlot) =>
+        Err(e) =>
         {
-            reply_label(ipc_buf, memmgr_errors::QUOTA);
-            return;
-        }
-        // `rec` came from `find` above, so `NoRecord` cannot arise.
-        Err(SealError::Grants | SealError::NoRecord) =>
-        {
-            reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+            drop_object_view(l, own_va, pages);
+            // `rec` came from `find` above, so `NoRecord` cannot arise.
+            let label = match e
+            {
+                SealError::NoSlot => memmgr_errors::QUOTA,
+                SealError::Grants | SealError::NoRecord => memmgr_errors::INVALID_ARGUMENT,
+            };
+            reply_label(ipc_buf, label);
             return;
         }
     };
     let Ok(cap) = syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, key)
     else
     {
-        let _ = l.unseal_object(rec, obj);
+        unseal(l, rec, obj);
         reply_label(ipc_buf, memmgr_errors::QUOTA);
         return;
     };
@@ -3928,7 +4153,98 @@ fn handle_seal_object(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
         // No handle reached the caller, so nothing can name the object: give
         // the caller its grants back.
         let _ = syscall::cap_delete(cap);
-        let _ = l.unseal_object(rec, obj);
+        unseal(l, rec, obj);
+    }
+}
+
+/// Map memmgr's own read-only view of the frames of the grants `ids` of
+/// `rec`, in their order, from `own_va`, a span of the object zone that
+/// holds their pages (services/memmgr/docs/memory-pool.md § Memory objects,
+/// Own mapping). On failure the part mapped is unmapped and the span given
+/// back ([`drop_object_view`]).
+///
+/// # Errors
+/// The error of the map that failed.
+fn map_object_view(l: &mut MemLedger, rec: NodeIdx, ids: &[u64], own_va: u64) -> Result<(), i64>
+{
+    let mut at = own_va;
+    for &id in ids
+    {
+        let Some((_, f)) = l.granted_frame(rec, id)
+        else
+        {
+            continue;
+        };
+        let pages = u64::from(f.page_count);
+        // SAFETY: `[at, at + pages)` lies in the span of the object zone the
+        // seal took for these frames (the zone map above), which nothing maps
+        // yet, so the map changes nothing memmgr runs on.
+        if let Err(e) = unsafe { map_self_with(l, f.cap_slot, at, 0, pages, MAP_READ) }
+        {
+            // The span up to the end of the failed map: a map that ran out of
+            // page tables part way left the pages before the failing one
+            // mapped.
+            let end = at.saturating_add(pages.saturating_mul(PAGE_SIZE));
+            drop_object_view(l, own_va, end.saturating_sub(own_va) / PAGE_SIZE);
+            return Err(e);
+        }
+        at = at.saturating_add(pages.saturating_mul(PAGE_SIZE));
+    }
+    Ok(())
+}
+
+/// Unmap memmgr's own view of an object's frames, `pages` pages of the
+/// object zone from `own_va`, and give the span back to the zone
+/// (`free_pool::Ledger::give_object_va`). Whether the unmap held: a span
+/// it failed to unmap may still map the frames, so it stays out of the zone,
+/// and the frames fail the quiescence check ([`quiescent`]) wherever they
+/// go, which keeps them from the pool.
+fn drop_object_view(l: &mut MemLedger, own_va: u64, pages: u64) -> bool
+{
+    // SAFETY: the span is an object's span of the object zone (the zone map
+    // above), which holds only memmgr's view of its frames; memmgr runs on
+    // nothing there, and reads it only to copy a page in a turn the object
+    // stays through.
+    if unsafe { syscall::mem_unmap(self_aspace(), own_va, pages) }.is_err()
+    {
+        return false;
+    }
+    let _ = l.give_object_va(own_va, pages);
+    true
+}
+
+/// Undo the seal of `obj` by its sealer `rec`, whose reply did not reach it:
+/// unmap memmgr's own view of the frames ([`drop_object_view`]), then give
+/// the sealer its grants back (`free_pool::Ledger::unseal_object`).
+fn unseal(l: &mut MemLedger, rec: NodeIdx, obj: NodeIdx)
+{
+    let (own_va, pages) = (l.object_va(obj), l.object_pages(obj));
+    let _ = drop_object_view(l, own_va, pages);
+    let _ = l.unseal_object(rec, obj, FRAME_VA_UNMAPPED);
+}
+
+/// Retire every memory object nothing names any more, once per turn after
+/// the request's handler (`free_pool::Ledger::retiring_object`): unmap
+/// memmgr's own view of its frames and give its span back
+/// ([`drop_object_view`]), so no mapping of memmgr's keeps a frame from the
+/// quiescence check, then pool each frame or defer it ([`quiescent`];
+/// `free_pool::Ledger::retire_object`). One place retires every object, so
+/// no path that drops an object's last name (`OBJECT_RELEASE`, a sealer's
+/// death, the last attachment's unregistering or its process's death) leaves
+/// the view behind, and an object's frames stay until the turn that dropped
+/// it ends.
+fn retire_objects(l: &mut MemLedger)
+{
+    let mut any = false;
+    while let Some((obj, own_va, pages)) = l.retiring_object()
+    {
+        let _ = drop_object_view(l, own_va, pages);
+        let _ = l.retire_object(obj, quiescent);
+        any = true;
+    }
+    if any
+    {
+        coalesce(l);
     }
 }
 
@@ -3937,10 +4253,12 @@ fn handle_seal_object(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
 /// (services/memmgr/docs/ipc-interface.md § Label 28). The handle is deleted
 /// on every path. The region is admitted ([`admit_attach`]) and charged as a
 /// committed region of its length; nothing is mapped until a fault
-/// ([`attachment_fault`]). A shared attachment is never writable, and no
-/// attachment is executable: an executable map needs a cap with the execute
-/// right, whose leaf grant would let a text write of `SYS_THREAD_WRITE_MEM`
-/// patch a frame other processes map. A reply that does not reach the caller
+/// ([`attachment_fault`]). A shared attachment is never writable, no
+/// attachment is writable and executable both (W^X, as `REGISTER_REGION`),
+/// and a zero-object one is never executable: an executable leaf's grant lets
+/// a text write of `SYS_THREAD_WRITE_MEM` patch a frame no other leaf maps,
+/// and only an object's frames carry memmgr's own view as that other leaf
+/// ([`map_origin`]). A reply that does not reach the caller
 /// detaches the region again, so a caller whose call was interrupted repeats
 /// it.
 fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
@@ -3964,7 +4282,9 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         || !va_base.is_multiple_of(PAGE_SIZE)
         || !len.is_multiple_of(PAGE_SIZE)
         || va_base.checked_add(len).is_none()
-        || prot & !(MAP_READ | MAP_WRITABLE) != 0
+        || prot & !(MAP_READ | MAP_WRITABLE | MAP_EXECUTABLE) != 0
+        || prot & (MAP_WRITABLE | MAP_EXECUTABLE) == MAP_WRITABLE | MAP_EXECUTABLE
+        || (handle.is_none() && prot & MAP_EXECUTABLE != 0)
         || flags & !memmgr_labels::ATTACH_PRIVATE != 0
         || (share == Share::Shared && prot & MAP_WRITABLE != 0)
     {
@@ -4154,9 +4474,7 @@ fn handle_object_release(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    recheck_deferred(l);
-    let _ = l.release_object(obj, quiescent);
-    coalesce(l);
+    let _ = l.release_object(obj);
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
@@ -4501,6 +4819,10 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             route_object(opcode, req, kept, ipc_buf, boot.service_ep);
         }
+        memmgr_labels::MAKE_PRIVATE =>
+        {
+            handle_make_private(req, ipc_buf, boot.procmgr_badge);
+        }
         _ =>
         {
             reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -4550,6 +4872,14 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
         syscall::thread_exit();
     }
     ingest_in_use(&boot);
+    // The object zone's one free span, once the arena holds the slot it takes.
+    // Without it every seal is refused `QUOTA`, as with no span left.
+    let l = ledger_mut();
+    let _ = ensure_slots(l, 1)
+        && l.give_object_va(
+            OBJECT_ZONE_VA,
+            OBJECT_ZONE_END.saturating_sub(OBJECT_ZONE_VA) / PAGE_SIZE,
+        );
 
     // The compression worker, at the fair class's top under memmgr's own
     // `SchedControl` cap. Without it memmgr evicts nothing and serves as
@@ -4599,6 +4929,7 @@ fn main(startup: &StartupInfo, sched_control: u64) -> !
         {
             guard.on_success();
             dispatch(&req, ipc_buf, &boot);
+            retire_objects(ledger_mut());
             signal_limits();
         }
         evict::turn(ledger_mut());

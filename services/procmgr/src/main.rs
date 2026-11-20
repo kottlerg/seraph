@@ -894,11 +894,12 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 
 /// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
 /// `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `MAKE_RESIDENT`,
-/// `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`, and `REGISTER_THREAD`, and answer
-/// any other opcode `UNKNOWN_OPCODE`, deleting the caps it carried. Every
-/// label but `REGISTER_CRASH_SERVICE`, which reads no table and calls the
-/// crash decliner, and `MAKE_RESIDENT`, which calls memmgr at `memmgr_ep`
-/// after the lock, is served under the table lock: each makes syscalls, its
+/// `MAKE_PRIVATE`, `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`, and
+/// `REGISTER_THREAD`, and answer any other opcode `UNKNOWN_OPCODE`, deleting
+/// the caps it carried. Every label but `REGISTER_CRASH_SERVICE`, which reads
+/// no table and calls the crash decliner, and `MAKE_RESIDENT` and
+/// `MAKE_PRIVATE`, which call memmgr at `memmgr_ep` after the lock, is served
+/// under the table lock: each makes syscalls, its
 /// reply among them, and a failed rebind's log line
 /// (services/procmgr/README.md § Concurrency). `headroom` is the request's
 /// hold of procmgr's `CSpace`, which `REGISTER_THREAD` reads.
@@ -920,6 +921,12 @@ fn dispatch_debug(
     {
         release_caps(req.caps());
         handle_make_resident(req, ipc_buf, tables, memmgr_ep);
+        return;
+    }
+    if label == procmgr_labels::MAKE_PRIVATE
+    {
+        release_caps(req.caps());
+        handle_make_private(req, ipc_buf, tables, memmgr_ep);
         return;
     }
     let table = &mut tables.lock().table;
@@ -1267,6 +1274,52 @@ fn handle_make_resident(
         .word(1, words[1])
         .word(2, words[2])
         .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Handle `MAKE_PRIVATE` — have memmgr give each page of the range
+/// `data[1]`, `data[2]` (an address and a length) of the process `data[0]`
+/// names that maps a memory object's frame a copy of its own, so a debugger's
+/// text write of `SYS_THREAD_WRITE_MEM` there patches that process alone
+/// (`services/procmgr/docs/ipc-interface.md` § `MAKE_PRIVATE`). A process
+/// that declared itself undebuggable is refused `NOT_ATTACHABLE`: no
+/// debugger may write it, so the copies would only cost it memory. The target
+/// is found under the table lock, and memmgr is called after it, as for
+/// `MAKE_RESIDENT`. A success carries memmgr's word 0, where it stopped,
+/// which the sender asks again from until it is the range's end.
+fn handle_make_private(
+    req: &IpcMessage,
+    ipc_buf: *mut u64,
+    tables: &process::Tables,
+    memmgr_ep: u64,
+)
+{
+    if !process_table::debug_authorized(req.badge)
+    {
+        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
+        return;
+    }
+    let target = tables
+        .lock()
+        .table
+        .find_by_badge(req.word(0))
+        .map(|e| (e.memmgr_badge, e.no_debug));
+    let (code, reached) = match target
+    {
+        Some((_, true)) => (procmgr_errors::NOT_ATTACHABLE, 0),
+        Some((badge, false)) =>
+        {
+            process::make_private(memmgr_ep, badge, req.word(1), req.word(2), ipc_buf)
+        }
+        None => (procmgr_errors::INVALID_BADGE, 0),
+    };
+    if code != procmgr_errors::SUCCESS
+    {
+        reply_empty(ipc_buf, code);
+        return;
+    }
+    let reply = IpcMessage::builder(code).word(0, reached).build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }

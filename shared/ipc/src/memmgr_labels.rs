@@ -555,8 +555,11 @@ pub const SWAP_WANTED_WORDS: u64 = 8;
 /// `caps[0]` an object handle ([`OBJECT_HANDLE_TAG`]); `INVALID_ARGUMENT`
 /// (unknown badge, a count out of range, an id that names no grant of the
 /// caller or is named twice, or a grant still held, mapped or retyped);
-/// `UNAUTHORIZED` (a phys-class caller); or `QUOTA` (memmgr's metadata or
-/// `CSpace` is full). A reply that does not reach the caller undoes the seal.
+/// `UNAUTHORIZED` (a phys-class caller); `QUOTA` (memmgr's metadata or
+/// `CSpace` is full, or its object zone holds no span of the object's pages);
+/// or `OUT_OF_MEMORY_BEST_EFFORT` (memmgr could not map its own read-only
+/// view of the frames, which every sealed object keeps). A reply that does
+/// not reach the caller undoes the seal.
 /// Specified in `services/memmgr/docs/ipc-interface.md` § Label 27:
 /// `SEAL_OBJECT`.
 pub const SEAL_OBJECT: u64 = 27;
@@ -567,11 +570,14 @@ pub const SEAL_OBJECT_MAX_GRANTS: u64 = 63;
 /// which memmgr deletes, or absent for the zero object, whose every page reads
 /// as zeros. `data[0]` the region's base, `data[1]` its length in bytes (both
 /// page-aligned, the length nonzero), `data[2]` its protection (`MAP_READ`,
-/// `MAP_WRITABLE`; `MAP_EXECUTABLE` is refused), `data[3]` the object page
-/// the region starts at (0 for the zero object), and `data[4]` the flags
+/// `MAP_WRITABLE`, `MAP_EXECUTABLE`, never writable and executable both,
+/// and never executable for the zero object), `data[3]` the object page the
+/// region starts at (0 for the zero object), and `data[4]` the flags
 /// ([`ATTACH_PRIVATE`]). A shared attachment maps the object's pages and is
 /// never writable; a private one maps them until the caller writes a page,
-/// which then gets a copy of its own. The caller's budget node is charged the
+/// which then gets a copy of its own. A text write of
+/// `SYS_THREAD_WRITE_MEM` to an object page is refused while the page maps
+/// the object's frame; [`MAKE_PRIVATE`] gives the page a copy first. The caller's budget node is charged the
 /// region's length and its page-table reservation either way, and a private
 /// attachment is committed as `REGION_COMMIT` commits a region, so no fault
 /// in it fails for memory. Reply: `SUCCESS`; `INVALID_ARGUMENT` (unknown
@@ -597,6 +603,33 @@ pub const ATTACH_PRIVATE: u64 = 1 << 0;
 /// released. Specified in `services/memmgr/docs/ipc-interface.md` § Label 29:
 /// `OBJECT_RELEASE`.
 pub const OBJECT_RELEASE: u64 = 29;
+/// procmgr only: give each page of a range of a process's attachments that
+/// maps its object's frame, or its zero frame, a copy of its own, as a write
+/// fault in a private attachment does, so a debugger's text write of
+/// `SYS_THREAD_WRITE_MEM` patches the process alone. The copy keeps the
+/// region's protection.
+///
+/// Wire format:
+/// * `data[0]` — the process's memmgr badge (from its `REGISTER_PROCESS`
+///   reply).
+/// * `data[1]` — `va`.
+/// * `data[2]` — `len_bytes` (nonzero).
+///
+/// Pages outside every attachment, and pages with a copy already, are passed
+/// over. A shared attachment's copy is promised a page as it is made; a
+/// private one's was promised when it attached.
+///
+/// Reply: `memmgr_errors::SUCCESS` with `data[0]` where memmgr stopped:
+/// `va + len_bytes` when the whole range is done, else the address to send
+/// the request again from, memmgr making at most a few copies per request;
+/// `UNAUTHORIZED` (caller is not procmgr); `INVALID_ARGUMENT` (unknown badge,
+/// zero length, or a range past the address space); `LIMIT` or
+/// `OUT_OF_MEMORY_BEST_EFFORT` when a shared attachment's copy is refused a
+/// page, as a committed `REGISTER_REGION` is; `QUOTA` (memmgr's metadata is
+/// full); or `OUT_OF_MEMORY_BEST_EFFORT` (a copy could not be made or
+/// mapped). Specified in `services/memmgr/docs/ipc-interface.md` § Label 30:
+/// `MAKE_PRIVATE`.
+pub const MAKE_PRIVATE: u64 = 30;
 
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.

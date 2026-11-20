@@ -3580,6 +3580,41 @@ pub fn make_resident(
     }
 }
 
+/// Have memmgr give each page of the range `[va, va + len)` of the process its
+/// badge `memmgr_badge` names that maps a memory object's frame a copy of its
+/// own (`memmgr_labels::MAKE_PRIVATE`), and return the reply code with, on
+/// `SUCCESS`, where memmgr stopped: the range's end when it is all done, else
+/// the address to ask again from, memmgr bounding the copies of one request.
+/// The code is `INVALID_ARGUMENT` for a range memmgr refuses, and
+/// `OUT_OF_MEMORY` when memmgr could not make a copy, or the call failed.
+pub fn make_private(
+    memmgr_ep: u64,
+    memmgr_badge: u64,
+    va: u64,
+    len: u64,
+    ipc_buf: *mut u64,
+) -> (u64, u64)
+{
+    let msg = IpcMessage::builder(memmgr_labels::MAKE_PRIVATE)
+        .word(0, memmgr_badge)
+        .word(1, va)
+        .word(2, len)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    match unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == memmgr_errors::SUCCESS =>
+        {
+            (procmgr_errors::SUCCESS, reply.word(0))
+        }
+        Ok(reply) if reply.label == memmgr_errors::INVALID_ARGUMENT =>
+        {
+            (procmgr_errors::INVALID_ARGUMENT, 0)
+        }
+        _ => (procmgr_errors::OUT_OF_MEMORY, 0),
+    }
+}
+
 /// Notify memmgr that a process died. Memmgr returns every memory cap attributed
 /// to the process badge to the free pool. Idempotent on memmgr's side.
 fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)

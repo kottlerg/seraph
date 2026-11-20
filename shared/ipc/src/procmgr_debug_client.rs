@@ -4,8 +4,9 @@
 // shared/ipc/src/procmgr_debug_client.rs
 
 //! A debug-authority holder's access to another process's memory when a page
-//! of it is evicted (`procmgr_labels::MAKE_RESIDENT`), re-exported at the
-//! crate root.
+//! of it is evicted (`procmgr_labels::MAKE_RESIDENT`), or maps a memory
+//! object's frame it is about to patch (`procmgr_labels::MAKE_PRIVATE`),
+//! re-exported at the crate root.
 
 // Under `rustc-dep-of-std` the crate root is `no_core`, and a submodule needs
 // its own prelude import (see `recv_guard.rs`).
@@ -313,6 +314,93 @@ pub unsafe fn make_resident_step(
         })
 }
 
+/// Ask procmgr, through the debug-authority cap `authority`, to give each
+/// page of the range of `len` bytes at `va` of the process whose process
+/// badge (as `procmgr_labels::LIST_PROCESSES` lists it) is `process` that
+/// maps a memory object's frame a copy of its own
+/// (`procmgr_labels::MAKE_PRIVATE`), so a `SYS_THREAD_WRITE_MEM` text write
+/// that failed with `InvalidState` there succeeds when retried
+/// (`services/memmgr/docs/memory-pool.md` § Memory objects, Make private).
+/// memmgr makes a bounded number of copies per request and replies where it
+/// stopped, so this asks again from there until the whole range is done
+/// ([`private_range`]). Whether every request was served: `false` when a
+/// call failed, procmgr refused (`NOT_ATTACHABLE` for a process that
+/// declared itself undebuggable, `OUT_OF_MEMORY` when a copy could not be
+/// made), or a reply made no progress.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+pub unsafe fn make_private(
+    authority: u64,
+    process: u64,
+    va: u64,
+    len: u64,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let Some(end) = va.checked_add(len)
+    else
+    {
+        return false;
+    };
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    private_range(va, end, |at| unsafe {
+        make_private_step(authority, process, at, end, ipc_buf)
+    })
+}
+
+/// One `procmgr_labels::MAKE_PRIVATE` request of [`make_private`] over
+/// `[at, end)`: where memmgr stopped, or `None` when the call failed or
+/// procmgr refused.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std process's main thread)"
+)]
+unsafe fn make_private_step(
+    authority: u64,
+    process: u64,
+    at: u64,
+    end: u64,
+    ipc_buf: *mut u64,
+) -> Option<u64>
+{
+    let request = IpcMessage::builder(procmgr_labels::MAKE_PRIVATE)
+        .word(0, process)
+        .word(1, at)
+        .word(2, end.saturating_sub(at))
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe { ipc_call(authority, &request, ipc_buf) }
+        .ok()
+        .filter(|reply| reply.label == procmgr_errors::SUCCESS)
+        .map(|reply| reply.word(0))
+}
+
+/// The loop of [`make_private`] over `[va, end)`: `step` makes one request
+/// from the address it is given and returns where memmgr stopped (`None`
+/// when the call failed or was refused), and the next request starts there.
+/// Whether the whole range is done: `false` when a request failed, or a
+/// reply stopped at or below the address it was given, or past `end`, which
+/// would ask forever or past the range. An empty range asks nothing.
+pub fn private_range(va: u64, end: u64, mut step: impl FnMut(u64) -> Option<u64>) -> bool
+{
+    let mut at = va;
+    while at < end
+    {
+        let Some(reached) = step(at).filter(|&r| r > at && r <= end)
+        else
+        {
+            return false;
+        };
+        at = reached;
+    }
+    true
+}
+
 /// Read `buf.len()` bytes at `va` of the address space of `thread`, a thread
 /// of the process `process` names, as [`read_mem_resident_bounded`] does,
 /// under a bound of its own: at most [`PENDING_TRIES`] pauses, about a
@@ -607,5 +695,32 @@ mod tests
         // bound, sends no request at all.
         let d = drive(0x1000, 0x9000, &mut bound, &[stopped(0x9000)]);
         assert!(!d.done && d.asks == 0 && d.made == 0);
+    }
+
+    // The defect caught: a make-private loop that stops before the range's
+    // end, asks again from a reply that made no progress (forever), or goes
+    // on past a refusal or a reply past the range.
+    #[test]
+    fn a_make_private_range_asks_from_each_reply_until_its_end()
+    {
+        let mut asked = [0u64; 3];
+        let mut asks = 0;
+        let replies = [0x3000, 0x7000, 0x9000];
+        assert!(private_range(0x1000, 0x9000, |at| {
+            asked[asks] = at;
+            asks += 1;
+            Some(replies[asks - 1])
+        }));
+        assert_eq!((asks, asked), (3, [0x1000, 0x3000, 0x7000]));
+        assert!(private_range(0x1000, 0x1000, |_| unreachable!()));
+        for bad in [None, Some(0x1000), Some(0x800), Some(0xA000)]
+        {
+            let mut asks = 0;
+            assert!(!private_range(0x1000, 0x9000, |_| {
+                asks += 1;
+                bad
+            }));
+            assert_eq!(asks, 1);
+        }
     }
 }

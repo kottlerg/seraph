@@ -13,9 +13,13 @@
 //! room opening; for the others, memmgr's pressure level falling below
 //! `CRITICAL`), and reports and declines it when the stall passes first. A
 //! fault it resumed that faults again at the same page is a repeat: held again
-//! only until its first hold's deadline while its memory is short, and
-//! declined at once otherwise, so no fault loops and the holds of one fault
-//! total at most the stall (`services/crashd/docs/operation.md` § Hold). A
+//! only until its first hold's deadline while its memory is short. With its
+//! memory there, a repeat of a fault that waits on the level is declined at
+//! once, so no fault loops on memory that came back and memmgr still cannot
+//! give it; one of a commit overrun is resumed again, remembered until that
+//! deadline, since one opening of the draw room backs one committed draw and
+//! another draw may have taken it first. The holds of one fault total at most
+//! the stall (`services/crashd/docs/operation.md` § Hold). A
 //! redirected fault reaches its slot's endpoint only when its thread next
 //! runs, so a hold ends when its memory is there only once its fault has
 //! arrived ([`Holds::arrived`]). A
@@ -193,7 +197,8 @@ pub enum Refusal
 {
     /// Every slot holds a fault.
     SlotsFull,
-    /// It repeats a fault crashd resumed, and its memory is not short.
+    /// It repeats a fault crashd resumed that waits on the level, and the
+    /// level is not `CRITICAL`.
     Repeat,
     /// The stall is 0: no fault is held.
     NoStall,
@@ -291,7 +296,10 @@ impl Holds
     /// at `now` with memmgr's memory at `rooms`. A first fault is held until
     /// the stall passes while its memory is short and resumed at once when it
     /// is there; a repeat of a resumed one is held until its first hold's
-    /// deadline while its memory is short and declined when it is there. A
+    /// deadline while its memory is short, and, when it is there, declined
+    /// for a fault that waits on the level and resumed again, remembered until
+    /// that deadline, for a commit overrun, which another draw may have
+    /// beaten to the draw room. A
     /// hold takes the slot [`Admit::Hold`] names, which [`Self::end`] frees;
     /// an [`Admit::Resume`] is remembered for the repeat rule.
     pub fn admit(&mut self, now: u64, key: Key, waits: Waits, rooms: Rooms) -> Admit
@@ -303,6 +311,11 @@ impl Holds
         self.forget_expired(now);
         match (self.take_resumed(key), rooms.of(waits))
         {
+            (Some(deadline), Room::Open) if waits == Waits::DrawRoom =>
+            {
+                self.remember(key, deadline);
+                Admit::Resume
+            }
             (Some(_), Room::Open) => Admit::Decline(Refusal::Repeat),
             (Some(deadline), Room::Short) => self.hold(key, waits, now, deadline),
             (None, Room::Open) =>
@@ -922,12 +935,39 @@ mod tests
                 ..
             }))
         ));
-        // Its repeat with the draw room still open is declined; with it short,
-        // held until the first hold's deadline.
+        // Its repeat with the draw room open is resumed again, since another
+        // draw may have taken the room it was resumed on, and is remembered
+        // until the first hold's deadline: a repeat then with the room short
+        // is held only until that deadline, and one after it is a new fault.
         assert_eq!(
             holds.admit(2, key(1), waits_on(11), draw_only),
-            Admit::Decline(Refusal::Repeat)
+            Admit::Resume
         );
-        assert_eq!(holds.opened(OPEN).collect::<Vec<_>>(), [level]);
+        let Admit::Hold {
+            slot: again,
+            deadline,
+        } = holds.admit(3, key(1), waits_on(11), SHORT)
+        else
+        {
+            panic!("a commit overrun's repeat with no draw room was not held");
+        };
+        assert_eq!(deadline, STALL);
+        holds.arrived(again);
+        assert_eq!(holds.opened(OPEN).collect::<Vec<_>>(), [again, level]);
+        assert!(matches!(
+            holds.end(again, Why::RoomOpened, Found::Fault),
+            Some(Ended::Resume(_))
+        ));
+        assert_eq!(
+            holds.admit(STALL + 1, key(1), waits_on(11), draw_only),
+            Admit::Resume
+        );
+        assert_eq!(
+            holds.admit(STALL + 2, key(1), waits_on(11), SHORT),
+            Admit::Hold {
+                slot: again,
+                deadline: STALL + 1 + STALL
+            }
+        );
     }
 }

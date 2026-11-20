@@ -527,7 +527,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 26) |
 | data[14] | `evictions` — the evictions memmgr has begun, background or direct, a count (not bytes) that only moves up, wrapping ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
 | data[15] | `allowance_bytes` — the overcommit allowance, what `promised` may exceed `data[3]` by: a chunk's pages for every free swap slot (`data[13]`), less the pages compression already freed from the chunks evicted and not on disk, plus the pages of the evicted chunks of committed regions; `0` while no swap service is registered ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
-| data[16] | `draw_room_bytes` — the free pages a fault on a committed page of a process outside the system reserve may take now: all of `data[3]` while `data[15]` is `0` or `data[3]` covers `data[8]`, else those above the growth floor, `data[11]`; open at `DEMAND_CHUNK_BYTES` or more, room for any one committed draw ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
+| data[16] | `draw_room_bytes` — the free pages a fault on a committed page of a process outside the system reserve may take now: all of `data[3]` while no swap slot is registered or `data[3]` covers `data[8]`, else those above the growth floor, `data[11]`; open at `DEMAND_CHUNK_BYTES` or more, room for any one committed draw ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 | data[17] | `uncommitted_free_bytes` — the free pages outside `promised`, which every admission but a commitment's reads and the pressure level is computed from: the lesser of `data[3]` plus `data[15]` less `data[8]`, and `data[3]`; `data[3]` less `data[8]` while `data[15]` is `0` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Promised) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
@@ -621,8 +621,8 @@ growth region this way.
 the region into its compressed store, so every page a fault backed stays
 mapped until the region is unregistered or the page discarded. Without it,
 memmgr may evict a cold chunk of an uncommitted region under memory pressure,
-or of a committed one under an overcommit allowance above 0, and restores it
-on the next fault on it, which only a debugger's
+or of a committed one while a swap service has registered swap slots, and
+restores it on the next fault on it, which only a debugger's
 `SYS_THREAD_READ_MEM` can tell apart ([`memory-pool.md`](memory-pool.md#eviction)
 § Eviction).
 
@@ -1347,7 +1347,7 @@ code 12 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 | 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Committed fault declines); for a fault on a chunk memmgr is evicting, holds raw or evicted, in either kind of region, the page-table funding the map of the chunk's runs needs would, past what a committed region's page-table reservation still holds; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
-| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while the allowance is above 0 and the pool does not cover `promised`) even after memmgr evicted victims in its turn; only an overcommit allowance above 0, or memmgr's own metadata taking free pages without admission, makes it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`) |
+| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while a swap service has registered swap slots and the pool does not cover `promised`) even after memmgr evicted victims in its turn; only registered swap slots, or memmgr's own metadata taking free pages without admission, make it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`) |
 | 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
@@ -1375,8 +1375,8 @@ declined only:
 
 - with code 7, when the split of a run larger than the pages to back fails;
 - with code 11, a commit overrun, when its draw finds no free page even after memmgr evicted
-  victims in its turn, which only an overcommit allowance above 0, or memmgr's own metadata taking
-  free pages without admission, makes reachable (§ Commit, Overcommit);
+  victims in its turn, which only registered swap slots, or memmgr's own metadata taking free pages
+  without admission, make reachable (§ Commit, Overcommit);
 - with code 10 or 9, when a page-table donation its map needs falls past what is left of the
   region's page-table reservation and is admitted as any other, and the max of the process's budget
   node or an ancestor (10) or the growth floor (9) refuses it; only the process spends the
@@ -1388,7 +1388,7 @@ declined only:
 - with code 6 or 8, when memmgr's metadata arena cannot grow, past what is left of the region's
   metadata bound, for the slots that record the run, or the run cannot be recorded on its chunk.
 
-Only an overcommit allowance above 0 makes a committed region's chunks evictable. A fault on one
+Only registered swap slots make a committed region's chunks evictable. A fault on one
 memmgr is evicting, or holds raw, maps the chunk's own runs back, and a fault on one it evicted
 restores the chunk; either is declined only:
 

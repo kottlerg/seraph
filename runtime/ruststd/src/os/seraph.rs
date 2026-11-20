@@ -1215,18 +1215,21 @@ pub fn memory_pressure_notification() -> Option<u64> {
     pal_alloc::pressure_notification()
 }
 
-/// Block until the memory-pressure level changes, or `timeout` passes, and
-/// return the level then. `None` waits without bound; `Some(Duration::ZERO)`
-/// takes a change already signalled without blocking.
+/// Block until memmgr sends [`MEMORY_PRESSURE_BIT`], at a change of the
+/// memory-pressure level or an opening of its draw room, or `timeout`
+/// passes, and return the level then, which a wake for the draw room leaves
+/// as it was: a caller that acts on a change of level compares it with the
+/// level it last acted on. `None` waits without bound; `Some(Duration::ZERO)`
+/// takes a signal already sent without blocking.
 ///
-/// Each change wakes one waiter of the process: a thread that waits here
+/// Each signal wakes one waiter of the process: a thread that waits here
 /// takes the bit from every other. A stop of the waiting thread, or an
 /// upcall to it, does not end the wait: it waits again for what is left of
 /// `timeout` (`docs/fault-handling.md` § Asynchronous Upcalls).
 ///
 /// # Errors
 /// `Unsupported` when the process is not registered
-/// ([`memory_pressure_notification`]), `TimedOut` when no change came in
+/// ([`memory_pressure_notification`]), `TimedOut` when no signal came in
 /// `timeout`, and another error when the wait or the read of the level fails.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn wait_memory_pressure(

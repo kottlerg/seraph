@@ -379,6 +379,18 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         )
     }
 
+    /// Whether `promised` may exceed the free pool: a swap service registered
+    /// swap slots, which a registration never withdraws. The allowance can be
+    /// spent to 0 while it does, the pool short of `promised` by what was
+    /// promised past its frames, so the draws and eviction read this rather
+    /// than the allowance (`services/memmgr/docs/memory-pool.md` § Commit,
+    /// Overcommit).
+    #[must_use]
+    pub const fn overcommits(&self) -> bool
+    {
+        self.slots.total() != 0
+    }
+
     /// The pages a commitment may still promise: the free pool and the
     /// overcommit allowance, less `promised`, which a committed registration
     /// or growth reads ([`Ledger::admit_commit`]).
@@ -404,12 +416,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// The most pages a committed draw (a fault in a committed region, or a
     /// restore of a committed chunk, each drawing from `promised`) may take
-    /// from the free pool: every free page while the allowance is 0 or the
-    /// pool covers `promised`, else only those above `floor`: for a budget
+    /// from the free pool: every free page while no swap service registered
+    /// slots ([`Self::overcommits`]) or the pool covers `promised`, else
+    /// only those above `floor`, the allowance spent or not: for a budget
     /// node outside the system reserve, the growth floor
     /// ([`Self::growth_floor`]), so the draws leave the reserve and the
     /// restore headroom to the restores of uncommitted chunks; 0 for a
-    /// reserve node. With an allowance of 0 the pool falls short of
+    /// reserve node. With no slot registered the pool falls short of
     /// `promised` only by memmgr's own metadata, so a draw takes any free
     /// page, as every committed fault did before there was an allowance
     /// (`services/memmgr/docs/memory-pool.md` § Commit, Overcommit).
@@ -417,7 +430,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     pub fn draw_room(&self, floor: u64) -> u64
     {
         let free = self.pool.free_pages();
-        if self.allowance() == 0 || free >= self.promised
+        if !self.overcommits() || free >= self.promised
         {
             free
         }
@@ -2046,11 +2059,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Whether the chunks of region `reg` of the record `rec` may be evicted:
-    /// the region is not registered no-evict, it is uncommitted or the
-    /// overcommit allowance is above 0, and the record's budget node is not a
-    /// reserve node, whose process frees memory under exhaustion and must not
-    /// wait on a restore to do so (`services/memmgr/docs/memory-pool.md`
-    /// § Eviction). With an allowance of 0 a committed chunk is not evicted:
+    /// the region is not registered no-evict, it is uncommitted or a swap
+    /// service registered slots ([`Self::overcommits`]), and the record's
+    /// budget node is not a reserve node, whose process frees memory under
+    /// exhaustion and must not wait on a restore to do so
+    /// (`services/memmgr/docs/memory-pool.md` § Eviction). With no slot registered a committed chunk is not evicted:
     /// its restore would draw from `promised`, so evicting it frees no page
     /// outside it and takes store pages ([`Ledger::evicting_frees`]).
     #[must_use]
@@ -2061,7 +2074,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return false;
         };
-        (self.commit_at(node.commit).is_none() || self.allowance() > 0)
+        (self.commit_at(node.commit).is_none() || self.overcommits())
             && node.region.evict == Evict::Allowed
             && budget::node(&self.arena, r.budget).is_some_and(|b| !b.reserve())
     }
@@ -5015,6 +5028,19 @@ mod tests
         assert_eq!(promised(&l), need.promised() - 16);
         assert_eq!(l.promise_free(), left);
         assert_eq!(l.draw_room(16), 1000 - 16 - 16);
+        // With every slot taken the allowance is spent, and a pool still short
+        // of `promised` keeps a committed draw off the reserve, its committed
+        // chunks evictable for frames.
+        let taken: Vec<u32> = (0..32).map(|_| l.slots.take(rec).unwrap()).collect();
+        assert_eq!(l.allowance(), 0);
+        assert!(l.promised() > l.pool.free_pages());
+        assert!(l.overcommits());
+        assert_eq!(l.draw_room(16), 1000 - 16 - 16);
+        assert!(l.evictable(rec, reg));
+        for s in taken
+        {
+            assert!(l.slots.release(s));
+        }
         // With the allowance above what the region promises, the free pool is
         // the lesser.
         register_slots(&mut l, 625);

@@ -1199,9 +1199,9 @@ fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
 /// reclaim does, any evictable chunk among them, until the draw fits or
 /// [`MAX_SYNC_VICTIMS`] have been tried (services/memmgr/docs/memory-pool.md
 /// § Commit, Overcommit); `spare`, a region and the base of a chunk of it,
-/// names the chunk a fault backs, which is never taken. With an allowance of
-/// 0 the draw always fits while a page is free. 0: the draw is a commit
-/// overrun.
+/// names the chunk a fault backs, which is never taken. With no swap slot
+/// registered the draw always fits while a page is free. Returns the pages
+/// the draw may take; 0 makes it a commit overrun.
 pub(crate) fn draw_room(
     l: &mut MemLedger,
     rec: NodeIdx,

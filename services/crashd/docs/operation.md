@@ -155,9 +155,12 @@ endpoint cannot be made is retired, logged, and holds no fault again until crash
 crashd remembers each fault it resumed, by its badge and faulting page, until that fault's hold
 deadline, in 16 entries, the one that expires first replaced when they are full. A fault of the same
 badge and page before then repeats it: while its memory is short it is held only until that
-deadline; with its memory there it is logged `not held: repeats a resumed fault` as a warning, then
-reported and declined. So an access memmgr cannot back once memory is freed is not resumed into a
-loop, and the holds of one fault total at most the stall.
+deadline. With its memory there, a repeat of a fault that waits on the level is logged `not held:
+repeats a resumed fault` as a warning, then reported and declined, so an access memmgr cannot back
+once memory is freed is not resumed into a loop. A repeat of a commit overrun with the draw room
+open is resumed again, logged `resumed at once: commit draw room open`, and remembered until the
+same deadline: one opening of the draw room backs one committed draw, and another may have taken
+it between the resume and the retry. The holds of one fault total at most the stall.
 
 **While memory is critical.** crashd runs inside memmgr's system reserve: its recipe's
 `reserve = yes` has svcmgr create it with a reserve budget node

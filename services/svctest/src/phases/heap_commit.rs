@@ -635,9 +635,9 @@ fn limited_child_main() -> !
 
 /// What the free frames can still back of a commitment of a node outside the
 /// reserve, in pages: memmgr's free pages less `promised` and the growth
-/// floor. With an overcommit allowance above 0 memmgr promises past them
-/// (services/memmgr/docs/memory-pool.md § Commit, Overcommit), and a fault
-/// past the free frames waits on eviction; a commitment within them has every
+/// floor. While a swap service has registered swap slots memmgr promises past
+/// them (services/memmgr/docs/memory-pool.md § Commit, Overcommit), and a
+/// fault past the free frames waits on eviction; a commitment within them has every
 /// fault backed by a free frame.
 pub(crate) fn uncommitted_available() -> u64
 {

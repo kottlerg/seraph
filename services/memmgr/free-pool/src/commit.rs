@@ -40,15 +40,17 @@ use syscall_abi::PAGE_SIZE;
 /// the frames they freed or the slots they hold are what backs them, so an
 /// eviction moves a committed chunk's pages between tiers without spending
 /// the allowance. With no swap service registered no slot is free and no
-/// committed chunk is evicted, and the allowance is 0.
+/// committed chunk is evicted, and the allowance is 0; it can also be spent
+/// to 0 while slots are registered.
 ///
 /// A commitment is admitted against the free pool and the allowance less
-/// `promised`, so with an allowance above 0 memmgr may promise pages it holds
-/// no frame for, and a committed fault that then finds no frame evicts a
-/// victim in its turn or is declined as a commit overrun; committed chunks
-/// become evictable. At 0 every commitment is backed by a free page, short only
-/// of what memmgr's own metadata takes without admission. Eviction leaves the
-/// free pool plus the allowance less `promised` as it was; a write lowers it
+/// `promised`, so while a swap service has registered slots memmgr may
+/// promise pages it holds no frame for, and a committed fault that then finds
+/// no frame evicts a victim in its turn or is declined as a commit overrun;
+/// committed chunks become evictable. With no swap slot registered every
+/// commitment is backed by a free page, short only of what memmgr's own
+/// metadata takes without admission. Eviction leaves the free pool plus the
+/// allowance less `promised` as it was; a write lowers it
 /// by the pages its chunk's slot holds no frame for, at most a chunk's pages
 /// less one, so a partly backed chunk spends some of what the allowance
 /// promised.

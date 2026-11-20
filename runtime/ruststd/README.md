@@ -674,6 +674,50 @@ procmgr's bound on each call on a caller-supplied file cap passes (`FILE_CAP_CAL
 
 ---
 
+## Call deadline
+
+`std::os::seraph::with_call_deadline(deadline, f)` runs `f` with `deadline` as the calling
+thread's call deadline, and `std::os::seraph::call_time_left` returns the time left to it (`None`
+outside every deadline, zero once it has passed). A process bounds a step that waits on servers it
+does not trust to answer, as crashd bounds a fault's report and a core dump
+([services/crashd/docs/operation.md](../../services/crashd/docs/operation.md) § Bounds), and the
+`deadline` fixture tests it ([programs/deadline/README.md](../../programs/deadline/README.md)).
+
+- **Bounded.** Every IPC call the runtime makes on the thread inside `f` carries the time left as
+  its `SYS_IPC_CALL` timeout, which bounds its wait for a receiver and for the reply
+  ([docs/ipc-design.md](../../docs/ipc-design.md)), and none is made once the deadline has passed:
+  the calls of `std::fs` and of the `std::os::seraph` file and namespace functions,
+  `std::process`'s spawn, `std::time::SystemTime::now`, `std::os::seraph::registry::lookup`,
+  `std::os::seraph::read_verified`, and the system log (`log!`, stderr, a panic's message), whose
+  own bound (`LOG_CALL_TIMEOUT_MS`) the time left shortens. A call that reaches the deadline fails
+  as its API reports a failed call: `io::ErrorKind::TimedOut` where it returns `io::Result`,
+  `UNIX_EPOCH` from `SystemTime::now`, `None` from the registry lookup, and a dropped line from
+  the log. Such a call may have reached its server, which may have acted on it, and whose reply
+  then finds no caller. A `File` dropped past the deadline sends no `FS_CLOSE`; the driver releases
+  that open once it finds the open's liveness cap gone, which the drop deletes
+  ([Filesystem Driver Protocol](../../services/fs/docs/fs-driver-protocol.md) § Label 18:
+  `FS_OPEN`).
+- **Not bounded.** The calls to memmgr (the heap, the stacks, the registration of demand-paged
+  regions, frames, the release of a `VerifiedData`): memmgr is the process's pager, so a stuck
+  memmgr stops the process at its next page fault whatever a call's bound, and a heap call that
+  failed would abort the process. The `DESTROY_PROCESS` with which a spawn that failed tears its
+  child down, which nothing else releases: a call that only gives back what a failed operation
+  took is not cut by that operation's deadline, so a spawn whose deadline passed may still wait
+  for that teardown. Every wait that is not an IPC call: a thread's join, a child's wait, a pipe,
+  a sleep, a lock. A caller that needs a bound on calls of its own passes `call_time_left` to them,
+  as `ipc::ipc_call_within` takes it.
+- **Scope.** A deadline set inside `f` takes effect only when it is earlier than the one in force.
+  The deadline in force before `with_call_deadline` is in force again once `f` returns, unwinds,
+  or returns early, so nothing of it is left set. It is thread-local: a thread `f` spawns does not
+  inherit it, so a new thread's registration with procmgr (§ Thread registration) waits for
+  procmgr's answer.
+
+The runtime makes each bounded call through one helper that reads the deadline (`deadline_call`),
+and the unbounded ones through two others, one for memmgr (`memmgr_call`) and one for the
+teardown (`destroy_process_call`), all in `src/os/seraph.rs`.
+
+---
+
 ## Synchronization primitives
 
 `std::sync::{Mutex, Condvar, RwLock, Once}` and `std::thread::{park, park_timeout}` all block

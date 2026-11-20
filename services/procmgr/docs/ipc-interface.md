@@ -1173,8 +1173,7 @@ that process, which gains on it the `CONTROL` the cap's holder already has.
 Until it declares, a process is bound and attachable like any other: a fault of one of those
 drivers between its creation and its declaration, which each sends before its bootstrap, reaches
 the crash service, whose log output then waits on the faulting process until the crash service's
-watchdog bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds) declines
-the fault.
+bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds) declines the fault.
 
 ### Label 22: `REGISTER_THREAD`
 

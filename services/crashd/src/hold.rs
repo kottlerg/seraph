@@ -35,7 +35,7 @@ use syscall_abi::{
     FAULT_REPLY_RESUME, PAGE_SIZE, SyscallError,
 };
 
-use crate::{BOUND, Dump, FAULT_BOUND_MS, await_settled, delete_caps, handle_fault, now_ms};
+use crate::{Dump, FAULT_BOUND, deadline_in, delete_caps, handle_fault, now_ms};
 
 /// The wait-set badge of procmgr's crash endpoint.
 const WAKE_FAULT: u64 = 0;
@@ -245,7 +245,7 @@ impl Hold
                     self.arrived(slot);
                 }
                 // A signal from memmgr, read at the loop's top; then a
-                // deadline, or a late upcall of the watchdog's.
+                // deadline.
                 Ok(_) =>
                 {}
                 Err(e)
@@ -615,15 +615,10 @@ fn held_ms(held: &Held) -> u64
     now_ms().saturating_sub(held.since)
 }
 
-/// Run `log`, a log write outside a fault's report, under the watchdog's
-/// bound, so a log write that waits on a stuck driver does not stop crashd
-/// serving faults and ending holds.
+/// Run `log`, a log write outside a fault's report, under a call deadline
+/// of [`FAULT_BOUND`], so a log write that waits on a stuck driver does not
+/// stop crashd serving faults and ending holds.
 fn bounded(log: impl FnOnce())
 {
-    let generation = BOUND.arm(now_ms(), FAULT_BOUND_MS);
-    log();
-    if BOUND.end(generation)
-    {
-        await_settled(generation);
-    }
+    std::os::seraph::with_call_deadline(deadline_in(FAULT_BOUND), log);
 }

@@ -28,6 +28,10 @@ filter, and the wire encodings are specified in
 times out the process's later calls take the short `LOG_CALL_UNANSWERED_TIMEOUT_MS` bound until
 one is answered, so a log receiver that stops answering costs a sender one long wait and then a
 short one per line ([docs/limits.md](../../docs/limits.md) § Shared IPC and protocol crates).
+std's `_start` installs the source of the calling thread's call deadline (`install_time_left`),
+and a call under a deadline takes the time left when it is shorter; a call the deadline ends does
+not count as an unanswered one
+([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Call deadline).
 `receiver_restarted`, which std exposes as `std::os::seraph::log::receiver_restarted`, returns
 the process to the long bound when it knows a new receiver has started in place of one that
 stopped receiving: svcmgr calls it once it has restarted logd, before it writes the lines it held

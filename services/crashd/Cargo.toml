@@ -17,8 +17,6 @@ test = false
 core-file = { package = "crashd-core-file", path = "core-file" }
 # The report block's emitter and the stack walk, host-tested there.
 crash-report = { path = "../../shared/crash-report" }
-# The state that bounds one fault's handling, host-tested there.
-fault-bound = { package = "crashd-fault-bound", path = "fault-bound" }
 ipc = { path = "../../shared/ipc" }
 # Which faults crashd holds for want of memory, and how each hold ends,
 # host-tested there.

@@ -12,9 +12,14 @@
 //! upcall with `UPCALL_ANY_INSTRUCTION`, which reaches the spinning worker at
 //! an interrupt's return. The supervisor receives the upcall, redirects the
 //! worker's instruction pointer into a cancellation routine, and resumes it;
-//! the routine marks the computation cancelled and ends the worker. The
-//! supervisor prints `PASS` once the worker is cancelled and has stopped
-//! computing.
+//! the routine marks the computation cancelled and ends the worker.
+//!
+//! The main thread then bounds blocking calls by a call deadline
+//! (`std::os::seraph::with_call_deadline`): a runtime call and a call of the
+//! fixture's own, each on an endpoint nobody receives on, end `TimedOut` and
+//! `WouldBlock` at the deadline, a later deadline nested inside does not
+//! extend it, and a call under a deadline already passed is not sent. The
+//! fixture prints `PASS` once both parts hold.
 //!
 //! Driven by its per-program tester (`tester/`), which `usertest` runs.
 
@@ -25,17 +30,31 @@
               is its FAIL verdict for the tester"
 )]
 
+use std::io::ErrorKind;
+use std::os::seraph::{call_time_left, with_call_deadline};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ipc::IpcMessage;
 use syscall_abi::{
-    FAULT_CLASS_UPCALL, FAULT_KIND_UPCALL, FAULT_LABEL, FAULT_REPLY_RESUME, UPCALL_ANY_INSTRUCTION,
-    UPCALL_POINT_INTERRUPT,
+    FAULT_CLASS_UPCALL, FAULT_KIND_UPCALL, FAULT_LABEL, FAULT_REPLY_RESUME, SyscallError,
+    UPCALL_ANY_INSTRUCTION, UPCALL_POINT_INTERRUPT,
 };
 
 /// How long the worker computes before the supervisor cancels it.
 const DEADLINE: Duration = Duration::from_millis(50);
+
+/// The call deadline's bound, from just before the bounded call.
+const CALL_BOUND: Duration = Duration::from_millis(100);
+
+/// The least a bounded call waits: half its bound, which leaves the kernel's
+/// timer a tick of slack and still tells a call that waited from one that
+/// failed at once.
+const CALL_WAIT_MIN: Duration = Duration::from_millis(50);
+
+/// The most a bounded call may take: past it the deadline did not end the
+/// call, which would otherwise wait for good.
+const CALL_WAIT_MAX: Duration = Duration::from_secs(5);
 
 /// The cookie the supervisor posts, read back from the upcall message.
 const COOKIE: u64 = 0xDEAD_11E0;
@@ -155,7 +174,89 @@ fn main()
         "the worker kept computing after its cancellation"
     );
     println!("deadline: worker cancelled after {at_cancel} spins");
+
+    call_deadline(ipc_buf);
     println!("PASS");
+}
+
+/// The instant `after` from `start`.
+fn at(start: Instant, after: Duration) -> Instant
+{
+    start
+        .checked_add(after)
+        .expect("the deadline fits an Instant")
+}
+
+/// Bound calls on an endpoint nobody receives on, which never answers, by a
+/// call deadline: a runtime call fails `TimedOut` and the fixture's own call
+/// `WouldBlock`, each after waiting about [`CALL_BOUND`]; a later deadline
+/// nested inside does not extend the scope; a call under a deadline already
+/// passed is not sent; and no deadline is left once the scope ends.
+fn call_deadline(ipc_buf: *mut u64)
+{
+    let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+        syscall::cap_create_endpoint(slab).ok()
+    })
+    .expect("create the endpoint nobody receives on");
+
+    let start = Instant::now();
+    let looked_up = with_call_deadline(at(start, CALL_BOUND), || {
+        with_call_deadline(at(start, CALL_WAIT_MAX), || {
+            std::os::seraph::namespace_lookup_file(ep, "x")
+        })
+    });
+    let waited = start.elapsed();
+    let err = looked_up.expect_err("a lookup on an endpoint nobody receives on was answered");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::TimedOut,
+        "the bounded runtime call failed {err}"
+    );
+    assert!(
+        (CALL_WAIT_MIN..CALL_WAIT_MAX).contains(&waited),
+        "the bounded runtime call ended after {waited:?}, not at its deadline"
+    );
+    assert!(
+        call_time_left().is_none(),
+        "a call deadline outlived its scope"
+    );
+
+    let own_start = Instant::now();
+    let called = with_call_deadline(at(own_start, CALL_BOUND), || {
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+        unsafe { ipc::ipc_call_within(ep, &IpcMessage::new(0), ipc_buf, call_time_left()) }
+    });
+    let own_waited = own_start.elapsed();
+    assert!(
+        matches!(called, Err(e) if e == SyscallError::WouldBlock as i64),
+        "the bounded call did not end WouldBlock"
+    );
+    assert!(
+        (CALL_WAIT_MIN..CALL_WAIT_MAX).contains(&own_waited),
+        "the bounded call ended after {own_waited:?}, not at its deadline"
+    );
+
+    let passed_start = Instant::now();
+    let refused = with_call_deadline(passed_start, || {
+        std::os::seraph::namespace_lookup_file(ep, "x")
+    });
+    let passed_waited = passed_start.elapsed();
+    let err = refused.expect_err("a lookup under a passed deadline was answered");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::TimedOut,
+        "the call under a passed deadline failed {err}"
+    );
+    assert!(
+        passed_waited < CALL_WAIT_MIN,
+        "a call under a passed deadline waited {passed_waited:?}"
+    );
+    println!(
+        "deadline: a call deadline ended a runtime call after {} ms and a call of the \
+         fixture's after {} ms",
+        waited.as_millis(),
+        own_waited.as_millis()
+    );
 }
 
 /// The cancellation routine the supervisor redirects the worker into: mark the

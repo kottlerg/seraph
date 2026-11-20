@@ -47,10 +47,11 @@ use syscall_abi::PAGE_SIZE;
 /// `promised`, so while a swap service has registered slots memmgr may
 /// promise pages it holds no frame for, and a committed fault that then finds
 /// no frame evicts a victim in its turn or is declined as a commit overrun;
-/// committed chunks become evictable. With no swap slot registered every
-/// commitment is backed by a free page, short only of what memmgr's own
-/// metadata takes without admission. Eviction leaves the free pool plus the
-/// allowance less `promised` as it was; a write lowers it
+/// committed chunks other than a memory-object attachment's become
+/// evictable. With no swap slot registered every commitment is backed by a
+/// free page, short only of what memmgr's own metadata takes without
+/// admission. Eviction leaves the free pool plus the allowance less
+/// `promised` as it was; a write lowers it
 /// by the pages its chunk's slot holds no frame for, at most a chunk's pages
 /// less one, so a partly backed chunk spends some of what the allowance
 /// promised.

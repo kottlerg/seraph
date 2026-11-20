@@ -949,8 +949,8 @@ first.
 
 A pager MUST evict only pages it mapped itself. Under memory pressure memmgr evicts cold pages it
 backed into a compressed store in RAM and restores them on the next fault, never evicting a page of
-a process whose budget node is a reserve node, nor a region registered no-evict
-([memmgr Memory Pool § Eviction](../services/memmgr/docs/memory-pool.md#eviction)).
+a process whose budget node is a reserve node, a region registered no-evict, nor a memory-object
+attachment ([memmgr Memory Pool § Eviction](../services/memmgr/docs/memory-pool.md#eviction)).
 
 ### Default System Pager
 

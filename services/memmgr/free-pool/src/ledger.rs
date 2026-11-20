@@ -181,8 +181,10 @@ pub enum SwapError
     /// The record slot named holds no record, the region slot no region of
     /// it, or the page lies outside the region.
     NoRegion,
-    /// The chunk may not be evicted: its region is committed or registered
-    /// no-evict, or its process's budget node is a reserve node.
+    /// The chunk may not be evicted ([`Ledger::evictable`]): its region is
+    /// registered no-evict, committed while no swap service has registered
+    /// slots, or a memory-object attachment, or its process's budget node is a
+    /// reserve node.
     Ineligible,
     /// The chunk's entry refused the transition ([`ChunkEntry`]).
     Chunk(ChunkError),
@@ -2791,9 +2793,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Whether the chunks of region `reg` of the record `rec` may be evicted:
     /// the region is not registered no-evict, it is uncommitted or a swap
-    /// service registered slots ([`Self::overcommits`]), and the record's
-    /// budget node is not a reserve node, whose process frees memory under
-    /// exhaustion and must not wait on a restore to do so
+    /// service registered slots ([`Self::overcommits`]), it is no
+    /// memory-object attachment, whose pages are its object's or a zero
+    /// frame's, and the record's budget node is not a reserve node, whose
+    /// process frees memory under exhaustion and must not wait on a restore
+    /// to do so
     /// (`services/memmgr/docs/memory-pool.md` § Eviction). With no slot
     /// registered a committed chunk is not evicted: its restore would draw from
     /// `promised`, so evicting it frees no page outside it and takes store

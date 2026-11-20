@@ -15,8 +15,9 @@
 //!    or one kept beside it, by a resume, a step, a detach, or the drop of
 //!    the session; any other at once.
 //! 2. Between two resumes GDB is told of, every live bound thread is held,
-//!    or was posted an upcall that has not arrived within [`STOP_WAIT`], or
-//!    is not yet started by its creator, read again meanwhile; an all-stop
+//!    or was posted an upcall that has not arrived within [`STOP_WAIT`] of
+//!    the all-stop's start, or of the post when its creator started it
+//!    during the all-stop, or is not yet started, read again meanwhile; an all-stop
 //!    that ends with one unstarted at its last read records it
 //!    ([`Session::awaits_start`]), and the attach then detaches. A
 //!    held stop GDB has been told of is never restarted: it is answered by
@@ -392,9 +393,10 @@ impl Session
     // ── Stops ────────────────────────────────────────────────────────────
 
     /// Stop every running thread with an upcall and wait, bounded by
-    /// [`STOP_WAIT`], for each stop, posting again every [`START_POLL`] to a
-    /// thread its creator has not started yet; a breakpoint another thread hits
-    /// meanwhile is held unreported and set back ([`Self::cancel_hit`]).
+    /// [`STOP_WAIT`], for each stop. A thread its creator has not started
+    /// yet is read again every [`START_POLL`] and posted once started, with
+    /// a whole [`STOP_WAIT`] from that post. A breakpoint another thread
+    /// hits meanwhile is held unreported and set back ([`Self::cancel_hit`]).
     /// Once every thread is held the table is refreshed: a thread the
     /// target spawned since the last refresh, under its spawner's badge,
     /// can have had its stop taken for its spawner's, so every unreported
@@ -404,11 +406,21 @@ impl Session
     /// its thread is held.
     pub fn stop_all(&mut self, k: &mut impl Kernel)
     {
-        let deadline = k.now().saturating_add(STOP_WAIT);
+        let mut deadline = k.now().saturating_add(STOP_WAIT);
         let mut refreshed = false;
+        let mut was_unstarted = 0;
         loop
         {
-            let unstarted = self.post_upcalls(k);
+            let now_unstarted = self.post_upcalls(k);
+            // A thread its creator started since the last read was posted
+            // just now: its upcall gets a whole wait from the post, not what
+            // is left of the all-stop's.
+            if now_unstarted < was_unstarted
+            {
+                deadline = deadline.max(k.now().saturating_add(STOP_WAIT));
+            }
+            was_unstarted = now_unstarted;
+            let unstarted = now_unstarted > 0;
             self.unstarted = unstarted;
             let waiting = self
                 .threads
@@ -475,11 +487,11 @@ impl Session
     }
 
     /// Post an upcall to every live thread not held and not yet posted;
-    /// returns whether one of them has not been started by its creator,
-    /// which the kernel posts nothing to until it is, so it stays unposted.
-    fn post_upcalls(&mut self, k: &mut impl Kernel) -> bool
+    /// returns how many of them have not been started by their creator,
+    /// which the kernel posts nothing to until it is, so they stay unposted.
+    fn post_upcalls(&mut self, k: &mut impl Kernel) -> usize
     {
-        let mut unstarted = false;
+        let mut unstarted: usize = 0;
         for t in self
             .threads
             .iter_mut()
@@ -490,7 +502,7 @@ impl Session
             // one with an upcall pending.
             if !k.started(t.cap) && k.alive(t.cap)
             {
-                unstarted = true;
+                unstarted = unstarted.saturating_add(1);
             }
             else if !k.post_upcall(t.cap) && !k.alive(t.cap)
             {
@@ -1268,6 +1280,10 @@ mod tests
         /// Threads their creator starts only at the given time, before which
         /// the kernel refuses them an upcall.
         unstarted: Vec<(usize, u64)>,
+        /// Threads whose upcall arrives the given time after its post.
+        late: Vec<(usize, u64)>,
+        /// The late upcalls posted, by thread and time due.
+        due: Vec<(usize, u64)>,
     }
 
     fn cap_of(t: usize) -> u64
@@ -1302,6 +1318,8 @@ mod tests
                 busy: 0,
                 refuse_bind: Vec::new(),
                 unstarted: Vec::new(),
+                late: Vec::new(),
+                due: Vec::new(),
             };
             sim.spawn(None, true);
             sim
@@ -1457,6 +1475,19 @@ mod tests
 
         fn next_stop(&mut self, until: u64) -> Option<Stop>
         {
+            // A late upcall arrives at its time, within the wait.
+            if self.queue.is_empty()
+                && let Some(i) = (0..self.due.len())
+                    .filter(|&i| self.due[i].1 <= until)
+                    .min_by_key(|&i| self.due[i].1)
+            {
+                let (t, at) = self.due.remove(i);
+                self.time = self.time.max(at);
+                if self.threads[t].run == Run::Running
+                {
+                    self.deliver(t, UPCALL, 0);
+                }
+            }
             // A delivery waits on the endpoint while every receiver holds one.
             let taken = if self.busy < self.receivers
             {
@@ -1598,6 +1629,12 @@ mod tests
             if self.deaf.contains(&t)
             {
                 return self.threads[t].run != Run::Exited;
+            }
+            if let Some(&(_, after)) = self.late.iter().find(|&&(u, _)| u == t)
+                && self.threads[t].run == Run::Running
+            {
+                self.due.push((t, self.time + after));
+                return true;
             }
             match self.threads[t].run
             {
@@ -2285,6 +2322,25 @@ mod tests
         assert!(s.awaits_start());
         assert!(s.detach(&mut sim));
         assert!(sim.detached);
+        sim.assert_sound();
+    }
+
+    // Defect caught: a target its creator started in the all-stop's last
+    // `START_POLL` before its bound, before its last read, was posted with
+    // what was left of the wait, and attached holding nothing when its
+    // upcall came later, while it ran.
+    #[test]
+    fn a_target_started_late_in_the_all_stop_gets_a_whole_wait()
+    {
+        let mut sim = Sim::new();
+        sim.unstarted.push((0, STOP_WAIT - START_POLL));
+        sim.late.push((0, 2 * START_POLL));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.is_held(0), "the main thread runs unheld");
+        assert!(!s.awaits_start());
+        assert_eq!(sim.time, STOP_WAIT + START_POLL, "the upcall came at once");
+        assert!(s.detach(&mut sim));
         sim.assert_sound();
     }
 

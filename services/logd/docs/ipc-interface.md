@@ -126,7 +126,7 @@ a sender that sets no level logs at info.
   it: a line below info is not sent in a default boot, and a tag after
   `[name] ` breaks a match anchored there. A line a document says a
   component logs, or tells its reader to read, stays at info too unless
-  the document changes with it: procmgr's `spawn image bias=0x…` line,
+  the document changes with it: procmgr's `spawn image bias=0x… (<argv0>)` line,
   from which `run --gdb` and `symbolize --bias` take a process's load bias
   ([xtask/README.md](../../../xtask/README.md#cargo-xtask-symbolize)), is
   one. A line whose text contains

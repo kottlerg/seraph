@@ -272,12 +272,15 @@ before it fails (see [Reclamation](#reclamation)). When no free run covers them,
 largest free run whole, which needs no split, and maps it over the part of the span around the
 faulting page: from the faulting page up, moved down only as far as needed to stay inside the span.
 A later fault on a page of the span the run did not cover is backed the same way, so the chunk fills
-in parts, each part one run and one frame record. A fault is therefore declined for want of RAM
-(code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the free
-pool holds no page, when every free page is in the growth floor (the system reserve and, while
-chunks are swapped, the restore headroom) and the process's node is outside the reserve, or when the
-split of a run larger than the pages to back fails. A fault on an evicting or compressed chunk first
-makes the chunk resident, a restore with its own admission ([Eviction](#eviction)).
+in parts, each part one run and one frame record. A fault in an uncommitted region is therefore
+declined for want of RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault
+message) only when the free pool holds no page, when every free page is in the growth floor (the
+system reserve and, while chunks are swapped, the restore headroom) and the process's node is
+outside the reserve, or when the split of a run larger than the pages to back fails. A fault in a
+committed region is declined with code 7 only for that failed split; when its draw finds no page,
+even after memmgr evicted victims in its turn, it is declined with code 11 ([Commit](#commit),
+Overcommit). A fault on an evicting or compressed chunk first makes the chunk resident, a restore
+with its own admission ([Eviction](#eviction)).
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
 protection, and recorded on its chunk's entry with its mapped VA and no region id, and charged to
@@ -796,12 +799,14 @@ each send the bits once; a send never blocks, and the bits of sends not yet take
 A region registered with `REGION_COMMIT` is committed ([ipc-interface.md](ipc-interface.md) § Label
 7). memmgr admits and charges its whole length when it registers it, and each growth by
 `EXTEND_REGION` (§ Label 12) when it accepts that growth, so a fault in a committed region is not
-declined for budget or RAM while the region's page-table reservation lasts, which only the process's
-own mappings and unmaps can spend early (Faults below): a refusal reaches the process as the error
-reply of the call that asked, where it can fail an allocation, not as a fault. std's heap grows this
-way. It keeps its uncommitted floor and registers one committed growth region directly above it on
-its first grow, which each later grow extends, so a heap is two regions however large it grows and
-holds no Memory caps ([Userspace Memory Model § Byte
+declined for budget, and for RAM only with code 7 when the split of a run larger than the pages to
+back fails, or with code 11 under an overcommit allowance above 0 or after memmgr's own metadata
+took free pages without admission (Overcommit, below), while the region's page-table reservation
+lasts, which only the process's own mappings and unmaps can spend early (Faults below): a refusal
+reaches the process as the error reply of the call that asked, where it can fail an allocation, not
+as a fault. std's heap grows this way. It keeps its uncommitted floor and registers one committed
+growth region directly above it on its first grow, which each later grow extends, so a heap is two
+regions however large it grows and holds no Memory caps ([Userspace Memory Model § Byte
 Heap](../../../docs/userspace-memory-model.md#byte-heap)).
 
 **Promised.** memmgr counts in `promised` what the committed regions can still take from the free
@@ -986,21 +991,22 @@ memmgr reclaims in the background until it reads `NORMAL`, and stops there. It d
 the background at `CRITICAL`: the free pages above the growth floor are gone, so every frame an
 eviction frees past the restore headroom goes to the next admission, which a process draining the
 pool makes before any victim faults. Eviction makes room for the processes that run while memory is
-low; at `CRITICAL` only a restore evicts, for itself (Direct reclaim, below), and the pool is
-otherwise left to the out-of-memory path (crashd's hold of a declined fault, oomd's stop of a job).
-While the level reads `LOW` or `CRITICAL`, the receive loop waits for a message a bounded time and,
-at most once per sweep interval, runs a slice of the clock: a hand walks the eligible regions of
-each process in turn, a bounded number of steps a slice ([docs/limits.md](../../../docs/limits.md)
-§ memmgr gives the interval and the bounds). For each span of up to 256 chunks it reads and clears
-the accessed bits with one `SYS_ASPACE_HARVEST`, and ages each resident chunk of the span with its
-two-bit age ([Chunk table](#chunk-table)): a chunk with no accessed page in two sweeps is cold, and
-at `LOW` the slice posts one job for each cold chunk whose eviction raises the free pages outside
-`promised` (Committed pages, above), as many as the compression worker has free job slots. The
-victims a slice finds and posts no job for are kept, a bounded number, for direct reclaim, one whose
-eviction raises the free pages outside `promised` taking the place of one only a committed draw may
-take when the list is full; at `CRITICAL` a slice finds the chunks with no accessed page in one
-sweep. A slice ends at the end of a pass, so no slice ages a chunk twice. The granule is the chunk:
-one unmap and one restore fault per chunk, over every run on its run list.
+low; at `CRITICAL` only a restore or a committed draw evicts, for itself (Direct reclaim, below),
+and the pool is otherwise left to the out-of-memory path (crashd's hold of a declined fault, oomd's
+stop of a job). While the level reads `LOW` or `CRITICAL`, the receive loop waits for a message a
+bounded time and, at most once per sweep interval, runs a slice of the clock: a hand walks the
+eligible regions of each process in turn, a bounded number of steps a slice
+([docs/limits.md](../../../docs/limits.md) § memmgr gives the interval and the bounds). For each
+span of up to 256 chunks it reads and clears the accessed bits with one `SYS_ASPACE_HARVEST`, and
+ages each resident chunk of the span with its two-bit age ([Chunk table](#chunk-table)): a chunk
+with no accessed page in two sweeps is cold, and at `LOW` the slice posts one job for each cold
+chunk whose eviction raises the free pages outside `promised` (Committed pages, above), as many as
+the compression worker has free job slots. The victims a slice finds and posts no job for are kept,
+a bounded number, for direct reclaim, one whose eviction raises the free pages outside `promised`
+taking the place of one only a committed draw may take when the list is full; at `CRITICAL` a slice
+finds the chunks with no accessed page in one sweep. A slice ends at the end of a pass, so no slice
+ages a chunk twice. The granule is the chunk: one unmap and one restore fault per chunk, over every
+run on its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, maps its
 runs into the job slot's input window of its own address space, and the chunk is evicting while

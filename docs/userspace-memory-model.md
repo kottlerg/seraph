@@ -136,7 +136,9 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   (`DISCARD_RANGE`) each whole chunk of the free block past its node that the
   free made free: memmgr takes back their frames and keeps the region's
   commitment, so a later touch of a discarded page is backed zero-filled and is
-  not declined for budget or RAM. The floor, an uncommitted region, is never
+  not declined for budget, and for RAM only in the cases
+  [memmgr's interface](../services/memmgr/docs/ipc-interface.md) § Label 7
+  gives for a committed region. The floor, an uncommitted region, is never
   given back, since a later touch of one of its pages could be declined. The
   heap lock is held across the call, so no thread allocates from the pages
   memmgr clears.
@@ -383,7 +385,7 @@ and the in-image TLS template — are mapped read-only (svctest's
 The bias is deliberately not a `ProcessInfo` field. A process that
 needs its own base reads the lld-synthesized `__ehdr_start` symbol's
 address; debugging correlates through the creator's spawn log line
-(procmgr: `spawn image bias=0x…`; init: `init: <svc> image bias=0x…`;
+(procmgr: `spawn image bias=0x… (<argv0>)`; init: `init: <svc> image bias=0x…`;
 kernel Phase 9: `init: PIE bias=0x…`) and loads symbols with
 `add-symbol-file symbols/<file> -o <bias>` in GDB, `<file>` being the
 store file `symbols/manifest` lists for the image's install path: the

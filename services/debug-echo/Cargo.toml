@@ -10,6 +10,7 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+device-tracker = { path = "../../shared/device-tracker" }
 gdb-rsp = { path = "../../shared/gdb-rsp" }
 ipc = { path = "../../shared/ipc" }
 syscall = { path = "../../shared/syscall" }

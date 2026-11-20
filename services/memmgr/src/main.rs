@@ -2477,11 +2477,12 @@ enum FaultDecline
     /// takes: its descriptor, and the chunk's path in the region's chunk
     /// table.
     NoArenaSlot = 6,
-    /// The free pool holds no page to back the faulting page: it is empty,
-    /// even after the deferred runs were rechecked, every free page it holds
-    /// is in the growth floor and the process's budget node is outside the
-    /// system reserve, or the split of a run larger than the pages to back
-    /// failed.
+    /// The free pool holds no page to back the faulting page: for a fault in
+    /// an uncommitted region, it is empty, even after the deferred runs were
+    /// rechecked, or every free page it holds is in the growth floor and the
+    /// process's budget node is outside the system reserve; for any fault, the
+    /// split of a run larger than the pages to back failed. A fault in a
+    /// committed region whose draw finds no page is [`Self::CommitOverrun`].
     NoFreePage = 7,
     /// The run could not be recorded on its chunk in the region's chunk
     /// table.

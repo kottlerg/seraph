@@ -16,9 +16,13 @@ on:
     branches: [master]
   workflow_dispatch:
 
+# A pull request's newer push cancels its older run. Every other run (each
+# push to master, each merge commit among them) is grouped by its commit, so
+# no later run cancels or replaces it: each merge commit gets its own run
+# (docs/conventions.md § CI Gating).
 concurrency:
-  group: build-test-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-test-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

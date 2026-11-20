@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Run the pre-merge review of a pull request once its CI is green (the pr-reviewer and pr-auditor agents), save the run record, build the ledger, and handle the findings up to the merge condition.
+description: Run the pre-merge review of a pull request while its CI runs (the pr-reviewer and pr-auditor agents), save the run record, build the ledger, and handle the findings up to the merge condition.
 ---
 
 # The pre-merge review
@@ -9,7 +9,9 @@ docs/conventions.md § Branch and PR Workflow owns the rules: what a finding is 
 review surface, the rounds, where a defect is recorded, the ledger, the auditor-only run, and the
 merge condition.
 This skill is the procedure that applies them. `.claude/CLAUDE.md` carries the maintainer's
-standing request to run it on every PR once CI is green.
+standing request to run it on every PR once its head is pushed, while CI runs: a run does not
+wait for the CI result (docs/conventions.md § Pre-merge review), and the merge condition still
+needs green CI at the head.
 
 ## Before a run
 
@@ -141,11 +143,11 @@ copy in the same push.
 
 ## After a fix round
 
-Once the fixes are pushed and CI is green again, run a `delta` run, or the auditor-only run when
-§ Auditor-only run allows it. Any later delta that changes anything but documentation or
-comments, or that holds a sync owing a reviewer run (docs/conventions.md § Syncing with
-`master`), takes a run with the reviewer, its `since` the head of the last run with the
-reviewer.
+Once the fixes are pushed, run a `delta` run, without waiting for CI on either head, or the
+auditor-only run when § Auditor-only run allows it. Any later delta that changes anything
+but documentation or comments, or that holds a sync owing a reviewer run (docs/conventions.md
+§ Syncing with `master`), takes a run with the reviewer, its `since` the head of the last run
+with the reviewer.
 
 ## The merge condition
 

@@ -28,8 +28,11 @@ Read `.claude/agents/worker.md` and follow it in **standalone** mode, with these
 - An Issue the worker file says to draft is filed with `cargo xtask issue-file`: the rolling
   follow-up Issue of a scope that has none without asking, any other with the maintainer's
   approval in the conversation.
-- Sync onto `master` yourself right before the validation run, and again if `master` moves
-  before the gate. docs/conventions.md § Syncing with `master` says what each sync owes.
+- Sync onto `master` yourself right before the validation run when `master` has changed a
+  file the PR changes since its merge base, and again if `master` changes one before the
+  merge, or the gate refuses a merge without a sync for several merge bases or a conflict; any
+  other PR merges without a sync once the CI run at `master`'s tip is green.
+  docs/conventions.md § Syncing with `master` says when a sync is needed and what each owes.
 - The worker file is a file this session read, not its system prompt, so a compaction drops it.
   After one, read `.claude/agents/worker.md` again before the next step, and take the state of
   the work from the PR body and the branch, not from the summary.

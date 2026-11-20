@@ -38,10 +38,12 @@ read it to find the document a task needs.
 - These are the maintainer's standing requests, so no session or worker asks before acting on
   them:
   - Given an Issue, commit to its feature branch, push it, and open the PR.
-  - After a push, watch the PR's CI run with `gh pr checks <N> --watch` as a background command.
-    The harness notifies on completion; do not poll or sleep.
-  - On green, say so in one line and run the pre-merge review as the `pr-review` skill
-    describes. On red, show the failing job's tail (`gh run view <run-id> --log-failed`).
+  - After a push, watch the PR's CI run with `gh pr checks <N> --watch` as a background command,
+    and run the pre-merge review as the `pr-review` skill describes at once, while CI runs
+    ([docs/conventions.md](../docs/conventions.md) § Pre-merge review). The harness notifies on
+    CI's completion; do not poll or sleep.
+  - On green, say so in one line. On red, show the failing job's tail
+    (`gh run view <run-id> --log-failed`).
 - After a review run, whoever ran it gives both verdict lines verbatim to the one it reports to:
   a worker records them in its status line for its orchestrator
   (`.claude/agents/worker.md` § Reporting), a standalone session gives them to the maintainer.

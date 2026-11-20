@@ -220,7 +220,8 @@ stub's endpoint.
   its resume runs the breakpoint again and the hit is reported then.
 - **Single-step.** `s`, or a `vCont` step action, runs one instruction of one thread, the others
   held: on x86-64 by the trap flag, on riscv64 by a `c.ebreak` planted at the successor the
-  instruction's decode gives and removed at the step's stop, with the hazards
+  instruction's decode gives, through the text write of **Breakpoints** (a page the target shares
+  becomes its own first), and removed at the step's stop, with the hazards
   [docs/fault-handling.md](../../docs/fault-handling.md) § Debugging lists for that route. An
   all-stop that ends otherwise (GDB's interrupt, another thread's stop) undoes the step once its
   thread is held, and the planted `c.ebreak` is written back through any live thread once the
@@ -354,8 +355,9 @@ a continue that ends every thread; and a detach with a stop pending, with every 
 with the step's thread exited or never stopped. `cargo xtask test-gdb` boots the `gdb-target`
 fixture (`programs/debugger --gdb-target`,
 [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch
-GDB session over the debug port: it lists two threads, breaks on the fixture's tick function and
-continues to it, rewrites and reads back a variable and a register, single-steps, selects the
+GDB session over the debug port: it lists two threads, single-steps the main thread from where the
+attach stopped it, on text the fixture attaches shared, breaks on the fixture's tick function and
+continues to it, rewrites and reads back a variable and a register, single-steps again, selects the
 second thread and reads its registers, and detaches, and the stub's detach line reports the crash
 bindings restored; it then has the port's driver killed under the stub and requires the stub to
 answer through the restarted driver ([docs/testing.md](../../docs/testing.md) § GDB stub

@@ -98,6 +98,9 @@ const GDB_TIMEOUT: Duration = Duration::from_mins(3);
 /// and restores before it steps.
 const SCRIPT: &[&str] = &[
     "info threads",
+    "echo @@attach-step\\n",
+    "stepi",
+    "print/x $pc",
     "echo @@break\\n",
     "break gdb_target_tick",
     "continue",
@@ -158,8 +161,8 @@ pub fn run(ctx: &Context, args: &TestGdbArgs) -> Result<()>
     expect_restored(session.detached.as_deref())?;
     session.restarted.context("the restart round")?;
     step(
-        "gdb stub test: PASS (break, memory and register write, step, second thread, detach, \
-         the session across a restart of the port's driver)",
+        "gdb stub test: PASS (step from the attach stop, break, memory and register write, step, \
+         second thread, detach, the session across a restart of the port's driver)",
     );
     Ok(())
 }
@@ -500,11 +503,17 @@ fn expect(output: &str) -> Result<()>
 {
     let threads = section(output, "@@break");
     let before = output
-        .split_once("@@break")
+        .split_once("@@attach-step")
         .map_or("", |(before, _)| before);
     if !lists_thread(before, 1) || !lists_thread(before, 2)
     {
         bail!("info threads did not list two threads");
+    }
+    // The first step runs from where the attach stopped the main thread, on
+    // text the target shares with no breakpoint planted on its page yet.
+    if printed_values(section(output, "@@attach-step")).is_empty()
+    {
+        bail!("stepi from the attach stop printed no pc");
     }
     if !threads.contains("Breakpoint 1, ") || !threads.contains("gdb_target_tick")
     {
@@ -562,13 +571,14 @@ mod tests
     use super::*;
 
     // Defect caught: a check that passes a session missing one of its
-    // results (the step, the rewritten variable or register, the second
+    // results (either step, the rewritten variable or register, the second
     // thread's row).
     #[test]
     fn a_session_missing_a_result_fails_the_check()
     {
         let good = "[New Thread 2]\n  Id   Target Id   Frame\n* 1    Thread 1   0x8 in f ()\n  \
-                    2    Thread 2   0x9 in f ()\n@@break\nBreakpoint 1, 0x10 in \
+                    2    Thread 2   0x9 in f ()\n@@attach-step\n0x0c in f ()\n$0 = 0xc\n\
+                    @@break\nBreakpoint 1, 0x10 in \
                     gdb_target_tick ()\n@@pc\n$1 = 0x10\n@@counter\n0x20:\t0x0000000000005eed\n\
                     @@register\nRegister cache flushed.\n$2 = 0x5eed5eed\n\
                     @@step\n$3 = 0x14\n@@thread\n[Switching to thread 2 (Thread 2)]\n$4 = 0x30\n\
@@ -582,6 +592,7 @@ mod tests
             .is_err()
         );
         assert!(expect(&good.replace("$3 = 0x14", "$3 = 0x10")).is_err());
+        assert!(expect(&good.replace("$0 = 0xc\n", "")).is_err());
         assert!(expect(&good.replace("0x0000000000005eed", "0x0000000000000000")).is_err());
         assert!(expect(&good.replace("$2 = 0x5eed5eed", "$2 = 0x7")).is_err());
         assert!(expect(&good.replace("2    Thread 2   0x9 in f ()", "")).is_err());

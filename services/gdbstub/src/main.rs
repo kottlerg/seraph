@@ -584,7 +584,16 @@ impl Kernel for Sys
         {
             return false;
         }
-        let Ok(undo) = arch::prepare_step(cap, part)
+        // The successor may lie on text the target shares and has not run:
+        // read it resident, and plant through the text route that gives the
+        // target a copy of its own of the page first.
+        let read = |va: u64, buf: &mut [u8]| {
+            // SAFETY: `self.ipc_buf` is the registered IPC buffer.
+            unsafe { ipc::read_mem_resident(self.debug, self.target, cap, va, buf, self.ipc_buf) }
+                .is_ok()
+        };
+        let plant = |va: u64, bytes: &[u8]| self.text_write(cap, va, bytes);
+        let Ok(undo) = arch::prepare_step(part, read, plant)
         else
         {
             return false;

@@ -403,21 +403,32 @@ After bootstrap, every process is created by procmgr. The flow:
    `cap_create_*` syscalls.
 5. **Procmgr → memmgr (frames).** Procmgr requests Memory caps from
    memmgr to back the child's stack, IPC buffer, `ProcessInfo` page,
-   argv/env region, TLS block, and ELF segments. These calls go over the child's badged
+   argv/env region, TLS block, and the ELF segments it loads itself (step 6). These calls go over
+   the child's badged
    SEND cap returned by `REGISTER_PROCESS` (step 2), so memmgr accounts
    the frames against the child's per-process record from allocation.
-6. **Procmgr maps + populates the child.** Procmgr stages each ELF
-   segment's frames through a transient procmgr-side scratch mapping,
+6. **Procmgr maps + populates the child.** A demand-paged child that may share its image (its
+   creator did not set `CREATE_PRIVATE_IMAGE` and it is not pinned) attaches the ELF segments
+   that are not writable (text and read-only data) shared from its binary's image object, a
+   memmgr memory object procmgr seals once per binary on its image store and releases with the
+   last instance ([procmgr README](../services/procmgr/README.md#image-sharing) § Image
+   Sharing). Procmgr stages each other ELF segment's frames (every writable segment, and every
+   segment of a private or pinned image) through a transient procmgr-side scratch mapping,
    copying the segment bytes and applying the image's relocations, then
    maps the frames into the child's address space at procmgr-chosen VAs
    and populates `ProcessInfo` (including `memmgr_endpoint_cap` from
    step 2 and the procmgr/log endpoints).
-7. **No ownership transfer.** Every child frame and kernel-object retype
+7. **No ownership transfer.** Every frame of the child's own and every kernel-object retype
    slab is requested on the child's badged memmgr cap, so memmgr accounts
    it to the child's record from the moment it leaves the pool; procmgr
    deletes its transient slots after mapping, and `PROCESS_DIED` reclaims
    the set (see
-   [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)).
+   [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)). An attachment
+   of the image object charges the child its full size, as if the pages were its own, while the
+   object's frames stay on the image store's record until the last instance's teardown releases
+   the object
+   ([memmgr memory-pool.md](../services/memmgr/docs/memory-pool.md#memory-objects) § Memory
+   objects).
 8. **Procmgr replies to caller.** `CREATE_PROCESS` returns the badged
    process handle and a thread cap to the original caller.
 9. **Caller sends `START_PROCESS`.** Procmgr runs `thread_configure` +
@@ -604,15 +615,17 @@ Death](supervision.md#core-set-and-system-death)).
 
 Seraph has no `fork()`. A process is always created from an image by `CREATE_PROCESS` or
 `CREATE_FROM_FILE`, with the capabilities its creator gives it and none inherited. The kernel
-implements no copy-on-write. memmgr, as pager, may back pages of several address spaces from
-one immutable memory object and gives a process its own copy of such a page when it first
-writes it; the pages of an image that no relocation touches are shared this way between the
-instances of one binary. An attachment to a memory object conveys bytes, never capabilities.
-Buffer handoff between processes moves or shares Memory capabilities over IPC.
+implements no copy-on-write. memmgr, as pager, may back pages of several address spaces from one
+immutable memory object and, in a private attachment, gives a process its own copy of such a page
+when it first writes it; the pages of an image that no relocation touches are shared this way
+between the instances of one binary, in shared attachments, which no write copies. An attachment to
+a memory object conveys bytes, never capabilities. Buffer handoff between processes moves or shares
+Memory capabilities over IPC.
 
 The memory objects, the attachments and the copies are memmgr's
 ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#memory-objects)
-§ Memory objects), and the image sharing procmgr's
+§ Memory objects), as is the copy a debugger's breakpoint gets the target of a page of a shared
+attachment (`MAKE_PRIVATE`), and the image sharing procmgr's
 ([services/procmgr/README.md](../services/procmgr/README.md#image-sharing) § Image Sharing).
 
 Userspace fault handling is specified as the pager protocol in [Fault Handling](fault-handling.md).

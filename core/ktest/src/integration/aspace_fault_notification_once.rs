@@ -6,8 +6,8 @@
 //! Integration: an address space posts its terminal-fault observers once, on
 //! its first terminal fault, however many of its threads fault after it
 //! (core/kernel/docs/syscalls.md § `SYS_ASPACE_BIND_NOTIFICATION`; kernel
-//! side: `AddressSpace::record_fault_and_snapshot`, which returns the
-//! observer chain only to the fault that sets the retained reason).
+//! side: `AddressSpace::record_end_and_snapshot`, which returns the
+//! observer chain only to the end that sets the retained reason).
 //!
 //! Each round binds one observer on a fresh address space and lets two of its
 //! threads terminal-fault, each on an unmapped entry PC, with no handler bound:
@@ -25,7 +25,7 @@
 //! made its posts, so every post either fault would make has landed before
 //! the queue is read. The queue must then hold exactly
 //! one entry, with the observer's correlator and the reason
-//! `CAP_INFO_ASPACE_TERMINAL_FAULT` read back before the teardown: the first
+//! `CAP_INFO_ASPACE_END` read back before the teardown: the first
 //! fault's. Both threads fault with the same class, so the entry's count, not
 //! its reason, is what tells a per-fault post apart.
 
@@ -34,7 +34,9 @@ use syscall::{
     cap_info, event_queue_create_observed, event_try_recv, event_try_recv_death, system_info,
     thread_configure, thread_set_affinity, thread_start,
 };
-use syscall_abi::{CAP_INFO_ASPACE_TERMINAL_FAULT, EXIT_FAULT_BASE, SyscallError, SystemInfoType};
+use syscall_abi::{
+    CAP_INFO_ASPACE_END, EXIT_FAULT_BASE, SyscallError, SystemInfoType, aspace_end_reason,
+};
 
 use crate::{TestContext, TestResult};
 
@@ -203,8 +205,10 @@ fn round(ctx: &TestContext, order: Order) -> TestResult
     {
         return Err("aspace_fault_notification_once: a thread did not terminal-fault");
     }
-    let retained = cap_info(caps.aspace, CAP_INFO_ASPACE_TERMINAL_FAULT)
-        .map_err(|_| "aspace_fault_notification_once: cap_info(ASPACE_TERMINAL_FAULT) failed")?;
+    let answer = cap_info(caps.aspace, CAP_INFO_ASPACE_END)
+        .map_err(|_| "aspace_fault_notification_once: cap_info(ASPACE_END) failed")?;
+    let retained = aspace_end_reason(answer)
+        .ok_or("aspace_fault_notification_once: the space did not read ended")?;
     // The retained reason is the first fault's: the first thread's when it
     // faulted alone, either thread's when they raced.
     let first_fault = match order

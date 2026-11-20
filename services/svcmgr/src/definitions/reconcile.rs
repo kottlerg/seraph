@@ -574,7 +574,7 @@ fn log_boot_death(def: &Definition, exit_reason: u64)
 /// Binding after the thread was started loses no death: the kernel retains a
 /// thread's `exit_reason` past death and `thread_bind_notification`
 /// serialises on the thread's `sched_lock`, and it retains the address
-/// space's first terminal fault and replays it to a later address-space bind,
+/// space's first terminal end and replays it to a later address-space bind,
 /// so a death in the window between init's spawn and this bind is delivered
 /// to the death queues when the bind lands (#106 Window 2). A devmgr or vfsd
 /// that died in that window and that procmgr has already torn down has had its

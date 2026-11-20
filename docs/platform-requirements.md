@@ -108,8 +108,12 @@ Each feature is classified per architecture as one of:
 - **PCID and INVPCID** — address-space-tagged TLBs. The kernel assigns a tag per address space and
   elides the per-switch flush; see [memory-model.md](memory-model.md).
 - **Invariant TSC** — a constant-rate timestamp counter, the basis of timekeeping.
-- **8254 PIT** — used once at boot to calibrate the TSC (and the local-APIC timer for the
-  periodic-fallback tick path).
+- **8254 PIT** — required only where CPUID leaf 0x15 does not give the TSC rate (it enumerates
+  no crystal frequency: AMD, older Intel, and QEMU's emulated CPUs). There the kernel measures the
+  TSC over one 8254 window at boot; where an exact rate is enumerated it never touches the 8254.
+  The local-APIC timer, which the periodic-fallback tick path uses, is measured against the TSC
+  whatever the TSC rate's source
+  ([core/kernel/src/arch/x86_64/timer_rate.rs](../core/kernel/src/arch/x86_64/timer_rate.rs)).
 - **Local APIC and an I/O APIC** — interrupt delivery and routing.
 - **CPUID extended-topology leaf 0x0B** — the source of the BSP's full 32-bit x2APIC ID (CPU
   topology itself comes from the ACPI MADT).
@@ -348,7 +352,8 @@ feature it halts with a message naming the specific feature, rather than failing
   features are deliberately not gated because the software emulator used for continuous integration
   (QEMU TCG) cannot provide them and the kernel degrades correctly: PCID/INVPCID tagged TLBs (the
   kernel retains a full-flush fallback), invariant TSC (a frequency-stability guarantee; the kernel
-  calibrates the TSC against the PIT), and the vendor-specific in-silicon mitigations.
+  takes the TSC rate from CPUID or measures it against the PIT), and the vendor-specific in-silicon
+  mitigations.
 - **riscv64**: required features are asserted where each is safely detectable from supervisor mode —
   the SBI HSM and RFENCE extensions at the gate, and the Vector extension and the ASID-tagged TLB at
   their initialization sites (every hart without V, a secondary hart with a `vlenb` other than the
@@ -367,9 +372,12 @@ feature it halts with a message naming the specific feature, rather than failing
   confirmed Ssaia for every hart and reported a supervisor-level APLIC domain and IMSIC layout.
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
-the gate; their absence manifests as a boot failure on the discovery path they feed. A missing or
-dead 8254 PIT halts the boot at timer calibration with a message naming the PIT, once a poll
-budget in TSC ticks expires.
+the gate; their absence manifests as a boot failure on the discovery path they feed. Where the
+8254 PIT is the TSC rate source, a missing or dead one counts as no working 8254 when its window
+ends at once, gives an implausible rate, or outlives a poll budget in TSC ticks; the kernel then
+takes the rate from CPUID leaf 0x16's base frequency, approximate, where leaf 0x15 enumerates the
+TSC ratio, and otherwise halts the boot at timer calibration with a message naming the sources it
+tried.
 
 ---
 

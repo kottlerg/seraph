@@ -172,7 +172,7 @@ const CORE_DEATH_CAPACITY: u32 = 6;
 /// memmgr's and procmgr's, through the thread and `Control`-only
 /// address-space caps init endowed in their `SUBSTRATE` rounds (`pending`),
 /// under their own correlators (`svcmgr_defs::core_death_correlator`). Each
-/// main thread's exit and the first terminal fault of any thread of each
+/// main thread's exit and the first terminal end of any thread of each
 /// member post an entry, and a member already dead posts its retained reason
 /// as the bind lands. The binds need Control, which svcmgr alone holds, so
 /// svcmgr makes them and hands the shutdown actuator only a receive-only
@@ -1089,8 +1089,8 @@ fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 /// restart decision, when the entry is active and the tag names its current
 /// instance (`svcmgr_defs::death_tag::routes`). Each instance's observers
 /// post under its own instance, so a post of an instance already routed (the
-/// second of the two posts a main-thread fault that is the address space's
-/// first terminal fault makes, or a post a resync overtook) is dropped.
+/// second of the two posts a main-thread fault or exit that is the address
+/// space's first terminal end makes, or a post a resync overtook) is dropped.
 ///
 /// The death of a core member (memmgr, procmgr), which only the resync finds
 /// here since its observers are on the core-death queue, is not svcmgr's to
@@ -1180,7 +1180,7 @@ fn route_namespace_server_death(
 /// when the thread cap no longer resolves, since procmgr's teardown of the
 /// process revokes it; and, for a service init created by raw syscalls
 /// (memmgr, procmgr), whose address space svcmgr holds, the retained
-/// terminal-fault reason when one of its threads has faulted. A fault of a
+/// end when one of its threads has ended it. A fault or exit of a
 /// worker thread of a procmgr-created service shows here only once procmgr
 /// has torn the service down.
 pub(crate) fn observed_death(entry: &service::ServiceEntry) -> Option<u64>

@@ -21,12 +21,14 @@ pub const CREATED: u64 = 1;
 /// record, the oldest record makes room, or the new one is dropped), or
 /// the badge was never valid. Equivalent to `ESRCH`.
 pub const UNKNOWN: u64 = 2;
-/// The process has exited: its main thread is already `Exited` (before
-/// procmgr's death-event drain reaps it), or procmgr reaped or destroyed
-/// (`DESTROY_PROCESS`) it within the recent-exit window (30 s) and still
-/// holds its record (best-effort; see [`UNKNOWN`]). Reply word 1 carries
-/// the kernel-encoded `exit_reason`; for a destroyed process, `EXIT_KILLED`
-/// unless its main thread had already exited, when the reason the kernel
-/// retained. After the window, queries on the same badge return
-/// `UNKNOWN`.
+/// The process has exited: its address space has ended or its main thread
+/// is already `Exited` (before procmgr's death-event drain reaps it), or
+/// procmgr reaped or destroyed (`DESTROY_PROCESS`) it within the
+/// recent-exit window (30 s) and still holds its record (best-effort; see
+/// [`UNKNOWN`]). Reply word 1 carries the kernel-encoded `exit_reason`:
+/// the address space's first terminal end, else the main thread's retained
+/// reason, read at the first `EXITED` answer, which fixes it for later
+/// answers and for the teardown, or else at the reap or destroy; for a
+/// destroyed process that had not ended, `EXIT_KILLED`.
+/// After the window, queries on the same badge return `UNKNOWN`.
 pub const EXITED: u64 = 3;

@@ -2060,13 +2060,13 @@ fn finalize_creation(
     }
 
     // Also bind an address-space observer with the SAME correlator, so a
-    // terminal fault in a *spawned* (non-main) thread — which the main-thread
-    // binding above does not cover — still routes into `dispatch_death` →
-    // `take_by_badge` → teardown. When the main thread's fault is its address
-    // space's first, both observers fire with the same correlator and
-    // `take_by_badge` reaps exactly once (the second event is a
-    // stale-correlator no-op). Without it a worker
-    // thread's fault would never reap the process, so its failure refuses
+    // terminal fault or a process exit (`SYS_ASPACE_EXIT`) in a *spawned*
+    // (non-main) thread — which the main-thread binding above does not cover —
+    // still routes into `dispatch_death` → `take_by_badge` → teardown. When
+    // the main thread's fault or exit is its address space's first end, both
+    // observers fire with the same correlator and `take_by_badge` reaps
+    // exactly once (the second event is a stale-correlator no-op). Without it
+    // a worker thread's fault or exit would never reap the process, so its failure refuses
     // the spawn; the caller's guards destroy the child, which returns the
     // main-thread observer's node.
     let bound = crate::lock(deaths).bind_aspace(child_aspace, badge);
@@ -2149,6 +2149,7 @@ fn finalize_creation(
         end_queue: 0,
         end_correlator: 0,
         image_ref,
+        ended_with: None,
     });
     if let Err(e) = inserted
     {
@@ -2616,7 +2617,7 @@ fn bind_pager(
     // badge, over procmgr's (procmgr-badged) endpoint so it lands on the
     // privileged DELEGATE_ASPACE tier. procmgr keeps `child_aspace`. Mask out
     // CONTROL: memmgr only maps pages into the AS; the authority to register
-    // terminal-fault death observers stays with procmgr (the creator), which
+    // terminal-end death observers stays with procmgr (the creator), which
     // holds the CONTROL-bearing `child_aspace`.
     let Ok(as_copy) = syscall::cap_derive(
         child_aspace,
@@ -3510,7 +3511,8 @@ pub fn destroy_process(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &T
 
 /// Under the table lock, reap the process `badge` names as its death would
 /// ([`reap_dead`]) when it has already ended, by an exit of its main thread
-/// or a terminal fault of any of its threads, and no destroy has marked it:
+/// or the end of its address space (a terminal fault or process exit of any
+/// of its threads), and no destroy has marked it:
 /// a destroy that reaches procmgr before the reaper does takes the end as
 /// the reaper would, so the process's children are re-parented (or, for a
 /// contained process, marked) whichever comes first. `None`, with nothing
@@ -3613,10 +3615,9 @@ pub fn destroy_created(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &T
 }
 
 /// The exit reason a destroy tears `entry` down with, which the death
-/// relay, the end queue, logd and `QUERY_PROCESS` then read: the reason the
-/// kernel retained when the main thread had already exited, or else the
-/// first terminal fault any of its threads took (a death procmgr's drain had
-/// not reaped yet, [`resync_exit_reason`]), else `EXIT_KILLED`, the reason
+/// relay, the end queue, logd and `QUERY_PROCESS` then read: the reason it
+/// ended with when it ended before the destroy ([`ended_exit_reason`], a
+/// death procmgr's drain had not reaped yet), else `EXIT_KILLED`, the reason
 /// the kernel records for a thread its teardown stops. Reads kernel state
 /// only, under the table lock.
 fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
@@ -3625,22 +3626,21 @@ fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
 }
 
 /// The reason `entry`'s process ended with when it has ended before procmgr
-/// reaped it: the reason the kernel retained when its main thread has
-/// exited, or else the first terminal fault any of its threads took
-/// ([`resync_exit_reason`]); `None` while it runs. Reads kernel state only.
+/// reaped it: the reason an earlier `QUERY_PROCESS` answer fixed
+/// ([`ProcessEntry::ended_with`]), or else its address space's terminal end,
+/// the first terminal fault or process exit of any of its threads, or else,
+/// when the space has not ended, the reason the kernel retained for its
+/// exited main thread ([`resync_exit_reason`]); `None` while it runs.
+/// Reads the entry and kernel state only.
 fn ended_exit_reason(entry: &ProcessEntry) -> Option<u64>
 {
+    if entry.ended_with.is_some()
+    {
+        return entry.ended_with;
+    }
     let main_thread = syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
-    let terminal_fault = syscall::cap_info(
-        entry.aspace_cap,
-        syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
-    )
-    .ok();
-    resync_exit_reason(
-        main_thread,
-        syscall_abi::THREAD_STATE_EXITED,
-        terminal_fault,
-    )
+    let aspace_end = syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_END).ok();
+    resync_exit_reason(main_thread, syscall_abi::THREAD_STATE_EXITED, aspace_end)
 }
 
 /// Delete the death relay of a re-parented child
@@ -3651,8 +3651,12 @@ fn delete_relay(relay: u64)
     let _ = syscall::cap_delete(relay);
 }
 
-/// Reap the process `badge` names after its death, with `exit_reason`, as
-/// [`destroy_process`] tears down a destroyed one: take its entry
+/// Reap the process `badge` names after its death, as [`destroy_process`]
+/// tears down a destroyed one, with the reason the kernel recorded for its
+/// end ([`ended_exit_reason`]), so the relay, the end queue, logd and the
+/// recent-exits ring read what `QUERY_PROCESS` answered before the reap,
+/// whichever of its death posts arrived first; `exit_reason`, the post's,
+/// only when neither reading shows an end (a read that failed). Take its entry
 /// (`ProcessTable::take_ended`, which re-parents its children, or dooms
 /// them when it was created contained), record the exit in the recent-exits
 /// ring, and tear it down, under one hold of the table lock, then tell
@@ -3668,6 +3672,7 @@ pub fn reap_dead(badge: u64, exit_reason: u64, memmgr_ep: u64, ipc_buf: *mut u64
         {
             return;
         };
+        let exit_reason = ended_exit_reason(&entry).unwrap_or(exit_reason);
         state.recent.record(badge, exit_reason, crate::now_ns());
         teardown_entry(entry, exit_reason, &mut state.table)
     };

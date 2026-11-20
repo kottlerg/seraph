@@ -16,7 +16,7 @@ and one more for each restart. One observer is on the main thread
 `SYS_THREAD_EXIT` or on an unhandled fault, the kernel posts the death entry
 `(exit_reason, correlator)` to its queue (per
 [syscalls.md](../../../core/kernel/docs/syscalls.md)). The other is on the
-address space, and the first terminal fault of any of its threads posts it.
+address space, and the first terminal end of any of its threads, a fault or an exit, posts it.
 procmgr's teardown of the process stops the main thread without a post and
 revokes svcmgr's thread cap, so the address-space observer is the one that
 reports a fault of another thread. svcmgr binds the address-space observer
@@ -76,22 +76,22 @@ table grows on the heap and never reuses a slot, so a slot names one
 service for svcmgr's lifetime. `route_death` routes a post only when the
 slot is active and the tag's instance is the slot's current one, and the exit
 reason is the post's. Any other post is dropped: a late post of an instance
-already routed, and the second of the two posts a main-thread fault makes when
-it is the address space's first terminal fault.
+already routed, and the second of the two posts a main-thread fault or exit makes when
+it is the address space's first terminal end.
 
 Each death queue has a fixed tuning capacity (`DEATHS_EQ_CAPACITY`, 64),
 not one sized from the service count. The kernel drops a post to a full
 queue, so a drain that takes a full queue's worth of events or more from one
 queue resyncs: it routes a death for every active service whose main thread the kernel reports
 exited (the kernel's reason), whose thread cap no longer resolves (`EXIT_KILLED`: procmgr's teardown
-revokes it), or whose endowed address space has a retained terminal fault
-(`CAP_INFO_ASPACE_TERMINAL_FAULT`). A dropped post leaves a full queue of events behind it for that
+revokes it), or whose endowed address space has a retained terminal end
+(`CAP_INFO_ASPACE_END`). A dropped post leaves a full queue of events behind it for that
 drain or the next, so the resync runs after the drop.
 
 A worker-thread fault of a service procmgr created shows in svcmgr's caps only once procmgr's
 teardown revokes the thread cap, which can follow the resync. So the resync then asks procmgr
 about each such service its caps show alive, through its process handle
-(`procmgr_labels::QUERY_PROCESS`): procmgr reads the space's retained terminal fault and answers
+(`procmgr_labels::QUERY_PROCESS`): procmgr reads the space's retained terminal end and answers
 `EXITED` with it before it reaps the process. The query runs only while memmgr and procmgr are
 active and alive, since it blocks until procmgr answers.
 

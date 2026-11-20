@@ -67,8 +67,8 @@ const _: () = assert!(SETTLE_TIMEOUT.as_millis() == ipc::devmgr_labels::SETTLE_T
 
 /// Death observers devmgr binds on each driver to its death queues
 /// (`crate::spawn::spawn_bound_driver`): one on the driver's main thread and
-/// one on its address space. A fault of the main thread that is the driver's
-/// first terminal fault posts to both.
+/// one on its address space. A fault or exit of the main thread that is the
+/// driver's first terminal end posts to both.
 pub const OBSERVERS_PER_DRIVER: u32 = 2;
 
 /// Wait-set badge of the job notification.

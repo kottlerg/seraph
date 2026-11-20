@@ -46,6 +46,7 @@ core/kernel/
 │   │   │   ├── idt.rs          # IDT, ISR stubs, exception and IRQ handlers
 │   │   │   ├── ioapic.rs       # I/O APIC driver
 │   │   │   ├── timer.rs        # TSC-deadline / periodic-APIC timer for preemption
+│   │   │   ├── timer_rate.rs   # TSC rate source order and arithmetic, APIC timer rate; host-tested
 │   │   │   ├── syscall.rs      # SYSCALL/SYSRET entry glue
 │   │   │   ├── cpu.rs          # CPUID, CR4/MSRs, SMEP/SMAP/PCID, baseline gate, per-CPU GS base
 │   │   │   ├── gdt.rs          # Global Descriptor Table and TSS

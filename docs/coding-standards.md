@@ -418,7 +418,7 @@ states the guarantee for each architecture.
   - a field of a `CSpace` that its spinlock serialises, as
     [capability-internals.md § Storage: Hybrid Radix Directory](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)
     records;
-  - an address space's terminal-fault observer state, which its `death_lock` serialises, as
+  - an address space's terminal-end observer state, which its `death_lock` serialises, as
     [memory-internals.md § Address Space Objects](../core/kernel/docs/memory-internals.md#address-space-objects-mmaddress_spacers)
     records.
 

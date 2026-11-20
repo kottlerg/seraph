@@ -21,7 +21,7 @@
 //!   3. Negative control: an observer bound *before* start still fires
 //!      exactly once — guarding the append path against a double-post
 //!      from the retained-delivery branch.
-//!   4. A child voluntarily exits via `SYS_PROCESS_EXIT(code)` with no observer
+//!   4. A child voluntarily exits via `SYS_ASPACE_EXIT(code)` with no observer
 //!      bound; a later bind delivers the retained `encode_exit_code(code)`,
 //!      proving the process-exit syscall records the encoded code on the thread.
 

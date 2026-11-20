@@ -250,8 +250,9 @@ pub struct AddressSpace
     /// A `u64` cannot wrap: at one modification per nanosecond it lasts over 500
     /// years.
     pub(crate) tlb_gen: AtomicU64,
-    /// Observers to notify when a thread in this address space takes a
-    /// terminal fault: a chain of death-observer nodes, each drawn from the
+    /// Observers to notify at this address space's terminal end, the first
+    /// terminal fault or `SYS_ASPACE_EXIT` of any of its threads: a chain of
+    /// death-observer nodes, each drawn from the
     /// observing queue's pool at bind and carrying its caller-chosen
     /// `correlator` (mirroring `ThreadControlBlock::death_observers`).
     /// Semantics are defined in `docs/capability-model.md` § "Kill process"
@@ -259,28 +260,30 @@ pub struct AddressSpace
     /// `SYS_ASPACE_BIND_NOTIFICATION`. Owned by `death_lock`.
     death_observers: crate::sched::thread::DeathObserverChain,
     /// Serialises `death_observers` and the retained
-    /// terminal-fault state below against a concurrent bind
-    /// (`sys_aspace_bind_notification`) and the terminal-fault record
-    /// (`record_aspace_terminal_fault`) — the address-space analogue of a
+    /// terminal-end state below against a concurrent bind
+    /// (`sys_aspace_bind_notification`) and the terminal-end record
+    /// (`record_aspace_end`) — the address-space analogue of a
     /// thread's `sched_lock` role for `ThreadControlBlock::death_observers`.
     /// Those three fields are bare under the exception of
     /// docs/coding-standards.md § Concurrency, with this lock as their owner
     /// (core/kernel/docs/memory-internals.md § Address Space Objects).
     death_lock: crate::sync::Spinlock,
-    /// Set when a thread in this address space takes a terminal fault. A later
-    /// bind onto an already-faulted space delivers `terminal_fault_reason` to
-    /// the new observer instead of dropping the event — the address-space
-    /// analogue of retaining a thread's `exit_reason` past death. First fault
-    /// wins: a later fault neither overwrites the reason nor posts the
-    /// observers again. Owned by `death_lock`.
-    terminal_faulted: bool,
-    /// Retained terminal-fault reason (`EXIT_FAULT_BASE + vector`), valid when
-    /// `terminal_faulted`. Owned by `death_lock`.
-    terminal_fault_reason: u64,
+    /// Set at this address space's terminal end: the first terminal fault or
+    /// `SYS_ASPACE_EXIT` of any of its threads. A later bind onto an ended
+    /// space delivers `end_reason` to the new observer instead of dropping the
+    /// event — the address-space analogue of retaining a thread's
+    /// `exit_reason` past death. First end wins: a later fault or exit neither
+    /// overwrites the reason nor posts the observers again. Owned by
+    /// `death_lock`.
+    ended: bool,
+    /// Retained terminal-end reason, valid when `ended`: `EXIT_FAULT_BASE +
+    /// vector` for a fault, the encoded exit code (`0` for a clean exit) for
+    /// an exit. Owned by `death_lock`.
+    end_reason: u64,
 }
 
 // SAFETY: All mutable state is protected by pt_lock (page tables), death_lock
-// (death observers + retained terminal-fault state), or atomic operations
+// (death observers + retained terminal-end state), or atomic operations
 // (active_cpus). Safe to share across threads and CPUs.
 unsafe impl Send for AddressSpace {}
 // SAFETY: pt_lock serializes page table modifications; death_lock serializes the
@@ -732,8 +735,8 @@ impl AddressSpace
             tlb_gen: AtomicU64::new(0),
             death_observers: crate::sched::thread::DeathObserverChain::new(),
             death_lock: crate::sync::Spinlock::new(),
-            terminal_faulted: false,
-            terminal_fault_reason: 0,
+            ended: false,
+            end_reason: 0,
         }
     }
 
@@ -763,23 +766,23 @@ impl AddressSpace
         }
     }
 
-    /// Bind a terminal-fault observer, or — if this address space has already
-    /// terminal-faulted — return the retained reason for the caller to deliver
+    /// Bind a terminal-end observer, or — if this address space has already
+    /// ended — return the retained reason for the caller to deliver
     /// to the new observer immediately.
     ///
     /// The address-space analogue of `sys_thread_bind_notification`'s
     /// retained-delivery branch. Serialises on `death_lock` against the
-    /// terminal-fault record ([`crate::sched::record_aspace_terminal_fault`]),
-    /// so a fault concurrent with a bind is delivered exactly once and never
-    /// dropped — closing the bind-after-fault window for an observer bound after
+    /// terminal-end record ([`crate::sched::record_aspace_end`]),
+    /// so an end concurrent with a bind is delivered exactly once and never
+    /// dropped — closing the bind-after-end window for an observer bound after
     /// the space was already running.
     ///
     /// Returns `Ok(None)` if `node` was linked, holding a reference on `eq`
     /// that the address space's teardown releases
     /// ([`Self::take_death_observers`]); `Ok(Some(reason))` if the space
-    /// already faulted (the caller posts `reason` to `eq` and returns `node`
+    /// already ended (the caller posts `reason` to `eq` and returns `node`
     /// to its pool; no reference is taken); `Err(OutOfMemory)` if `node` is
-    /// null (the queue had no free node) and the space has not faulted; or
+    /// null (the queue had no free node) and the space has not ended; or
     /// `Err(QuotaExceeded)` if `eq`'s reference count is at its limit.
     ///
     /// # Safety
@@ -801,13 +804,12 @@ impl AddressSpace
         let saved = unsafe { death_lock.lock_raw() };
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
-            reason = "every access reads a terminal-fault field of this, which the held death_lock \
+            reason = "every access reads a terminal-end field of this, which the held death_lock \
                       serialises"
         )]
-        // SAFETY: terminal_faulted/terminal_fault_reason read under death_lock.
-        let (faulted, reason) =
-            unsafe { ((*this).terminal_faulted, (*this).terminal_fault_reason) };
-        let result = if faulted
+        // SAFETY: ended/end_reason read under death_lock.
+        let (ended, reason) = unsafe { ((*this).ended, (*this).end_reason) };
+        let result = if ended
         {
             Ok(Some(reason))
         }
@@ -841,26 +843,27 @@ impl AddressSpace
         result
     }
 
-    /// Record the address space's terminal fault and return the first node of
-    /// the observer chain, read under `death_lock`, when this fault is the
-    /// space's first; return null on any later fault, which records nothing.
+    /// Record the address space's terminal end (a terminal fault or a
+    /// `SYS_ASPACE_EXIT` of one of its threads) and return the first node of
+    /// the observer chain, read under `death_lock`, when this end is the
+    /// space's first; return null on any later end, which records nothing.
     ///
-    /// The address space dies once: only the fault that sets
-    /// `terminal_faulted` returns the chain, so its observers are posted once,
-    /// with the retained reason, however many of its threads fault, and on
-    /// however many CPUs at once (each takes `death_lock`, and only the first
-    /// holder finds the flag clear). The terminal-fault post walks the chain
-    /// from the returned node outside the lock, after the faulting thread's
-    /// `Exited` commit (a linked node's links never change until the teardown
-    /// takes the chain); recording the reason lets `retained_terminal_fault`
-    /// read it back and a later `bind_or_retained` deliver it to an observer
-    /// bound after the fault, and stops any further link.
+    /// The address space ends once: only the end that sets `ended` returns
+    /// the chain, so its observers are posted once, with the retained reason,
+    /// however many of its threads fault or exit, and on however many CPUs at
+    /// once (each takes `death_lock`, and only the first holder finds the
+    /// flag clear). The terminal-end post walks the chain from the returned
+    /// node outside the lock, after the ending thread's `Exited` commit (a
+    /// linked node's links never change until the teardown takes the chain);
+    /// recording the reason lets `retained_end` read it back and a later
+    /// `bind_or_retained` deliver it to an observer bound after the end, and
+    /// stops any further link.
     ///
     /// # Safety
     /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold
     /// `death_lock`.
     #[cfg(not(test))]
-    pub unsafe fn record_fault_and_snapshot(
+    pub unsafe fn record_end_and_snapshot(
         this: *mut Self,
         reason: u64,
     ) -> *mut crate::sched::thread::DeathObserver
@@ -871,20 +874,20 @@ impl AddressSpace
         let saved = unsafe { death_lock.lock_raw() };
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
-            reason = "every access is to a terminal-fault field or the observer chain of this, \
+            reason = "every access is to a terminal-end field or the observer chain of this, \
                       which the held death_lock serialises"
         )]
         // SAFETY: this validated by caller; fields read and written under
         // death_lock.
         let first = unsafe {
-            if (*this).terminal_faulted
+            if (*this).ended
             {
                 core::ptr::null_mut()
             }
             else
             {
-                (*this).terminal_faulted = true;
-                (*this).terminal_fault_reason = reason;
+                (*this).ended = true;
+                (*this).end_reason = reason;
                 (*this).death_observers.first()
             }
         };
@@ -893,16 +896,17 @@ impl AddressSpace
         first
     }
 
-    /// The retained terminal-fault reason (`EXIT_FAULT_BASE + vector`), or
-    /// `None` while no thread of this address space has taken a terminal
-    /// fault. Read under `death_lock`, so it never sees the flag without its
-    /// reason. Backs `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT`.
+    /// The retained terminal-end reason (`EXIT_FAULT_BASE + vector` for a
+    /// fault, the encoded exit code for an exit, `0` among them), or `None`
+    /// while this address space has not ended. Read under `death_lock`, so it
+    /// never sees the flag without its reason. Backs `SYS_CAP_INFO`'s
+    /// `CAP_INFO_ASPACE_END`.
     ///
     /// # Safety
     /// `this` must be a valid `AddressSpace` pointer. The caller must NOT hold
     /// `death_lock`.
     #[cfg(not(test))]
-    pub unsafe fn retained_terminal_fault(this: *const Self) -> Option<u64>
+    pub unsafe fn retained_end(this: *const Self) -> Option<u64>
     {
         // SAFETY: this validated by caller.
         let death_lock = unsafe { &(*this).death_lock };
@@ -910,15 +914,11 @@ impl AddressSpace
         let saved = unsafe { death_lock.lock_raw() };
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
-            reason = "every access reads a terminal-fault field of this, which the held death_lock \
+            reason = "every access reads a terminal-end field of this, which the held death_lock \
                       serialises"
         )]
         // SAFETY: this validated by caller; fields read under death_lock.
-        let retained = unsafe {
-            (*this)
-                .terminal_faulted
-                .then_some((*this).terminal_fault_reason)
-        };
+        let retained = unsafe { (*this).ended.then_some((*this).end_reason) };
         // SAFETY: paired with the lock_raw above.
         unsafe { death_lock.unlock_raw(saved) };
         retained
@@ -932,7 +932,7 @@ impl AddressSpace
     /// # Safety
     /// `this` must be a valid `AddressSpace` whose teardown is running: no
     /// capability, binding, or bound thread reaches it any more, so no bind
-    /// or terminal-fault post can race the call. The caller must NOT hold
+    /// or terminal-end post can race the call. The caller must NOT hold
     /// `death_lock`.
     #[cfg(not(test))]
     pub unsafe fn take_death_observers(this: *mut Self)

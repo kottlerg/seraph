@@ -502,6 +502,8 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `scrub-child`               | `memmgr`       | `memmgr_frame_scrub` (frames of a death)    |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
+| `exit-code-thread`          | `exit_code`    | `exit_code_thread` (exit off main)          |
+| `recv-wedge-thread`         | `recv_guard`   | `recv_wedge_thread` (wedge off main)        |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |
 | `aslr-layout-diverge-child` | `random`       | `aslr-layout` (per-process layout tuple)    |
 | `stale-map-child`           | `unmount`      | `vfsd_unmount_stale_mapping` (mapped page)  |

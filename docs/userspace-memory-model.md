@@ -157,7 +157,7 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   (std's abort path, which traps on seraph): a terminal fault that tears down the whole process
   (procmgr reaps it on the address-space death notification; when a
   full death queue dropped that post, procmgr's death resync recovers it
-  from the address space's retained terminal-fault reason, see
+  from the address space's retained end, see
   [services/procmgr/README.md](../services/procmgr/README.md) § Process
   table and death queues). svcmgr observes the death via its event queue
   and applies restart policy. No kernel panic.

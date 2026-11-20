@@ -1430,7 +1430,7 @@ fn handle_declare_no_debug(badge: u64, ipc_buf: *mut u64, table: &mut process::P
 }
 
 /// Handle `BIND_DEATH_OBSERVER` — bind the queue of `caps[0]` as a
-/// terminal-fault death observer, correlator `data[0]`, on the address
+/// terminal-end death observer, correlator `data[0]`, on the address
 /// space of the child the process handle names
 /// (`services/procmgr/docs/ipc-interface.md` § Label 25:
 /// `BIND_DEATH_OBSERVER`). `dispatch_ipc` has refused it on any cap but a
@@ -1644,12 +1644,17 @@ fn handle_query_live_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &proc
 ///
 /// Consults the kernel for the authoritative records, the main thread's
 /// lifecycle snapshot (`CAP_INFO_THREAD_STATE`) and the address space's
-/// terminal fault (`CAP_INFO_ASPACE_TERMINAL_FAULT`), so a child whose main
-/// thread exited or any of whose threads took a terminal fault is reported
+/// terminal end (`CAP_INFO_ASPACE_END`), so a child whose main thread exited
+/// or any of whose threads took a terminal fault or exited the process is
+/// reported
 /// as EXITED even before procmgr's own death-event drain has reaped the
 /// entry (`process_table::QueryEntry::state`). Without this, the userspace
 /// death-eq drain races a parent's "wait then `QUERY_PROCESS`" sequence and
-/// produces a transient ALIVE answer for an already-dead child.
+/// produces a transient ALIVE answer for an already-dead child. The first
+/// `EXITED` answer for a live entry fixes its reason
+/// (`ProcessTable::latch_end`), which later answers and its reap or destroy
+/// carry, so an end of the address space after a main-thread exit the query
+/// already reported changes no answer.
 fn resolve_query_state(badge: u64, state: &mut process::TableState) -> (u64, u64)
 {
     use ipc::procmgr_process_state;
@@ -1658,18 +1663,13 @@ fn resolve_query_state(badge: u64, state: &mut process::TableState) -> (u64, u64
     {
         let main_thread =
             syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
-        let terminal_fault = syscall::cap_info(
-            entry.aspace_cap,
-            syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
-        )
-        .ok();
-        match entry.state(
-            main_thread,
-            syscall_abi::THREAD_STATE_EXITED,
-            terminal_fault,
-        )
+        let aspace_end = syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_END).ok();
+        match entry.state(main_thread, syscall_abi::THREAD_STATE_EXITED, aspace_end)
         {
-            process::QueryState::Exited(reason) => (procmgr_process_state::EXITED, reason),
+            process::QueryState::Exited(reason) => (
+                procmgr_process_state::EXITED,
+                table.latch_end(badge, reason),
+            ),
             process::QueryState::Alive => (procmgr_process_state::ALIVE, 0u64),
             process::QueryState::Created => (procmgr_process_state::CREATED, 0u64),
         }
@@ -1746,12 +1746,12 @@ fn dispatch_death(ctx: &ProcmgrCtx, ipc_buf: *mut u64, batch: &mut Vec<syscall::
 }
 
 /// Reap every live entry whose main thread the kernel reports exited, or
-/// whose address space it reports took a terminal fault: the recovery for
-/// the death posts a full queue dropped. Reads each entry's main-thread state
-/// (`CAP_INFO_THREAD_STATE`) and its address space's terminal-fault reason
-/// (`CAP_INFO_ASPACE_TERMINAL_FAULT`), both of which the kernel records
-/// before it posts, so a process whose main-thread post, or whose
-/// address-space post for a worker thread's fault, was dropped is found here
+/// whose address space it reports ended: the recovery for the death posts a
+/// full queue dropped. Reads each entry's main-thread state
+/// (`CAP_INFO_THREAD_STATE`) and its address space's terminal end
+/// (`CAP_INFO_ASPACE_END`), both of which the kernel records before it
+/// posts, so a process whose main-thread post, or whose address-space post
+/// for a worker thread's fault or process exit, was dropped is found here
 /// ([`process::resync_exit_reason`]). A process that exits or faults after
 /// the scan posts to a queue this drain has emptied.
 ///
@@ -1768,11 +1768,7 @@ fn resync_deaths(memmgr_ep: u64, ipc_buf: *mut u64, tables: &process::Tables)
         |entry| {
             (
                 syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok(),
-                syscall::cap_info(
-                    entry.aspace_cap,
-                    syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
-                )
-                .ok(),
+                syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_END).ok(),
             )
         },
         &mut dead,

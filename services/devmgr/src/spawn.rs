@@ -238,7 +238,7 @@ pub fn send_destroy(process_handle: u64, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) };
 }
 
-/// Have procmgr bind `eq` as a terminal-fault death observer on the address
+/// Have procmgr bind `eq` as a terminal-end death observer on the address
 /// space of the child `process_handle` names, with `correlator`
 /// (`procmgr_labels::BIND_DEATH_OBSERVER`), through a `POST` copy of `eq`
 /// that the call transfers.
@@ -536,11 +536,11 @@ fn serve_list_round(
 /// it reports ready or after it is served: one on the driver's main thread,
 /// which an exit or a fault of that thread posts, and one on its address
 /// space, bound by procmgr (`procmgr_labels::BIND_DEATH_OBSERVER`), which the
-/// first terminal fault of any of its threads posts. procmgr's teardown of the
-/// driver after a fault of another thread stops the main thread with no post,
-/// so the address-space observer is the only one that sees that death; a
-/// fault of the main thread that is the driver's first terminal fault posts
-/// to both.
+/// first terminal end of any of its threads posts. procmgr's teardown of the
+/// driver after a fault or exit of another thread stops the main thread with
+/// no post, so the address-space observer is the only one that sees that
+/// death; a fault or exit of the main thread that is the driver's first
+/// terminal end posts to both.
 ///
 /// A `held` driver is created `CREATE_PINNED`, since its device may write
 /// its memory before a demand fault could back it, and `CREATE_DMA_HOLD`,

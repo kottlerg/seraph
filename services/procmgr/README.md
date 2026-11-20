@@ -164,8 +164,8 @@ procmgr/
   `REGISTER_THREAD`.
 - **Death observer binding** — serve `BIND_DEATH_OBSERVER` on a process
   handle: bind the caller's `EventQueue` on that process's address space,
-  so the first terminal fault of any of its threads posts the caller's correlator,
-  while the space's Control right stays with procmgr. See
+  so the first terminal end of any of its threads, a fault or an exit, posts the caller's
+  correlator, while the space's Control right stays with procmgr. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § Label 25:
   `BIND_DEATH_OBSERVER`.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during
@@ -376,7 +376,7 @@ the reaper drains every queue on each death wakeup. The kernel drops a post to a
 full queue, so a drain that takes a full queue's worth of events or more from
 one queue rescans the table and reaps every entry whose main thread the kernel
 reports exited (`CAP_INFO_THREAD_STATE`), or whose address space it reports took
-a terminal fault (`CAP_INFO_ASPACE_TERMINAL_FAULT`, a worker thread's fault
+a terminal end (`CAP_INFO_ASPACE_END`, a worker thread's fault or exit
 while the main thread runs). Any dropped post leaves a full queue of events
 behind it for that drain or the next, so the rescan runs after the drop and
 recovers either death. A reaped or destroyed (`DESTROY_PROCESS`) child stays in

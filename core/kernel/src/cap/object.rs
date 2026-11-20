@@ -4070,9 +4070,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // every bound thread is stopped and off-CPU.
                 unsafe { space.release_mapped_frames() };
 
-                // Release the terminal-fault observers' EventQueue references.
+                // Release the terminal-end observers' EventQueue references.
                 // Every bound thread is stopped and off-CPU (above), so no
-                // terminal-fault post can still read them.
+                // terminal-end post can still read them.
                 // SAFETY: as_ptr valid and uniquely owned; death_lock not held.
                 let first =
                     unsafe { crate::mm::address_space::AddressSpace::take_death_observers(as_ptr) };

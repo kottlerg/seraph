@@ -446,9 +446,9 @@ WaitSet holds the service endpoint (badge 0), every death queue
 waiting for memory (badge 2; [restart-protocol.md § Decision
 tree](restart-protocol.md#decision-tree)).
 
-When the main thread exits (clean or fault), or any thread takes the address space's first
-terminal fault, the kernel posts the death entry `(exit_reason, correlator)` to the queue its
-observer was bound on (see [restart-protocol.md](restart-protocol.md#death-detection)). svcmgr
+When the main thread exits (clean or fault), or any thread makes the address space's first terminal
+end (a fault or an exit), the kernel posts the death entry `(exit_reason, correlator)` to the queue
+its observer was bound on (see [restart-protocol.md](restart-protocol.md#death-detection)). svcmgr
 drains every queue and routes each payload whose tag names the slot's active, current instance
 to its `ServiceEntry`, then dispatches through
 [`restart::handle_death`](../src/restart.rs).

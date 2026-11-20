@@ -232,8 +232,8 @@ pub fn settle<T, E: SettleEvents<T>>(
 
 /// Mark dead every driver whose death the event queue holds, handing each
 /// post for a badge the batch does not hold to the caller. A post for a
-/// driver the batch already holds dead is dropped: a fault of a driver's
-/// main thread that is its first terminal fault posts to both its
+/// driver the batch already holds dead is dropped: a fault or exit of a
+/// driver's main thread that is its first terminal end posts to both its
 /// observers, the main thread's and its address space's, with the same
 /// badge.
 fn drain_deaths<T, E: SettleEvents<T>>(events: &mut E, roster: &mut Roster<T>)

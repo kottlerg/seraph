@@ -236,6 +236,7 @@ mod tests
             end_queue: 0,
             end_correlator: 0,
             image_ref: 0,
+            ended_with: None,
         }
     }
 

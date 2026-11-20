@@ -203,7 +203,7 @@ reclaimed for a new one, but a number in active use is never reassigned.
 25  SYS_CAP_MOVE                 51  SYS_IOPORT_SPLIT
                                  52  SYS_SCHED_SPLIT
                                  53  SYS_ASPACE_BIND_NOTIFICATION
-                                 54  SYS_PROCESS_EXIT
+                                 54  SYS_ASPACE_EXIT
                                  55  SYS_GETRANDOM
                                  56  SYS_THREAD_GET_FAULT_HANDLER
                                  57  SYS_THREAD_INHERIT_FAULT_HANDLER
@@ -830,7 +830,7 @@ a donation's first page becomes that bookkeeping and only `init_pages − 1` pag
 the pool, so a one-page donation can leave the budget unchanged. Read the budget back via
 `SYS_CAP_INFO` rather than assuming `init_pages` were added.
 
-`Control` lets the creator register terminal-fault death observers via
+`Control` lets the creator register terminal-end death observers via
 `SYS_ASPACE_BIND_NOTIFICATION`; copies handed to other components drop it via the
 `SYS_CAP_DERIVE` rights mask (see
 [capability-model.md](../../../docs/capability-model.md) § Address Space).
@@ -1186,14 +1186,16 @@ no other process holds a capability through which to add one. A user mapping is 
 (`CAP_INFO_MEMORY_MAPPINGS` counts those). memmgr reads it before it returns a reclaimed frame to
 its pool ([memory-pool.md § Reclamation](../../../services/memmgr/docs/memory-pool.md#reclamation)).
 
-`CAP_INFO_ASPACE_TERMINAL_FAULT` (14) returns, for an AddressSpace cap, `0` while no thread of the
-address space has taken a terminal fault, and otherwise the retained reason of the first one
-(`EXIT_FAULT_BASE` plus the fault vector or cause; never `0`), which later faults do not overwrite.
-It is the reason a `SYS_ASPACE_BIND_NOTIFICATION` observer of the space receives, read under the
-same lock that serialises the fault's record and the bind, so a holder that missed the post reads
-the outcome back here. The kernel records the reason before it commits the faulting thread's
-`Exited` state, and posts it to the observers after, so a holder that has read a thread of the space
-`Exited` by a terminal fault (`CAP_INFO_THREAD_STATE`) reads a non-zero reason here.
+`CAP_INFO_ASPACE_END` (14) returns, for an AddressSpace cap, `0` while the address space has not
+ended, and otherwise `ASPACE_ENDED` (bit 32) ORed with the retained reason of its first terminal
+end: a terminal fault of any of its threads (`EXIT_FAULT_BASE` plus the fault vector or cause) or a
+`SYS_ASPACE_EXIT` (the encoded code, `0` for a clean exit, which the flag tells from no end).
+Later ends do not overwrite it; `syscall_abi::aspace_end_reason` decodes the answer. It is the
+reason a `SYS_ASPACE_BIND_NOTIFICATION` observer of the space receives, read under the same lock
+that serialises the end's record and the bind, so a holder that missed the post reads the outcome
+back here. The kernel records the end before it commits the ending thread's `Exited` state, and
+posts it to the observers after, so a holder that has read a thread of the space `Exited` by a
+terminal fault or a `SYS_ASPACE_EXIT` (`CAP_INFO_THREAD_STATE`) reads the space ended here.
 
 `CAP_INFO_IRQ_MSG_ADDRESS` (15) and `CAP_INFO_IRQ_MSG_DATA` (16) return, for an Interrupt cap
 naming a message-signaled target (§ `SYS_IRQ_MSG_ALLOC`), the message a device writes to raise it:
@@ -1636,7 +1638,8 @@ handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` of a
 than a virtual-memory one, of one with no exception handler bound, or of the fault of a
 restartable syscall's user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), kills it as
 an unhandled fault, which posts its death observers and, when the fault is its address space's
-first terminal fault, the space's observers, or, for the fault of a restartable syscall's user
+first terminal end (no earlier fault or `SYS_ASPACE_EXIT` of any of its threads), the space's
+observers, or, for the fault of a restartable syscall's user
 copy, fails that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). Starting one whose claiming reply was a `FAULT_REPLY_REDIRECT` that named an
@@ -1691,7 +1694,7 @@ commit again.
 ### `SYS_THREAD_STOP` (20)
 
 Stop a running or runnable thread. The thread transitions to `Stopped` state. A stop that
-lands while the target is inside its own exit (`SYS_THREAD_EXIT`, `SYS_PROCESS_EXIT`, or a
+lands while the target is inside its own exit (`SYS_THREAD_EXIT`, `SYS_ASPACE_EXIT`, or a
 terminal fault) still returns 0, but the exit then commits `Exited` over the `Stopped` mark, so
 the target never runs again and a later `SYS_THREAD_START` returns `InvalidArgument`.
 
@@ -1796,8 +1799,9 @@ capability is required — this syscall acts on the calling thread implicitly.
 
 Exit the calling thread. The thread is marked `Exited` and another thread is
 scheduled; it is never re-enqueued. This is the correct way for an individual
-thread (e.g. a `std::thread`) to terminate itself. To exit the whole process
-with a code, use `SYS_PROCESS_EXIT`.
+thread (e.g. a `std::thread`) to terminate itself. It posts the thread's death
+observers only, never its address space's. To end the whole process with a
+code, use `SYS_ASPACE_EXIT`.
 
 **Arguments:** None.
 
@@ -1807,21 +1811,23 @@ with a code, use `SYS_PROCESS_EXIT`.
 
 ---
 
-### `SYS_PROCESS_EXIT` (54)
+### `SYS_ASPACE_EXIT` (54)
 
-Exit the calling process with a voluntary exit code (the `std::process::exit` /
-`main`-return path). The kernel encodes `code` via `syscall_abi::encode_exit_code`
-into the exit-reason space (`0` clean, `1..=0x0FFF` verbatim with larger codes saturating
-to `0x0FFF`; disjoint from the fault range `0x1000..=0x1FFF`; see
-[process-lifecycle.md](../../../docs/process-lifecycle.md) § Exit reason), records it as
-the calling thread's exit reason, and posts
-it to that thread's death observers — a parent that bound the main thread (so
-`ExitStatus::code()` carries it) and procmgr's per-thread observer (which reaps
-the process). Structurally identical to `SYS_THREAD_EXIT` but with the encoded
-caller-supplied reason (zero for a `code` of `0`); it does not post to the
-address-space death surface (reserved for terminal faults). Sibling threads are reaped
-by procmgr's cap-revoke teardown;
-the kernel does not enumerate or stop them here (see
+End the caller's address space with a voluntary exit code, from any of its threads (the
+`std::process::exit` / `main`-return path, and a receive loop's fatal exit). The kernel encodes
+`code` via `syscall_abi::encode_exit_code` into the exit-reason space (`0` clean, `1..=0x0FFF`
+verbatim with larger codes saturating to `0x0FFF`; disjoint from the fault range
+`0x1000..=0x1FFF`; see [process-lifecycle.md](../../../docs/process-lifecycle.md) § Exit reason)
+and records it as the address space's terminal end, as a terminal fault does: the first end of the
+space, fault or exit, wins, and `CAP_INFO_ASPACE_END` reads it back (§ `SYS_CAP_INFO`). It then
+commits the calling thread `Exited` with the same reason, posts the reason to the thread's death
+observers (§ `SYS_THREAD_BIND_NOTIFICATION`), and, when this end is the space's first, to the
+space's (§ `SYS_ASPACE_BIND_NOTIFICATION`): procmgr's observer reaps the process whichever thread
+ended it. The record precedes the `Exited` commit and the posts follow it, in the terminal-fault
+path's order; the calling thread stays on its CPU from the record to the posts, and the
+address-space post reads only the observers snapshotted with the record, so a reap the first post
+wakes cannot free what the second reads. The kernel has no notion of a main thread and does not
+enumerate or stop the other threads of the space: procmgr's cap-revoke teardown stops them (see
 [process-lifecycle.md](../../../docs/process-lifecycle.md) § Process Death).
 
 **Arguments:**
@@ -3195,13 +3201,14 @@ right, so only a process that may read physical addresses translates its pages.
 
 ### `SYS_ASPACE_BIND_NOTIFICATION` (53)
 
-Bind a terminal-fault death observer to an address space. On the first terminal fault of any
-thread in the space (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
-pattern for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the
-bound event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. The address space dies
-once: a later terminal fault of another of its threads, on any CPU, exits that thread and posts
-nothing, so a binding receives one entry in its life, carrying the retained reason that
-`CAP_INFO_ASPACE_TERMINAL_FAULT` reads back (§ `SYS_CAP_INFO`). Voluntary
+Bind a terminal-end death observer to an address space. On the first terminal end of the space, a
+terminal fault or a `SYS_ASPACE_EXIT` of any of its threads (see
+[capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern for the
+triggers), the kernel posts the two-word entry `(exit reason, correlator)` to the bound event
+queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. The address space ends once: a later
+terminal fault or `SYS_ASPACE_EXIT` of another of its threads, on any CPU, exits that thread and
+posts nothing to these observers, so a binding receives one entry in its life, carrying the
+retained reason that `CAP_INFO_ASPACE_END` reads back (§ `SYS_CAP_INFO`). Voluntary
 `SYS_THREAD_EXIT` does not fire these observers (see
 [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
@@ -3210,17 +3217,17 @@ nothing, so a binding receives one entry in its life, carrying the retained reas
 | # | Name | Description |
 |---|---|---|
 | 0 | `aspace_cap` | AddressSpace capability (Control rights) to observe |
-| 1 | `eventq_cap` | Event queue capability (Post rights) the fault notification is posted to |
+| 1 | `eventq_cap` | Event queue capability (Post rights) the end notification is posted to |
 | 2 | `correlator` | Caller-chosen `u64` routing tag, delivered unchanged as the tag word |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure. If the space has
-already terminal-faulted, the retained reason is delivered immediately and the call
+already ended, the retained reason is delivered immediately and the call
 still returns 0.
 
 **Lifetime:** a binding holds a reference on the event queue object from the bind until the
 address space is destroyed, so deleting every capability to the queue leaves it live for the
-terminal-fault post; the address space's teardown releases the reference. A bind onto an
-already-faulted space posts at once and holds no reference
+terminal-end post; the address space's teardown releases the reference. A bind onto an
+already-ended space posts at once and holds no reference
 ([capability-internals.md](capability-internals.md#kernel-object-reference-counting) § Kernel
 Object Reference Counting).
 
@@ -3228,7 +3235,7 @@ Object Reference Counting).
 
 **Observer nodes:** each live binding holds one death-observer node of `eventq_cap`'s pool
 (§ `SYS_CAP_CREATE_EVENT_Q` (9), argument 2) until the address space is destroyed; a bind onto an
-already-faulted space takes none.
+already-ended space takes none.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (address space lacks Control or
 event queue lacks Post), `OutOfMemory` (the event queue has no free observer node),

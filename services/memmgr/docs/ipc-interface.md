@@ -42,12 +42,13 @@ Two privilege classes:
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
   `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`,
   `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
-  `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`) are callable over any
-  badged cap but a node handle, including those memmgr returned from
-  `REGISTER_PROCESS`. `REGISTER_REGION`, `UNREGISTER_REGION`,
-  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
-  `SHRINK_REGION`, `CREATE_SUB_NODE` and `DISCARD_RANGE` are attributed to
-  the caller by its own badge.
+  `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`, `SEAL_OBJECT`,
+  `ATTACH_OBJECT`) are callable over any badged cap but a node handle or an
+  object handle, including those memmgr returned from `REGISTER_PROCESS`.
+  `REGISTER_REGION`, `UNREGISTER_REGION`, `QUERY_MEMORY_USAGE`,
+  `REGISTER_PRESSURE`, `EXTEND_REGION`, `SHRINK_REGION`, `CREATE_SUB_NODE`,
+  `DISCARD_RANGE`, `SEAL_OBJECT` and `ATTACH_OBJECT` are attributed to the
+  caller by its own badge.
 - **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
   `NODE_REGISTER_LIMIT`, `NODE_RELEASE`) are callable only over a node
   handle, and act on the budget node it names (§ Node Handles).
@@ -56,19 +57,22 @@ Two privilege classes:
   `SEND|GRANT` badged `SWAP_AUTHORITY` (bit 61) alone, which init mints on
   memmgr's endpoint and svcmgr publishes seed-only as `memmgr.swap`: the swap
   service's interface to the disk tier (§ Labels 22 to 26).
+- The **object** label (`OBJECT_RELEASE`) is callable only over an object
+  handle, and acts on the memory object it names (§ Object Handles).
 
-memmgr tells the classes apart by two verb bits, the node-handle bit
-`NODE_HANDLE_TAG` (bit 62) and the swap authority's `SWAP_AUTHORITY` (bit
-61), the pattern of
+memmgr tells the classes apart by three verb bits, the node-handle bit
+`NODE_HANDLE_TAG` (bit 62), the swap authority's `SWAP_AUTHORITY` (bit 61)
+and the object-handle bit `OBJECT_HANDLE_TAG` (bit 60), the pattern of
 [docs/capability-model.md](../../../docs/capability-model.md) § Verb-bit
 authority pattern: it serves the node labels only on a badge that carries bit
-62, the swap labels only on one that carries bit 61, and every other label
-only on one that carries neither, and replies `UNAUTHORIZED` otherwise,
-deleting any cap the message carries. No process badge carries either:
-memmgr draws a process badge with every verb bit of `ipc::VERB_BIT_MASK`
-(bits 58 to 63) clear but the phys-class bit 63, and a node handle's key with
-them clear but bit 62, and init mints procmgr's badge on memmgr's endpoint
-with all six clear.
+62, the swap labels only on one that carries bit 61, `OBJECT_RELEASE` only on
+one that carries bit 60, and every other label only on one that carries none
+of them, and replies `UNAUTHORIZED` otherwise, deleting any cap the message
+carries. No process badge carries any of them: memmgr draws a process badge
+with every verb bit of `ipc::VERB_BIT_MASK` (bits 58 to 63) clear but the
+phys-class bit 63, a node handle's key with them clear but bit 62, and an
+object handle's key with them clear but bit 60, and init mints procmgr's
+badge on memmgr's endpoint with all six clear.
 
 The badge on an ordinary IPC message is the badge of the sender's cap,
 and it cannot be forged: badges are minted by `cap_derive_badge` only
@@ -136,17 +140,35 @@ and the sub-nodes it made. Nothing is reclaimed or killed through a handle.
 
 ---
 
+## Object Handles
+
+An object handle is the authority to attach one memory object and to release
+it ([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects): a
+SEND+GRANT cap on memmgr's endpoint whose badge is `OBJECT_HANDLE_TAG` and a
+key of 58 random bits outside `VERB_BIT_MASK`, drawn as a node handle's key is
+(§ Node Handles). memmgr derives one, in the reply of `SEAL_OBJECT`
+(§ Label 27), for the object it seals. A holder can derive copies of it, which
+carry the same badge, and pass one to any process, which attaches the object
+with it (§ Label 28). The object's handle state belongs to its sealer and goes
+on `OBJECT_RELEASE` (§ Label 29) or the sealer's `PROCESS_DIED`; from then on
+memmgr refuses every handle carrying its key with `INVALID_ARGUMENT`. The
+object outlives its handle state while a region attaches it.
+
+---
+
 ## Messages
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). The message
 label field identifies the operation. Data words and capability slots
 carry arguments; the reply carries results. Error codes below are the
 `memmgr_errors` constants in `shared/ipc`. A label memmgr does not define
-replies `INVALID_ARGUMENT`, or `UNAUTHORIZED` over a node handle. Every
-label but the node labels also replies `UNAUTHORIZED` over a node handle, and
-every label but the swap labels over the swap authority (§ Badge
+replies `INVALID_ARGUMENT`, or `UNAUTHORIZED` over a node handle or an
+object handle. Every label but the node labels also replies `UNAUTHORIZED`
+over a node handle, every label but the swap labels over the swap authority,
+and every label but `OBJECT_RELEASE` over an object handle (§ Badge
 Discipline); the node labels' tables list the refusal over any other badge, as
-§ Labels 22 to 26 does for the swap labels.
+§ Labels 22 to 26 does for the swap labels and § Label 29 for
+`OBJECT_RELEASE`.
 
 ### Label 1: `REQUEST_MEMORY_CAPS`
 
@@ -615,13 +637,13 @@ reservation to the caller's budget node, and those and a metadata bound to
 then admitted without the budget and RAM tests of an uncommitted one, and
 declined only in the cases § Committed fault declines lists.
 Only a committed region grows by `EXTEND_REGION` (§ Label 12) or shrinks by
-`SHRINK_REGION` (§ Label 13); a discard by `DISCARD_RANGE` (§ Label 20) keeps
-its commitment, so a refault of a discarded page is admitted as its first
-touch was. A refused commitment registers nothing. A reply that does not reach the caller
-unregisters the region again, as a grant whose reply fails is rolled back, so a
-caller whose call was interrupted makes it again
-([`memory-pool.md`](memory-pool.md) § Commit). The std heap registers its
-growth region this way.
+`SHRINK_REGION` (§ Label 13), an attachment (§ Label 28) excepted; a discard by
+`DISCARD_RANGE` (§ Label 20) keeps its commitment, so a refault of a discarded
+page is admitted as its first touch was. A refused commitment registers nothing.
+A reply that does not reach the caller unregisters the region again, as a grant
+whose reply fails is rolled back, so a caller whose call was interrupted makes
+it again ([`memory-pool.md`](memory-pool.md) § Commit). The std heap registers
+its growth region this way.
 
 **No-evict regions.** With `REGION_NO_EVICT`, memmgr never evicts a page of
 the region into its compressed store, so every page a fault backed stays
@@ -702,6 +724,9 @@ occupies its own VA surface, so the span unmap touches only frames memmgr
 backed on fault; frames the caller mapped itself (e.g. `REQUEST_MEMORY_CAPS`
 grants) live on a disjoint surface and are untouched. The frames return to the
 pool as on `PROCESS_DIED`, so the all-RAM-accounted identity is unaffected.
+Unregistering an attachment (§ Label 28) detaches it: its own copies of pages
+return to the pool, its object's frames stay with the object, and its
+commitment is released.
 
 **Reply (success):** `label` 0.
 
@@ -819,7 +844,7 @@ length.
 |---|---|---|
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The growth's charge would leave fewer of the free pages and the overcommit allowance outside `promised` than the growth floor, for a caller outside the system reserve, or than none ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow for the chunk table's new levels |
-| 4 | `INVALID_ARGUMENT` | Unknown badge, no committed region based at `va_base`, a length unaligned, smaller, or past the address space, or growth that meets another region |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, no committed region other than an attachment (§ Label 28) based at `va_base`, a length unaligned, smaller, or past the address space, or growth that meets another region |
 | 8 | `LIMIT` | The growth's charge would take the subtree of the caller's budget node, or of an ancestor, over its max |
 
 ### Label 13: `SHRINK_REGION`
@@ -853,7 +878,7 @@ length.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `INVALID_ARGUMENT` | Unknown badge, no committed region based at `va_base`, or a length that is zero, not a chunk multiple, or larger than the length |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, no committed region other than an attachment (§ Label 28) based at `va_base`, or a length that is zero, not a chunk multiple, or larger than the length |
 
 ### Label 14: `NODE_SET_MAX`
 
@@ -1065,7 +1090,7 @@ run changes nothing, so an interrupted call is safe to repeat.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `INVALID_ARGUMENT` | Unknown badge, no region holds `va`, or a range that breaks the rule above or leaves the region |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, no region holds `va`, the region is an attachment (§ Label 28), or a range that breaks the rule above or leaves the region |
 | 5 | `UNAUTHORIZED` | The badge is a node handle |
 
 ### Label 21: `MAKE_RESIDENT`
@@ -1271,6 +1296,132 @@ there and changes nothing.
 |---|---|---|
 | 0 | `SUCCESS` | `data[0]` the count of words, at most `SWAP_WANTED_WORDS` (8); the words in `data[1]` on |
 
+### Labels 27 to 29: memory objects
+
+A memory object is an immutable set of frames that any number of processes
+map, each charged for what it maps
+([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects). Its
+sealer receives an object handle (§ Object Handles), with which any process it
+is passed to attaches the object.
+
+#### Label 27: `SEAL_OBJECT`
+
+Seal grants of the caller into a memory object. Privilege: universal —
+attributed to the caller by `recv.badge` — but a phys-class caller is
+refused: a device it programmed may still write the frames.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 27 |
+| data[0] | `count`, 1 to `SEAL_OBJECT_MAX_GRANTS` (63) |
+| data[1..=count] | The region id of each grant, as its grant reply reported it, in the order of the object's pages |
+| cap[*] | The grants' Memory caps, handed back as to `RELEASE_MEMORY_CAPS`; memmgr deletes them |
+
+memmgr seals only grants that pass the quiescence check
+([`memory-pool.md`](memory-pool.md#reclamation) § Reclamation): no capability
+to the frame but memmgr's own, no byte of it retyped, and no address space
+mapping a page of it, so no process can write a frame once it is sealed. The
+caller unmaps each grant and hands its cap back with the request. A grant that
+fails the check refuses the seal whole, and the caller keeps its grants. A
+sealed grant is no longer the caller's, and its region id names nothing; its
+frames stay charged to the caller's budget node until the object is freed
+(§ Label 29). A reply that does not reach the caller undoes the seal, so a
+caller whose call was interrupted makes it again.
+
+**Reply (success):** label 0, `data[0]` the object's pages, `cap[0]` an
+object handle to it.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 3 | `QUOTA` | memmgr's metadata arena could not grow, or the handle could not be derived |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, a count out of range or past the words sent, an id that names no grant of the caller or is named twice, or a grant that fails the quiescence check |
+| 5 | `UNAUTHORIZED` | A phys-class caller, or a badge that is a handle or the swap authority |
+
+#### Label 28: `ATTACH_OBJECT`
+
+Attach pages of a memory object, or of the zero object, as a region of the
+caller. Privilege: universal — attributed to the caller by `recv.badge`; the
+object handle is the authority to attach its object.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 28 |
+| data[0] | `va_base` (page-aligned virtual address) |
+| data[1] | `len_bytes` (page-multiple, nonzero) |
+| data[2] | `prot`: `MAP_READ`, and `MAP_WRITABLE` for a private attachment only; `MAP_EXECUTABLE` is refused |
+| data[3] | `first_page`: the object page the region starts at; 0 for the zero object |
+| data[4] | flags: bit 0 `ATTACH_PRIVATE`; 0 for none |
+| cap[0] | The object handle (§ Object Handles), whose badge memmgr reads before it deletes it; none for the zero object |
+
+The region's pages are the object's pages from `first_page` on, which lie
+inside the object, or, for the zero object, pages that read zero. A shared
+attachment maps them read-only and is never writable. A private one maps them
+read-only until the caller writes a page, which its fault then gives a copy of
+its own that no other process sees, a zeroed page for the zero object. memmgr
+charges the caller's budget node the region's pages and page-table reservation,
+as for a committed region of its length (§ Label 7), so a process pays for what
+it maps however many others map it. A private attachment is a committed region:
+its admission, its share of `promised` and its faults are those of § Label 7.
+A shared one takes no page but its page tables: its pages count against the max
+of the budget node and its ancestors, and only its page-table reservation
+against the free pages outside `promised`, which it adds to `promised`
+([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects). An
+attachment is never evicted, `EXTEND_REGION`, `SHRINK_REGION` and
+`DISCARD_RANGE` refuse it, and `UNREGISTER_REGION` (§ Label 9) and
+`PROCESS_DIED` detach it, releasing its commitment. An object lives while a
+region attaches it, whatever became of its handle state.
+
+No attachment is executable. An executable map needs a capability with the
+execute right, and a leaf mapped through one lets a text write of
+`SYS_THREAD_WRITE_MEM` change its frame while one address space maps it
+([core/kernel/docs/memory-internals.md](../../../core/kernel/docs/memory-internals.md#leaf-grant)
+§ Leaf Grant), so a process could patch a page others attach.
+
+A reply that does not reach the caller detaches the region again, so a caller
+whose call was interrupted makes it again.
+
+**Reply (success):** label 0. Nothing is mapped until a fault.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The attachment's share of `promised` would leave fewer of the free pages and the overcommit allowance outside `promised` than the growth floor, for a caller outside the system reserve, or than none ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit), or the zero frame of a zero-object attachment could not be taken |
+| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), for the region or for a new zero frame's record |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, bad alignment, zero length, an unknown prot or flag bit, `MAP_EXECUTABLE`, `MAP_WRITABLE` without `ATTACH_PRIVATE`, a cap that is no live object handle, pages past the object's end, a `first_page` other than 0 for the zero object, or overlap |
+| 5 | `UNAUTHORIZED` | The badge is a handle or the swap authority |
+| 8 | `LIMIT` | The attachment's charge would take the subtree of the caller's budget node, or of an ancestor, over its max; or it would map a frame past the bound memmgr keeps its mappings under: the object is attached `OBJECT_MAX_ATTACHMENTS` times, or a zero-object attachment is longer than `ZERO_FRAME_SPAN` pages, the most one zero frame backs ([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects, Mapping bound) |
+
+#### Label 29: `OBJECT_RELEASE`
+
+Drop the handle state of a memory object. Privilege: object, over an object
+handle (§ Object Handles).
+
+**Request:** label 29, no words, no caps.
+
+memmgr drops the state, so every handle carrying its key is refused from then
+on; the sealer's `PROCESS_DIED` does the same for each object it sealed. An
+object no region attaches is freed then, and an attached one when its last
+attachment goes: each of its frames is pooled, its charge on the sealer's
+budget node released, or held on the deferred list, still charged, while a
+mapping or a capability other than memmgr's still reaches it
+([`memory-pool.md`](memory-pool.md#reclamation) § Reclamation).
+
+**Reply (success):** label 0, no words, no caps.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | The handle's key names no live object |
+| 5 | `UNAUTHORIZED` | The badge is not an object handle |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page fault the kernel cannot
@@ -1339,6 +1490,19 @@ both threads resume onto the mapped chunk. A fault on a chunk on disk with no sw
 registered, and one on a lost chunk, are declined with code 12
 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 
+A fault in an attachment (§ Label 28) maps its origin read-only over the part of
+the faulting page's chunk that no write has copied: the object's pages there
+that the frame holding the faulting page holds, or its zero frame at each page,
+through a capability derived with the map right alone, so no leaf of an origin
+carries a write or execute grant. A write to a private attachment gives the
+faulting page a copy of its object page, a page drawn as a committed region's
+fault draws it and copied through memmgr's scrub window, mapped once memmgr has
+unmapped the page's read-only leaf; in a zero-object attachment it backs the
+span as a committed region's fault does, once memmgr has unmapped the span's
+leaves of its zero frame ([`memory-pool.md`](memory-pool.md#memory-objects)
+§ Memory objects). A write to a shared attachment, and a fetch from any, is
+declined with code 4.
+
 | Code | Decline |
 |---|---|
 | 1 | Not a `FAULT_KIND_VM` fault |
@@ -1349,7 +1513,7 @@ registered, and one on a lost chunk, are declined with code 12
 | 6 | The metadata arena cannot grow for the slots recording the run takes: its descriptor, and the chunk's path in the region's chunk table |
 | 7 | No free page can back the faulting page: for a fault in an uncommitted region, the free pool is empty after the deferred runs are rechecked, every free page outside `promised` is in the growth floor and the process's budget node is outside the system reserve, or none is outside `promised`; for any fault, the split of a run larger than the pages to back failed. A fault in a committed region whose draw finds no page is code 11 |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
-| 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
+| 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents) or to copy an attachment's object page into it, or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 | 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Committed fault declines); for a fault on a chunk memmgr is evicting, holds raw or evicted, in either kind of region, the page-table funding the map of the chunk's runs needs would, past what a committed region's page-table reservation still holds; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
 | 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while a swap service has registered swap slots and the pool does not cover `promised`) even after memmgr evicted victims in its turn; only registered swap slots, or memmgr's own metadata taking free pages without admission, make it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`) |
 | 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
@@ -1408,8 +1572,16 @@ restores the chunk; either is declined only:
   the runs cannot be recorded on the chunk;
 - with code 12, when the chunk is on disk and cannot be restored.
 
-A refusal of a commitment itself, at a registration or a growth, is the error reply of that call,
-never a fault.
+An attachment (§ Label 28) is a committed region here, never evicted. A write to a private one is
+declined as a first touch above; one that copies an object page also with code 9 when the map of
+the object page or of its copy into memmgr's scrub window fails, or the unmap of the page's
+read-only leaf from the process does. A read of either kind takes no page but the page-table
+donations its map needs, so it is declined only with code 10 or 9 for a donation as above, with
+code 9 when the derivation of its map capability or the map fails as any map can, and with code 6
+when memmgr's metadata arena cannot grow for a donation's descriptor.
+
+A refusal of a commitment itself, at a registration, a growth or an attachment, is the error reply
+of that call, never a fault.
 
 ---
 
@@ -1427,24 +1599,24 @@ reclaims. `RELEASE_MEMORY_CAPS` names each region by its region id, and
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
 
-Only eight labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
+Only nine labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
 attached cap), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE` (`cap[0]`),
 `REGISTER_PROCESS` (`cap[0]`), `NODE_REGISTER_LIMIT` (`cap[0]` and
-`cap[1]`), and the swap labels `SWAP_REGISTER` (`cap[0]` and `cap[1]`), `SWAP_TAKE` and
-`SWAP_RESTORE` (`cap[0]`). memmgr deletes every other cap a message carries before it
-handles the message, whatever the label, the caller, or the reply: the caps
-attached to any other label (a `FAULT_LABEL` message and an unknown label
-included), the caps after `cap[0]` on `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
-`REGISTER_PROCESS`, `SWAP_TAKE` and `SWAP_RESTORE`, every cap on `SWAP_DONE` and
-`SWAP_WANTED`, and the caps after `cap[1]` on `NODE_REGISTER_LIMIT` and
+`cap[1]`), the swap labels `SWAP_REGISTER` (`cap[0]` and `cap[1]`), `SWAP_TAKE` and
+`SWAP_RESTORE` (`cap[0]`), and `ATTACH_OBJECT` (`cap[0]`). memmgr deletes every other cap a
+message carries before it handles the message, whatever the label, the caller, or the reply: the
+caps attached to any other label (a `FAULT_LABEL` message, `SEAL_OBJECT`'s handed-back grants and
+an unknown label included), the caps after `cap[0]` on `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
+`REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE` and `ATTACH_OBJECT`, every cap on `SWAP_DONE`
+and `SWAP_WANTED`, and the caps after `cap[1]` on `NODE_REGISTER_LIMIT` and
 `SWAP_REGISTER`. It deletes the contract caps as well when a
 procmgr-only label's caller is not procmgr, when a label's class does not
 match the badge (§ Badge Discipline), and in the error cases the labels'
 sections state. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's
 endpoint, and its `cap[1]`, when present, as the swap service's want Notification;
 `SWAP_TAKE` and `SWAP_RESTORE` move their `cap[0]` back on every reply, and delete it
-only when that reply cannot reach the caller. `REGISTER_PROCESS` reads the
-badge of its `cap[0]` and deletes it on every path, and `NODE_REGISTER_LIMIT` its `cap[1]`. An
+only when that reply cannot reach the caller. `REGISTER_PROCESS` and `ATTACH_OBJECT` read the
+badge of their `cap[0]` and delete it on every path, and `NODE_REGISTER_LIMIT` its `cap[1]`. An
 attached cap therefore never outlives the call that carried it unless memmgr takes ownership of it,
 so no client can fill memmgr's `CSpace` by attaching caps until its receive loop fails and memmgr
 exits with `EXIT_RECV_WEDGE` (see

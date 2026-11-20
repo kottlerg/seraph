@@ -168,7 +168,9 @@ pub fn node<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<BudgetNode>
         | Node::Commit(_)
         | Node::Handle(_)
         | Node::Limit(_)
-        | Node::Disk(_) => None,
+        | Node::Disk(_)
+        | Node::Object(_)
+        | Node::ZeroFrame(_) => None,
     }
 }
 

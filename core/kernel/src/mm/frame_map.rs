@@ -194,8 +194,9 @@ impl FrameMap
 
     /// Count one more user leaf mapping of the frame holding `phys`.
     ///
-    /// The `u32` ceiling is unreachable: 2^32 leaf PTEs naming one frame need
-    /// 32 GiB of page tables, and a saturated count refuses the map, never wraps.
+    /// Reaching the `u32` ceiling takes 2^32 leaf PTEs naming one frame, 32 GiB
+    /// of page tables, and a saturated count refuses the map, never wraps
+    /// (docs/limits.md § Kernel: memory management).
     ///
     /// # Errors
     /// `Err(())` when the count is already `u32::MAX`; nothing changes.

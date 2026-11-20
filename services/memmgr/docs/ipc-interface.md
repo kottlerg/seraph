@@ -1556,9 +1556,9 @@ declined only:
 - with code 6 or 8, when memmgr's metadata arena cannot grow, past what is left of the region's
   metadata bound, for the slots that record the run, or the run cannot be recorded on its chunk.
 
-Only registered swap slots make a committed region's chunks evictable. A fault on one
-memmgr is evicting, or holds raw, maps the chunk's own runs back, and a fault on one it evicted
-restores the chunk; either is declined only:
+Only registered swap slots make a committed region's chunks evictable, and never an attachment's.
+A fault on one memmgr is evicting, or holds raw, maps the chunk's own runs back, and a fault on one
+it evicted restores the chunk; either is declined only:
 
 - with code 11, when a restore's draw finds too few free pages for the chunk's backed pages even
   after memmgr evicted victims in its turn, and with code 7 when the runs covering them cannot then

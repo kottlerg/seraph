@@ -1090,8 +1090,10 @@ fault. It never evicts a granted frame, since a client holding a Memory cap to i
 sent or DMA-mapped it; a page of a process whose budget node is a reserve node ([Distribution
 policy](#distribution-policy)), since those processes free memory under exhaustion and must not
 wait on a restore to do so; a page of a region registered with `REGION_NO_EVICT`
-([`ipc-interface.md`](ipc-interface.md) § Label 7); or a page of a process with no delegated
-address space, whose accessed bits memmgr cannot read. A spawned thread's IPC buffer is a grant
+([`ipc-interface.md`](ipc-interface.md) § Label 7); a page of a memory-object attachment
+([Memory objects](#memory-objects)), since its pages are its object's or a zero frame's, which
+other address spaces may map; or a page of a process with no delegated address space, whose
+accessed bits memmgr cannot read. A spawned thread's IPC buffer is a grant
 ([Userspace Memory Model § Page
 Reservations](../../../docs/userspace-memory-model.md#page-reservations)), and init, memmgr and
 procmgr have no pager, so eviction never reaches a page the kernel's non-restartable IPC-buffer
@@ -1402,7 +1404,7 @@ terminal fault tears down the whole process (see
   separate swap service's, which reads and writes the slots; memmgr performs
   no device I/O and waits on no swap service. memmgr evicts only pages it
   mapped as pager, never a grant, a page of a process whose budget node is a
-  reserve node, or a no-evict region.
+  reserve node, a no-evict region, or a memory-object attachment.
 - **Live migration.** memmgr does not relocate pages held by a live
   process to defragment the pool. Defragmentation depends on processes
   exiting (or calling `RELEASE_MEMORY_CAPS`) and the resulting coalesce.

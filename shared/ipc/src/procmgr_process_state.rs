@@ -27,6 +27,8 @@ pub const UNKNOWN: u64 = 2;
 /// recent-exit window (30 s) and still holds its record (best-effort; see
 /// [`UNKNOWN`]). Reply word 1 carries the kernel-encoded `exit_reason`:
 /// the address space's first terminal end, else the main thread's retained
-/// reason; for a destroyed process that had not ended, `EXIT_KILLED`.
+/// reason, read at the first `EXITED` answer, which fixes it for later
+/// answers and for the teardown, or else at the reap or destroy; for a
+/// destroyed process that had not ended, `EXIT_KILLED`.
 /// After the window, queries on the same badge return `UNKNOWN`.
 pub const EXITED: u64 = 3;

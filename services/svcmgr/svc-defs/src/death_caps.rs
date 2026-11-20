@@ -21,9 +21,10 @@ use crate::death_tag::DeathTag;
 /// `cap_info(CAP_INFO_ASPACE_END)` on its address-space cap; `None`
 /// for a cap svcmgr does not hold. An ended space (`syscall_abi::aspace_end_reason`)
 /// gives the reason of its first terminal fault or process exit, `0` for a
-/// clean exit, ahead of the thread, as procmgr reads a process's end: it is
-/// the process's first end by a fault or an exit, whichever thread made it.
-/// Otherwise the thread reading decodes as every creator
+/// clean exit, ahead of the thread, in the order procmgr reads a process's
+/// end before it has answered one: the space's end is the process's first
+/// end by a fault or an exit, whichever thread made it. Otherwise the thread
+/// reading decodes as every creator
 /// decodes it (`ipc::bootstrap::thread_death`): an exited thread gives the
 /// reason the kernel recorded, and a thread cap that no longer resolves gives
 /// `EXIT_KILLED`, since procmgr's teardown of the process revokes it. A thread that

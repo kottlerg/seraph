@@ -53,6 +53,7 @@ use std::time::{Duration, Instant};
 use crate::arch::Arch;
 use crate::breakpoint_kill;
 use crate::cli::{CoreDeathTarget, TestCoreDeathArgs};
+use crate::commands::run_parallel::HANDOVER_MARKER;
 use crate::context::Context;
 use crate::debug_stub;
 use crate::disk::DiskLayout;
@@ -158,10 +159,6 @@ const RESTARTED_MARKER: &str = "service restarted: ";
 /// before its bootstrap request, after `svcmgr: <name>`. Kept in sync with
 /// `services/svcmgr/src/definitions/reconcile.rs`.
 const BOOT_DEATH_MARKER: &str = " died during its bootstrap";
-
-/// init-logd's last line, written once real-logd has pulled its history and
-/// released it. Kept in sync with `services/init/src/logging.rs`.
-const HANDOVER_MARKER: &str = "handover complete; init-logd thread exiting";
 
 /// The pause after a kill before the stub is asked to attach again, so its
 /// walk does not find the dying instance.

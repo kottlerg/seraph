@@ -85,7 +85,7 @@ use firmware::dma::{
 };
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::iommu_restart::{
-    self, Domain, Domains, Holds, Refusal, RemapEntry, RemapTable, Remaps, Replay,
+    self, Domain, Domains, Holds, Outcome, Refusal, RemapEntry, RemapTable, Remaps, Replay,
 };
 use firmware::rimt;
 use ipc::{IpcMessage, iommu_errors, iommu_labels, memmgr_errors, memmgr_labels};
@@ -414,9 +414,11 @@ impl IommuClient
 
     /// Block the domain `handle`'s function at its device's withdrawal;
     /// whether the block is in place. A domain the ledger no longer holds was
-    /// left out of a restarted instance's tables, its replay having failed,
-    /// so its function is blocked already: a domain is recorded at its
-    /// `ATTACH` and forgotten only at its block or at that failure.
+    /// left out of the tables of a restarted instance that committed, its
+    /// replay having failed, so the units block its function already: a
+    /// domain is recorded at its `ATTACH` and forgotten only at its block or
+    /// at that commit (`iommu_restart::Outcome::committed`), never for an
+    /// attempt that does not commit.
     pub fn block_withdrawn(&self, handle: u64) -> bool
     {
         if self.domains().get(handle).is_none()
@@ -2526,16 +2528,8 @@ impl Iommu
                 return None;
             }
         };
-        let replayed = self
-            .replay(ep, kit.handed.units.len(), caps.dma.as_ref())
-            .and_then(|replayed| {
-                call_on(ep, &request(iommu_labels::COMMIT).build())
-                    .map(|_| replayed)
-                    .map_err(|code| {
-                        std::os::seraph::log!(warn: "IOMMU restart: COMMIT failed ({})", code);
-                    })
-            });
-        let Ok(replayed) = replayed
+        let replayed = self.replay_and_commit(ep, kit.handed.units.len(), caps.dma.as_ref());
+        let Ok(outcome) = replayed
         else
         {
             // Not served: its death, which the destroy below causes, is no
@@ -2551,6 +2545,14 @@ impl Iommu
                 ipc_buf,
             );
             return None;
+        };
+        // Committed: the units walk the new tables, which block every absent
+        // domain, so the ledger forgets them before any call reaches the new
+        // instance (`IommuClient::block_withdrawn`).
+        let replayed = Replayed {
+            domains: outcome.domains,
+            mappings: outcome.mappings,
+            failed: outcome.committed(&mut self.client.domains()),
         };
         self.client.serve_restarted(ep, badge);
         let mut released = 0usize;
@@ -2577,6 +2579,25 @@ impl Iommu
     }
 
     /// Replay devmgr's records into the restarted instance whose endpoint is
+    /// `ep` ([`Self::replay`]), then have it commit its tables (`COMMIT`).
+    ///
+    /// # Errors
+    /// The replay failed, or the instance refused the commit; logged.
+    fn replay_and_commit(
+        &self,
+        ep: u64,
+        units: usize,
+        dma: Option<&crate::dma::DmaService>,
+    ) -> Result<Outcome, ()>
+    {
+        let outcome = self.replay(ep, units, dma)?;
+        call_on(ep, &request(iommu_labels::COMMIT).build()).map_err(|code| {
+            std::os::seraph::log!(warn: "IOMMU restart: COMMIT failed ({})", code);
+        })?;
+        Ok(outcome)
+    }
+
+    /// Replay devmgr's records into the restarted instance whose endpoint is
     /// `ep`, which drives `units` units: check that it reports the widths
     /// the boot instance did, then for each confined device of the DMA table
     /// (`firmware::dma::DmaTable::replay`) `ATTACH` its function with its
@@ -2584,8 +2605,8 @@ impl Iommu
     /// range, `MAP_MSI` each held interrupt file and `MAP` each mapping it
     /// may reach; and on VT-d set the interrupt remapping table up again on
     /// devmgr's cap and write each entry recorded. A device whose replay
-    /// fails is blocked in the instance, forgotten from the domain ledger, and
-    /// named in [`Replayed::failed`].
+    /// fails is blocked in the instance and counted in the [`Outcome`], which
+    /// forgets its domain once the attempt commits.
     ///
     /// # Errors
     /// The widths differ, the table cannot be read, a device's domain is
@@ -2596,7 +2617,7 @@ impl Iommu
         ep: u64,
         units: usize,
         dma: Option<&crate::dma::DmaService>,
-    ) -> Result<Replayed, ()>
+    ) -> Result<Outcome, ()>
     {
         if Some(&query_widths(ep, units)) != self.client.widths.get()
         {
@@ -2609,46 +2630,27 @@ impl Iommu
             std::os::seraph::log!(warn: "IOMMU restart: no memory to read the DMA table");
             return Err(());
         };
-        let mut replayed = Replayed {
-            domains: 0,
-            mappings: 0,
-            failed: Vec::new(),
-        };
+        let mut outcome = Outcome::default();
         for device in &plan
         {
             let domain = self.client.domains().get(device.handle);
             let replay = iommu_restart::replay_device(domain, &mut ReplayOn { ep, device });
-            // An absent domain is forgotten: a withdrawal finds its function
-            // blocked (`IommuClient::block_withdrawn`).
-            self.client.domains().settle(device.handle, replay);
-            match replay
+            if let Replay::Absent(code) = replay
             {
-                Replay::Rebuilt(mappings) =>
-                {
-                    replayed.domains = replayed.domains.saturating_add(1);
-                    replayed.mappings = replayed.mappings.saturating_add(mappings);
-                }
-                Replay::Unblocked =>
-                {
-                    std::os::seraph::log!(
-                        warn: "IOMMU restart: device {}'s domain neither rebuilt nor blocked",
-                        device.badge
-                    );
-                    return Err(());
-                }
-                Replay::Absent(code) =>
-                {
-                    std::os::seraph::log!(
-                        warn: "IOMMU restart: device {}'s domain not rebuilt ({})",
-                        device.badge,
-                        code
-                    );
-                    if replayed.failed.try_reserve(1).is_err()
-                    {
-                        return Err(());
-                    }
-                    replayed.failed.push(device.badge);
-                }
+                std::os::seraph::log!(
+                    warn: "IOMMU restart: device {}'s domain not rebuilt ({})",
+                    device.badge,
+                    code
+                );
+            }
+            if outcome.add(device.badge, device.handle, replay).is_err()
+            {
+                std::os::seraph::log!(
+                    warn: "IOMMU restart: device {}'s domain neither rebuilt nor blocked, \
+                           or not recorded",
+                    device.badge
+                );
+                return Err(());
             }
         }
         let (table, entries) = {
@@ -2681,7 +2683,7 @@ impl Iommu
                 }
             }
         }
-        Ok(replayed)
+        Ok(outcome)
     }
 }
 

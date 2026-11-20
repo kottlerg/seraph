@@ -20,7 +20,8 @@
 //! instance's pages. How one device's replay ends ([`replay_device`]): its
 //! domain rebuilt, absent from the new tables, or attached and not blocked
 //! again, which ends the attempt, is decided here over the calls devmgr's
-//! control thread makes on the new instance ([`ReplayCalls`]).
+//! control thread makes on the new instance ([`ReplayCalls`]), and an absent
+//! domain is forgotten only once the attempt commits ([`Outcome`]).
 
 extern crate alloc;
 
@@ -142,18 +143,6 @@ impl Domains
         Ok(())
     }
 
-    /// Settle the ledger after the replay of the device whose domain is
-    /// `handle` ended in `replay`: a domain absent from the restarted
-    /// instance's tables is forgotten, so a withdrawal finds its function
-    /// blocked and a later restart does not replay it.
-    pub fn settle(&mut self, handle: u64, replay: Replay)
-    {
-        if matches!(replay, Replay::Absent(_))
-        {
-            self.forget(handle);
-        }
-    }
-
     /// Forget the domain `handle`, blocked or never attached.
     pub fn forget(&mut self, handle: u64)
     {
@@ -201,8 +190,8 @@ pub enum Replay
     /// It was refused, with this error label, and its domain is absent from
     /// the instance's staged tables: either the `ATTACH` was refused or the
     /// domain was blocked again, so the units block the device from the
-    /// commit on. devmgr forgets the domain ([`Domains::settle`]) and
-    /// withdraws the device's driver.
+    /// commit on. Once the attempt commits, devmgr forgets the domain
+    /// ([`Outcome::committed`]) and withdraws the device's driver.
     Absent(u64),
     /// A step after the `ATTACH` was refused and so was the `BLOCK` that
     /// would undo it: the staged tables hold the domain with part of its
@@ -248,6 +237,71 @@ pub fn replay_device(domain: Option<Domain>, calls: &mut impl ReplayCalls) -> Re
     else
     {
         Replay::Unblocked
+    }
+}
+
+/// A device's replay that ends its restart attempt ([`Outcome::add`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndsAttempt;
+
+/// What the replay of every confined device into one restart attempt left,
+/// kept until the attempt commits.
+#[derive(Debug, Default)]
+pub struct Outcome
+{
+    /// The domains rebuilt.
+    pub domains: usize,
+    /// The mappings installed again.
+    pub mappings: usize,
+    /// The device badge and domain handle of each device whose domain is
+    /// absent from the instance's tables.
+    absent: Vec<(u64, u64)>,
+}
+
+impl Outcome
+{
+    /// Count the replay of the device `badge`, whose domain is `handle`,
+    /// which ended in `replay`.
+    ///
+    /// # Errors
+    /// [`EndsAttempt`]: the domain is attached and not blocked again
+    /// ([`Replay::Unblocked`]), or the record cannot grow.
+    pub fn add(&mut self, badge: u64, handle: u64, replay: Replay) -> Result<(), EndsAttempt>
+    {
+        match replay
+        {
+            Replay::Rebuilt(mappings) =>
+            {
+                self.domains = self.domains.saturating_add(1);
+                self.mappings = self.mappings.saturating_add(mappings);
+                Ok(())
+            }
+            Replay::Absent(_) =>
+            {
+                self.absent.try_reserve(1).map_err(|_| EndsAttempt)?;
+                self.absent.push((badge, handle));
+                Ok(())
+            }
+            Replay::Unblocked => Err(EndsAttempt),
+        }
+    }
+
+    /// The attempt committed, so its tables are the ones the units walk:
+    /// forget from `domains` each domain absent from them, whose function the
+    /// units now block, so a withdrawal finds it blocked and a later restart
+    /// does not replay it. The badges of those devices, whose drivers devmgr
+    /// withdraws. An attempt that does not commit leaves the units on the
+    /// tables before it, where those domains stand, and leaves the ledger
+    /// as it was.
+    pub fn committed(self, domains: &mut Domains) -> Vec<u64>
+    {
+        self.absent
+            .into_iter()
+            .map(|(badge, handle)| {
+                domains.forget(handle);
+                badge
+            })
+            .collect()
     }
 }
 
@@ -484,8 +538,22 @@ mod tests
         assert_eq!(replay, Replay::Rebuilt(3));
         assert_eq!(fake.blocked, []);
         let mut domains = ledger();
-        domains.settle(REPLAYED.handle, replay);
+        let mut outcome = Outcome::default();
+        outcome.add(1, REPLAYED.handle, replay).unwrap();
+        assert_eq!((outcome.domains, outcome.mappings), (1, 3));
+        assert_eq!(outcome.committed(&mut domains), []);
         assert_eq!(domains.get(REPLAYED.handle), Some(REPLAYED));
+    }
+
+    /// Commit an attempt whose one replay ended in `replay`: the badges
+    /// withdrawn, and whether the ledger still holds the domain.
+    fn commit_one(replay: Replay) -> (Vec<u64>, bool)
+    {
+        let mut domains = ledger();
+        let mut outcome = Outcome::default();
+        outcome.add(9, REPLAYED.handle, replay).unwrap();
+        let withdrawn = outcome.committed(&mut domains);
+        (withdrawn, domains.get(REPLAYED.handle).is_some())
     }
 
     #[test]
@@ -500,9 +568,7 @@ mod tests
             "nothing is installed in a domain not attached"
         );
         assert_eq!(fake.blocked, [], "a domain not attached needs no block");
-        let mut domains = ledger();
-        domains.settle(REPLAYED.handle, replay);
-        assert_eq!(domains.get(REPLAYED.handle), None);
+        assert_eq!(commit_one(replay), (vec![9], false));
     }
 
     #[test]
@@ -513,9 +579,7 @@ mod tests
         let replay = replay_device(Some(REPLAYED), &mut fake);
         assert_eq!(replay, Replay::Absent(OUT_OF_RESOURCES));
         assert_eq!(fake.blocked, [REPLAYED.handle]);
-        let mut domains = ledger();
-        domains.settle(REPLAYED.handle, replay);
-        assert_eq!(domains.get(REPLAYED.handle), None);
+        assert_eq!(commit_one(replay), (vec![9], false));
     }
 
     #[test]
@@ -540,8 +604,19 @@ mod tests
         fake.block = false;
         let replay = replay_device(Some(REPLAYED), &mut fake);
         assert_eq!(replay, Replay::Unblocked);
-        let mut domains = ledger();
-        domains.settle(REPLAYED.handle, replay);
+        let mut outcome = Outcome::default();
+        assert_eq!(outcome.add(9, REPLAYED.handle, replay), Err(EndsAttempt));
+    }
+
+    #[test]
+    fn an_attempt_that_does_not_commit_leaves_the_ledger_as_it_was()
+    {
+        let domains = ledger();
+        let mut outcome = Outcome::default();
+        outcome
+            .add(9, REPLAYED.handle, Replay::Absent(OUT_OF_RESOURCES))
+            .unwrap();
+        drop(outcome);
         assert_eq!(domains.get(REPLAYED.handle), Some(REPLAYED));
     }
 

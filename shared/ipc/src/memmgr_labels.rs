@@ -377,7 +377,8 @@ pub const DEMAND_CHUNK_BYTES: u64 = 64 * 1024;
 /// `recv.badge`: memmgr unmaps them and takes back the frames that backed
 /// them, and the next touch of a page of them faults in a zero-filled page.
 /// A committed region keeps its commitment, so that touch is not declined
-/// for budget or RAM.
+/// for budget, and for RAM only in the few cases
+/// `services/memmgr/docs/ipc-interface.md` § Label 7 gives.
 ///
 /// Wire format:
 /// * `data[0]` — `va` (a whole number of 64 KiB demand chunks above the

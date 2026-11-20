@@ -163,7 +163,8 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   before and after a `MAKE_RESIDENT` walk over a range that completed
 ///   with no reply pending knows no chunk of the range was being evicted,
 ///   held raw, compressed or being written at the second read. A chunk on
-///   disk or lost can remain; `data[10]` and `data[12]` count it.
+///   disk or lost can remain: `data[10]` counts both, `data[12]` only a
+///   chunk on disk.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no

@@ -568,7 +568,8 @@ after a `MAKE_RESIDENT` walk over a range that completed with no reply
 pending (§ Label 21) knows that no chunk of the range was being evicted, held
 raw, compressed or being written at the second read, whatever was in flight
 at the first; a chunk held raw counts in no other word until it is written.
-A chunk on disk or lost can remain, which `data[10]` and `data[12]` count.
+A chunk on disk or lost can remain: `data[10]` counts both, `data[12]` only a
+chunk on disk.
 `data[3]` to `data[14]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 

@@ -749,6 +749,10 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
         // can wait on it with no call of its own. A failure leaves the
         // process unregistered; nothing else depends on it.
         pal_alloc::register_pressure();
+        // Take the CSpace slot reserve, from which a grant whose reply finds
+        // no free slot grows the CSpace. A refused request leaves the process
+        // without one until a top-up takes it.
+        pal_alloc::refill_cspace_reserve();
     }
 
     // In a demand-paged process, let the main-thread stack grow on demand below
@@ -1556,6 +1560,12 @@ pub fn cspace_slot_headroom(self_cspace: u64) -> u64 {
 /// caller's burst; an allocation that then finds the headroom spent fails
 /// with the refillable `OutOfMemory`.
 ///
+/// A `CSpace` with no free slot is funded too: the grant whose reply cannot
+/// land there is recovered by growing the process's `CSpace` from the
+/// runtime's slot reserve, a grant every std process holds from start and
+/// takes again after spending it (runtime/ruststd/README.md § CSpace slot
+/// headroom).
+///
 /// `slots == 0` still keeps the arena's page. Returns `false` only when a
 /// top-up was needed and could not be had: memmgr is unreachable or refuses
 /// the grant, or the kernel refuses the donation. A headroom that reads short
@@ -1622,9 +1632,12 @@ impl CSpaceHeadroom {
     /// headroom ([`cspace_slot_headroom`]) is all the operation may take: a
     /// capability received by IPC takes a general slot while one is free and
     /// then a slot of the IPC receive reserve, and the next top-up's own
-    /// reply needs that reserve. So an operation that receives capabilities
-    /// goes on only while the headroom covers what it receives, and
-    /// otherwise fails as if refused for memory.
+    /// reply needs that reserve, or else the runtime's slot reserve
+    /// ([`fund_cspace_slot_budget`]), which recovers one such top-up and is
+    /// taken again only by a grant the memory a refused top-up lacked may
+    /// refuse too. So an operation that receives capabilities goes on only
+    /// while the headroom covers what it receives, and otherwise fails as if
+    /// refused for memory.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     #[must_use = "a refused top-up leaves the CSpace short of the mark: act on it, or say why the caller's capability intake is bounded"]
     pub fn hold(&self, self_cspace: u64) -> bool {

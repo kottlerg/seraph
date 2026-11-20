@@ -1046,11 +1046,9 @@ victim of that kind takes the place of one the slice found before it once the sl
 so the chunks a committed draw needs are not crowded out by those it does not. The victims a slice
 finds and posts no job for are kept, a bounded number, for direct reclaim; when the list is full,
 one whose eviction frees a page above the growth floor while memmgr evicts for frames takes the
-place of one whose eviction does not, and otherwise one whose eviction raises the free pages outside
-`promised` takes the place of one whose eviction does neither; at `CRITICAL` a slice finds the
-chunks with no accessed page in one sweep. A slice ends at the end of a pass, so no slice ages a
-chunk twice. The granule is the chunk: one unmap and one restore fault per chunk, over every run on
-its run list.
+place of one whose eviction does not; at `CRITICAL` a slice finds the chunks with no accessed page
+in one sweep. A slice ends at the end of a pass, so no slice ages a chunk twice. The granule is the
+chunk: one unmap and one restore fault per chunk, over every run on its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, maps its
 runs into the job slot's input window of its own address space, and the chunk is evicting while the

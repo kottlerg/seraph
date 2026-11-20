@@ -11,12 +11,17 @@ pwrmgr/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    ├── main.rs       # Entry, bootstrap, IPC dispatch loop, cap-gating
-    ├── caps.rs       # svcmgr bootstrap: the service endpoint, the two seeds, svcmgr's death queue
+    ├── main.rs       # Entry, bootstrap, IPC dispatch loop, cap-gating, the core-death power-off
+    ├── lib.rs        # Host-tested library: the modules below
+    ├── guard.rs      # The allocation guard the core-death power-off runs under
+    ├── core_death.rs # The core-death queue's entries: the member and the exit reason
+    ├── caps.rs       # svcmgr bootstrap: the service endpoint, the two seeds, the core-death queue
     └── arch/
         ├── mod.rs         # Arch dispatch: `arch::current` (Actuator, resolve,
-        │                  # watch_events, shutdown, reboot)
-        ├── x86_64/mod.rs  # acpid's SLEEP(5) and RESET; the power-button thread on WAIT_EVENT
+        │                  # watch_events, shutdown, reboot, PowerOff,
+        │                  # resolve_power_off, power_off_now)
+        ├── x86_64/mod.rs  # acpid's SLEEP(5) and RESET; the power-button thread on WAIT_EVENT;
+        │                  # PM1a_CNT from acpid's QUERY_SLEEP and the S5 write
         └── riscv64/mod.rs # devmgr's SbiControl derivation; SBI SRST shutdown + cold reboot
 ```
 
@@ -24,10 +29,11 @@ pwrmgr/
 
 ## Responsibilities
 
-pwrmgr owns the shutdown *interpretation* and holds no hardware caps of its own. devmgr is the
-hardware authority, and acpid ([services/acpid/README.md](../acpid/README.md)) holds the ACPI
-registers and runs the AML; pwrmgr reads no table and holds no port. Each architecture uses one
-of its two seeds and deletes the other at startup:
+pwrmgr owns the shutdown *interpretation*. devmgr is the hardware authority, and acpid
+([services/acpid/README.md](../acpid/README.md)) holds the ACPI registers and runs the AML;
+pwrmgr reads no table. The one hardware cap it holds of its own is for the death of a core service
+(below): on x86-64 a derivation of acpid's `PM1a_CNT` port block. Each architecture uses one of
+its two seeds and deletes the other at startup:
 
 - **x86-64** — pwrmgr powers off with acpid's `SLEEP` of state S5 and reboots with acpid's
   `RESET` (the FADT's `RESET_REG`), through the `acpid.power` seed
@@ -73,19 +79,38 @@ issued, and a reboot about one second after.
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.
 
-pwrmgr observes svcmgr, which cannot observe its own death
-([docs/supervision.md](../../docs/supervision.md#observing-svcmgr)
-§ Observing svcmgr). It waits on one wait set over its service endpoint and
-the receive-only derivation of svcmgr's death queue that svcmgr serves it
-(Cap flow below). An entry on the queue is svcmgr's death: pwrmgr drains the
-queue, logs `svcmgr died (exit reason <reason>); powering off` at error level,
-and powers the platform off as `SHUTDOWN` does. A power-off that does not take
-effect, or the absence of an actuator, is logged, and pwrmgr serves on. Without
-the queue, or when the wait set cannot be made, pwrmgr logs that svcmgr's
-death is unobserved and receives on its endpoint alone.
-`cargo xtask test-core-death` kills svcmgr and checks the power-off
-([docs/testing.md](../../docs/testing.md#core-death-test-core-death) § Core death).
+pwrmgr owns the death of the core set, svcmgr, memmgr and procmgr
+([docs/supervision.md](../../docs/supervision.md#core-set-and-system-death) § Core Set and System
+Death). It waits on one wait set over its service endpoint and the receive-only derivation of the
+core-death queue that svcmgr serves it (Cap flow below), on which svcmgr has bound the death
+observers of all three ([docs/supervision.md](../../docs/supervision.md#observing-the-core-set)
+§ Observing the Core Set). An entry on the queue is a core death, and pwrmgr powers the platform
+off at once, by a path that needs no other service and none of the dead member's pages:
 
+- svcmgr creates pwrmgr pinned (`CREATE_PINNED`), so none of its pages is demand-paged on memmgr
+  or evicted by it.
+- At startup pwrmgr resolves its immediate power-off: on RISC-V the same `SbiControl` derivation
+  its `SHUTDOWN` uses; on x86-64 acpid's `QUERY_SLEEP` of S5
+  ([acpid § Power requests](../acpid/README.md#power-requests)), a derivation of acpid's
+  `PM1a_CNT` port block, which pwrmgr binds to its main thread, and the S5 `SLP_TYPa`. With the
+  queue observed, the power-off held and no pager advertised, it logs
+  `core-death power-off armed`; otherwise it logs why the power-off is not armed at error level.
+  Without `PM1a_CNT` (a hardware-reduced x86-64 platform among them) or a usable `\_S5_`, it is
+  not armed.
+- On an entry pwrmgr arms its allocation guard against its main thread, drains the queue, and
+  powers off: SBI SRST on RISC-V; on x86-64 it reads `PM1a_CNT` and writes the S5 sleep type to
+  it, then with `SLP_EN`, as acpid's `SLEEP` does, but without the `\_PTS(5)` and the event
+  quiescing acpid runs first. Nothing on that path allocates, frees, logs or calls a service; an
+  allocation there fails, which ends pwrmgr without a power-off.
+- Only when the platform keeps running, or no immediate power-off is held, does pwrmgr log
+  `<member> died (exit reason <reason>); powering off` at error level and power off as `SHUTDOWN`
+  does. A power-off that does not take effect, or the absence of an actuator, is logged, and pwrmgr
+  serves on.
+
+Without the queue, or when the wait set cannot be made, pwrmgr logs that a core death is
+unobserved and receives on its endpoint alone. `cargo xtask test-core-death` kills svcmgr,
+memmgr and procmgr, the last two once pwrmgr has logged that its power-off is armed, and checks
+the power-off ([docs/testing.md](../../docs/testing.md#core-death-test-core-death) § Core death).
 ---
 
 ## Cap flow
@@ -116,13 +141,17 @@ death is unobserved and receives on its endpoint alone.
    assert the gate rejects an unauthorised cap
    ([`provides`](../svcmgr/docs/service-definitions.md#provides);
    [svctest Capabilities](../svctest/README.md#capabilities)).
-4. svcmgr serves pwrmgr, the recognised shutdown actuator, a RECV-only
-   derivation of the event queue its own main thread and address space post
-   their death to, as bootstrap `cap[3]`, on its first launch and on every
+4. svcmgr creates pwrmgr, the recognised shutdown actuator, pinned, and serves
+   it a RECV-only derivation of the core-death queue, which the death
+   observers of svcmgr's, memmgr's and procmgr's main threads and address
+   spaces post to, as bootstrap `cap[3]`, on its first launch and on every
    restart
    ([`shutdown_actuator`](../svcmgr/docs/service-definitions.md#shutdown_actuator)).
    The queue is svcmgr's, so its death observers outlive every pwrmgr
    instance, and the derivation keeps the queue alive past svcmgr's death.
+   On x86-64 pwrmgr's `QUERY_SLEEP` call through `acpid.power` returns a
+   derivation of acpid's `PM1a_CNT` `IoPort`, an object of its own that
+   outlives acpid's restarts.
 5. svctest, at the end of `main()` after `ALL TESTS PASSED`, or from its
    failure hooks after `SOME TESTS FAILED`, sends
    `pwrmgr_labels::SHUTDOWN` through the authorised cap, per
@@ -182,7 +211,8 @@ acceptance criteria are written.
 `core/ktest/src/arch/x86_64/acpi_shutdown.rs` and
 `core/ktest/src/arch/riscv64/sbi_shutdown.rs`
 hold ktest's own shutdown: the S5 write from the FADT and the `\_S5_` package on x86-64, which
-pwrmgr leaves to acpid, and the SBI call on RISC-V, which pwrmgr also makes. They are kept
+pwrmgr leaves to acpid but for the write of its core-death power-off, whose port block and sleep
+type acpid hands it, and the SBI call on RISC-V, which pwrmgr also makes. They are kept
 deliberately separate so the kernel-validation harness, which runs no service, does not depend
 on any userspace-service crate. The ktest copies are a frozen, single-purpose `shutdown(info)`.
 There is no shared crate and no cross-reference between the two trees.
@@ -194,12 +224,12 @@ There is no shared crate and no cross-reference between the two trees.
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System-wide service inventory; pwrmgr's role |
-| [docs/supervision.md](../../docs/supervision.md) | Supervision hierarchy; pwrmgr as svcmgr's observer |
+| [docs/supervision.md](../../docs/supervision.md) | Supervision hierarchy; pwrmgr as the observer of the core set |
 | [docs/testing.md](../../docs/testing.md) | Cross-harness completion convention; harnesses request pwrmgr shutdown when they finish |
 | [shared/ipc/src/pwrmgr_labels.rs](../../shared/ipc/src/pwrmgr_labels.rs) | Authoritative IPC label definitions (`pwrmgr_labels`) |
 | [shared/ipc/src/pwrmgr_errors.rs](../../shared/ipc/src/pwrmgr_errors.rs) | Authoritative IPC error definitions (`pwrmgr_errors`) |
 | [shared/ipc/src/devmgr_labels.rs](../../shared/ipc/src/devmgr_labels.rs) | The `devmgr_labels` pwrmgr calls |
-| [services/acpid/README.md](../acpid/README.md) | Evaluates the firmware's AML; serves the x86-64 sleep, reset and power-button requests pwrmgr calls |
+| [services/acpid/README.md](../acpid/README.md) | Evaluates the firmware's AML; serves the x86-64 sleep, sleep-register, reset and power-button requests pwrmgr calls |
 | [services/devmgr/README.md](../devmgr/README.md) | Hardware authority; the `QUERY_SHUTDOWN_DEVICE` broker pwrmgr acquires its RISC-V cap through |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher + supervisor; the provider path that publishes `pwrmgr.shutdown` / `pwrmgr.deny` |
 | [services/svctest/README.md](../svctest/README.md) | Services-tier harness; seeds `pwrmgr.shutdown`, resolves the public `pwrmgr.deny` through `QUERY_ENDPOINT`, asserts the deny path, and requests the terminal shutdown |

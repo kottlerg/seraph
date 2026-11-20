@@ -1308,7 +1308,8 @@ before the first kill (the first instance died before its bootstrap request or a
 release), the restart must produce it.
 memmgr and procmgr are reached through QEMU's own gdbstub, on a unix socket, with a hardware
 breakpoint on a function of the target's binary, read from the symbols store's file of its build id,
-hit by a `hello` the command types at the shell. It passes for a target when QMP's `SHUTDOWN` event,
+hit by a `hello` the command types at the shell once the terminal's READY line and pwrmgr's
+`core-death power-off armed` line have appeared. It passes for a target when QMP's `SHUTDOWN` event,
 after the kill, gives reason `guest-shutdown`, and QEMU exits on its own within two minutes of the
 kill; [docs/testing.md](../docs/testing.md) § Core death (`test-core-death`) says when each target
 is killed and which path powers the system off. Every target is tried; the command fails naming each

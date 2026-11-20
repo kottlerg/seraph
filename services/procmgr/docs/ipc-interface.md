@@ -207,7 +207,8 @@ child then backs reserved regions lazily via
 `std::os::seraph::register_demand_paged`. The label's bit 16 (`CREATE_PINNED`,
 in the `[16..31]` window shared with `CREATE_FROM_FILE`) opts out: the
 child is left eager-mapped with no pager. Set it only for a process that cannot
-depend on the fault path — a DMA driver. init, memmgr, and procmgr are pre-pager
+depend on the fault path — a DMA driver, or the shutdown actuator, which svcmgr
+creates pinned. init, memmgr, and procmgr are pre-pager
 and never routed through this path, so they are pinned by construction. See
 [docs/fault-handling.md](../../../docs/fault-handling.md). The binding is
 best-effort: a failure degrades to "no pager" (faults kill), never blocking

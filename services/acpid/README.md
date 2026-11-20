@@ -16,7 +16,7 @@ acpid/
 │   └── devmgr.md         # Capabilities, region grants, configuration access, pushes, checks
 └── src/
     ├── lib.rs            # Host-tested library: `Failure`, `Why`
-    ├── power.rs          # Power requests: decode, `\_S5_`, `\_PTS`, the `PM1a_CNT` values
+    ├── power.rs          # Power requests: decode, `\_S5_`, `\_PTS`
     ├── events.rs         # The fixed power button and the GPEs: arm, scan, dispatch, re-enable
     ├── hotplug.rs        # PCI hotplug: the `Notify` values, the slot's port, `_EJ0` and `_OST`
     ├── walk.rs           # The `_STA` / `_INI` initialization walk
@@ -29,7 +29,7 @@ acpid/
     ├── platform.rs       # The evaluator's `Host`: region grants, configuration access
     ├── startup.rs        # The start-up sequence and the pushes
     ├── server.rs         # The work loop, the receivers, the event and hotplug threads,
-    │                     # `WAIT_EVENT`
+    │                     # `WAIT_EVENT`, `QUERY_SLEEP`
     └── arch/
         ├── mod.rs            # Arch dispatch: `arch::current`
         ├── x86_64/mod.rs     # ACPI mode, port I/O, the APIC model, PM1a_CNT, RESET_REG,
@@ -68,7 +68,8 @@ requests); a request sent during start-up waits in the endpoint's queue.
 ## Power requests
 
 acpid serves `ipc::acpid_labels` on its endpoint from two receiver threads, which hand each
-`SLEEP` and `RESET` to the evaluation thread and wait for its answer, so every evaluation runs in
+`SLEEP`, `QUERY_SLEEP` and `RESET` to the evaluation thread and wait for its answer, so every
+evaluation runs in
 turn on the one thread that owns the namespace. A request is checked in order: the label
 (`UNKNOWN_OPCODE`), the badge's `POWER_AUTHORITY` (`UNAUTHORIZED`), `ACPID_LABELS_VERSION` in
 `data[0]` (`LABEL_VERSION_MISMATCH`), then the argument.
@@ -90,12 +91,23 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   which enables it again, and the power button is left as the quiesce left it: a press taken
   before or during the sleep is delivered once, by the `WAIT_EVENT` it is posted to, which
   enables the button again. So each event is handled once.
+- `QUERY_SLEEP`, with the state in `data[1]`, of which only S5 is served (`INVALID_REQUEST` for
+  another): acpid evaluates `\_S5_` for `SLP_TYPa` as `SLEEP` does and replies `SUCCESS` with a
+  `Use`-only derivation of its `PM1a_CNT` `IoPort` in `caps[0]`, the block's first port in
+  `data[0]` and `SLP_TYPa` in `data[1]`, logging `QUERY_SLEEP(5): PM1a_CNT ..., SLP_TYPa ...`.
+  It writes nothing: the caller enters S5 itself, writing the two values `SLEEP` writes
+  (`ipc::acpid_labels::pm1_control_writes`), with no call on acpid and without `\_PTS` and the
+  quiescing of the events. pwrmgr calls it once at its start, for its power-off on the death of a
+  core service ([pwrmgr](../pwrmgr/README.md#responsibilities)). The derivation is an
+  `IoPort` object of its own, so acpid's death, which deletes acpid's block, leaves the caller's
+  standing.
 - `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG` port and logs
   `RESET: RESET_REG ...` before the write.
 - `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and
   replies `SUCCESS` with the pending events in `data[0]` (`EVENT_POWER_BUTTON`) (§ Events). One
   call waits at a time: a later `WAIT_EVENT` takes its place and the earlier one is replied
-  `SUPERSEDED`, so the other receiver stays free for `SLEEP` and `RESET`. `NO_DEVICE` when
+  `SUPERSEDED`, so the other receiver stays free for `SLEEP`, `QUERY_SLEEP` and `RESET`.
+  `NO_DEVICE` when
   acpid has no event to wait for: no SCI, no PM1a event block, or a FADT that declares no fixed
   power button, and always on RISC-V.
 
@@ -104,7 +116,8 @@ arrives. A `SUCCESS` reply to `SLEEP` means the platform still runs 10 s after t
 to `RESET` that the write returned and the platform still runs; the caller decides how long to
 wait.
 `NO_DEVICE` means the platform lacks what the request needs: `PM1a_CNT`, a usable `\_S5_` or
-loaded AML for `SLEEP`, an I/O-space `RESET_REG` for `RESET`, and always on RISC-V, whose
+loaded AML for `SLEEP` and `QUERY_SLEEP` (and, for `QUERY_SLEEP`, a derivation that succeeds), an
+I/O-space `RESET_REG` for `RESET`, and always on RISC-V, whose
 platforms power off and reset through SBI. acpid acquires `PM1a_CNT` and `RESET_REG` from
 devmgr (`QUERY_ACPI_RESOURCES`) at the start of its start-up and binds them to the evaluation
 thread. The endpoint is served even when the DSDT did not load, and, with every request that passes

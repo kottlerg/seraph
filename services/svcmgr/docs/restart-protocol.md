@@ -166,6 +166,13 @@ permanently down. The two concerns are orthogonal — `restart` owns
 *whether/when to respawn*, `critical` owns *can the system survive its
 permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
 
+A core member's death is not decided here. The observers of memmgr and procmgr are on the
+core-death queue, whose entries the shutdown actuator acts on, so svcmgr's death queues carry none
+of their posts, and only a resync finds such a death (§ Death detection): `route_death` then marks
+the entry inactive and returns, with no line, no restart decision and no graceful shutdown, each of
+which could wait on the dead member; pwrmgr powers the system off ([Supervision § Core Set and
+System Death](../../../docs/supervision.md#core-set-and-system-death)).
+
 1. **`should_restart(svc, exit_reason)`** evaluates the restart policy:
    * `POLICY_NEVER` → no restart.
    * `POLICY_ON_FAILURE` → restart iff `exit_reason >= EXIT_FAULT_BASE`
@@ -499,9 +506,10 @@ waits on none of them. svctest's
 `logd_restart` phase kills logd and checks both
 ([services/svctest/README.md](../../svctest/README.md)).
 
-svcmgr's own death is not routed here: svcmgr is in the core set, and
-pwrmgr observes it and powers the system off
-([Supervision § Observing svcmgr](../../../docs/supervision.md#observing-svcmgr)).
+svcmgr's own death is not routed here, nor memmgr's or procmgr's: they
+are the core set, and pwrmgr observes their deaths on the core-death queue
+and powers the system off
+([Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)).
 
 ---
 

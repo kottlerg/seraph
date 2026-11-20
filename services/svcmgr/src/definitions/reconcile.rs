@@ -412,8 +412,8 @@ fn record_shutdown_actuator(
 /// the service-table slot of the supervised entry it recorded, or `None`
 /// for a one-shot launch or one that did not land. `role` marks the
 /// recognised shutdown actuator: a supervised launch of it, and each restart,
-/// carries the receive-only derivation of svcmgr's own death queue
-/// (`launch::launch`).
+/// is created pinned and carries the receive-only derivation of the
+/// core-death queue (`launch::launch`).
 ///
 /// A supervised service that died during its bootstrap rounds
 /// (`launch::Launched::died`) is recorded as launched, then its death is
@@ -514,7 +514,7 @@ fn handle_definition(
         log!(warn: "svcmgr: no memory for {}'s entry; not launched", def.name);
         return None;
     };
-    recipe.observes_svcmgr = role == launch::Role::ShutdownActuator;
+    recipe.shutdown_actuator = role == launch::Role::ShutdownActuator;
 
     let Some(launched) = launch::launch(def, ctx, registry, Some(tag), role)
     else
@@ -558,12 +558,15 @@ fn log_boot_death(def: &Definition, exit_reason: u64)
 
 /// Bind-only path: bind death-notification on a thread init already
 /// started in Phase 1/2/3, and the observer of its address space through the
-/// cap init endowed with it, and record the `ServiceEntry`. For memmgr and
-/// procmgr, which init created by raw syscalls, that cap is a `Control`-only
-/// address-space cap, bound directly and kept for the resync; for devmgr and
-/// vfsd, which init created through procmgr, it is the process handle,
+/// cap init endowed with it, and record the `ServiceEntry`. For devmgr and
+/// vfsd, which init created through procmgr, that cap is the process handle,
 /// through which procmgr binds the observer
-/// (`procmgr_labels::BIND_DEATH_OBSERVER`) and which the entry keeps.
+/// (`procmgr_labels::BIND_DEATH_OBSERVER`) and which the entry keeps. memmgr
+/// and procmgr, which init created by raw syscalls, come with a
+/// `Control`-only address-space cap: their observers are on the core-death
+/// queue, bound at svcmgr's start (`observe_core_deaths` in `main.rs`), whose
+/// entries the shutdown actuator acts on, so svcmgr binds neither here and
+/// only records both caps, for the resync's liveness reads.
 ///
 /// Binding after the thread was started loses no death: the kernel retains a
 /// thread's `exit_reason` past death and `thread_bind_notification`
@@ -613,10 +616,13 @@ fn bind_only(
         release();
         return None;
     };
-    if ctx
-        .deaths
-        .bind_thread(pending.thread_cap, tag.correlator())
-        .is_err()
+    // A core member's observers are on the core-death queue, not svcmgr's.
+    let core = svcmgr_defs::core_death_correlator(pending.name_str()).is_some();
+    if !core
+        && ctx
+            .deaths
+            .bind_thread(pending.thread_cap, tag.correlator())
+            .is_err()
     {
         // Recorded all the same: a revoked thread cap is a death the resync
         // after reconciliation routes.
@@ -628,7 +634,7 @@ fn bind_only(
         SubstrateObserver::AddressSpace(aspace) =>
         {
             entry.aspace_cap = aspace;
-            ctx.deaths.bind_aspace(aspace, tag.correlator()).is_ok()
+            true
         }
         SubstrateObserver::ProcessHandle(handle) =>
         {
@@ -692,7 +698,7 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         entropy_authority: def.entropy_authority,
         reserve: def.reserve,
         stop_source: def.stop_source,
-        observes_svcmgr: false,
+        shutdown_actuator: false,
         priority: def.priority.unwrap_or(0),
         sched_max: def.sched_max.unwrap_or(0),
     })

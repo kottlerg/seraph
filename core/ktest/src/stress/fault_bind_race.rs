@@ -117,7 +117,7 @@ impl Parts
     {
         // Ending the handlers first lets their threads exit before the
         // endpoints go; a handler left blocked is released by the delete of
-        // its endpoint (its receive returns InvalidCapability or Interrupted).
+        // its endpoint (its receive returns InvalidCapability or NoReceiver).
         for (badged, handler) in self.badged.iter().zip(&self.handlers)
         {
             if let (Some(cap), Some(_)) = (badged, handler)

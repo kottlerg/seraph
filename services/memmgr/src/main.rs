@@ -4182,7 +4182,7 @@ fn map_object_view(
             continue;
         };
         let frame_pages = u64::from(f.page_count);
-        // SAFETY: `[at, at + pages)` lies in the span of the object zone the
+        // SAFETY: `[at, at + frame_pages)` lies in the span of the object zone the
         // seal took for these frames (the zone map above), which nothing maps
         // yet, so the map changes nothing memmgr runs on.
         if let Err(e) = unsafe { map_self_with(l, f.cap_slot, at, 0, frame_pages, MAP_READ) }

@@ -95,7 +95,8 @@ process creation to procmgr IPC.
   descriptors, so that stop does not arise). Serve a single bootstrap-IPC
   round carrying the pool's memory-cap range + a read-only phys-table cap
   (so memmgr can ingest its pool) (`finalize_memmgr`, served via
-  `ipc::bootstrap::serve_round`; `../src/main.rs`).
+  `ipc::bootstrap::serve_round_watched`, as is every round init serves (see
+  [A death during the bootstrap](#a-death-during-the-bootstrap)); `../src/main.rs`).
   Init retains every boot-module Memory cap (its self-loaded
   memmgr/procmgr ELFs plus the devmgr/vfsd/driver modules) as sole
   owner; those donate to memmgr's pool on the reap-handoff route, not
@@ -359,6 +360,29 @@ raw syscalls. Every later service spawn goes through procmgr IPC.
 After the raw bootstrap completes, the only `no_std` userspace
 services in the running system are init and
 [memmgr](../../memmgr/README.md); everything else is std-built.
+
+### A death during the bootstrap
+
+init serves every bootstrap round it owes a child, memmgr's and procmgr's in the raw bootstrap,
+devmgr's and vfsd's, and svcmgr's endowment, through `serve_child` (`../src/main.rs`), which
+serves with `ipc::bootstrap::serve_round_watched`: the wait for the child's request is a receive
+bounded at `ipc::bootstrap::WATCH_POLL_MS`, and after each one that expires init reads the child's
+main thread through the thread cap it holds (`ipc::bootstrap::thread_cap_death`): memmgr's and
+procmgr's from their raw creation, devmgr's, vfsd's and svcmgr's from procmgr's create reply.
+init deletes svcmgr's once the endowment ends; devmgr's and vfsd's reach svcmgr in the
+`SUBSTRATE` rounds.
+
+A child that dies before its round reaches it is system death, which before svcmgr's handover is a
+logged halt ([Supervision § Core Set and System
+Death](../../../docs/supervision.md#core-set-and-system-death)): init logs
+`init: FATAL: <service> died during its bootstrap (exit reason 0x<reason>)` (`bootstrap_death`,
+`../src/main.rs`), serves nothing more, and its main thread exits. init-logd keeps serving the
+master log endpoint, so the line reaches the serial console, and nothing powers the system off.
+init reads only the child whose request it waits for: memmgr's or procmgr's death after its own
+rounds is not seen, and init's next call that reaches the dead service waits for good.
+A round that fails with the child alive keeps its own handling: memmgr's or procmgr's is FATAL,
+devmgr's or vfsd's ends that service's rounds, and svcmgr is endowed without its substrate round,
+and svcmgr's ends the endowment as [Handover](#handover) describes.
 
 ---
 

@@ -11,9 +11,9 @@
 //! requests on init's bootstrap endpoint to deliver their per-service
 //! capability set.
 
-use crate::idle_loop;
 use crate::log_levels::{ArgvEnv, SpawnEnv};
 use crate::logging::{log, log_parts};
+use crate::{BootChild, idle_loop};
 use crate::{module_name, walk};
 use init_log_levels::Service;
 use init_protocol::{CapType, InitInfo};
@@ -282,15 +282,16 @@ fn start_process(process_handle: u64, ipc_buf: *mut u64, ok_msg: &str, fail_msg:
     }
 }
 
-/// Serve one bootstrap round from init to the named child. Logs `context`
-/// and returns `false` on failure; [`serve_checked`] keeps the error code.
+/// Serve `child` one bootstrap round ([`crate::serve_child`], which halts
+/// init on the child's death). Logs `context` and returns `false` when the
+/// round fails with the child alive; [`serve_checked`] keeps the error code.
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "`done` is the round's done flag, which the reply encodes for the child"
 )]
 fn serve(
     bootstrap_ep: u64,
-    badge: u64,
+    child: &BootChild,
     ipc_buf: *mut u64,
     done: bool,
     caps: &[u64],
@@ -298,10 +299,10 @@ fn serve(
     context: &str,
 ) -> bool
 {
-    serve_checked(bootstrap_ep, badge, ipc_buf, done, caps, data, context).is_ok()
+    serve_checked(bootstrap_ep, child, ipc_buf, done, caps, data, context).is_ok()
 }
 
-/// [`serve`], returning the `ipc::bootstrap::serve_round` error code
+/// [`serve`], returning the round's error code
 /// (`bootstrap_errors::NO_CHILD` when another child's request was received
 /// and refused, so the named child's request is still pending;
 /// `bootstrap_errors::INVALID` otherwise, including a failed reply that has
@@ -312,7 +313,7 @@ fn serve(
 )]
 fn serve_checked(
     bootstrap_ep: u64,
-    badge: u64,
+    child: &BootChild,
     ipc_buf: *mut u64,
     done: bool,
     caps: &[u64],
@@ -321,7 +322,7 @@ fn serve_checked(
 ) -> Result<(), u64>
 {
     // SAFETY: ipc_buf is caller's registered IPC buffer.
-    unsafe { ipc::bootstrap::serve_round(bootstrap_ep, badge, ipc_buf, done, caps, data) }
+    unsafe { crate::serve_child(bootstrap_ep, child, ipc_buf, done, caps, data) }
         .inspect_err(|_| log(context))
 }
 
@@ -482,7 +483,7 @@ const EXTENTS_PER_ROUND: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 2) / 2;
 /// after logging, when a round fails.
 fn serve_extent_rounds(
     bootstrap_ep: u64,
-    child_badge: u64,
+    child: &BootChild,
     ipc_buf: *mut u64,
     extents: impl IntoIterator<Item = (u64, u64)>,
 ) -> bool
@@ -508,7 +509,7 @@ fn serve_extent_rounds(
         *count_word = n as u64;
         if !serve(
             bootstrap_ep,
-            child_badge,
+            child,
             ipc_buf,
             false,
             &[],
@@ -576,7 +577,7 @@ const _: () = assert!(MODULES_PER_ROUND >= 1);
 fn serve_module_rounds(
     info: &InitInfo,
     bootstrap_ep: u64,
-    child_badge: u64,
+    child: &BootChild,
     ipc_buf: *mut u64,
 ) -> bool
 {
@@ -654,7 +655,7 @@ fn serve_module_rounds(
         }
         if !serve(
             bootstrap_ep,
-            child_badge,
+            child,
             ipc_buf,
             false,
             // `n` is at most `MODULES_PER_ROUND`, so both ranges are in bounds.
@@ -702,7 +703,7 @@ mod present
 /// round fails.
 fn serve_region_rounds(
     bootstrap_ep: u64,
-    child_badge: u64,
+    child: &BootChild,
     ipc_buf: *mut u64,
     round_kind: u64,
     regions: impl IntoIterator<Item = (u64, u64, u64)>,
@@ -744,7 +745,7 @@ fn serve_region_rounds(
         *count_word = n as u64;
         if !serve(
             bootstrap_ep,
-            child_badge,
+            child,
             ipc_buf,
             false,
             // `n` is at most four, so both ranges are in bounds.
@@ -826,6 +827,11 @@ pub fn create_devmgr_with_caps(
         argv_env,
         ipc_buf,
     )?;
+    let child = BootChild {
+        name: b"devmgr",
+        badge: child_badge,
+        thread: thread_cap,
+    };
 
     let hw = collect_hw_caps(info);
 
@@ -918,7 +924,7 @@ pub fn create_devmgr_with_caps(
     }
     if !serve(
         bootstrap_ep,
-        child_badge,
+        &child,
         ipc_buf,
         false,
         // At most three optional caps follow the registry cap, so the count is at most four.
@@ -936,25 +942,25 @@ pub fn create_devmgr_with_caps(
     // ── Aperture and ACPI region rounds ─────────────────────────────────
     if !serve_region_rounds(
         bootstrap_ep,
-        child_badge,
+        &child,
         ipc_buf,
         kind::APERTURE,
         aperture_caps(info),
         "devmgr: bootstrap aperture round failed",
     ) || !serve_region_rounds(
         bootstrap_ep,
-        child_badge,
+        &child,
         ipc_buf,
         kind::ACPI_REGION,
         acpi_region_caps(info),
         "devmgr: bootstrap ACPI region round failed",
-    ) || !serve_extent_rounds(bootstrap_ep, child_badge, ipc_buf, pooled_extents(info))
+    ) || !serve_extent_rounds(bootstrap_ep, &child, ipc_buf, pooled_extents(info))
     {
         return None;
     }
 
     // ── Module rounds (every boot module outside the bootstrap set) ─────
-    if !serve_module_rounds(info, bootstrap_ep, child_badge, ipc_buf)
+    if !serve_module_rounds(info, bootstrap_ep, &child, ipc_buf)
     {
         return None;
     }
@@ -974,7 +980,7 @@ pub fn create_devmgr_with_caps(
         let sf = u64::from(fb.stride) | (u64::from(pf_disc) << 32);
         if !serve(
             bootstrap_ep,
-            child_badge,
+            &child,
             ipc_buf,
             false,
             &[],
@@ -1040,7 +1046,7 @@ pub fn create_devmgr_with_caps(
         // but it WILL exit the round-receive loop.
         let _ = serve(
             bootstrap_ep,
-            child_badge,
+            &child,
             ipc_buf,
             true,
             &[],
@@ -1082,7 +1088,7 @@ pub fn create_devmgr_with_caps(
 
     let _ = serve(
         bootstrap_ep,
-        child_badge,
+        &child,
         ipc_buf,
         true,
         // `bundle_cap_count` is one or two, within the two-element array.
@@ -1160,6 +1166,11 @@ pub fn create_vfsd_with_caps(
         argv_env,
         ipc_buf,
     )?;
+    let child = BootChild {
+        name: b"vfsd",
+        badge: child_badge,
+        thread: thread_cap,
+    };
 
     let Ok(service_copy) = syscall::cap_derive(spawn.vfsd_service_ep, syscall::RIGHTS_ALL)
     else
@@ -1182,7 +1193,7 @@ pub fn create_vfsd_with_caps(
     // (log + procmgr auto-delivered via ProcessInfo.)
     if !serve(
         bootstrap_ep,
-        child_badge,
+        &child,
         ipc_buf,
         false,
         &[service_copy, block_class],
@@ -1217,7 +1228,7 @@ pub fn create_vfsd_with_caps(
 
     let _ = serve(
         bootstrap_ep,
-        child_badge,
+        &child,
         ipc_buf,
         true,
         fatfs_caps,
@@ -1240,7 +1251,9 @@ const SVCMGR_PATH: &[u8] = b"/services/svcmgr";
 /// Create svcmgr from `/services/svcmgr` via `CREATE_FROM_FILE` and install
 /// init's seed system-root cap on the child via `CONFIGURE_NAMESPACE`.
 ///
-/// Returns `(process_handle, child_badge)` on success.
+/// Returns svcmgr's process handle and the [`BootChild`] its endowment is
+/// served to, whose thread cap, from the create reply, init deletes once the
+/// endowment ends.
 #[expect(
     clippy::large_stack_frames,
     reason = "the `msg` and `reply` `IpcMessage`s (568 B each) and the builder's copy; on init's \
@@ -1253,7 +1266,7 @@ pub fn create_svcmgr_from_file(
     system_root_cap: u64,
     spawn_env: &SpawnEnv,
     ipc_buf: *mut u64,
-) -> Option<(u64, u64)>
+) -> Option<(u64, BootChild)>
 {
     // SAFETY: `ipc_buf` is init's main-thread IPC buffer (`INIT_IPC_BUF_VA`,
     // registered in `run`), passed down unchanged.
@@ -1317,20 +1330,23 @@ pub fn create_svcmgr_from_file(
         return None;
     }
 
-    let reply_caps = reply.caps();
-    let Some(&process_handle) = reply_caps.first()
-    else
+    // CREATE_FROM_FILE returns (process_handle, thread_cap). The thread cap
+    // is the endowment's liveness read of svcmgr ([`crate::serve_child`]).
+    let (process_handle, thread_cap) = match *reply.caps()
     {
-        log("phase 3: svcmgr reply missing caps");
-        return None;
+        [process_handle, thread_cap, ..] => (process_handle, thread_cap),
+        [process_handle] =>
+        {
+            log("phase 3: svcmgr reply missing its thread cap");
+            destroy_partial_child(process_handle, ipc_buf);
+            return None;
+        }
+        [] =>
+        {
+            log("phase 3: svcmgr reply missing caps");
+            return None;
+        }
     };
-    // CREATE_FROM_FILE returns (process_handle, thread_cap); this caller
-    // path has no use for the thread cap. Release the slot so it does
-    // not accumulate in init's CSpace.
-    if let Some(&thread_cap) = reply_caps.get(1)
-    {
-        let _ = syscall::cap_delete(thread_cap);
-    }
 
     // svcmgr is the supervisor and holds the universal root: it
     // reads `/config/svcmgr/services/*.svc` at handover,
@@ -1347,10 +1363,18 @@ pub fn create_svcmgr_from_file(
         ipc_buf,
     )
     {
+        let _ = syscall::cap_delete(thread_cap);
         return None;
     }
 
-    Some((process_handle, child_badge))
+    Some((
+        process_handle,
+        BootChild {
+            name: b"svcmgr",
+            badge: child_badge,
+            thread: thread_cap,
+        },
+    ))
 }
 
 /// Source + endpoint caps init endows svcmgr with at handover. svcmgr
@@ -1445,7 +1469,8 @@ fn derive_or_absent(source: u64, rights: u64) -> u64
 /// leaves svcmgr blocked in its round loop with nothing more from init, and
 /// init skips the handover. Any other failure has already woken svcmgr with
 /// an error (it exits) or left its state unknown, so init receives nothing
-/// further.
+/// further. A svcmgr that dies before a round reaches it halts init
+/// ([`crate::serve_child`]).
 ///
 /// Returns whether svcmgr holds its endowment through a delivered terminal
 /// round, so it is serving its service endpoint: only then can it receive
@@ -1453,7 +1478,7 @@ fn derive_or_absent(source: u64, rights: u64) -> u64
 fn endow_svcmgr(
     bootstrap_ep: u64,
     process_handle: u64,
-    child_badge: u64,
+    child: &BootChild,
     endow: &SvcmgrEndowment,
     thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
@@ -1550,7 +1575,7 @@ fn endow_svcmgr(
     {
         if let Err(code) = serve_checked(
             bootstrap_ep,
-            child_badge,
+            child,
             ipc_buf,
             false,
             caps_round.caps(),
@@ -1560,7 +1585,7 @@ fn endow_svcmgr(
         {
             if code == ipc::bootstrap_errors::NO_CHILD
             {
-                end_endowment(bootstrap_ep, child_badge, ipc_buf);
+                end_endowment(bootstrap_ep, child, ipc_buf);
             }
             return false;
         }
@@ -1569,7 +1594,7 @@ fn endow_svcmgr(
     // A substrate round that fails on NO_CHILD leaves svcmgr's request
     // pending: skip the remaining substrates and serve the real terminal
     // round below, so svcmgr keeps its log-sink sources.
-    if let Err(code) = serve_substrate_rounds(bootstrap_ep, child_badge, thread_caps, ipc_buf)
+    if let Err(code) = serve_substrate_rounds(bootstrap_ep, child, thread_caps, ipc_buf)
         && code != ipc::bootstrap_errors::NO_CHILD
     {
         return false;
@@ -1588,7 +1613,7 @@ fn endow_svcmgr(
     });
     serve(
         bootstrap_ep,
-        child_badge,
+        child,
         ipc_buf,
         true,
         logd_round.caps(),
@@ -1599,7 +1624,7 @@ fn endow_svcmgr(
 
 /// Serve svcmgr one `SUBSTRATE` round per init-bootstrapped service whose
 /// thread cap init captured, stopping at the first failure with its
-/// `serve_round` error code. Each round carries the service's thread cap and
+/// round's error code. Each round carries the service's thread cap and
 /// its address-space observer cap ([`Observer`]): for memmgr and procmgr a
 /// `Control`-only derivation of the address space, for devmgr and vfsd the
 /// process handle. An address-space cap that cannot be derived leaves the
@@ -1612,7 +1637,7 @@ fn endow_svcmgr(
 /// service (the `LOGD_SOURCES` round), not a parked substrate.
 fn serve_substrate_rounds(
     bootstrap_ep: u64,
-    child_badge: u64,
+    child: &BootChild,
     thread_caps: ServiceThreadCaps,
     ipc_buf: *mut u64,
 ) -> Result<(), u64>
@@ -1658,7 +1683,7 @@ fn serve_substrate_rounds(
         };
         serve_checked(
             bootstrap_ep,
-            child_badge,
+            child,
             ipc_buf,
             false,
             round.caps(),
@@ -1673,7 +1698,7 @@ fn serve_substrate_rounds(
 /// svcmgr leaves its round loop (`request_round`) rather than block in it.
 /// Called only after a `NO_CHILD` failure, which leaves svcmgr's request
 /// pending, so the receive is answered. A further failure is logged.
-fn end_endowment(bootstrap_ep: u64, child_badge: u64, ipc_buf: *mut u64)
+fn end_endowment(bootstrap_ep: u64, child: &BootChild, ipc_buf: *mut u64)
 {
     let empty = svcmgr_endowment::encode_logd_sources(&svcmgr_endowment::LogdSources {
         master_log_source: 0,
@@ -1681,7 +1706,7 @@ fn end_endowment(bootstrap_ep: u64, child_badge: u64, ipc_buf: *mut u64)
     });
     let _ = serve(
         bootstrap_ep,
-        child_badge,
+        child,
         ipc_buf,
         true,
         empty.caps(),
@@ -1739,7 +1764,7 @@ pub fn phase3_svcmgr_handover(
     };
 
     log("phase 3: loading svcmgr from /services/svcmgr");
-    let Some((svcmgr_handle, svcmgr_badge)) = create_svcmgr_from_file(
+    let Some((svcmgr_handle, svcmgr_child)) = create_svcmgr_from_file(
         info,
         procmgr_ep,
         bootstrap_ep,
@@ -1789,11 +1814,14 @@ pub fn phase3_svcmgr_handover(
     let svcmgr_endowed = endow_svcmgr(
         bootstrap_ep,
         svcmgr_handle,
-        svcmgr_badge,
+        &svcmgr_child,
         &endowment,
         thread_caps,
         ipc_buf,
     );
+    // svcmgr's thread cap served only the endowment's liveness read;
+    // deleting it keeps the slot from accumulating in init's CSpace.
+    let _ = syscall::cap_delete(svcmgr_child.thread);
 
     // Bind procmgr's init-reap death observers on both init threads BEFORE the
     // svcmgr handover. svcmgr launches real-logd in response to

@@ -21,6 +21,9 @@ device's BAR 2 (`ipc::test_fault_labels`):
   and answers the next round with a request devmgr's bootstrap server refuses, so devmgr
   withdraws the device and destroys the process before its bootstrap ends, returning the
   memory.
+- A BAR 2 of `DIE_BAR_BYTES` (16 KiB): once that BAR's round arrives it exits without
+  requesting the next, so devmgr's wait for that request sees the death and abandons the bind,
+  and goes on binding the functions after it.
 
 [svctest](../../svctest/README.md)'s devmgr on-demand bind phase drives it. See
 [devmgr Responsibilities](../../devmgr/docs/responsibilities.md#responsibilities) for the
@@ -35,7 +38,7 @@ test-fault/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Declaration, round-by-round resource list, the three roles
+    └── main.rs            # Declaration, round-by-round resource list, the four roles
 ```
 
 ---

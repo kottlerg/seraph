@@ -25,12 +25,16 @@
 //!
 //! The on-demand bind phase sends `BIND_DRIVERS` on `devmgr.bind` with a cap
 //! on `/tests/drivers/`, which holds the `test-fault` fixture, whose
-//! declaration matches the four `pci-testdev` functions a test launch
+//! declaration matches the five `pci-testdev` functions a test launch
 //! attaches (`cargo xtask run --test-devices`): two the fixture serves, one
-//! on which it never reports ready, and one on which it refuses its
+//! on which it exits before its next bootstrap request, bound between the
+//! two, one on which it never reports ready, and one on which it refuses its
 //! bootstrap. It asserts that the registry serves another class while the
 //! bind's settle runs, that the settle ends no earlier than its bound with
-//! the two serving fixtures at ordinals 0 and 1 and no other, that a served
+//! the two serving fixtures at ordinals 0 and 1 and no other, that devmgr
+//! logged the death of the fixture that exits before its bootstrap request
+//! (read from logd's history through `logd.query`) and went on binding, so
+//! the second serving fixture holds ordinal 1, that a served
 //! fixture's death withdraws it (a call queued on it returns, its ordinal
 //! replies `WITHDRAWN`) while ordinal 1 keeps its fixture, that a fault of a
 //! thread other than the main thread of the fixture at ordinal 1 withdraws
@@ -455,14 +459,15 @@ fn bind_test_drivers(devmgr_bind: u64)
 /// devmgr binds a directory's drivers on demand, in a settle batch of its
 /// own while the registry serves; the settle ends at its bound and destroys
 /// a driver that never reports ready; a driver that fails its bootstrap is
-/// destroyed; a served driver's death withdraws its endpoint (a call queued
-/// on it returns) and leaves a tombstone at its ordinal while the later
-/// ordinal keeps its driver; a fault of a served driver's worker thread
-/// withdraws it the same way; a second bind over the same directory binds
-/// nothing. A `WATCH_CLASS` watch on the class is signalled when the bind
-/// serves the fixtures and when the dead one is withdrawn, and the class
-/// holds at most `MAX_CLASS_WATCHERS` watches, a gone one dropped for a new
-/// one.
+/// destroyed; a driver that dies before a bootstrap request is abandoned and
+/// the bind goes on to the next function; a served driver's death withdraws
+/// its endpoint (a call queued on it returns) and leaves a tombstone at its
+/// ordinal while the later ordinal keeps its driver; a fault of a served
+/// driver's worker thread withdraws it the same way; a second bind over the
+/// same directory binds nothing. A `WATCH_CLASS` watch on the class is
+/// signalled when the bind serves the fixtures and when the dead one is
+/// withdrawn, and the class holds at most `MAX_CLASS_WATCHERS` watches, a gone
+/// one dropped for a new one.
 fn on_demand_bind_phase(caps: &Caps)
 {
     use ipc::devmgr_errors::{NO_DEVICE, SUCCESS, WITHDRAWN};
@@ -532,8 +537,16 @@ fn on_demand_bind_phase(caps: &Caps)
         "devmgr_on_demand_bind: the settle ended after {settle:?}, before its bound {bound:?}, \
          with a fixture that never reports ready"
     );
-    let second = query_class(fault, 1, "test-fault")
-        .unwrap_or_else(|l| panic!("devmgr_on_demand_bind: test-fault ordinal 1 status {l:#x}"));
+    assert_death_in_bootstrap_logged(caps.logd_query);
+    // The function devmgr binds after the one whose fixture exits before its
+    // next bootstrap request: served only when devmgr's wait for that request
+    // saw the death and the bind went on.
+    let second = query_class(fault, 1, "test-fault").unwrap_or_else(|l| {
+        panic!(
+            "devmgr_on_demand_bind: test-fault ordinal 1 status {l:#x}; a bind stopped at the \
+             fixture that died before its bootstrap request leaves it unbound"
+        )
+    });
     assert_eq!(
         query_class(fault, 2, "test-fault"),
         Err(NO_DEVICE),
@@ -581,10 +594,52 @@ fn on_demand_bind_phase(caps: &Caps)
 
     std::os::seraph::log!(
         "devmgr_on_demand_bind passed: settle ended at its bound after {settle:?}, \
-         never-ready and refusing fixtures destroyed, dead driver withdrawn, later ordinal \
+         never-ready and refusing fixtures destroyed, bind abandoned for the fixture that died \
+         before its bootstrap request, dead driver withdrawn, later ordinal \
          kept, driver whose worker thread faulted withdrawn, second bind settled after \
          {rebind:?}, watch signalled on serve and withdrawals"
     );
+}
+
+/// The line devmgr logs when a driver dies before a bootstrap request it
+/// waits for (`serve_list_round` in `services/devmgr/src/spawn.rs`).
+const DIED_IN_BOOTSTRAP: &[u8] = b"driver died during its bootstrap";
+
+/// devmgr logged the death of the fixture that exits before its next
+/// bootstrap request, read from logd's history through `query`
+/// (`logd.query`): the function was bound, and devmgr's wait for that
+/// request saw the death. Polled for at most [`DEVICE_WAIT_MS`], since the
+/// line reaches logd's history after devmgr sends it.
+fn assert_death_in_bootstrap_logged(query: u64)
+{
+    assert!(
+        query != 0,
+        "devmgr_on_demand_bind: no logd.query cap seeded"
+    );
+    let start = Instant::now();
+    let wait = Duration::from_millis(DEVICE_WAIT_MS);
+    loop
+    {
+        let logged = super::procmgr::logd_history_with(query, None, |entry| {
+            entry
+                .bytes
+                .windows(DIED_IN_BOOTSTRAP.len())
+                .any(|w| w == DIED_IN_BOOTSTRAP)
+        })
+        .into_iter()
+        .any(|hit| hit);
+        if logged
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < wait,
+            "devmgr_on_demand_bind: devmgr logged no driver death during its bootstrap within \
+             {wait:?}: the fixture that exits before its next bootstrap request was not bound, or \
+             its death was not seen"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A fault of a thread other than the main thread of the served fixture at

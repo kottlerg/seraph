@@ -532,63 +532,75 @@ pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
     unsafe { crate::ipc_reply(&msg, ipc_buf) }
 }
 
-/// Receive one bootstrap request, verify the sender's badge, and reply
-/// with the given round.
-///
-/// Blocks until a [`REQUEST`] arrives on `bootstrap_ep`. If the badge
-/// embedded in the received cap does not match `expected_badge`, replies with
-/// [`bootstrap_errors::NO_CHILD`] and returns `Err`. If the label is not
-/// [`REQUEST`], replies with [`bootstrap_errors::INVALID`] and returns `Err`.
-/// Otherwise, replies with the round (caps + data + done flag). A child that
-/// dies before its request leaves this wait without end; a creator that must
-/// go on then serves with [`serve_round_watched`].
-///
-/// # Safety
-/// `ipc_buf` must point to the caller thread's registered IPC buffer page.
-///
-/// # Errors
-/// * `Err(bootstrap_errors::NO_CHILD)` — unexpected badge.
-/// * `Err(bootstrap_errors::INVALID)` — protocol error.
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`done` is the round's terminal flag, sent in the reply label"
-)]
-pub unsafe fn serve_round(
-    bootstrap_ep: u64,
-    expected_badge: u64,
-    ipc_buf: *mut u64,
-    done: bool,
-    caps: &[u64],
-    data: &[u64],
-) -> Result<(), u64>
+/// The interval, in milliseconds, at which a creator's watched wait for a
+/// child's bootstrap request ([`serve_round_watched`]) reads whether the
+/// child has died. A tuning value that bounds no capacity: a request wakes the
+/// wait at once, so the interval is only how late a child that died before its
+/// request is seen, at one liveness read per expiry while a live child is slow
+/// to ask. Every creator that serves through [`serve_round_watched`] waits at
+/// this interval.
+pub const WATCH_POLL_MS: u64 = 50;
+
+/// The exit reason of a thread whose `cap_info(CAP_INFO_THREAD_STATE)` read,
+/// `state`, shows it dead, else `None`. An exited thread gives the reason the
+/// kernel recorded, the low half of the packed state. A cap that no longer
+/// resolves gives `EXIT_KILLED`, since procmgr's teardown of a process revokes
+/// the caps on its threads. A thread that runs or has not started shows
+/// nothing.
+#[must_use]
+pub fn thread_death(state: Result<u64, i64>) -> Option<u64>
 {
-    // SAFETY: caller guarantees `ipc_buf` is the registered IPC buffer.
-    let request =
-        unsafe { crate::ipc_recv(bootstrap_ep, ipc_buf) }.map_err(|_| bootstrap_errors::INVALID)?;
-    // SAFETY: same invariant.
-    unsafe { answer_request(&request, expected_badge, ipc_buf, done, caps, data) }
+    match state
+    {
+        Ok(packed) if packed >> 32 == u64::from(syscall_abi::THREAD_STATE_EXITED) =>
+        {
+            Some(packed & 0xFFFF_FFFF)
+        }
+        Ok(_) => None,
+        Err(_) => Some(syscall_abi::EXIT_KILLED),
+    }
+}
+
+/// [`thread_death`] of the thread `thread_cap` names, read with `cap_info`:
+/// the liveness check a creator gives [`serve_round_watched`] for a child
+/// whose main-thread cap it holds.
+#[must_use]
+pub fn thread_cap_death(thread_cap: u64) -> Option<u64>
+{
+    thread_death(syscall::cap_info(
+        thread_cap,
+        syscall_abi::CAP_INFO_THREAD_STATE,
+    ))
 }
 
 /// Why [`serve_round_watched`] ended without its round delivered.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ServeFailure
 {
-    /// The round failed as [`serve_round`] fails, the child still alive: the
-    /// [`bootstrap_errors`] code.
+    /// The round failed, the child still alive: the [`bootstrap_errors`]
+    /// code, `NO_CHILD` when the request received was another child's, which
+    /// was refused, so the named child's request is still pending, and
+    /// `INVALID` otherwise, a failed reply that has already woken the child
+    /// with an error included.
     Refused(u64),
     /// The child died before the round reached it: its exit reason, as the
     /// caller's liveness check read it.
     ChildDied(u64),
 }
 
-/// [`serve_round`] for a child that can die before its request: the wait for
-/// the request is a receive bounded at `poll_ms` milliseconds, and after each
-/// one that expires `child_death` is read, which gives the child's exit
-/// reason once it has died and `None` while it lives. A dead child ends the
-/// wait. A round that fails is read against `child_death` as well, so a child
-/// that died after its request, before the reply reached it, is a death and
-/// not a refusal. A live child that sends no request is waited for without
-/// end, `poll_ms` at a time.
+/// Receive one bootstrap request on `bootstrap_ep` and answer it with the
+/// round (caps, data and the `done` flag) when its badge is `expected_badge`
+/// and its label [`REQUEST`]. A request with another badge is answered
+/// [`bootstrap_errors::NO_CHILD`], and one with another label
+/// [`bootstrap_errors::INVALID`]; either fails the round.
+///
+/// The child can die before its request, so the wait for the request is a
+/// receive bounded at `poll_ms` milliseconds, and after each one that expires
+/// `child_death` is read, which gives the child's exit reason once it has died
+/// and `None` while it lives. A dead child ends the wait. A round that fails is
+/// read against `child_death` as well, so a child that died after its request,
+/// before the reply reached it, is a death and not a refusal. A live child that
+/// sends no request is waited for without end, `poll_ms` at a time.
 ///
 /// `poll_ms` is taken between 1 and one below `syscall::WAIT_TRY_ONCE`, so
 /// the receive neither waits without bound (`0`) nor spins (`WAIT_TRY_ONCE`).
@@ -599,15 +611,15 @@ pub enum ServeFailure
 /// # Errors
 /// * `Err(ServeFailure::ChildDied(reason))` — the child died before the round
 ///   reached it.
-/// * `Err(ServeFailure::Refused(code))` — the round failed as
-///   [`serve_round`]'s does, with its code, and the child lives.
+/// * `Err(ServeFailure::Refused(code))` — the round failed, with its
+///   [`bootstrap_errors`] code, and the child lives.
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "`done` is the round's terminal flag, sent in the reply label"
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "serve_round's six, and the poll interval and the liveness check the watch adds"
+    reason = "the round's six, and the poll interval and the liveness check the watch adds"
 )]
 pub unsafe fn serve_round_watched(
     bootstrap_ep: u64,
@@ -905,6 +917,36 @@ mod tests
         );
         let got = await_request(script(&[Err(INTERRUPTED)]), &mut || Some(0x2000));
         assert_eq!(got.map(|m| m.label), Err(ServeFailure::ChildDied(0x2000)));
+    }
+
+    #[test]
+    fn an_exited_thread_gives_its_recorded_reason()
+    {
+        let exited = (u64::from(syscall_abi::THREAD_STATE_EXITED) << 32) | 0x1003;
+        assert_eq!(thread_death(Ok(exited)), Some(0x1003));
+    }
+
+    // A child torn down by procmgr leaves its creator a revoked cap, not an
+    // exited thread: that too is its death.
+    #[test]
+    fn a_cap_that_no_longer_resolves_is_a_kill()
+    {
+        assert_eq!(
+            thread_death(Err(SyscallError::InvalidCapability as i64)),
+            Some(syscall_abi::EXIT_KILLED)
+        );
+    }
+
+    #[test]
+    fn a_running_or_unstarted_thread_shows_no_death()
+    {
+        for state in [
+            syscall_abi::THREAD_STATE_ALIVE,
+            syscall_abi::THREAD_STATE_CREATED,
+        ]
+        {
+            assert_eq!(thread_death(Ok(u64::from(state) << 32)), None);
+        }
     }
 
     #[test]

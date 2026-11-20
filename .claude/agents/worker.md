@@ -340,8 +340,10 @@ Orchestrated:
   conditions of docs/conventions.md § Syncing with `master` hold too: one merge base, GitHub's
   `MERGEABLE`, and a green CI run at `master`'s tip. The gate names the condition that fails.
   A gate refused for several merge bases or a conflict needs a sync, so report it to the
-  orchestrator, which says `master quiet`. A gate refused only because the CI run at
-  `master`'s tip has not finished needs only a wait (§ Gate).
+  orchestrator, which says `master quiet`. A gate refused because the CI run at `master`'s tip
+  is red or was cancelled is reported to the orchestrator too, which puts the fix of a red
+  `master` first. One refused only because that run has not finished needs only a wait
+  (§ Gate).
 
 Standalone, there is no grant: the commands' launch rules are the whole protocol, and you sync
 yourself before the validation runs.
@@ -404,11 +406,13 @@ You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the
 `master`), and a run record for the head has `AUDIT PASS`, no failed agent, and a verdict of
 `READY TO MERGE` (docs/conventions.md § Pre-merge review). When the gate fails only because the
 CI run at `master`'s tip has not finished, or the orchestrator sends `master pending <run id>`,
-await that run inside one script (`gh run watch <run id> --exit-status`) and run the gate again.
-Hand back the gate report with the merge command `gh pr merge <N> --merge --delete-branch`. The
-merge is the orchestrator's, on a gate it has verified; standalone, it is made on the
-maintainer's instruction. The release PR, which the command names with `gate-release-approval`,
-also needs the maintainer's approval of its merge; say so in the gate report.
+await that run inside one script (`gh run watch <run id>`, which ends whatever the run
+concludes), run the gate again, and hand back the gate report with its result line, passing or
+failing: a red or cancelled run is the orchestrator's to act on. A passing gate report carries
+the merge command `gh pr merge <N> --merge --delete-branch`. The merge is the orchestrator's,
+on a gate it has verified; standalone, it is made on the maintainer's instruction. The release
+PR, which the command names with `gate-release-approval`, also needs the maintainer's approval
+of its merge; say so in the gate report.
 
 ## Composition check
 

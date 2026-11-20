@@ -309,7 +309,8 @@ pub struct Ledger<S, W>
     /// or cancelled, starts there.
     evictions: u64,
     /// The first [`Node::ZeroFrame`] slot, the others chained through the
-    /// slot `next` link; kept for memmgr's life.
+    /// slot `next` link; each kept for memmgr's life unless the request that
+    /// took it is refused ([`Self::remove_zero_frame`]).
     zero_frames: NodeIdx,
 }
 
@@ -1805,7 +1806,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Record the zeroed page `cap_slot` at `phys_base` as a new zero frame
-    /// backing no attachment yet, kept for memmgr's life.
+    /// backing no attachment yet, kept for memmgr's life unless the request that
+    /// took it is refused ([`Self::remove_zero_frame`]).
     ///
     /// # Errors
     /// [`RegionError::NoSlot`] when the arena has no free slot outside its

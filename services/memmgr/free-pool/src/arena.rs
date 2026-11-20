@@ -210,9 +210,10 @@ pub const OBJECT_MAX_ATTACHMENTS: u32 = 1 << 31;
 
 /// A zero frame (`services/memmgr/docs/memory-pool.md` § Memory objects,
 /// Mapping bound): one zeroed page that every untouched page of the
-/// zero-object attachments it backs maps read-only, kept for memmgr's life and
-/// charged to no budget node. memmgr takes one whenever no zero frame's span
-/// takes a new attachment's pages.
+/// zero-object attachments it backs maps read-only, charged to no budget node.
+/// memmgr takes one whenever no zero frame's span takes a new attachment's
+/// pages, and keeps it for its life unless the request that took it is
+/// refused, when it gives the page back (`Ledger::remove_zero_frame`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZeroFrame
 {

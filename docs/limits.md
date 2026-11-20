@@ -298,8 +298,10 @@ Every entry in this section is correct as is.
 | `MAX_SPINS_PER_UNIT` | `core/kernel/src/bounded_wait.rs` | 10 000 spins per us | provable unreachability (a 10 GHz clock), so the fallback never times out early | none | correct as is | None |
 | `start_ap` delays | `core/kernel/src/arch/x86_64/interrupts.rs` | 10 ms, 200 us | hardware spec (Intel SDM INIT-SIPI-SIPI) | none | correct as is | None |
 | `delay_us` pre-calibration spin | `core/kernel/src/arch/x86_64/timer.rs` | `us * 200` iterations | tuning (early boot only) | none | correct as is | None |
-| `PIT_CALIBRATION_MS` | `core/kernel/src/arch/x86_64/timer.rs` | 10 ms | hardware spec (PIT) | none | correct as is | None |
-| `PIT_POLL_BUDGET_TSC_TICKS` | `core/kernel/src/arch/x86_64/timer.rs` | 2^32 TSC ticks (0.43 s at 10 GHz), then fatal | tuning (bounds no capacity) | none | correct as is | None |
+| `PIT_CALIBRATION_MS` (`PIT_WINDOW_COUNTS`) | `core/kernel/src/arch/x86_64/timer.rs` | 10 ms, 11 931 PIT counts | hardware spec (PIT 16-bit counter) | none | correct as is | None |
+| `PIT_POLL_BUDGET_TSC_TICKS` | `core/kernel/src/arch/x86_64/timer.rs` | 2^32 TSC ticks (0.43 s at 10 GHz), then the 8254 counts as not working | tuning (bounds no capacity) | none | correct as is | None |
+| `APIC_CALIBRATION_MS` | `core/kernel/src/arch/x86_64/timer.rs` | 10 ms of TSC time | tuning (sampling window; bounds no capacity) | none | correct as is | None |
+| `TSC_RATE_MIN_HZ`, `TSC_RATE_MAX_HZ` | `core/kernel/src/arch/x86_64/timer_rate.rs` | 100 MHz ..= 10 GHz, a rate outside refused from every source | hardware (the nominal TSC rates of CPUs at the platform floor; the poll budget's fastest rate) | none | correct as is | None |
 | `rdseed_u64`, `rdrand_u64` retry | `core/kernel/src/arch/x86_64/entropy.rs` | 32 | tolerance (above the Intel DRNG RDRAND guidance of 10; RDSEED has no fixed count) | none | correct as is | None |
 | riscv64 `SEED_WORD_BUDGET_US` | `core/kernel/src/arch/riscv64/entropy.rs` | 10 ms per 64-bit `seed` word, then the draw gives up | tuning (time-based; the source's sample rate is the platform's) | none | correct as is | None |
 | `enable_tagged_tlb` | `core/kernel/src/arch/x86_64/paging.rs` | 4096 | hardware spec (12-bit PCID) | none | correct as is | None |

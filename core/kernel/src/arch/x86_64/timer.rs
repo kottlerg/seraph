@@ -14,21 +14,29 @@
 //! requires x2APIC — the LVT mode bits exist in both xAPIC and x2APIC
 //! register layouts, and the shared `apic_write` accessor abstracts them.
 //!
-//! # Calibration
-//! The APIC timer frequency is CPU-specific and unknown at compile time.
-//! We calibrate it against the 8254 PIT (Programmable Interval Timer) by:
+//! # Rates
+//! The TSC rate (`TSC_PER_US`), which `elapsed_us()` and TSC-deadline
+//! arming consume, is taken once on the BSP from the first of three sources
+//! that gives a plausible rate: CPUID leaf 0x15's crystal frequency and ratio,
+//! one 8254 PIT channel-2 window, or CPUID leaf 0x16's base frequency
+//! (approximate). [`super::timer_rate`] holds the order and the arithmetic;
+//! this file holds the probes. The source taken is logged; where no source
+//! gives a rate, the boot halts.
 //!
-//! 1. Programming PIT channel 2 for a ~10 ms one-shot countdown.
-//! 2. Starting the APIC timer with initial count `0xFFFF_FFFF`, divide-by-16.
-//! 3. Spinning until the PIT expires.
-//! 4. Reading the remaining APIC count to derive ticks per 10 ms.
+//! The 8254 window is measured only where leaf 0x15 gives no crystal
+//! frequency. It programs channel 2 for ~10 ms and spins until the output on
+//! port 0x61 (bit 5) rises, counting TSC ticks from the gate-enable; it clears
+//! the channel-2 gate before programming the count (firmware may leave it
+//! set), so the PIT window starts at the gate-enable together with the TSC
+//! window. A window that never ends within its poll budget, or gives an
+//! implausible rate (an undecoded port 0x61 reads all ones and ends it at
+//! once), counts as no working 8254.
 //!
-//! The PIT output is readable on port 0x61 (bit 5: channel 2 output). The
-//! same window also calibrates the TSC (`TSC_PER_US`), which both
-//! `elapsed_us()` and TSC-deadline arming consume — so the PIT is used
-//! exactly once, at boot, in either mode. Calibration clears the channel-2
-//! gate before programming the count (firmware may leave it set), so the PIT
-//! window starts at the gate-enable, together with the APIC and TSC windows.
+//! The local-APIC timer's rate, which only the periodic tick uses, is measured
+//! against the TSC once the TSC rate is known, whatever its source: the timer
+//! runs at divide-by-16 from `0xFFFF_FFFF` over a 10 ms TSC window. Which clock
+//! feeds the APIC timer differs by platform and is not enumerable, so it is
+//! never taken from the crystal.
 //!
 //! # Timer ISR
 //! The ISR re-arms the deadline (TSC-deadline mode only; periodic mode
@@ -78,6 +86,8 @@ use super::cpu;
 use super::interrupts;
 #[cfg(not(test))]
 use super::interrupts::{apic_read, apic_write};
+#[cfg(not(test))]
+use super::timer_rate::{self, Leaf15, NoSource, PitFault, PitWindow, Source, TscRate};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -110,8 +120,21 @@ const PIT_CMD: u16 = 0x43;
 const PIT_CH2: u16 = 0x42;
 const PIT_GATE: u16 = 0x61;
 
-// PIT oscillator frequency (Hz).
-const PIT_HZ: u64 = 1_193_182;
+/// PIT window length: ~10 ms. A sampling window, not a capacity; it keeps
+/// [`PIT_WINDOW_COUNTS`] inside the PIT's 16-bit counter (about 54.9 ms at
+/// [`timer_rate::PIT_HZ`]).
+#[cfg(not(test))]
+const PIT_CALIBRATION_MS: u64 = 10;
+
+/// PIT counts in one window of [`PIT_CALIBRATION_MS`].
+#[cfg(not(test))]
+const PIT_WINDOW_COUNTS: u16 = (timer_rate::PIT_HZ * PIT_CALIBRATION_MS / 1000) as u16;
+
+/// Local-APIC timer measurement window, in milliseconds of TSC time. A
+/// sampling window, not a capacity: at divide-by-16 the timer's 32-bit count
+/// lasts far longer at any APIC timer clock.
+#[cfg(not(test))]
+const APIC_CALIBRATION_MS: u64 = 10;
 
 /// Budget, in TSC ticks, for the calibration poll to see PIT channel 2 expire. 2^32 ticks is
 /// 0.43 s at a 10 GHz TSC, over 40 times the 10 ms window, and longer at any slower rate; the
@@ -137,20 +160,21 @@ static INTERRUPT_RATE: AtomicU64 = AtomicU64::new(0);
 static TSC_DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Tick period in TSC ticks (TSC-deadline mode). Computed on the BSP from
-/// the PIT-calibrated `TSC_PER_US` and reused on every core, relying on the
-/// invariant TSC required by
+/// `TSC_PER_US` and reused on every core, relying on the invariant TSC
+/// required by
 /// [platform-requirements.md](../../../../../docs/platform-requirements.md)
 /// § x86-64 Classification.
 static PERIOD_TSC_TICKS: AtomicU64 = AtomicU64::new(0);
 
 // ── High-resolution time state ────────────────────────────────────────────────
 
-/// TSC value recorded at the end of APIC timer calibration ("boot time = 0").
+/// TSC value recorded once the TSC rate is known ("boot time = 0").
 /// Zero means not yet calibrated.
 static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 
-/// TSC ticks per microsecond, measured over the 10 ms PIT calibration window.
-/// Zero means not yet calibrated.
+/// TSC ticks per microsecond, from the rate source [`init`] takes (whole
+/// ticks; the plausible floor keeps it at 100 or more). Zero means not yet
+/// calibrated.
 static TSC_PER_US: AtomicU64 = AtomicU64::new(0);
 
 // ── TSC helper ───────────────────────────────────────────────────────────────
@@ -240,32 +264,28 @@ unsafe fn inb(port: u16) -> u8
 
 // ── Calibration ───────────────────────────────────────────────────────────────
 
-/// Calibrate the APIC timer using the 8254 PIT as the reference.
+/// Measure one 8254 PIT channel-2 window against the TSC.
 ///
-/// Programs PIT channel 2 for `pit_counts` counts (`PIT_CALIBRATION_MS`,
-/// ~10 ms), starts the APIC timer at full count with divide-by-16, spins
-/// until the PIT expires, and records `TSC_PER_US` and `BOOT_TSC` from the
-/// same window. The channel-2 gate is cleared before the count is programmed,
-/// so the PIT counts only from the gate-enable that opens the APIC and TSC
-/// windows, whatever state firmware left the gate in.
+/// Programs PIT channel 2 for [`PIT_WINDOW_COUNTS`] counts (~10 ms) and spins
+/// until the channel-2 output rises, bounded by [`PIT_POLL_BUDGET_TSC_TICKS`].
+/// The channel-2 gate is cleared before the count is programmed, so the PIT
+/// counts only from the gate-enable that opens the TSC window, whatever state
+/// firmware left the gate in.
 ///
-/// Returns APIC timer ticks per second at divide-by-16 (the 10 ms sample
-/// scaled by 100).
+/// Returns the TSC ticks the window took, or [`PitWindow::NeverExpired`] when
+/// the output never rose; [`timer_rate::pit_rate`] judges the result.
+///
+/// # Safety
+/// Ring 0, from a single-threaded context: the window owns the 8254's
+/// channel 2 and the port-0x61 gate.
 #[cfg(not(test))]
-unsafe fn calibrate_apic_timer() -> u64
+unsafe fn measure_pit_window() -> PitWindow
 {
-    // PIT calibration interval: ~10 ms. A sampling window, not a capacity; it
-    // keeps `pit_counts` inside the PIT's 16-bit counter (about 54.9 ms at `PIT_HZ`).
-    const PIT_CALIBRATION_MS: u64 = 10;
-    // PIT counts for 10 ms.
-    let pit_counts = (PIT_HZ * PIT_CALIBRATION_MS / 1000) as u16;
-
     // Clear bit 1 of port 0x61 (speaker data enable) and bit 0 (channel 2
     // gate). Mode 0 counts only while the gate is high, so with the gate low
-    // the count written below waits for the gate-enable after the APIC timer
-    // start and `tsc_start`; a gate firmware left set would start the PIT
-    // window at the count write instead, and both calibrated rates would read
-    // low by that skew.
+    // the count written below waits for the gate-enable after `tsc_start`; a
+    // gate firmware left set would start the PIT window at the count write
+    // instead, and the measured rate would read low by that skew.
     // SAFETY: port I/O at ring 0.
     let gate = unsafe { inb(PIT_GATE) };
     // SAFETY: port I/O at ring 0; the write keeps port 0x61's other bits as read.
@@ -280,18 +300,8 @@ unsafe fn calibrate_apic_timer() -> u64
     // SAFETY: PIT ports (0x42, 0x43) are standard legacy hardware; ring 0 I/O access.
     unsafe {
         outb(PIT_CMD, 0b1011_0000);
-        outb(PIT_CH2, (pit_counts & 0xFF) as u8);
-        outb(PIT_CH2, (pit_counts >> 8) as u8);
-    }
-
-    // Set APIC timer divide-by-16 and start with max initial count.
-    // SAFETY: APIC MMIO registers are valid; single-threaded calibration context.
-    unsafe {
-        apic_write(APIC_TIMER_DIVIDE, DIVIDE_BY_16);
-    }
-    // SAFETY: as for the divide register; the initial count starts the timer.
-    unsafe {
-        apic_write(APIC_TIMER_INITIAL, 0xFFFF_FFFF);
+        outb(PIT_CH2, (PIT_WINDOW_COUNTS & 0xFF) as u8);
+        outb(PIT_CH2, (PIT_WINDOW_COUNTS >> 8) as u8);
     }
 
     // Set PIT channel 2 gate (bit 0 of port 0x61, cleared above). Setting it
@@ -305,8 +315,8 @@ unsafe fn calibrate_apic_timer() -> u64
 
     // Spin until PIT output (bit 5 of port 0x61) goes high, bounded in TSC ticks: the TSC is
     // not yet calibrated, but it always reads, and `PIT_POLL_BUDGET_TSC_TICKS` covers the
-    // window at any plausible TSC rate. A platform without a working 8254 never raises the
-    // output, so the boot halts naming the PIT rather than hanging silently.
+    // window at any plausible TSC rate. An 8254 whose clock is gated off never raises the
+    // output, so the window ends as never expired rather than hanging.
     let expired = crate::bounded_wait::spin_until(
         || {
             // SAFETY: port 0x61 read is safe at ring 0; polling PIT status.
@@ -318,29 +328,143 @@ unsafe fn calibrate_apic_timer() -> u64
     );
     if !expired
     {
-        crate::fatal("timer: PIT channel 2 never expired (no working 8254 PIT; required)");
+        return PitWindow::NeverExpired;
     }
     let tsc_end = read_tsc();
+    PitWindow::Expired {
+        tsc_ticks: tsc_end.saturating_sub(tsc_start),
+    }
+}
 
-    // Store TSC calibration data: ticks per µs and the "zero" reference.
-    // This is used by elapsed_us() for high-resolution timestamps that do not
-    // depend on the APIC timer interrupt having fired.
-    let tsc_per_10ms = tsc_end.saturating_sub(tsc_start);
-    TSC_PER_US.store((tsc_per_10ms / 10_000).max(1), Ordering::Relaxed);
-    BOOT_TSC.store(tsc_end, Ordering::Relaxed);
+/// Measure the local-APIC timer's rate against the TSC, running at `tsc_hz`.
+///
+/// Starts the timer at divide-by-16 from `0xFFFF_FFFF`, spins for
+/// [`APIC_CALIBRATION_MS`] of TSC time, and scales the count it ran down.
+/// Halts the boot when the timer did not count.
+///
+/// Returns APIC timer ticks per second at divide-by-16.
+///
+/// # Safety
+/// Ring 0, from a single-threaded context, with this CPU's local APIC enabled
+/// and its timer not in use.
+#[cfg(not(test))]
+unsafe fn measure_apic_timer(tsc_hz: u64) -> u64
+{
+    let window = tsc_hz.saturating_mul(APIC_CALIBRATION_MS) / 1000;
 
-    // Stop the APIC timer.
+    // SAFETY: APIC registers are valid; single-threaded init context.
+    unsafe {
+        apic_write(APIC_TIMER_DIVIDE, DIVIDE_BY_16);
+    }
+    // SAFETY: as for the divide register; the initial count starts the timer.
+    unsafe {
+        apic_write(APIC_TIMER_INITIAL, 0xFFFF_FFFF);
+    }
+    let tsc_start = read_tsc();
+    // The invariant TSC always advances, so the spin ends.
+    while read_tsc().wrapping_sub(tsc_start) < window
+    {
+        core::hint::spin_loop();
+    }
+    let tsc_end = read_tsc();
     let remaining = apic_read(APIC_TIMER_CURRENT);
-    // SAFETY: APIC MMIO register write to stop the timer; single-threaded calibration context.
+    // SAFETY: APIC register write to stop the timer; single-threaded init context.
     unsafe {
         apic_write(APIC_TIMER_INITIAL, 0);
     }
 
     // The count ran down from 0xFFFF_FFFF, so the ticks elapsed are its complement.
     let elapsed = u64::from(!remaining);
-    // Scale to ticks/second: elapsed ticks in PIT_CALIBRATION_MS ms. Below 2^42, so the
-    // product does not saturate.
-    elapsed.saturating_mul(1000) / PIT_CALIBRATION_MS
+    timer_rate::apic_ticks_per_sec(elapsed, tsc_end.wrapping_sub(tsc_start), tsc_hz)
+        .unwrap_or_else(|| crate::fatal("timer: local APIC timer did not count against the TSC"))
+}
+
+/// CPUID leaf 0x15, and leaf 0x16 EAX[15:0] (the base frequency in MHz), each
+/// where the CPU's maximum basic leaf reaches it: a leaf above the maximum
+/// returns another leaf's data on Intel.
+#[cfg(not(test))]
+fn probe_frequency_leaves() -> (Option<Leaf15>, Option<u32>)
+{
+    let max_leaf = cpu::cpuid(0).0;
+    let leaf15 = (max_leaf >= 0x15).then(|| {
+        let (eax, ebx, ecx, _) = cpu::cpuid(0x15);
+        Leaf15 {
+            denominator: eax,
+            numerator: ebx,
+            crystal_hz: ecx,
+        }
+    });
+    let base_mhz = (max_leaf >= 0x16).then(|| cpu::cpuid(0x16).0 & 0xFFFF);
+    (leaf15, base_mhz)
+}
+
+/// Leaf 0x15 as probed, for the boot log.
+#[cfg(not(test))]
+struct Leaf15Note(Option<Leaf15>);
+
+#[cfg(not(test))]
+impl core::fmt::Display for Leaf15Note
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self.0
+        {
+            None => write!(f, "CPUID leaf 0x15 absent"),
+            Some(leaf) => write!(
+                f,
+                "CPUID leaf 0x15 crystal {} Hz, ratio {}/{}",
+                leaf.crystal_hz, leaf.numerator, leaf.denominator
+            ),
+        }
+    }
+}
+
+/// Why the 8254 gave no rate, for the boot log.
+#[cfg(not(test))]
+struct PitNote(PitFault);
+
+#[cfg(not(test))]
+impl core::fmt::Display for PitNote
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match self.0
+        {
+            PitFault::NeverExpired => write!(f, "8254 channel 2 never expired"),
+            PitFault::Implausible { hz } => write!(
+                f,
+                "8254 window gave {hz} Hz, outside {}..={} Hz",
+                timer_rate::TSC_RATE_MIN_HZ,
+                timer_rate::TSC_RATE_MAX_HZ
+            ),
+        }
+    }
+}
+
+/// Log the TSC rate and the source it was taken from.
+#[cfg(not(test))]
+fn log_tsc_rate(rate: TscRate, leaf15: Option<Leaf15>)
+{
+    let hz = rate.hz;
+    match rate.source
+    {
+        Source::Crystal(_) =>
+        {
+            crate::kprintln!("timer: TSC {hz} Hz from {}", Leaf15Note(leaf15));
+        }
+        Source::Pit =>
+        {
+            crate::kprintln!("timer: TSC {hz} Hz from the 8254 ({})", Leaf15Note(leaf15));
+        }
+        Source::BaseFrequency { base_mhz, pit } =>
+        {
+            crate::kprintln!(
+                "timer: TSC {hz} Hz from CPUID leaf 0x16 base {base_mhz} MHz, approximate ({}; {})",
+                Leaf15Note(leaf15),
+                PitNote(pit)
+            );
+        }
+    }
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────
@@ -348,10 +472,11 @@ unsafe fn calibrate_apic_timer() -> u64
 /// Initialise the preemption timer at `period_us` microseconds and
 /// **enable interrupts** (`sti`).
 ///
-/// Calibrates the TSC and the APIC timer against the PIT (one calibration
-/// window serves both), then arms the tick: TSC-deadline mode when CPUID
-/// advertises it, periodic APIC timer otherwise. The decision is stored
-/// for [`init_ap`] to mirror.
+/// Takes the TSC rate from the first source that gives one (module
+/// documentation, § Rates), then arms the tick: TSC-deadline mode when CPUID
+/// advertises it, periodic APIC timer otherwise, at the rate measured against
+/// the TSC. The decision is stored for [`init_ap`] to mirror. Halts the boot
+/// when no source gives a TSC rate.
 ///
 /// Must be called after `interrupts::init()`.
 ///
@@ -360,11 +485,35 @@ unsafe fn calibrate_apic_timer() -> u64
 #[cfg(not(test))]
 pub unsafe fn init(period_us: u64)
 {
-    // Calibrate: measure APIC ticks per second (and TSC_PER_US/BOOT_TSC,
-    // which elapsed_us() and the deadline path consume).
-    // SAFETY: ring 0, single-threaded; PIT and APIC hardware are accessible.
-    let tps = unsafe { calibrate_apic_timer() };
-    APIC_TICKS_PER_SEC.store(tps, Ordering::Relaxed);
+    // The TSC rate, which elapsed_us() and the deadline path consume.
+    let (leaf15, base_mhz) = probe_frequency_leaves();
+    let rate = timer_rate::select(leaf15, base_mhz, PIT_WINDOW_COUNTS, || {
+        // SAFETY: ring 0, single-threaded; the 8254 ports are legacy I/O ports.
+        unsafe { measure_pit_window() }
+    });
+    let tsc_hz = match rate
+    {
+        Ok(rate) =>
+        {
+            log_tsc_rate(rate, leaf15);
+            rate.hz
+        }
+        Err(NoSource { pit }) =>
+        {
+            crate::kprintln!(
+                "timer: no TSC rate: {}; {}; CPUID leaf 0x16 base {:?} MHz",
+                Leaf15Note(leaf15),
+                PitNote(pit),
+                base_mhz
+            );
+            crate::fatal(
+                "timer: no TSC rate source (CPUID leaf 0x15 crystal, 8254 PIT, CPUID leaf 0x16 \
+                 base frequency)",
+            );
+        }
+    };
+    BOOT_TSC.store(read_tsc(), Ordering::Relaxed);
+    TSC_PER_US.store(tsc_hz / 1_000_000, Ordering::Relaxed);
     // A zero period is taken as one microsecond.
     INTERRUPT_RATE.store(
         1_000_000u64.checked_div(period_us).unwrap_or(1_000_000),
@@ -397,6 +546,10 @@ pub unsafe fn init(period_us: u64)
     }
     else
     {
+        // SAFETY: ring 0, single-threaded init context; the local APIC is enabled.
+        let tps = unsafe { measure_apic_timer(tsc_hz) };
+        APIC_TICKS_PER_SEC.store(tps, Ordering::Relaxed);
+
         // Compute initial count for the requested period.
         // Formula: initial_count = tps * period_us / 1_000_000. `tps` was
         // measured with DIVIDE_BY_16 already applied, so no further division
@@ -415,7 +568,9 @@ pub unsafe fn init(period_us: u64)
             apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
             apic_write(APIC_TIMER_INITIAL, initial_count as u32);
         }
-        crate::kprintln!("timer: mode = periodic APIC (TSC-deadline unavailable)");
+        crate::kprintln!(
+            "timer: mode = periodic APIC (TSC-deadline unavailable), APIC timer {tps} Hz"
+        );
     }
 
     // Enable interrupts — the timer will now fire.
@@ -600,7 +755,8 @@ pub fn ticks_per_second() -> u64
 /// timer has not yet been calibrated (pre-Phase 5).
 ///
 /// Uses `rdtsc` directly — no interrupt dependency, sub-microsecond source.
-/// The TSC frequency is measured against the PIT during `init()`.
+/// The TSC rate is the one `init()` takes from its first source that gives one
+/// (module documentation, § Rates).
 #[cfg(not(test))]
 pub fn elapsed_us() -> Option<u64>
 {

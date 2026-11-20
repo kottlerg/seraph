@@ -57,7 +57,8 @@ pub use ledger::{
 };
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 pub use pressure::{
-    PRESSURE_BAND_DIVISOR, PRESSURE_LOW_DIVISOR, PressureLevel, band, pressure_level,
+    PRESSURE_BAND_DIVISOR, PRESSURE_LOW_DIVISOR, PressureBits, PressureLevel, PressureSignal, band,
+    pressure_level,
 };
 
 use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_WRITABLE, PAGE_SIZE};

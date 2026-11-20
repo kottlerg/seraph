@@ -1708,6 +1708,11 @@ const PRESSURE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// runtime's [`std::os::seraph::MEMORY_PRESSURE_BIT`].
 const PRESSURE_OWN_BIT: u64 = 1 << 5;
 
+/// How long [`pressure_phase`] waits on the runtime's Notification for a
+/// change of level that a draw-room bit alone must not end. A test wait
+/// bound: memmgr sends nothing at a steady level.
+const DRAW_ROOM_ONLY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// How many times [`pressure_phase`] stops and starts the thread waiting in
 /// [`std::os::seraph::wait_memory_pressure`], and the sleep before each stop,
 /// which lets the thread reach its wait first.
@@ -1732,11 +1737,13 @@ pub(crate) fn pool_pressure_status() -> (u64, u64, u64)
     (reply.word(2) / page, reply.word(17) / page, reply.word(7))
 }
 
-/// memmgr's reply label to a `REGISTER_PRESSURE` of `bits` carrying `cap`, or
-/// no cap for `0`.
-fn register_pressure(cap: u64, bits: u64) -> u64
+/// memmgr's reply label to a `REGISTER_PRESSURE` of the level bits `bits` and
+/// the draw-room bits `draw_room` carrying `cap`, or no cap for `0`.
+fn register_pressure(cap: u64, bits: u64, draw_room: u64) -> u64
 {
-    let mut req = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_PRESSURE).word(0, bits);
+    let mut req = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_PRESSURE)
+        .word(0, bits)
+        .word(1, draw_room);
     if cap != 0
     {
         req = req.cap(cap);
@@ -1827,7 +1834,8 @@ fn release_under_stopped_waiter(held: Vec<(u64, u64)>) -> std::os::seraph::Memor
 /// (services/memmgr/docs/memory-pool.md § Memory pressure):
 ///
 /// 1. `REGISTER_PRESSURE` refuses a missing cap, a Memory cap, a Notification
-///    without Notify, and zero bits, with `INVALID_ARGUMENT`.
+///    without Notify, zero level bits, and level or draw-room bits above the
+///    low 32, with `INVALID_ARGUMENT`.
 /// 2. svctest, which makes no registration of its own at start, holds the one
 ///    the runtime made ([`std::os::seraph::memory_pressure_notification`]), and
 ///    the level reads `Normal`.
@@ -1842,6 +1850,10 @@ fn release_under_stopped_waiter(held: Vec<(u64, u64)>) -> std::os::seraph::Memor
 ///    then releases the grants: the wait outlasts the stops and returns at
 ///    the runtime's bit, the level reads `Normal`, and the second
 ///    Notification receives nothing more.
+/// 5. A wake of the runtime's Notification that carries only its draw-room
+///    bit (`std::os::seraph::COMMIT_DRAW_ROOM_BIT`), sent by svctest, does
+///    not end `wait_memory_pressure`, which takes it and times out; one that
+///    carries the level's bit with it does.
 ///
 /// memmgr's low threshold and band are 1/16 and 1/128 of the pool
 /// (`PRESSURE_LOW_DIVISOR`, `PRESSURE_BAND_DIVISOR`) and its reserve 2/128;
@@ -1863,28 +1875,38 @@ pub fn pressure_phase(_: &Caps)
     // 1. Refusals; none replaces the runtime's registration.
     let invalid = ipc::memmgr_errors::INVALID_ARGUMENT;
     assert_eq!(
-        register_pressure(0, 1),
+        register_pressure(0, 1, 0),
         invalid,
         "REGISTER_PRESSURE with no cap"
     );
     let (grant, region_id) = request_one_page();
     let alias = syscall::cap_derive(grant, syscall::RIGHTS_ALL).expect("cap_derive of grant");
     assert_eq!(
-        register_pressure(alias, 1),
+        register_pressure(alias, 1, 0),
         invalid,
         "REGISTER_PRESSURE with a Memory cap"
     );
     release_grant(grant, region_id);
     let wait_only = syscall::cap_derive(own_sig, syscall::RIGHTS_NTF_WAIT).expect("cap_derive");
     assert_eq!(
-        register_pressure(wait_only, 1),
+        register_pressure(wait_only, 1, 0),
         invalid,
         "REGISTER_PRESSURE with a Notification without Notify"
     );
     assert_eq!(
-        register_pressure(notify_only(own_sig), 0),
+        register_pressure(notify_only(own_sig), 0, 1),
         invalid,
-        "REGISTER_PRESSURE with zero bits"
+        "REGISTER_PRESSURE with zero level bits"
+    );
+    assert_eq!(
+        register_pressure(notify_only(own_sig), 1 << 32, 0),
+        invalid,
+        "REGISTER_PRESSURE with a level bit above the low 32"
+    );
+    assert_eq!(
+        register_pressure(notify_only(own_sig), 1, 1 << 32),
+        invalid,
+        "REGISTER_PRESSURE with a draw-room bit above the low 32"
     );
 
     // 2. The runtime's registration, at Normal.
@@ -1906,7 +1928,7 @@ pub fn pressure_phase(_: &Caps)
 
     // 3. A second registration replaces the runtime's; drive the level to Low.
     assert_eq!(
-        register_pressure(notify_only(own_sig), PRESSURE_OWN_BIT),
+        register_pressure(notify_only(own_sig), PRESSURE_OWN_BIT, 0),
         ipc::memmgr_errors::SUCCESS,
         "REGISTER_PRESSURE replacing the runtime's"
     );
@@ -1934,7 +1956,8 @@ pub fn pressure_phase(_: &Caps)
     assert_eq!(
         register_pressure(
             notify_only(runtime_sig),
-            std::os::seraph::MEMORY_PRESSURE_BIT
+            std::os::seraph::MEMORY_PRESSURE_BIT,
+            std::os::seraph::COMMIT_DRAW_ROOM_BIT
         ),
         ipc::memmgr_errors::SUCCESS,
         "REGISTER_PRESSURE restoring the runtime's"
@@ -1948,9 +1971,34 @@ pub fn pressure_phase(_: &Caps)
     );
     syscall::cap_delete(own_sig).expect("cap_delete of the second Notification");
 
+    // 5. A draw-room bit alone is no change of level.
+    let _ = take_bits(runtime_sig);
+    syscall::notification_send(runtime_sig, std::os::seraph::COMMIT_DRAW_ROOM_BIT)
+        .expect("notification_send of the draw-room bit");
+    let woken = std::os::seraph::wait_memory_pressure(Some(DRAW_ROOM_ONLY_WAIT));
+    assert!(
+        woken
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::TimedOut),
+        "a draw-room bit alone ended the wait for a change of level: {woken:?}"
+    );
+    assert_eq!(
+        take_bits(runtime_sig),
+        0,
+        "the wait left the draw-room bit pending"
+    );
+    syscall::notification_send(
+        runtime_sig,
+        std::os::seraph::COMMIT_DRAW_ROOM_BIT | std::os::seraph::MEMORY_PRESSURE_BIT,
+    )
+    .expect("notification_send of both bits");
+    let level = std::os::seraph::wait_memory_pressure(Some(DRAW_ROOM_ONLY_WAIT))
+        .expect("a wake carrying the level's bit ends the wait");
+    assert_eq!(level, MemoryPressure::Normal, "level at the level's bit");
+
     std::os::seraph::log!(
         "memmgr_pressure: Normal -> Low at {low_free} of {total} pages free -> Normal, each \
          change signalled to the registration in place, the last wait outlasting stops of its \
-         thread"
+         thread, and a draw-room bit alone ending no wait for a change of level"
     );
 }

@@ -38,7 +38,9 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
+use core::time::Duration;
+
+use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX, SyscallError};
 
 // ── IPC label constants ─────────────────────────────────────────────────────
 //
@@ -894,6 +896,70 @@ pub unsafe fn ipc_call_timeout(
     Ok(unsafe { IpcMessage::from_ipc_buf(ipc_buf, reply_label, 0, reply_word_count) })
 }
 
+/// The `SYS_IPC_CALL` timeout of a call made with `left` of its caller's
+/// deadline to run: none when the caller has no deadline, the time left in
+/// milliseconds, rounded up so the call never ends before the deadline,
+/// otherwise. A time left past `u32::MAX` milliseconds (about 49 days) is
+/// bounded at that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallTimeout
+{
+    /// No deadline: the call waits without bound.
+    Unbounded,
+    /// The call's timeout, in milliseconds, at least 1.
+    Ms(u32),
+    /// The deadline has passed: the call is not made.
+    Expired,
+}
+
+/// The timeout of a call made with `left` of its caller's deadline to run,
+/// `None` for a caller with no deadline ([`CallTimeout`]).
+#[must_use]
+pub fn call_timeout(left: Option<Duration>) -> CallTimeout
+{
+    let Some(left) = left
+    else
+    {
+        return CallTimeout::Unbounded;
+    };
+    if left.is_zero()
+    {
+        return CallTimeout::Expired;
+    }
+    let ms = left
+        .as_millis()
+        .saturating_add(u128::from(left.subsec_nanos() % 1_000_000 != 0));
+    CallTimeout::Ms(u32::try_from(ms).unwrap_or(u32::MAX))
+}
+
+/// [`ipc_call`] made with `left` of its caller's deadline to run, `None` for
+/// a caller with no deadline: bounded by the time left ([`call_timeout`],
+/// [`ipc_call_timeout`]), and not made at all once the deadline has passed.
+///
+/// # Safety
+/// As [`ipc_call`].
+///
+/// # Errors
+/// As [`ipc_call_timeout`]; `WouldBlock` too, with nothing sent, when `left`
+/// is zero.
+#[inline]
+pub unsafe fn ipc_call_within(
+    ep: u64,
+    msg: &IpcMessage,
+    ipc_buf: *mut u64,
+    left: Option<Duration>,
+) -> Result<IpcMessage, i64>
+{
+    let timeout_ms = match call_timeout(left)
+    {
+        CallTimeout::Unbounded => 0,
+        CallTimeout::Ms(ms) => ms,
+        CallTimeout::Expired => return Err(SyscallError::WouldBlock as i64),
+    };
+    // SAFETY: this fn's contract is ipc_call_timeout's.
+    unsafe { ipc_call_timeout(ep, msg, ipc_buf, timeout_ms) }
+}
+
 /// Receive on an endpoint cap, returning a stack-owned message snapshot.
 ///
 /// Blocks until a caller sends. Copies the message (label, badge, data
@@ -1017,6 +1083,37 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    // The defect caught: a call that ends before its caller's deadline (a
+    // time left rounded down, or under a millisecond read as no timeout at
+    // all, which waits without bound), or one made once the deadline passed.
+    #[test]
+    fn a_call_timeout_rounds_the_time_left_up_and_ends_at_the_deadline()
+    {
+        assert_eq!(call_timeout(None), CallTimeout::Unbounded);
+        assert_eq!(call_timeout(Some(Duration::ZERO)), CallTimeout::Expired);
+        assert_eq!(
+            call_timeout(Some(Duration::from_nanos(1))),
+            CallTimeout::Ms(1)
+        );
+        assert_eq!(
+            call_timeout(Some(Duration::from_millis(1))),
+            CallTimeout::Ms(1)
+        );
+        assert_eq!(
+            call_timeout(Some(Duration::from_micros(1_001))),
+            CallTimeout::Ms(2)
+        );
+        assert_eq!(
+            call_timeout(Some(Duration::from_millis(2_000))),
+            CallTimeout::Ms(2_000)
+        );
+        assert_eq!(
+            call_timeout(Some(Duration::from_millis(u64::from(u32::MAX) + 7))),
+            CallTimeout::Ms(u32::MAX)
+        );
+        assert_eq!(call_timeout(Some(Duration::MAX)), CallTimeout::Ms(u32::MAX));
+    }
 
     #[test]
     fn packed_bytes_round_trip_through_data_bytes_with_zero_padding()

@@ -6,18 +6,19 @@ Client-side helper for the svcmgr name-to-cap discovery registry.
 
 ## Overview
 
-Each process's
-`process_abi::ProcessInfo` carries at most one registry cap, the `service_registry_cap` procmgr
-seeds (per [abi/process-abi/README.md](../../abi/process-abi/README.md)); this crate caches
-that one cap. `install_registry_cap` stores it in a process-global atomic once in `_start`, and
-`registry_cap` reads it back so callers can issue `QUERY_ENDPOINT` without threading the cap
-through every API. `pack_name` packs a name of at most `NAME_MAX` = 64 bytes into `NAME_WORDS`
-payload words; all three are `shared/ipc`'s `svcmgr_labels` items, re-exported. Lookups are
-reentrant; svcmgr derives a fresh SEND on every lookup (per
+Each process's `process_abi::ProcessInfo` carries at most one registry cap, the
+`service_registry_cap` procmgr seeds (per
+[abi/process-abi/README.md](../../abi/process-abi/README.md)); this crate caches that one cap.
+`install_registry_cap` stores it in a process-global atomic once in `_start`, and `registry_cap`
+reads it back so callers can issue `QUERY_ENDPOINT` without threading the cap through every API.
+`pack_name` packs a name of at most `NAME_MAX` = 64 bytes into `NAME_WORDS` payload words; all three
+are `shared/ipc`'s `svcmgr_labels` items, re-exported. Lookups are reentrant; svcmgr derives a fresh
+SEND on every lookup (per
 [services/svcmgr/docs/ipc-interface.md](../../services/svcmgr/docs/ipc-interface.md) § Label 4:
-`QUERY_ENDPOINT`), and callers cache the returned cap themselves. There is no publish helper:
-`PUBLISH_ENDPOINT` succeeds only for a cap stamped with `PUBLISH_AUTHORITY`, which the
-per-process cap procmgr seeds never is.
+`QUERY_ENDPOINT`), and callers cache the returned cap themselves. `lookup_within` bounds a lookup by
+the time left to a deadline (`ipc::ipc_call_within`), failing `WouldBlock` when it passes. There is
+no publish helper: `PUBLISH_ENDPOINT` succeeds only for a cap stamped with `PUBLISH_AUTHORITY`,
+which the per-process cap procmgr seeds never is.
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 

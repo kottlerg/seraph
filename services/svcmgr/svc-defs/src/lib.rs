@@ -103,7 +103,10 @@ pub fn log_sink_handover_owed(reap_reply: Option<(u64, u64)>) -> bool
 /// [`CREATE_PINNED`](ipc::procmgr_labels::CREATE_PINNED) for the recognised
 /// shutdown actuator (`shutdown_actuator`, [`shutdown_actuator`]), which
 /// powers the system off on a core death and so may take no page fault on
-/// memmgr (docs/fault-handling.md § Default System Pager).
+/// memmgr (docs/fault-handling.md § Default System Pager); and
+/// [`CREATE_PRIVATE_IMAGE`](ipc::procmgr_labels::CREATE_PRIVATE_IMAGE) for a
+/// recipe that sets `private_image = yes` ([`Definition::private_image`]),
+/// so its image is private to it.
 #[must_use]
 #[expect(
     clippy::fn_params_excessive_bools,
@@ -114,6 +117,7 @@ pub const fn create_flags(
     oom_stop: bool,
     stop_source: bool,
     shutdown_actuator: bool,
+    private_image: bool,
 ) -> u64
 {
     let mut flags = 0;
@@ -132,6 +136,10 @@ pub const fn create_flags(
     if stop_source
     {
         flags |= ipc::procmgr_labels::CREATE_CONTAIN;
+    }
+    if private_image
+    {
+        flags |= ipc::procmgr_labels::CREATE_PRIVATE_IMAGE;
     }
     flags
 }
@@ -430,6 +438,11 @@ pub struct Definition
     /// (`procmgr_labels::CREATE_RESERVE`, [`create_flags`]), on its launch
     /// and on every restart, so it may take the pages memmgr keeps in reserve.
     pub reserve: bool,
+    /// `private_image = yes` loads the service's image private
+    /// (`procmgr_labels::CREATE_PRIVATE_IMAGE`, [`create_flags`]), on its
+    /// launch and on every restart, so its text is not shared with the
+    /// binary's other instances. Not a core role.
+    pub private_image: bool,
     /// `stop_source = <class>` makes the service a stop source of that class:
     /// while it runs, svcmgr lists it to a stop-authority holder
     /// (`svcmgr_labels::LIST_STOP_SOURCES`) with the class and a SEND on its
@@ -704,23 +717,43 @@ mod tests
     fn each_recipe_key_asks_for_its_own_create_flag()
     {
         use ipc::procmgr_labels::{
-            CREATE_CONTAIN, CREATE_NODE_HANDLE, CREATE_PINNED, CREATE_RESERVE,
+            CREATE_CONTAIN, CREATE_NODE_HANDLE, CREATE_PINNED, CREATE_PRIVATE_IMAGE, CREATE_RESERVE,
         };
-        assert_eq!(create_flags(false, false, false, false), 0);
-        assert_eq!(create_flags(true, false, false, false), CREATE_RESERVE);
-        assert_eq!(create_flags(false, true, false, false), CREATE_NODE_HANDLE);
-        assert_eq!(create_flags(false, false, true, false), CREATE_CONTAIN);
+        assert_eq!(create_flags(false, false, false, false, false), 0);
+        assert_eq!(
+            create_flags(true, false, false, false, false),
+            CREATE_RESERVE
+        );
+        assert_eq!(
+            create_flags(false, true, false, false, false),
+            CREATE_NODE_HANDLE
+        );
+        assert_eq!(
+            create_flags(false, false, true, false, false),
+            CREATE_CONTAIN
+        );
+        assert_eq!(
+            create_flags(false, false, false, false, true),
+            CREATE_PRIVATE_IMAGE
+        );
         // Defect caught: a shutdown actuator created demand-paged, whose
         // core-death power-off can then fault on a dead memmgr.
-        assert_eq!(create_flags(false, false, false, true), CREATE_PINNED);
         assert_eq!(
-            create_flags(true, true, true, true),
-            CREATE_RESERVE | CREATE_NODE_HANDLE | CREATE_CONTAIN | CREATE_PINNED
+            create_flags(false, false, false, true, false),
+            CREATE_PINNED
+        );
+        assert_eq!(
+            create_flags(true, true, true, true, true),
+            CREATE_RESERVE
+                | CREATE_NODE_HANDLE
+                | CREATE_CONTAIN
+                | CREATE_PINNED
+                | CREATE_PRIVATE_IMAGE
         );
         // Never a flag procmgr refuses from svcmgr: the charge-node flag, with
         // which procmgr refuses CREATE_RESERVE.
         assert_eq!(
-            create_flags(true, true, true, true) & ipc::procmgr_labels::CREATE_CHARGE_NODE,
+            create_flags(true, true, true, true, true) & ipc::procmgr_labels::CREATE_CHARGE_NODE,
             0
         );
     }

@@ -44,7 +44,7 @@ pub struct ServiceEntry
     /// A `Control`-only cap on the address space of a service init created by
     /// raw syscalls (memmgr, procmgr), from its endowment round: svcmgr bound
     /// the service's address-space observer on the core-death queue with it,
-    /// and reads the space's retained terminal fault back through it in a
+    /// and reads the space's retained end back through it in a
     /// resync. Zero
     /// for every other service, whose address space procmgr observes for
     /// svcmgr through [`Self::process_handle`].
@@ -212,6 +212,9 @@ pub struct RestartRecipe
     /// The `reserve = yes` service: each instance is created in the system
     /// reserve (`svcmgr_defs::create_flags`).
     pub reserve: bool,
+    /// The `private_image = yes` service: each instance is created with a
+    /// private image (`svcmgr_defs::create_flags`).
+    pub private_image: bool,
     /// The `stop_source = <class>` service's class: each instance is created
     /// contained (`svcmgr_defs::create_flags`), and while it runs, a
     /// stop-authority holder finds it, with a stop-badged SEND on its service

@@ -76,6 +76,7 @@ pub mod fs_ipc;
 pub mod fs_opens;
 pub mod fs_std;
 pub mod heap_commit;
+pub mod image_sharing;
 pub mod layout;
 pub mod log_client;
 pub mod logd_restart;
@@ -136,6 +137,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(discard::phases());
     out.extend_from_slice(memory_objects::phases());
     out.extend_from_slice(memory_object_text::phases());
+    out.extend_from_slice(image_sharing::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

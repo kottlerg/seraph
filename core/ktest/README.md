@@ -44,7 +44,8 @@ core/ktest/
     ├── framebuffer.rs      # Direct framebuffer output
     ├── frame_pool.rs       # Memory capability pool for tests that map memory
     ├── init_info.rs        # The InitInfo capability-descriptor array, for initial-cap lookups
-    ├── spawn.rs            # Child-thread spawn helpers, argument blocks, exit probes
+    ├── spawn.rs            # Child-thread spawn helpers, argument blocks, exit probes,
+    │                       # code-stub install
     ├── cpu_sample.rs       # The CPUs a per-CPU case checks past 16 CPUs
     ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
     ├── arch/               # Arch-dispatch surface (see Test structure)
@@ -81,22 +82,23 @@ instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
 `REGS_<ARCH>_IP_OFFSET` constants). A cell that binds an I/O port runs only
 where `crate::arch::HAS_IO_PORTS` holds. The register-file probes of the FPU
 and callee-saved-register tests are `crate::arch::fpu` and
-`crate::arch::callee_saved`, the machine-code stubs of `unit::retype`
-`crate::arch::code_stub`, and the harness's UART, I/O port seed, shutdown, and
-cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
+`crate::arch::callee_saved`, the machine-code stubs of `unit::retype` and
+`integration::aspace_exit_notification` `crate::arch::code_stub`, and the harness's UART, I/O
+port seed, shutdown, and cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
 `cycles_now`.
 
 ### Tier 1 — `src/unit/`
 
 Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFICATION`,
-`SYS_PROCESS_EXIT`, the fault-handler binding syscalls (`SYS_THREAD_SET_FAULT_HANDLER`,
+`SYS_ASPACE_EXIT`, the fault-handler binding syscalls (`SYS_THREAD_SET_FAULT_HANDLER`,
 `SYS_THREAD_GET_FAULT_HANDLER`, and `SYS_THREAD_INHERIT_FAULT_HANDLER`), the upcall syscalls
 (`SYS_THREAD_POST_UPCALL` and `SYS_THREAD_SET_UPCALL_MASK`), the thread-memory syscalls
 (`SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`), and the core-dump enumeration syscalls
 (`SYS_THREAD_LIST_PAGES` and `SYS_THREAD_READ_EXT_REGS`) has at least one positive-path test and the
 most important negative paths (wrong rights, invalid arguments, wrong object state). Those are
 exercised in Tier 2, by `aspace_fault_notification_late_bind.rs`, by
-`death_notification_late_bind.rs`, by `fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`,
+`death_notification_late_bind.rs` and `aspace_exit_notification.rs`, by `fault_pager_roundtrip.rs`,
+`fault_resume_modifies_pc.rs`,
 `fault_handler_declines_kills.rs`, `fault_forward.rs`, `fault_redirect.rs`,
 `fault_handler_rebind.rs`, `fault_class_bindings.rs`, and `fault_exception_redirect.rs`, by
 `thread_upcall.rs`, by `thread_memory.rs`, and by `thread_list_pages.rs` and `thread_ext_regs.rs`,
@@ -153,9 +155,10 @@ concurrent notification and queue events.
 | `thread_upcall.rs` | Asynchronous upcalls, as [docs/fault-handling.md § Asynchronous Upcalls](../../docs/fault-handling.md#asynchronous-upcalls) defines: a post to an unstarted thread or one with no upcall handler is refused (`InvalidState`); a yielding thread takes the upcall at a syscall's return with its badge, cookie, and point, and resumes; a post during a delivery is delivered after the reply, and a post to a stopped thread is kept (a second is `QueueFull`) until the start; a syscall-point upcall stays pending on a thread that makes no syscall, refusing a second post (`QueueFull`); an `UPCALL_ANY_INSTRUCTION` upcall reaches a spinning thread at an interrupt's return and redirects it; a masked thread sleeps through a post and takes it at the unmask; a notification wait and a sleep return `Interrupted` and take the upcall; an upcall waits for a held page fault; a stop during a delivery drops it; a call queued on an endpoint, a call awaiting its reply, and a call made with an upcall already pending each read `THREAD_UPCALL_IN_CALL` and `THREAD_UPCALL_PENDING` (`CAP_INFO_THREAD_UPCALL`) and are not cut short: the reply completes the call intact and the upcall arrives at its return; a thread with a syscall-point upcall pending reads `THREAD_UPCALL_PENDING`, and a masked one also `THREAD_UPCALL_MASKED`; a post that finds the thread spinning refuses its next park, a notification wait that returns `Interrupted` at once; a cap without `UPCALL` (`InsufficientRights`), an `UPCALL`-only cap's any-instruction post (`InsufficientRights`), an undefined flag (`InvalidArgument`), and a mask argument other than 0 or 1 (`InvalidArgument`) are refused |
 | `stop_read_regs_remote.rs` | A thread spinning in user mode on another CPU is stopped, then its registers are read at once (never refused with `InvalidState`, since the stop returns only once that CPU has descheduled it and published its register save, as [core/kernel/docs/syscalls.md § `SYS_THREAD_READ_REGS`](../kernel/docs/syscalls.md#sys_thread_read_regs-39) defines), its saved instruction pointer lies in its spin code, and a register write redirecting it takes effect on restart, every round, with the redirected child's stack one call chain deep across the rounds (≥ 2 CPUs) |
 | `death_notification_late_bind.rs` | A death observer bound after the thread already died still receives the retained exit reason |
-| `aspace_fault_notification_late_bind.rs` | An address-space terminal-fault observer bound after a thread in that space already faulted still receives the retained fault reason, which `CAP_INFO_ASPACE_TERMINAL_FAULT` reads back (`0` before the fault) as soon as the thread reads `Exited`; with 2+ CPUs, 16 rounds, each with a fresh space, pin the controller and the faulting thread to different CPUs and poll the thread's state without sleeping (bounded by elapsed time), and the thread carries 32 death observers whose posts follow its `Exited` commit, so a kernel that recorded the space's fault only after those posts would show a `0` read-back |
-| `aspace_fault_notification_once.rs` | An address space posts its terminal-fault observers once: with one observer bound, two threads of a fresh space fault, the second only once the first reads `Exited`, and, with 3+ CPUs, in 8 further rounds with the controller on CPU 0 and the threads pinned to CPUs 1 and 2 and started back to back; after the threads and the space are deleted (a thread's deletion waits until it runs on no CPU, which a faulting thread leaves only after its posts), the queue holds exactly one entry, carrying the reason `CAP_INFO_ASPACE_TERMINAL_FAULT` read back, the first fault's |
-| `death_observer_outlives_queue_caps.rs` | An event queue bound as a thread's death observer and one bound as its address space's terminal-fault observer stay allocated after their last caps are deleted and through the thread's terminal fault, which posts to both, and are freed when the thread and the address space are torn down (each binding holds a reference on its queue) |
+| `aspace_fault_notification_late_bind.rs` | An address-space terminal-end observer bound after a thread in that space already faulted still receives the retained fault reason, which `CAP_INFO_ASPACE_END` reads back (not ended before the fault) as soon as the thread reads `Exited`; with 2+ CPUs, 16 rounds, each with a fresh space, pin the controller and the faulting thread to different CPUs and poll the thread's state without sleeping (bounded by elapsed time), and the thread carries 32 death observers whose posts follow its `Exited` commit, so a kernel that recorded the space's fault only after those posts would read the space as not ended |
+| `aspace_fault_notification_once.rs` | An address space posts its terminal-end observers once: with one observer bound, two threads of a fresh space fault, the second only once the first reads `Exited`, and, with 3+ CPUs, in 8 further rounds with the controller on CPU 0 and the threads pinned to CPUs 1 and 2 and started back to back; after the threads and the space are deleted (a thread's deletion waits until it runs on no CPU, which a faulting thread leaves only after its posts), the queue holds exactly one entry, carrying the reason `CAP_INFO_ASPACE_END` read back, the first fault's |
+| `aspace_exit_notification.rs` | `SYS_ASPACE_EXIT` from one thread of a fresh space, with code `0` and with code `7`, ends the space as a terminal fault does: the thread reads `Exited` with the encoded code, `CAP_INFO_ASPACE_END` reads the space ended with that reason (`0` included), a spinning thread of the space still runs, a third thread's later terminal fault leaves the reason as it was, and once the threads are deleted the space's observer and the exiting thread's observer each hold exactly one entry with the reason; an observer bound after the end receives it at once, once |
+| `death_observer_outlives_queue_caps.rs` | An event queue bound as a thread's death observer and one bound as its address space's terminal-end observer stay allocated after their last caps are deleted and through the thread's terminal fault, which posts to both, and are freed when the thread and the address space are torn down (each binding holds a reference on its queue) |
 | `cap_transfer.rs` | Cap rights flow through an IPC endpoint round-trip |
 | `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
 | `wait_concurrency.rs` | Wait set with concurrent notification + queue sources |
@@ -309,7 +312,7 @@ child waits of `integration::stop_read_regs_remote`; the barrier wait of
 event and memory polls of `integration::fault_kills_thread`,
 `integration::fault_exception_no_handler_kills`, `integration::fault_handler_declines_kills`,
 `integration::aspace_fault_notification_late_bind`, `integration::aspace_fault_notification_once`,
-`integration::death_notification_late_bind`,
+`integration::aspace_exit_notification`, `integration::death_notification_late_bind`,
 `integration::death_observer_outlives_queue_caps`, `integration::reply_binding_displaced`,
 `integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
 `integration::mmio_revoke_unmaps`, `integration::ioport_revoke`,

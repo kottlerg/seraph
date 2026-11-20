@@ -25,6 +25,7 @@ pub mod shadow_stack;
 pub mod speculation;
 pub mod syscall;
 pub mod timer;
+pub mod timer_rate;
 pub mod trap_frame;
 pub mod vulnerability;
 

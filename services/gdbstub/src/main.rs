@@ -385,7 +385,13 @@ impl Sys
         match write()
         {
             Ok(()) => true,
-            Err(e) if e == syscall_abi::SyscallError::InvalidState as i64 =>
+            // A page others map refuses the write (InvalidState), and a page
+            // the target has not touched is not present (InvalidAddress):
+            // memmgr gives the target a present copy of its own of either
+            // (services/memmgr/docs/ipc-interface.md § Label 30).
+            Err(e)
+                if e == syscall_abi::SyscallError::InvalidState as i64
+                    || e == syscall_abi::SyscallError::InvalidAddress as i64 =>
             {
                 // SAFETY: `self.ipc_buf` is the registered IPC buffer.
                 let private = unsafe {
@@ -583,7 +589,16 @@ impl Kernel for Sys
         {
             return false;
         }
-        let Ok(undo) = arch::prepare_step(cap, part)
+        // The successor may lie on text the target shares and has not run:
+        // read it resident, and plant through the text route that gives the
+        // target a copy of its own of the page first.
+        let read = |va: u64, buf: &mut [u8]| {
+            // SAFETY: `self.ipc_buf` is the registered IPC buffer.
+            unsafe { ipc::read_mem_resident(self.debug, self.target, cap, va, buf, self.ipc_buf) }
+                .is_ok()
+        };
+        let plant = |va: u64, bytes: &[u8]| self.text_write(cap, va, bytes);
+        let Ok(undo) = arch::prepare_step(part, read, plant)
         else
         {
             return false;
@@ -1392,8 +1407,21 @@ impl Stub
         {
             return false;
         };
-        if syscall::thread_read_mem(cap, addr, saved).is_err()
-            || !self.sys.text_write(cap, addr, insn)
+        // The saved bytes may lie on text the target has not run, which is
+        // not present until memmgr maps it (§ Label 21 of memmgr's IPC
+        // interface).
+        // SAFETY: `self.sys.ipc_buf` is the registered IPC buffer.
+        let read = unsafe {
+            ipc::read_mem_resident(
+                self.sys.debug,
+                self.sys.target,
+                cap,
+                addr,
+                saved,
+                self.sys.ipc_buf,
+            )
+        };
+        if read.is_err() || !self.sys.text_write(cap, addr, insn)
         {
             return false;
         }

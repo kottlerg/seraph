@@ -270,8 +270,89 @@ impl ImageBuffer
         })
     }
 
+    /// A buffer of `pages` pages to fill as a memory object, from frames
+    /// requested on `memmgr` (the image store's account) as many runs as
+    /// memmgr has, for [`Self::seal`].
+    ///
+    /// # Errors
+    /// As the constructor's.
+    pub fn for_object(
+        self_aspace: u64,
+        memmgr: u64,
+        pages: u64,
+        ipc_buf: *mut u64,
+    ) -> Result<Self, u64>
+    {
+        let len = pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        Self::new(self_aspace, memmgr, len, ipc_buf, Shape::BestEffort)
+    }
+
+    /// Seal the buffer's frames into a memory object
+    /// (`memmgr_labels::SEAL_OBJECT`) on the account they were granted on:
+    /// unmap them from procmgr and delete procmgr's caps to them, so they pass
+    /// memmgr's quiescence check, then name every grant in the request.
+    /// Returns the object handle and the object's pages. The frames are the
+    /// object's from then on, charged to the account until memmgr frees the
+    /// object.
+    ///
+    /// # Errors
+    /// `OUT_OF_MEMORY` when the buffer is more runs than one seal names
+    /// (`memmgr_labels::SEAL_OBJECT_MAX_GRANTS`), or memmgr refuses the seal
+    /// or the call fails; `MAP_FAILED` when procmgr's mapping will not come
+    /// down. The buffer then drops, returning the grants memmgr still counts
+    /// as the account's.
+    pub fn seal(mut self) -> Result<(u64, u64), u64>
+    {
+        if self.regions.is_empty()
+            || self.regions.len() as u64 > memmgr_labels::SEAL_OBJECT_MAX_GRANTS
+        {
+            return Err(procmgr_errors::OUT_OF_MEMORY);
+        }
+        if let Some(range) = self.range.take()
+        {
+            // SAFETY: the span is this buffer's own reservation, and every
+            // slice over it borrows the buffer, which this call owns.
+            if unsafe { syscall::mem_unmap(self.self_aspace, range.va_start(), self.pages) }
+                .is_err()
+            {
+                // Put back for `Drop`, which leaves a span that will not
+                // unmap reserved.
+                self.range = Some(range);
+                return Err(procmgr_errors::MAP_FAILED);
+            }
+            unreserve_pages(range);
+        }
+        crate::release_caps(&self.caps);
+        self.caps.clear();
+        let msg = IpcMessage::builder(memmgr_labels::SEAL_OBJECT)
+            .word(0, self.regions.len() as u64)
+            .words(1, &self.regions)
+            .build();
+        // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call(self.memmgr, &msg, self.ipc_buf) }
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        if reply.label != memmgr_errors::SUCCESS
+        {
+            crate::release_caps(reply.caps());
+            return Err(procmgr_errors::OUT_OF_MEMORY);
+        }
+        // The grants are the object's now, and their ids name nothing.
+        self.regions.clear();
+        match *reply.caps()
+        {
+            [handle] => Ok((handle, reply.word(0))),
+            ref caps =>
+            {
+                crate::release_caps(caps);
+                Err(procmgr_errors::OUT_OF_MEMORY)
+            }
+        }
+    }
+
     /// The object's bytes, to fill.
-    fn bytes_mut(&mut self) -> &mut [u8]
+    pub fn bytes_mut(&mut self) -> &mut [u8]
     {
         // SAFETY: as [`Self::bytes`]; the exclusive borrow of `self` makes the
         // slice the only reference into the buffer.

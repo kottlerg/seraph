@@ -433,7 +433,7 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// plus `READ` when the source Memory cap carries `MemRights::PHYS`: `READ`
 /// gates `SYS_ASPACE_QUERY`, which returns physical addresses, so only a
 /// holder of the physical-address right mints it. `CONTROL` lets the creator
-/// register terminal-fault death observers on the address space via
+/// register terminal-end death observers on the address space via
 /// `SYS_ASPACE_BIND_NOTIFICATION`; derived copies handed to other components
 /// (e.g. memmgr) drop it via the `cap_derive` rights mask. Returns the new
 /// cap handle.
@@ -3044,7 +3044,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
     use core::sync::atomic::Ordering;
 
     use syscall::{
-        CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_ASPACE_TERMINAL_FAULT, CAP_INFO_CSPACE_BUDGET,
+        CAP_INFO_ASPACE_END, CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET,
         CAP_INFO_CSPACE_CAPACITY, CAP_INFO_CSPACE_USED, CAP_INFO_IRQ_MSG_ADDRESS,
         CAP_INFO_IRQ_MSG_DATA, CAP_INFO_IRQ_REMAP_ENTRY, CAP_INFO_IRQ_REMAP_HANDLES,
         CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_HAS_RETYPE, CAP_INFO_MEMORY_MAPPINGS,
@@ -3382,7 +3382,7 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             }
             crate::irq::remap_entry(io.start).map_err(remap_error)
         }
-        CAP_INFO_ASPACE_TERMINAL_FAULT =>
+        CAP_INFO_ASPACE_END =>
         {
             if tag != CapTag::AddressSpace
             {
@@ -3401,9 +3401,9 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             }
             // SAFETY: as_ptr is the AddressSpace the pinned wrapper holds, live
             // while the pin holds the wrapper; no lock is held.
-            let retained =
-                unsafe { crate::mm::address_space::AddressSpace::retained_terminal_fault(as_ptr) };
-            Ok(retained.unwrap_or(0))
+            let retained = unsafe { crate::mm::address_space::AddressSpace::retained_end(as_ptr) };
+            // The flag tells an end with reason 0 (a clean exit) from no end.
+            Ok(retained.map_or(0, |reason| syscall::ASPACE_ENDED | reason))
         }
         CAP_INFO_CSPACE_CAPACITY =>
         {
@@ -3730,7 +3730,7 @@ mod tests
             syscall::CAP_INFO_TLB_PERFORMED,
             syscall::CAP_INFO_MEMORY_MAPPINGS,
             syscall::CAP_INFO_SOLE_REFERENCE,
-            syscall::CAP_INFO_ASPACE_TERMINAL_FAULT,
+            syscall::CAP_INFO_ASPACE_END,
             syscall::CAP_INFO_IRQ_MSG_ADDRESS,
             syscall::CAP_INFO_IRQ_MSG_DATA,
             syscall::CAP_INFO_IRQ_REMAP_ENTRY,

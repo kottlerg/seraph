@@ -46,6 +46,7 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 
 use ipc::{IpcMessage, svcmgr_errors, svcmgr_labels};
 
@@ -82,22 +83,49 @@ pub fn registry_cap() -> u64
 /// `ipc_buf` must point at the registered IPC buffer page for this
 /// thread.
 #[must_use]
+pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u64>
+{
+    // SAFETY: the caller's contract is lookup_within's.
+    unsafe { lookup_within(name, ipc_buf, None) }.ok().flatten()
+}
+
+/// [`lookup`] with `left` of the caller's call deadline to run, `None` for
+/// none, as `ipc::ipc_call_within` bounds the query. `Ok(Some(cap))` for a
+/// fresh SEND svcmgr derived; `Ok(None)` when no registry cap is installed,
+/// the name is invalid, or svcmgr refused or does not hold it; `Err` with the
+/// call's error code when the query's call failed, `WouldBlock` when the
+/// deadline passed first, in which case svcmgr may have received the query.
+///
+/// # Safety
+/// `ipc_buf` must point at the registered IPC buffer page for this
+/// thread.
+///
+/// # Errors
+/// The error code of the failed call (`ipc::ipc_call_within`).
 #[expect(
     clippy::large_stack_frames,
     reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copies, one per \
               name word; on its caller's stack, 32 KiB at the smallest (a std process's main \
               thread)"
 )]
-pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u64>
+pub unsafe fn lookup_within(
+    name: &[u8],
+    ipc_buf: *mut u64,
+    left: Option<Duration>,
+) -> Result<Option<u64>, i64>
 {
     let registry = REGISTRY_CAP.load(Ordering::Acquire);
     if registry == 0 || name.is_empty()
     {
-        return None;
+        return Ok(None);
     }
     // `pack_name` refuses a name longer than NAME_MAX.
     let mut words = [0u64; NAME_WORDS];
-    let word_count = pack_name(name, &mut words)?;
+    let Some(word_count) = pack_name(name, &mut words)
+    else
+    {
+        return Ok(None);
+    };
 
     let mut builder =
         IpcMessage::builder(svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16));
@@ -108,10 +136,10 @@ pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u64>
     let request = builder.build();
 
     // SAFETY: ipc_buf is the caller-supplied registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(registry, &request, ipc_buf) }.ok()?;
+    let reply = unsafe { ipc::ipc_call_within(registry, &request, ipc_buf, left) }?;
     if reply.label != svcmgr_errors::SUCCESS
     {
-        return None;
+        return Ok(None);
     }
-    reply.caps().first().copied().filter(|&c| c != 0)
+    Ok(reply.caps().first().copied().filter(|&c| c != 0))
 }

@@ -158,7 +158,8 @@ pub fn pci_line_mode(overrides: &[SourceOverride], gsi: u32) -> u64
 /// The legacy ports of the interrupt controllers and timers the kernel owns,
 /// `(base, count)`: the two 8259s and their edge/level control registers,
 /// the PIT and the port-0x61 gate of its channel 2, which the kernel
-/// calibrates its timer against, and COM1, the kernel console.
+/// measures the TSC against where CPUID gives no TSC rate, and COM1, the
+/// kernel console.
 const KERNEL_PORTS: [(u16, u16); 6] = [
     (0x20, 2),
     (0xA0, 2),

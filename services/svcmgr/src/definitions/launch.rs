@@ -444,6 +444,7 @@ pub fn launch(
             def.oom_stop,
             def.stop_source.is_some(),
             role == Role::ShutdownActuator,
+            def.private_image,
         ),
         ctx.procmgr_ep,
         ctx.bootstrap_ep,

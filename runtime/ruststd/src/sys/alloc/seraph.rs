@@ -47,7 +47,7 @@ use crate::alloc::Layout;
 use crate::cell::UnsafeCell;
 use crate::marker::PhantomData;
 use crate::mem::{align_of, size_of};
-use crate::os::seraph::{current_ipc_buf, ipc_call_until_answered};
+use crate::os::seraph::{current_ipc_buf, memmgr_call, memmgr_call_until_answered};
 use crate::ptr::{NonNull, null_mut};
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -464,7 +464,7 @@ impl Heap {
     /// no frame to back it (docs/userspace-memory-model.md § Byte Heap).
     ///
     /// memmgr undoes a commitment whose reply did not reach the caller, so an
-    /// interrupted call is made again ([`ipc_call_until_answered`]) without
+    /// interrupted call is made again ([`memmgr_call_until_answered`]) without
     /// being charged twice. The region's page tables are funded from the
     /// reservation memmgr holds for it, so no top-up precedes the call.
     fn grow_committed(&mut self, pages: u64) -> bool {
@@ -489,7 +489,7 @@ impl Heap {
         };
         // SAFETY: ipc_buf is the current thread's kernel-registered,
         // page-aligned IPC buffer.
-        match unsafe { ipc_call_until_answered(self.memmgr_ep, &msg, ipc_buf) } {
+        match unsafe { memmgr_call_until_answered(self.memmgr_ep, &msg, ipc_buf) } {
             Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => {}
             _ => return false,
         }
@@ -524,7 +524,7 @@ impl Heap {
     /// from them, and memmgr would clear what it wrote. As with `grow`, the
     /// IPC under the lock allocates nothing. A refused or failed call changes
     /// nothing in the heap, and a repeat of an interrupted one is safe
-    /// ([`ipc_call_until_answered`]).
+    /// ([`memmgr_call_until_answered`]).
     fn give_back(&mut self, block: (usize, usize), freed: usize, freed_len: usize) {
         if self.growth_len == 0 {
             return;
@@ -577,7 +577,7 @@ impl Heap {
         // SAFETY: ipc_buf is the current thread's kernel-registered,
         // page-aligned IPC buffer.
         matches!(
-            unsafe { ipc_call_until_answered(self.memmgr_ep, msg, ipc_buf) },
+            unsafe { memmgr_call_until_answered(self.memmgr_ep, msg, ipc_buf) },
             Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
         )
     }
@@ -642,7 +642,7 @@ impl Heap {
             // back by memmgr, so the repeat is not charged twice.
             // SAFETY: ipc_buf is the current thread's kernel-registered,
             // page-aligned IPC buffer.
-            let Ok(reply) = (unsafe { ipc_call_until_answered(self.memmgr_ep, &msg, ipc_buf) })
+            let Ok(reply) = (unsafe { memmgr_call_until_answered(self.memmgr_ep, &msg, ipc_buf) })
             else {
                 break false;
             };
@@ -973,7 +973,7 @@ pub fn slab_request_pages(memmgr_ep: u64, min_pages: u64) -> Option<(u64, u64, u
         ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, u64::from(want) | flags).build();
     // An interrupted request is made again, as in `Heap::grow_exact`.
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc_call_until_answered(memmgr_ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { memmgr_call_until_answered(memmgr_ep, &msg, ipc_buf) }.ok()?;
     let caps = reply.caps();
     let layout = ipc::memmgr_grant_layout(&reply);
     let keep = layout.and_then(|(page_counts, _)| page_counts.iter().position(|&p| p >= min_pages));
@@ -1048,7 +1048,7 @@ fn request_runs(
     let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, u64::from(want)).build();
     // An interrupted request is made again, as in `slab_request_pages`.
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { memmgr_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
     let caps = reply.caps();
     let Some((counts, ids)) = ipc::memmgr_grant_layout(&reply) else {
         release_reply_caps(ep, ipc_buf, caps, &[], |_| false);
@@ -1104,7 +1104,7 @@ fn release_reply_caps(
         .words(1, &released[..n])
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let _ = unsafe { ipc_call_until_answered(memmgr_ep, &msg, ipc_buf) };
+    let _ = unsafe { memmgr_call_until_answered(memmgr_ep, &msg, ipc_buf) };
 }
 
 /// Bytes withheld from a fresh grant's local ledger as slack against any
@@ -1322,7 +1322,7 @@ pub fn slab_release_fresh(region_id: u64) {
     }
     let msg = ipc::IpcMessage::builder(RELEASE_MEMORY_CAPS).word(0, 1).word(1, region_id).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let _ = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) };
+    let _ = unsafe { memmgr_call_until_answered(ep, &msg, ipc_buf) };
 }
 
 /// Retype one kernel object out of the slab machinery.
@@ -1424,7 +1424,7 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
     }
     let msg = ipc::IpcMessage::builder(QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { memmgr_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
     if reply.label != 0 {
         return None;
     }
@@ -1442,7 +1442,7 @@ pub fn memmgr_query_pressure() -> Option<u64> {
     }
     let msg = ipc::IpcMessage::builder(QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { memmgr_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
     (reply.label == 0).then(|| reply.word(7))
 }
 
@@ -1458,7 +1458,7 @@ pub fn memmgr_query_draw_room() -> Option<u64> {
     }
     let msg = ipc::IpcMessage::builder(QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { memmgr_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
     (reply.label == 0).then(|| reply.word(16))
 }
 
@@ -1514,7 +1514,7 @@ pub fn register_pressure() {
             .cap(notify)
             .build();
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-        let result = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
+        let result = unsafe { memmgr_call(ep, &msg, ipc_buf) };
         // A cap the call moved to memmgr has left this slot, and its handle's
         // generation keeps the delete from reaching a later occupant.
         let _ = syscall::cap_delete(notify);

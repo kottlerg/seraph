@@ -21,8 +21,10 @@ pub const ARCH: gdb_rsp::target::Arch = gdb_rsp::target::Arch::X86_64;
 /// trap, so the pointer is the instruction after the one-byte `int3`.
 pub const BREAKPOINT_PC_ADVANCE: u64 = 1;
 
-/// Prepare the stopped thread `thread`, whose register file is `regs`, to
-/// run one instruction: set the trap flag. The caller writes `regs` back.
+/// Prepare a stopped thread, whose register file is `regs`, to run one
+/// instruction: set the trap flag. The caller writes `regs` back. The
+/// target's memory (`_read`, `_plant`, as riscv64's route uses them) is not
+/// touched.
 ///
 /// # Errors
 /// None on x86-64; the riscv64 route can refuse an instruction.
@@ -31,7 +33,11 @@ pub const BREAKPOINT_PC_ADVANCE: u64 = 1;
     reason = "the arch-dispatch signature is shared with riscv64, whose decoder refuses some \
               instructions"
 )]
-pub fn prepare_step(_thread: u64, regs: &mut [u8]) -> Result<StepUndo, StepError>
+pub fn prepare_step(
+    regs: &mut [u8],
+    _read: impl Fn(u64, &mut [u8]) -> bool,
+    _plant: impl Fn(u64, &[u8]) -> bool,
+) -> Result<StepUndo, StepError>
 {
     update_flags(regs, |f| f | syscall_abi::X86_64_RFLAGS_TF);
     Ok(StepUndo)

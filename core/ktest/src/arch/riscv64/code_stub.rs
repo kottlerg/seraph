@@ -3,11 +3,11 @@
 
 // core/ktest/src/arch/riscv64/code_stub.rs
 
-//! RISC-V machine-code encoders for the stubs `crate::unit::retype` maps
-//! executable in a fresh address space and runs a child thread from. Each
-//! returns the stub's bytes.
+//! RISC-V machine-code encoders for the stubs `crate::unit::retype` and
+//! `crate::integration::aspace_exit_notification` map executable in a fresh
+//! address space and run a child thread from. Each returns the stub's bytes.
 
-use syscall_abi::SYS_CAP_DELETE;
+use syscall_abi::{SYS_ASPACE_EXIT, SYS_CAP_DELETE};
 
 /// `loop {}`: `jal x0, 0` (to itself).
 const SPIN: u32 = 0x0000_006F;
@@ -20,19 +20,34 @@ pub fn spin() -> [u8; 4]
 }
 
 /// Encode `cap_delete(handle); loop {}`.
-///
-/// The handle is stored as an 8-byte literal after the spin loop and loaded
-/// PC-relative, since it fills all 64 bits (its generation sits above the
-/// 32-bit index) and no short immediate sequence carries that. The literal
-/// sits at offset 24, 8-byte aligned when the stub is placed on a page.
 #[must_use]
 pub fn self_delete(handle: u64) -> [u8; 32]
+{
+    syscall1_then_spin(SYS_CAP_DELETE, handle)
+}
+
+/// Encode `SYS_ASPACE_EXIT(code); loop {}`. The syscall does not return; the
+/// loop is never reached.
+#[must_use]
+pub fn aspace_exit(code: u64) -> [u8; 32]
+{
+    syscall1_then_spin(SYS_ASPACE_EXIT, code)
+}
+
+/// Encode syscall `nr` with its first argument `arg`, then `loop {}`.
+///
+/// `arg` is stored as an 8-byte literal after the spin loop and loaded
+/// PC-relative, since a capability handle fills all 64 bits (its generation
+/// sits above the 32-bit index) and no short immediate sequence carries that.
+/// The literal sits at offset 24, 8-byte aligned when the stub is placed on a
+/// page.
+fn syscall1_then_spin(nr: u64, arg: u64) -> [u8; 32]
 {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "syscall numbers fit 32 bits"
     )]
-    let (lui, addi) = li32(17, SYS_CAP_DELETE as u32); // a7 = nr
+    let (lui, addi) = li32(17, nr as u32); // a7 = nr
     let words = [
         lui,
         addi,
@@ -48,7 +63,7 @@ pub fn self_delete(handle: u64) -> [u8; 32]
         *slot = word.to_le_bytes();
     }
     // Six words end at offset 24, where a0's literal goes.
-    out[24..].copy_from_slice(&handle.to_le_bytes());
+    out[24..].copy_from_slice(&arg.to_le_bytes());
     out
 }
 

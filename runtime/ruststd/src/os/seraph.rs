@@ -301,6 +301,131 @@ pub fn current_ipc_buf() -> *mut u64 {
     IPC_BUF_TLS.get()
 }
 
+// ── Call deadline ───────────────────────────────────────────────────────────
+//
+// The calling thread's call deadline: the instant by which every IPC call
+// the runtime makes on this thread is to have returned, set for the length
+// of a closure by [`with_call_deadline`]. Thread-local, so a deadline bounds
+// only the thread that set it.
+
+#[thread_local]
+static CALL_DEADLINE: Cell<Option<crate::time::Instant>> = Cell::new(None);
+
+/// Run `f` with `deadline` as the calling thread's call deadline, and
+/// return what it returns.
+///
+/// Every IPC call std makes on this thread inside `f` carries the time left
+/// to the deadline as its `SYS_IPC_CALL` timeout, and once the deadline has
+/// passed no such call is made: those of `std::fs` and of the
+/// `std::os::seraph` file and namespace functions, `std::process`'s
+/// spawn, `std::time::SystemTime::now`, [`registry::lookup`],
+/// [`read_verified`], and the system log ([`log!`](crate::os::seraph::log),
+/// stderr, a panic's message). A call that reaches the deadline fails as the
+/// API reports a failed call: an `io::Error` of kind `TimedOut` where it
+/// returns `io::Result`; `UNIX_EPOCH` from `SystemTime::now`, `None` from
+/// [`registry::lookup`], and a dropped line from the log, which report no
+/// error. Such a call may have reached its server, which may have acted on
+/// it and whose reply then finds no caller.
+///
+/// Not bounded by the deadline: the calls to memmgr (the heap, the stacks,
+/// the registration of demand-paged regions, frames, the release of a
+/// [`VerifiedData`]), since memmgr is this process's pager, which a stuck
+/// memmgr stops at its next page fault whatever a call's bound, and a heap
+/// call that failed would abort the process; the `DESTROY_PROCESS` with
+/// which a spawn that failed tears its child down, and the one with which a
+/// `Child` dropped without a wait tears its child down, which nothing else
+/// can do, so a spawn whose deadline passed, or such a drop, may still wait
+/// for that teardown (`Child::kill` is bounded, and fails `TimedOut`); and
+/// every wait that is not an IPC call (a thread join, a child's
+/// wait, a pipe, a sleep, a lock). A caller that needs a bound on its own
+/// calls takes [`call_time_left`] for them, as `ipc::ipc_call_within` does.
+///
+/// A deadline set inside `f` takes effect only when it is earlier than this
+/// one. The deadline in force before the call is in force again once `f`
+/// returns, unwinds, or returns early. A thread `f` spawns does not inherit
+/// the deadline.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn with_call_deadline<R>(deadline: crate::time::Instant, f: impl FnOnce() -> R) -> R {
+    /// Restores the deadline in force before the scope when dropped.
+    struct Restore(Option<crate::time::Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CALL_DEADLINE.set(self.0);
+        }
+    }
+    let outer = CALL_DEADLINE.get();
+    let _restore = Restore(outer);
+    CALL_DEADLINE.set(Some(outer.map_or(deadline, |outer| outer.min(deadline))));
+    f()
+}
+
+/// The time left to the calling thread's call deadline
+/// ([`with_call_deadline`]): `None` outside every deadline, zero once it has
+/// passed.
+#[must_use]
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn call_time_left() -> Option<crate::time::Duration> {
+    CALL_DEADLINE.get().map(|deadline| deadline.saturating_duration_since(crate::time::Instant::now()))
+}
+
+/// `ipc::ipc_call` under the calling thread's call deadline
+/// ([`with_call_deadline`], `ipc::ipc_call_within`): the call every runtime
+/// IPC call site makes, apart from the two below.
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+pub(crate) unsafe fn deadline_call(
+    ep: u64,
+    msg: &ipc::IpcMessage,
+    ipc_buf: *mut u64,
+) -> Result<ipc::IpcMessage, i64> {
+    // SAFETY: the caller passes the registered IPC buffer page.
+    unsafe { ipc::ipc_call_within(ep, msg, ipc_buf, call_time_left()) }
+}
+
+/// The error for a runtime IPC call that failed with `code`, `what` naming
+/// the call: `TimedOut` when the thread's call deadline passed first
+/// (`WouldBlock`, [`deadline_call`]), `Other` otherwise.
+pub(crate) fn call_failed(code: i64, what: &'static str) -> crate::io::Error {
+    let kind = if code == syscall_abi::SyscallError::WouldBlock as i64 {
+        crate::io::ErrorKind::TimedOut
+    } else {
+        crate::io::ErrorKind::Other
+    };
+    crate::io::Error::new(kind, what)
+}
+
+/// `ipc::ipc_call` to memmgr, `memmgr_ep`, outside the call deadline: the
+/// runtime's one call to memmgr, which no deadline bounds
+/// ([`with_call_deadline`]).
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+pub(crate) unsafe fn memmgr_call(
+    memmgr_ep: u64,
+    msg: &ipc::IpcMessage,
+    ipc_buf: *mut u64,
+) -> Result<ipc::IpcMessage, i64> {
+    // SAFETY: the caller passes the registered IPC buffer page.
+    unsafe { ipc::ipc_call(memmgr_ep, msg, ipc_buf) }
+}
+
+/// `DESTROY_PROCESS` on `process_handle`, outside the call deadline: the
+/// teardown of a child a spawn created and could not finish, or whose
+/// `Child` was dropped without a wait, which nothing else releases
+/// ([`with_call_deadline`]).
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+pub(crate) unsafe fn destroy_process_call(
+    process_handle: u64,
+    ipc_buf: *mut u64,
+) -> Result<ipc::IpcMessage, i64> {
+    let msg = ipc::IpcMessage::new(ipc::procmgr_labels::DESTROY_PROCESS);
+    // SAFETY: the caller passes the registered IPC buffer page.
+    unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }
+}
+
 #[thread_local]
 static SELF_THREAD_TLS: Cell<u64> = Cell::new(0);
 
@@ -562,6 +687,8 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     // roundtrip. Zero is tolerated (the macro silently drops in
     // processes without a logger).
     ::log::install_badged_cap(info.log_send_cap);
+    // Each log call is bounded by its thread's call deadline too.
+    ::log::install_time_left(call_time_left);
     // The most verbose level `seraph::log!` sends: the one the process's
     // `SERAPH_LOG` environment entry names, read once here, else info.
     if let Some(level) = argv_env::env_value(env_blob, info.env_count as usize, ::log::LEVEL_ENV_KEY)
@@ -926,7 +1053,7 @@ impl Drop for VerifiedData {
             // SAFETY: current_ipc_buf returns the registered IPC buffer page;
             // a release is safe to repeat (memmgr ignores an id it has
             // taken back).
-            let _ = unsafe { ipc_call_until_answered(memmgr_ep, &msg, ipc_buf) };
+            let _ = unsafe { memmgr_call_until_answered(memmgr_ep, &msg, ipc_buf) };
         }
     }
 }
@@ -966,13 +1093,15 @@ pub fn read_verified(file_cap: u64, len: u64, name: &str) -> crate::io::Result<V
     };
     let msg = builder.cap(file_cap).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-    let reply = match unsafe { ipc::ipc_call(info.procmgr_endpoint, &msg, ipc_buf) } {
+    let reply = match unsafe { deadline_call(info.procmgr_endpoint, &msg, ipc_buf) } {
         Ok(reply) => reply,
-        Err(_) => {
-            // The call failed before the kernel moved the cap: the slot
-            // still holds it.
+        Err(e) => {
+            // A call that failed before the kernel moved the cap leaves it
+            // in the slot; one cut short after procmgr received it leaves
+            // the slot empty, and procmgr releases the run its reply could
+            // not deliver.
             let _ = syscall::cap_delete(file_cap);
-            return Err(Error::other("seraph: verified read IPC failed"));
+            return Err(call_failed(e, "seraph: verified read IPC failed"));
         }
     };
     let caps = reply.caps();
@@ -1616,8 +1745,8 @@ fn unregister_then_unreserve(range: ReservedRange, va: u64, len: u64) -> bool {
     answered
 }
 
-/// `ipc::ipc_call`, made again for as long as it returns `Interrupted`, so the
-/// result is the server's reply or an error no stop caused.
+/// [`memmgr_call`], made again for as long as it returns `Interrupted`, so the
+/// result is memmgr's reply or an error no stop caused.
 ///
 /// A stop cancels a blocked call with `Interrupted`, which does not mean the
 /// request went undelivered (docs/fault-handling.md
@@ -1627,14 +1756,14 @@ fn unregister_then_unreserve(range: ReservedRange, va: u64, len: u64) -> bool {
 ///
 /// # Safety
 /// `ipc_buf` is the calling thread's registered IPC buffer page.
-pub(crate) unsafe fn ipc_call_until_answered(
+pub(crate) unsafe fn memmgr_call_until_answered(
     ep: u64,
     msg: &ipc::IpcMessage,
     ipc_buf: *mut u64,
 ) -> Result<ipc::IpcMessage, i64> {
     loop {
         // SAFETY: the caller passes the registered IPC buffer page.
-        match unsafe { ipc::ipc_call(ep, msg, ipc_buf) } {
+        match unsafe { memmgr_call(ep, msg, ipc_buf) } {
             Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => {}
             result => return result,
         }
@@ -1670,7 +1799,7 @@ pub(crate) unsafe fn register_rw_region(
     let mut interrupted = false;
     loop {
         // SAFETY: the caller passes the registered IPC buffer page.
-        match unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) } {
+        match unsafe { memmgr_call(memmgr_ep, &msg, ipc_buf) } {
             Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => return true,
             Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => interrupted = true,
             Ok(reply) if interrupted && reply.label == ipc::memmgr_errors::INVALID_ARGUMENT => {
@@ -1702,7 +1831,7 @@ unsafe fn unregister_rw_region(memmgr_ep: u64, ipc_buf: *mut u64, va: u64, len: 
         .build();
     // SAFETY: the caller passes the registered IPC buffer page.
     matches!(
-        unsafe { ipc_call_until_answered(memmgr_ep, &msg, ipc_buf) },
+        unsafe { memmgr_call_until_answered(memmgr_ep, &msg, ipc_buf) },
         Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS
             || reply.label == ipc::memmgr_errors::INVALID_ARGUMENT
     )
@@ -2054,7 +2183,9 @@ pub mod registry {
             return None;
         }
         // SAFETY: current_ipc_buf returns the registered IPC buffer page.
-        unsafe { ::registry_client::lookup(name, buf) }
+        unsafe { ::registry_client::lookup_within(name, buf, super::call_time_left()) }
+            .ok()
+            .flatten()
     }
 
     /// Return the installed registry cap, or zero if `_start` did not
@@ -2353,6 +2484,15 @@ pub mod process {
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn pinned(&mut self, on: bool) -> &mut Self;
 
+        /// Load the child's image private (the `CREATE_PRIVATE_IMAGE` label
+        /// flag). By default a demand-paged child attaches its text and
+        /// read-only data shared with the binary's other instances. A child
+        /// that holds keys sets `private_image(true)`: text it shares lets
+        /// other processes that map it observe by cache timing which of its
+        /// code runs. Defaults to off.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn private_image(&mut self, on: bool) -> &mut Self;
+
         /// Request the priority level the child's initial thread is created
         /// at (the `CREATE_PRIORITY` label field). `0` (the default)
         /// reverts to procmgr's policy default, clamped to the child's
@@ -2388,6 +2528,11 @@ pub mod process {
 
         fn pinned(&mut self, on: bool) -> &mut Command {
             self.as_inner_mut().set_pinned(on);
+            self
+        }
+
+        fn private_image(&mut self, on: bool) -> &mut Command {
+            self.as_inner_mut().set_private_image(on);
             self
         }
 

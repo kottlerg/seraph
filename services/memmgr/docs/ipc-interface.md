@@ -321,7 +321,12 @@ rechecks. See [`memory-pool.md`](memory-pool.md) §"Reclamation".
 Procmgr informs memmgr of a new process. Memmgr allocates a per-process
 tracking entry and the process's budget node, and returns a badged SEND cap
 on memmgr's endpoint that procmgr will install in the new process's
-`ProcessInfo.memmgr_endpoint_cap`. Privilege: procmgr-only.
+`ProcessInfo.memmgr_endpoint_cap`. Privilege: procmgr-only. procmgr also
+registers one record that is no process, its image store, on whose SEND it
+requests the frames of the image objects it seals, so they are charged to a
+node of their own
+([services/procmgr/README.md](../../procmgr/README.md#image-sharing) § Image
+Sharing); memmgr treats it as any record.
 
 **Request:**
 
@@ -1097,19 +1102,21 @@ run changes nothing, so an interrupted call is safe to repeat.
 
 ### Label 21: `MAKE_RESIDENT`
 
-Make a range of a process's demand regions resident for a debugger: memmgr
-restores each chunk of the range it holds in its store, compressed or writing,
-and maps back each it is evicting, so a `SYS_THREAD_READ_MEM` that failed on a
-page of it succeeds when the reader retries. memmgr reads no swap slot and
-waits on no swap service, so a chunk on disk it asks the swap service for: when
-the registered swap service gave a want Notification (§ Label 22), memmgr posts
-the chunk's slot word to it, sends on the Notification, and replies pending
-(below); the swap service takes the word (`SWAP_WANTED`, § Label 26), reads the
-slot and restores the chunk ahead of a fault (`SWAP_RESTORE`, § Label 25), and
-the reader asks again. A page no fault has backed stays not present, and so
-does a page of a lost chunk, or of a chunk on disk with no swap service to ask,
-which memmgr passes over
-([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
+Make a range of a process's demand regions resident for a debugger, so a `SYS_THREAD_READ_MEM` that
+failed on a page of it succeeds when the reader retries. For each page of the range memmgr does what
+a read fault on it does when that read takes no page: it restores each chunk of the range it holds
+in its store, compressed or writing, and maps back each it is evicting; and it maps an attachment's
+page with no copy of its own to its origin, read-only, as a read fault does
+([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects): the object's page, or the zero
+frame, with no data page and no new charge, so a debugger reads a process's shared text it has not
+run. memmgr reads no swap slot and waits on no swap service, so a chunk on disk it asks the swap
+service for: when the registered swap service gave a want Notification (§ Label 22), memmgr posts
+the chunk's slot word to it, sends on the Notification, and replies pending (below); the swap
+service takes the word (`SWAP_WANTED`, § Label 26), reads the slot and restores the chunk ahead of a
+fault (`SWAP_RESTORE`, § Label 25), and the reader asks again. A page of an ordinary region no fault
+has backed stays not present, since a read fault there would take a fresh zeroed page: its bytes are
+zero and nothing holds them. So does a page of a lost chunk, or of a chunk on disk with no swap
+service to ask, which memmgr passes over ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 Privilege: procmgr only, which sends it for a holder of its debug authority
 (`services/procmgr/docs/ipc-interface.md` § `MAKE_RESIDENT`).
 
@@ -1123,12 +1130,13 @@ Privilege: procmgr only, which sends it for a holder of its debug authority
 | data[2] | `len_bytes` (nonzero) |
 
 Each restore is admitted and made as a fault's on the chunk
-([`memory-pool.md`](memory-pool.md#eviction) § Eviction), and counts as an
-access in the chunk's age. A process with no delegated address space has
-nothing evicted, and the request succeeds. memmgr walks only the chunks that
-have an entry, in address order, and stops after `MAKE_RESIDENT_CHUNKS` (4)
-chunks made resident or `MAKE_RESIDENT_VISITS` (64) chunks and regions
-visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction), and counts as an access in the chunk's
+age. A process with no delegated address space has nothing evicted, and the request succeeds. An
+origin map is made as a read fault's, from the chunk of the page it starts at, over the part of that
+chunk no copy backs. memmgr walks only the chunks that have an entry, and each chunk of an
+attachment, in address order, and stops after `MAKE_RESIDENT_CHUNKS` (4) chunks made resident, an
+origin map counting as one, or `MAKE_RESIDENT_VISITS` (64) chunks and regions visited
+([docs/limits.md](../../../docs/limits.md) § memmgr).
 
 **Reply (success):**
 

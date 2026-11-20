@@ -1,20 +1,21 @@
 # shared/ipc
 
-Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot type, the
-`ipc_call` / `ipc_recv` / `ipc_reply` wrappers, with the bounded and try-once forms
-`ipc_call_timeout`, `ipc_recv_timeout`, and `ipc_try_recv`, that keep the kernel's per-thread IPC
-buffer as scratch at the syscall boundary, the generic bootstrap protocol, the
-`RecvGuard` receive-failure policy for blocking receive loops, the per-service IPC label and
-error-code modules, the shared policy tables (`sched_policy`, `published_names`, `log_badges`),
-the `keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`, and
+Shared IPC helpers for Seraph userspace: the stack-owned `IpcMessage` snapshot type, the `ipc_call`
+/ `ipc_recv` / `ipc_reply` wrappers, with the bounded and try-once forms `ipc_call_timeout`,
+`ipc_recv_timeout`, and `ipc_try_recv`, and `ipc_call_within`, a call bounded by the time left to a
+deadline (`call_timeout`; `WouldBlock` without a call once none is left;
+[runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Call deadline), that keep the
+kernel's per-thread IPC buffer as scratch at the syscall boundary, the generic bootstrap protocol,
+the `RecvGuard` receive-failure policy for blocking receive loops, the per-service IPC label and
+error-code modules, the shared policy tables (`sched_policy`, `published_names`, `log_badges`), the
+`keysym` codes and event packing, the `memmgr_bootstrap`, `device_info_kind`, and
 `procmgr_process_state` constants, the create requests' argv/env header codec
 (`procmgr_labels::ArgvEnvHeader`), the crate-level limits and masks (`VERB_BIT_MASK`,
 `MAX_PATH_LEN`), the svcmgr name limit and codec (`svcmgr_labels::NAME_MAX`, `pack_name`,
-`unpack_name`), reply-shape decoders (today `memmgr_grant_layout`), the driver-side
-`DMA_MAP` and `DMA_UNMAP` calls (`dma_map`, `dma_unmap`), and the log record codec
-(`log_record`: the `STREAM_RECORD` payload's encoder `RecordWriter`, decoder `Record`, limits, and
-key alphabet; [logd IPC interface](../../services/logd/docs/ipc-interface.md)
-§ `stream_labels::STREAM_RECORD`).
+`unpack_name`), reply-shape decoders (today `memmgr_grant_layout`), the driver-side `DMA_MAP` and
+`DMA_UNMAP` calls (`dma_map`, `dma_unmap`), and the log record codec (`log_record`: the
+`STREAM_RECORD` payload's encoder `RecordWriter`, decoder `Record`, limits, and key alphabet; [logd
+IPC interface](../../services/logd/docs/ipc-interface.md) § `stream_labels::STREAM_RECORD`).
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 

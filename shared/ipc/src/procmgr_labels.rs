@@ -55,7 +55,8 @@ pub const START_PROCESS: u64 = 2;
 /// * bit `33` — [`CREATE_NODE_HANDLE`]
 /// * bit `34` — [`CREATE_CHARGE_NODE`]
 /// * bit `35` — [`CREATE_CONTAIN`]
-/// * bits `[36..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+/// * bit `36` — [`CREATE_PRIVATE_IMAGE`]
+/// * bits `[37..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
 ///
 /// IPC data words:
 /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
@@ -115,7 +116,8 @@ pub const CREATE_PINNED: u64 = 1 << 16;
 /// procmgr keeps the relay for the child's life and posts the child's end
 /// to it once, as the entry `(reason, 0)`: the fault class at the reap of
 /// a terminal fault in any of the child's threads, the exit reason at the
-/// reap of its main thread's exit, or the reason a destroy tore it down
+/// reap of its main thread's exit or of a process exit (`SYS_ASPACE_EXIT`)
+/// of any of its threads, or the reason a destroy tore it down
 /// with (`EXIT_KILLED` for a running child), so `Child::wait()` returns
 /// whoever ended the child. procmgr deletes its copy once it has posted,
 /// and when the child is re-parented, its creator having ended
@@ -238,11 +240,23 @@ pub const CREATE_CHARGE_NODE: u64 = 1 << 34;
 /// process that ends take its nearest live ancestor as their parent.
 /// Specified in `services/procmgr/docs/ipc-interface.md` § Process Tree.
 pub const CREATE_CONTAIN: u64 = 1 << 35;
-/// Still-reserved bits `[36..64]` of a create label. Procmgr rejects
+/// Label flag (bit 36) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+/// load the child's image private. Without it, a demand-paged child
+/// attaches the pages of its image that no relocation touches (its text and
+/// read-only data) shared with the binary's other instances, from one
+/// memmgr memory object, and only its writable segments are its own; with
+/// it, every segment is loaded into frames of the child's own, as for a
+/// pinned child, which shares nothing. A key-holding service asks for it:
+/// text it shares lets the other processes that map it observe, by cache
+/// timing, which of its code runs. Specified
+/// in `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
+/// (**Private image**).
+pub const CREATE_PRIVATE_IMAGE: u64 = 1 << 36;
+/// Still-reserved bits `[37..64]` of a create label. Procmgr rejects
 /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
 /// addition is provably additive: existing senders are known to send
 /// zeros.
-pub const CREATE_RESERVED_MASK: u64 = !((1 << 36) - 1);
+pub const CREATE_RESERVED_MASK: u64 = !((1 << 37) - 1);
 /// Data words an [`ArgvEnvHeader`] takes in a create request.
 pub const ARGV_ENV_HEADER_WORDS: usize = 4;
 /// The first data word of a create request after its fixed word 0, the
@@ -416,13 +430,13 @@ pub const DESTROY_PROCESS: u64 = 8;
 /// tools and `std::process::Child::try_wait`-style probes that want to
 /// peek without blocking on a death event.
 pub const QUERY_PROCESS: u64 = 9;
-/// Bind the caller's event queue as a terminal-fault death observer on
+/// Bind the caller's event queue as a terminal-end death observer on
 /// a child's address space, sent on the child's badged
 /// `process_handle` only: `caps[0]` a `POST` cap on the queue,
-/// `data[0]` the correlator the post carries. The first terminal fault
-/// in any of the child's threads then posts `(fault class, correlator)`
-/// to the queue, once; a child that has already faulted posts its retained fault
-/// class at once. procmgr keeps the address space's `Control` right
+/// `data[0]` the correlator the post carries. The first terminal end (a
+/// fault or an exit) of any of the child's threads then posts
+/// `(exit reason, correlator)` to the queue, once; a child that has already
+/// ended posts its retained reason at once. procmgr keeps the address space's `Control` right
 /// and deletes its copy of the cap whatever the outcome. Replies
 /// `SUCCESS`; `UNAUTHORIZED` on a cap other than a process handle;
 /// `INVALID_BADGE` when the handle names no live process;
@@ -924,10 +938,11 @@ fn entry_base(index: usize, stride: usize) -> Option<usize>
 pub const DETACH_PROCESS: u64 = 24;
 
 /// Make a range of a process's memory resident for a debugger: memmgr
-/// restores each chunk of the range it evicted into its compressed store,
-/// so a `SYS_THREAD_READ_MEM` that failed with `InvalidAddress` on such a
-/// page succeeds when the reader retries; a page no fault has backed stays
-/// not present. Served only on a badge carrying [`DEBUG_AUTHORITY`].
+/// restores each chunk of the range it evicted into its compressed store
+/// and maps an attachment's page with no copy of its own to its origin,
+/// read-only, so a `SYS_THREAD_READ_MEM` that failed with `InvalidAddress`
+/// on such a page succeeds when the reader retries; a page of an ordinary
+/// region no fault has backed stays not present. Served only on a badge carrying [`DEBUG_AUTHORITY`].
 /// `data[0]` is the target's process badge, `data[1]` the address and
 /// `data[2]` the length in bytes, nonzero. Replies `SUCCESS` with `data[0]`
 /// where memmgr stopped, which does a bounded part of the range per

@@ -770,14 +770,14 @@ withdraws the driver. It binds two death observers on each driver, with the driv
 the correlator: one on the driver's main thread, which an exit or a fault of that thread posts, and
 one procmgr binds on the driver's address space at devmgr's request ([procmgr IPC
 Interface](../../procmgr/docs/ipc-interface.md) § Label 25: `BIND_DEATH_OBSERVER`), which the first
-terminal fault of any of the driver's threads posts, once. A fault of a worker thread drives
-procmgr's teardown of the driver, whose stop of the main thread posts nothing, so only the
-address-space observer reports that death. A fault of the main thread that is the driver's first
-terminal fault posts to both observers; devmgr takes the first post and drops the second, which
-names a driver already dead or withdrawn. An
-exit of the main thread posts only the thread observer, since the kernel fires an address space's
-observers on a terminal fault alone, so neither observer covers the other. A served driver that dies
-is restarted as § Driver Restart describes (the supervision hierarchy is in
+terminal end of any of the driver's threads, a fault or an exit, posts, once. A fault or exit of a
+worker thread drives procmgr's teardown of the driver, whose stop of the main thread posts nothing,
+so only the address-space observer reports that death. A fault or exit of the main thread that is
+the driver's first terminal end posts to both observers; devmgr takes the first post and drops the
+second, which names a driver already dead or withdrawn. A `SYS_THREAD_EXIT` of the main thread
+posts only the thread observer, since the kernel fires an address space's observers on a terminal
+end alone, so neither observer covers the other. A served driver that dies is restarted as § Driver
+Restart describes (the supervision hierarchy is in
 [docs/supervision.md](../../../docs/supervision.md)). After
 discovering a device, devmgr requests procmgr to create the driver process and then delegates
 the per-device capability set via IPC. Drivers MUST NOT be started independently of devmgr. See

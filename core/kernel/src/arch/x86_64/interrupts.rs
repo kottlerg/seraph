@@ -20,8 +20,8 @@
 //! 6. Mask all LVT entries.
 //! 7. Initialise the I/O APICs (`ioapic::init`): read pin counts, mask every entry.
 //!
-//! Interrupts are **not** enabled here; `timer::init()` enables them after the
-//! APIC timer is calibrated and configured.
+//! Interrupts are **not** enabled here; `timer::init()` enables them once the
+//! TSC rate is known and the tick is configured.
 //!
 //! # Local APIC access
 //! Two access modes share a single accessor pair ([`apic_read`] /
@@ -734,8 +734,8 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
 /// `trampoline_phys`: 4 KiB-aligned physical address < 1 MiB of the AP trampoline.
 ///
 /// # Safety
-/// Must be called from the BSP with the IDT loaded and the APIC timer calibrated
-/// (so `timer::delay_us` works). The trampoline page must have been set up via
+/// Must be called from the BSP with the IDT loaded and `timer::init` run, so the
+/// TSC rate is known and `timer::delay_us` works. The trampoline page must have been set up via
 /// `ap_trampoline::setup_trampoline` and `setup_ap_params`.
 #[cfg(not(test))]
 pub unsafe fn start_ap(target_apic_id: u32, trampoline_phys: u64)
@@ -746,7 +746,7 @@ pub unsafe fn start_ap(target_apic_id: u32, trampoline_phys: u64)
         reason = "every call is a step of the one Intel SDM INIT-SIPI-SIPI sequence to \
                   `target_apic_id`"
     )]
-    // SAFETY: caller guarantees APIC is initialized, trampoline set up, and timer calibrated; INIT+SIPI sequence follows Intel SDM.
+    // SAFETY: caller guarantees APIC is initialized, trampoline set up, and the TSC rate known; INIT+SIPI sequence follows Intel SDM.
     unsafe {
         send_init_ipi(target_apic_id);
         super::timer::delay_us(10_000); // 10 ms after INIT (Intel SDM §8.4.4.1)

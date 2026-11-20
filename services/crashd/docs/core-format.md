@@ -59,7 +59,13 @@ evicted there is mapped again and listed, one on disk once the swap service has 
 ([memmgr Memory Pool](../../memmgr/docs/memory-pool.md#eviction) § Eviction). A chunk memmgr cannot
 restore, for want of memory, is not listed, nor is a chunk on disk the swap service does not restore
 within the dump's `ipc::PENDING_TRIES` pauses (about a second over the whole dump), one lost, one
-on disk with no swap service registered to ask, or an evicted chunk outside those ranges. Adjacent
+on disk with no swap service registered to ask, or an evicted chunk outside those ranges. Text and
+read-only data a process shares with the other instances of its binary
+([procmgr](../../procmgr/README.md#image-sharing) § Image Sharing) are listed where the process
+has touched them, and in those ranges, where `MAKE_RESIDENT` maps them; elsewhere they are not
+present and so not listed, and a debugger reads them from the binary, whose bytes they are.
+crashd reads the image's ELF header, for the auxiliary vector, through procmgr in the same way
+(`ipc::read_mem_resident_bounded`). Adjacent
 pages of one protection joined into one run, in address order, at most 65 533 (`e_phnum` is 16
 bits and the `PN_XNUM` extension is not written). Each `PT_LOAD` carries:
 

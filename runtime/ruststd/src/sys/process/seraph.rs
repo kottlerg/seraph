@@ -72,6 +72,7 @@ use crate::thread::JoinHandle;
 use super::CommandEnvs;
 use super::env::{CommandEnv, CommandResolvedEnvs};
 
+use crate::os::seraph::{call_failed, deadline_call, destroy_process_call};
 use ipc::{procmgr_errors, procmgr_labels};
 
 /// Sentinel `event_post` payload used by `Process::Drop` to unblock the
@@ -156,6 +157,12 @@ pub struct Command {
     /// no system pager. Set via `CommandExt::pinned`. Defaults to off — the
     /// child is demand-paged by the system default.
     pinned: bool,
+    /// When set, spawn ORs `procmgr_labels::CREATE_PRIVATE_IMAGE` into the
+    /// `CREATE_FROM_FILE` label so procmgr loads the child's image private
+    /// instead of attaching its text and read-only data shared with the
+    /// binary's other instances. Set via `CommandExt::private_image`. Defaults
+    /// to off.
+    private_image: bool,
     /// `CREATE_PRIORITY` label field for the next spawn. `0` (default) =
     /// procmgr's policy default, clamped to the child's band. Set via
     /// `CommandExt::priority`.
@@ -179,6 +186,7 @@ impl Command {
             namespace_cap: 0,
             cwd_dir_cap: 0,
             pinned: false,
+            private_image: false,
             priority: 0,
             sched_max: 0,
         }
@@ -196,6 +204,11 @@ impl Command {
     /// `ProcessInfo.current_dir_cap`. Called by `CommandExt::cwd_dir_cap`.
     pub fn set_cwd_dir_cap(&mut self, cap: u64) {
         self.cwd_dir_cap = cap;
+    }
+
+    /// Request a private-image child. Called by `CommandExt::private_image`.
+    pub fn set_private_image(&mut self, on: bool) {
+        self.private_image = on;
     }
 
     /// Request a pinned (eager-mapped, no pager) child. Called by
@@ -460,8 +473,14 @@ impl Command {
         } else {
             0
         };
+        let private_image_flag = if self.private_image {
+            procmgr_labels::CREATE_PRIVATE_IMAGE
+        } else {
+            0
+        };
         let label = procmgr_labels::CREATE_FROM_FILE
             | pinned_flag
+            | private_image_flag
             | procmgr_labels::CREATE_DEATH_RELAY
             | procmgr_labels::create_sched_bits(self.priority, self.sched_max)
             | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 };
@@ -491,15 +510,21 @@ impl Command {
         // procmgr via the IPC; procmgr cap_deletes the file cap and the
         // argv/env cap before it replies, and keeps the relay for the child's
         // life.
-        let reply = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_ptr) };
+        let reply = unsafe { deadline_call(procmgr_ep, &msg, ipc_ptr) };
         // procmgr holds no copy of the argv/env cap now; the run goes back
         // to memmgr unless procmgr may still map its pages.
         if let Some(argv_env) = argv_env {
             argv_env.settle(reply.as_ref().map_or(0, |r| r.label));
         }
-        let reply = reply.map_err(|_| {
+        let reply = reply.map_err(|e| {
+            // The call may have failed before procmgr received it (the call
+            // deadline passed, or the call timed out queued), when the caps
+            // it carried are still here; a handle that moved is stale and
+            // its delete fails harmlessly.
+            let _ = syscall::cap_delete(file_cap);
+            let _ = syscall::cap_delete(death_relay);
             let _ = syscall::cap_delete(death_eq);
-            io::Error::other("CREATE_FROM_FILE syscall failed")
+            call_failed(e, "CREATE_FROM_FILE syscall failed")
         })?;
         if reply.label != procmgr_errors::SUCCESS {
             let _ = syscall::cap_delete(death_eq);
@@ -778,7 +803,7 @@ impl Command {
             }
             let ns_msg = ns_builder.build();
             // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
-            let ns_reply = unsafe { ipc::ipc_call(process_handle, &ns_msg, ipc_ptr) };
+            let ns_reply = unsafe { deadline_call(process_handle, &ns_msg, ipc_ptr) };
             // The caps were transferred by ipc_call regardless of the
             // reply label; clear our slot indices unconditionally.
             let _ = syscall::cap_delete(ns_cap);
@@ -806,7 +831,7 @@ impl Command {
                     let _ = syscall::cap_delete(process_handle);
                     return Err(map_procmgr_error(reply.label));
                 }
-                Err(_) => {
+                Err(e) => {
                     if let Some(b) = bridge {
                         let _ = syscall::event_post(death_eq, BRIDGE_SENTINEL_DROP);
                         if let Some(h) = b.handle {
@@ -823,7 +848,7 @@ impl Command {
                     let _ = syscall::cap_delete(thread_cap);
                     destroy_child(process_handle);
                     let _ = syscall::cap_delete(process_handle);
-                    return Err(io::Error::other("CONFIGURE_NAMESPACE syscall failed"));
+                    return Err(call_failed(e, "CONFIGURE_NAMESPACE syscall failed"));
                 }
             }
         }
@@ -831,11 +856,11 @@ impl Command {
         // Kick the child off.
         let start_msg = ipc::IpcMessage::new(procmgr_labels::START_PROCESS);
         // SAFETY: `ipc_ptr` is this thread's registered IPC buffer page.
-        let start_result = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_ptr) };
+        let start_result = unsafe { deadline_call(process_handle, &start_msg, ipc_ptr) };
         let start_error = match &start_result {
             Ok(reply) if reply.label == procmgr_errors::SUCCESS => None,
             Ok(reply) => Some(map_procmgr_error(reply.label)),
-            Err(_) => Some(io::Error::other("START_PROCESS syscall failed")),
+            Err(e) => Some(call_failed(*e, "START_PROCESS syscall failed")),
         };
         if let Some(e) = start_error {
             // If a bridge is running, wake it with the sentinel so it
@@ -847,7 +872,7 @@ impl Command {
                 }
                 let _ = syscall::cap_delete(b.completion_notification);
             }
-            // An interrupted START_PROCESS may have started the child, so
+            // An interrupted or timed-out START_PROCESS may have started the child, so
             // the rings count as never used only once the teardown has
             // returned; otherwise their grants stay accounted to this
             // process, as the death bridge leaves them.
@@ -920,8 +945,15 @@ fn install_pipe(
         .cap(caps.space_notification)
         .build();
     // SAFETY: `ipc_ptr` is the calling thread's registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(process_handle, &cap_msg, ipc_ptr) }
-        .map_err(|_| io::Error::other("CONFIGURE_PIPE syscall failed"))?;
+    let reply = unsafe { deadline_call(process_handle, &cap_msg, ipc_ptr) }.map_err(|e| {
+        // A call that failed before procmgr received it leaves the handoff
+        // caps here; a handle that moved is stale and its delete fails
+        // harmlessly.
+        for cap in [caps.memory, caps.data_notification, caps.space_notification] {
+            let _ = syscall::cap_delete(cap);
+        }
+        call_failed(e, "CONFIGURE_PIPE syscall failed")
+    })?;
     if reply.label != procmgr_errors::SUCCESS {
         return Err(map_procmgr_error(reply.label));
     }
@@ -1036,9 +1068,7 @@ impl Process {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        if !destroy_child(self.process_handle) {
-            return Err(io::Error::other("Child::kill: DESTROY_PROCESS failed"));
-        }
+        kill_child(self.process_handle)?;
         // The kernel posts to the main-thread binding only on voluntary
         // exit (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
         // silent. procmgr posts the child's end to the relay once, at the
@@ -1269,17 +1299,39 @@ fn bridge_main(h: BridgeHandles) {
     let _ = syscall::notification_send(h.completion_notification, 1);
 }
 
-/// Send `DESTROY_PROCESS` on `process_handle`, retrying a call that a stop and
-/// restart of this thread interrupted, and report whether procmgr replied.
+/// `Child::kill`'s `DESTROY_PROCESS` on `process_handle`, under the thread's
+/// call deadline (`deadline_call`), retrying a call that a stop and restart of
+/// this thread interrupted: `TimedOut` when the deadline passed first, and
+/// the child may then still run.
+fn kill_child(process_handle: u64) -> io::Result<()> {
+    let ipc_buf = crate::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null() {
+        return Err(io::Error::other("Child::kill: IPC buffer not registered"));
+    }
+    let msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+    loop {
+        // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
+        match unsafe { deadline_call(process_handle, &msg, ipc_buf) } {
+            Ok(_) => return Ok(()),
+            Err(e) if e == SyscallError::Interrupted as i64 => {}
+            Err(e) => return Err(call_failed(e, "Child::kill: DESTROY_PROCESS failed")),
+        }
+    }
+}
+
+/// Send `DESTROY_PROCESS` on `process_handle`, outside the thread's call
+/// deadline (`destroy_process_call`): the teardown of a child a spawn could
+/// not finish, or of one its `Child` was dropped without a wait, which
+/// nothing else releases. Retries a call that a stop and restart of this
+/// thread interrupted, and reports whether procmgr replied.
 fn destroy_child(process_handle: u64) -> bool {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null() {
         return false;
     }
-    let destroy_msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
     loop {
         // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
-        match unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) } {
+        match unsafe { destroy_process_call(process_handle, ipc_buf) } {
             Ok(_) => return true,
             Err(e) if e == SyscallError::Interrupted as i64 => {}
             Err(_) => return false,

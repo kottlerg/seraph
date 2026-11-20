@@ -48,8 +48,7 @@ use syscall::{
 use syscall_abi::{
     CAP_INFO_ASPACE_PT_BUDGET, CAP_INFO_CSPACE_BUDGET, CAP_INFO_CSPACE_USED,
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, CAP_INFO_THREAD_STATE, EXIT_KILLED,
-    FAULT_LABEL, MAP_EXECUTABLE, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_NTF_NOTIFY, SystemInfoType,
-    THREAD_STATE_EXITED,
+    FAULT_LABEL, MAP_WRITABLE, RIGHTS_ALL, RIGHTS_NTF_NOTIFY, SystemInfoType, THREAD_STATE_EXITED,
 };
 
 use crate::{TestContext, TestResult};
@@ -81,8 +80,6 @@ fn pages_to_cover(index: u32) -> u64
 /// Canonical in every paging mode (below the 2^38 Sv39 user half) and
 /// distinct from other tests' VAs.
 const STUB_VA: u64 = 0x3E_6000_0000;
-/// Scratch VA in ktest's own address space through which the stub is written.
-const STUB_SCRATCH_VA: u64 = 0x3E_6100_0000;
 /// Unmapped entry PC for the fault-blocked child.
 const STUB_UNMAPPED_VA: u64 = 0x3E_6200_0000;
 /// Badge bound with the fault handler of the fault-blocked child.
@@ -91,70 +88,6 @@ const FAULT_BADGE: u64 = 0xA5_7A5E;
 /// which stretches it past [`crate::UNSCALED_CPUS`] CPUs, where the child's
 /// CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
-
-/// Write the machine-code stub `code` into a fresh frame-pool page and map it
-/// executable at [`STUB_VA`] in `aspace`. Returns the frame's Memory cap.
-///
-/// The page is written through a temporary writable mapping in ktest's own
-/// address space and unmapped before the executable mapping is made (W^X).
-/// The executable `mem_map` synchronises instruction fetch with the write
-/// (docs/memory-model.md § Instruction-Fetch Coherence), and the stub's
-/// callers then run it. Under QEMU a missing synchronisation does not fail,
-/// so the `SYS_SYSTEM_INFO(InstructionCacheSyncs)` count must rise across
-/// the map: the check that the path was taken.
-fn install_stub(ctx: &TestContext, aspace: u64, code: &[u8]) -> Result<u64, &'static str>
-{
-    if u64::try_from(code.len()).map_or(true, |len| len > syscall_abi::PAGE_SIZE)
-    {
-        return Err("retype::stub: stub larger than a page");
-    }
-    let frame =
-        crate::frame_pool::alloc().ok_or("retype::stub: frame_pool::alloc returned None")?;
-    // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
-    // span holds no Rust object or IPC page of ktest.
-    if unsafe { mem_map(frame, ctx.aspace_cap, STUB_SCRATCH_VA, 0, 1, MAP_WRITABLE) }.is_err()
-    {
-        // SAFETY: `frame` came from `alloc` above and the failed map left it
-        // mapped nowhere.
-        unsafe { crate::frame_pool::free(frame) };
-        return Err("retype::stub: scratch mem_map failed");
-    }
-    for (i, b) in code.iter().enumerate()
-    {
-        // SAFETY: i is below the stub's length, which the check above keeps
-        // within a page, so the byte lies in STUB_SCRATCH_VA..+PAGE.
-        let dst = unsafe { (STUB_SCRATCH_VA as *mut u8).add(i) };
-        // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above, and
-        // `dst` is a byte of it.
-        unsafe { dst.write_volatile(*b) };
-    }
-    // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
-    // span holds no Rust object or IPC page of ktest.
-    if unsafe { mem_unmap(ctx.aspace_cap, STUB_SCRATCH_VA, 1) }.is_err()
-    {
-        // The frame is still mapped at STUB_SCRATCH_VA, and `free` requires
-        // it unmapped, so it stays allocated rather than re-enter the pool.
-        return Err("retype::stub: scratch mem_unmap failed");
-    }
-    let syncs = || system_info(SystemInfoType::InstructionCacheSyncs as u64).ok();
-    let before = syncs();
-    // SAFETY: `STUB_VA` is a scratch VA (crate docs § Scratch VAs), so the
-    // span holds no Rust object or IPC page of ktest.
-    if unsafe { mem_map(frame, aspace, STUB_VA, 0, 1, MAP_EXECUTABLE) }.is_err()
-    {
-        // SAFETY: `frame` came from `alloc` above; the scratch mapping is
-        // gone and the failed map left it mapped nowhere.
-        unsafe { crate::frame_pool::free(frame) };
-        return Err("retype::stub: executable mem_map failed");
-    }
-    // The frame stays mapped in `aspace` on this failure, so it is not freed;
-    // the caller's teardown of `aspace` unmaps it.
-    match (before, syncs())
-    {
-        (Some(b), Some(a)) if a > b => Ok(frame),
-        _ => Err("retype::stub: the executable mem_map did not synchronise instruction fetch"),
-    }
-}
 
 /// Exit reason of an already-`Exited` thread, or an error naming `what`.
 fn exited_reason(thread: u64, what: &'static str) -> Result<u64, &'static str>
@@ -323,9 +256,10 @@ fn aspace_stop_running(ctx: &TestContext) -> TestResult
     };
     phase.cspace = cap_create_cspace(memory, 0, 4)
         .map_err(|_| "retype::aspace_stop: cap_create_cspace (spin) failed")?;
-    phase.stub = Some(install_stub(
+    phase.stub = Some(crate::spawn::install_stub(
         ctx,
         phase.aspace,
+        STUB_VA,
         &crate::arch::code_stub::spin(),
     )?);
     phase.thread = cap_create_thread(memory, phase.aspace, phase.cspace, 0, 0)
@@ -403,7 +337,12 @@ pub fn aspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::aspace_self_delete: cap_create_cspace failed")?;
     let child_as = cap_copy(aspace, cspace, RIGHTS_ALL)
         .map_err(|_| "retype::aspace_self_delete: cap_copy(aspace) failed")?;
-    let frame = install_stub(ctx, aspace, &crate::arch::code_stub::self_delete(child_as))?;
+    let frame = crate::spawn::install_stub(
+        ctx,
+        aspace,
+        STUB_VA,
+        &crate::arch::code_stub::self_delete(child_as),
+    )?;
     let thread = cap_create_thread(memory, aspace, cspace, 0, 0)
         .map_err(|_| "retype::aspace_self_delete: cap_create_thread failed")?;
     // SAFETY: the thread is bound to the `aspace` this test created, not

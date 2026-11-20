@@ -13,6 +13,10 @@
 # which credits them with no entropy (services/entropyd/README.md). It
 # provides no endpoint: it serves no draws, which SYS_GETRANDOM alone does.
 #
+# entropyd's image is private (procmgr's CREATE_PRIVATE_IMAGE): it handles the
+# bytes it mixes into the kernel pool, and text it shared would let other
+# processes observe by cache timing which of its code runs.
+#
 # `restart = on_failure`, `critical = no`: without entropyd the pool runs
 # on the kernel's own sources, as it does on a machine with no hardware RNG.
 binary            = /services/entropyd
@@ -21,3 +25,4 @@ critical          = no
 namespace         = none
 seed              = devmgr.class.hwrng
 entropy_authority = yes
+private_image     = yes

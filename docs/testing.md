@@ -84,7 +84,7 @@ program opt in or skip; absence is the default.
 - The tester binary MUST exit `0` on pass and non-zero on fail.
 - The tester binary's exit code is the authoritative verdict. Seraph propagates
   it natively, without POSIX 8-bit truncation (see
-  [syscalls.md § `SYS_PROCESS_EXIT`](../core/kernel/docs/syscalls.md#sys_process_exit-54));
+  [syscalls.md § `SYS_ASPACE_EXIT`](../core/kernel/docs/syscalls.md#sys_aspace_exit-54));
   the orchestrator reads it through `ExitStatus::success()`/`code()`.
 - The tester SHOULD emit a final stdout line `[<name>-tester] PASS` or
   `[<name>-tester] FAIL` for log readability. The orchestrator does not
@@ -548,12 +548,13 @@ acpid's `SLEEP(5)` and pwrmgr's core-death power-off write the FADT's `SLEEP_CON
 ([acpid § Power requests](../services/acpid/README.md#power-requests);
 [supervision.md § Core Set and System Death](supervision.md#core-set-and-system-death)). No QEMU
 machine boots the system on such a platform. QEMU's one hardware-reduced x86-64 machine,
-`microvm` with `acpi=on`, decodes no port 0x61, so the 8254 gate the kernel calibrates its clock
-through reads all-ones and the calibration fails; it publishes no MCFG, so devmgr finds no ECAM
-window; and the boot loader's `Mmio` apertures do not cover the ECAM window its DSDT names. So the
-platform is tested by this procedure, on a machine that meets the system's requirements, the
-8254 PIT among them ([platform-requirements.md § Required](platform-requirements.md#required)),
-and publishes an MCFG ([services/devmgr/docs/pci-enumeration.md § ECAM Configuration
+`microvm` with `acpi=on`, decodes no port 0x61, so the 8254 gate the kernel measures its clock
+through, where CPUID leaf 0x15 gives no TSC rate, reads all-ones and the 8254 gives no rate; it
+publishes no MCFG, so devmgr finds no ECAM window; and the boot loader's `Mmio` apertures do not
+cover the ECAM window its DSDT names. So the platform is tested by this procedure, on a machine
+that meets the system's requirements, a TSC rate source among them (CPUID leaf 0x15, or else the
+8254 PIT; [platform-requirements.md § Required](platform-requirements.md#required)), and
+publishes an MCFG ([services/devmgr/docs/pci-enumeration.md § ECAM Configuration
 Space](../services/devmgr/docs/pci-enumeration.md#ecam-configuration-space)):
 
 1. Build the x86-64 sysroot, stage the svctest recipe as § Gating describes (the test class files
@@ -652,12 +653,14 @@ from a host GDB over the debug port, so its check is a host GDB session.
 2. Boot the current sysroot once with the debug port, and wait for the stub's
    `[gdbstub] attached; serving the debug port` line on the serial stream.
 3. Run `gdb -batch` against the port with the target's binary for symbols: list the threads,
-   break on the tick function and continue to it, read the pointer, rewrite the counter and read
-   it back, rewrite a caller-saved register, read it back from the stub past GDB's register
-   cache, and restore it, single-step, delete the breakpoint, select the second thread and read
-   its registers, and detach. The output must show two threads, the breakpoint's stop, the
-   rewritten counter and register, a step that moved the pointer, the second thread's registers,
-   and GDB's `[Inferior 1 (Remote target) detached]`.
+   single-step from where the attach stopped the main thread, on text the target attaches shared
+   from its binary's image object, break on the tick function and continue to it, read the pointer,
+   rewrite the counter and read it back, rewrite a caller-saved register, read it back from the stub
+   past GDB's register cache, and restore it, single-step, delete the breakpoint, select the second
+   thread and read its registers, and detach. The output must show two threads, a pointer printed
+   after the first step, the breakpoint's stop, the rewritten counter and register, a step that
+   moved the pointer, the second thread's registers, and GDB's `[Inferior 1 (Remote target)
+   detached]`.
 4. Wait up to 30 s for the stub's `[gdbstub] detached from gdb-target (crash bindings restored:
    true)` line: procmgr took the target's crash bindings back.
 5. Restart the port's driver under the stub: connect again, `qSupported` (the stub attaches to

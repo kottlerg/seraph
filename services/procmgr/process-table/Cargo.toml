@@ -14,6 +14,9 @@ ipc = { path = "../../../shared/ipc" }
 # `Role` and `RoleSet`: the signature policy on each creator's record
 # (`sign_policy`).
 objsig = { path = "../../../shared/objsig" }
+# `aspace_end_reason`: the death resync decodes the kernel's
+# `CAP_INFO_ASPACE_END` answer.
+syscall-abi = { path = "../../../abi/syscall" }
 
 [dev-dependencies]
 # The model of the kernel's death queue and the drain procmgr's reaper makes,

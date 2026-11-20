@@ -20,7 +20,7 @@ memory, retried at half the pool, down to the first pool's size, when memmgr ref
 grant that large. When the queues fill the wait set, the set replaces it with one of twice the
 members, up to `WAIT_SET_MAX_MEMBERS`, and moves every member across. Each service sets its
 queues' ring capacity and its first pool when it creates the set; `bind_thread` and `bind_aspace`
-bind a thread's death observer and an address space's terminal-fault observer, `bind_with` binds
+bind a thread's death observer and an address space's terminal-end observer, `bind_with` binds
 one through a closure the service makes the bind with (a procmgr request, for one), and `drain`
 hands every pending death event to the service, reporting a queue that gave up a full ring's worth
 so the service resyncs; `try_recv` takes one, uncounted, for a counted set. A `DeathSet` is `Send`

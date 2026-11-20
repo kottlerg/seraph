@@ -13,9 +13,11 @@
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
+use core::time::Duration;
+
 use syscall_abi::SyscallError;
 
-use crate::{IpcMessage, ipc_call, memmgr_labels, procmgr_errors, procmgr_labels};
+use crate::{IpcMessage, ipc_call, ipc_call_within, memmgr_labels, procmgr_errors, procmgr_labels};
 
 /// How long a reader pauses before it asks again for a range memmgr replied
 /// pending on: the swap service is reading a chunk on disk, which takes a slot
@@ -103,24 +105,27 @@ pub fn next(at: u64, end: u64, step: ResidentStep, paused: u32) -> Next
 /// resident: the pauses it has spent against [`PENDING_TRIES`], never reset,
 /// so a reader that passes one bound to several ranges, as crashd does to
 /// every read of a dump, pauses at most [`PENDING_TRIES`] times over all of
-/// them; and the reader's own stop, checked before each request, so a reader
-/// whose own bound has passed (crashd's fault or dump bound) sends no further
-/// request.
+/// them; and the time left of the reader's own deadline, which each request
+/// carries as its call's timeout ([`ipc_call_within`]), so a reader whose
+/// own deadline has passed (crashd's fault or dump bound) sends no further
+/// request, and one whose request the server does not answer in time stops
+/// waiting at the deadline.
 pub struct ResidentBound<'a>
 {
     /// The pauses spent.
     pauses: u32,
-    /// Whether the reader's own bound has passed.
-    stop: &'a dyn Fn() -> bool,
+    /// The time left of the reader's own deadline, `None` for none.
+    left: &'a dyn Fn() -> Option<Duration>,
 }
 
 impl<'a> ResidentBound<'a>
 {
-    /// A bound with no pause spent, which stops once `stop` returns `true`.
+    /// A bound with no pause spent, under the deadline whose time left
+    /// `left` returns, `None` for none; it stops once the time left is zero.
     #[must_use]
-    pub fn new(stop: &'a dyn Fn() -> bool) -> Self
+    pub fn new(left: &'a dyn Fn() -> Option<Duration>) -> Self
     {
-        Self { pauses: 0, stop }
+        Self { pauses: 0, left }
     }
 
     /// The pauses spent against [`PENDING_TRIES`].
@@ -130,12 +135,12 @@ impl<'a> ResidentBound<'a>
         self.pauses
     }
 
-    /// Whether the reader's own bound has passed: no further request is sent
-    /// under this bound.
+    /// Whether the reader's own deadline has passed: no further request is
+    /// sent under this bound.
     #[must_use]
     pub fn stopped(&self) -> bool
     {
-        (self.stop)()
+        (self.left)().is_some_and(|left| left.is_zero())
     }
 }
 
@@ -143,7 +148,7 @@ impl<'a> ResidentBound<'a>
 /// range of `len` bytes at `va` of the process whose process badge (as
 /// `procmgr_labels::LIST_PROCESSES` lists it) is `process` resident
 /// (`procmgr_labels::MAKE_RESIDENT`), under a bound of its own: at most
-/// [`PENDING_TRIES`] pauses, about a second, and no stop. This is
+/// [`PENDING_TRIES`] pauses, about a second, and no deadline. This is
 /// [`make_resident_bounded`] for a reader that runs under no bound of its
 /// own, as gdbstub does; a reader that does passes its bound to that.
 ///
@@ -165,7 +170,7 @@ pub unsafe fn make_resident(
             va,
             len,
             ipc_buf,
-            &mut ResidentBound::new(&|| false),
+            &mut ResidentBound::new(&|| None),
         )
     }
 }
@@ -174,21 +179,24 @@ pub unsafe fn make_resident(
 /// range of `len` bytes at `va` of the process whose process badge (as
 /// `procmgr_labels::LIST_PROCESSES` lists it) is `process` resident
 /// (`procmgr_labels::MAKE_RESIDENT`): memmgr restores each chunk of the
-/// range it evicted into its compressed store, so a `SYS_THREAD_READ_MEM` or
-/// `SYS_THREAD_WRITE_MEM` that failed with `InvalidAddress` on such a page
+/// range it evicted into its compressed store, and maps each page of an
+/// attachment with no copy of its own to its origin, read-only, so a
+/// `SYS_THREAD_READ_MEM` that failed with `InvalidAddress` on such a page
 /// succeeds when retried (`services/memmgr/docs/memory-pool.md` § Eviction,
 /// Debugger reads), and asks the swap service to restore each chunk of it on
-/// disk. A page no fault has backed stays not present. memmgr does a bounded
-/// part of the range per request and replies where it stopped, so this asks
+/// disk. A page of an ordinary region no fault has backed stays not present.
+/// memmgr does a bounded part of the range per request and replies where it
+/// stopped, so this asks
 /// again from there until the whole range is done ([`next`]); where memmgr
 /// stopped at a chunk on disk, it pauses [`PENDING_PAUSE_MS`] before it asks
 /// again, while `bound` has pauses left, and past them goes on past the
-/// chunks on disk; once `bound` has stopped, it sends no further request
+/// chunks on disk; each request carries the time left of `bound`'s deadline
+/// as its timeout, and once that has passed, it sends no further request
 /// ([`resident_range`]).
 /// Whether every request was served: `false` when a call failed, procmgr
 /// refused (`OUT_OF_MEMORY` when memmgr could not restore a chunk of the
 /// range), a reply made no progress, a chunk on disk was not restored within
-/// the bound's pauses, or the bound stopped.
+/// the bound's pauses, or the bound's deadline passed.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -206,14 +214,15 @@ pub unsafe fn make_resident_bounded(
     {
         return false;
     };
+    let left = bound.left;
     resident_range(
         va,
         end,
         bound,
         // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-        |at| unsafe { make_resident_step(authority, process, at, end, ipc_buf) },
-        // A sleep cut short (crashd's watchdog upcall) only asks again
-        // sooner, which the bound's pauses and its stop bound as well.
+        |at| unsafe { resident_step_within(authority, process, at, end, ipc_buf, left()) },
+        // A sleep cut short (an upcall) only asks again sooner, which the
+        // bound's pauses and its deadline bound as well.
         || {
             let _ = syscall::thread_sleep(PENDING_PAUSE_MS);
         },
@@ -223,13 +232,13 @@ pub unsafe fn make_resident_bounded(
 /// The loop of [`make_resident_bounded`] over `[va, end)`: `step` makes one
 /// request from the address it is given (`None` when the call failed or was
 /// refused), and `pause` waits [`PENDING_PAUSE_MS`] after a pending reply.
-/// No request is made once `bound` has stopped. `bound` counts the pauses
+/// No request is made once `bound`'s deadline has passed. `bound` counts the pauses
 /// spent against [`PENDING_TRIES`] and is never reset, so a caller that
 /// passes one bound to several ranges, as crashd does for a dump's, bounds
 /// the wait on the swap service over all of them; once its pauses are spent,
 /// a range still goes on past its chunks on disk, so the chunks memmgr
 /// restores from its store beyond them are restored. Whether the whole range
-/// is done: `false` when the bound stopped, a request failed, a reply made no
+/// is done: `false` when the bound's deadline passed, a request failed, a reply made no
 /// progress, or a chunk on disk was passed over.
 pub fn resident_range(
     va: u64,
@@ -280,16 +289,12 @@ pub fn resident_range(
 /// debug-authority cap `authority`: where procmgr replied that memmgr
 /// stopped, `end` when the range is done, and whether it stopped at a chunk
 /// on disk the swap service was asked to restore, or `None` when the call
-/// failed or procmgr refused. [`make_resident_bounded`] drives
-/// [`resident_range`] with this, one request per step.
+/// failed or procmgr refused. The call waits without bound;
+/// [`make_resident_bounded`] drives [`resident_range`] with the same request
+/// under its bound's deadline, one request per step.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
-              caller's stack, a std service's thread (crashd, gdbstub), 32 KiB at the smallest"
-)]
 pub unsafe fn make_resident_step(
     authority: u64,
     process: u64,
@@ -298,13 +303,36 @@ pub unsafe fn make_resident_step(
     ipc_buf: *mut u64,
 ) -> Option<ResidentStep>
 {
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe { resident_step_within(authority, process, at, end, ipc_buf, None) }
+}
+
+/// [`make_resident_step`] with `left` of its caller's deadline to run, as
+/// [`ipc_call_within`] takes it.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, a std service's thread (crashd, gdbstub), 32 KiB at the smallest"
+)]
+unsafe fn resident_step_within(
+    authority: u64,
+    process: u64,
+    at: u64,
+    end: u64,
+    ipc_buf: *mut u64,
+    left: Option<Duration>,
+) -> Option<ResidentStep>
+{
     let request = IpcMessage::builder(procmgr_labels::MAKE_RESIDENT)
         .word(0, process)
         .word(1, at)
         .word(2, end.saturating_sub(at))
         .build();
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
-    unsafe { ipc_call(authority, &request, ipc_buf) }
+    unsafe { ipc_call_within(authority, &request, ipc_buf, left) }
         .ok()
         .filter(|reply| reply.label == procmgr_errors::SUCCESS)
         .map(|reply| ResidentStep {
@@ -404,7 +432,7 @@ pub fn private_range(va: u64, end: u64, mut step: impl FnMut(u64) -> Option<u64>
 /// Read `buf.len()` bytes at `va` of the address space of `thread`, a thread
 /// of the process `process` names, as [`read_mem_resident_bounded`] does,
 /// under a bound of its own: at most [`PENDING_TRIES`] pauses, about a
-/// second, and no stop, for a reader that runs under no bound of its own, as
+/// second, and no deadline, for a reader that runs under no bound of its own, as
 /// gdbstub does.
 ///
 /// # Safety
@@ -430,7 +458,7 @@ pub unsafe fn read_mem_resident(
             va,
             buf,
             ipc_buf,
-            &mut ResidentBound::new(&|| false),
+            &mut ResidentBound::new(&|| None),
         )
     }
 }
@@ -450,7 +478,7 @@ pub unsafe fn read_mem_resident(
 /// The error of the last `SYS_THREAD_READ_MEM`: the first read's when it
 /// failed with anything but `InvalidAddress`, or when procmgr did not make
 /// the range resident (a chunk on disk the swap service did not restore
-/// within the bound's pauses, or a bound that stopped, included); else the
+/// within the bound's pauses, or a bound whose deadline passed, included); else the
 /// second read's.
 pub unsafe fn read_mem_resident_bounded(
     authority: u64,
@@ -594,10 +622,10 @@ mod tests
         }
     }
 
-    /// A reader's own bound that never stops.
-    fn never() -> bool
+    /// A reader's own deadline that never comes.
+    fn never() -> Option<Duration>
     {
-        false
+        None
     }
 
     #[test]
@@ -673,12 +701,23 @@ mod tests
     #[test]
     fn a_stopped_bound_sends_no_further_request()
     {
-        // The reader's own bound passes during the second pause: the range
+        // The reader's own deadline passes during the second pause: the range
         // ends there, its pauses left unspent, with no third request.
         let asked = core::cell::Cell::new(0u32);
         let fired = core::cell::Cell::new(false);
-        let stop = || fired.get();
-        let mut bound = ResidentBound::new(&stop);
+        let left = || {
+            Some(
+                if fired.get()
+                {
+                    Duration::ZERO
+                }
+                else
+                {
+                    Duration::from_secs(1)
+                },
+            )
+        };
+        let mut bound = ResidentBound::new(&left);
         let done = resident_range(
             0x1000,
             0x9000,

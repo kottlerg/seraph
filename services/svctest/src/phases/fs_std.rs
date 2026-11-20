@@ -54,6 +54,10 @@ pub fn phases() -> &'static [Phase]
             run: std_frame_write_pool_phase,
         },
         Phase {
+            name: "std_frame_write_past_deadline",
+            run: std_frame_write_past_deadline_phase,
+        },
+        Phase {
             name: "std_read_dir",
             run: std_read_dir_phase,
         },
@@ -262,12 +266,74 @@ pub fn std_bulk_write_phase(_: &Caps)
     std::os::seraph::log!("std_bulk_write phase passed");
 }
 
-/// Frame-path writes (over 504 bytes) [`std_frame_write_pool_phase`] makes.
+/// Frame-path writes (over 504 bytes) [`std_frame_write_pool_phase`] and
+/// [`std_frame_write_past_deadline_phase`] make.
 const FRAME_WRITES: u64 = 64;
 
-/// Recheck rounds [`std_frame_write_pool_phase`] gives the charge to return
-/// to its baseline, or below it, after the writes.
+/// Recheck rounds [`measure_frame_writes`] gives the charge to return to
+/// its baseline, or below it, after the writes.
 const FRAME_POOL_RECHECKS: u32 = 16;
+
+/// svctest's charge around [`FRAME_WRITES`] frame-path writes, in pages.
+struct FrameCharge
+{
+    /// Before the writes.
+    base: u64,
+    /// Right after them.
+    written: u64,
+    /// After the rechecks.
+    now: u64,
+    /// The recheck rounds taken.
+    rechecks: u32,
+}
+
+/// Make [`FRAME_WRITES`] frame-path writes of one 2 KiB chunk to the start
+/// of a fresh file at `path` with `write`, after a warm-up write, and
+/// measure svctest's charge around them as [`std_frame_write_pool_phase`]
+/// describes; the file is removed again.
+fn measure_frame_writes(path: &str, mut write: impl FnMut(&mut std::fs::File, &[u8]))
+-> FrameCharge
+{
+    use std::io::{Seek, SeekFrom, Write};
+
+    let _ = std::fs::remove_file(path);
+    let chunk = vec![0x5Au8; 2048];
+    let mut f = std::fs::File::create(path).expect("create frame-pool file");
+    f.write_all(&chunk).expect("warm-up frame write");
+    let recheck = || {
+        let (grant, region_id) = super::memmgr::try_request_contiguous(1)
+            .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
+        super::memmgr::release_grant(grant, region_id);
+    };
+    recheck();
+    let (base, _, _) = super::memmgr::memory_usage();
+    for _ in 0..FRAME_WRITES
+    {
+        f.seek(SeekFrom::Start(0)).expect("seek to start");
+        write(&mut f, &chunk);
+    }
+    let (written, _, _) = super::memmgr::memory_usage();
+    let mut now = written;
+    let mut rechecks = 0;
+    for round in 1..=FRAME_POOL_RECHECKS
+    {
+        if now <= base
+        {
+            break;
+        }
+        recheck();
+        rechecks = round;
+        (now, _, _) = super::memmgr::memory_usage();
+    }
+    drop(f);
+    std::fs::remove_file(path).expect("cleanup");
+    FrameCharge {
+        base,
+        written,
+        now,
+        rechecks,
+    }
+}
 
 /// Each frame-path write returns its source page to memmgr when it ends, so
 /// repeated writes leave svctest's own charge where it was.
@@ -295,40 +361,16 @@ const FRAME_POOL_RECHECKS: u32 = 16;
 /// them) lowers the charge below the baseline, which no leak does.
 pub fn std_frame_write_pool_phase(_: &Caps)
 {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
 
-    let path = "/data/svctest/std_frame_pool.bin";
-    let _ = std::fs::remove_file(path);
-    let chunk = vec![0x5Au8; 2048];
-    let mut f = std::fs::File::create(path).expect("create frame-pool file");
-    f.write_all(&chunk).expect("warm-up frame write");
-    let recheck = || {
-        let (grant, region_id) = super::memmgr::try_request_contiguous(1)
-            .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
-        super::memmgr::release_grant(grant, region_id);
-    };
-    recheck();
-    let (base, _, _) = super::memmgr::memory_usage();
-    for _ in 0..FRAME_WRITES
-    {
-        f.seek(SeekFrom::Start(0)).expect("seek to start");
-        f.write_all(&chunk).expect("frame write");
-    }
-    let (written, _, _) = super::memmgr::memory_usage();
-    let mut now = written;
-    let mut rechecks = 0;
-    for round in 1..=FRAME_POOL_RECHECKS
-    {
-        if now <= base
-        {
-            break;
-        }
-        recheck();
-        rechecks = round;
-        (now, _, _) = super::memmgr::memory_usage();
-    }
-    drop(f);
-    std::fs::remove_file(path).expect("cleanup");
+    let FrameCharge {
+        base,
+        written,
+        now,
+        rechecks,
+    } = measure_frame_writes("/data/svctest/std_frame_pool.bin", |f, chunk| {
+        f.write_all(chunk).expect("frame write");
+    });
     assert!(
         now <= base,
         "std_frame_write_pool: charge {now} pages after {FRAME_WRITES} frame writes and \
@@ -337,6 +379,42 @@ pub fn std_frame_write_pool_phase(_: &Caps)
     std::os::seraph::log!(
         "std_frame_write_pool phase passed (charge {base} pages, {written} after the writes, \
          {rechecks} rechecks)"
+    );
+}
+
+/// A frame-path write under a call deadline that has passed
+/// (`std::os::seraph::with_call_deadline`) fails `TimedOut` without sending
+/// `FS_WRITE_MEMORY`, and returns its source page as a completed write does:
+/// a frame kept as though the driver might still copy from it would leave the
+/// charge [`FRAME_WRITES`] pages up ([`std_frame_write_pool_phase`]).
+pub fn std_frame_write_past_deadline_phase(_: &Caps)
+{
+    use std::io::Write;
+
+    let FrameCharge {
+        base,
+        written,
+        now,
+        rechecks,
+    } = measure_frame_writes("/data/svctest/std_frame_deadline.bin", |f, chunk| {
+        let wrote =
+            std::os::seraph::with_call_deadline(std::time::Instant::now(), || f.write(chunk));
+        let err = wrote.expect_err("a frame write under a passed call deadline was sent");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "std_frame_write_past_deadline: the write failed {err}"
+        );
+    });
+    assert!(
+        now <= base,
+        "std_frame_write_past_deadline: charge {now} pages after {FRAME_WRITES} writes past the \
+         deadline and {rechecks} rechecks, above the baseline {base} (right after the writes: \
+         {written} pages)"
+    );
+    std::os::seraph::log!(
+        "std_frame_write_past_deadline phase passed (charge {base} pages, {written} after the \
+         writes, {rechecks} rechecks)"
     );
 }
 

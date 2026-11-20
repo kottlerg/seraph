@@ -9,11 +9,13 @@
 //! process from a verified in-memory ELF image ([`crate::image`] reads and
 //! verifies it), as well as starting suspended processes.
 
+use crate::image_cache::{self, Executable, ImageGuard};
 use crate::loader::{self, ScratchMapping};
 use death_set::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
+use process_table::image_share::{self, ImageKey, SegmentSpan, ShareLayout};
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use syscall_abi::{
@@ -2028,6 +2030,7 @@ fn finalize_creation(
     parent_relay_cap: u64,
     sched: ChildSched,
     image: ImageSpan,
+    image_ref: u64,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
     self_aspace: u64,
@@ -2057,13 +2060,13 @@ fn finalize_creation(
     }
 
     // Also bind an address-space observer with the SAME correlator, so a
-    // terminal fault in a *spawned* (non-main) thread — which the main-thread
-    // binding above does not cover — still routes into `dispatch_death` →
-    // `take_by_badge` → teardown. When the main thread's fault is its address
-    // space's first, both observers fire with the same correlator and
-    // `take_by_badge` reaps exactly once (the second event is a
-    // stale-correlator no-op). Without it a worker
-    // thread's fault would never reap the process, so its failure refuses
+    // terminal fault or a process exit (`SYS_ASPACE_EXIT`) in a *spawned*
+    // (non-main) thread — which the main-thread binding above does not cover —
+    // still routes into `dispatch_death` → `take_by_badge` → teardown. When
+    // the main thread's fault or exit is its address space's first end, both
+    // observers fire with the same correlator and `take_by_badge` reaps
+    // exactly once (the second event is a stale-correlator no-op). Without it
+    // a worker thread's fault or exit would never reap the process, so its failure refuses
     // the spawn; the caller's guards destroy the child, which returns the
     // main-thread observer's node.
     let bound = crate::lock(deaths).bind_aspace(child_aspace, badge);
@@ -2073,24 +2076,7 @@ fn finalize_creation(
         return Err(procmgr_errors::OUT_OF_MEMORY);
     }
 
-    // Derive the process handle, a badged endpoint cap for the caller. The
-    // badge names this process on its later START_PROCESS, CONFIGURE_*,
-    // QUERY_PROCESS, and DESTROY_PROCESS calls; the handle tag tells it from
-    // the child's own procmgr cap, so DECLARE_NO_DEBUG and REGISTER_THREAD,
-    // which name their sender, are refused on it
-    // (`process_table::served_on_handle`).
-    let process_handle = syscall::cap_derive_badge(
-        self_endpoint,
-        syscall::RIGHTS_EP_SEND_GRANT,
-        badge | ipc::procmgr_labels::PROCESS_HANDLE_TAG,
-    )
-    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-    let Ok(thread_for_caller) = syscall::cap_derive(child_thread, syscall::RIGHTS_THREAD)
-    else
-    {
-        let _ = syscall::cap_delete(process_handle);
-        return Err(procmgr_errors::OUT_OF_MEMORY);
-    };
+    let (process_handle, thread_for_caller) = caller_caps(self_endpoint, child_thread, badge)?;
 
     // Demand-paged wiring (best-effort): delegate the child address space to
     // memmgr and bind the main thread's fault handler to it, then advertise
@@ -2099,8 +2085,10 @@ fn finalize_creation(
     // otherwise-complete creation; the advertisement is written last, so the
     // page never names a pager the child does not have. Which processes are
     // exempt from the default pager is in docs/fault-handling.md § Default
-    // System Pager.
-    if paging == Paging::Demand
+    // System Pager. A child that attaches a shared image (`image_ref`) is
+    // refused without a pager instead: nothing maps its image's attached
+    // pages but a fault memmgr serves.
+    let paged = paging == Paging::Demand
         && memmgr_send_cap != 0
         && self_memmgr_ep != 0
         && bind_pager(
@@ -2110,9 +2098,17 @@ fn finalize_creation(
             memmgr_badge,
             self_memmgr_ep,
             ipc_buf,
-        )
+        );
+    if paged
     {
         advertise_pager(self_aspace, pi_memory_cap, memmgr_badge);
+    }
+    else if image_ref != 0
+    {
+        std::os::seraph::log!(warn: "shared image without a pager; spawn refused");
+        let _ = syscall::cap_delete(thread_for_caller);
+        let _ = syscall::cap_delete(process_handle);
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     }
     bind_crash_endpoint(child_thread, badge);
 
@@ -2152,6 +2148,8 @@ fn finalize_creation(
         unanswered: true,
         end_queue: 0,
         end_correlator: 0,
+        image_ref,
+        ended_with: None,
     });
     if let Err(e) = inserted
     {
@@ -2174,6 +2172,35 @@ fn finalize_creation(
         image_bias,
         name: info_caps.name,
     })
+}
+
+/// The caps a create's reply gives its caller, derived for the child `badge`
+/// whose main thread is `child_thread`: the process handle, a badged SEND on
+/// procmgr's endpoint `self_endpoint`, and a copy of the thread cap. The
+/// handle's badge names this process on its later `START_PROCESS`,
+/// `CONFIGURE_*`, `QUERY_PROCESS`, and `DESTROY_PROCESS` calls; the handle
+/// tag tells it from the child's own procmgr cap, so `DECLARE_NO_DEBUG` and
+/// `REGISTER_THREAD`, which name their sender, are refused on it
+/// (`process_table::served_on_handle`).
+///
+/// # Errors
+/// `procmgr_errors::OUT_OF_MEMORY` when either cannot be derived; none is
+/// left.
+fn caller_caps(self_endpoint: u64, child_thread: u64, badge: u64) -> Result<(u64, u64), u64>
+{
+    let process_handle = syscall::cap_derive_badge(
+        self_endpoint,
+        syscall::RIGHTS_EP_SEND_GRANT,
+        badge | ipc::procmgr_labels::PROCESS_HANDLE_TAG,
+    )
+    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    let Ok(thread_for_caller) = syscall::cap_derive(child_thread, syscall::RIGHTS_THREAD)
+    else
+    {
+        let _ = syscall::cap_delete(process_handle);
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    };
+    Ok((process_handle, thread_for_caller))
 }
 
 /// The create reply code for a refused insert of a child's entry: the creator
@@ -2590,7 +2617,7 @@ fn bind_pager(
     // badge, over procmgr's (procmgr-badged) endpoint so it lands on the
     // privileged DELEGATE_ASPACE tier. procmgr keeps `child_aspace`. Mask out
     // CONTROL: memmgr only maps pages into the AS; the authority to register
-    // terminal-fault death observers stays with procmgr (the creator), which
+    // terminal-end death observers stays with procmgr (the creator), which
     // holds the CONTROL-bearing `child_aspace`.
     let Ok(as_copy) = syscall::cap_derive(
         child_aspace,
@@ -2669,6 +2696,12 @@ fn relro_page_range(va: u64, size: u64, bias: u64) -> Option<(u64, u64)>
 
 /// Create a process from an in-memory ELF byte slice (suspended).
 ///
+/// A demand-paged child of a binary whose body `image_key` names attaches
+/// its segments that are not writable shared from the binary's image object
+/// ([`share_image`]), and has its writable segments loaded private; any
+/// other child, or one whose object cannot be had, has every segment loaded
+/// private (services/procmgr/README.md § Image Sharing).
+///
 /// # Errors
 /// `INVALID_ELF` when the image fails validation, its relocations do not
 /// all land, its stack note is out of range, its `PT_TLS` reaches past the
@@ -2677,7 +2710,8 @@ fn relro_page_range(va: u64, size: u64, bias: u64) -> Option<(u64, u64)>
 /// `OUT_OF_MEMORY` when a kernel object, memory cap, badge, page, or the
 /// table entry cannot be had; a segment load's `OUT_OF_MEMORY` (its pages),
 /// `MAP_FAILED` (a scratch or child mapping), or `INSUFFICIENT_RIGHTS` (a
-/// rights derivation) ([`loader::load_elf_segment_into_child`]); and the main
+/// rights derivation) ([`loader::load_elf_segment_into_child`]); an attachment's
+/// `OUT_OF_MEMORY` or `MAP_FAILED` ([`image_cache::attach`]); and the main
 /// TLS block's and [`populate_child_info`]'s other codes.
 #[expect(
     clippy::similar_names,
@@ -2705,6 +2739,7 @@ pub fn create_process_from_bytes(
     deaths: &Mutex<DeathSet>,
     parent_relay_cap: u64,
     sched: ChildSched,
+    image_key: Option<&ImageKey>,
     ipc_buf: *mut u64,
 ) -> Result<CreateResult, u64>
 {
@@ -2782,20 +2817,34 @@ pub fn create_process_from_bytes(
 
     let child_memmgr_send = universals.memmgr_endpoint;
 
+    let segments = elf::load_segments(ehdr, module_bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| procmgr_errors::INVALID_ELF)?;
+    // Declared after the child's guards, so a failed create drops the
+    // reference before they release the child.
+    let shared = share_image(
+        self_aspace,
+        &segments,
+        module_bytes,
+        bias,
+        image_key,
+        universals.paging,
+        ipc_buf,
+    );
+
     let mut applied_relocs = 0u64;
     let mut image = ImageSpan {
         load_bias: bias,
         ..ImageSpan::default()
     };
-    for seg_result in elf::load_segments(ehdr, module_bytes)
+    for (index, seg) in segments.iter().enumerate()
     {
-        let seg = seg_result.map_err(|_| procmgr_errors::INVALID_ELF)?;
         if seg.memsz == 0
         {
             continue;
         }
 
-        let prot = segment_prot(&seg);
+        let prot = segment_prot(seg);
         // The segment's addresses and file range come from the image; any
         // that overflows or leaves the file refuses it.
         let seg_vaddr = seg
@@ -2819,6 +2868,29 @@ pub fn create_process_from_bytes(
             file_range(module_bytes, seg.offset, seg.filesz).ok_or(procmgr_errors::INVALID_ELF)?;
         // `first_page` is `seg_vaddr` rounded down, so the difference is below a page.
         let dest_offset = seg_vaddr.saturating_sub(first_page) as usize;
+
+        if let Some(shared) = &shared
+            && let Some(Some(slot)) = shared.layout.segments.get(index)
+        {
+            let executable = if seg.executable
+            {
+                Executable::Yes
+            }
+            else
+            {
+                Executable::No
+            };
+            image_cache::attach(
+                child_memmgr_send,
+                shared.object.handle(),
+                first_page,
+                num_pages,
+                slot.object_page,
+                executable,
+                ipc_buf,
+            )?;
+            continue;
+        }
 
         // SAFETY: `child_aspace` is the fresh address space
         // `create_child_kernel_objects` retyped for this child above.
@@ -2984,6 +3056,7 @@ pub fn create_process_from_bytes(
         parent_relay_cap,
         sched,
         image,
+        shared.as_ref().map_or(0, |s| s.object.id()),
         ipc_buf,
         &layout,
         self_aspace,
@@ -2991,7 +3064,93 @@ pub fn create_process_from_bytes(
     let _ = child_objs.disarm();
     info_caps.disarm();
     let _ = main_tls_memory.disarm();
+    // The entry holds the reference now; its teardown releases it.
+    let _ = shared.map(|s| s.object.into_id());
     Ok(result)
+}
+
+/// The image object a child attaches its segments that are not writable
+/// from, and where each lies in it.
+struct SharedImage
+{
+    /// Where each segment of the image lies in the object, in program-header
+    /// order (`None` for a segment loaded private).
+    layout: ShareLayout,
+    /// The child's reference to the object.
+    object: ImageGuard,
+}
+
+/// The image object of the binary whose verified body is `module_bytes`,
+/// for a child placed at `bias` whose `PT_LOAD` segments are `segments`:
+/// the cached object of the body `image_key` names, or one sealed now, its
+/// pages filled as the private loader fills the same segments (zeroed, then
+/// each segment's file bytes at its offset in its first page;
+/// [`image_cache::object_for`]). `None`, so the image is loaded private
+/// whole, when the creator asked for a private image (no `image_key`), the
+/// child is pinned, the bias is not a whole number of pages (the object's
+/// bytes would depend on it), the layout shares nothing
+/// ([`image_share::share_layout`]), a segment's file range leaves the image
+/// (the private load then refuses it), or the object cannot be had.
+fn share_image(
+    self_aspace: u64,
+    segments: &[elf::LoadSegment],
+    module_bytes: &[u8],
+    bias: u64,
+    image_key: Option<&ImageKey>,
+    paging: Paging,
+    ipc_buf: *mut u64,
+) -> Option<SharedImage>
+{
+    let key = image_key?;
+    if paging != Paging::Demand || !bias.is_multiple_of(PAGE_SIZE)
+    {
+        return None;
+    }
+    let spans: Vec<SegmentSpan> = segments
+        .iter()
+        .map(|seg| SegmentSpan {
+            vaddr: seg.vaddr,
+            memsz: seg.memsz,
+            writable: seg.writable,
+        })
+        .collect();
+    let layout = image_share::share_layout(&spans)?;
+    // Each shared segment's file bytes, at most its size in memory, and the
+    // object byte they start at.
+    let mut parts: Vec<(usize, &[u8])> = Vec::new();
+    for (seg, slot) in segments.iter().zip(&layout.segments)
+    {
+        let Some(slot) = slot
+        else
+        {
+            continue;
+        };
+        let data = file_range(module_bytes, seg.offset, seg.filesz)?;
+        let data = data.get(..data.len().min(usize::try_from(seg.memsz).ok()?))?;
+        let at = slot
+            .object_page
+            .checked_mul(PAGE_SIZE)?
+            .checked_add(seg.vaddr % PAGE_SIZE)?;
+        parts.push((usize::try_from(at).ok()?, data));
+    }
+    let object = image_cache::object_for(
+        self_aspace,
+        key,
+        layout.pages,
+        |bytes| {
+            // Each part lies in its segment's pages of the object, which the
+            // layout sized to hold the segment's bytes in memory.
+            for &(at, data) in &parts
+            {
+                if let Some(dst) = bytes.get_mut(at..at.saturating_add(data.len()))
+                {
+                    dst.copy_from_slice(data);
+                }
+            }
+        },
+        ipc_buf,
+    )?;
+    Some(SharedImage { layout, object })
 }
 
 // ── Per-creation resource guards ────────────────────────────────────────────
@@ -3352,7 +3511,8 @@ pub fn destroy_process(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &T
 
 /// Under the table lock, reap the process `badge` names as its death would
 /// ([`reap_dead`]) when it has already ended, by an exit of its main thread
-/// or a terminal fault of any of its threads, and no destroy has marked it:
+/// or the end of its address space (a terminal fault or process exit of any
+/// of its threads), and no destroy has marked it:
 /// a destroy that reaches procmgr before the reaper does takes the end as
 /// the reaper would, so the process's children are re-parented (or, for a
 /// contained process, marked) whichever comes first. `None`, with nothing
@@ -3455,10 +3615,9 @@ pub fn destroy_created(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &T
 }
 
 /// The exit reason a destroy tears `entry` down with, which the death
-/// relay, the end queue, logd and `QUERY_PROCESS` then read: the reason the
-/// kernel retained when the main thread had already exited, or else the
-/// first terminal fault any of its threads took (a death procmgr's drain had
-/// not reaped yet, [`resync_exit_reason`]), else `EXIT_KILLED`, the reason
+/// relay, the end queue, logd and `QUERY_PROCESS` then read: the reason it
+/// ended with when it ended before the destroy ([`ended_exit_reason`], a
+/// death procmgr's drain had not reaped yet), else `EXIT_KILLED`, the reason
 /// the kernel records for a thread its teardown stops. Reads kernel state
 /// only, under the table lock.
 fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
@@ -3467,22 +3626,21 @@ fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
 }
 
 /// The reason `entry`'s process ended with when it has ended before procmgr
-/// reaped it: the reason the kernel retained when its main thread has
-/// exited, or else the first terminal fault any of its threads took
-/// ([`resync_exit_reason`]); `None` while it runs. Reads kernel state only.
+/// reaped it: the reason an earlier `QUERY_PROCESS` answer fixed
+/// ([`ProcessEntry::ended_with`]), or else its address space's terminal end,
+/// the first terminal fault or process exit of any of its threads, or else,
+/// when the space has not ended, the reason the kernel retained for its
+/// exited main thread ([`resync_exit_reason`]); `None` while it runs.
+/// Reads the entry and kernel state only.
 fn ended_exit_reason(entry: &ProcessEntry) -> Option<u64>
 {
+    if entry.ended_with.is_some()
+    {
+        return entry.ended_with;
+    }
     let main_thread = syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
-    let terminal_fault = syscall::cap_info(
-        entry.aspace_cap,
-        syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
-    )
-    .ok();
-    resync_exit_reason(
-        main_thread,
-        syscall_abi::THREAD_STATE_EXITED,
-        terminal_fault,
-    )
+    let aspace_end = syscall::cap_info(entry.aspace_cap, syscall_abi::CAP_INFO_ASPACE_END).ok();
+    resync_exit_reason(main_thread, syscall_abi::THREAD_STATE_EXITED, aspace_end)
 }
 
 /// Delete the death relay of a re-parented child
@@ -3493,8 +3651,12 @@ fn delete_relay(relay: u64)
     let _ = syscall::cap_delete(relay);
 }
 
-/// Reap the process `badge` names after its death, with `exit_reason`, as
-/// [`destroy_process`] tears down a destroyed one: take its entry
+/// Reap the process `badge` names after its death, as [`destroy_process`]
+/// tears down a destroyed one, with the reason the kernel recorded for its
+/// end ([`ended_exit_reason`]), so the relay, the end queue, logd and the
+/// recent-exits ring read what `QUERY_PROCESS` answered before the reap,
+/// whichever of its death posts arrived first; `exit_reason`, the post's,
+/// only when neither reading shows an end (a read that failed). Take its entry
 /// (`ProcessTable::take_ended`, which re-parents its children, or dooms
 /// them when it was created contained), record the exit in the recent-exits
 /// ring, and tear it down, under one hold of the table lock, then tell
@@ -3510,6 +3672,7 @@ pub fn reap_dead(badge: u64, exit_reason: u64, memmgr_ep: u64, ipc_buf: *mut u64
         {
             return;
         };
+        let exit_reason = ended_exit_reason(&entry).unwrap_or(exit_reason);
         state.recent.record(badge, exit_reason, crate::now_ns());
         teardown_entry(entry, exit_reason, &mut state.table)
     };
@@ -3722,6 +3885,7 @@ pub fn teardown_entry(
         relay: entry.relay,
         end_queue: entry.end_queue,
         end_correlator: entry.end_correlator,
+        image_ref: entry.image_ref,
     }
 }
 
@@ -3739,13 +3903,18 @@ pub struct TeardownTail
     /// The child's end queue, `0` for none, and the correlator posted to it.
     end_queue: u64,
     end_correlator: u64,
+    /// The child's reference to its image object, `0` for none.
+    image_ref: u64,
 }
 
 impl TeardownTail
 {
     /// Notify memmgr to reclaim the child's memory, then drop procmgr's
-    /// badged SEND copy, unless the reclaim was parked; then post the child's
-    /// end; then forward the death to logd. Called with no lock held.
+    /// badged SEND copy, unless the reclaim was parked; then release the
+    /// child's reference to its image object, the last one releasing the
+    /// object ([`image_cache::release`]), which memmgr frees once no region
+    /// attaches it, a parked reclaim's included; then post the child's end;
+    /// then forward the death to logd. Called with no lock held.
     ///
     /// The end goes to the death relay as the entry `(exit_reason, 0)` and to
     /// the end queue as `(exit_reason, end_correlator)`, the entries a death
@@ -3765,6 +3934,7 @@ impl TeardownTail
                 let _ = syscall::cap_delete(memmgr_send_cap);
             }
         }
+        image_cache::release(self.image_ref, ipc_buf);
         for (queue, tag) in [(self.relay, 0), (self.end_queue, self.end_correlator)]
         {
             if queue != 0

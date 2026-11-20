@@ -15,14 +15,11 @@ report.
    ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `debug_authority`).
 3. It reads its core-dump policy from the `CORE_DUMP` entry of its environment and logs it
    ([Core Dump](#core-dump)), and its stall from `CRASHD_OOM_STALL_MS` ([Hold](#hold)).
-4. It starts its watchdog thread, then binds its main thread's upcall class to an endpoint the
-   watchdog receives on, so the watchdog does not copy that binding onto itself
-   ([Bounds](#bounds)).
-5. It sends `REGISTER_CRASH_SERVICE` with a Thread cap of its main thread, and receives a `RECV` cap
+4. It sends `REGISTER_CRASH_SERVICE` with a Thread cap of its main thread, and receives a `RECV` cap
    on procmgr's crash endpoint, which every process procmgr creates has its exception class bound
    to ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
    Authority).
-6. With a stall set, it makes its hold endpoints and wait set and touches its stack and heap
+5. With a stall set, it makes its hold endpoints and wait set and touches its stack and heap
    ([Hold](#hold)), and logs `holding faults declined for want of memory up to <stall> ms`. It
    logs `reporting crashes` and receives faults.
 
@@ -175,7 +172,7 @@ decline would end them, with no report
 declines new faults until the respawned crashd registers. The reserve is shared with the core
 services, so crashd draws on it as little as it can: with a stall set, crashd touches
 64 KiB of its heap at start (`HEAP_TOUCH_BYTES`), which the allocator reuses for a report's
-buffers, and 32 KiB of the stacks of its main and watchdog threads (`STACK_TOUCH_BYTES`); its log
+buffers, and 32 KiB of its thread's stack (`STACK_TOUCH_BYTES`); its log
 writes format on the stack. A report allocates its block's lines, its stack scan (at most 8 KiB),
 its registers, the bytes at the instruction pointer and its frames, all within that heap. While the
 level reads `CRITICAL` it writes no core, since a core's buffers and the file system's writes need
@@ -226,7 +223,7 @@ A dump follows the block when the report attached and read the process within it
 7. It writes the core under its `.part` name, reading the pages through the faulting thread's
    cap, and renames it. A page the read finds not present, one memmgr evicted since the list, is
    made resident through procmgr and read again, under the dump's bound of step 5: its pauses count
-   against the same `ipc::PENDING_TRIES`, and once the dump's generation has fired no page is asked
+   against the same `ipc::PENDING_TRIES`, and once the dump's deadline has passed no page is asked
    for (`ipc::read_mem_resident_bounded`).
 
 The threads it stopped stay stopped: the decline that follows ends the process, whose teardown ends
@@ -246,37 +243,41 @@ A process the policy does not name gets no line.
 
 ## Bounds
 
-Handling one fault, its reading and its block's logging, is bounded by a watchdog, 2 s per fault
-(`FAULT_BOUND`, checked every 100 ms, `WATCHDOG_TICK`). The attach request can wait on procmgr, and
-procmgr can be waiting on the faulting process (an fs driver serving a `CREATE_FROM_FILE` read); a
-log write can wait on a driver logd writes through, for up to logd's `SINK_STALL_MS` per sink
-([logd IPC interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks). When the
-bound passes, the watchdog posts the receiving thread an upcall
-([docs/fault-handling.md](../../../docs/fault-handling.md) § Asynchronous Upcalls), which cancels
-the blocking request it waits in (`Interrupted`) and is then served by the watchdog. It posts
-another each tick until crashd ends that step, so a request a runtime call sends after the first
-cancellation (the close a file sends as it is dropped) is cancelled in its turn. An upcall never
-cancels a fault of the receiving thread's own, a page fault on its pager included, so the bound
-cannot end crashd. Each fault takes a generation, and the watchdog commits to cancel one only while
-it is still being handled ([`fault-bound/`](../fault-bound/src/lib.rs), host-tested). Once it has,
-crashd starts no further request of that fault's handling, and one a runtime call still sends waits
-at most a tick, wherever the upcall was delivered. On the cancellation crashd declines the fault at
-once, marking the block `status=timeout` when an attach was the request cancelled, waits for the
-watchdog to have served its last upcall, and logs the rest of the block after the decline, when
-nothing waits on the faulting thread any more. So no cancellation of one fault reaches the next
-fault's handling, unless the watchdog has not served it within another 2 s; crashd then logs that
-and goes on, and the late upcall can cut one request of the next fault's handling short. The stack
-scan reads at most 8 KiB (`STACK_SCAN_BYTES`); a stack page it asks procmgr to make resident waits
-on the swap service for at most `ipc::PENDING_TRIES` pauses, about a second, over the whole scan,
-and none is asked for once the fault's generation has fired.
+Handling one fault, its reading and its block's logging, runs under a call deadline 2 s ahead
+(`FAULT_BOUND`; `std::os::seraph::with_call_deadline`,
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md) § Call deadline). The attach request
+can wait on procmgr, and procmgr can be waiting on the faulting process (an fs driver serving a
+`CREATE_FROM_FILE` read); a log write can wait on a driver logd writes through, for up to logd's
+`SINK_STALL_MS` per sink ([logd IPC interface](../../logd/docs/ipc-interface.md#output-sinks)
+§ Output sinks). Every call of the step carries the time left as its `SYS_IPC_CALL` timeout, so
+the kernel ends the one waiting at the deadline (`WouldBlock`): crashd's own requests, the attach
+and the stack walk's resident requests (`ipc::ipc_call_within`, `ipc::ResidentBound`), and the
+runtime's, the log writes among them. None is sent once the deadline has passed. The deadline
+bounds only calls: a page fault of crashd's own, a page fault on its pager included, is not cut,
+so the bound cannot end crashd. When the deadline passes, crashd declines the fault at once,
+marking the block `status=timeout` when an attach was the call it ended, and logs the rest of the
+block after the decline, when nothing waits on the faulting thread any more. The deadline ends
+with the step, so nothing of one fault's bound reaches the next fault's handling. The stack scan
+reads at most 8 KiB (`STACK_SCAN_BYTES`); a stack page it asks procmgr to make resident waits on
+the swap service for at most `ipc::PENDING_TRIES` pauses, about a second, over the whole scan,
+and none is asked for once the deadline has passed. The log lines crashd writes about its holds
+([Hold](#hold)) each run under a deadline of the same 2 s, so a write that waits on a stuck driver
+does not stop crashd serving faults and ending holds.
 
-A dump runs under a bound of its own, 60 s (`DUMP_BOUND`), after the report's and outside it, as
-a new generation of the same watchdog. A request it waits in, an attach or a file-system call, is
-cancelled as the report's is, and the runtime's file calls return an error for it; crashd then
-starts no further request, the runtime's close of the core file cancelled in its turn, writes no
-core, logs `not written: the dump passed its bound`, and
-declines. The faulting thread is held while the dump runs, so the bound is the most a dump delays
-the process's teardown and crashd's next fault. It covers a core of the per-core budget, 2 MiB
+A dump runs under a call deadline of its own, 60 s (`DUMP_BOUND`), after the report's and outside
+it. Its calls, the attach, the process list, the resident requests, and the runtime's file-system
+calls, each carry the time left, and the one it waits in ends at the deadline: crashd's own end
+`WouldBlock`, and the runtime's file calls fail `TimedOut`. crashd then starts no further
+request, writes no core, logs `not written: the dump passed its bound`, and declines. What the
+dump leaves: a request the driver had received before the deadline may still be carried out (a
+write lands, a file is created); the core file's close, as it is dropped, is not sent past the
+deadline, and the driver releases that open once it finds the open's liveness cap gone, which the
+drop deletes ([fs driver protocol](../../fs/docs/fs-driver-protocol.md) § Label 18: `FS_OPEN`); the
+`.part` file stays,
+and the next dump deletes it (step 6 of [Core Dump](#core-dump)); and the threads it stopped stay
+stopped until the decline ends the process. The faulting thread is held while the dump runs, so
+the bound is the most a dump delays the process's teardown and crashd's next fault, which crashd
+then handles with no deadline left set. It covers a core of the per-core budget, 2 MiB
 (`CORE_BYTES_MAX`), at half the slowest rate measured writing through the FAT driver, about
 75 KB/s on a riscv64 debug build under QEMU, where each 4 KiB write allocates a cluster: the 0.9 MiB
 core of crashme's `worker` mode took 8 s to 12 s on debug builds of both architectures.
@@ -311,11 +312,11 @@ core of crashme's `worker` mode took 8 s to 12 s on debug builds of both archite
 - **Debugged threads.** A debugger that binds a thread's exception class takes its faults; crashd
   sees none of them.
 - **Cores.** A process whose faulting thread never registered gets no core, and a core records at
-  most 256 threads ([Core Dump](#core-dump)). A file write the dump's bound cancels leaves its page
-  frame mapped in crashd until crashd exits, since the FAT driver may still be copying from it
-  (`write_memory_chunks` in
-  [`runtime/ruststd/src/sys/fs/seraph.rs`](../../../runtime/ruststd/src/sys/fs/seraph.rs)); each
-  cancelled dump costs one page so.
+  most 256 threads ([Core Dump](#core-dump)). A file write the dump's bound ends after the FAT
+  driver received it leaves its page frame mapped in crashd until crashd exits, since the driver may
+  still be copying from it; one the bound ends before then returns the frame (`write_memory_chunks`
+  in [`runtime/ruststd/src/sys/fs/seraph.rs`](../../../runtime/ruststd/src/sys/fs/seraph.rs)). An
+  abandoned dump costs at most one page so.
 
 Persistence of the reports through logd's disk and network sinks, and holding a crashed process
 stopped for a debugger, are design intent; not yet implemented

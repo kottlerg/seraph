@@ -405,13 +405,13 @@ fn reply_node_handle(path: &str, label_bits: u64, reply_caps: &[u64]) -> u64
 /// The create label's fields beyond the opcode and `CREATE_ARGV_ENV` for a
 /// recipe: its scheduling fields (`priority` and `sched_max`, `0` for
 /// unspecified, when procmgr applies its defaults against svcmgr's band) and
-/// the create flags its `reserve`, `oom_stop` and `stop_source` keys and
-/// the shutdown actuator's role ask for (`svcmgr_defs::create_flags`).
+/// the create flags its `reserve`, `oom_stop`, `stop_source` and `private_image`
+/// keys and the shutdown actuator's role ask for (`svcmgr_defs::create_flags`).
 /// Shared by the launch and restart paths.
 #[expect(
     clippy::fn_params_excessive_bools,
-    reason = "`reserve`, `oom_stop` and `stop_source` are whether the recipe sets the keys \
-              of those names, and `shutdown_actuator` whether it holds that role"
+    reason = "`reserve`, `oom_stop`, `stop_source` and `private_image` are whether the recipe \
+              sets the keys of those names, and `shutdown_actuator` whether it holds that role"
 )]
 pub(crate) fn create_label_bits(
     priority: u8,
@@ -420,10 +420,17 @@ pub(crate) fn create_label_bits(
     oom_stop: bool,
     stop_source: bool,
     shutdown_actuator: bool,
+    private_image: bool,
 ) -> u64
 {
     procmgr_labels::create_sched_bits(priority, sched_max)
-        | svcmgr_defs::create_flags(reserve, oom_stop, stop_source, shutdown_actuator)
+        | svcmgr_defs::create_flags(
+            reserve,
+            oom_stop,
+            stop_source,
+            shutdown_actuator,
+            private_image,
+        )
 }
 
 /// Send `START_PROCESS` via the badged process handle. Shared by the
@@ -1110,6 +1117,7 @@ fn create_process(
             r.oom_stop,
             r.stop_source.is_some(),
             r.shutdown_actuator,
+            r.private_image,
         )
     });
     let created = create_from_file(
@@ -1324,7 +1332,8 @@ pub(crate) fn destroy_partial_child(process_handle: u64, thread_cap: u64, ipc_bu
 /// Bind both death observers of a new instance under `correlator`: one on its
 /// main thread (`thread_cap`), and one on its address space, which procmgr
 /// binds on svcmgr's behalf through `process_handle` ([`bind_fault_observer`]),
-/// so the first terminal fault of any of its threads reaches svcmgr. True when
+/// so the first terminal fault or process exit of any of its threads reaches
+/// svcmgr. True when
 /// both are bound. Shared by the launch and restart paths, which call it
 /// before `START_PROCESS`.
 pub(crate) fn bind_instance_observers(
@@ -1341,21 +1350,23 @@ pub(crate) fn bind_instance_observers(
 /// The exit reason of a service the kernel shows dead in the caps svcmgr holds
 /// on it, else `None`: its main thread's state through `thread_cap` and, when
 /// `aspace_cap` is non-zero (memmgr and procmgr), its address space's retained
-/// terminal fault (`svcmgr_defs::death_caps::caps_death` decodes both). A zero
+/// terminal end (`svcmgr_defs::death_caps::caps_death` decodes both). A zero
 /// `thread_cap` is not read.
 pub(crate) fn caps_death(thread_cap: u64, aspace_cap: u64) -> Option<u64>
 {
     let thread_state = (thread_cap != 0)
         .then(|| syscall::cap_info(thread_cap, syscall_abi::CAP_INFO_THREAD_STATE));
-    let aspace_fault = (aspace_cap != 0)
-        .then(|| syscall::cap_info(aspace_cap, syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT));
-    svcmgr_defs::death_caps::caps_death(thread_state, aspace_fault)
+    let aspace_end =
+        (aspace_cap != 0).then(|| syscall::cap_info(aspace_cap, syscall_abi::CAP_INFO_ASPACE_END));
+    svcmgr_defs::death_caps::caps_death(thread_state, aspace_end)
 }
 
 /// The exit reason of the process `process_handle` names when procmgr reports
 /// it dead (`procmgr_labels::QUERY_PROCESS`), else `None`. procmgr answers
-/// `EXITED` with the main thread's reason or the address space's retained
-/// terminal fault before it reaps the process, and for a while after;
+/// `EXITED` before it reaps the process, and for a while after, with the
+/// address space's retained terminal end, else the main thread's reason,
+/// read at its first `EXITED` answer, which fixes it for later answers and
+/// the teardown, or else at the reap or destroy;
 /// `UNKNOWN` (no entry) reads as `EXIT_KILLED`. A failed or refused call is
 /// `None`. The caller holds procmgr alive, since the call blocks until procmgr
 /// answers.
@@ -1376,7 +1387,7 @@ pub(crate) fn queried_death(process_handle: u64, ipc_buf: *mut u64) -> Option<u6
     }
 }
 
-/// Have procmgr bind one of svcmgr's death queues as a terminal-fault death
+/// Have procmgr bind one of svcmgr's death queues as a terminal-end death
 /// observer, posting `correlator`, on the address space of the child
 /// `process_handle` names (`procmgr_labels::BIND_DEATH_OBSERVER`), through a
 /// `POST` copy of the queue the call transfers. The death set picks the queue

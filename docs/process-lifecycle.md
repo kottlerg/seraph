@@ -403,21 +403,32 @@ After bootstrap, every process is created by procmgr. The flow:
    `cap_create_*` syscalls.
 5. **Procmgr → memmgr (frames).** Procmgr requests Memory caps from
    memmgr to back the child's stack, IPC buffer, `ProcessInfo` page,
-   argv/env region, TLS block, and ELF segments. These calls go over the child's badged
+   argv/env region, TLS block, and the ELF segments it loads itself (step 6). These calls go over
+   the child's badged
    SEND cap returned by `REGISTER_PROCESS` (step 2), so memmgr accounts
    the frames against the child's per-process record from allocation.
-6. **Procmgr maps + populates the child.** Procmgr stages each ELF
-   segment's frames through a transient procmgr-side scratch mapping,
+6. **Procmgr maps + populates the child.** A demand-paged child that may share its image (its
+   creator did not set `CREATE_PRIVATE_IMAGE` and it is not pinned) attaches the ELF segments
+   that are not writable (text and read-only data) shared from its binary's image object, a
+   memmgr memory object procmgr seals once per binary on its image store and releases with the
+   last instance ([procmgr README](../services/procmgr/README.md#image-sharing) § Image
+   Sharing). Procmgr stages each other ELF segment's frames (every writable segment, and every
+   segment of a private or pinned image) through a transient procmgr-side scratch mapping,
    copying the segment bytes and applying the image's relocations, then
    maps the frames into the child's address space at procmgr-chosen VAs
    and populates `ProcessInfo` (including `memmgr_endpoint_cap` from
    step 2 and the procmgr/log endpoints).
-7. **No ownership transfer.** Every child frame and kernel-object retype
+7. **No ownership transfer.** Every frame of the child's own and every kernel-object retype
    slab is requested on the child's badged memmgr cap, so memmgr accounts
    it to the child's record from the moment it leaves the pool; procmgr
    deletes its transient slots after mapping, and `PROCESS_DIED` reclaims
    the set (see
-   [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)).
+   [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)). An attachment
+   of the image object charges the child its full size, as if the pages were its own, while the
+   object's frames stay on the image store's record until the last instance's teardown releases
+   the object
+   ([memmgr memory-pool.md](../services/memmgr/docs/memory-pool.md#memory-objects) § Memory
+   objects).
 8. **Procmgr replies to caller.** `CREATE_PROCESS` returns the badged
    process handle and a thread cap to the original caller.
 9. **Caller sends `START_PROCESS`.** Procmgr runs `thread_configure` +
@@ -451,8 +462,8 @@ releases every registered thread at the process's teardown
 
 A process dies when:
 
-- It calls `sys_process_exit` (the `std::process::exit` / `main`-return path),
-  carrying a voluntary exit code.
+- Any of its threads calls `sys_aspace_exit` (the `std::process::exit` / `main`-return path,
+  and a receive loop's fatal exit), carrying a voluntary exit code.
 - It calls `sys_thread_exit` on its last thread (a thread completing).
 - procmgr revokes and deletes its caps to the process's `Thread`, `CSpace`, and `AddressSpace` (the
   "kill process" pattern; see [`capability-model.md`](capability-model.md)
@@ -494,40 +505,50 @@ a fault or kill reason — defined once in `syscall_abi`:
 
 | Reason value | Class | Meaning |
 |---|---|---|
-| `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_process_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
-| `1 ..= 0x0FFF` | Voluntary, code | `sys_process_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
+| `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_aspace_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
+| `1 ..= 0x0FFF` | Voluntary, code | `sys_aspace_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
 | `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) | Fault | unhandled CPU/VM fault; kernel-terminated |
 | `0x2000` (`EXIT_KILLED`) | Killed | recorded by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown (that stop posts no death event; an observer bound afterwards receives the retained reason through the bind); posted by userspace (`Child::kill`) |
 
-`sys_process_exit` records the encoded reason as the calling thread's exit reason and posts it to
-that thread's death observers — a parent that bound the main thread (so `ExitStatus::code()` carries
-it) and procmgr's per-thread observer (which reaps the process). It is structurally identical to
-`sys_thread_exit` but with the encoded caller-supplied reason (zero for `exit(0)`), and schedules
-away immediately after the post; it does **not** post to the address-space death surface (reserved
-for terminal faults), because doing so on every clean exit would dereference the address space after
-procmgr had already been woken to reap it. The kernel only *notifies*; it does not enumerate or stop
-sibling threads at that point — they are stopped when procmgr's cap-revoke teardown below deletes
-the process's `CSpace` (every thread bound to it is stopped before its storage is reclaimed,
-wherever their thread caps are held) and reaped
-through their own thread caps.
-`ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a Seraph-native
-encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native fault
-classes, not signals. See [`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md) §
-`SYS_PROCESS_EXIT`.
+The address space's death surface is the process's terminal-end surface. A process ends at the first
+terminal end of any of its threads, a terminal fault or a `sys_aspace_exit`, whichever thread makes
+it; the kernel has no notion of a main thread. `sys_aspace_exit` from any thread records the encoded
+reason (zero for `exit(0)`) as the address space's terminal end, as a terminal fault does (the first
+end wins, and a later one changes nothing), and as the calling thread's exit reason; it then posts
+the reason to that thread's death observers (a parent that bound the main thread, so
+`ExitStatus::code()` carries it when the main thread exits), and to the address space's death
+observers when this end is its first: procmgr's observer, which reaps the process whichever thread
+ended it, and a supervisor's. The address-space post walks the observers the kernel read when it
+recorded the end, without touching the address space, and the address space's teardown waits until
+the calling thread runs on no CPU, so procmgr's reap on the first post cannot free what the later
+post reads. procmgr folds the two posts of a main thread's end into one reap, and gives the process
+one reason whichever post it takes first: the address space's end once the space has ended, else the
+main thread's (a `sys_thread_exit` of the main thread ends no address space), read at the first
+`QUERY_PROCESS` that finds the process ended, which fixes it, or else at the reap or destroy. Its
+reap, `QUERY_PROCESS`, a destroy, the death relay, the end queue and logd all carry it. The kernel
+only *notifies*; it does not enumerate or stop sibling threads at that point — they are stopped when
+procmgr's cap-revoke teardown below deletes the process's `CSpace` (every thread bound to it is
+stopped before its storage is reclaimed, wherever their thread caps are held) and reaped through
+their own thread caps. `sys_thread_exit` ends the calling thread alone and posts only its thread
+observers. `ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a
+Seraph-native encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native
+fault classes, not signals. See [`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md) §
+`SYS_ASPACE_EXIT`.
 
 The death-notification flow:
 
 1. **Procmgr observes.** Procmgr's existing supervision path detects
    the death (a death notification on the child's main thread, an
-   address-space death notification for the first terminal fault in any thread,
+   address-space death notification for the first terminal end, a terminal fault or an exit, of
+   any thread,
    or an explicit `DESTROY_PROCESS` or `DESTROY_CHILD` teardown, which
    takes every process below the destroyed one too, see
    [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md#process-tree)
    § Process Tree). When one of its death
    queues was full and a post was dropped, procmgr recovers the
    main-thread deaths from the kernel's thread states, and the
-   address-space terminal faults from each address space's retained
-   terminal-fault reason (see
+   address-space terminal ends from each address space's retained
+   terminal-end reason (see
    [services/procmgr/README.md](../services/procmgr/README.md) § Process
    table and death queues).
 2. **Procmgr → memmgr.** Procmgr sends `PROCESS_DIED` to memmgr carrying
@@ -602,14 +623,20 @@ Death](supervision.md#core-set-and-system-death)).
 
 ## Out of Scope
 
-Seraph does not implement `fork()`, and the kernel implements no copy-on-write.
-Process creation is always from-scratch via `CREATE_PROCESS` or
-`CREATE_FROM_FILE`. memmgr, as pager, backs pages of several address spaces
-from one immutable memory object, and gives a process its own copy of such a
-page when it first writes it in a private attachment
+Seraph has no `fork()`. A process is always created from an image by `CREATE_PROCESS` or
+`CREATE_FROM_FILE`, with the capabilities its creator gives it and none inherited. The kernel
+implements no copy-on-write. memmgr, as pager, may back pages of several address spaces from one
+immutable memory object and, in a private attachment, gives a process its own copy of such a page
+when it first writes it; the pages of an image that no relocation touches are shared this way
+between the instances of one binary, in shared attachments, which no write copies. An attachment to
+a memory object conveys bytes, never capabilities. Buffer handoff between processes moves or shares
+Memory capabilities over IPC.
+
+The memory objects, the attachments and the copies are memmgr's
 ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#memory-objects)
-§ Memory objects); an attachment conveys bytes, never capabilities. Zero-copy
-buffer handoff between processes moves or shares Memory capabilities over IPC.
+§ Memory objects), as is the copy a debugger's breakpoint gets the target of a page of a shared
+attachment (`MAKE_PRIVATE`), and the image sharing procmgr's
+([services/procmgr/README.md](../services/procmgr/README.md#image-sharing) § Image Sharing).
 
 Userspace fault handling is specified as the pager protocol in [Fault Handling](fault-handling.md).
 An unresolved fault is delivered to the thread's bound handler (for a page fault memmgr, the

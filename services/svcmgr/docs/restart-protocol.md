@@ -16,7 +16,7 @@ and one more for each restart. One observer is on the main thread
 `SYS_THREAD_EXIT` or on an unhandled fault, the kernel posts the death entry
 `(exit_reason, correlator)` to its queue (per
 [syscalls.md](../../../core/kernel/docs/syscalls.md)). The other is on the
-address space, and the first terminal fault of any of its threads posts it.
+address space, and the first terminal end of any of its threads, a fault or an exit, posts it.
 procmgr's teardown of the process stops the main thread without a post and
 revokes svcmgr's thread cap, so the address-space observer is the one that
 reports a fault of another thread. svcmgr binds the address-space observer
@@ -76,22 +76,22 @@ table grows on the heap and never reuses a slot, so a slot names one
 service for svcmgr's lifetime. `route_death` routes a post only when the
 slot is active and the tag's instance is the slot's current one, and the exit
 reason is the post's. Any other post is dropped: a late post of an instance
-already routed, and the second of the two posts a main-thread fault makes when
-it is the address space's first terminal fault.
+already routed, and the second of the two posts a main-thread fault or exit makes when
+it is the address space's first terminal end.
 
 Each death queue has a fixed tuning capacity (`DEATHS_EQ_CAPACITY`, 64),
 not one sized from the service count. The kernel drops a post to a full
 queue, so a drain that takes a full queue's worth of events or more from one
 queue resyncs: it routes a death for every active service whose main thread the kernel reports
 exited (the kernel's reason), whose thread cap no longer resolves (`EXIT_KILLED`: procmgr's teardown
-revokes it), or whose endowed address space has a retained terminal fault
-(`CAP_INFO_ASPACE_TERMINAL_FAULT`). A dropped post leaves a full queue of events behind it for that
+revokes it), or whose endowed address space has a retained terminal end
+(`CAP_INFO_ASPACE_END`). A dropped post leaves a full queue of events behind it for that
 drain or the next, so the resync runs after the drop.
 
 A worker-thread fault of a service procmgr created shows in svcmgr's caps only once procmgr's
 teardown revokes the thread cap, which can follow the resync. So the resync then asks procmgr
 about each such service its caps show alive, through its process handle
-(`procmgr_labels::QUERY_PROCESS`): procmgr reads the space's retained terminal fault and answers
+(`procmgr_labels::QUERY_PROCESS`): procmgr reads the space's retained terminal end and answers
 `EXITED` with it before it reaps the process. The query runs only while memmgr and procmgr are
 active and alive, since it blocks until procmgr answers.
 
@@ -354,9 +354,9 @@ The launch path is documented in
 [service-definitions.md](service-definitions.md#reconciliation). The
 `.svc` recipe is the single source of truth for both paths: the fixed
 fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
-the log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`
-and `reserve` flags, the `stop_source` class, and the scheduling fields on the parallel
-`RestartRecipe`, so
+the log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop`,
+`reserve` and `private_image` flags, the `stop_source` class, and the scheduling fields on the
+parallel `RestartRecipe`, so
 a restart reproduces the first-launch spawn shape byte-for-byte, except the
 log-sink round, whose history-pull SEND is absent on a restart once procmgr
 reports init reaped (per
@@ -390,8 +390,8 @@ string at its own length:
 
 The launch surfaces svcmgr replays beyond that record (the
 argv / env / cwd / seed, plus the log-sink, debug-authority,
-stop-authority, entropy-authority, `oom_stop` and `reserve` flags, the `stop_source`
-class and the scheduling fields) are held in a parallel
+stop-authority, entropy-authority, `oom_stop`, `reserve` and `private_image` flags, the
+`stop_source` class and the scheduling fields) are held in a parallel
 [`RestartRecipe`](../src/service.rs) table
 (`ServiceTable.recipes`), index-aligned with `services` by slot:
 
@@ -407,13 +407,15 @@ class and the scheduling fields) are held in a parallel
 | `entropy_authority` | `entropy_authority = ...`; cleared on every declaration after the first in launch order |
 | `oom_stop` | `oom_stop = ...` |
 | `reserve` | `reserve = ...` |
+| `private_image` | `private_image = ...` |
 | `stop_source` | `stop_source = ...` (`None` = unset); svcmgr lists a running source by it (`LIST_STOP_SOURCES`) |
 | `priority` | `priority = ...` (`0` = unset) |
 | `sched_max` | `sched_max = ...` (`0` = unset) |
 
 `restart_process` replays every field on every respawn — argv/env, the
-scheduling fields and the create flags `reserve`, `oom_stop` and `stop_source`
-ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`) into
+scheduling fields and the create flags `reserve`, `oom_stop`, `stop_source` and
+`private_image` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`,
+`CREATE_PRIVATE_IMAGE`) into
 `CREATE_FROM_FILE`, cwd
 through `apply_namespace_policy`, seeds re-resolved from the discovery
 registry, a fresh `DEBUG_AUTHORITY` and `STOP_AUTHORITY` cap and `EntropyControl` copy after them,

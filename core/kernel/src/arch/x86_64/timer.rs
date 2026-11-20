@@ -753,7 +753,8 @@ pub fn ticks_per_second() -> u64
 /// timer has not yet been calibrated (pre-Phase 5).
 ///
 /// Uses `rdtsc` directly — no interrupt dependency, sub-microsecond source.
-/// The TSC frequency is measured against the PIT during `init()`.
+/// The TSC rate is the one `init()` takes from its first source that gives one
+/// (module documentation, § Rates).
 #[cfg(not(test))]
 pub fn elapsed_us() -> Option<u64>
 {

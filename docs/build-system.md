@@ -653,8 +653,10 @@ the checkout on its first build and discards them
 The `build-image` job of `release.yml` boots nothing (its one `cargo xtask`
 command is `build`), so it installs no QEMU and runs on `ubuntu-latest`.
 
-`build-test.yml` cancels stacked runs on the same ref
-(`cancel-in-progress: true`). `burnin.yml` and `release.yml` do not
+`build-test.yml` cancels a pull request's stacked runs on the same ref;
+every other run, each push to `master` among them, is grouped by its commit
+and never cancelled, so each merge commit gets its own run
+([conventions.md](conventions.md#ci-gating) § CI Gating). `burnin.yml` and `release.yml` do not
 cancel on the same ref — a tag-push run completes even if a later tag
 pushes.
 

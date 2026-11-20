@@ -569,7 +569,8 @@ inventory and per-workflow shape live in
 [build-system.md](build-system.md#continuous-integration); local
 equivalents are the `cargo xtask` commands documented there.
 
-`master`'s own CI runs on each push to it, and so checks each merge,
+`master`'s own CI runs on each push to it, and every merge commit gets a
+run of its own that no later push cancels, so it checks each merge,
 among them the merge of a PR that was not built with the commits
 `master` gained after its merge base (§ Syncing with `master`); the
 composition check (§ Composition check) is the other backstop. A red

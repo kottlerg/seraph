@@ -15,8 +15,8 @@
 //! `pr-check` adds the pull request: § PR-body checklist discipline (unticked
 //! boxes, the validated head and its delta), § Milestones, the Issues the
 //! body closes or references, and, with `--gate`, the merge gate (check
-//! rollup, merge state, `master` included, and a passing review record for
-//! the head).
+//! rollup, merge state, `master` included or its change disjoint from the
+//! PR's files, and a passing review record for the head).
 //!
 //! What needs judgment stays with the pre-merge review: whether the body's
 //! claims match the diff, whether an acceptance item is delivered, and which
@@ -1735,6 +1735,266 @@ fn check_release_approval(pat: &Patterns, added: &str) -> Vec<Diag>
         .collect()
 }
 
+/// The workflow whose runs on pushes to the base branch are that branch's
+/// own CI (docs/conventions.md § CI Gating).
+const BASE_WORKFLOW: &str = "build-test.yml";
+
+/// How many of the shared files a gate error names.
+const SHARED_FILES_NAMED: usize = 5;
+
+/// How the PR head stands to the base branch's tip (docs/conventions.md
+/// § Syncing with `master`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MasterCase
+{
+    /// The tip is an ancestor of the head.
+    Contained,
+    /// The tip is not, and the files the base branch changed since the one
+    /// merge base share none with the PR's own change from it: `behind`
+    /// commits the head lacks, which change `files` files.
+    Disjoint
+    {
+        behind: usize, files: usize
+    },
+    /// The base branch changed these files of the PR's own change since the
+    /// merge base.
+    Overlap(Vec<String>),
+    /// The head and the tip have this many merge bases (a criss-cross
+    /// history), so no one diff is the PR's own change.
+    MergeBases(usize),
+}
+
+impl MasterCase
+{
+    /// The line the gate prints for the case.
+    pub fn describe(&self, base: &str) -> String
+    {
+        match self
+        {
+            MasterCase::Contained => format!("contains {base}"),
+            MasterCase::Disjoint { behind, files } => format!(
+                "disjoint: the head lacks {behind} commit(s) of {base}, whose {files} changed \
+                 file(s) are none of the PR's"
+            ),
+            MasterCase::Overlap(shared) => format!(
+                "overlap: {base} changed {} of the PR's files since the merge base",
+                shared.len()
+            ),
+            MasterCase::MergeBases(n) => format!("{n} merge bases with {base}"),
+        }
+    }
+}
+
+/// The paths listed in both `ours` and `theirs`, each a `git diff
+/// --name-only` output, sorted.
+pub fn shared_files(ours: &str, theirs: &str) -> Vec<String>
+{
+    let theirs: std::collections::BTreeSet<&str> =
+        theirs.lines().filter(|l| !l.is_empty()).collect();
+    let mut shared: Vec<String> = ours
+        .lines()
+        .filter(|l| theirs.contains(l))
+        .map(str::to_owned)
+        .collect();
+    shared.sort();
+    shared.dedup();
+    shared
+}
+
+/// Read how `head` stands to `base`. The two sides are the net changes
+/// from the merge base, `git diff --name-only --no-renames`, so a rename
+/// names its old and its new path: the files a merge of the two would
+/// combine.
+fn master_case(root: &Path, base: &str, head: &str) -> Result<MasterCase>
+{
+    if git_ok(root, &["merge-base", "--is-ancestor", base, head])
+    {
+        return Ok(MasterCase::Contained);
+    }
+    let bases = git(root, &["merge-base", "--all", base, head])?;
+    let bases: Vec<&str> = bases.lines().filter(|l| !l.is_empty()).collect();
+    let [merge_base] = bases[..]
+    else
+    {
+        return Ok(MasterCase::MergeBases(bases.len()));
+    };
+    let names = |to: &str| {
+        git(
+            root,
+            &["diff", "--name-only", "--no-renames", merge_base, to],
+        )
+    };
+    let (theirs, ours) = (names(base)?, names(head)?);
+    let shared = shared_files(&ours, &theirs);
+    if !shared.is_empty()
+    {
+        return Ok(MasterCase::Overlap(shared));
+    }
+    let behind = git(root, &["rev-list", "--count", &format!("{head}..{base}")])?;
+    Ok(MasterCase::Disjoint {
+        behind: behind.trim().parse().unwrap_or(0),
+        files: theirs.lines().filter(|l| !l.is_empty()).count(),
+    })
+}
+
+/// The base branch's CI state: that of its latest concluded run of
+/// `BASE_WORKFLOW` on a push, a cancelled or skipped run aside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BaseCi
+{
+    /// The run at this commit succeeded.
+    Green(String),
+    /// The run at this commit concluded otherwise.
+    Red(String, String),
+    /// No concluded run was found, or the runs could not be read: why.
+    Unknown(String),
+}
+
+/// The CI state of the runs `gh run list --json headSha,status,conclusion`
+/// returns, newest first.
+pub fn base_ci(runs: &Value) -> BaseCi
+{
+    let concluded = runs
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .find(|run| {
+            run["status"].as_str() == Some("completed")
+                && !matches!(
+                    run["conclusion"].as_str().unwrap_or(""),
+                    "" | "cancelled" | "skipped"
+                )
+        });
+    match concluded
+    {
+        None => BaseCi::Unknown("no concluded run on a push".to_owned()),
+        Some(run) =>
+        {
+            let sha = short(run["headSha"].as_str().unwrap_or("?")).to_owned();
+            match run["conclusion"].as_str().unwrap_or("")
+            {
+                "success" => BaseCi::Green(sha),
+                other => BaseCi::Red(sha, other.to_owned()),
+            }
+        }
+    }
+}
+
+/// The `gate-includes-master` and `gate-base-green` findings. A head that
+/// contains the base branch's tip passes. One that does not passes only when
+/// the base branch's change since the merge base is disjoint from the PR's
+/// files, GitHub reports the PR `MERGEABLE`, and the base branch's CI is
+/// green (`ci`, read for that case alone): while it is red, only a head that
+/// contains the tip merges, whose own green CI shows the red fixed.
+pub fn check_master(
+    case: &MasterCase,
+    mergeable: &str,
+    ci: Option<&BaseCi>,
+    base: &str,
+    head: &str,
+) -> Vec<Diag>
+{
+    let at = short(head);
+    match case
+    {
+        MasterCase::Contained => Vec::new(),
+        MasterCase::Overlap(shared) =>
+        {
+            let mut named = shared
+                .iter()
+                .take(SHARED_FILES_NAMED)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if shared.len() > SHARED_FILES_NAMED
+            {
+                named.push_str(", ...");
+            }
+            vec![Diag::error(
+                "gate-includes-master",
+                at,
+                format!(
+                    "{base} is not an ancestor of the PR head and changed files the PR changes \
+                     since the merge base ({named}); sync the branch"
+                ),
+            )]
+        }
+        MasterCase::MergeBases(n) => vec![Diag::error(
+            "gate-includes-master",
+            at,
+            format!(
+                "{base} is not an ancestor of the PR head, and the two have {n} merge bases; \
+                 sync the branch"
+            ),
+        )],
+        MasterCase::Disjoint { .. } =>
+        {
+            let mut out = Vec::new();
+            if mergeable != "MERGEABLE"
+            {
+                out.push(Diag::error(
+                    "gate-includes-master",
+                    at,
+                    format!(
+                        "{base} is not an ancestor of the PR head, and GitHub reports the PR \
+                         {mergeable}, not MERGEABLE; sync the branch"
+                    ),
+                ));
+            }
+            match ci
+            {
+                Some(BaseCi::Green(_)) =>
+                {}
+                Some(BaseCi::Red(sha, conclusion)) => out.push(Diag::error(
+                    "gate-base-green",
+                    format!("{base} {sha}"),
+                    format!(
+                        "{base}'s CI concluded {conclusion}: while it is red only a head that \
+                         contains {base} merges; sync the branch, or fix {base} first"
+                    ),
+                )),
+                Some(BaseCi::Unknown(why)) => out.push(Diag::error(
+                    "gate-base-green",
+                    base.to_owned(),
+                    format!("{base}'s CI state could not be read ({why}); sync the branch"),
+                )),
+                None => out.push(Diag::error(
+                    "gate-base-green",
+                    base.to_owned(),
+                    format!("{base}'s CI state was not read"),
+                )),
+            }
+            out
+        }
+    }
+}
+
+/// Read the base branch's CI state with `gh run list`.
+fn read_base_ci(root: &Path, branch: &str) -> BaseCi
+{
+    match gh::json(
+        root,
+        &[
+            "run",
+            "list",
+            "--workflow",
+            BASE_WORKFLOW,
+            "--branch",
+            branch,
+            "--event",
+            "push",
+            "--limit",
+            "20",
+            "--json",
+            "headSha,status,conclusion",
+        ],
+    )
+    {
+        Ok(runs) => base_ci(&runs),
+        Err(err) => BaseCi::Unknown(format!("{err:#}")),
+    }
+}
+
 fn gate(
     ctx: &BuildContext,
     pat: &Patterns,
@@ -1758,13 +2018,21 @@ fn gate(
             format!("the files the PR adds could not be read: {err:#}"),
         )),
     }
-    if !git_ok(&ctx.root, &["merge-base", "--is-ancestor", base, head])
+    match master_case(&ctx.root, base, head)
     {
-        out.push(Diag::error(
+        Ok(case) =>
+        {
+            println!("    master: {}", case.describe(base));
+            let ci = matches!(case, MasterCase::Disjoint { .. })
+                .then(|| read_base_ci(&ctx.root, base.strip_prefix("origin/").unwrap_or(base)));
+            let mergeable = pr["mergeable"].as_str().unwrap_or("UNKNOWN");
+            out.extend(check_master(&case, mergeable, ci.as_ref(), base, head));
+        }
+        Err(err) => out.push(Diag::error(
             "gate-includes-master",
             short(head),
-            format!("{base} is not an ancestor of the PR head; sync the branch"),
-        ));
+            format!("how the head stands to {base} could not be read: {err:#}"),
+        )),
     }
     let dir = review::record_dir(ctx, number);
     match review::read_records(&dir)
@@ -1791,7 +2059,7 @@ pub fn run_pr_check(ctx: &BuildContext, args: &PrCheckArgs) -> Result<()>
             "view",
             &args.pr.to_string(),
             "--json",
-            "body,headRefOid,baseRefName,mergeStateStatus,statusCheckRollup,milestone",
+            "body,headRefOid,baseRefName,mergeStateStatus,mergeable,statusCheckRollup,milestone",
         ],
     )?;
     let body = pr.get("body").and_then(Value::as_str).unwrap_or("");
@@ -3145,5 +3413,154 @@ mod tests
 
         let none: Value = json::parse(r#"{"mergeStateStatus":"CLEAN"}"#).unwrap();
         assert_eq!(rules(&check_merge_state(&none)), ["gate-checks"]);
+    }
+
+    #[test]
+    fn a_head_that_contains_master_is_contained()
+    {
+        let repo = Repo::new("master-contained");
+        repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.on_master("a.rs", "// master\nfn a() {}\nlet x = 1;\n");
+        assert!(matches!(
+            master_case(&repo.root, "master", &repo.head()).unwrap(),
+            MasterCase::Overlap(_)
+        ));
+        let head = repo.merge_master(&[("a.rs", "// master\nfn a() {}\nlet x = 2;\n")]);
+        assert_eq!(
+            master_case(&repo.root, "master", &head).unwrap(),
+            MasterCase::Contained
+        );
+    }
+
+    #[test]
+    fn master_changing_only_other_files_is_disjoint()
+    {
+        let repo = Repo::new("master-disjoint");
+        let head = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.on_master("b.rs", "fn b() {}\nfn c() {}\n");
+        repo.on_master("d.rs", "fn d() {}\n");
+        assert_eq!(
+            master_case(&repo.root, "master", &head).unwrap(),
+            MasterCase::Disjoint {
+                behind: 2,
+                files: 2
+            }
+        );
+    }
+
+    #[test]
+    fn master_changing_a_file_of_the_pr_overlaps_even_in_a_comment()
+    {
+        let repo = Repo::new("master-overlap");
+        let head = repo.commit("a.rs", "fn a() {}\nlet x = 2;\n");
+        repo.on_master("b.rs", "fn b() {}\nfn c() {}\n");
+        repo.on_master("a.rs", "// why\nfn a() {}\nlet x = 1;\n");
+        assert_eq!(
+            master_case(&repo.root, "master", &head).unwrap(),
+            MasterCase::Overlap(vec!["a.rs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_rename_on_master_of_a_file_of_the_pr_overlaps()
+    {
+        let repo = Repo::new("master-rename");
+        let head = repo.commit("b.rs", "fn b() {}\nfn e() {}\n");
+        repo.git(&["checkout", "-q", "master"]);
+        repo.git(&["mv", "b.rs", "c.rs"]);
+        repo.git(&["commit", "-q", "-m", "test: rename"]);
+        repo.git(&["checkout", "-q", "pr"]);
+        assert_eq!(
+            master_case(&repo.root, "master", &head).unwrap(),
+            MasterCase::Overlap(vec!["b.rs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_file_the_pr_and_master_both_add_overlaps()
+    {
+        let repo = Repo::new("master-both-add");
+        let head = repo.commit("n.rs", "fn n() {}\n");
+        repo.on_master("n.rs", "fn n() -> u8 {\n    1\n}\n");
+        assert_eq!(
+            master_case(&repo.root, "master", &head).unwrap(),
+            MasterCase::Overlap(vec!["n.rs".to_owned()])
+        );
+    }
+
+    #[test]
+    fn only_a_disjoint_mergeable_head_on_a_green_master_passes_without_master()
+    {
+        let disjoint = MasterCase::Disjoint {
+            behind: 1,
+            files: 1,
+        };
+        let green = BaseCi::Green("abc1234".to_owned());
+        let red = BaseCi::Red("abc1234".to_owned(), "failure".to_owned());
+        let unknown = BaseCi::Unknown("no run".to_owned());
+        let check = |case: &MasterCase, mergeable: &str, ci: Option<&BaseCi>| {
+            check_master(case, mergeable, ci, "origin/master", "0123456789")
+        };
+        assert_eq!(
+            check(&MasterCase::Contained, "UNKNOWN", None),
+            [] as [Diag; 0]
+        );
+        assert_eq!(check(&disjoint, "MERGEABLE", Some(&green)), [] as [Diag; 0]);
+        assert_eq!(
+            rules(&check(&disjoint, "CONFLICTING", Some(&green))),
+            ["gate-includes-master"]
+        );
+        assert_eq!(
+            rules(&check(&disjoint, "MERGEABLE", Some(&red))),
+            ["gate-base-green"]
+        );
+        assert_eq!(
+            rules(&check(&disjoint, "MERGEABLE", Some(&unknown))),
+            ["gate-base-green"]
+        );
+        assert_eq!(
+            rules(&check(&disjoint, "MERGEABLE", None)),
+            ["gate-base-green"]
+        );
+        let overlap = MasterCase::Overlap((0..7).map(|i| format!("f{i}.rs")).collect());
+        let found = check(&overlap, "MERGEABLE", Some(&green));
+        assert_eq!(rules(&found), ["gate-includes-master"]);
+        assert!(
+            found[0].message.contains("f4.rs, ..."),
+            "{}",
+            found[0].message
+        );
+        assert!(!found[0].message.contains("f5.rs"), "{}", found[0].message);
+        assert_eq!(
+            rules(&check(
+                &MasterCase::MergeBases(2),
+                "MERGEABLE",
+                Some(&green)
+            )),
+            ["gate-includes-master"]
+        );
+    }
+
+    #[test]
+    fn the_base_ci_is_its_latest_concluded_run()
+    {
+        let runs: Value = json::parse(
+            r#"[{"headSha":"cccccccccc","status":"in_progress","conclusion":""},
+                {"headSha":"bbbbbbbbbb","status":"completed","conclusion":"cancelled"},
+                {"headSha":"aaaaaaaaaa","status":"completed","conclusion":"failure"},
+                {"headSha":"9999999999","status":"completed","conclusion":"success"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            base_ci(&runs),
+            BaseCi::Red("aaaaaaaa".to_owned(), "failure".to_owned())
+        );
+        let green: Value = json::parse(
+            r#"[{"headSha":"9999999999","status":"completed","conclusion":"success"}]"#,
+        )
+        .unwrap();
+        assert_eq!(base_ci(&green), BaseCi::Green("99999999".to_owned()));
+        let none: Value = json::parse("[]").unwrap();
+        assert!(matches!(base_ci(&none), BaseCi::Unknown(_)));
     }
 }

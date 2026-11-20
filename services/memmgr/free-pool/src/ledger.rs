@@ -48,8 +48,9 @@
 //! ([`commit::allowance`]; `services/memmgr/docs/memory-pool.md` § Commit).
 
 use crate::arena::{
-    Arena, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, LimitReg, NO_REGION_ID,
-    NODE_NULL, Node, NodeHandle, NodeIdx, ProcessCaps, ProcessRecord, RegionNode, Slot, SlotStore,
+    Arena, Attachment, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, LimitReg,
+    MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx, ProcessCaps, ProcessRecord,
+    RegionNode, Share, Slot, SlotStore, ZERO_OBJECT,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError, ChunkState, SealTag};
@@ -75,6 +76,25 @@ pub enum RegionError
     NoSlot,
     /// The record slot named holds no process record.
     NoRecord,
+    /// The memory object named is not live, or is attached as often as its
+    /// count holds ([`Ledger::attach_object`]).
+    NoObject,
+    /// The attachment's pages run past the object's end.
+    OutsideObject,
+}
+
+/// Why [`Ledger::seal_object`] sealed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealError
+{
+    /// The record slot named holds no process record.
+    NoRecord,
+    /// No grant is named, a region id names no frame of the record, or one is
+    /// named twice.
+    Grants,
+    /// The arena has no free slot outside its reserve, or the index no
+    /// bucket storage.
+    NoSlot,
 }
 
 /// Whether [`Ledger::add_region`] registers a region committed
@@ -125,6 +145,9 @@ pub enum ResizeError
     /// The arena has fewer free slots outside its reserve than the levels a
     /// grown chunk table adds.
     NoSlot,
+    /// The region attaches a memory object, whose pages its attachment fixes
+    /// ([`Ledger::attach_object`]).
+    Attached,
 }
 
 /// Why [`Ledger::back_chunk`] recorded no run.
@@ -549,7 +572,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Disk(_) => None,
+            | Node::Disk(_)
+            | Node::Object(_) => None,
         }
     }
 
@@ -571,7 +595,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Disk(_) => None,
+            | Node::Disk(_)
+            | Node::Object(_) => None,
         }
     }
 
@@ -594,7 +619,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Caps(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Disk(_) => None,
+            | Node::Disk(_)
+            | Node::Object(_) => None,
         }
     }
 
@@ -641,7 +667,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Disk(_) => None,
+            | Node::Disk(_)
+            | Node::Object(_) => None,
         }
     }
 
@@ -826,7 +853,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Caps(_)
             | Node::Commit(_)
             | Node::Limit(_)
-            | Node::Disk(_) => None,
+            | Node::Disk(_)
+            | Node::Object(_) => None,
         }
     }
 
@@ -850,7 +878,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Caps(_)
             | Node::Commit(_)
             | Node::Handle(_)
-            | Node::Disk(_) => None,
+            | Node::Disk(_)
+            | Node::Object(_) => None,
         }
     }
 
@@ -1012,27 +1041,62 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return;
         }
         let mut cur = caps.handles;
-        while let Some(mut s) = self.handle(cur)
+        while let Some(after) = self.owned_next(cur)
         {
-            if s.owned_next == h
+            if after == h
             {
-                s.owned_next = next;
-                self.arena.set_node(cur, Node::Handle(s));
+                self.set_owned_next(cur, next);
                 return;
             }
-            cur = s.owned_next;
+            cur = after;
         }
     }
 
-    /// Drop every handle state the record `rec` owns ([`Ledger::drop_handle`]),
-    /// calling `release` with each nonzero limit cap.
-    pub fn drop_owned_handles(&mut self, rec: NodeIdx, mut release: impl FnMut(u64))
+    /// The next slot of the owner's list after the handle state `h`, a node
+    /// handle state or a memory object; `None` when `h` holds neither.
+    fn owned_next(&self, h: NodeIdx) -> Option<NodeIdx>
+    {
+        if let Some(s) = self.handle(h)
+        {
+            return Some(s.owned_next);
+        }
+        self.object(h).map(|o| o.owned_next)
+    }
+
+    /// Link `next` after the handle state `h` on its owner's list.
+    fn set_owned_next(&mut self, h: NodeIdx, next: NodeIdx)
+    {
+        if let Some(mut s) = self.handle(h)
+        {
+            s.owned_next = next;
+            self.arena.set_node(h, Node::Handle(s));
+        }
+        else
+        {
+            self.set_object(h, |o| o.owned_next = next);
+        }
+    }
+
+    /// Drop every handle state the record `rec` owns: each node handle state
+    /// ([`Ledger::drop_handle`]), calling `release` with each nonzero limit
+    /// cap, and each memory object's ([`Ledger::release_object`]), whose
+    /// frames retire through `quiescent` when no region attaches it.
+    pub fn drop_owned_handles(
+        &mut self,
+        rec: NodeIdx,
+        mut release: impl FnMut(u64),
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
+    )
     {
         while let Some(h) = self
             .caps(rec)
             .map(|c| c.handles)
             .filter(|&h| h != NODE_NULL)
         {
+            if self.release_object(h, &mut quiescent)
+            {
+                continue;
+            }
             match self.drop_handle(h)
             {
                 Some(0) =>
@@ -1203,15 +1267,15 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     pub fn remove_process(
         &mut self,
         badge: u64,
-        quiescent: impl FnMut(&FreeRun) -> bool,
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
         mut release: impl FnMut(u64),
     ) -> Option<(ProcessRecord, ProcessCaps)>
     {
         let rec = self.find(badge)?;
-        self.drop_owned_handles(rec, &mut release);
+        self.drop_owned_handles(rec, &mut release, &mut quiescent);
         self.drop_limits(rec, &mut release);
         let rec = self.index.remove(&mut self.arena, badge)?;
-        self.reclaim_all(rec, quiescent);
+        self.reclaim_all(rec, &mut quiescent);
         let r = self.record(rec);
         let c = self.caps(rec);
         self.arena.free(rec);
@@ -1219,6 +1283,454 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.arena.free(r.caps);
         budget::unref(&mut self.arena, r.budget);
         Some((r, c?))
+    }
+
+    // ── Memory objects ──────────────────────────────────────────────────────
+
+    /// The memory object in slot `obj`.
+    #[must_use]
+    pub fn object(&self, obj: NodeIdx) -> Option<MemObject>
+    {
+        match self.arena.get(obj).node
+        {
+            Node::Object(o) => Some(o),
+            Node::Free
+            | Node::Run(_)
+            | Node::Deferred(_)
+            | Node::Budget(_)
+            | Node::Region(_)
+            | Node::Frame(_)
+            | Node::Process(_)
+            | Node::ChunkDir(_)
+            | Node::Chunk(_)
+            | Node::Caps(_)
+            | Node::Commit(_)
+            | Node::Handle(_)
+            | Node::Limit(_)
+            | Node::Disk(_) => None,
+        }
+    }
+
+    /// The slot of the live memory object keyed by `badge`, the badge of an
+    /// object handle; `None` once its handle state is dropped.
+    #[must_use]
+    pub fn find_object(&self, badge: u64) -> Option<NodeIdx>
+    {
+        self.index
+            .find(&self.arena, badge)
+            .filter(|&obj| self.object(obj).is_some_and(|o| o.live))
+    }
+
+    /// The frame of the frame list of `rec` that the grant `region_id`
+    /// returned, with its slot; `None` for [`NO_REGION_ID`] or an id that
+    /// names no frame of `rec`.
+    #[must_use]
+    pub fn granted_frame(&self, rec: NodeIdx, region_id: u64) -> Option<(NodeIdx, FrameDesc)>
+    {
+        if region_id == NO_REGION_ID
+        {
+            return None;
+        }
+        let mut cur = self.record(rec)?.frame_head;
+        while let Node::Frame(f) = self.arena.get(cur).node
+        {
+            if f.region_id == region_id
+            {
+                return Some((cur, f));
+            }
+            cur = self.arena.get(cur).next;
+        }
+        None
+    }
+
+    /// Seal the frames of `rec` that the grants `region_ids` returned into a
+    /// new memory object keyed by `key` (a badge no slot is keyed by), its
+    /// pages in the order of the ids, owned by `rec` and live. The frames
+    /// leave the record's frame list and keep their charge on its budget node,
+    /// which the object names. That no process can still write a frame (the
+    /// caller's quiescence check) is the caller's to establish first.
+    ///
+    /// # Errors
+    /// [`SealError::NoRecord`]; [`SealError::Grants`] for no id, an id that
+    /// names no frame of `rec`, or an id named twice;
+    /// [`SealError::NoSlot`] when the arena has no free slot outside its
+    /// reserve for the object or the index no bucket storage. Nothing changes
+    /// then.
+    pub fn seal_object(
+        &mut self,
+        rec: NodeIdx,
+        region_ids: &[u64],
+        key: u64,
+    ) -> Result<NodeIdx, SealError>
+    {
+        let r = self.record(rec).ok_or(SealError::NoRecord)?;
+        let caps = self.caps(rec).ok_or(SealError::NoRecord)?;
+        if region_ids.is_empty()
+        {
+            return Err(SealError::Grants);
+        }
+        for (i, &id) in region_ids.iter().enumerate()
+        {
+            let repeated = region_ids.iter().take(i).any(|&before| before == id);
+            if repeated || self.granted_frame(rec, id).is_none()
+            {
+                return Err(SealError::Grants);
+            }
+        }
+        let object = Node::Object(MemObject {
+            key,
+            owner: r.badge,
+            owned_next: caps.handles,
+            runs: NODE_NULL,
+            budget: r.budget,
+            attached: 0,
+            live: true,
+        });
+        let obj = self
+            .arena
+            .alloc(object, NODE_NULL)
+            .ok_or(SealError::NoSlot)?;
+        if !self.index.insert(&mut self.arena, obj)
+        {
+            self.arena.free(obj);
+            return Err(SealError::NoSlot);
+        }
+        // The last id's frame first, each put at the head, so the list runs in
+        // the order of the ids.
+        let mut runs = NODE_NULL;
+        for &id in region_ids.iter().rev()
+        {
+            if let Some((idx, _)) = self.granted_frame(rec, id)
+            {
+                self.unlink_frame(rec, idx);
+                self.arena.set_next(idx, runs);
+                runs = idx;
+            }
+        }
+        self.set_object(obj, |o| o.runs = runs);
+        self.update_caps(rec, |c| c.handles = obj);
+        Ok(obj)
+    }
+
+    /// Undo the seal of the memory object `obj`, which no region attaches,
+    /// whose reply did not reach its sealer `rec`: its frames go back onto
+    /// the record's frame list under the region ids they had, still charged,
+    /// so the sealer holds its grants as before the seal and a repeat of the
+    /// call finds them. Returns `false`, changing nothing, when `obj` holds
+    /// no live object of `rec` or one a region attaches.
+    pub fn unseal_object(&mut self, rec: NodeIdx, obj: NodeIdx) -> bool
+    {
+        let Some(o) = self.object(obj).filter(|o| o.live && o.attached == 0)
+        else
+        {
+            return false;
+        };
+        if self.record(rec).is_none_or(|r| r.badge != o.owner)
+        {
+            return false;
+        }
+        let _ = self.index.remove(&mut self.arena, o.key);
+        self.unlink_owned(rec, obj, o.owned_next);
+        let Some(mut r) = self.record(rec)
+        else
+        {
+            return false;
+        };
+        let mut cur = o.runs;
+        while let Node::Frame(_) = self.arena.get(cur).node
+        {
+            let next = self.arena.get(cur).next;
+            self.arena.set_next(cur, r.frame_head);
+            r.frame_head = cur;
+            cur = next;
+        }
+        self.set_record(rec, r);
+        self.arena.free(obj);
+        true
+    }
+
+    /// Take the frame slot `idx` off the frame list of `rec`, leaving the
+    /// slot and its charge as they are.
+    fn unlink_frame(&mut self, rec: NodeIdx, idx: NodeIdx)
+    {
+        let Some(mut r) = self.record(rec)
+        else
+        {
+            return;
+        };
+        let next = self.arena.get(idx).next;
+        if r.frame_head == idx
+        {
+            r.frame_head = next;
+            self.set_record(rec, r);
+            return;
+        }
+        let mut cur = r.frame_head;
+        while let Node::Frame(_) = self.arena.get(cur).node
+        {
+            let after = self.arena.get(cur).next;
+            if after == idx
+            {
+                self.arena.set_next(cur, next);
+                return;
+            }
+            cur = after;
+        }
+    }
+
+    /// Rewrite the memory object in slot `obj` with `f`; a slot that holds
+    /// none is left alone.
+    fn set_object(&mut self, obj: NodeIdx, f: impl FnOnce(&mut MemObject))
+    {
+        if let Some(mut o) = self.object(obj)
+        {
+            f(&mut o);
+            self.arena.set_node(obj, Node::Object(o));
+        }
+    }
+
+    /// Pages of the memory object in slot `obj`: those of its frames; 0 for
+    /// a slot that holds none.
+    #[must_use]
+    pub fn object_pages(&self, obj: NodeIdx) -> u64
+    {
+        let mut pages: u64 = 0;
+        self.for_each_object_frame(obj, |_, f| {
+            pages = pages.saturating_add(u64::from(f.page_count));
+        });
+        pages
+    }
+
+    /// The frame that holds page `page` of the memory object `obj`, with the
+    /// page's index in it; `None` for a page past its end.
+    #[must_use]
+    pub fn object_frame(&self, obj: NodeIdx, page: u64) -> Option<(FrameDesc, u64)>
+    {
+        let mut first: u64 = 0;
+        let mut found = None;
+        self.for_each_object_frame(obj, |_, f| {
+            let end = first.saturating_add(u64::from(f.page_count));
+            if found.is_none() && page >= first && page < end
+            {
+                found = Some((*f, page.saturating_sub(first)));
+            }
+            first = end;
+        });
+        found
+    }
+
+    /// Call `f` with the slot and descriptor of each frame of the memory
+    /// object `obj`, in object page order.
+    fn for_each_object_frame(&self, obj: NodeIdx, mut f: impl FnMut(NodeIdx, &FrameDesc))
+    {
+        let Some(o) = self.object(obj)
+        else
+        {
+            return;
+        };
+        let mut cur = o.runs;
+        while let Node::Frame(frame) = self.arena.get(cur).node
+        {
+            f(cur, &frame);
+            cur = self.arena.get(cur).next;
+        }
+    }
+
+    /// Drop the handle state of the live memory object `obj`: unindex it, so
+    /// every handle carrying its key is refused from then on, and unlink it
+    /// from its owner's list. An object no region attaches retires
+    /// ([`Ledger::retire_object`]); an attached one retires when its last
+    /// attachment goes. Returns `false`, changing nothing, when `obj` holds no
+    /// live object.
+    pub fn release_object(&mut self, obj: NodeIdx, quiescent: impl FnMut(&FreeRun) -> bool)
+    -> bool
+    {
+        let Some(o) = self.object(obj).filter(|o| o.live)
+        else
+        {
+            return false;
+        };
+        let _ = self.index.remove(&mut self.arena, o.key);
+        if let Some(rec) = self.find(o.owner)
+        {
+            self.unlink_owned(rec, obj, o.owned_next);
+        }
+        self.set_object(obj, |o| {
+            o.live = false;
+            o.owned_next = NODE_NULL;
+        });
+        if o.attached == 0
+        {
+            self.retire_object(obj, quiescent);
+        }
+        true
+    }
+
+    /// Drop one attachment's reference on the memory object `obj` (the zero
+    /// object holds none), retiring it when it was the last and its handle
+    /// state is gone.
+    fn detach(&mut self, obj: NodeIdx, quiescent: impl FnMut(&FreeRun) -> bool)
+    {
+        let Some(o) = self.object(obj)
+        else
+        {
+            return;
+        };
+        let attached = o.attached.saturating_sub(1);
+        self.set_object(obj, |o| o.attached = attached);
+        if attached == 0 && !o.live
+        {
+            self.retire_object(obj, quiescent);
+        }
+    }
+
+    /// Free the memory object `obj`, which nothing names any more: each of its
+    /// frames moves to the free pool, its charge on the object's budget node
+    /// released, when `quiescent` accepts it, else to the deferred list, still
+    /// charged ([`retire`]).
+    fn retire_object(&mut self, obj: NodeIdx, mut quiescent: impl FnMut(&FreeRun) -> bool)
+    {
+        let Some(o) = self.object(obj)
+        else
+        {
+            return;
+        };
+        let mut cur = o.runs;
+        while let Node::Frame(frame) = self.arena.get(cur).node
+        {
+            let next = self.arena.get(cur).next;
+            retire(
+                &mut self.arena,
+                &mut self.pool,
+                &mut self.deferred,
+                cur,
+                &frame,
+                o.budget,
+                &mut quiescent,
+            );
+            cur = next;
+        }
+        self.arena.free(obj);
+    }
+
+    /// Whether region `len` bytes long attaching shared or private
+    /// (`share`) may be attached by `rec`, with `reserve` the free pages
+    /// a charge to a node outside the system reserve must leave
+    /// ([`Self::growth_floor`]). A private attachment is admitted as a
+    /// committed region of its length ([`Self::admit_commit`]). A shared one
+    /// is charged the same, its pages and page-table reservation, against the
+    /// node's max, but promises only the reservation
+    /// ([`commit::attach_promise`]), so only that is taken from the pages a
+    /// commitment may still promise. A record that does not exist admits
+    /// nothing.
+    ///
+    /// # Errors
+    /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
+    pub fn admit_attach(
+        &self,
+        rec: NodeIdx,
+        len: u64,
+        share: Share,
+        reserve: u64,
+    ) -> Result<(), ChargeError>
+    {
+        let need = commit::grow_need(0, len);
+        match share
+        {
+            Share::Private => self.admit_commit(rec, need, reserve),
+            Share::Shared =>
+            {
+                let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
+                // The data pages count against the max as pending pages do,
+                // and take no free page.
+                budget::admit(
+                    &self.arena,
+                    node,
+                    need.pt,
+                    need.pages,
+                    self.promise_free(),
+                    reserve,
+                )
+            }
+        }
+    }
+
+    /// Attach pages `[source.first_page, source.first_page + region.len /
+    /// PAGE_SIZE)` of the memory object `source.object`, or of the zero
+    /// object, as the region `region` of `rec`
+    /// (`services/memmgr/docs/memory-pool.md` § Memory objects). The region
+    /// holds a commitment that names the object, and the object a reference
+    /// for it. It is charged to the budget node of `rec` as a committed region
+    /// of its length is, and promises what [`commit::attach_promise`] says;
+    /// admitting it is the caller's ([`Self::admit_attach`]).
+    ///
+    /// # Errors
+    /// [`RegionError::NoObject`] for an object slot that holds no live object
+    /// or one attached `u32::MAX` times; [`RegionError::OutsideObject`] for
+    /// pages past the object's end, or a zero-object attachment whose first
+    /// page is not 0; and as [`Ledger::add_region`]. Nothing changes then.
+    pub fn attach_object(
+        &mut self,
+        rec: NodeIdx,
+        region: DemandRegion,
+        source: Attachment,
+    ) -> Result<NodeIdx, RegionError>
+    {
+        let pages = region.len / PAGE_SIZE;
+        let attached = if source.object == ZERO_OBJECT
+        {
+            if source.first_page != 0
+            {
+                return Err(RegionError::OutsideObject);
+            }
+            None
+        }
+        else
+        {
+            let o = self
+                .object(source.object)
+                .filter(|o| o.live)
+                .ok_or(RegionError::NoObject)?;
+            let end = source
+                .first_page
+                .checked_add(pages)
+                .ok_or(RegionError::OutsideObject)?;
+            if end > self.object_pages(source.object)
+            {
+                return Err(RegionError::OutsideObject);
+            }
+            Some(o.attached.checked_add(1).ok_or(RegionError::NoObject)?)
+        };
+        let need = commit::grow_need(0, region.len);
+        let meta_left = match source.share
+        {
+            Share::Private => need.meta,
+            Share::Shared => 0,
+        };
+        let commitment = Commitment {
+            pt_left: need.pt,
+            meta_left,
+            high_len: region.len,
+            source: Some(source),
+        };
+        let (idx, budget) = self.link_region(rec, region, Some(commitment))?;
+        budget::charge(&mut self.arena, budget, need.charged());
+        self.promised = self
+            .promised
+            .saturating_add(commit::attach_promise(need, source.share));
+        if let Some(attached) = attached
+        {
+            self.set_object(source.object, |o| o.attached = attached);
+        }
+        Ok(idx)
+    }
+
+    /// The attachment of the region in slot `reg`: `None` for a region of the
+    /// process's own memory, or a slot that holds no region.
+    #[must_use]
+    pub fn attachment(&self, reg: NodeIdx) -> Option<Attachment>
+    {
+        self.commitment(reg)?.source
     }
 
     /// The delegated address-space cap of `rec`, or `0` for none.
@@ -1363,6 +1875,36 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         commit: Commit,
     ) -> Result<NodeIdx, RegionError>
     {
+        let need = commit::grow_need(0, region.len);
+        let commitment = (commit == Commit::Committed).then_some(Commitment {
+            pt_left: need.pt,
+            meta_left: need.meta,
+            high_len: region.len,
+            source: None,
+        });
+        let (idx, budget) = self.link_region(rec, region, commitment)?;
+        if commitment.is_some()
+        {
+            budget::charge(&mut self.arena, budget, need.charged());
+            self.promised = self.promised.saturating_add(need.promised());
+        }
+        Ok(idx)
+    }
+
+    /// Put `region` first on the region list of `rec` with an empty chunk
+    /// table and, when `commitment` is given, a slot of its own for it.
+    /// Returns the region's slot and the record's budget node; charging it is
+    /// the caller's.
+    ///
+    /// # Errors
+    /// As [`Ledger::add_region`]. Nothing is left allocated then.
+    fn link_region(
+        &mut self,
+        rec: NodeIdx,
+        region: DemandRegion,
+        commitment: Option<Commitment>,
+    ) -> Result<(NodeIdx, NodeIdx), RegionError>
+    {
         let Some(mut r) = self.record(rec)
         else
         {
@@ -1382,27 +1924,18 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             }
             cur = self.arena.get(cur).next;
         }
-        let need = commit::grow_need(0, region.len);
-        let committed = commit == Commit::Committed;
-        let slots = if committed { 2 } else { 1 };
+        let slots = if commitment.is_some() { 2 } else { 1 };
         if self.arena.available() < slots
         {
             return Err(RegionError::NoSlot);
         }
-        let commit_slot = if committed
+        let commit_slot = match commitment
         {
-            let c = Commitment {
-                pt_left: need.pt,
-                meta_left: need.meta,
-                high_len: region.len,
-            };
-            self.arena
+            Some(c) => self
+                .arena
                 .alloc(Node::Commit(c), NODE_NULL)
-                .ok_or(RegionError::NoSlot)?
-        }
-        else
-        {
-            NODE_NULL
+                .ok_or(RegionError::NoSlot)?,
+            None => NODE_NULL,
         };
         let node = RegionNode {
             region,
@@ -1417,12 +1950,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         };
         r.region_head = idx;
         self.set_record(rec, r);
-        if committed
-        {
-            budget::charge(&mut self.arena, r.budget, need.charged());
-            self.promised = self.promised.saturating_add(need.promised());
-        }
-        Ok(idx)
+        Ok((idx, r.budget))
     }
 
     /// The region of `rec` based at `va_base`, with its slot.
@@ -1454,10 +1982,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             if cur == reg
             {
-                return self
+                let c = self
                     .commit_at(have.commit)
-                    .map(|c| (have, c))
-                    .ok_or(ResizeError::NotCommitted);
+                    .ok_or(ResizeError::NotCommitted)?;
+                if c.source.is_some()
+                {
+                    return Err(ResizeError::Attached);
+                }
+                return Ok((have, c));
             }
             cur = self.arena.get(cur).next;
         }
@@ -1534,6 +2066,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 pt_left: c.pt_left.saturating_add(need.pt),
                 meta_left: c.meta_left.saturating_add(need.meta),
                 high_len: c.high_len.max(new_len),
+                ..c
             },
         );
         budget::charge(&mut self.arena, r.budget, need.charged());
@@ -1706,6 +2239,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ) -> Result<(NodeIdx, DemandRegion), ResizeError>
     {
         let (reg, region) = self.region_for(rec, va).ok_or(ResizeError::NoRegion)?;
+        if self.attachment(reg).is_some()
+        {
+            return Err(ResizeError::Attached);
+        }
         let offset = va.saturating_sub(region.va_base);
         let end = offset.checked_add(len).ok_or(ResizeError::Length)?;
         if len == 0
@@ -2131,7 +2668,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return false;
         };
-        (self.commit_at(node.commit).is_none() || self.overcommits())
+        let commitment = self.commit_at(node.commit);
+        (commitment.is_none() || self.overcommits())
+            && commitment.is_none_or(|c| c.source.is_none())
             && node.region.evict == Evict::Allowed
             && budget::node(&self.arena, r.budget).is_some_and(|b| !b.reserve())
     }
@@ -3311,13 +3850,29 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 pages.saturating_sub(released.run_pages.saturating_add(released.swapped));
             let held = unbacked.saturating_add(c.pt_left);
             budget::uncharge(&mut self.arena, charged, held);
+            // A shared attachment promised no data page: it never takes one.
+            let unpromised = match c.source
+            {
+                Some(Attachment {
+                    share: Share::Shared,
+                    ..
+                }) => 0,
+                Some(Attachment {
+                    share: Share::Private,
+                    ..
+                })
+                | None => pages.saturating_sub(released.run_pages),
+            };
             self.promised = self.promised.saturating_sub(
-                pages
-                    .saturating_sub(released.run_pages)
+                unpromised
                     .saturating_add(c.pt_left)
                     .saturating_add(c.meta_left),
             );
             self.arena.free(node.commit);
+            if let Some(source) = c.source
+            {
+                self.detach(source.object, &mut quiescent);
+            }
         }
     }
 
@@ -4223,6 +4778,12 @@ mod tests
                 {
                     pages += d.run.page_count;
                 }
+                // A memory object's frames stay charged to its sealer's node.
+                if let Node::Object(o) = l.arena.get(idx).node
+                    && o.budget == node
+                {
+                    pages += l.object_pages(idx);
+                }
                 continue;
             };
             if r.budget != node
@@ -4292,8 +4853,8 @@ mod tests
     }
 
     /// What `promised` must equal, walked from every committed region: its
-    /// pages that hold no run, its reservation left, and its metadata bound
-    /// left.
+    /// pages that hold no run (none for a shared attachment), its reservation
+    /// left, and its metadata bound left.
     fn promised_by(l: &Ledger<VecStore, VecWords>) -> u64
     {
         let mut pages = 0;
@@ -4302,8 +4863,16 @@ mod tests
             if let Node::Region(have) = l.arena.get(idx).node
                 && let Some(c) = l.commit_at(have.commit)
             {
-                pages +=
-                    have.region.len / PAGE_SIZE - run_pages(l, &have) + c.pt_left + c.meta_left;
+                // A shared attachment promises no data page.
+                let data = match c.source
+                {
+                    Some(Attachment {
+                        share: Share::Shared,
+                        ..
+                    }) => 0,
+                    _ => have.region.len / PAGE_SIZE - run_pages(l, &have),
+                };
+                pages += data + c.pt_left + c.meta_left;
             }
         }
         pages
@@ -4571,6 +5140,7 @@ mod tests
                 | Node::Handle(_)
                 | Node::Limit(_)
                 | Node::Disk(_)
+                | Node::Object(_)
                 | Node::ChunkDir(_)
                 | Node::Chunk(_) => (),
             }
@@ -6748,5 +7318,309 @@ mod tests
             l2.next_to_write(&mut hand, 64).map(|v| v.page_base),
             Some(BASE)
         );
+    }
+
+    // ── Memory objects ───────────────────────────────────────────────────────
+
+    /// A record with `n` grants of `pages` pages each, and their region ids.
+    fn granted(
+        l: &mut Ledger<VecStore, VecWords>,
+        badge: u64,
+        n: u64,
+        pages: u32,
+    ) -> (NodeIdx, Vec<u64>)
+    {
+        let rec = l.insert_process(badge, NodeSpec::TOP).unwrap();
+        let ids = (0..n)
+            .map(|_| {
+                let (cap, got, phys) = take(l, pages, crate::Fit::Contiguous);
+                assert_eq!(got, pages);
+                l.push_grant(rec, cap, pages, phys, UNMAPPED).unwrap()
+            })
+            .collect();
+        (rec, ids)
+    }
+
+    fn attachment(object: NodeIdx, first_page: u64, share: Share) -> Attachment
+    {
+        Attachment {
+            object,
+            first_page,
+            share,
+        }
+    }
+
+    // The defect caught: a seal that loses the order of the grants, leaves a
+    // sealed frame on the sealer's frame list (where a release or a teardown
+    // would pool it under the object), drops its charge, or changes anything
+    // when it refuses.
+    #[test]
+    fn a_seal_takes_the_named_grants_in_order_and_keeps_their_charge()
+    {
+        let mut l = roomy_ledger(1000);
+        let (rec, ids) = granted(&mut l, 1, 3, 2);
+        let charged = usage(&l, rec);
+        let before = l.arena.free_count();
+        for bad in [&[][..], &[ids[0], ids[0]][..], &[ids[0], 999][..]]
+        {
+            assert_eq!(l.seal_object(rec, bad, 77), Err(SealError::Grants));
+        }
+        assert_eq!(l.arena.free_count(), before);
+        let first = l.granted_frame(rec, ids[2]).unwrap().1;
+        let obj = l.seal_object(rec, &[ids[2], ids[0]], 77).unwrap();
+        assert_eq!(l.find_object(77), Some(obj));
+        assert_eq!(l.object_pages(obj), 4);
+        assert_eq!(l.object_frame(obj, 1), Some((first, 1)));
+        assert_eq!(l.object_frame(obj, 4), None);
+        // The sealed grants left the frame list; the third stays there.
+        assert!(l.granted_frame(rec, ids[0]).is_none() && l.granted_frame(rec, ids[2]).is_none());
+        assert!(l.granted_frame(rec, ids[1]).is_some());
+        assert!(!l.release_frame_by_region(rec, ids[0], pool_all));
+        assert_eq!(usage(&l, rec), charged);
+        assert_eq!(l.find(77), None);
+        assert_eq!(l.find_handle(77), None);
+    }
+
+    // The defect caught: a seal whose reply failed that leaves the sealer
+    // without its grants, or the object's key still naming it.
+    #[test]
+    fn an_unsealed_object_gives_the_sealer_its_grants_back()
+    {
+        let mut l = roomy_ledger(1000);
+        let (rec, ids) = granted(&mut l, 1, 2, 2);
+        let other = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let charged = usage(&l, rec);
+        let free = l.arena.free_count();
+        let obj = l.seal_object(rec, &ids, 77).unwrap();
+        assert!(!l.unseal_object(other, obj));
+        assert!(l.unseal_object(rec, obj));
+        assert!(!l.unseal_object(rec, obj));
+        assert_eq!(l.find_object(77), None);
+        assert_eq!(l.arena.free_count(), free);
+        assert_eq!(usage(&l, rec), charged);
+        for id in ids
+        {
+            assert!(l.granted_frame(rec, id).is_some());
+            assert!(l.release_frame_by_region(rec, id, pool_all));
+        }
+        assert_eq!(usage(&l, rec), (0, 0));
+    }
+
+    // The defect caught: an object whose frames return to the pool while a
+    // region still maps them, or that never retires once released and
+    // detached, or whose released handle still attaches.
+    #[test]
+    fn an_object_retires_its_frames_once_released_and_no_longer_attached()
+    {
+        let mut l = roomy_ledger(1000);
+        let (sealer, ids) = granted(&mut l, 1, 2, 4);
+        let obj = l.seal_object(sealer, &ids, 77).unwrap();
+        let other = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let reg = l
+            .attach_object(
+                other,
+                region(BASE, 8 * PAGE_SIZE),
+                attachment(obj, 0, Share::Shared),
+            )
+            .unwrap();
+        let free = l.pool.free_pages();
+        assert!(l.release_object(obj, pool_all));
+        assert!(!l.release_object(obj, pool_all));
+        assert_eq!(l.find_object(77), None);
+        assert_eq!(l.pool.free_pages(), free);
+        assert_eq!(usage(&l, sealer).0, 8);
+        assert_eq!(
+            l.attach_object(
+                other,
+                region(BASE + CHUNK, PAGE_SIZE),
+                attachment(obj, 0, Share::Shared)
+            ),
+            Err(RegionError::NoObject)
+        );
+        l.remove_region(other, reg, pool_all).unwrap();
+        assert_eq!(l.pool.free_pages(), free + 8);
+        assert_eq!(usage(&l, sealer), (0, 0));
+        assert_eq!(usage(&l, other), (0, 0));
+        assert_eq!(l.object(obj), None);
+    }
+
+    // The defect caught: a sealer's death that leaves its objects' handles
+    // live, pools the frames of an object another process attaches, or
+    // pools a frame the quiescence check refuses.
+    #[test]
+    fn a_sealers_death_drops_its_objects_whose_frames_wait_for_the_last_attachment()
+    {
+        let mut l = roomy_ledger(1000);
+        let (sealer, ids) = granted(&mut l, 1, 1, 4);
+        let obj = l.seal_object(sealer, &ids, 77).unwrap();
+        let node = l.record(sealer).unwrap().budget;
+        let other = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let reg = l
+            .attach_object(
+                other,
+                region(BASE, 4 * PAGE_SIZE),
+                attachment(obj, 0, Share::Private),
+            )
+            .unwrap();
+        let free = l.pool.free_pages();
+        l.remove_process(1, pool_all, |_| {}).unwrap();
+        assert_eq!(l.find_object(77), None);
+        assert_eq!(l.pool.free_pages(), free);
+        assert_eq!(held_by(&l, node), 4);
+        // A frame still mapped somewhere waits on the deferred list, charged.
+        l.remove_region(other, reg, |_| false).unwrap();
+        assert_eq!(l.object(obj), None);
+        assert_eq!(l.deferred.pages(), 4);
+        assert_eq!(held_by(&l, node), 4);
+        assert_eq!(usage(&l, other), (0, 0));
+        assert_eq!(promised(&l), 0);
+    }
+
+    // The defect caught: a shared attachment that promises data pages it
+    // never takes, or a private one that does not promise the copies its
+    // writes take, or a teardown that leaves either's charge or promise.
+    #[test]
+    fn an_attachment_is_charged_its_length_and_only_a_private_one_promises_its_pages()
+    {
+        let mut l = roomy_ledger(1000);
+        let (sealer, ids) = granted(&mut l, 1, 1, 16);
+        let obj = l.seal_object(sealer, &ids, 77).unwrap();
+        let rec = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let len = 16 * PAGE_SIZE;
+        let need = commit::grow_need(0, len);
+        let shared = l
+            .attach_object(rec, region(BASE, len), attachment(obj, 0, Share::Shared))
+            .unwrap();
+        assert_eq!(usage(&l, rec).0, need.charged());
+        assert_eq!(promised(&l), need.pt);
+        let private = l
+            .attach_object(
+                rec,
+                region(BASE + CHUNK, len),
+                attachment(obj, 0, Share::Private),
+            )
+            .unwrap();
+        let zero = l
+            .attach_object(
+                rec,
+                region(BASE + 2 * CHUNK, len),
+                attachment(ZERO_OBJECT, 0, Share::Private),
+            )
+            .unwrap();
+        assert_eq!(usage(&l, rec).0, 3 * need.charged());
+        assert_eq!(promised(&l), need.pt + 2 * need.promised());
+        assert_eq!(
+            l.attachment(private),
+            Some(attachment(obj, 0, Share::Private))
+        );
+        assert_eq!(l.attachment(zero).unwrap().object, ZERO_OBJECT);
+        // A written page's copy is drawn from the promise, charged nothing more.
+        let (cap, _, phys) = take(&mut l, 1, crate::Fit::Contiguous);
+        l.back_chunk(rec, private, frame(cap, 1, phys, BASE + CHUNK + PAGE_SIZE))
+            .unwrap();
+        assert_eq!(usage(&l, rec).0, 3 * need.charged());
+        assert_eq!(promised(&l), need.pt + 2 * need.promised() - 1);
+        for reg in [shared, private, zero]
+        {
+            l.remove_region(rec, reg, pool_all).unwrap();
+        }
+        assert_eq!(usage(&l, rec), (0, 0));
+        assert_eq!(promised(&l), 0);
+        assert_eq!(l.object(obj).unwrap().attached, 0);
+    }
+
+    // The defect caught: a private attachment admitted past the max or the
+    // pages a commitment may promise, which a later write could not back,
+    // or a shared one refused for RAM it never takes.
+    #[test]
+    fn a_private_attachment_needs_the_max_and_the_promise_and_a_shared_one_the_max()
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, spec_max(600)).unwrap();
+        let big = 2000 * PAGE_SIZE;
+        assert_eq!(
+            l.admit_attach(rec, big, Share::Private, 0),
+            Err(ChargeError::Limit)
+        );
+        assert_eq!(
+            l.admit_attach(rec, big, Share::Shared, 0),
+            Err(ChargeError::Limit)
+        );
+        let roomy = l.insert_process(2, NodeSpec::TOP).unwrap();
+        assert_eq!(
+            l.admit_attach(roomy, big, Share::Private, 0),
+            Err(ChargeError::Reserve)
+        );
+        assert_eq!(l.admit_attach(roomy, big, Share::Shared, 0), Ok(()));
+        assert_eq!(
+            l.admit_attach(rec, 500 * PAGE_SIZE, Share::Private, 0),
+            Ok(())
+        );
+    }
+
+    // The defect caught: an attachment evicted (its object pages are not
+    // its own runs) or resized or discarded, which would desynchronise its
+    // pages from the object's.
+    #[test]
+    fn an_attachment_is_never_evicted_resized_or_discarded()
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let reg = l
+            .attach_object(
+                rec,
+                region(BASE, 2 * CHUNK),
+                attachment(ZERO_OBJECT, 0, Share::Private),
+            )
+            .unwrap();
+        assert!(!l.evictable(rec, reg));
+        assert_eq!(
+            l.extend_region(rec, reg, 4 * CHUNK),
+            Err(ResizeError::Attached)
+        );
+        assert_eq!(
+            l.shrink_region(rec, reg, CHUNK, pool_all),
+            Err(ResizeError::Attached)
+        );
+        assert_eq!(
+            l.discard_range(rec, BASE, CHUNK, pool_all),
+            Err(ResizeError::Attached)
+        );
+    }
+
+    // The defect caught: an attachment that maps pages past its object's
+    // end, names a slot that holds no object, or offsets into the zero
+    // object, any of which would map a frame the object does not hold.
+    #[test]
+    fn an_attachment_lies_inside_a_live_object()
+    {
+        let mut l = roomy_ledger(1000);
+        let (rec, ids) = granted(&mut l, 1, 1, 4);
+        let obj = l.seal_object(rec, &ids, 77).unwrap();
+        let before = l.arena.free_count();
+        for (len, first, object, err) in [
+            (4, 1, obj, RegionError::OutsideObject),
+            (1, u64::MAX, obj, RegionError::OutsideObject),
+            (1, 1, ZERO_OBJECT, RegionError::OutsideObject),
+            (1, 0, rec, RegionError::NoObject),
+        ]
+        {
+            assert_eq!(
+                l.attach_object(
+                    rec,
+                    region(BASE, len * PAGE_SIZE),
+                    attachment(object, first, Share::Shared)
+                ),
+                Err(err)
+            );
+        }
+        assert_eq!(l.arena.free_count(), before);
+        assert_eq!(promised(&l), 0);
+        l.attach_object(
+            rec,
+            region(BASE, 3 * PAGE_SIZE),
+            attachment(obj, 1, Share::Shared),
+        )
+        .unwrap();
     }
 }

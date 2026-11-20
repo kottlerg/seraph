@@ -97,6 +97,22 @@ const _: () = core::assert!(
         && SWAP_AUTHORITY != NODE_HANDLE_TAG
         && SWAP_AUTHORITY != PHYS_CLASS_BADGE_BIT
 );
+/// Badge bit of an object handle: a SEND on memmgr's endpoint badged with
+/// this bit and a random key, which names one memory object
+/// ([`SEAL_OBJECT`]). It is the authority to attach the object
+/// ([`ATTACH_OBJECT`], which takes it as a cap) and to serve
+/// [`OBJECT_RELEASE`] on it. No process badge, node handle or swap
+/// authority carries it, so memmgr serves [`OBJECT_RELEASE`] only on a badge
+/// carrying it and the other labels only on one without it, and refuses the
+/// rest with `UNAUTHORIZED`. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Object Handles.
+pub const OBJECT_HANDLE_TAG: u64 = 1 << 60;
+const _: () = core::assert!(
+    OBJECT_HANDLE_TAG & crate::VERB_BIT_MASK != 0
+        && OBJECT_HANDLE_TAG != SWAP_AUTHORITY
+        && OBJECT_HANDLE_TAG != NODE_HANDLE_TAG
+        && OBJECT_HANDLE_TAG != PHYS_CLASS_BADGE_BIT
+);
 /// Procmgr-only: notify process death. `data[0]` carries the dead process's
 /// memmgr badge (no cap is required); memmgr reclaims every Memory cap
 /// it had issued to that badge, runs coalescing, and clears the
@@ -517,6 +533,57 @@ pub const SWAP_WANTED: u64 = 26;
 /// [`SWAP_WANTED`] reply carries: a full list drops its oldest word for a new
 /// one, which the reader posts again when it asks again.
 pub const SWAP_WANTED_WORDS: u64 = 8;
+
+/// Seal grants of the caller, attributed by `recv.badge`, into an immutable
+/// memory object. `data[0]` is the count of grants, 1 to
+/// [`SEAL_OBJECT_MAX_GRANTS`], and the words after it name each by the region
+/// id its grant reply reported, in the order of the object's pages. The caller
+/// hands back the grants' Memory caps with the request, as for
+/// [`RELEASE_MEMORY_CAPS`], and has unmapped them: memmgr seals only grants
+/// no process holds a cap to, maps or has retyped, and otherwise changes
+/// nothing. The frames stay charged to the caller's budget node until the
+/// object is freed. Reply: `SUCCESS` with `data[0]` the object's pages and
+/// `caps[0]` an object handle ([`OBJECT_HANDLE_TAG`]); `INVALID_ARGUMENT`
+/// (unknown badge, a count out of range, an id that names no grant of the
+/// caller or is named twice, or a grant still held, mapped or retyped);
+/// `UNAUTHORIZED` (a phys-class caller); or `QUOTA` (memmgr's metadata or
+/// `CSpace` is full). A reply that does not reach the caller undoes the seal.
+/// Specified in `services/memmgr/docs/ipc-interface.md` § Label 27:
+/// `SEAL_OBJECT`.
+pub const SEAL_OBJECT: u64 = 27;
+/// The most grants one [`SEAL_OBJECT`] names: the data words after the count.
+pub const SEAL_OBJECT_MAX_GRANTS: u64 = 63;
+/// Attach pages of a memory object as a region of the caller, attributed by
+/// `recv.badge`. `caps[0]` is the object handle ([`OBJECT_HANDLE_TAG`]),
+/// which memmgr deletes, or absent for the zero object, whose every page reads
+/// as zeros. `data[0]` the region's base, `data[1]` its length in bytes (both
+/// page-aligned, the length nonzero), `data[2]` its protection (`MAP_READ`,
+/// `MAP_WRITABLE`; `MAP_EXECUTABLE` is refused), `data[3]` the object page
+/// the region starts at (0 for the zero object), and `data[4]` the flags
+/// ([`ATTACH_PRIVATE`]). A shared attachment maps the object's pages and is
+/// never writable; a private one maps them until the caller writes a page,
+/// which then gets a copy of its own. The caller's budget node is charged the
+/// region's length and its page-table reservation either way, and a private
+/// attachment is committed as `REGION_COMMIT` commits a region, so no fault
+/// in it fails for memory. Reply: `SUCCESS`; `INVALID_ARGUMENT` (unknown
+/// badge, a bad range, protection or flag, a cap that is no live object
+/// handle, pages past the object's end, or a range overlapping a region of the
+/// caller); `LIMIT` or `OUT_OF_MEMORY_BEST_EFFORT` as for a committed
+/// `REGISTER_REGION`; or `QUOTA`. A reply that does not reach the caller
+/// detaches the region again. [`UNREGISTER_REGION`] detaches it. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 28: `ATTACH_OBJECT`.
+pub const ATTACH_OBJECT: u64 = 28;
+/// [`ATTACH_OBJECT`] flag (`data[4]` bit 0): attach the pages private, so
+/// a write to one copies it for the caller alone. Without it the attachment
+/// is shared and `MAP_WRITABLE` is refused.
+pub const ATTACH_PRIVATE: u64 = 1 << 0;
+/// Release an object handle's state, on an object handle: every handle to the
+/// object is refused from then on, and the object's frames are freed once no
+/// region attaches it. The sealer's death releases every object it sealed the
+/// same way. Reply: `SUCCESS`, or `INVALID_ARGUMENT` for a handle already
+/// released. Specified in `services/memmgr/docs/ipc-interface.md` § Label 29:
+/// `OBJECT_RELEASE`.
+pub const OBJECT_RELEASE: u64 = 29;
 
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.

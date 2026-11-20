@@ -35,16 +35,16 @@ pub mod pressure;
 pub mod store;
 
 pub use arena::{
-    Arena, ArenaLayout, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, NO_REGION_ID,
-    NODE_NULL, Node, NodeHandle, NodeIdx, ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE,
-    SlotStore,
+    Arena, ArenaLayout, Attachment, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc,
+    MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx, ProcessCaps, ProcessRecord,
+    RegionNode, SLOTS_PER_PAGE, Share, SlotStore, ZERO_OBJECT,
 };
 pub use budget::{
     BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, growth_floor,
     reserve_pages, restore_headroom,
 };
 pub use chunk::{COLD_SWEEPS, ChunkEntry, ChunkError, ChunkState};
-pub use commit::{CommitNeed, PT_DONATION_PAGES};
+pub use commit::{CommitNeed, PT_DONATION_PAGES, attach_promise};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use disk::{
     FaultPath, Posted, Registered, ResidentPath, SlotError, SwapSlots, WANT_WORDS, WantList,
@@ -52,8 +52,8 @@ pub use disk::{
 };
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
 pub use ledger::{
-    BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SwapError,
-    Victim,
+    BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SealError,
+    SwapError, Victim,
 };
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 pub use pressure::{

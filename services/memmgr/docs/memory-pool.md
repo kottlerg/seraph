@@ -214,7 +214,8 @@ and never reclaims them. Each entry records:
   child `AddressSpace` cap, when demand-paged, the Notification cap
   `REGISTER_PRESSURE` gave, with the bits it is signalled with
   ([Memory pressure](#memory-pressure)), the head of the list of node
-  handle states the process owns, and the head of the list of the limit
+  handle states and memory objects the process owns
+  ([Memory objects](#memory-objects)), and the head of the list of the limit
   registrations it made ([Distribution policy](#distribution-policy)), and
   the count of its pages that are swapped ([Eviction](#eviction)), all of
   which go with the record.
@@ -235,7 +236,8 @@ only when the arena cannot grow because system RAM is exhausted, surfaced as
 `QUOTA`.
 
 Each record is itself an arena node, so the number of tracked processes is bounded by RAM, not by a
-constant. Records are found by badge, and node handle states by the key their handles carry, through
+constant. Records are found by badge, and node handle states and memory objects by the key their
+handles carry, through
 one linear-hash index: a bucket array of arena indices, in its own window of memmgr's address space,
 that grows one page of buckets at a time from the pool. Linear hashing splits one bucket per step
 once the mean chain length passes two, so the array only ever appends and lookup stays constant-time
@@ -407,8 +409,9 @@ a general heap against itself, but it *can* host fixed-size nodes in pages
 carved from its own pool:
 
 - Nodes are fixed-size `Slot`s (a tagged run, deferred run, budget, process,
-  process caps, node handle, limit registration, region, commitment, frame,
-  chunk-directory, chunk, or free payload plus a `next` index)
+  process caps, node handle, limit registration, memory object, region,
+  commitment, frame, chunk-directory, chunk, or free payload plus a `next`
+  index)
   reached by a
   `u64` index, so the index never bounds the
   arena before the address space does.
@@ -603,8 +606,10 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
    alive, so it goes before the reclaim: the frame then passes the quiescence
    check of step 4 instead of waiting on the deferred list.
 2. Recheck the deferred list.
-3. Remove the per-process record from the index. If absent (untracked
-   badge), skip to step 6 — the death notification is idempotent.
+3. Drop the node handle states and memory objects the record owns
+   ([Memory objects](#memory-objects)), then remove the per-process record
+   from the index. If absent (untracked badge), skip to step 6 — the death
+   notification is idempotent.
 4. For each frame node in the record's frame list and on the run lists of
    its regions' chunk tables, rewrite the node into a run of the retained
    Memory cap and insert it into the free pool at its sorted position when
@@ -946,6 +951,70 @@ free chunks of a large freed block and cuts the free chunks at its top ([Userspa
 as a grant whose reply fails is rolled back, so a caller whose call was interrupted makes it again
 and is charged once. A cut repeated finds the region at its new length and succeeds, and a discard
 repeated finds no run in its range and succeeds.
+
+## Memory objects
+
+A memory object is an immutable set of frames that any number of processes map, each charged for
+what it maps ([ipc-interface.md](ipc-interface.md) § Labels 27 to 29). The zero object is a
+memory object of any length whose every page reads zero.
+
+**Seal.** `SEAL_OBJECT` takes grants of the caller into a new object: memmgr moves the grants'
+frame nodes off the record's frame list onto the object's, in the order the request names them,
+which is the order of the object's pages. It seals only grants that pass the quiescence check
+([Reclamation](#reclamation)), so no capability but memmgr's own reaches a sealed frame, no byte of
+it is retyped and no address space maps it: no process can write a frame once it is sealed. A
+phys-class caller is refused, since a device it programmed may still write the frames. The frames
+stay charged to the sealer's budget node, which the object names, until the object is freed. The
+object is an arena node, found through the record index by the key of its handle
+([ipc-interface.md](ipc-interface.md) § Object Handles) and listed on the sealer's record with its
+node handle states ([Per-Process Tracking](#per-process-tracking)). A seal whose reply does not
+reach the caller is undone: the frames go back onto the record's frame list under their region ids.
+
+**Release.** `OBJECT_RELEASE`, or the sealer's `PROCESS_DIED`, drops the object's handle state:
+its key leaves the index, so every handle is refused from then on. Each attachment holds a
+reference on the object, and the object is freed when it has neither: each frame retires through
+the quiescence check as a reclaimed frame does, pooled and uncharged from the sealer's budget node,
+or deferred and still charged to it ([Reclamation](#reclamation)). A charge keeps a budget node
+alive, so the node outlives the sealer while the object's frames are charged to it.
+
+**Attach.** `ATTACH_OBJECT` registers a region whose pages are the object's, from a first object
+page on, or the zero object's. An attachment is a committed region whose commitment names its
+origin ([Commit](#commit)), and is charged as a committed region of its length is, its pages and
+its page-table reservation, so a process pays for every page it maps however many others map it.
+A private attachment is admitted and promised as a committed region is, since a write to each of
+its pages can take a page. A shared one is never writable and takes no page but its page tables:
+its pages count against the max of the budget node and its ancestors, and only its page-table
+reservation against the free pages outside `promised`, so `promised` holds that reservation and
+no data page or metadata bound for it. An attachment is never evicted, and is never resized or
+discarded, since its pages are its object's; `UNREGISTER_REGION` and `PROCESS_DIED` detach it
+and release its commitment as a committed region's (Commit, Shrink and release), a shared one's
+holding no data page. memmgr refuses an executable attachment: an executable map needs a capability
+with the execute right, and a leaf mapped through one lets a text write of `SYS_THREAD_WRITE_MEM`
+change its frame while one address space maps it
+([core/kernel/docs/memory-internals.md](../../../core/kernel/docs/memory-internals.md#leaf-grant)
+§ Leaf Grant).
+
+**Faults.** A read fault in an attachment maps its origin read-only over the part of the faulting
+page's chunk that no write has given a page of its own ([Chunk table](#chunk-table)): the object's
+pages there that the frame holding the faulting page holds, in one map, or the zero frame at each
+page. memmgr maps them through a capability it derives from its own with the map right alone and
+deletes after the map; the kernel keeps the mapping. A leaf records the write and execute rights of
+the capability it was mapped through as its grant (§ Leaf Grant), so no leaf of an origin carries
+either, and neither `SYS_MEM_PROTECT` nor a text write can make a frame others map writable. A
+write to a private attachment gives the faulting page a page of its own, drawn from the commitment
+as a committed region's fault draws its run (Commit, Faults) and recorded on its chunk as any run
+is. For an object it is one page: memmgr copies the object page into it through its scrub window
+([Frame contents](#frame-contents)), the source mapped read-only beside it, which leaves no byte to
+clear, unmaps the page's read-only leaf from the process, and maps the copy with the region's
+protection. For the zero object it is the span a committed region's fault backs, zeroed, mapped once
+memmgr has unmapped the span's leaves of the zero frame. The unmap invalidates each leaf on every
+CPU before it returns, so no thread of the process reads the origin through a stale entry at a page
+that is then mapped writable. A write to a shared attachment, and a fetch from any, is declined as
+its protection refuses it ([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message).
+
+**Zero frame.** The zero object's one frame is taken from the free pool at the first zero-object
+attachment, which is refused when the pool cannot spare it, zeroed, and kept for memmgr's life,
+charged to no budget node, as memmgr's metadata is.
 
 ---
 

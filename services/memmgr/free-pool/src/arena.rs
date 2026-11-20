@@ -87,8 +87,9 @@ pub struct ProcessCaps
     pub pressure: u64,
     /// The bits a change of pressure level sends on [`ProcessCaps::pressure`].
     pub pressure_bits: u64,
-    /// The first [`Node::Handle`] slot the process owns, chained through
-    /// [`NodeHandle::owned_next`]; [`NODE_NULL`] for none. Each goes with the
+    /// The first handle-state slot the process owns, a [`Node::Handle`] or a
+    /// [`Node::Object`], chained through [`NodeHandle::owned_next`] and
+    /// [`MemObject::owned_next`]; [`NODE_NULL`] for none. Each goes with the
     /// record ([`crate::Ledger::remove_process`]).
     pub handles: NodeIdx,
     /// The first [`Node::Limit`] slot of the limit registrations the process
@@ -170,9 +171,10 @@ pub struct RegionNode
 }
 
 /// The state of a committed region's commitment ([`crate::commit`]): what
-/// is left of its page-table reservation and of its metadata bound, and the
-/// largest length it has had. In a slot of its own beside the region's
-/// [`RegionNode`], so the region node stays within the slot size.
+/// is left of its page-table reservation and of its metadata bound, the
+/// largest length it has had, and, for an attachment, the object it maps. In
+/// a slot of its own beside the region's [`RegionNode`], so the region node
+/// stays within the slot size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Commitment
 {
@@ -186,6 +188,67 @@ pub struct Commitment
     /// tables of the pages it cuts, so the reservation is that of this length
     /// ([`crate::commit::regrow_need`]).
     pub high_len: u64,
+    /// The memory object the region attaches, or `None` for a committed
+    /// region of the process's own memory.
+    pub source: Option<Attachment>,
+}
+
+/// [`Attachment::object`] of an attachment of the zero object: every page
+/// reads as zero, and no object slot holds it.
+pub const ZERO_OBJECT: NodeIdx = NODE_NULL;
+
+/// How a region attaches a memory object
+/// (`services/memmgr/docs/memory-pool.md` § Memory objects): the object, the
+/// object page the region's first page shows, and whether the region shares
+/// the object's pages or takes its own copy of each page it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attachment
+{
+    /// The [`Node::Object`] slot, or [`ZERO_OBJECT`].
+    pub object: NodeIdx,
+    /// The object page at the region's base; 0 for the zero object.
+    pub first_page: u64,
+    pub share: Share,
+}
+
+/// Whether an attachment shares its object's pages or copies each it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Share
+{
+    /// Read-only: every page maps the object's own frame, never copied.
+    Shared,
+    /// A write gives the region its own copy of the page; the region is
+    /// charged and promised its whole length, as a committed region is.
+    Private,
+}
+
+/// An immutable memory object (`services/memmgr/docs/memory-pool.md`
+/// § Memory objects): the frames a process sealed, in object page order, and
+/// its handle state. It is its own handle state: while `live`, the index
+/// files it by `key`, the badge its handles carry, and it is chained on the
+/// owner's list of handle states ([`ProcessCaps::handles`]). Its frames stay
+/// charged to the budget node they were charged to when sealed. It lives
+/// while it is live or attached, and its frames retire once it is neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemObject
+{
+    /// The badge every handle to the object carries.
+    pub key: u64,
+    /// The badge of the process that sealed it, whose record owns its handle
+    /// state.
+    pub owner: u64,
+    /// The next handle-state slot of the owner's list.
+    pub owned_next: NodeIdx,
+    /// The first [`Node::Frame`] slot of its frames, chained through the
+    /// slot `next` link in object page order.
+    pub runs: NodeIdx,
+    /// The [`BudgetNode`] its frames are charged to.
+    pub budget: NodeIdx,
+    /// The regions that attach it.
+    pub attached: u32,
+    /// Whether its handle state stands: neither released nor gone with its
+    /// owner.
+    pub live: bool,
 }
 
 // Hard size budget: a region node and a commitment share the arena slot with
@@ -197,6 +260,7 @@ const _: () = assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<LimitReg>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<DiskNode>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<MemObject>() <= size_of::<ProcessRecord>());
 
 /// Where a write stands ([`DiskNode`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,6 +330,8 @@ pub enum Node
     Chunk(ChunkEntry),
     /// A chunk the swap service holds or is writing in a swap slot.
     Disk(DiskNode),
+    /// An immutable memory object.
+    Object(MemObject),
 }
 
 /// An arena slot: a payload plus the index of the next slot on whichever

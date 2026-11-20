@@ -702,10 +702,12 @@ carries a verb-bit procmgr sets itself,
 `procmgr_labels::PROCESS_HANDLE_TAG`, which tells it from the child's own
 procmgr SEND ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
 § Messages). memmgr does the same on its endpoint: its per-process badges keep
-bits 58 to 62 clear, bit 63 marking a phys-class process, and its node
+bits 58 to 62 clear, bit 63 marking a phys-class process, its node
 handles carry `memmgr_labels::NODE_HANDLE_TAG` (bit 62), which selects the
 labels that act on a budget node ([memmgr IPC
-Interface](../services/memmgr/docs/ipc-interface.md) § Node Handles). An
+Interface](../services/memmgr/docs/ipc-interface.md) § Node Handles), and its
+object handles `memmgr_labels::OBJECT_HANDLE_TAG` (bit 60), which selects the
+label that releases a memory object (§ Object Handles there). An
 un-badged SEND on such an endpoint stays with the server and its trusted
 minters, since its holder could badge it with any verb-bit. svcmgr's `QUERY_ENDPOINT` answers every
 process, so a queryable verb-bit cap would be ambient: a verb-bit cap

@@ -89,6 +89,10 @@ services/svctest/
         ├── discard.rs         # DISCARD_RANGE and SHRINK_REGION return frames; discarded pages
         │                      #   refault zero-filled and, committed, from the promise they keep;
         │                      #   the std heap's discard and trim; all-RAM-accounted identity
+        ├── memory_objects.rs  # memmgr memory objects: seal refusal and charge, attach refusals,
+        │                      #   shared and private attachments in svctest and a child, a
+        │                      #   private write seen by no other attacher, a shared write kills
+        │                      #   its writer, release, the zero object
         ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
         │                      #   held `LOW` level and restores them: debugger reads and
         │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
@@ -487,6 +491,8 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 | `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
 | `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
+| `memory-object-child`       | `memory_objects` | `memmgr_memory_objects` (attaches, writes) |
+| `memory-object-limited`     | `memory_objects` | `memmgr_memory_objects` (4096-page max)   |
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the free frames) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |

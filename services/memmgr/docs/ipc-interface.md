@@ -593,18 +593,20 @@ lazily on fault, and only once procmgr has delegated this process's
 region's whole length before it registers it: its pages and a page-table
 reservation to the caller's budget node, and those and a metadata bound to
 `promised` (`QUERY_POOL_STATUS` `data[8]`). A fault in a committed region is
-then not declined for budget or RAM (codes 7, 10 and 11 below; code 11 only
-under an overcommit allowance above 0, [`memory-pool.md`](memory-pool.md#commit)
-§ Commit, Overcommit) while the region's
-page-table reservation, which its page-table donations draw on, lasts: a thread
-of the process that maps while a committed fault's map is funded, or a
-reclaiming unmap of page tables in the region's span the process made or asked
-for, can spend it, and a donation past it is admitted as any other, so the
-fault can then be declined with code 10 or 9. Only a committed region grows by
-`EXTEND_REGION` (§ Label 12) or shrinks by `SHRINK_REGION` (§ Label 13); a
-discard by `DISCARD_RANGE` (§ Label 20) keeps its commitment, so a refault of
-a discarded page is admitted as its first touch was. A
-refused commitment registers nothing. A reply that does not reach the caller
+then not declined for budget (code 10 below), and for RAM only in the cases
+the rows of codes 7 and 11 below give: code 7 only when the split of a run
+larger than the pages to back fails, and code 11 only under an overcommit
+allowance above 0 or after memmgr's own metadata took free pages without
+admission ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit).
+That holds while the region's page-table reservation, which its page-table
+donations draw on, lasts: a thread of the process that maps while a committed
+fault's map is funded, or a reclaiming unmap of page tables in the region's
+span the process made or asked for, can spend it, and a donation past it is
+admitted as any other, so the fault can then be declined with code 10 or 9.
+Only a committed region grows by `EXTEND_REGION` (§ Label 12) or shrinks by
+`SHRINK_REGION` (§ Label 13); a discard by `DISCARD_RANGE` (§ Label 20) keeps
+its commitment, so a refault of a discarded page is admitted as its first
+touch was. A refused commitment registers nothing. A reply that does not reach the caller
 unregisters the region again, as a grant whose reply fails is rolled back, so a
 caller whose call was interrupted makes it again
 ([`memory-pool.md`](memory-pool.md) § Commit). The std heap registers its
@@ -1035,8 +1037,9 @@ page tables. In an uncommitted region each run is uncharged from the caller's
 budget node as it rejoins the pool. A committed region (§ Label 7) keeps its
 commitment: its charge stays, and the pages taken back, with the metadata their
 chunks gave back, return to `promised`, so a refault of a discarded page is
-not declined for budget or RAM, as its first touch was not
-([`memory-pool.md`](memory-pool.md#commit) § Commit). A range that holds no
+admitted as its first touch was: not declined for budget, and for RAM only in
+the cases § Label 7 gives ([`memory-pool.md`](memory-pool.md#commit)
+§ Commit). A range that holds no
 run changes nothing, so an interrupted call is safe to repeat.
 
 **Reply (success):** `label` 0, also for a range already discarded.

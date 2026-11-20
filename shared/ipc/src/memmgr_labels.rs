@@ -193,9 +193,10 @@ pub const QUERY_POOL_STATUS: u64 = 6;
 pub const REGISTER_REGION: u64 = 7;
 /// [`REGISTER_REGION`] flag (`data[3]` bit 0): commit the region. memmgr
 /// admits and charges its whole length when it registers it, so a fault
-/// in it is not declined for budget or RAM while the region's page-table
-/// reservation lasts, which only the process's own mappings and unmaps
-/// can spend early (`services/memmgr/docs/ipc-interface.md` § Label 7),
+/// in it is not declined for budget, and for RAM only in the few cases
+/// `services/memmgr/docs/ipc-interface.md` § Label 7 gives, while the
+/// region's page-table reservation lasts, which only the process's own
+/// mappings and unmaps can spend early,
 /// and only a committed region grows by [`EXTEND_REGION`] or shrinks by
 /// [`SHRINK_REGION`]. A reply that does not reach the caller undoes the
 /// registration, so a caller whose call was interrupted makes it again.

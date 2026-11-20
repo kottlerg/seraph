@@ -29,9 +29,14 @@
 //! hardware authority cap (ISA `IoPort` for CMOS; MMIO aperture for
 //! goldfish-rtc) through the bootstrap protocol. An `rtc`
 //! [`devmgr_labels::QUERY_DEVICE`](crate::devmgr_labels::QUERY_DEVICE) that would find no driver waits until
-//! the pass and its settle are done. Spawn is at-most-once per boot;
-//! failure is sticky and clients see [`devmgr_errors::NO_DEVICE`](crate::devmgr_errors::NO_DEVICE)
-//! permanently. RTC drivers are **not** carried in the boot bundle.
+//! the pass and its settle are done. Each spawn is attempted at most once
+//! per boot, apart from devmgr's restart of a served driver that dies, which
+//! it serves at the class's next ordinal
+//! (`services/devmgr/docs/responsibilities.md` § Driver Restart): the RTC
+//! at ordinal 0 need not last the boot. A spawn that fails, or a driver that
+//! dies before it reports ready, is sticky: clients see
+//! [`devmgr_errors::NO_DEVICE`](crate::devmgr_errors::NO_DEVICE) for the rest
+//! of the boot. RTC drivers are **not** carried in the boot bundle.
 //!
 //! Adding a new RTC chip is a matter of writing a driver crate that
 //! answers this single label and binding it through devmgr's per-board

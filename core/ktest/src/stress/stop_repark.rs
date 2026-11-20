@@ -45,14 +45,14 @@
 //! and after the cancellation. Every second round is checked: after the
 //! entry, the controller waits until the waiter has consumed a delivery since
 //! the stop (bounded by [`DELIVERY_WAIT_US`]) before its spin, and a timeout
-//! probes the waiter ([`probe_waiter`]) and fails the cell. A restart that
-//! leaves the waiter stopped, undispatched, or parked where no delivery wakes
-//! it makes no progress, and the next stop would cancel that park and hide
-//! it, so the check catches a strand after any checked restart, not only
-//! after the last. The other rounds keep the stop landing on the first park
-//! after the restart. After the rounds, with the sender paused, the
-//! controller delivers to A and to B until the waiter has consumed a delivery
-//! on each (bounded by [`FINAL_POLLS`]): a lost wake or a stranded waiter
+//! pauses the sender, probes the waiter ([`probe_waiter`]) and fails the
+//! cell. A restart that leaves the waiter stopped, undispatched, or parked
+//! where no delivery wakes it makes no progress, and the next stop would
+//! cancel that park and hide it, so the check catches a strand after any
+//! checked restart, not only after the last. The other rounds keep the stop
+//! landing on the first park after the restart. After the rounds, with the
+//! sender paused, the controller delivers to A and to B until the waiter has
+//! consumed a delivery on each (bounded by [`FINAL_POLLS`]): a lost wake or a stranded waiter
 //! makes no progress on one of them. A failed final check logs the rounds'
 //! tallies and probes the waiter before the children end, so the log names
 //! where it was stranded. When a checked round, a held round or the final
@@ -574,10 +574,12 @@ fn consumed_total() -> u32
 
 /// A checked round's wait, bounded by [`DELIVERY_WAIT_US`], until the
 /// restarted waiter has consumed a delivery since the stop (the total moved
-/// past `consumed`). On a timeout, probe the waiter ([`probe_waiter`]) and
-/// fail, since a waiter left stopped, undispatched, or parked where no
-/// delivery wakes it makes no progress, and the next stop would cancel that
-/// park and hide it.
+/// past `consumed`). On a timeout, pause the sender and probe the waiter
+/// ([`probe_waiter`]), then fail, since a waiter left stopped, undispatched,
+/// or parked where no delivery wakes it makes no progress, and the next stop
+/// would cancel that park and hide it. The sender is paused first, as before
+/// the final check, so the probe's restarted counters show the stranded
+/// wait's own result and no delivery the sender makes after the restart.
 fn require_consumed(waiter: u64, consumed: u32) -> TestResult
 {
     if super::await_within(crate::scaled_bound(DELIVERY_WAIT_US), || {
@@ -586,6 +588,9 @@ fn require_consumed(waiter: u64, consumed: u32) -> TestResult
     {
         return Ok(());
     }
+    // A sender that did not pause is reported by the phase, which pauses it
+    // again before its final check.
+    let _ = pause_sender();
     probe_waiter(waiter);
     Err(
         "stress::stop_repark: the waiter consumed no delivery after a checked round's restart (a \

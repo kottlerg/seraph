@@ -732,9 +732,14 @@ fn event_loop(
             WS_BADGE_PRESSURE =>
             {
                 // Take the bits before the read, so a change after the read
-                // signals again.
-                let _ = syscall::notification_try_wait(restart_ctx.pressure_notification);
-                retry_memory_waits(state, &restart_ctx, Wake::Signal);
+                // signals again. Only the level's bit retries (`Wake::signal`):
+                // an opening of memmgr's draw room alone is the timer's.
+                let bits =
+                    syscall::notification_try_wait(restart_ctx.pressure_notification).unwrap_or(0);
+                if let Some(wake) = Wake::signal(bits, std::os::seraph::MEMORY_PRESSURE_BIT)
+                {
+                    retry_memory_waits(state, &restart_ctx, wake);
+                }
             }
             _ => std::os::seraph::log!(warn: "unexpected wait-set badge"),
         }

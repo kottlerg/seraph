@@ -101,8 +101,9 @@ pub const DEVMGR_BIND: &[u8] = b"devmgr.bind";
 pub const DEVMGR_ACPI: &[u8] = b"devmgr.acpi";
 
 /// `acpid_labels::POWER_AUTHORITY`-badged SEND on acpid's service
-/// endpoint: `acpid_labels::SLEEP`, `acpid_labels::RESET` and
-/// `acpid_labels::WAIT_EVENT`. Seed-only and seeded only by pwrmgr.
+/// endpoint: `acpid_labels::SLEEP`, `acpid_labels::QUERY_SLEEP`,
+/// `acpid_labels::RESET` and `acpid_labels::WAIT_EVENT`. Seed-only and seeded
+/// only by pwrmgr.
 pub const ACPID_POWER: &[u8] = b"acpid.power";
 
 /// SEND on acpid's service endpoint badged with a sentinel that carries

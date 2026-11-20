@@ -198,14 +198,14 @@ pub mod timed_errors;
 
 /// Wire-protocol version of [`pwrmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PWRMGR_LABELS_VERSION: u32 = 1;
+pub const PWRMGR_LABELS_VERSION: u32 = 2;
 pub mod pwrmgr_labels;
 
 pub mod pwrmgr_errors;
 
 /// Wire-protocol version of [`acpid_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const ACPID_LABELS_VERSION: u32 = 2;
+pub const ACPID_LABELS_VERSION: u32 = 3;
 pub mod acpid_labels;
 
 pub mod acpid_errors;

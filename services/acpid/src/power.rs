@@ -5,8 +5,9 @@
 
 //! acpid's power requests (`ipc::acpid_labels`): their decoding, and the
 //! evaluation the sleep sequence needs (ACPI 6.5 § 7.4.2 and § 16.1.6): the
-//! state's `SLP_TYPa` from its `\_Sx_` package, `\_PTS`, and the two
-//! `PM1a_CNT` values written. The binary performs the register writes.
+//! state's `SLP_TYPa` from its `\_Sx_` package and `\_PTS`. The binary
+//! performs the register writes, whose values
+//! `ipc::acpid_labels::pm1_control_writes` gives.
 //!
 //! Only `PM1a_CNT` is written: devmgr serves no `PM1b` block, and no
 //! platform acpid runs on declares one.
@@ -16,22 +17,14 @@ use ipc::{acpid_errors, acpid_labels};
 
 use crate::Why;
 
-/// `PM1_CNT` bit 13, `SLP_EN`: the write that sets it enters the state
-/// `SLP_TYP` names.
-pub const SLP_EN: u16 = 1 << 13;
-
-/// The position of `PM1_CNT`'s three-bit `SLP_TYP` field (bits 12:10).
-const SLP_TYP_SHIFT: u16 = 10;
-
-/// The largest `SLP_TYP`, the field being three bits wide.
-pub const SLP_TYP_MAX: u64 = 7;
-
 /// A request acpid serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request
 {
     /// `SLEEP` of the state, which is S5.
     Sleep(u8),
+    /// `QUERY_SLEEP` of the state, which is S5.
+    QuerySleep(u8),
     /// `RESET`.
     Reset,
     /// `WAIT_EVENT`.
@@ -46,10 +39,12 @@ pub enum Request
 ///
 /// The `acpid_errors` code to reply: `UNKNOWN_OPCODE`, `UNAUTHORIZED` for
 /// a badge without `POWER_AUTHORITY`, `LABEL_VERSION_MISMATCH`, or
-/// `INVALID_REQUEST` for a sleep state other than S5.
+/// `INVALID_REQUEST` for a sleep state other than S5 (`SLEEP` and
+/// `QUERY_SLEEP`).
 pub fn decode(label: u64, badge: u64, version: u64, arg: u64) -> Result<Request, u64>
 {
     if label != acpid_labels::SLEEP
+        && label != acpid_labels::QUERY_SLEEP
         && label != acpid_labels::RESET
         && label != acpid_labels::WAIT_EVENT
     {
@@ -75,6 +70,10 @@ pub fn decode(label: u64, badge: u64, version: u64, arg: u64) -> Result<Request,
     {
         return Err(acpid_errors::INVALID_REQUEST);
     }
+    if label == acpid_labels::QUERY_SLEEP
+    {
+        return Ok(Request::QuerySleep(5));
+    }
     Ok(Request::Sleep(5))
 }
 
@@ -91,7 +90,7 @@ fn package_path(state: u8) -> String
 ///
 /// [`Why::Fault`] when evaluating the package faults, and [`Why::Shape`]
 /// when it is no package, or its first element is no integer of at most
-/// [`SLP_TYP_MAX`].
+/// [`acpid_labels::SLP_TYP_MAX`].
 pub fn sleep_type(ev: &mut Evaluator<'_>, state: u8) -> Result<Option<u16>, Why>
 {
     let Some(node) = ev.namespace().find(&package_path(state))
@@ -107,7 +106,7 @@ pub fn sleep_type(ev: &mut Evaluator<'_>, state: u8) -> Result<Option<u16>, Why>
     };
     match elements.first()
     {
-        Some(&Data::Integer(v)) if v <= SLP_TYP_MAX =>
+        Some(&Data::Integer(v)) if v <= acpid_labels::SLP_TYP_MAX =>
         {
             u16::try_from(v).map(Some).map_err(|_| Why::Shape)
         }
@@ -122,18 +121,6 @@ pub fn prepare(ev: &mut Evaluator<'_>, state: u8) -> Option<Fault>
     let node = ev.namespace().find("\\_PTS")?;
     ev.evaluate(node, vec![Data::Integer(u64::from(state))])
         .err()
-}
-
-/// The two values written to `PM1a_CNT`, which reads `current`, to enter
-/// the state of `SLP_TYPa` `slp_typ`: `SLP_TYP` with `SLP_EN` clear, then
-/// with it set, every other bit kept. `slp_typ` is at most
-/// [`SLP_TYP_MAX`]; higher bits are dropped.
-#[must_use]
-pub fn pm1_control_writes(current: u16, slp_typ: u16) -> [u16; 2]
-{
-    let field = 0b111 << SLP_TYP_SHIFT;
-    let typed = (current & !(field | SLP_EN)) | ((slp_typ << SLP_TYP_SHIFT) & field);
-    [typed, typed | SLP_EN]
 }
 
 #[cfg(test)]
@@ -180,6 +167,10 @@ mod tests
             decode(acpid_labels::SLEEP, auth, v, s5),
             Ok(Request::Sleep(5))
         );
+        assert_eq!(
+            decode(acpid_labels::QUERY_SLEEP, auth, v, s5),
+            Ok(Request::QuerySleep(5))
+        );
         assert_eq!(decode(acpid_labels::RESET, auth, v, 0), Ok(Request::Reset));
         assert_eq!(
             decode(acpid_labels::WAIT_EVENT, auth, v, 9),
@@ -214,6 +205,20 @@ mod tests
         );
         assert_eq!(
             decode(acpid_labels::SLEEP, auth, v, 6),
+            Err(acpid_errors::INVALID_REQUEST)
+        );
+        // QUERY_SLEEP is gated and checked as SLEEP is: the deny twin's
+        // badge, a stale version, and a state other than S5.
+        assert_eq!(
+            decode(acpid_labels::QUERY_SLEEP, 1, v, s5),
+            Err(acpid_errors::UNAUTHORIZED)
+        );
+        assert_eq!(
+            decode(acpid_labels::QUERY_SLEEP, auth, v + 1, s5),
+            Err(acpid_errors::LABEL_VERSION_MISMATCH)
+        );
+        assert_eq!(
+            decode(acpid_labels::QUERY_SLEEP, auth, v, 3),
             Err(acpid_errors::INVALID_REQUEST)
         );
     }
@@ -276,16 +281,5 @@ mod tests
         let mut ns = sim::namespace(&[sim::table(&pts(&[0x78, 0x01, 0x00, 0x00, 0x60]))]);
         let mut ev = Evaluator::new(&mut ns, &mut host);
         assert!(matches!(prepare(&mut ev, 5), Some(f) if f.kind == FaultKind::DivideByZero));
-    }
-
-    #[test]
-    fn pm1_writes_set_slp_typ_then_slp_en_and_keep_the_other_bits()
-    {
-        // SCI_EN (bit 0) and a stale SLP_TYP and SLP_EN.
-        assert_eq!(pm1_control_writes(0x3C01, 0), [0x0001, 0x2001]);
-        assert_eq!(pm1_control_writes(0x0001, 5), [0x1401, 0x3401]);
-        assert_eq!(pm1_control_writes(0x0000, 7), [0x1C00, 0x3C00]);
-        // A value past the field is cut to it.
-        assert_eq!(pm1_control_writes(0x0000, 0xF), [0x1C00, 0x3C00]);
     }
 }

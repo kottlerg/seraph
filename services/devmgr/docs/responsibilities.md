@@ -610,9 +610,9 @@ devmgr's responsibilities are:
   reads only the directory and table headers to locate it).
   `QUERY_SHUTDOWN_DEVICE` serves the shutdown-actuator cap pwrmgr needs on
   RISC-V, a Reset-only `SbiControl` derivation; on x86-64 it replies
-  `NO_DEVICE`, since pwrmgr powers off and resets through acpid and holds no
-  port. On every call the cap is re-derived from the `SbiControl` cap devmgr
-  holds, so nothing is consumed and a restarted pwrmgr re-acquires it cleanly.
+  `NO_DEVICE`, since pwrmgr powers off and resets through acpid and devmgr
+  serves it no port. On every call the cap is re-derived from the `SbiControl`
+  cap devmgr holds, so nothing is consumed and a restarted pwrmgr re-acquires it cleanly.
   devmgr runs no shutdown logic; it brokers the cap, pwrmgr actuates.
   `QUERY_ACPI_TABLE` is gated on `REGISTRY_QUERY_AUTHORITY`; `QUERY_SHUTDOWN_DEVICE` on
   `SHUTDOWN_DEVICE_AUTHORITY`, which only the `devmgr.shutdown` cap carries:

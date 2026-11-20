@@ -517,9 +517,10 @@ terminal. Two routes reach the thread:
   `svcmgr: launching: logd` line has appeared, and the stub answers its first request once it
   holds logd.
 - **QEMU's own gdbstub**, for memmgr and procmgr, which init creates with raw syscalls, so no
-  debugger can attach to them. Once the terminal's READY line has appeared, the host sets a hardware
-  breakpoint on a function of the target's binary, at the image bias init logs for it plus the
-  function's address in the binary's symbol table, read from the symbols store's file of its build
+  debugger can attach to them. Once the terminal's READY line and pwrmgr's `core-death power-off
+  armed` line have appeared, the host sets a hardware breakpoint on a function of the target's
+  binary, at the image bias init logs for it plus the function's address in the binary's symbol
+  table, read from the symbols store's file of its build
   id ([docs/build-system.md](build-system.md#symbols-store) § Symbols Store), and types `hello` at
   the shell over the serial line, whose spawn and reap run it: `memmgr::admit` (memmgr's receive
   loop, in an allocation's admission), `procmgr::handle_create` (a procmgr request worker, in the
@@ -529,10 +530,11 @@ terminal. Two routes reach the thread:
   CPU's program counter, removes the breakpoint, and resumes the VM.
 
 A boot passes when, after the kill, QMP's `SHUTDOWN` event gives reason `guest-shutdown` and QEMU
-exits on its own within two minutes. The paths it covers are svcmgr's `critical service
-unrecoverable` shutdown through the actuator for memmgr, procmgr, devmgr, vfsd and logd, the
-address-space observer for a procmgr thread other than the main one, and pwrmgr's observer of
-svcmgr ([supervision.md § Observing svcmgr](supervision.md#observing-svcmgr)). See
+exits on its own within two minutes. The paths it covers are pwrmgr's core-death power-off for
+memmgr, procmgr and svcmgr (the core-death queue, and the address-space observer for a procmgr
+thread other than the main one; [supervision.md § Observing the Core
+Set](supervision.md#observing-the-core-set)), and svcmgr's `critical service unrecoverable`
+shutdown through the actuator for devmgr, vfsd and logd. See
 [xtask/README.md § test-core-death](../xtask/README.md#cargo-xtask-test-core-death) for the command.
 Same boot requirements as `test-terminal` (default boot set, terminal autostarted). In CI it runs
 as a further boot set inside each `usertest` cell (both arches, both profiles), after

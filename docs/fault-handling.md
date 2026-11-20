@@ -984,6 +984,11 @@ The default MUST exempt only the narrow set that cannot depend on the fault path
   ([driver-binding.md](driver-binding.md#driver-declarations) § Driver Declarations), and for
   the IOMMU driver, whose units walk its table pages. The exemption
   is a creation-request flag, never a badge-range test.
+- **The shutdown actuator (pwrmgr)** — it powers the system off on the death of a core member,
+  memmgr's included, and that path MUST NOT depend on the member that died ([Supervision § Core Set
+  and System Death](supervision.md#core-set-and-system-death)). svcmgr sets
+  `procmgr_labels::CREATE_PINNED` on its every launch because of its role (`shutdown_actuator`),
+  not because of a key its recipe sets.
 
 A userspace fault round-trip is costlier than a kernel-internal fill; this cost is accepted
 to keep paging policy out of the kernel.

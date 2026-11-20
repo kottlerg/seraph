@@ -62,6 +62,37 @@ pub fn resolve(bootstrap: &Bootstrap, ipc_buf: *mut u64) -> Option<Actuator>
 /// button for acpid to report.
 pub const fn watch_events(_act: Actuator) {}
 
+/// The core-death power-off: the same `SbiControl` derivation, which the
+/// SRST call needs alone.
+pub struct PowerOff
+{
+    sbi_control_cap: u64,
+}
+
+/// The core-death power-off from `actuator`, the SRST authority resolved at
+/// startup; `None` without one.
+pub fn resolve_power_off(actuator: Option<&Actuator>, _ipc_buf: *mut u64) -> Option<PowerOff>
+{
+    actuator.map(|act| PowerOff {
+        sbi_control_cap: act.sbi_control_cap,
+    })
+}
+
+/// Power off at once: SBI SRST shutdown through the kernel. Allocates,
+/// logs and calls nothing; returns only when the kernel or the firmware
+/// refuses the call, and the caller then takes the ordinary shutdown.
+pub fn power_off_now(power_off: &PowerOff)
+{
+    let _ = syscall::sbi_call(
+        power_off.sbi_control_cap,
+        SBI_EXT_SRST,
+        SBI_SRST_RESET,
+        SRST_TYPE_SHUTDOWN,
+        SRST_REASON_NONE,
+        0,
+    );
+}
+
 /// Attempt SBI SRST shutdown. Logs and returns on failure.
 pub fn shutdown(act: &Actuator, _ipc_buf: *mut u64)
 {

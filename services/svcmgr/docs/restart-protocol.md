@@ -250,7 +250,7 @@ or below that floor and leaves it only once the free pool clears it by a hystere
 the level reads `CRITICAL`, as when oomd stops a service that is not the one holding the memory,
 has its create refused with `OUT_OF_MEMORY`, and so does one that needs more than the margin above
 the floor below `CRITICAL`. Only memory coming free ends such a refusal, and memmgr signals a
-change of level, and an opening of its draw room, but not memory coming free otherwise. The
+change of level but not memory coming free otherwise. The
 wait is one state machine, `svcmgr_defs::memory_wait` (host-tested over every transition), which
 `restart.rs` and the main loop drive:
 
@@ -258,7 +258,7 @@ wait is one state machine, `svcmgr_defs::memory_wait` (host-tested over every tr
 |---|---|---|
 | decided (step 1 charged the death's restart to the budget) | create refused `OUT_OF_MEMORY`, the service outside the reserve and not the log sink, svcmgr holding the pressure Notification | waiting |
 | decided | any other create failure, or one of a reserve service, of the log sink, or with no Notification | down |
-| waiting, level read `CRITICAL` or unread | a signal (a change of level, or an opening of the draw room) read below `CRITICAL` | retry (on a signal) |
+| waiting, level read `CRITICAL` or unread | a signal (a change of level) read below `CRITICAL` | retry (on a signal) |
 | waiting, level read `CRITICAL` or unread | a signal read at `CRITICAL`, or unread | waiting; no timer |
 | waiting, level read below `CRITICAL` | the retry deadline, armed `MEMORY_RETRY_MS` (1 s) ahead and moved by no other event, passes, whatever woke the main loop | retry (timed); the next deadline armed |
 | waiting, level read below `CRITICAL` | a signal read at `CRITICAL` | waiting; deadline cleared |
@@ -288,7 +288,11 @@ wait is one state machine, `svcmgr_defs::memory_wait` (host-tested over every tr
 
 svcmgr waits on its own Notification (`std::os::seraph::memory_pressure_notification`, which the
 std runtime registers for every process) in its main wait set (badge 2), and takes its bits before
-it reads the level, so a change after the read signals again.
+it reads the level, so a change after the read signals again. A wake is a signal only when its bits
+hold `MEMORY_PRESSURE_BIT` (`Wake::signal`): one carrying only `COMMIT_DRAW_ROOM_BIT`, an
+opening of memmgr's draw room, is left to the timer, since no hysteresis band spaces the openings,
+and a draw room that a waiting create's partial grants close and its teardown reopens would
+otherwise retry it at once, uncounted, at each opening.
 
 A waiting service is not running wherever svcmgr reports a service's state: a stop of it is refused
 `NO_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES` leave it out, no death post routes to its

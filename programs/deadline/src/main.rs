@@ -100,8 +100,16 @@ mod arch
     }
 }
 
+/// The argument that runs the fixture as the idle child [`call_deadline`]
+/// kills.
+const IDLE_ARG: &str = "idle";
+
 fn main()
 {
+    if std::env::args().nth(1).as_deref() == Some(IDLE_ARG)
+    {
+        idle();
+    }
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
         syscall::cap_create_endpoint(slab).ok()
@@ -179,6 +187,15 @@ fn main()
     println!("PASS");
 }
 
+/// The idle child: wait to be killed.
+fn idle() -> !
+{
+    loop
+    {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
 /// The instant `after` from `start`.
 fn at(start: Instant, after: Duration) -> Instant
 {
@@ -191,7 +208,8 @@ fn at(start: Instant, after: Duration) -> Instant
 /// call deadline: a runtime call fails `TimedOut` and the fixture's own call
 /// `WouldBlock`, each after waiting about [`CALL_BOUND`]; a later deadline
 /// nested inside does not extend the scope; a call under a deadline already
-/// passed is not sent; and no deadline is left once the scope ends.
+/// passed is not sent, `Child::kill` among them; and no deadline is left
+/// once the scope ends.
 fn call_deadline(ipc_buf: *mut u64)
 {
     let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
@@ -241,6 +259,19 @@ fn call_deadline(ipc_buf: *mut u64)
         std::os::seraph::namespace_lookup_file(ep, "x")
     });
     let passed_waited = passed_start.elapsed();
+    let mut child = std::process::Command::new("/programs/deadline")
+        .arg(IDLE_ARG)
+        .spawn()
+        .expect("spawn the idle child");
+    let kill_err = with_call_deadline(Instant::now(), || child.kill())
+        .expect_err("a kill under a passed deadline was sent");
+    assert_eq!(
+        kill_err.kind(),
+        ErrorKind::TimedOut,
+        "the kill under a passed deadline failed {kill_err}"
+    );
+    child.kill().expect("kill the idle child");
+    child.wait().expect("wait for the idle child");
     let err = refused.expect_err("a lookup under a passed deadline was answered");
     assert_eq!(
         err.kind(),

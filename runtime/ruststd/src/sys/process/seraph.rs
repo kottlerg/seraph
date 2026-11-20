@@ -499,6 +499,12 @@ impl Command {
             argv_env.settle(reply.as_ref().map_or(0, |r| r.label));
         }
         let reply = reply.map_err(|e| {
+            // The call may have failed before procmgr received it (the call
+            // deadline passed, or the call timed out queued), when the caps
+            // it carried are still here; a handle that moved is stale and
+            // its delete fails harmlessly.
+            let _ = syscall::cap_delete(file_cap);
+            let _ = syscall::cap_delete(death_relay);
             let _ = syscall::cap_delete(death_eq);
             call_failed(e, "CREATE_FROM_FILE syscall failed")
         })?;
@@ -921,8 +927,15 @@ fn install_pipe(
         .cap(caps.space_notification)
         .build();
     // SAFETY: `ipc_ptr` is the calling thread's registered IPC buffer.
-    let reply = unsafe { deadline_call(process_handle, &cap_msg, ipc_ptr) }
-        .map_err(|e| call_failed(e, "CONFIGURE_PIPE syscall failed"))?;
+    let reply = unsafe { deadline_call(process_handle, &cap_msg, ipc_ptr) }.map_err(|e| {
+        // A call that failed before procmgr received it leaves the handoff
+        // caps here; a handle that moved is stale and its delete fails
+        // harmlessly.
+        for cap in [caps.memory, caps.data_notification, caps.space_notification] {
+            let _ = syscall::cap_delete(cap);
+        }
+        call_failed(e, "CONFIGURE_PIPE syscall failed")
+    })?;
     if reply.label != procmgr_errors::SUCCESS {
         return Err(map_procmgr_error(reply.label));
     }
@@ -1037,9 +1050,7 @@ impl Process {
     }
 
     pub fn kill(&mut self) -> io::Result<()> {
-        if !destroy_child(self.process_handle) {
-            return Err(io::Error::other("Child::kill: DESTROY_PROCESS failed"));
-        }
+        kill_child(self.process_handle)?;
         // The kernel posts to the main-thread binding only on voluntary
         // exit (`SYS_THREAD_EXIT`) or fault — cap_revoke-driven teardown is
         // silent. procmgr posts the child's end to the relay once, at the
@@ -1270,10 +1281,32 @@ fn bridge_main(h: BridgeHandles) {
     let _ = syscall::notification_send(h.completion_notification, 1);
 }
 
+/// `Child::kill`'s `DESTROY_PROCESS` on `process_handle`, under the thread's
+/// call deadline (`deadline_call`), retrying a call that a stop and restart of
+/// this thread, or an upcall to it, interrupted: `TimedOut` when the deadline
+/// passed first, and the child may then still run.
+fn kill_child(process_handle: u64) -> io::Result<()> {
+    let ipc_buf = crate::os::seraph::current_ipc_buf();
+    if ipc_buf.is_null() {
+        return Err(io::Error::other("Child::kill: IPC buffer not registered"));
+    }
+    let msg = ipc::IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
+    loop {
+        // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
+        match unsafe { deadline_call(process_handle, &msg, ipc_buf) } {
+            Ok(_) => return Ok(()),
+            Err(e) if e == SyscallError::Interrupted as i64 => {}
+            Err(e) => return Err(call_failed(e, "Child::kill: DESTROY_PROCESS failed")),
+        }
+    }
+}
+
 /// Send `DESTROY_PROCESS` on `process_handle`, outside the thread's call
-/// deadline (`destroy_process_call`), retrying a call that a stop and restart
-/// of this thread, or an upcall to it, interrupted, and report whether
-/// procmgr replied.
+/// deadline (`destroy_process_call`): the teardown of a child a spawn could
+/// not finish, or of one its `Child` was dropped without a wait, which
+/// nothing else releases. Retries a call that a stop and restart of this
+/// thread, or an upcall to it, interrupted, and reports whether procmgr
+/// replied.
 fn destroy_child(process_handle: u64) -> bool {
     let ipc_buf = crate::os::seraph::current_ipc_buf();
     if ipc_buf.is_null() {

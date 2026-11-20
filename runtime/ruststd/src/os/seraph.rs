@@ -332,9 +332,11 @@ static CALL_DEADLINE: Cell<Option<crate::time::Instant>> = Cell::new(None);
 /// [`VerifiedData`]), since memmgr is this process's pager, which a stuck
 /// memmgr stops at its next page fault whatever a call's bound, and a heap
 /// call that failed would abort the process; the `DESTROY_PROCESS` with
-/// which a spawn that failed tears its child down, which nothing else can
-/// do, so a spawn whose deadline passed may still wait for that teardown;
-/// and every wait that is not an IPC call (a thread join, a child's
+/// which a spawn that failed tears its child down, and the one with which a
+/// `Child` dropped without a wait tears its child down, which nothing else
+/// can do, so a spawn whose deadline passed, or such a drop, may still wait
+/// for that teardown (`Child::kill` is bounded, and fails `TimedOut`); and
+/// every wait that is not an IPC call (a thread join, a child's
 /// wait, a pipe, a sleep, a lock). A caller that needs a bound on its own
 /// calls takes [`call_time_left`] for them, as `ipc::ipc_call_within` does.
 ///
@@ -409,8 +411,9 @@ pub(crate) unsafe fn memmgr_call(
 }
 
 /// `DESTROY_PROCESS` on `process_handle`, outside the call deadline: the
-/// teardown of a child a spawn created and could not finish, which nothing
-/// else releases ([`with_call_deadline`]).
+/// teardown of a child a spawn created and could not finish, or whose
+/// `Child` was dropped without a wait, which nothing else releases
+/// ([`with_call_deadline`]).
 ///
 /// # Safety
 /// `ipc_buf` is the calling thread's registered IPC buffer page.

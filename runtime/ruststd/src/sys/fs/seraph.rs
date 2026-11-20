@@ -1019,8 +1019,9 @@ fn release_write_frame(frame: WriteFrame, aspace: u64)
 /// How one `FS_WRITE_MEMORY` chunk failed.
 enum ChunkError
 {
-    /// The call was interrupted after it blocked, possibly after the driver
-    /// received it, so the driver may still copy from the frame.
+    /// The call was interrupted, or its deadline ended it, after it
+    /// blocked, possibly after the driver received it, so the driver may
+    /// still copy from the frame.
     Call(io::Error),
     /// The frame was not lent, or the driver replied: the frame is idle.
     Settled(io::Error),
@@ -1028,10 +1029,11 @@ enum ChunkError
 
 /// Bulk write via `FS_WRITE_MEMORY`: loop chunks of at most `PAGE_SIZE`
 /// bytes through a [`WriteFrame`] acquired for this write and into the
-/// file, then release the frame with [`release_write_frame`]. After an
-/// interrupted call ([`ChunkError::Call`]) the driver may still be copying
-/// from the frame, so it is left mapped and accounted to this process until
-/// it exits instead.
+/// file, then release the frame with [`release_write_frame`]. After a call
+/// interrupted, or ended by the thread's call deadline, once it blocked
+/// ([`ChunkError::Call`]) the driver may still be copying from the frame, so
+/// it is left mapped and accounted to this process until it exits instead. A
+/// chunk under a deadline already passed lends no frame and sends nothing.
 ///
 /// Returns the bytes written. An error after some chunks reached the file
 /// returns their count instead, as a short write, so the caller's position
@@ -1115,6 +1117,14 @@ fn write_frame_chunk(
         core::ptr::copy_nonoverlapping(chunk.as_ptr(), va, chunk.len());
         core::ptr::write_bytes(va.add(chunk.len()), 0, PAGE_SIZE_USIZE - chunk.len());
     }
+    // A call under a deadline already passed is not sent: report it before
+    // the frame is lent, so the frame stays idle and is released.
+    if crate::os::seraph::call_time_left().is_some_and(|left| left.is_zero()) {
+        return Err(ChunkError::Settled(io::const_error!(
+            io::ErrorKind::TimedOut,
+            "seraph fs: FS_WRITE_MEMORY past the call deadline",
+        )));
+    }
     let lent = syscall::cap_derive(frame.cap, syscall_abi::RIGHTS_MEM_MAP).map_err(|_| {
         ChunkError::Settled(io::Error::other("seraph fs: cap_derive of write frame failed"))
     })?;
@@ -1134,8 +1144,9 @@ fn write_frame_chunk(
         }
     }
     let _ = syscall::cap_delete(lent);
-    // `Interrupted` and `WouldBlock` (the thread's call deadline passed) are
-    // the errors a call can return after the driver received the message;
+    // `Interrupted` and `WouldBlock` (the thread's call deadline passed
+    // while the call waited; one already passed is settled above) are the
+    // errors a call can return after the driver received the message;
     // every other one is a refusal before the call blocked (`ipc::ipc_call`
     // and `ipc::ipc_call_timeout` # Errors).
     let reply = reply.map_err(|e| {

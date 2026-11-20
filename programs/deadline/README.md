@@ -64,7 +64,9 @@ timeout ends it, and bounds calls on it with a call deadline (`std::os::seraph::
 2. no deadline is left once the scope returns (`std::os::seraph::call_time_left` is `None`);
 3. a call of the fixture's own (`ipc::ipc_call_within` with the time left) ends `WouldBlock`
    within the same window;
-4. a runtime call under a deadline already passed fails `TimedOut` without waiting.
+4. a runtime call under a deadline already passed fails `TimedOut` without waiting, and so does
+   `Child::kill` of a child the fixture spawned idle (`deadline idle`), which it then kills and
+   waits for outside the deadline.
 
 The tester passes when the fixture prints `PASS` and exits cleanly; any failed step panics the
 fixture, a non-clean exit.

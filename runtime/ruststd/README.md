@@ -703,9 +703,10 @@ does not trust to answer, as crashd bounds a fault's report and a core dump
   failed would abort the process. The `DESTROY_PROCESS` with which a spawn that failed tears its
   child down, which nothing else releases: a call that only gives back what a failed operation
   took is not cut by that operation's deadline, so a spawn whose deadline passed may still wait
-  for that teardown. Every wait that is not an IPC call: a thread's join, a child's wait, a pipe,
-  a sleep, a lock. A caller that needs a bound on calls of its own passes `call_time_left` to them,
-  as `ipc::ipc_call_within` takes it.
+  for that teardown. The same teardown of a child whose `Child` is dropped without a wait, which
+  nothing else releases either; `Child::kill` is bounded and fails `TimedOut`. Every wait that is
+  not an IPC call: a thread's join, a child's wait, a pipe, a sleep, a lock. A caller that needs a
+  bound on calls of its own passes `call_time_left` to them, as `ipc::ipc_call_within` takes it.
 - **Scope.** A deadline set inside `f` takes effect only when it is earlier than the one in force.
   The deadline in force before `with_call_deadline` is in force again once `f` returns, unwinds,
   or returns early, so nothing of it is left set. It is thread-local: a thread `f` spawns does not

@@ -361,18 +361,19 @@ after it.
 
 - Every sync owes a passing CI run on the synced head, which builds and boots both
   architectures there.
-- A sync whose incoming diff touches a file the PR's own diff touches and is not comment-only,
-  or whose merge resolves a conflict, also owes the PR's own validation again at the synced
-  head (the builds and boots its `## Test plan` reports) and a run with the reviewer over the
-  sync. An incoming diff is comment-only as [testing.md](testing.md#coverage-tiers)
-  § Coverage tiers defines a comment-only change: Markdown aside, it alters only comment
-  lines, and no file a build embeds. Whether it is comment-only is judged over the whole
-  incoming diff, not only over the files both diffs touch: an incoming diff that changes only
-  Markdown is comment-only, even in a file the PR's own diff touches, and one that changes code
-  anywhere is not, even when it touches the PR's files only in Markdown.
-- Any other sync owes nothing more. The validated head before it stands, and the PR body's
-  `## Validation` section states that the incoming diff touches none of the PR's files, or
-  that it is comment-only.
+- What else a sync owes is judged on its incoming diff restricted to the files the PR's own
+  diff touches (`git diff <merge base before> <merge base after> -- <the PR's files>`); the rest
+  of the incoming diff, in files the PR does not touch, does not count. When that restricted
+  diff alters, Markdown aside, anything but comment lines, or a file a build embeds (it is not
+  comment-only as [testing.md](testing.md#coverage-tiers) § Coverage tiers defines a
+  comment-only change), or when the merge resolves a conflict, the sync owes the PR's own
+  validation again at the synced head (the builds and boots its `## Test plan` reports) and a
+  run with the reviewer over the sync.
+- Any other sync, whose restricted incoming diff is empty or changes only Markdown or comment
+  lines and no file a build embeds, owes an auditor-only run (§ Auditor-only run) beside its CI
+  run. The validated head before it stands, and the PR body's `## Validation` section states
+  that the incoming diff touches none of the PR's files, or that its change to them is
+  comment-only.
 
 The local host runs of [testing.md](testing.md#coverage-tiers) § Coverage tiers keep their own
 rule (When the runs are owed): a sync that leaves the PR's own changes to a run's surface as
@@ -545,7 +546,8 @@ gives the PR-level linear view.
   section; for a documentation-only or comment-only delta since that head,
   it MUST say so (see [testing.md](testing.md#coverage-tiers)), and for a
   sync since that head that leaves it standing, it MUST say that the
-  incoming diff touches none of the PR's files, or that it is comment-only
+  incoming diff touches none of the PR's files, or that its change to
+  them is comment-only
   (§ Syncing with `master`).
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each

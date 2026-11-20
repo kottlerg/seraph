@@ -1075,8 +1075,8 @@ pub fn states_documentation_only(pat: &Patterns, body: &str) -> bool
 /// head: when the PR's change moved, the body must say the delta is
 /// documentation or comments only; `changes` and `embedded` must both be
 /// empty; and a merge of the base branch between the two heads asks the body
-/// to state that the incoming diff touches none of the PR's files, or that it
-/// is comment-only.
+/// to state that the incoming diff touches none of the PR's files, or that its
+/// change to them is comment-only.
 pub fn delta_diags(pat: &Patterns, body: &str, validated: &str, delta: &Delta) -> Vec<Diag>
 {
     let at = format!("validated head {validated}");
@@ -1129,7 +1129,8 @@ pub fn delta_diags(pat: &Patterns, body: &str, validated: &str, delta: &Delta) -
             "pr-validated-sync",
             &at,
             "validated before a merge of the base branch; the body must state that the \
-             incoming diff touches none of this PR's files, or that it is comment-only",
+             incoming diff touches none of this PR's files, or that its change to them is \
+             comment-only",
         ));
     }
     out

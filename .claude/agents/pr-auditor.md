@@ -172,13 +172,15 @@ claims.
    line (`git log --merges --first-parent X..<head>`; a merge the base
    branch brought in is another branch's), on its own incoming diff
    (`git diff $(git merge-base M^1 M^2) M^2`).
-   For each, the body MUST state that its incoming diff touches none of
-   the PR's files or that it is comment-only, no file of that incoming
-   diff (the same command with `--name-only`) may be one the PR's own diff
-   names (`git diff --name-only <merge base at the head> <head>`) unless
-   that incoming diff alters, Markdown aside, only comment lines and no
-   build-embedded text (judged as the delta above), and M may resolve no
-   conflict (`git show M` prints no combined diff). FAIL a sync that
+   Judge it restricted to the files the PR's own diff names
+   (`git diff --name-only <merge base at the head> <head>`): the
+   incoming diff over those files alone (the same command with
+   `-- <those files>`); its change to other files does not count. For
+   each, the body MUST state that its incoming diff touches none of the
+   PR's files or that its change to them is comment-only, that restricted
+   incoming diff MUST be empty or alter, Markdown aside, only comment lines
+   and no build-embedded text (judged as the delta above), and M may
+   resolve no conflict (`git show M` prints no combined diff). FAIL a sync that
    breaks one of these without a validation at the synced head. FAIL when
    X is absent, when X is none of the head, the merge base, or a commit
    between them, when X is not the head and that statement is missing or
@@ -265,9 +267,9 @@ claims.
     `git log --merges --first-parent <since>..<head>` merges the base
     branch and that sync
     owes a run with the reviewer as `docs/conventions.md` § Syncing with
-    `master` says (its incoming diff names a file the PR's own diff names
-    and is not comment-only, or the merge resolved a conflict; step 9 gives
-    the commands): each owes
+    `master` says (its incoming diff restricted to the files the PR's own
+    diff names is not comment-only, or the merge resolved a conflict; step
+    9 gives the commands): each owes
     a run with the reviewer. Compare every comment line and document
     statement the PR's own change in the range alters against the code it
     describes, citing `path:line` on both sides, and FAIL each one the

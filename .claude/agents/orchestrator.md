@@ -178,10 +178,10 @@ Keep your own reads out of your context the same way:
 2. Size the wave at four to six PRs in flight, on scopes whose files do not overlap. A merge
    makes an open PR sync only when it changes a file that PR changes: a PR whose files
    `master` has not changed since its merge base merges without one (docs/conventions.md
-   § Syncing with `master`). A sync owes green CI, and it re-owes a PR's validation set and a
-   reviewer run only when the incoming diff touches a file that PR touches and is not
-   comment-only, or the merge resolves a conflict, so two PRs on the same files cost more in
-   parallel than in sequence.
+   § Syncing with `master`). A sync owes green CI and an auditor-only run, and it re-owes a
+   PR's validation set and a reviewer run instead only when the incoming diff restricted to
+   that PR's files is not comment-only, or the merge resolves a conflict, so two PRs on the
+   same files cost more in parallel than in sequence.
 3. Start the record with `cargo xtask orch start --goal "<the batch's goal>"`; a goal the
    maintainer gave in more than one line of 300 characters goes into `--goal` as a one-line
    summary and whole into the answers file described below. The record is the files under

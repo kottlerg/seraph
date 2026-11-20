@@ -319,9 +319,10 @@ Orchestrated:
   `<scope>: merge master into the <kind> branch`, `<kind>` being the branch's prefix.
   docs/conventions.md § Syncing with `master` says what a sync owes: green CI on the synced
   head always, and the validation set and a run with the reviewer again only when the incoming
-  diff touches a file your PR touches and is not comment-only (docs/testing.md § Coverage
-  tiers), or the merge has a conflict. Otherwise the validated head stands, and the body says
-  that the incoming diff touches none of the PR's files, or that it is comment-only. A PR whose
+  diff restricted to your PR's files is not comment-only (docs/testing.md § Coverage tiers), or
+  the merge has a conflict. Otherwise the sync owes an auditor-only run, the validated head
+  stands, and the body says that the incoming diff touches none of the PR's files, or that its
+  change to them is comment-only. A PR whose
   files `master` has not changed since its merge base merges without a sync when the other
   conditions of docs/conventions.md § Syncing with `master` hold too: one merge base, GitHub's
   `MERGEABLE`, and a green CI run at `master`'s tip. The gate names the condition that fails.

@@ -24,7 +24,7 @@ use free_pool::{
     NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError,
     ResidentPath, ResizeError, SelectError, SlotStore, WordStore, arena::Slot, chunk::table_height,
     chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pending_from,
-    pressure_level, region_grants, reserve_pages,
+    region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -3212,12 +3212,7 @@ fn signal_pressure()
 {
     let l = ledger_mut();
     let prev = current_pressure();
-    let level = pressure_level(
-        prev,
-        l.uncommitted_free(),
-        pool_total_pages(),
-        l.swapped_pages(),
-    );
+    let level = l.pressure_level(prev, pool_total_pages());
     let open = draw_open(l);
     // SAFETY: only the receive loop's thread reaches this; no concurrent access.
     let opened = open && !unsafe { DRAW_OPEN };

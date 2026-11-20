@@ -955,15 +955,15 @@ memmgr tells processes how close the free pool is to the growth floor, so a proc
 memory it can give back (a cache) gives it back before a grant is refused. It acts on the level in
 no other way: it only signals, and kills nothing.
 
-**Levels.** The level is computed from the free pool's pages outside `promised`
-([Commit](#commit)), deferred pages excluded, against `pool_total`. It is `CRITICAL` at or below the
-growth floor, the system reserve and, while chunks are swapped, the restore headroom (§ Distribution
-policy; § Eviction, Restore headroom), where a grant to a process outside the reserve is refused;
-`LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A worse level applies
-at once. A better one applies only once the free pool clears that level's threshold by a hysteresis
-band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a pool that hovers at a
-threshold does not flip the level on every turn: the level becomes the one the free pool less the
-band gives, and no worse than before. The constants are tuning values proportional to RAM
+**Levels.** The level is computed from the free pool's pages outside `promised` ([Commit](#commit)),
+deferred pages excluded, against `pool_total`. It is `CRITICAL` at or below the growth floor, the
+system reserve and, while chunks of uncommitted regions are swapped, the restore headroom (§
+Distribution policy; § Eviction, Restore headroom), where a grant to a process outside the reserve
+is refused; `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A worse
+level applies at once. A better one applies only once the free pool clears that level's threshold by
+a hysteresis band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a pool that
+hovers at a threshold does not flip the level on every turn: the level becomes the one the free pool
+less the band gives, and no worse than before. The constants are tuning values proportional to RAM
 ([docs/limits.md](../../../docs/limits.md) § memmgr); the computation is the host-tested `free-pool`
 module `pressure`.
 
@@ -1043,7 +1043,7 @@ so the chunks a committed draw needs are not crowded out by those it does not. T
 finds and posts no job for are kept, a bounded number, for direct reclaim; when the list is full,
 one whose eviction frees a page above the growth floor while memmgr evicts for frames takes the
 place of one whose eviction does not, and otherwise one whose eviction raises the free pages outside
-`promised` takes the place of one only a committed draw may take; at `CRITICAL` a slice finds the
+`promised` takes the place of one whose eviction does neither; at `CRITICAL` a slice finds the
 chunks with no accessed page in one sweep. A slice ends at the end of a pass, so no slice ages a
 chunk twice. The granule is the chunk: one unmap and one restore fault per chunk, over every run on
 its run list.

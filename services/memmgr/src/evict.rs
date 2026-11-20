@@ -510,8 +510,8 @@ fn still_victim(l: &MemLedger, v: &Victim, idle: u8, need: Need) -> bool
 /// the draw room while memmgr evicts for frames, [`Need::Draw`]) takes the
 /// place of a kept one it does not name, and otherwise a victim whose eviction
 /// raises the free pages outside `promised` ([`Need::Free`]) takes the place
-/// of a kept one only a committed draw may take, so neither need's victims
-/// crowd out the other's.
+/// of a kept one whose eviction neither raises them nor, by `opens`, opens
+/// the draw room, so neither need's victims crowd out the other's.
 fn keep_victims(l: &MemLedger, found: &[Victim], opens: impl Fn(&MemLedger, NodeIdx) -> bool)
 {
     let cache = &mut evictor().cache;
@@ -537,7 +537,7 @@ fn keep_victims(l: &MemLedger, found: &[Victim], opens: impl Fn(&MemLedger, Node
             .iter()
             .position(Option::is_none)
             .or_else(|| replaces(&|reg| opens(l, reg)))
-            .or_else(|| replaces(&|reg| l.evicting_frees(reg)));
+            .or_else(|| replaces(&|reg| l.evicting_frees(reg) || opens(l, reg)));
         if let Some(k) = slot.and_then(|i| cache.get_mut(i))
         {
             *k = Some(*v);

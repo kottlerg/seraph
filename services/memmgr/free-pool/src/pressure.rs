@@ -47,7 +47,8 @@ pub enum PressureLevel
 }
 
 /// The level `free` pages give against `pool_total`, `swapped` of whose
-/// pages are swapped, with no hysteresis.
+/// pages are swapped chunks of uncommitted regions, which the restore headroom
+/// counts ([`growth_floor`]), with no hysteresis.
 fn classify(free: u64, pool_total: u64, swapped: u64) -> PressureLevel
 {
     if free <= growth_floor(pool_total, swapped)
@@ -66,7 +67,7 @@ fn classify(free: u64, pool_total: u64, swapped: u64) -> PressureLevel
 
 /// The level after `prev`, for `free` pages of the free pool outside
 /// `promised` (deferred pages excluded) out of `pool_total`, with `swapped`
-/// pages swapped.
+/// pages of uncommitted regions swapped (`Ledger::uncommitted_swapped`).
 ///
 /// A worse level applies at once. A better one applies only once the free
 /// pool clears its threshold by the hysteresis band: the result is the level

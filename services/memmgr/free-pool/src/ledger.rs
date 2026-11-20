@@ -468,6 +468,23 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         budget::growth_floor(pool_total, self.uncommitted_swapped())
     }
 
+    /// The pressure level after `prev` in a pool of `pool_total` pages
+    /// ([`crate::pressure_level`]): for the free pages outside `promised`
+    /// ([`Self::uncommitted_free`]) against the growth floor, whose restore
+    /// headroom counts the swapped pages of uncommitted regions
+    /// ([`Self::uncommitted_swapped`]), so the level reads `CRITICAL` exactly
+    /// where a charge outside the reserve is refused.
+    #[must_use]
+    pub fn pressure_level(&self, prev: PressureLevel, pool_total: u64) -> PressureLevel
+    {
+        crate::pressure_level(
+            prev,
+            self.uncommitted_free(),
+            pool_total,
+            self.uncommitted_swapped(),
+        )
+    }
+
     /// The pages of the evicted chunks of uncommitted regions, compressed,
     /// writing or on disk, whose restores the restore headroom keeps free
     /// pages for: the swapped pages less those of committed regions.
@@ -5211,8 +5228,16 @@ mod tests
         let free = l.pool.free_pages();
         let floor = l.growth_floor(total);
         swap_out(&mut l, rec, reg, 0, 1, 2);
-        // Its restore draws from `promised`, so it takes no restore headroom.
+        // Its restore draws from `promised`, so it takes no restore headroom,
+        // and the level reads it so: in a pool whose reserve stands 8 pages
+        // below the free pages, the 16 swapped pages leave it short of
+        // `CRITICAL`.
         assert_eq!((l.uncommitted_swapped(), l.growth_floor(total)), (0, floor));
+        let near = 64 * (l.uncommitted_free() - 8);
+        assert_eq!(
+            l.pressure_level(PressureLevel::Normal, near),
+            PressureLevel::Low
+        );
         assert_eq!(promised(&l), held + 16);
         assert_eq!(l.pool.free_pages(), free + 16 - 2);
         assert_eq!(

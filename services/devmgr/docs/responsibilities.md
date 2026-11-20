@@ -746,12 +746,15 @@ records nothing, acpid's answered `OUT_OF_RESOURCES` (`firmware::headroom::hotpl
 [hotplug.md](hotplug.md#grant) § Grant and § Add Job); the registry refuses `WATCH_CLASS`, whose
 watch keeps a Notification, with `OUT_OF_RESOURCES`; and the DMA thread refuses `DMA_MAP`, which
 keeps the mapped Memory cap, with `OUT_OF_RESOURCES` (`firmware::headroom`). A hotplug removal job
-runs, since its card is leaving: it frees the capabilities of each driver it withdraws, and keeps at
-most the configuration page of each function it quiesces, which devmgr keeps once per function for
-the boot, so a repeat adds none. Every other request keeps nothing past its reply, or a fixed number
-of directory caps that a repeat does not add to, and is served: `SET_DRIVERS_DIR` the drivers
-directory's and the platform tables' (`caps[1]`, which the drivers-directory job deletes), once per
-boot, and `BIND_DRIVERS` one while its pass is pending.
+runs, since its card is leaving: it frees the capabilities of each driver it withdraws. Every other
+request keeps nothing past its reply, or a fixed number of capabilities that a repeat does not add
+to, and is served: `SET_DRIVERS_DIR` the drivers directory's and the platform tables' (`caps[1]`,
+which the drivers-directory job deletes), once per boot; `BIND_DRIVERS` one while its pass is
+pending; acpid's `ACPI_REGION_GRANT` the page it carves for each memory page acpid asks for, kept
+for the boot and derived again for a repeat ([acpid's
+devmgr.md](../../acpid/docs/devmgr.md#region-grants) § Region grants); and acpid's configuration
+access and a hotplug removal's quiesce the configuration page of the function they reach, which
+devmgr keeps once per function for the boot (`bind::config_page`).
 
 ---
 

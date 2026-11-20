@@ -1613,8 +1613,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// cleared chunks gave back ([`commit::meta_of_chunks`], what is left of
     /// the region's bound rising by it, at most to [`commit::meta_bound`] of
     /// its length). A refault of a discarded page is then admitted from
-    /// `promised` as its first touch was, so it is declined for neither budget
-    /// nor RAM. An evicted chunk frees its store to the free pool, and in an
+    /// `promised` as its first touch was, and declined only in the cases
+    /// `services/memmgr/docs/ipc-interface.md` § Committed fault declines
+    /// lists.
+    /// An evicted chunk frees its store to the free pool, and in an
     /// uncommitted region its pages' charge ([`Ledger::settle`]); in a
     /// committed region its pages are in `promised` already.
     /// A range that holds no run changes nothing, so a repeat is safe.

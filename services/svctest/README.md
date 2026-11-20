@@ -87,7 +87,7 @@ services/svctest/
         │                      #   past the promised bound, no fault declined, committed region
         │                      #   register, extend, shrink; all-RAM-accounted identity
         ├── discard.rs         # DISCARD_RANGE and SHRINK_REGION return frames; discarded pages
-        │                      #   refault zero-filled and, committed, cannot be declined;
+        │                      #   refault zero-filled and, committed, from the promise they keep;
         │                      #   the std heap's discard and trim; all-RAM-accounted identity
         ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
         │                      #   held `LOW` level and restores them: debugger reads and

@@ -802,16 +802,14 @@ each send the bits once; a send never blocks, and the bits of sends not yet take
 
 A region registered with `REGION_COMMIT` is committed ([ipc-interface.md](ipc-interface.md) § Label
 7). memmgr admits and charges its whole length when it registers it, and each growth by
-`EXTEND_REGION` (§ Label 12) when it accepts that growth, so a fault in a committed region is not
-declined for budget, and for RAM only with code 7 when the split of a run larger than the pages to
-back fails, or with code 11 under an overcommit allowance above 0 or after memmgr's own metadata
-took free pages without admission (Overcommit, below), while the region's page-table reservation
-lasts, which only the process's own mappings and unmaps can spend early (Faults below): a refusal
-reaches the process as the error reply of the call that asked, where it can fail an allocation, not
-as a fault. std's heap grows this way. It keeps its uncommitted floor and registers one committed
-growth region directly above it on its first grow, which each later grow extends, so a heap is two
-regions however large it grows and holds no Memory caps ([Userspace Memory Model § Byte
-Heap](../../../docs/userspace-memory-model.md#byte-heap)).
+`EXTEND_REGION` (§ Label 12) when it accepts that growth, so a refusal reaches the process as the
+error reply of the call that asked, where it can fail an allocation, not as a fault, and a fault in
+a committed region is declined only in the cases
+[ipc-interface.md](ipc-interface.md#committed-fault-declines) § Committed fault declines lists, each
+from a mechanism below (Faults, Overcommit). std's heap grows this way. It keeps its uncommitted
+floor and registers one committed growth region directly above it on its first grow, which each
+later grow extends, so a heap is two regions however large it grows and holds no Memory caps
+([Userspace Memory Model § Byte Heap](../../../docs/userspace-memory-model.md#byte-heap)).
 
 **Promised.** memmgr counts in `promised` what the committed regions can still take from the free
 pool: for each, its pages that hold no frame yet, and what is left of its page-table reservation and

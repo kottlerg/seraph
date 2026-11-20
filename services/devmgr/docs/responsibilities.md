@@ -199,7 +199,10 @@ devmgr's responsibilities are:
   states (`devmgr_firmware::dma::iova_limit`), and the thread has the IOMMU
   driver install the mapping (`MAP`, moving it a derivation of the cap) before it
   replies, and remove it (`UNMAP`) before it deletes the cap; a refused or
-  failed IOMMU call replies `IOMMU_FAILED`. The thread serves it apart from the registry
+  failed IOMMU call replies `IOMMU_FAILED`. Every call devmgr makes to the IOMMU driver is made
+  with the calling thread's upcalls masked (`ipc::ipc_call_masked`), so a debugger's stop of
+  devmgr waits for the driver's reply rather than cutting the call short, which would leave a
+  mapping the driver installed unknown to devmgr. The thread serves it apart from the registry
   and the control thread (below) because the control thread makes nested calls and settles
   batches during which drivers map their buffers: a `CREATE_FROM_FILE` reads a driver binary through
   virtio-blk, which maps the read's buffer, and every `VirtIO` driver maps its
@@ -733,21 +736,31 @@ serve meanwhile: about 450 slots. The page `CSpaceHeadroom` holds beyond the mar
 of those arena pages funded.
 
 devmgr holds it before each turn of the control thread's loop (acpid's requests, hotplug jobs,
-withdrawals, and the bind passes they start), before each record's carves (PCI and platform),
-before each driver spawn (the IOMMU driver's included), before each registry request a worker
-serves, and before each DMA request. A failed top-up is retried at the next hold; the control
-thread logs a run of them once, since a registry worker or the DMA thread may be serving logd, or
-a driver logd writes through, and must not log.
+withdrawals, and the bind passes they start), before each record's carves (PCI and platform), before
+each driver spawn (the IOMMU driver's included), before each hotplug slot's grant and each hotplug
+add job, before each registry request a worker serves, and before each DMA request. A failed top-up
+is retried at the next hold; the control thread logs a run of them once, since a registry worker or
+the DMA thread may be serving logd, or a driver logd writes through, and must not log.
 
-While the headroom is short of the mark and its top-up was refused, devmgr takes no capability
-it would keep, so the slots left and the IPC receive reserve the next top-up's reply needs stay
-free: a record's carves and a driver spawn fail, logged, and the record is not bound; the
-registry refuses `WATCH_CLASS`, whose watch keeps a Notification, with `OUT_OF_RESOURCES`; and
-the DMA thread refuses `DMA_MAP`, which keeps the mapped Memory cap, with `OUT_OF_RESOURCES`
-(`firmware::headroom`). Every other request keeps nothing past its reply, or a fixed number of
-directory caps that a repeat does not add to, and is served: `SET_DRIVERS_DIR` the drivers
-directory's and the platform tables' (`caps[1]`, which the drivers-directory job deletes), once
-per boot, and `BIND_DRIVERS` one while its pass is pending.
+While the headroom is short of the mark and its top-up was refused, devmgr takes no capability it
+would keep, so the slots left and the IPC receive reserve the next top-up's reply needs stay free: a
+record's carves and a driver spawn fail, logged, and the record is not bound; a hotplug slot whose
+grant has come waits, logged once, and a later turn manages it or leaves it to the firmware, either
+of which keeps capabilities (`firmware::hotplug::held_grant`); a hotplug add job, which keeps the
+configuration page of each function it reads and the held pages of its BARs, is refused, logged, and
+records nothing, acpid's answered `OUT_OF_RESOURCES` (`firmware::headroom::hotplug_refusal`;
+[hotplug.md](hotplug.md#grant) § Grant and § Add Job); the registry refuses `WATCH_CLASS`, whose
+watch keeps a Notification, with `OUT_OF_RESOURCES`; and the DMA thread refuses `DMA_MAP`, which
+keeps the mapped Memory cap, with `OUT_OF_RESOURCES` (`firmware::headroom`). A hotplug removal job
+runs, since its card is leaving: it frees the capabilities of each driver it withdraws. Every other
+request keeps nothing past its reply, or a fixed number of capabilities that a repeat does not add
+to, and is served: `SET_DRIVERS_DIR` the drivers directory's and the platform tables' (`caps[1]`,
+which the drivers-directory job deletes), once per boot; `BIND_DRIVERS` one while its pass is
+pending; acpid's `ACPI_REGION_GRANT` the page it carves for each memory page acpid asks for, kept
+for the boot and derived again for a repeat ([acpid's
+devmgr.md](../../acpid/docs/devmgr.md#region-grants) § Region grants); and acpid's configuration
+access and a hotplug removal's quiesce the configuration page of the function they reach, which
+devmgr keeps once per function for the boot (`bind::config_page`).
 
 ---
 

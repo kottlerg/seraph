@@ -508,7 +508,9 @@ pub const QUERY_HOST_BRIDGE: u64 = 30;
 /// logged, when the port is not a hotplug slot devmgr's boot scan found;
 /// [`super::devmgr_errors::REFUSED`], logged, when the slot's hotplug is
 /// not the firmware's (devmgr manages it natively, has no grant for it
-/// yet, or could not hold it); [`super::devmgr_errors::INVALID_REQUEST`]
+/// yet, or could not hold it); [`super::devmgr_errors::OUT_OF_RESOURCES`],
+/// logged, for an add while devmgr's `CSpace` headroom is short, which
+/// records nothing; [`super::devmgr_errors::INVALID_REQUEST`]
 /// for an unknown event, a short request, or a malformed address.
 pub const ACPI_HOTPLUG: u64 = 31;
 /// [`ACPI_HOTPLUG`] event: a card is present in the slot (a device check).

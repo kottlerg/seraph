@@ -656,11 +656,18 @@ impl IommuClient
 /// Call the instance whose endpoint is `ep` with `msg` from the calling
 /// thread. `Err` with the driver's error label, the reply's caps deleted, or
 /// `HARDWARE_TIMEOUT` when the call itself fails.
+///
+/// The call is made with the thread's upcalls masked (`ipc::ipc_call_masked`),
+/// so a debugger's stop of devmgr waits for the driver's reply rather than
+/// cutting the call short. A call cut short would fail while the driver may
+/// have acted on it: a `MAP` it installed would stand in the domain with its
+/// IOVA free in the DMA table, which gives that IOVA out again, and the
+/// driver refuses each later `MAP` there (`ADDRESS_IN_USE`).
 fn call_on(ep: u64, msg: &IpcMessage) -> Result<IpcMessage, u64>
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
-    match unsafe { ipc::ipc_call(ep, msg, ipc_buf) }
+    match unsafe { ipc::ipc_call_masked(ep, msg, ipc_buf) }
     {
         Ok(reply) if reply.label == iommu_errors::SUCCESS => Ok(reply),
         Ok(reply) =>

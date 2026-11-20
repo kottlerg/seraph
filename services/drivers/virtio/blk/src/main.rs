@@ -21,7 +21,7 @@ use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::time::Instant;
 use syscall_abi::PAGE_SIZE;
-use virtio_blk::{Geometry, IoOutcome, PartitionTable};
+use virtio_blk::{Geometry, IoOutcome, PartitionTable, RequestTiming};
 use virtio_core::bootstrap::{DeliveredDevice, DeviceInterrupt};
 use virtio_core::pci::PciTransport;
 use virtio_core::virtqueue::{self, SplitVirtqueue};
@@ -737,7 +737,8 @@ fn drop_caps(caps: &[u64])
 /// the caller cannot take (it died, or its `CSpace` is full) deletes it. A
 /// request the device loses (see
 /// [`io::submit_and_wait`]) is answered only after [`quiesce_device`] has
-/// stopped the device, so the returned cap is free of device DMA.
+/// stopped the device, so the returned cap is free of device DMA
+/// ([`run_transfer`]).
 fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir: io::IoDirection)
 {
     let mem_cap = msg.caps().first().copied().unwrap_or(0);
@@ -818,46 +819,101 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
         }
     };
 
-    // The data segment is mapped for the device only for this request: from
-    // here to the unmap below, which follows the completion or the quiesce
-    // of a lost request.
-    let access = match dir
+    let transfer = Transfer {
+        dir,
+        sector,
+        block_count,
+        data_len,
+        badge: msg.badge,
+    };
+    let code = run_transfer(rt, &transfer, mem_cap, ipc_buf);
+    reply_with(code, ipc_buf);
+}
+
+/// A checked transfer request: its direction, its first `VirtIO` sector, its
+/// length in logical blocks and in bytes, and the client's badge.
+struct Transfer
+{
+    dir: io::IoDirection,
+    sector: u64,
+    block_count: u64,
+    data_len: u32,
+    badge: u64,
+}
+
+/// Run `transfer` on the data segment `mem_cap`, and return the reply label.
+///
+/// The data segment is mapped for the device only for this request: from
+/// the map here to the unmap, which follows the completion or the quiesce of
+/// a lost request. A map that fails is answered `DEVICE_FAULT`. The clock is
+/// read at the map, the submission, the completion and the unmap, so a
+/// request that took [`virtio_blk::SLOW_REQUEST`] or longer is logged with
+/// its [`RequestTiming`] (README § Slow requests).
+fn run_transfer(rt: &mut BlkRuntime, transfer: &Transfer, mem_cap: u64, ipc_buf: *mut u64) -> u64
+{
+    let access = match transfer.dir
     {
         io::IoDirection::Read => virtio_core::dma::DEVICE_READS_WRITES,
         io::IoDirection::Write => virtio_core::dma::DEVICE_READS,
     };
+    let map_start = Instant::now();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let data_addr = match unsafe { virtio_core::dma::map(rt.dma_ep, mem_cap, access, ipc_buf) }
     {
         Ok(addr) => addr,
         Err(e) =>
         {
-            std::os::seraph::log!(warn: "data segment not mapped for the device ({e:?})");
-            reply_with(ipc::blk_errors::DEVICE_FAULT, ipc_buf);
-            return;
+            std::os::seraph::log!(
+                warn: "data segment not mapped for the device ({e:?}) after {} ms",
+                map_start.elapsed().as_millis()
+            );
+            return ipc::blk_errors::DEVICE_FAULT;
         }
     };
-    let outcome = io::submit_and_wait(
+    let submitted = Instant::now();
+    let (outcome, waits) = io::submit_and_wait(
         rt.layout,
-        dir,
-        sector,
+        transfer.dir,
+        transfer.sector,
         data_addr,
-        data_len,
+        transfer.data_len,
         rt.vq,
         rt.transport,
         rt.queue_notify_off,
         rt.completion,
     );
-    if outcome == IoOutcome::Lost
+    let ended = Instant::now();
+    let unmap_start = if outcome == IoOutcome::Lost
     {
         quiesce_device(rt);
+        Instant::now()
     }
+    else
+    {
+        ended
+    };
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if let Err(e) = unsafe { virtio_core::dma::unmap(rt.dma_ep, data_addr, ipc_buf) }
     {
         std::os::seraph::log!(warn: "data segment not unmapped for the device ({e:?})");
     }
-    reply_with(outcome.reply_label(), ipc_buf);
+    let timing = RequestTiming {
+        map: submitted.duration_since(map_start),
+        device: ended.duration_since(submitted),
+        unmap: unmap_start.elapsed(),
+        waits,
+    };
+    if timing.is_slow()
+    {
+        std::os::seraph::log!(
+            warn: "slow request: {} of {} blocks at sector {} (badge {:#x}) took {timing}",
+            transfer.dir.name(),
+            transfer.block_count,
+            transfer.sector,
+            transfer.badge
+        );
+    }
+    outcome.reply_label()
 }
 
 /// Check the data-segment Memory cap of a transfer of `data_len` bytes;

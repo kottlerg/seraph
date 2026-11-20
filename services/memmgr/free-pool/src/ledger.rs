@@ -485,19 +485,31 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         )
     }
 
-    /// Whether the free pool holds the frames to restore `pages` pages of an
+    /// Whether the free pool admits the restore of `pages` pages of an
     /// evicted chunk of an uncommitted region for a budget node that must
-    /// leave `reserve` free pages (0 for a reserve node). A restore takes
-    /// frames alone: its pages are charged already, and it leaves the pages a
-    /// commitment may still promise ([`Self::promise_free`]) as they were,
-    /// since the allowance offers again the swap they took. So it reads the
-    /// free frames, not the free pages outside `promised`, which can stand
-    /// below the growth floor while the allowance bounds them, the evictions
-    /// that raised the restore headroom having freed frames alone.
+    /// leave `reserve` free pages (0 for a reserve node). Its pages are
+    /// charged already. While no swap service has registered slots the
+    /// allowance stays 0 and the restore lowers the free pages outside
+    /// `promised` by its pages, so it reads those ([`Self::uncommitted_free`]),
+    /// which keeps a frame for every promised page. While one has, it leaves
+    /// the pages a commitment may still promise ([`Self::promise_free`]) as
+    /// they were, since the allowance offers again the swap they took, and
+    /// takes frames alone: it reads the free frames, since the free pages
+    /// outside `promised` can stand below the growth floor while the allowance
+    /// bounds them, the evictions that raised the restore headroom having
+    /// freed frames alone.
     #[must_use]
     pub fn restore_fits(&self, pages: u64, reserve: u64) -> bool
     {
-        self.pool.free_pages() >= pages.saturating_add(reserve)
+        let free = if self.overcommits()
+        {
+            self.pool.free_pages()
+        }
+        else
+        {
+            self.uncommitted_free()
+        };
+        free >= pages.saturating_add(reserve)
     }
 
     /// The pages of the evicted chunks of uncommitted regions, compressed,
@@ -5217,6 +5229,12 @@ mod tests
         back_whole(&mut l, rec, plain, 0);
         l.add_region(rec, region(BASE + CHUNK, 8 * CHUNK), Commit::Committed)
             .unwrap();
+        // With no slot registered a restore reads the free pages outside
+        // `promised`, so every promised page keeps its frame.
+        let outside = l.uncommitted_free();
+        assert!(outside < l.pool.free_pages());
+        assert!(l.restore_fits(16, outside - 16));
+        assert!(!l.restore_fits(16, outside - 15));
         register_slots(&mut l, 4);
         // `promised` past the allowance: the pages a commitment may still
         // promise bound the free pages outside `promised`.

@@ -1075,14 +1075,17 @@ any ancestor for its pages, since the node stays charged for its evicted pages; 
 donation its map needs is admitted as any other ([Client page-table
 funding](#client-page-table-funding)), and declined with code 10 at the max or 9 at the growth
 floor, unless the chunk is a committed region's, whose reservation carries it ([Commit](#commit),
-Faults). A restore of an uncommitted chunk passes the RAM test of an uncommitted demand run, `U - R
->= want`, with U the free pages outside `promised` ([Commit](#commit), Promised), want the chunk's
-backed pages and R the system reserve for a node outside it and 0 for a reserve node, after the
-deferred recheck ([Distribution policy](#distribution-policy), System reserve): R, not the growth
-floor, so the restore draws on the restore headroom (below). When the free pages do not admit it,
-memmgr reclaims directly (Direct reclaim, below), and declines the restore with code 7 only when
-that does not make room, the chunk staying compressed and its store kept. A restore of a committed
-chunk, which only registered swap slots let memmgr evict, is a committed draw instead
+Faults). A restore of an uncommitted chunk passes `F - R >= want` after the deferred recheck
+([Distribution policy](#distribution-policy), System reserve), with want the chunk's backed pages
+and R the system reserve for a node outside it and 0 for a reserve node. F is the free frames while
+a swap service has registered slots, and otherwise U, the free pages outside `promised`
+([Commit](#commit), Promised), the RAM test of an uncommitted demand run, so every promised page
+keeps its frame. With slots, a restore takes frames and no promise, since the allowance offers again
+the swap its pages took, and U can stand below the growth floor (Restore headroom, below). The test
+reads R, not the growth floor, so the restore draws on the restore headroom. When the free pages do
+not admit it, memmgr reclaims directly (Direct reclaim, below), and declines the restore with code 7
+only when that does not make room, the chunk staying compressed and its store kept. A restore of a
+committed chunk, which only registered swap slots let memmgr evict, is a committed draw instead
 ([Commit](#commit), Overcommit): it draws from `promised`, and is declined with code 11 when it
 finds no frame. The chunk is the granule, so a restore is never clamped to part of a chunk. memmgr
 takes runs covering exactly the chunk's backed pages (no run spans an unbacked page of a chunk
@@ -1122,22 +1125,22 @@ worker, so its latency lands on no fault or grant.
 the reserve leaves a restore headroom H free above the reserve R: their swapped pages, and at most
 R, so it is admitted when `U - R - H >= want` with `H = min(swapped - committed_swapped, R)`, and
 the level is `CRITICAL` at or below `R + H` ([Memory pressure](#memory-pressure)). A restore of an
-uncommitted chunk is admitted on the free frames against R alone, so it draws on H: it takes frames
-and no promise, and while the allowance bounds U, the evictions that raised H freed frames and left
-U where it was. A committed chunk's restore is a committed draw, from `promised` ([Commit](#commit),
-Overcommit), so its pages raise no H. Without H, the frames background eviction frees at `LOW` go to
-a process draining the pool, whose grants are never victims, and by `CRITICAL` the evicted chunks of
-idle processes, a filesystem driver's thread stacks woken by the pressure signal among them, find
-neither a free page nor a victim, and their faults are declined. With H, the restores of up to R
-swapped pages find their frames whatever a drainer took, and direct reclaim covers the rest. The
-cost falls on growth: each uncommitted chunk's eviction raises H by its pages and frees them less
-its store pages, so eviction gives growth, and a committed draw, no page until H reaches R; a
-committed chunk's eviction moves no H. A raw chunk moves neither H nor the free pages until its
-write ends: mapping its own frames back needs none. With nothing swapped H is 0, and every admission
-and level is as it is without eviction. H is at most R, a sixty-fourth of the pool, so `LOW`'s
-threshold stays above `CRITICAL`'s. `QUERY_POOL_STATUS` reports `R + H` as `growth_floor_bytes`
-([ipc-interface.md](ipc-interface.md) § Label 6). The computation is the host-tested `free-pool`
-function `budget::growth_floor`.
+uncommitted chunk is admitted against R alone (States, above), so it draws on H; while slots are
+registered it reads the free frames, since the allowance can bound U, and then the evictions that
+raised H freed frames and left U where it was. A committed chunk's restore is a committed draw, from
+`promised` ([Commit](#commit), Overcommit), so its pages raise no H. Without H, the frames
+background eviction frees at `LOW` go to a process draining the pool, whose grants are never
+victims, and by `CRITICAL` the evicted chunks of idle processes, a filesystem driver's thread stacks
+woken by the pressure signal among them, find neither a free page nor a victim, and their faults are
+declined. With H, the restores of up to R swapped pages find their frames whatever a drainer took,
+and direct reclaim covers the rest. The cost falls on growth: each uncommitted chunk's eviction
+raises H by its pages and frees them less its store pages, so eviction gives growth, and a committed
+draw, no page until H reaches R; a committed chunk's eviction moves no H. A raw chunk moves neither
+H nor the free pages until its write ends: mapping its own frames back needs none. With nothing
+swapped H is 0, and every admission and level is as it is without eviction. H is at most R, a
+sixty-fourth of the pool, so `LOW`'s threshold stays above `CRITICAL`'s. `QUERY_POOL_STATUS` reports
+`R + H` as `growth_floor_bytes` ([ipc-interface.md](ipc-interface.md) § Label 6). The computation is
+the host-tested `free-pool` function `budget::growth_floor`.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr, at the top of the
 fair class (`ipc::sched_policy::MEMMGR_WORKER_PRIORITY`), below the receive loop's priority. It

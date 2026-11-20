@@ -504,11 +504,8 @@ fn still_victim(l: &MemLedger, v: &Victim, idle: u8, need: Need) -> bool
 /// be evicted, then add each of `found` not kept already while there is
 /// room. When there is none, a victim `opens` names (one whose eviction opens
 /// the draw room while memmgr evicts for frames, [`Need::Draw`]) takes the
-/// place of a kept one it does not name, and otherwise, while an eviction
-/// raises the free pages outside `promised`
-/// ([`free_pool::Ledger::evicting_frees`]), any victim takes the place of a
-/// kept one that `opens` does not name, so neither need's victims crowd out
-/// the other's.
+/// place of a kept one it does not name, so the victims a committed draw
+/// needs are not crowded out by those it does not.
 fn keep_victims(l: &MemLedger, found: &[Victim], opens: impl Fn(&MemLedger, NodeIdx) -> bool)
 {
     let cache = &mut evictor().cache;
@@ -533,8 +530,7 @@ fn keep_victims(l: &MemLedger, found: &[Victim], opens: impl Fn(&MemLedger, Node
         let slot = cache
             .iter()
             .position(Option::is_none)
-            .or_else(|| replaces(&|reg| opens(l, reg)))
-            .or_else(|| replaces(&|reg| l.evicting_frees() || opens(l, reg)));
+            .or_else(|| replaces(&|reg| opens(l, reg)));
         if let Some(k) = slot.and_then(|i| cache.get_mut(i))
         {
             *k = Some(*v);
@@ -1108,7 +1104,8 @@ fn give_back(l: &mut MemLedger, runs: &[FrameDesc])
 /// region `reg` of `rec` from `source`: the bytes a swap slot held opened,
 /// a stream or a raw chunk's pages, for a chunk on disk (`crate::disk`), else
 /// its store runs (services/memmgr/docs/memory-pool.md § Eviction, States): admitted when the
-/// free frames cover its backed pages and, for a node outside the reserve,
+/// free frames (with no swap slot registered, the free pages outside
+/// `promised`) cover its backed pages and, for a node outside the reserve,
 /// the system reserve, once direct reclaim has made room when needed
 /// ([`admit_restore`]), or, for a chunk of a committed region, which draws
 /// from `promised`, when the draw finds its frames ([`draw_room`]); then runs
@@ -1200,12 +1197,14 @@ pub(crate) fn restore(
 }
 
 /// Whether a restore of `pages` pages of an uncommitted chunk for `rec` is
-/// admitted: the free frames cover them and, for a budget node outside the
-/// reserve, the system reserve, but not the restore headroom that growth
-/// leaves for restores (`free_pool::growth_floor`;
+/// admitted: the free frames while a swap service has registered slots, else
+/// the free pages outside `promised`, cover them and, for a budget node
+/// outside the reserve, the system reserve, but not the restore headroom that
+/// growth leaves for restores (`free_pool::growth_floor`;
 /// [`free_pool::Ledger::restore_fits`]). When they do not, memmgr reclaims
-/// directly ([`reclaim`]), taking any victim, since each eviction frees
-/// frames ([`Need::Frames`]).
+/// directly ([`reclaim`]), taking any victim ([`Need::Frames`]): each
+/// eviction frees frames, and with no slot registered only uncommitted chunks
+/// are evicted, each raising the free pages outside `promised` as well.
 fn admit_restore(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> bool
 {
     let reserve = reserve_of(l, rec);

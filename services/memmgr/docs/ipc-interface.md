@@ -1305,35 +1305,29 @@ of a user-mode access ([docs/fault-handling.md § Reply](../../../docs/fault-han
 Either way the fault takes the decline's outcome unless that handler resumes it, and memmgr waits on
 no handler it forwards to.
 
-A fault on a chunk memmgr is evicting, or holds raw on its own runs, maps the
-chunk's runs back and resumes, a raw chunk's write cancelled, declined with code
-10 or 9 when a page-table donation the map needs is refused at the max or the
-growth floor, and with code 9 when the map fails; a
-fault on a chunk it evicted restores the whole chunk from its compressed store
-before it resumes, declined with code 7 when the free pages outside
-`promised` and, for a process outside it, the system reserve do not cover the
-chunk's backed pages or the runs covering them cannot be taken, with code 6 or 8
-when the runs cannot be recorded, with code 10 or 9 when a page-table donation
-its map needs is refused at the max or the growth floor, and with code 9 when a
-map fails or, with detail 0, the store runs cannot be mapped or the stored chunk
-does not decode (a committed region's chunk: § Committed fault declines); the
-chunk then stays evicted
-([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a writing
-compressed chunk is restored from its store runs as a compressed chunk's, and
-its write cancelled. A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming
-the registered swap service's endpoint, with data word 0 the slot word, which
-the endpoint receives as data word `FAULT_REDIRECT_WORD` (4): the slot in its
-low 28 bits, the slot's byte count less one in the next 16 (1 to 65536 bytes,
-a full slot's), and in the top 20 the low
-bits of the nonce counter of the seal the slot holds
-(`free_pool::disk::slot_word`). The thread stays fault-blocked until the
-swap service, having handed memmgr the slot's bytes with the word (§ Label
-25), resumes it on `SUCCESS` or `RESTORE_STALE`, or forwards it with the
-decline word of `RESTORE_DECLINED`. Two threads faulting on one chunk on disk
-are redirected twice; the first restore makes the chunk resident, the second
-is `RESTORE_STALE`, and both threads resume onto the mapped chunk. A fault on
-a chunk on disk with no swap service registered, and one on a lost chunk, are declined with
-code 12 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
+A fault on a chunk memmgr is evicting, or holds raw on its own runs, maps the chunk's runs back and
+resumes, a raw chunk's write cancelled, declined with code 10 or 9 when a page-table donation the
+map needs is refused at the max or the growth floor, and with code 9 when the map fails; a fault on
+a chunk it evicted restores the whole chunk from its compressed store before it resumes, declined
+with code 7 when the free frames (with no swap slot registered, the free pages outside `promised`)
+and, for a process outside it, the system reserve do not cover the chunk's backed pages or the runs
+covering them cannot be taken, with code 6 or 8 when the runs cannot be recorded, with code 10 or 9
+when a page-table donation its map needs is refused at the max or the growth floor, and with code 9
+when a map fails or, with detail 0, the store runs cannot be mapped or the stored chunk does not
+decode (a committed region's chunk: § Committed fault declines); the chunk then stays evicted
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a writing compressed chunk is
+restored from its store runs as a compressed chunk's, and its write cancelled. A fault on a chunk on
+disk replies `FAULT_REPLY_REDIRECT` naming the registered swap service's endpoint, with data word 0
+the slot word, which the endpoint receives as data word `FAULT_REDIRECT_WORD` (4): the slot in its
+low 28 bits, the slot's byte count less one in the next 16 (1 to 65536 bytes, a full slot's), and in
+the top 20 the low bits of the nonce counter of the seal the slot holds
+(`free_pool::disk::slot_word`). The thread stays fault-blocked until the swap service, having handed
+memmgr the slot's bytes with the word (§ Label 25), resumes it on `SUCCESS` or `RESTORE_STALE`, or
+forwards it with the decline word of `RESTORE_DECLINED`. Two threads faulting on one chunk on disk
+are redirected twice; the first restore makes the chunk resident, the second is `RESTORE_STALE`, and
+both threads resume onto the mapped chunk. A fault on a chunk on disk with no swap service
+registered, and one on a lost chunk, are declined with code 12
+([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 
 | Code | Decline |
 |---|---|

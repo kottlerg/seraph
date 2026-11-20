@@ -13,7 +13,8 @@
 //! `Blocked` thread referenced only by the IPC object it parked on, invisible
 //! to a `current`-only dump. Object teardown walks it ([`for_each`]) to find
 //! and stop every thread bound to a dying `CSpace` or `AddressSpace`
-//! (`sched::stop_threads_bound_to`).
+//! (`sched::stop_threads_bound_to`). The address-space hold and release walk it
+//! ([`for_each`]) to find every thread of the held space.
 //!
 //! [`THREAD_REGISTRY_LOCK`] sits above every IPC-source, `SLEEP_LIST_LOCK`,
 //! `sched_lock`, and run-queue lock; its ordering and the rule that it is never

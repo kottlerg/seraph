@@ -2,9 +2,9 @@
 
 This document specifies the cross-cutting invariants for thread lifecycle transitions
 (`sys_thread_start` (first start and resume), `sys_thread_stop`, `sys_exit` / `sys_aspace_exit`,
-and `dealloc_object(Thread)`), the global sleep list (the `SLEEP_LIST` deadline heap +
-`SLEEP_LIST_LOCK`), and the
-timer-driven wakeup arbitration in `sleep_check_wakeups`.
+`dealloc_object(Thread)`, and the address-space hold, `sys_aspace_hold` / `sys_aspace_release`), the
+global sleep list (the `SLEEP_LIST` deadline heap + `SLEEP_LIST_LOCK`), and the timer-driven wakeup
+arbitration in `sleep_check_wakeups`.
 
 ---
 
@@ -23,7 +23,7 @@ invariants.
 | Doc | Owns |
 |---|---|
 | [scheduling-internals.md](scheduling-internals.md) | Lock hierarchy, cross-CPU TCB ownership table, wake protocol, BSP boot transient, IPI taxonomy, atomic ordering pairings. |
-| **This document** | Sleep-list invariants, storage, and BSP-servicing model (including the timed-source quiesce); `timed_out` cross-CPU protocol; `sys_thread_start` / `sys_thread_stop` / `sys_exit` / `sys_aspace_exit` state-machine table and the stop protocol (`commit_cancelling_park`); the upcall cancel-and-wake protocol (`cancel_for_upcall`); `dealloc_object(Thread)` cross-CPU drain protocol; the `BlockedOnReply` reply-slot claim protocol (every publisher and claimant of `reply_tcb`). |
+| **This document** | Sleep-list invariants, storage, and BSP-servicing model (including the timed-source quiesce); `timed_out` cross-CPU protocol; `sys_thread_start` / `sys_thread_stop` / `sys_exit` / `sys_aspace_exit` state-machine table and the stop protocol (`commit_cancelling_park`); the upcall cancel-and-wake protocol (`cancel_for_upcall`); the address-space hold and release protocol (`hold_space`, `release_space`); `dealloc_object(Thread)` cross-CPU drain protocol; the `BlockedOnReply` reply-slot claim protocol (every publisher and claimant of `reply_tcb`). |
 | [scheduler.md](scheduler.md) | Scheduling algorithm (priority, FIFO, slice, affinity, idle role). |
 | [ipc-internals.md](ipc-internals.md) | IPC primitive object layouts and syscall paths. |
 
@@ -41,6 +41,10 @@ touches these):
   `stop_threads_bound_to`, `select_target_cpu_excluding`, `prod_remote_cpu`, `pin_thread_aspace`.
 - `core/kernel/src/sched/deadline_heap.rs` — `DeadlineHeap`, `DeadlineNode`, the sleep list's
   storage.
+- `core/kernel/src/sched/hold.rs` — `HoldState`, `HoldMark`, the hold decisions, `hold_space`,
+  `release_space` (§ Address-Space Hold), and the hold diverts they drive in `enqueue_and_wake` and
+  `schedule()`'s requeue (`core/kernel/src/sched/mod.rs`).
+- `core/kernel/src/syscall/mem.rs` — `sys_aspace_hold`, `sys_aspace_release`.
 - `core/kernel/src/sched/thread.rs` — `ThreadState`, `IpcThreadState`, TCB.
 - `core/kernel/src/syscall/{thread,mod}.rs` — `sys_thread_configure`, `sys_thread_start` (and its
   suspended commit, `commit_suspended_start`), `sys_thread_stop`, `sys_thread_read_regs`,
@@ -265,7 +269,7 @@ the handler uses for the target's `state` write.
 | `sys_thread_stop` (running remote) | `Running` | `Stopped` | calling CPU ≠ running CPU | `commit_cancelling_park(target, Stopped, None)` returns `StateCommit::Committed(Some(run_cpu))`; the syscall handler then calls `prod_remote_cpu(run_cpu)` (sends a wakeup IPI whose trap snapshots the target's registers; the remote CPU drops the `Stopped` target at the next `schedule(Requeue::Always)` its `timer_tick` performs with preemption enabled, at a slice expiry or, for a target dispatched at a fair level, at a tick that finds an RT thread queued, or at the target's own park or yield) and bounded-spins until `sched_remote.current != target_tcb` and the target's `context_saved` is set (`current` moves off the target before `switch()` publishes its save), or the target is no longer `Stopped` (an object teardown committed `Exited` over it; a start cannot commit while the target is `current` anywhere). A drain pass that must wait reads the stopper's own state under its `sched_lock`; a stopper that is itself `Stopped` (a peer stopping its stopper) or `Exited` deschedules in place and, when restarted, re-enters the drain only if its capability slot still names the target with Control rights, otherwise returning at once ([Cross-CPU Stop Protocol](#sys_thread_stop-cross-cpu-stop-protocol) step 4), so two threads stopping each other both end `Stopped`. The drain is what gives `sys_thread_read_regs` a fresh `trap_frame`: a drained call returns only once the target has left its CPU through a trap, so the snapshot is never the stale one from the target's previous kernel entry ([Cross-CPU Stop Protocol](#sys_thread_stop-cross-cpu-stop-protocol) invariant 1 states where this does not hold). A target that is inside its own exit when the stop commits is not refused: its exit's `exit_under_all_locks` then commits `Exited` over the `Stopped` mark (only an `Exited` target refuses it), the drain ends on that state, and a later start returns `InvalidArgument`. |
 | `sys_thread_stop` (Ready, on a run queue) | `Ready` | `Stopped` | calling CPU | `commit_cancelling_park(target, Stopped, None)`, whose all-locks commit removes the entry from every run queue inside the locked region; the `schedule()` skip-loop is only defence-in-depth. A target `current` on no CPU at the commit may still be finishing its switch out on the CPU it just left: the call waits (`await_stopped_save`, interrupts enabled; spin site `stop:save`) until its `context_saved` is set or a teardown commits `Exited`. |
 | `sys_thread_stop` (Blocked) | `Blocked` | `Stopped` | calling CPU | `commit_cancelling_park(target, Stopped, None)`: `cancel_ipc_block(target)` (try-locks the source IPC lock matching `tcb.ipc_state` under the target's `sched_lock` once the binding still matches, and unlinks the waiter), then the all-locks commit, retried while the target's `park_seq` changed (see [`sys_thread_stop` Cross-CPU Stop Protocol](#sys_thread_stop-cross-cpu-stop-protocol)). A target that parks after an unlocked `Running` or `Ready` read takes this row too. A target `current` on no CPU at the commit may still be finishing its switch out on the CPU it just left: the call waits (`await_stopped_save`, interrupts enabled; spin site `stop:save`) until its `context_saved` is set or a teardown commits `Exited`. |
-| `sys_thread_stop` (Created or Exited or Stopped) | `*` | `*` | calling CPU | n/a — returns `InvalidState`. No state write. An `Exited` target observed only at the locked commit (the thread died between the unlocked precheck and the commit) is refused there with the same `InvalidState`. |
+| `sys_thread_stop` (Created or Exited or Stopped) | `*` | `*` | calling CPU | n/a — returns `InvalidState`. No state write. The exception is a `Stopped` thread an address-space hold stopped (marked `Stopped`): the stop's all-locks commit rewrites `Stopped` and clears the mark, returning 0, so the release leaves the thread stopped (§ Address-Space Hold). An `Exited` target observed only at the locked commit (the thread died between the unlocked precheck and the commit) is refused there with the same `InvalidState`. |
 | `sys_thread_set_priority` | `*` | `*` (priority changed) | calling CPU | Holds `(*tcb).sched_lock` across the `state` read and the `(*tcb).priority` write, and — when the target is `Ready` — relocates the queue entry via `sched::relocate_ready_priority`: lock the single `preferred_cpu`-hinted CPU's `scheduler.lock` and verify membership with `remove_from_queue` (O(1) locks), falling back on a miss to the ascending all-CPU walk. `remove_from_queue`'s boolean identifies the home CPU; the re-enqueue lands at the new priority on the located scheduler. The held `sched_lock` serialises with `dealloc_object(Thread)`, `migrate_ready_thread`, and `set_state_under_all_locks`. |
 | `sys_thread_set_affinity` | `*` | `*` | calling CPU | Does NOT touch `state`; writes `cpu_affinity` under the target's `sched_lock`, held across the `state` read and the action. When the new affinity names a CPU other than the target's `preferred_cpu`, the `state` read picks the action: a `Ready` target is migrated at once (`migrate_ready_thread`, which takes both scheduler locks and declines if the thread is no longer linked on its source); a `Running` target's CPU has reschedule-pending set and is prodded after the unlock (`set_reschedule_pending_for`, `prod_remote_cpu`), so its next `schedule()` routes the thread cross-CPU; a `Blocked`, `Stopped` or `Created` target observes the affinity on its next enqueue. Clearing affinity (`AFFINITY_ANY`) migrates nothing. The target is pinned for the call (its capability pin), so a concurrent delete of its last capability frees it only after the call ([syscalls.md § `SYS_THREAD_SET_AFFINITY`](syscalls.md#sys_thread_set_affinity-38)). |
 | `sys_thread_read_regs` | `Stopped`, or `Blocked` (`BlockedOnFault`) | unchanged | calling CPU | `sched::with_held_frame`: under the target's `sched_lock`, the target, `Stopped` or fault-blocked, must be `current` on no CPU with its save published; a `Stopped` target not yet settled is refused (`InvalidState`) and a fault-blocked one still switching out is waited for (outside every lock, interrupts enabled, preemption disabled; spin site `regs:settle`). The frame is snapshotted under the lock and copied to the caller's buffer after it. No scheduler-state mutation. |
@@ -277,6 +281,10 @@ the handler uses for the target's `state` write.
 | `dealloc_object(Thread)` (caller ≠ tcb) | `*` | `Exited` | calling CPU (refcount → 0) | Acquires `(*tcb).sched_lock` (outer), then every CPU's scheduler.lock in ascending order, writes `state = Exited`, walks `remove_from_queue` for every CPU, releases all. After release: unconditionally scans every CPU until none has `sched.current == tcb`, then unconditionally on `tcb.context_saved == 1`, then the reply-bound client wake, sleep-list removal, source-IPC unlink, fault-handler release, wake-in-flight gate and timer quiesce, registry unlink, and free. See Drain Protocol below. |
 | `dealloc_object(Thread)` (caller == tcb, self-teardown) | `Running` | `Exited` | calling CPU = running CPU | A thread deleting the last capability to its own `Thread` object cannot run the post-release scan (its CPU's `current == tcb` never clears from within the spin). Marks Exited + drains run queues only, queues the object on this CPU's deferred-reclaim stack, and returns; the syscall epilogue reschedules and the free completes off-CPU. See [Self-teardown](#self-teardown-the-caller-is-the-freed-thread) below. |
 | `dealloc_object(CSpaceObj)` / `dealloc_object(AddressSpace)` — bound-thread stop (`stop_threads_bound_to`) | `*` | `Exited` | calling CPU (object refcount → 0) | For every registered thread bound to the dying object: `commit_cancelling_park(tcb, Exited, Some(EXIT_KILLED))` — `cancel_ipc_block` if `Blocked`, then the `Exited` commit with `EXIT_KILLED` recorded in the same all-locks hold, retried while `park_seq` changed (a commit refused because the thread exited on its own meanwhile writes neither, and that thread still posts its own reason — no death walk posts `EXIT_KILLED`; an observer bound after the stop receives it through the bind); each running CPU is prodded inside the registry walk, under the registry lock, and the caller spins until no other CPU has a bound thread as `current` (and, for an `AddressSpace`, until `active_cpus` is empty). The thread is stopped, not freed: its object waits for its own last cap. If the caller's own thread is stopped — bound here, or by a concurrent teardown — nothing is freed: the object goes onto this CPU's deferred-reclaim stack (as in the self-teardown row) and the epilogue schedules the thread away. See [scheduling-internals.md § Thread Registry](scheduling-internals.md#thread-registry). |
+| `sys_aspace_hold` | `Ready` | `Stopped` (marked `Stopped`) | calling CPU | `hold_space`'s registry walk: under the thread's `sched_lock`, then every CPU's scheduler lock, the `Stopped` commit with the run-queue drain (`stop_ready_under_cpu_locks`). A `Running` or `Blocked` thread is only marked `Pending` under its `sched_lock`; its state is not written. See § Address-Space Hold. |
+| hold divert (a wake, or `schedule()`'s requeue, of a thread marked `Pending`) | `Blocked`, `Running` | `Stopped` (marked `Stopped`) | waking CPU, or running CPU | `enqueue_and_wake`'s `Blocked` arm (under the thread's `sched_lock`, clearing the park's binding and releasing `wake_in_flight`), or `schedule()`'s outgoing requeue (under `current.sched_lock`); neither links the thread. See § Address-Space Hold. |
+| `sys_thread_start` (held space) | `Created`, `Stopped` | `Stopped` (marked `Stopped`) | calling CPU | `start_under_all_locks`, whose commit returns `StateCommit::Deferred` once the target is settled; nothing is linked and the syscall returns 0. A target marked `Stopped` is refused (`InvalidArgument`). See § Address-Space Hold. |
+| `sys_aspace_release` | `Stopped` (marked `Stopped`) | `Ready` | calling CPU | `release_space`'s registry walk: under the thread's `sched_lock`, then every CPU's scheduler lock, the `Ready` commit once `start_ready_to_link` holds, advancing `start_seq` and clearing the mark, then `enqueue_ready_thread` at that `start_seq` after the unlock, as for `sys_thread_start`. A `Pending` mark is cleared. See § Address-Space Hold. |
 
 **Why the all-CPU lock acquire in `dealloc_object(Thread)`:**
 
@@ -1037,6 +1045,115 @@ all-stop that counts it stopped at once is sound.
    wait for the wake (§ `sys_thread_stop` invariant 4). A stop that commits `Stopped` over the
    claimed park before the wake lands makes the wake abort on `Stopped`, leaving the `INTERRUPTED`
    stamp for the restart, as for any waker.
+
+---
+
+## Address-Space Hold
+
+`SYS_ASPACE_HOLD` and `SYS_ASPACE_RELEASE` ([syscalls.md](syscalls.md) § `SYS_ASPACE_HOLD` (71)
+and § `SYS_ASPACE_RELEASE` (72)) stop and restart every thread of an address space without
+cancelling any park. `core/kernel/src/sched/hold.rs` holds the states and the decisions as pure
+functions; this section states the protocol that applies them and its invariants. A host test drives
+a model of the decisions through every interleaving of hold, release, wake, requeue, start, stop and
+exit events up to a bound and checks the invariants below (`sched::hold`'s tests); ktest checks
+them on the kernel (`integration::aspace_hold`).
+
+**State.** Each address space carries `AddressSpace::hold`, an atomic byte:
+`Free → Holding → Held → Releasing → Free`. The moves `Free → Holding` and `Held → Releasing` are
+compare-and-swaps, and the hold or release that made one stores the next state, so one call owns
+the space's hold state at a time. Each thread carries a `HoldMark` in the Scheduling field group,
+written under its `sched_lock`: `None`; `Pending`, the hold found it `Running` or `Blocked`;
+`Stopped`, the hold stopped it and the release starts it.
+
+**Hold** (`hold_space`):
+
+1. Compare-and-swap the space `Free → Holding`; on failure return `InvalidState`.
+2. Walk the thread registry (`thread_registry::for_each`: its lock held, interrupts disabled on
+   this CPU). For each thread whose `address_space` is the space, under its `sched_lock`: a
+   `Ready` thread is committed `Stopped` and marked `Stopped` under every CPU's scheduler lock,
+   its run-queue link drained, as a `sys_thread_stop` commit drains it (a CPU whose dispatch
+   already dequeued it finds it `Stopped` at the dispatch flip and does not run it); a `Running`
+   or `Blocked` thread is marked `Pending`; a `Created`, `Stopped` or `Exited` one is left
+   alone.
+3. Wait, preemption disabled and interrupts enabled (spin site `hold:settle`), until no CPU's
+   `current` executes in the space, read under each CPU's scheduler lock in turn, and every thread
+   of the space has `context_saved` set, read in a registry walk. A pass that finds either unmet
+   first reads the caller under its `sched_lock`: a caller `Stopped`, `Exited` or marked
+   `Pending` abandons the hold.
+4. Store `Held` and return 0. An abandoned hold stores `Releasing`, runs the release walk below,
+   stores `Free`, and the caller leaves its CPU and returns `Interrupted`.
+
+**Diverts.** A `Pending` thread's next passage toward `Ready` commits `Stopped` instead and moves
+its mark to `Stopped`, linking it on no run queue:
+
+- the `Blocked` arm of `enqueue_and_wake`, through which every `Blocked → Ready` wake passes
+  ([scheduling-internals.md](scheduling-internals.md) § ThreadState Transitions). The waker has
+  deposited the outcome in the TCB before the call, as every waker does
+  ([sched-ipc-redesign.md](sched-ipc-redesign.md) § 2.1), and the syscall reads it when the
+  thread next runs, so nothing depends on the park's kind. The arm clears the park's binding and
+  releases the `wake_in_flight` pin, as the link arm does. A thread woken while still `current` in
+  its voluntary-block window leaves its CPU through the `schedule()` its park ends in, whose
+  requeue skips a `Stopped` thread;
+- `schedule()`'s requeue of a runnable outgoing `current` (a slice expiry, a preemption, a yield,
+  a refused park), decided before the cross-CPU affinity branch, so it links the thread nowhere.
+
+A `Pending` thread that parks keeps its mark: a park is no passage toward `Ready`.
+
+**Starts.** The start commit (`commit_state_under_all_locks` with `start`) decides by
+`hold::start_decision`: a thread marked `Stopped` is refused (`InvalidArgument`), since to its
+starter it is running; a `Created` or `Stopped` thread of a `Holding` or `Held` space is committed
+`Stopped` and marked `Stopped` (`StateCommit::Deferred`), once it is settled as for any start, and
+the syscall returns 0 without linking it; otherwise the commit is the usual one. A start during
+`Releasing` is not deferred, since the release walk may already have passed the thread. A suspended
+start commits `Stopped` with no mark. Every `Stopped` or `Exited` commit of the all-locks path
+(`sys_thread_stop`, an exit, a teardown) clears the mark, so a stop during the hold leaves the
+thread stopped after the release, and an end is final.
+
+**Release** (`release_space`):
+
+1. Compare-and-swap the space `Held → Releasing`; on failure return `InvalidState`.
+2. Walk the thread registry. For each thread of the space, under its `sched_lock`: one marked
+   `Stopped` is, when settled (`start_ready_to_link`: `current` on no CPU, its save published, no
+   wake owed), committed `Ready` under every CPU's scheduler lock with its `start_seq` advanced and
+   its mark cleared, then linked after the unlock by `enqueue_ready_thread` at that `start_seq`, as
+   `sys_thread_start` links a thread; one not yet settled is left for another pass. A `Pending`
+   mark is cleared, so the wake that ends the park links the thread as usual.
+3. While a pass left a thread unsettled, wait with interrupts enabled (spin site
+   `release:settle`) and walk again. Then store `Free` and return 0.
+
+**Invariants.**
+
+1. **Containment.** While the space is `Holding` or `Held`, no thread of it becomes `Ready` or
+   `current`, except that a thread `Running` when the walk visits it runs until it next leaves its
+   CPU. Once the hold returns, no thread of the space is `current`, and none becomes so before
+   the release: the walk stopped every `Ready` thread and marked every `Running` or `Blocked` one
+   under its `sched_lock`, the diverts link no marked thread, and every start is deferred.
+2. **No park cancelled.** The hold writes no park disposition and unlinks no waiter. The outcome
+   a wake deposits during the hold is the one the thread's syscall returns after the release.
+3. **Exact release.** The release starts exactly the threads marked `Stopped`. A thread a
+   `sys_thread_stop` stopped, before the hold or during it, stays `Stopped`; a `Pending` thread
+   whose wake has not come stays parked, unmarked.
+4. **Single owner.** A hold of a space not `Free` and a release of a space not `Held` are
+   refused, and only the call that moved the hold state stores the next one.
+5. **Terminal.** An `Exited` commit wins over every mark, and the release starts no `Exited`
+   thread.
+6. **Deferred starts.** A thread started during the hold runs only after the release.
+7. **Deadlines.** A timed park whose deadline passes during the hold is woken by the timer and
+   diverted; its syscall returns its expiry result (`WouldBlock` for a timed call) after the
+   release.
+
+**Progress.** The hold's wait needs each marked running thread to reach its next reschedule,
+which its CPU's timer brings within the latency [syscalls.md](syscalls.md) § `SYS_THREAD_STOP`
+(20) states, and each thread switching out to publish its save. A holder that is stopped, killed or
+marked would be waited for by its own stopper or holder, so it abandons: two threads holding each
+other's spaces mark each other `Pending`, and at least one of them abandons. The release's wait is
+the tail of a switch out (`context_saved`) or of a wake already claimed (`wake_in_flight`), which
+no other thread's progress gates.
+
+**Lock order.** The registry lock, then a thread's `sched_lock`, then every CPU's scheduler lock in
+ascending order, as the teardown walk takes them
+([scheduling-internals.md](scheduling-internals.md) § Lock Hierarchy, rules 3 and 4). The hold's
+wait takes each CPU's scheduler lock, and then the registry lock, one at a time.
 
 ---
 

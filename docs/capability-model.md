@@ -250,7 +250,8 @@ A capability to a process's virtual address space. Rights:
   their physical addresses); minted on init's kernel-created address space and,
   for an address space retyped later, only when its Memory cap carries `Phys`
 - **Control** — may register terminal-end death observers
-  (`aspace_bind_notification`); held by the space's creator and masked out of
+  (`aspace_bind_notification`) and hold and release the space's threads
+  (`SYS_ASPACE_HOLD`, `SYS_ASPACE_RELEASE`); held by the space's creator and masked out of
   copies handed to components that only map into the space
 
 The kernel holds implicit authority over all address spaces; this capability is

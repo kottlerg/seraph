@@ -1308,7 +1308,9 @@ pub struct ThreadControlBlock
     /// `THREAD_REGISTRY_LOCK`. Read by the softlockup watchdog, to enumerate
     /// `Blocked` waiters the per-CPU `current` dump cannot reach (#351), and by
     /// object teardown (`stop_threads_bound_to`), to find every thread bound to a
-    /// dying `CSpace` or `AddressSpace`. Never read on any scheduling hot path.
+    /// dying `CSpace` or `AddressSpace`, and by the address-space hold and
+    /// release, to find every thread of the held space. Never read on any
+    /// scheduling hot path.
     /// Owned by `THREAD_REGISTRY_LOCK` (the Registry row).
     pub registry_next: *mut ThreadControlBlock,
     /// Intrusive backward link; see [`registry_next`](Self::registry_next).

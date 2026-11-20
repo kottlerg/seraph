@@ -1327,6 +1327,11 @@ pub unsafe fn thread_configure_with_tls(
 ///
 /// The thread must have been configured via [`thread_configure`] first.
 ///
+/// A thread of a held address space (`SYS_ASPACE_HOLD`) is not started: the
+/// call returns `Ok` and the release starts it (`core/kernel/docs/syscalls.md`
+/// § `SYS_ASPACE_HOLD` (71)). A thread the hold stopped, not one a stop
+/// stopped, is refused with `InvalidArgument`.
+///
 /// A `Stopped` thread whose fault episode a stop cancelled before any reply
 /// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL` (or a
 /// `FAULT_REPLY_FORWARD` of a delivery other than a virtual-memory one, of one
@@ -2676,7 +2681,8 @@ pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 /// # Errors
 /// Returns a negative `i64` error code if the thread cap is invalid or lacks
 /// Control rights, or `-15` (`InvalidState`) if the thread is not yet
-/// started, already stopped, or exited.
+/// started, already stopped other than by an address-space hold (which a stop
+/// overrides, leaving it stopped), or exited.
 #[inline]
 pub fn thread_stop(thread_cap: u64) -> Result<(), i64>
 {

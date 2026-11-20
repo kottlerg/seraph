@@ -521,7 +521,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL`, at or below the growth floor ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
 | data[8] | `promised_bytes` — what the committed regions can still take from the free runs: their pages that hold no frame yet, and bounds on the page tables and metadata they can need ([`memory-pool.md`](memory-pool.md) § Commit) |
 | data[9] | `store_bytes` — subset of `pool_total_bytes` the compressed store holds: the stored pages of every evicted chunk ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
-| data[10] | `swapped_bytes` — the pages of every evicted chunk, in either tier (compressed in the store, being written, on disk, or lost), which their processes' budget nodes stay charged for |
+| data[10] | `swapped_bytes` — the pages of every evicted chunk, in either tier (compressed in the store, being written, on disk, or lost; a chunk held raw on its own frames for a swap slot counts once written), which their processes' budget nodes stay charged for |
 | data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
 | data[12] | `disk_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
 | data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 26) |
@@ -1156,28 +1156,31 @@ clamped to the slot map's window ([docs/limits.md](../../../docs/limits.md)
 
 #### Label 23: `SWAP_TAKE`
 
-Take the next compressed chunk for a swap slot, and write the slot's bytes into
-the swap service's buffer.
+Take the next compressed or raw chunk for a swap slot, and write the slot's
+bytes into the swap service's buffer.
 
 | Field | Value |
 |---|---|
 | label | 23 |
 | caps[0] | a Memory cap of at least `DEMAND_CHUNK_BYTES` with the write right: the swap service's buffer |
 
-memmgr walks its records' regions for a compressed chunk, a bounded number of
-steps a request (`TAKE_STEPS`, [docs/limits.md](../../../docs/limits.md)
-§ memmgr), from where the last walk stopped. It copies the chunk's stream into
-its own buffer, seals it there under its per-boot key and the next nonce,
-takes a slot and a disk node, and writes the slot's bytes, the sealed stream
-and its 16-byte tag, into the buffer from offset 0 through its own mapping of
-the cap. The chunk is writing until `SWAP_DONE`.
+memmgr walks its records' regions for a compressed or raw chunk
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction, States), a bounded
+number of steps a request (`TAKE_STEPS`,
+[docs/limits.md](../../../docs/limits.md) § memmgr), from where the last walk
+stopped. It copies the chunk's stream, or a raw chunk's backed pages in page
+order, into its own buffer, seals it there under its per-boot key and the next
+nonce, takes a slot and a disk node, and writes the slot's bytes into the
+buffer from offset 0 through its own mapping of the cap: the sealed stream and
+its 16-byte tag, or a raw chunk's sealed pages alone, whose tag memmgr keeps.
+The chunk is writing until `SWAP_DONE`.
 
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | `data[0]` the slot, `data[1]` its byte count, `data[2]` its slot word, the word a fault on the chunk is redirected with (§ Kernel-origin fault message) |
-| 3 | `QUOTA` | The arena or the slot map could not grow, or the chunk's store runs could not be mapped |
+| 3 | `QUOTA` | The arena or the slot map could not grow, or the chunk's store runs, or a raw chunk's runs, could not be mapped |
 | 4 | `INVALID_ARGUMENT` | No swap service is registered, or `caps[0]` missing, no Memory cap, smaller than a chunk, or not mappable writable |
-| 9 | `NOTHING_TO_TAKE` | The walk found no compressed chunk within its bound; the next request goes on from where it stopped |
+| 9 | `NOTHING_TO_TAKE` | The walk found no compressed or raw chunk within its bound; the next request goes on from where it stopped |
 | 10 | `SWAP_FULL` | Every registered slot is taken |
 
 #### Label 24: `SWAP_DONE`
@@ -1190,8 +1193,9 @@ End the write of a slot `SWAP_TAKE` named.
 | data[0] | the slot |
 | data[1] | `0` when the slot is written, nonzero when it is not |
 
-A written chunk is on disk, its store runs returned to the free pool; an
-unwritten one is compressed again on them, its slot freed. A write a restore or a
+A written chunk is on disk, its store runs, or a raw chunk's runs, returned to
+the free pool; an unwritten one is compressed, or raw, again on them, its slot
+freed. A write a restore or a
 teardown cancelled while it was in flight frees its slot either way.
 
 | Code | Name | Meaning |
@@ -1211,14 +1215,16 @@ service or ahead of one.
 | caps[0] | a Memory cap holding the slot's bytes from offset 0 |
 
 The slot word names one use of a slot: the slot, its byte count, and the
-generation of the seal it holds. A word whose slot holds no chunk on disk, or
+generation of the seal it holds (§ Kernel-origin fault message gives its
+layout). A word whose slot holds no chunk on disk, or
 holds one under another seal, was made for a use that has ended (the chunk
 restored by another fault or ahead of one, or torn down, and the slot taken
 again since): memmgr replies `RESTORE_STALE` and changes nothing, so a late
 or repeated request never reaches a chunk it was not made for. Two uses of a
 slot share a word only when `2^20` seals, or a multiple, came between them.
 Otherwise memmgr maps the cap read-only, copies the slot's bytes into its own
-buffer, and checks the tag there under the nonce of the chunk's last seal. A
+buffer, and checks the tag there under the nonce of the chunk's last seal, a
+raw chunk's against the tag memmgr kept. A
 good slot is restored as a fault restores a compressed chunk (§ Kernel-origin
 fault message), its slot and disk node freed. A tag failure makes the chunk
 lost and frees its slot.
@@ -1293,7 +1299,8 @@ of a user-mode access ([docs/fault-handling.md § Reply](../../../docs/fault-han
 Either way the fault takes the decline's outcome unless that handler resumes it, and memmgr waits on
 no handler it forwards to.
 
-A fault on a chunk memmgr is evicting maps the chunk's runs back and resumes; a
+A fault on a chunk memmgr is evicting, or holds raw on its own runs, maps the
+chunk's runs back and resumes, a raw chunk's write cancelled; a
 fault on a chunk it evicted restores the whole chunk from its compressed store
 before it resumes, declined with code 7 when the free pages outside
 `promised` and, for a process outside it, the system reserve do not cover the
@@ -1301,11 +1308,12 @@ chunk's backed pages (code 11 when the chunk is a committed region's and the
 draw finds no frame), and with code 9 when a map fails or, with detail 0, the
 stored chunk does not decode; the chunk then stays evicted
 ([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a writing
-chunk is restored from its store runs as a compressed chunk's, and its write
-cancelled. A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming
+compressed chunk is restored from its store runs as a compressed chunk's, and
+its write cancelled. A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming
 the registered swap service's endpoint, with data word 0 the slot word, which
 the endpoint receives as data word `FAULT_REDIRECT_WORD` (4): the slot in its
-low 28 bits, the slot's byte count in the next 16, and in the top 20 the low
+low 28 bits, the slot's byte count less one in the next 16 (1 to 65536 bytes,
+a full slot's), and in the top 20 the low
 bits of the nonce counter of the seal the slot holds
 (`free_pool::disk::slot_word`). The thread stays fault-blocked until the
 swap service, having handed memmgr the slot's bytes with the word (§ Label

@@ -16,6 +16,10 @@
 //! chunk whose every backed page is zero is the empty stream and takes none.
 //! A page is decoded by reading the stream in the same order, so the stream
 //! needs no index and no length.
+//!
+//! A raw chunk, whose stream gains nothing, is written to a swap slot as its
+//! backed pages alone, in page order ([`RawPages`]); a restore reads either
+//! through [`PageReader`].
 
 use crate::compress::{self, CodecError, HashTable, PAGE_BYTES};
 
@@ -96,6 +100,54 @@ pub const fn store_pages(len: usize) -> u64
     len.div_ceil(PAGE_BYTES) as u64
 }
 
+/// A source of a chunk's backed pages, read one at a time in page order, as a
+/// restore fills them.
+pub trait PageReader
+{
+    /// Write every byte of the next page into `page`.
+    ///
+    /// # Errors
+    /// [`CodecError::Malformed`] when the source cannot give the page whole;
+    /// `page` then holds a partial page.
+    fn next_page(&mut self, page: &mut [u8; PAGE_BYTES]) -> Result<(), CodecError>;
+}
+
+/// A reader over a raw chunk's bytes: its backed pages, whole and in page
+/// order, with nothing between them.
+pub struct RawPages<'a>
+{
+    bytes: &'a [u8],
+}
+
+impl<'a> RawPages<'a>
+{
+    /// A reader at the start of `bytes`.
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self
+    {
+        Self { bytes }
+    }
+}
+
+impl PageReader for RawPages<'_>
+{
+    /// Copy the next page's bytes into `page`.
+    ///
+    /// # Errors
+    /// [`CodecError::Malformed`] when fewer than a page's bytes are left;
+    /// `page` is then unchanged.
+    fn next_page(&mut self, page: &mut [u8; PAGE_BYTES]) -> Result<(), CodecError>
+    {
+        let (next, rest) = self
+            .bytes
+            .split_first_chunk::<PAGE_BYTES>()
+            .ok_or(CodecError::Malformed)?;
+        page.copy_from_slice(next);
+        self.bytes = rest;
+        Ok(())
+    }
+}
+
 /// A reader over one chunk's stream, which hands out its pages in the order
 /// [`encode_chunk`] wrote them.
 pub struct Decoder<'a>
@@ -114,14 +166,17 @@ impl<'a> Decoder<'a>
     {
         Self { stream, pos: 0 }
     }
+}
 
+impl PageReader for Decoder<'_>
+{
     /// Write every byte of the next page of the stream into `page`.
     ///
     /// # Errors
     /// [`CodecError::Malformed`] when the stream ends inside the page, its
     /// header is past [`RAW_PAGE`], or its compressed bytes are malformed
     /// ([`compress::decompress`]); `page` then holds a partial page.
-    pub fn next_page(&mut self, page: &mut [u8; PAGE_BYTES]) -> Result<(), CodecError>
+    fn next_page(&mut self, page: &mut [u8; PAGE_BYTES]) -> Result<(), CodecError>
     {
         if self.stream.is_empty()
         {
@@ -283,6 +338,28 @@ mod tests
         );
         assert_eq!(
             Decoder::new(&[3, 0, 0x10, 1, 0]).next_page(&mut p),
+            Err(CodecError::Malformed)
+        );
+    }
+
+    #[test]
+    fn raw_pages_hand_out_whole_pages_in_order_and_refuse_a_short_one()
+    {
+        let src = pages();
+        let mut tail: Vec<u8> = src[..3].iter().flatten().copied().collect();
+        tail.extend_from_slice(&[7; 10]);
+        let mut r = RawPages::new(&tail);
+        let mut p = [0u8; PAGE_BYTES];
+        for want in &src[..3]
+        {
+            r.next_page(&mut p).unwrap();
+            assert_eq!(&p, want);
+        }
+        // Ten bytes are left, short of a page: refused, the page unchanged.
+        assert_eq!(r.next_page(&mut p), Err(CodecError::Malformed));
+        assert_eq!(&p, &src[2]);
+        assert_eq!(
+            RawPages::new(&[]).next_page(&mut p),
             Err(CodecError::Malformed)
         );
     }

@@ -145,7 +145,8 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   compressed store holds, the stored pages of every evicted chunk.
 /// * `data[10]` — `swapped_bytes`: the pages of every evicted chunk, in
 ///   either tier (compressed in the store, being written, on disk, or
-///   lost), which their processes' budget nodes stay charged for.
+///   lost; a chunk held raw on its own frames for a swap slot counts once
+///   written), which their processes' budget nodes stay charged for.
 /// * `data[11]` — `growth_floor_bytes`: the free pages outside
 ///   `promised` a charge to a budget node outside the reserve may not take:
 ///   the system reserve and, while chunks are swapped, the restore headroom
@@ -447,7 +448,9 @@ pub const SWAP_REGISTER: u64 = 22;
 /// Swap authority only: take one evicted chunk for a swap slot. `caps[0]`
 /// is a Memory cap of at least [`DEMAND_CHUNK_BYTES`] memmgr writes the
 /// slot's bytes into (the chunk's stream, encrypted and authenticated under
-/// memmgr's per-boot key, and its tag). Reply: `SUCCESS` with `data[0]` the
+/// memmgr's per-boot key, and its tag, or a chunk held raw because its
+/// stream gained nothing, its backed pages sealed alone, memmgr keeping the
+/// tag). Reply: `SUCCESS` with `data[0]` the
 /// slot, `data[1]` its byte count and `data[2]` its slot word, the word a
 /// fault on the chunk is redirected with, or an error code; `caps[0]` moved
 /// back on every reply. Specified in `services/memmgr/docs/ipc-interface.md`

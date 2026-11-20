@@ -2698,7 +2698,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     }
     if matches!(
         path,
-        free_pool::FaultPath::CancelEvict | free_pool::FaultPath::RestoreFromStore
+        free_pool::FaultPath::Remap | free_pool::FaultPath::RestoreFromStore
     ) && let Err((reason, detail)) =
         evict::make_resident(l, rec, reg, &region, page_base, aspace_cap)
     {

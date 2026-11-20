@@ -109,7 +109,7 @@ const HOLE_PAGE: u64 = (HOLE_CHUNK + 1) * CHUNK_PAGES - 1;
 const NOEVICT_PAGES: u64 = 64;
 /// What each word of the main region is xored with: the word's byte offset
 /// in the region gives the word.
-const MAIN_XOR: u64 = 0x5eed_5eed_0000_0001;
+pub(super) const MAIN_XOR: u64 = 0x5eed_5eed_0000_0001;
 /// What each word of the no-evict region is xored with.
 const NOEVICT_XOR: u64 = 0x7a11_0ff0_1234_5678;
 /// What a thread's array words are xored with, multiplied by the thread's
@@ -519,7 +519,7 @@ impl Hog
     }
 
     /// Read the pool and act on it ([`step`]); the status read.
-    fn tick(&mut self) -> Pool
+    pub(super) fn tick(&mut self) -> Pool
     {
         let status = pool();
         self.step(&status);
@@ -645,13 +645,15 @@ pub(super) struct Fixture
 
 impl Fixture
 {
-    /// Spawn the fixture with a main region of `main_pages` pages, piped
-    /// stdin and stdout, and a thread that passes each line it prints on.
-    fn spawn(main_pages: u64) -> Self
+    /// Spawn the fixture with a main region of `main_pages` pages filled as
+    /// `fill` says, piped stdin and stdout, and a thread that passes each
+    /// line it prints on.
+    fn spawn(main_pages: u64, fill: Fill) -> Self
     {
         let mut child = Command::new("/tests/svctest")
             .arg(FIXTURE_ROLE)
             .arg(main_pages.to_string())
+            .arg(fill.token())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -1050,7 +1052,7 @@ fn swap_phase(caps: &Caps)
     let _ = settle_resident(authority, None);
     let baseline = baseline_totals();
     let reserve = pool().reserve_pages();
-    let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve));
+    let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
     let threads = attach(authority, process, "the fixture");
     let thread = *threads.first().expect("the attach returned a thread");
     read_before_hog(thread, &ready);
@@ -1143,13 +1145,13 @@ pub(super) fn main_pages(reserve: u64) -> u64
         .max(MAIN_PAGES_MIN)
 }
 
-/// Spawn the fixture with a main region of `main_pages` pages, wait for its
-/// ready line, and find its process badge as the one entry `LIST_PROCESSES`
-/// lists that it did not before the spawn.
-pub(super) fn start_fixture(authority: u64, main_pages: u64) -> (Fixture, Ready, u64)
+/// Spawn the fixture with a main region of `main_pages` pages filled as
+/// `fill` says, wait for its ready line, and find its process badge as the
+/// one entry `LIST_PROCESSES` lists that it did not before the spawn.
+pub(super) fn start_fixture(authority: u64, main_pages: u64, fill: Fill) -> (Fixture, Ready, u64)
 {
     let before = listed_badges(authority);
-    let mut fixture = Fixture::spawn(main_pages);
+    let mut fixture = Fixture::spawn(main_pages, fill);
     let line = fixture.line(None, "ready");
     let ready = parse_ready(&line);
     let new: Vec<u64> = listed_badges(authority)
@@ -1476,9 +1478,44 @@ pub(super) fn settle_resident(authority: u64, baseline: Option<u64>) -> u64
 
 // ── The fixture child ────────────────────────────────────────────────────────
 
-/// Write each word of the page at `va` of the region at `base` with its byte
-/// offset in the region xored with `xor`.
-fn fill_page(va: u64, base: u64, xor: u64)
+/// How the fixture fills its main region: the token of its `argv[3]`.
+#[derive(Clone, Copy)]
+pub(super) enum Fill
+{
+    /// Each page one word repeated ([`pattern`]), which compresses to a few
+    /// bytes.
+    Page,
+    /// Each word its own ([`noise`]), whose compressed stream gains nothing,
+    /// so memmgr holds an evicted chunk of it raw.
+    Noise,
+}
+
+impl Fill
+{
+    /// The fill's `argv[3]` token.
+    const fn token(self) -> &'static str
+    {
+        match self
+        {
+            Self::Page => "page",
+            Self::Noise => "noise",
+        }
+    }
+
+    /// The word at `at` of a region at `base` filled so, with `xor`.
+    pub(super) const fn word(self, at: u64, base: u64, xor: u64) -> u64
+    {
+        match self
+        {
+            Self::Page => pattern(at, base, xor),
+            Self::Noise => noise(at.saturating_sub(base) ^ xor),
+        }
+    }
+}
+
+/// Write each word of the page at `va` of the region at `base` as `fill`
+/// makes it with `xor`.
+fn fill_page(va: u64, base: u64, xor: u64, fill: Fill)
 {
     for word in 0..PAGE_WORDS
     {
@@ -1486,7 +1523,7 @@ fn fill_page(va: u64, base: u64, xor: u64)
         // SAFETY: the word is in a region this process registered writable,
         // in a reservation of its own that no Rust object occupies; the
         // write is volatile so that it is made, and faults, here.
-        unsafe { std::ptr::write_volatile(at as *mut u64, pattern(va, base, xor)) };
+        unsafe { std::ptr::write_volatile(at as *mut u64, fill.word(at, base, xor)) };
     }
 }
 
@@ -1499,15 +1536,25 @@ const fn pattern(va: u64, base: u64, xor: u64) -> u64
     (va & !(PAGE_SIZE - 1)).saturating_sub(base) ^ xor
 }
 
+/// `SplitMix64`'s output for `seed`: a word whose bits look random, a different
+/// one for each seed, so a page of them leaves a compressor nothing to gain.
+const fn noise(seed: u64) -> u64
+{
+    let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// Whether each word of the page at `va` reads as [`fill_page`] wrote it.
-fn page_intact(va: u64, base: u64, xor: u64) -> bool
+fn page_intact(va: u64, base: u64, xor: u64, fill: Fill) -> bool
 {
     (0..PAGE_WORDS).all(|word| {
         let at = va.saturating_add(word.saturating_mul(8));
         // SAFETY: as in [`fill_page`]; the read restores the page when memmgr
         // evicted it.
         let got = unsafe { std::ptr::read_volatile(at as *const u64) };
-        got == pattern(va, base, xor)
+        got == fill.word(at, base, xor)
     })
 }
 
@@ -1577,25 +1624,45 @@ fn fixture_noevict() -> (u64, u64)
     }
     for page in 0..NOEVICT_PAGES
     {
-        fill_page(page_va(noevict_base, page), noevict_base, NOEVICT_XOR);
+        fill_page(
+            page_va(noevict_base, page),
+            noevict_base,
+            NOEVICT_XOR,
+            Fill::Page,
+        );
     }
     (noevict_base, noevict_len)
 }
 
-/// Child role: register the main region and the no-evict region and fill
-/// them, start [`FIXTURE_THREADS`] threads, print `ready <region> <len> <hole>
+/// The fixture's main region's pages, `argv[2]`, and its fill, `argv[3]`.
+/// Exits [`FIXTURE_BAD_ARGUMENT`] when either is not one the fixture takes.
+fn fixture_args() -> (u64, Fill)
+{
+    let mut args = std::env::args().skip(2);
+    let main_pages = args
+        .next()
+        .and_then(|a| a.parse::<u64>().ok())
+        .filter(|&p| p > HOLE_PAGE && p % CHUNK_PAGES == 0);
+    let fill = match args.next().as_deref()
+    {
+        Some("page") => Some(Fill::Page),
+        Some("noise") => Some(Fill::Noise),
+        _ => None,
+    };
+    match (main_pages, fill)
+    {
+        (Some(pages), Some(fill)) => (pages, fill),
+        _ => exit(FIXTURE_BAD_ARGUMENT),
+    }
+}
+
+/// Child role: register the main region, which `argv[3]` fills ([`Fill`]),
+/// and the no-evict region and fill them, start [`FIXTURE_THREADS`] threads, print `ready <region> <len> <hole>
 /// <noevict> <len>` in hex, and serve `swapped`, `verify` and `exit` lines
 /// on stdin until one of `exit` or the end of the input, then exit 0.
 fn fixture_main() -> !
 {
-    let Some(main_pages) = std::env::args()
-        .nth(2)
-        .and_then(|a| a.parse::<u64>().ok())
-        .filter(|&p| p > HOLE_PAGE && p % CHUNK_PAGES == 0)
-    else
-    {
-        exit(FIXTURE_BAD_ARGUMENT);
-    };
+    let (main_pages, fill) = fixture_args();
     let Ok(region) = register_demand_paged(main_pages)
     else
     {
@@ -1606,7 +1673,7 @@ fn fixture_main() -> !
     {
         if page / CHUNK_PAGES != HOLE_CHUNK
         {
-            fill_page(page_va(base, page), base, MAIN_XOR);
+            fill_page(page_va(base, page), base, MAIN_XOR, fill);
         }
     }
     let (noevict_base, noevict_len) = fixture_noevict();
@@ -1658,7 +1725,7 @@ fn fixture_main() -> !
             "verify" =>
             {
                 VERIFY.store(true, Ordering::Release);
-                let verdict = fixture_verdict(base, main_pages, noevict_base);
+                let verdict = fixture_verdict(base, main_pages, noevict_base, fill);
                 for handle in threads.drain(..)
                 {
                     let _ = handle.join();
@@ -1682,7 +1749,7 @@ fn fixture_main() -> !
                 {
                     let ok = va >= base
                         && va < page_va(base, main_pages)
-                        && page_intact(va & !(PAGE_SIZE - 1), base, MAIN_XOR);
+                        && page_intact(va & !(PAGE_SIZE - 1), base, MAIN_XOR, fill);
                     println!("touched {}", if ok { "ok" } else { "bad" });
                 }
             }
@@ -1692,20 +1759,27 @@ fn fixture_main() -> !
     exit(0);
 }
 
-/// Read every page of both regions, the main one of `main_pages` pages, but
-/// the hole's chunk; the first that does not read as written, named.
-fn fixture_verdict(base: u64, main_pages: u64, noevict_base: u64) -> Option<String>
+/// Read every page of both regions, the main one of `main_pages` pages filled
+/// as `fill` says, but the hole's chunk; the first that does not read as
+/// written, named.
+fn fixture_verdict(base: u64, main_pages: u64, noevict_base: u64, fill: Fill) -> Option<String>
 {
     for page in 0..main_pages
     {
-        if page / CHUNK_PAGES != HOLE_CHUNK && !page_intact(page_va(base, page), base, MAIN_XOR)
+        if page / CHUNK_PAGES != HOLE_CHUNK
+            && !page_intact(page_va(base, page), base, MAIN_XOR, fill)
         {
             return Some(format!("main page {page}"));
         }
     }
     for page in 0..NOEVICT_PAGES
     {
-        if !page_intact(page_va(noevict_base, page), noevict_base, NOEVICT_XOR)
+        if !page_intact(
+            page_va(noevict_base, page),
+            noevict_base,
+            NOEVICT_XOR,
+            Fill::Page,
+        )
         {
             return Some(format!("noevict page {page}"));
         }

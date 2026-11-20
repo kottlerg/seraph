@@ -9,13 +9,14 @@
 //!
 //! An entry records which pages of its chunk hold data (the backed mask), the
 //! chunk's [`ChunkState`], a pin flag, a two-bit age, the job slot of an
-//! eviction in flight, and a link: the head of the list of runs that back the
-//! chunk while it is resident or evicting, the store handle of its
-//! compressed pages while it is compressed, the head of the list of store runs
-//! that hold its stream ([`crate::store`]), or its disk node
-//! ([`crate::arena::DiskNode`]) while the swap service writes or holds it.
-//! The tree's
-//! leaves are [`Node::Chunk`] slots and its directory nodes [`Node::ChunkDir`]
+//! eviction in flight, whether its pages are held raw, and a link: the head of
+//! the list of runs that back the chunk while it is resident or evicting, or
+//! hold it while it is raw, or the store handle of its compressed pages, the
+//! head of the list of store runs that hold its stream ([`crate::store`]),
+//! while it is compressed. While the swap service writes or holds the chunk,
+//! the entry also names its disk node ([`crate::arena::DiskNode`]), keeps the
+//! link until the write ends, and, for a raw chunk, keeps the tag of its seal.
+//! The tree's leaves are [`Node::Chunk`] slots and its directory nodes [`Node::ChunkDir`]
 //! slots of [`DIR_FANOUT`] children; the table's height is fixed by the
 //! region's chunk count ([`table_height`]), and a node exists only on the path
 //! to a chunk that has an entry, so an absent child stands for unbacked chunks
@@ -25,6 +26,7 @@
 //! `services/memmgr/docs/memory-pool.md` § Chunk table.
 
 use crate::arena::{Arena, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, SlotStore};
+use crate::disk::TAG_BYTES;
 use crate::{DEMAND_CHUNK_PAGES, FreeRun};
 
 /// Children of a directory node: as many slot indices as fill the largest
@@ -65,12 +67,18 @@ pub enum ChunkState
     /// The pages the backed mask names are held compressed under the entry's
     /// store handle, and no run backs the chunk.
     Compressed,
-    /// Compressed, and the swap service is writing the chunk's sealed stream to a
-    /// swap slot: the entry names the disk node, which holds the store handle
-    /// until the write ends.
+    /// The pages did not compress below the pages they take, and a swap slot
+    /// was free: the runs on the entry's run list hold them, unmapped, until
+    /// the swap service takes them for a slot; a fault on the chunk maps the
+    /// same runs again.
+    Raw,
+    /// Compressed or raw, and the swap service is writing the chunk's sealed
+    /// bytes to the swap slot of the entry's disk node: the entry keeps its
+    /// store handle, or its runs, until the write ends.
     Writing,
     /// The chunk's pages are held only in the swap slot the entry's disk node
-    /// names; a fault on the chunk is redirected to the swap service.
+    /// names, and, for a raw chunk, the entry's tag; a fault on the chunk is
+    /// redirected to the swap service.
     OnDisk,
     /// The chunk's bytes read back from its swap slot failed authentication:
     /// its pages are gone, and every fault on it is declined.
@@ -90,6 +98,11 @@ pub enum ChunkError
     Window,
 }
 
+/// The tag of a raw chunk's seal: its pages fill a swap slot, so the tag a
+/// compressed chunk's slot holds after its stream is kept on the entry
+/// instead ([`crate::disk::seal_detached`]).
+pub type SealTag = [u8; TAG_BYTES];
+
 /// One chunk's entry in its region's chunk table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkEntry
@@ -103,11 +116,23 @@ pub struct ChunkEntry
     /// The job slot of the eviction in flight while evicting
     /// ([`Self::begin_evict`]), 0 otherwise.
     job: u8,
-    /// The head of the run list while resident or evicting, the store handle
-    /// while compressed, the disk node while writing or on disk, [`NODE_NULL`]
-    /// while unbacked or lost.
+    /// Whether the chunk's pages are held raw, from [`Self::finish_raw`]
+    /// until it is resident again or lost.
+    raw: bool,
+    /// The head of the run list while resident, evicting or raw, and while a
+    /// raw chunk is writing; the store handle while compressed, and while a
+    /// compressed chunk is writing; [`NODE_NULL`] while unbacked, on disk or
+    /// lost.
     link: u64,
+    /// The disk node while writing or on disk, [`NODE_NULL`] otherwise.
+    disk: NodeIdx,
+    /// The tag of a raw chunk's seal while it is writing or on disk, zero
+    /// otherwise.
+    tag: SealTag,
 }
+
+// Hard size budget: a leaf shares the arena slot with every other payload.
+const _: () = assert!(size_of::<ChunkEntry>() <= size_of::<ProcessRecord>());
 
 impl ChunkEntry
 {
@@ -119,7 +144,10 @@ impl ChunkEntry
         pinned: false,
         age: 0,
         job: 0,
+        raw: false,
         link: NODE_NULL,
+        disk: NODE_NULL,
+        tag: [0; TAG_BYTES],
     };
 
     /// The chunk's state.
@@ -143,18 +171,27 @@ impl ChunkEntry
         self.pinned
     }
 
+    /// Whether the chunk's pages are held raw: raw, or writing or on disk
+    /// after it was raw ([`ChunkState::Raw`]).
+    #[must_use]
+    pub const fn is_raw(&self) -> bool
+    {
+        self.raw
+    }
+
     /// The head of the chunk's run list, linked through the runs' slot `next`
-    /// links: its runs while it is resident or evicting, [`NODE_NULL`]
-    /// otherwise.
+    /// links: its runs while it is resident, evicting or raw, and while a raw
+    /// chunk is writing, [`NODE_NULL`] otherwise.
     #[must_use]
     pub const fn runs(&self) -> NodeIdx
     {
         match self.state
         {
-            ChunkState::Resident | ChunkState::Evicting => self.link,
+            ChunkState::Resident | ChunkState::Evicting | ChunkState::Raw => self.link,
+            ChunkState::Writing if self.raw => self.link,
             ChunkState::Unbacked
-            | ChunkState::Compressed
             | ChunkState::Writing
+            | ChunkState::Compressed
             | ChunkState::OnDisk
             | ChunkState::Lost => NODE_NULL,
         }
@@ -170,23 +207,27 @@ impl ChunkEntry
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::OnDisk
             | ChunkState::Lost => None,
         }
     }
 
-    /// The store handle of the chunk's compressed pages, while it is compressed:
-    /// the head of its store-run list, [`NODE_NULL`] for the empty stream.
+    /// The store handle of the chunk's compressed pages, while it is
+    /// compressed, or writing after it was compressed: the head of its
+    /// store-run list, [`NODE_NULL`] for the empty stream.
     #[must_use]
     pub const fn store(&self) -> Option<u64>
     {
         match self.state
         {
             ChunkState::Compressed => Some(self.link),
+            ChunkState::Writing if !self.raw => Some(self.link),
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Evicting
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::OnDisk
             | ChunkState::Lost => None,
@@ -199,24 +240,45 @@ impl ChunkEntry
     {
         match self.state
         {
-            ChunkState::Writing | ChunkState::OnDisk => Some(self.link),
+            ChunkState::Writing | ChunkState::OnDisk => Some(self.disk),
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Evicting
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Lost => None,
         }
     }
 
-    /// Whether the chunk's pages are evicted, held in the store, in a swap
-    /// slot, or lost: no run backs it, and its budget node stays charged for
-    /// its pages.
+    /// The tag of a raw chunk's seal, while it is writing or on disk.
+    #[must_use]
+    pub const fn tag(&self) -> Option<SealTag>
+    {
+        match self.state
+        {
+            ChunkState::Writing | ChunkState::OnDisk if self.raw => Some(self.tag),
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Evicting
+            | ChunkState::Compressed
+            | ChunkState::Raw
+            | ChunkState::Writing
+            | ChunkState::OnDisk
+            | ChunkState::Lost => None,
+        }
+    }
+
+    /// Whether the chunk's pages are evicted, held raw, in the store, in a
+    /// swap slot, or lost: no run maps them in the process. Its budget node
+    /// stays charged for its pages, a raw chunk's through the runs it keeps
+    /// until its write ends.
     #[must_use]
     pub const fn is_evicted(&self) -> bool
     {
         match self.state
         {
             ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::OnDisk
             | ChunkState::Lost => true,
@@ -294,6 +356,7 @@ impl ChunkEntry
             {}
             ChunkState::Evicting
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::OnDisk
             | ChunkState::Lost => return Err(ChunkError::State),
@@ -333,6 +396,7 @@ impl ChunkEntry
             ChunkState::Unbacked
             | ChunkState::Evicting
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::OnDisk
             | ChunkState::Lost => Err(ChunkError::State),
@@ -357,6 +421,7 @@ impl ChunkEntry
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::OnDisk
             | ChunkState::Lost => Err(ChunkError::State),
@@ -382,15 +447,42 @@ impl ChunkEntry
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::OnDisk
             | ChunkState::Lost => Err(ChunkError::State),
         }
     }
 
-    /// A compressed, writing or on-disk chunk's pages were restored into the
-    /// runs from `runs`: it is resident with the same mask, and its store
-    /// handle or disk node is gone, so the caller settles them first
+    /// An evicting chunk's pages gain nothing compressed and wait raw for a
+    /// swap slot: its runs stay on the entry, unmapped.
+    ///
+    /// # Errors
+    /// [`ChunkError::State`] for a chunk that is not evicting.
+    pub fn finish_raw(self) -> Result<Self, ChunkError>
+    {
+        match self.state
+        {
+            ChunkState::Evicting => Ok(Self {
+                state: ChunkState::Raw,
+                job: 0,
+                raw: true,
+                ..self
+            }),
+            ChunkState::Unbacked
+            | ChunkState::Resident
+            | ChunkState::Compressed
+            | ChunkState::Raw
+            | ChunkState::Writing
+            | ChunkState::OnDisk
+            | ChunkState::Lost => Err(ChunkError::State),
+        }
+    }
+
+    /// A compressed, raw, writing or on-disk chunk is resident on the runs from
+    /// `runs`, with the same mask: its pages restored into fresh runs, or, for
+    /// a raw chunk not yet on disk, its own runs mapped back. Its store handle,
+    /// disk node and tag are gone, so the caller settles them first
     /// ([`Self::store`], [`Self::disk`]).
     ///
     /// # Errors
@@ -399,12 +491,18 @@ impl ChunkEntry
     {
         match self.state
         {
-            ChunkState::Compressed | ChunkState::Writing | ChunkState::OnDisk => Ok(Self {
-                state: ChunkState::Resident,
-                age: 0,
-                link: runs,
-                ..self
-            }),
+            ChunkState::Compressed | ChunkState::Raw | ChunkState::Writing | ChunkState::OnDisk =>
+            {
+                Ok(Self {
+                    state: ChunkState::Resident,
+                    age: 0,
+                    raw: false,
+                    link: runs,
+                    disk: NODE_NULL,
+                    tag: [0; TAG_BYTES],
+                    ..self
+                })
+            }
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Evicting
@@ -412,32 +510,34 @@ impl ChunkEntry
         }
     }
 
-    /// The swap service takes a compressed chunk's sealed stream for the slot of
-    /// the disk node `disk`, which holds the chunk's store handle from now
-    /// on: the chunk is writing.
+    /// The swap service takes a compressed or raw chunk's sealed bytes for the
+    /// slot of the disk node `disk`: the chunk is writing, its store handle or
+    /// its runs kept on the entry until the write ends. `tag` is the tag of a
+    /// raw chunk's seal, which the slot has no room for, and `None` for a
+    /// compressed chunk, whose slot holds it.
     ///
     /// # Errors
-    /// [`ChunkError::State`] for a chunk that is not compressed.
-    pub fn begin_write(self, disk: NodeIdx) -> Result<Self, ChunkError>
+    /// [`ChunkError::State`] for a chunk that is neither compressed nor raw,
+    /// or given a tag that does not match it.
+    pub fn begin_write(self, disk: NodeIdx, tag: Option<SealTag>) -> Result<Self, ChunkError>
     {
-        match self.state
+        let tag = match (self.state, tag)
         {
-            ChunkState::Compressed => Ok(Self {
-                state: ChunkState::Writing,
-                link: disk,
-                ..self
-            }),
-            ChunkState::Unbacked
-            | ChunkState::Resident
-            | ChunkState::Evicting
-            | ChunkState::Writing
-            | ChunkState::OnDisk
-            | ChunkState::Lost => Err(ChunkError::State),
-        }
+            (ChunkState::Compressed, None) => [0; TAG_BYTES],
+            (ChunkState::Raw, Some(tag)) => tag,
+            _ => return Err(ChunkError::State),
+        };
+        Ok(Self {
+            state: ChunkState::Writing,
+            disk,
+            tag,
+            ..self
+        })
     }
 
     /// The swap service wrote a writing chunk's slot: the chunk is on disk,
-    /// under the same disk node, whose store handle the caller frees.
+    /// under the same disk node, and its store handle or runs are gone, so the
+    /// caller takes them ([`Self::store`], [`Self::runs`]) first.
     ///
     /// # Errors
     /// [`ChunkError::State`] for a chunk that is not writing.
@@ -447,35 +547,46 @@ impl ChunkEntry
         {
             ChunkState::Writing => Ok(Self {
                 state: ChunkState::OnDisk,
+                link: NODE_NULL,
                 ..self
             }),
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Evicting
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::OnDisk
             | ChunkState::Lost => Err(ChunkError::State),
         }
     }
 
     /// A writing chunk's write failed or was abandoned: the chunk is compressed
-    /// again under `store`, the store handle its disk node held.
+    /// again on its store, or raw again on its runs, and its disk node is gone.
     ///
     /// # Errors
     /// [`ChunkError::State`] for a chunk that is not writing.
-    pub fn cancel_write(self, store: u64) -> Result<Self, ChunkError>
+    pub fn cancel_write(self) -> Result<Self, ChunkError>
     {
         match self.state
         {
             ChunkState::Writing => Ok(Self {
-                state: ChunkState::Compressed,
-                link: store,
+                state: if self.raw
+                {
+                    ChunkState::Raw
+                }
+                else
+                {
+                    ChunkState::Compressed
+                },
+                disk: NODE_NULL,
+                tag: [0; TAG_BYTES],
                 ..self
             }),
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Evicting
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::OnDisk
             | ChunkState::Lost => Err(ChunkError::State),
         }
@@ -492,13 +603,17 @@ impl ChunkEntry
         {
             ChunkState::OnDisk => Ok(Self {
                 state: ChunkState::Lost,
+                raw: false,
                 link: NODE_NULL,
+                disk: NODE_NULL,
+                tag: [0; TAG_BYTES],
                 ..self
             }),
             ChunkState::Unbacked
             | ChunkState::Resident
             | ChunkState::Evicting
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::Lost => Err(ChunkError::State),
         }
@@ -549,6 +664,7 @@ impl ChunkEntry
             ChunkState::Unbacked
             | ChunkState::Evicting
             | ChunkState::Compressed
+            | ChunkState::Raw
             | ChunkState::Writing
             | ChunkState::OnDisk
             | ChunkState::Lost => self,
@@ -830,8 +946,8 @@ pub fn release<S: SlotStore>(
     }
 }
 
-/// Hand each run on the run list of `entry` (a resident or evicting chunk's;
-/// none for another) to `take` with its slot, which `take` takes over.
+/// Hand each run on the run list of `entry` (a resident, evicting or raw
+/// chunk's, or a raw chunk's while it is writing; none for another) to `take` with its slot, which `take` takes over.
 pub fn take_runs<S: SlotStore>(
     arena: &mut Arena<S>,
     entry: ChunkEntry,
@@ -847,8 +963,8 @@ pub fn take_runs<S: SlotStore>(
     }
 }
 
-/// Hand each store run on the store-run list of `entry` (a compressed chunk's;
-/// none for another) to `take` with its slot, which `take` takes over.
+/// Hand each store run on the store-run list of `entry` (a compressed chunk's,
+/// or a compressed chunk's while it is writing; none for another) to `take` with its slot, which `take` takes over.
 pub fn take_store<S: SlotStore>(
     arena: &mut Arena<S>,
     entry: ChunkEntry,
@@ -1742,15 +1858,26 @@ mod tests
             .unwrap()
             .finish_evict(0xABC)
             .unwrap();
-        let writing = compressed.begin_write(0x55).unwrap();
+        let writing = compressed.begin_write(0x55, None).unwrap();
+        // The entry keeps the store until the write ends.
         assert_eq!(
-            (writing.state(), writing.disk(), writing.store()),
-            (ChunkState::Writing, Some(0x55), None)
+            (
+                writing.state(),
+                writing.disk(),
+                writing.store(),
+                writing.tag()
+            ),
+            (ChunkState::Writing, Some(0x55), Some(0xABC), None)
         );
         let on_disk = writing.finish_write().unwrap();
         assert_eq!(
-            (on_disk.state(), on_disk.disk(), on_disk.backed()),
-            (ChunkState::OnDisk, Some(0x55), 0xFFFF)
+            (
+                on_disk.state(),
+                on_disk.disk(),
+                on_disk.backed(),
+                on_disk.store()
+            ),
+            (ChunkState::OnDisk, Some(0x55), 0xFFFF, None)
         );
         assert!(writing.is_evicted() && on_disk.is_evicted());
         for from in [writing, on_disk]
@@ -1762,7 +1889,7 @@ mod tests
             );
         }
         // An abandoned write leaves the chunk compressed on the store it had.
-        let again = writing.cancel_write(0xABC).unwrap();
+        let again = writing.cancel_write().unwrap();
         assert_eq!(again, compressed);
     }
 
@@ -1774,7 +1901,7 @@ mod tests
             .unwrap()
             .finish_evict(0xABC)
             .unwrap()
-            .begin_write(0x55)
+            .begin_write(0x55, None)
             .unwrap()
             .finish_write()
             .unwrap();
@@ -1787,7 +1914,11 @@ mod tests
         assert_eq!(lost.restore(1), Err(ChunkError::State));
         assert_eq!(lost.back(0, 1, 1), Err(ChunkError::State));
         assert_eq!(lost.lose(), Err(ChunkError::State));
-        assert_eq!(lost.begin_write(1), Err(ChunkError::State));
+        assert_eq!(lost.begin_write(1, None), Err(ChunkError::State));
+        assert_eq!(
+            lost.begin_write(1, Some([1; TAG_BYTES])),
+            Err(ChunkError::State)
+        );
         assert_eq!(lost.sweep(0), lost);
     }
 
@@ -1800,13 +1931,19 @@ mod tests
             .unwrap()
             .finish_evict(0xABC)
             .unwrap();
-        let writing = compressed.begin_write(0x55).unwrap();
+        let writing = compressed.begin_write(0x55, None).unwrap();
         let on_disk = writing.finish_write().unwrap();
-        assert_eq!(resident.begin_write(1), Err(ChunkError::State));
-        assert_eq!(writing.begin_write(1), Err(ChunkError::State));
+        assert_eq!(resident.begin_write(1, None), Err(ChunkError::State));
+        assert_eq!(writing.begin_write(1, None), Err(ChunkError::State));
+        // A compressed chunk's slot holds its tag; a tag offered for one is
+        // refused.
+        assert_eq!(
+            compressed.begin_write(1, Some([1; TAG_BYTES])),
+            Err(ChunkError::State)
+        );
         assert_eq!(compressed.finish_write(), Err(ChunkError::State));
         assert_eq!(on_disk.finish_write(), Err(ChunkError::State));
-        assert_eq!(on_disk.cancel_write(1), Err(ChunkError::State));
+        assert_eq!(on_disk.cancel_write(), Err(ChunkError::State));
         assert_eq!(writing.lose(), Err(ChunkError::State));
         // A chunk on the swap tier is neither backed nor evicted again, and a
         // sweep leaves it as it is.
@@ -1817,5 +1954,140 @@ mod tests
             assert_eq!(e.sweep(0), e);
             assert!(!e.is_idle(0));
         }
+    }
+    /// A resident chunk of the pages from `first`, evicted raw.
+    fn raw(first: u32, pages: u32) -> ChunkEntry
+    {
+        resident(first, pages)
+            .begin_evict(2)
+            .unwrap()
+            .finish_raw()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_raw_chunk_keeps_its_runs_through_its_write_and_is_restored_from_any_state()
+    {
+        let raw = raw(0, 16);
+        assert_eq!(
+            (
+                raw.state(),
+                raw.runs(),
+                raw.store(),
+                raw.job(),
+                raw.is_raw()
+            ),
+            (ChunkState::Raw, 7, None, None, true)
+        );
+        assert!(raw.is_evicted());
+        let tag = [0x5A; TAG_BYTES];
+        // A raw chunk's slot has no room for its tag, so it needs one.
+        assert_eq!(raw.begin_write(0x55, None), Err(ChunkError::State));
+        let writing = raw.begin_write(0x55, Some(tag)).unwrap();
+        assert_eq!(
+            (
+                writing.state(),
+                writing.runs(),
+                writing.store(),
+                writing.disk(),
+                writing.tag()
+            ),
+            (ChunkState::Writing, 7, None, Some(0x55), Some(tag))
+        );
+        let on_disk = writing.finish_write().unwrap();
+        assert_eq!(
+            (
+                on_disk.runs(),
+                on_disk.disk(),
+                on_disk.tag(),
+                on_disk.is_raw()
+            ),
+            (NODE_NULL, Some(0x55), Some(tag), true)
+        );
+        // Raw or writing, a fault maps the chunk's own runs back; on disk, its
+        // pages are restored into fresh ones. Each leaves a plain resident chunk.
+        for (from, runs) in [(raw, 7), (writing, 7), (on_disk, 11)]
+        {
+            let back = from.restore(runs).unwrap();
+            assert_eq!(
+                (back.state(), back.backed(), back.runs(), back.age()),
+                (ChunkState::Resident, 0xFFFF, runs, 0)
+            );
+            assert_eq!(
+                (back.is_raw(), back.disk(), back.tag(), back.store()),
+                (false, None, None, None)
+            );
+            back.begin_evict(0).unwrap();
+        }
+        // An abandoned write leaves the chunk raw on its runs, as it was.
+        assert_eq!(writing.cancel_write(), Ok(raw));
+        // A lost raw chunk is plain lost.
+        let lost = on_disk.lose().unwrap();
+        assert_eq!(
+            (lost.is_raw(), lost.tag(), lost.disk()),
+            (false, None, None)
+        );
+    }
+
+    #[test]
+    fn a_raw_chunk_refuses_every_transition_but_its_write_and_its_restore()
+    {
+        let raw = raw(3, 2);
+        assert_eq!(resident(0, 1).finish_raw(), Err(ChunkError::State));
+        assert_eq!(raw.finish_raw(), Err(ChunkError::State));
+        assert_eq!(raw.back(0, 1, 1), Err(ChunkError::State));
+        assert_eq!(raw.begin_evict(1), Err(ChunkError::State));
+        assert_eq!(raw.cancel_evict(), Err(ChunkError::State));
+        assert_eq!(raw.finish_evict(1), Err(ChunkError::State));
+        assert_eq!(raw.finish_write(), Err(ChunkError::State));
+        assert_eq!(raw.cancel_write(), Err(ChunkError::State));
+        assert_eq!(raw.lose(), Err(ChunkError::State));
+        assert_eq!(raw.sweep(0), raw);
+        assert!(!raw.is_idle(0));
+        // A compressed chunk is never made raw.
+        let compressed = resident(0, 1)
+            .begin_evict(1)
+            .unwrap()
+            .finish_evict(1)
+            .unwrap();
+        assert_eq!(compressed.finish_raw(), Err(ChunkError::State));
+    }
+
+    #[test]
+    fn take_runs_hands_over_a_raw_chunks_runs_until_it_is_written()
+    {
+        let mut a = arena();
+        let frame = |cap_slot| {
+            Node::Frame(FrameDesc {
+                cap_slot,
+                page_count: 1,
+                phys_base: cap_slot * 0x1000,
+                va: 0,
+                region_id: NO_REGION_ID,
+            })
+        };
+        let second = a.alloc(frame(2), NODE_NULL).unwrap();
+        let first = a.alloc(frame(1), second).unwrap();
+        let raw = ChunkEntry::UNBACKED
+            .back(0, 2, first)
+            .unwrap()
+            .begin_evict(0)
+            .unwrap()
+            .finish_raw()
+            .unwrap();
+        let writing = raw.begin_write(9, Some([0; TAG_BYTES])).unwrap();
+        for e in [raw, writing]
+        {
+            let mut seen = Vec::new();
+            take_runs(&mut a, e, |_, _, f| seen.push(f.cap_slot));
+            assert_eq!(seen, [1, 2]);
+            // Its runs are no store.
+            take_store(&mut a, e, |_, _, _| {
+                panic!("a raw chunk's runs taken as a store")
+            });
+        }
+        let mut seen = 0;
+        take_runs(&mut a, writing.finish_write().unwrap(), |_, _, _| seen += 1);
+        assert_eq!(seen, 0);
     }
 }

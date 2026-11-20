@@ -8,12 +8,14 @@
 //! chunk's stream into a slot's bytes, and what a fault on a chunk of each state
 //! needs.
 //!
-//! A swap slot holds one chunk: its stream ([`crate::store`]), encrypted and
-//! authenticated with ChaCha20-Poly1305 under memmgr's per-boot key, followed by
-//! the tag. The nonce is a per-boot counter memmgr never repeats under the key,
-//! recorded on the chunk's disk node, so the bytes of a slot open only as the
-//! seal memmgr last made for the chunk that holds it: another chunk's bytes, an
-//! older seal of the same chunk, or any change fail the tag.
+//! A swap slot holds one chunk, encrypted and authenticated with
+//! ChaCha20-Poly1305 under memmgr's per-boot key: a compressed chunk's stream
+//! ([`crate::store`]) followed by the tag, or a raw chunk's backed pages in page
+//! order, which can fill the slot, so its tag is kept on the chunk's entry
+//! ([`seal_detached`]). The nonce is a per-boot counter memmgr never repeats
+//! under the key, recorded on the chunk's disk node, so the bytes of a slot open
+//! only as the seal memmgr last made for the chunk that holds it: another
+//! chunk's bytes, an older seal of the same chunk, or any change fail the tag.
 //!
 //! [`SwapSlots`] maps each taken slot to the disk node of its chunk, so a
 //! request naming a slot finds the chunk, and keeps the free slots on a list
@@ -27,7 +29,7 @@ use syscall_abi::PAGE_SIZE;
 
 use crate::CHUNK_BYTES;
 use crate::arena::NodeIdx;
-use crate::chunk::{ChunkEntry, ChunkState};
+use crate::chunk::{ChunkEntry, ChunkState, SealTag};
 use crate::index::WordStore;
 
 /// Bytes of memmgr's per-boot key.
@@ -323,11 +325,67 @@ pub fn open(
     Ok(len)
 }
 
+/// Seal a raw chunk's pages, the first `len` bytes of `buf`, in place under
+/// `key` with the nonce of `counter`. The pages can fill a slot, which then
+/// has no room for the tag, so the slot's bytes are the `len` sealed bytes
+/// alone and the tag is returned, for memmgr to keep on the chunk's entry
+/// ([`crate::chunk::ChunkEntry::tag`]).
+///
+/// # Errors
+/// [`SlotError::Size`] when `len` is 0 or past `buf` or a slot; `buf` is
+/// then unchanged.
+pub fn seal_detached(
+    key: &[u8; KEY_BYTES],
+    counter: u64,
+    buf: &mut [u8],
+    len: usize,
+) -> Result<SealTag, SlotError>
+{
+    if len == 0 || u64::try_from(len).map_or(true, |l| l > SLOT_BYTES)
+    {
+        return Err(SlotError::Size);
+    }
+    let bytes = buf.get_mut(..len).ok_or(SlotError::Size)?;
+    chacha20poly1305::seal(key, &nonce(counter), &[], bytes).map_err(|_| SlotError::Size)
+}
+
+/// Open a raw chunk's slot bytes, the first `len` bytes of `buf`, in place:
+/// check `tag`, the tag [`seal_detached`] returned, under `key` and the
+/// nonce of `counter`, and only on a match decrypt them.
+///
+/// # Errors
+/// [`SlotError::Size`] when `len` is 0 or past `buf` or a slot, and
+/// [`SlotError::Tampered`] when the tag does not verify; the bytes are then
+/// unchanged.
+pub fn open_detached(
+    key: &[u8; KEY_BYTES],
+    counter: u64,
+    buf: &mut [u8],
+    len: usize,
+    tag: &SealTag,
+) -> Result<(), SlotError>
+{
+    if len == 0 || u64::try_from(len).map_or(true, |l| l > SLOT_BYTES)
+    {
+        return Err(SlotError::Size);
+    }
+    let bytes = buf.get_mut(..len).ok_or(SlotError::Size)?;
+    chacha20poly1305::open(key, &nonce(counter), &[], bytes, tag).map_err(|_| SlotError::Tampered)
+}
+
 /// Bits of a slot word's slot: [`WORD_SLOTS`] slots.
 const SLOT_BITS: u32 = 28;
 
-/// Bits of a slot word's byte count.
+/// Bits of a slot word's length field, which holds the byte count less one
+/// ([`len_field`]).
 const LEN_BITS: u32 = 16;
+
+/// The length field's mask.
+const LEN_MASK: u64 = (1 << LEN_BITS) - 1;
+
+// Hard size budget: the length field names every byte count from 1 to a full
+// slot's, the bytes of a raw chunk of every page backed.
+const _: () = assert!(1 << LEN_BITS == SLOT_BYTES);
 
 /// Bits of a slot word's generation: the low bits of the nonce counter of the
 /// seal the slot holds.
@@ -338,9 +396,31 @@ const _: () = assert!(SLOT_BITS + LEN_BITS + GENERATION_BITS == 64);
 /// The slots a slot word can name.
 pub const WORD_SLOTS: u64 = 1 << SLOT_BITS;
 
+/// The length field of a slot word naming `len` bytes: `len` less one, so the
+/// field's 16 bits name every count from 1 byte to a full slot's 65536. A
+/// slot's bytes are never none: a compressed chunk's hold at least its tag,
+/// and a raw chunk's at least a page. A count of 0, or past a slot, names no
+/// slot's bytes, and has no field of its own.
+#[must_use]
+pub const fn len_field(len: u32) -> u64
+{
+    (len.saturating_sub(1) as u64) & LEN_MASK
+}
+
+/// The byte count the slot word length field `field` names: the field plus
+/// one ([`len_field`]).
+#[must_use]
+pub fn field_len(field: u64) -> u32
+{
+    // The mask keeps 16 bits, and one more is at most 65536, which a `u32`
+    // holds.
+    u32::try_from((field & LEN_MASK).saturating_add(1)).unwrap_or(u32::MAX)
+}
+
 /// The word naming slot `slot` while it holds the seal numbered `counter`,
-/// of `len` bytes: the slot in its low 28 bits, the byte count in the next
-/// 16, and the counter's low [`GENERATION_BITS`] bits above them. A fault
+/// of `len` bytes, 1 to a slot's: the slot in its low 28 bits, the length
+/// field, the byte count less one ([`len_field`]), in the next 16, and the
+/// counter's low [`GENERATION_BITS`] bits above them. A fault
 /// redirected to the swap service carries it (`FAULT_REDIRECT_WORD`), as
 /// `SWAP_TAKE`'s reply does, and `SWAP_RESTORE` names it back, so a request
 /// made for one use of a slot is told from one made for a later use: the slot
@@ -348,10 +428,10 @@ pub const WORD_SLOTS: u64 = 1 << SLOT_BITS;
 /// slot share a word only when `2^GENERATION_BITS` seals, or a multiple,
 /// came between them.
 #[must_use]
-pub const fn slot_word(slot: u32, len: u16, counter: u64) -> u64
+pub const fn slot_word(slot: u32, len: u32, counter: u64) -> u64
 {
     (counter << (SLOT_BITS + LEN_BITS))
-        | ((len as u64) << SLOT_BITS)
+        | (len_field(len) << SLOT_BITS)
         | (slot as u64 & (WORD_SLOTS - 1))
 }
 
@@ -363,12 +443,11 @@ pub fn word_slot(word: u64) -> u32
     u32::try_from(word & (WORD_SLOTS - 1)).unwrap_or(u32::MAX)
 }
 
-/// The byte count a slot word names.
+/// The byte count a slot word names, from its length field ([`field_len`]).
 #[must_use]
-pub fn word_len(word: u64) -> u16
+pub fn word_len(word: u64) -> u32
 {
-    // The mask keeps 16 bits, which a `u16` holds.
-    u16::try_from((word >> SLOT_BITS) & ((1 << LEN_BITS) - 1)).unwrap_or(u16::MAX)
+    field_len(word >> SLOT_BITS)
 }
 
 /// What a fault on a chunk of a demand region needs before the page can be
@@ -380,10 +459,11 @@ pub enum FaultPath
     /// Nothing: the chunk is resident or unbacked, and the page is backed as
     /// any demand fault's.
     Back,
-    /// The evicting chunk's runs mapped back.
-    CancelEvict,
-    /// The chunk restored from the store: compressed, or writing, whose store
-    /// runs are kept until its write ends.
+    /// The chunk's own runs mapped back: an evicting chunk's, or a raw chunk's
+    /// before or while its write.
+    Remap,
+    /// The chunk restored from the store: compressed, or writing after it was
+    /// compressed, whose store runs are kept until its write ends.
     RestoreFromStore,
     /// The fault redirected to the swap service, which reads the slot and
     /// hands memmgr its bytes (`SWAP_RESTORE`).
@@ -402,7 +482,8 @@ pub const fn fault_path(entry: &ChunkEntry, registered: Registered) -> FaultPath
     match entry.state()
     {
         ChunkState::Unbacked | ChunkState::Resident => FaultPath::Back,
-        ChunkState::Evicting => FaultPath::CancelEvict,
+        ChunkState::Evicting | ChunkState::Raw => FaultPath::Remap,
+        ChunkState::Writing if entry.is_raw() => FaultPath::Remap,
         ChunkState::Compressed | ChunkState::Writing => FaultPath::RestoreFromStore,
         ChunkState::OnDisk => match registered
         {
@@ -441,7 +522,7 @@ pub const fn resident_path(entry: &ChunkEntry, wants: Registered) -> ResidentPat
     match entry.state()
     {
         ChunkState::Unbacked | ChunkState::Resident => ResidentPath::Skip,
-        ChunkState::Evicting | ChunkState::Compressed | ChunkState::Writing =>
+        ChunkState::Evicting | ChunkState::Compressed | ChunkState::Raw | ChunkState::Writing =>
         {
             ResidentPath::Restore
         }
@@ -749,10 +830,14 @@ mod tests
     {
         let word = slot_word(5, 4112, 9);
         assert_eq!((word_slot(word), word_len(word)), (5, 4112));
-        // The last slot and the longest count round-trip.
+        // The last slot and a full slot's count round-trip, as does the
+        // shortest count.
         let top = u32::try_from(WORD_SLOTS - 1).unwrap();
-        let word_top = slot_word(top, u16::MAX, u64::MAX);
-        assert_eq!((word_slot(word_top), word_len(word_top)), (top, u16::MAX));
+        let full = u32::try_from(SLOT_BYTES).unwrap();
+        let word_top = slot_word(top, full, u64::MAX);
+        assert_eq!((word_slot(word_top), word_len(word_top)), (top, full));
+        assert_eq!(word_len(slot_word(0, 1, 0)), 1);
+        assert_ne!(slot_word(5, full, 9), slot_word(5, 1, 9));
         // Another seal of the same slot and length is another word, until the
         // generation wraps.
         assert_ne!(slot_word(5, 4112, 10), word);
@@ -761,19 +846,101 @@ mod tests
         assert_ne!(slot_word(6, 4112, 9), word);
     }
 
+    // Defect guarded: a field holding the count itself cannot name a full
+    // slot's 65536 bytes, a raw chunk's of every page, in 16 bits.
+    #[test]
+    fn the_length_field_holds_the_count_less_one_from_one_byte_to_a_full_slot()
+    {
+        let full = u32::try_from(SLOT_BYTES).unwrap();
+        assert_eq!((len_field(1), field_len(0)), (0, 1));
+        assert_eq!((len_field(full), field_len(LEN_MASK)), (LEN_MASK, full));
+        for len in [1, 2, 16, 4096, 4112, full - 1, full]
+        {
+            assert_eq!(field_len(len_field(len)), len, "{len}");
+        }
+        // The field keeps to its bits, whatever lies above them in a word.
+        assert_eq!(field_len(LEN_MASK + 1), 1);
+    }
+
+    #[test]
+    fn a_raw_chunks_pages_seal_to_a_full_slot_with_the_tag_apart()
+    {
+        let pages: Vec<u8> = (0..slot())
+            .map(|i| (i.wrapping_mul(7919) >> 3).to_le_bytes()[0])
+            .collect();
+        let mut buf = pages.clone();
+        let tag = seal_detached(&KEY, 4, &mut buf, slot()).unwrap();
+        assert_ne!(buf, pages);
+        let sealed = buf.clone();
+        // Another nonce, another tag, or a flipped byte fails and changes
+        // nothing.
+        let mut other = sealed.clone();
+        assert_eq!(
+            open_detached(&KEY, 5, &mut other, slot(), &tag),
+            Err(SlotError::Tampered)
+        );
+        let mut bad_tag = tag;
+        bad_tag[0] ^= 1;
+        assert_eq!(
+            open_detached(&KEY, 4, &mut other, slot(), &bad_tag),
+            Err(SlotError::Tampered)
+        );
+        other[slot() - 1] ^= 1;
+        assert_eq!(
+            open_detached(&KEY, 4, &mut other, slot(), &tag),
+            Err(SlotError::Tampered)
+        );
+        assert_eq!(&other[..slot() - 1], &sealed[..slot() - 1]);
+        let mut good = sealed.clone();
+        assert_eq!(open_detached(&KEY, 4, &mut good, slot(), &tag), Ok(()));
+        assert_eq!(good, pages);
+        // No bytes, or more than a slot, is refused unchanged.
+        let mut big = vec![1u8; slot() + 1];
+        assert_eq!(seal_detached(&KEY, 1, &mut big, 0), Err(SlotError::Size));
+        assert_eq!(
+            seal_detached(&KEY, 1, &mut big, slot() + 1),
+            Err(SlotError::Size)
+        );
+        assert_eq!(
+            seal_detached(&KEY, 1, &mut good, slot() + 1),
+            Err(SlotError::Size)
+        );
+        assert_eq!(big, vec![1u8; slot() + 1]);
+        assert_eq!(
+            open_detached(&KEY, 4, &mut big, slot() + 1, &tag),
+            Err(SlotError::Size)
+        );
+    }
+
     #[test]
     fn a_fault_redirects_an_on_disk_chunk_only_while_a_swap_service_is_registered()
     {
         let resident = ChunkEntry::UNBACKED.back(0, 4, 7).unwrap();
         let evicting = resident.begin_evict(1).unwrap();
         let compressed = evicting.finish_evict(9).unwrap();
-        let writing = compressed.begin_write(5).unwrap();
+        let writing = compressed.begin_write(5, None).unwrap();
         let on_disk = writing.finish_write().unwrap();
         let lost = on_disk.lose().unwrap();
+        let raw = ChunkEntry::UNBACKED
+            .back(0, 4, 8)
+            .unwrap()
+            .begin_evict(1)
+            .unwrap()
+            .finish_raw()
+            .unwrap();
+        let raw_writing = raw.begin_write(6, Some([3; TAG_BYTES])).unwrap();
+        let raw_on_disk = raw_writing.finish_write().unwrap();
         for (entry, yes, no) in [
             (ChunkEntry::UNBACKED, FaultPath::Back, FaultPath::Back),
             (resident, FaultPath::Back, FaultPath::Back),
-            (evicting, FaultPath::CancelEvict, FaultPath::CancelEvict),
+            (evicting, FaultPath::Remap, FaultPath::Remap),
+            (raw, FaultPath::Remap, FaultPath::Remap),
+            (raw_writing, FaultPath::Remap, FaultPath::Remap),
+            (
+                raw_on_disk,
+                FaultPath::Redirect,
+                FaultPath::DeclineUnregistered,
+            ),
             (
                 compressed,
                 FaultPath::RestoreFromStore,
@@ -798,16 +965,28 @@ mod tests
         let resident = ChunkEntry::UNBACKED.back(0, 4, 7).unwrap();
         let evicting = resident.begin_evict(1).unwrap();
         let compressed = evicting.finish_evict(9).unwrap();
-        let writing = compressed.begin_write(5).unwrap();
+        let writing = compressed.begin_write(5, None).unwrap();
         let on_disk = writing.finish_write().unwrap();
         let lost = on_disk.lose().unwrap();
+        let raw = ChunkEntry::UNBACKED
+            .back(0, 4, 8)
+            .unwrap()
+            .begin_evict(1)
+            .unwrap()
+            .finish_raw()
+            .unwrap();
+        let raw_writing = raw.begin_write(6, Some([3; TAG_BYTES])).unwrap();
+        let raw_on_disk = raw_writing.finish_write().unwrap();
         for (entry, yes, no) in [
             (ChunkEntry::UNBACKED, ResidentPath::Skip, ResidentPath::Skip),
             (resident, ResidentPath::Skip, ResidentPath::Skip),
             (evicting, ResidentPath::Restore, ResidentPath::Restore),
             (compressed, ResidentPath::Restore, ResidentPath::Restore),
             (writing, ResidentPath::Restore, ResidentPath::Restore),
+            (raw, ResidentPath::Restore, ResidentPath::Restore),
+            (raw_writing, ResidentPath::Restore, ResidentPath::Restore),
             (on_disk, ResidentPath::Want, ResidentPath::PassOver),
+            (raw_on_disk, ResidentPath::Want, ResidentPath::PassOver),
             (lost, ResidentPath::PassOver, ResidentPath::PassOver),
         ]
         {

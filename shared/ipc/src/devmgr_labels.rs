@@ -244,21 +244,30 @@ pub const QUERY_ACPI_TABLE: u64 = 7;
 /// when `data[0]` is not `DEVMGR_LABELS_VERSION`.
 pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
-/// Serve acpid the `IoPort` of one fixed ACPI register block the FADT
+/// Serve acpid the capability over one fixed ACPI register block the FADT
 /// declares, or the SCI's `Interrupt` (x86-64).
 ///
 /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
 /// `data[1]` = the block ([`ACPI_PM1A_EVT`], [`ACPI_PM1A_CNT`],
-/// [`ACPI_GPE0`], [`ACPI_SMI_CMD`], [`ACPI_RESET`], or [`ACPI_SCI`]).
+/// [`ACPI_GPE0`], [`ACPI_SMI_CMD`], [`ACPI_RESET`],
+/// [`ACPI_SLEEP_CONTROL`], [`ACPI_SLEEP_STATUS`], or [`ACPI_SCI`]).
 /// Caller's badge MUST carry [`ACPI_AUTHORITY`]; the handler replies
 /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
 ///
 /// Reply ([`super::devmgr_errors::SUCCESS`]) for a register block:
 /// `caps[0]` = a narrow `IoPort` over the block, derived from devmgr's
-/// full-rights `IoPort` on every call; `data[0]` = its first port;
-/// `data[1]` = its port count; `data[2]` = the FADT's `ACPI_ENABLE` value
-/// for [`ACPI_SMI_CMD`], its `RESET_VALUE` for [`ACPI_RESET`], and 0 for
-/// the others. For [`ACPI_SCI`]: `caps[0]` = an `Interrupt` cap carrying
+/// full-rights `IoPort` on every call, or, for a sleep register in the
+/// memory space, an `Mmio` over the page that holds it, a derivation of
+/// the grant of that page devmgr keeps for acpid, as [`ACPI_REGION_GRANT`]
+/// keeps it; `data[0]` = its first port, or the register's physical
+/// address; `data[1]` = its port or byte count; `data[2]` = the FADT's
+/// `ACPI_ENABLE` value for [`ACPI_SMI_CMD`], its `RESET_VALUE` for
+/// [`ACPI_RESET`], and 0 for the others; `data[3]` = its space,
+/// [`ACPI_SPACE_IO`], or [`ACPI_SPACE_MEMORY`] for a sleep register in
+/// the memory space. The sleep registers, served only for a FADT that sets
+/// `HW_REDUCED_ACPI`, are checked as [`ACPI_REGION_GRANT`] checks a
+/// range, and a register a holder overlaps is refused, logged, with
+/// [`super::devmgr_errors::REFUSED`]. For [`ACPI_SCI`]: `caps[0]` = an `Interrupt` cap carrying
 /// `RIGHTS_IRQ_NOTIFY` on the SCI's line, a derivation of the line devmgr
 /// holds for the boot, made on every call; `data[0]` = the line's GSI;
 /// `data[1]` = the `SYS_IRQ_REGISTER` mode it is routed in; `data[2]` =
@@ -266,9 +275,13 @@ pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 /// restarted acpid), else 0. Replies [`super::devmgr_errors::NO_DEVICE`]
 /// when the platform has no such block or SCI (every one on RISC-V, a
 /// zero FADT field, a `RESET_REG` outside the I/O space, a
-/// hardware-reduced FADT), the FADT cannot be read, or the carve or the
-/// derivation fails, and [`super::devmgr_errors::INVALID_REQUEST`] for an
-/// unknown block.
+/// hardware-reduced FADT for the fixed blocks and the SCI, a FADT that is
+/// not hardware-reduced or names no usable 8-bit register for the sleep
+/// registers), the FADT cannot be read, or the carve or the derivation
+/// fails, and [`super::devmgr_errors::INVALID_REQUEST`] for an unknown
+/// block. The SCI and the sleep registers are answered on devmgr's
+/// control thread, the other blocks on the registry worker that receives
+/// the request.
 pub const QUERY_ACPI_RESOURCES: u64 = 24;
 /// [`QUERY_ACPI_RESOURCES`] block: `PM1a_EVT_BLK`, `PM1_EVT_LEN` ports.
 pub const ACPI_PM1A_EVT: u64 = 1;
@@ -283,6 +296,12 @@ pub const ACPI_SMI_CMD: u64 = 4;
 pub const ACPI_RESET: u64 = 5;
 /// [`QUERY_ACPI_RESOURCES`] resource: the SCI, the FADT's `SCI_INT` line.
 pub const ACPI_SCI: u64 = 6;
+/// [`QUERY_ACPI_RESOURCES`] block: the FADT's `SLEEP_CONTROL_REG`, one
+/// byte in the memory or the I/O space, on a hardware-reduced platform.
+pub const ACPI_SLEEP_CONTROL: u64 = 7;
+/// [`QUERY_ACPI_RESOURCES`] block: the FADT's `SLEEP_STATUS_REG`, one
+/// byte in the memory or the I/O space, on a hardware-reduced platform.
+pub const ACPI_SLEEP_STATUS: u64 = 8;
 
 /// Grant acpid part of an operation region it evaluated: a `SystemIO`
 /// range, or the `SystemMemory` page an access reaches, that no device

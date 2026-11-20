@@ -20,8 +20,9 @@
 #     before pwrmgr because of this seed.
 # Each architecture deletes the seed it does not use. devmgr is the hardware
 # authority and acpid holds the ACPI registers; on x86-64 pwrmgr also holds a
-# Use-only PM1a_CNT port block derived from acpid's QUERY_SLEEP, for its
-# core-death power-off.
+# derivation from acpid's QUERY_SLEEP of its capability over PM1a_CNT, or
+# over SLEEP_CONTROL_REG on a hardware-reduced platform, for its core-death
+# power-off.
 #
 # `restart = on_failure`: svcmgr re-creates pwrmgr from /services/pwrmgr and
 # re-serves a fresh RECV on the persistent endpoint, so a SHUTDOWN_AUTHORITY

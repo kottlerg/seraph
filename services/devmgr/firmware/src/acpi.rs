@@ -4,7 +4,8 @@
 // services/devmgr/firmware/src/acpi.rs
 
 //! Narrow ACPI walk: RSDP → XSDT → MCFG, FADT (`PM1a_CNT_BLK`, `CENTURY`,
-//! the DSDT, the fixed register blocks acpid is served, and the FACS), and
+//! the DSDT, the fixed register blocks acpid is served, the sleep control
+//! and status registers of a hardware-reduced FADT, and the FACS), and
 //! MADT (its Interrupt Source Overrides and I/O APICs).
 //!
 //! Operates on byte-slice views of ACPI tables — the caller is responsible
@@ -79,8 +80,23 @@ const FADT_OFF_SCI_INT: usize = 46;
 /// FADT `Flags` bit `HW_REDUCED_ACPI`: the platform implements no fixed
 /// hardware, the SCI among it.
 const FADT_FLAG_HW_REDUCED_ACPI: u32 = 1 << 20;
+/// Generic Address Structure space ID of the memory space.
+const GAS_SPACE_MEMORY: u8 = 0;
 /// Generic Address Structure space ID of the I/O space.
 const GAS_SPACE_IO: u8 = 1;
+/// Generic Address Structure access size of a byte access; 0 is the
+/// undefined access size, which leaves the access to the register's width.
+const GAS_ACCESS_BYTE: u8 = 1;
+/// FADT `SLEEP_CONTROL_REG` (ACPI 6.5 § 5.2.9): a 12-byte Generic Address
+/// Structure, used on a hardware-reduced platform.
+const FADT_OFF_SLEEP_CONTROL_REG: usize = 244;
+/// FADT `SLEEP_STATUS_REG`: a 12-byte Generic Address Structure, used on a
+/// hardware-reduced platform.
+const FADT_OFF_SLEEP_STATUS_REG: usize = 256;
+/// The bytes of a Generic Address Structure.
+const GAS_LEN: usize = 12;
+/// The ports past the last I/O port.
+const IO_PORT_END: u64 = 0x1_0000;
 /// The bytes of the FACS that hold its fields up to the reserved tail: the
 /// length ACPI 6.5 § 5.2.10 requires at least.
 pub const FACS_MIN_LEN: u64 = 64;
@@ -268,9 +284,11 @@ pub struct IoBlock
 ///
 /// Returns `None` if the signature isn't `FACP`, the table (bounded by its
 /// reported length and the slice) does not reach the fields, the port is
-/// zero or past 0xFFFF, the block's length is zero or runs past 0xFFFF, or,
-/// for [`FadtBlock::Reset`], `RESET_REG_SUP` is clear or the register is
-/// not in the I/O space.
+/// zero or past 0xFFFF, the block's length is zero or runs past 0xFFFF, the
+/// FADT sets `HW_REDUCED_ACPI` and `block` is not [`FadtBlock::Reset`]
+/// (OSPM ignores the fixed-hardware fields then, ACPI 6.5 § 5.2.9), or, for
+/// [`FadtBlock::Reset`], `RESET_REG_SUP` is clear or the register is not in
+/// the I/O space.
 #[must_use]
 pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
 {
@@ -286,6 +304,11 @@ pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
             .get(off..off.checked_add(4)?)
             .map(|_| read_u32(table, off))
     };
+    if block != FadtBlock::Reset
+        && dword(FADT_OFF_FLAGS).is_some_and(|flags| flags & FADT_FLAG_HW_REDUCED_ACPI != 0)
+    {
+        return None;
+    }
     let (port, count, value) = match block
     {
         FadtBlock::Pm1aEvt => (
@@ -331,6 +354,77 @@ pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
         .checked_sub(1)
         .and_then(|last| port.checked_add(last))?;
     Some(IoBlock { port, count, value })
+}
+
+/// One of the two registers a hardware-reduced platform enters a sleep state
+/// through (ACPI 6.5 § 4.8.3.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SleepRegister
+{
+    /// `SLEEP_CONTROL_REG`: `SLP_TYPx` and `SLP_EN` are written to it.
+    Control,
+    /// `SLEEP_STATUS_REG`: `WAK_STS` is cleared in it.
+    Status,
+}
+
+/// Where a [`SleepRegister`] lies: its space and its address, a port in the
+/// I/O space or a physical address in the memory space. The register is one
+/// byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixedRegister
+{
+    pub space: crate::acpid::Space,
+    pub address: u64,
+}
+
+/// Read where the FADT places `register` (ACPI 6.5 § 5.2.9 and § 4.8.3.7).
+///
+/// Returns `None` if the signature isn't `FACP`, the table (bounded by its
+/// reported length and the slice) does not reach the register's Generic
+/// Address Structure or `Flags`, `HW_REDUCED_ACPI` is clear (the field is
+/// used only on a hardware-reduced platform), or the structure is not the
+/// 8-bit register the specification defines: a space other than memory or
+/// I/O, a bit width other than 8, a non-zero bit offset, an access size other
+/// than undefined or byte, a zero address, or a port past 0xFFFF.
+#[must_use]
+pub fn fadt_sleep_register(fadt_bytes: &[u8], register: SleepRegister) -> Option<FixedRegister>
+{
+    if sdt_signature(fadt_bytes) != *b"FACP"
+    {
+        return None;
+    }
+    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
+    let table = fadt_bytes.get(..total_len)?;
+    let flags = table
+        .get(FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4)
+        .map(|_| read_u32(table, FADT_OFF_FLAGS))?;
+    if flags & FADT_FLAG_HW_REDUCED_ACPI == 0
+    {
+        return None;
+    }
+    let off = match register
+    {
+        SleepRegister::Control => FADT_OFF_SLEEP_CONTROL_REG,
+        SleepRegister::Status => FADT_OFF_SLEEP_STATUS_REG,
+    };
+    let gas = table.get(off..)?.first_chunk::<GAS_LEN>()?;
+    let &[space_id, bit_width, bit_offset, access, ..] = gas;
+    let space = match space_id
+    {
+        GAS_SPACE_MEMORY => crate::acpid::Space::Memory,
+        GAS_SPACE_IO => crate::acpid::Space::Io,
+        _ => return None,
+    };
+    if bit_width != 8 || bit_offset != 0 || !(access == 0 || access == GAS_ACCESS_BYTE)
+    {
+        return None;
+    }
+    let address = read_u64(gas, 4);
+    if address == 0 || (space == crate::acpid::Space::Io && address >= IO_PORT_END)
+    {
+        return None;
+    }
+    Some(FixedRegister { space, address })
 }
 
 /// Read the physical address of the FACS from the FADT: `X_FIRMWARE_CTRL`
@@ -1522,6 +1616,135 @@ mod tests
         assert_eq!(sci_gsi([], 9), 9);
         assert_eq!(line_mode([], 9), PCI_INTX_MODE);
         assert_eq!(sci_gsi([over(9, 20, 0)], 0x109), 0x109);
+    }
+
+    /// A hardware-reduced FADT of 276 bytes whose `SLEEP_CONTROL_REG` and
+    /// `SLEEP_STATUS_REG` are the 8-bit registers of `space` at `control`
+    /// and `status`. Its fixed blocks and `SMI_CMD` are left as q35's, as
+    /// stale fields a hardware-reduced platform's OSPM ignores.
+    fn reduced_fadt(space: u8, control: u64, status: u64) -> Vec<u8>
+    {
+        let mut b = fadt(276, 0x604);
+        b[FADT_OFF_PM1A_EVT_BLK..FADT_OFF_PM1A_EVT_BLK + 4]
+            .copy_from_slice(&0x600u32.to_le_bytes());
+        b[FADT_OFF_GPE0_BLK..FADT_OFF_GPE0_BLK + 4].copy_from_slice(&0x620u32.to_le_bytes());
+        b[FADT_OFF_SMI_CMD..FADT_OFF_SMI_CMD + 4].copy_from_slice(&0xB2u32.to_le_bytes());
+        b[FADT_OFF_PM1_EVT_LEN] = 4;
+        b[FADT_OFF_PM1_CNT_LEN] = 2;
+        b[FADT_OFF_GPE0_BLK_LEN] = 16;
+        b[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4]
+            .copy_from_slice(&FADT_FLAG_HW_REDUCED_ACPI.to_le_bytes());
+        for (off, address) in [
+            (FADT_OFF_SLEEP_CONTROL_REG, control),
+            (FADT_OFF_SLEEP_STATUS_REG, status),
+        ]
+        {
+            b[off] = space;
+            b[off + 1] = 8;
+            b[off + 4..off + 12].copy_from_slice(&address.to_le_bytes());
+        }
+        b
+    }
+
+    // Defect caught: a sleep register read from the wrong offset, in the
+    // wrong space, or a hardware-reduced FADT served the legacy blocks.
+    #[test]
+    fn a_hardware_reduced_fadt_gives_its_sleep_registers_in_either_space()
+    {
+        use crate::acpid::Space;
+        let reg = |space, address| Some(FixedRegister { space, address });
+        let t = reduced_fadt(GAS_SPACE_MEMORY, 0xFEA0_0200, 0xFEA0_0201);
+        assert_eq!(
+            fadt_sleep_register(&t, SleepRegister::Control),
+            reg(Space::Memory, 0xFEA0_0200)
+        );
+        assert_eq!(
+            fadt_sleep_register(&t, SleepRegister::Status),
+            reg(Space::Memory, 0xFEA0_0201)
+        );
+        for block in [
+            FadtBlock::Pm1aEvt,
+            FadtBlock::Pm1aCnt,
+            FadtBlock::Gpe0,
+            FadtBlock::SmiCmd,
+        ]
+        {
+            assert_eq!(fadt_io_block(&t, block), None, "{block:?}");
+        }
+        assert_eq!(fadt_sci_int(&t), None);
+        // The same fields serve the blocks once the flag is clear, so the
+        // refusals above are the flag's.
+        let mut legacy = t.clone();
+        legacy[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(fadt_io_block(&legacy, FadtBlock::Pm1aCnt).is_some());
+        assert!(fadt_io_block(&legacy, FadtBlock::SmiCmd).is_some());
+        let t = reduced_fadt(GAS_SPACE_IO, 0x404, 0x405);
+        assert_eq!(
+            fadt_sleep_register(&t, SleepRegister::Control),
+            reg(Space::Io, 0x404)
+        );
+        assert_eq!(
+            fadt_sleep_register(&t, SleepRegister::Status),
+            reg(Space::Io, 0x405)
+        );
+        // The byte access size is accepted as the undefined one is.
+        let mut t = reduced_fadt(GAS_SPACE_IO, 0x404, 0x405);
+        t[FADT_OFF_SLEEP_CONTROL_REG + 3] = GAS_ACCESS_BYTE;
+        assert_eq!(
+            fadt_sleep_register(&t, SleepRegister::Control),
+            reg(Space::Io, 0x404)
+        );
+    }
+
+    // Defect caught: a sleep register served from a FADT that is not
+    // hardware-reduced, from a field the table does not reach, or one that is
+    // not the specification's 8-bit register.
+    #[test]
+    fn a_sleep_register_is_withheld_unless_reduced_reached_and_well_formed()
+    {
+        let control = |t: &[u8]| fadt_sleep_register(t, SleepRegister::Control);
+        let good = reduced_fadt(GAS_SPACE_MEMORY, 0xFEA0_0200, 0xFEA0_0201);
+        assert!(control(&good).is_some());
+        // HW_REDUCED_ACPI clear: q35's FADT, and the reduced one with the flag
+        // cleared.
+        assert_eq!(control(&q35_fadt(0)), None);
+        let mut t = good.clone();
+        t[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(control(&t), None);
+        // The reported length, or the slice, stops inside the structure; an
+        // ACPI 5.0 FADT of 268 bytes still reaches both.
+        let mut t = good.clone();
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&250u32.to_le_bytes());
+        assert_eq!(control(&t), None);
+        assert_eq!(control(&good[..250]), None);
+        let mut t = good.clone();
+        t[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&268u32.to_le_bytes());
+        assert!(control(&t).is_some());
+        assert!(fadt_sleep_register(&t, SleepRegister::Status).is_some());
+        // Each malformed field of the structure.
+        let field = |off: usize, v: u8| {
+            let mut t = good.clone();
+            t[FADT_OFF_SLEEP_CONTROL_REG + off] = v;
+            control(&t)
+        };
+        assert_eq!(field(0, 2), None, "PCI configuration space");
+        assert_eq!(field(1, 16), None, "a 16-bit register");
+        assert_eq!(field(1, 0), None, "no bit width");
+        assert_eq!(field(2, 1), None, "a bit offset");
+        assert_eq!(field(3, 2), None, "a word access");
+        assert_eq!(
+            control(&reduced_fadt(GAS_SPACE_MEMORY, 0, 0xFEA0_0201)),
+            None,
+            "a zero address"
+        );
+        assert_eq!(
+            control(&reduced_fadt(GAS_SPACE_IO, 0x1_0000, 0x405)),
+            None,
+            "a port past 0xFFFF"
+        );
+        let mut t = good;
+        t[..4].copy_from_slice(b"APIC");
+        assert_eq!(control(&t), None);
     }
 
     #[test]

@@ -20,7 +20,9 @@
 //! coming free ends such a refusal. memmgr signals a change of level on the
 //! Notification the std runtime registers for every process, but memory can
 //! come free below `CRITICAL` with no change of level, so svcmgr also retries
-//! on a timer while the level reads below.
+//! on a timer while the level reads below. memmgr also signals an opening of
+//! its draw room there, on a bit of its own, which svcmgr takes and leaves to
+//! the timer ([`Wake::signal`]).
 //!
 //! The states of one service's restart, and the events that move it:
 //!
@@ -78,14 +80,38 @@ pub enum CreateFailure
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Wake
 {
-    /// A signal of the pressure Notification: the level changed, or memmgr's
-    /// draw room opened, which write-out to swap brings about as it frees
-    /// pages; svcmgr reads the level at either.
+    /// A signal of the pressure Notification that carries the bit of a change
+    /// of level ([`Wake::signal`]); svcmgr reads the level at it.
     Signal,
     /// The retry deadline has passed ([`MemoryWaits::poll_timer`] returned
     /// [`Timer::Due`]), whatever woke the main loop; an expiry of its wait
     /// alone is not this wake.
     Timer,
+}
+
+impl Wake
+{
+    /// The wake a take of the pressure Notification makes, `bits` being what
+    /// the take returned and `level_bit` the bit memmgr sends on a change of
+    /// level (`std::os::seraph::MEMORY_PRESSURE_BIT`): [`Wake::Signal`] when
+    /// `bits` holds it, `None` otherwise. A take with only the bit of an
+    /// opening of memmgr's draw room retries nothing: the hysteresis band
+    /// spaces the changes of level, while nothing spaces the openings, so a
+    /// draw room that a waiting create's partial grants close and its teardown
+    /// reopens would retry the create at once, uncounted, at each opening.
+    /// Memory come free with no change of level is the timer's.
+    #[must_use]
+    pub const fn signal(bits: u64, level_bit: u64) -> Option<Self>
+    {
+        if bits & level_bit != 0
+        {
+            Some(Self::Signal)
+        }
+        else
+        {
+            None
+        }
+    }
 }
 
 /// A retry of every waiting restart that a [`Wake`] makes due.
@@ -94,7 +120,7 @@ pub struct Retry
 {
     /// Whether the timer made it; only a timed retry counts against
     /// [`MEMORY_RETRY_LIMIT`], since signals are bounded by memmgr's changes
-    /// of level and openings of its draw room.
+    /// of level.
     pub timed: bool,
 }
 
@@ -369,6 +395,21 @@ mod tests
         assert_eq!(at(Some(PRESSURE_CRITICAL)).wake(Wake::Signal), None);
         assert_eq!(at(Some(PRESSURE_LOW)).wake(Wake::Signal), Some(SIGNAL));
         assert_eq!(at(Some(PRESSURE_NORMAL)).wake(Wake::Signal), Some(SIGNAL));
+    }
+
+    // Waiting: only a take carrying the level's bit is a signal; one with only
+    // another bit (an opening of memmgr's draw room) is left to the timer, so
+    // the retries a signal makes uncounted stay bounded by the changes of
+    // level.
+    #[test]
+    fn only_the_level_bit_is_a_signal()
+    {
+        const LEVEL: u64 = 1;
+        const DRAW_ROOM: u64 = 2;
+        assert_eq!(Wake::signal(LEVEL, LEVEL), Some(Wake::Signal));
+        assert_eq!(Wake::signal(LEVEL | DRAW_ROOM, LEVEL), Some(Wake::Signal));
+        assert_eq!(Wake::signal(DRAW_ROOM, LEVEL), None);
+        assert_eq!(Wake::signal(0, LEVEL), None);
     }
 
     #[test]

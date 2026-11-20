@@ -32,7 +32,8 @@ acpid/
     │                     # `WAIT_EVENT`, `QUERY_SLEEP`
     └── arch/
         ├── mod.rs            # Arch dispatch: `arch::current`
-        ├── x86_64/mod.rs     # ACPI mode, port I/O, the APIC model, PM1a_CNT, RESET_REG,
+        ├── x86_64/mod.rs     # ACPI mode, port I/O, the APIC model, PM1a_CNT or the
+        │                     # sleep control and status registers, RESET_REG,
         │                     # the event blocks and the SCI
         └── riscv64/mod.rs    # No I/O space, one interrupt model, no power registers or events
 ```
@@ -82,25 +83,35 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   every fixed event but the power button, S5's wake event, and clears every PM1 and GPE0 status,
   `WAK_STS` among them, as ACPI 6.5 § 16.1.6 requires before `SLP_EN` is written. It then
   writes `PM1a_CNT` twice, keeping its other bits: `SLP_TYPa` with `SLP_EN` clear, then with
-  `SLP_EN` (bit 13) set, and logs `SLEEP(5): PM1a_CNT ...` before the writes. When the writes
-  return, acpid keeps the events quiesced for 10 s (`SLEEP_GRACE`), the wait after which ACPICA
-  takes an S5 write as not taken; when the platform still runs then, acpid enables the GPEs
-  again, logs `SLEEP(5): still running 10 s after the writes; GPEs enabled again`, and
-  dispatches each GPE that was enabled before the sleep and latched meanwhile. A GPE that had
-  fired before the sleep, or that the quiesce took, is left disabled for its queued method,
-  which enables it again, and the power button is left as the quiesce left it: a press taken
-  before or during the sleep is delivered once, by the `WAIT_EVENT` it is posted to, which
-  enables the button again. So each event is handled once.
+  `SLP_EN` (bit 13) set, and logs `SLEEP(5): PM1a_CNT ...` before the writes. A
+  hardware-reduced platform has no `PM1a_CNT` and no fixed events: after `\_PTS(5)` acpid
+  writes `WAK_STS` (bit 7) to the FADT's `SLEEP_STATUS_REG`, when devmgr serves it, then
+  `SLP_TYPa` in bits 4:2 with `SLP_EN` (bit 5) to its `SLEEP_CONTROL_REG` in one byte
+  (`ipc::acpid_labels::sleep_control_value`; ACPI 6.5 § 4.8.3.7), and logs
+  `SLEEP(5): SLEEP_CONTROL_REG ...` before the writes. When the writes return, acpid waits 10 s
+  (`SLEEP_GRACE`), the wait after which ACPICA takes an S5 write as not taken, the events kept
+  quiesced; when the platform still runs then, acpid logs
+  `SLEEP(5): still running 10 s after the writes` without armed events, as on a hardware-reduced
+  platform, or, with them, enables the GPEs again, logs
+  `SLEEP(5): still running 10 s after the writes; GPEs enabled again`, and dispatches each GPE
+  that was enabled before the sleep and latched meanwhile. A GPE that had fired before the sleep, or
+  that the quiesce took, is left disabled for its queued method, which enables it again, and the
+  power button is left as the quiesce left it: a press taken before or during the sleep is delivered
+  once, by the `WAIT_EVENT` it is posted to, which enables the button again. So each event is
+  handled once.
 - `QUERY_SLEEP`, with the state in `data[1]`, of which only S5 is served (`INVALID_REQUEST` for
   another): acpid evaluates `\_S5_` for `SLP_TYPa` as `SLEEP` does and replies `SUCCESS` with a
-  `Use`-only derivation of its `PM1a_CNT` `IoPort` in `caps[0]`, the block's first port in
-  `data[0]` and `SLP_TYPa` in `data[1]`, logging `QUERY_SLEEP(5): PM1a_CNT ..., SLP_TYPa ...`.
-  It writes nothing: the caller enters S5 itself, writing the two values `SLEEP` writes
-  (`ipc::acpid_labels::pm1_control_writes`), with no call on acpid and without `\_PTS` and the
-  quiescing of the events. pwrmgr calls it once at its start, for its power-off on the death of a
-  core service ([pwrmgr](../pwrmgr/README.md#responsibilities)). The derivation is an
-  `IoPort` object of its own, so acpid's death, which deletes acpid's block, leaves the caller's
-  standing.
+  derivation of its capability over the register `SLEEP` writes in `caps[0]`, that register's
+  port or physical address in `data[0]`, `SLP_TYPa` in `data[1]` and which register it is in
+  `data[2]`: a `Use`-only `IoPort` over `PM1a_CNT`, the block's first port; on a
+  hardware-reduced platform a `Use`-only `IoPort` over `SLEEP_CONTROL_REG`'s port, or an `Mmio`
+  that maps and writes the page holding it, with the register's physical address. It logs
+  `QUERY_SLEEP(5): <register> ..., SLP_TYPa ...` and writes nothing: the caller enters S5 itself,
+  writing what `SLEEP` writes to that register (`ipc::acpid_labels::pm1_control_writes` or
+  `sleep_control_value`), with no call on acpid and without `\_PTS`, the quiescing of the events
+  and the clearing of `WAK_STS`. pwrmgr calls it once at its start, for its power-off on the death
+  of a core service ([pwrmgr](../pwrmgr/README.md#responsibilities)). The derivation is an object
+  of its own, so acpid's death, which deletes acpid's capability, leaves the caller's standing.
 - `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG` port and logs
   `RESET: RESET_REG ...` before the write.
 - `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and
@@ -115,17 +126,18 @@ On the success path of `SLEEP` and `RESET` the platform powers off or resets and
 arrives. A `SUCCESS` reply to `SLEEP` means the platform still runs 10 s after the writes, and
 to `RESET` that the write returned and the platform still runs; the caller decides how long to
 wait.
-`NO_DEVICE` means the platform lacks what the request needs: `PM1a_CNT`, a usable `\_S5_` or
-loaded AML for `SLEEP` and `QUERY_SLEEP` (and, for `QUERY_SLEEP`, a derivation that succeeds), an
-I/O-space `RESET_REG` for `RESET`, and always on RISC-V, whose
-platforms power off and reset through SBI. acpid acquires `PM1a_CNT` and `RESET_REG` from
-devmgr (`QUERY_ACPI_RESOURCES`) at the start of its start-up and binds them to the evaluation
-thread. The endpoint is served even when the DSDT did not load, and, with every request that passes
-the checks answered `NO_DEVICE`, when the bootstrap round delivered the endpoint without the
-`devmgr.acpi` seed. A receive that keeps failing exits acpid (`ipc::recv_guard`), and svcmgr
-restarts it on the same endpoint. pwrmgr bounds each call at 30 s
-([pwrmgr](../pwrmgr/README.md#responsibilities)), so a request that acpid, down or blocked, does
-not answer fails rather than holding the shutdown.
+`NO_DEVICE` means the platform lacks what the request needs: `PM1a_CNT` or `SLEEP_CONTROL_REG`,
+a usable `\_S5_` or loaded AML for `SLEEP` and `QUERY_SLEEP` (and, for `QUERY_SLEEP`, a
+derivation that succeeds), an I/O-space `RESET_REG` for `RESET`, and always on RISC-V, whose
+platforms power off and reset through SBI. acpid acquires `PM1a_CNT`, or, when devmgr serves
+none, `SLEEP_CONTROL_REG` and `SLEEP_STATUS_REG`, and `RESET_REG` from devmgr
+(`QUERY_ACPI_RESOURCES`) at the start of its start-up: it binds each port to the evaluation thread
+and maps a memory register's page for its lifetime. The endpoint is served even when the DSDT did
+not load, and, with every request that passes the checks answered `NO_DEVICE`, when the bootstrap
+round delivered the endpoint without the `devmgr.acpi` seed. A receive that keeps failing exits
+acpid (`ipc::recv_guard`), and svcmgr restarts it on the same endpoint. pwrmgr bounds each call at
+30 s ([pwrmgr](../pwrmgr/README.md#responsibilities)), so a request that acpid, down or blocked,
+does not answer fails rather than holding the shutdown.
 
 ---
 

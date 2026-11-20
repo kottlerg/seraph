@@ -180,26 +180,34 @@ impl<'a> Platform<'a>
     /// Map the `Mmio` capability `cap` of `len` bytes; its address.
     fn map(&self, cap: u64, len: u64) -> Result<u64, HostError>
     {
-        let pages = len.div_ceil(PAGE_SIZE);
-        let Ok(range) = reserve_pages(pages)
-        else
-        {
-            let _ = syscall::cap_delete(cap);
-            return Err(HostError::Failed);
-        };
-        let va = range.va_start();
-        // SAFETY: `range` is a fresh reservation of `pages` pages from the
-        // per-process arena: VA no Rust object or IPC page occupies. The
-        // grant is held for acpid's lifetime, so the range is never returned
-        // and nothing else is placed there.
-        if unsafe { std::os::seraph::mmio_map_funded(self.aspace, cap, va, pages) }.is_err()
-        {
-            // A refused map can leave some pages mapped, so the range stays
-            // reserved and the capability is kept with it.
-            return Err(HostError::Failed);
-        }
-        Ok(va)
+        map_held(self.aspace, cap, len.div_ceil(PAGE_SIZE)).ok_or(HostError::Failed)
     }
+}
+
+/// Map the `Mmio` capability `cap`, of `pages` pages, into the address
+/// space `aspace`, acpid's own, at fresh VA, for acpid's lifetime; the VA.
+/// `None` when no VA is left, the capability then deleted, or when the map
+/// is refused, the VA and the capability then kept.
+pub fn map_held(aspace: u64, cap: u64, pages: u64) -> Option<u64>
+{
+    let Ok(range) = reserve_pages(pages)
+    else
+    {
+        let _ = syscall::cap_delete(cap);
+        return None;
+    };
+    let va = range.va_start();
+    // SAFETY: `range` is a fresh reservation of `pages` pages from the
+    // per-process arena: VA no Rust object or IPC page occupies. The grant
+    // is held for acpid's lifetime, so the range is never returned and
+    // nothing else is placed there.
+    if unsafe { std::os::seraph::mmio_map_funded(aspace, cap, va, pages) }.is_err()
+    {
+        // A refused map can leave some pages mapped, so the range stays
+        // reserved and the capability is kept with it.
+        return None;
+    }
+    Some(va)
 }
 
 /// The ASL path of the absolute path `path`, root first (`\_SB_.PCI0`).

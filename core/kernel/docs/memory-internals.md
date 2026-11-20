@@ -331,8 +331,12 @@ the retained reason under it (`AddressSpace::retained_terminal_fault`).
 ### Fork-Like Operations
 
 Seraph does not provide a `fork()` equivalent. New address spaces are created empty
-and populated by the process loader. Copy-on-write is not implemented. Shared memory
-is established by mapping the same memory capability into multiple address spaces.
+and populated by the process loader. The kernel implements no copy-on-write. Shared memory
+is established by mapping the same memory capability into multiple address spaces; memmgr
+does so for a memory object, and gives a private attachment of one its own copy of a page
+when the page is first written
+([services/memmgr/docs/memory-pool.md](../../../services/memmgr/docs/memory-pool.md#memory-objects)
+§ Memory objects).
 
 ---
 

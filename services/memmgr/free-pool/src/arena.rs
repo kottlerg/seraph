@@ -197,6 +197,26 @@ pub struct Commitment
 /// reads as zero, and no object slot holds it.
 pub const ZERO_OBJECT: NodeIdx = NODE_NULL;
 
+/// The zero frames memmgr keeps at most: each backs the zero-object
+/// attachments assigned to it, at most [`ZERO_FRAME_SPAN`] pages of them
+/// (`services/memmgr/docs/memory-pool.md` § Memory objects). Every index
+/// fits [`Attachment::zero_frame`]. A full span's attachments promise their
+/// page-table reservation, 16 GiB of leaf tables, so the table is full only
+/// while 4 TiB of RAM is promised to zero-object page tables.
+pub const ZERO_FRAMES: usize = 256;
+
+/// The zero-object attachment pages one zero frame backs at most. Each page
+/// maps its zero frame at most once, so the kernel's per-frame mapping count,
+/// a saturating `u32` that refuses the map at its ceiling, stays below half
+/// of it, and no process can make another's read of the zero object fail.
+pub const ZERO_FRAME_SPAN: u64 = 1 << 31;
+
+/// The regions that may attach one memory object at once. Each maps an object
+/// frame at most once, and memmgr's scrub window once more while it copies
+/// the frame, so the kernel's per-frame mapping count of an object frame stays
+/// below its `u32` ceiling and no attacher can make another's read fail.
+pub const OBJECT_MAX_ATTACHMENTS: u32 = 1 << 31;
+
 /// How a region attaches a memory object
 /// (`services/memmgr/docs/memory-pool.md` § Memory objects): the object, the
 /// object page the region's first page shows, and whether the region shares
@@ -209,6 +229,9 @@ pub struct Attachment
     /// The object page at the region's base; 0 for the zero object.
     pub first_page: u64,
     pub share: Share,
+    /// For the zero object, the zero frame its pages map, below
+    /// [`ZERO_FRAMES`]; 0 for any other object.
+    pub zero_frame: u8,
 }
 
 /// Whether an attachment shares its object's pages or copies each it writes.

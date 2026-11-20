@@ -49,8 +49,9 @@
 
 use crate::arena::{
     Arena, Attachment, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, LimitReg,
-    MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx, ProcessCaps, ProcessRecord,
-    RegionNode, Share, Slot, SlotStore, ZERO_OBJECT,
+    MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx, OBJECT_MAX_ATTACHMENTS,
+    ProcessCaps, ProcessRecord, RegionNode, Share, Slot, SlotStore, ZERO_FRAME_SPAN, ZERO_FRAMES,
+    ZERO_OBJECT,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError, ChunkState, SealTag};
@@ -76,11 +77,15 @@ pub enum RegionError
     NoSlot,
     /// The record slot named holds no process record.
     NoRecord,
-    /// The memory object named is not live, or is attached as often as its
-    /// count holds ([`Ledger::attach_object`]).
+    /// The memory object named is not live.
     NoObject,
     /// The attachment's pages run past the object's end.
     OutsideObject,
+    /// The attachment would map a frame more often than memmgr lets one
+    /// frame be mapped: its object is attached [`OBJECT_MAX_ATTACHMENTS`]
+    /// times, or its zero frame's span cannot take its pages
+    /// ([`ZERO_FRAME_SPAN`]).
+    MapBound,
 }
 
 /// Why [`Ledger::seal_object`] sealed nothing.
@@ -304,6 +309,9 @@ pub struct Ledger<S, W>
     /// wrapping: every eviction, background or direct, ending compressed, raw
     /// or cancelled, starts there.
     evictions: u64,
+    /// The zero-object attachment pages each zero frame backs, at most
+    /// [`ZERO_FRAME_SPAN`] each.
+    zero_spans: [u64; ZERO_FRAMES],
 }
 
 impl<S: SlotStore, W: WordStore> Ledger<S, W>
@@ -325,6 +333,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             disk_pages: 0,
             committed_swapped: 0,
             evictions: 0,
+            zero_spans: [0; ZERO_FRAMES],
         }
     }
 
@@ -1566,9 +1575,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         true
     }
 
-    /// Drop one attachment's reference on the memory object `obj` (the zero
-    /// object holds none), retiring it when it was the last and its handle
-    /// state is gone.
+    /// Drop one attachment's reference on the memory object `obj`, retiring
+    /// it when it was the last and its handle state is gone.
     fn detach(&mut self, obj: NodeIdx, quiescent: impl FnMut(&FreeRun) -> bool)
     {
         let Some(o) = self.object(obj)
@@ -1664,11 +1672,16 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// of its length is, and promises what [`commit::attach_promise`] says;
     /// admitting it is the caller's ([`Self::admit_attach`]).
     ///
+    /// A zero-object attachment adds its pages to the span of its zero frame,
+    /// `source.zero_frame`, which [`Self::zero_frame_for`] chose.
+    ///
     /// # Errors
-    /// [`RegionError::NoObject`] for an object slot that holds no live object
-    /// or one attached `u32::MAX` times; [`RegionError::OutsideObject`] for
-    /// pages past the object's end, or a zero-object attachment whose first
-    /// page is not 0; and as [`Ledger::add_region`]. Nothing changes then.
+    /// [`RegionError::NoObject`] for an object slot that holds no live
+    /// object; [`RegionError::MapBound`] for an object attached
+    /// [`OBJECT_MAX_ATTACHMENTS`] times, or a zero frame whose span cannot
+    /// take the pages; [`RegionError::OutsideObject`] for pages past the
+    /// object's end, or a zero-object attachment whose first page is not 0;
+    /// and as [`Ledger::add_region`]. Nothing changes then.
     pub fn attach_object(
         &mut self,
         rec: NodeIdx,
@@ -1683,7 +1696,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             {
                 return Err(RegionError::OutsideObject);
             }
-            None
+            let span = self
+                .zero_spans
+                .get(usize::from(source.zero_frame))
+                .and_then(|s| s.checked_add(pages))
+                .filter(|&s| s <= ZERO_FRAME_SPAN)
+                .ok_or(RegionError::MapBound)?;
+            Some(span)
         }
         else
         {
@@ -1699,7 +1718,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             {
                 return Err(RegionError::OutsideObject);
             }
-            Some(o.attached.checked_add(1).ok_or(RegionError::NoObject)?)
+            if o.attached >= OBJECT_MAX_ATTACHMENTS
+            {
+                return Err(RegionError::MapBound);
+            }
+            Some(u64::from(o.attached).saturating_add(1))
         };
         let need = commit::grow_need(0, region.len);
         let meta_left = match source.share
@@ -1718,11 +1741,36 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.promised = self
             .promised
             .saturating_add(commit::attach_promise(need, source.share));
-        if let Some(attached) = attached
+        match attached
         {
-            self.set_object(source.object, |o| o.attached = attached);
+            Some(span) if source.object == ZERO_OBJECT =>
+            {
+                if let Some(s) = self.zero_spans.get_mut(usize::from(source.zero_frame))
+                {
+                    *s = span;
+                }
+            }
+            // Below `OBJECT_MAX_ATTACHMENTS`, which a `u32` holds.
+            Some(count) => self.set_object(source.object, |o| {
+                o.attached = u32::try_from(count).unwrap_or(OBJECT_MAX_ATTACHMENTS);
+            }),
+            None =>
+            {}
         }
         Ok(idx)
+    }
+
+    /// The zero frame whose span takes `pages` more zero-object attachment
+    /// pages, the first that does, for [`Self::attach_object`]; `None` when
+    /// none does, every one backing up to [`ZERO_FRAME_SPAN`] pages.
+    #[must_use]
+    pub fn zero_frame_for(&self, pages: u64) -> Option<u8>
+    {
+        let i = self
+            .zero_spans
+            .iter()
+            .position(|s| s.checked_add(pages).is_some_and(|s| s <= ZERO_FRAME_SPAN))?;
+        u8::try_from(i).ok()
     }
 
     /// The attachment of the region in slot `reg`: `None` for a region of the
@@ -3869,9 +3917,20 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                     .saturating_add(c.meta_left),
             );
             self.arena.free(node.commit);
-            if let Some(source) = c.source
+            match c.source
             {
-                self.detach(source.object, &mut quiescent);
+                // An attachment is never resized, so its pages are those it
+                // added to its zero frame's span.
+                Some(source) if source.object == ZERO_OBJECT =>
+                {
+                    if let Some(span) = self.zero_spans.get_mut(usize::from(source.zero_frame))
+                    {
+                        *span = span.saturating_sub(pages);
+                    }
+                }
+                Some(source) => self.detach(source.object, &mut quiescent),
+                None =>
+                {}
             }
         }
     }
@@ -7347,6 +7406,7 @@ mod tests
             object,
             first_page,
             share,
+            zero_frame: 0,
         }
     }
 
@@ -7622,5 +7682,63 @@ mod tests
             attachment(obj, 1, Share::Shared),
         )
         .unwrap();
+    }
+
+    // The defect caught: an attachment admitted past the bound memmgr keeps
+    // a frame's mappings under, the kernel's per-frame count, which would
+    // let one attacher make another's read of the same frame fail; a zero
+    // frame chosen whose span cannot take the pages; or a detach that leaves
+    // its pages on the span.
+    #[test]
+    fn no_attachment_maps_a_frame_past_the_bound()
+    {
+        let mut l = roomy_ledger(1000);
+        let (rec, ids) = granted(&mut l, 1, 1, 4);
+        let obj = l.seal_object(rec, &ids, 77).unwrap();
+        l.set_object(obj, |o| o.attached = OBJECT_MAX_ATTACHMENTS - 1);
+        let last = l
+            .attach_object(
+                rec,
+                region(BASE, PAGE_SIZE),
+                attachment(obj, 0, Share::Shared),
+            )
+            .unwrap();
+        let before = l.arena.free_count();
+        assert_eq!(
+            l.attach_object(
+                rec,
+                region(BASE + CHUNK, PAGE_SIZE),
+                attachment(obj, 0, Share::Shared)
+            ),
+            Err(RegionError::MapBound)
+        );
+        assert_eq!(l.arena.free_count(), before);
+        l.remove_region(rec, last, pool_all).unwrap();
+        assert_eq!(l.object(obj).unwrap().attached, OBJECT_MAX_ATTACHMENTS - 1);
+
+        let zero = |frame: u8| Attachment {
+            zero_frame: frame,
+            ..attachment(ZERO_OBJECT, 0, Share::Shared)
+        };
+        let before = l.arena.free_count();
+        l.zero_spans[0] = ZERO_FRAME_SPAN - 2;
+        assert_eq!(l.zero_frame_for(2), Some(0));
+        assert_eq!(l.zero_frame_for(3), Some(1));
+        assert_eq!(l.zero_frame_for(ZERO_FRAME_SPAN + 1), None);
+        assert_eq!(
+            l.attach_object(rec, region(BASE, 3 * PAGE_SIZE), zero(0)),
+            Err(RegionError::MapBound)
+        );
+        assert_eq!(l.arena.free_count(), before);
+        let reg = l
+            .attach_object(rec, region(BASE, 2 * PAGE_SIZE), zero(0))
+            .unwrap();
+        assert_eq!(l.zero_spans[0], ZERO_FRAME_SPAN);
+        assert_eq!(l.zero_frame_for(1), Some(1));
+        l.zero_spans[1..].fill(ZERO_FRAME_SPAN);
+        assert_eq!(l.zero_frame_for(1), None);
+        l.remove_region(rec, reg, pool_all).unwrap();
+        assert_eq!(l.zero_spans[0], ZERO_FRAME_SPAN - 2);
+        assert_eq!(l.zero_frame_for(2), Some(0));
     }
 }

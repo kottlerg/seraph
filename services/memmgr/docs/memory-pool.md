@@ -618,8 +618,8 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
 5. Return every chunk-table node, every region node, the commitment node of
    each committed region, the record's own node, and its caps node to the
    arena free list, and drop the record's reference
-   to its budget node, which is freed with it unless a deferred run is still
-   charged to it.
+   to its budget node, which is freed with it unless a deferred run or a
+   memory object's frames are still charged to it.
 6. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
@@ -726,8 +726,9 @@ reservation, charged whole when the region is committed whether or not its pages
 ([Commit](#commit)), and each such run on the deferred list until it rejoins the free pool
 ([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
 index pages, its page tables and its `CSpace` growth) is charged to no node. A node outlives its
-process while a node below it is alive or a run charged to it is on the deferred list, and its
-charge stays in its parent's subtree meanwhile, so a process cannot hand its frames to another
+process while a node below it is alive, a run charged to it is on the deferred list, or a memory
+object's frames are charged to it ([Memory objects](#memory-objects)), and its charge stays in its
+parent's subtree meanwhile, so a process cannot hand its frames to another
 process, die, and free its subtree's budget while the frames stay held.
 
 **Charging.** A charge is checked against the max of the node and of every ancestor. A request that
@@ -996,7 +997,7 @@ change its frame while one address space maps it
 
 **Faults.** A read fault in an attachment maps its origin read-only over the part of the faulting
 page's chunk that no write has given a page of its own ([Chunk table](#chunk-table)): the object's
-pages there that the frame holding the faulting page holds, in one map, or the zero frame at each
+pages there that the frame holding the faulting page holds, in one map, or its zero frame at each
 page. memmgr maps them through a capability it derives from its own with the map right alone and
 deletes after the map; the kernel keeps the mapping. A leaf records the write and execute rights of
 the capability it was mapped through as its grant (§ Leaf Grant), so no leaf of an origin carries
@@ -1007,14 +1008,29 @@ is. For an object it is one page: memmgr copies the object page into it through 
 ([Frame contents](#frame-contents)), the source mapped read-only beside it, which leaves no byte to
 clear, unmaps the page's read-only leaf from the process, and maps the copy with the region's
 protection. For the zero object it is the span a committed region's fault backs, zeroed, mapped once
-memmgr has unmapped the span's leaves of the zero frame. The unmap invalidates each leaf on every
+memmgr has unmapped the span's leaves of its zero frame. The unmap invalidates each leaf on every
 CPU before it returns, so no thread of the process reads the origin through a stale entry at a page
 that is then mapped writable. A write to a shared attachment, and a fetch from any, is declined as
 its protection refuses it ([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message).
 
-**Zero frame.** The zero object's one frame is taken from the free pool at the first zero-object
-attachment, which is refused when the pool cannot spare it, zeroed, and kept for memmgr's life,
-charged to no budget node, as memmgr's metadata is.
+**Mapping bound.** The kernel counts the leaves that map each frame in a `u32` and refuses a map
+that would take the count past it (core/kernel/docs/memory-internals.md §
+[Frame Map Table](../../../core/kernel/docs/memory-internals.md#frame-map-table-mmframe_maprs)),
+so a frame many address spaces map must stay under that count, or one attacher could make
+another's read fail. Each attachment maps a page of its origin at most once. An object takes at
+most `OBJECT_MAX_ATTACHMENTS` (2^31) attachments at once, and memmgr maps an object frame itself
+only in its scrub window while it copies the frame. The zero object is backed by up to
+`ZERO_FRAMES` (256) zero frames, and each zero-object attachment by one of them, the first whose
+span, the pages of the attachments it backs, can take the attachment's pages within
+`ZERO_FRAME_SPAN` (2^31); a detach gives its pages back to the span. An attachment past either
+bound is refused with `LIMIT` ([ipc-interface.md](ipc-interface.md) § Label 28). A zero frame's
+span, full, holds attachments that promise 16 GiB of page tables, so the zero frames run out only
+while 4 TiB of RAM is promised to zero-object page tables
+([docs/limits.md](../../../docs/limits.md) § memmgr).
+
+**Zero frames.** A zero frame is taken from the free pool at the first zero-object attachment it
+backs, which is refused when the pool cannot spare it, zeroed, and kept for memmgr's life, charged
+to no budget node, as memmgr's metadata is.
 
 ---
 

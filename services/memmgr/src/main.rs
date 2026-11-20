@@ -23,8 +23,9 @@ use free_pool::{
     Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node,
     NodeError, NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget,
     RegionError, ResidentPath, ResizeError, SealError, SelectError, Share, SlotStore, WordStore,
-    ZERO_OBJECT, arena::Slot, chunk::table_height, chunk_count, chunk_for, commit::grow_need,
-    commit::regrow_need, fault_window, pending_from, region_grants, reserve_pages,
+    ZERO_FRAMES, ZERO_OBJECT, arena::Slot, chunk::table_height, chunk_count, chunk_for,
+    commit::grow_need, commit::regrow_need, fault_window, pending_from, region_grants,
+    reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -2052,7 +2053,8 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
             RegionError::Overlap
             | RegionError::NoRecord
             | RegionError::NoObject
-            | RegionError::OutsideObject,
+            | RegionError::OutsideObject
+            | RegionError::MapBound,
         ) =>
         {
             reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -2678,7 +2680,7 @@ fn select_fault_run(
 /// ([`release_unmapped_chunk`]).
 ///
 /// A fault in an attachment (§ Memory objects) maps its object's pages, or
-/// the zero frame, read-only, and a write to a private one gives the page a
+/// its zero frame, read-only, and a write to a private one gives the page a
 /// copy of its own, or for the zero object backs the span as in any committed
 /// region ([`attachment_fault`]).
 fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
@@ -3220,7 +3222,7 @@ fn attachment_fault(
     {
         return copy_object_page(l, target, region, att).map(Some);
     }
-    // The span's pages map the zero frame or nothing. Unmap them first: the
+    // The span's pages map its zero frame or nothing. Unmap them first: the
     // unmap invalidates each leaf on every CPU before it returns, so no thread
     // of the process reads the zero frame through a stale entry where the run
     // is then mapped writable.
@@ -3235,10 +3237,11 @@ fn attachment_fault(
 /// Map the origin of the attachment `att` read-only over the part of the
 /// faulting page's chunk no write has copied (`target.span`): the pages of it
 /// that the object frame holding the faulting page holds, in one map, or the
-/// zero frame at each of its pages for the zero object. The map goes through a
-/// cap derived from memmgr's with the map right alone, deleted after it. A leaf
-/// records the write and execute rights of the cap it was mapped through as its
-/// grant, so no leaf of an attachment's origin carries either, and neither
+/// attachment's zero frame at each of its pages for the zero object. The map
+/// goes through a cap derived from memmgr's with the map right alone, deleted
+/// after it. A leaf records the write and execute rights of the cap it was
+/// mapped through as its grant, so no leaf of an attachment's origin carries
+/// either, and neither
 /// `SYS_MEM_PROTECT` nor a text write of `SYS_THREAD_WRITE_MEM` can make a
 /// page other processes map writable (services/memmgr/docs/memory-pool.md
 /// § Memory objects). The kernel keeps the mapping after the cap goes.
@@ -3255,8 +3258,8 @@ fn map_origin(
     let (start, end) = target.span;
     let (cap, offset, va, pages, step) = if att.object == ZERO_OBJECT
     {
-        // An attachment of the zero object took the zero frame first.
-        let zero = zero_frame(l).ok_or((FaultDecline::NoFreePage, 0))?;
+        // An attachment of the zero object took its zero frame first.
+        let zero = zero_frame(l, att.zero_frame).ok_or((FaultDecline::NoFreePage, 0))?;
         let pages = end.saturating_sub(start) / PAGE_SIZE;
         (zero, 0, start, pages, 1)
     }
@@ -3392,20 +3395,25 @@ fn copy_page(l: &mut MemLedger, src: u64, src_offset: u64, dst: u64) -> Result<(
     unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, 2) }
 }
 
-/// The zero object's frame: one page taken from the pool at the first
-/// zero-object attachment, zeroed, and kept for memmgr's life, charged to no
-/// budget node, as the arena's pages are. Every page of a zero-object
-/// attachment no write has backed maps it read-only. Only the receive loop's
-/// thread reaches it, so a plain static suffices.
-static mut ZERO_FRAME: Option<u64> = None;
+/// The zero object's frames: each one page, taken from the pool at the first
+/// zero-object attachment assigned to it, zeroed, and kept for memmgr's life,
+/// charged to no budget node, as the arena's pages are. Every page of a
+/// zero-object attachment no write has backed maps its attachment's frame
+/// read-only, and the ledger keeps each frame's attachments within
+/// `ZERO_FRAME_SPAN` pages, so its mapping count stays below the kernel's
+/// ceiling. Only the receive loop's thread reaches them, so a plain static
+/// suffices.
+static mut ZERO_FRAME_CAPS: [Option<u64>; ZERO_FRAMES] = [None; ZERO_FRAMES];
 
-/// The cap of the zero object's frame ([`ZERO_FRAME`]), taking and zeroing it
+/// The cap of zero frame `index` ([`ZERO_FRAME_CAPS`]), taking and zeroing it
 /// first when memmgr has none. `None` when the pool cannot spare the page or
 /// its scrub fails.
-fn zero_frame(l: &mut MemLedger) -> Option<u64>
+fn zero_frame(l: &mut MemLedger, index: u8) -> Option<u64>
 {
+    let i = usize::from(index);
     // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    if let Some(cap) = unsafe { ZERO_FRAME }
+    let have = unsafe { (*core::ptr::addr_of!(ZERO_FRAME_CAPS)).get(i).copied() }.flatten();
+    if let Some(cap) = have
     {
         return Some(cap);
     }
@@ -3417,8 +3425,9 @@ fn zero_frame(l: &mut MemLedger) -> Option<u64>
         return None;
     }
     // SAFETY: as above.
-    unsafe {
-        ZERO_FRAME = Some(outer);
+    if let Some(slot) = unsafe { (*core::ptr::addr_of_mut!(ZERO_FRAME_CAPS)).get_mut(i) }
+    {
+        *slot = Some(outer);
     }
     Some(outer)
 }
@@ -4003,11 +4012,15 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    if object == ZERO_OBJECT && zero_frame(l).is_none()
+    let zero = match attach_zero_frame(l, object, len / PAGE_SIZE)
     {
-        reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
-        return;
-    }
+        Ok(index) => index,
+        Err(label) =>
+        {
+            reply_label(ipc_buf, label);
+            return;
+        }
+    };
     if let Err(e) = admit_attach(l, rec, len, share)
     {
         reply_label(ipc_buf, commit_refusal(e));
@@ -4023,6 +4036,7 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         object,
         first_page,
         share,
+        zero_frame: zero,
     };
     let mut result = l.attach_object(rec, region, source);
     // The region's slot and its commitment's.
@@ -4036,6 +4050,11 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         Err(RegionError::NoSlot) =>
         {
             reply_label(ipc_buf, memmgr_errors::QUOTA);
+            return;
+        }
+        Err(RegionError::MapBound) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::LIMIT);
             return;
         }
         Err(
@@ -4056,6 +4075,25 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         // As in [`handle_register_region`]: nothing faulted in it yet.
         let _ = l.remove_region(rec, reg, quiescent);
     }
+}
+
+/// The zero frame an attachment of `pages` pages of `object` maps: for the
+/// zero object, the first whose span takes the pages
+/// ([`MemLedger::zero_frame_for`]), taken first when memmgr has none
+/// ([`zero_frame`]); 0 for any other object.
+///
+/// # Errors
+/// The label of the error reply: `LIMIT` when no zero frame's span takes the
+/// pages, `OUT_OF_MEMORY_BEST_EFFORT` when the frame cannot be taken.
+fn attach_zero_frame(l: &mut MemLedger, object: NodeIdx, pages: u64) -> Result<u8, u64>
+{
+    if object != ZERO_OBJECT
+    {
+        return Ok(0);
+    }
+    let index = l.zero_frame_for(pages).ok_or(memmgr_errors::LIMIT)?;
+    zero_frame(l, index).ok_or(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT)?;
+    Ok(index)
 }
 
 /// Hand a memory-object label (`SEAL_OBJECT` to `OBJECT_RELEASE`) to its

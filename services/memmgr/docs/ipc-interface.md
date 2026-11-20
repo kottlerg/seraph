@@ -1382,11 +1382,11 @@ whose call was interrupted makes it again.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The attachment's share of `promised` would leave fewer of the free pages and the overcommit allowance outside `promised` than the growth floor, for a caller outside the system reserve, or than none ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit), or the zero object's frame could not be taken |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The attachment's share of `promised` would leave fewer of the free pages and the overcommit allowance outside `promised` than the growth floor, for a caller outside the system reserve, or than none ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit), or the zero frame of a zero-object attachment could not be taken |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) |
 | 4 | `INVALID_ARGUMENT` | Unknown badge, bad alignment, zero length, an unknown prot or flag bit, `MAP_EXECUTABLE`, `MAP_WRITABLE` without `ATTACH_PRIVATE`, a cap that is no live object handle, pages past the object's end, a `first_page` other than 0 for the zero object, or overlap |
 | 5 | `UNAUTHORIZED` | The badge is a handle or the swap authority |
-| 8 | `LIMIT` | The attachment's charge would take the subtree of the caller's budget node, or of an ancestor, over its max |
+| 8 | `LIMIT` | The attachment's charge would take the subtree of the caller's budget node, or of an ancestor, over its max; or it would map a frame past the bound memmgr keeps its mappings under: the object is attached `OBJECT_MAX_ATTACHMENTS` times, or no zero frame's span takes the pages of a zero-object attachment ([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects, Mapping bound) |
 
 #### Label 29: `OBJECT_RELEASE`
 
@@ -1482,14 +1482,14 @@ registered, and one on a lost chunk, are declined with code 12
 
 A fault in an attachment (§ Label 28) maps its origin read-only over the part of
 the faulting page's chunk that no write has copied: the object's pages there
-that the frame holding the faulting page holds, or the zero frame at each page,
+that the frame holding the faulting page holds, or its zero frame at each page,
 through a capability derived with the map right alone, so no leaf of an origin
 carries a write or execute grant. A write to a private attachment gives the
 faulting page a copy of its object page, a page drawn as a committed region's
 fault draws it and copied through memmgr's scrub window, mapped once memmgr has
 unmapped the page's read-only leaf; in a zero-object attachment it backs the
 span as a committed region's fault does, once memmgr has unmapped the span's
-leaves of the zero frame ([`memory-pool.md`](memory-pool.md#memory-objects)
+leaves of its zero frame ([`memory-pool.md`](memory-pool.md#memory-objects)
 § Memory objects). A write to a shared attachment, and a fetch from any, is
 declined with code 4.
 

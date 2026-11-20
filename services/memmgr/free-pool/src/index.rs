@@ -3,12 +3,13 @@
 
 // services/memmgr/free-pool/src/index.rs
 
-//! Badge-keyed process index: a linear hash over arena-resident records and
-//! budget-node handle states.
+//! Badge-keyed process index: a linear hash over arena-resident records,
+//! budget-node handle states and live memory objects.
 //!
 //! Records are [`Node::Process`] slots in the [`Arena`], keyed by their
-//! badge, and handle states [`Node::Handle`] slots, keyed by the badge their
-//! node handles carry ([`key_of`]); each is chained per bucket through its
+//! badge, handle states [`Node::Handle`] slots, keyed by the badge their
+//! node handles carry, and live memory objects [`Node::Object`] slots, keyed by
+//! the badge their object handles carry ([`key_of`]); each is chained per bucket through its
 //! slot `next` link. The bucket array is a [`WordStore`] of
 //! bucket heads that only grows, one page of buckets at a time; linear
 //! hashing splits one bucket per step, so growth never rehashes the whole
@@ -52,8 +53,9 @@ const fn hash(badge: u64) -> u64
     badge.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(32)
 }
 
-/// The key the index files a slot under: a record's badge, or the badge a
-/// handle state's node handles carry; `None` for any other payload. One key
+/// The key the index files a slot under: a record's badge, the badge a
+/// handle state's node handles carry, or the badge a memory object's handles
+/// carry; `None` for any other payload. One key
 /// names one slot: the owner draws each new key off every key in use.
 #[must_use]
 pub const fn key_of(node: &Node) -> Option<u64>
@@ -62,7 +64,9 @@ pub const fn key_of(node: &Node) -> Option<u64>
     {
         Node::Process(rec) => Some(rec.badge),
         Node::Handle(h) => Some(h.key),
+        Node::Object(o) => Some(o.key),
         Node::Free
+        | Node::ZeroFrame(_)
         | Node::Run(_)
         | Node::Deferred(_)
         | Node::Budget(_)

@@ -89,6 +89,10 @@ services/svctest/
         ├── discard.rs         # DISCARD_RANGE and SHRINK_REGION return frames; discarded pages
         │                      #   refault zero-filled and, committed, from the promise they keep;
         │                      #   the std heap's discard and trim; all-RAM-accounted identity
+        ├── memory_objects.rs  # memmgr memory objects: seal refusal and charge, attach refusals,
+        │                      #   shared and private attachments in svctest and a child, a
+        │                      #   private write seen by no other attacher, a shared write kills
+        │                      #   its writer, release, the zero object
         ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
         │                      #   held `LOW` level and restores them: debugger reads and
         │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
@@ -188,9 +192,10 @@ framebuffer-killed and framebuffer-restarted cases (`caps[13]`), the svcmgr seed
 seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and `acpid.deny` names it resolves), the
 svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd and vfsd unmount phases
 (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`,
-`logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, and
-`rtc_create_retry` phases (`caps[6]`), the vfsd swap-partition phase (`caps[14]`), the
-`memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases (`caps[18]`), the
+`logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`,
+`rtc_create_retry`, `oom_policy`, and `memmgr_swap_commit` phases (`caps[6]`), the vfsd
+swap-partition phase (`caps[14]`), the `memmgr_swap_client`, `memmgr_swap_raw` and `swapd`
+phases (`caps[18]`), the
 `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[20]`),
 the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`,
 `memmgr_swap_client`, `memmgr_swap_raw`, `swapd`,
@@ -226,7 +231,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry` phases: read logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`, `oom_policy`, `memmgr_swap_commit` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
@@ -499,6 +504,8 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 | `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
 | `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
+| `memory-object-child`       | `memory_objects` | `memmgr_memory_objects` (attaches, writes) |
+| `memory-object-limited`     | `memory_objects` | `memmgr_memory_objects` (4096-page max)   |
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the free frames) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |

@@ -25,6 +25,7 @@ memmgr/
 ├── free-pool/                  # `memmgr-free-pool` crate: pure host-tested
 │                               # arena, free pool, deferred list, process
 │                               # index, budget nodes, region logic,
+│                               # memory objects and attachments,
 │                               # per-region chunk tables, commitment
 │                               # bounds (`commit.rs`), the compressed
 │                               # store's page codec and chunk stream
@@ -98,6 +99,11 @@ Allocation Contract").
   from the bytes it hands back once their tag checks (see
   [`docs/memory-pool.md`](docs/memory-pool.md#disk-tier) § Disk tier and
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 22 to 26).
+- **Memory objects** — seal a process's grants into an immutable memory object, and attach
+  it, or the zero object, as a region of any process holding its handle, shared read-only or
+  private, a write then copying the page, each attacher charged for what it maps (see
+  [`docs/memory-pool.md`](docs/memory-pool.md#memory-objects) § Memory objects and
+  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 27 to 29).
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments. Runs after every
@@ -168,6 +174,11 @@ The full memmgr IPC specification is in
 - `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
   address space (procmgr-only)
 - `CREATE_SUB_NODE(max) → max, node_handle` — make a sub-node of the caller's own budget node
+- `SEAL_OBJECT(region_id[..]) → pages, object_handle` — seal unmapped grants of the caller into
+  an immutable memory object
+- `ATTACH_OBJECT(va, len, prot, first_page, flags[, object_handle])` — attach an object, or the
+  zero object without a handle, as a region of the caller, shared or `ATTACH_PRIVATE`
+- Over an object handle only: `OBJECT_RELEASE` — drop the object's handle state
 - Over a node handle only: `NODE_SET_MAX(max) → max`, `NODE_CREATE(max) → max, node_handle`,
   `NODE_QUERY_USAGE`, `NODE_REGISTER_LIMIT(bits, notification_cap, registrant_send)` and
   `NODE_RELEASE` — set, divide, read and watch the budget node the handle names, and drop a
@@ -178,8 +189,8 @@ The full memmgr IPC specification is in
 ## Sizing constants
 
 memmgr's bookkeeping is RAM-bound, not capped by a constant: free runs,
-process records, their budget nodes, node handle states and limit registrations,
-per-process region, commitment and frame descriptors, and the regions' chunk-table nodes
+process records, their budget nodes, node handle states and limit registrations, memory
+objects, per-process region, commitment and frame descriptors, and the regions' chunk-table nodes
 are nodes in a self-hosted metadata arena carved from memmgr's own pool, indexed by `u64` (see
 [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records are
 found through a linear-hash index that grows with them. The arena grows until

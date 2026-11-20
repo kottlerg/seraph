@@ -19,16 +19,19 @@
 )]
 
 use free_pool::{
-    ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Evict, Fit, FrameDesc,
-    FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError,
-    NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureBits, PressureLevel, PressureSignal,
-    RecheckBudget, RegionError, ResidentPath, ResizeError, SelectError, SlotStore, WordStore,
-    arena::Slot, chunk::table_height, chunk_count, chunk_for, commit::grow_need,
-    commit::regrow_need, fault_window, pending_from, region_grants, reserve_pages,
+    ArenaLayout, Attachment, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Evict,
+    Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node,
+    NodeError, NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureBits, PressureLevel,
+    PressureSignal, RecheckBudget, RegionError, ResidentPath, ResizeError, SealError, SelectError,
+    Share, SlotStore, WordStore, ZERO_FRAME_SPAN, arena::Slot, chunk::table_height, chunk_count,
+    chunk_for, commit::grow_need, commit::regrow_need, fault_window, pending_from, region_grants,
+    reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
-use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError};
+use syscall_abi::{
+    FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError,
+};
 
 mod disk;
 mod evict;
@@ -1032,15 +1035,29 @@ fn mint_process_badge(l: &MemLedger, class_bit: u64) -> Option<u64>
 }
 
 /// Draw the badge of a new node handle: [`memmgr_labels::NODE_HANDLE_TAG`]
-/// and random bits outside `VERB_BIT_MASK`, redrawn until no record or handle
-/// state is keyed by it. Random, as a process badge is, so a key reveals
-/// nothing of how many nodes exist. `None` if the entropy draw fails.
+/// and random bits outside `VERB_BIT_MASK` ([`mint_handle_key`]).
 fn mint_node_key(l: &MemLedger) -> Option<u64>
+{
+    mint_handle_key(l, memmgr_labels::NODE_HANDLE_TAG)
+}
+
+/// Draw the badge of a new object handle:
+/// [`memmgr_labels::OBJECT_HANDLE_TAG`] and random bits outside
+/// `VERB_BIT_MASK` ([`mint_handle_key`]).
+fn mint_object_key(l: &MemLedger) -> Option<u64>
+{
+    mint_handle_key(l, memmgr_labels::OBJECT_HANDLE_TAG)
+}
+
+/// Draw a handle's badge: `tag` and random bits outside `VERB_BIT_MASK`,
+/// redrawn until no record, handle state or memory object is keyed by it.
+/// Random, as a process badge is, so a key reveals nothing of how many nodes
+/// or objects exist. `None` if the entropy draw fails.
+fn mint_handle_key(l: &MemLedger, tag: u64) -> Option<u64>
 {
     loop
     {
-        let k =
-            (syscall::random_u64().ok()? & !ipc::VERB_BIT_MASK) | memmgr_labels::NODE_HANDLE_TAG;
+        let k = (syscall::random_u64().ok()? & !ipc::VERB_BIT_MASK) | tag;
         if !l.key_in_use(k)
         {
             return Some(k);
@@ -2033,8 +2050,16 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
     {
         Ok(reg) => reg,
         // `rec` came from `find` above, so `NoRecord` cannot arise; it would
-        // mean an unknown caller, which is an invalid argument too.
-        Err(RegionError::Overlap | RegionError::NoRecord) =>
+        // mean an unknown caller, which is an invalid argument too. A region of
+        // the process's own memory names no object, so neither can the object
+        // errors.
+        Err(
+            RegionError::Overlap
+            | RegionError::NoRecord
+            | RegionError::NoObject
+            | RegionError::OutsideObject
+            | RegionError::MapBound,
+        ) =>
         {
             reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
             return;
@@ -2070,11 +2095,14 @@ const fn commit_refusal(e: ChargeError) -> u64
 }
 
 /// The committed region of the record `rec` based at `va_base`: its slot, its
-/// length and the largest length it has had.
+/// length and the largest length it has had. An attachment is none: its pages
+/// are its object's, so it is never resized
+/// (services/memmgr/docs/memory-pool.md § Memory objects).
 fn committed_region(l: &MemLedger, rec: NodeIdx, va_base: u64) -> Option<(NodeIdx, u64, u64)>
 {
     l.region_based(rec, va_base).and_then(|(reg, node)| {
         l.commitment(reg)
+            .filter(|c| c.source.is_none())
             .map(|c| (reg, node.region.len, c.high_len))
     })
 }
@@ -2138,7 +2166,8 @@ fn handle_extend_region(req: &IpcMessage, ipc_buf: *mut u64)
             ResizeError::NoRegion
             | ResizeError::NotCommitted
             | ResizeError::Length
-            | ResizeError::Overlap,
+            | ResizeError::Overlap
+            | ResizeError::Attached,
         ) => memmgr_errors::INVALID_ARGUMENT,
     };
     let reply = IpcMessage::new(code);
@@ -2653,6 +2682,11 @@ fn select_fault_run(
 /// holds (services/memmgr/docs/memory-pool.md § Chunk table). A declined
 /// fault's run is unmapped before it returns to the pool
 /// ([`release_unmapped_chunk`]).
+///
+/// A fault in an attachment (§ Memory objects) maps its object's pages, or
+/// its zero frame, read-only, and a write to a private one gives the page a
+/// copy of its own, or for the zero object backs the span as in any committed
+/// region ([`attachment_fault`]).
 fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 {
     if req.word(0) != syscall_abi::FAULT_KIND_VM
@@ -2754,9 +2788,14 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         committed,
         charged: false,
     };
-    let frame = match back_span(l, &target, span_pages)
+    let frame = match serve_span(l, &target, &region, reg, req.word(2), span_pages)
     {
-        Ok(frame) => frame,
+        Ok(Some(frame)) => frame,
+        Ok(None) =>
+        {
+            reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
+            return;
+        }
         Err((reason, detail)) =>
         {
             decline_fault(ipc_buf, reason, detail);
@@ -2931,6 +2970,21 @@ fn map_client_chunk(
     frame: &FrameDesc,
 ) -> Result<(), MapRefusal>
 {
+    map_client(l, target, frame, 0, target.prot)
+}
+
+/// Map pages `[offset, offset + frame.page_count)` of the Memory cap
+/// `frame.cap_slot` into the client address space of `target` at `frame.va`
+/// with the protection `prot`, funding its page tables as
+/// [`map_client_chunk`] describes.
+fn map_client(
+    l: &mut MemLedger,
+    target: &FaultTarget,
+    frame: &FrameDesc,
+    offset: u64,
+    prot: u64,
+) -> Result<(), MapRefusal>
+{
     let aspace_cap = target.aspace_cap;
     // A committed region's commitment carries the run's charge already, as
     // the budget node does for a chunk's own runs mapped back.
@@ -2953,9 +3007,9 @@ fn map_client_chunk(
                 frame.cap_slot,
                 aspace_cap,
                 frame.va,
-                0,
+                offset,
                 u64::from(frame.page_count),
-                target.prot,
+                prot,
             )
         };
         let Err(e) = mapped
@@ -3119,6 +3173,228 @@ fn release_unmapped_chunk(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64, fram
     {
         let _ = l.push_frame(rec, frame);
     }
+}
+
+/// Serve the span of `target` in the region `reg`, `access` being the fault's
+/// access bits: back it ([`back_span`]), or, in an attachment, map its origin
+/// or give a written page a copy of its own ([`attachment_fault`]). Returns
+/// the run to record on the chunk, or `None` when the fault needs none.
+///
+/// # Errors
+/// The [`FaultDecline`] and its detail word ([`decline_fault`]).
+fn serve_span(
+    l: &mut MemLedger,
+    target: &FaultTarget,
+    region: &DemandRegion,
+    reg: NodeIdx,
+    access: u64,
+    span_pages: u32,
+) -> Result<Option<FrameDesc>, (FaultDecline, u64)>
+{
+    match l.attachment(reg)
+    {
+        Some(att) => attachment_fault(l, target, region, att, access, span_pages),
+        None => back_span(l, target, span_pages).map(Some),
+    }
+}
+
+/// Serve a fault in the attachment `att` (services/memmgr/docs/memory-pool.md
+/// § Memory objects), `access` being the fault's access bits. A read maps the
+/// origin's pages over the span read-only ([`map_origin`]) and asks for no
+/// record (`None`). A write, which only a private attachment admits, gives the
+/// page a copy of its object page ([`copy_object_page`]), or, for the zero
+/// object, backs the span as a committed region's fault does, once the
+/// zero-frame leaves in the span are gone; either returns the run for the
+/// caller to record on its chunk.
+///
+/// # Errors
+/// The [`FaultDecline`] and its detail word ([`decline_fault`]).
+fn attachment_fault(
+    l: &mut MemLedger,
+    target: &FaultTarget,
+    region: &DemandRegion,
+    att: Attachment,
+    access: u64,
+    span_pages: u32,
+) -> Result<Option<FrameDesc>, (FaultDecline, u64)>
+{
+    if access & FAULT_ACCESS_WRITE == 0
+    {
+        return map_origin(l, target, region, att).map(|()| None);
+    }
+    if l.zero_frame(att.object).is_none()
+    {
+        return copy_object_page(l, target, region, att).map(Some);
+    }
+    // The span's pages map its zero frame or nothing. Unmap them first: the
+    // unmap invalidates each leaf on every CPU before it returns, so no thread
+    // of the process reads the zero frame through a stale entry where the run
+    // is then mapped writable.
+    // SAFETY: `aspace_cap` is a client address space procmgr delegated
+    // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
+    // memmgr runs on.
+    unsafe { syscall::mem_unmap(target.aspace_cap, target.span.0, u64::from(span_pages)) }
+        .map_err(|e| (FaultDecline::MapFailed, e.unsigned_abs()))?;
+    back_span(l, target, span_pages).map(Some)
+}
+
+/// Map the origin of the attachment `att` read-only over the part of the
+/// faulting page's chunk no write has copied (`target.span`): the pages of it
+/// that the object frame holding the faulting page holds, in one map, or the
+/// attachment's zero frame at each of its pages for the zero object. The map
+/// goes through a cap derived from memmgr's with the map right alone, deleted
+/// after it. A leaf records the write and execute rights of the cap it was
+/// mapped through as its grant, so no leaf of an attachment's origin carries
+/// either, and neither
+/// `SYS_MEM_PROTECT` nor a text write of `SYS_THREAD_WRITE_MEM` can make a
+/// page other processes map writable (services/memmgr/docs/memory-pool.md
+/// § Memory objects). The kernel keeps the mapping after the cap goes.
+///
+/// # Errors
+/// The [`FaultDecline`] and its detail word ([`decline_fault`]).
+fn map_origin(
+    l: &mut MemLedger,
+    target: &FaultTarget,
+    region: &DemandRegion,
+    att: Attachment,
+) -> Result<(), (FaultDecline, u64)>
+{
+    let (start, end) = target.span;
+    let (cap, offset, va, pages, step) = if let Some(zero) = l.zero_frame(att.object)
+    {
+        let pages = end.saturating_sub(start) / PAGE_SIZE;
+        (zero.cap_slot, 0, start, pages, 1)
+    }
+    else
+    {
+        let page = target.page_base.saturating_sub(region.va_base) / PAGE_SIZE;
+        // The attachment lies inside its object, whose frames stay while it is
+        // attached, so a frame holds the page.
+        let (frame, off) = l
+            .object_frame(att.object, att.first_page.saturating_add(page))
+            .ok_or((FaultDecline::NoRegion, 0))?;
+        // The span's pages before the faulting one that the frame holds, and
+        // those from the faulting one on, which count it: `off` is below the
+        // frame's page count and the span ends past the faulting page.
+        let before = (target.page_base.saturating_sub(start) / PAGE_SIZE).min(off);
+        let after = (end.saturating_sub(target.page_base) / PAGE_SIZE)
+            .min(u64::from(frame.page_count).saturating_sub(off));
+        let pages = before.saturating_add(after);
+        let va = target
+            .page_base
+            .saturating_sub(before.saturating_mul(PAGE_SIZE));
+        (frame.cap_slot, off.saturating_sub(before), va, pages, pages)
+    };
+    let map_cap = syscall::cap_derive(cap, syscall::RIGHTS_MEM_MAP)
+        .map_err(|e| (FaultDecline::MapFailed, e.unsigned_abs()))?;
+    let mut mapped = Ok(());
+    let mut done: u64 = 0;
+    while done < pages && mapped.is_ok()
+    {
+        let frame = FrameDesc {
+            cap_slot: map_cap,
+            // A step is at most a chunk's pages.
+            page_count: u32::try_from(step).unwrap_or(1),
+            phys_base: 0,
+            va: va.saturating_add(done.saturating_mul(PAGE_SIZE)),
+            region_id: NO_REGION_ID,
+        };
+        mapped = map_client(l, target, &frame, offset, MAP_READ).map_err(|r| r.decline());
+        done = done.saturating_add(step);
+    }
+    let _ = syscall::cap_delete(map_cap);
+    mapped
+}
+
+/// Give the faulting page of the private attachment `att` a copy of its
+/// object page, for a write: draw one page from the region's commitment
+/// ([`select_fault_run`]), copy the object page into it ([`copy_page`]),
+/// unmap the page's read-only leaf from the process, and map the copy with the
+/// region's protection. The unmap invalidates the leaf on every CPU before it
+/// returns, so no thread of the process reads the object page there once the
+/// copy is mapped writable (services/memmgr/docs/memory-pool.md § Memory
+/// objects). Returns the copy's run for the caller to record on its chunk.
+///
+/// # Errors
+/// The [`FaultDecline`] and its detail word ([`decline_fault`]).
+fn copy_object_page(
+    l: &mut MemLedger,
+    target: &FaultTarget,
+    region: &DemandRegion,
+    att: Attachment,
+) -> Result<FrameDesc, (FaultDecline, u64)>
+{
+    let page = target.page_base.saturating_sub(region.va_base) / PAGE_SIZE;
+    // As in [`map_origin`], a frame of the object holds the page.
+    let (source, off) = l
+        .object_frame(att.object, att.first_page.saturating_add(page))
+        .ok_or((FaultDecline::NoRegion, 0))?;
+    let grant = select_fault_run(l, target, 1).map_err(|reason| (reason, 0))?;
+    let (outer, pages, phys) = grant.entries[0];
+    let run = FreeRun {
+        cap_slot: outer,
+        page_count: u64::from(pages),
+        phys_base: phys,
+    };
+    // The copy writes the whole page, so it needs no scrub.
+    if let Err(e) = copy_page(l, source.cap_slot, off, outer)
+    {
+        insert_run(l, run);
+        return Err((FaultDecline::MapFailed, e.unsigned_abs()));
+    }
+    // SAFETY: `aspace_cap` is a client address space procmgr delegated
+    // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
+    // memmgr runs on.
+    if let Err(e) = unsafe { syscall::mem_unmap(target.aspace_cap, target.page_base, 1) }
+    {
+        insert_run(l, run);
+        return Err((FaultDecline::MapFailed, e.unsigned_abs()));
+    }
+    let frame = FrameDesc {
+        cap_slot: outer,
+        page_count: pages,
+        phys_base: phys,
+        va: target.page_base,
+        region_id: NO_REGION_ID,
+    };
+    if let Err(refusal) = map_client_chunk(l, target, &frame)
+    {
+        release_unmapped_chunk(l, target.rec, target.aspace_cap, frame);
+        return Err(refusal.decline());
+    }
+    Ok(frame)
+}
+
+/// Copy page `src_offset` of the Memory cap `src` into the first page of
+/// `dst` through memmgr's scrub window: `dst` mapped read-write at
+/// [`SCRUB_VA`], `src` read-only on the page after it, both unmapped again
+/// after the copy, as every pass through the window leaves it.
+fn copy_page(l: &mut MemLedger, src: u64, src_offset: u64, dst: u64) -> Result<(), i64>
+{
+    let src_va = SCRUB_VA.saturating_add(PAGE_SIZE);
+    // SAFETY: the scrub window is memmgr's own zone (the zone map above),
+    // which every pass leaves unmapped, so the map changes nothing memmgr runs
+    // on.
+    unsafe { map_self(l, dst, SCRUB_VA, 0, 1) }?;
+    // SAFETY: as for the map above, on the window's second page.
+    if let Err(e) = unsafe { map_self_with(l, src, src_va, src_offset, 1, MAP_READ) }
+    {
+        // SAFETY: the span is the window page mapped above.
+        let _ = unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, 1) };
+        return Err(e);
+    }
+    // SAFETY: both pages were mapped just above, apart, and nothing else refers
+    // to them. The unmap below is inline assembly without `nomem`, which the
+    // compiler must assume reads memory, so the stores are made before it.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            src_va as *const u8,
+            SCRUB_VA as *mut u8,
+            PAGE_SIZE as usize,
+        );
+    }
+    // SAFETY: the span is the two window pages mapped above.
+    unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, 2) }
 }
 
 /// Total pages of RAM memmgr owns: every page it has taken ownership of since
@@ -3528,6 +3804,362 @@ pub(crate) fn is_notify_cap(cap: u64) -> bool
     })
 }
 
+// ── Memory objects ───────────────────────────────────────────────────────────
+
+/// Admit an attachment of `len` bytes, shared or private (`share`), by
+/// `rec` (`free_pool::Ledger::admit_attach`): a private one as a committed
+/// region of its length ([`admit_commit`]), a shared one its charge against
+/// the max and only its page-table reservation against the free pages outside
+/// `promised`. A refusal rechecks the deferred runs once, as [`admit`] does.
+fn admit_attach(l: &mut MemLedger, rec: NodeIdx, len: u64, share: Share)
+-> Result<(), ChargeError>
+{
+    let reserve = l.growth_floor(pool_total_pages());
+    let r = l.admit_attach(rec, len, share, reserve).or_else(|e| {
+        if recheck_deferred(l) == 0
+        {
+            return Err(e);
+        }
+        coalesce(l);
+        l.admit_attach(rec, len, share, reserve)
+    });
+    let refused = if r.is_ok()
+    {
+        0
+    }
+    else
+    {
+        grow_need(0, len).charged()
+    };
+    note_admission(l, rec, refused);
+    r
+}
+
+/// `SEAL_OBJECT`: seal grants of the caller into a memory object and reply
+/// its pages and an object handle to it (services/memmgr/docs/ipc-interface.md
+/// § Label 27). The grants' caps the caller handed back were deleted by
+/// [`dispatch`], so each grant passes [`quiescent`] unless the caller kept a
+/// cap to it, a mapping or a retype; one that does not refuses the seal whole,
+/// since a process that can still write a frame could change an object others
+/// map. A phys-class caller is refused: a device it programmed may write the
+/// frames. A reply that does not reach the caller undoes the seal
+/// (`free_pool::Ledger::unseal_object`), so a caller whose call was
+/// interrupted repeats it.
+fn handle_seal_object(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
+{
+    if req.badge & PHYS_CLASS_BADGE_BIT != 0
+    {
+        reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
+        return;
+    }
+    let l = ledger_mut();
+    let count = req.word(0) as usize;
+    let Some(rec) = l.find(req.badge).filter(|_| {
+        count != 0
+            && count as u64 <= memmgr_labels::SEAL_OBJECT_MAX_GRANTS
+            && count < req.word_count()
+    })
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let mut words = [0u64; memmgr_labels::SEAL_OBJECT_MAX_GRANTS as usize];
+    for (i, id) in words.iter_mut().take(count).enumerate()
+    {
+        *id = req.word(i.saturating_add(1));
+    }
+    let ids = words.get(..count).unwrap_or_default();
+    let all_quiescent = ids.iter().all(|&id| {
+        l.granted_frame(rec, id).is_some_and(|(_, f)| {
+            quiescent(&FreeRun {
+                cap_slot: f.cap_slot,
+                page_count: u64::from(f.page_count),
+                phys_base: f.phys_base,
+            })
+        })
+    });
+    if !all_quiescent
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    let Some(key) = mint_object_key(l)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    };
+    ensure_index(l);
+    if !ensure_slots(l, 1)
+    {
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    }
+    let obj = match l.seal_object(rec, ids, key)
+    {
+        Ok(obj) => obj,
+        Err(SealError::NoSlot) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::QUOTA);
+            return;
+        }
+        // `rec` came from `find` above, so `NoRecord` cannot arise.
+        Err(SealError::Grants | SealError::NoRecord) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+            return;
+        }
+    };
+    let Ok(cap) = syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, key)
+    else
+    {
+        let _ = l.unseal_object(rec, obj);
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, l.object_pages(obj))
+        .cap(cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        // No handle reached the caller, so nothing can name the object: give
+        // the caller its grants back.
+        let _ = syscall::cap_delete(cap);
+        let _ = l.unseal_object(rec, obj);
+    }
+}
+
+/// `ATTACH_OBJECT`: attach pages of the memory object the handle in `caps`
+/// names, or of the zero object with no cap, as a region of the caller
+/// (services/memmgr/docs/ipc-interface.md § Label 28). The handle is deleted
+/// on every path. The region is admitted ([`admit_attach`]) and charged as a
+/// committed region of its length; nothing is mapped until a fault
+/// ([`attachment_fault`]). A shared attachment is never writable, and no
+/// attachment is executable: an executable map needs a cap with the execute
+/// right, whose leaf grant would let a text write of `SYS_THREAD_WRITE_MEM`
+/// patch a frame other processes map. A reply that does not reach the caller
+/// detaches the region again, so a caller whose call was interrupted repeats
+/// it.
+fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
+{
+    // The handle's badge, read first, which deletes the cap.
+    let handle = caps.first().map(|&cap| cap_badge(service_ep, cap));
+    let va_base = req.word(0);
+    let len = req.word(1);
+    let prot = req.word(2);
+    let first_page = req.word(3);
+    let flags = req.word(4);
+    let share = if flags & memmgr_labels::ATTACH_PRIVATE == 0
+    {
+        Share::Shared
+    }
+    else
+    {
+        Share::Private
+    };
+    if len == 0
+        || !va_base.is_multiple_of(PAGE_SIZE)
+        || !len.is_multiple_of(PAGE_SIZE)
+        || va_base.checked_add(len).is_none()
+        || prot & !(MAP_READ | MAP_WRITABLE) != 0
+        || flags & !memmgr_labels::ATTACH_PRIVATE != 0
+        || (share == Share::Shared && prot & MAP_WRITABLE != 0)
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    let l = ledger_mut();
+    let Some(rec) = l.find(req.badge)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    // The object's slot, or for the zero object the zero frame's, and
+    // whether this request took that zero frame.
+    let found = match handle
+    {
+        None => attach_zero_frame(l, len / PAGE_SIZE),
+        Some(badge) => badge
+            .filter(|b| b & memmgr_labels::OBJECT_HANDLE_TAG != 0)
+            .and_then(|b| l.find_object(b))
+            .map(|object| (object, false))
+            .ok_or(memmgr_errors::INVALID_ARGUMENT),
+    };
+    let (object, fresh) = match found
+    {
+        Ok(found) => found,
+        Err(label) =>
+        {
+            reply_label(ipc_buf, label);
+            return;
+        }
+    };
+    // A refused request gives back the zero frame it took.
+    let refuse = |l: &mut MemLedger, label: u64| {
+        if fresh
+        {
+            drop_zero_frame(l, object);
+        }
+        reply_label(ipc_buf, label);
+    };
+    if let Err(e) = admit_attach(l, rec, len, share)
+    {
+        refuse(l, commit_refusal(e));
+        return;
+    }
+    let region = DemandRegion {
+        va_base,
+        len,
+        prot,
+        evict: Evict::Never,
+    };
+    let source = Attachment {
+        object,
+        first_page,
+        share,
+    };
+    let reg = match attach_region(l, rec, region, source)
+    {
+        Ok(reg) => reg,
+        Err(label) =>
+        {
+            refuse(l, label);
+            return;
+        }
+    };
+    let reply = IpcMessage::new(memmgr_errors::SUCCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        // As in [`handle_register_region`]: nothing faulted in it yet.
+        let _ = l.remove_region(rec, reg, quiescent);
+        if fresh
+        {
+            drop_zero_frame(l, object);
+        }
+    }
+}
+
+/// Record `region` of process `rec` as an attachment of `source`
+/// ([`MemLedger::attach_object`]), growing the arena once when it is full.
+///
+/// # Errors
+/// The label of the error reply: `QUOTA` when the arena cannot grow,
+/// `LIMIT` past the mapping bound, `INVALID_ARGUMENT` for an overlapping
+/// range or pages outside the object.
+fn attach_region(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    region: DemandRegion,
+    source: Attachment,
+) -> Result<NodeIdx, u64>
+{
+    let mut result = l.attach_object(rec, region, source);
+    // The region's slot and its commitment's.
+    if result == Err(RegionError::NoSlot) && ensure_slots(l, 2)
+    {
+        result = l.attach_object(rec, region, source);
+    }
+    result.map_err(|e| match e
+    {
+        RegionError::NoSlot => memmgr_errors::QUOTA,
+        RegionError::MapBound => memmgr_errors::LIMIT,
+        RegionError::Overlap
+        | RegionError::NoRecord
+        | RegionError::NoObject
+        | RegionError::OutsideObject => memmgr_errors::INVALID_ARGUMENT,
+    })
+}
+
+/// The zero frame a zero-object attachment of `pages` pages maps, and
+/// whether it was taken for this attachment: the fullest whose span still
+/// takes the pages ([`MemLedger::zero_frame_for`]), or else a new one, a page
+/// taken from the pool and zeroed, kept for memmgr's life and charged to no
+/// budget node, as the arena's pages are, unless the request that took it is
+/// refused ([`drop_zero_frame`])
+/// (services/memmgr/docs/memory-pool.md § Memory objects, Mapping bound).
+///
+/// # Errors
+/// The label of the error reply: `LIMIT` for more pages than one zero frame
+/// backs, `OUT_OF_MEMORY_BEST_EFFORT` when the pool cannot spare the page or
+/// its scrub fails, `QUOTA` when the arena cannot grow for its record.
+fn attach_zero_frame(l: &mut MemLedger, pages: u64) -> Result<(NodeIdx, bool), u64>
+{
+    if let Some(zero) = l.zero_frame_for(pages)
+    {
+        return Ok((zero, false));
+    }
+    if pages > ZERO_FRAME_SPAN
+    {
+        return Err(memmgr_errors::LIMIT);
+    }
+    let grant =
+        select(l, 1, Fit::Contiguous).map_err(|_| memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT)?;
+    let (outer, taken, phys) = grant.entries[0];
+    if scrub_run(l, outer, u64::from(taken)).is_err()
+    {
+        return_taken(l, outer, taken, phys);
+        return Err(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+    }
+    let mut added = l.add_zero_frame(outer, phys);
+    if added == Err(RegionError::NoSlot) && ensure_slots(l, 1)
+    {
+        added = l.add_zero_frame(outer, phys);
+    }
+    if let Ok(zero) = added
+    {
+        return Ok((zero, true));
+    }
+    return_taken(l, outer, taken, phys);
+    Err(memmgr_errors::QUOTA)
+}
+
+/// Give zero frame `zero`'s page back to the pool once it backs no
+/// attachment ([`MemLedger::remove_zero_frame`]), for a request refused after
+/// it took the frame; a frame still backing one is kept.
+fn drop_zero_frame(l: &mut MemLedger, zero: NodeIdx)
+{
+    if let Some(z) = l.remove_zero_frame(zero)
+    {
+        return_taken(l, z.cap_slot, 1, z.phys_base);
+    }
+}
+
+/// Hand a memory-object label (`SEAL_OBJECT` to `OBJECT_RELEASE`) to its
+/// handler, as [`route`] does.
+fn route_object(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, service_ep: u64)
+{
+    match opcode
+    {
+        memmgr_labels::SEAL_OBJECT => handle_seal_object(req, ipc_buf, service_ep),
+        memmgr_labels::ATTACH_OBJECT => handle_attach_object(req, kept, ipc_buf, service_ep),
+        _ => handle_object_release(req, ipc_buf),
+    }
+}
+
+/// `OBJECT_RELEASE`: drop the handle state of the object the handle names,
+/// so every handle to it is refused from then on; its frames are freed, pooled
+/// or deferred, once no region attaches it
+/// (services/memmgr/docs/ipc-interface.md § Label 29).
+fn handle_object_release(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let l = ledger_mut();
+    let Some(obj) = l.find_object(req.badge)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    recheck_deferred(l);
+    let _ = l.release_object(obj, quiescent);
+    coalesce(l);
+    reply_label(ipc_buf, memmgr_errors::SUCCESS);
+}
+
 // ── Reply helpers ────────────────────────────────────────────────────────────
 
 fn reply_label(ipc_buf: *mut u64, label: u64)
@@ -3714,9 +4346,9 @@ fn delete_caps(caps: &[u64])
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
 /// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first two
 /// for `NODE_REGISTER_LIMIT` and `SWAP_REGISTER`, the first for
-/// `DELEGATE_ASPACE`, `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`
-/// and `SWAP_RESTORE`, none for any other label. [`dispatch`] deletes the
-/// rest.
+/// `DELEGATE_ASPACE`, `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`,
+/// `SWAP_RESTORE` and `ATTACH_OBJECT`, none for any other label.
+/// [`dispatch`] deletes the rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
     match opcode
@@ -3726,7 +4358,8 @@ fn contract_cap_count(opcode: u64, attached: usize) -> usize
         | memmgr_labels::REGISTER_PRESSURE
         | memmgr_labels::REGISTER_PROCESS
         | memmgr_labels::SWAP_TAKE
-        | memmgr_labels::SWAP_RESTORE => attached.min(1),
+        | memmgr_labels::SWAP_RESTORE
+        | memmgr_labels::ATTACH_OBJECT => attached.min(1),
         memmgr_labels::NODE_REGISTER_LIMIT | memmgr_labels::SWAP_REGISTER => attached.min(2),
         _ => 0,
     }
@@ -3756,13 +4389,16 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     let (kept, stray) = attached.split_at(contract_cap_count(opcode, attached.len()));
     delete_caps(stray);
     // A node handle is served the node labels and nothing else, the swap
-    // authority the swap labels and nothing else, and every other badge
-    // everything else (services/memmgr/docs/ipc-interface.md § Node Handles,
+    // authority the swap labels and nothing else, an object handle
+    // `OBJECT_RELEASE` and nothing else, and every other badge everything else
+    // (services/memmgr/docs/ipc-interface.md § Node Handles, § Object Handles,
     // § Badge Discipline).
     let node_label = (memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE).contains(&opcode);
     let swap_label = (memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED).contains(&opcode);
+    let object_label = opcode == memmgr_labels::OBJECT_RELEASE;
     if node_label != (req.badge & memmgr_labels::NODE_HANDLE_TAG != 0)
         || swap_label != (req.badge & memmgr_labels::SWAP_AUTHORITY != 0)
+        || object_label != (req.badge & memmgr_labels::OBJECT_HANDLE_TAG != 0)
     {
         delete_caps(kept);
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
@@ -3860,6 +4496,10 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED =>
         {
             disk::route(opcode, req, kept, ipc_buf, boot.service_ep);
+        }
+        memmgr_labels::SEAL_OBJECT..=memmgr_labels::OBJECT_RELEASE =>
+        {
+            route_object(opcode, req, kept, ipc_buf, boot.service_ep);
         }
         _ =>
         {

@@ -21,7 +21,7 @@
 //! reservation is that of the largest length the region has had, since a cut
 //! keeps the page tables of the pages it cuts ([`regrow_need`]).
 
-use crate::arena::SLOTS_PER_PAGE;
+use crate::arena::{SLOTS_PER_PAGE, Share};
 use crate::chunk::table_height;
 use crate::{CHUNK_BYTES, DEMAND_CHUNK_PAGES};
 
@@ -157,6 +157,22 @@ impl CommitNeed
     pub const fn promised(&self) -> u64
     {
         self.charged().saturating_add(self.meta)
+    }
+}
+
+/// The part of the growth `need` of an attachment from length 0 that a
+/// memory-object attachment shared as `share` adds to `promised`: all of it
+/// for a private attachment, whose writes back pages as a committed region's
+/// faults do, and the page-table reservation alone for a shared one, which
+/// maps only the object's own frames and so takes no data page and records no
+/// run (`services/memmgr/docs/memory-pool.md` § Memory objects).
+#[must_use]
+pub const fn attach_promise(need: CommitNeed, share: Share) -> u64
+{
+    match share
+    {
+        Share::Private => need.promised(),
+        Share::Shared => need.pt,
     }
 }
 

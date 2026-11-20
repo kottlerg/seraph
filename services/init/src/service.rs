@@ -1624,7 +1624,7 @@ fn endow_svcmgr(
 
 /// Serve svcmgr one `SUBSTRATE` round per init-bootstrapped service whose
 /// thread cap init captured, stopping at the first failure with its
-/// `serve_round` error code. Each round carries the service's thread cap and
+/// round's error code. Each round carries the service's thread cap and
 /// its address-space observer cap ([`Observer`]): for memmgr and procmgr a
 /// `Control`-only derivation of the address space, for devmgr and vfsd the
 /// process handle. An address-space cap that cannot be derived leaves the

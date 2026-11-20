@@ -378,6 +378,8 @@ Death](../../../docs/supervision.md#core-set-and-system-death)): init logs
 `init: FATAL: <service> died during its bootstrap (exit reason 0x<reason>)` (`bootstrap_death`,
 `../src/main.rs`), serves nothing more, and its main thread exits. init-logd keeps serving the
 master log endpoint, so the line reaches the serial console, and nothing powers the system off.
+init reads only the child whose request it waits for: memmgr's or procmgr's death after its own
+rounds is not seen, and init's next call that reaches the dead service waits for good.
 A round that fails with the child alive keeps its own handling: memmgr's or procmgr's is FATAL,
 devmgr's or vfsd's ends that service's rounds, and svcmgr is endowed without its substrate round,
 and svcmgr's ends the endowment as [Handover](#handover) describes.

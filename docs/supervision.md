@@ -35,7 +35,8 @@ and no shutdown.
 
 ```
 init            launches the bootstrap substrate, endows svcmgr, exits; supervises nothing, and
-                halts the boot on a death before the handover (§ Core Set and System Death)
+                halts the boot on a child's death during its bootstrap rounds (§ Core Set and
+                System Death)
 svcmgr          supervises the substrate (memmgr, procmgr, devmgr, vfsd) and every service it
    │            launches from a recipe (logd, timed, pwrmgr, crashd, ...)
    ├── devmgr   observes each driver's death, withdraws a dead driver, restarts a served one
@@ -95,8 +96,8 @@ Bootstrap Stages](../services/init/docs/bootstrap.md).
 ## Core Set and System Death
 
 memmgr, procmgr and svcmgr are the core set. None of them restarts, and the death of any of them is
-system death: the system powers off, except before svcmgr's handover, where system death is init's
-logged halt (below).
+system death: the system powers off, except for a death init sees before svcmgr's handover, which is
+init's logged halt (below).
 
 - **memmgr** holds every RAM frame and is the pager of nearly every process
   ([Fault Handling § Default System Pager](fault-handling.md#default-system-pager)).
@@ -170,7 +171,9 @@ only acpid evaluates, and acpid is a driver launched after the handover. One hal
 architectures keeps the window to the rule every other bootstrap failure of init follows. The
 halted system keeps the FATAL line on the serial console, which init-logd writes until real-logd
 takes over, and a test boot fails at that line, which the `FATAL:` marker of the run's fail
-pattern matches, rather than at its deadline.
+pattern matches, rather than at its deadline. init reads only the child whose request it waits for:
+a core death outside that wait, memmgr's or procmgr's after its own rounds, is not seen, and init's
+next call that reaches the dead service waits for good (#1185), so the boot hangs with no line.
 
 ---
 

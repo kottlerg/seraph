@@ -33,10 +33,13 @@ pub const LABEL_VERSION_MISMATCH: u64 = 3;
 /// the settle bound, etc.), or (c) binds no driver of the class on this
 /// machine. A query received while the drivers-directory pass or its
 /// settle runs waits until both are done and gets no case (a) reply.
-/// Case (a) ends once `SET_DRIVERS_DIR` arrives, and (b) and (c) end
-/// only when a later bind pass serves a driver of the class
-/// (`BIND_DRIVERS`), which a client cannot foresee: a client with a
-/// no-device path (timed) MUST treat the reply as terminal and take
+/// Case (a) ends once `SET_DRIVERS_DIR` arrives. Case (b) ends when
+/// devmgr's retry of a create procmgr refused with `IO_ERROR` or
+/// `OUT_OF_MEMORY` starts the driver, within `CREATE_RETRY_LIMIT`
+/// retries (services/devmgr/docs/responsibilities.md § Create retry),
+/// and (b) and (c) end when a later bind pass serves a driver of the
+/// class (`BIND_DRIVERS`). A client can foresee neither: a client with
+/// a no-device path (timed) MUST treat the reply as terminal and take
 /// that path, and a client that cannot proceed without the device
 /// waits on a `WATCH_CLASS` watch and queries again when it is
 /// signalled ([`super::await_device`]), never polling `QUERY_DEVICE`.

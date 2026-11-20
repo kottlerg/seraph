@@ -283,16 +283,16 @@ at least 16 and at most 504 bytes, the two answers to differ, and `READ(0)` to a
 The drivers hwrng restart phase kills the virtio-rng driver through `caps[19]`, requires its ordinal
 on `caps[16]` to answer `WITHDRAWN` and the class's next ordinal to answer with a new instance, and
 requires a `READ` through that instance to answer with bytes.
-The `rtc_create_retry` phase, just before it, runs when `memhog.svc` is staged and passes
-otherwise. It stops devmgr's main thread, which runs every driver restart, through `caps[19]`,
-kills the RTC driver and waits until procmgr no longer lists it, then has
+The `rtc_create_retry` phase runs just before `timed_rtc_restart`, when `memhog.svc` is staged, and
+passes otherwise. It stops devmgr's main thread, which runs every driver restart, through
+`caps[19]`, kills the RTC driver and waits until procmgr no longer lists it, then has
 [memhog](../memhog/README.md) fill the pool down to the growth floor and, once the level reads
 `CRITICAL`, starts devmgr's main thread again, so devmgr's restart of the driver makes its create
 while no page is left to a driver outside the system reserve, and procmgr refuses it. It requires
 devmgr's line for the refusal and its first retry in logd's history through `caps[6]`, stamped
 after the kill; once oomd's stop of memhog, or svctest's own through `caps[20]` when no oomd stops
-it, has ended the window, a new RTC driver listed within 90 s; and devmgr's line for the retry
-that started it ([devmgr responsibilities](../devmgr/docs/responsibilities.md#create-retry)).
+it, has ended the window, a new RTC driver listed within 90 s; and devmgr's line for a retry
+of its create ([devmgr responsibilities](../devmgr/docs/responsibilities.md#create-retry)).
 The `timed_rtc_restart` phase kills the RTC driver (`cmos-rtc` on x86-64, `goldfish-rtc` on
 riscv64) through `caps[19]` and waits for devmgr's restart of it, then kills timed (its recipe's
 `argv = timed` names it), and requires `SystemTime::now()` to give a time between 2024 and 2100

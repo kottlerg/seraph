@@ -172,7 +172,7 @@ const DEVMGR_NAME: &[u8] = b"devmgr";
 
 /// How long the RTC create-retry phase holds memory critical when no oomd
 /// stops the `memhog` fixture, and svctest stops it: past devmgr's first two
-/// retries (1 s and 2 s after the refusal). A test wait bound.
+/// retries (1 s and 3 s after the refusal). A test wait bound.
 const RETRY_HOLD: Duration = Duration::from_secs(5);
 
 /// How long the RTC create-retry phase waits for each of devmgr's lines and
@@ -247,7 +247,8 @@ pub fn rtc_create_retry_phase(caps: &Caps)
     );
     let took = retried_us.saturating_sub(refused_us) / 1000;
     std::os::seraph::log!(
-        "rtc_create_retry phase passed (the RTC driver's restart refused while memory was          critical, and its create retried {took} ms later)"
+        "rtc_create_retry phase passed (the RTC driver's restart refused while memory was \
+         critical; its first create retry {took} ms later)"
     );
 }
 

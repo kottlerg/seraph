@@ -4106,7 +4106,7 @@ fn handle_seal_object(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
         reply_label(ipc_buf, memmgr_errors::QUOTA);
         return;
     };
-    if map_object_view(l, rec, ids, own_va).is_err()
+    if map_object_view(l, rec, ids, own_va, pages).is_err()
     {
         reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
         return;
@@ -4158,14 +4158,20 @@ fn handle_seal_object(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
 }
 
 /// Map memmgr's own read-only view of the frames of the grants `ids` of
-/// `rec`, in their order, from `own_va`, a span of the object zone that
-/// holds their pages (services/memmgr/docs/memory-pool.md § Memory objects,
-/// Own view). On failure the part mapped is unmapped and the span given
-/// back ([`drop_object_view`]).
+/// `rec`, in their order, from `own_va`, the span of `pages` pages of the
+/// object zone the seal took for them (services/memmgr/docs/memory-pool.md
+/// § Memory objects, Own view). On failure the part mapped is unmapped and
+/// the whole span given back ([`drop_object_view`]).
 ///
 /// # Errors
 /// The error of the map that failed.
-fn map_object_view(l: &mut MemLedger, rec: NodeIdx, ids: &[u64], own_va: u64) -> Result<(), i64>
+fn map_object_view(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    ids: &[u64],
+    own_va: u64,
+    pages: u64,
+) -> Result<(), i64>
 {
     let mut at = own_va;
     for &id in ids
@@ -4175,20 +4181,19 @@ fn map_object_view(l: &mut MemLedger, rec: NodeIdx, ids: &[u64], own_va: u64) ->
         {
             continue;
         };
-        let pages = u64::from(f.page_count);
+        let frame_pages = u64::from(f.page_count);
         // SAFETY: `[at, at + pages)` lies in the span of the object zone the
         // seal took for these frames (the zone map above), which nothing maps
         // yet, so the map changes nothing memmgr runs on.
-        if let Err(e) = unsafe { map_self_with(l, f.cap_slot, at, 0, pages, MAP_READ) }
+        if let Err(e) = unsafe { map_self_with(l, f.cap_slot, at, 0, frame_pages, MAP_READ) }
         {
-            // The span up to the end of the failed map: a map that ran out of
-            // page tables part way left the pages before the failing one
-            // mapped.
-            let end = at.saturating_add(pages.saturating_mul(PAGE_SIZE));
-            drop_object_view(l, own_va, end.saturating_sub(own_va) / PAGE_SIZE);
+            // The whole span: a map that ran out of page tables part way left
+            // the pages before the failing one mapped, and the unmap passes
+            // over the pages no map reached.
+            drop_object_view(l, own_va, pages);
             return Err(e);
         }
-        at = at.saturating_add(pages.saturating_mul(PAGE_SIZE));
+        at = at.saturating_add(frame_pages.saturating_mul(PAGE_SIZE));
     }
     Ok(())
 }

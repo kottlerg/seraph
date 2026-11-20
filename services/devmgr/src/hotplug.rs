@@ -482,12 +482,11 @@ impl Hotplug
     {
         while let Ok(job) = self.jobs.try_recv()
         {
-            let (index, owner, event) = match job
+            let (index, owner, removal) = match job
             {
-                Job::Added(index, owner) => (index, owner, devmgr_labels::HOTPLUG_ADDED),
-                Job::Removed(index, owner) => (index, owner, devmgr_labels::HOTPLUG_REMOVED),
+                Job::Added(index, owner) => (index, owner, false),
+                Job::Removed(index, owner) => (index, owner, true),
             };
-            let removal = event == devmgr_labels::HOTPLUG_REMOVED;
             let Some(candidate) = self.candidates.get(index)
             else
             {
@@ -550,48 +549,68 @@ impl Hotplug
                 }
                 continue;
             }
-            if matches!(owner, Owner::Acpi(_))
-            {
-                if records.live_pci().any(|r| slot.holds(address(r)))
-                {
-                    std::os::seraph::log!(
-                        "hotplug: slot {}:{}:{}.{}: the firmware reports a card, whose functions \
-                         are recorded; nothing added",
-                        s,
-                        b,
-                        d,
-                        f
-                    );
-                    owner.reply(Reply::success(&[0]));
-                    continue;
-                }
-                std::os::seraph::log!(
-                    "hotplug: slot {}:{}:{}.{}: card added (the firmware's device check)",
-                    s,
-                    b,
-                    d,
-                    f
-                );
-            }
-            if let Some(code) = firmware::headroom::hotplug_refusal(event)
-                && !crate::headroom::hold()
-            {
-                std::os::seraph::log!(
-                    warn: "hotplug: slot {}:{}:{}.{}: CSpace short of its headroom; card not \
-                           added, nothing recorded",
-                    s, b, d, f
-                );
-                owner.reply(Reply::status(code));
-                continue;
-            }
-            let added = add(&slot, records, carve.caps);
-            if added > 0
-            {
-                bind_added(registry, records, carve, watch, ipc_buf);
-            }
-            owner.reply(Reply::success(&[u64::try_from(added).unwrap_or(u64::MAX)]));
+            run_add(&slot, &owner, registry, records, carve, watch, ipc_buf);
         }
     }
+}
+
+/// Run the add job of `slot`, posted by `owner`, to its reply
+/// ([`Hotplug::run`]): an acpid job records nothing while live records lie
+/// behind the slot, and any add job is refused, recording nothing, while
+/// devmgr's `CSpace` headroom is short and its top-up refused
+/// (`firmware::headroom::hotplug_refusal`); else [`add`], then
+/// [`bind_added`] when it recorded a function.
+fn run_add(
+    slot: &Slot,
+    owner: &Owner,
+    registry: &Registry,
+    records: &mut bind::Records,
+    carve: &mut bind::Carve,
+    watch: &mut settle::DriverWatch,
+    ipc_buf: *mut u64,
+)
+{
+    let (s, b, d, f) = slot.port;
+    if matches!(owner, Owner::Acpi(_))
+    {
+        if records.live_pci().any(|r| slot.holds(address(r)))
+        {
+            std::os::seraph::log!(
+                "hotplug: slot {}:{}:{}.{}: the firmware reports a card, whose functions \
+                 are recorded; nothing added",
+                s,
+                b,
+                d,
+                f
+            );
+            owner.reply(Reply::success(&[0]));
+            return;
+        }
+        std::os::seraph::log!(
+            "hotplug: slot {}:{}:{}.{}: card added (the firmware's device check)",
+            s,
+            b,
+            d,
+            f
+        );
+    }
+    if let Some(code) = firmware::headroom::hotplug_refusal(devmgr_labels::HOTPLUG_ADDED)
+        && !crate::headroom::hold()
+    {
+        std::os::seraph::log!(
+            warn: "hotplug: slot {}:{}:{}.{}: CSpace short of its headroom; card not \
+                   added, nothing recorded",
+            s, b, d, f
+        );
+        owner.reply(Reply::status(code));
+        return;
+    }
+    let added = add(slot, records, carve.caps);
+    if added > 0
+    {
+        bind_added(registry, records, carve, watch, ipc_buf);
+    }
+    owner.reply(Reply::success(&[u64::try_from(added).unwrap_or(u64::MAX)]));
 }
 
 /// Bind the functions an add job recorded, in a drivers-directory pass of

@@ -144,12 +144,16 @@ stub's endpoint.
   the stub's badge among them, so its stops arrive under its spawner's badge. The stub credits a
   stop to the thread its badge names only when that thread is not already held and its register
   file reads at the pointer the message carries. Any other stop makes it refresh its table: it
-  pages procmgr's thread list (`ATTACH_PROCESS`) from the count of the table's threads still
-  alive, since procmgr lists those first and in the same order, retaking the page when one of them
-  exits meanwhile (`REFRESH_TRIES` times), and binds each new thread under its own badge, in the
-  slot of an exited thread or after the last. A bind to a new badge delivers the new thread's stop
-  again under it ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and
-  Kill, Rebind), and cancels the first delivery, which ignores the stub's answer. A new thread
+  pages procmgr's thread list (`ATTACH_PROCESS`) from the index of the first thread the table
+  does not hold, one past the main thread and the table's live registered threads, since procmgr
+  lists the main thread at index 0 whether or not it has exited, then each registered thread still
+  alive in registration order
+  ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`). It
+  retakes the page when a thread of the table exits meanwhile (`REFRESH_TRIES` times), and binds
+  each new thread under its own badge, in the slot of an exited thread or after the last. A bind
+  to a new badge delivers the new thread's stop again under it
+  ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and Kill, Rebind),
+  and cancels the first delivery, which ignores the stub's answer. A new thread
   stored in the slot of the exited spawner whose badge it copied keeps its binding, which cancels
   nothing, so the stub credits the stop to that thread when it is the one blocked at its pointer.
   When a refresh adds a thread, every held breakpoint hit or fault GDB has not been told of is

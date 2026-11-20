@@ -222,6 +222,9 @@ struct Slot
     /// it lives and is not shown to GDB.
     bound: bool,
     held: Option<Held>,
+    /// The target's main thread: procmgr's index 0, which procmgr lists
+    /// there whether or not it has exited.
+    main: bool,
     /// Repeats of the held stop, kept beside it once GDB has been told of
     /// it ([`Unclaimed::Keep`]), and answered with it.
     beside: Vec<Stop>,
@@ -289,7 +292,7 @@ pub struct Session
 {
     threads: Vec<Slot>,
     /// The table holds every thread procmgr listed, so a refresh can page
-    /// on from the count of threads still alive.
+    /// on from the first index the table does not hold.
     complete: bool,
     /// How far past a software breakpoint the architecture reports the
     /// pointer.
@@ -322,9 +325,14 @@ impl Session
             current: 0,
             breakpoints: Breakpoints::new(),
         };
-        for cap in page.caps
+        for (index, cap) in page.caps.into_iter().enumerate()
         {
-            s.add_thread(k, cap);
+            let slot = s.add_thread(k, cap);
+            if index == 0
+                && let Some(t) = s.threads.get_mut(slot)
+            {
+                t.main = true;
+            }
         }
         s.stop_all(k);
         s
@@ -333,8 +341,9 @@ impl Session
     // ── The table ────────────────────────────────────────────────────────
 
     /// Store `cap` in the slot of an exited thread with no stop held, or
-    /// after the last, and bind it under that slot's badge.
-    fn add_thread(&mut self, k: &mut impl Kernel, cap: u64)
+    /// after the last, and bind it under that slot's badge; returns the
+    /// slot.
+    fn add_thread(&mut self, k: &mut impl Kernel, cap: u64) -> usize
     {
         let free = control::free_slot(self.threads.iter().map(|t| (t.gone, t.held.is_some())));
         let index = free.unwrap_or(self.threads.len());
@@ -347,6 +356,7 @@ impl Session
             cap,
             bound,
             held: None,
+            main: false,
             beside: Vec::new(),
             upcall: Upcall::Unposted,
             gone: !bound && !k.alive(cap),
@@ -360,6 +370,7 @@ impl Session
         {
             self.threads.push(slot);
         }
+        index
     }
 
     /// Mark the exited threads gone; returns how many are alive.
@@ -376,9 +387,11 @@ impl Session
     }
 
     /// Take the threads the target registered since the attach from
-    /// procmgr's list and bind them; returns whether one was added. procmgr
-    /// lists the threads still alive first and in the same order, so the
-    /// new ones start at the count of the table's live threads.
+    /// procmgr's list and bind them; returns whether one was added.
+    /// procmgr lists the main thread at index 0 whether or not it has
+    /// exited, then each registered thread still alive in registration
+    /// order, so the new ones start after the main thread and the table's
+    /// live registered threads.
     fn refresh(&mut self, k: &mut impl Kernel) -> bool
     {
         if !self.complete
@@ -388,12 +401,13 @@ impl Session
         for _ in 0..REFRESH_TRIES
         {
             let alive = self.alive_count(k);
-            let Some(page) = k.list(alive as u64, MAX_THREADS.saturating_sub(alive))
+            let first = self.unlisted_index();
+            let Some(page) = k.list(first, MAX_THREADS.saturating_sub(alive))
             else
             {
                 return false;
             };
-            if self.alive_count(k) != alive || page.count < alive as u64
+            if self.alive_count(k) != alive || page.count < first
             {
                 for cap in page.caps
                 {
@@ -405,11 +419,20 @@ impl Session
             let added = !page.caps.is_empty();
             for cap in page.caps
             {
-                self.add_thread(k, cap);
+                let _ = self.add_thread(k, cap);
             }
             return added;
         }
         false
+    }
+
+    /// The index in procmgr's list of the first thread the table does not
+    /// hold: one for the main thread, held or exited, and one for each live
+    /// registered thread of the table. Read after [`Self::alive_count`].
+    fn unlisted_index(&self) -> u64
+    {
+        let registered = self.threads.iter().filter(|t| !t.gone && !t.main).count();
+        (registered as u64).saturating_add(1)
     }
 
     // ── Stops ────────────────────────────────────────────────────────────
@@ -1723,8 +1746,13 @@ mod tests
 
         fn list(&mut self, first: u64, room: usize) -> Option<Page>
         {
+            // As procmgr lists them: the main thread, thread 0, at index 0
+            // whether or not it has exited, then each registered thread
+            // still alive.
             let listed: Vec<u64> = (0..self.threads.len())
-                .filter(|&t| self.threads[t].registered && self.threads[t].run != Run::Exited)
+                .filter(|&t| {
+                    t == 0 || (self.threads[t].registered && self.threads[t].run != Run::Exited)
+                })
                 .map(cap_of)
                 .collect();
             let first = usize::try_from(first).unwrap();
@@ -2256,6 +2284,7 @@ mod tests
                     cap: cap_of(0),
                     bound: false,
                     held: Some(held),
+                    main: false,
                     beside: Vec::new(),
                     upcall: Upcall::Unposted,
                     gone: true,
@@ -2275,6 +2304,40 @@ mod tests
         hold_more(&mut s, 1);
         let _ = s.next_stop(&mut sim, 0);
         assert_eq!(sim.receivers, MAX_RECEIVERS, "no more past the bound");
+    }
+
+    // Defect caught: a refresh after the main thread's exit paged procmgr's
+    // list from the count of the table's live threads, which procmgr's
+    // index 0, the exited main thread, put one short: it added a held
+    // thread a second time, rebinding it under the new slot's badge.
+    #[test]
+    fn a_refresh_after_the_main_thread_s_exit_adds_each_thread_once()
+    {
+        let mut sim = Sim::new();
+        let worker = sim.spawn(Some(0), true);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        resume(&mut sim, &mut s);
+        sim.exit(0);
+        let n = sim.spawn(Some(worker), true);
+        assert!(s.interrupt(&mut sim));
+        let slots_of = |s: &Session, t: usize| {
+            s.threads
+                .iter()
+                .filter(|slot| slot.cap == cap_of(t) && !slot.gone)
+                .count()
+        };
+        assert_eq!(slots_of(&s, worker), 1, "the worker takes one slot");
+        assert_eq!(slots_of(&s, n), 1, "the new thread is added once");
+        assert_eq!(s.live_ids().len(), 2);
+        assert_eq!(
+            sim.threads[worker].badge,
+            Some(control::thread_badge(1)),
+            "the worker stays bound under its own slot's badge"
+        );
+        assert!(s.is_held(1), "the worker is held");
+        assert!(sim.held_live(&s));
+        sim.assert_sound();
     }
 
     // Defect caught: a simulation that misses a resume past a breakpoint,

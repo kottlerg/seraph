@@ -19,12 +19,14 @@ use crate::death_tag::DeathTag;
 /// `thread_state` is the result of `cap_info(CAP_INFO_THREAD_STATE)` on its
 /// main-thread cap, and `aspace_end` that of
 /// `cap_info(CAP_INFO_ASPACE_END)` on its address-space cap; `None`
-/// for a cap svcmgr does not hold. The thread reading decodes as every creator
+/// for a cap svcmgr does not hold. An ended space (`syscall_abi::aspace_end_reason`)
+/// gives the reason of its first terminal fault or process exit, `0` for a
+/// clean exit, ahead of the thread, as procmgr reads a process's end: it is
+/// the process's first end by a fault or an exit, whichever thread made it.
+/// Otherwise the thread reading decodes as every creator
 /// decodes it (`ipc::bootstrap::thread_death`): an exited thread gives the
 /// reason the kernel recorded, and a thread cap that no longer resolves gives
-/// `EXIT_KILLED`, since procmgr's teardown of the process revokes it. An
-/// ended space (`syscall_abi::aspace_end_reason`) gives the reason of its
-/// first terminal fault or process exit, `0` for a clean exit. A thread that
+/// `EXIT_KILLED`, since procmgr's teardown of the process revokes it. A thread that
 /// runs or has not started, a space that has not ended, and a failed read of
 /// the space show nothing.
 #[must_use]
@@ -33,13 +35,13 @@ pub fn caps_death(
     aspace_end: Option<Result<u64, i64>>,
 ) -> Option<u64>
 {
-    if let Some(reason) = thread_state.and_then(ipc::bootstrap::thread_death)
-    {
-        return Some(reason);
-    }
-    aspace_end
+    if let Some(end) = aspace_end
         .and_then(Result::ok)
         .and_then(syscall_abi::aspace_end_reason)
+    {
+        return Some(end);
+    }
+    thread_state.and_then(ipc::bootstrap::thread_death)
 }
 
 /// One slot of svcmgr's service table, as the death resync reads it.
@@ -198,10 +200,25 @@ mod tests
     fn a_thread_cap_that_no_longer_resolves_is_killed()
     {
         assert_eq!(caps_death(Some(Err(-1)), None), Some(EXIT_KILLED));
-        // The thread's reading wins over the space's.
+        assert_eq!(caps_death(Some(Err(-1)), Some(Ok(0))), Some(EXIT_KILLED));
+    }
+
+    // The defect caught: the thread's reading ranked ahead of the space's
+    // end, so a worker's process exit (5) followed by the main thread's
+    // exit (0) read 0 here while procmgr reports 5.
+    #[test]
+    fn an_ended_space_gives_its_first_end_over_the_threads_reading()
+    {
+        assert_eq!(
+            caps_death(
+                Some(Ok(packed(THREAD_STATE_EXITED, 0))),
+                Some(Ok(ASPACE_ENDED | 5))
+            ),
+            Some(5)
+        );
         assert_eq!(
             caps_death(Some(Err(-1)), Some(Ok(ASPACE_ENDED | 7))),
-            Some(EXIT_KILLED)
+            Some(7)
         );
     }
 

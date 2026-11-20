@@ -490,17 +490,17 @@ handle with no data words or caps.
 | data[0] | State: 0 `ALIVE`, 1 `CREATED` (not yet started), 2 `UNKNOWN` (no entry; reaped or destroyed more than `RECENT_EXIT_RETENTION_NS` ago, dropped early under heap exhaustion, or never valid), 3 `EXITED` |
 | data[1] | Kernel-encoded exit reason when `data[0]` is `EXITED`; 0 otherwise |
 
-A live entry whose main thread the kernel reports as exited, or any of whose
-threads ended its address space (its recorded end), answers
-`EXITED` before procmgr reaps it, with the main thread's reason or else the
-end's. After the reap, or after a `DESTROY_PROCESS` teardown, the
-badge answers `EXITED` for `RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time,
-however many other processes die in the window, while procmgr's heap can hold
-their records, and `UNKNOWN` after that. Retention is best-effort: when the heap
-cannot hold a new record, the oldest record makes room (or, with none held, the
-new one is dropped), so such a badge can answer `UNKNOWN` early. A destroyed
-process's reason is the one the kernel retained if its main thread had already
-exited, or else its address space's first terminal end's, else `EXIT_KILLED`.
+A live entry any of whose threads ended its address space (its recorded end), or whose main thread
+the kernel reports as exited, answers `EXITED` before procmgr reaps it, with the end's reason, the
+process's first end by a fault or a `sys_aspace_exit` whichever thread made it, or else, when the
+space has not ended, the main thread's. procmgr reaps with the same reading, whichever death post
+arrives first, so the relay, the end queue, logd and this answer agree. After the reap, or after a
+`DESTROY_PROCESS` teardown, the badge answers `EXITED` for `RECENT_EXIT_RETENTION_NS` (30 s) of
+monotonic time, however many other processes die in the window, while procmgr's heap can hold their
+records, and `UNKNOWN` after that. Retention is best-effort: when the heap cannot hold a new record,
+the oldest record makes room (or, with none held, the new one is dropped), so such a badge can
+answer `UNKNOWN` early. A destroyed process's reason is the one a live entry would have answered,
+else `EXIT_KILLED`.
 
 ### Label 11: `CONFIGURE_PIPE`
 
@@ -814,9 +814,10 @@ death resync, and `DESTROY_PROCESS`) posts the two-word death entry
 `(exit_reason, process badge)` to it with `SYS_EVENT_POST`, the full `u64`
 badge in the correlator word (`syscall::DeathEvent`), after the process's
 objects are torn down. procmgr, not the kernel, is the source of logd's death
-events: a worker thread's terminal fault that tears down its process reaches
-logd too, and `DESTROY_PROCESS` posts the reason the kernel retained if the
-process's main thread had already exited, else `EXIT_KILLED`. A process torn down
+events: a worker thread's terminal fault or `sys_aspace_exit` that tears down
+its process reaches logd too, and `DESTROY_PROCESS` posts the reason the
+process ended with when it ended before the destroy (§ Label 9), else
+`EXIT_KILLED`. A process torn down
 before the registration posts nothing. A post the full queue refuses
 (`QueueFull`) is dropped, as the kernel drops a post to a full queue; logd's
 full-drain resync recovers it.

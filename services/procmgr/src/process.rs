@@ -3456,11 +3456,9 @@ pub fn destroy_created(badge: u64, memmgr_ep: u64, ipc_buf: *mut u64, tables: &T
 }
 
 /// The exit reason a destroy tears `entry` down with, which the death
-/// relay, the end queue, logd and `QUERY_PROCESS` then read: the reason the
-/// kernel retained when the main thread had already exited, or else the
-/// address space's terminal end, the first terminal fault or process exit of
-/// any of its threads (a death procmgr's drain had not reaped yet,
-/// [`resync_exit_reason`]), else `EXIT_KILLED`, the reason
+/// relay, the end queue, logd and `QUERY_PROCESS` then read: the reason it
+/// ended with when it ended before the destroy ([`ended_exit_reason`], a
+/// death procmgr's drain had not reaped yet), else `EXIT_KILLED`, the reason
 /// the kernel records for a thread its teardown stops. Reads kernel state
 /// only, under the table lock.
 fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
@@ -3469,10 +3467,10 @@ fn destroyed_exit_reason(entry: &ProcessEntry) -> u64
 }
 
 /// The reason `entry`'s process ended with when it has ended before procmgr
-/// reaped it: the reason the kernel retained when its main thread has
-/// exited, or else its address space's terminal end, the first terminal
-/// fault or process exit of any of its threads ([`resync_exit_reason`]);
-/// `None` while it runs. Reads kernel state only.
+/// reaped it: its address space's terminal end, the first terminal fault or
+/// process exit of any of its threads, or else, when the space has not
+/// ended, the reason the kernel retained for its exited main thread
+/// ([`resync_exit_reason`]); `None` while it runs. Reads kernel state only.
 fn ended_exit_reason(entry: &ProcessEntry) -> Option<u64>
 {
     let main_thread = syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
@@ -3488,8 +3486,12 @@ fn delete_relay(relay: u64)
     let _ = syscall::cap_delete(relay);
 }
 
-/// Reap the process `badge` names after its death, with `exit_reason`, as
-/// [`destroy_process`] tears down a destroyed one: take its entry
+/// Reap the process `badge` names after its death, as [`destroy_process`]
+/// tears down a destroyed one, with the reason the kernel recorded for its
+/// end ([`ended_exit_reason`]), so the relay, the end queue, logd and the
+/// recent-exits ring read what `QUERY_PROCESS` answered before the reap,
+/// whichever of its death posts arrived first; `exit_reason`, the post's,
+/// only when neither reading shows an end (a read that failed). Take its entry
 /// (`ProcessTable::take_ended`, which re-parents its children, or dooms
 /// them when it was created contained), record the exit in the recent-exits
 /// ring, and tear it down, under one hold of the table lock, then tell
@@ -3505,6 +3507,7 @@ pub fn reap_dead(badge: u64, exit_reason: u64, memmgr_ep: u64, ipc_buf: *mut u64
         {
             return;
         };
+        let exit_reason = ended_exit_reason(&entry).unwrap_or(exit_reason);
         state.recent.record(badge, exit_reason, crate::now_ns());
         teardown_entry(entry, exit_reason, &mut state.table)
     };

@@ -1638,7 +1638,8 @@ handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` of a
 than a virtual-memory one, of one with no exception handler bound, or of the fault of a
 restartable syscall's user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), kills it as
 an unhandled fault, which posts its death observers and, when the fault is its address space's
-first terminal fault, the space's observers, or, for the fault of a restartable syscall's user
+first terminal end (no earlier fault or `SYS_ASPACE_EXIT` of any of its threads), the space's
+observers, or, for the fault of a restartable syscall's user
 copy, fails that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). Starting one whose claiming reply was a `FAULT_REPLY_REDIRECT` that named an

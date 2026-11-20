@@ -1355,8 +1355,8 @@ pub(crate) fn caps_death(thread_cap: u64, aspace_cap: u64) -> Option<u64>
 
 /// The exit reason of the process `process_handle` names when procmgr reports
 /// it dead (`procmgr_labels::QUERY_PROCESS`), else `None`. procmgr answers
-/// `EXITED` with the main thread's reason or the address space's retained
-/// terminal end before it reaps the process, and for a while after;
+/// `EXITED` with the address space's retained terminal end, else the main
+/// thread's reason, before it reaps the process, and for a while after;
 /// `UNKNOWN` (no entry) reads as `EXIT_KILLED`. A failed or refused call is
 /// `None`. The caller holds procmgr alive, since the call blocks until procmgr
 /// answers.

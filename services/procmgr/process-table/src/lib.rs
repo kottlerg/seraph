@@ -1854,9 +1854,12 @@ impl QueryEntry
 /// `CAP_INFO_ASPACE_END` (`0` while the space has not ended, else
 /// `ASPACE_ENDED` with the reason of its first terminal end, a terminal fault
 /// or a process exit of any of its threads, `0` for a clean exit); a read that
-/// failed is `None`. An exited main thread reaps with its own reason, as its
-/// post would have; otherwise an ended address space reaps with its reason, as
-/// the address space's post would have.
+/// failed is `None`. An ended address space gives the reason of its end, the
+/// process's first end by a fault or a process exit, whichever thread made it
+/// and whether or not the main thread has exited since; otherwise an exited
+/// main thread (a `SYS_THREAD_EXIT`, which ends no address space) gives its
+/// own reason. Both readings are written once, so a process that has ended
+/// keeps one reason for every reader once its address space has ended.
 #[must_use]
 pub fn resync_exit_reason(
     main_thread: Option<u64>,
@@ -1864,14 +1867,13 @@ pub fn resync_exit_reason(
     aspace_end: Option<u64>,
 ) -> Option<u64>
 {
-    match (
-        main_thread,
-        aspace_end.and_then(syscall_abi::aspace_end_reason),
-    )
+    if let Some(end) = aspace_end.and_then(syscall_abi::aspace_end_reason)
     {
-        (Some(packed), _) if (packed >> 32) as u32 == exited => Some(packed & 0xFFFF_FFFF),
-        (_, end) => end,
+        return Some(end);
     }
+    main_thread
+        .filter(|packed| (packed >> 32) as u32 == exited)
+        .map(|packed| packed & 0xFFFF_FFFF)
 }
 
 // ── Badge acceptance ─────────────────────────────────────────────────────────
@@ -1927,10 +1929,24 @@ mod tests
             resync_exit_reason(Some(packed), EXITED, Some(0)),
             Some(0x1007)
         );
-        // The main thread's reason wins over a fault a worker took first.
+        assert_eq!(resync_exit_reason(Some(packed), EXITED, None), Some(0x1007));
+    }
+
+    // Defect caught: the main thread's reason ranked ahead of the address
+    // space's end, so a worker's process exit (5) followed by the main
+    // thread's exit (0) before the reap read 0 here and 5 at the reap.
+    #[test]
+    fn the_resync_reports_the_address_spaces_first_end_over_a_later_main_thread_exit()
+    {
+        let main_exited_clean = u64::from(EXITED) << 32;
         assert_eq!(
-            resync_exit_reason(Some(packed), EXITED, Some(ended(0x100E))),
-            Some(0x1007)
+            resync_exit_reason(Some(main_exited_clean), EXITED, Some(ended(5))),
+            Some(5)
+        );
+        let main_faulted = (u64::from(EXITED) << 32) | 0x1007;
+        assert_eq!(
+            resync_exit_reason(Some(main_faulted), EXITED, Some(ended(0x100E))),
+            Some(0x100E)
         );
     }
 

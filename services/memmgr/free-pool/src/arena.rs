@@ -280,7 +280,7 @@ pub struct MemObject
     /// frames in object page order: the view keeps every frame's mapping
     /// count above one while any process maps the frame, so the kernel
     /// refuses a text write to it (`services/memmgr/docs/memory-pool.md`
-    /// § Memory objects, Own mapping), and it is the source a copy of the
+    /// § Memory objects, Own view), and it is the source a copy of the
     /// page reads.
     pub runs: NodeIdx,
     /// The [`BudgetNode`] its frames are charged to.

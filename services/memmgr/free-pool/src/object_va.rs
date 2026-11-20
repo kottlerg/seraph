@@ -5,7 +5,7 @@
 
 //! The address space memmgr maps its own read-only view of every memory
 //! object's frames in (`services/memmgr/docs/memory-pool.md` § Memory objects,
-//! Own mapping): a zone of memmgr's address space handed out in spans, one per
+//! Own view): a zone of memmgr's address space handed out in spans, one per
 //! object, and taken back when the object is freed.
 //!
 //! The spans are kept by a [`FreePool`] of their own, whose runs name

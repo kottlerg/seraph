@@ -141,7 +141,10 @@ procmgr/
   the live processes with their names (each child's first argv string,
   recorded at creation), and `DETACH_PROCESS`, which binds an attached
   process back to the crash endpoint, as procmgr also does unasked once the
-  attached debugger's thread has exited; and `DECLARE_NO_DEBUG`, by which
+  attached debugger's thread has exited; `MAKE_RESIDENT` and
+  `MAKE_PRIVATE`, which have memmgr make a range of a process resident, or
+  give its memory-object pages copies of their own, for a holder about to
+  read or patch it; and `DECLARE_NO_DEBUG`, by which
   a process opts out of the crash endpoint and the attach. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § Crash Endpoint and Debug
   Authority.

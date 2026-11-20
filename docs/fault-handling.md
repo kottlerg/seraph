@@ -759,10 +759,15 @@ itself (§ Label 20: `ATTACH_PROCESS` there). The pieces are:
   thread's mapping read-only and executable, so W^X holds for every user mapping. It refuses the
   write with `InsufficientRights` when the page was mapped through a capability carrying neither
   Write nor Execute (firmware tables, a page lent read-only, a loaded process's read-only data),
-  and when the page's frame is mapped more than once, since the frame would then be text or data
-  of another mapping, possibly another process's; procmgr's loader gives each process its own image
-  frames ([services/procmgr/README.md](../services/procmgr/README.md) § Responsibilities), so a
-  process's text takes it. Every write synchronises instruction fetch on every CPU before it
+  and with `InvalidState` when the page's frame is mapped more than once, since the frame would
+  then be text or data of another mapping, possibly another process's; procmgr's loader gives each
+  process its own image frames ([services/procmgr/README.md](../services/procmgr/README.md)
+  § Responsibilities), so a process's text takes it. A page of a memory-object attachment that
+  maps its object's frame is refused, since memmgr's own view maps every object frame; the
+  debugger asks procmgr's `MAKE_PRIVATE` to give the page a copy of its own first, and the write
+  then patches the process alone
+  ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md#memory-objects)
+  § Memory objects, Make private). Every write synchronises instruction fetch on every CPU before it
   returns
   ([memory-model.md § Instruction-Fetch Coherence](memory-model.md#instruction-fetch-coherence)),
   so the thread's next fetch of the page sees the new bytes. A thread of the space running while the

@@ -232,7 +232,12 @@ stub's endpoint.
 - **Memory.** `m`, `M`, and `X` read and write the target's address space through any held
   thread's cap; a write that a read-only page refuses goes through the text route, which reaches
   text, mapped through a capability that carries Execute, but not read-only data such as `.rodata`
-  or RELRO, mapped through a Map-only one, so such a write is answered `E01`. Only pages present in
+  or RELRO, mapped through a Map-only one, so such a write is answered `E01`. A text-route write,
+  a breakpoint's included, that the kernel refuses because another leaf maps the page's frame, as
+  memmgr's own view does every page of a memory-object attachment, asks procmgr, through the debug
+  authority, to give the range pages of their own (`MAKE_PRIVATE`, `ipc::make_private`;
+  [memmgr Memory Pool](../memmgr/docs/memory-pool.md#memory-objects) § Memory objects) and writes
+  again, so the write patches the target alone. Only pages present in
   the space are reached, so a demand-paged page the target has not touched reads as an error.
 
 ---

@@ -81,6 +81,7 @@ pub mod log_client;
 pub mod logd_restart;
 pub mod logd_sinks;
 pub mod memmgr;
+pub mod memory_object_text;
 pub mod memory_objects;
 pub mod namespace;
 pub mod node_handle;
@@ -134,6 +135,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(heap_commit::phases());
     out.extend_from_slice(discard::phases());
     out.extend_from_slice(memory_objects::phases());
+    out.extend_from_slice(memory_object_text::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

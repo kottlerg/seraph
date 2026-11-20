@@ -208,7 +208,7 @@ const META_ARENA_LOW_END: u64 = OBJECT_ZONE_VA;
 /// Base of the object zone (64 GiB), where memmgr maps its own read-only view
 /// of every memory object's frames, one span per object, from the seal until
 /// the object retires (services/memmgr/docs/memory-pool.md § Memory objects,
-/// Own mapping). Its spans are handed out and taken back by the ledger
+/// Own view). Its spans are handed out and taken back by the ledger
 /// (`free_pool::Ledger::take_object_va`). Below the shared layout ceiling,
 /// so it exists under every paging mode, Sv39 included; deterministic, since
 /// nothing but memmgr can read memmgr's address space.
@@ -3435,7 +3435,7 @@ fn attachment_fault(
 /// execute right, which lets a text write of `SYS_THREAD_WRITE_MEM` patch a
 /// read-only page whose frame no other leaf maps; memmgr's own view of every
 /// object frame is that other leaf, so the write is refused
-/// (services/memmgr/docs/memory-pool.md § Memory objects, Own mapping). The
+/// (services/memmgr/docs/memory-pool.md § Memory objects, Own view). The
 /// kernel keeps the mapping after the cap goes.
 ///
 /// # Errors
@@ -4160,7 +4160,7 @@ fn handle_seal_object(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
 /// Map memmgr's own read-only view of the frames of the grants `ids` of
 /// `rec`, in their order, from `own_va`, a span of the object zone that
 /// holds their pages (services/memmgr/docs/memory-pool.md § Memory objects,
-/// Own mapping). On failure the part mapped is unmapped and the span given
+/// Own view). On failure the part mapped is unmapped and the span given
 /// back ([`drop_object_view`]).
 ///
 /// # Errors

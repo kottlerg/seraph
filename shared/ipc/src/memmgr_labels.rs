@@ -577,10 +577,10 @@ pub const SEAL_OBJECT_MAX_GRANTS: u64 = 63;
 /// never writable; a private one maps them until the caller writes a page,
 /// which then gets a copy of its own. A text write of
 /// `SYS_THREAD_WRITE_MEM` to an object page is refused while the page maps
-/// the object's frame; [`MAKE_PRIVATE`] gives the page a copy first. The caller's budget node is charged the
-/// region's length and its page-table reservation either way, and a private
-/// attachment is committed as `REGION_COMMIT` commits a region, so no fault
-/// in it fails for memory. Reply: `SUCCESS`; `INVALID_ARGUMENT` (unknown
+/// the object's frame; [`MAKE_PRIVATE`] gives the page a copy first. The
+/// caller's budget node is charged the region's length and its page-table
+/// reservation either way, and a private attachment is committed as
+/// `REGION_COMMIT` commits a region, so no fault in it fails for memory. Reply: `SUCCESS`; `INVALID_ARGUMENT` (unknown
 /// badge, a bad range, protection or flag, a cap that is no live object
 /// handle, pages past the object's end, or a range overlapping a region of the
 /// caller); `LIMIT` or `OUT_OF_MEMORY_BEST_EFFORT` as for a committed
@@ -623,11 +623,10 @@ pub const OBJECT_RELEASE: u64 = 29;
 /// `va + len_bytes` when the whole range is done, else the address to send
 /// the request again from, memmgr making at most a few copies per request;
 /// `UNAUTHORIZED` (caller is not procmgr); `INVALID_ARGUMENT` (unknown badge,
-/// zero length, or a range past the address space); `LIMIT` or
-/// `OUT_OF_MEMORY_BEST_EFFORT` when a shared attachment's copy is refused a
-/// page, as a committed `REGISTER_REGION` is; `QUOTA` (memmgr's metadata is
-/// full); or `OUT_OF_MEMORY_BEST_EFFORT` (a copy could not be made or
-/// mapped). Specified in `services/memmgr/docs/ipc-interface.md` § Label 30:
+/// zero length, or a range past the address space); `QUOTA` (memmgr's
+/// metadata is full); or `OUT_OF_MEMORY_BEST_EFFORT` (a shared attachment's
+/// copy is refused a page, as a committed `REGISTER_REGION` is, or a copy
+/// could not be made or mapped). Specified in `services/memmgr/docs/ipc-interface.md` § Label 30:
 /// `MAKE_PRIVATE`.
 pub const MAKE_PRIVATE: u64 = 30;
 

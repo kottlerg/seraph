@@ -1141,7 +1141,8 @@ holds one chunk (`DEMAND_CHUNK_BYTES`).
 
 Without `caps[1]`, `MAKE_RESIDENT` passes the chunks on disk over, as a lost
 chunk. A registration replaces the one before it, whose caps memmgr deletes, and
-ends every write in flight: each writing chunk is compressed again on its store runs,
+ends every write in flight: each writing chunk is compressed again on its store runs, or
+raw again on its runs,
 and each slot whose write a restore or a teardown cancelled is freed. The
 chunks on disk stay, and so do the slot words posted for the swap service: memmgr
 sends on the new Notification at once when any are posted, so a restarted swap

@@ -213,7 +213,9 @@ pub(crate) fn post_want(l: &MemLedger, disk: Option<NodeIdx>) -> bool
 /// Whether an evicted chunk whose stream gains nothing is kept raw for a swap
 /// slot (services/memmgr/docs/memory-pool.md § Eviction, States): a swap
 /// service is registered, the key was drawn, and the free swap slots exceed
-/// the raw chunks waiting for one, so every raw chunk has a slot to go to.
+/// the raw chunks waiting for one. `SWAP_TAKE` takes compressed chunks from
+/// the same slots and a new registration can lower them, so a raw chunk can
+/// still wait for a slot.
 pub(crate) fn takes_raw(l: &MemLedger) -> bool
 {
     let s = state();

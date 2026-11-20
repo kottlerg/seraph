@@ -893,10 +893,10 @@ pub fn set_entry<S: SlotStore>(
 
 /// Free every node of the table at `root`, handing the entry of each leaf to
 /// `retire` before its slot is freed: `retire` takes over the slots of its
-/// lists, the runs of a resident or evicting chunk ([`take_runs`]) or the
-/// store runs of a compressed one ([`take_store`]). The walk keeps its pending nodes on a stack threaded through
-/// their slot `next` links, which no table node uses otherwise, so it needs
-/// neither memory nor recursion.
+/// lists, the runs of a resident, evicting or raw chunk ([`take_runs`]) or
+/// the store runs of a compressed one ([`take_store`]). The walk keeps its
+/// pending nodes on a stack threaded through their slot `next` links, which no
+/// table node uses otherwise, so it needs neither memory nor recursion.
 pub fn release<S: SlotStore>(
     arena: &mut Arena<S>,
     root: NodeIdx,
@@ -947,7 +947,8 @@ pub fn release<S: SlotStore>(
 }
 
 /// Hand each run on the run list of `entry` (a resident, evicting or raw
-/// chunk's, or a raw chunk's while it is writing; none for another) to `take` with its slot, which `take` takes over.
+/// chunk's, or a raw chunk's while it is writing; none for another) to `take`
+/// with its slot, which `take` takes over.
 pub fn take_runs<S: SlotStore>(
     arena: &mut Arena<S>,
     entry: ChunkEntry,
@@ -964,7 +965,8 @@ pub fn take_runs<S: SlotStore>(
 }
 
 /// Hand each store run on the store-run list of `entry` (a compressed chunk's,
-/// or a compressed chunk's while it is writing; none for another) to `take` with its slot, which `take` takes over.
+/// or a compressed chunk's while it is writing; none for another) to `take`
+/// with its slot, which `take` takes over.
 pub fn take_store<S: SlotStore>(
     arena: &mut Arena<S>,
     entry: ChunkEntry,

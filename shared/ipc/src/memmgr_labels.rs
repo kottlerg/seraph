@@ -437,7 +437,8 @@ pub const RESIDENT_PENDING: u64 = 1;
 /// Notify right memmgr sends `data[1]` (nonzero) on when [`MAKE_RESIDENT`]
 /// posts a slot word for the swap service to take with [`SWAP_WANTED`]. A
 /// registration replaces the one before it and ends every write in flight,
-/// the chunks staying in memmgr's store.
+/// each writing chunk staying in memmgr, compressed on its store runs or raw
+/// on its runs.
 /// Reply: `SUCCESS` with `data[0]` the slots memmgr uses; `INVALID_ARGUMENT`
 /// when `caps[0]` is no endpoint cap, the count is below a slot ever taken,
 /// or `caps[1]` is present and no Notification with the Notify right or

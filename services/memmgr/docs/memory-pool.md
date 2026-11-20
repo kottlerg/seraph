@@ -297,21 +297,25 @@ entry records:
 
 - The backed mask: one bit per page of the chunk, set when a run backs the page.
 - The chunk's state: unbacked; resident, its pages backed by the runs on the entry's run list and
-  mapped in the process; evicting; compressed; writing or on disk, its pages taken by the swap
+  mapped in the process; evicting; compressed; raw, its runs held unmapped on the entry's run list
+  until the swap service takes them for a slot; writing or on disk, its pages taken by the swap
   service ([Disk tier](#disk-tier)); or lost, its swap slot's bytes having failed authentication.
+  A raw flag marks a chunk held raw, from then until it is resident again or lost.
 - A pin flag and a two-bit age.
 - The job slot of its eviction while it is evicting, so a completion is applied only to the
   eviction it was posted for.
-- A link: the head of the chunk's run list while it is resident or evicting, the head of the list
-  of store runs its pages are stored in while it is compressed, and its disk node while it is
-  writing or on disk.
+- A link: the head of the chunk's run list while it is resident, evicting or raw, and while a raw
+  chunk is writing; the head of the list of store runs its pages are stored in while it is
+  compressed, and while a compressed chunk is writing.
+- Its disk node while it is writing or on disk, and, over the same time, the tag of a raw chunk's
+  seal ([Disk tier](#disk-tier), Write-out).
 
-The evicting and compressed states, the pin flag, and the age are the swap path's: memmgr reclaiming
-a cold chunk's runs under memory pressure and storing its pages, a fault restoring them
+The evicting, compressed and raw states, the pin flag, and the age are the swap path's: memmgr
+reclaiming a cold chunk's runs under memory pressure and storing its pages, a fault restoring them
 ([Eviction](#eviction)); the writing, on-disk and lost states are the disk tier's. A fault on an
-evicting, compressed or writing chunk makes the whole chunk resident before it backs anything, so a
-resident chunk's every backed page is mapped; a fault on a chunk on disk is redirected to the swap
-service, and one on a lost chunk is declined.
+evicting, compressed, raw or writing chunk makes the whole chunk resident before it backs anything,
+so a resident chunk's every backed page is mapped; a fault on a chunk on disk is redirected to the
+swap service, and one on a lost chunk is declined.
 
 The table is a radix tree of [Metadata Arena](#metadata-arena) slots rooted in the region's node.
 A directory node holds `DIR_FANOUT` (6) children: the slot indices that fit in the slot's largest
@@ -336,10 +340,10 @@ leaves the entry as it was.
 nodes on a stack threaded through their own `next` links, which no table node uses otherwise. The
 walk needs no memory and no recursion. It rewrites each run's descriptor into a run node in place,
 which joins the free pool or the deferred list as any reclaimed frame does (see
-[Reclamation](#reclamation)), returns each store run of a compressed or writing chunk, which no
-process ever mapped, to the free pool, frees an on-disk chunk's swap slot and disk node, cancels a
-writing chunk's write ([Disk tier](#disk-tier)), and returns every directory and leaf node to the
-arena's free list.
+[Reclamation](#reclamation)), returns each store run of a compressed chunk, writing or not, which no
+process ever mapped, to the free pool, retires each run of a raw chunk, writing or not, as a
+resident chunk's runs, frees an on-disk chunk's swap slot and disk node, cancels a writing chunk's
+write ([Disk tier](#disk-tier)), and returns every directory and leaf node to the arena's free list.
 
 ---
 
@@ -1009,19 +1013,21 @@ ages a chunk twice. The granule is the chunk: one unmap and one restore fault pe
 run on its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, maps its
-runs into the job slot's input window of its own address space, and the chunk is evicting while
-the compression worker stores its pages. A fault on an evicting chunk maps the same runs back and
-cancels the eviction: the job's completion is then stale, since the chunk's entry names the job
-slot of the eviction in flight. Once stored, the chunk is compressed: its runs return to the
-free pool and its entry's link holds the head of its store-run list. An all-zero page takes no store
-space, and a chunk whose every page is zero takes no store page. A stream that would take as many
-pages as the chunk's backed pages gains nothing. While the disk tier takes one (a swap service is
-registered, and more of its slots are free than raw chunks wait for one), the chunk is then raw: its
-runs stay on its entry, mapped nowhere, until the swap service takes it for a slot ([Disk
-tier](#disk-tier), Write-out), and a fault on it maps the same runs back, as on an evicting chunk.
-Otherwise memmgr maps the runs back, and the chunk stays resident. A raw chunk keeps its frames and
-their charge until its write ends, and only then frees them and counts as swapped; the raw chunks
-are never more than the free slots.
+runs into the job slot's input window of its own address space, and the chunk is evicting while the
+compression worker stores its pages. A fault on an evicting chunk maps the same runs back and
+cancels the eviction: the job's completion is then stale, since the chunk's entry names the job slot
+of the eviction in flight. Once stored, the chunk is compressed: its runs return to the free pool
+and its entry's link holds the head of its store-run list. An all-zero page takes no store space,
+and a chunk whose every page is zero takes no store page. A stream that would take as many pages as
+the chunk's backed pages gains nothing. While the disk tier takes one (a swap service is registered,
+and more of its slots are free than raw chunks wait for one), the chunk is then raw: its runs stay
+on its entry, mapped nowhere, until the swap service takes it for a slot ([Disk tier](#disk-tier),
+Write-out), and a fault on it maps the same runs back, as on an evicting chunk. Otherwise memmgr
+maps the runs back, and the chunk stays resident. A raw chunk keeps its frames and their charge
+until its write ends, and only then frees them and counts as swapped. A slot was free for each raw
+chunk when it became raw, but `SWAP_TAKE` takes compressed and raw chunks in one walk and a new
+registration can lower the slots, so a raw chunk can wait, its frames held, until a slot is free
+again or a fault maps it back.
 
 A fault on a compressed chunk is restored in the fault arm within the turn, since the restore is
 bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
@@ -1219,10 +1225,11 @@ slot's write-out, or a filesystem request), and restores are served one after an
 
 **Accounting.** A writing chunk's store runs stay in `store`, and a raw chunk's runs with its
 record, until the write ends; an on-disk or lost chunk holds no page of `pool_total`. The swapped
-pages count every evicted chunk, and the budget node stays charged for its pages throughout, until a
-restore or a teardown; a lost chunk's charge goes with its region. `QUERY_POOL_STATUS` reports the
-pages on disk and the free slots apart ([`ipc-interface.md`](ipc-interface.md) § Label 6). A disk
-node is an arena slot, and the slot map's pages are memmgr's metadata.
+pages count every evicted chunk, a raw one once it is written, and the budget node stays charged for
+its pages throughout, until a restore or a teardown; a lost chunk's charge goes with its region.
+`QUERY_POOL_STATUS` reports the pages on disk and the free slots apart
+([`ipc-interface.md`](ipc-interface.md) § Label 6). A disk node is an arena slot, and the slot map's
+pages are memmgr's metadata.
 
 ---
 

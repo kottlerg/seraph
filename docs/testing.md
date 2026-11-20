@@ -500,11 +500,14 @@ terminal. Two routes reach the thread:
   main thread and detaches, which gives the target its crash bindings back, and the thread runs
   into the fault. A main thread blocked in an IPC call takes the stub's stop only at the call's
   return, so the host reads its program counter again until the stub holds it. svcmgr is killed
-  at the attach, while the boot waits on it. devmgr and vfsd are released at the attach and held
-  again once the terminal's READY line and svcmgr's reconciliation line have appeared: svcmgr's
-  launches still call them, and a call to one that died after svcmgr's check of it waits for good
-  (#1185). logd is killed at the attach, as svcmgr is, which can fall before logd asks svcmgr for
-  its bootstrap round, a death svcmgr routes as any other ([Restart Protocol § Death
+  at the attach, while the boot waits on it. devmgr and vfsd are killed twice over, one boot each:
+  at the attach (targets `devmgr-launch` and `vfsd-launch`), while svcmgr's launches still call
+  them, so a call svcmgr makes to the held server waits unreceived until the kill fails it with
+  `NoReceiver` ([IPC Design § Endpoints](ipc-design.md#endpoints)) and svcmgr's check after the
+  failed call finds the death; and, released at the attach, held again once the terminal's READY
+  line and svcmgr's reconciliation line have appeared (targets `devmgr` and `vfsd`), as
+  supervised services. logd is killed at the attach, as svcmgr is, which can fall before logd asks
+  svcmgr for its bootstrap round, a death svcmgr routes as any other ([Restart Protocol § Death
   detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). When init-logd's
   `handover complete; init-logd thread exiting` line has not appeared before the first kill,
   whether the first instance died before its bootstrap request or after it (before its release),
@@ -910,7 +913,7 @@ CI matrix cells follow these rules per boot. The `usertest` cell runs its
 boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
 the terminal interactive test (via `test-terminal`) after dropping
 `usertest.svc` and repacking to restore the default boot (terminal present),
-then the `test-wedge` boot pair, then the `test-reboot` boot, then the seven `test-core-death`
+then the `test-wedge` boot pair, then the `test-reboot` boot, then the nine `test-core-death`
 boots, then the four `test-signing` boots, then on x86_64 the `test-vmgenid` save/restore boot
 pair and the `test-powerbutton` boot. The terminal and wedge test boots have *no*
 shutdown-invoking harness: `test-terminal` and `test-wedge` compute the verdict host-side and kill

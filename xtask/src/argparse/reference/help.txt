@@ -1365,7 +1365,7 @@ Usage: xtask test-core-death [OPTIONS]
 
 Options:
       --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --target <TARGET>   The services to kill, one boot each (default: every one). Repeatable, or comma-separated [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+      --target <TARGET>   The services to kill, one boot each (default: every one). Repeatable, or comma-separated [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, devmgr-launch, vfsd-launch, logd]
       --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
       --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
       --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -1399,6 +1399,8 @@ Options:
           - svcmgr:         svcmgr's main thread
           - devmgr:         devmgr's main thread
           - vfsd:           vfsd's main thread
+          - devmgr-launch:  devmgr's main thread, held at the stub's attach while svcmgr's launches still call devmgr
+          - vfsd-launch:    vfsd's main thread, held at the stub's attach while svcmgr's launches still call vfsd
           - logd:           logd's main thread, once per restart its budget allows and once more
 
       --cpus <CPUS>

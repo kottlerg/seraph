@@ -15893,28 +15893,31 @@ ok test-core-death target=["logd","svcmgr"]
 ["test-core-death","--target","devmgr","--target","vfsd"]
 ok test-core-death target=["devmgr","vfsd"]
 
+["test-core-death","--target","devmgr-launch,vfsd-launch"]
+ok test-core-death target=["devmgr-launch","vfsd-launch"]
+
 ["test-core-death","--target","procmgr","--arch","riscv64"]
 ok test-core-death arch=["riscv64"] target=["procmgr"]
 
 ["test-core-death","--target"]
 InvalidValue
 error: a value is required for '--target <TARGET>' but none was supplied
-  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, devmgr-launch, vfsd-launch, logd]
 
 ["test-core-death","--target","bogus"]
 InvalidValue
 error: invalid value 'bogus' for '--target <TARGET>'
-  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, devmgr-launch, vfsd-launch, logd]
 
 ["test-core-death","--target",""]
 InvalidValue
 error: a value is required for '--target <TARGET>' but none was supplied
-  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, devmgr-launch, vfsd-launch, logd]
 
 ["test-core-death","--target=memmgr,"]
 InvalidValue
 error: a value is required for '--target <TARGET>' but none was supplied
-  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+  [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, devmgr-launch, vfsd-launch, logd]
 
 ["test-kaslr"]
 ok-all test-kaslr arch=default["x86_64"] cpus=default["4"] mem=default["512"] riscv_mmu=default["sv48"] x86_paging=default["4"] host_override=default alone=default timing=default

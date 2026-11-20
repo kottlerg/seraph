@@ -135,8 +135,11 @@ reconciliation and routed then. svcmgr reads its recipes through vfsd, so a vfsd
 reconciliation leaves it no recipe and no shutdown actuator: it routes the death as system death,
 which with no actuator is the logged degraded state
 ([Restart Protocol § Death detection](../services/svcmgr/docs/restart-protocol.md#death-detection)).
-A server that dies after the check, while svcmgr's next call to it waits unreceived, leaves svcmgr
-blocked: a call on an endpoint none of whose receivers is left never returns (#1185).
+A server that dies after the check, while svcmgr's next call to it waits unreceived, fails that
+call: svcmgr and init hold no capability with the Receive right on the server's endpoints, so once
+the server's process is torn down none is left, and the kernel releases the call with
+`NoReceiver` ([IPC Design § Endpoints](ipc-design.md#endpoints)); the liveness check after the
+failed call routes the death.
 
 The root filesystem's driver and the driver of the disk under it never restart, and the root is not
 remounted in a running system ([Boot Media](boot-media.md) § Bootstrap-Only Boot Copies). The loss
@@ -150,11 +153,12 @@ The path from a core or critical death to power-off MUST NOT depend on the servi
 svcmgr, devmgr, vfsd and logd (until svcmgr's restart budget for it is spent), one boot each, by a
 terminal fault made from outside the guest, and checks that the system powers off, on both
 architectures ([Testing § Core death](testing.md#core-death-test-core-death)). It kills devmgr and
-vfsd once svcmgr has reconciled its recipes, after the window that #1185 leaves open above, and
-logd from the stub's first attach to it, which can fall before logd asks svcmgr for its bootstrap
-round. svcmgr does not wait for good on a service that dies after its start and before that
-request: its wait for the request ends at the death, which it routes by the service's restart
-policy, on the first launch and on a restart alike, and it goes on with its reconciliation or its
+vfsd twice over, one boot each: during svcmgr's launches, which still call them, and once svcmgr has
+reconciled its recipes; and logd from the stub's first attach to it, which can fall before logd asks
+svcmgr for its bootstrap round. svcmgr does not wait for good on a service that dies after its start
+and before that request: its wait for the request ends at the death, which it routes by the
+service's restart policy, on the first launch and on a restart alike, and it goes on with its
+reconciliation or its
 supervision ([Restart Protocol § Death
 detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). For a core death the path
 holds the requirement by construction. pwrmgr is pinned: svcmgr creates the shutdown actuator with

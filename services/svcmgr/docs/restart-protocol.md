@@ -130,19 +130,20 @@ svcmgr calls vfsd and devmgr before reconciliation records them. vfsd serves svc
 root: before the handover svcmgr reads the device class files and walks the drivers and platform
 tables directories through it, and at the handover it reads the recipe directory. devmgr mints each
 device class and takes `SET_DRIVERS_DIR` before the handover, through the endowed devmgr-registry
-source. A call to a dead server waits for good, since svcmgr's own capability keeps the endpoint
-alive with none of its receivers left. So svcmgr reads a server's liveness from its substrate
-registration before each step that calls it and after every call to it that fails
-([`src/endowed_servers.rs`](../src/endowed_servers.rs)): the state of the endowed thread cap
-(`EXIT_KILLED` for a revoked one), then, while memmgr and procmgr show alive, `QUERY_PROCESS` on the
-endowed process handle, which reports a worker-thread fault procmgr has not yet torn down. A dead
-server ends the step. A dead devmgr is then recorded by reconciliation, and the resync after it
-routes its death, as above. A dead vfsd found at the handover, before or during the recipe scan, is
-system death with no recipe to supervise by: svcmgr records and launches nothing, releases every
-substrate registration (each such service runs on unsupervised, logged), and takes the graceful
-shutdown path, which, with no shutdown actuator recorded, logs the degraded state (§ Decision tree).
-A server that dies after a check, while svcmgr's next call to it waits unreceived, still leaves
-svcmgr blocked (#1185).
+source. A call to a dead server fails: svcmgr's capabilities to its endpoints carry no Receive
+right, and init keeps none, so once the server's process is torn down no capability with the Receive
+right is left and the kernel fails the call, queued or new, with `NoReceiver`. So svcmgr reads a
+server's liveness from its substrate registration before each step that calls it and after every
+call to it that fails ([`src/endowed_servers.rs`](../src/endowed_servers.rs)): the state of the
+endowed thread cap (`EXIT_KILLED` for a revoked one), then, while memmgr and procmgr show alive,
+`QUERY_PROCESS` on the endowed process handle, which reports a worker-thread fault procmgr has not
+yet torn down. A dead server ends the step. A dead devmgr is then recorded by reconciliation, and
+the resync after it routes its death, as above. A dead vfsd found at the handover, before or during
+the recipe scan, is system death with no recipe to supervise by: svcmgr records and launches
+nothing, releases every substrate registration (each such service runs on unsupervised, logged), and
+takes the graceful shutdown path, which, with no shutdown actuator recorded, logs the degraded state
+(§ Decision tree). A server that dies after a check, while svcmgr's next call to it waits
+unreceived, fails that call the same way, and the check after the failed call finds the death.
 
 Exit reason encoding (owned by
 [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)), and

@@ -13,7 +13,8 @@ the Issue numbers, the branch name, any rulings for this batch, and whether you 
 you run in is the maintainer's). Orchestrated, you never merge; standalone, you merge only on
 the maintainer's instruction. Your lifetime is the one PR, or the one defined set of related
 PRs, that the prompt names: you retire when it stands at its gate, apart from what its gate
-still owes it (a sync when `master` moves, and the composition check after its merge).
+still owes it (a sync when `master` changes a file it changes, and the composition check after
+its merge).
 
 ## Authorities
 
@@ -320,8 +321,10 @@ Orchestrated:
   head always, and the validation set and a run with the reviewer again only when the incoming
   diff touches a file your PR touches and is not comment-only (docs/testing.md § Coverage
   tiers), or the merge has a conflict. Otherwise the validated head stands, and the body says
-  that the incoming diff touches none of the PR's files, or that it is comment-only. The gate
-  needs the head to include `master` either way.
+  that the incoming diff touches none of the PR's files, or that it is comment-only. A PR whose
+  files `master` has not changed since its merge base needs no sync to merge
+  (docs/conventions.md § Syncing with `master`); the gate needs the head to include `master`
+  only when `master` changed one of them.
 
 Standalone, there is no grant: the commands' launch rules are the whole protocol, and you sync
 yourself before the validation runs.
@@ -344,8 +347,10 @@ write wrong code is a defect the first review reports.
 
 Push and open the PR (`gh pr create`, template filled) as soon as `cargo xtask test` and
 `lint-docs` pass, so CI and the first review run before the host runs. Watch CI with
-`gh pr checks <N> --watch` in the background. On green, run the pre-merge review as the
-`pr-review` skill describes. Before every run:
+`gh pr checks <N> --watch` in the background, and run the pre-merge review as the `pr-review`
+skill describes at once, while CI runs (docs/conventions.md § Pre-merge review). Push a fix round
+without waiting for the CI of the head it replaces. A red CI is read and fixed as a defect, and
+its fix owes what the delta rules say. Before every run:
 
 - Refresh the PR body to the head the run reviews: the validated head, the Validation report,
   the Acceptance ticks, every claim.
@@ -378,12 +383,13 @@ use them.
 ## Gate
 
 You are at the gate when `cargo xtask pr-check <N> --gate` passes: CI green, the head includes
-`master`, and a run record for the head has `AUDIT PASS`, no failed agent, and a verdict of
-`READY TO MERGE` (docs/conventions.md § Pre-merge review). Hand back the gate report with the merge
-command `gh pr merge <N> --merge --delete-branch`. The merge is the orchestrator's, on a gate
-it has verified; standalone, it is made on the maintainer's instruction. The release PR, which
-the command names with `gate-release-approval`, also needs the maintainer's approval of its
-merge; say so in the gate report.
+`master` or `master`'s change since the merge base touches none of the PR's files (and
+`master`'s CI is green), and a run record for the head has `AUDIT PASS`, no failed agent,
+and a verdict of `READY TO MERGE` (docs/conventions.md § Pre-merge review). Hand back the gate
+report with the merge command `gh pr merge <N> --merge --delete-branch`. The merge is the
+orchestrator's, on a gate it has verified; standalone, it is made on the maintainer's
+instruction. The release PR, which the command names with `gate-release-approval`, also needs
+the maintainer's approval of its merge; say so in the gate report.
 
 ## Composition check
 

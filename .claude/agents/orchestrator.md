@@ -175,11 +175,12 @@ Keep your own reads out of your context the same way:
    Classify: follow-up and defect lists (drain scopes), single defects (group by the surface
    they touch, two to seven per PR), design and feature Issues (the maintainer's unless the
    batch names them). The maintainer names the batch's goal; you name the scopes.
-2. Size the wave at four to six PRs in flight, on scopes whose files do not overlap. Each
-   merge makes every open PR re-sync. A sync owes green CI, and it re-owes a PR's validation
-   set and a reviewer run only when the incoming diff touches a file that PR touches and is
-   not comment-only, or the merge resolves a conflict (docs/conventions.md § Syncing with
-   `master`), so two PRs on the same files cost more in
+2. Size the wave at four to six PRs in flight, on scopes whose files do not overlap. A merge
+   makes an open PR sync only when it changes a file that PR changes: a PR whose files
+   `master` has not changed since its merge base merges without one (docs/conventions.md
+   § Syncing with `master`). A sync owes green CI, and it re-owes a PR's validation set and a
+   reviewer run only when the incoming diff touches a file that PR touches and is not
+   comment-only, or the merge resolves a conflict, so two PRs on the same files cost more in
    parallel than in sequence.
 3. Start the record with `cargo xtask orch start --goal "<the batch's goal>"`; a goal the
    maintainer gave in more than one line of 300 characters goes into `--goal` as a one-line
@@ -364,8 +365,9 @@ vCPUs and any timing-sensitive measurement take the exclusive grant:
 - Grant a speculative set (a run at a head that a sync still owed will change) only when the
   host is otherwise idle.
 - `master quiet` tells a worker to sync now, right before its validation runs, so one run
-  covers the sync. Say it when no merge will land before that worker's gate; otherwise hold the
-  worker and let the pending merge land first.
+  covers the sync. Say it only to a worker whose files `master` has changed since its merge
+  base, since any other merges without a sync, and only when no merge that changes its files
+  will land before its gate; otherwise hold the worker and let the pending merge land first.
 - You MAY run a boundary set, or direct a worker to, for a PR that does not owe one, when you
   judge that the change warrants it (docs/testing.md § Coverage tiers, Boundary surface).
   Nothing schedules such a run; the release host runs are the backstop. The PR body reports it
@@ -384,7 +386,9 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
    references, closing keywords, attribution, signatures), the PR body (boxes, validated head
    and its comment-only delta), the Issues the PR closes or references (the ticks of both, the
    milestone of those it closes), the check rollup and merge state, that `master` is an
-   ancestor of the head, and the run record for the head.
+   ancestor of the head or that `master`'s change since the merge base touches none of the
+   PR's files on a green `master` (it prints which case held), and the run record for the
+   head.
 3. Read what the command cannot decide: when it prints `gate-defects-recorded`, that each
    defect a run recorded off the surface is on its Issue (docs/conventions.md § Findings); for
    records of the earlier form, when it prints `gate-findings-recorded`, that each finding it
@@ -395,9 +399,12 @@ A worker's gate report is a claim. Verify the gate yourself before a merge:
 
 Then merge with `gh pr merge <N> --merge --delete-branch`, and tell the maintainer in a line
 (§ Reporting to the maintainer). Fast-forward your own checkout, record the merge and its
-cost, prune the state (§ Plan, steps 6 and 7), and tell every open PR's worker what moved and
-which files the merge touched. That message is information: `master quiet` is the only
-instruction to sync.
+cost, prune the state (§ Plan, steps 6 and 7), and tell each open PR's worker whose files the
+merge touched what moved and which of its files. That message is information: `master quiet`
+is the only instruction to sync. Watch `master`'s CI run on the merge: a red `master` is a
+composition defect, fixed before anything else merges (docs/conventions.md § CI Gating), so
+put its fix first and merge nothing else until it lands; the gate refuses a PR that does not
+contain `master` meanwhile.
 
 After each merge that shares a file with another merge since the previous release tag, send the
 merged PR's worker `composition check <merge>` (docs/conventions.md § Composition check;
@@ -408,11 +415,12 @@ names is recorded there and leads to no PR. Once a check hands back and leaves t
 nothing is left for it: remove its parked worktree (§ Worktree removal). A defect PR's own merge
 owes a check on the same terms as any other, and the worktree then waits for that check.
 
-Order merges to minimize re-validation. A PR whose merge touches only Markdown or comments, or
-no file another open PR touches, costs the others a CI run and nothing else, so merge it as
-soon as its gate passes. Hold a PR at its gate only when its merge touches files another open
-PR touches and merging it later would force fewer re-validations; among such PRs, merge first
-the one whose later syncs the others have not validated yet.
+Order merges to minimize re-validation. A PR whose merge touches no file another open PR
+touches costs the others nothing, and one that touches their files only in Markdown or comments
+costs those a sync and a CI run, so merge it as soon as its gate passes. Hold a PR at its gate
+only when its merge touches files another open PR touches and merging it later would force
+fewer re-validations; among such PRs, merge first the one whose later syncs the others have not
+validated yet.
 
 `--delete-branch` removes the remote branch, and a worker whose worktree sits on it may not be
 resumable afterwards. Before merging a worker's last PR, make sure nothing is left for it. If a

@@ -211,7 +211,7 @@ rewrite (§ Operations) is for a MUST violation.
   the underlying issue and commit again.
 - Commits on `master` are immutable: no amend, no rewrite, no force push.
 - On feature branches before merge, amending and force-pushing your own branch is fine and often
-  preferable to a "fix typo" commit. The merge into `master` is the linear-green commit that lands.
+  preferable to a "fix typo" commit. The merge into `master` is the commit that lands.
 
 ## Branch and PR Workflow
 
@@ -222,9 +222,11 @@ are forbidden; `master` MUST NOT receive force pushes.
 - PRs have no second human reviewer; the file-by-file diff view, line
   comments, and CI status integration are the value, and the pre-merge
   review (§ Pre-merge review) gates the merge alongside CI.
-- CI MUST gate merge. `master` MUST stay linearly green: every commit on
-  `master` is a passing CI state. Branches MAY have intermediate failures;
-  merge is the green gate.
+- CI MUST gate merge: a PR merges only with green CI at its head. A PR
+  that merges without a sync (§ Syncing with `master`) was not built with
+  the commits `master` gained after its merge base, so `master`'s own CI
+  run checks each merge (§ CI Gating). Branches MAY have intermediate
+  failures.
 - PRs that close an Issue MUST carry `Fixes #N` / `Closes #N` in the PR
   description so merge auto-closes the Issue. The acceptance-checklist
   tick-through (§ Acceptance checklist discipline) lands in the same merge
@@ -237,6 +239,13 @@ Merge is gated by the pre-merge review: the `pr-reviewer` and `pr-auditor` agent
 closure audit, and their prose verdict lines are the gate. The reviewer reports defects only
 (§ Findings), in a bounded number of rounds (§ Rounds); the audit checks the PR's claims against
 the diff. `.claude/skills/pr-review/SKILL.md` gives the assistant's procedure.
+
+The review of a head starts once the head is pushed and the local validation the change owes has
+passed, apart from a run the `## Validation` section reports as pending, which makes the run one
+of the reviewer alone (below). It runs while the head's CI runs and does not wait for the CI
+result. A fix round is pushed, and its run started, without waiting for the CI of the head it
+replaces. A red CI is read and fixed as before, and what its fix owes follows § Rounds and
+§ Auditor-only run. The merge condition still needs green CI at the head.
 
 A run MAY be made with the reviewer alone while the PR body's `## Validation` section reports
 a build, a boot, or an owed local host run as pending, since an audit of that head would fail
@@ -251,7 +260,8 @@ The reviewer verdict is:
 - `BLOCKING ISSUES` when a defect is on the review surface or a reviewer returned no result;
 - `READY TO MERGE` otherwise.
 
-A PR meets the merge condition when its CI is green, its head contains `master`, and the last
+A PR meets the merge condition when its CI is green, its head contains `master` or meets the
+conditions to merge without it (§ Syncing with `master`), and the last
 run at its head is a completed run (one with the reviewer and the auditor, a run of the
 reviewer alone that its audit has completed, or the auditor-only run of § Auditor-only run)
 with no failed agent, `AUDIT PASS`, and the reviewer verdict `READY TO MERGE`.
@@ -331,9 +341,23 @@ audit carries either check.
 
 ### Syncing with `master`
 
-A PR's head MUST contain `master` when it merges (§ Branch protection). A sync is a merge of
-`master` into the PR's branch, and its incoming diff is what that merge brings in: the diff
-from the PR's merge base with `master` before the sync to its merge base after it.
+A PR's head MUST contain `master` when it merges, unless all of these hold at the merge:
+
+- the PR's head and `master`'s tip have one merge base;
+- `master`'s change since that merge base (`git diff --name-only --no-renames <merge base>
+  master`, so a rename names both its paths) names no file that the PR's own change from it
+  names;
+- GitHub reports the PR mergeable without conflict;
+- `master`'s CI is green (§ CI Gating).
+
+The PR's green CI at its head and its run record for the head are owed as for any merge. When
+`master`'s change names a file the PR changes, comment-only or not, the PR syncs before it
+merges, under the rules below. `cargo xtask pr-check <N> --gate` checks these conditions and
+prints which case held.
+
+A sync is a merge of `master` into the PR's branch, and its incoming diff is what that merge
+brings in: the diff from the PR's merge base with `master` before the sync to its merge base
+after it.
 
 - Every sync owes a passing CI run on the synced head, which builds and boots both
   architectures there.
@@ -495,7 +519,8 @@ gives the PR-level linear view.
 `master` is protected by a GitHub branch protection rule enforcing:
 
 - Pull request required before merging.
-- Required status checks (strict, branch up-to-date): `host-tests`,
+- Required status checks (not strict: a branch need not be up to date with
+  `master`, § Syncing with `master`): `host-tests`,
   `validate (x86_64, debug, ktest)`, `validate (x86_64, debug, svctest)`,
   `validate (x86_64, debug, usertest)`, `validate (x86_64, release, ktest)`,
   `validate (x86_64, release, svctest)`, `validate (x86_64, release, usertest)`,
@@ -543,6 +568,16 @@ CI status checks MUST pass before merge. The authoritative workflow
 inventory and per-workflow shape live in
 [build-system.md](build-system.md#continuous-integration); local
 equivalents are the `cargo xtask` commands documented there.
+
+`master`'s own CI runs on each push to it, and so checks each merge,
+among them the merge of a PR that was not built with the commits
+`master` gained after its merge base (§ Syncing with `master`); the
+composition check (§ Composition check) is the other backstop. A red
+`master` is a composition defect, and it is fixed before anything else
+merges: while `master`'s latest concluded CI run is red, a PR merges only
+at a head that contains `master`, whose own green CI shows the red fixed,
+and `cargo xtask pr-check <N> --gate` refuses any other. A release is cut
+only from a green `master` (§ Release Production).
 
 ## Release Production
 
@@ -601,7 +636,8 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    that contains both.
 4. Run the release host runs ([testing.md](testing.md#coverage-tiers)
    § Coverage tiers) on the commit to be tagged, a `master` commit that
-   contains the bump and the notes file: the whole
+   contains the bump and the notes file and whose own CI run is green (a
+   release is cut only from a green `master`, § CI Gating): the whole
    boundary set (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once
    each in the debug profile and once each in the release profile, and
    the memory variation, the disk variations (a 4Kn disk and three

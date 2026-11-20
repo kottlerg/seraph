@@ -360,7 +360,7 @@ impl DmaGrant
         };
         let blocked = match (withdrawn.confinement, self.shared.client())
         {
-            (Confinement::Domain { handle, .. }, Some(client)) => client.block(handle),
+            (Confinement::Domain { handle, .. }, Some(client)) => client.block_withdrawn(handle),
             _ => false,
         };
         if self.confined && !blocked

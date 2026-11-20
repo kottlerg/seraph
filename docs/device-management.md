@@ -425,9 +425,10 @@ on it, as is a `MAP` or `UNMAP` the dead instance answered or left unanswered, a
 every dead instance and releases its hold, now that no unit walks its pages, and logs the restart
 with the domains and mappings rebuilt and the holds released.
 
-**Failure.** A device whose replay fails has its driver withdrawn without a restart: its domain is
-absent from the new tables, so the device is blocked once the commit is made. An attempt fails when
-its instance does not report ready, reports other widths, is refused the remapping table or an
+**Failure.** A device whose replay fails has its driver withdrawn without a restart: devmgr blocks
+the domain again when a step after its `ATTACH` is refused, so the domain is absent from the new
+tables and the device is blocked once the commit is made. An attempt fails when its instance does
+not report ready, reports other widths, refuses that block, is refused the remapping table or an
 entry, or fails `COMMIT`: the units stay on the tables they translate through, the instance is
 destroyed and its hold kept, since its queues may have been walked, and the next attempt follows.
 When the restart budget is spent, devmgr no longer holds what a restart needs, or the death was an

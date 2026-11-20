@@ -460,14 +460,14 @@ fn bind_test_drivers(devmgr_bind: u64)
 /// own while the registry serves; the settle ends at its bound and destroys
 /// a driver that never reports ready; a driver that fails its bootstrap is
 /// destroyed; a driver that dies before a bootstrap request is abandoned and
-/// the bind goes on to the next function; a served driver's death withdraws its endpoint (a call queued
-/// on it returns) and leaves a tombstone at its ordinal while the later
-/// ordinal keeps its driver; a fault of a served driver's worker thread
-/// withdraws it the same way; a second bind over the same directory binds
-/// nothing. A `WATCH_CLASS` watch on the class is signalled when the bind
-/// serves the fixtures and when the dead one is withdrawn, and the class
-/// holds at most `MAX_CLASS_WATCHERS` watches, a gone one dropped for a new
-/// one.
+/// the bind goes on to the next function; a served driver's death withdraws
+/// its endpoint (a call queued on it returns) and leaves a tombstone at its
+/// ordinal while the later ordinal keeps its driver; a fault of a served
+/// driver's worker thread withdraws it the same way; a second bind over the
+/// same directory binds nothing. A `WATCH_CLASS` watch on the class is
+/// signalled when the bind serves the fixtures and when the dead one is
+/// withdrawn, and the class holds at most `MAX_CLASS_WATCHERS` watches, a gone
+/// one dropped for a new one.
 fn on_demand_bind_phase(caps: &Caps)
 {
     use ipc::devmgr_errors::{NO_DEVICE, SUCCESS, WITHDRAWN};

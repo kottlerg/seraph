@@ -597,10 +597,10 @@ pub enum ServeFailure
 /// The child can die before its request, so the wait for the request is a
 /// receive bounded at `poll_ms` milliseconds, and after each one that expires
 /// `child_death` is read, which gives the child's exit reason once it has died
-/// and `None` while it lives. A dead child ends the wait. A round that fails is read against `child_death` as well, so a child
-/// that died after its request, before the reply reached it, is a death and
-/// not a refusal. A live child that sends no request is waited for without
-/// end, `poll_ms` at a time.
+/// and `None` while it lives. A dead child ends the wait. A round that fails is
+/// read against `child_death` as well, so a child that died after its request,
+/// before the reply reached it, is a death and not a refusal. A live child that
+/// sends no request is waited for without end, `poll_ms` at a time.
 ///
 /// `poll_ms` is taken between 1 and one below `syscall::WAIT_TRY_ONCE`, so
 /// the receive neither waits without bound (`0`) nor spins (`WAIT_TRY_ONCE`).

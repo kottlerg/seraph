@@ -5,8 +5,9 @@
 
 //! Host-testable parts of pwrmgr's power-off on the death of a core service
 //! (docs/supervision.md § Core Set and System Death): the allocation guard
-//! the power-off runs under ([`guard`]), and the reading of the core-death
-//! queue's entries ([`core_death`]).
+//! the power-off runs under ([`guard`]), the reading of the core-death
+//! queue's entries ([`core_death`]), and the reading of the register the
+//! x86-64 power-off writes ([`power_off`]).
 //!
 //! The binary (`main.rs`) installs the guard as its global allocator and
 //! drains the queue svcmgr serves it with [`core_death::first`].
@@ -15,3 +16,4 @@
 
 pub mod core_death;
 pub mod guard;
+pub mod power_off;

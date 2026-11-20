@@ -34,12 +34,12 @@ pub struct Power;
 impl Power
 {
     /// Nothing to acquire.
-    pub const fn acquire(_devmgr: &Devmgr, _thread: u64) -> Self
+    pub const fn acquire(_devmgr: &Devmgr, _aspace: u64, _thread: u64) -> Self
     {
         Self
     }
 
-    /// False: no `PM1a_CNT`.
+    /// False: no `PM1a_CNT` and no sleep control register.
     #[expect(
         clippy::unused_self,
         reason = "mirrors the x86-64 `Power`, whose methods read its blocks"
@@ -49,7 +49,7 @@ impl Power
         false
     }
 
-    /// False, with no write: no `PM1a_CNT`.
+    /// False, with no write: no sleep register.
     #[expect(
         clippy::unused_self,
         reason = "mirrors the x86-64 `Power`, whose methods read its blocks"
@@ -59,12 +59,12 @@ impl Power
         false
     }
 
-    /// `None`: no `PM1a_CNT`.
+    /// `None`: no sleep register.
     #[expect(
         clippy::unused_self,
         reason = "mirrors the x86-64 `Power`, whose methods read its blocks"
     )]
-    pub const fn derive_control(&self) -> Option<(u64, u16)>
+    pub const fn derive_control(&self) -> Option<acpid::power::Derived>
     {
         None
     }

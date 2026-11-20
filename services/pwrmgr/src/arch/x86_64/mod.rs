@@ -11,12 +11,15 @@
 //! [`acpid_labels::STATE_S5`] to power off and [`acpid_labels::RESET`] to
 //! reboot, through the `acpid.power` seed. It reads no table.
 //!
-//! For the death of a core service it holds one port block of its own:
-//! at startup it asks acpid for `PM1a_CNT` and the S5 `SLP_TYPa`
-//! ([`acpid_labels::QUERY_SLEEP`]), binds the block to its main thread, and
-//! on a core death writes the S5 sleep type itself ([`power_off_now`]),
-//! with no call on acpid, which may be stuck on the dead member, and without
-//! the `\_PTS` and the event quiescing that acpid's `SLEEP` runs first.
+//! For the death of a core service it holds one register of its own: at
+//! startup it asks acpid for the register acpid's `SLEEP` writes and the S5
+//! `SLP_TYPa` ([`acpid_labels::QUERY_SLEEP`]), `PM1a_CNT` or, on a
+//! hardware-reduced platform, `SLEEP_CONTROL_REG`; it binds a port to its
+//! main thread or maps a memory register's page, and on a core death writes
+//! the S5 sleep type itself ([`power_off_now`]), with no call on acpid,
+//! which may be stuck on the dead member, and without the `\_PTS`, the
+//! event quiescing and the clearing of `WAK_STS` that acpid's `SLEEP` runs
+//! first.
 //!
 //! Each call is bounded by [`ACPID_CALL_TIMEOUT_MS`], so an acpid that is
 //! down, or blocked, fails the request instead of holding pwrmgr and its
@@ -36,6 +39,7 @@ use std::time::Duration;
 
 use crate::caps::{Bootstrap, drop_unused};
 use ipc::{IpcMessage, acpid_errors, acpid_labels};
+use pwrmgr::power_off::{Target, page_and_offset};
 
 /// The bound on one acpid call, from the send to the reply, in
 /// milliseconds. A time bound that bounds no capacity: far above acpid's
@@ -93,22 +97,38 @@ pub fn reboot(act: &Actuator, ipc_buf: *mut u64)
     call(act, acpid_labels::RESET, 0, "reboot", ipc_buf);
 }
 
-/// The core-death power-off: `PM1a_CNT`, bound to pwrmgr's main thread,
-/// and the S5 `SLP_TYPa`, both from acpid's [`acpid_labels::QUERY_SLEEP`].
-pub struct PowerOff
+/// The core-death power-off: the register acpid's
+/// [`acpid_labels::QUERY_SLEEP`] served, ready to write, and what is written.
+pub enum PowerOff
 {
-    /// The block's first port, `PM1a_CNT`.
-    port: u16,
-    /// The S5 sleep type, at most `acpid_labels::SLP_TYP_MAX`.
-    slp_typ: u16,
+    /// `PM1a_CNT`, the first port of the block bound to pwrmgr's main
+    /// thread, and the S5 sleep type, at most `acpid_labels::SLP_TYP_MAX`.
+    Pm1aCnt
+    {
+        port: u16, slp_typ: u16
+    },
+    /// `SLEEP_CONTROL_REG`'s port, bound to pwrmgr's main thread, and the
+    /// value that enters S5.
+    ControlPort
+    {
+        port: u16, value: u8
+    },
+    /// `SLEEP_CONTROL_REG`'s address in pwrmgr's address space, where the
+    /// page that holds it is mapped for pwrmgr's lifetime, and the value that
+    /// enters S5.
+    ControlMemory
+    {
+        va: u64, value: u8
+    },
 }
 
 /// The core-death power-off: acpid's [`acpid_labels::QUERY_SLEEP`] of S5,
 /// bounded by [`ACPID_CALL_TIMEOUT_MS`], through `actuator`, with the
-/// block it serves bound to the calling thread, pwrmgr's main thread, which
-/// runs [`power_off_now`]. `None`, logged, without an actuator, when acpid
-/// refuses (no `PM1a_CNT`, as on a hardware-reduced platform, or no usable
-/// `\_S5_`) or does not answer, or when the block cannot be bound.
+/// register it serves made ready for the calling thread, pwrmgr's main
+/// thread, which runs [`power_off_now`]: a port bound to it, or a page
+/// mapped. `None`, logged, without an actuator, when acpid refuses (no
+/// sleep register, or no usable `\_S5_`) or does not answer, when its
+/// answer is malformed, or when the port cannot be bound or the page mapped.
 pub fn resolve_power_off(actuator: Option<&Actuator>, ipc_buf: *mut u64) -> Option<PowerOff>
 {
     let act = actuator?;
@@ -133,11 +153,8 @@ pub fn resolve_power_off(actuator: Option<&Actuator>, ipc_buf: *mut u64) -> Opti
         std::os::seraph::log!(error: "QUERY_SLEEP refused (acpid replied {:#x})", reply.label);
         return None;
     }
-    let (Some(cap), Ok(port), Ok(slp_typ)) = (
-        cap,
-        u16::try_from(reply.word(0)),
-        u16::try_from(reply.word(1)),
-    )
+    let target = Target::from_answer(reply.word(2), reply.word(0), reply.word(1));
+    let (Some(cap), Some(target)) = (cap, target)
     else
     {
         if let Some(cap) = cap
@@ -147,33 +164,110 @@ pub fn resolve_power_off(actuator: Option<&Actuator>, ipc_buf: *mut u64) -> Opti
         std::os::seraph::log!(error: "QUERY_SLEEP answer malformed");
         return None;
     };
-    if u64::from(slp_typ) > acpid_labels::SLP_TYP_MAX || !bind_ports(cap)
+    let power_off = match target
     {
-        let _ = syscall::cap_delete(cap);
-        std::os::seraph::log!(error: "PM1a control block {port:#x} not usable");
-        return None;
+        Target::Pm1aCnt { port, slp_typ } if bind_ports(cap) =>
+        {
+            Some(PowerOff::Pm1aCnt { port, slp_typ })
+        }
+        Target::ControlPort { port, value } if bind_ports(cap) =>
+        {
+            Some(PowerOff::ControlPort { port, value })
+        }
+        Target::ControlMemory { address, value } =>
+        {
+            map_page(cap, address).map(|va| PowerOff::ControlMemory { va, value })
+        }
+        Target::Pm1aCnt { .. } | Target::ControlPort { .. } =>
+        {
+            let _ = syscall::cap_delete(cap);
+            None
+        }
+    };
+    if power_off.is_none()
+    {
+        std::os::seraph::log!(error: "sleep register {target:?} not usable");
     }
-    Some(PowerOff { port, slp_typ })
+    power_off
 }
 
-/// Power off at once: write the S5 sleep type to `PM1a_CNT`, then with
+/// Map the `Mmio` capability `cap` over the page that holds the register at
+/// physical `address` into pwrmgr's address space, for pwrmgr's lifetime;
+/// the register's address there. `None` when no VA is left, the capability
+/// then deleted, or the map is refused, the VA and the capability then kept.
+/// Runs at startup: the map takes its page-table pages from memmgr through
+/// the object slab, and the power-off that writes the register later maps
+/// nothing.
+fn map_page(cap: u64, address: u64) -> Option<u64>
+{
+    let (_, offset) = page_and_offset(address);
+    let Ok(range) = std::os::seraph::reserve_pages(1)
+    else
+    {
+        let _ = syscall::cap_delete(cap);
+        return None;
+    };
+    let va = range.va_start();
+    let aspace = std::os::seraph::startup_info().self_aspace;
+    // SAFETY: `range` is a fresh one-page reservation from the per-process
+    // arena: VA no Rust object or IPC page occupies. The register is held for
+    // pwrmgr's lifetime, so the range is never returned and nothing else is
+    // placed there.
+    if unsafe { std::os::seraph::mmio_map_funded(aspace, cap, va, 1) }.is_err()
+    {
+        // A refused map can leave the page mapped, so the range stays
+        // reserved and the capability is kept with it.
+        return None;
+    }
+    // `va` is page-aligned and `offset` below the page size, so the OR adds
+    // them.
+    Some(va | offset)
+}
+
+/// Power off at once: on `PM1a_CNT`, write the S5 sleep type, then with
 /// `SLP_EN`, keeping the register's other bits
-/// ([`acpid_labels::pm1_control_writes`]). Port I/O alone: allocates, logs
-/// and calls nothing. Runs on pwrmgr's main thread, to which
-/// [`resolve_power_off`] bound the block; returns only when the platform
+/// ([`acpid_labels::pm1_control_writes`]); on `SLEEP_CONTROL_REG`, write the
+/// one value that enters S5 (`acpid_labels::sleep_control_value`). Port I/O
+/// or one store to a page mapped at startup alone: allocates, maps, logs and
+/// calls nothing. Runs on pwrmgr's main thread, to which
+/// [`resolve_power_off`] bound the port; returns only when the platform
 /// keeps running.
 pub fn power_off_now(power_off: &PowerOff)
 {
-    // SAFETY: `power_off.port` is `PM1a_CNT`, the first port of the block
-    // acpid served for it and `resolve_power_off` bound to this thread; a
-    // read of it has no side effect.
-    let current = unsafe { inw(power_off.port) };
-    let [typed, enter] = acpid_labels::pm1_control_writes(current, power_off.slp_typ);
-    // SAFETY: as the read; writing `SLP_TYP` with `SLP_EN` clear is the
-    // first step of the ACPI sleep sequence.
-    unsafe { outw(power_off.port, typed) };
-    // SAFETY: as the read; writing `SLP_TYP | SLP_EN` enters the state.
-    unsafe { outw(power_off.port, enter) };
+    match *power_off
+    {
+        PowerOff::Pm1aCnt { port, slp_typ } =>
+        {
+            // SAFETY: `port` is `PM1a_CNT`, the first port of the block acpid
+            // served for it and `resolve_power_off` bound to this thread; a
+            // read of it has no side effect.
+            let current = unsafe { inw(port) };
+            let [typed, enter] = acpid_labels::pm1_control_writes(current, slp_typ);
+            // SAFETY: as the read; writing `SLP_TYP` with `SLP_EN` clear is
+            // the first step of the ACPI sleep sequence.
+            unsafe { outw(port, typed) };
+            // SAFETY: as the read; writing `SLP_TYP | SLP_EN` enters the
+            // state.
+            unsafe { outw(port, enter) };
+        }
+        PowerOff::ControlPort { port, value } =>
+        {
+            // SAFETY: `port` is `SLEEP_CONTROL_REG`, the port acpid served
+            // for it and `resolve_power_off` bound to this thread; writing
+            // `SLP_TYPx | SLP_EN` to it enters the state (ACPI 6.5
+            // § 4.8.3.7).
+            unsafe { outb(port, value) };
+        }
+        PowerOff::ControlMemory { va, value } =>
+        {
+            // SAFETY: `va` is `SLEEP_CONTROL_REG` in the page acpid served for
+            // it, which `resolve_power_off` mapped for pwrmgr's lifetime, so
+            // the store reaches that byte of device memory and takes no fault;
+            // writing `SLP_TYPx | SLP_EN` to it enters the state (ACPI 6.5
+            // § 4.8.3.7).
+            unsafe { (va as *mut u8).write_volatile(value) };
+        }
+    }
 }
 
 /// Bind the `IoPort` `cap` to pwrmgr's main thread. Its first bind takes the
@@ -223,6 +317,20 @@ unsafe fn inw(port: u16) -> u16
         core::arch::asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack));
     };
     value
+}
+
+/// `out dx, al`.
+///
+/// # Safety
+///
+/// `port` lies in an `IoPort` block bound to the calling thread, and
+/// writing `value` to it has the effect the caller intends.
+unsafe fn outb(port: u16, value: u8)
+{
+    // SAFETY: the caller's contract.
+    unsafe {
+        core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack));
+    };
 }
 
 /// `out dx, ax`.

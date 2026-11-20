@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
-# Host-testable parts of the core-death power-off: the allocation guard and
-# the core-death queue's entries (bins are test = false).
+# Host-testable parts of the core-death power-off: the allocation guard, the
+# core-death queue's entries and the register the x86-64 power-off writes
+# (bins are test = false).
 [lib]
 name = "pwrmgr"
 path = "src/lib.rs"

@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use acpid::events::{self, Fired, Handled, Handler, Layout, Start};
 use acpid::hotplug::{self, Event, Held, HotplugJob, HotplugSlots, Outcome};
-use acpid::power::{self, Request};
+use acpid::power::{self, Derived, Request};
 use aml::namespace::NodeId;
 use aml::{Evaluator, Namespace};
 use ipc::{IpcMessage, acpid_errors, acpid_labels, devmgr_errors, devmgr_labels};
@@ -41,8 +41,8 @@ use crate::devmgr::{CallError, Devmgr};
 use crate::platform::{Platform, path_text};
 use crate::startup::path;
 
-/// How long a sleep keeps the events quiesced after its `PM1a_CNT` writes
-/// return before it takes the platform to be still running and enables
+/// How long a sleep keeps the events quiesced after its sleep register
+/// writes return before it takes the platform to be still running and enables
 /// the GPEs again ([`events::resume`]): ACPICA's wait before it takes an S4 or S5 write as not taken. A
 /// platform entering the state stops well within it, with only its wake
 /// events enabled.
@@ -235,7 +235,7 @@ pub fn serve(
                 // A receiver that is gone leaves the derivation here.
                 if let Err(mpsc::SendError(Ok(control))) = answer.send(control)
                 {
-                    let _ = syscall::cap_delete(control.cap);
+                    let _ = syscall::cap_delete(control.derived.cap);
                 }
             }
             Work::Gpe(gpe) =>
@@ -758,8 +758,9 @@ fn ask_sleep(state: u8, work: &Sender<Work>) -> Result<SleepControl, u64>
     answered.recv().unwrap_or(Err(acpid_errors::NO_DEVICE))
 }
 
-/// Reply to a `QUERY_SLEEP` with `control`: its derivation, its port and
-/// its `SLP_TYPa`, or the status of its refusal. A derivation whose reply
+/// Reply to a `QUERY_SLEEP` with `control`: its derivation, its register's
+/// port or address, its `SLP_TYPa` and which register it is, or the status
+/// of its refusal. A derivation whose reply
 /// fails, the caller gone, is deleted.
 fn reply_sleep_control(control: Result<SleepControl, u64>, ipc_buf: *mut u64)
 {
@@ -769,14 +770,15 @@ fn reply_sleep_control(control: Result<SleepControl, u64>, ipc_buf: *mut u64)
         Err(status) => return reply(status, ipc_buf),
     };
     let msg = IpcMessage::builder(acpid_errors::SUCCESS)
-        .word(0, u64::from(control.port))
+        .word(0, control.derived.address)
         .word(1, u64::from(control.slp_typ))
-        .cap(control.cap)
+        .word(2, control.derived.register)
+        .cap(control.derived.cap)
         .build();
     // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
     if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
     {
-        let _ = syscall::cap_delete(control.cap);
+        let _ = syscall::cap_delete(control.derived.cap);
     }
 }
 
@@ -869,11 +871,12 @@ type SleepEvents<'a> = (&'a Armed, &'a Mailbox, &'a Sender<Work>);
 
 /// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then, with the
 /// events `armed`, [`events::quiesce`], which hands on each event it takes,
-/// then the `PM1a_CNT` writes. When
-/// the writes return, the events stay quiesced for [`SLEEP_GRACE`]; when the
-/// platform still runs then, the GPEs are enabled again
-/// ([`events::resume`]) and what latched is handed on, each event once. The
-/// reply status when the platform keeps running.
+/// then the sleep register writes (`Power::sleep`). When
+/// the writes return, acpid waits [`SLEEP_GRACE`], the events staying
+/// quiesced; when the platform still runs then, the GPEs are enabled again
+/// ([`events::resume`]) and what latched is handed on, each event once. A
+/// platform without armed events, a hardware-reduced one among them, waits
+/// the same grace. The reply status when the platform keeps running.
 fn sleep(
     state: u8,
     ns: Option<&mut Namespace>,
@@ -898,16 +901,26 @@ fn sleep(
         quiesced
     });
     let entered = power.sleep(state, slp_typ);
-    if let (Some((armed, mailbox, work)), Some(quiesced)) = (armed, quiesced)
+    if entered
     {
-        if entered
+        std::thread::sleep(SLEEP_GRACE);
+        if quiesced.is_some()
         {
-            std::thread::sleep(SLEEP_GRACE);
             std::os::seraph::log!(
                 warn: "SLEEP({state}): still running {} s after the writes; GPEs enabled again",
                 SLEEP_GRACE.as_secs()
             );
         }
+        else
+        {
+            std::os::seraph::log!(
+                warn: "SLEEP({state}): still running {} s after the writes",
+                SLEEP_GRACE.as_secs()
+            );
+        }
+    }
+    if let (Some((armed, mailbox, work)), Some(quiesced)) = (armed, quiesced)
+    {
         let fired = events::resume(
             &mut *lock(&armed.regs),
             &armed.layout,
@@ -928,8 +941,8 @@ fn sleep(
 
 /// The `SLP_TYPa` of sleep state `state` for the request `request` (its
 /// name in the log), read from its `\_Sx_` package in `ns`, and `ns`
-/// back. Refused, logged, with `NO_DEVICE` when `power` holds no
-/// `PM1a_CNT`, no AML is loaded, or the package is absent or unusable.
+/// back. Refused, logged, with `NO_DEVICE` when `power` holds no sleep
+/// register, no AML is loaded, or the package is absent or unusable.
 fn sleep_type<'n>(
     request: &str,
     state: u8,
@@ -940,7 +953,7 @@ fn sleep_type<'n>(
 {
     if !power.can_sleep()
     {
-        std::os::seraph::log!(warn: "{request}({state}) refused: no PM1a control block");
+        std::os::seraph::log!(warn: "{request}({state}) refused: no PM1a_CNT or SLEEP_CONTROL_REG");
         return Err(acpid_errors::NO_DEVICE);
     }
     let Some(ns) = ns
@@ -967,17 +980,17 @@ fn sleep_type<'n>(
     }
 }
 
-/// What a `QUERY_SLEEP` hands its caller: a derivation of the `IoPort`
-/// over `PM1a_CNT`, the block's first port, and the state's `SLP_TYPa`.
+/// What a `QUERY_SLEEP` hands its caller: the derivation of the register
+/// acpid's `SLEEP` writes, with which register it is and its port or
+/// address, and the state's `SLP_TYPa`.
 struct SleepControl
 {
-    cap: u64,
-    port: u16,
+    derived: Derived,
     slp_typ: u16,
 }
 
 /// `QUERY_SLEEP` of `state`: its `SLP_TYPa`, as [`sleep`] reads it, and a
-/// derivation of the `PM1a_CNT` block `power` holds. The status to reply,
+/// derivation of the sleep register `power` holds. The status to reply,
 /// logged, when [`sleep_type`] refuses or the derivation fails.
 fn query_sleep(
     state: u8,
@@ -987,14 +1000,23 @@ fn query_sleep(
 ) -> Result<SleepControl, u64>
 {
     let (slp_typ, _) = sleep_type("QUERY_SLEEP", state, ns, platform, power)?;
-    let Some((cap, port)) = power.derive_control()
+    let Some(derived) = power.derive_control()
     else
     {
-        std::os::seraph::log!(warn: "QUERY_SLEEP({state}) refused: PM1a control block not derived");
+        std::os::seraph::log!(warn: "QUERY_SLEEP({state}) refused: sleep register not derived");
         return Err(acpid_errors::NO_DEVICE);
     };
-    std::os::seraph::log!("QUERY_SLEEP({state}): PM1a_CNT {port:#x}, SLP_TYPa {slp_typ:#x}");
-    Ok(SleepControl { cap, port, slp_typ })
+    let register = match derived.register
+    {
+        acpid_labels::SLEEP_REGISTER_PM1A_CNT => "PM1a_CNT",
+        acpid_labels::SLEEP_REGISTER_CONTROL_IO => "SLEEP_CONTROL_REG port",
+        _ => "SLEEP_CONTROL_REG memory",
+    };
+    std::os::seraph::log!(
+        "QUERY_SLEEP({state}): {register} {:#x}, SLP_TYPa {slp_typ:#x}",
+        derived.address
+    );
+    Ok(SleepControl { derived, slp_typ })
 }
 
 /// Reset through `RESET_REG`. The reply status when the platform keeps

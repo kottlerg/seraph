@@ -1290,16 +1290,16 @@ impl Registry
             {
                 handle_query_shutdown_device(&self.firmware, msg, badge, ipc_buf);
             }
-            ipc::devmgr_labels::QUERY_ACPI_RESOURCES
-                if msg.word(1) != ipc::devmgr_labels::ACPI_SCI =>
+            ipc::devmgr_labels::QUERY_ACPI_RESOURCES if !acpi::on_control(msg.word(1)) =>
             {
                 if Self::admits(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf)
                 {
                     acpi::query_resources(&self.firmware, msg, ipc_buf);
                 }
             }
-            // The SCI's `QUERY_ACPI_RESOURCES` goes to the control thread,
-            // which owns the interrupt lines.
+            // The `QUERY_ACPI_RESOURCES` of the SCI and of the sleep
+            // registers goes to the control thread, which owns the interrupt
+            // lines and the kept memory grants.
             ipc::devmgr_labels::QUERY_ACPI_RESOURCES
             | ipc::devmgr_labels::ACPI_REGION_GRANT
             | ipc::devmgr_labels::ACPI_PCI_CONFIG

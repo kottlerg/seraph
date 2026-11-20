@@ -23,6 +23,15 @@ pub const PRESSURE_LOW_DIVISOR: u64 = 16;
 /// (docs/limits.md § memmgr).
 pub const PRESSURE_BAND_DIVISOR: u64 = 128;
 
+/// The hysteresis band of a pool of `pool_total` pages:
+/// `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one.
+#[must_use]
+pub const fn band(pool_total: u64) -> u64
+{
+    let band = pool_total / PRESSURE_BAND_DIVISOR;
+    if band == 0 { 1 } else { band }
+}
+
 /// A memory-pressure level, ordered from the least pressure to the most.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PressureLevel
@@ -38,7 +47,8 @@ pub enum PressureLevel
 }
 
 /// The level `free` pages give against `pool_total`, `swapped` of whose
-/// pages are swapped, with no hysteresis.
+/// pages are swapped chunks of uncommitted regions, which the restore headroom
+/// counts ([`growth_floor`]), with no hysteresis.
 fn classify(free: u64, pool_total: u64, swapped: u64) -> PressureLevel
 {
     if free <= growth_floor(pool_total, swapped)
@@ -57,7 +67,7 @@ fn classify(free: u64, pool_total: u64, swapped: u64) -> PressureLevel
 
 /// The level after `prev`, for `free` pages of the free pool outside
 /// `promised` (deferred pages excluded) out of `pool_total`, with `swapped`
-/// pages swapped.
+/// pages of uncommitted regions swapped (`Ledger::uncommitted_swapped`).
 ///
 /// A worse level applies at once. A better one applies only once the free
 /// pool clears its threshold by the hysteresis band: the result is the level
@@ -78,8 +88,7 @@ pub fn pressure_level(
     {
         return raw;
     }
-    let band = (pool_total / PRESSURE_BAND_DIVISOR).max(1);
-    classify(free.saturating_sub(band), pool_total, swapped).min(prev)
+    classify(free.saturating_sub(band(pool_total)), pool_total, swapped).min(prev)
 }
 
 #[cfg(test)]

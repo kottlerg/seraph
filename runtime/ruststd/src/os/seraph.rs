@@ -1179,19 +1179,34 @@ pub fn memory_pressure() -> Option<MemoryPressure> {
     }
 }
 
+/// memmgr's draw room in bytes: what a fault on a committed page of a process
+/// outside the system reserve may take from the free pool now
+/// (`QUERY_POOL_STATUS` `data[16]`; `services/memmgr/docs/memory-pool.md`
+/// § Commit, Overcommit). A fault memmgr declined as a commit overrun can be
+/// backed once it is open, at a demand chunk's bytes or more, which write-out
+/// to swap brings about while the level stays `Critical`; memmgr signals its
+/// opening and not its closing. `None` if memmgr is unreachable.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn commit_draw_room_bytes() -> Option<u64> {
+    pal_alloc::memmgr_query_draw_room()
+}
+
 /// The bit memmgr sends on [`memory_pressure_notification`] when the
-/// memory-pressure level changes.
+/// memory-pressure level changes, or its draw room opens
+/// ([`commit_draw_room_bytes`]).
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub const MEMORY_PRESSURE_BIT: u64 = pal_alloc::PRESSURE_BIT;
 
 /// The Notification memmgr sends [`MEMORY_PRESSURE_BIT`] on when the
-/// memory-pressure level changes, with every right, so a server can add it
-/// to its wait set; `None` when the process is not registered (a process
-/// with no memmgr endpoint, or one whose registration at start failed).
+/// memory-pressure level changes, or its draw room opens, with every
+/// right, so a server can add it to its wait set; `None` when the process is
+/// not registered (a process with no memmgr endpoint, or one whose
+/// registration at start failed).
 ///
 /// `_start` registers it, so the process makes no call of its own. A send
-/// coalesces with one not yet taken, so a wake says the level changed at
-/// least once since the last; [`memory_pressure`] then reads the level.
+/// coalesces with one not yet taken, so a wake says the level changed, or
+/// the draw room opened, at least once since the last; [`memory_pressure`] and
+/// [`commit_draw_room_bytes`] then read them.
 /// A process that registers another Notification with memmgr itself
 /// (`memmgr_labels::REGISTER_PRESSURE`) replaces this one, which is then
 /// signalled no more.
@@ -1200,18 +1215,21 @@ pub fn memory_pressure_notification() -> Option<u64> {
     pal_alloc::pressure_notification()
 }
 
-/// Block until the memory-pressure level changes, or `timeout` passes, and
-/// return the level then. `None` waits without bound; `Some(Duration::ZERO)`
-/// takes a change already signalled without blocking.
+/// Block until memmgr sends [`MEMORY_PRESSURE_BIT`], at a change of the
+/// memory-pressure level or an opening of its draw room, or `timeout`
+/// passes, and return the level then, which a wake for the draw room leaves
+/// as it was: a caller that acts on a change of level compares it with the
+/// level it last acted on. `None` waits without bound; `Some(Duration::ZERO)`
+/// takes a signal already sent without blocking.
 ///
-/// Each change wakes one waiter of the process: a thread that waits here
+/// Each signal wakes one waiter of the process: a thread that waits here
 /// takes the bit from every other. A stop of the waiting thread, or an
 /// upcall to it, does not end the wait: it waits again for what is left of
 /// `timeout` (`docs/fault-handling.md` § Asynchronous Upcalls).
 ///
 /// # Errors
 /// `Unsupported` when the process is not registered
-/// ([`memory_pressure_notification`]), `TimedOut` when no change came in
+/// ([`memory_pressure_notification`]), `TimedOut` when no signal came in
 /// `timeout`, and another error when the wait or the read of the level fails.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn wait_memory_pressure(

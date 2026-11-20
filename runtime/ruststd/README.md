@@ -727,11 +727,17 @@ pressure):
 
 - `memory_pressure()` reads the level (`MemoryPressure::Normal`, `Low` or `Critical`) from
   `QUERY_POOL_STATUS`.
+- `commit_draw_room_bytes()` reads memmgr's draw room, the free bytes a fault on a committed page
+  may take, from `QUERY_POOL_STATUS`; it is open at a demand chunk's bytes or more
+  ([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md#commit) § Commit,
+  Overcommit).
 - `memory_pressure_notification()` is the registered Notification, with every right, which memmgr
-  sends `MEMORY_PRESSURE_BIT` on at each change of level; a server adds it to its wait set.
-- `wait_memory_pressure(timeout)` waits for the bit and returns the level then. Each change wakes
-  one waiter of the process. A wait cancelled with `Interrupted` (a stop of the thread, or an
-  upcall to it) waits again for what is left of `timeout`.
+  sends `MEMORY_PRESSURE_BIT` on at each change of level and each opening of the draw room, not at
+  its closing; a server adds it to its wait set.
+- `wait_memory_pressure(timeout)` waits for the bit and returns the level then, unchanged after a
+  wake for the draw room, so a caller acting on a change of level compares it with the last. Each
+  signal wakes one waiter of the process. A wait cancelled with `Interrupted` (a stop of the
+  thread, or an upcall to it) waits again for what is left of `timeout`.
 
 A process that registers another Notification itself replaces the runtime's, which memmgr then
 signals no more.

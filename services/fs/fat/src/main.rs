@@ -31,9 +31,11 @@
 //! uses the node's cached `DirEntryLocation`.
 //!
 //! Memory pressure: a pressure thread waits on the runtime's memory-pressure
-//! Notification (`std::os::seraph::wait_memory_pressure`). When memmgr's
-//! level changes to `Low` or `Critical`, it marks a release pending and wakes
-//! the dispatch loop with an unbadged call on the service endpoint. The loop,
+//! Notification (`std::os::seraph::wait_memory_pressure`), whose wakes include
+//! the openings of memmgr's draw room, which leave the level as it was. When
+//! memmgr's level reads `Low` or `Critical` and differs from the level its
+//! last wake read, it marks a release pending and wakes the dispatch loop with
+//! an unbadged call on the service endpoint. The loop,
 //! at the top of its next turn, gives memmgr back the pages the cache holds
 //! idle but the few most recently used, which a miss evicts when memmgr
 //! refuses a page ([`cache::PageCache::release_idle_pages`]), and goes on
@@ -223,8 +225,10 @@ fn spawn_pressure_thread(service: u64)
     }
 }
 
-/// Wait for memmgr's level to change; at `Low` or `Critical` mark a
-/// release pending and wake the dispatch loop with a call on `wake`. A call
+/// Wait for memmgr's level to change; at `Low` or `Critical`, other than the
+/// level the last wake read, mark a release pending and wake the dispatch
+/// loop with a call on `wake`. A wake that leaves the level as it was (an opening of
+/// memmgr's draw room) is not a change, and acts on nothing. A call
 /// that a stop or an upcall interrupts is made again, since a second wake
 /// costs the loop one more refused request. Ends when the wait fails, or
 /// when the call fails otherwise, as it does once vfsd has revoked the
@@ -232,13 +236,18 @@ fn spawn_pressure_thread(service: u64)
 /// driver.
 fn pressure_thread(wake: u64)
 {
+    let mut last = MemoryPressure::Normal;
     loop
     {
         match std::os::seraph::wait_memory_pressure(None)
         {
-            Ok(MemoryPressure::Low | MemoryPressure::Critical) =>
-            {}
-            Ok(_) => continue,
+            Ok(level) if level == last => continue,
+            Ok(level @ (MemoryPressure::Low | MemoryPressure::Critical)) => last = level,
+            Ok(level) =>
+            {
+                last = level;
+                continue;
+            }
             Err(e) =>
             {
                 std::os::seraph::log!(warn: "memory-pressure wait failed ({e}); cache kept under pressure");

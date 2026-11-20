@@ -1446,8 +1446,24 @@ pub fn memmgr_query_pressure() -> Option<u64> {
     (reply.label == 0).then(|| reply.word(7))
 }
 
+/// memmgr's draw room in bytes (`QUERY_POOL_STATUS`, reply `data[16]`): what
+/// a committed page's fault may take from the free pool now. `None` if
+/// memmgr is unreachable. Made again for as long as the call is interrupted,
+/// as a read-only query may be.
+pub fn memmgr_query_draw_room() -> Option<u64> {
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    let ipc_buf = current_ipc_buf();
+    if ep == 0 || ipc_buf.is_null() {
+        return None;
+    }
+    let msg = ipc::IpcMessage::builder(QUERY_POOL_STATUS).build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    (reply.label == 0).then(|| reply.word(16))
+}
+
 /// The bit memmgr sends on [`pressure_notification`] when the pressure level
-/// changes.
+/// changes, or the draw room opens.
 pub const PRESSURE_BIT: u64 = 1;
 
 /// The Notification [`register_pressure`] registered with memmgr, with every

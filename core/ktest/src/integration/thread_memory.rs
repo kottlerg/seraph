@@ -21,11 +21,13 @@
 //!   derived cap, as a process loader maps text, frame mapped once) refuses a
 //!   write without `THREAD_MEM_TEXT` and takes one with it, and a text page
 //!   whose frame ktest also maps refuses it;
-//! - a page lent read-only (mapped through a Map-only derived cap) refuses a
-//!   `mem_protect` to writable or executable through the full-rights cap of
-//!   its own frame, and a text write, each `InsufficientRights`: a page goes
-//!   no further than the rights of the cap that mapped it, while the protect
-//!   page, mapped read-only through a full-rights cap, turns executable;
+//! - a page lent read-only (mapped writable through its frame's full-rights
+//!   cap, then mapped again over that writable leaf through a Map-only derived
+//!   cap, so the remap rewrites the leaf's grant) refuses a `mem_protect` to
+//!   writable or executable through the full-rights cap of its own frame, and
+//!   a text write, each `InsufficientRights`: a page goes no further than the
+//!   rights of the cap that last mapped it, while the protect page, mapped
+//!   read-only through a full-rights cap, turns executable;
 //! - `SYS_SYSTEM_INFO(InstructionCacheSyncs)` rises across an executable
 //!   `mem_map`, a `mem_protect` to executable (of a read-only page, and of a
 //!   page already executable, the route for code written through a writable
@@ -332,7 +334,12 @@ fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect, lent]: [u6
     unsafe { mem_map(shared, ctx.aspace_cap, KT_SHARED, 0, 1, MAP_READ) }
         .map_err(|_| "integration::thread_memory: ktest shared mem_map failed")?;
 
-    // The lent page: read-only through a Map-only cap.
+    // The lent page: writable through its full-rights cap, then read-only
+    // through a Map-only cap mapped over that writable leaf, which rewrites
+    // the leaf's grant to the Map-only cap's.
+    // SAFETY: `b` is an address space this test created, not ktest's own.
+    unsafe { mem_map(lent, b, B_LENT, 0, 1, MAP_WRITABLE) }
+        .map_err(|_| "integration::thread_memory: B lent mem_map failed")?;
     map_attenuated(lent, RIGHTS_MEM_MAP, b, B_LENT, MAP_READ)?;
 
     // The protect page: read-only through a full-rights cap, then executable,
@@ -513,10 +520,10 @@ fn text_write(th: u64) -> TestResult
     Ok(())
 }
 
-/// The page lent read-only goes no further than its Map-only cap: a
-/// `mem_protect` to writable or to executable through `lent`, the
-/// full-rights cap of the same frame, is refused, and so is a text write,
-/// each leaving the page as it was.
+/// The page lent read-only goes no further than the Map-only cap mapped over
+/// its writable leaf: a `mem_protect` to writable or to executable through
+/// `lent`, the full-rights cap of the same frame, is refused, and so is a
+/// text write, each leaving the page as it was.
 fn lent_page_refused(b: u64, th: u64, lent: u64) -> TestResult
 {
     let refused = Err(err(SyscallError::InsufficientRights));

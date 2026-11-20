@@ -32,13 +32,20 @@
 //! own (a table operation's heap growth may call memmgr), and a mapping is
 //! pending in the table while its IOMMU call is in flight, so a withdrawal
 //! meanwhile neither races the commit nor deletes the cap the call carries.
-//! See `docs/device-management.md` § DMA Authorisation.
+//! While the IOMMU driver restarts, the thread's `MAP` and `UNMAP` wait for
+//! the restarted instance, and a call the dead instance answered, or left
+//! unanswered, is made again on it ([`install`], [`remove`]). See
+//! `docs/device-management.md` § DMA Authorisation and § IOMMU Driver
+//! Restart.
 
 use std::os::seraph::thread::BuilderExt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use std::collections::TryReserveError;
+
 use firmware::dma::{
-    Confinement, DmaTable, IommuBlock, MapError, Mapping, ReservedRange, UnmapError, check_access,
+    Confinement, DeviceReplay, DmaTable, IommuBlock, MapError, Mapping, ReservedRange, UnmapError,
+    check_access,
 };
 use ipc::recv_guard::RecvGuard;
 use ipc::{IpcMessage, devmgr_dma_errors, devmgr_dma_labels, iommu_errors};
@@ -57,8 +64,10 @@ fn lock(table: &Mutex<DmaTable>) -> MutexGuard<'_, DmaTable>
 /// each device given DMA, and, once the IOMMU driver reports ready, the
 /// IOMMU devmgr calls it through.
 ///
-/// Each lock is a leaf, held only around a table operation: neither is held
-/// while the other is taken or across an IPC.
+/// Each lock is held only around a table operation, never across an IPC,
+/// and neither while the other is taken. The IOMMU client's link lock is
+/// taken inside the table's when the DMA thread records the outcome of an
+/// IOMMU call (`IommuClient::serves`); it takes no lock itself.
 struct Shared
 {
     table: Mutex<DmaTable>,
@@ -145,6 +154,21 @@ impl DmaService
             return None;
         }
         Some(Self { ep, shared })
+    }
+
+    /// What a restarted IOMMU driver is given again
+    /// ([`DmaTable::replay`]), read under the table's lock: the restart
+    /// runs once a death has stopped the DMA thread recording IOMMU
+    /// outcomes in the table (`IommuClient::serves`), so no mapping changes
+    /// state between this read and the restarted instance's commit, but for
+    /// a withdrawal, which the restart, on the same control thread, does not
+    /// interleave.
+    ///
+    /// # Errors
+    /// The list cannot grow.
+    pub fn replay(&self) -> Result<Vec<DeviceReplay>, TryReserveError>
+    {
+        lock(&self.shared.table).replay()
     }
 
     /// Route every confined device's mappings through the IOMMU driver
@@ -575,13 +599,12 @@ fn map(msg: &IpcMessage, cap: u64, shared: &Shared) -> Result<u64, u64>
     let mapping = lock(&shared.table)
         .reserve(msg.badge, cap, len, access, phys)
         .map_err(map_error_code)?;
-    if let Some(handle) = handle
-        && let Err(code) = install(shared, handle, &mapping)
+    let committed = match handle
     {
-        lock(&shared.table).abort(msg.badge, mapping.device_addr);
-        return Err(code);
-    }
-    if !lock(&shared.table).commit(msg.badge, mapping.device_addr)
+        Some(handle) => install(shared, msg.badge, handle, &mapping)?,
+        None => lock(&shared.table).commit(msg.badge, mapping.device_addr),
+    };
+    if !committed
     {
         // Withdrawn while the IOMMU call was in flight; the withdrawal's
         // BLOCK removed whatever the call installed.
@@ -621,28 +644,56 @@ fn faults(shared: &Shared, badge: u64) -> IpcMessage
         .build()
 }
 
-/// Have the IOMMU driver install `mapping` in the domain `handle`, moving it
-/// a derivation of the mapping's cap; the `devmgr_dma_errors` code when it
-/// does not.
-fn install(shared: &Shared, handle: u64, mapping: &Mapping) -> Result<(), u64>
+/// Have the IOMMU driver install `mapping`, pending in the table for the
+/// device `badge`, in the domain `handle`, moving it a derivation of the
+/// mapping's cap, and commit it; whether the table still held it (`false`:
+/// the device was withdrawn meanwhile). The outcome is recorded under the
+/// table's lock only while the instance called still serves
+/// ([`IommuClient::serves`]): once a death has moved the client on, the
+/// restart's replay leaves this pending mapping out, so the call is made
+/// again on the instance that serves next, at most
+/// [`crate::iommu::CALL_ATTEMPTS`] times.
+///
+/// # Errors
+/// The `devmgr_dma_errors` code when the driver does not install it, the
+/// mapping then aborted.
+fn install(shared: &Shared, badge: u64, handle: u64, mapping: &Mapping) -> Result<bool, u64>
 {
-    let Some(client) = shared.client()
-    else
+    let addr = mapping.device_addr;
+    if let Some(client) = shared.client()
     {
-        return Err(devmgr_dma_errors::IOMMU_FAILED);
-    };
-    let Ok(copy) = syscall::cap_derive(mapping.cap, syscall::RIGHTS_ALL)
-    else
-    {
-        return Err(devmgr_dma_errors::OUT_OF_RESOURCES);
-    };
-    client
-        .map(handle, mapping.device_addr, mapping.access, copy)
-        .map_err(|code| match code
+        for _ in 0..crate::iommu::CALL_ATTEMPTS
         {
-            iommu_errors::OUT_OF_RESOURCES => devmgr_dma_errors::OUT_OF_RESOURCES,
-            _ => devmgr_dma_errors::IOMMU_FAILED,
-        })
+            let Some(ep) = client.await_serving()
+            else
+            {
+                break;
+            };
+            let result = IommuClient::map_on(ep, handle, addr, mapping.access, mapping.cap);
+            let recorded = {
+                let mut table = lock(&shared.table);
+                client.serves(ep).then(|| match result
+                {
+                    Ok(()) => Ok(table.commit(badge, addr)),
+                    Err(code) =>
+                    {
+                        table.abort(badge, addr);
+                        Err(match code
+                        {
+                            iommu_errors::OUT_OF_RESOURCES => devmgr_dma_errors::OUT_OF_RESOURCES,
+                            _ => devmgr_dma_errors::IOMMU_FAILED,
+                        })
+                    }
+                })
+            };
+            if let Some(recorded) = recorded
+            {
+                return recorded;
+            }
+        }
+    }
+    lock(&shared.table).abort(badge, addr);
+    Err(devmgr_dma_errors::IOMMU_FAILED)
 }
 
 /// Withdraw the device `badge`'s standing mapping at `device_addr`: have the
@@ -658,25 +709,97 @@ fn unmap(shared: &Shared, badge: u64, device_addr: u64) -> u64
         Err(UnmapError::UnknownDevice) => return devmgr_dma_errors::UNAUTHORIZED,
         Err(UnmapError::NoMapping) => return devmgr_dma_errors::NO_MAPPING,
     };
-    if let Confinement::Domain { handle, .. } = confinement
+    let removal = match confinement
     {
-        let removed = shared
-            .client()
-            .is_some_and(|c| c.unmap(handle, device_addr).is_ok());
-        if !removed
+        Confinement::Domain { handle, .. } => remove(shared, badge, handle, device_addr),
+        Confinement::Unconfined =>
         {
-            if !lock(&shared.table).restore(badge, device_addr)
-            {
-                // Withdrawn meanwhile: its BLOCK withdrew every range, and
-                // the cap the table no longer holds is this thread's.
-                let _ = syscall::cap_delete(mapping.cap);
-            }
-            return devmgr_dma_errors::IOMMU_FAILED;
+            lock(&shared.table).finish_unmap(badge, device_addr);
+            Removal::Removed
+        }
+    };
+    match removal
+    {
+        Removal::Removed =>
+        {
+            let _ = syscall::cap_delete(mapping.cap);
+            devmgr_dma_errors::SUCCESS
+        }
+        Removal::Standing => devmgr_dma_errors::IOMMU_FAILED,
+        Removal::Withdrawn =>
+        {
+            // Its BLOCK withdrew every range, and the cap the table no
+            // longer holds is this thread's.
+            let _ = syscall::cap_delete(mapping.cap);
+            devmgr_dma_errors::IOMMU_FAILED
         }
     }
-    lock(&shared.table).finish_unmap(badge, device_addr);
-    let _ = syscall::cap_delete(mapping.cap);
-    devmgr_dma_errors::SUCCESS
+}
+
+/// How an unmap the table began ended.
+enum Removal
+{
+    /// The range is removed and the table's unmap finished.
+    Removed,
+    /// The driver did not remove it: the mapping stands again.
+    Standing,
+    /// The driver did not remove it, and the device was withdrawn meanwhile.
+    Withdrawn,
+}
+
+/// Have the IOMMU driver remove the range at `device_addr` of the domain
+/// `handle`, whose unmap the table began for the device `badge`, and finish
+/// or restore the unmap in the table. As [`install`] does, the outcome is
+/// recorded only while the instance called still serves: the restart's
+/// replay gives the next instance a mapping whose unmap is in flight, so the
+/// call is made again on it.
+fn remove(shared: &Shared, badge: u64, handle: u64, device_addr: u64) -> Removal
+{
+    if let Some(client) = shared.client()
+    {
+        for _ in 0..crate::iommu::CALL_ATTEMPTS
+        {
+            let Some(ep) = client.await_serving()
+            else
+            {
+                break;
+            };
+            let result = IommuClient::unmap_on(ep, handle, device_addr);
+            let recorded = {
+                let mut table = lock(&shared.table);
+                client.serves(ep).then(|| {
+                    if result.is_ok()
+                    {
+                        table.finish_unmap(badge, device_addr);
+                        Removal::Removed
+                    }
+                    else
+                    {
+                        restore(&mut table, badge, device_addr)
+                    }
+                })
+            };
+            if let Some(removal) = recorded
+            {
+                return removal;
+            }
+        }
+    }
+    restore(&mut lock(&shared.table), badge, device_addr)
+}
+
+/// Restore the mapping at `device_addr` of the device `badge`, whose unmap
+/// failed.
+fn restore(table: &mut DmaTable, badge: u64, device_addr: u64) -> Removal
+{
+    if table.restore(badge, device_addr)
+    {
+        Removal::Standing
+    }
+    else
+    {
+        Removal::Withdrawn
+    }
 }
 
 /// Delete the Memory cap devmgr kept for each removed mapping. Called with

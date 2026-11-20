@@ -488,6 +488,26 @@ pub fn settle_withdrawal(block: IommuBlock, stop: impl FnOnce() -> bool) -> With
     }
 }
 
+/// What a restarted IOMMU driver is given again for one confined device
+/// ([`DmaTable::replay`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeviceReplay
+{
+    /// The device's badge.
+    pub badge: u64,
+    /// The domain handle that confines it.
+    pub handle: u64,
+    /// The firmware-reserved ranges its domain maps at their own addresses.
+    pub reserved: Vec<ReservedRange>,
+    /// The pages of the interrupt files its domain maps at their own
+    /// addresses.
+    pub files: Vec<ReservedRange>,
+    /// Every mapping the device may reach: each standing one and each whose
+    /// `UNMAP` is not yet answered. A pending one is left out: its `MAP`
+    /// is made again once the restarted driver serves.
+    pub mappings: Vec<Mapping>,
+}
+
 /// Every device devmgr gives DMA, by badge, with its mappings.
 #[derive(Default)]
 pub struct DmaTable
@@ -772,6 +792,55 @@ impl DmaTable
         {
             d.reserved.remove(held);
         }
+    }
+
+    /// What a restarted IOMMU driver is given again so that each confined
+    /// device reaches what it reached under the dead one
+    /// (`docs/device-management.md` § IOMMU Driver Restart): per device, its
+    /// domain handle, its firmware-reserved ranges and held interrupt files,
+    /// and each mapping standing or being unmapped. A mapping whose `UNMAP`
+    /// is in flight is replayed, since the device reaches it until that call
+    /// is answered, and the thread making it calls the restarted driver
+    /// again; one whose `MAP` is in flight is not, and its `MAP` is made
+    /// again.
+    ///
+    /// # Errors
+    /// The list cannot grow.
+    pub fn replay(&self) -> Result<Vec<DeviceReplay>, TryReserveError>
+    {
+        let mut out = Vec::new();
+        for d in &self.devices
+        {
+            let Confinement::Domain { handle, .. } = d.confinement
+            else
+            {
+                continue;
+            };
+            let firmware = d.reserved.get(..d.firmware).unwrap_or_default();
+            let mut reserved = Vec::new();
+            reserved.try_reserve_exact(firmware.len())?;
+            reserved.extend_from_slice(firmware);
+            let mut files = Vec::new();
+            files.try_reserve_exact(d.files().len())?;
+            files.extend_from_slice(d.files());
+            let mut mappings = Vec::new();
+            mappings.try_reserve_exact(d.entries.len())?;
+            mappings.extend(
+                d.entries
+                    .iter()
+                    .filter(|e| e.state != State::Pending)
+                    .map(|e| e.mapping),
+            );
+            out.try_reserve(1)?;
+            out.push(DeviceReplay {
+                badge: d.badge,
+                handle,
+                reserved,
+                files,
+                mappings,
+            });
+        }
+        Ok(out)
     }
 
     /// Remove the device `badge`, so its driver's later requests are refused,
@@ -1098,6 +1167,41 @@ mod tests
         assert_eq!(t.begin_unmap(7, iova), Err(UnmapError::NoMapping));
         assert!(t.restore(7, iova));
         unmap(&mut t, 7, iova).unwrap();
+    }
+
+    // Defect caught: a restarted IOMMU driver given a mapping whose MAP is in
+    // flight, or not given one whose UNMAP is, so the device reaches a range
+    // its driver was never told of, or loses one it still uses.
+    #[test]
+    fn a_replay_gives_each_confined_device_its_ranges_files_and_reachable_mappings()
+    {
+        let reserved = [ReservedRange {
+            base: 0x8_0000,
+            len: PAGE_SIZE,
+        }];
+        let mut t = DmaTable::new();
+        t.register(7, DOMAIN, &reserved).unwrap();
+        t.register(8, Confinement::Unconfined, &[]).unwrap();
+        map_at(&mut t, 8, 0x10_0000, PAGE_SIZE).unwrap();
+        let standing = map_iova(&mut t, 7, PAGE_SIZE).unwrap();
+        let unmapping = map_iova(&mut t, 7, PAGE_SIZE).unwrap();
+        t.begin_unmap(7, unmapping).unwrap();
+        t.reserve(7, 9, PAGE_SIZE, RW, None).unwrap();
+        assert_eq!(t.hold_interrupt_file(7, 0x2800_0000), Ok(true));
+        let plan = t.replay().unwrap();
+        assert_eq!(plan.len(), 1, "an unconfined device has nothing to replay");
+        let device = &plan[0];
+        assert_eq!((device.badge, device.handle), (7, 3));
+        assert_eq!(device.reserved, reserved);
+        assert_eq!(
+            device.files,
+            [ReservedRange {
+                base: 0x2800_0000,
+                len: PAGE_SIZE,
+            }]
+        );
+        let addrs: Vec<u64> = device.mappings.iter().map(|m| m.device_addr).collect();
+        assert_eq!(addrs, [standing, unmapping]);
     }
 
     #[test]

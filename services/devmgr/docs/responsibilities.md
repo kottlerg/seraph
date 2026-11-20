@@ -73,9 +73,10 @@ devmgr's responsibilities are:
   architecture's family, `iommu-vtd` (VT-d) on x86-64 and `iommu-riscv` (the
   RISC-V IOMMU) on riscv64, which it spawns from its boot module before the
   boot batch, in a settle batch of its own, delivering it in its resource
-  list each unit's segment, its scope resolved against the PCI scan, and its
-  register `Mmio` cap, whose original devmgr deletes once the spawn returns
-  (devmgr keeps no copy). A VT-d unit's cap is carved from the
+  list each unit's segment, its scope resolved against the PCI scan, its
+  register `Mmio` cap, and its anchor, a zeroed page devmgr allocates from memmgr
+  that the driver makes the unit's root structure; devmgr keeps its own register
+  cap and the anchor for the boot, for a restart. A VT-d unit's cap is carved from the
   apertures and its scope is the DMAR's, resolved against the scan's bridges;
   a RISC-V IOMMU is a PCI function the ACPI RIMT names, whose cap is the first
   page of its BAR 0, carved before devmgr turns on the function's memory
@@ -84,9 +85,10 @@ devmgr's responsibilities are:
   ID mappings: each bus they cover whole and each scanned function on a bus
   they cover in part.
   The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`,
-  `CREATE_PHYS_ACCESS`, and `CREATE_RESERVE` at `BOOT_DRIVER_PRIORITY`, and its hold is never
-  released: devmgr deletes the release token of its create reply at the
-  spawn, so its table pages stay quarantined for the boot; devmgr and it are
+  `CREATE_PHYS_ACCESS`, and `CREATE_RESERVE` at `BOOT_DRIVER_PRIORITY`, and its hold is
+  released only once a restarted instance has committed tables of its own: devmgr keeps the
+  release token of each instance's create reply, so a dead instance's table pages stay
+  quarantined until then; devmgr and it are
   the processes that read physical addresses
   ([docs/device-management.md](../../../docs/device-management.md#physical-addresses)
   § Physical Addresses). Once it is ready devmgr attaches every
@@ -105,11 +107,15 @@ devmgr's responsibilities are:
   behind it, which the log line states). A thread of devmgr's
   takes the driver's recorded faults every second (`TAKE_FAULTS`) and logs
   each against its device. If the driver dies after it reported ready, a death
-  watch thread of devmgr's own, which no call of its control thread can delay, fails the
-  IOMMU client at once; devmgr logs once, refuses every later `DMA_MAP` of
-  every confined device, answers any of its own calls still queued on the
-  driver's endpoint from a drain thread, and withdraws every confined device's
-  driver; it restarts none of them, nor the IOMMU driver (§ Driver Restart). See
+  watch thread of devmgr's own, which no call of its control thread can delay, marks the
+  IOMMU client restarting at once and devmgr restarts the driver beneath its units (§ Driver
+  Restart); it fails closed only when the death is an exit of the driver's own, the restart
+  budget is spent, or devmgr lacks what a restart needs: it then logs once, refuses every later
+  `DMA_MAP` of every confined device, answers any of its own calls still queued on the
+  driver's endpoint from the death watch thread, and withdraws every confined device's
+  driver. See
+  [docs/device-management.md § IOMMU Driver Restart](../../../docs/device-management.md#iommu-driver-restart)
+  and
   [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming).
 
   devmgr binds PCI devices in two passes
@@ -675,12 +681,12 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 | Capability | Rights | Purpose |
 |---|---|---|
 | Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`, `QUERY_HOST_BRIDGE`), acpid's labels (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`, `ACPI_HOTPLUG`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
-| Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr delivers to the IOMMU driver, keeping no copy; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
+| Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr delivers to the IOMMU driver, keeping its own for a restart; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify, Mint | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps, each routed with `SYS_IRQ_ROUTE` when carved and kept for the boot, whose derivations are delegated to drivers; mint message-signaled targets with `SYS_IRQ_MSG_ALLOC` through a copy carrying `RIGHTS_IRQ_MINT` alone, derived at startup ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and acpid's FADT register-block ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
 | Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64, and the RIMT's PCI IOMMUs and ID mappings on riscv64 |
-| Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table a root mount needs, untagged and held in `DevmgrCaps.modules`; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed; a module that is neither, or that fails to read, is logged and released |
+| Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table a root mount needs, untagged and held in `DevmgrCaps.modules`; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed; a module that is neither, or that fails to read, is logged and released. The IOMMU driver's module is released once devmgr has copied its image into contiguous pages it allocates, from which every restart spawns the driver |
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
 | SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (each driver of the boot tier from a boot module, the IOMMU driver and each PCI-bound one, at 26; every other driver, the serial, framebuffer and RTC drivers included, at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, the IOMMU fault-log thread at 24, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |
 
@@ -698,7 +704,7 @@ device (the bootloader seeds an aperture over each, since no other table
 names those pages), and delivers each to the VT-d IOMMU driver. It discovers
 the RISC-V IOMMUs from the RIMT, carves the first page of each one's BAR 0,
 which lies in a PCI window the bootloader seeds already, and delivers each to
-the RISC-V IOMMU driver, keeping no copy of either (see
+the RISC-V IOMMU driver, keeping its own cap of each for a restart (see
 [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
 ---
@@ -805,9 +811,11 @@ stop being final (an ordinal's driver once answered could change).
 
 A restart is considered for the death of a served driver of a class, which devmgr's death watch
 takes (§ Relationship to drivers). No other withdrawal restarts its driver: a hotplug removal's,
-the IOMMU driver's death's (`fail_iommu`), or a settle's withdrawal of a driver that died or did
-not report ready before its batch settled, which was never served. The IOMMU driver itself is never
-restarted ([#1079](https://github.com/kottlerg/seraph/issues/1079)).
+the withdrawal of a device whose replay into a restarted IOMMU driver failed, the withdrawals of
+the IOMMU driver's fail-closed (`fail_iommu`), or a settle's withdrawal of a driver that died or
+did not report ready before its batch settled, which was never served. The IOMMU driver itself is
+restarted beneath its units, not by this policy ([docs/device-management.md § IOMMU Driver
+Restart](../../../docs/device-management.md#iommu-driver-restart)).
 
 The death is restarted when every check passes, in this order:
 

@@ -279,9 +279,11 @@ it discovers, devmgr carves an `Mmio` cap for the unit's register range through 
 aperture-carving flow as any other device (for a RISC-V IOMMU, then turning on the function's
 memory decode and bus mastering through its configuration page, the hand-over's last step, so an
 IOMMU not handed over is left as the firmware left it) and delivers it to that family's
-IOMMU driver, with the unit's PCI segment and its scope resolved against the PCI topology,
-deleting its own once the spawn returns, so it keeps no copy. devmgr keeps the DMA endpoint, its
-`devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver over
+IOMMU driver, with the unit's PCI segment and its scope resolved against the PCI topology, keeping
+its own for a restart (§ IOMMU Driver Restart). With each unit it delivers the unit's anchor: a
+zeroed page devmgr allocates from memmgr and keeps for the boot, which the driver makes the unit's
+root structure (the VT-d root table, the RISC-V device-directory root). devmgr keeps the DMA
+endpoint, its `devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver over
 `ipc::iommu_labels` to attach a device to a domain of its own, install and withdraw mappings,
 block a device, and take the faults the units recorded, so drivers see the same protocol
 whichever IOMMU, or none, sits behind it. The kernel does not read or write IOMMU registers and
@@ -294,12 +296,12 @@ a settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the unit
 pages, `CREATE_DMA_HOLD`, `CREATE_PHYS_ACCESS`, since the units are programmed with physical
 addresses (§ Physical Addresses), and `CREATE_RESERVE`, since it is on the storage path the swap
 service calls to end a pressure episode, at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls
-it on every mapping). The driver programs each unit with empty tables and turns translation on, so
-from its ready report every function a unit translates reaches nothing until devmgr attaches it, the
-functions no driver binds included. devmgr never releases the driver's hold, and deletes its release
-token at the spawn: a unit may walk any of its table pages while translation is on, so they stay
-quarantined for the boot. For each DMA-capable device devmgr then decides, before it grants the
-device DMA:
+it on every mapping). The driver programs each unit with empty tables beneath its anchor and turns
+translation on, so from its ready report every function a unit translates reaches nothing until
+devmgr attaches it, the functions no driver binds included. devmgr keeps the release token of the
+driver's hold and releases the hold only once a restarted instance has committed tables of its own
+(§ IOMMU Driver Restart): until then a unit may walk any of the instance's table and queue pages.
+For each DMA-capable device devmgr then decides, before it grants the device DMA:
 
 - **Confined.** A unit translates the device: devmgr attaches it (`ATTACH`), maps the regions the
   firmware reserves for it (below) in that domain, and grants it DMA there.
@@ -354,15 +356,11 @@ When no unit is found, no IOMMU driver module was delivered, or the driver does 
 within the settle bound, devmgr logs once that DMA runs unconfined and every device runs so. A
 driver that fails its own setup turns translation off again before it exits, so it leaves no device
 blocked. A driver that dies or hangs after it turned a unit's translation on, before it reported
-ready, leaves that unit blocking every device behind it, which devmgr cannot undo, since it keeps no
-register cap; its log line says so, and those devices' DMA fails. The case that is not an absent
-IOMMU is a driver that dies after it reported ready: the units go on translating through the tables
-it left, so devmgr cannot fall back to unconfined DMA. It fails closed. A death watch thread of
-devmgr's own sees the death at once, independent of the control thread, which may be blocked in a
-call to the dead driver. devmgr then logs once, refuses every later `DMA_MAP` of every confined
-device, answers any of its own calls still queued on the dead driver's endpoint with an error, and
-withdraws the driver of every confined device; it restarts nothing, restartability being
-[#262](https://github.com/kottlerg/seraph/issues/262). Invalidation is synchronous, through VT-d's
+ready, leaves that unit blocking every device behind it, which devmgr does not undo: it releases
+the register caps of a driver that never reported ready. Its log line says so, and those devices'
+DMA fails. The case that is not an absent IOMMU is a driver that dies after it reported ready: the
+units go on translating through the tables it left, so devmgr cannot fall back to unconfined DMA,
+and restarts the driver (§ IOMMU Driver Restart). Invalidation is synchronous, through VT-d's
 invalidation queue and through the RISC-V IOMMU's command queue, each polled to completion,
 two IPC hops per mapping; batching it is
 [#772](https://github.com/kottlerg/seraph/issues/772). Faults are polled, not signalled, because
@@ -378,6 +376,68 @@ DMA
 capability (§ DMA Authorisation). With no IOMMU confining the device the physical
 isolation is absent, and devmgr runs the device unconfined (§ DMA Safety
 Model); the kernel is agnostic to both outcomes.
+
+### IOMMU Driver Restart
+
+When the IOMMU driver dies after its ready report, the units go on translating through its tables,
+whose pages its DMA hold keeps, so every confined device's existing DMA continues. devmgr restarts
+the driver beneath the units without turning translation off: a new instance rebuilds every
+translation structure from devmgr's records beneath the anchors devmgr owns, and swaps the rebuilt
+entries into the anchors in place. No unit's root pointer is rewritten while it translates, and no
+state the dead instance wrote is trusted.
+
+devmgr keeps for the boot what a restart needs: each unit's register cap and anchor; a copy of the
+driver's boot-module image in pages it allocates, since a retained derivation of the module's cap
+pins init's donated pool run, and a read of the binary from the drivers directory needs a `DMA_MAP`,
+which needs the IOMMU driver; the release token of each instance's DMA hold; each domain's handle
+and domain ID, which `ATTACH` replies; on x86-64 the interrupt remapping table, which devmgr
+allocates and hands to the driver in `REMAP_SETUP`, with every entry it set; and the `DmaTable` (§
+DMA Authorisation), which holds every confined device's domain, reserved ranges, interrupt files and
+mappings.
+
+**Death.** Each instance has a death watch thread of devmgr's own, which sees the death at once,
+independent of the control thread, which may be blocked in a call to the dead instance. It marks the
+IOMMU client restarting and answers every call queued on the dead instance's endpoint with an error
+for the rest of the boot. While the driver restarts, the DMA thread's `DMA_MAP` and `DMA_UNMAP` wait
+for it, up to three settle bounds (a settle the control thread may be in, the new instance's, and
+the replay), and the fault-log thread's take fails. A death by a fault or a kill (exit reason
+`EXIT_FAULT_BASE` and above) is restarted; an exit of its own is the driver's decision to stop
+serving, and devmgr fails closed (below).
+
+**Attempt.** The control thread restarts the driver in a settle batch of its own. Each attempt is
+charged to the driver's restart budget (`RESTART_BURST` in `RESTART_WINDOW_NS`,
+[restart-budget](../shared/restart-budget/README.md)) and spawns an instance from devmgr's image
+copy over the same units, with a new service endpoint and each unit flagged to be adopted
+([shared/driver-binding/README.md](../shared/driver-binding/README.md)). Such an instance must find
+each unit translating from its anchor, or it reports no ready; it leaves translation and, on VT-d,
+interrupt remapping on, replaces only the unit's command queue (VT-d's invalidation queue) and, on
+RISC-V, its fault queue, and builds into staging root pages of its own. Once it reports ready with
+the unit widths the boot instance reported (`QUERY_UNIT`), devmgr replays its records into it: for
+each confined device of the `DmaTable`, `ATTACH` with the recorded handle and domain ID,
+`MAP_RESERVED` for each reserved range, `MAP_MSI` for each interrupt file it reaches (riscv64), and
+`MAP` for each mapping it may reach, standing or with its unmap in flight; on VT-d, `REMAP_SETUP` on
+the kept table, then `REMAP_SET` for each entry set. `COMMIT` then copies each staged root entry
+into the anchor, one aligned 64-bit store per entry wherever the old entry matches devmgr's records,
+so a function sees either its old or its new context, both of which translate as devmgr's records
+say, and runs a global invalidation with drain; on VT-d it then clears each remapping entry not set
+since the restart. From the commit the instance serves: every call waiting for the restart is made
+on it, as is a `MAP` or `UNMAP` the dead instance answered or left unanswered, and devmgr destroys
+every dead instance and releases its hold, now that no unit walks its pages, and logs the restart
+with the domains and mappings rebuilt and the holds released.
+
+**Failure.** A device whose replay fails has its driver withdrawn without a restart: its domain is
+absent from the new tables, so the device is blocked once the commit is made. An attempt fails when
+its instance does not report ready, reports other widths, is refused the remapping table or an
+entry, or fails `COMMIT`: the units stay on the tables they translate through, the instance is
+destroyed and its hold kept, since its queues may have been walked, and the next attempt follows.
+When the restart budget is spent, devmgr no longer holds what a restart needs, or the death was an
+exit of the driver's own, devmgr fails closed: it logs once, refuses every later `DMA_MAP` of every
+confined device, and withdraws the driver of every confined device.
+
+devmgr deletes a dead instance's endpoint and event queue once a later instance has committed,
+which ends the thread that answered the endpoint; a thread still holding the endpoint fails its
+call, since a deleted cap's handle is refused even once its slot is reused
+([capability-model.md](capability-model.md)).
 
 ### Physical Addresses
 

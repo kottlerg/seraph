@@ -313,7 +313,7 @@ fn classify(bytes: &[u8]) -> Classified
 /// mapped read-only, whole, for the call and unmapped after; `None`, logged,
 /// when the module cannot be mapped. The cap covers whole pages: the bytes
 /// past `module_bytes` are not the module's, and `read` never sees them.
-fn with_module<R>(
+pub fn with_module<R>(
     caps: &caps::DevmgrCaps,
     module_cap: u64,
     module_bytes: u64,

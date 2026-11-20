@@ -2495,7 +2495,9 @@ enum FaultDecline
     MapFailed = 9,
     /// Backing the faulting page, or the faulting page and the least
     /// page-table funding its map needs ([`back_span`]), would take the
-    /// subtree of the process's budget node, or of an ancestor, over its max
+    /// subtree of the process's budget node, or of an ancestor, over its max;
+    /// or, for a chunk memmgr is evicting, holds raw or evicted, the page-table
+    /// funding the map of its runs needs would (`evict::map_runs`)
     /// (services/memmgr/docs/memory-pool.md § Distribution policy).
     BudgetLimit = 10,
     /// A commit overrun: the faulting page lies in a committed region, or its

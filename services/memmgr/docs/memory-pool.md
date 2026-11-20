@@ -725,12 +725,13 @@ process while a node below it is alive or a run charged to it is on the deferred
 charge stays in its parent's subtree meanwhile, so a process cannot hand its frames to another
 process, die, and free its subtree's budget while the frames stay held.
 
-**Charging.** A charge is checked against the max of the node and of every ancestor. A request
-that would take a subtree over its max fails with `LIMIT`, distinct from the out-of-memory codes of
+**Charging.** A charge is checked against the max of the node and of every ancestor. A request that
+would take a subtree over its max fails with `LIMIT`, distinct from the out-of-memory codes of
 system exhaustion. A demand fault first shortens its run to what the max allows, and is declined
 with code 10, distinct from code 7, only when the max admits not even the faulting page (and the
-least page-table donation its map needs), so a crash report tells a budget kill from an exhaustion
-kill ([Demand faults](#demand-faults)). Lowering a max reclaims
+least page-table donation its map needs), or, on a chunk memmgr is evicting, holds raw or evicted,
+not the donation the map of the chunk's runs needs ([Eviction](#eviction)), so a crash report tells
+a budget kill from an exhaustion kill ([Demand faults](#demand-faults)). Lowering a max reclaims
 nothing and kills no process: it refuses new charges until the subtree's usage falls below it. A
 node without a max is limited only by its ancestors and the system reserve. No recipe, and nothing
 else in the default image, sets a max, so no default per-process ceiling exists.

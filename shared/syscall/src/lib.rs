@@ -2859,26 +2859,30 @@ pub fn thread_set_upcall_mask(masked: bool) -> Result<bool, i64>
     if ret < 0 { Err(ret) } else { Ok(ret != 0) }
 }
 
-/// Copy the register state of a stopped or fault-blocked thread into `buf`.
+/// Copy the register state of a stopped or blocked thread into `buf`.
 ///
 /// The thread must be `Stopped` and descheduled (off every CPU, its register
-/// save published), or fault-blocked awaiting a fault-handler reply; a
-/// `Stopped` thread still on a CPU is refused with `InvalidState`
-/// (`core/kernel/docs/syscalls.md` § `SYS_THREAD_READ_REGS`). `buf` must be at
-/// least `size_of::<TrapFrame>()` bytes (architecture-defined). Returns the
-/// number of bytes written on success.
+/// save published), or `Blocked`: fault-blocked awaiting a fault-handler
+/// reply, or blocked in a syscall; a `Stopped` thread still on a CPU is
+/// refused with `InvalidState` (`core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_READ_REGS`). `buf` must be at least `size_of::<TrapFrame>()`
+/// bytes (architecture-defined). Returns the number of bytes written and the
+/// state the thread was read in: `THREAD_REGS_STOPPED`, `THREAD_REGS_FAULT`,
+/// or `THREAD_REGS_SYSCALL`, whose result registers the syscall's return has
+/// not yet written. A caller that looks for the thread held at a fault or a
+/// stop checks this state: a thread blocked in a syscall reads too.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` (the thread cap
 /// is invalid), `InsufficientRights` (it lacks Observe), `InvalidState` (the
-/// thread is neither fault-blocked nor `Stopped` and descheduled),
+/// thread is neither `Blocked` nor `Stopped` and descheduled),
 /// `InvalidArgument` (`buf` is shorter than the frame, or the thread has no
 /// register frame), or `InvalidAddress` (`buf` is not wholly in the user half,
 /// or a fault on it is unhandled: the call is restartable, and with a fault
 /// handler bound a fault on `buf` is delivered to it and the call re-executes
 /// on resume, `core/kernel/docs/syscalls.md` § Restartable Syscalls).
 #[inline]
-pub fn thread_read_regs(thread_cap: u64, buf: &mut [u8]) -> Result<u64, i64>
+pub fn thread_read_regs(thread_cap: u64, buf: &mut [u8]) -> Result<(u64, u64), i64>
 {
     // SAFETY: `buf` is a live, exclusively borrowed slice, so the kernel's
     // writes of at most `buf.len()` bytes land in memory no other Rust
@@ -2887,7 +2891,8 @@ pub fn thread_read_regs(thread_cap: u64, buf: &mut [u8]) -> Result<u64, i64>
 }
 
 /// Raw `SYS_THREAD_READ_REGS`: the kernel writes the thread's register frame,
-/// at most `len` bytes, through `buf`.
+/// at most `len` bytes, through `buf`, and returns the bytes written and the
+/// state the thread was read in, as [`thread_read_regs`].
 ///
 /// The call is restartable: a fault on the span is delivered to the calling
 /// thread's fault handler, when one is bound, and the call re-executes on its
@@ -2901,18 +2906,29 @@ pub fn thread_read_regs(thread_cap: u64, buf: &mut [u8]) -> Result<u64, i64>
 ///
 /// # Errors
 /// As [`thread_read_regs`].
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "ret is proven non-negative in the Ok branch; it is a byte count"
-)]
 #[inline]
-pub unsafe fn thread_read_regs_raw(thread_cap: u64, buf: *mut u8, len: usize) -> Result<u64, i64>
+pub unsafe fn thread_read_regs_raw(
+    thread_cap: u64,
+    buf: *mut u8,
+    len: usize,
+) -> Result<(u64, u64), i64>
 {
-    // SAFETY: syscall3 issues the raw syscall; the caller's contract makes the
-    // span one the kernel's writes cannot disturb; the call changes no mapping,
-    // IPC page, or thread entry state.
-    let ret = unsafe { syscall3(SYS_THREAD_READ_REGS, thread_cap, buf as u64, len as u64) };
-    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+    // SAFETY: syscall5_ret2 issues the raw syscall, its last two argument
+    // registers unused; the caller's contract makes the span one the kernel's
+    // writes cannot disturb; the call changes no mapping, IPC page, or thread
+    // entry state.
+    let (ret, held) = unsafe {
+        syscall5_ret2(
+            SYS_THREAD_READ_REGS,
+            thread_cap,
+            buf as u64,
+            len as u64,
+            0,
+            0,
+        )
+    };
+    // A non-negative count converts; a negative one is the error code.
+    u64::try_from(ret).map_or(Err(ret), |written| Ok((written, held)))
 }
 
 /// Write register state from `buf` into a stopped or fault-blocked thread.
@@ -3100,7 +3116,7 @@ pub fn thread_list_pages(
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` (the thread cap
 /// is invalid), `InsufficientRights` (it lacks Observe), `InvalidState` (the
-/// thread is neither fault-blocked nor `Stopped` and descheduled),
+/// thread is neither `Blocked` nor `Stopped` and descheduled),
 /// `InvalidArgument` (a length of 0 or above `MAX_THREAD_MEM_COPY`, or the
 /// thread has no extended-state area), or `InvalidAddress` (`buf` is not
 /// wholly in the user half, or a fault on it is unhandled: the call is

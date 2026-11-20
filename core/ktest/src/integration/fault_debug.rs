@@ -28,7 +28,7 @@ use syscall::{
 };
 use syscall_abi::{
     FAULT_CLASS_EXCEPTION, FAULT_EXC_BREAKPOINT, FAULT_KIND_EXCEPTION, FAULT_LABEL,
-    FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY,
+    FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY, THREAD_REGS_FAULT,
 };
 
 use crate::arch::{BREAKPOINT_RESUME_ADVANCE, IP_OFFSET, breakpoint_reported_ip};
@@ -119,8 +119,12 @@ fn breakpoint(ctx: &TestContext, child: &spawn::SpawnedChild, ep: u64, sig: u64)
     let reported = msg.word(3);
 
     let mut regs = [0u8; BUF];
-    thread_read_regs(child.th, &mut regs[..BUF])
+    let (_, held) = thread_read_regs(child.th, &mut regs[..BUF])
         .map_err(|_| "integration::fault_debug: thread_read_regs failed")?;
+    if held != THREAD_REGS_FAULT
+    {
+        return Err("integration::fault_debug: the read did not report the fault-blocked hold");
+    }
     if crate::spawn::reg_word(&regs, IP_OFFSET)? != reported
     {
         return Err("integration::fault_debug: register IP does not match the message's");

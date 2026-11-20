@@ -108,11 +108,11 @@ unsafe fn stamp_syscall_entry(nr: u64, frame: *mut TrapFrame)
 ///
 /// The frame lives on the thread's kernel stack and is published as its
 /// `trap_frame`, through which other CPUs read and write it while the thread
-/// is held off-CPU (`SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` on a
-/// `Stopped` or fault-blocked thread, `sched::with_held_frame`) — including
-/// while the thread is blocked inside a syscall. A `&mut TrapFrame` held by
-/// the handler across such a block would be live during those foreign
-/// accesses. A `UserFrame` instead carries the raw frame pointer, and each
+/// is held off-CPU (`SYS_THREAD_READ_REGS` on a `Stopped` or `Blocked`
+/// thread, `SYS_THREAD_WRITE_REGS` on a `Stopped` or fault-blocked one,
+/// `sched::with_held_frame`), including while the thread is blocked inside a
+/// syscall. A `&mut TrapFrame` held by the handler across such a block would
+/// be live during those foreign accesses. A `UserFrame` instead carries the raw frame pointer, and each
 /// accessor derives a reference for that one access, which ends before the
 /// accessor returns; no access spans a block, so the thread's own accesses
 /// and the foreign ones never overlap (core/kernel/docs/arch-interface.md

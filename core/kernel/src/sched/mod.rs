@@ -3787,25 +3787,50 @@ unsafe fn start_ready_to_link(tcb: *mut ThreadControlBlock, cpu_count: usize) ->
     settled && (0..cpu_count).all(|cpu| unsafe { scheduler_for(cpu).current() } != tcb)
 }
 
+/// What a register syscall does with a held thread's frame, which decides the
+/// states [`with_held_frame`] admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameAccess
+{
+    /// A read: a `Stopped` thread, or a `Blocked` one in any IPC state.
+    Read,
+    /// A write: a `Stopped` thread, or a fault-blocked one. A thread blocked
+    /// in a syscall is refused, since the syscall's return still writes its
+    /// frame.
+    Write,
+}
+
+/// The state [`with_held_frame`] found a held thread in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameHold
+{
+    /// `Stopped`.
+    Stopped,
+    /// Fault-blocked (`Blocked` with `BlockedOnFault`): a fault or an upcall
+    /// delivery awaits its handler's reply.
+    Fault,
+    /// `Blocked` in a syscall, in any other IPC state.
+    Syscall,
+}
+
 /// Run `access` on `tcb`'s register frame (`trap_frame`, possibly null) while
-/// the thread is held still, and return its result; `None`, without calling
-/// `access`, when the thread is neither fault-blocked nor `Stopped`, or is
-/// `Stopped` but not yet settled.
+/// the thread is held still, with the state it was found in, and return its
+/// result; `None`, without calling `access`, when `mode` does not admit the
+/// thread's state, or the thread is `Stopped` but not yet settled.
 ///
 /// Held still means `current` on no CPU with the last register save
-/// published (`context_saved`), and either `Stopped` or fault-blocked
-/// (`Blocked` with `BlockedOnFault`). A thread stopped while it runs on
-/// another CPU is `Stopped` from the stop's commit but executes, and may
-/// enter or leave the kernel through its frame, until that CPU deschedules
-/// it; such a thread is refused. A fault-blocked thread is waited for
-/// instead: the fault protocol hands its frame to the bound handler, and a
-/// faulter that has committed its park is only finishing its switch out
+/// published (`context_saved`), and in a state `mode` admits: `Stopped`,
+/// or `Blocked` (fault-blocked only, for a write). A thread stopped while it
+/// runs on another CPU is `Stopped` from the stop's commit but executes, and
+/// may enter or leave the kernel through its frame, until that CPU
+/// deschedules it; such a thread is refused. A `Blocked` thread is waited for
+/// instead: it has committed its park and is only finishing its switch out
 /// (whose save writes the frame on riscv64), so the wait is that switch's
 /// tail. The wait spins outside every lock with interrupts enabled, and the
 /// state is re-checked under the lock. `access` runs under `tcb`'s
-/// `sched_lock`, which every dispatch, start, and stop or exit commit takes,
-/// so the thread stays held still for its duration; `access` must therefore
-/// not fault or take another TCB's `sched_lock`.
+/// `sched_lock`, which every dispatch, wake, start, and stop or exit commit
+/// takes, so the thread stays held still for its duration; `access` must
+/// therefore not fault or take another TCB's `sched_lock`.
 ///
 /// # Safety
 /// `tcb` must be valid, and the caller must hold no scheduler lock and no
@@ -3813,7 +3838,8 @@ unsafe fn start_ready_to_link(tcb: *mut ThreadControlBlock, cpu_count: usize) ->
 #[cfg(not(test))]
 pub unsafe fn with_held_frame<R>(
     tcb: *mut ThreadControlBlock,
-    access: impl FnOnce(*mut u8) -> R,
+    mode: FrameAccess,
+    access: impl FnOnce(*mut u8, FrameHold) -> R,
 ) -> Option<R>
 {
     use core::sync::atomic::Ordering;
@@ -3821,9 +3847,9 @@ pub unsafe fn with_held_frame<R>(
     /// What a locked look at the thread decided.
     enum Look
     {
-        /// Held still: run the access.
-        Held,
-        /// Fault-blocked but still switching out: wait and look again.
+        /// Held still, in this state: run the access.
+        Held(FrameHold),
+        /// `Blocked` but still switching out: wait and look again.
         Settling,
         /// Not accessible.
         Refused,
@@ -3843,12 +3869,25 @@ pub unsafe fn with_held_frame<R>(
         let state = unsafe { (*tcb).state };
         // SAFETY: tcb valid; ipc_state is written under the held sched_lock.
         let ipc_state = unsafe { (*tcb).ipc_state };
-        let fault_blocked = state == thread::ThreadState::Blocked
-            && ipc_state == thread::IpcThreadState::BlockedOnFault;
-        let look = if state == thread::ThreadState::Stopped || fault_blocked
+        let blocked = state == thread::ThreadState::Blocked;
+        let hold = if !blocked
         {
-            // Neither state can become `current` while this sched_lock is
-            // held (dispatch takes it), so one pass over the CPUs, each read
+            FrameHold::Stopped
+        }
+        else if ipc_state == thread::IpcThreadState::BlockedOnFault
+        {
+            FrameHold::Fault
+        }
+        else
+        {
+            FrameHold::Syscall
+        };
+        let admitted = state == thread::ThreadState::Stopped
+            || (blocked && (mode == FrameAccess::Read || hold == FrameHold::Fault));
+        let look = if admitted
+        {
+            // No admitted state can become `current` while this sched_lock
+            // is held (dispatch takes it), so one pass over the CPUs, each read
             // under that CPU's lock, sees every CPU it can still be on.
             let off_cpu = (0..cpu_count).all(|cpu| {
                 // SAFETY: cpu < cpu_count; scheduler slab initialised by
@@ -3867,9 +3906,9 @@ pub unsafe fn with_held_frame<R>(
             let saved_regs = unsafe { (*tcb).context_saved.load(Ordering::Acquire) } != 0;
             if off_cpu && saved_regs
             {
-                Look::Held
+                Look::Held(hold)
             }
-            else if fault_blocked
+            else if blocked
             {
                 Look::Settling
             }
@@ -3884,7 +3923,7 @@ pub unsafe fn with_held_frame<R>(
         };
         let done = match look
         {
-            Look::Held =>
+            Look::Held(hold) =>
             {
                 let run = access.take();
                 // SAFETY: trap_frame is read under the held sched_lock; access
@@ -3895,7 +3934,7 @@ pub unsafe fn with_held_frame<R>(
                         .load(core::sync::atomic::Ordering::Relaxed)
                 }
                 .cast::<u8>();
-                Some(run.map(|f| f(frame)))
+                Some(run.map(|f| f(frame, hold)))
             }
             Look::Refused => Some(None),
             Look::Settling => None,

@@ -203,10 +203,15 @@ stub's endpoint.
   an interrupt. GDB's thread ids are the table's indices plus one; thread 1 is the main thread.
   `Hg` of a thread GDB cannot select is answered `E04` when its bind failed, `E05` when it has
   exited, and `E01` when the table has no such slot, and the stub logs the refusal, so the cause
-  reaches the host even when the line cannot, as when the target held is logd. A register read or
-  write of a thread still held in a call is answered `E06`, since the kernel reads a thread's
-  registers only while it is stopped or fault-blocked (#1405 asks for a read of a blocked thread's
-  saved frame), and `qThreadExtraInfo` shows it as `held in a call`.
+  reaches the host even when the line cannot, as when the target held is logd. `g` and `p` of a
+  thread still held in a call read the registers the kernel reads of a thread blocked in a
+  syscall: the frame of the call's entry, at the instruction past the `syscall` on x86-64 and at
+  the `ecall` on riscv64, with result registers that hold the call's arguments until it returns
+  (core/kernel/docs/syscalls.md § `SYS_THREAD_READ_REGS`); `G` and `P` of it are answered
+  `E06`, since the kernel writes only a stopped or fault-blocked thread's registers, the call's
+  return still writing them. A read the kernel refuses because the thread left its call after the
+  stub found it there is made again once the stub has waited for the upcall the call's return
+  takes. `qThreadExtraInfo` shows such a thread as `held in a call`.
 - **Memory.** `m` reads and `M` and `X` write the target's memory through a live thread of it, in
   the chunks the kernel copies at once. A chunk on a page memmgr evicted, into its compressed store
   or to disk, is not present to the kernel's copy, so the stub asks procmgr, through its debug
@@ -268,7 +273,7 @@ stub's endpoint.
 | `qXfer:features:read:target.xml` | the architecture's target description |
 | `qfThreadInfo`, `qsThreadInfo`, `qC`, `Hg`, `Hc`, `T` | the live threads, the current one, its selection |
 | `qThreadExtraInfo` | what the thread does: `stopped`, `held in a call`, or `running` ([Stop Model](#stop-model)) |
-| `g`, `G`, `p`, `P` | the current thread's registers, read and written through its register file; `E06` for a thread held in a call |
+| `g`, `G`, `p`, `P` | the current thread's registers, read and written through its register file; a thread held in a call reads, and `G` and `P` of it are answered `E06` |
 | `m`, `M`, `X` | target memory |
 | `Z0`, `z0` | software breakpoints |
 | `c`, `C`, `s`, `S`, `vCont?`, `vCont` | resume and step, as above |

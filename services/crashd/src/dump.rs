@@ -399,12 +399,15 @@ fn hold_threads(
     }
 }
 
-/// Whether the thread `cap` names is held at `ip`: its registers read,
-/// which a running thread's do not, with its instruction pointer at `ip`.
+/// Whether the thread `cap` names is held at `ip`: its registers read as a
+/// stopped or fault-blocked thread's, with its instruction pointer at `ip`. A
+/// running thread's registers do not read, and a thread blocked in a syscall
+/// reads as such, its frame naming that syscall, not a fault.
 fn held_at(cap: u64, ip: u64) -> bool
 {
     let mut file = [0u8; arch::current::REGS_SIZE];
-    syscall::thread_read_regs(cap, &mut file).is_ok()
+    syscall::thread_read_regs(cap, &mut file)
+        .is_ok_and(|(_, held)| held != syscall_abi::THREAD_REGS_SYSCALL)
         && word_at(&file, arch::current::IP_OFFSET) == ip
 }
 

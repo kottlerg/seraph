@@ -203,7 +203,8 @@ const _: () = assert!(size_of::<DiskNode>() <= size_of::<ProcessRecord>());
 pub enum DiskState
 {
     /// `SWAP_TAKE` handed the chunk's sealed bytes to the swap service, whose
-    /// write to the slot is in flight; the chunk's store runs are kept.
+    /// write to the slot is in flight; the chunk's entry keeps its store runs,
+    /// or a raw chunk's runs.
     Writing,
     /// The swap service wrote the slot: the chunk's bytes are on disk only.
     OnDisk,
@@ -215,8 +216,7 @@ pub enum DiskState
 
 /// One chunk the swap service holds, or is writing, in a swap slot
 /// (`services/memmgr/docs/memory-pool.md` § Disk tier): the chunk, the nonce
-/// its bytes were sealed under, its store runs while the write is in flight,
-/// and the slot. The chunk's entry names this slot; the slot map names it by
+/// its bytes were sealed under, the slot and its byte count. The chunk's entry names this slot; the slot map names it by
 /// its swap slot ([`crate::disk::SwapSlots`]). The chunk fields are stale once
 /// it is [`DiskState::Cancelled`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,13 +231,11 @@ pub struct DiskNode
     /// The per-boot nonce counter the chunk's bytes were sealed under, used
     /// for no other seal.
     pub nonce: u64,
-    /// The head of the chunk's store-run list while it is writing,
-    /// [`NODE_NULL`] otherwise.
-    pub store: NodeIdx,
     /// The swap slot.
     pub slot: u32,
-    /// Bytes the slot holds: the sealed stream and its tag.
-    pub len: u16,
+    /// Bytes the slot holds, 1 to a slot's: a compressed chunk's sealed stream
+    /// and its tag, or a raw chunk's sealed pages.
+    pub len: u32,
     pub state: DiskState,
 }
 

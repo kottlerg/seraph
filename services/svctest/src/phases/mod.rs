@@ -54,8 +54,9 @@
 //!     oomd's grace. oomd then stops memhog, and svcmgr's restart of it, made
 //!     while the level still reads `CRITICAL`, fails, which leaves memhog down
 //!     with its endpoint still published.
-//! 13. [`swapd`] after [`swap`] and [`swap_client`]: it reuses their fixture and
-//!     hog, and kills swapd, which no phase after it needs for a restore.
+//! 13. [`swapd`] after [`swap`], [`swap_client`] and [`swap_raw`]: it reuses
+//!     their fixture and hog, and kills swapd, which no phase after it needs
+//!     for a restore.
 
 use crate::runner::Phase;
 
@@ -96,6 +97,7 @@ pub mod startup;
 pub mod svcmgr;
 pub mod swap;
 pub mod swap_client;
+pub mod swap_raw;
 pub mod swapd;
 pub mod threading;
 pub mod timed;
@@ -151,6 +153,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(swap::phases());
     out.extend_from_slice(swap_client::phases());
+    out.extend_from_slice(swap_raw::phases());
     out.extend_from_slice(swapd::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(logd_sinks::phases());

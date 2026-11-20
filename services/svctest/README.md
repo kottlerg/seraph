@@ -87,7 +87,7 @@ services/svctest/
         │                      #   past the promised bound, no fault declined, committed region
         │                      #   register, extend, shrink; all-RAM-accounted identity
         ├── discard.rs         # DISCARD_RANGE and SHRINK_REGION return frames; discarded pages
-        │                      #   refault zero-filled and, committed, cannot be declined;
+        │                      #   refault zero-filled and, committed, from the promise they keep;
         │                      #   the std heap's discard and trim; all-RAM-accounted identity
         ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
         │                      #   held `LOW` level and restores them: debugger reads and
@@ -99,6 +99,10 @@ services/svctest/
         │                      #   stale restores, a restore ahead, `ipc::make_resident` of a
         │                      #   chunk whose slot holds no seal, so memmgr loses it, and the
         │                      #   fixture killed on a fault in it; all-RAM-accounted identity
+        ├── swap_raw.rs        # memmgr's raw chunks, as that second swap client: a chunk of
+        │                      #   noise held raw and counted swapped only once written, its
+        │                      #   pages sealed alone in a whole slot, restored; one mapped
+        │                      #   back by `MAKE_RESIDENT`, the rest and one in flight by faults
         ├── swapd.rs           # swapd's disk tier end to end: memmgr serving with a write and a
         │                      #   restore in flight and swapd's threads stopped, write-out at
         │                      #   `CRITICAL`, the storage path's stacks never evicted, the want
@@ -180,11 +184,12 @@ seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and `acpid.deny` names i
 svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd and vfsd unmount phases
 (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`,
 `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, and `devmgr_iommu_restart` phases
-(`caps[6]`), the vfsd
-swap-partition phase (`caps[14]`), the `memmgr_swap_client` and `swapd` phases (`caps[18]`), the
+(`caps[6]`), the vfsd swap-partition phase (`caps[14]`), the `memmgr_swap_client`,
+`memmgr_swap_raw` and `swapd` phases (`caps[18]`), the
 `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[20]`),
 the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`,
-`memmgr_swap_client`, `swapd`, `vfsd_driver_death`, and `timed_rtc_restart` phases, and the drivers
+`memmgr_swap_client`, `memmgr_swap_raw`, `swapd`,
+`vfsd_driver_death`, and `timed_rtc_restart` phases, and the drivers
 hwrng restart phase (`caps[19]`), the `svcmgr_stop_service` phase (`caps[20]`, and `caps[19]`
 with `stopsrc` staged), and the no-stop cases of the `oom_policy` and `logd_reserve` phases
 (`caps[20]`), instead fail their assertions. The seed-only phase thus fails the run on a zero
@@ -227,8 +232,8 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[15]` | `sessiond.operator` (`SEND\|GRANT`) | `sessiond_operator` phase: `OPEN_SESSION`, `REGISTER_INTERFACE`; `oom_policy` phase: opens the operator session whose shell runs the large job |
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
-| `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client` and `swapd` phases: memmgr's swap labels, as a second swap client beside swapd, registering nothing, over a RAM slot store |
-| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases: memmgr's swap labels, as a second swap client beside swapd, registering nothing, over a RAM slot store |
+| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -478,7 +483,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 | `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
 | `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
-| `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `swapd` (evicted regions, threads) |
+| `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---
@@ -630,3 +635,4 @@ layout](../../docs/testing.md#sysroot-layout).
 [services/drivers/test-fault/README.md](../drivers/test-fault/README.md),
 [services/pwrmgr/README.md](../pwrmgr/README.md),
 [`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)
+

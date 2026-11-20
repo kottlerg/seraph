@@ -532,7 +532,8 @@ fn write_out(swap: &Swap, pressure: u64, mut buf: u64) -> !
 }
 
 /// Write the `len` bytes `SWAP_TAKE` put in `buf` to slot `slot`, and end the
-/// write: written, or not, which compresses the chunk again on its store runs.
+/// write: written, or not, which compresses the chunk again on its store runs
+/// or holds a raw chunk raw again on its runs.
 /// The write's outcome, `Failed` for a slot word that names no slot of the
 /// partition.
 fn write_slot(swap: &Swap, slot: u64, len: u64, buf: &mut u64) -> Transfer

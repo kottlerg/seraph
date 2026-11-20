@@ -340,6 +340,15 @@ mod tests
             })
         );
         assert_eq!(g.word_extent(slot_word(8, 4000, 1)), None);
+        // A raw chunk's bytes fill the slot: the word's length field holds
+        // the count less one, so 65536 bytes name the whole slot.
+        assert_eq!(
+            g.word_extent(slot_word(5, 65536, 77)),
+            Some(Extent {
+                lba: 5 * SLOT_BYTES / 512,
+                count: SLOT_BYTES / 512
+            })
+        );
     }
 
     #[test]

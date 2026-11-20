@@ -43,8 +43,8 @@
 # driver checks, which the drivers deny phase sends READ on; its class
 # file lives in /config/devmgr/tests/ with the other deny classes.
 # memmgr.swap is memmgr's SWAP_AUTHORITY SEND|GRANT, through which the
-# memmgr_swap_client and swapd phases act as a swap client over a RAM slot
-# store.
+# memmgr_swap_client, memmgr_swap_raw and swapd phases act as a swap client
+# over a RAM slot store.
 # swapd's recipe seeds it too; svctest is a second swap client beside swapd
 # that takes and restores chunks of its own and registers nothing, since a
 # registration would replace swapd's.

@@ -55,17 +55,17 @@ changes nothing.
 ## Write-out
 
 The write-out thread waits on the runtime's memory-pressure Notification and reads memmgr's level.
-While the level reads `CRITICAL`, it takes a chunk (`SWAP_TAKE`): memmgr seals the chunk's stream
-into the write buffer and names its slot. swapd writes the bytes to the slot
+While the level reads `CRITICAL`, it takes a chunk (`SWAP_TAKE`): memmgr seals the chunk's stream,
+or a raw chunk's pages, into the write buffer and names its slot. swapd writes the bytes to the slot
 (`BLK_WRITE_FROM_MEMORY`) and ends the write (`SWAP_DONE`, `0` when written), which returns the
-chunk's store pages to the free pool; a write that failed ends with `1`, and memmgr compresses the
-chunk again on its store runs. `NOTHING_TO_TAKE` is asked again at once, 64 times in a row at most
-(`TAKE_SWEEP`), since each walk covers a bounded part of memmgr's records; after that sweep, or on
-`QUOTA`, the thread waits 50 ms (`TAKE_BACKOFF_MS`) or until the level changes. `SWAP_FULL` and a
-refusal make it wait 1 s (`FULL_BACKOFF_MS`) or until the level changes, since a restore frees a
-slot without a change of the level. So does a slot it could not write, since a device that fails a
-write, read-only or failing media, may fail every write without losing the device; the first such
-write is logged.
+chunk's store pages, or a raw chunk's runs, to the free pool; a write that failed ends with `1`, and
+memmgr compresses the chunk again on its store runs, or holds a raw chunk raw again on its runs.
+`NOTHING_TO_TAKE` is asked again at once, 64 times in a row at most (`TAKE_SWEEP`), since each walk
+covers a bounded part of memmgr's records; after that sweep, or on `QUOTA`, the thread waits 50 ms
+(`TAKE_BACKOFF_MS`) or until the level changes. `SWAP_FULL` and a refusal make it wait 1 s
+(`FULL_BACKOFF_MS`) or until the level changes, since a restore frees a slot without a change of the
+level. So does a slot it could not write, since a device that fails a write, read-only or failing
+media, may fail every write without losing the device; the first such write is logged.
 
 Only `CRITICAL` writes. The compressed store is the cheaper tier: a restore from it takes no device
 read, where a restore from disk takes a slot's read and the open, a few milliseconds

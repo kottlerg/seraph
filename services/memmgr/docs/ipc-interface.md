@@ -521,7 +521,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL`, at or below the growth floor ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
 | data[8] | `promised_bytes` — what the committed regions can still take from the free runs: their pages that hold no frame yet, and bounds on the page tables and metadata they can need ([`memory-pool.md`](memory-pool.md) § Commit) |
 | data[9] | `store_bytes` — subset of `pool_total_bytes` the compressed store holds: the stored pages of every evicted chunk ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
-| data[10] | `swapped_bytes` — the pages of every evicted chunk, in either tier (compressed in the store, being written, on disk, or lost), which their processes' budget nodes stay charged for |
+| data[10] | `swapped_bytes` — the pages of every evicted chunk, in either tier (compressed in the store, being written, on disk, or lost; a chunk held raw on its own frames for a swap slot counts once written), which their processes' budget nodes stay charged for |
 | data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
 | data[12] | `disk_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
 | data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 26) |
@@ -593,16 +593,8 @@ lazily on fault, and only once procmgr has delegated this process's
 region's whole length before it registers it: its pages and a page-table
 reservation to the caller's budget node, and those and a metadata bound to
 `promised` (`QUERY_POOL_STATUS` `data[8]`). A fault in a committed region is
-then not declined for budget (code 10 below), and for RAM only in the cases
-the rows of codes 7 and 11 below give: code 7 only when the split of a run
-larger than the pages to back fails, and code 11 only under an overcommit
-allowance above 0 or after memmgr's own metadata took free pages without
-admission ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit).
-That holds while the region's page-table reservation, which its page-table
-donations draw on, lasts: a thread of the process that maps while a committed
-fault's map is funded, or a reclaiming unmap of page tables in the region's
-span the process made or asked for, can spend it, and a donation past it is
-admitted as any other, so the fault can then be declined with code 10 or 9.
+then admitted without the budget and RAM tests of an uncommitted one, and
+declined only in the cases § Committed fault declines lists.
 Only a committed region grows by `EXTEND_REGION` (§ Label 12) or shrinks by
 `SHRINK_REGION` (§ Label 13); a discard by `DISCARD_RANGE` (§ Label 20) keeps
 its commitment, so a refault of a discarded page is admitted as its first
@@ -1037,9 +1029,8 @@ page tables. In an uncommitted region each run is uncharged from the caller's
 budget node as it rejoins the pool. A committed region (§ Label 7) keeps its
 commitment: its charge stays, and the pages taken back, with the metadata their
 chunks gave back, return to `promised`, so a refault of a discarded page is
-admitted as its first touch was: not declined for budget, and for RAM only in
-the cases § Label 7 gives ([`memory-pool.md`](memory-pool.md#commit)
-§ Commit). A range that holds no
+admitted as its first touch was, and declined only in the cases § Committed
+fault declines lists ([`memory-pool.md`](memory-pool.md#commit) § Commit). A range that holds no
 run changes nothing, so an interrupted call is safe to repeat.
 
 **Reply (success):** `label` 0, also for a range already discarded.
@@ -1141,7 +1132,8 @@ holds one chunk (`DEMAND_CHUNK_BYTES`).
 
 Without `caps[1]`, `MAKE_RESIDENT` passes the chunks on disk over, as a lost
 chunk. A registration replaces the one before it, whose caps memmgr deletes, and
-ends every write in flight: each writing chunk is compressed again on its store runs,
+ends every write in flight: each writing chunk is compressed again on its store runs, or
+raw again on its runs,
 and each slot whose write a restore or a teardown cancelled is freed. The
 chunks on disk stay, and so do the slot words posted for the swap service: memmgr
 sends on the new Notification at once when any are posted, so a restarted swap
@@ -1156,28 +1148,31 @@ clamped to the slot map's window ([docs/limits.md](../../../docs/limits.md)
 
 #### Label 23: `SWAP_TAKE`
 
-Take the next compressed chunk for a swap slot, and write the slot's bytes into
-the swap service's buffer.
+Take the next compressed or raw chunk for a swap slot, and write the slot's
+bytes into the swap service's buffer.
 
 | Field | Value |
 |---|---|
 | label | 23 |
 | caps[0] | a Memory cap of at least `DEMAND_CHUNK_BYTES` with the write right: the swap service's buffer |
 
-memmgr walks its records' regions for a compressed chunk, a bounded number of
-steps a request (`TAKE_STEPS`, [docs/limits.md](../../../docs/limits.md)
-§ memmgr), from where the last walk stopped. It copies the chunk's stream into
-its own buffer, seals it there under its per-boot key and the next nonce,
-takes a slot and a disk node, and writes the slot's bytes, the sealed stream
-and its 16-byte tag, into the buffer from offset 0 through its own mapping of
-the cap. The chunk is writing until `SWAP_DONE`.
+memmgr walks its records' regions for a compressed or raw chunk
+([`memory-pool.md`](memory-pool.md#eviction) § Eviction, States), a bounded
+number of steps a request (`TAKE_STEPS`,
+[docs/limits.md](../../../docs/limits.md) § memmgr), from where the last walk
+stopped. It copies the chunk's stream, or a raw chunk's backed pages in page
+order, into its own buffer, seals it there under its per-boot key and the next
+nonce, takes a slot and a disk node, and writes the slot's bytes into the
+buffer from offset 0 through its own mapping of the cap: the sealed stream and
+its 16-byte tag, or a raw chunk's sealed pages alone, whose tag memmgr keeps.
+The chunk is writing until `SWAP_DONE`.
 
 | Code | Name | Meaning |
 |---|---|---|
 | 0 | `SUCCESS` | `data[0]` the slot, `data[1]` its byte count, `data[2]` its slot word, the word a fault on the chunk is redirected with (§ Kernel-origin fault message) |
-| 3 | `QUOTA` | The arena or the slot map could not grow, or the chunk's store runs could not be mapped |
+| 3 | `QUOTA` | The arena or the slot map could not grow, or the chunk's store runs, or a raw chunk's runs, could not be mapped |
 | 4 | `INVALID_ARGUMENT` | No swap service is registered, or `caps[0]` missing, no Memory cap, smaller than a chunk, or not mappable writable |
-| 9 | `NOTHING_TO_TAKE` | The walk found no compressed chunk within its bound; the next request goes on from where it stopped |
+| 9 | `NOTHING_TO_TAKE` | The walk found no compressed or raw chunk within its bound; the next request goes on from where it stopped |
 | 10 | `SWAP_FULL` | Every registered slot is taken |
 
 #### Label 24: `SWAP_DONE`
@@ -1190,8 +1185,9 @@ End the write of a slot `SWAP_TAKE` named.
 | data[0] | the slot |
 | data[1] | `0` when the slot is written, nonzero when it is not |
 
-A written chunk is on disk, its store runs returned to the free pool; an
-unwritten one is compressed again on them, its slot freed. A write a restore or a
+A written chunk is on disk, its store runs, or a raw chunk's runs, returned to
+the free pool; an unwritten one is compressed, or raw, again on them, its slot
+freed. A write a restore or a
 teardown cancelled while it was in flight frees its slot either way.
 
 | Code | Name | Meaning |
@@ -1211,14 +1207,16 @@ service or ahead of one.
 | caps[0] | a Memory cap holding the slot's bytes from offset 0 |
 
 The slot word names one use of a slot: the slot, its byte count, and the
-generation of the seal it holds. A word whose slot holds no chunk on disk, or
+generation of the seal it holds (§ Kernel-origin fault message gives its
+layout). A word whose slot holds no chunk on disk, or
 holds one under another seal, was made for a use that has ended (the chunk
 restored by another fault or ahead of one, or torn down, and the slot taken
 again since): memmgr replies `RESTORE_STALE` and changes nothing, so a late
 or repeated request never reaches a chunk it was not made for. Two uses of a
 slot share a word only when `2^20` seals, or a multiple, came between them.
 Otherwise memmgr maps the cap read-only, copies the slot's bytes into its own
-buffer, and checks the tag there under the nonce of the chunk's last seal. A
+buffer, and checks the tag there under the nonce of the chunk's last seal, a
+raw chunk's against the tag memmgr kept. A
 good slot is restored as a fault restores a compressed chunk (§ Kernel-origin
 fault message), its slot and disk node freed. A tag failure makes the chunk
 lost and frees its slot.
@@ -1265,10 +1263,8 @@ the mapping) is resumed without backing. When no free run covers that part, the 
 backs the pages around the faulting one, so the fault is declined for want of RAM only when no page
 it may take is free ([`memory-pool.md`](memory-pool.md#demand-faults) § Demand faults). A fault in a
 committed region (§ Label 7) takes the pages `promised` holds for it, and is admitted without the
-budget and RAM tests that follow ([`memory-pool.md`](memory-pool.md#commit) § Commit); only under
-an overcommit allowance above 0, or after memmgr's own metadata took free pages without admission,
-can it find no free page, and it is then declined with code 11
-once memmgr's eviction of victims in its turn found none (§ Commit, Overcommit). For an
+budget and RAM tests that follow ([`memory-pool.md`](memory-pool.md#commit) § Commit); § Committed
+fault declines lists the cases it is declined in. For an
 uncommitted region of a process whose budget node is outside the system reserve, neither the pages
 `promised` holds nor the growth floor's pages are among them: the fault is declined with code 7 when
 no free page lies above the floor, and with code 9 when the floor refuses the page-table funding its
@@ -1293,19 +1289,26 @@ of a user-mode access ([docs/fault-handling.md § Reply](../../../docs/fault-han
 Either way the fault takes the decline's outcome unless that handler resumes it, and memmgr waits on
 no handler it forwards to.
 
-A fault on a chunk memmgr is evicting maps the chunk's runs back and resumes; a
+A fault on a chunk memmgr is evicting, or holds raw on its own runs, maps the
+chunk's runs back and resumes, a raw chunk's write cancelled, declined with code
+10 or 9 when a page-table donation the map needs is refused at the max or the
+growth floor, and with code 9 when the map fails; a
 fault on a chunk it evicted restores the whole chunk from its compressed store
 before it resumes, declined with code 7 when the free pages outside
 `promised` and, for a process outside it, the system reserve do not cover the
-chunk's backed pages (code 11 when the chunk is a committed region's and the
-draw finds no frame), and with code 9 when a map fails or, with detail 0, the
-stored chunk does not decode; the chunk then stays evicted
+chunk's backed pages or the runs covering them cannot be taken, with code 6 or 8
+when the runs cannot be recorded, with code 10 or 9 when a page-table donation
+its map needs is refused at the max or the growth floor, and with code 9 when a
+map fails or, with detail 0, the store runs cannot be mapped or the stored chunk
+does not decode (a committed region's chunk: § Committed fault declines); the
+chunk then stays evicted
 ([`memory-pool.md`](memory-pool.md#eviction) § Eviction). A fault on a writing
-chunk is restored from its store runs as a compressed chunk's, and its write
-cancelled. A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming
+compressed chunk is restored from its store runs as a compressed chunk's, and
+its write cancelled. A fault on a chunk on disk replies `FAULT_REPLY_REDIRECT` naming
 the registered swap service's endpoint, with data word 0 the slot word, which
 the endpoint receives as data word `FAULT_REDIRECT_WORD` (4): the slot in its
-low 28 bits, the slot's byte count in the next 16, and in the top 20 the low
+low 28 bits, the slot's byte count less one in the next 16 (1 to 65536 bytes,
+a full slot's), and in the top 20 the low
 bits of the nonce counter of the seal the slot holds
 (`free_pool::disk::slot_word`). The thread stays fault-blocked until the
 swap service, having handed memmgr the slot's bytes with the word (§ Label
@@ -1327,7 +1330,7 @@ code 12 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 | 7 | No free page can back the faulting page: for a fault in an uncommitted region, the free pool is empty after the deferred runs are rechecked, every free page outside `promised` is in the growth floor and the process's budget node is outside the system reserve, or none is outside `promised`; for any fault, the split of a run larger than the pages to back failed. A fault in a committed region whose draw finds no page is code 11 |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
-| 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Label 7); a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
+| 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Committed fault declines); for a fault on a chunk memmgr is evicting, holds raw or evicted, in either kind of region, the page-table funding the map of the chunk's runs needs would; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
 | 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the system reserve, for a process outside it, while the allowance is above 0 and the pool does not cover `promised`) even after memmgr evicted victims in its turn; only an overcommit allowance above 0, or memmgr's own metadata taking free pages without admission, makes it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it as it holds code 7 |
 | 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
 
@@ -1340,6 +1343,53 @@ pool are recorded on the process record, like a grant, and reclaimed by
 admits as much of the span as the node takes, at least the faulting page,
 before it selects the run, and each donation, beside the run whose map needs
 it, before it makes it ([`memory-pool.md`](memory-pool.md) § Demand faults).
+
+#### Committed fault declines
+
+This is the one full statement of when memmgr declines a fault in a committed region (§ Label 7),
+and with which code; every other statement refers here. It covers the first touch of a page, the
+refault of a page `DISCARD_RANGE` discarded (§ Label 20), which is admitted as its first touch
+was, and a fault on a chunk of the region that memmgr is evicting, holds raw or evicted. Such a
+fault is admitted without the budget
+and RAM tests of an uncommitted one: the commitment carries its charge, and `promised` holds a free
+page for each of the region's pages that holds no frame
+([`memory-pool.md`](memory-pool.md#commit) § Commit). Besides codes 1 to 5, which a fault outside
+its process's or its region's contract takes whatever the region, a first touch or a refault is
+declined only:
+
+- with code 7, when the split of a run larger than the pages to back fails;
+- with code 11, a commit overrun, when its draw finds no free page even after memmgr evicted
+  victims in its turn, which only an overcommit allowance above 0, or memmgr's own metadata taking
+  free pages without admission, makes reachable (§ Commit, Overcommit);
+- with code 10 or 9, when a page-table donation its map needs falls past what is left of the
+  region's page-table reservation and is admitted as any other, and the max of the process's budget
+  node or an ancestor (10) or the growth floor (9) refuses it; only the process spends the
+  reservation early, by a thread that maps between the rounds of one map, or by a reclaiming unmap
+  of page tables in the region's span that it made or asked for (§ Commit, Faults);
+- with code 9, when a map of the run fails as any map can: the map into memmgr that zeroes it, or
+  the map into the process when no two contiguous free pages remain for a donation, or when a
+  thread of the process takes the donated pages faster than four rounds fund them;
+- with code 6 or 8, when memmgr's metadata arena cannot grow, past what is left of the region's
+  metadata bound, for the slots that record the run, or the run cannot be recorded on its chunk.
+
+Only an overcommit allowance above 0 makes a committed region's chunks evictable. A fault on one
+memmgr is evicting, or holds raw, maps the chunk's own runs back, and a fault on one it evicted
+restores the chunk; either is declined only:
+
+- with code 11, when a restore's draw finds too few free pages for the chunk's backed pages even
+  after memmgr evicted victims in its turn, and with code 7 when the runs covering them cannot then
+  be taken from the pool;
+- with code 10 or 9, when a page-table donation the map needs is refused at the max of the
+  process's budget node or an ancestor (10) or at the growth floor (9): either admits its
+  donations as any other, whatever is left of the region's page-table reservation;
+- with code 9, when a map fails as any map can, and with detail 0 when a restore's store runs
+  cannot be mapped at the stream window or its stored bytes do not decode;
+- with code 6 or 8, when memmgr's metadata arena cannot grow for a restore's run descriptors, or
+  the runs cannot be recorded on the chunk;
+- with code 12, when the chunk is on disk and cannot be restored.
+
+A refusal of a commitment itself, at a registration or a growth, is the error reply of that call,
+never a fault.
 
 ---
 

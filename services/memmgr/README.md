@@ -92,10 +92,10 @@ Allocation Contract").
   (a demand fault with decline code 10), and keep the system reserve for the
   core (see [`docs/memory-pool.md`](docs/memory-pool.md) § Distribution
   policy).
-- **Disk tier** — serve the swap service's swap labels on the swap
-  authority alone: hand it compressed chunks sealed under a per-boot key that
-  never leaves memmgr, redirect a fault on a chunk on disk to it, and restore
-  the chunk from the bytes it hands back once their tag checks (see
+- **Disk tier** — serve the swap service's swap labels on the swap authority alone: hand it
+  compressed chunks, and chunks whose stream gains nothing as their pages, sealed under a per-boot
+  key that never leaves memmgr, redirect a fault on a chunk on disk to it, and restore the chunk
+  from the bytes it hands back once their tag checks (see
   [`docs/memory-pool.md`](docs/memory-pool.md#disk-tier) § Disk tier and
   [`docs/ipc-interface.md`](docs/ipc-interface.md) § Labels 22 to 26).
 - **Coalescing** — fold adjacent free pages back into larger contiguous
@@ -285,3 +285,4 @@ mint or retire process badges (see [`docs/ipc-interface.md`](docs/ipc-interface.
 [Capability Model](../../docs/capability-model.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
 [init Bootstrap Stages](../init/docs/bootstrap.md)
+

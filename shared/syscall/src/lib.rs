@@ -257,9 +257,11 @@ pub unsafe fn ipc_buffer_set(virt: u64) -> Result<(), i64>
 /// slot repeated in one message, or `data_count > 0` or `cap_count > 0` with
 /// no IPC buffer page registered), `InvalidAddress` (the registered IPC
 /// buffer page is unmapped), `InvalidState` (a cap slot is pinned by an in-flight
-/// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer), or
-/// `Interrupted` (the call was cancelled while blocked, including by the
-/// receiver receiving again before it replied). A `data_count` above
+/// `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC capability transfer),
+/// `NoReceiver` (no capability with the Receive right on the endpoint is
+/// left, at the call or while it was queued), or `Interrupted` (the call was
+/// cancelled while blocked, including by the receiver receiving again before
+/// it replied). A `data_count` above
 /// `MSG_DATA_WORDS_MAX` or a `cap_count` above `MSG_CAP_SLOTS_MAX` is clamped
 /// to the maximum, not rejected.
 /// Cap-slot problems are rejected before the caller blocks; a refusal
@@ -334,9 +336,11 @@ pub fn raw_ipc_call_timeout(
 /// Endpoint cap), `InsufficientRights` (`ep` lacks Receive), `QuotaExceeded`
 /// (this thread's `CSpace` directory is structurally full for an incoming
 /// cap transfer), `OutOfMemory` (the `CSpace` slot-page pool is exhausted),
-/// or `Interrupted` (this thread was stopped or interrupted by an upcall, or
-/// the endpoint destroyed, while the receive was blocked). The first four
-/// refuse the receive before any pending reply is released.
+/// `NoReceiver` (every capability with the Receive right on the endpoint,
+/// `ep` among them, was freed, before the receive or while it was blocked),
+/// or `Interrupted` (this thread was stopped or interrupted by an
+/// upcall while the receive was blocked). The first four refuse the receive
+/// before any pending reply is released.
 #[doc(hidden)]
 #[inline]
 pub fn raw_ipc_recv(ep: u64) -> Result<(u64, u64, usize), i64>

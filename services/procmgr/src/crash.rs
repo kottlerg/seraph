@@ -118,13 +118,22 @@ pub fn start()
 fn decline_loop(ep: u64, wake: u64) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
+    let mut guard = ipc::recv_guard::RecvGuard::new(crate::recv_diag);
     loop
     {
         // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-        let Ok(msg) = (unsafe { ipc::ipc_recv(ep, ipc_buf) })
-        else
+        let msg = match unsafe { ipc::ipc_recv(ep, ipc_buf) }
         {
-            continue;
+            Ok(msg) =>
+            {
+                guard.on_success();
+                msg
+            }
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
         };
         if msg.label == FAULT_LABEL
         {

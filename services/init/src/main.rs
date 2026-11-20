@@ -123,6 +123,24 @@ pub(crate) fn endpoint_slab() -> u64
     ENDPOINT_SLAB.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Replace init's full-rights endpoint cap `ep` with one carrying only
+/// `rights` (no Receive right), and return it. The delete hoists the copies
+/// derived from `ep`, the server's own among them, so they stay live.
+fn keep_send_rights(ep: u64, rights: u64) -> u64
+{
+    let Ok(kept) = syscall::cap_derive(ep, rights)
+    else
+    {
+        logging::log("FATAL: cannot derive a send-only copy of a server endpoint");
+        syscall::thread_exit();
+    };
+    if syscall::cap_delete(ep).is_err()
+    {
+        logging::log("init: cannot delete a server endpoint's full-rights cap");
+    }
+    kept
+}
+
 // ── Thread start ─────────────────────────────────────────────────────────────
 
 /// Start `thread_cap`, retrying while the start returns `Interrupted`: init
@@ -1108,6 +1126,15 @@ fn run(info_ptr: u64) -> !
     {
         logging::log("no vfsd module available");
     }
+
+    // devmgr and vfsd now hold their own copies of the two endpoints they
+    // serve. init keeps only the rights it derives from (svcmgr's `SEND|GRANT`
+    // registry source, badged `SEND`s), so a server's copy is the endpoint's
+    // only capability with the Receive right: once the server dies, a call on
+    // the endpoint fails with `NoReceiver` instead of waiting for a receiver
+    // that can never come (docs/ipc-design.md § Endpoints).
+    let devmgr_registry_ep = keep_send_rights(devmgr_registry_ep, syscall::RIGHTS_EP_SEND_GRANT);
+    let vfsd_service_ep = keep_send_rights(vfsd_service_ep, syscall::RIGHTS_EP_SEND);
 
     logging::log("phase 1 bootstrap complete");
 

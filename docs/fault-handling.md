@@ -311,8 +311,9 @@ syscall point, past the `ecall` its reported pointer names.
 - **Kill (cancellation).** If the binding is severed before a reply — the handler thread is
   destroyed (its last Thread capability deleted), the handler thread receives again while the fault
   reply is still pending, with a receive that passes its capability and headroom checks
-  ([Liveness](#liveness) rule 2), or the handler endpoint is destroyed while the fault is still
-  queued on it ([Liveness](#liveness) rule 3) — the fault is unhandled ([Reply](#reply)): the
+  ([Liveness](#liveness) rule 2), or the handler endpoint is left with no capability holding the
+  Receive right (or is destroyed) while the fault is still queued on it
+  ([Liveness](#liveness) rule 3) — the fault is unhandled ([Reply](#reply)): the
   faulting thread is killed, or, for a kernel copy's fault, its syscall fails
   ([Kernel Copies](#kernel-copies)). A stop of the faulting thread before any reply claims the
   fault also cancels the episode, but acts on nothing at once: it gives the episode a kill outcome
@@ -404,18 +405,20 @@ decline reason on its serial console, on a `fault unhandled` line ahead of the `
 diagnostic, which names the fault's kind, its address, and the instruction pointer, and dumps the
 registers. The `fault unhandled` line also names the kernel's own unhandled causes: the binding of
 the fault's class found cleared at delivery, the delivery cancelled before a reply, no handler bound
-for the fault's class at all, and a redirect reply that named no endpoint, so every killed user
-fault that the fault path considered has one. The kills the fault path never considers print none:
-an x86-64 user `#PF` with a reserved bit set, which no user action causes, and a syscall return
-whose instruction pointer is not canonical ([Implementation Status](#implementation-status)). A
-decline with no data words prints no reason. memmgr's reasons are tabled in
+for the fault's class at all, the handler endpoint with no capability holding its Receive right
+left (`handler endpoint has no receiver`), and a redirect reply that named no endpoint, so every
+killed user fault that the fault path considered has one. The kills the fault path never considers
+print none: an x86-64 user `#PF` with a reserved bit set, which no user action causes, and a
+syscall return whose instruction pointer is not canonical
+([Implementation Status](#implementation-status)). A decline with no data words prints no reason.
+memmgr's reasons are tabled in
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md#kernel-origin-fault-message-fault_label),
 and the crash service's reason is its report's id
 ([services/crashd/docs/operation.md](../services/crashd/docs/operation.md) § Per Fault).
 
 A declined fault, like every other unhandled one (the binding of its class cleared before delivery,
-the delivery cancelled, [Delivery, Resume, and Kill](#delivery-resume-and-kill), or a redirect
-that named no endpoint), takes the
+the delivery cancelled, [Delivery, Resume, and Kill](#delivery-resume-and-kill), the handler
+endpoint with no Receive-right capability left, or a redirect that named no endpoint), takes the
 outcome it has with no handler bound: a fault of a user-mode access kills the thread, and a fault of
 a kernel copy fails its syscall with `InvalidAddress` ([Kernel Copies](#kernel-copies)). The reply
 has this one meaning whatever raised the fault. The message is the same for both, and the handler
@@ -495,8 +498,12 @@ the handler.
    is still pending (a receive that passes its capability and headroom checks; see
    [IPC Design](ipc-design.md#the-callreply-model)). A handler thread that only exits, or is
    stopped `Exited` by an object teardown, keeps its pending fault reply until it is destroyed.
-3. A faulting thread blocked on a handler endpoint that has not yet received is released if
-   that endpoint is destroyed.
+3. A fault delivered to a handler endpoint with no capability holding the Receive right is
+   unhandled at once and does not park, and a faulting thread blocked on a handler endpoint that
+   has not yet received is released, unhandled, when the last such capability goes or the endpoint
+   is destroyed. A fault already forwarded keeps its forwarder's decline reason. A binding is a
+   reference, not a Receive-right capability, so it does not keep the endpoint receivable; an
+   unused Receive-right capability anywhere does.
 4. Handler death is a system-level failure. Clients block on their next fault until a
    receiver reappears or a supervisor (procmgr, as a death observer) tears them down. The
    kernel does not special-case this beyond the rules above.
@@ -575,7 +582,8 @@ Every disposition resumes the thread at its registers:
   - a stop of the thread before a reply (the thread resumes when next started);
   - the handler thread's destruction;
   - the handler thread receiving again;
-  - the handler endpoint's destruction while the message is queued;
+  - the handler endpoint's loss of its last Receive-right capability, or its destruction, while the
+    message is queued;
   - a binding found cleared at delivery.
 
 A `FAULT_REPLY_REDIRECT` reply ([Reply](#reply)) delivers the upcall, as it delivers a fault, to the

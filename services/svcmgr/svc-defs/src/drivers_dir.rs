@@ -8,9 +8,11 @@
 //! the drivers directory and the platform description tables' directory, and
 //! sends both caps to devmgr (`ipc::devmgr_labels::SET_DRIVERS_DIR`).
 //!
-//! A call to a server none of whose receivers is left waits for good, so
-//! svcmgr reads a server's liveness before the step and after every call to
-//! it that fails, and a dead server ends the step
+//! Once a dead server's process is torn down, no capability with the Receive
+//! right on its endpoints is left, so the kernel fails a call to it, queued
+//! or new, with `NoReceiver`. A failed call does not itself say that the
+//! server died, so svcmgr reads a server's liveness before the step and after
+//! every call to it that fails, and a dead server ends the step
 //! (`services/svcmgr/docs/restart-protocol.md` § Death detection). [`run`]
 //! makes that order through [`Calls`], which svcmgr implements with the
 //! walks, the request and the liveness reads, so the order is host-tested

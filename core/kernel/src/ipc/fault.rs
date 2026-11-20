@@ -77,6 +77,12 @@ pub const FAULT_OUTCOME_REDIRECTED: u8 = 6;
 /// [`syscall::FAULT_REPLY_REDIRECT`] naming no endpoint it holds, so the
 /// fault is unhandled ([`KillCause::RedirectRefused`]).
 pub const FAULT_OUTCOME_REDIRECT_REFUSED: u8 = 7;
+/// [`ThreadControlBlock::fault_outcome`] value: the delivery's endpoint has
+/// no capability with the Receive right left, so no handler can receive the
+/// fault, and it is unhandled ([`KillCause::NoReceiver`]). Committed by the
+/// endpoint's drain for a delivery queued on it, and returned by
+/// [`deliver_once`] for one the endpoint refused at once.
+pub const FAULT_OUTCOME_NO_RECEIVER: u8 = 8;
 
 /// [`deliver_once`]'s result when no binding was found: never a
 /// `fault_outcome` value, it reports [`KillCause::BindingCleared`].
@@ -192,8 +198,8 @@ pub enum KillCause
     /// read it.
     BindingCleared,
     /// The delivery was cancelled before any reply claimed it (handler thread
-    /// destroyed, handler endpoint destroyed, a later receive on the handler
-    /// thread, or a stop of the faulting thread).
+    /// destroyed, a later receive on the handler thread, or a stop of the
+    /// faulting thread).
     Cancelled,
     /// The handler replied [`syscall::FAULT_REPLY_KILL`], with the reason its
     /// reply's data word 0 carried, if it sent one; or a VM-class handler
@@ -206,6 +212,9 @@ pub enum KillCause
     /// A handler replied [`syscall::FAULT_REPLY_REDIRECT`] without naming an
     /// endpoint it holds.
     RedirectRefused,
+    /// The endpoint the fault was delivered to has no capability with the
+    /// Receive right left, so no handler could receive it.
+    NoReceiver,
 }
 
 /// Print, on the kernel serial console, why the user-mode fault of the thread
@@ -245,6 +254,10 @@ pub fn report_user_kill(tid: u32, cause: KillCause)
         KillCause::RedirectRefused =>
         {
             crate::kprintln_serial!("fault unhandled: tid={tid} handler redirect refused");
+        }
+        KillCause::NoReceiver =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} handler endpoint has no receiver");
         }
     }
 }
@@ -554,16 +567,20 @@ pub unsafe fn release_endpoints(eps: [*mut EndpointObject; FAULT_CLASSES])
 /// binding change cancelled ([`FAULT_OUTCOME_REDELIVER`]) is made again under
 /// the binding current then, in this loop rather than by a return to user
 /// mode, so a trap-type exception whose saved instruction pointer is already
-/// past the trapping instruction is not lost; a binding found cleared returns
-/// [`FaultOutcome::Kill`], the unhandled-fault path. A [`CLASS_VM`] delivery
+/// past the trapping instruction is not lost; a binding found cleared, or an
+/// endpoint with no receiver left ([`FAULT_OUTCOME_NO_RECEIVER`], at once or
+/// while the delivery was queued), returns [`FaultOutcome::Kill`], the
+/// unhandled-fault path. A [`CLASS_VM`] delivery
 /// its handler forwarded ([`FAULT_OUTCOME_FORWARDED`]) is made again through
 /// the [`CLASS_EXCEPTION`] binding, which every later pass of the fault uses,
-/// with the forwarder's reason as data word 4; with that binding cleared the
-/// fault takes the outcome of the forwarder's own decline. A delivery its
+/// with the forwarder's reason as data word 4; with that binding cleared, or
+/// its endpoint without a receiver, the fault takes the outcome of the
+/// forwarder's own decline. A delivery its
 /// handler redirected ([`FAULT_OUTCOME_REDIRECTED`]) is made again to the
 /// endpoint the reply named ([`take_redirect`]), in flight under the class of
 /// the delivery redirected, so a change of that class's binding cancels it
-/// and the next pass goes back to that binding. Every pass parks, and only a
+/// and the next pass goes back to that binding. Every pass parks, unless its
+/// endpoint has no receiver, which ends the loop, and only a
 /// binding change, the one forward, or a handler's redirecting reply re-runs
 /// one, so the loop is iterative and bounded by the binder's changes and the
 /// handlers' replies.
@@ -660,6 +677,16 @@ unsafe fn dispatch(
             FAULT_OUTCOME_REDIRECT_REFUSED =>
             {
                 return FaultOutcome::Kill(KillCause::RedirectRefused);
+            }
+            // No handler can receive on the endpoint: unhandled, as an unbound
+            // class is, a forwarded fault keeping its decline's reason.
+            FAULT_OUTCOME_NO_RECEIVER =>
+            {
+                return FaultOutcome::Kill(match forwarded
+                {
+                    Forward::Reason(reason) => KillCause::Declined(reason),
+                    Forward::None => KillCause::NoReceiver,
+                });
             }
             FAULT_OUTCOME_DECLINED =>
             {
@@ -758,7 +785,9 @@ unsafe fn reply_reason(tcb: *mut ThreadControlBlock) -> Option<u64>
 /// Make one delivery of `info` by `route`, through `tcb`'s binding for
 /// `class` or to a redirect's endpoint in flight under `class`, and block
 /// until it is given a disposition, which is returned as its `fault_outcome`
-/// value, or return [`DELIVERY_UNBOUND`] when no binding was found. A
+/// value, or return [`DELIVERY_UNBOUND`] when no binding was found, or
+/// [`FAULT_OUTCOME_NO_RECEIVER`], without parking, when the endpoint has no
+/// receiver left. A
 /// redirected delivery carries the redirector's word as data word
 /// [`syscall::FAULT_REDIRECT_WORD`]; a `forwarded` delivery through a binding
 /// carries the forwarder's reason (`0` for none) as data word
@@ -853,7 +882,17 @@ unsafe fn deliver_once(
         crate::ipc::endpoint::endpoint_call(ep_state, tcb, &msg, IpcThreadState::BlockedOnFault, 0)
     };
 
-    if let Ok(woken_handler) = result
+    if let crate::ipc::endpoint::CallRendezvous::NoReceiver = result
+    {
+        // No thread can receive on the endpoint again: the fault is unhandled,
+        // and the thread did not park. The pin goes as below.
+        // SAFETY: as for the release below; the thread has not parked.
+        unsafe { crate::cap::object::release_ref(ep_obj.cast::<KernelObjectHeader>()) };
+        // SAFETY: tcb is the running thread, with no lock held.
+        unsafe { close_delivery(tcb) };
+        return FAULT_OUTCOME_NO_RECEIVER;
+    }
+    if let crate::ipc::endpoint::CallRendezvous::Bound(woken_handler) = result
     {
         // A handler was waiting; enqueue it so it can service the fault.
         // SAFETY: woken_handler returned by endpoint_call; valid TCB.
@@ -911,18 +950,29 @@ unsafe fn deliver_once(
             (*tcb).thread_id,
         );
     }
-    // Close the delivery under the lock pin_binding opened it under, so a
-    // binder's in-flight check never reads a torn marker.
-    // SAFETY: tcb still valid.
+    // SAFETY: tcb is the running thread, with no lock held.
+    unsafe { close_delivery(tcb) };
+    outcome
+}
+
+/// Close `tcb`'s fault delivery under the lock [`pin_binding`] or
+/// [`open_redirect`] opened it under, so a binder's in-flight check
+/// ([`delivery_in_flight`]) never reads a torn marker.
+///
+/// # Safety
+/// `tcb` must be the current CPU's running thread, with no lock held.
+#[cfg(not(test))]
+unsafe fn close_delivery(tcb: *mut ThreadControlBlock)
+{
+    // SAFETY: tcb is the running thread (contract).
     let sched_lock = unsafe { &(*tcb).sched_lock };
     // SAFETY: lock_raw paired with the unlock_raw below.
     let saved = unsafe { sched_lock.lock_raw() };
-    // SAFETY: tcb still valid; in_fault_delivery is written under the held
+    // SAFETY: tcb is valid; in_fault_delivery is written under the held
     // sched_lock.
     unsafe { (*tcb).in_fault_delivery = false };
     // SAFETY: paired with the lock_raw above.
     unsafe { sched_lock.unlock_raw(saved) };
-    outcome
 }
 
 /// Cancel the fault delivery of `class` in flight on `tcb` for a change of

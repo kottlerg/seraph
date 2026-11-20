@@ -63,10 +63,12 @@
 //! stop found already exited — the teardown woke it first and its next wait
 //! met the deleted handle — answers the stop `InvalidState` and the start
 //! `InvalidArgument`) and waits, bounded by [`EXIT_WAIT_US`], for it to exit:
-//! its interrupted wait returns `Interrupted` whether the stop's cancel or the
-//! source's teardown claimed the park, both stamping that disposition, and
-//! its next wait meets the deleted handle and returns `InvalidCapability`,
-//! after which it exits. In a Thread-delete phase the racer's delete ends the
+//! its interrupted wait returns `Interrupted` when the stop's cancel claimed
+//! the park, and what the source's teardown stamps when that claimed it:
+//! `Interrupted` for a notification, an event queue or a wait set,
+//! `NoReceiver` for an endpoint, whose deleted capability was its last
+//! with the Receive right. Its next wait meets the deleted handle and returns
+//! `InvalidCapability`, after which it exits. In a Thread-delete phase the racer's delete ends the
 //! waiter wherever it is.
 //!
 //! The served-call phases aim at the refused-rebind claimant. A long-lived
@@ -74,8 +76,9 @@
 //! after a varying delay of its own it receives on the round's endpoint,
 //! replies at once to any caller it receives (the waiter counts a served call
 //! and calls again), and receives again, until a receive meets the deleted
-//! endpoint: `Interrupted` (the teardown drained it while it was parked) or
-//! `InvalidCapability` (the handle was gone at entry). Its receive can thus
+//! endpoint: `NoReceiver` (the delete of the last Receive right released it
+//! while it was parked) or `InvalidCapability` (the handle was gone at
+//! entry). Its receive can thus
 //! dequeue a caller whose stop, or whose Thread delete, commits between the
 //! dequeue and the reply rebind. The controller deletes the endpoint, waits
 //! for the racer and the server, and in the stop phase does not restart the
@@ -120,14 +123,15 @@
 //! inside a wait, or a delete that no longer meets a parked receive, leaves
 //! the floor unmet after every held round and fails.
 //!
-//! Required, per phase: every wait returned `Interrupted` or
-//! `InvalidCapability` (nothing is ever delivered); every racer action returned
+//! Required, per phase: every wait returned `Interrupted`, `NoReceiver` (an
+//! endpoint's), or `InvalidCapability` (nothing is ever delivered); every racer action returned
 //! an accepted result (a stop `Ok` or `InvalidState`, a Thread delete `Ok`),
 //! and every restart after an `Ok` stop returned `Ok`, or `InvalidArgument` on
 //! a waiter the stop caught inside its exit syscall, whose exit then committed
 //! `Exited` over the stop; in a stop phase some stop landed on a waiter inside
 //! a wait (the waiter's counts, read once it is stopped, show the wait entered
-//! and not finished) and some wait returned `Interrupted`; in a Thread-delete
+//! and not finished) and some wait returned `Interrupted` or `NoReceiver`; in
+//! a Thread-delete
 //! phase some delete ended a waiter inside a wait. Which of the racer's action
 //! and the source's teardown claimed a park is reached statistically across the
 //! rounds; the kernel's own tripwires (a freed object's lock or magic word, the
@@ -135,7 +139,7 @@
 //! freed source, so the cell's checks are that the kernel survives and that the
 //! race armed. A served-call wait may also return the server's reply (tallied
 //! as served, never required), and in the served-call stop phase, with no
-//! restart, no `Interrupted` is required. A served-call phase also requires
+//! restart, neither is required. A served-call phase also requires
 //! [`MIN_PARKED`] server receives parked on a deleted endpoint. Each
 //! requirement counts the phase's held rounds, and each phase logs the held
 //! rounds it ran.
@@ -253,9 +257,11 @@ static RACER_RESULT: AtomicU64 = AtomicU64::new(RESULT_OK);
 /// inside a wait and zero if it was between waits.
 static WAITS_ENTERED: AtomicU32 = AtomicU32::new(0);
 static WAITS_DONE: AtomicU32 = AtomicU32::new(0);
-/// Waits that returned `Interrupted`, and waits that returned
+/// Waits that returned `Interrupted`, waits that returned `NoReceiver` (an
+/// endpoint's last Receive right deleted under them), and waits that returned
 /// `InvalidCapability` (the handle met after the delete).
 static INTERRUPTED: AtomicU32 = AtomicU32::new(0);
+static NO_RECEIVER: AtomicU32 = AtomicU32::new(0);
 static GONE: AtomicU32 = AtomicU32::new(0);
 /// Served-call phases: calls the server answered (the waiter calls again).
 static SERVED: AtomicU32 = AtomicU32::new(0);
@@ -268,9 +274,9 @@ static SERVER_EXITED: AtomicU32 = AtomicU32::new(0);
 /// Served-call phases: server → controller, the round whose first receive
 /// the server is entering, stored just before it.
 static SERVER_ENTERED: AtomicU32 = AtomicU32::new(0);
-/// Served-call phases: receives that ended in `Interrupted` (parked on the
+/// Served-call phases: receives that ended in `NoReceiver` (parked on the
 /// endpoint when it was deleted).
-static SERVER_INTERRUPTED: AtomicU32 = AtomicU32::new(0);
+static SERVER_PARKED: AtomicU32 = AtomicU32::new(0);
 /// Waits that returned anything else (with the wait's value or error).
 static BAD_WAITS: BadTally = BadTally::new();
 /// Racer actions, and restarts, outside the accepted results (with the
@@ -412,13 +418,15 @@ struct Seen
     /// wait, and between waits (or after its exit).
     died_in_wait: u32,
     died_between: u32,
-    /// Waits that returned `Interrupted`, and `InvalidCapability`.
+    /// Waits that returned `Interrupted`, `NoReceiver`, and
+    /// `InvalidCapability`.
     interrupted: u32,
+    no_receiver: u32,
     gone: u32,
     /// Served-call phases: calls the server answered, and server receives
     /// that were parked on the endpoint when it was deleted.
     served: u32,
-    server_interrupted: u32,
+    server_parked: u32,
     /// Held rounds run after the fixed rounds.
     extra_rounds: u32,
 }
@@ -531,9 +539,10 @@ fn log_seen(seen: &Seen)
         (" died_in_wait=", seen.died_in_wait),
         (" died_between=", seen.died_between),
         (" interrupted=", seen.interrupted),
+        (" no_receiver=", seen.no_receiver),
         (" gone=", seen.gone),
         (" served=", seen.served),
-        (" server_interrupted=", seen.server_interrupted),
+        (" server_parked=", seen.server_parked),
         (" extra_rounds=", seen.extra_rounds),
     ]
     {
@@ -543,13 +552,14 @@ fn log_seen(seen: &Seen)
 
 /// Check a phase's tallies: nothing failed, and the race armed (a stop or a
 /// Thread delete landed on a waiter inside a wait; a stop phase's restarted
-/// waiters saw `Interrupted`; a served-call phase's server was parked on the
+/// waiters saw `Interrupted` or `NoReceiver`; a served-call phase's server was parked on the
 /// endpoint at [`MIN_PARKED`] deletes).
 fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
 {
     BAD_WAITS.check(
         CELL,
-        "stress::stop_source_delete: a wait returned neither Interrupted nor InvalidCapability",
+        "stress::stop_source_delete: a wait returned none of Interrupted, NoReceiver, and \
+         InvalidCapability",
     )?;
     BAD_ACTIONS.check(
         CELL,
@@ -563,9 +573,12 @@ fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
             {
                 return Err("stress::stop_source_delete: no stop landed on a waiter inside a wait");
             }
-            if kind != Kind::CallServed && seen.interrupted == 0
+            if kind != Kind::CallServed && seen.interrupted == 0 && seen.no_receiver == 0
             {
-                return Err("stress::stop_source_delete: no restarted wait returned Interrupted");
+                return Err(
+                    "stress::stop_source_delete: no restarted wait returned Interrupted or \
+                     NoReceiver",
+                );
             }
         }
         Race::ThreadDelete =>
@@ -578,7 +591,7 @@ fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
             }
         }
     }
-    if kind == Kind::CallServed && seen.server_interrupted < MIN_PARKED
+    if kind == Kind::CallServed && seen.server_parked < MIN_PARKED
     {
         return Err(
             "stress::stop_source_delete: too few server receives were parked on a deleted endpoint",
@@ -600,13 +613,14 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
         &WAITS_ENTERED,
         &WAITS_DONE,
         &INTERRUPTED,
+        &NO_RECEIVER,
         &GONE,
         &SERVED,
         &SERVER_ARMED,
         &SERVER_DONE,
         &SERVER_EXITED,
         &SERVER_ENTERED,
-        &SERVER_INTERRUPTED,
+        &SERVER_PARKED,
     ]
     {
         counter.store(0, Ordering::Release);
@@ -655,9 +669,10 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
     server_ended?;
     released?;
     seen.interrupted = INTERRUPTED.load(Ordering::Acquire);
+    seen.no_receiver = NO_RECEIVER.load(Ordering::Acquire);
     seen.gone = GONE.load(Ordering::Acquire);
     seen.served = SERVED.load(Ordering::Acquire);
-    seen.server_interrupted = SERVER_INTERRUPTED.load(Ordering::Acquire);
+    seen.server_parked = SERVER_PARKED.load(Ordering::Acquire);
     Ok(seen)
 }
 
@@ -736,7 +751,7 @@ fn race_unarmed(seen: &Seen, kind: Kind, race: Race) -> bool
         Race::ThreadDelete => seen.died_in_wait,
     };
     landed_in_wait == 0
-        || (kind == Kind::CallServed && SERVER_INTERRUPTED.load(Ordering::Acquire) < MIN_PARKED)
+        || (kind == Kind::CallServed && SERVER_PARKED.load(Ordering::Acquire) < MIN_PARKED)
 }
 
 /// Run round `cycle` ([`round`]) and delete what remains of it.
@@ -1198,7 +1213,8 @@ fn wait(kind: Kind, source: u64, buf: *mut u64) -> Result<u64, i64>
 /// Waiter: wait on the round's source, counting each entry and classifying
 /// each result, until a wait meets the deleted handle (`InvalidCapability`)
 /// or returns anything unaccepted; then exit. `Interrupted` (the stop's
-/// cancel, or the source's teardown) re-enters the loop.
+/// cancel, or the teardown of a source other than an endpoint) and an
+/// endpoint's `NoReceiver` (its teardown) re-enter the loop.
 extern "C" fn waiter_entry(arg: u64) -> !
 {
     let kind = Kind::decode(arg);
@@ -1223,6 +1239,13 @@ extern "C" fn waiter_entry(arg: u64) -> !
             Err(e) if e == SyscallError::Interrupted as i64 =>
             {
                 INTERRUPTED.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+            Err(e)
+                if e == SyscallError::NoReceiver as i64
+                    && matches!(kind, Kind::Recv | Kind::Call | Kind::CallServed) =>
+            {
+                NO_RECEIVER.fetch_add(1, Ordering::AcqRel);
                 true
             }
             Err(e) if e == SyscallError::InvalidCapability as i64 =>
@@ -1303,8 +1326,8 @@ extern "C" fn racer_entry(arg: u64) -> !
 /// spin a varying delay (a different hash from the racer's), publish that it
 /// is entering its receive ([`SERVER_ENTERED`]), then receive on the round's
 /// endpoint, replying at once to each caller it receives, until a
-/// receive meets the deleted endpoint (`Interrupted` if it was parked when the
-/// teardown drained it, `InvalidCapability` if the handle was gone at entry);
+/// receive meets the deleted endpoint (`NoReceiver` if it was parked when the
+/// delete released it, `InvalidCapability` if the handle was gone at entry);
 /// then acknowledge the round. Any other result is recorded as unaccepted.
 extern "C" fn server_entry(_arg: u64) -> !
 {
@@ -1349,9 +1372,9 @@ extern "C" fn server_entry(_arg: u64) -> !
                     // which needs no handling: it is not waiting).
                     let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(SERVER_REPLY_LABEL), buf) };
                 }
-                Err(e) if e == SyscallError::Interrupted as i64 =>
+                Err(e) if e == SyscallError::NoReceiver as i64 =>
                 {
-                    SERVER_INTERRUPTED.fetch_add(1, Ordering::AcqRel);
+                    SERVER_PARKED.fetch_add(1, Ordering::AcqRel);
                     break;
                 }
                 Err(e) if e == SyscallError::InvalidCapability as i64 => break,

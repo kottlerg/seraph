@@ -29,6 +29,7 @@ pub mod cspace_nested_teardown;
 pub mod death_notification_late_bind;
 pub mod death_observer_outlives_queue_caps;
 pub mod destroyed_source_interrupts;
+pub mod endpoint_no_receiver;
 pub mod fair_share_progress;
 pub mod fault_class_bindings;
 pub mod fault_debug;
@@ -151,6 +152,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::destroyed_source_interrupts",
         destroyed_source_interrupts::run(ctx)
+    );
+    run_integration_test!(
+        "integration::endpoint_no_receiver",
+        endpoint_no_receiver::run(ctx)
     );
     run_integration_test!(
         "integration::queued_waiters_fifo",

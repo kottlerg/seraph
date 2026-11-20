@@ -766,21 +766,33 @@ fn remap_set_msg(entry: &RemapEntry) -> IpcMessage
 /// Answer every call queued on the dead instance's endpoint `ep` with
 /// `HARDWARE_TIMEOUT`, deleting the caps it carries, until devmgr deletes
 /// the endpoint ([`Instance::release`]), so no devmgr thread waits on an
-/// instance that will never receive.
+/// instance that will never receive. The delete ends the receive parked on
+/// the endpoint with `NoReceiver`, or the next one with
+/// `InvalidCapability`; any other failure goes through the receive guard.
 fn drain(ep: u64)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let reply = IpcMessage::new(iommu_errors::HARDWARE_TIMEOUT);
+    let mut guard = ipc::recv_guard::RecvGuard::new(crate::recv_diag);
     loop
     {
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
         let msg = match unsafe { ipc::ipc_recv(ep, ipc_buf) }
         {
-            Ok(msg) => msg,
-            Err(e) if e == SyscallError::InvalidCapability as i64 => return,
-            Err(_) =>
+            Ok(msg) =>
             {
-                let _ = syscall::thread_yield();
+                guard.on_success();
+                msg
+            }
+            Err(e)
+                if e == SyscallError::NoReceiver as i64
+                    || e == SyscallError::InvalidCapability as i64 =>
+            {
+                return;
+            }
+            Err(e) =>
+            {
+                guard.on_failure(e);
                 continue;
             }
         };

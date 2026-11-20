@@ -50,7 +50,7 @@ use core::num::{NonZeroU32, NonZeroUsize};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use super::object::{CSpaceKernelObject, KernelObjectHeader, MemoryObject};
+use super::object::{CSpaceKernelObject, KernelObjectHeader};
 use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
 use crate::arch::nospec;
 
@@ -1333,12 +1333,13 @@ impl CSpace
             );
             return;
         }
-        if slot.tag == CapTag::Memory
+        if slot.tag != CapTag::Null
             && let Some(object) = slot.object
         {
             // SAFETY: an occupied slot holds a reference on its object, so the
-            // Memory object it names is live, and its fill counted it.
-            unsafe { MemoryObject::note_slot_released(object) };
+            // object it names is live, of the type its tag names, and its fill
+            // counted it.
+            unsafe { super::object::note_slot_released(slot.tag, slot.rights, object) };
         }
         // Bump the per-slot generation before returning the slot to the free
         // list (the legitimate-free path only — the double-free guard above
@@ -1392,7 +1393,8 @@ impl CSpace
     }
 
     /// Populate the just-allocated slot `index` with a fresh, unlinked cap,
-    /// counting it on a Memory object ([`MemoryObject::slot_count`]).
+    /// counting it on the object's slot counts
+    /// ([`note_slot_filled`](super::object::note_slot_filled)).
     ///
     /// `object` is the live object the caller hands the slot's reference to,
     /// as for every insert.
@@ -1413,12 +1415,9 @@ impl CSpace
         slot.deriv_first_child = None;
         slot.deriv_next_sibling = None;
         slot.deriv_prev_sibling = None;
-        if tag == CapTag::Memory
-        {
-            // SAFETY: the inserting caller hands this slot a reference on the
-            // live object, which a Memory tag names as a MemoryObject.
-            unsafe { MemoryObject::note_slot_filled(object) };
-        }
+        // SAFETY: the inserting caller hands this slot a reference on the live
+        // object, of the type `tag` names.
+        unsafe { super::object::note_slot_filled(tag, rights, object) };
         Ok(())
     }
 
@@ -1655,14 +1654,15 @@ impl CSpace
         self.allocated_slots
     }
 
-    /// Call `f` for each non-null slot's kernel object pointer.
+    /// Call `f` with each non-null slot's tag, rights, and kernel object
+    /// pointer.
     ///
-    /// Used by `dealloc_object(CSpaceObj)` to dec-ref all objects before
-    /// the `CSpace` pages are freed. Skips slot 0 (permanently null) and
-    /// unallocated pages.
+    /// Used by `dealloc_object(CSpaceObj)` to uncount and dec-ref all objects
+    /// before the `CSpace` pages are freed. Skips slot 0 (permanently null)
+    /// and unallocated pages.
     pub fn for_each_object<F>(&self, mut f: F)
     where
-        F: FnMut(NonNull<KernelObjectHeader>),
+        F: FnMut(CapTag, Rights, NonNull<KernelObjectHeader>),
     {
         for leaf_idx in 0..self.next_leaf as usize
         {
@@ -1678,7 +1678,7 @@ impl CSpace
                     if slot.tag != CapTag::Null
                         && let Some(obj) = slot.object
                     {
-                        f(obj);
+                        f(slot.tag, slot.rights, obj);
                     }
                 }
             }
@@ -1809,7 +1809,7 @@ unsafe fn free_dir_level2(dir: *mut DirLevel2)
 mod tests
 {
     use super::*;
-    use crate::cap::object::{KernelObjectHeader, ObjectType};
+    use crate::cap::object::{KernelObjectHeader, MemoryObject, ObjectType};
     use crate::cap::slot::MemRights;
     use core::ptr::NonNull;
 
@@ -2041,6 +2041,76 @@ mod tests
         assert_eq!(count(obj), 1, "a double free must not uncount");
         cs.free_slot(c.get());
         assert_eq!(count(obj), 0);
+    }
+
+    #[test]
+    fn endpoint_receivers_follow_every_fill_and_free_with_receive()
+    {
+        // The slots that name an endpoint with the Receive right are counted
+        // on every fill path and uncounted on a free, so a call can tell that
+        // no thread can receive again; a slot without the right, a refused
+        // insert, and a double free count nothing.
+        use crate::cap::object::EndpointObject;
+        use crate::cap::slot::EpRights;
+        use crate::ipc::endpoint::EndpointState;
+        let state = Box::into_raw(Box::new(EndpointState::new()));
+        let obj = Box::into_raw(Box::new(EndpointObject {
+            header: KernelObjectHeader::new(ObjectType::Endpoint),
+            state,
+        }));
+        // SAFETY: Box::into_raw never returns null.
+        let obj = unsafe { NonNull::new_unchecked(obj.cast::<KernelObjectHeader>()) };
+        // SAFETY: the state is leaked, so live for the test.
+        let count = || unsafe { (*state).receivers.load(Ordering::Relaxed) };
+        let recv = EpRights::RECEIVE.erase();
+        let send = EpRights::SEND.erase();
+        let all = send | recv | EpRights::GRANT.erase();
+        let mut cs = CSpace::new(0);
+        let a = cs.insert_cap(CapTag::Endpoint, all, obj).unwrap();
+        cs.insert_cap_at(9, CapTag::Endpoint, recv, obj).unwrap();
+        let c = cs.insert_cap_transfer(CapTag::Endpoint, recv, obj).unwrap();
+        let s = cs.insert_cap(CapTag::Endpoint, send, obj).unwrap();
+        assert!(cs.insert_cap_at(9, CapTag::Endpoint, recv, obj).is_err());
+        assert_eq!(count(), 3, "the Send-only slot is not counted");
+        // SAFETY: the state is leaked, so live for the test.
+        assert!(unsafe { (*state).has_receiver() });
+        cs.free_slot(s.get());
+        assert_eq!(count(), 3, "freeing the Send-only slot uncounts nothing");
+        cs.free_slot(a.get());
+        cs.free_slot(9);
+        assert_eq!(count(), 1);
+        cs.free_slot(9);
+        assert_eq!(count(), 1, "a double free must not uncount");
+        cs.free_slot(c.get());
+        assert_eq!(count(), 0);
+        // SAFETY: the state is leaked, so live for the test.
+        assert!(!unsafe { (*state).has_receiver() });
+    }
+
+    #[test]
+    fn for_each_object_yields_each_slot_tag_and_rights()
+    {
+        // A dying CSpace's release uncounts each slot from the tag and rights
+        // this walk passes, so they must be the slot's own.
+        use crate::cap::slot::EpRights;
+        let mut cs = CSpace::new(0);
+        let obj = dummy_object();
+        cs.insert_cap(CapTag::Memory, MemRights::MAP.erase(), obj)
+            .unwrap();
+        cs.insert_cap_at(7, CapTag::Endpoint, EpRights::SEND.erase(), obj)
+            .unwrap();
+        let mut seen = Vec::new();
+        cs.for_each_object(|tag, rights, o| {
+            assert_eq!(o, obj);
+            seen.push((tag, rights));
+        });
+        assert_eq!(
+            seen,
+            [
+                (CapTag::Memory, MemRights::MAP.erase()),
+                (CapTag::Endpoint, EpRights::SEND.erase())
+            ]
+        );
     }
 
     #[test]

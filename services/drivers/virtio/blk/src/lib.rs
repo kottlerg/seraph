@@ -261,11 +261,11 @@ impl IoOutcome
 /// segment's map for the device to the end of its unmap, is logged with
 /// where the time went ([`RequestTiming`]).
 ///
-/// A tenth of procmgr's `FILE_CAP_CALL_TIMEOUT_MS` (10 s,
-/// `services/procmgr/src/image.rs`), the tightest bound a client puts on a
-/// call that waits on a filesystem driver and so on this driver: a filesystem
+/// A fifth of vfsd's `FS_UNMOUNT_TIMEOUT_MS` (5 s,
+/// `services/vfsd/src/main.rs`), the tightest bound a client puts on a call
+/// that waits on a filesystem driver and so on this driver: a filesystem
 /// request makes several block calls, so one block request this slow already
-/// spends a tenth of that bound. A request takes milliseconds otherwise, so
+/// spends a fifth of that bound. A request takes milliseconds otherwise, so
 /// the line is quiet unless a layer of the request path stalls. A diagnostic
 /// bound that bounds no capacity: it decides only which requests are logged.
 pub const SLOW_REQUEST: Duration = Duration::from_secs(1);

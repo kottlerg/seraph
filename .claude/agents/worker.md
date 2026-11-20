@@ -2,7 +2,9 @@
 name: worker
 description: Drives one GitHub Issue (or one stated scope) to a pull request at its merge gate, under the project's conventions; orchestrated or standalone.
 model: opus
-autoCompactWindow: 500000
+autoCompactWindow: 300000
+experimental:
+  cacheTtl: 1h
 disallowedTools: Artifact, ArtifactComments, ArtifactData
 ---
 
@@ -25,9 +27,10 @@ it changed, of which the copy loaded for you is the old one. Read it as `master`
 (`git fetch origin`, then `git show origin/master:<path>`), since your branch may predate the
 merge that changed it; where it differs from the copy loaded for you, it governs. The same holds
 when the orchestrator tells you later that a file changed: read it again that way before your
-next step. Tell every agent you spawn (a `pr-reviewer`, a `pr-auditor`, an `Explore`, a
-`scribe`) whose own agent file is among those files to read it the same way first. Then read
-each Issue
+next step. Tell an agent you spawn (a `pr-reviewer`, a `pr-auditor`, an `Explore`, a
+`scribe`) to read its own agent file the same way first only when that file is among those
+files, named by your prompt or by a later message of the orchestrator; a prompt asks for no such
+read otherwise, since it costs the agent a turn. Then read each Issue
 (`gh issue view <N> --comments`) and what the change needs:
 
 - Every change: docs/conventions.md § Commit Messages and § Branch and PR Workflow, and the
@@ -37,7 +40,12 @@ each Issue
 
 Read docs/limits.md, docs/testing.md and `xtask/README.md` by section; they are long. Read
 source files you will change, or judge, whole: a summary or an excerpt of kernel code is not a
-basis for a change to it.
+basis for a change to it. Anything else a command prints enters your context and is re-read on every
+later call, so a command returns only the lines a decision needs: a log, a diff or `gh` JSON
+stays in a file or a REPL variable, and you quote from it. A document you have read whole is not
+read whole again unless it changed or a compaction dropped it; read the section the step needs.
+The independent reads and commands that one decision needs go in one script; a new call is for a
+step that depends on the previous one's result.
 
 You own your PR technically, as `.claude/CLAUDE.md` § Design decisions says: its mechanism, its
 tests, its documents and their quality are your decisions, made from the code you have read and
@@ -117,6 +125,11 @@ Hand back in two cases only: a question the orchestrator must answer before you 
 host request is one), or the gate report. A pending CI run or review is not a reason, and
 neither is a launch the host's rules refuse: run the command again with `--wait-host 1800`,
 which waits up to 30 minutes (§ Host runs). A launch still refused after that is a question.
+With nothing to do until something arrives, end your turn, or await it inside the one script
+that needs its result. Make no call whose only purpose is to wait or to look whether something
+arrived, and run no sleep loop: each call re-reads your whole context. A CI run is watched by
+one background command that exits when the run ends (§ Review), a refused launch waits inside
+its own command, and neither is queried again while it waits.
 The turns the orchestrator starts after the gate end the same way: a composition check
 (§ Composition check) and a stand-down hand back their one line.
 

@@ -29,6 +29,10 @@ needs green CI at the head.
 
 Invoke `pr-reviewer` and `pr-auditor` in parallel: one message, two `Agent` calls. Give both the
 PR number and the open Issue list (`gh issue list --state open --limit 500 --json number,title`).
+Tell an agent to read its own agent file from `master` first only when that file is known to
+have changed since the session started: your prompt or a later message of your orchestrator
+names it, a `spawns read from disk` ruling in force lists it, or this session merged the change
+(`.claude/agents/worker.md` § Authorities). No prompt asks for that read otherwise.
 Give the reviewer, in addition:
 
 - the ledger's path, once one exists. The ledger of a previous PR on the same surface, when

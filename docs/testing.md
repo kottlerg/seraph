@@ -547,12 +547,13 @@ acpid's `SLEEP(5)` and pwrmgr's core-death power-off write the FADT's `SLEEP_CON
 ([acpid § Power requests](../services/acpid/README.md#power-requests);
 [supervision.md § Core Set and System Death](supervision.md#core-set-and-system-death)). No QEMU
 machine boots the system on such a platform. QEMU's one hardware-reduced x86-64 machine,
-`microvm` with `acpi=on`, decodes no port 0x61, so the 8254 gate the kernel calibrates its clock
-through reads all-ones and the calibration fails; it publishes no MCFG, so devmgr finds no ECAM
-window; and the boot loader's `Mmio` apertures do not cover the ECAM window its DSDT names. So the
-platform is tested by this procedure, on a machine that meets the system's requirements, the
-8254 PIT among them ([platform-requirements.md § Required](platform-requirements.md#required)),
-and publishes an MCFG ([services/devmgr/docs/pci-enumeration.md § ECAM Configuration
+`microvm` with `acpi=on`, decodes no port 0x61, so the 8254 gate the kernel measures its clock
+through, where CPUID leaf 0x15 gives no TSC rate, reads all-ones and the 8254 gives no rate; it
+publishes no MCFG, so devmgr finds no ECAM window; and the boot loader's `Mmio` apertures do not
+cover the ECAM window its DSDT names. So the platform is tested by this procedure, on a machine
+that meets the system's requirements, a TSC rate source among them (CPUID leaf 0x15, or else the
+8254 PIT; [platform-requirements.md § Required](platform-requirements.md#required)), and
+publishes an MCFG ([services/devmgr/docs/pci-enumeration.md § ECAM Configuration
 Space](../services/devmgr/docs/pci-enumeration.md#ecam-configuration-space)):
 
 1. Build the x86-64 sysroot, stage the svctest recipe as § Gating describes (the test class files

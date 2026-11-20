@@ -1169,7 +1169,7 @@ impl ProcessTable
     /// push onto `dead` the badge and exit reason of every live entry the
     /// kernel shows dead, in badge order. `read` gives an entry's kernel
     /// records, its main thread's `CAP_INFO_THREAD_STATE` and its address
-    /// space's `CAP_INFO_ASPACE_TERMINAL_FAULT` (`None` for a read that
+    /// space's `CAP_INFO_ASPACE_END` (`None` for a read that
     /// failed), which [`resync_exit_reason`] reads against `exited`, the
     /// state value meaning the thread exited. Returns `false` when `dead`
     /// could not grow to hold every such entry; those left out stay live for
@@ -1181,8 +1181,8 @@ impl ProcessTable
         let mut listed_all = true;
         for entry in &self.entries
         {
-            let (main_thread, terminal_fault) = read(entry);
-            let Some(exit_reason) = resync_exit_reason(main_thread, exited, terminal_fault)
+            let (main_thread, aspace_end) = read(entry);
+            let Some(exit_reason) = resync_exit_reason(main_thread, exited, aspace_end)
             else
             {
                 continue;
@@ -1796,7 +1796,7 @@ pub struct QueryEntry
     /// `CAP_INFO_THREAD_STATE`.
     pub thread_cap: u64,
     /// procmgr's slot for the child's address space, for the kernel's
-    /// `CAP_INFO_ASPACE_TERMINAL_FAULT`.
+    /// `CAP_INFO_ASPACE_END`.
     pub aspace_cap: u64,
 }
 
@@ -1816,8 +1816,9 @@ impl QueryEntry
 {
     /// The entry's state from the kernel's records, read as
     /// [`resync_exit_reason`] reads them (`main_thread`, `exited`,
-    /// `terminal_fault`): a process whose main thread exited, or one of
-    /// whose threads took a terminal fault, is exited though procmgr has not
+    /// `aspace_end`): a process whose main thread exited, or whose address
+    /// space ended (a terminal fault or a process exit of any of its threads),
+    /// is exited though procmgr has not
     /// reaped it yet, so a caller whose wait returned on its death never sees
     /// it alive.
     #[must_use]
@@ -1825,10 +1826,10 @@ impl QueryEntry
         &self,
         main_thread: Option<u64>,
         exited: u32,
-        terminal_fault: Option<u64>,
+        aspace_end: Option<u64>,
     ) -> QueryState
     {
-        if let Some(reason) = resync_exit_reason(main_thread, exited, terminal_fault)
+        if let Some(reason) = resync_exit_reason(main_thread, exited, aspace_end)
         {
             QueryState::Exited(reason)
         }
@@ -1849,24 +1850,27 @@ impl QueryEntry
 /// to leave it live. `main_thread` is the kernel's packed
 /// `CAP_INFO_THREAD_STATE` of the entry's main thread (the state above bit
 /// 32, the retained exit reason below), `exited` the state value meaning the
-/// thread exited, and `terminal_fault` the entry's `AddressSpace`
-/// `CAP_INFO_ASPACE_TERMINAL_FAULT` (`0` while no thread of it took a
-/// terminal fault, else the first such fault's reason); a read that failed is
-/// `None`. An exited main thread reaps with its own reason, as its post would
-/// have; otherwise a terminal fault in any thread reaps with the fault's
-/// reason, as the address space's post would have.
+/// thread exited, and `aspace_end` the entry's `AddressSpace`
+/// `CAP_INFO_ASPACE_END` (`0` while the space has not ended, else
+/// `ASPACE_ENDED` with the reason of its first terminal end, a terminal fault
+/// or a process exit of any of its threads, `0` for a clean exit); a read that
+/// failed is `None`. An exited main thread reaps with its own reason, as its
+/// post would have; otherwise an ended address space reaps with its reason, as
+/// the address space's post would have.
 #[must_use]
 pub fn resync_exit_reason(
     main_thread: Option<u64>,
     exited: u32,
-    terminal_fault: Option<u64>,
+    aspace_end: Option<u64>,
 ) -> Option<u64>
 {
-    match (main_thread, terminal_fault)
+    match (
+        main_thread,
+        aspace_end.and_then(syscall_abi::aspace_end_reason),
+    )
     {
         (Some(packed), _) if (packed >> 32) as u32 == exited => Some(packed & 0xFFFF_FFFF),
-        (_, Some(fault)) if fault != 0 => Some(fault),
-        _ => None,
+        (_, end) => end,
     }
 }
 
@@ -1908,6 +1912,13 @@ mod tests
     /// function compares against whatever value the caller passes.
     const EXITED: u32 = 3;
 
+    /// An address space's `CAP_INFO_ASPACE_END` answer once it ended with
+    /// `reason`.
+    fn ended(reason: u64) -> u64
+    {
+        syscall_abi::ASPACE_ENDED | reason
+    }
+
     #[test]
     fn the_resync_reaps_an_exited_main_thread_with_its_own_reason()
     {
@@ -1918,7 +1929,7 @@ mod tests
         );
         // The main thread's reason wins over a fault a worker took first.
         assert_eq!(
-            resync_exit_reason(Some(packed), EXITED, Some(0x100E)),
+            resync_exit_reason(Some(packed), EXITED, Some(ended(0x100E))),
             Some(0x1007)
         );
     }
@@ -1928,10 +1939,30 @@ mod tests
     {
         let running = u64::from(EXITED - 1) << 32;
         assert_eq!(
-            resync_exit_reason(Some(running), EXITED, Some(0x100E)),
+            resync_exit_reason(Some(running), EXITED, Some(ended(0x100E))),
             Some(0x100E)
         );
-        assert_eq!(resync_exit_reason(None, EXITED, Some(0x100E)), Some(0x100E));
+        assert_eq!(
+            resync_exit_reason(None, EXITED, Some(ended(0x100E))),
+            Some(0x100E)
+        );
+    }
+
+    // Defect caught: a worker thread's clean process exit (reason `0`) read
+    // as an address space that has not ended, so a process whose death post
+    // was dropped is never reaped.
+    #[test]
+    fn the_resync_reaps_a_running_process_whose_worker_exited_it_cleanly()
+    {
+        let running = u64::from(EXITED - 1) << 32;
+        assert_eq!(
+            resync_exit_reason(Some(running), EXITED, Some(ended(0))),
+            Some(0)
+        );
+        assert_eq!(
+            resync_exit_reason(Some(running), EXITED, Some(ended(7))),
+            Some(7)
+        );
     }
 
     #[test]
@@ -2941,11 +2972,11 @@ mod tests
         assert_eq!(table.query_by_badge(99), None);
     }
 
-    /// Defect caught: a process whose worker thread took a terminal fault
-    /// answered ALIVE between its death post and procmgr's reap, because only
-    /// the main thread's state was read.
+    /// Defect caught: a process whose worker thread took a terminal fault or
+    /// exited the process answered ALIVE between its death post and
+    /// procmgr's reap, because only the main thread's state was read.
     #[test]
-    fn a_query_answers_exited_for_a_main_thread_exit_or_any_terminal_fault()
+    fn a_query_answers_exited_for_a_main_thread_exit_or_any_aspace_end()
     {
         const EXITED: u32 = 3;
         let running = 1u64 << 32;
@@ -2959,8 +2990,12 @@ mod tests
             QueryState::Alive
         );
         assert_eq!(
-            started.state(Some(running), EXITED, Some(0x0E)),
-            QueryState::Exited(0x0E)
+            started.state(Some(running), EXITED, Some(ended(0x100E))),
+            QueryState::Exited(0x100E)
+        );
+        assert_eq!(
+            started.state(Some(running), EXITED, Some(ended(0))),
+            QueryState::Exited(0)
         );
         assert_eq!(
             started.state(Some((u64::from(EXITED) << 32) | 5), EXITED, Some(0)),
@@ -3002,22 +3037,24 @@ mod tests
         let running = u64::from(EXITED - 1) << 32;
         let mut table = ProcessTable::new();
         // The kernel's records, by cap: each main thread's state and each
-        // address space's retained terminal fault.
+        // address space's retained terminal end.
         let mut threads = HashMap::new();
-        let mut faults = HashMap::new();
-        for badge in 1..=6u64
+        let mut ends = HashMap::new();
+        for badge in 1..=7u64
         {
             let mut entry = entry_with_badge(badge);
             entry.thread_cap = 100 + badge;
             entry.aspace_cap = 200 + badge;
             threads.insert(entry.thread_cap, running);
-            faults.insert(entry.aspace_cap, 0);
+            ends.insert(entry.aspace_cap, 0);
             assert_eq!(table.insert(entry), Ok(()));
         }
-        // Five processes die before the reaper drains, more than the ring
+        // Six processes die before the reaper drains, more than the ring
         // holds. The kernel records each death before it posts it: 1 to 4
-        // exit, posting through their main threads' observers, and a worker
-        // thread of 5 faults, posting through its address space's. 6 lives.
+        // exit on their main threads, posting through their main threads'
+        // observers, a worker thread of 5 exits the process cleanly and a
+        // worker thread of 6 faults, each posting through its address
+        // space's. 7 lives.
         let mut queue = KernelQueue::new(RING);
         let mut dropped = 0;
         for badge in 1..=4u64
@@ -3025,9 +3062,11 @@ mod tests
             threads.insert(100 + badge, (u64::from(EXITED) << 32) | badge);
             dropped += usize::from(!queue.post((badge, badge)));
         }
-        faults.insert(205, 0x100E);
-        dropped += usize::from(!queue.post((5, 0x100E)));
-        assert_eq!(dropped, 3);
+        ends.insert(205, syscall_abi::ASPACE_ENDED);
+        dropped += usize::from(!queue.post((5, 0)));
+        ends.insert(206, syscall_abi::ASPACE_ENDED | 0x100E);
+        dropped += usize::from(!queue.post((6, 0x100E)));
+        assert_eq!(dropped, 4);
 
         let mut reaped = Vec::new();
         let full = death_set::drain_queues(
@@ -3051,7 +3090,7 @@ mod tests
             |entry| {
                 (
                     threads.get(&entry.thread_cap).copied(),
-                    faults.get(&entry.aspace_cap).copied(),
+                    ends.get(&entry.aspace_cap).copied(),
                 )
             },
             &mut dead,
@@ -3065,10 +3104,13 @@ mod tests
             }
         }
         reaped.sort_unstable();
-        assert_eq!(reaped, [(1, 1), (2, 2), (3, 3), (4, 4), (5, 0x100E)]);
+        assert_eq!(
+            reaped,
+            [(1, 1), (2, 2), (3, 3), (4, 4), (5, 0), (6, 0x100E)]
+        );
         let mut live = Vec::new();
         table.for_each(|e| live.push(e.badge));
-        assert_eq!(live, [6]);
+        assert_eq!(live, [7]);
     }
 
     #[test]

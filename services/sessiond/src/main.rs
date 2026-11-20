@@ -44,7 +44,7 @@ const SESSION_MAX: usize = 16;
 const INTERFACE_MAX: usize = 8;
 
 /// Entries the death queue holds: each leader posts its main thread's end and
-/// its first terminal fault at most, and a slot's old leader may have both
+/// its first terminal end at most, and a slot's old leader may have both
 /// still queued while its new one posts.
 const DEATH_CAPACITY: u32 = 64;
 

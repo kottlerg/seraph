@@ -467,8 +467,9 @@ removes the process entry, revokes and deletes the process's `Thread`, `CSpace`,
 `START_PROCESS`, sends memmgr `PROCESS_DIED` for its memmgr badge, unless it was created with
 `CREATE_DMA_HOLD` and started, whose reclaim waits for `RELEASE_HOLD` (§ Label 3), and posts its
 end to its death relay (§ Label 1, **Death relay**) and its end queue (§ Label 29). A process
-that has already ended, by an exit of its main thread or a terminal fault of any of its threads,
-and that procmgr has not reaped yet, is reaped instead, in the same hold of the table lock, with
+that has already ended, by an exit of its main thread, or by a terminal fault or a
+`sys_aspace_exit` of any of its threads, and that procmgr has not reaped yet, is reaped instead,
+in the same hold of the table lock, with
 the reason it ended with: its children are re-parented, or destroyed when it was created contained,
 as at its reap (§ Process Tree), so whether the destroy or the reaper comes first changes nothing.
 
@@ -490,16 +491,16 @@ handle with no data words or caps.
 | data[1] | Kernel-encoded exit reason when `data[0]` is `EXITED`; 0 otherwise |
 
 A live entry whose main thread the kernel reports as exited, or any of whose
-threads took a terminal fault (its address space's recorded fault), answers
+threads ended its address space (its recorded end), answers
 `EXITED` before procmgr reaps it, with the main thread's reason or else the
-fault's. After the reap, or after a `DESTROY_PROCESS` teardown, the
+end's. After the reap, or after a `DESTROY_PROCESS` teardown, the
 badge answers `EXITED` for `RECENT_EXIT_RETENTION_NS` (30 s) of monotonic time,
 however many other processes die in the window, while procmgr's heap can hold
 their records, and `UNKNOWN` after that. Retention is best-effort: when the heap
 cannot hold a new record, the oldest record makes room (or, with none held, the
 new one is dropped), so such a badge can answer `UNKNOWN` early. A destroyed
 process's reason is the one the kernel retained if its main thread had already
-exited, or else its first terminal fault's, else `EXIT_KILLED`.
+exited, or else its address space's first terminal end's, else `EXIT_KILLED`.
 
 ### Label 11: `CONFIGURE_PIPE`
 
@@ -616,10 +617,10 @@ included, as for `CREATE_PROCESS`.
 
 ### Label 25: `BIND_DEATH_OBSERVER`
 
-Bind the caller's event queue as a terminal-fault death observer on the address space of the child a
-process handle names, so the creator sees the first terminal fault in any of the child's threads,
-not only in the main thread its `Thread` cap observes. procmgr keeps the address space's `Control`
-right, which binding such an observer needs
+Bind the caller's event queue as a terminal-end death observer on the address space of the child a
+process handle names, so the creator sees the first terminal fault or exit in any of the child's
+threads, not only in the main thread its `Thread` cap observes. procmgr keeps the address space's
+`Control` right, which binding such an observer needs
 ([docs/capability-model.md](../../../docs/capability-model.md#address-space) § Address Space), and
 makes the bind on the creator's behalf. A creator may send it any number of times while the child
 lives, before or after `START_PROCESS`, each with its own queue and correlator. devmgr uses it for
@@ -635,17 +636,18 @@ whose process handles init endows.
 | cap[0] | a cap on the observing `EventQueue` carrying `POST` |
 
 procmgr binds the queue with `aspace_bind_notification` and deletes its copy of the cap on every
-outcome, as it deletes any further cap. Once bound, the first terminal fault of any thread of the
-child posts the death entry `(fault class, correlator)` to the queue, once: a later fault posts
-nothing ([syscalls.md](../../../core/kernel/docs/syscalls.md) § `SYS_ASPACE_BIND_NOTIFICATION`
-(53)). A child that has already taken a terminal fault posts its retained fault class at once, so a
-bind that follows the fault loses nothing. The binding takes one death-observer node of the queue's
-pool until the child's address space is torn down (none when the bind follows the fault). Only a
-terminal fault posts: an exit (`sys_thread_exit`, `sys_process_exit`) posts only to the exiting
-thread's observers, and a teardown (`DESTROY_PROCESS`, or procmgr's reap) posts to neither
+outcome, as it deletes any further cap. Once bound, the first terminal end of any thread of the
+child, a fault or a `sys_aspace_exit`, posts the death entry `(exit reason, correlator)` to the
+queue, once: a later end posts nothing ([syscalls.md](../../../core/kernel/docs/syscalls.md) §
+`SYS_ASPACE_BIND_NOTIFICATION` (53)). A child that has already ended posts its retained reason at
+once, so a bind that follows the end loses nothing. The binding takes one death-observer node of the
+queue's pool until the child's address space is torn down (none when the bind follows the end). Only
+a terminal end posts: `sys_thread_exit` posts only to the exiting thread's observers, and a teardown
+(`DESTROY_PROCESS`, or procmgr's reap) posts to neither
 ([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason) § Exit reason). A fault
-of the main thread that is its address space's first terminal fault posts both to this observer
-and to the main thread's observers; a later one posts only to the main thread's observers.
+or `sys_aspace_exit` of the main thread that is its address space's first terminal end posts both to
+this observer and to the main thread's observers; a later one posts only to the main thread's
+observers.
 
 **Reply:** label 0 (success), or an error code.
 
@@ -790,7 +792,7 @@ capability (Control, Observe, and Upcall rights, `RIGHTS_THREAD`), and, for a
 `CREATE_DMA_HOLD` child, its release token to the caller. procmgr retains the
 original caps for process lifecycle management, and hands out no cap on the
 child's address space: a creator observes the child's end through its death relay (§ Label 1,
-**Death relay**), and its first terminal fault through `BIND_DEATH_OBSERVER` (§ Label 25).
+**Death relay**), and its first terminal end through `BIND_DEATH_OBSERVER` (§ Label 25).
 
 ---
 

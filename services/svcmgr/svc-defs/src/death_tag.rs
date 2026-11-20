@@ -7,10 +7,11 @@
 //! with, and the rule that routes a death post by it.
 //!
 //! A supervised service has two observers per instance: one on its main
-//! thread, and one on its address space, which the first terminal fault of any
-//! of its threads posts. Both carry the same [`DeathTag`]: the service's slot in
-//! svcmgr's table and the instance the observer was bound for. The specification
-//! is `services/svcmgr/docs/restart-protocol.md` § Death detection.
+//! thread, and one on its address space, which the first terminal end of any
+//! of its threads, a fault or an exit, posts. Both carry the same [`DeathTag`]:
+//! the service's slot in svcmgr's table and the instance the observer was bound
+//! for. The specification is `services/svcmgr/docs/restart-protocol.md` § Death
+//! detection.
 
 /// The slot and instance a death post names.
 ///

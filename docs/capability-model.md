@@ -249,7 +249,7 @@ A capability to a process's virtual address space. Rights:
 - **Read** — may inspect current mappings (`SYS_ASPACE_QUERY`, which returns
   their physical addresses); minted on init's kernel-created address space and,
   for an address space retyped later, only when its Memory cap carries `Phys`
-- **Control** — may register terminal-fault death observers
+- **Control** — may register terminal-end death observers
   (`aspace_bind_notification`); held by the space's creator and masked out of
   copies handed to components that only map into the space
 
@@ -1077,10 +1077,13 @@ terminal when:
   the fault reply is pending; or
 - the faulting thread is stopped before any reply claims the fault, which cancels the episode.
 
-On the first terminal fault by any thread in the address space, the kernel posts the fault class
-(`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) to each bound observer.
-The address space dies once: a later terminal fault of another of its threads posts nothing. Every
-terminal fault exits its faulting thread. A stopped faulting thread is the exception in timing
+On the first terminal end of the address space, a terminal fault or a `SYS_ASPACE_EXIT` by any
+thread in it, the kernel posts the end's reason (`EXIT_FAULT_BASE + vector` on x86-64,
+`EXIT_FAULT_BASE + cause` on riscv64, for a fault; the encoded exit code for an exit) to each bound
+observer. The address space dies once: a later terminal fault or exit of another of its threads
+posts nothing to them. Every terminal fault and every `SYS_ASPACE_EXIT` exits its calling thread,
+and the kernel stops no other thread. `SYS_THREAD_EXIT` ends only the caller and posts only its
+thread's observers. A stopped faulting thread is the exception in timing
 only: whether the stop cancelled the episode or a `KILL` reply had already claimed it, the
 terminal fault takes effect, and is posted, only if the thread is started again (see
 [Fault Handling](fault-handling.md#delivery-resume-and-kill)). The fault of a restartable syscall's
@@ -1088,14 +1091,14 @@ copy of a user buffer is never terminal: in each of the cases above it fails tha
 `InvalidAddress`, the thread runs on, and nothing is posted (see
 [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
 
-procmgr binds such an observer at process creation, so a fatal fault on any thread — a worker, not
-just the main thread — drives procmgr's teardown of the whole process. A worker's fault fails to
-drive that teardown at once only when a full procmgr death queue drops its post, and then
+procmgr binds such an observer at process creation, so a fatal fault or an exit on any thread — a
+worker, not just the main thread — drives procmgr's teardown of the whole process. A worker's end
+fails to drive that teardown at once only when a full procmgr death queue drops its post, and then
 procmgr's next drain recovers it: it reads the main-thread deaths it missed from the kernel's
-thread states, and the terminal faults from each address space's retained terminal-fault reason
-(`CAP_INFO_ASPACE_TERMINAL_FAULT`; see
+thread states, and the terminal ends from each address space's retained end
+(`CAP_INFO_ASPACE_END`; see
 [services/procmgr/README.md](../services/procmgr/README.md) § Process table and death queues).
-Normal thread exit does not fire these observers.
+`SYS_THREAD_EXIT` does not fire these observers.
 
 ---
 

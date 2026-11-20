@@ -5,7 +5,7 @@
 
 //! A service's death as the caps svcmgr holds on it show it: its main thread's
 //! state and, for a service whose address space svcmgr holds (memmgr and
-//! procmgr), the space's retained terminal fault. svcmgr reads both with
+//! procmgr), the space's retained terminal end. svcmgr reads both with
 //! `cap_info` and decodes them here ([`caps_death`]), for a supervised
 //! service's entry and for a substrate registration not yet reconciled alike.
 //! The death resync ([`resync`]) reads them for every active service, after a
@@ -17,30 +17,29 @@ use crate::death_tag::DeathTag;
 /// The exit reason of a service its caps show dead, else `None`.
 ///
 /// `thread_state` is the result of `cap_info(CAP_INFO_THREAD_STATE)` on its
-/// main-thread cap, and `aspace_fault` that of
-/// `cap_info(CAP_INFO_ASPACE_TERMINAL_FAULT)` on its address-space cap; `None`
+/// main-thread cap, and `aspace_end` that of
+/// `cap_info(CAP_INFO_ASPACE_END)` on its address-space cap; `None`
 /// for a cap svcmgr does not hold. The thread reading decodes as every creator
 /// decodes it (`ipc::bootstrap::thread_death`): an exited thread gives the
 /// reason the kernel recorded, and a thread cap that no longer resolves gives
-/// `EXIT_KILLED`, since procmgr's teardown of the process revokes it. A
-/// non-zero retained fault gives that fault's reason. A thread that runs or has
-/// not started, a space with no retained fault, and a failed read of the space
-/// show nothing.
+/// `EXIT_KILLED`, since procmgr's teardown of the process revokes it. An
+/// ended space (`syscall_abi::aspace_end_reason`) gives the reason of its
+/// first terminal fault or process exit, `0` for a clean exit. A thread that
+/// runs or has not started, a space that has not ended, and a failed read of
+/// the space show nothing.
 #[must_use]
 pub fn caps_death(
     thread_state: Option<Result<u64, i64>>,
-    aspace_fault: Option<Result<u64, i64>>,
+    aspace_end: Option<Result<u64, i64>>,
 ) -> Option<u64>
 {
     if let Some(reason) = thread_state.and_then(ipc::bootstrap::thread_death)
     {
         return Some(reason);
     }
-    match aspace_fault
-    {
-        Some(Ok(reason)) if reason != 0 => Some(reason),
-        _ => None,
-    }
+    aspace_end
+        .and_then(Result::ok)
+        .and_then(syscall_abi::aspace_end_reason)
 }
 
 /// One slot of svcmgr's service table, as the death resync reads it.
@@ -89,10 +88,11 @@ pub trait ResyncTable
 /// svcmgr's death resync: route a death for every active service whose
 /// current instance is dead, the recovery for the death posts a full queue
 /// dropped. The kernel records a death before it posts it, so a main-thread
-/// exit, a revoked thread cap, and a fault of a service whose address space
-/// svcmgr holds show in svcmgr's caps ([`ResyncTable::caps_death`]), and
-/// those deaths are routed first. A worker-thread fault of a service procmgr
-/// created shows there only once procmgr's teardown revokes the thread cap,
+/// exit, a revoked thread cap, and a fault or process exit of a service whose
+/// address space svcmgr holds show in svcmgr's caps
+/// ([`ResyncTable::caps_death`]), and those deaths are routed first. A
+/// worker-thread fault or process exit of a service procmgr created shows
+/// there only once procmgr's teardown revokes the thread cap,
 /// which can follow the resync, so each service the caps showed alive is
 /// asked of procmgr ([`ResyncTable::queried_death`]) when one was, and only
 /// while the substrate is alive ([`ResyncTable::substrate_alive`]), since
@@ -167,7 +167,8 @@ mod tests
 {
     use super::*;
     use syscall_abi::{
-        EXIT_FAULT_BASE, EXIT_KILLED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED, THREAD_STATE_EXITED,
+        ASPACE_ENDED, EXIT_FAULT_BASE, EXIT_KILLED, THREAD_STATE_ALIVE, THREAD_STATE_CREATED,
+        THREAD_STATE_EXITED,
     };
 
     /// A thread cap's `CAP_INFO_THREAD_STATE` reading: the state code in the
@@ -198,7 +199,10 @@ mod tests
     {
         assert_eq!(caps_death(Some(Err(-1)), None), Some(EXIT_KILLED));
         // The thread's reading wins over the space's.
-        assert_eq!(caps_death(Some(Err(-1)), Some(Ok(7))), Some(EXIT_KILLED));
+        assert_eq!(
+            caps_death(Some(Err(-1)), Some(Ok(ASPACE_ENDED | 7))),
+            Some(EXIT_KILLED)
+        );
     }
 
     #[test]
@@ -216,11 +220,26 @@ mod tests
     fn a_retained_fault_of_another_thread_is_the_death()
     {
         let fault = EXIT_FAULT_BASE + 13;
+        let ended = ASPACE_ENDED | fault;
         assert_eq!(
-            caps_death(Some(Ok(packed(THREAD_STATE_ALIVE, 0))), Some(Ok(fault))),
+            caps_death(Some(Ok(packed(THREAD_STATE_ALIVE, 0))), Some(Ok(ended))),
             Some(fault)
         );
-        assert_eq!(caps_death(None, Some(Ok(fault))), Some(fault));
+        assert_eq!(caps_death(None, Some(Ok(ended))), Some(fault));
+    }
+
+    // The defect caught: a clean process exit by another thread (reason
+    // `0`) read as a space that has not ended, so the death stays unrouted.
+    #[test]
+    fn a_clean_process_exit_of_another_thread_is_the_death()
+    {
+        assert_eq!(
+            caps_death(
+                Some(Ok(packed(THREAD_STATE_ALIVE, 0))),
+                Some(Ok(ASPACE_ENDED))
+            ),
+            Some(0)
+        );
     }
 
     #[test]

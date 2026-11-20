@@ -40,23 +40,23 @@ use syscall::SyscallError;
 
 #[cfg(not(test))]
 use syscall::{
-    SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_HARVEST, SYS_ASPACE_QUERY, SYS_CAP_COPY,
-    SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
-    SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
-    SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
-    SYS_ENDPOINT_BADGE, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM,
-    SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV,
-    SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE,
-    SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT,
-    SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
-    SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
-    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL,
-    SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
-    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
+    SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_EXIT, SYS_ASPACE_HARVEST, SYS_ASPACE_QUERY,
+    SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT,
+    SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD,
+    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
+    SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENDPOINT_BADGE, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST,
+    SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET,
+    SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER,
+    SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP,
+    SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_MERGE, SYS_MMIO_SPLIT,
+    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO,
+    SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
+    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
+    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
+    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
+    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SYSCALL_NR_BOUND,
 };
 
 // ── Syscall dispatch ──────────────────────────────────────────────────────────
@@ -483,7 +483,7 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
         SYS_IPC_BUFFER_SET => sys_ipc_buffer_set(tf),
         SYS_THREAD_YIELD => sys_yield(tf),
         SYS_THREAD_EXIT => sys_exit(tf),
-        SYS_PROCESS_EXIT => sys_process_exit(tf),
+        SYS_ASPACE_EXIT => sys_aspace_exit(tf),
         SYS_SYSTEM_INFO => sysinfo::sys_system_info(tf),
         SYS_ASPACE_QUERY => sysinfo::sys_aspace_query(tf),
         SYS_GETRANDOM => return entropy::sys_getrandom(tf),
@@ -584,53 +584,73 @@ fn sys_exit(_tf: UserFrame) -> Result<u64, SyscallError>
     crate::arch::current::cpu::halt_loop();
 }
 
-/// `SYS_PROCESS_EXIT` (54): terminate the calling process with an exit code.
+/// `SYS_ASPACE_EXIT` (54): end the caller's address space with an exit code.
 ///
 /// Encodes `arg0` via [`syscall::encode_exit_code`] into the voluntary range
-/// `[0, EXIT_FAULT_BASE)`, records it as the calling thread's exit reason, and
-/// posts it to the calling thread's death observers — a parent that bound the
-/// main thread (so `ExitStatus::code()` carries it) and procmgr's per-thread
-/// observer (which reaps the process). Structurally identical to [`sys_exit`]
-/// but with the encoded caller-supplied reason (zero for `exit(0)`); in
-/// particular it schedules away immediately
-/// after the post, with no further dereference of the thread or its address
-/// space, so it cannot race procmgr's cap-revoke teardown.
+/// `[0, EXIT_FAULT_BASE)` and makes it the address space's terminal end and
+/// the calling thread's exit reason, whichever thread of the space calls it:
+/// the reason is recorded on the address space before the thread's `Exited`
+/// commit (first end wins, a terminal fault's included), then posted to the
+/// calling thread's death observers and, when this is the space's first end,
+/// to the address space's death observers — procmgr's, through which it reaps
+/// the process with this reason, and a supervisor's. The order is the
+/// terminal-fault path's ([`crate::sched::record_aspace_end`]), and like it
+/// this schedules away right after the posts, with no further dereference of
+/// the thread or its address space: interrupts stay masked from the record to
+/// the posts, so the thread stays on its CPU and the address space's teardown,
+/// which waits until every bound thread runs on no CPU, cannot take the
+/// observer chain the post walks.
 ///
-/// It does NOT post to the address-space death-observer surface, which is
-/// reserved for terminal faults (rationale: docs/process-lifecycle.md § Exit
-/// reason). Whole-process exit from a non-main thread is not yet modelled.
-///
-/// Like [`sys_exit`], this stops only the calling thread; sibling threads and
-/// the process's resources are torn down by procmgr (see
-/// docs/process-lifecycle.md § Process Death).
+/// The kernel stops only the calling thread and has no notion of a main
+/// thread; sibling threads and the process's resources are torn down by
+/// procmgr once it observes the end (docs/process-lifecycle.md § Exit reason
+/// and § Process Death).
 #[cfg(not(test))]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "arg0 carries a u32 exit code zero-extended to u64 by the `process_exit` wrapper; \
               truncating back to u32 is the intended decode"
 )]
-fn sys_process_exit(tf: UserFrame) -> Result<u64, SyscallError>
+fn sys_aspace_exit(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let reason = syscall::encode_exit_code(tf.arg(0) as u32);
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let tcb = unsafe { current_tcb() };
     if !tcb.is_null()
     {
+        // Record the address space's terminal end before the `Exited`
+        // commit, so a holder that reads the thread `Exited` also reads the
+        // space ended (core/kernel/docs/syscalls.md § `SYS_CAP_INFO`); its
+        // observers are posted below.
+        // SAFETY: tcb validated non-null.
+        let aspace = unsafe { (*tcb).address_space };
+        // SAFETY: address_space may be null, which record_aspace_end
+        // handles; no death_lock is held.
+        let aspace_post = unsafe { crate::sched::record_aspace_end(aspace, reason) };
+
         // Commit Exited under all-CPU scheduler.locks (see sys_exit); the
         // reason is written in the same hold. A refusal means the thread was
         // already torn down: an object-teardown stop recorded `EXIT_KILLED`,
-        // or a `dealloc_object(Thread)` committed `Exited`. The post below
-        // still carries this path's own reason (no death walk posts
+        // or a `dealloc_object(Thread)` committed `Exited`. The posts below
+        // still carry this path's own reason (no death walk posts
         // `EXIT_KILLED`).
         // SAFETY: tcb validated non-null.
         let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 
-        // Notify the calling thread's observers (a parent that bound the main
-        // thread; procmgr's per-thread observer), then schedule immediately —
-        // no further tcb/aspace dereference, matching sys_exit's safe window.
+        // Notify the calling thread's observers (a parent that bound the
+        // main thread; procmgr's per-thread observer of a main thread).
         // SAFETY: tcb is valid; post_death_notification handles null eq check.
         unsafe {
             crate::sched::post_death_notification(tcb, reason);
+        }
+
+        // Notify the address-space observers recorded above, so procmgr
+        // reaps the whole process whichever thread exited.
+        // SAFETY: aspace_post comes from this path's record, and the thread
+        // has stayed on this CPU since (interrupts masked); it is now Exited
+        // and no lock is held.
+        unsafe {
+            crate::sched::post_aspace_death_notification(&aspace_post);
         }
     }
     // Switch to the next runnable thread. The exited thread must not be
@@ -920,14 +940,15 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
-/// `SYS_ASPACE_BIND_NOTIFICATION` (53): bind a terminal-fault death observer
+/// `SYS_ASPACE_BIND_NOTIFICATION` (53): bind a terminal-end death observer
 /// to an address space.
 ///
 /// arg0 = `AddressSpace` cap slot index (`CONTROL` right required).
 /// arg1 = `EventQueue` cap slot index (`POST` right required).
 /// arg2 = caller-chosen `correlator: u64` (opaque routing tag; every bit kept).
 ///
-/// On the first terminal fault by any thread in the address space (no handler
+/// On the space's terminal end, the first `SYS_ASPACE_EXIT` or terminal fault
+/// by any of its threads (a terminal fault being one with no handler
 /// bound, the handler replied `KILL`, or the fault episode was cancelled by
 /// destruction of the handler thread, by destruction of the handler endpoint
 /// while the fault is still queued on it, or by a later receive on the
@@ -936,25 +957,25 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// fault, cancelling the episode before any reply claims it or keeping a
 /// claimed `KILL`, and it takes effect, and is posted, only if the thread is
 /// started again; see docs/fault-handling.md § Delivery, Resume, and Kill),
-/// the kernel posts the entry `(terminal-fault reason, correlator)` to each
-/// bound observer; a later terminal fault of another thread of the space posts
-/// nothing (the space dies once, with the reason retained from its first
-/// fault). Only a fault of a thread's own access is terminal: a restartable
+/// the kernel posts the entry `(terminal-end reason, correlator)` to each
+/// bound observer; a later fault or exit of another thread of the space posts
+/// nothing (the space ends once, with the reason retained from its first
+/// end). Only a fault of a thread's own access is terminal: a restartable
 /// syscall's copy fault in any of these cases fails that syscall with
 /// `InvalidAddress` and posts nothing (docs/fault-handling.md § Kernel
 /// Copies). The kernel only notifies; it never enumerates or terminates
-/// threads, and normal `thread_exit` does NOT fire these observers.
+/// threads, and `SYS_THREAD_EXIT` does NOT fire these observers.
 ///
 /// A binding holds a reference on the `EventQueue` object until the address
 /// space's teardown releases it (core/kernel/docs/syscalls.md
-/// § `SYS_ASPACE_BIND_NOTIFICATION`); a bind after the fault takes none.
+/// § `SYS_ASPACE_BIND_NOTIFICATION`); a bind after the end takes none.
 ///
-/// Binding onto an address space that has *already* terminal-faulted posts the
-/// retained fault reason to the `EventQueue` immediately (serialised on the
-/// space's `death_lock`), so an observer bound after the space was running does
-/// not miss the fault. Each live binding holds one death-observer node of the
+/// Binding onto an address space that has *already* ended posts the retained
+/// reason to the `EventQueue` immediately (serialised on the space's
+/// `death_lock`), so an observer bound after the space was running does not
+/// miss the end. Each live binding holds one death-observer node of the
 /// queue's pool until the address space's teardown; returns `OutOfMemory` if
-/// the queue has no free node (only reachable before the first fault).
+/// the queue has no free node (only reachable before the end).
 #[cfg(not(test))]
 fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -1000,10 +1021,10 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
         .as_ptr()
         .cast::<crate::cap::object::EventQueueObject>();
 
-    // Bind the observer, or — if the address space already terminal-faulted —
-    // deliver the retained reason to the new queue immediately.
+    // Bind the observer, or — if the address space already ended — deliver
+    // the retained reason to the new queue immediately.
     // `bind_or_retained` serialises on the space's `death_lock` against the
-    // terminal-fault post, so a fault before this bind is not lost (the
+    // terminal-end record, so an end before this bind is not lost (the
     // address-space analogue of the thread bind-after-death path above).
     //
     // The node comes from the queue's pool under eq.lock alone, before
@@ -1396,7 +1417,7 @@ fn sys_ipc_buffer_set(tf: UserFrame) -> Result<u64, SyscallError>
 }
 
 // Host unit tests for the exit-code encoding (`syscall::encode_exit_code`)
-// that `sys_process_exit` applies to the caller's exit code.
+// that `sys_aspace_exit` applies to the caller's exit code.
 #[cfg(test)]
 mod exit_code_tests
 {

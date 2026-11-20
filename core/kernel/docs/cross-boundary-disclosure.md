@@ -59,7 +59,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `CAP_INFO_MEMORY_PHYS_BASE` → `MemoryObject::base`, to a holder of `MemRights::PHYS` (the queried cap's, or a credential's in arg2) | `cap::sys_cap_info`, `cap::object::MemoryObject` | **e** |
 | `CAP_INFO_MEMORY_MAPPINGS` → summed user-mapping counts of the frames in a window of a Memory region | `cap::sys_cap_info`, `mm::frame_map::mappings_in` | d |
 | `CAP_INFO_SOLE_REFERENCE` → whether the queried slot is the only reference to its object (a boolean of `KernelObjectHeader::ref_count`) | `cap::sys_cap_info`, `cap::object::KernelObjectHeader` | d |
-| `CAP_INFO_ASPACE_TERMINAL_FAULT` → an address space's retained terminal-fault reason (`EXIT_FAULT_BASE` + vector or cause), or `0` | `cap::sys_cap_info`, `AddressSpace::retained_terminal_fault` | d |
+| `CAP_INFO_ASPACE_END` → an address space's retained end: `0` while it has not ended, else `ASPACE_ENDED` ORed with the first end's reason (a fault's `EXIT_FAULT_BASE` + vector or cause, or a `SYS_ASPACE_EXIT` code) | `cap::sys_cap_info`, `AddressSpace::retained_end` | d |
 | `CAP_INFO_IRQ_MSG_ADDRESS` → a message-signaled Interrupt cap's message address: an interrupt controller's message window (the x86-64 local APIC range at `0xFEE00000`, in the compatibility format naming the target CPU's APIC id or, with interrupt remapping on, the remappable format naming the target's remapping handle; or a riscv64 IMSIC file), never RAM; a wired Interrupt cap answers `InvalidArgument` | `cap::sys_cap_info` | d |
 | `CAP_INFO_IRQ_MSG_DATA` → a message-signaled Interrupt cap's message data: a vector, the subhandle `0` with interrupt remapping on, or an interrupt identity; a wired Interrupt cap answers `InvalidArgument` | `cap::sys_cap_info` | d |
 | `CAP_INFO_IRQ_REMAP_ENTRY` → the remapping entry a routed line or a message-signaled target needs with interrupt remapping on: its handle (derived from the target CPU's index and vector), the vector, and the target CPU's APIC id, all firmware-originated or fixed by the handle formula; x86-64 only | `cap::sys_cap_info`, `irq::remap_entry` | d |
@@ -176,9 +176,10 @@ Notes on the non-obvious entries:
   or notification, whether any other party still holds it. memmgr needs exactly that answer
   before it reuses a frame. It reveals neither which process holds the other reference nor how
   many there are.
-- **`CAP_INFO_ASPACE_TERMINAL_FAULT`** returns an exit-reason value fixed by ABI contract (**d**):
-  `0`, or `EXIT_FAULT_BASE` plus the architectural fault vector or cause of the first terminal
-  fault a thread of the queried address space took. It carries no address, and it is the value a
+- **`CAP_INFO_ASPACE_END`** returns an exit-reason value fixed by ABI contract (**d**): `0`, or
+  `ASPACE_ENDED` ORed with the reason of the first terminal end of the queried address space, the
+  architectural fault vector or cause (`EXIT_FAULT_BASE` plus it) of a thread's terminal fault or
+  the code of a thread's `SYS_ASPACE_EXIT`. It carries no address, and it is the value a
   `SYS_ASPACE_BIND_NOTIFICATION` observer of that space already receives, so it discloses nothing
   a holder of the address-space capability could not learn by binding one.
 

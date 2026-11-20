@@ -145,7 +145,7 @@ svcmgr/
   primitives, § Death detection).
 - **Health monitoring** — bind two death observers per supervised
   service to svcmgr's death queues, one on the main thread and one on the
-  address space (posted by the first terminal fault of any thread), both
+  address space (posted by the first terminal end of any thread), both
   with the `DeathTag` correlator `(instance << 32) | slot`, adding a queue
   when every pool is out of nodes. Detect crashes via async
   notifications, resyncing from the kernel's thread and address-space

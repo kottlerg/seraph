@@ -5,14 +5,14 @@
 
 //! Integration: an address-space terminal-fault observer bound *after* a thread
 //! in that space already faulted still receives the retained fault reason, and
-//! `CAP_INFO_ASPACE_TERMINAL_FAULT` reads the same retained reason back as soon
+//! `CAP_INFO_ASPACE_END` reads the same retained reason back as soon
 //! as the faulting thread reads `Exited`.
 //!
 //! The address-space analogue of `death_notification_late_bind`: it exercises
 //! the retained-reason delivery of `core/kernel/docs/syscalls.md`
-//! § `SYS_ASPACE_BIND_NOTIFICATION` (kernel side: `record_aspace_terminal_fault`
+//! § `SYS_ASPACE_BIND_NOTIFICATION` (kernel side: `record_aspace_end`
 //! and `AddressSpace::bind_or_retained`) and its read-back through
-//! § `SYS_CAP_INFO` (`AddressSpace::retained_terminal_fault`), which the kernel
+//! § `SYS_CAP_INFO` (`AddressSpace::retained_end`), which the kernel
 //! records before it commits the faulting thread's `Exited` state.
 //!
 //! Isolation: the faulting thread runs in a *dedicated* address space (not the
@@ -26,8 +26,8 @@
 //! reason in the same iteration as its first `Exited` read. The thread carries
 //! [`THREAD_OBSERVERS`] death observers, whose posts run on its exit path after
 //! the `Exited` commit, so on a kernel that recorded the space's terminal fault
-//! only after those posts the read lands before the record and shows as a `0`
-//! read-back. On one CPU the thread runs only while the controller sleeps, so
+//! only after those posts the read lands before the record and reads the space
+//! as not ended. On one CPU the thread runs only while the controller sleeps, so
 //! the exit path completes before the read and one round is made.
 
 use syscall::{
@@ -37,8 +37,8 @@ use syscall::{
     thread_set_affinity, thread_sleep, thread_start,
 };
 use syscall_abi::{
-    CAP_INFO_ASPACE_TERMINAL_FAULT, CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, SyscallError,
-    SystemInfoType, THREAD_STATE_EXITED,
+    CAP_INFO_ASPACE_END, CAP_INFO_THREAD_STATE, EXIT_FAULT_BASE, SyscallError, SystemInfoType,
+    THREAD_STATE_EXITED, aspace_end_reason,
 };
 
 use crate::{TestContext, TestResult};
@@ -179,7 +179,7 @@ fn round(ctx: &TestContext, placement: Placement) -> TestResult
     caps.thread = thread;
 
     // No thread of the fresh space has faulted, so nothing is retained.
-    if cap_info(aspace, CAP_INFO_ASPACE_TERMINAL_FAULT) != Ok(0)
+    if cap_info(aspace, CAP_INFO_ASPACE_END) != Ok(0)
     {
         return Err("aspace_fault_notification_late_bind: a fresh aspace read a retained fault");
     }
@@ -221,11 +221,11 @@ fn round(ctx: &TestContext, placement: Placement) -> TestResult
     // The space retains the fault's reason for a holder that bound no observer,
     // from before the thread reads `Exited` (core/kernel/docs/syscalls.md
     // § `SYS_CAP_INFO`).
-    if retained != fault_reason
+    if retained != Some(fault_reason)
     {
         return Err(
-            "aspace_fault_notification_late_bind: CAP_INFO_ASPACE_TERMINAL_FAULT did not read \
-             the retained reason",
+            "aspace_fault_notification_late_bind: CAP_INFO_ASPACE_END did not read the retained \
+             reason",
         );
     }
 
@@ -258,10 +258,14 @@ fn round(ctx: &TestContext, placement: Placement) -> TestResult
 }
 
 /// Poll `thread` until it reads `Exited` and return its exit reason with the
-/// `CAP_INFO_ASPACE_TERMINAL_FAULT` read of `aspace` made right after that
-/// first `Exited` read, spacing the reads as `polling` says. Both bounds go
+/// `CAP_INFO_ASPACE_END` read of `aspace` made right after that first
+/// `Exited` read, decoded (`None` for a space not ended), spacing the reads as `polling` says. Both bounds go
 /// through [`crate::scaled_bound`].
-fn await_exit(thread: u64, aspace: u64, polling: Polling) -> Result<(u64, u64), &'static str>
+fn await_exit(
+    thread: u64,
+    aspace: u64,
+    polling: Polling,
+) -> Result<(u64, Option<u64>), &'static str>
 {
     let max_sleeps = crate::scaled_polls(MAX_POLLS);
     let dense_bound_us = crate::scaled_bound(DENSE_BOUND_US);
@@ -273,10 +277,9 @@ fn await_exit(thread: u64, aspace: u64, polling: Polling) -> Result<(u64, u64), 
             .map_err(|_| "aspace_fault_notification_late_bind: cap_info(THREAD_STATE) failed")?;
         if (packed >> 32) as u32 == THREAD_STATE_EXITED
         {
-            let retained = cap_info(aspace, CAP_INFO_ASPACE_TERMINAL_FAULT).map_err(
-                |_| "aspace_fault_notification_late_bind: cap_info(ASPACE_TERMINAL_FAULT) failed",
-            )?;
-            return Ok((packed & 0xFFFF_FFFF, retained));
+            let retained = cap_info(aspace, CAP_INFO_ASPACE_END)
+                .map_err(|_| "aspace_fault_notification_late_bind: cap_info(ASPACE_END) failed")?;
+            return Ok((packed & 0xFFFF_FFFF, aspace_end_reason(retained)));
         }
         polls = polls.wrapping_add(1);
         let expired = match polling

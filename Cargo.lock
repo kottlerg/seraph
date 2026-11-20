@@ -69,7 +69,6 @@ version = "0.1.4"
 dependencies = [
  "crash-report",
  "crashd-core-file",
- "crashd-fault-bound",
  "crashd-oom-hold",
  "ipc",
  "syscall",
@@ -82,10 +81,6 @@ version = "0.1.4"
 dependencies = [
  "syscall-abi",
 ]
-
-[[package]]
-name = "crashd-fault-bound"
-version = "0.1.4"
 
 [[package]]
 name = "crashd-oom-hold"

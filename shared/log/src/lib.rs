@@ -45,10 +45,11 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence};
+use core::time::Duration;
 
 use ipc::{
-    IpcMessage,
+    CallTimeout, IpcMessage,
     log_query::SLOT_NAME_MAX,
     log_record::RecordWriter,
     stream_labels::{
@@ -86,7 +87,8 @@ pub const LOG_CALL_TIMEOUT_MS: u32 = 5000;
 pub const LOG_CALL_UNANSWERED_TIMEOUT_MS: u32 = 10;
 
 /// Whether the log receiver has left a log call of this process unanswered:
-/// set when a call times out (`WouldBlock`), cleared when a call is answered
+/// set when a call times out (`WouldBlock`) at its own bound, not at its
+/// thread's call deadline ([`install_time_left`]), cleared when a call is answered
 /// or when the process is told that a new receiver has started
 /// ([`receiver_restarted`]), and left as it is by any other failure, which
 /// says nothing of the receiver ([`unanswered_after`]). While set, log calls
@@ -96,37 +98,109 @@ pub const LOG_CALL_UNANSWERED_TIMEOUT_MS: u32 = 10;
 /// answering none of them.
 static RECEIVER_UNANSWERED: AtomicBool = AtomicBool::new(false);
 
-/// The bound on a log call while [`RECEIVER_UNANSWERED`] reads `unanswered`.
+/// The source of the time left of the calling thread's call deadline, as
+/// std's `_start` installs it ([`install_time_left`]): null until then, else
+/// a `fn() -> Option<Duration>` stored as a pointer.
+static TIME_LEFT: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Install `source`, which returns the time left of the calling thread's
+/// call deadline, `None` for a thread with none, as every log call's limit:
+/// a log call is then bounded by the earlier of its own bound and the
+/// deadline, and is not made once the deadline has passed. std's `_start`
+/// installs `std::os::seraph::call_time_left`; a process that installs none
+/// makes its log calls under their own bound alone. Last writer wins.
+pub fn install_time_left(source: fn() -> Option<Duration>)
+{
+    TIME_LEFT.store((source as *const ()).cast_mut(), Ordering::Release);
+}
+
+/// The time left of the calling thread's call deadline, through the source
+/// [`install_time_left`] installed; `None` when none is installed.
+fn time_left() -> Option<Duration>
+{
+    let raw = TIME_LEFT.load(Ordering::Acquire);
+    if raw.is_null()
+    {
+        return None;
+    }
+    // SAFETY: `install_time_left` is the only writer of a non-null value, and
+    // it stores a `fn() -> Option<Duration>`, never a dangling one; a data
+    // pointer and a fn pointer are the same width on every target, so the
+    // round-trip yields that live function.
+    let source = unsafe { core::mem::transmute::<*mut (), fn() -> Option<Duration>>(raw) };
+    source()
+}
+
+/// The bound a log call is made with, in milliseconds, and whose it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bound
+{
+    /// The call's own bound, as [`RECEIVER_UNANSWERED`] selects it: a
+    /// timeout says the receiver did not answer.
+    Receiver(u32),
+    /// The time left of the calling thread's call deadline, shorter than the
+    /// call's own bound: a timeout says nothing of the receiver.
+    Deadline(u32),
+}
+
+impl Bound
+{
+    /// The bound in milliseconds.
+    const fn ms(self) -> u32
+    {
+        match self
+        {
+            Self::Receiver(ms) | Self::Deadline(ms) => ms,
+        }
+    }
+}
+
+/// The bound on a log call while [`RECEIVER_UNANSWERED`] reads `unanswered`,
+/// with `left` of the calling thread's call deadline to run (`None` for
+/// none): the earlier of the two, or `None`, no call, once the deadline has
+/// passed.
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "`unanswered` is the value of `RECEIVER_UNANSWERED`, which the function maps to a \
               bound"
 )]
-fn call_bound(unanswered: bool) -> u32
+fn call_bound(unanswered: bool, left: Option<Duration>) -> Option<Bound>
 {
-    if unanswered
+    let own = if unanswered
     {
         LOG_CALL_UNANSWERED_TIMEOUT_MS
     }
     else
     {
         LOG_CALL_TIMEOUT_MS
+    };
+    match ipc::call_timeout(left)
+    {
+        CallTimeout::Expired => None,
+        CallTimeout::Ms(ms) if ms < own => Some(Bound::Deadline(ms)),
+        CallTimeout::Unbounded | CallTimeout::Ms(_) => Some(Bound::Receiver(own)),
     }
 }
 
-/// [`RECEIVER_UNANSWERED`] after a log call with `outcome`, from `unanswered`
-/// before it: cleared by an answer, set by a timeout, kept by any other error.
+/// [`RECEIVER_UNANSWERED`] after a log call made with `bound` with
+/// `outcome`, from `unanswered` before it: cleared by an answer, set by a
+/// timeout at the call's own bound, kept by a timeout at the thread's
+/// deadline and by any other error.
 #[expect(
     clippy::fn_params_excessive_bools,
     reason = "`unanswered` is the value of `RECEIVER_UNANSWERED`, which the function maps to its \
               next value"
 )]
-fn unanswered_after<T>(unanswered: bool, outcome: &Result<T, i64>) -> bool
+fn unanswered_after<T>(unanswered: bool, bound: Bound, outcome: &Result<T, i64>) -> bool
 {
     match outcome
     {
         Ok(_) => false,
-        Err(code) if *code == SyscallError::WouldBlock as i64 => true,
+        Err(code)
+            if *code == SyscallError::WouldBlock as i64 && matches!(bound, Bound::Receiver(_)) =>
+        {
+            true
+        }
         Err(_) => unanswered,
     }
 }
@@ -144,19 +218,26 @@ pub fn receiver_restarted()
     RECEIVER_UNANSWERED.store(false, Ordering::Relaxed);
 }
 
-/// One call made by `call` with the bound [`RECEIVER_UNANSWERED`] selects,
-/// which it then updates from the outcome. The reply when the call was
-/// answered.
-fn bounded<T>(call: impl FnOnce(u32) -> Result<T, i64>) -> Option<T>
+/// One call made by `call` with the bound [`call_bound`] selects from
+/// [`RECEIVER_UNANSWERED`] and `left` of the calling thread's call deadline,
+/// then [`RECEIVER_UNANSWERED`] updated from the outcome. The reply when the
+/// call was answered; `None`, with no call made, once the deadline has
+/// passed.
+fn bounded<T>(left: Option<Duration>, call: impl FnOnce(u32) -> Result<T, i64>) -> Option<T>
 {
     let unanswered = RECEIVER_UNANSWERED.load(Ordering::Relaxed);
-    let outcome = call(call_bound(unanswered));
-    RECEIVER_UNANSWERED.store(unanswered_after(unanswered, &outcome), Ordering::Relaxed);
+    let bound = call_bound(unanswered, left)?;
+    let outcome = call(bound.ms());
+    RECEIVER_UNANSWERED.store(
+        unanswered_after(unanswered, bound, &outcome),
+        Ordering::Relaxed,
+    );
     outcome.ok()
 }
 
-/// One call of `msg` on `cap`, bounded as [`RECEIVER_UNANSWERED`] selects
-/// ([`bounded`]). The reply's label when the call was answered.
+/// One call of `msg` on `cap`, bounded as [`RECEIVER_UNANSWERED`] and the
+/// calling thread's call deadline select ([`bounded`]). The reply's label
+/// when the call was answered.
 ///
 /// # Safety
 /// `ipc_buf` must be this thread's registered IPC buffer page (the contract
@@ -164,8 +245,10 @@ fn bounded<T>(call: impl FnOnce(u32) -> Result<T, i64>) -> Option<T>
 unsafe fn bounded_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Option<u64>
 {
     // SAFETY: the caller's contract covers `ipc_buf`.
-    bounded(|bound| unsafe { ipc::ipc_call_timeout(cap, msg, ipc_buf, bound) })
-        .map(|reply| reply.label)
+    bounded(time_left(), |bound| unsafe {
+        ipc::ipc_call_timeout(cap, msg, ipc_buf, bound)
+    })
+    .map(|reply| reply.label)
 }
 
 /// One log message, `msg`, delivered on `cap` ([`deliver`]): each call
@@ -809,19 +892,59 @@ mod tests
         let timeout: Result<(), i64> = Err(SyscallError::WouldBlock as i64);
         let other: Result<(), i64> = Err(SyscallError::InvalidCapability as i64);
         let answered: Result<(), i64> = Ok(());
+        let own = Bound::Receiver(LOG_CALL_TIMEOUT_MS);
 
-        assert_eq!(call_bound(false), LOG_CALL_TIMEOUT_MS);
-        assert_eq!(call_bound(true), LOG_CALL_UNANSWERED_TIMEOUT_MS);
+        assert_eq!(call_bound(false, None), Some(own));
+        assert_eq!(
+            call_bound(true, None),
+            Some(Bound::Receiver(LOG_CALL_UNANSWERED_TIMEOUT_MS))
+        );
 
         // A timeout sets the flag, from either state.
-        assert!(unanswered_after(false, &timeout));
-        assert!(unanswered_after(true, &timeout));
+        assert!(unanswered_after(false, own, &timeout));
+        assert!(unanswered_after(true, own, &timeout));
         // An answer clears it, from either state.
-        assert!(!unanswered_after(true, &answered));
-        assert!(!unanswered_after(false, &answered));
+        assert!(!unanswered_after(true, own, &answered));
+        assert!(!unanswered_after(false, own, &answered));
         // Any other failure leaves it as it was.
-        assert!(unanswered_after(true, &other));
-        assert!(!unanswered_after(false, &other));
+        assert!(unanswered_after(true, own, &other));
+        assert!(!unanswered_after(false, own, &other));
+    }
+
+    // The defect caught: a log call made inside a call deadline that outlives
+    // it, or that is made once it has passed; and a timeout at the caller's
+    // deadline read as the receiver's silence, which would cut every later
+    // log call of the process to the short bound.
+    #[test]
+    fn a_call_deadline_bounds_a_log_call_and_its_timeout_blames_no_receiver()
+    {
+        let timeout: Result<(), i64> = Err(SyscallError::WouldBlock as i64);
+        let ms = Duration::from_millis;
+
+        // A deadline nearer than the call's own bound bounds the call.
+        assert_eq!(call_bound(false, Some(ms(30))), Some(Bound::Deadline(30)));
+        assert_eq!(call_bound(true, Some(ms(3))), Some(Bound::Deadline(3)));
+        // A farther one leaves the call's own bound.
+        assert_eq!(
+            call_bound(false, Some(ms(60_000))),
+            Some(Bound::Receiver(LOG_CALL_TIMEOUT_MS))
+        );
+        assert_eq!(
+            call_bound(true, Some(ms(30))),
+            Some(Bound::Receiver(LOG_CALL_UNANSWERED_TIMEOUT_MS))
+        );
+        // A passed deadline makes no call.
+        assert_eq!(call_bound(false, Some(Duration::ZERO)), None);
+
+        // A timeout at the deadline leaves the flag as it was.
+        assert!(!unanswered_after(false, Bound::Deadline(30), &timeout));
+        assert!(unanswered_after(true, Bound::Deadline(3), &timeout));
+        // An answer within it still clears the flag.
+        assert!(!unanswered_after(
+            true,
+            Bound::Deadline(3),
+            &Ok::<(), i64>(())
+        ));
     }
 
     // Defect caught: the lines svcmgr holds for the death of a log sink that
@@ -846,16 +969,16 @@ mod tests
         assert!(LOG_CALL_UNANSWERED_TIMEOUT_MS < start_ms && start_ms < LOG_CALL_TIMEOUT_MS);
 
         // A line written while no receiver receives times out.
-        assert_eq!(bounded(|_| timeout()), None);
+        assert_eq!(bounded(None, |_| timeout()), None);
         // Its timeout shortens the next call below the restarted receiver's
         // start: the line is dropped.
-        assert_eq!(bounded(starting(start_ms)), None);
+        assert_eq!(bounded(None, starting(start_ms)), None);
         // Told of the restart, the process waits the full bound for the next
         // line, which the restarted receiver answers, and later lines keep the
         // full bound.
         receiver_restarted();
-        assert_eq!(bounded(starting(start_ms)), Some(()));
-        assert_eq!(bounded(starting(start_ms)), Some(()));
+        assert_eq!(bounded(None, starting(start_ms)), Some(()));
+        assert_eq!(bounded(None, starting(start_ms)), Some(()));
         assert!(!RECEIVER_UNANSWERED.load(Ordering::Relaxed));
     }
 

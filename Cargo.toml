@@ -19,7 +19,6 @@ members = [
     "services/crasher",
     "services/crashd",
     "services/crashd/core-file",
-    "services/crashd/fault-bound",
     "services/crashd/oom-hold",
     "services/oomd",
     "services/oomd/policy",

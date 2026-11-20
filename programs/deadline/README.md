@@ -1,7 +1,8 @@
 # deadline
 
-Test fixture for the asynchronous upcall: a supervisor bounds a worker's computation by a
-deadline and cancels it with an upcall.
+Test fixture for deadlines: a supervisor bounds a worker's computation by a deadline and cancels
+it with an asynchronous upcall, and a call deadline bounds the calls of a thread that waits on a
+server that never answers.
 
 ---
 
@@ -22,7 +23,7 @@ deadline/
 ├── Cargo.toml
 ├── README.md
 ├── src/
-│   └── main.rs            # Supervisor and spinning worker; the cancellation routine
+│   └── main.rs            # Supervisor, spinning worker, cancellation routine; call deadline
 └── tester/
     ├── Cargo.toml
     └── src/
@@ -47,8 +48,28 @@ syscall and never ends. The supervisor, the main thread:
 4. waits for the routine to mark the computation cancelled, checks that the worker computes no
    further, and prints `PASS`.
 
-The cancellation routine ends the worker thread with `SYS_THREAD_EXIT`. The tester passes when
-the fixture prints `PASS` and exits cleanly; any failed step panics the fixture, a non-clean exit.
+The cancellation routine ends the worker thread with `SYS_THREAD_EXIT`.
+
+---
+
+## Call Deadline Under Test
+
+The main thread then makes an endpoint nobody receives on, so a call on it waits until its
+timeout ends it, and bounds calls on it with a call deadline (`std::os::seraph::with_call_deadline`,
+[runtime/ruststd/README.md](../../runtime/ruststd/README.md)):
+
+1. a runtime call (`std::os::seraph::namespace_lookup_file`) under a deadline 100 ms ahead, inside
+   which a later deadline is nested, fails `io::ErrorKind::TimedOut` after 50 ms or more and
+   under 5 s: the earlier deadline holds, and the call waits for it and no longer;
+2. no deadline is left once the scope returns (`std::os::seraph::call_time_left` is `None`);
+3. a call of the fixture's own (`ipc::ipc_call_within` with the time left) ends `WouldBlock`
+   within the same window;
+4. a runtime call under a deadline already passed fails `TimedOut` without waiting, and so does
+   `Child::kill` of a child the fixture spawned idle (`deadline idle`), which it then kills and
+   waits for outside the deadline.
+
+The tester passes when the fixture prints `PASS` and exits cleanly; any failed step panics the
+fixture, a non-clean exit.
 
 ---
 

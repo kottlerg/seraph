@@ -1021,8 +1021,9 @@ fn register_with_procmgr(self_thread_cap: u64, ipc_buf: *mut u64) {
     };
     let msg = ipc::IpcMessage::builder(procmgr_labels::REGISTER_THREAD).cap(cap).build();
     // SAFETY: `ipc_buf` is this thread's IPC buffer page, registered by the
-    // caller just before; the cap moves to procmgr with the message.
-    match unsafe { ipc::ipc_call(procmgr, &msg, ipc_buf) } {
+    // caller just before; the cap moves to procmgr with the message. A new
+    // thread holds no call deadline, so the call waits for procmgr's answer.
+    match unsafe { crate::os::seraph::deadline_call(procmgr, &msg, ipc_buf) } {
         Ok(reply) => {
             for &extra in reply.caps() {
                 let _ = syscall::cap_delete(extra);

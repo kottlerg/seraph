@@ -35,9 +35,11 @@ pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
 static TIMED_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Resolution state machine for `TIMED_CAP`:
-/// `0` = untried, `1` = resolving (some thread is doing the registry
-/// lookup), `2` = resolved (success or terminal failure; readers should
-/// load `TIMED_CAP` and accept it as final).
+/// `0` = untried, or given back by a lookup its thread's call deadline cut
+/// short (`std::os::seraph::with_call_deadline`), `1` = resolving (some
+/// thread is doing the registry lookup), `2` = resolved (success or
+/// terminal failure; readers should load `TIMED_CAP` and accept it as
+/// final).
 static TIMED_RESOLVED: AtomicU32 = AtomicU32::new(0);
 
 /// How long a thread waits on another thread's in-flight `timed` lookup
@@ -85,8 +87,21 @@ fn timed_cap_once(ipc_buf: *mut u64) -> u64
             Ok(_) =>
             {
                 // We claimed the resolution duty.
+                let left = crate::os::seraph::call_time_left();
                 // SAFETY: ipc_buf is the registered IPC buffer page.
-                let resolved = unsafe { registry_client::lookup(b"timed", ipc_buf) }.unwrap_or(0);
+                let resolved = match unsafe { registry_client::lookup_within(b"timed", ipc_buf, left) }
+                {
+                    Ok(cap) => cap.unwrap_or(0),
+                    // The thread's call deadline passed: no answer says the
+                    // name is absent, so the duty is given back for a later
+                    // call to resolve.
+                    Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 =>
+                    {
+                        TIMED_RESOLVED.store(0, Ordering::Release);
+                        return 0;
+                    }
+                    Err(_) => 0,
+                };
                 if resolved != 0
                 {
                     TIMED_CAP.store(resolved, Ordering::Release);
@@ -103,9 +118,13 @@ fn timed_cap_once(ipc_buf: *mut u64) -> u64
                 let now = elapsed_us();
                 if now >= *deadline.get_or_insert(now.saturating_add(RESOLVE_WAIT_US))
                 {
+                    let left = crate::os::seraph::call_time_left();
                     // SAFETY: ipc_buf is the registered IPC buffer page.
-                    let fallback = unsafe { registry_client::lookup(b"timed", ipc_buf) }
-                        .unwrap_or(0);
+                    let fallback =
+                        unsafe { registry_client::lookup_within(b"timed", ipc_buf, left) }
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0);
                     if fallback == 0
                     {
                         return 0;
@@ -174,7 +193,7 @@ impl SystemTime {
 
         let request = IpcMessage::new(timed_labels::GET_WALL_TIME);
         // SAFETY: ipc_buf is the registered IPC buffer page for this thread.
-        let Ok(reply) = (unsafe { ipc::ipc_call(cap, &request, ipc_buf) }) else {
+        let Ok(reply) = (unsafe { crate::os::seraph::deadline_call(cap, &request, ipc_buf) }) else {
             return UNIX_EPOCH;
         };
         if reply.label != timed_errors::SUCCESS {

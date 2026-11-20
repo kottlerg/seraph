@@ -13,12 +13,12 @@
 //! held thread's registers and extended state, lists the space's pages,
 //! lays the core out within its byte budget, makes room in the directory by
 //! deleting the oldest cores, and writes the file under a `.part` name,
-//! renamed once complete. Every blocking request is started only while the
-//! dump's generation has not fired, and once the bound passes the watchdog
-//! cancels the one it waits in, and each the runtime still sends until the
-//! dump ends (a file's close as it is dropped), so the dump ends within the
-//! bound and a tick per such request whatever the process or the storage
-//! path does.
+//! renamed once complete. The dump runs under a call deadline of its bound
+//! (`std::os::seraph::with_call_deadline`): each request it makes, its own
+//! and those the runtime makes for it (a file's write, its close as it is
+//! dropped), carries the time left as its timeout, and none is sent once the
+//! deadline has passed, so the dump ends within the bound whatever the
+//! process or the storage path does.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -31,10 +31,10 @@ use core_file::store::{self, Entry, StoreError};
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels, svcmgr_labels};
 use syscall_abi::{MAX_PAGE_RUNS, MAX_THREAD_MEM_COPY, PAGE_SIZE, PageRun, SyscallError};
 
-use crate::{AttachFailed, BOUND, arch, attach, await_settled, fired, now_ms, word_at};
+use crate::{AttachFailed, arch, attach, deadline_in, expired, word_at};
 
-/// How long one dump may take before the watchdog cancels the request it
-/// waits in. The faulting thread stays held for its length, so the bound
+/// How long one dump may take: the call deadline it runs under, which ends
+/// the request it waits in. The faulting thread stays held for its length, so the bound
 /// is the most a dump delays the process's teardown. It covers a core of
 /// [`CORE_BYTES_MAX`] written at half the slowest rate measured through the
 /// FAT driver, about 75 KB/s under QEMU, one page per write
@@ -98,19 +98,16 @@ pub enum Outcome
     Cancelled,
 }
 
-/// Dump `target` under `policy`, in a generation of [`DUMP_BOUND`] of its
-/// own, and let the watchdog's cancellation finish when the bound passed.
+/// Dump `target` under `policy`, under a call deadline of [`DUMP_BOUND`] of
+/// its own. A dump that fails because the deadline passed ends
+/// [`Outcome::Cancelled`].
 pub fn dump(policy: &Policy, target: &Target, authority: u64, ipc_buf: *mut u64) -> Outcome
 {
-    let bound_ms = u64::try_from(DUMP_BOUND.as_millis()).unwrap_or(u64::MAX);
-    let generation = BOUND.arm(now_ms(), bound_ms);
     let mut held = Vec::new();
-    let outcome = capture(policy, target, authority, generation, ipc_buf, &mut held);
-    let cancelled = BOUND.end(generation);
-    if cancelled
-    {
-        await_settled(generation);
-    }
+    let (outcome, cancelled) = std::os::seraph::with_call_deadline(deadline_in(DUMP_BOUND), || {
+        let outcome = capture(policy, target, authority, ipc_buf, &mut held);
+        (outcome, expired())
+    });
     for thread in &held
     {
         let _ = syscall::cap_delete(thread.cap);
@@ -139,12 +136,11 @@ fn capture(
     policy: &Policy,
     target: &Target,
     authority: u64,
-    generation: u64,
     ipc_buf: *mut u64,
     held: &mut Vec<Held>,
 ) -> Outcome
 {
-    let name = match process_name(target.process, authority, generation, ipc_buf)
+    let name = match process_name(target.process, authority, ipc_buf)
     {
         Ok(name) => name,
         Err(outcome) => return outcome,
@@ -161,7 +157,7 @@ fn capture(
     {
         return Outcome::Failed("memory is critical");
     }
-    match hold_threads(target, authority, generation, ipc_buf, held)
+    match hold_threads(target, authority, ipc_buf, held)
     {
         Ok(true) => (),
         Ok(false) => return Outcome::Failed("the faulting thread is not listed"),
@@ -181,14 +177,14 @@ fn capture(
         )
         .collect();
     // One bound for every resident request of the dump: a swap service that
-    // is down costs the dump one bound's pauses, about a second, and none is
-    // sent once the dump's generation has fired.
-    let stop = || fired(generation);
-    let mut bound = ipc::ResidentBound::new(&stop);
+    // is down costs the dump one bound's pauses, about a second, each request
+    // carries the time left of the dump's deadline, and none is sent once it
+    // has passed.
+    let mut bound = ipc::ResidentBound::new(&std::os::seraph::call_time_left);
     // The list holds only mapped pages: first have memmgr restore, with the
     // threads held, what the core keeps first.
     restore_first(&first, target.process, authority, ipc_buf, &mut bound);
-    let runs = match list_runs(reader, generation)
+    let runs = match list_runs(reader)
     {
         Ok(runs) => runs,
         Err(outcome) => return outcome,
@@ -247,7 +243,7 @@ fn capture(
         authority,
         ipc_buf,
     };
-    write_core(&core, &name, &source, generation, &mut bound)
+    write_core(&core, &name, &source, &mut bound)
 }
 
 /// Have memmgr restore the chunks it evicted of `process` from the page of
@@ -263,7 +259,7 @@ fn capture(
 /// spends the free pages, and other processes' idle chunks, that memmgr keeps
 /// for restores. A chunk memmgr cannot restore, for want of memory, is left
 /// out of the list, as it is not present. The bound stops once the dump's
-/// generation has fired, so a dump past its bound starts no more requests.
+/// deadline has passed, so a dump past its bound starts no more requests.
 fn restore_first(
     first: &[u64],
     process: u64,
@@ -308,13 +304,9 @@ struct Source
     ipc_buf: *mut u64,
 }
 
-/// The name of the process `badge` names, from `LIST_PROCESSES`.
-fn process_name(
-    badge: u64,
-    authority: u64,
-    generation: u64,
-    ipc_buf: *mut u64,
-) -> Result<Vec<u8>, Outcome>
+/// The name of the process `badge` names, from `LIST_PROCESSES`, sent with
+/// the time left of the dump's deadline as its timeout.
+fn process_name(badge: u64, authority: u64, ipc_buf: *mut u64) -> Result<Vec<u8>, Outcome>
 {
     // A page that resumes after `badge - 1` starts at `badge` while it lives.
     let request = IpcMessage::builder(procmgr_labels::LIST_PROCESSES)
@@ -323,15 +315,13 @@ fn process_name(
         .build();
     let reply = loop
     {
-        if fired(generation)
-        {
-            return Err(Outcome::Cancelled);
-        }
+        let left = std::os::seraph::call_time_left();
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        match unsafe { ipc::ipc_call(authority, &request, ipc_buf) }
+        match unsafe { ipc::ipc_call_within(authority, &request, ipc_buf, left) }
         {
-            Err(e) if e == SyscallError::Interrupted as i64 && !fired(generation) =>
+            Err(e) if e == SyscallError::Interrupted as i64 =>
             {}
+            Err(e) if e == SyscallError::WouldBlock as i64 => return Err(Outcome::Cancelled),
             Ok(r) if r.label == procmgr_errors::SUCCESS => break r,
             _ => return Err(Outcome::Failed("the process list was not read")),
         }
@@ -346,14 +336,14 @@ fn process_name(
 
 /// Stop every thread the attach lists but the faulting one, and read the
 /// registers and extended state of each, at most [`CORE_THREADS_MAX`], the
-/// faulting thread first; whether the faulting thread was among them. The faulting thread is the one the fault's badge
-/// names when it is held at the fault's instruction; a stop of it would
+/// faulting thread first; whether the faulting thread was among them. The
+/// faulting thread is the one the fault's badge names when it is held at the
+/// fault's instruction; a stop of it would
 /// cancel its fault. A thread that never registered faults under its
 /// spawner's badge and is not listed, so it is neither stopped nor recorded.
 fn hold_threads(
     target: &Target,
     authority: u64,
-    generation: u64,
     ipc_buf: *mut u64,
     held: &mut Vec<Held>,
 ) -> Result<bool, Outcome>
@@ -362,10 +352,10 @@ fn hold_threads(
     let mut found = false;
     loop
     {
-        let reply = match attach(target.fault_badge, first, authority, generation, ipc_buf)
+        let reply = match attach(target.fault_badge, first, authority, ipc_buf)
         {
             Ok(reply) => reply,
-            Err(AttachFailed::Cancelled) => return Err(Outcome::Cancelled),
+            Err(AttachFailed::Expired) => return Err(Outcome::Cancelled),
             Err(AttachFailed::Refused) => return Err(Outcome::Failed("the attach was refused")),
         };
         let count = reply.word(0);
@@ -455,14 +445,14 @@ fn read_thread(cap: u64) -> Option<Held>
 
 /// The mapped pages of the space `reader` executes in, as runs in address
 /// order, the runs two calls split joined.
-fn list_runs(reader: u64, generation: u64) -> Result<Vec<Run>, Outcome>
+fn list_runs(reader: u64) -> Result<Vec<Run>, Outcome>
 {
     let mut runs: Vec<Run> = Vec::new();
     let mut page = vec![PageRun::default(); usize::try_from(MAX_PAGE_RUNS).unwrap_or(1)];
     let mut start = 0;
     loop
     {
-        if fired(generation)
+        if expired()
         {
             return Err(Outcome::Cancelled);
         }
@@ -504,18 +494,17 @@ fn write_core(
     core: &layout::Core,
     name: &[u8],
     source: &Source,
-    generation: u64,
     bound: &mut ipc::ResidentBound<'_>,
 ) -> Outcome
 {
-    let seq = match make_room(core.size, generation)
+    let seq = match make_room(core.size)
     {
         Ok(seq) => seq,
         Err(outcome) => return outcome,
     };
     let (core_name, partial_name) = store::names(seq, name);
     let partial = format!("{CORE_DIR}{partial_name}");
-    if fired(generation)
+    if expired()
     {
         return Outcome::Cancelled;
     }
@@ -527,16 +516,16 @@ fn write_core(
     {
         return Outcome::Failed("the core file was not created");
     };
-    if let Err(outcome) = write_bounded(&mut file, &core.head, generation)
+    if let Err(outcome) = write_bounded(&mut file, &core.head)
     {
         return outcome;
     }
-    if let Err(outcome) = write_loads(&mut file, core, source, generation, bound)
+    if let Err(outcome) = write_loads(&mut file, core, source, bound)
     {
         return outcome;
     }
     drop(file);
-    if fired(generation)
+    if expired()
     {
         return Outcome::Cancelled;
     }
@@ -550,9 +539,9 @@ fn write_core(
 /// Delete the `.part` files earlier dumps left and the oldest cores until a
 /// core of `size` bytes fits [`CORE_DIR_BYTES_MAX`]; the new core's sequence
 /// number.
-fn make_room(size: u64, generation: u64) -> Result<u64, Outcome>
+fn make_room(size: u64) -> Result<u64, Outcome>
 {
-    if fired(generation)
+    if expired()
     {
         return Err(Outcome::Cancelled);
     }
@@ -565,7 +554,7 @@ fn make_room(size: u64, generation: u64) -> Result<u64, Outcome>
     let mut cores = Vec::new();
     for item in dir
     {
-        if fired(generation)
+        if expired()
         {
             return Err(Outcome::Cancelled);
         }
@@ -608,7 +597,7 @@ fn make_room(size: u64, generation: u64) -> Result<u64, Outcome>
     {
         if evicted.contains(seq)
         {
-            if fired(generation)
+            if expired()
             {
                 return Err(Outcome::Cancelled);
             }
@@ -625,13 +614,12 @@ fn make_room(size: u64, generation: u64) -> Result<u64, Outcome>
 /// `source` one page at a time; a page the kernel refuses to copy, and
 /// procmgr cannot make resident under the dump's `bound`, is written as
 /// zeros. The bound's pauses are the dump's ([`restore_first`]), and once the
-/// dump's generation has fired no page is asked for: the next write ends the
+/// dump's deadline has passed no page is asked for: the next write ends the
 /// dump.
 fn write_loads(
     file: &mut File,
     core: &layout::Core,
     source: &Source,
-    generation: u64,
     bound: &mut ipc::ResidentBound<'_>,
 ) -> Result<(), Outcome>
 {
@@ -670,27 +658,27 @@ fn write_loads(
                     page.fill(0);
                 }
             }
-            write_bounded(file, part, generation)?;
+            write_bounded(file, part)?;
             va = va.saturating_add(len as u64);
         }
     }
     Ok(())
 }
 
-/// Write all of `bytes` to `file`, sending no write once `generation` has
-/// fired. A write the watchdog cancelled fails, as does any other, and ends
-/// the dump.
-fn write_bounded(file: &mut File, mut bytes: &[u8], generation: u64) -> Result<(), Outcome>
+/// Write all of `bytes` to `file`, under the dump's deadline: a write the
+/// deadline ends fails `TimedOut` and ends the dump [`Outcome::Cancelled`],
+/// and any other failure ends it too.
+fn write_bounded(file: &mut File, mut bytes: &[u8]) -> Result<(), Outcome>
 {
     while !bytes.is_empty()
     {
-        if fired(generation)
-        {
-            return Err(Outcome::Cancelled);
-        }
         match file.write(bytes)
         {
             Ok(n) if n > 0 => bytes = bytes.get(n..).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(Outcome::Cancelled);
+            }
             _ => return Err(Outcome::Failed("the core file was not written")),
         }
     }

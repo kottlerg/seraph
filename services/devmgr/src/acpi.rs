@@ -7,8 +7,8 @@
 //!
 //! `QUERY_ACPI_RESOURCES` of a fixed register block is answered on the
 //! registry worker that receives it, from the FADT alone. Every other
-//! request, the `QUERY_ACPI_RESOURCES` of the SCI and of the sleep
-//! registers among them ([`on_control`]), runs on the control thread,
+//! request, the `QUERY_ACPI_RESOURCES` of the SCI, of `RESET_REG` and of
+//! the sleep registers among them ([`on_control`]), runs on the control thread,
 //! which owns the device records, the apertures, the interrupt lines and
 //! the configuration space: the worker posts it as a [`Job`], signals the control thread, and
 //! replies with what it hands back, so a region grant, a configuration
@@ -26,7 +26,7 @@
 
 use std::sync::mpsc;
 
-use firmware::acpi::{FixedRegister, SleepRegister};
+use firmware::acpi::{FixedRegister, ResetRegister, SleepRegister};
 use firmware::acpid::{
     Address, ConfigAccess, ConfigError, ConfigOp, Disagreement, Grants, Osc, PrtMode, PrtTable,
     Push, Range, Space, Window,
@@ -93,6 +93,8 @@ pub enum Request
     /// `QUERY_ACPI_RESOURCES` of `ACPI_SLEEP_CONTROL` or
     /// `ACPI_SLEEP_STATUS`.
     Sleep(SleepRegister),
+    /// `QUERY_ACPI_RESOURCES` of `ACPI_RESET`.
+    Reset,
     /// `ACPI_HOTPLUG`: `event` at the slot of the port at `port`.
     Hotplug
     {
@@ -265,6 +267,7 @@ fn resources_request(which: u64) -> Option<Request>
     match which
     {
         labels::ACPI_SCI => Some(Request::Sci),
+        labels::ACPI_RESET => Some(Request::Reset),
         labels::ACPI_SLEEP_CONTROL => Some(Request::Sleep(SleepRegister::Control)),
         labels::ACPI_SLEEP_STATUS => Some(Request::Sleep(SleepRegister::Status)),
         _ => None,
@@ -345,15 +348,19 @@ pub fn run_on_control(jobs: &Jobs, signal: impl FnOnce(), request: Request, ipc_
 }
 
 /// Whether `QUERY_ACPI_RESOURCES` of `block` runs on the control thread: the
-/// SCI, whose line the control thread holds, and the sleep registers, whose
-/// memory page it keeps beside the region grants (`AcpiService::memory`),
-/// since one page can hold both. The worker answers every other block
+/// SCI, whose line the control thread holds, and `RESET_REG` and the sleep
+/// registers, whose memory page it keeps beside the region grants
+/// (`AcpiService::memory_cap`), since one page can hold them and an
+/// operation region. The worker answers every other block
 /// ([`query_resources`]).
 pub const fn on_control(block: u64) -> bool
 {
     matches!(
         block,
-        labels::ACPI_SCI | labels::ACPI_SLEEP_CONTROL | labels::ACPI_SLEEP_STATUS
+        labels::ACPI_SCI
+            | labels::ACPI_RESET
+            | labels::ACPI_SLEEP_CONTROL
+            | labels::ACPI_SLEEP_STATUS
     )
 }
 
@@ -370,7 +377,6 @@ pub fn query_resources(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
         labels::ACPI_PM1A_CNT => FadtBlock::Pm1aCnt,
         labels::ACPI_GPE0 => FadtBlock::Gpe0,
         labels::ACPI_SMI_CMD => FadtBlock::SmiCmd,
-        labels::ACPI_RESET => FadtBlock::Reset,
         _ =>
         {
             reply_status(errors::INVALID_REQUEST, ipc_buf);
@@ -441,6 +447,9 @@ pub struct AcpiService
     /// when the FADT is not hardware-reduced or names no usable register
     /// (`firmware::acpi::fadt_sleep_register`).
     sleep: [Option<FixedRegister>; 2],
+    /// The FADT's `RESET_REG` and `RESET_VALUE`, `None` when it names no
+    /// usable one (`firmware::acpi::fadt_reset_register`).
+    reset: Option<ResetRegister>,
 }
 
 impl AcpiService
@@ -469,6 +478,9 @@ impl AcpiService
                     firmware::acpi::fadt_sleep_register(bytes, register)
                 })
             })
+        });
+        let reset = tables::locate_table_by_sig(firmware, *b"FACP").and_then(|fadt| {
+            tables::with_acpi_table(firmware, fadt, firmware::acpi::fadt_reset_register)
         });
         let facs = facs_phys.and_then(|base| {
             firmware::acpid::grant_range(Space::Memory, base, firmware::acpi::FACS_MIN_LEN)
@@ -499,6 +511,7 @@ impl AcpiService
             sci_int,
             sci_served: false,
             sleep,
+            reset,
         }
     }
 
@@ -621,6 +634,7 @@ impl AcpiService
             Request::HostBridge { ordinal } => self.host_bridge(ordinal),
             Request::Sci => self.sci(irq_range),
             Request::Sleep(register) => self.sleep_register(register, records, caps),
+            Request::Reset => self.reset_register(records, caps),
             // `run` posts it to the hotplug slots.
             Request::Hotplug { .. } => Reply::status(errors::INVALID_REQUEST),
         }
@@ -658,11 +672,8 @@ impl AcpiService
         }
     }
 
-    /// `QUERY_ACPI_RESOURCES` of a sleep register: its range, the port or the
-    /// page that holds it, refused, logged, as a region grant is refused
-    /// ([`Self::refusal`]); then an `IoPort` over the port, or the kept
-    /// grant of the page ([`Self::memory_cap`]), with the register's address,
-    /// its byte count, 0, and its space.
+    /// `QUERY_ACPI_RESOURCES` of a sleep register, checked as a region grant
+    /// is ([`Self::checked_register`]).
     fn sleep_register(
         &mut self,
         register: SleepRegister,
@@ -671,16 +682,63 @@ impl AcpiService
     ) -> Reply
     {
         let [control, status] = self.sleep;
-        let fixed = match register
+        let (fixed, name) = match register
         {
-            SleepRegister::Control => control,
-            SleepRegister::Status => status,
+            SleepRegister::Control => (control, "SLEEP_CONTROL_REG"),
+            SleepRegister::Status => (status, "SLEEP_STATUS_REG"),
         };
-        let Some(FixedRegister { space, address }) = fixed
+        fixed.map_or_else(
+            || Reply::status(errors::NO_DEVICE),
+            |fixed| self.checked_register(fixed, 0, name, records, caps),
+        )
+    }
+
+    /// `QUERY_ACPI_RESOURCES` of `RESET_REG`. A memory register is checked as
+    /// a region grant is ([`Self::checked_register`]): its cap reaches the
+    /// whole page that holds it. A port is served as the other fixed blocks
+    /// are, unchecked: its cap reaches that port alone, and a PC chipset's
+    /// `RESET_REG`, port 0xCF9, lies among the configuration-mechanism ports
+    /// a region grant is refused. Both replies carry `RESET_VALUE`.
+    fn reset_register(&mut self, records: &bind::Records, caps: &mut DevmgrCaps) -> Reply
+    {
+        let Some(ResetRegister { register, value }) = self.reset
         else
         {
             return Reply::status(errors::NO_DEVICE);
         };
+        if register.space == Space::Memory
+        {
+            return self.checked_register(register, value, "RESET_REG", records, caps);
+        }
+        let Some(cap) = u16::try_from(register.address)
+            .ok()
+            .and_then(|port| arch::current::carve_io_ports(caps, port, 1))
+        else
+        {
+            std::os::seraph::log!(
+                warn: "acpid: RESET_REG port {:#x} not served",
+                register.address
+            );
+            return Reply::status(errors::NO_DEVICE);
+        };
+        register_reply(register, value, cap)
+    }
+
+    /// A byte register of the FADT, `name`, with `value` the FADT gives with
+    /// it: its range, the port or the page that holds it, refused, logged, as
+    /// a region grant is refused ([`Self::refusal`]); then an `IoPort` over
+    /// the port, or the kept grant of the page ([`Self::memory_cap`]), with
+    /// the register's address, its byte count, `value`, and its space.
+    fn checked_register(
+        &mut self,
+        register: FixedRegister,
+        value: u8,
+        name: &str,
+        records: &bind::Records,
+        caps: &mut DevmgrCaps,
+    ) -> Reply
+    {
+        let FixedRegister { space, address } = register;
         let Some(range) = firmware::acpid::request_range(space, address, 1)
         else
         {
@@ -700,22 +758,10 @@ impl AcpiService
         };
         match cap
         {
-            Ok(cap) =>
-            {
-                let space = match space
-                {
-                    Space::Io => labels::ACPI_SPACE_IO,
-                    Space::Memory => labels::ACPI_SPACE_MEMORY,
-                };
-                let mut reply = Reply::success(&[address, 1, 0, space]);
-                reply.cap = Some(cap);
-                reply
-            }
+            Ok(cap) => register_reply(register, value, cap),
             Err(status) =>
             {
-                std::os::seraph::log!(
-                    warn: "acpid: {register:?} sleep register {space:?} {address:#x} not served"
-                );
+                std::os::seraph::log!(warn: "acpid: {name} {space:?} {address:#x} not served");
                 Reply::status(status)
             }
         }
@@ -946,6 +992,20 @@ impl AcpiService
             bridge.windows.as_ref().map_or(0, |h| h.covered),
         ])
     }
+}
+
+/// The `SUCCESS` reply serving byte register `register` through `cap`: its
+/// address, its byte count, `value`, and its space.
+fn register_reply(register: FixedRegister, value: u8, cap: u64) -> Reply
+{
+    let space = match register.space
+    {
+        Space::Io => labels::ACPI_SPACE_IO,
+        Space::Memory => labels::ACPI_SPACE_MEMORY,
+    };
+    let mut reply = Reply::success(&[register.address, 1, u64::from(value), space]);
+    reply.cap = Some(cap);
+    reply
 }
 
 /// `ACPI_PCI_CONFIG`: make the access `firmware::acpid::config_access`

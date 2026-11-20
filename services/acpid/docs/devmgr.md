@@ -14,8 +14,15 @@ by acpid's recipe alone. `ACPI_AUTHORITY` gates every label acpid alone calls; d
 - the DSDT and the SSDTs, each a read-only `Memory` capability over the reclaimable region that
   holds it (`QUERY_ACPI_TABLE`);
 - on x86-64, an `IoPort` over each FADT register block it names: the PM1a event and control
-  blocks, GPE0, `SMI_CMD` with the `ACPI_ENABLE` value, and `RESET_REG` when it is in
-  `SystemIO` (`QUERY_ACPI_RESOURCES`). RISC-V platforms have none;
+  blocks, GPE0, and `SMI_CMD` with the `ACPI_ENABLE` value (`QUERY_ACPI_RESOURCES`). RISC-V
+  platforms have none;
+- on x86-64, the FADT's `RESET_REG` with its `RESET_VALUE` (`QUERY_ACPI_RESOURCES` with
+  `ACPI_RESET`), on a hardware-reduced platform or not: an `IoPort` over its port, or an `Mmio`
+  over the page that holds it in `SystemMemory`, with the register's address. devmgr answers it
+  on its control thread; a memory register is checked and kept as a sleep register is (below),
+  and a port is served unchecked, as the other register blocks are, since a PC chipset's
+  `RESET_REG`, port 0xCF9, lies among the configuration-mechanism ports a region grant is
+  refused;
 - on a hardware-reduced x86-64 platform, which has none of those blocks, the FADT's
   `SLEEP_CONTROL_REG` and `SLEEP_STATUS_REG` (`QUERY_ACPI_RESOURCES` with `ACPI_SLEEP_CONTROL`
   and `ACPI_SLEEP_STATUS`): an `IoPort` over a port, or an `Mmio` over the page that holds a
@@ -159,14 +166,14 @@ ACPI Hotplug).
 
 ## Ordering
 
-`QUERY_ACPI_RESOURCES` for a register block (the PM1a and GPE0 blocks, `SMI_CMD`, `RESET_REG`) is
-answered on the registry worker that receives it, from the FADT alone. The SCI, the sleep registers
-and every other acpid request run on devmgr's control thread, which owns the interrupt lines, which
-owns the device records, the apertures and the configuration space: a region check and its carve, a
-configuration access and a push are decided against records no bind changes meanwhile. A request
-waits while the control thread runs a bind pass and its settle. devmgr never calls acpid, so a dead
-or stalled acpid blocks no devmgr work. A request runs to its end whatever happens to acpid: a reply
-that cannot be delivered deletes only the capability copy it carried.
+`QUERY_ACPI_RESOURCES` for a register block (the PM1a and GPE0 blocks, `SMI_CMD`) is answered on the
+registry worker that receives it, from the FADT alone. The SCI, `RESET_REG`, the sleep registers and
+every other acpid request run on devmgr's control thread, which owns the interrupt lines, the device
+records, the apertures and the configuration space: a region check and its carve, a configuration
+access and a push are decided against records no bind changes meanwhile. A request waits while the
+control thread runs a bind pass and its settle. devmgr never calls acpid, so a dead or stalled acpid
+blocks no devmgr work. A request runs to its end whatever happens to acpid: a reply that cannot be
+delivered deletes only the capability copy it carried.
 
 ---
 

@@ -31,7 +31,8 @@ use crate::endowed_servers;
 /// liveness of both is read from their registrations in `pending` before the
 /// pass, vfsd's after every read that fails and devmgr's after every mint that
 /// fails ([`endowed_servers::death`]), and a dead server ends the pass: a
-/// later call to it would wait for good.
+/// later call to it fails with `NoReceiver`, which does not itself say that
+/// the server died.
 pub fn configure(
     registry: &mut registry::Registry,
     devmgr_registry: u64,

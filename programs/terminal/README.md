@@ -21,7 +21,6 @@ terminal/
 ├── README.md
 └── src/
     ├── main.rs            # Device resolution, the session loop, line discipline
-    ├── device.rs          # One class's current driver, followed across a driver restart
     ├── session.rs         # sessiond client: registration, open, stream handover
     ├── input.rs           # Keyboard and serial RX producer threads
     └── output.rs          # Output sink: framebuffer (SGR-parsed) and serial mirror
@@ -55,15 +54,15 @@ terminal/
   new instance at the class's next ordinal
   ([Driver Restart](../../services/devmgr/docs/responsibilities.md#driver-restart)).
   Each class the terminal uses (input, framebuffer, serial) is followed by a
-  tracker (`device.rs`): it registers the class's `WATCH_CLASS` watch before
-  its first resolve and, on each signal, looks at the class again
-  (`ipc::refresh_device`), keeping the driver devmgr still serves and replacing
-  a withdrawn one with the first live driver past it. A thread whose call on a
+  [`device_tracker::Device`](../../shared/device-tracker/README.md), whose
+  crate states the contract: the class's watch registered before the first
+  resolve, a tracker thread that looks at the class again on each signal, and
+  a generation per driver it resolves. A thread whose call on a
   driver fails waits up to a second for a newer one, then calls again; the
   serial receive thread registers its notification with each new instance, and
   the sink starts its SGR parser again with a new framebuffer instance, which
   starts at the driver's default attributes. The terminal logs each driver it
-  holds (`terminal: <class> driver at ordinal <n>`) and the first write that
+  holds (`<class> driver at ordinal <n>`, under its `[terminal]` tag) and the first write that
   reaches a framebuffer instance after the first.
 - **Line discipline**:
   - local echo of each typed character to the output,

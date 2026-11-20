@@ -11,7 +11,13 @@
 //! attached (a `virtio-console` device whose host end QEMU serves on a TCP
 //! port). Once the fixture logs [`READY_MARKER`] on the serial stream, the
 //! host connects and drives one exchange ([`exchange`]), framing and checking
-//! every packet with the same `gdb-rsp` crate the fixture links. The fixture's
+//! every packet with the same `gdb-rsp` crate the fixture links. A restart
+//! round follows on the same connection ([`restart_round`]): the host kills
+//! the port's driver through QEMU's gdbstub at a hardware breakpoint in its
+//! code (`breakpoint_kill`; the driver declares itself undebuggable, so no
+//! guest debugger reaches it), waits for the fixture's [`FOLLOWED_MARKER`]
+//! once devmgr has restarted the driver at the class's next ordinal, and
+//! drives an echo through the restarted driver. The fixture's
 //! recipe is always removed and the images repacked in that layout afterwards. The verdict
 //! is computed here and the host kills QEMU, as `test-terminal` does.
 //!
@@ -19,6 +25,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -29,6 +36,7 @@ use gdb_rsp::PACKET_SIZE;
 use gdb_rsp::frame::{Event, PacketReader, PacketWriter, unescape};
 
 use crate::arch::Arch;
+use crate::breakpoint_kill;
 use crate::cli::TestDebugPortArgs;
 use crate::context::Context;
 use crate::disk::DiskLayout;
@@ -46,6 +54,22 @@ const RECIPE: &str = "debug-echo.svc";
 /// The fixture's line once it holds the debug port. Kept in sync with
 /// `services/debug-echo/src/main.rs`.
 const READY_MARKER: &str = "[debug-echo] READY on the debug port";
+
+/// The fixture's line once it holds the driver devmgr restarted at the
+/// class's next ordinal. Kept in sync with `shared/device-tracker`.
+const FOLLOWED_MARKER: &str = "[debug-echo] debug port driver at ordinal 1";
+
+/// The debug port's driver: its process name (its install path, which devmgr
+/// creates it with as its `argv[0]`), its binary under the sysroot, and the
+/// function the kill breaks on, which the driver runs on every
+/// `SERIAL_READ_BYTES` and out of line in both profiles. Kept in sync with
+/// `services/drivers/virtio/console/src/main.rs`.
+const PORT_DRIVER_NAME: &str = "/services/drivers/virtio-console";
+const PORT_DRIVER_BINARY: &str = "services/drivers/virtio-console";
+const PORT_DRIVER_FUNCTION: &str = "<virtio_console::Console>::drain_rx";
+
+/// Budget for the restart, from the kill to [`FOLLOWED_MARKER`].
+const RESTART_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Budget for the boot to reach [`READY_MARKER`].
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
@@ -84,7 +108,10 @@ pub fn run(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
         .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, layout))
         .context("restoring the disk images without the fixture")?;
     booted?;
-    step("debug port test: PASS (packets reached the fixture and its answers came back)");
+    step(
+        "debug port test: PASS (packets reached the fixture and its answers came back, across a \
+         restart of the port's driver)",
+    );
     Ok(())
 }
 
@@ -95,6 +122,12 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<(
     // Picked here, right before QEMU binds it, to keep the window in which
     // another process could take it short.
     let port = crate::util::debug_port_or_free(args.port)?;
+    let driver = breakpoint_kill::resolve_installed(ctx, PORT_DRIVER_BINARY, PORT_DRIVER_FUNCTION)?;
+    let sock_dir = ctx.target_dir.join("xtask");
+    std::fs::create_dir_all(&sock_dir)
+        .with_context(|| format!("creating {}", sock_dir.display()))?;
+    let gdb_sock = sock_dir.join(format!("debug-port-{}.gdb", std::process::id()));
+    let _ = std::fs::remove_file(&gdb_sock);
     let (firmware_code, firmware_vars) = match args.arch
     {
         Arch::X86_64 => (find_ovmf_code()?, None),
@@ -120,7 +153,7 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<(
         threads_per_core: 1,
         mem_mib: args.mem,
         display: QemuDisplay::Headless,
-        gdb: GdbMode::Off,
+        gdb: GdbMode::Unix(&gdb_sock),
         qmp_socket: None,
         vmgenid_guid: Some("auto"),
         incoming: None,
@@ -148,12 +181,11 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<(
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
 
-    // Serial lines on a worker thread, so the wait for the marker has a
+    // Serial lines on a worker thread, so each wait for a marker has a
     // deadline; the thread keeps echoing the guest's log through the
     // exchange.
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<String>();
     let reader = thread::spawn(move || {
-        let mut signalled = false;
         for line in BufReader::new(stdout).lines()
         {
             let Ok(l) = line
@@ -162,31 +194,31 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<(
                 break;
             };
             println!("{l}");
-            if !signalled && l.contains(READY_MARKER)
+            if tx.send(l).is_err()
             {
-                signalled = true;
-                let _ = tx.send(());
+                break;
             }
         }
     });
 
-    let result = rx
-        .recv_timeout(BOOT_TIMEOUT)
-        .map_err(|_| {
-            crate::error::err!(
-                "the fixture's {READY_MARKER:?} line did not appear within {}s",
-                BOOT_TIMEOUT.as_secs()
-            )
-        })
+    let mut serial = Serial {
+        rx,
+        seen: Vec::new(),
+    };
+    let result = serial
+        .wait_for(&[READY_MARKER], BOOT_TIMEOUT)
         .and_then(|()| {
             let stream = TcpStream::connect(("127.0.0.1", port))
                 .with_context(|| format!("connecting to 127.0.0.1:{port}"))?;
             stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
-            exchange(&mut Link::new(stream))
+            let mut link = Link::new(stream);
+            exchange(&mut link)?;
+            restart_round(args.arch, &gdb_sock, &driver, &mut link, &mut serial)
         });
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
+    let _ = std::fs::remove_file(&gdb_sock);
     result
 }
 
@@ -330,6 +362,84 @@ fn exchange(link: &mut Link) -> Result<()>
     })?;
     expect_body(link, b"E02", "the refusal of a packet past the buffer")?;
     Ok(())
+}
+
+/// The restart round, in no-ack mode after [`exchange`]: kill the port's
+/// driver at [`PORT_DRIVER_FUNCTION`], which it runs on each of the
+/// fixture's reads, so no trigger is needed; wait for the fixture to hold the
+/// driver devmgr restarted, and echo through that driver.
+fn restart_round(
+    arch: Arch,
+    gdb_sock: &Path,
+    driver: &breakpoint_kill::Function,
+    link: &mut Link,
+    serial: &mut Serial,
+) -> Result<()>
+{
+    let bias = breakpoint_kill::spawn_bias(&serial.seen, PORT_DRIVER_NAME).with_context(|| {
+        format!("no procmgr bias line for {PORT_DRIVER_NAME} before the fixture's READY")
+    })?;
+    let killed = breakpoint_kill::kill_at_breakpoint(arch, gdb_sock, bias, driver, || ())?;
+    step(&format!(
+        "debug port test: moved the port's driver at {:#x} to 0",
+        killed.pc
+    ));
+    serial.wait_for(&[FOLLOWED_MARKER], RESTART_TIMEOUT)?;
+    let data = b"after the restart";
+    link.send_packet(|w| {
+        w.bytes(b"qSeraph.Echo:").bytes(data);
+    })?;
+    let echoed = link.expect(&Expect::Packet, "the echo after the restart")?;
+    if echoed != data
+    {
+        bail!(
+            "the echo after the restart differs: {:?}",
+            String::from_utf8_lossy(&echoed)
+        );
+    }
+    Ok(())
+}
+
+/// The guest's serial lines, as the reader thread passes them on, and every
+/// line taken so far.
+struct Serial
+{
+    rx: mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+impl Serial
+{
+    /// Wait until every one of `markers` has appeared, in any order, within
+    /// `budget`.
+    fn wait_for(&mut self, markers: &[&str], budget: Duration) -> Result<()>
+    {
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .context("the wait's deadline")?;
+        let mut missing: Vec<&str> = markers.to_vec();
+        while !missing.is_empty()
+        {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left)
+            {
+                Ok(line) =>
+                {
+                    missing.retain(|m| !line.contains(m));
+                    self.seen.push(line);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) =>
+                {
+                    bail!("{missing:?} did not appear within {}s", budget.as_secs())
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) =>
+                {
+                    bail!("the serial stream ended waiting for {missing:?}")
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Expect a packet whose body is `want`.

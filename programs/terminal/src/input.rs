@@ -21,7 +21,7 @@ use std::time::Duration;
 use ipc::{IpcMessage, input_errors, input_labels, keysym, serial_errors, serial_labels};
 
 use crate::Msg;
-use crate::device::{Device, Driver};
+use device_tracker::{Device, Driver};
 
 /// Bounded wait between serial RX drains. Backstops the edge-triggered
 /// delivery the serial driver registers the x86 UART line with (mode 0; a

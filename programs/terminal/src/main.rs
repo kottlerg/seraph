@@ -25,13 +25,12 @@
 //! ownership of the sink is why no locking is needed, and its source-agnostic
 //! discipline is why a new input source is just another producer.
 //!
-//! Each driver class is followed by a [`device::Device`], which keeps its
+//! Each driver class is followed by a [`device_tracker::Device`], which keeps its
 //! current driver across devmgr's restart of it, on the class's watch.
 //!
 //! Remaining deferrals are documented in `README.md`: signals/cooked-raw/
 //! job-control/multi-session (#29) and the real interactive shell (#112).
 
-mod device;
 mod input;
 mod output;
 mod session;
@@ -73,7 +72,8 @@ fn main() -> !
         std::os::seraph::log!(error: "terminal: a seed is missing; exiting");
         syscall::thread_exit();
     };
-    let input = device::Device::start(input_class, "input", ipc_buf);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let input = unsafe { device_tracker::Device::start(input_class, "input", ipc_buf) };
     let Some(input_driver) = input.await_first("input")
     else
     {
@@ -83,12 +83,14 @@ fn main() -> !
     // The framebuffer is the primary output but optional: a headless boot has
     // none, and the terminal then mirrors to serial only, until devmgr serves
     // one.
-    let framebuffer = device::Device::start(fb_class, "framebuffer", ipc_buf);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let framebuffer = unsafe { device_tracker::Device::start(fb_class, "framebuffer", ipc_buf) };
     if framebuffer.current().is_none()
     {
         std::os::seraph::log!(warn: "terminal: framebuffer unavailable; serial-only output");
     }
-    let serial = device::Device::start(serial_class, "serial", ipc_buf);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let serial = unsafe { device_tracker::Device::start(serial_class, "serial", ipc_buf) };
     let Some(serial_driver) = serial.await_first("serial")
     else
     {

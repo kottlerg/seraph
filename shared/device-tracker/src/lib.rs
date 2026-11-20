@@ -1,23 +1,47 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// programs/terminal/src/device.rs
+// shared/device-tracker/src/lib.rs
 
-//! The terminal's drivers, one [`Device`] per class (input, framebuffer,
-//! serial), each kept current across a driver's restart.
+//! A device class's current driver, kept across devmgr's restart of it, for
+//! the `std` clients of the class (the terminal, gdbstub, debug-echo): one
+//! [`Device`] per class a client follows.
 //!
-//! devmgr restarts a served driver that dies and serves the new instance at
-//! the class's next ordinal, and signals the class's `WATCH_CLASS` watches at
-//! the withdrawal and again when the new instance is served
-//! (services/devmgr/docs/responsibilities.md § Driver Restart, Clients). A
-//! [`Device`] registers the watch before its first resolve, so no change is
-//! missed, and a tracker thread of its own waits on it and looks at the class
-//! again on each signal (`ipc::refresh_device`): the held driver is kept while
-//! devmgr still serves it, and replaced by the first live driver past it once
-//! withdrawn. The look waits for a restart's settle, which no other thread of
-//! the terminal does. The threads that call the driver read the current one
-//! here, each with its generation, so a thread whose call fails waits for a
-//! newer one ([`Device::await_newer`]) and the sink sees a new instance.
+//! The contract, which services/devmgr/docs/responsibilities.md § Driver
+//! Restart, Clients sets for every client:
+//!
+//! - **Watch before the first resolve.** devmgr restarts a served driver that
+//!   dies and serves the new instance at the class's next ordinal, and
+//!   signals the class's `WATCH_CLASS` watches at the withdrawal and again
+//!   when the new instance is served. [`Device::start`] registers the watch
+//!   before it resolves the class's first live driver, so no change between
+//!   the two is missed.
+//! - **The look on each signal.** A tracker thread of the device's own waits
+//!   on the watch and looks at the class again on each signal
+//!   (`ipc::refresh_device`): the held driver is kept while devmgr still
+//!   serves its ordinal, and replaced by the first live driver past it once
+//!   withdrawn, or none. devmgr's answer at the held ordinal decides, not the
+//!   held SEND, which can still work when the signal comes.
+//! - **The settle wait is the tracker's.** A `QUERY_DEVICE` past a withdrawn
+//!   ordinal waits until the restart's settle ends, which can take as long as
+//!   the new instance's start. The tracker thread makes it, so no thread that
+//!   calls the driver, or serves anything else, waits on it.
+//! - **Generations.** Each driver the tracker resolves takes the next
+//!   generation ([`Driver::generation`]). A user reads the current driver
+//!   with [`Device::current`] before each call, and tells a new instance from
+//!   the one it held by its generation: a thread whose call failed waits for
+//!   a newer one ([`Device::await_newer`]), and a client re-registers with a
+//!   new instance whatever it registered with the dead one (an RX
+//!   notification) when the generation changes.
+//! - **The tracker deletes the dead SEND.** When it replaces or loses a
+//!   driver it deletes the SEND it held; a call still in flight on it then
+//!   fails, and its thread reads the current driver again.
+//!
+//! The crate spawns `std` threads and logs through `std::os::seraph`, so it
+//! compiles only for seraph. Its lines carry the client's log name; `what`
+//! names the class in them.
+
+#![cfg(target_os = "seraph")]
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
@@ -60,16 +84,20 @@ pub struct Device
 impl Device
 {
     /// Follow the class whose class SEND is `class_send`, named `what` in
-    /// the terminal's lines: register its watch, resolve its first live
+    /// the client's lines: register its watch, resolve its first live
     /// driver, and start the tracker thread. A refused watch, or a tracker
     /// that cannot be spawned, leaves the first resolve for the run, logged.
-    pub fn start(class_send: u64, what: &'static str, ipc_buf: *mut u64) -> Self
+    ///
+    /// # Safety
+    /// `ipc_buf` must point to the calling thread's registered IPC buffer
+    /// page.
+    pub unsafe fn start(class_send: u64, what: &'static str, ipc_buf: *mut u64) -> Self
     {
-        // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+        // SAFETY: the caller guarantees ipc_buf is the registered IPC buffer.
         let watch = unsafe { ipc::watch_class(class_send, ipc_buf) }
             .inspect_err(|e| {
                 std::os::seraph::log!(
-                    warn: "terminal: {what} class watch refused ({e:?}); resolved once"
+                    warn: "{what} class watch refused ({e:?}); resolved once"
                 );
             })
             .ok();
@@ -102,7 +130,7 @@ impl Device
         }
         else
         {
-            std::os::seraph::log!(warn: "terminal: {what} tracker not spawned; resolved once");
+            std::os::seraph::log!(warn: "{what} tracker not spawned; resolved once");
             let _ = syscall::cap_delete(watch.note);
         }
         device
@@ -115,7 +143,7 @@ impl Device
         let ipc_buf = std::os::seraph::current_ipc_buf();
         if ipc_buf.is_null()
         {
-            std::os::seraph::log!(error: "terminal: {what} tracker has no IPC buffer");
+            std::os::seraph::log!(error: "{what} tracker has no IPC buffer");
             return;
         }
         loop
@@ -129,7 +157,7 @@ impl Device
                 Err(e) =>
                 {
                     std::os::seraph::log!(
-                        error: "terminal: {what} class watch wait failed ({e}); no longer followed"
+                        error: "{what} class watch wait failed ({e}); no longer followed"
                     );
                     return;
                 }
@@ -152,7 +180,7 @@ impl Device
             Ok(Refresh::Lost) => None,
             Err(e) =>
             {
-                std::os::seraph::log!(warn: "terminal: {what} device query failed ({e:?})");
+                std::os::seraph::log!(warn: "{what} device query failed ({e:?})");
                 return;
             }
         };
@@ -173,9 +201,9 @@ impl Device
         {
             Some((ordinal, _)) =>
             {
-                std::os::seraph::log!("terminal: {what} driver at ordinal {ordinal}");
+                std::os::seraph::log!("{what} driver at ordinal {ordinal}");
             }
-            None => std::os::seraph::log!(warn: "terminal: {what} driver withdrawn; none served"),
+            None => std::os::seraph::log!(warn: "{what} driver withdrawn; none served"),
         }
         if let Some(old) = old
         {
@@ -190,10 +218,11 @@ impl Device
         lock.lock().unwrap_or_else(PoisonError::into_inner).driver
     }
 
-    /// The first driver, for a class the terminal cannot run without: the
+    /// The first driver, for a class the client cannot run without: the
     /// current one, or, while the class serves none, the first the tracker
     /// resolves, waited for without a bound and logged once as `what`.
     /// `None` when no tracker follows the class and none was resolved.
+    #[must_use]
     pub fn await_first(&self, what: &str) -> Option<Driver>
     {
         if let Some(driver) = self.current()
@@ -204,7 +233,7 @@ impl Device
         {
             return None;
         }
-        std::os::seraph::log!("terminal: no {what} device yet; waiting for devmgr to serve one");
+        std::os::seraph::log!("no {what} device yet; waiting for devmgr to serve one");
         self.wait_for(|driver| driver.is_some(), None)
     }
 
@@ -212,6 +241,7 @@ impl Device
     /// waited for for at most `bound`. `None` when none came in that time,
     /// and the thread calls `held` again; a failure devmgr does not follow
     /// with a withdrawal is retried so.
+    #[must_use]
     pub fn await_newer(&self, held: Driver, bound: Duration) -> Option<Driver>
     {
         self.wait_for(

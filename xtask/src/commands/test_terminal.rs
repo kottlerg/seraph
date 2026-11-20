@@ -116,8 +116,8 @@ const SERIAL_INPUT: &[u8] = b"helpx\x7f\r";
 const INPUT_DRIVER: &str = "/services/drivers/virtio-input";
 
 /// The terminal's line once it holds the input driver devmgr restarted at the
-/// class's next ordinal. Kept in sync with `programs/terminal/src/device.rs`.
-const INPUT_REPLACED: &str = "terminal: input driver at ordinal 1";
+/// class's next ordinal. Kept in sync with `shared/device-tracker`.
+const INPUT_REPLACED: &str = "[terminal] input driver at ordinal 1";
 
 /// Budget for the stub's answer to the host's first request: the stub
 /// answers once its look for the target at its start has ended

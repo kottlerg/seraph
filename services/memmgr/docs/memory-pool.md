@@ -1019,18 +1019,20 @@ that would take the count past it (core/kernel/docs/memory-internals.md §
 so a frame many address spaces map must stay under that count, or one attacher could make
 another's read fail. Each attachment maps a page of its origin at most once. An object takes at
 most `OBJECT_MAX_ATTACHMENTS` (2^31) attachments at once, and memmgr maps an object frame itself
-only in its scrub window while it copies the frame. The zero object is backed by up to
-`ZERO_FRAMES` (256) zero frames, and each zero-object attachment by one of them, the first whose
-span, the pages of the attachments it backs, can take the attachment's pages within
-`ZERO_FRAME_SPAN` (2^31); a detach gives its pages back to the span. An attachment past either
-bound is refused with `LIMIT` ([ipc-interface.md](ipc-interface.md) § Label 28). A zero frame's
-span, full, holds attachments that promise 16 GiB of page tables, so the zero frames run out only
-while 4 TiB of RAM is promised to zero-object page tables
-([docs/limits.md](../../../docs/limits.md) § memmgr).
+only in its scrub window while it copies the frame. Each zero-object attachment maps one zero
+frame, which backs at most `ZERO_FRAME_SPAN` (2^31) pages of the attachments it is chosen for:
+memmgr chooses the first whose span takes the attachment's pages, and takes a new one when none
+does; a detach gives its pages back to the span. An attachment past either bound, an object
+attached `OBJECT_MAX_ATTACHMENTS` times or a zero-object attachment longer than
+`ZERO_FRAME_SPAN` pages, is refused with `LIMIT` ([ipc-interface.md](ipc-interface.md)
+§ Label 28); a longer zero region is attached in several attachments.
 
-**Zero frames.** A zero frame is taken from the free pool at the first zero-object attachment it
-backs, which is refused when the pool cannot spare it, zeroed, and kept for memmgr's life, charged
-to no budget node, as memmgr's metadata is.
+**Zero frames.** A zero frame is a page taken from the free pool when no zero frame's span takes a
+new zero-object attachment, which is refused when the pool cannot spare it, zeroed, and recorded
+in an arena node on the ledger's list of zero frames. It is kept for memmgr's life and charged to
+no budget node, as memmgr's metadata is. A zero frame is taken only when every other one's span is
+too full for the new attachment, so the zero frames grow only with the zero-object attachments
+standing at once, each of which holds arena slots and page tables of its own.
 
 ---
 

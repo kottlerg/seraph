@@ -569,7 +569,11 @@ pub const SEAL_OBJECT_MAX_GRANTS: u64 = 63;
 /// badge, a bad range, protection or flag, a cap that is no live object
 /// handle, pages past the object's end, or a range overlapping a region of the
 /// caller); `LIMIT` or `OUT_OF_MEMORY_BEST_EFFORT` as for a committed
-/// `REGISTER_REGION`; or `QUOTA`. A reply that does not reach the caller
+/// `REGISTER_REGION`, `LIMIT` also for an object attached as often as
+/// memmgr lets one be or a zero-object region longer than one zero frame
+/// backs (§ Memory objects, Mapping bound, of
+/// `services/memmgr/docs/memory-pool.md`), split into shorter ones; or
+/// `QUOTA`. A reply that does not reach the caller
 /// detaches the region again. [`UNREGISTER_REGION`] detaches it. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 28: `ATTACH_OBJECT`.
 pub const ATTACH_OBJECT: u64 = 28;

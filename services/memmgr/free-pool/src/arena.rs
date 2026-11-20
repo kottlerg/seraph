@@ -193,22 +193,11 @@ pub struct Commitment
     pub source: Option<Attachment>,
 }
 
-/// [`Attachment::object`] of an attachment of the zero object: every page
-/// reads as zero, and no object slot holds it.
-pub const ZERO_OBJECT: NodeIdx = NODE_NULL;
-
-/// The zero frames memmgr keeps at most: each backs the zero-object
-/// attachments assigned to it, at most [`ZERO_FRAME_SPAN`] pages of them
-/// (`services/memmgr/docs/memory-pool.md` § Memory objects). Every index
-/// fits [`Attachment::zero_frame`]. A full span's attachments promise their
-/// page-table reservation, 16 GiB of leaf tables, so the table is full only
-/// while 4 TiB of RAM is promised to zero-object page tables.
-pub const ZERO_FRAMES: usize = 256;
-
 /// The zero-object attachment pages one zero frame backs at most. Each page
 /// maps its zero frame at most once, so the kernel's per-frame mapping count,
 /// a saturating `u32` that refuses the map at its ceiling, stays below half
-/// of it, and no process can make another's read of the zero object fail.
+/// of it, and no process can make another's read of the zero object fail. A
+/// larger zero region is attached in several attachments.
 pub const ZERO_FRAME_SPAN: u64 = 1 << 31;
 
 /// The regions that may attach one memory object at once. Each maps an object
@@ -217,6 +206,21 @@ pub const ZERO_FRAME_SPAN: u64 = 1 << 31;
 /// below its `u32` ceiling and no attacher can make another's read fail.
 pub const OBJECT_MAX_ATTACHMENTS: u32 = 1 << 31;
 
+/// A zero frame (`services/memmgr/docs/memory-pool.md` § Memory objects,
+/// Mapping bound): one zeroed page that every untouched page of the
+/// zero-object attachments it backs maps read-only, kept for memmgr's life and
+/// charged to no budget node. memmgr takes one whenever no zero frame's span
+/// takes a new attachment's pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZeroFrame
+{
+    /// memmgr's cap of the page.
+    pub cap_slot: u64,
+    pub phys_base: u64,
+    /// The pages of the attachments it backs, at most [`ZERO_FRAME_SPAN`].
+    pub span: u64,
+}
+
 /// How a region attaches a memory object
 /// (`services/memmgr/docs/memory-pool.md` § Memory objects): the object, the
 /// object page the region's first page shows, and whether the region shares
@@ -224,14 +228,12 @@ pub const OBJECT_MAX_ATTACHMENTS: u32 = 1 << 31;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attachment
 {
-    /// The [`Node::Object`] slot, or [`ZERO_OBJECT`].
+    /// The [`Node::Object`] slot, or for the zero object the
+    /// [`Node::ZeroFrame`] slot of the zero frame its pages map.
     pub object: NodeIdx,
     /// The object page at the region's base; 0 for the zero object.
     pub first_page: u64,
     pub share: Share,
-    /// For the zero object, the zero frame its pages map, below
-    /// [`ZERO_FRAMES`]; 0 for any other object.
-    pub zero_frame: u8,
 }
 
 /// Whether an attachment shares its object's pages or copies each it writes.
@@ -284,6 +286,7 @@ const _: () = assert!(size_of::<LimitReg>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<DiskNode>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<MemObject>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<ZeroFrame>() <= size_of::<ProcessRecord>());
 
 /// Where a write stands ([`DiskNode`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +358,8 @@ pub enum Node
     Disk(DiskNode),
     /// An immutable memory object.
     Object(MemObject),
+    /// A zero frame, on the ledger's list of them.
+    ZeroFrame(ZeroFrame),
 }
 
 /// An arena slot: a payload plus the index of the next slot on whichever

@@ -23,9 +23,8 @@ use free_pool::{
     Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node,
     NodeError, NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget,
     RegionError, ResidentPath, ResizeError, SealError, SelectError, Share, SlotStore, WordStore,
-    ZERO_FRAMES, ZERO_OBJECT, arena::Slot, chunk::table_height, chunk_count, chunk_for,
-    commit::grow_need, commit::regrow_need, fault_window, pending_from, region_grants,
-    reserve_pages,
+    ZERO_FRAME_SPAN, arena::Slot, chunk::table_height, chunk_count, chunk_for, commit::grow_need,
+    commit::regrow_need, fault_window, pending_from, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -3218,7 +3217,7 @@ fn attachment_fault(
     {
         return map_origin(l, target, region, att).map(|()| None);
     }
-    if att.object != ZERO_OBJECT
+    if l.zero_frame(att.object).is_none()
     {
         return copy_object_page(l, target, region, att).map(Some);
     }
@@ -3256,12 +3255,10 @@ fn map_origin(
 ) -> Result<(), (FaultDecline, u64)>
 {
     let (start, end) = target.span;
-    let (cap, offset, va, pages, step) = if att.object == ZERO_OBJECT
+    let (cap, offset, va, pages, step) = if let Some(zero) = l.zero_frame(att.object)
     {
-        // An attachment of the zero object took its zero frame first.
-        let zero = zero_frame(l, att.zero_frame).ok_or((FaultDecline::NoFreePage, 0))?;
         let pages = end.saturating_sub(start) / PAGE_SIZE;
-        (zero, 0, start, pages, 1)
+        (zero.cap_slot, 0, start, pages, 1)
     }
     else
     {
@@ -3393,43 +3390,6 @@ fn copy_page(l: &mut MemLedger, src: u64, src_offset: u64, dst: u64) -> Result<(
     }
     // SAFETY: the span is the two window pages mapped above.
     unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, 2) }
-}
-
-/// The zero object's frames: each one page, taken from the pool at the first
-/// zero-object attachment assigned to it, zeroed, and kept for memmgr's life,
-/// charged to no budget node, as the arena's pages are. Every page of a
-/// zero-object attachment no write has backed maps its attachment's frame
-/// read-only, and the ledger keeps each frame's attachments within
-/// `ZERO_FRAME_SPAN` pages, so its mapping count stays below the kernel's
-/// ceiling. Only the receive loop's thread reaches them, so a plain static
-/// suffices.
-static mut ZERO_FRAME_CAPS: [Option<u64>; ZERO_FRAMES] = [None; ZERO_FRAMES];
-
-/// The cap of zero frame `index` ([`ZERO_FRAME_CAPS`]), taking and zeroing it
-/// first when memmgr has none. `None` when the pool cannot spare the page or
-/// its scrub fails.
-fn zero_frame(l: &mut MemLedger, index: u8) -> Option<u64>
-{
-    let i = usize::from(index);
-    // SAFETY: only the receive loop's thread reaches this; no concurrent access.
-    let have = unsafe { (*core::ptr::addr_of!(ZERO_FRAME_CAPS)).get(i).copied() }.flatten();
-    if let Some(cap) = have
-    {
-        return Some(cap);
-    }
-    let grant = select(l, 1, Fit::Contiguous).ok()?;
-    let (outer, pages, phys) = grant.entries[0];
-    if scrub_run(l, outer, u64::from(pages)).is_err()
-    {
-        return_taken(l, outer, pages, phys);
-        return None;
-    }
-    // SAFETY: as above.
-    if let Some(slot) = unsafe { (*core::ptr::addr_of_mut!(ZERO_FRAME_CAPS)).get_mut(i) }
-    {
-        *slot = Some(outer);
-    }
-    Some(outer)
 }
 
 /// Total pages of RAM memmgr owns: every page it has taken ownership of since
@@ -3999,22 +3959,24 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         return;
     }
     let l = ledger_mut();
-    let object = match handle
-    {
-        None => Some(ZERO_OBJECT),
-        Some(badge) => badge
-            .filter(|b| b & memmgr_labels::OBJECT_HANDLE_TAG != 0)
-            .and_then(|b| l.find_object(b)),
-    };
-    let (Some(object), Some(rec)) = (object, l.find(req.badge))
+    let Some(rec) = l.find(req.badge)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let zero = match attach_zero_frame(l, object, len / PAGE_SIZE)
+    // The object's slot, or for the zero object the zero frame's.
+    let object = match handle
     {
-        Ok(index) => index,
+        None => attach_zero_frame(l, len / PAGE_SIZE),
+        Some(badge) => badge
+            .filter(|b| b & memmgr_labels::OBJECT_HANDLE_TAG != 0)
+            .and_then(|b| l.find_object(b))
+            .ok_or(memmgr_errors::INVALID_ARGUMENT),
+    };
+    let object = match object
+    {
+        Ok(object) => object,
         Err(label) =>
         {
             reply_label(ipc_buf, label);
@@ -4036,7 +3998,6 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
         object,
         first_page,
         share,
-        zero_frame: zero,
     };
     let mut result = l.attach_object(rec, region, source);
     // The region's slot and its commitment's.
@@ -4077,23 +4038,45 @@ fn handle_attach_object(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, servi
     }
 }
 
-/// The zero frame an attachment of `pages` pages of `object` maps: for the
-/// zero object, the first whose span takes the pages
-/// ([`MemLedger::zero_frame_for`]), taken first when memmgr has none
-/// ([`zero_frame`]); 0 for any other object.
+/// The zero frame a zero-object attachment of `pages` pages maps: the first
+/// whose span takes the pages ([`MemLedger::zero_frame_for`]), or else a new
+/// one, a page taken from the pool and zeroed, kept for memmgr's life and
+/// charged to no budget node, as the arena's pages are
+/// (services/memmgr/docs/memory-pool.md § Memory objects, Mapping bound).
 ///
 /// # Errors
-/// The label of the error reply: `LIMIT` when no zero frame's span takes the
-/// pages, `OUT_OF_MEMORY_BEST_EFFORT` when the frame cannot be taken.
-fn attach_zero_frame(l: &mut MemLedger, object: NodeIdx, pages: u64) -> Result<u8, u64>
+/// The label of the error reply: `LIMIT` for more pages than one zero frame
+/// backs, `OUT_OF_MEMORY_BEST_EFFORT` when the pool cannot spare the page or
+/// its scrub fails, `QUOTA` when the arena cannot grow for its record.
+fn attach_zero_frame(l: &mut MemLedger, pages: u64) -> Result<NodeIdx, u64>
 {
-    if object != ZERO_OBJECT
+    if let Some(zero) = l.zero_frame_for(pages)
     {
-        return Ok(0);
+        return Ok(zero);
     }
-    let index = l.zero_frame_for(pages).ok_or(memmgr_errors::LIMIT)?;
-    zero_frame(l, index).ok_or(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT)?;
-    Ok(index)
+    if pages > ZERO_FRAME_SPAN
+    {
+        return Err(memmgr_errors::LIMIT);
+    }
+    let grant =
+        select(l, 1, Fit::Contiguous).map_err(|_| memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT)?;
+    let (outer, taken, phys) = grant.entries[0];
+    if scrub_run(l, outer, u64::from(taken)).is_err()
+    {
+        return_taken(l, outer, taken, phys);
+        return Err(memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+    }
+    let mut added = l.add_zero_frame(outer, phys);
+    if added == Err(RegionError::NoSlot) && ensure_slots(l, 1)
+    {
+        added = l.add_zero_frame(outer, phys);
+    }
+    if let Ok(zero) = added
+    {
+        return Ok(zero);
+    }
+    return_taken(l, outer, taken, phys);
+    Err(memmgr_errors::QUOTA)
 }
 
 /// Hand a memory-object label (`SEAL_OBJECT` to `OBJECT_RELEASE`) to its

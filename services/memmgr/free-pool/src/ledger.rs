@@ -50,8 +50,7 @@
 use crate::arena::{
     Arena, Attachment, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc, LimitReg,
     MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx, OBJECT_MAX_ATTACHMENTS,
-    ProcessCaps, ProcessRecord, RegionNode, Share, Slot, SlotStore, ZERO_FRAME_SPAN, ZERO_FRAMES,
-    ZERO_OBJECT,
+    ProcessCaps, ProcessRecord, RegionNode, Share, Slot, SlotStore, ZERO_FRAME_SPAN, ZeroFrame,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError, ChunkState, SealTag};
@@ -309,9 +308,9 @@ pub struct Ledger<S, W>
     /// wrapping: every eviction, background or direct, ending compressed, raw
     /// or cancelled, starts there.
     evictions: u64,
-    /// The zero-object attachment pages each zero frame backs, at most
-    /// [`ZERO_FRAME_SPAN`] each.
-    zero_spans: [u64; ZERO_FRAMES],
+    /// The first [`Node::ZeroFrame`] slot, the others chained through the
+    /// slot `next` link; kept for memmgr's life.
+    zero_frames: NodeIdx,
 }
 
 impl<S: SlotStore, W: WordStore> Ledger<S, W>
@@ -333,7 +332,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             disk_pages: 0,
             committed_swapped: 0,
             evictions: 0,
-            zero_spans: [0; ZERO_FRAMES],
+            zero_frames: NODE_NULL,
         }
     }
 
@@ -582,7 +581,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Handle(_)
             | Node::Limit(_)
             | Node::Disk(_)
-            | Node::Object(_) => None,
+            | Node::Object(_)
+            | Node::ZeroFrame(_) => None,
         }
     }
 
@@ -605,7 +605,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Handle(_)
             | Node::Limit(_)
             | Node::Disk(_)
-            | Node::Object(_) => None,
+            | Node::Object(_)
+            | Node::ZeroFrame(_) => None,
         }
     }
 
@@ -629,7 +630,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Handle(_)
             | Node::Limit(_)
             | Node::Disk(_)
-            | Node::Object(_) => None,
+            | Node::Object(_)
+            | Node::ZeroFrame(_) => None,
         }
     }
 
@@ -677,7 +679,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Handle(_)
             | Node::Limit(_)
             | Node::Disk(_)
-            | Node::Object(_) => None,
+            | Node::Object(_)
+            | Node::ZeroFrame(_) => None,
         }
     }
 
@@ -863,7 +866,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Limit(_)
             | Node::Disk(_)
-            | Node::Object(_) => None,
+            | Node::Object(_)
+            | Node::ZeroFrame(_) => None,
         }
     }
 
@@ -888,7 +892,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Handle(_)
             | Node::Disk(_)
-            | Node::Object(_) => None,
+            | Node::Object(_)
+            | Node::ZeroFrame(_) => None,
         }
     }
 
@@ -1316,7 +1321,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Commit(_)
             | Node::Handle(_)
             | Node::Limit(_)
-            | Node::Disk(_) => None,
+            | Node::Disk(_)
+            | Node::ZeroFrame(_) => None,
         }
     }
 
@@ -1672,12 +1678,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// of its length is, and promises what [`commit::attach_promise`] says;
     /// admitting it is the caller's ([`Self::admit_attach`]).
     ///
-    /// A zero-object attachment adds its pages to the span of its zero frame,
-    /// `source.zero_frame`, which [`Self::zero_frame_for`] chose.
+    /// A zero-object attachment names the zero frame its pages map
+    /// ([`Self::zero_frame_for`], [`Self::add_zero_frame`]) and adds its pages
+    /// to that frame's span.
     ///
     /// # Errors
-    /// [`RegionError::NoObject`] for an object slot that holds no live
-    /// object; [`RegionError::MapBound`] for an object attached
+    /// [`RegionError::NoObject`] for a slot that holds neither a live object
+    /// nor a zero frame; [`RegionError::MapBound`] for an object attached
     /// [`OBJECT_MAX_ATTACHMENTS`] times, or a zero frame whose span cannot
     /// take the pages; [`RegionError::OutsideObject`] for pages past the
     /// object's end, or a zero-object attachment whose first page is not 0;
@@ -1690,19 +1697,19 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ) -> Result<NodeIdx, RegionError>
     {
         let pages = region.len / PAGE_SIZE;
-        let attached = if source.object == ZERO_OBJECT
+        // The origin as it stands once the region attaches it.
+        let origin = if let Some(z) = self.zero_frame(source.object)
         {
             if source.first_page != 0
             {
                 return Err(RegionError::OutsideObject);
             }
-            let span = self
-                .zero_spans
-                .get(usize::from(source.zero_frame))
-                .and_then(|s| s.checked_add(pages))
+            let span = z
+                .span
+                .checked_add(pages)
                 .filter(|&s| s <= ZERO_FRAME_SPAN)
                 .ok_or(RegionError::MapBound)?;
-            Some(span)
+            Node::ZeroFrame(ZeroFrame { span, ..z })
         }
         else
         {
@@ -1722,7 +1729,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             {
                 return Err(RegionError::MapBound);
             }
-            Some(u64::from(o.attached).saturating_add(1))
+            Node::Object(MemObject {
+                attached: o.attached.saturating_add(1),
+                ..o
+            })
         };
         let need = commit::grow_need(0, region.len);
         let meta_left = match source.share
@@ -1741,36 +1751,64 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.promised = self
             .promised
             .saturating_add(commit::attach_promise(need, source.share));
-        match attached
-        {
-            Some(span) if source.object == ZERO_OBJECT =>
-            {
-                if let Some(s) = self.zero_spans.get_mut(usize::from(source.zero_frame))
-                {
-                    *s = span;
-                }
-            }
-            // Below `OBJECT_MAX_ATTACHMENTS`, which a `u32` holds.
-            Some(count) => self.set_object(source.object, |o| {
-                o.attached = u32::try_from(count).unwrap_or(OBJECT_MAX_ATTACHMENTS);
-            }),
-            None =>
-            {}
-        }
+        self.arena.set_node(source.object, origin);
         Ok(idx)
     }
 
-    /// The zero frame whose span takes `pages` more zero-object attachment
-    /// pages, the first that does, for [`Self::attach_object`]; `None` when
-    /// none does, every one backing up to [`ZERO_FRAME_SPAN`] pages.
+    /// The zero frame in slot `idx`, or `None` for a slot that holds none.
     #[must_use]
-    pub fn zero_frame_for(&self, pages: u64) -> Option<u8>
+    pub fn zero_frame(&self, idx: NodeIdx) -> Option<ZeroFrame>
     {
-        let i = self
-            .zero_spans
-            .iter()
-            .position(|s| s.checked_add(pages).is_some_and(|s| s <= ZERO_FRAME_SPAN))?;
-        u8::try_from(i).ok()
+        if let Node::ZeroFrame(z) = self.arena.get(idx).node
+        {
+            Some(z)
+        }
+        else
+        {
+            None
+        }
+    }
+
+    /// The first zero frame whose span takes `pages` more zero-object
+    /// attachment pages, for [`Self::attach_object`]; `None` when none does,
+    /// and memmgr takes a new one ([`Self::add_zero_frame`]).
+    #[must_use]
+    pub fn zero_frame_for(&self, pages: u64) -> Option<NodeIdx>
+    {
+        let mut cur = self.zero_frames;
+        while let Some(z) = self.zero_frame(cur)
+        {
+            if z.span
+                .checked_add(pages)
+                .is_some_and(|s| s <= ZERO_FRAME_SPAN)
+            {
+                return Some(cur);
+            }
+            cur = self.arena.get(cur).next;
+        }
+        None
+    }
+
+    /// Record the zeroed page `cap_slot` at `phys_base` as a new zero frame
+    /// backing no attachment yet, kept for memmgr's life.
+    ///
+    /// # Errors
+    /// [`RegionError::NoSlot`] when the arena has no free slot outside its
+    /// reserve; nothing changes then.
+    pub fn add_zero_frame(&mut self, cap_slot: u64, phys_base: u64)
+    -> Result<NodeIdx, RegionError>
+    {
+        let node = Node::ZeroFrame(ZeroFrame {
+            cap_slot,
+            phys_base,
+            span: 0,
+        });
+        let idx = self
+            .arena
+            .alloc(node, self.zero_frames)
+            .ok_or(RegionError::NoSlot)?;
+        self.zero_frames = idx;
+        Ok(idx)
     }
 
     /// The attachment of the region in slot `reg`: `None` for a region of the
@@ -3917,20 +3955,20 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                     .saturating_add(c.meta_left),
             );
             self.arena.free(node.commit);
-            match c.source
+            if let Some(source) = c.source
             {
                 // An attachment is never resized, so its pages are those it
                 // added to its zero frame's span.
-                Some(source) if source.object == ZERO_OBJECT =>
+                if let Some(z) = self.zero_frame(source.object)
                 {
-                    if let Some(span) = self.zero_spans.get_mut(usize::from(source.zero_frame))
-                    {
-                        *span = span.saturating_sub(pages);
-                    }
+                    let span = z.span.saturating_sub(pages);
+                    self.arena
+                        .set_node(source.object, Node::ZeroFrame(ZeroFrame { span, ..z }));
                 }
-                Some(source) => self.detach(source.object, &mut quiescent),
-                None =>
-                {}
+                else
+                {
+                    self.detach(source.object, &mut quiescent);
+                }
             }
         }
     }
@@ -5200,6 +5238,7 @@ mod tests
                 | Node::Limit(_)
                 | Node::Disk(_)
                 | Node::Object(_)
+                | Node::ZeroFrame(_)
                 | Node::ChunkDir(_)
                 | Node::Chunk(_) => (),
             }
@@ -7406,8 +7445,13 @@ mod tests
             object,
             first_page,
             share,
-            zero_frame: 0,
         }
+    }
+
+    fn new_zero_frame(l: &mut Ledger<VecStore, VecWords>) -> NodeIdx
+    {
+        let (cap, _, phys) = take(l, 1, crate::Fit::Contiguous);
+        l.add_zero_frame(cap, phys).unwrap()
     }
 
     // The defect caught: a seal that loses the order of the grants, leaves a
@@ -7560,11 +7604,12 @@ mod tests
                 attachment(obj, 0, Share::Private),
             )
             .unwrap();
+        let zero_frame = new_zero_frame(&mut l);
         let zero = l
             .attach_object(
                 rec,
                 region(BASE + 2 * CHUNK, len),
-                attachment(ZERO_OBJECT, 0, Share::Private),
+                attachment(zero_frame, 0, Share::Private),
             )
             .unwrap();
         assert_eq!(usage(&l, rec).0, 3 * need.charged());
@@ -7573,7 +7618,7 @@ mod tests
             l.attachment(private),
             Some(attachment(obj, 0, Share::Private))
         );
-        assert_eq!(l.attachment(zero).unwrap().object, ZERO_OBJECT);
+        assert_eq!(l.attachment(zero).unwrap().object, zero_frame);
         // A written page's copy is drawn from the promise, charged nothing more.
         let (cap, _, phys) = take(&mut l, 1, crate::Fit::Contiguous);
         l.back_chunk(rec, private, frame(cap, 1, phys, BASE + CHUNK + PAGE_SIZE))
@@ -7626,11 +7671,12 @@ mod tests
     {
         let mut l = roomy_ledger(1000);
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let zero = new_zero_frame(&mut l);
         let reg = l
             .attach_object(
                 rec,
                 region(BASE, 2 * CHUNK),
-                attachment(ZERO_OBJECT, 0, Share::Private),
+                attachment(zero, 0, Share::Private),
             )
             .unwrap();
         assert!(!l.evictable(rec, reg));
@@ -7657,11 +7703,12 @@ mod tests
         let mut l = roomy_ledger(1000);
         let (rec, ids) = granted(&mut l, 1, 1, 4);
         let obj = l.seal_object(rec, &ids, 77).unwrap();
+        let zero = new_zero_frame(&mut l);
         let before = l.arena.free_count();
         for (len, first, object, err) in [
             (4, 1, obj, RegionError::OutsideObject),
             (1, u64::MAX, obj, RegionError::OutsideObject),
-            (1, 1, ZERO_OBJECT, RegionError::OutsideObject),
+            (1, 1, zero, RegionError::OutsideObject),
             (1, 0, rec, RegionError::NoObject),
         ]
         {
@@ -7687,8 +7734,8 @@ mod tests
     // The defect caught: an attachment admitted past the bound memmgr keeps
     // a frame's mappings under, the kernel's per-frame count, which would
     // let one attacher make another's read of the same frame fail; a zero
-    // frame chosen whose span cannot take the pages; or a detach that leaves
-    // its pages on the span.
+    // frame chosen whose span cannot take the pages; no new zero frame when
+    // every span is full; or a detach that leaves its pages on the span.
     #[test]
     fn no_attachment_maps_a_frame_past_the_bound()
     {
@@ -7716,29 +7763,53 @@ mod tests
         l.remove_region(rec, last, pool_all).unwrap();
         assert_eq!(l.object(obj).unwrap().attached, OBJECT_MAX_ATTACHMENTS - 1);
 
-        let zero = |frame: u8| Attachment {
-            zero_frame: frame,
-            ..attachment(ZERO_OBJECT, 0, Share::Shared)
-        };
+        assert_eq!(l.zero_frame_for(1), None);
+        let first = new_zero_frame(&mut l);
+        let span = |l: &Ledger<VecStore, VecWords>, z| l.zero_frame(z).unwrap().span;
+        l.arena.set_node(
+            first,
+            Node::ZeroFrame(ZeroFrame {
+                span: ZERO_FRAME_SPAN - 2,
+                ..l.zero_frame(first).unwrap()
+            }),
+        );
+        assert_eq!(l.zero_frame_for(2), Some(first));
+        assert_eq!(l.zero_frame_for(3), None);
         let before = l.arena.free_count();
-        l.zero_spans[0] = ZERO_FRAME_SPAN - 2;
-        assert_eq!(l.zero_frame_for(2), Some(0));
-        assert_eq!(l.zero_frame_for(3), Some(1));
-        assert_eq!(l.zero_frame_for(ZERO_FRAME_SPAN + 1), None);
         assert_eq!(
-            l.attach_object(rec, region(BASE, 3 * PAGE_SIZE), zero(0)),
+            l.attach_object(
+                rec,
+                region(BASE, 3 * PAGE_SIZE),
+                attachment(first, 0, Share::Shared)
+            ),
             Err(RegionError::MapBound)
         );
         assert_eq!(l.arena.free_count(), before);
+        assert_eq!(span(&l, first), ZERO_FRAME_SPAN - 2);
         let reg = l
-            .attach_object(rec, region(BASE, 2 * PAGE_SIZE), zero(0))
+            .attach_object(
+                rec,
+                region(BASE, 2 * PAGE_SIZE),
+                attachment(first, 0, Share::Shared),
+            )
             .unwrap();
-        assert_eq!(l.zero_spans[0], ZERO_FRAME_SPAN);
-        assert_eq!(l.zero_frame_for(1), Some(1));
-        l.zero_spans[1..].fill(ZERO_FRAME_SPAN);
+        assert_eq!(span(&l, first), ZERO_FRAME_SPAN);
         assert_eq!(l.zero_frame_for(1), None);
+        let second = new_zero_frame(&mut l);
+        assert_eq!(l.zero_frame_for(1), Some(second));
+        assert_eq!(l.zero_frame_for(ZERO_FRAME_SPAN + 1), None);
+        let other = l
+            .attach_object(
+                rec,
+                region(BASE + CHUNK, PAGE_SIZE),
+                attachment(second, 0, Share::Private),
+            )
+            .unwrap();
+        assert_eq!(span(&l, second), 1);
         l.remove_region(rec, reg, pool_all).unwrap();
-        assert_eq!(l.zero_spans[0], ZERO_FRAME_SPAN - 2);
-        assert_eq!(l.zero_frame_for(2), Some(0));
+        l.remove_region(rec, other, pool_all).unwrap();
+        assert_eq!(span(&l, first), ZERO_FRAME_SPAN - 2);
+        assert_eq!(span(&l, second), 0);
+        assert_eq!(l.zero_frame_for(2), Some(second));
     }
 }

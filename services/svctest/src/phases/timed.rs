@@ -17,8 +17,30 @@
 //! ordinal: `SystemTime::now()` must give a time again within a bound, where
 //! a timed that resolved the withdrawn ordinal answers
 //! `WALL_CLOCK_UNAVAILABLE` for the boot and `now()` gives `UNIX_EPOCH`.
+//!
+//! The RTC create-retry phase before it, which runs when the `memhog` fixture
+//! is staged, has devmgr's restart of the RTC driver made while memory is
+//! critical, so procmgr refuses its create, and requires devmgr to retry the
+//! create until the driver starts
+//! (services/devmgr/docs/responsibilities.md § Create retry). It attaches to
+//! devmgr and stops its main thread, which runs every restart, kills the RTC
+//! driver and waits until procmgr no longer lists it, so the driver's frames
+//! are free before the fill. Through `oom::critical_window`, the fixture then
+//! fills the pool down to the growth floor, and once the level reads
+//! `CRITICAL` the phase starts devmgr's main thread again: devmgr withdraws
+//! the dead driver, admits its restart, and makes its create while the
+//! fixture holds every page a driver outside the system reserve could take,
+//! so procmgr refuses it. The phase requires devmgr's line for the refusal
+//! and its first retry, stamped after the kill, then, once the fixture is
+//! stopped and the level falls, a new RTC driver listed, and devmgr's line for
+//! the retry that started it. Without the retry devmgr logs the restart as
+//! failed and leaves the record with no driver, and the phase fails. Its
+//! restart leaves timed holding the withdrawn ordinal, which the RTC restart
+//! phase's kill of timed resolves again.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
 use crate::arch::current::RTC_DRIVER_NAME;
 use crate::bootstrap::Caps;
@@ -38,6 +60,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "system_time",
             run: system_time_phase,
+        },
+        Phase {
+            name: "rtc_create_retry",
+            run: rtc_create_retry_phase,
         },
         Phase {
             name: "timed_rtc_restart",
@@ -138,6 +164,169 @@ pub fn system_time_phase(_: &Caps)
     std::os::seraph::log!(
         "SystemTime phase passed ({y:04}-{mo:02}-{dd:02}T{hh:02}:{mm:02}:{ss:02}Z, sys_delta={sys_delta:?}, mono_bounds=[{mono_min:?}, {mono_max:?}], slack={slack:?})"
     );
+}
+
+/// devmgr's process name in `LIST_PROCESSES`: init creates it from its boot
+/// module.
+const DEVMGR_NAME: &[u8] = b"devmgr";
+
+/// How long the RTC create-retry phase holds memory critical when no oomd
+/// stops the `memhog` fixture, and svctest stops it: past devmgr's first two
+/// retries (1 s and 3 s after the refusal). A test wait bound.
+const RETRY_HOLD: Duration = Duration::from_secs(5);
+
+/// How long the RTC create-retry phase waits for each of devmgr's lines and
+/// for the retried driver: past devmgr's whole retry schedule (63 s,
+/// `CREATE_RETRY_LIMIT` in services/devmgr/firmware/src/restart.rs) and a
+/// settle bound. A test wait bound.
+const RETRY_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Have devmgr's restart of the RTC driver refused while memory is critical,
+/// and require devmgr to retry its create until the driver starts (see the
+/// module documentation).
+pub fn rtc_create_retry_phase(caps: &Caps)
+{
+    let phase = "rtc_create_retry";
+    if !super::svcmgr::recipe_staged(super::oom::MEMHOG_RECIPE, phase)
+    {
+        std::os::seraph::log!("rtc_create_retry phase passed (memhog.svc not staged)");
+        return;
+    }
+    let authority = caps.debug_authority;
+    assert_ne!(authority, 0, "{phase}: no debug authority");
+    assert_ne!(caps.logd_query, 0, "{phase}: no logd.query seed");
+    // devmgr's lines name the driver by its declared name, the last part of
+    // its install path.
+    let driver = RTC_DRIVER_NAME
+        .rsplit(|&b| b == b'/')
+        .next()
+        .unwrap_or(RTC_DRIVER_NAME);
+
+    let devmgr = super::crash::badge_named(authority, DEVMGR_NAME)
+        .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no devmgr"));
+    let rtc = super::crash::badge_named(authority, RTC_DRIVER_NAME)
+        .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no RTC driver"));
+    let threads = attach(authority, devmgr, phase);
+    let control = *threads
+        .first()
+        .unwrap_or_else(|| panic!("{phase}: the devmgr attach returned no main thread"));
+    syscall::thread_stop(control)
+        .unwrap_or_else(|e| panic!("{phase}: stopping devmgr's main thread ({e})"));
+    let killed_us = super::oom::elapsed_us();
+    super::logd_sinks::kill(authority, rtc, "RTC");
+    super::logd_sinks::await_gone(authority, rtc, RTC_DRIVER_NAME, "RTC");
+    let mut resumed = Ok(());
+    super::oom::critical_window(caps, phase, RETRY_HOLD, || {
+        // The driver's death post waits on devmgr's queue: the restart it
+        // admits makes its create now, with the pool at the growth floor.
+        resumed = syscall::thread_start(control);
+    });
+    resumed.unwrap_or_else(|e| panic!("{phase}: starting devmgr's main thread ({e})"));
+    detach(authority, devmgr, threads, phase);
+
+    let refused_us = await_line(
+        caps.logd_query,
+        &[driver, b": create refused (", b"); retry 1 of "],
+        killed_us,
+        phase,
+    );
+    let start_at = Instant::now();
+    while super::crash::badge_named(authority, RTC_DRIVER_NAME).is_none_or(|b| b == rtc)
+    {
+        assert!(
+            start_at.elapsed() < RETRY_TIMEOUT,
+            "{phase}: devmgr's retries did not start the RTC driver"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let retried_us = await_line(
+        caps.logd_query,
+        &[driver, b": create retry "],
+        refused_us,
+        phase,
+    );
+    let took = retried_us.saturating_sub(refused_us) / 1000;
+    std::os::seraph::log!(
+        "rtc_create_retry phase passed (the RTC driver's restart refused while memory was \
+         critical; its first create retry {took} ms later)"
+    );
+}
+
+/// Attach to devmgr, `process`: the caps of its threads, main thread first.
+fn attach(authority: u64, process: u64, phase: &str) -> Vec<u64>
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let msg = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
+        .word(0, process)
+        .word(1, 0)
+        .build();
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(authority, &msg, ipc_buf) }
+        .unwrap_or_else(|e| panic!("{phase}: ATTACH_PROCESS of devmgr failed ({e})"));
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "{phase}: ATTACH_PROCESS of devmgr refused ({:#x})",
+        reply.label
+    );
+    reply.caps().to_vec()
+}
+
+/// Let go of devmgr, `process` (`DETACH_PROCESS`), and delete its thread
+/// caps.
+fn detach(authority: u64, process: u64, threads: Vec<u64>, phase: &str)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let msg = IpcMessage::builder(procmgr_labels::DETACH_PROCESS)
+        .word(0, process)
+        .build();
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(authority, &msg, ipc_buf) }
+        .unwrap_or_else(|e| panic!("{phase}: DETACH_PROCESS of devmgr failed ({e})"));
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "{phase}: DETACH_PROCESS of devmgr refused ({:#x})",
+        reply.label
+    );
+    for cap in threads
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+}
+
+/// The stamp of the oldest entry of logd's history, through `query`, that is
+/// stamped at or after `after_us` and holds every one of `parts`, read every
+/// [`POLL_INTERVAL`] until one is there, for up to [`RETRY_TIMEOUT`].
+fn await_line(query: u64, parts: &[&[u8]], after_us: u64, phase: &str) -> u64
+{
+    let holds = |bytes: &[u8]| {
+        parts
+            .iter()
+            .all(|part| bytes.windows(part.len()).any(|w| w == *part))
+    };
+    let start = Instant::now();
+    loop
+    {
+        // Newest first: the last match read is the oldest.
+        let oldest = super::procmgr::logd_history_with(query, None, |entry| {
+            (entry.us >= after_us && holds(entry.bytes)).then_some(entry.us)
+        })
+        .into_iter()
+        .rev()
+        .flatten()
+        .next();
+        if let Some(us) = oldest
+        {
+            return us;
+        }
+        let shown: Vec<_> = parts.iter().map(|p| String::from_utf8_lossy(p)).collect();
+        assert!(
+            start.elapsed() < RETRY_TIMEOUT,
+            "{phase}: logd's history holds no line with {shown:?} stamped after {after_us} us"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 /// Kill the RTC driver, then timed, and require the restarted timed to serve

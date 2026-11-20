@@ -3,8 +3,13 @@
 
 // xtask/src/commands/test.rs
 
-//! Test command: lint the test code, then run the unit tests on the host and
-//! under riscv64 emulation.
+//! Test command: check the formatting of the selected packages, lint the
+//! test code, then run the unit tests on the host and under riscv64
+//! emulation.
+//!
+//! The formatting check runs `cargo fmt --check` over the selected packages
+//! (`docs/coding-standards.md` § Formatters), so an unformatted change fails
+//! the command a change is tested with before it is pushed.
 //!
 //! The lint pass runs Clippy over the test configuration of the selected
 //! packages once for each architecture's Linux target, so test code gated on
@@ -28,7 +33,7 @@ use crate::error::{Result, bail};
 
 use crate::cli::{TestArgs, TestComponent};
 use crate::context::Context as BuildContext;
-use crate::util::{require_tool, run_cmd, run_cmd_capture, step};
+use crate::util::{check_formatting, require_tool, run_cmd, run_cmd_capture, step};
 
 /// The targets the test lint pass checks: the Linux target of each
 /// architecture Seraph supports.
@@ -96,6 +101,9 @@ pub fn run(ctx: &BuildContext, args: &TestArgs) -> Result<()>
 {
     let packages = packages(args.component);
 
+    step("Checking formatting");
+    check_formatting(&ctx.root, &fmt_selection(packages))?;
+
     for target in LINT_TARGETS
     {
         step(&format!("Linting test code for {target}"));
@@ -134,6 +142,17 @@ fn packages(component: TestComponent) -> &'static [&'static str]
         TestComponent::Init => &["-p", "init"],
         TestComponent::All => &["--workspace"],
     }
+}
+
+/// The `cargo fmt` package selection of the cargo selection `packages`:
+/// `cargo fmt` names the whole workspace `--all`, where `cargo test` takes
+/// `--workspace`.
+fn fmt_selection<'a>(packages: &[&'a str]) -> Vec<&'a str>
+{
+    packages
+        .iter()
+        .map(|arg| if *arg == "--workspace" { "--all" } else { arg })
+        .collect()
 }
 
 /// Fail with the packages to install when a tool or the C library the
@@ -324,6 +343,16 @@ mod tests
         assert_eq!(&host[..split], ["-p", "xtask", "--tests"]);
         assert!(!host.contains(&LINT_BUILD_STD), "{host:?}");
         assert_eq!(host_lint_args(packages(TestComponent::Kernel)), None);
+    }
+
+    #[test]
+    fn the_formatting_check_selects_the_tested_packages()
+    {
+        assert_eq!(fmt_selection(packages(TestComponent::All)), ["--all"]);
+        assert_eq!(
+            fmt_selection(packages(TestComponent::Kernel)),
+            ["-p", "kernel"]
+        );
     }
 
     #[test]

@@ -212,7 +212,8 @@ and never reclaims them. Each entry records:
 - The index of its caps node, an arena node made and freed with the record,
   so the record stays within the arena's slot size: it holds the delegated
   child `AddressSpace` cap, when demand-paged, the Notification cap
-  `REGISTER_PRESSURE` gave, with the bits it is signalled with
+  `REGISTER_PRESSURE` gave, with the bits it is signalled with on a change
+  of level and on an opening of the draw room
   ([Memory pressure](#memory-pressure)), the head of the list of node
   handle states and memory objects the process owns
   ([Memory objects](#memory-objects)), and the head of the list of the limit
@@ -917,10 +918,10 @@ least its faulting page. A draw still short is declined with code 11, a commit o
 ([ipc-interface.md](ipc-interface.md) § Kernel-origin fault message); with no swap slot registered
 that is a pool with no free page at all. The draw room is open at a demand chunk's pages or more,
 room for any one committed draw, and memmgr signals its opening to every `REGISTER_PRESSURE`
-registrant ([Memory pressure](#memory-pressure), Signal); crashd holds a commit overrun until then
-([crashd Operation § Hold](../../crashd/docs/operation.md#hold)). The admission and draw rules and A
-are the host-tested `free-pool` ledger's (`promise_free`, `uncommitted_free`, `draw_room`,
-`frames_short` and `allowance`).
+registrant that gave bits for it ([Memory pressure](#memory-pressure), Signal); crashd holds a
+commit overrun until then ([crashd Operation § Hold](../../crashd/docs/operation.md#hold)). The
+admission and draw rules and A are the host-tested `free-pool` ledger's (`promise_free`,
+`uncommitted_free`, `draw_room`, `frames_short` and `allowance`).
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
@@ -1056,19 +1057,23 @@ less the band gives, and no worse than before. The constants are tuning values p
 module `pressure`.
 
 **Signal.** A process registers a Notification cap and the bits to send on it with
-`REGISTER_PRESSURE` ([ipc-interface.md](ipc-interface.md) § Label 11); the std runtime registers
-every process at start. The cap sits in the record's caps node ([Per-Process
-Tracking](#per-process-tracking)), so a process holds one slot of memmgr's `CSpace`: a second
+`REGISTER_PRESSURE` ([ipc-interface.md](ipc-interface.md) § Label 11), one mask for a change of
+the level and one for an opening of the draw room, each in the low 32 bits so the two fit the caps
+node; the std runtime registers every process at start, with a bit for each. The cap sits in the
+record's caps node ([Per-Process Tracking](#per-process-tracking)), so a process holds one slot of
+memmgr's `CSpace`: a second
 registration replaces the first and memmgr deletes the cap the first carried. `PROCESS_DIED`
 deletes the cap before it takes the process's frames back, since the cap keeps the Notification,
 and the frame it was retyped from, alive ([Reclamation](#reclamation)).
 
 At the top of each turn of its receive loop, after the `CSpace` top-up, memmgr recomputes the
-level and the draw room ([Commit](#commit), Overcommit), and on a change of the level, or an
-opening of the draw room, it sends each registrant its bits once. The send ORs the bits into the
-Notification and never blocks, so no client can hold memmgr, and bits not yet taken coalesce: a
-registrant that wakes knows the level changed, or the draw room opened, at least once, and reads the
-level and the draw room, which `QUERY_POOL_STATUS` returns in `data[7]` and `data[16]`. A send that
+level and the draw room ([Commit](#commit), Overcommit), and sends each registrant, in one send,
+its level bits on a change of the level and its draw-room bits on an opening of the draw room. The
+send ORs the bits into the Notification and never blocks, so no client can hold memmgr, and bits not
+yet taken coalesce: a registrant that wakes with its level bits knows the level changed at least
+once, perhaps back to where it was, and with its draw-room bits that the draw room opened, and reads
+the level and the draw room, which `QUERY_POOL_STATUS` returns in `data[7]` and `data[16]`. The
+host-tested `free-pool` module `pressure` chooses the bits (`PressureBits`). A send that
 fails, to a cap the client revoked, is dropped. The broadcast walks every record through the index,
 a cost paid only on such a change.
 

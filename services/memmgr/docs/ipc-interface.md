@@ -551,6 +551,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[15] | `allowance_bytes` — the overcommit allowance, what `promised` may exceed `data[3]` by: a chunk's pages for every free swap slot (`data[13]`), less the pages compression already freed from the chunks evicted and not on disk, plus the pages of the evicted chunks of committed regions; `0` while no swap service is registered ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 | data[16] | `draw_room_bytes` — the free pages a fault on a committed page of a process outside the system reserve may take now: all of `data[3]` while no swap slot is registered or `data[3]` covers `data[8]`, else those above the growth floor, `data[11]`; open at `DEMAND_CHUNK_BYTES` or more, room for any one committed draw ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 | data[17] | `uncommitted_free_bytes` — the free pages outside `promised`, which every admission but a commitment's reads and the pressure level is computed from: the lesser of `data[3]` plus `data[15]` less `data[8]`, and `data[3]`; `data[3]` less `data[8]` while `data[15]` is `0` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Promised) |
+| data[18] | `committed_swapped_bytes` — the part of `data[8]` the evicted chunks of committed regions hold for their restores: the subset of `data[10]` in committed regions, which `promised` holds again once a chunk holds no frame of its own ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit); the rest of `data[8]` is the commitments' pages never backed or discarded and their page-table and metadata bounds |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -595,8 +596,13 @@ pending (§ Label 21) knows that no chunk of the range was being evicted, held
 raw, compressed or being written at the second read, whatever was in flight
 at the first; a chunk held raw counts in no other word until it is written.
 A chunk on disk or lost can remain: `data[10]` counts both, `data[12]` only a
-chunk on disk.
-`data[3]` to `data[17]` are appended after the identity terms;
+chunk on disk. While a swap service has registered slots memmgr evicts the
+chunks of committed regions too, each moving `data[8]` by its backed pages
+once it holds no frame of its own, and back at its restore, and `data[18]`
+with it, so a caller asserting that a commitment was released compares
+`data[8] - data[18]`, the promised total net of eviction, beside the free
+total net of eviction.
+`data[3]` to `data[18]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
@@ -768,8 +774,8 @@ usage falls below it.
 ### Label 11: `REGISTER_PRESSURE`
 
 Register the Notification memmgr signals when the memory-pressure level
-changes, or the draw room opens ([`memory-pool.md`](memory-pool.md) § Memory
-pressure). Privilege:
+changes, and when the draw room opens ([`memory-pool.md`](memory-pool.md)
+§ Memory pressure), with bits of the caller's choice for each. Privilege:
 universal — attributed to the caller by `recv.badge`. The std runtime
 registers every process at start (`runtime/ruststd/README.md` § Process
 Entry), so a process waits on the signal with no call of its own.
@@ -779,19 +785,23 @@ Entry), so a process waits on the signal with no call of its own.
 | Field | Value |
 |---|---|
 | label | 11 |
-| data[0] | `bits` — the bits to send on a change of level or an opening of the draw room; nonzero |
+| data[0] | `bits` — the bits to send on a change of level; nonzero, within the low 32 bits |
+| data[1] | `draw_room_bits` — the bits to send on an opening of the draw room, within the low 32 bits; `0` for no signal of it |
 | cap[0] | a Notification cap with Notify rights; ownership transfers to memmgr |
 
 memmgr keeps one registration per process: a second replaces the first, and
 memmgr deletes the cap the first carried, so a client holds one slot of
 memmgr's `CSpace` however often it registers. `PROCESS_DIED` deletes the cap.
-On each change of level, and each opening of the draw room (`QUERY_POOL_STATUS`
-`data[16]` rising to `DEMAND_CHUNK_BYTES` or more), memmgr sends `bits` on the
-cap once, without blocking: a send to a Notification ORs the bits in and never
-waits, and bits not yet taken coalesce. The bit says that the level changed or
-the draw room opened; the level is read from `QUERY_POOL_STATUS` `data[7]`,
-and the draw room from `data[16]`. A send that fails, for a cap the client
-revoked, is dropped.
+On each change of level memmgr sends `bits` on the cap once, and on each
+opening of the draw room (`QUERY_POOL_STATUS` `data[16]` rising to
+`DEMAND_CHUNK_BYTES` or more) `draw_room_bits`, both in one send when one
+turn makes both; the send never blocks: a send to a Notification ORs the bits
+in and never waits, and bits not yet taken coalesce. So with the two masks
+apart, a wake that carries `bits` says that the level changed at least once
+since the last, perhaps back to where it was, and one that carries
+`draw_room_bits` that the draw room opened; the level is read from
+`QUERY_POOL_STATUS` `data[7]`, and the draw room from `data[16]`. A send
+that fails, for a cap the client revoked, is dropped.
 
 **Reply (success):** label 0, no words, no caps.
 
@@ -799,7 +809,7 @@ revoked, is dropped.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `INVALID_ARGUMENT` | Unknown badge, zero `bits`, or `cap[0]` missing or not a Notification with Notify rights; memmgr deletes the cap, and any earlier registration stays |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, zero `bits`, a bit of `bits` or `draw_room_bits` above the low 32, or `cap[0]` missing or not a Notification with Notify rights; memmgr deletes the cap, and any earlier registration stays |
 
 ### Label 12: `EXTEND_REGION`
 

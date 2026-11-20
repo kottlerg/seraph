@@ -67,8 +67,9 @@ subcommands! {
         /// Remove the sysroot (and optionally cargo target/).
         Clean(CleanArgs),
 
-        /// Lint the test code, then run Seraph unit tests on the host and, built
-        /// for riscv64, under QEMU's user-mode emulator (see xtask/README.md).
+        /// Check formatting and lint the test code, then run Seraph unit tests on
+        /// the host and, built for riscv64, under QEMU's user-mode emulator (see
+        /// xtask/README.md).
         Test(TestArgs),
 
         /// Regenerate the reference vectors of shared/crypto/testkit with
@@ -464,11 +465,11 @@ args! {
         #[arg(long, value_delimiter = ',', value_parser = parse_build_component)]
         pub debug: Vec<BuildComponent>,
 
-        /// Skip `cargo fmt` and per-component `cargo check` (clippy). `cargo
-        /// xtask run` sets this internally to keep the tight edit → rebuild →
-        /// launch loop responsive — an unchanged tree would otherwise pay for
-        /// ~2× cargo invocations per component (check + build) on every
-        /// re-run. Use `cargo xtask build` when you want the full lint pass.
+        /// Skip the formatting check (`cargo fmt --check`) and the
+        /// per-component `cargo check` (clippy), which would otherwise double
+        /// the cargo invocations per component. `cargo xtask compare-images`
+        /// and `cargo xtask test-signing` set it for the builds they run.
+        /// Use `cargo xtask build` without it for the full lint pass.
         #[arg(long, hide = true)]
         pub skip_lints: bool,
 

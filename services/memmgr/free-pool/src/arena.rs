@@ -19,6 +19,7 @@ use syscall_abi::PAGE_SIZE;
 
 use crate::budget::BudgetNode;
 use crate::chunk::{ChunkEntry, DIR_FANOUT};
+use crate::pressure::PressureBits;
 use crate::{DemandRegion, FreeRun};
 
 /// Arena slot index. `u64` so the index never bounds the arena before the
@@ -85,8 +86,9 @@ pub struct ProcessCaps
     pub aspace: u64,
     /// The Notification cap `REGISTER_PRESSURE` gave, or `0` for none.
     pub pressure: u64,
-    /// The bits a change of pressure level sends on [`ProcessCaps::pressure`].
-    pub pressure_bits: u64,
+    /// The bits a change of pressure level, and an opening of the draw room,
+    /// send on [`ProcessCaps::pressure`].
+    pub pressure_bits: PressureBits,
     /// The first handle-state slot the process owns, a [`Node::Handle`] or a
     /// [`Node::Object`], chained through [`NodeHandle::owned_next`] and
     /// [`MemObject::owned_next`]; [`NODE_NULL`] for none. Each goes with the

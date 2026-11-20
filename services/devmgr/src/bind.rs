@@ -15,7 +15,8 @@
 //! match an unbound record ([`crate::decls`]) into a
 //! [`MatchTable`], walks the records in record order, and binds each to the
 //! declaration the table chooses ([`bind_pci`]). A record is bound at most
-//! once a boot: once a driver was started for it, or, for a RISC-V IOMMU's
+//! once a boot: once a driver was started for it or a retry of its refused
+//! create queued ([`queue_retry`]), or, for a RISC-V IOMMU's
 //! function, once devmgr took it as a unit for the IOMMU driver
 //! ([`crate::iommu`]), and, for a hotplug slot's port, once devmgr
 //! managed the slot ([`crate::hotplug`]).
@@ -39,7 +40,7 @@ use firmware::pci::{BarSpan, InterruptPlan, MessagesRefused, Msi, Msix};
 use firmware::pci_records::{PciRecords, RecordState};
 use firmware::records::{PlatformRecord, PlatformRecords};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
-use firmware::restart::{RecordId, Teardown};
+use firmware::restart::{CREATE_RETRY_LIMIT, RecordId, Retries, Teardown};
 use firmware::roster::Roster;
 use restart_budget::RestartBudget;
 use syscall_abi::PAGE_SIZE;
@@ -235,14 +236,18 @@ fn keys(pci_dev: &pci::PciDevice) -> RecordKeys<'static>
 
 // ── Passes ──────────────────────────────────────────────────────────────────
 
-/// The settle batch a pass starts its drivers into, and the roster that
-/// records them.
+/// The settle batch a pass starts its drivers into, the roster that
+/// records them, and the create retries it queues.
 pub struct Pass<'a>
 {
     pub batch: &'a settle::SettleBatch,
     /// The watch the pass's drivers' death observers are bound on.
     pub watch: &'a settle::DriverWatch,
     pub roster: &'a mut Roster<SpawnedDriver>,
+    /// The create retries the pass queues ([`queue_retry`]), each due at
+    /// its delay; the caller hands them to the control thread's list once
+    /// the pass ends.
+    pub retries: &'a mut Retries<CreateRetry>,
 }
 
 /// What a bind carves from and records into: devmgr's held caps, its
@@ -377,10 +382,14 @@ pub struct RestartSource
     /// path.
     pub path: Box<[u8]>,
     pub budget: RestartBudget,
-    /// A platform record's caps, taken from the dead instance; `None` while
-    /// an instance holds them, and for a PCI record, whose caps a restart
-    /// carves again.
+    /// A platform record's caps, taken from the dead instance, or kept from
+    /// a create procmgr refused for a retry; `None` while an instance holds
+    /// them, and for a PCI record, whose caps a restart or a retry carves
+    /// again.
     pub platform: Option<PlatformDeviceCaps>,
+    /// The create retries the start of the record's next instance has made
+    /// ([`queue_retry`]): 0 for a first create, a restart's included.
+    pub create_retries: u32,
 }
 
 impl RestartSource
@@ -408,6 +417,7 @@ impl RestartSource
             path: copy.into_boxed_slice(),
             budget,
             platform: None,
+            create_retries: 0,
         })
     }
 
@@ -429,9 +439,9 @@ impl RestartSource
 /// record, which stays bound ([`firmware::restart::same_driver`]); and bind
 /// the record to it ([`bind_pci`], [`bind_platform`]) into `pass`, the
 /// new instance carrying `source`'s budget, and a platform record's driver
-/// the caps devmgr kept. Returns whether the driver was started; `false`,
-/// logged, otherwise, the record then staying bound with no driver and the
-/// kept caps released.
+/// the caps devmgr kept. Returns whether the driver was started or a retry
+/// of its refused create queued; `false`, logged, otherwise, the record
+/// then staying bound with no driver and the kept caps released.
 pub fn restart(
     records: &Records,
     source: RestartSource,
@@ -449,6 +459,8 @@ pub fn restart(
         path,
         budget,
         mut platform,
+        // A restart's create is a first create; its retries count afresh.
+        ..
     } = source;
     let label = name.as_str();
     let same = |decl: &DriverDecl, keys: &RecordKeys<'_>| {
@@ -551,6 +563,213 @@ fn read_installed(
         },
     })
 }
+
+// ── Create retries ──────────────────────────────────────────────────────────
+
+/// A driver start whose create procmgr refused with an error a later create
+/// can outlive, held until its retry is due
+/// (services/devmgr/docs/responsibilities.md § Create retry): the driver it
+/// starts, from devmgr's own copy of the binary the refused create was made
+/// from, and what the new instance is restarted from, which carries its
+/// record, the retries made so far, and, for a platform record, the caps
+/// devmgr carved for it. Its record stays bound while it is held.
+pub struct CreateRetry
+{
+    candidate: Candidate<Binary>,
+    source: RestartSource,
+}
+
+impl CreateRetry
+{
+    /// The driver's declared name.
+    pub fn name(&self) -> &str
+    {
+        self.candidate.decl.name.as_str()
+    }
+
+    /// Release the binary and the platform record's caps the retry holds,
+    /// when it is not made.
+    pub fn release(&self)
+    {
+        self.candidate.binary.release();
+        self.source.release();
+    }
+}
+
+/// Retry the start `retry` holds into `pass`, once its delay has passed:
+/// bind its record, when it is still bound and not removed, to the same
+/// driver from the same binary ([`bind_pci`], [`bind_platform`]), a
+/// platform record's driver delivered the caps the retry kept. The
+/// declaration is not read again: the retry repeats the create of a start
+/// already matched. Returns whether the driver was started or its create
+/// queued for a further retry; `false`, logged, otherwise, the record then
+/// staying bound with no driver and the caps released.
+pub fn retry(
+    records: &Records,
+    retry: CreateRetry,
+    carve: &mut Carve,
+    pass: &mut Pass,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    let CreateRetry { candidate, source } = retry;
+    let label = candidate.decl.name.as_str();
+    std::os::seraph::log!(
+        "{}: create retry {} of {}",
+        label,
+        source.create_retries,
+        CREATE_RETRY_LIMIT
+    );
+    let started = match source.record
+    {
+        RecordId::Pci(at) =>
+        {
+            let bound = records.pci.state(at) == Some(RecordState::Bound);
+            if let Some(pci_dev) = records.pci.devices().get(at).filter(|_| bound)
+            {
+                bind_pci(pci_dev, &candidate, Some(source), carve, pass, ipc_buf)
+            }
+            else
+            {
+                std::os::seraph::log!(warn: "{}: its device was removed; not retried", label);
+                source.release();
+                false
+            }
+        }
+        RecordId::Platform(index) =>
+        {
+            let bound = records.platform_states.get(index) == Some(&RecordState::Bound);
+            if let Some(found) = records.platform.records().get(index).filter(|_| bound)
+            {
+                bind_platform(index, found, &candidate, Some(source), carve, pass, ipc_buf)
+            }
+            else
+            {
+                std::os::seraph::log!(warn: "{}: its record was removed; not retried", label);
+                source.release();
+                false
+            }
+        }
+    };
+    candidate.binary.release();
+    if !started
+    {
+        std::os::seraph::log!(warn: "{}: not started", label);
+    }
+    started
+}
+
+/// Queue a retry of the start of `candidate`, which ended with no driver
+/// started, into `pass`, when procmgr refused its create (`refusal`, the
+/// reply label) with an error a later create can outlive
+/// (`firmware::restart::create_retryable`) and the start has retries left
+/// (`firmware::restart::retry_delay_ms`): with a copy of its binary, `restart`, what the new instance is restarted from, and
+/// `platform`, the caps a platform record's bind carved, which cannot be
+/// carved again once released. A start from a boot module is not retried:
+/// its cap pins init's donated pool run until the boot pass releases it,
+/// and procmgr's only transient refusal of it is for want of memory, which
+/// nothing frees while only the bootstrap substrate runs; its record stays
+/// unbound for the drivers-directory pass. Returns whether the retry is
+/// queued, the record then staying bound; on `false`, logged unless the
+/// refusal is final, `platform` is released.
+fn queue_retry(
+    candidate: &Candidate<Binary>,
+    restart: Option<RestartSource>,
+    platform: Option<PlatformDeviceCaps>,
+    refusal: Option<u64>,
+    pass: &mut Pass,
+) -> bool
+{
+    let name = candidate.decl.name.as_str();
+    let Some(label) = refusal.filter(|&label| firmware::restart::create_retryable(label))
+    else
+    {
+        release_kept(platform);
+        return false;
+    };
+    if candidate.source == Source::BootModule
+    {
+        std::os::seraph::log!(warn: "{}: a boot module's create is not retried", name);
+        release_kept(platform);
+        return false;
+    }
+    let Some(mut source) = restart
+    else
+    {
+        std::os::seraph::log!(warn: "{}: no install path kept; its create is not retried", name);
+        release_kept(platform);
+        return false;
+    };
+    let retry = source.create_retries.saturating_add(1);
+    let Some(delay_ms) = firmware::restart::retry_delay_ms(retry)
+    else
+    {
+        std::os::seraph::log!(
+            warn: "{}: create refused ({:#x}) after {} retries; given up",
+            name,
+            label,
+            CREATE_RETRY_LIMIT
+        );
+        release_kept(platform);
+        return false;
+    };
+    let Some(binary) = retained_copy(&candidate.binary)
+    else
+    {
+        std::os::seraph::log!(warn: "{}: binary not kept; its create is not retried", name);
+        release_kept(platform);
+        return false;
+    };
+    source.create_retries = retry;
+    source.platform = platform;
+    let held = CreateRetry {
+        candidate: Candidate {
+            decl: candidate.decl,
+            source: candidate.source,
+            bound: 0,
+            binary,
+        },
+        source,
+    };
+    let due_ns = crate::now_ns().saturating_add(delay_ms.saturating_mul(1_000_000));
+    if let Err((_, held)) = pass.retries.push(due_ns, held)
+    {
+        std::os::seraph::log!(warn: "{}: no memory to hold its create retry; given up", name);
+        held.release();
+        return false;
+    }
+    std::os::seraph::log!(
+        warn: "{}: create refused ({:#x}); retry {} of {} in {} ms",
+        name,
+        label,
+        retry,
+        CREATE_RETRY_LIMIT,
+        delay_ms
+    );
+    true
+}
+
+/// devmgr's own copy of the drivers-directory file `binary` names, for a
+/// create retry: a derivation of its cap and a copy of its install path.
+/// `None` for a boot module, or when the cap or the path cannot be copied.
+fn retained_copy(binary: &Binary) -> Option<Binary>
+{
+    let Binary::File { cap, size, name } = binary
+    else
+    {
+        return None;
+    };
+    let mut path = Vec::new();
+    path.try_reserve_exact(name.len()).ok()?;
+    path.extend_from_slice(name);
+    let cap = syscall::cap_derive(*cap, syscall::RIGHTS_ALL).ok()?;
+    Some(Binary::File {
+        cap,
+        size: *size,
+        name: path.into_boxed_slice(),
+    })
+}
+
 fn collect(
     table: &mut MatchTable<Binary>,
     records: &mut Records,
@@ -745,8 +964,10 @@ fn granted(decl: &DriverDecl, source: Source) -> firmware::binding::Grants
 /// declared class, with `restart`, what devmgr restarts it from. A restart
 /// whose source holds the caps devmgr kept for the record delivers those
 /// again, under a new catalog entry ([`renew_platform_device`]), instead of
-/// carving them. Returns whether the driver was started; `false`, logged,
-/// as for [`bind_pci`], the caps released.
+/// carving them. Returns whether the record is bound to the driver: it was
+/// started, or its create was refused and a retry of it queued, which keeps
+/// the caps ([`queue_retry`]); `false`, logged, as for [`bind_pci`], the
+/// caps released.
 fn bind_platform(
     index: usize,
     record: &PlatformRecord,
@@ -849,11 +1070,12 @@ fn bind_platform(
             let _ = syscall::cap_delete(service_ep);
             dev_caps.release();
         }
-        spawn::DriverSpawn::Failed =>
+        // No driver was created, so no copy of the caps was derived: a
+        // retry keeps them, and they are released otherwise.
+        failed @ (spawn::DriverSpawn::Refused(_) | spawn::DriverSpawn::Failed) =>
         {
             let _ = syscall::cap_delete(service_ep);
-            dev_caps.release();
-            return false;
+            return queue_retry(candidate, restart, Some(dev_caps), failed.refusal(), pass);
         }
     }
     true
@@ -1130,10 +1352,11 @@ fn push_bound(resources: &mut Vec<Resource>, resource: Resource) -> bool
 /// binary at the tier its source allows, deliver it the resource list
 /// ([`spawn::spawn_bound_driver`]), and record it in the pass's roster to be
 /// served under its declared class when its batch settles, with `restart`,
-/// what devmgr restarts it from. Returns whether the driver was started;
-/// `false`, logged, when the declaration names no class, a resource cannot
-/// be carved, a required interrupt cannot be had, or the spawn fails before
-/// the start.
+/// what devmgr restarts it from. Returns whether the record is bound to the
+/// driver: it was started, or its create was refused and a retry of it
+/// queued ([`queue_retry`]); `false`, logged, when the declaration names no
+/// class, a resource cannot be carved, a required interrupt cannot be had,
+/// or the spawn fails before the start and is not retried.
 fn bind_pci(
     pci_dev: &pci::PciDevice,
     candidate: &Candidate<Binary>,
@@ -1237,11 +1460,12 @@ fn bind_pci(
             let _ = syscall::cap_delete(service_ep);
             dev_caps.release(&mut carve.caps.slot_bars);
         }
-        spawn::DriverSpawn::Failed =>
+        // A retry carves the device again, as a restart does.
+        failed @ (spawn::DriverSpawn::Refused(_) | spawn::DriverSpawn::Failed) =>
         {
             let _ = syscall::cap_delete(service_ep);
             dev_caps.release(&mut carve.caps.slot_bars);
-            return false;
+            return queue_retry(candidate, restart, None, failed.refusal(), pass);
         }
     }
     true

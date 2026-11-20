@@ -214,8 +214,8 @@ fn main() -> !
     // the device records, the carve tables, the catalog, and the death
     // watch, and runs the work a request leaves for it (the drivers-directory
     // pass and settle after `SET_DRIVERS_DIR`, the on-demand pass and settle
-    // after `BIND_DRIVERS`, and acpid's requests) and every withdrawal of a
-    // driver whose death the watch takes.
+    // after `BIND_DRIVERS`, and acpid's requests), every withdrawal of a
+    // driver whose death the watch takes, and each create retry once due.
     start_registry_workers(&registry);
     std::os::seraph::log!("enumeration complete, registry open");
 
@@ -251,7 +251,9 @@ fn main() -> !
             ipc_buf,
         );
         registry.withdraw_deaths(&watch, &mut caps.slot_bars, ipc_buf);
-        match watch.wait()
+        // No longer than the earliest create retry is due, so it runs then
+        // whatever else wakes the thread meanwhile.
+        match watch.wait(registry.retry_wait_ms(now_ns()))
         {
             Ok(_) => guard.on_success(),
             Err(e) => guard.on_failure(e),
@@ -378,7 +380,9 @@ const REGISTRY_WORKERS: usize = 4;
 
 /// Run the work registry requests left for the control thread, in this
 /// order: the drivers-directory job, the restarts of drivers that died, each
-/// in a settle batch of its own, then the on-demand pass and settle. The
+/// in a settle batch of its own, the create retries due
+/// ([`RegistryState::retries`]), each in a batch of its own, then the
+/// on-demand pass and settle. The
 /// drivers-directory job reads the platform description tables from the
 /// root filesystem and appends the matching one's records, unless a boot
 /// module's table matched ([`platform::read_tables`]), settles the hotplug
@@ -457,6 +461,13 @@ fn run_jobs(
             );
         }
         registry.finish_job(|_| ());
+    }
+    // Every create retry due by now, each in a batch of its own; one a
+    // retry queues again falls due a delay later, at a later pass.
+    let now = now_ns();
+    while let Some(retry) = registry.take_due_retry(now)
+    {
+        retry_driver(retry, records, tables, watch, registry, ipc_buf);
     }
     if jobs.bind
     {
@@ -609,6 +620,11 @@ struct RegistryState
     /// The drivers whose restart is admitted and charged, for the restart
     /// job to start, in death order.
     restarts: Vec<bind::RestartSource>,
+    /// The driver starts whose create procmgr refused with an error a later
+    /// create can outlive, each held until its retry is due
+    /// ([`bind::CreateRetry`]); the control thread runs each once due
+    /// (`run_jobs`) and waits no longer than the earliest is due.
+    retries: firmware::restart::Retries<bind::CreateRetry>,
 }
 
 // A class name a `MINT_CLASS_SEND` request can carry is one a declaration
@@ -726,6 +742,7 @@ impl Registry
                 bind_dir_cap: 0,
                 bind_dir_path: DirPath::EMPTY,
                 restarts: Vec::new(),
+                retries: firmware::restart::Retries::new(),
             }),
             settled: Condvar::new(),
             job_note,
@@ -785,6 +802,50 @@ impl Registry
     fn signal_jobs(&self)
     {
         let _ = syscall::notification_send(self.job_note, 1);
+    }
+
+    /// Count a job the control thread starts of its own unsettled, as
+    /// [`Self::post`] counts a posted one: a create retry, which no request
+    /// posts. [`Self::finish_job`] counts it done.
+    fn begin_job(&self)
+    {
+        let mut state = self.lock();
+        state.unsettled = state.unsettled.saturating_add(1);
+    }
+
+    /// Hold the create retries a batch queued, `batch` left empty, until
+    /// each is due; each is released, logged, when the list cannot hold them.
+    fn hold_retries(&self, batch: &mut firmware::restart::Retries<bind::CreateRetry>)
+    {
+        if batch.is_empty()
+        {
+            return;
+        }
+        let held = self.lock().retries.append(batch);
+        if held.is_err()
+        {
+            for retry in batch.drain()
+            {
+                std::os::seraph::log!(
+                    warn: "{}: no memory to hold its create retry; given up",
+                    retry.name()
+                );
+                retry.release();
+            }
+        }
+    }
+
+    /// Take the create retry due earliest, when it is due at `now_ns`.
+    fn take_due_retry(&self, now_ns: u64) -> Option<bind::CreateRetry>
+    {
+        self.lock().retries.take_due(now_ns)
+    }
+
+    /// How long the control thread may wait from `now_ns` before a create
+    /// retry falls due, in milliseconds; `None` with none pending.
+    fn retry_wait_ms(&self, now_ns: u64) -> Option<u64>
+    {
+        self.lock().retries.wait_ms(now_ns)
     }
 
     /// Count one job done, applying `record` to the state in the same hold,
@@ -2767,6 +2828,7 @@ fn spawn_boot_drivers(
         return;
     };
     let mut roster = Roster::new();
+    let mut retries = firmware::restart::Retries::new();
     bind::boot_pass(
         records,
         modules,
@@ -2780,6 +2842,7 @@ fn spawn_boot_drivers(
             batch: &batch,
             watch,
             roster: &mut roster,
+            retries: &mut retries,
         },
         ipc_buf,
     );
@@ -2793,6 +2856,7 @@ fn spawn_boot_drivers(
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
+    registry.hold_retries(&mut retries);
 }
 
 /// Create a driver service endpoint devmgr owns; `None` when it cannot be
@@ -2837,6 +2901,7 @@ fn spawn_dir_drivers(
         return;
     };
     let mut roster = Roster::new();
+    let mut retries = firmware::restart::Retries::new();
     bind::drivers_dir_pass(
         records,
         dir_cap,
@@ -2846,6 +2911,7 @@ fn spawn_dir_drivers(
             batch: &batch,
             watch,
             roster: &mut roster,
+            retries: &mut retries,
         },
         ipc_buf,
     );
@@ -2859,6 +2925,7 @@ fn spawn_dir_drivers(
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
+    registry.hold_retries(&mut retries);
 }
 
 /// Restart the driver `source` describes in a settle batch of its own, on
@@ -2893,6 +2960,7 @@ fn restart_driver(
         return;
     };
     let mut roster = Roster::new();
+    let mut retries = firmware::restart::Retries::new();
     bind::restart(
         records,
         source,
@@ -2903,6 +2971,7 @@ fn restart_driver(
             batch: &batch,
             watch,
             roster: &mut roster,
+            retries: &mut retries,
         },
         ipc_buf,
     );
@@ -2916,6 +2985,58 @@ fn restart_driver(
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
+    registry.hold_retries(&mut retries);
+}
+
+/// Retry the start `retry` holds, once its delay has passed, in a settle
+/// batch of its own, on the control thread, as `run_jobs` runs it: its
+/// record bound to the same driver from the same binary ([`bind::retry`]),
+/// and the batch settled and served ([`settle_batch`]), the new instance at
+/// its class's next ordinal. The retry is counted a job while it runs, so a
+/// query that would find no driver waits for its settle, as for a restart's.
+fn retry_driver(
+    retry: bind::CreateRetry,
+    records: &bind::Records,
+    carve: &mut bind::Carve,
+    watch: &mut settle::DriverWatch,
+    registry: &Registry,
+    ipc_buf: *mut u64,
+)
+{
+    let Some(batch) = settle::SettleBatch::new()
+    else
+    {
+        std::os::seraph::log!(warn: "{}: no settle batch; create not retried", retry.name());
+        retry.release();
+        return;
+    };
+    registry.begin_job();
+    let mut roster = Roster::new();
+    let mut retries = firmware::restart::Retries::new();
+    bind::retry(
+        records,
+        retry,
+        carve,
+        &mut bind::Pass {
+            batch: &batch,
+            watch,
+            roster: &mut roster,
+            retries: &mut retries,
+        },
+        ipc_buf,
+    );
+    settle_batch(
+        batch,
+        roster,
+        watch,
+        carve.catalog,
+        registry,
+        &mut carve.caps.slot_bars,
+        settle::SETTLE_TIMEOUT,
+        ipc_buf,
+    );
+    registry.hold_retries(&mut retries);
+    registry.finish_job(|_| ());
 }
 
 /// Halt when devmgr's own address space cap carries `RIGHTS_AS_READ`, or

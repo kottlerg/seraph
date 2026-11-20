@@ -137,7 +137,8 @@ services/svctest/
         ├── oom.rs             # Out-of-memory policy: memhog filled until oomd stops it, a
         │                      #   stop source's job stopped first, a held write resumed
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed; a timed started
-        │                      #   after the RTC driver's restart serves the wall clock
+        │                      #   after the RTC driver's restart serves the wall clock; the
+        │                      #   RTC driver's create refused under memory pressure, retried
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
         │                      #   fall-through, remount, a mapped page across the unmount,
         │                      #   a killed fs driver
@@ -192,17 +193,19 @@ seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and `acpid.deny` names i
 svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd and vfsd unmount phases
 (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`,
 `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`,
-`oom_policy`, and `memmgr_swap_commit` phases (`caps[6]`), the vfsd swap-partition phase
-(`caps[14]`), the `memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases (`caps[18]`), the
+`rtc_create_retry`, `oom_policy`, and `memmgr_swap_commit` phases (`caps[6]`), the vfsd
+swap-partition phase (`caps[14]`), the `memmgr_swap_client`, `memmgr_swap_raw` and `swapd`
+phases (`caps[18]`), the
 `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[20]`),
 the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`,
 `memmgr_swap_client`, `memmgr_swap_raw`, `swapd`,
-`vfsd_driver_death`, and `timed_rtc_restart` phases, and the drivers
+`vfsd_driver_death`, `rtc_create_retry`, and `timed_rtc_restart` phases, and the drivers
 hwrng restart phase (`caps[19]`), the `svcmgr_stop_service` phase (`caps[20]`, and `caps[19]`
-with `stopsrc` staged), and the no-stop cases of the `oom_policy` and `logd_reserve` phases
-(`caps[20]`), instead fail their assertions. The seed-only phase thus fails the run on a zero
-`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
-reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
+with `stopsrc` staged), and the no-stop cases of the `oom_policy`, `logd_reserve` and
+`rtc_create_retry` phases (`caps[20]`), instead fail their assertions. The seed-only phase
+thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's
+own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero
+cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -228,7 +231,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `oom_policy`, `memmgr_swap_commit` phases: read logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`, `oom_policy`, `memmgr_swap_commit` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
@@ -241,8 +244,8 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
 | `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases: memmgr's swap labels, as a second swap client beside swapd, registering nothing, over a RAM slot store |
-| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
-| `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
+| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `rtc_create_retry` phase: finds devmgr and the RTC driver, attaches to devmgr, stops and starts its main thread, and kills the RTC driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy`, `logd_reserve` and `rtc_create_retry` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the nine `devmgr.class.*` names among them. `caps[2]` carries
@@ -289,6 +292,16 @@ at least 16 and at most 504 bytes, the two answers to differ, and `READ(0)` to a
 The drivers hwrng restart phase kills the virtio-rng driver through `caps[19]`, requires its ordinal
 on `caps[16]` to answer `WITHDRAWN` and the class's next ordinal to answer with a new instance, and
 requires a `READ` through that instance to answer with bytes.
+The `rtc_create_retry` phase runs just before `timed_rtc_restart`, when `memhog.svc` is staged, and
+passes otherwise. It stops devmgr's main thread, which runs every driver restart, through
+`caps[19]`, kills the RTC driver and waits until procmgr no longer lists it, then has
+[memhog](../memhog/README.md) fill the pool down to the growth floor and, once the level reads
+`CRITICAL`, starts devmgr's main thread again, so devmgr's restart of the driver makes its create
+while no page is left to a driver outside the system reserve, and procmgr refuses it. It requires
+devmgr's line for the refusal and its first retry in logd's history through `caps[6]`, stamped
+after the kill; once oomd's stop of memhog, or svctest's own through `caps[20]` when no oomd stops
+it, has ended the window, a new RTC driver listed within 90 s; and devmgr's line for a retry
+of its create ([devmgr responsibilities](../devmgr/docs/responsibilities.md#create-retry)).
 The `timed_rtc_restart` phase kills the RTC driver (`cmos-rtc` on x86-64, `goldfish-rtc` on
 riscv64) through `caps[19]` and waits for devmgr's restart of it, then kills timed (its recipe's
 `argv = timed` names it), and requires `SystemTime::now()` to give a time between 2024 and 2100

@@ -72,6 +72,11 @@ direct console paths remain as fallbacks for the life of the system.
    ([boot-media.md](boot-media.md) § The Bootstrap Closure): devmgr starts both from the root
    filesystem, so a boot whose root does not mount ends with init-logd's lines on the UART and the
    kernel's console on the screen.
+   devmgr retries a console driver's start whose create procmgr refuses with an error a later
+   create can outlive, within a bound
+   ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#create-retry)): the
+   serial driver comes up once a retry's create succeeds, and never comes up only when its retries
+   are given up or its start fails otherwise.
 
 4. **Serial-driver-mediated path** — devmgr spawns the serial driver (`services/drivers/serial/`)
    from the root filesystem, in the drivers-directory pass that svcmgr's `SET_DRIVERS_DIR` posts

@@ -16,8 +16,8 @@
 //! commits all but [`HOG_MARGIN_PAGES`] of what memmgr can still promise,
 //! sees a grant past that refused although free pages exist, and touches every
 //! page it committed with no fault declined. Each child's charge leaves
-//! svctest's budget subtree before the phase goes on, memmgr's free total net
-//! of eviction and its promised total then return to their levels
+//! svctest's budget subtree before the phase goes on, memmgr's free and
+//! promised totals, each net of eviction, then return to their levels
 //! ([`PoolLevels`]), and the all-RAM-accounted identity holds.
 
 use std::os::seraph::startup_info;
@@ -166,9 +166,11 @@ pub(crate) fn pool_totals() -> Option<(u64, u64, u64)>
 }
 
 /// memmgr's `QUERY_POOL_STATUS` totals a window compares, in pages: the free
-/// total (`data[3]`), the promised total (`data[8]`), and the store and
-/// swapped totals (`data[9]` and `data[10]`) that net eviction out of the
-/// free total ([`Self::net_free`]).
+/// total (`data[3]`), the promised total (`data[8]`), the store and swapped
+/// totals (`data[9]` and `data[10]`) that net eviction out of the free total
+/// ([`Self::net_free`]), and the part of `promised` evicted committed chunks
+/// hold (`data[18]`), which nets it out of the promised total
+/// ([`Self::net_promised`]).
 #[derive(Clone, Copy)]
 struct PoolLevels
 {
@@ -176,6 +178,7 @@ struct PoolLevels
     promised: u64,
     store: u64,
     swapped: u64,
+    committed_swapped: u64,
 }
 
 impl PoolLevels
@@ -204,6 +207,7 @@ impl PoolLevels
             promised: reply.word(8) / PAGE_SIZE,
             store: reply.word(9) / PAGE_SIZE,
             swapped: reply.word(10) / PAGE_SIZE,
+            committed_swapped: reply.word(18) / PAGE_SIZE,
         }
     }
 
@@ -228,11 +232,25 @@ impl PoolLevels
             .wrapping_sub(i128::from(self.swapped))
     }
 
-    /// What a window compares: the free total net of eviction and the
-    /// promised total.
-    fn level(&self) -> (i128, u64)
+    /// The promised total net of eviction: `promised` less the pages of it
+    /// that evicted committed chunks hold, `promised - committed_swapped`.
+    /// While a swap service has registered slots memmgr evicts committed
+    /// chunks too, any process's, and each one's `b` backed pages join
+    /// `promised` for its restore once it holds no frame of its own, and
+    /// leave it at the restore (services/memmgr/docs/memory-pool.md § Commit,
+    /// Overcommit); `committed_swapped` moves with them, so neither moves this
+    /// difference, which a commitment's registration, its faults and its
+    /// release move.
+    fn net_promised(&self) -> i128
     {
-        (self.net_free(), self.promised)
+        i128::from(self.promised).wrapping_sub(i128::from(self.committed_swapped))
+    }
+
+    /// What a window compares: the free and promised totals net of
+    /// eviction.
+    fn level(&self) -> (i128, i128)
+    {
+        (self.net_free(), self.net_promised())
     }
 }
 
@@ -242,12 +260,15 @@ impl std::fmt::Display for PoolLevels
     {
         write!(
             f,
-            "{} free net of eviction ({} free, {} in the store, {} swapped) and {} promised",
+            "{} free net of eviction ({} free, {} in the store, {} swapped) and {} promised net \
+             of eviction ({} promised, {} of it for evicted committed chunks)",
             self.net_free(),
             self.free,
             self.store,
             self.swapped,
-            self.promised
+            self.net_promised(),
+            self.promised,
+            self.committed_swapped
         )
     }
 }
@@ -279,9 +300,9 @@ fn levels_settle_to(before: PoolLevels) -> Result<(), PoolLevels>
     Err(last)
 }
 
-/// Run `window` in up to [`POOL_WINDOWS`] windows, until memmgr's free
-/// total net of eviction and its promised total return after one to the
-/// levels they read before it ([`PoolLevels`], [`settled_levels`],
+/// Run `window` in up to [`POOL_WINDOWS`] windows, until memmgr's free and
+/// promised totals net of eviction return after one to the levels they read
+/// before it ([`PoolLevels`], [`settled_levels`],
 /// [`levels_settle_to`]). `window` takes what memmgr charged svctest's
 /// descendants before it ([`children_charge`]). Panics, naming `what`,
 /// when no window settles, stating the last window's levels and the totals it
@@ -305,9 +326,9 @@ pub(crate) fn windows_settle(what: &str, mut window: impl FnMut(u64))
         panic!(
             "memmgr's levels did not return after {what} in any of {POOL_WINDOWS} windows: \
              the last window's levels were {before}, and it read last {last}, {:+} free net of \
-             eviction and {:+} promised",
+             eviction and {:+} promised net of eviction",
             last.net_free().wrapping_sub(before.net_free()),
-            i128::from(last.promised).wrapping_sub(i128::from(before.promised))
+            last.net_promised().wrapping_sub(before.net_promised())
         );
     }
 }

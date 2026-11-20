@@ -1010,10 +1010,14 @@ uncommitted chunk frees its frames less the store pages its contents take, while
 committed chunk adds its pages to `promised` again and only takes store pages from the free pages
 outside it. While a swap service has registered swap slots heap pages are evictable too, and the
 allowance counts an evicted committed chunk's pages again ([Commit](#commit), Overcommit). A victim
-of background eviction at `LOW`, or of an uncommitted restore's direct reclaim, must raise the free
-pages outside `promised`: a committed chunk does only while a chunk's pages more in `promised` keep
-it within the allowance, where the free pool, not `promised`, bounds those pages. Eviction for
-frames (Selection, below) and a committed draw take any victim, since they need free frames alone.
+of background eviction at `LOW` must raise the free pages outside `promised`. While slots are
+registered no eviction changes the pages a commitment may still promise: an uncommitted chunk's
+pages take swap the allowance no longer offers, and a committed chunk's join `promised` again. So an
+eviction then raises the free pages outside `promised` only while a chunk's pages more in `promised`
+keep it within the allowance, where the free pool, not `promised`, bounds those pages. A restore of
+an uncommitted chunk and a reserve node's committed draw take any victim, since they need free
+frames alone; eviction for frames and any other committed draw take a victim whose eviction frees a
+page above the growth floor (Selection, below).
 
 **Selection.** While the pool's pressure level reads `LOW` ([Memory pressure](#memory-pressure)),
 memmgr reclaims in the background until it reads `NORMAL`, and stops there. It also evicts for
@@ -1118,20 +1122,22 @@ worker, so its latency lands on no fault or grant.
 the reserve leaves a restore headroom H free above the reserve R: their swapped pages, and at most
 R, so it is admitted when `U - R - H >= want` with `H = min(swapped - committed_swapped, R)`, and
 the level is `CRITICAL` at or below `R + H` ([Memory pressure](#memory-pressure)). A restore of an
-uncommitted chunk is admitted against R alone, so it draws on H. A committed chunk's restore is a
-committed draw, from `promised` ([Commit](#commit), Overcommit), so its pages raise no H. Without H,
-the frames background eviction frees at `LOW` go to a process draining the pool, whose grants are
-never victims, and by `CRITICAL` the evicted chunks of idle processes, a filesystem driver's thread
-stacks woken by the pressure signal among them, find neither a free page nor a victim, and their
-faults are declined. With H, the restores of up to R swapped pages find their frames whatever a
-drainer took, and direct reclaim covers the rest. The cost falls on growth: each uncommitted chunk's
-eviction raises H by its pages and frees them less its store pages, so eviction gives growth, and a
-committed draw, no page until H reaches R; a committed chunk's eviction moves no H. A raw chunk
-moves neither H nor the free pages until its write ends: mapping its own frames back needs none.
-With nothing swapped H is 0, and every admission and level is as it is without eviction. H is at
-most R, a sixty-fourth of the pool, so `LOW`'s threshold stays above `CRITICAL`'s.
-`QUERY_POOL_STATUS` reports `R + H` as `growth_floor_bytes` ([ipc-interface.md](ipc-interface.md) §
-Label 6). The computation is the host-tested `free-pool` function `budget::growth_floor`.
+uncommitted chunk is admitted on the free frames against R alone, so it draws on H: it takes frames
+and no promise, and while the allowance bounds U, the evictions that raised H freed frames and left
+U where it was. A committed chunk's restore is a committed draw, from `promised` ([Commit](#commit),
+Overcommit), so its pages raise no H. Without H, the frames background eviction frees at `LOW` go to
+a process draining the pool, whose grants are never victims, and by `CRITICAL` the evicted chunks of
+idle processes, a filesystem driver's thread stacks woken by the pressure signal among them, find
+neither a free page nor a victim, and their faults are declined. With H, the restores of up to R
+swapped pages find their frames whatever a drainer took, and direct reclaim covers the rest. The
+cost falls on growth: each uncommitted chunk's eviction raises H by its pages and frees them less
+its store pages, so eviction gives growth, and a committed draw, no page until H reaches R; a
+committed chunk's eviction moves no H. A raw chunk moves neither H nor the free pages until its
+write ends: mapping its own frames back needs none. With nothing swapped H is 0, and every admission
+and level is as it is without eviction. H is at most R, a sixty-fourth of the pool, so `LOW`'s
+threshold stays above `CRITICAL`'s. `QUERY_POOL_STATUS` reports `R + H` as `growth_floor_bytes`
+([ipc-interface.md](ipc-interface.md) § Label 6). The computation is the host-tested `free-pool`
+function `budget::growth_floor`.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr, at the top of the
 fair class (`ipc::sched_policy::MEMMGR_WORKER_PRIORITY`), below the receive loop's priority. It

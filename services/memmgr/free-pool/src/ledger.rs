@@ -485,6 +485,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         )
     }
 
+    /// Whether the free pool holds the frames to restore `pages` pages of an
+    /// evicted chunk of an uncommitted region for a budget node that must
+    /// leave `reserve` free pages (0 for a reserve node). A restore takes
+    /// frames alone: its pages are charged already, and it leaves the pages a
+    /// commitment may still promise ([`Self::promise_free`]) as they were,
+    /// since the allowance offers again the swap they took. So it reads the
+    /// free frames, not the free pages outside `promised`, which can stand
+    /// below the growth floor while the allowance bounds them, the evictions
+    /// that raised the restore headroom having freed frames alone.
+    #[must_use]
+    pub fn restore_fits(&self, pages: u64, reserve: u64) -> bool
+    {
+        self.pool.free_pages() >= pages.saturating_add(reserve)
+    }
+
     /// The pages of the evicted chunks of uncommitted regions, compressed,
     /// writing or on disk, whose restores the restore headroom keeps free
     /// pages for: the swapped pages less those of committed regions.
@@ -2109,19 +2124,22 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             && budget::node(&self.arena, r.budget).is_some_and(|b| !b.reserve())
     }
 
-    /// Whether evicting a chunk of the region `reg` raises the free pages
-    /// outside `promised` ([`Ledger::uncommitted_free`]). An uncommitted chunk's
-    /// eviction frees its runs less its store pages. A committed chunk's frees
-    /// them too, but its pages join `promised` again, since its restore draws
-    /// from it, and the allowance counts them again ([`commit::allowance`]),
-    /// so the pages a commitment may still promise stay as they were: it
-    /// raises the free pages outside `promised` only while the free pool, not
-    /// `promised`, bounds them, which a chunk's pages more in `promised` leave
-    /// so when they keep it within the allowance.
+    /// Whether evicting a chunk raises the free pages outside `promised`
+    /// ([`Ledger::uncommitted_free`]). Every eviction frees the chunk's runs
+    /// less its store pages. While no swap service has registered slots the
+    /// allowance stays 0 and only an uncommitted chunk is evicted, so that is
+    /// the rise. While one has, an eviction leaves the pages a commitment may
+    /// still promise ([`Ledger::promise_free`]) as they were: an uncommitted
+    /// chunk's pages take swap the allowance no longer offers, and a committed
+    /// chunk's join `promised` again, its restore drawing from it, while the
+    /// allowance counts them again ([`commit::allowance`]). It then raises the
+    /// free pages outside `promised` only while the free pool, not the
+    /// pages a commitment may still promise, bounds them, which holds while a
+    /// chunk's pages more in `promised` stay within the allowance.
     #[must_use]
-    pub fn evicting_frees(&self, reg: NodeIdx) -> bool
+    pub fn evicting_frees(&self) -> bool
     {
-        !self.is_committed(reg)
+        !self.overcommits()
             || self.promised.saturating_add(u64::from(DEMAND_CHUNK_PAGES)) <= self.allowance()
     }
 
@@ -2158,7 +2176,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         band: u64,
     ) -> bool
     {
-        (level == PressureLevel::Low && self.evicting_frees(reg))
+        (level == PressureLevel::Low && self.evicting_frees())
             || (self.frames_short(self.growth_floor(pool_total), band)
                 && self.evicting_opens(reg, pool_total))
     }
@@ -5186,6 +5204,40 @@ mod tests
     }
 
     #[test]
+    fn an_uncommitted_restore_reads_free_frames_under_a_bounding_allowance()
+    {
+        let mut l = roomy_ledger(10_000);
+        // With no slot registered an uncommitted chunk's eviction raises the
+        // free pages outside `promised`.
+        assert!(l.evicting_frees());
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let plain = l
+            .add_region(rec, region(BASE, CHUNK), Commit::Uncommitted)
+            .unwrap();
+        back_whole(&mut l, rec, plain, 0);
+        l.add_region(rec, region(BASE + CHUNK, 8 * CHUNK), Commit::Committed)
+            .unwrap();
+        register_slots(&mut l, 4);
+        // `promised` past the allowance: the pages a commitment may still
+        // promise bound the free pages outside `promised`.
+        assert!(promised(&l) > l.allowance());
+        let outside = l.uncommitted_free();
+        assert!(outside < l.pool.free_pages());
+        assert!(!l.evicting_frees());
+        let free = l.pool.free_pages();
+        swap_out(&mut l, rec, plain, 0, 1, 2);
+        // The eviction freed frames, took swap the allowance offered, and
+        // left the free pages outside `promised` as they were.
+        assert_eq!(l.pool.free_pages(), free + 16 - 2);
+        assert_eq!(l.uncommitted_free(), outside);
+        // Its restore reads the free frames.
+        let free = l.pool.free_pages();
+        assert!(l.restore_fits(16, free - 16));
+        assert!(!l.restore_fits(16, free - 15));
+        assert!(l.restore_fits(16, outside));
+    }
+
+    #[test]
     fn a_committed_chunk_is_evicted_only_under_an_allowance_and_its_pages_are_promised_again()
     {
         let mut l = roomy_ledger(10_000);
@@ -5208,16 +5260,15 @@ mod tests
         register_slots(&mut l, slots);
         assert!(l.allowance() >= held + 16);
         assert!(l.evictable(rec, reg));
-        // Its eviction raises the free pages outside `promised` only while a
+        // An eviction raises the free pages outside `promised` only while a
         // chunk's pages more in `promised` stay within the allowance.
-        assert!(l.evicting_frees(reg));
+        assert!(l.evicting_frees());
         register_slots(&mut l, slots - 1);
         assert!(l.allowance() < held + 16);
-        assert!(!l.evicting_frees(reg));
+        assert!(!l.evicting_frees());
         let plain = l
             .add_region(rec, region(BASE + len, CHUNK), Commit::Uncommitted)
             .unwrap();
-        assert!(l.evicting_frees(plain));
         // An eviction returns the runs and promises the chunk's pages again:
         // its restore draws from `promised`. The commitment's charge stands.
         // A committed chunk's eviction opens the draw room; an uncommitted

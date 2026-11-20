@@ -703,11 +703,11 @@ impl Stub
         self.sys.target = badge;
         self.bias = attached.bias;
         let session = Session::attach(&mut self.sys, BREAKPOINT_PC_ADVANCE, attached.page);
-        if session.awaits_start(&mut self.sys)
+        if session.awaits_start()
         {
-            // Its creator has not started it within the all-stop's wait: no
-            // stop is held, and the started target would run on while GDB
-            // took it for stopped. Serve detached; GDB's next connection
+            // Its creator had not started it at the all-stop's last read: it
+            // is not held, and once started it would run on while GDB took it
+            // for stopped. Serve detached; GDB's next connection
             // attaches again.
             let restored = session.detach(&mut self.sys);
             std::os::seraph::log!(

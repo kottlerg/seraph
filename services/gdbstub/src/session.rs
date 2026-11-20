@@ -16,7 +16,9 @@
 //!    the session; any other at once.
 //! 2. Between two resumes GDB is told of, every live bound thread is held,
 //!    or was posted an upcall that has not arrived within [`STOP_WAIT`], or
-//!    was not started by its creator within it, posted again meanwhile. A
+//!    is not yet started by its creator, read again meanwhile; an all-stop
+//!    that ends with one unstarted at its last read records it
+//!    ([`Session::awaits_start`]), and the attach then detaches. A
 //!    held stop GDB has been told of is never restarted: it is answered by
 //!    a resume, a step, a detach, or the drop, or replaced by an upcall or
 //!    `#DB` under its badge, which a thread held on its own stop cannot
@@ -272,6 +274,9 @@ pub struct Session
     stepping: Option<usize>,
     /// The target was resumed and no stop has been reported since.
     running: bool,
+    /// The last all-stop ended with a live thread its creator had not
+    /// started at its last read, so neither held nor posted.
+    unstarted: bool,
     /// The thread register and memory commands act on, by slot.
     pub current: usize,
     /// The breakpoints planted in the target's text.
@@ -290,6 +295,7 @@ impl Session
             advance,
             stepping: None,
             running: true,
+            unstarted: false,
             current: 0,
             breakpoints: Breakpoints::new(),
         };
@@ -403,6 +409,7 @@ impl Session
         loop
         {
             let unstarted = self.post_upcalls(k);
+            self.unstarted = unstarted;
             let waiting = self
                 .threads
                 .iter()
@@ -417,7 +424,7 @@ impl Session
                 self.restart_unreported(k, None);
                 continue;
             }
-            // A thread not started yet is posted again once this wait ends.
+            // A thread not started yet is read again once this wait ends.
             let until = if unstarted
             {
                 k.now().saturating_add(START_POLL).min(deadline)
@@ -1106,14 +1113,15 @@ impl Session
         self.threads.get(index).is_some_and(|t| t.held.is_some())
     }
 
-    /// Whether the session holds no stop while a live thread of it has not
-    /// been started by its creator: the target has run nothing yet and,
-    /// once started, runs on, so the session has no stop to report.
+    /// Whether the last all-stop ended with a live thread its creator had
+    /// not started at the all-stop's last read of it: that thread is neither
+    /// held nor posted and, once started, runs on, so the session has no
+    /// stop of it to report. The record is the all-stop's, not a new read: a
+    /// thread started after that read is unposted all the same.
     #[must_use]
-    pub fn awaits_start(&self, k: &mut impl Kernel) -> bool
+    pub fn awaits_start(&self) -> bool
     {
-        self.threads.iter().all(|t| t.held.is_none())
-            && self.threads.iter().any(|t| t.live() && !k.started(t.cap))
+        self.unstarted
     }
 }
 
@@ -2255,7 +2263,7 @@ mod tests
         let page = sim.page();
         let s = Session::attach(&mut sim, ADVANCE, page);
         assert!(s.is_held(0), "the main thread runs unheld");
-        assert!(!s.awaits_start(&mut sim));
+        assert!(!s.awaits_start());
         assert!(sim.time < STOP_WAIT, "the all-stop waited out its bound");
         assert!(s.detach(&mut sim));
         sim.assert_sound();
@@ -2274,7 +2282,25 @@ mod tests
         assert_eq!(sim.time, STOP_WAIT, "the all-stop ends at its bound");
         assert!(!s.is_held(0));
         assert_eq!(s.slot_state(ThreadId::Id(1)).0, SlotState::Live);
-        assert!(s.awaits_start(&mut sim));
+        assert!(s.awaits_start());
+        assert!(s.detach(&mut sim));
+        assert!(sim.detached);
+        sim.assert_sound();
+    }
+
+    // Defect caught: a target its creator started after the all-stop's last
+    // read, in its last `START_POLL`, was read again as started once the
+    // all-stop had ended, and attached holding nothing while it ran.
+    #[test]
+    fn a_target_started_after_the_all_stops_last_read_detaches()
+    {
+        let mut sim = Sim::new();
+        sim.unstarted.push((0, STOP_WAIT - START_POLL / 2));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert_eq!(sim.time, STOP_WAIT, "the all-stop ends at its bound");
+        assert!(!s.is_held(0));
+        assert!(s.awaits_start(), "a target running unheld is attached");
         assert!(s.detach(&mut sim));
         assert!(sim.detached);
         sim.assert_sound();

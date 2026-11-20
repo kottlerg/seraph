@@ -93,9 +93,10 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
    procmgr's list, and is not shown to GDB. A refused or failed page deletes the caps already
    taken and has procmgr drop the watch again (`DETACH_PROCESS`).
 5. It stops every thread ([Stop Model](#stop-model)) and logs
-   `attached; serving the debug port (<name>)`. A target its creator has not started by the end
-   of that all-stop holds no stop, and once started it would run while GDB took it for stopped: the
-   stub detaches from it again, logs
+   `attached; serving the debug port (<name>)`. A target its creator had not started at that
+   all-stop's last read of it, at most `START_POLL` before its end, holds no stop, and once
+   started it would run while GDB took it for stopped. The stub detaches from such a target
+   instead, logs
    `<name> not started within the attach's wait; detached (crash bindings restored: <bool>)`, and
    counts the attach as failed.
 

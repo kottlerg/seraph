@@ -75,8 +75,8 @@ pub const DRAIN_WAIT: u64 = 500;
 /// before it ends, within [`DRAIN_WAIT`].
 pub const DRAIN_QUIET: u64 = 50;
 
-/// How many thread-list pages a refresh takes when a thread of the table
-/// exits during one.
+/// How many times a refresh, or the attach, takes procmgr's thread list
+/// when a thread it lists exits during the walk of its pages.
 pub const REFRESH_TRIES: u32 = 3;
 
 /// A fault or upcall message one receiver took off the endpoint, which that
@@ -146,7 +146,10 @@ pub trait Kernel
     fn unbind_upcall(&mut self, cap: u64);
     /// Delete the cap.
     fn delete(&mut self, cap: u64);
-    /// The page of procmgr's thread list from `first`, at most `room` caps.
+    /// The page of procmgr's thread list from `first`, at most `room` caps,
+    /// walked in procmgr's replies of `ATTACH_THREADS_PAGE` caps from the
+    /// index past the last reply's, until one reaches the end of the list
+    /// or the room.
     fn list(&mut self, first: u64, room: usize) -> Option<Page>;
     /// Arm one instruction's step on the held thread, keeping its undo;
     /// `false` when the step cannot be armed, which leaves the thread as it
@@ -312,9 +315,37 @@ pub struct Session
 impl Session
 {
     /// Attach to the threads of `page`, procmgr's list from its start, and
-    /// stop them all.
+    /// stop them all. A list whose walk a thread's exit can have torn
+    /// ([`walk_torn`]) is taken again, [`REFRESH_TRIES`] times in all;
+    /// one still torn then is attached as incomplete, so no refresh pages
+    /// on from it.
     pub fn attach(k: &mut impl Kernel, advance: u64, page: Page) -> Self
     {
+        let mut page = page;
+        let mut tries = 1;
+        while walk_torn(k, 0, &page.caps)
+        {
+            let again = if tries < REFRESH_TRIES
+            {
+                k.list(0, MAX_THREADS)
+            }
+            else
+            {
+                None
+            };
+            let Some(again) = again
+            else
+            {
+                page.complete = false;
+                break;
+            };
+            tries = tries.saturating_add(1);
+            for &cap in &page.caps
+            {
+                k.delete(cap);
+            }
+            page = again;
+        }
         let mut s = Self {
             threads: Vec::new(),
             complete: page.complete,
@@ -391,7 +422,9 @@ impl Session
     /// procmgr lists the main thread at index 0 whether or not it has
     /// exited, then each registered thread still alive in registration
     /// order, so the new ones start after the main thread and the table's
-    /// live registered threads.
+    /// live registered threads. The list is taken again when a thread of
+    /// the table, or one the list took, exits during its walk
+    /// ([`walk_torn`]).
     fn refresh(&mut self, k: &mut impl Kernel) -> bool
     {
         if !self.complete
@@ -407,7 +440,9 @@ impl Session
             {
                 return false;
             };
-            if self.alive_count(k) != alive || page.count < first
+            if self.alive_count(k) != alive
+                || page.count < first
+                || walk_torn(k, first, &page.caps)
             {
                 for cap in page.caps
                 {
@@ -1184,6 +1219,25 @@ impl Session
     }
 }
 
+/// Whether a walk of procmgr's list that took `caps` from index `first`
+/// ([`Kernel::list`]) can have skipped a thread: one taken from a reply
+/// before the last, past the main thread at index 0, has exited. procmgr
+/// drops an exited thread from the list before each reply, so an exit
+/// between two replies moves every later thread one index down, past the
+/// next reply's first index. The main thread stays listed after its exit,
+/// and an exit of a thread of the last reply moves none the walk takes.
+fn walk_torn(k: &mut impl Kernel, first: u64, caps: &[u64]) -> bool
+{
+    const REPLY: usize = ipc::procmgr_labels::ATTACH_THREADS_PAGE;
+    // Every reply but the last is full, so the last starts at the last
+    // multiple of a reply below the count.
+    let last = (caps.len().saturating_sub(1) / REPLY).saturating_mul(REPLY);
+    caps.iter()
+        .take(last)
+        .zip(first..)
+        .any(|(&cap, index)| index != 0 && !k.alive(cap))
+}
+
 /// [`control::settle`] of `stop`, a delivery under the badge of a thread
 /// holding `held` that was not credited to it.
 fn settle_beside(held: &Held, stop: &Stop) -> Unclaimed
@@ -1334,6 +1388,9 @@ mod tests
         /// At the given time the given thread registers a thread its creator
         /// never starts, and a thread it spawned stops under its badge.
         spawn_at: Vec<(u64, usize)>,
+        /// Threads that exit between the first two replies of the next walk
+        /// of procmgr's list.
+        exit_mid_list: Vec<usize>,
     }
 
     fn cap_of(t: usize) -> u64
@@ -1371,6 +1428,7 @@ mod tests
                 late: Vec::new(),
                 due: Vec::new(),
                 spawn_at: Vec::new(),
+                exit_mid_list: Vec::new(),
             };
             sim.spawn(None, true);
             sim
@@ -1746,22 +1804,43 @@ mod tests
 
         fn list(&mut self, first: u64, room: usize) -> Option<Page>
         {
-            // As procmgr lists them: the main thread, thread 0, at index 0
-            // whether or not it has exited, then each registered thread
-            // still alive.
-            let listed: Vec<u64> = (0..self.threads.len())
-                .filter(|&t| {
-                    t == 0 || (self.threads[t].registered && self.threads[t].run != Run::Exited)
-                })
-                .map(cap_of)
-                .collect();
+            // As the service walks procmgr's list: a reply of at most
+            // `ATTACH_THREADS_PAGE` caps from the next index, each reply's
+            // list the main thread, thread 0, at index 0 whether or not it
+            // has exited, then each registered thread still alive.
             let first = usize::try_from(first).unwrap();
-            let caps: Vec<u64> = listed.iter().skip(first).take(room).copied().collect();
-            Some(Page {
-                count: listed.len() as u64,
-                complete: first + caps.len() >= listed.len(),
-                caps,
-            })
+            let mut caps = Vec::new();
+            let mut next = first;
+            loop
+            {
+                let listed: Vec<u64> = (0..self.threads.len())
+                    .filter(|&t| {
+                        t == 0
+                            || (self.threads[t].registered && self.threads[t].run != Run::Exited)
+                    })
+                    .map(cap_of)
+                    .collect();
+                let reply: Vec<u64> = listed
+                    .iter()
+                    .skip(next)
+                    .take(ipc::procmgr_labels::ATTACH_THREADS_PAGE)
+                    .copied()
+                    .collect();
+                caps.extend(reply.iter().take(room.saturating_sub(caps.len())));
+                next += reply.len();
+                if reply.is_empty() || next >= listed.len() || caps.len() >= room
+                {
+                    return Some(Page {
+                        count: listed.len() as u64,
+                        complete: first + caps.len() >= listed.len(),
+                        caps,
+                    });
+                }
+                for t in core::mem::take(&mut self.exit_mid_list)
+                {
+                    self.exit(t);
+                }
+            }
         }
 
         fn prepare_step(&mut self, cap: u64) -> bool
@@ -2321,12 +2400,6 @@ mod tests
         sim.exit(0);
         let n = sim.spawn(Some(worker), true);
         assert!(s.interrupt(&mut sim));
-        let slots_of = |s: &Session, t: usize| {
-            s.threads
-                .iter()
-                .filter(|slot| slot.cap == cap_of(t) && !slot.gone)
-                .count()
-        };
         assert_eq!(slots_of(&s, worker), 1, "the worker takes one slot");
         assert_eq!(slots_of(&s, n), 1, "the new thread is added once");
         assert_eq!(s.live_ids().len(), 2);
@@ -2336,6 +2409,62 @@ mod tests
             "the worker stays bound under its own slot's badge"
         );
         assert!(s.is_held(1), "the worker is held");
+        assert!(sim.held_live(&s));
+        sim.assert_sound();
+    }
+
+    /// How many live slots of the table hold simulated thread `t`.
+    fn slots_of(s: &Session, t: usize) -> usize
+    {
+        s.threads
+            .iter()
+            .filter(|slot| slot.cap == cap_of(t) && !slot.gone)
+            .count()
+    }
+
+    // Defect caught: a thread that exited between two replies of a
+    // refresh's walk of procmgr's list moved the later ones an index down,
+    // so the walk skipped one and, taken for complete, the next refresh
+    // added a thread the table held.
+    #[test]
+    fn a_refresh_whose_walk_a_thread_s_exit_tore_takes_the_list_again()
+    {
+        let (mut sim, mut s) = attached();
+        resume(&mut sim, &mut s);
+        let new: Vec<usize> = (0..6).map(|_| sim.spawn(Some(0), true)).collect();
+        sim.exit_mid_list.push(new[1]);
+        assert!(s.interrupt(&mut sim));
+        for &t in new.iter().filter(|&&t| t != new[1])
+        {
+            assert_eq!(slots_of(&s, t), 1, "thread {t} is in one slot");
+        }
+        resume(&mut sim, &mut s);
+        assert!(s.interrupt(&mut sim));
+        for &t in new.iter().filter(|&&t| t != new[1])
+        {
+            assert_eq!(slots_of(&s, t), 1, "thread {t} is in one slot");
+        }
+        assert!(sim.held_live(&s));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread that exited between two replies of the
+    // attach's walk of procmgr's list left a later thread out of the table,
+    // never stopped, which a refresh then took for one the table held.
+    #[test]
+    fn an_attach_whose_walk_a_thread_s_exit_tore_takes_the_list_again()
+    {
+        let mut sim = Sim::new();
+        let workers: Vec<usize> = (0..5).map(|_| sim.spawn(Some(0), true)).collect();
+        sim.exit_mid_list.push(workers[0]);
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.complete);
+        for &t in [0].iter().chain(&workers[1..])
+        {
+            assert_eq!(slots_of(&s, t), 1, "thread {t} is in one slot");
+            assert!(matches!(sim.threads[t].run, Run::Blocked(_)), "thread {t} is held");
+        }
         assert!(sim.held_live(&s));
         sim.assert_sound();
     }

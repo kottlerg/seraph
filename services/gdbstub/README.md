@@ -91,7 +91,10 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
    ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`). A
    thread whose bind fails keeps its place in the table, so the indices after it stay those of
    procmgr's list, and is not shown to GDB. A refused or failed page deletes the caps already
-   taken and has procmgr drop the watch again (`DETACH_PROCESS`).
+   taken and has procmgr drop the watch again (`DETACH_PROCESS`). A list whose walk a thread's
+   exit can have torn ([Stop Model](#stop-model), Crediting a stop) is taken again,
+   `REFRESH_TRIES` walks in all; the attach keeps a list still torn then and refreshes its table
+   no more.
 5. It stops every thread ([Stop Model](#stop-model)) and logs
    `attached; serving the debug port (<name>)`. A target its creator had not started at that
    all-stop's last read of it, at most `START_POLL` before its end, holds no stop, and once
@@ -149,9 +152,12 @@ stub's endpoint.
   lists the main thread at index 0 whether or not it has exited, then each registered thread still
   alive in registration order
   ([procmgr IPC Interface](../procmgr/docs/ipc-interface.md) § Label 20: `ATTACH_PROCESS`). It
-  retakes the page when a thread of the table exits meanwhile (`REFRESH_TRIES` times), and binds
-  each new thread under its own badge, in the slot of an exited thread or after the last. A bind
-  to a new badge delivers the new thread's stop again under it
+  takes the list again, `REFRESH_TRIES` walks in all, when a thread of the table exits meanwhile,
+  or one taken from a reply of the walk before its last does: procmgr pages the list in replies of
+  `ATTACH_THREADS_PAGE` caps and drops an exited thread before each, so such an exit moves every
+  later thread an index down and the walk skips one. It binds each new thread under its own badge,
+  in the slot of an exited thread or after the last. A bind to a new badge delivers the new
+  thread's stop again under it
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Delivery, Resume, and Kill, Rebind),
   and cancels the first delivery, which ignores the stub's answer. A new thread
   stored in the slot of the exited spawner whose badge it copied keeps its binding, which cancels
@@ -304,7 +310,7 @@ still attached.
 | `START_POLL` | 10 ms | the all-stop's interval between reads of a thread its creator has not started |
 | `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the target at startup | the stub serves detached (no target) |
 | `REATTACH_ATTEMPTS` × `FIND_INTERVAL` | 50 × 100 ms, for the target at a `qSupported` that finds the stub detached | the stub stays detached; `?` reports the target exited |
-| `REFRESH_TRIES` | 3 pages per refresh | the stop is settled as no new thread's, and the next stop that is not its thread's own refreshes again |
+| `REFRESH_TRIES` | 3 walks of the thread list per refresh or attach | a refresh's stop is settled as no new thread's, and the next stop that is not its thread's own refreshes again; the attach keeps its last list and refreshes no more |
 | `DRAIN_WAIT`, `DRAIN_QUIET` | 500 ms, ended early by 50 ms with no stop, per detach | a stop that reaches the stub's endpoint after procmgr's rebind is a thread's procmgr did not rebind, and the stub declines it |
 | `POLL_MS` | 10 ms | the serve loop's wait for port bytes between looks at the threads' stops |
 

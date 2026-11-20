@@ -16,8 +16,9 @@
 //! The hog then holds the level at `LOW` until memmgr holds chunks of the
 //! fixture's main region swapped, and is released; with the level back at
 //! `NORMAL`, where memmgr evicts nothing, the phase makes every other range
-//! of every process resident and requires memmgr's swapped total to be the
-//! fixture's, so every chunk `SWAP_TAKE` takes is one of the main region's.
+//! of every process resident until memmgr's swapped total is the fixture's
+//! and its count of evictions begun did not move while it did ([`isolate`]),
+//! so every chunk `SWAP_TAKE` takes is one of the main region's.
 //! It requires:
 //!
 //! * no page on disk and free slots, swapd's registration having made them;
@@ -340,8 +341,14 @@ pub(super) fn await_normal()
 }
 
 /// Make every range of every process resident but the fixture's main region,
-/// until memmgr's swapped total is the fixture's own. Returns the fixture's
-/// swapped pages then.
+/// until memmgr's swapped total is the fixture's own and no eviction began
+/// while the ranges were made resident. A chunk the round meets evicting, raw
+/// or evicted is made resident, an eviction in flight on it cancelled, and a
+/// chunk leaves the resident state again only by an eviction begun, which
+/// `QUERY_POOL_STATUS` `data[14]` counts: an unchanged count leaves no chunk
+/// outside the main region that `SWAP_TAKE` can take, a raw one included,
+/// which counts in no swapped total until it is written. Returns the
+/// fixture's swapped pages then.
 pub(super) fn isolate(
     authority: u64,
     process: u64,
@@ -357,6 +364,7 @@ pub(super) fn isolate(
     let start = Instant::now();
     loop
     {
+        let before = pool().evictions;
         for badge in listed_badges(authority)
         {
             let ranges: &[(u64, u64)] = if badge == process
@@ -383,15 +391,18 @@ pub(super) fn isolate(
             .nth(3)
             .and_then(|n| n.parse().ok())
             .unwrap_or_else(|| panic!("{PHASE}: the fixture answered swapped with {line:?}"));
-        let total = pool().swapped / PAGE_SIZE;
-        if total == node
+        let status = pool();
+        let total = status.swapped / PAGE_SIZE;
+        let moved = status.evictions.wrapping_sub(before);
+        if total == node && moved == 0
         {
             return node;
         }
         assert!(
             start.elapsed() < SETTLE_BOUND,
-            "{PHASE}: memmgr holds {total} pages swapped, the fixture {node}, after \
-             {SETTLE_BOUND:?} of making every other range resident"
+            "{PHASE}: memmgr holds {total} pages swapped, the fixture {node}, and began \
+             {moved} evictions in the last round, after {SETTLE_BOUND:?} of making every \
+             other range resident"
         );
         std::thread::sleep(HOG_TICK);
     }
@@ -421,8 +432,16 @@ fn swap_client_phase(caps: &Caps)
     let baseline = baseline_totals();
     let reserve = pool().reserve_pages();
     let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
+    let begun = pool().evictions;
     hog.fill_to_low();
     await_swapped(&mut hog, &mut fixture, SWAPPED_CHUNKS * CHUNK_PAGES);
+    assert!(
+        pool().evictions.wrapping_sub(begun) >= SWAPPED_CHUNKS,
+        "{PHASE}: memmgr's count of evictions begun moved by {} while it swapped {} chunks \
+         of the fixture's",
+        pool().evictions.wrapping_sub(begun),
+        SWAPPED_CHUNKS
+    );
     hog.release_all();
     await_normal();
     let swapped = isolate(authority, process, &ready, &mut fixture);

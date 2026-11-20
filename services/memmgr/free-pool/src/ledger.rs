@@ -259,6 +259,10 @@ pub struct Ledger<S, W>
     pub slots: SwapSlots<W>,
     /// Pages of every on-disk chunk, which only its swap slot holds.
     disk_pages: u64,
+    /// Evictions begun ([`Ledger::begin_evict`]), a count that only moves up,
+    /// wrapping: every eviction, background or direct, ending compressed, raw
+    /// or cancelled, starts there.
+    evictions: u64,
 }
 
 impl<S: SlotStore, W: WordStore> Ledger<S, W>
@@ -279,6 +283,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             raw_chunks: 0,
             slots: SwapSlots::new(swap_words),
             disk_pages: 0,
+            evictions: 0,
         }
     }
 
@@ -304,6 +309,16 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     pub const fn swapped_pages(&self) -> u64
     {
         self.swapped_pages
+    }
+
+    /// Evictions begun since the ledger was made, wrapping: the one way a
+    /// chunk leaves the resident state, so a reader that finds the count the
+    /// same at two reads knows no chunk began an eviction between them
+    /// (`services/memmgr/docs/ipc-interface.md` § Label 6).
+    #[must_use]
+    pub const fn evictions(&self) -> u64
+    {
+        self.evictions
     }
 
     /// Raw chunks waiting for a swap slot: evicted raw ([`Ledger::finish_raw`])
@@ -2108,6 +2123,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
         let evicting = entry.begin_evict(job).map_err(SwapError::Chunk)?;
         self.put_chunk(reg, node, height, index, evicting);
+        self.evictions = self.evictions.wrapping_add(1);
         Ok(evicting)
     }
 
@@ -4426,6 +4442,37 @@ mod tests
             back_whole(&mut l, rec, reg, c);
         }
         (l, rec, reg)
+    }
+
+    #[test]
+    fn the_eviction_count_moves_only_when_an_eviction_begins()
+    {
+        let (mut l, rec, reg) = swap_ledger(2);
+        assert_eq!(l.evictions(), 0);
+        l.begin_evict(rec, reg, BASE, 1).unwrap();
+        assert_eq!(l.evictions(), 1);
+        // A refusal and a cancel move nothing: a chunk already evicting, an
+        // unbacked chunk, a page outside the region.
+        assert!(matches!(
+            l.begin_evict(rec, reg, BASE, 2),
+            Err(SwapError::Chunk(_))
+        ));
+        assert!(matches!(
+            l.begin_evict(rec, reg, BASE + 2 * CHUNK, 2),
+            Err(SwapError::Chunk(_))
+        ));
+        assert_eq!(
+            l.begin_evict(rec, reg, BASE + 4 * CHUNK, 2),
+            Err(SwapError::NoRegion)
+        );
+        l.cancel_evict(rec, reg, BASE).unwrap();
+        assert_eq!(l.evictions(), 1);
+        // An eviction begun and stored moves it once.
+        swap_out(&mut l, rec, reg, 1, 2, 2);
+        assert_eq!(l.evictions(), 2);
+        // The cancelled chunk, resident again, begins another.
+        l.begin_evict(rec, reg, BASE, 3).unwrap();
+        assert_eq!(l.evictions(), 3);
     }
 
     #[test]

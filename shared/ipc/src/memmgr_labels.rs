@@ -157,11 +157,19 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   subset of `data[10]` the swap service's slots alone hold.
 /// * `data[13]` — `swap_slots_free`: the swap slots registered and not
 ///   taken, `0` while no swap service is registered.
+/// * `data[14]` — `evictions`: the evictions memmgr has begun, a count, not
+///   bytes, that only moves up, wrapping. An eviction is the one way a chunk
+///   leaves the resident state, so a reader that finds the same count
+///   before and after a `MAKE_RESIDENT` walk over a range that completed
+///   with no reply pending knows no chunk of the range was being evicted,
+///   held raw, compressed or being written at the second read. A chunk on
+///   disk or lost can remain: `data[10]` counts both, `data[12]` only a
+///   chunk on disk.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[13]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[14]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.

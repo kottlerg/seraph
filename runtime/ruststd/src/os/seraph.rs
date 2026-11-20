@@ -2484,6 +2484,15 @@ pub mod process {
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn pinned(&mut self, on: bool) -> &mut Self;
 
+        /// Load the child's image private (the `CREATE_PRIVATE_IMAGE` label
+        /// flag). By default a demand-paged child attaches its text and
+        /// read-only data shared with the binary's other instances. A child
+        /// that holds keys sets `private_image(true)`: text it shares lets
+        /// other processes that map it observe by cache timing which of its
+        /// code runs. Defaults to off.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn private_image(&mut self, on: bool) -> &mut Self;
+
         /// Request the priority level the child's initial thread is created
         /// at (the `CREATE_PRIORITY` label field). `0` (the default)
         /// reverts to procmgr's policy default, clamped to the child's
@@ -2519,6 +2528,11 @@ pub mod process {
 
         fn pinned(&mut self, on: bool) -> &mut Command {
             self.as_inner_mut().set_pinned(on);
+            self
+        }
+
+        fn private_image(&mut self, on: bool) -> &mut Command {
+            self.as_inner_mut().set_private_image(on);
             self
         }
 

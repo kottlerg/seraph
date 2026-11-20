@@ -652,12 +652,14 @@ from a host GDB over the debug port, so its check is a host GDB session.
 2. Boot the current sysroot once with the debug port, and wait for the stub's
    `[gdbstub] attached; serving the debug port` line on the serial stream.
 3. Run `gdb -batch` against the port with the target's binary for symbols: list the threads,
-   break on the tick function and continue to it, read the pointer, rewrite the counter and read
-   it back, rewrite a caller-saved register, read it back from the stub past GDB's register
-   cache, and restore it, single-step, delete the breakpoint, select the second thread and read
-   its registers, and detach. The output must show two threads, the breakpoint's stop, the
-   rewritten counter and register, a step that moved the pointer, the second thread's registers,
-   and GDB's `[Inferior 1 (Remote target) detached]`.
+   single-step from where the attach stopped the main thread, on text the target attaches shared
+   from its binary's image object, break on the tick function and continue to it, read the pointer,
+   rewrite the counter and read it back, rewrite a caller-saved register, read it back from the stub
+   past GDB's register cache, and restore it, single-step, delete the breakpoint, select the second
+   thread and read its registers, and detach. The output must show two threads, a pointer printed
+   after the first step, the breakpoint's stop, the rewritten counter and register, a step that
+   moved the pointer, the second thread's registers, and GDB's `[Inferior 1 (Remote target)
+   detached]`.
 4. Wait up to 30 s for the stub's `[gdbstub] detached from gdb-target (crash bindings restored:
    true)` line: procmgr took the target's crash bindings back.
 5. Restart the port's driver under the stub: connect again, `qSupported` (the stub attaches to

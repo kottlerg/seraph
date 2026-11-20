@@ -23,8 +23,9 @@
 //! registered crash service with its registration's generation
 //! ([`crash_registrant`]), the signature policy each creator's record
 //! carries ([`sign_policy`]), the requests refused while procmgr's own
-//! `CSpace` is short of its headroom ([`headroom_refusal`]), and the process
-//! tree: each entry's parent, the
+//! `CSpace` is short of its headroom ([`headroom_refusal`]), which pages of an
+//! image the instances of one binary share and the table of the objects that
+//! hold them ([`image_share`]), and the process tree: each entry's parent, the
 //! marking of a subtree a destroy has begun on, and the re-parenting or
 //! containment at a process's end ([`ProcessTable::doom_subtree`],
 //! [`ProcessTable::take_ended`]). None of these
@@ -47,6 +48,7 @@ pub mod create_blobs;
 pub mod death_queues;
 pub mod dma_holds;
 pub mod fs_reads;
+pub mod image_share;
 pub mod init_reap;
 pub mod names;
 pub mod request_caps;
@@ -239,6 +241,10 @@ pub struct ProcessEntry
     /// The correlator posted with the child's end to its end queue, as the
     /// tag word.
     pub end_correlator: u64,
+    /// The id of the image object the child attaches in procmgr's image
+    /// cache ([`image_share::ImageCache`]), whose reference the child's
+    /// teardown releases; `0` for a child loaded private.
+    pub image_ref: u64,
     /// The exit reason procmgr first answered `QUERY_PROCESS` with for the
     /// child before its reap ([`ProcessTable::latch_end`]); `None` until a
     /// query found it ended. Its reap or destroy tears it down with this
@@ -2052,6 +2058,7 @@ mod tests
             unanswered: false,
             end_queue: 0,
             end_correlator: 0,
+            image_ref: 0,
             ended_with: None,
         }
     }

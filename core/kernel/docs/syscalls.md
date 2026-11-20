@@ -2124,14 +2124,16 @@ mapping capability with WRITE or EXECUTE, since one with neither (a firmware tab
 read-only) gave its holder no right to change or run what the page holds (see
 [memory-internals.md § Leaf Grant](memory-internals.md#leaf-grant)); and its frame mapped once,
 since a frame mapped elsewhere too may be another process's text or data, which the write would
-change through this thread's capability. procmgr's ELF loader gives each process its own image
-frames and maps text through an Execute-bearing capability
-([services/procmgr/README.md](../../../services/procmgr/README.md) § Responsibilities), so the text
-of a process it loads takes the write; its read-only data segments, mapped through Map-only
-capabilities, do not. The frame is written through the kernel's mapping of it; the
-thread's mapping is not changed, so W^X holds for every user mapping. Every write synchronises
-instruction fetch on every CPU before the call returns, whatever the target's leaves grant, since a
-writable page's frame may be mapped executable elsewhere ([memory-model.md § Instruction-Fetch
+change through this thread's capability. procmgr's ELF loader maps text through an Execute-bearing
+capability ([services/procmgr/README.md](../../../services/procmgr/README.md) § Responsibilities),
+so the text of a process whose image is its own, a private or pinned one, takes the write. Text a
+process shares with the other instances of its binary is mapped more than once and refuses it until
+memmgr gives the process a copy of its own of the page (`MAKE_PRIVATE`), and its read-only data
+segments, mapped through Map-only capabilities, refuse it always. The frame is
+written through the kernel's mapping of it; the thread's mapping is not changed, so W^X holds for
+every user mapping. Every write synchronises instruction fetch on every CPU before the call returns,
+whatever the target's leaves grant, since a writable page's frame may be mapped executable elsewhere
+([memory-model.md § Instruction-Fetch
 Coherence](../../../docs/memory-model.md#instruction-fetch-coherence)).
 
 A thread of the space that runs during the write may run or read old or new bytes, and on x86-64 a

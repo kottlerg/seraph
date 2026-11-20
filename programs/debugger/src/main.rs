@@ -41,7 +41,7 @@
 )]
 
 use std::io::{BufRead, BufReader};
-use std::os::seraph::process::ChildExt;
+use std::os::seraph::process::{ChildExt, CommandExt};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -267,8 +267,11 @@ fn child_target() -> u64
 /// Step 4: debug the debuggee process through its main-thread cap.
 fn cross_process(ep: u64, ipc_buf: *mut u64)
 {
+    // A private image, so the breakpoint lands on text frames the debuggee
+    // alone maps (README.md § Private images).
     let mut child = Command::new("/programs/debugger")
         .arg("--debuggee")
+        .private_image(true)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn the debuggee process");
@@ -305,8 +308,8 @@ fn cross_process(ep: u64, ipc_buf: *mut u64)
 
     let mut original = arch::BREAKPOINT;
     syscall::thread_read_mem(th, target, &mut original).expect("read the child's text");
-    // SAFETY: as above. The child's loader gave its text frames to it alone,
-    // so the write needs only THREAD_MEM_TEXT.
+    // SAFETY: as above. The child's image is private, so its text frames are
+    // its alone and the write needs only THREAD_MEM_TEXT.
     unsafe { syscall::thread_write_mem(th, target, &arch::BREAKPOINT, THREAD_MEM_TEXT) }
         .expect("plant the breakpoint in the child's text");
     // SAFETY: as above.

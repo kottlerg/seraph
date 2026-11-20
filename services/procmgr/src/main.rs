@@ -26,6 +26,7 @@ mod arch;
 mod crash;
 mod death_queues;
 mod image;
+mod image_cache;
 mod init_reap;
 mod loader;
 mod process;
@@ -165,6 +166,9 @@ fn main() -> !
         trust_store,
         cert_cache: Mutex::new(objsig::CertificateCache::new()),
     }));
+
+    // The memmgr record image objects are sealed on, before any create.
+    image_cache::register_store(ctx.memmgr_ep, std::os::seraph::current_ipc_buf());
 
     // procmgr's ProcessInfo names no procmgr endpoint, so its own spawned
     // threads send no `REGISTER_THREAD` and start without waiting on it
@@ -2424,7 +2428,9 @@ struct CreateRequest<'a>
 /// ([`image::read_module`], [`image::read_file`]), verify the copy under the
 /// request's name and `sched`'s signature policy ([`image::verify`]), narrow
 /// the policy by the verified role set, and load the verified body
-/// (`process::create_process_from_bytes`). The buffer goes back to memmgr
+/// (`process::create_process_from_bytes`), its read-only segments shared with
+/// the binary's other instances unless the label sets
+/// `procmgr_labels::CREATE_PRIVATE_IMAGE`. The buffer goes back to memmgr
 /// before the registration settles. Single exit: any failure, a refused
 /// signature among them, creates nothing and releases what it took.
 ///
@@ -2514,6 +2520,14 @@ fn create_child(
         paging: process::Paging::of_label(request.label),
         self_memmgr_ep: ctx.memmgr_ep,
     };
+    // A creator's private image shares nothing; the others name the binary by
+    // its signed body (services/procmgr/README.md § Image Sharing).
+    let image_key = (request.label & procmgr_labels::CREATE_PRIVATE_IMAGE == 0).then_some(
+        process_table::image_share::ImageKey {
+            hash: verified.attrs.body_hash,
+            len: verified.attrs.body_len,
+        },
+    );
     let mut result = process::create_process_from_bytes(
         verified.body,
         ctx.self_aspace,
@@ -2525,10 +2539,12 @@ fn create_child(
         &ctx.deaths,
         request.relay,
         *sched,
+        image_key.as_ref(),
         ipc_buf,
     );
-    // The segments are copied into the child's own frames; the object's
-    // frames go back to memmgr before the registration settles.
+    // The segments are copied into the child's own frames or the image
+    // object's; the buffer's frames go back to memmgr before the registration
+    // settles.
     drop(buffer);
     mms.settle(&mut result);
     result

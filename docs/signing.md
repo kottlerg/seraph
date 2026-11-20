@@ -407,7 +407,8 @@ from a file and from a Memory cap alike: a boot module's Memory cap carries full
 and a file server can still write a cache page it lends procmgr. It reads the object once, the
 length the creator gives, page by page from the file server's cache or whole from the Memory cap,
 into frames only procmgr maps; verifies the copy; parses and loads only the body the verifier
-returned; and returns the frames to memmgr once the segments are copied into the child
+returned; and returns the frames to memmgr once the segments are copied into the child, or into
+its binary's image object
 ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Image Verification). Any
 refusal is one reply, `SIGNATURE_REFUSED`, logged with the name and the verifier's reason, and
 creates nothing.

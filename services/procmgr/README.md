@@ -34,14 +34,17 @@ procmgr/
 │                                 attach and detach refusals and image
 │                                 span, the process names, the
 │                                 thread registry and crash badges,
-│                                 and the process tree (parent links,
-│                                 destroy marks, re-parenting)
+│                                 the process tree (parent links,
+│                                 destroy marks, re-parenting), and
+│                                 the image-sharing layout and cache
 ├── src/
 │   ├── main.rs                 # main() (std runtime), request workers, reaper
 │   ├── crash.rs                # Crash endpoint, its decliner, the handover
 │   ├── death_queues.rs         # Death-queue ring capacity (`DEATH_EQ_CAPACITY`)
 │   ├── image.rs                # One copy of a create's object or of a verified
-│   │                           #   read's file, its verification, the read-only hand-over
+│   │                           #   read's file, its verification, the read-only hand-over;
+│   │                           #   an image object's frames and its seal
+│   ├── image_cache.rs          # The shared image objects, the image store, attachment
 │   ├── trust_store.rs          # The trust store the bootloader hands forward
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
@@ -70,11 +73,16 @@ procmgr/
   `READ_VERIFIED`.
 - **ELF loading** — parse the verified ELF image,
   request memory caps from memmgr, map LOAD segments with correct
-  permissions. Each segment's pages are fresh pages memmgr allocates to the
-  child, filled by copying the file's bytes in, so no frame of a child's image
-  is mapped by another process; a debugger's text write
-  (`SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT`) relies on it, since the
-  kernel refuses that write to a frame mapped more than once. Each page is
+  permissions. A demand-paged child attaches the segments that are not
+  writable, its text and read-only data, shared from its binary's image
+  object (§ Image Sharing), unless its creator asked for a private image.
+  Every other segment's pages, and every page of a private or pinned image,
+  are fresh pages memmgr allocates to the child, filled by copying the file's
+  bytes in, so no other process maps those frames; a debugger's text write
+  (`SYS_THREAD_WRITE_MEM` with `THREAD_MEM_TEXT`) patches such a page, while
+  the kernel refuses it on a frame mapped more than once, as a shared page's
+  is, until `MAKE_PRIVATE` gives the child a copy of its own. Each page a
+  child loads private is
   mapped through a copy of its cap derived to the segment's protection
   (`derive_memory_for_prot`): text through Map and Execute, writable data
   through Map and Write, and read-only data and the `PT_GNU_RELRO` pages
@@ -166,6 +174,54 @@ procmgr/
   kernel-object caps before `HANDOVER_COMPLETE`, reclaimable Memory caps and
   `INIT_TEARDOWN_DONE` after. Then reap init. See the
   [Init reap](#init-reap) subsection below.
+
+---
+
+## Image Sharing
+
+The instances of one binary share the pages of its image that no relocation touches: its text
+and read-only data. The first time a demand-paged process is created from a binary, procmgr
+fills fresh frames with the segments that are not writable, laid out as the loader lays them in
+the child (zeroed, each segment's file bytes at its offset in its first page), and seals them
+into one memmgr memory object (`SEAL_OBJECT`). It attaches the object shared to that process and
+to every later instance of the binary (`ATTACH_OBJECT`): text readable and executable, read-only
+data read-only. The writable segments (data, `.bss`, and the `PT_GNU_RELRO` pages relocations
+write) are loaded private, as is any page a writable segment shares with one that is not. memmgr
+maps an attached page read-only on the instance's first fault on it
+([services/memmgr/docs/memory-pool.md](../memmgr/docs/memory-pool.md#memory-objects)
+§ Memory objects), so no instance can write it.
+
+- **Key.** An object is the image of one verified body: the body's hash and length as the
+  signature check returned them (§ Responsibilities, Image verification). Every instance of the
+  same signed bytes shares it, whatever path or name it was created under, and a binary replaced
+  by other bytes gets an object of its own.
+- **Placement.** The object's bytes depend on where each segment lies in its pages, so procmgr
+  shares an image only at a load bias that is a whole number of pages, which every bias it draws
+  is (`process_layout::choose_image_bias`).
+- **Charging.** The object's frames are charged to the image store, a memmgr record procmgr
+  registers for them alone at startup (`REGISTER_PROCESS`): a top-level budget node outside the
+  system reserve, with no max, so a seal never draws on the reserve and the object outlives the
+  instance that sealed it. Each instance is charged the full size it attaches as well, as memmgr
+  charges every attacher, so a budget sees no saving from sharing; the saving shows as free RAM.
+- **Lifetime.** procmgr keeps one object per body while an instance attaches it. The last
+  instance's teardown releases it (`OBJECT_RELEASE`), and memmgr frees its frames once no region
+  attaches it.
+- **Private images.** A creator asks for a private image with `CREATE_PRIVATE_IMAGE`
+  ([docs/ipc-interface.md](docs/ipc-interface.md) § Label 1, **Private image**): with std's
+  `CommandExt::private_image`, or a svcmgr recipe's `private_image = yes`. Every segment is then
+  loaded into frames of the child's own. A key-holding service asks for one, since text it shares
+  lets the other processes that map it observe, by cache timing, which of its code runs;
+  entropyd's recipe does. A pinned process shares nothing, since it has no pager to map an
+  attachment.
+- **Fallback.** With no image store registered, an object memmgr will not grant or seal, or a
+  layout that shares no page, the image is loaded private. An attachment memmgr refuses fails the
+  create, and so does a shared image whose pager binding fails, since nothing else maps its pages.
+- **Debugging.** Shared text an instance has not touched is not present to the kernel's copy: a
+  debugger's read has memmgr map it (`MAKE_RESIDENT`), and its breakpoint gives the instance a copy
+  of the page first (`MAKE_PRIVATE`)
+  ([docs/fault-handling.md](../../docs/fault-handling.md) § Debugging). crashd's core leaves text
+  the process did not touch to the binary
+  ([services/crashd/docs/core-format.md](../crashd/docs/core-format.md#page-runs) § Page runs).
 
 ---
 

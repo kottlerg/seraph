@@ -700,6 +700,7 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         stop_authority: def.stop_authority,
         entropy_authority: def.entropy_authority,
         reserve: def.reserve,
+        private_image: def.private_image,
         stop_source: def.stop_source,
         shutdown_actuator: false,
         priority: def.priority.unwrap_or(0),

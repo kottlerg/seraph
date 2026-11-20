@@ -969,7 +969,9 @@ which is the order of the object's pages. It seals only grants that pass the qui
 it is retyped and no address space maps it: no process can write a frame once it is sealed. memmgr
 then maps its own view of the frames (Own view) before it records the seal. A
 phys-class caller is refused, since a device it programmed may still write the frames. The frames
-stay charged to the sealer's budget node, which the object names, until the object is freed. The
+stay charged to the sealer's budget node, which the object names, until the object is freed;
+procmgr seals the image objects the instances of a binary share on a record of its own, its image
+store ([services/procmgr/README.md](../../procmgr/README.md#image-sharing) § Image Sharing). The
 object is an arena node, found through the record index by the key of its handle
 ([ipc-interface.md](ipc-interface.md) § Object Handles) and listed on the sealer's record with its
 node handle states ([Per-Process Tracking](#per-process-tracking)). A seal whose reply does not
@@ -1308,29 +1310,33 @@ and swapped pages apart ([`ipc-interface.md`](ipc-interface.md)). The swapped pa
 evicted chunk that holds no frame of its own: compressed, writing, on disk and lost, a raw chunk
 once its write ends ([Disk tier](#disk-tier)).
 
-**Debugger reads.** `SYS_THREAD_READ_MEM` fails on a page that is not present and does not ask the
+*Debugger reads.** `SYS_THREAD_READ_MEM` fails on a page that is not present and does not ask the
 pager
 ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_thread_read_mem-60) §
 `SYS_THREAD_READ_MEM`). A debugger or crash service that gets that failure on a page of an evicted
-chunk asks procmgr, through the debug authority, to make the range resident (`MAKE_RESIDENT`,
+chunk, or on a page of an attachment the process has not touched, asks procmgr, through the debug
+authority, to make the range resident (`MAKE_RESIDENT`,
 [procmgr's IPC interface](../../procmgr/docs/ipc-interface.md)); only a holder of the debug
 authority may ask, and memmgr takes the request from procmgr alone
 ([`ipc-interface.md`](ipc-interface.md) § Label 21). memmgr restores each compressed chunk of the
-range, and maps back each evicting or raw one; either counts as an access in the chunk's age. It
-walks only the chunks that have an entry, and one request makes at most a few chunks resident and
-visits at most a bounded number ([docs/limits.md](../../../docs/limits.md) § memmgr); its reply says
-where it stopped, and the reader asks again from there, so a request's turn delays the faults and
-grants behind it no more than a few restores would. The reader then retries its read. The request
-restores and backs nothing else: a page no fault has backed stays not present. memmgr reads no swap
-slot and waits on no swap service, so a chunk on disk it asks the swap service for: when the swap
-service registered a want Notification, memmgr posts the chunk's slot word to a short list the swap
-service takes (`SWAP_WANTED`), sends on the Notification, and replies that the range is pending at
-that chunk; the swap service reads the slot and restores the chunk ahead of a fault, and the reader,
-after a pause, asks again. After about a second of pauses a reader asks on from where memmgr's walk
-stopped, past the chunks on disk, so a swap service that is down or cannot read the slot leaves
-their pages not present and the rest of the range resident. A lost chunk, and a chunk on disk with
-no swap service to ask, are passed over; a page of either stays not present ([Disk
-tier](#disk-tier)).
+range, and maps back each evicting or raw one; either counts as an access in the chunk's age. Over a
+page of an attachment with no copy of its own it maps the origin, read-only, as a read fault does
+([Memory objects](#memory-objects), Faults), which takes no page and no new charge. It walks only
+the chunks that have an entry, and each chunk of an attachment, and one request makes at most a few
+chunks resident and visits at most a bounded number ([docs/limits.md](../../../docs/limits.md) §
+memmgr); its reply says where it stopped, and the reader asks again from there, so a request's turn
+delays the faults and grants behind it no more than a few restores would. The reader then retries
+its read. The request restores, maps and backs nothing else: a page of an ordinary region no fault
+has backed stays not present, since a read fault there would take a fresh zeroed page. memmgr reads
+no swap slot and waits on no swap service, so a chunk on disk it asks the swap service for: when the
+swap service registered a want Notification, memmgr posts the chunk's slot word to a short list the
+swap service takes (`SWAP_WANTED`), sends on the Notification, and replies that the range is pending
+at that chunk; the swap service reads the slot and restores the chunk ahead of a fault, and the
+reader, after a pause, asks again. After about a second of pauses a reader asks on from where
+memmgr's walk stopped, past the chunks on disk, so a swap service that is down or cannot read the
+slot leaves their pages not present and the rest of the range resident. A lost chunk, and a chunk on
+disk with no swap service to ask, are passed over; a page of either stays not present
+([Disk tier](#disk-tier)).
 
 ---
 

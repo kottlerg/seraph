@@ -27,8 +27,8 @@ a trust store built into it, before it parses any of them, and hands the store f
 procmgr ([signing.md](signing.md)), which verifies every image it creates against it before it
 parses it. The ESP is derived from the root filesystem: the bundle carries the bootstrap closure,
 what is needed to reach the root filesystem and begin loading from it, and every object on the
-ESP is a copy of an installed file, used during bootstrap alone
-([boot-media.md](boot-media.md)).
+ESP is a copy of an installed file, used during bootstrap alone, apart from the IOMMU driver's
+image, a copy of which devmgr keeps for the driver's restart ([boot-media.md](boot-media.md)).
 
 Boot-time configuration on disk consists of only the two ESP files
 named above, the optional presence-only `\EFI\seraph\nokaslr` KASLR

@@ -728,9 +728,11 @@ devmgr loads driver binaries from one of two places:
   valid UTF-8 text as a platform description table, and logs and releases anything else. It binds
   the PCI and platform records those declarations match in the boot settle batch (the IOMMU family
   record in a batch of its own before it), and spawns every driver via
-  `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only for that boot pass; a device added
-  later, a disk included, binds the copy under `/services/drivers/` at the auxiliary tier
-  ([driver-binding.md](driver-binding.md) § Declaration Bounds).
+  `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only in the pass that binds it, apart from
+  devmgr's copy of the IOMMU driver's image, from which every restart of that driver starts
+  (§ IOMMU Driver Restart); a device added later, a disk included, binds the copy under
+  `/services/drivers/` at the auxiliary tier ([driver-binding.md](driver-binding.md) § Declaration
+  Bounds).
 - **On-disk rootfs** — non-essentials (the serial and framebuffer drivers of the consoles, the
   per-arch RTC, bound to its platform record, the
   [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's

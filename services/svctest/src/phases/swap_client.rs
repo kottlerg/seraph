@@ -364,7 +364,7 @@ pub(super) fn isolate(
     let start = Instant::now();
     loop
     {
-        let begun = pool().evictions;
+        let before = pool().evictions;
         for badge in listed_badges(authority)
         {
             let ranges: &[(u64, u64)] = if badge == process
@@ -393,15 +393,15 @@ pub(super) fn isolate(
             .unwrap_or_else(|| panic!("{PHASE}: the fixture answered swapped with {line:?}"));
         let status = pool();
         let total = status.swapped / PAGE_SIZE;
-        let began = status.evictions.wrapping_sub(begun);
-        if total == node && began == 0
+        let moved = status.evictions.wrapping_sub(before);
+        if total == node && moved == 0
         {
             return node;
         }
         assert!(
             start.elapsed() < SETTLE_BOUND,
             "{PHASE}: memmgr holds {total} pages swapped, the fixture {node}, and began \
-             {began} evictions in the last round, after {SETTLE_BOUND:?} of making every \
+             {moved} evictions in the last round, after {SETTLE_BOUND:?} of making every \
              other range resident"
         );
         std::thread::sleep(HOG_TICK);

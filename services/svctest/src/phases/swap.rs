@@ -248,6 +248,10 @@ pub(super) struct Pool
     pub(super) free_slots: u64,
     /// `data[14]`: the evictions memmgr has begun, a count.
     pub(super) evictions: u64,
+    /// `data[15]`: the overcommit allowance.
+    pub(super) allowance: u64,
+    /// `data[17]`: the free pages outside `promised`.
+    uncommitted: u64,
 }
 
 impl Pool
@@ -262,7 +266,7 @@ impl Pool
     /// quantity the pressure level reads.
     fn available_pages(&self) -> u64
     {
-        self.free.saturating_sub(self.promised) / PAGE_SIZE
+        self.uncommitted / PAGE_SIZE
     }
 
     /// The pages `available_pages` falls below at `LOW`: a sixteenth of the pool.
@@ -322,6 +326,8 @@ pub(super) fn pool() -> Pool
         on_disk: reply.word(12),
         free_slots: reply.word(13),
         evictions: reply.word(14),
+        allowance: reply.word(15),
+        uncommitted: reply.word(17),
     }
 }
 

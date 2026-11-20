@@ -96,57 +96,71 @@ waits on the policy, and a stop that frees memory within it resumes the thread r
 it.
 
 With a stall set, crashd makes 16 hold endpoints at start (`SLOTS`), each the queue of one held
-fault, and a wait set of procmgr's crash endpoint and the Notification on which the runtime
-receives memmgr's pressure-level changes. It waits on the wait set with a timeout of the earliest
-hold's deadline, and receives from the crash endpoint without blocking when the wait set names it.
-When the endpoints or the wait set cannot be made, or the process has no pressure registration, it
-logs a warning and runs with no hold. It reads memmgr's level when the Notification has signalled
-a change since its last read, and takes the level as `CRITICAL` while memmgr does not answer.
+fault, and a wait set of procmgr's crash endpoint and the Notification on which the runtime receives
+memmgr's pressure-level changes and draw-room openings. It waits on the wait set with a timeout of
+the earliest hold's deadline, and receives from the crash endpoint without blocking when the wait
+set names it. When the endpoints or the wait set cannot be made, or the process has no pressure
+registration, it logs a warning and runs with no hold. It reads memmgr's level and draw room when
+the Notification has signalled since its last read, and the draw room again for each commit overrun
+that reaches it, since memmgr signals the draw room's opening and not its closing. It takes the
+level as `CRITICAL`, and the draw room as short, while memmgr does not answer.
 
 A fault is holdable when it is a VM fault memmgr forwarded with decline code 7 (no free page can
-back it), 11 (a commit overrun: no free frame for a committed page, held as code 7 is), 6 (the
-metadata arena cannot grow) or 8 (the region's chunk table cannot record the run)
+back it), 11 (a commit overrun: no free frame for a committed page), 6 (the metadata arena cannot
+grow) or 8 (the region's chunk table cannot record the run)
 ([memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) § Kernel-origin fault message). Code
 10, a budget node's max, is the process's own limit, and a holdable fault is never one of an
-exception class; crashd handles each such fault at once. A holdable fault that arrives:
+exception class; crashd handles each such fault at once. A fault of code 6, 7 or 8 waits on the
+level: its memory is short while the level reads `CRITICAL`. A commit overrun waits on memmgr's
+draw room, the free frames a fault on a committed page may take (`QUERY_POOL_STATUS` `data[16]`;
+[memmgr Memory Pool](../../memmgr/docs/memory-pool.md#commit) § Commit, Overcommit): its memory
+is short while the draw room is below a demand chunk's 64 KiB, the most one committed draw takes,
+and the draw room opens at that, which memmgr signals. Write-out to swap brings the draw room back
+while the level stays `CRITICAL`, so a commit overrun waits on the draw room and not on the level.
+A holdable fault that arrives:
 
-- at `CRITICAL` with a slot free is redirected (`FAULT_REPLY_REDIRECT`,
+- while its memory is short, with a slot free, is redirected (`FAULT_REPLY_REDIRECT`,
   [docs/fault-handling.md](../../../docs/fault-handling.md) § Reply) to that slot's endpoint, with
   the slot as its reason word. crashd keeps the fault's message as it arrived and logs
-  `fault badge=<badge> addr=<addr> held: memory critical (reason=<code>), up to <stall> ms`. The
+  `fault badge=<badge> addr=<addr> held: <short> (reason=<code>), up to <stall> ms`, `<short>`
+  being `memory critical` for the level and `no commit draw room` for the draw room. The
   thread stays fault-blocked, and its fault reaches that endpoint when the thread next runs, to
   wait there queued; no thread of crashd waits on it, so crashd goes on receiving and reporting
   other faults. The endpoint is in crashd's wait set from the redirect until the fault arrives;
-- at `CRITICAL` with every slot taken is logged `not held: no free hold slot` as a warning, then
-  reported and declined;
-- below `CRITICAL`, the level having fallen between memmgr's decline and crashd's receive, is
-  resumed at once (`FAULT_REPLY_RESUME`), logged `resumed at once: memory no longer critical`.
-
-When the level falls below `CRITICAL`, crashd receives each held fault that has arrived from its
-endpoint without blocking and resumes it, logging `resumed after <ms> ms: memory no longer
-critical`; the thread retries its access, which faults into memmgr again. A fault that has not
-arrived yet stays held, and is resumed when it arrives. When a hold's deadline passes first,
-crashd receives that fault, logs `hold timed out after <ms> ms` as a warning, and reports and
-declines it as [Per Fault](#per-fault) does, from the message it kept. A receive that finds
-nothing after the fault arrived frees the slot with no answer, logged `withdrawn after <ms> ms
-held`: the fault left the endpoint while held, when a debugger's attach stopped the thread, which
-cancels its fault, the process was destroyed, or the thread's exception class was rebound, which
-delivers the fault again under the new binding
-([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill). A
-fault that has not arrived when its deadline passes (its thread was stopped or destroyed before
-it ran) is logged `not delivered to its hold in <ms> ms` as a warning, and crashd replaces the
-slot's endpoint with a new one, so a slot's endpoint only ever queues the fault crashd holds
-there. Should that fault reach the old endpoint later, its delivery holds the endpoint's last
-reference, and the fault is released unhandled, its thread killed with no report
+- while its memory is short, with every slot taken, is logged `not held: no free hold slot` as a
+  warning, then reported and declined;
+- with its memory there, the level having fallen below `CRITICAL`, or the draw room having
+  opened, between memmgr's decline and crashd's receive, is resumed at once (`FAULT_REPLY_RESUME`),
+  logged `resumed at once: <back>`, `<back>` being `memory no longer critical` for the level and
+  `commit draw room open` for the draw room.
+When the memory a held fault waits for is there, the level below `CRITICAL` or the draw room open,
+crashd receives each such held fault that has arrived from its endpoint without blocking and resumes
+it, logging `resumed after <ms> ms: <back>`; the thread retries its access, which faults into memmgr
+again. A fault that has not arrived yet stays held, and is resumed when it arrives. When a hold's
+deadline passes first, crashd receives that fault, logs `hold timed out after <ms> ms` as a warning,
+and reports and declines it as [Per Fault](#per-fault) does, from the message it kept. A receive
+that finds nothing after the fault arrived frees the slot with no answer, logged `withdrawn after
+<ms> ms held`: the fault left the endpoint while held, when a debugger's attach stopped the thread,
+which cancels its fault, the process was destroyed, or the thread's exception class was rebound,
+which delivers the fault again under the new binding
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill). A fault
+that has not arrived when its deadline passes (its thread was stopped or destroyed before it ran) is
+logged `not delivered to its hold in <ms> ms` as a warning, and crashd replaces the slot's endpoint
+with a new one, so a slot's endpoint only ever queues the fault crashd holds there. Should that
+fault reach the old endpoint later, its delivery holds the endpoint's last reference, and the fault
+is released unhandled, its thread killed with no report
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Liveness, rule 1). A slot whose new
 endpoint cannot be made is retired, logged, and holds no fault again until crashd restarts.
 
 crashd remembers each fault it resumed, by its badge and faulting page, until that fault's hold
-deadline, in 16 entries, the one that expires first replaced when they are full. A fault of the
-same badge and page before then repeats it: at `CRITICAL` it is held only until that deadline;
-below `CRITICAL` it is logged `not held: repeats a resumed fault` as a warning, then reported and
-declined. So an access memmgr cannot back once memory is freed is not resumed into a loop, and the
-holds of one fault total at most the stall.
+deadline, in 16 entries, the one that expires first replaced when they are full. A fault of the same
+badge and page before then repeats it: while its memory is short it is held only until that
+deadline. With its memory there, a repeat of a fault that waits on the level is logged `not held:
+repeats a resumed fault` as a warning, then reported and declined, so an access memmgr cannot back
+once memory is freed is not resumed into a loop. A repeat of a commit overrun with the draw room
+open is resumed again, logged `resumed at once: commit draw room open`, and remembered until the
+same deadline: one opening of the draw room backs one committed draw, and another may have taken
+it between the resume and the retry. The holds of one fault total at most the stall.
 
 **While memory is critical.** crashd runs inside memmgr's system reserve: its recipe's
 `reserve = yes` has svcmgr create it with a reserve budget node

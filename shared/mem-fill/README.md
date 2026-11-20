@@ -15,9 +15,10 @@ allocates only the blocks it commits. The ballast holds the heap's floor, an unc
 region whose untouched pages memmgr backs only while it has pages to spare, so every block the fill
 commits lies above it.
 
-`top_up` reads what memmgr can still promise a process outside the reserve, from
-`QUERY_POOL_STATUS` (its free pages less `promised` and the growth floor, `data[11]`;
-[memmgr Memory Pool](../../services/memmgr/docs/memory-pool.md) § Commit), and commits that much
+`top_up` reads what memmgr can still grant a process outside the reserve, from
+`QUERY_POOL_STATUS` (its free pages outside `promised`, `data[17]`, less the growth floor,
+`data[11]`; [memmgr Memory Pool](../../services/memmgr/docs/memory-pool.md) § Commit), which a
+commitment of it does not pass, and commits that much
 through the heap, halving an attempt memmgr refuses, until fewer than 16 pages are left or the block
 list is full; it takes the rest a page at a time by `REQUEST_MEMORY_CAPS` grants, whose caps stay
 in the process's `CSpace` until it dies. `to_critical` tops up every `TICK_MS` (10 ms) until

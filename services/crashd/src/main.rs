@@ -18,9 +18,10 @@
 //! When its `CRASHD_OOM_STALL_MS` setting gives a stall, crashd holds a page
 //! fault memmgr declined for want of memory instead (the `hold` module): it
 //! redirects the fault to one of its hold endpoints, where it waits with its
-//! thread fault-blocked, resumes it when memmgr's pressure level falls below
-//! `CRITICAL`, and reports and declines it when the stall passes first. The
-//! mechanism and its limits are in services/crashd/docs/operation.md.
+//! thread fault-blocked, resumes it when memmgr's memory is there (the level
+//! below `CRITICAL`, or for a commit overrun the draw room open), and reports
+//! and declines it when the stall passes first. The mechanism and its limits
+//! are in services/crashd/docs/operation.md.
 
 mod arch;
 mod dump;

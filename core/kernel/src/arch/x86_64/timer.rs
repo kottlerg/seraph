@@ -568,7 +568,9 @@ pub unsafe fn init(period_us: u64)
             apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
             apic_write(APIC_TIMER_INITIAL, initial_count as u32);
         }
-        crate::kprintln!("timer: mode = periodic APIC (TSC-deadline unavailable)");
+        crate::kprintln!(
+            "timer: mode = periodic APIC (TSC-deadline unavailable), APIC timer {tps} Hz"
+        );
     }
 
     // Enable interrupts — the timer will now fire.

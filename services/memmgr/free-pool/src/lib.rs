@@ -30,6 +30,7 @@ pub mod deferred;
 pub mod disk;
 pub mod index;
 pub mod ledger;
+pub mod object_va;
 pub mod pool;
 pub mod pressure;
 pub mod store;
@@ -56,6 +57,7 @@ pub use ledger::{
     BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SealError,
     SwapError, Victim,
 };
+pub use object_va::ObjectVa;
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 pub use pressure::{
     PRESSURE_BAND_DIVISOR, PRESSURE_LOW_DIVISOR, PressureBits, PressureLevel, PressureSignal, band,

@@ -58,6 +58,7 @@ use crate::commit::{self, CommitNeed};
 use crate::deferred::{DeferredList, RecheckBudget};
 use crate::disk::SwapSlots;
 use crate::index::{ProcessIndex, WordStore};
+use crate::object_va::ObjectVa;
 use crate::pool::FreePool;
 use crate::{
     CHUNK_BYTES, DEMAND_CHUNK_PAGES, DemandRegion, Evict, FreeRun, PressureBits, PressureLevel,
@@ -312,6 +313,13 @@ pub struct Ledger<S, W>
     /// slot `next` link; each kept for memmgr's life unless the request that
     /// took it is refused ([`Self::remove_zero_frame`]).
     zero_frames: NodeIdx,
+    /// The free spans of the zone memmgr maps its own read-only view of each
+    /// memory object's frames in ([`MemObject::runs`]).
+    object_va: ObjectVa,
+    /// The first memory object that nothing names any more and whose frames
+    /// wait for memmgr to unmap its own view of them, the others chained
+    /// through [`MemObject::owned_next`] ([`Self::retiring_object`]).
+    retiring: NodeIdx,
 }
 
 impl<S: SlotStore, W: WordStore> Ledger<S, W>
@@ -334,6 +342,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             committed_swapped: 0,
             evictions: 0,
             zero_frames: NODE_NULL,
+            object_va: ObjectVa::new(),
+            retiring: NODE_NULL,
         }
     }
 
@@ -1104,21 +1114,16 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Drop every handle state the record `rec` owns: each node handle state
     /// ([`Ledger::drop_handle`]), calling `release` with each nonzero limit
-    /// cap, and each memory object's ([`Ledger::release_object`]), whose
-    /// frames retire through `quiescent` when no region attaches it.
-    pub fn drop_owned_handles(
-        &mut self,
-        rec: NodeIdx,
-        mut release: impl FnMut(u64),
-        mut quiescent: impl FnMut(&FreeRun) -> bool,
-    )
+    /// cap, and each memory object's ([`Ledger::release_object`]), which
+    /// retires once no region attaches it.
+    pub fn drop_owned_handles(&mut self, rec: NodeIdx, mut release: impl FnMut(u64))
     {
         while let Some(h) = self
             .caps(rec)
             .map(|c| c.handles)
             .filter(|&h| h != NODE_NULL)
         {
-            if self.release_object(h, &mut quiescent)
+            if self.release_object(h)
             {
                 continue;
             }
@@ -1297,7 +1302,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     ) -> Option<(ProcessRecord, ProcessCaps)>
     {
         let rec = self.find(badge)?;
-        self.drop_owned_handles(rec, &mut release, &mut quiescent);
+        self.drop_owned_handles(rec, &mut release);
         self.drop_limits(rec, &mut release);
         let rec = self.index.remove(&mut self.arena, badge)?;
         self.reclaim_all(rec, &mut quiescent);
@@ -1374,7 +1379,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// pages in the order of the ids, owned by `rec` and live. The frames
     /// leave the record's frame list and keep their charge on its budget node,
     /// which the object names. That no process can still write a frame (the
-    /// caller's quiescence check) is the caller's to establish first.
+    /// caller's quiescence check) is the caller's to establish first, and so
+    /// is memmgr's own read-only mapping of the frames, in object page order,
+    /// from `own_va`, a span of [`Self::take_object_va`]: each frame's `va`
+    /// becomes the address of its first page there ([`MemObject::runs`]).
     ///
     /// # Errors
     /// [`SealError::NoRecord`]; [`SealError::Grants`] for no id, an id that
@@ -1387,6 +1395,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         rec: NodeIdx,
         region_ids: &[u64],
         key: u64,
+        own_va: u64,
     ) -> Result<NodeIdx, SealError>
     {
         let r = self.record(rec).ok_or(SealError::NoRecord)?;
@@ -1421,6 +1430,16 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             self.arena.free(obj);
             return Err(SealError::NoSlot);
         }
+        // Each frame's address in memmgr's own view, in the order of the ids.
+        let mut va = own_va;
+        for &id in region_ids
+        {
+            if let Some((idx, f)) = self.granted_frame(rec, id)
+            {
+                self.arena.set_node(idx, Node::Frame(FrameDesc { va, ..f }));
+                va = va.saturating_add(u64::from(f.page_count).saturating_mul(PAGE_SIZE));
+            }
+        }
         // The last id's frame first, each put at the head, so the list runs in
         // the order of the ids.
         let mut runs = NODE_NULL;
@@ -1441,10 +1460,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// Undo the seal of the memory object `obj`, which no region attaches,
     /// whose reply did not reach its sealer `rec`: its frames go back onto
     /// the record's frame list under the region ids they had, still charged,
-    /// so the sealer holds its grants as before the seal and a repeat of the
-    /// call finds them. Returns `false`, changing nothing, when `obj` holds
-    /// no live object of `rec` or one a region attaches.
-    pub fn unseal_object(&mut self, rec: NodeIdx, obj: NodeIdx) -> bool
+    /// each with `va` the caller-owned-mapping marker a grant carries, so the
+    /// sealer holds its grants as before the seal and a repeat of the call
+    /// finds them. Its span of memmgr's object zone is given back
+    /// ([`Self::give_object_va`]); memmgr unmapped its own view there first.
+    /// Returns `false`, changing nothing, when `obj` holds no live object of
+    /// `rec` or one a region attaches.
+    pub fn unseal_object(&mut self, rec: NodeIdx, obj: NodeIdx, va: u64) -> bool
     {
         let Some(o) = self.object(obj).filter(|o| o.live && o.attached == 0)
         else
@@ -1455,6 +1477,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return false;
         }
+        let pages = self.object_pages(obj);
+        let own_va = self.object_va(obj);
         let _ = self.index.remove(&mut self.arena, o.key);
         self.unlink_owned(rec, obj, o.owned_next);
         let Some(mut r) = self.record(rec)
@@ -1463,15 +1487,17 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return false;
         };
         let mut cur = o.runs;
-        while let Node::Frame(_) = self.arena.get(cur).node
+        while let Node::Frame(f) = self.arena.get(cur).node
         {
             let next = self.arena.get(cur).next;
+            self.arena.set_node(cur, Node::Frame(FrameDesc { va, ..f }));
             self.arena.set_next(cur, r.frame_head);
             r.frame_head = cur;
             cur = next;
         }
         self.set_record(rec, r);
         self.arena.free(obj);
+        let _ = self.give_object_va(own_va, pages);
         true
     }
 
@@ -1565,11 +1591,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// Drop the handle state of the live memory object `obj`: unindex it, so
     /// every handle carrying its key is refused from then on, and unlink it
     /// from its owner's list. An object no region attaches retires
-    /// ([`Ledger::retire_object`]); an attached one retires when its last
+    /// ([`Ledger::retiring_object`]); an attached one retires when its last
     /// attachment goes. Returns `false`, changing nothing, when `obj` holds no
     /// live object.
-    pub fn release_object(&mut self, obj: NodeIdx, quiescent: impl FnMut(&FreeRun) -> bool)
-    -> bool
+    pub fn release_object(&mut self, obj: NodeIdx) -> bool
     {
         let Some(o) = self.object(obj).filter(|o| o.live)
         else
@@ -1587,14 +1612,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         });
         if o.attached == 0
         {
-            self.retire_object(obj, quiescent);
+            self.queue_retire(obj);
         }
         true
     }
 
     /// Drop one attachment's reference on the memory object `obj`, retiring
     /// it when it was the last and its handle state is gone.
-    fn detach(&mut self, obj: NodeIdx, quiescent: impl FnMut(&FreeRun) -> bool)
+    fn detach(&mut self, obj: NodeIdx)
     {
         let Some(o) = self.object(obj)
         else
@@ -1605,21 +1630,69 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.set_object(obj, |o| o.attached = attached);
         if attached == 0 && !o.live
         {
-            self.retire_object(obj, quiescent);
+            self.queue_retire(obj);
         }
     }
 
-    /// Free the memory object `obj`, which nothing names any more: each of its
-    /// frames moves to the free pool, its charge on the object's budget node
-    /// released, when `quiescent` accepts it, else to the deferred list, still
-    /// charged ([`retire`]).
-    fn retire_object(&mut self, obj: NodeIdx, mut quiescent: impl FnMut(&FreeRun) -> bool)
+    /// Put the memory object `obj`, which nothing names any more, on the list
+    /// of objects to retire, chained through its `owned_next`, which its
+    /// owner's list no longer uses.
+    fn queue_retire(&mut self, obj: NodeIdx)
     {
-        let Some(o) = self.object(obj)
+        let next = self.retiring;
+        self.set_object(obj, |o| o.owned_next = next);
+        self.retiring = obj;
+    }
+
+    /// The first memory object nothing names any more, with the span of
+    /// memmgr's own view of its frames, `(slot, own_va, pages)`: memmgr
+    /// unmaps that span from its address space, so no mapping of its own
+    /// keeps a frame from the quiescence check, and then retires the object
+    /// ([`Self::retire_object`]). `None` when no object waits.
+    #[must_use]
+    pub fn retiring_object(&self) -> Option<(NodeIdx, u64, u64)>
+    {
+        self.object(self.retiring)?;
+        Some((
+            self.retiring,
+            self.object_va(self.retiring),
+            self.object_pages(self.retiring),
+        ))
+    }
+
+    /// The first address of memmgr's own view of the frames of the memory
+    /// object `obj` ([`MemObject::runs`]); 0 for a slot that holds none.
+    #[must_use]
+    pub fn object_va(&self, obj: NodeIdx) -> u64
+    {
+        let mut first = None;
+        self.for_each_object_frame(obj, |_, f| {
+            first = first.or(Some(f.va));
+        });
+        first.unwrap_or(0)
+    }
+
+    /// Free the memory object `obj`, first on the list of objects to retire
+    /// ([`Self::retiring_object`]), once memmgr has unmapped its own view of
+    /// it: each of its frames moves to the free pool, its charge on the
+    /// object's budget node released, when `quiescent` accepts it, else to
+    /// the deferred list, still charged ([`retire`]), and its span of the
+    /// object zone is given back ([`Self::give_object_va`]). Returns `false`,
+    /// changing nothing, when `obj` is not the first object to retire.
+    pub fn retire_object(
+        &mut self,
+        obj: NodeIdx,
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> bool
+    {
+        let Some(o) = self.object(obj).filter(|_| obj == self.retiring)
         else
         {
-            return;
+            return false;
         };
+        let pages = self.object_pages(obj);
+        let own_va = self.object_va(obj);
+        self.retiring = o.owned_next;
         let mut cur = o.runs;
         while let Node::Frame(frame) = self.arena.get(cur).node
         {
@@ -1636,6 +1709,34 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             cur = next;
         }
         self.arena.free(obj);
+        let _ = self.give_object_va(own_va, pages);
+        true
+    }
+
+    /// Add the span of `pages` pages at `va` to the free spans of memmgr's
+    /// object zone, where it maps its own read-only view of each object's
+    /// frames ([`MemObject::runs`]): the zone itself when memmgr starts, and
+    /// an object's span when it is freed or a seal is refused. `false` when
+    /// the arena has no slot for it at all, which loses the span to the zone
+    /// ([`ObjectVa::give`]).
+    pub fn give_object_va(&mut self, va: u64, pages: u64) -> bool
+    {
+        self.object_va.give(&mut self.arena, va, pages)
+    }
+
+    /// Take a span of `pages` pages of memmgr's object zone for an object
+    /// about to be sealed, its first address; `None` when no free span holds
+    /// it ([`ObjectVa::take`]).
+    pub fn take_object_va(&mut self, pages: u64) -> Option<u64>
+    {
+        self.object_va.take(&mut self.arena, pages)
+    }
+
+    /// Pages of memmgr's object zone no object holds.
+    #[must_use]
+    pub const fn object_va_free(&self) -> u64
+    {
+        self.object_va.free_pages()
     }
 
     /// Whether region `len` bytes long attaching shared or private
@@ -1864,6 +1965,65 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     pub fn attachment(&self, reg: NodeIdx) -> Option<Attachment>
     {
         self.commitment(reg)?.source
+    }
+
+    /// Promise the page a copy of an object page takes in the attachment
+    /// `reg` of `rec`, before a make-private draws it
+    /// (`services/memmgr/docs/memory-pool.md` § Memory objects, Make
+    /// private): the draw takes the page from `promised` as any committed
+    /// run does ([`Self::back_chunk`]). A private attachment promised each
+    /// page that holds no copy when it was made, so nothing changes. A shared
+    /// one promised no data page, so one is added to `promised`, admitted
+    /// against the pages a commitment may still promise, of which a promise
+    /// for a node outside the system reserve must leave `reserve`
+    /// ([`Self::growth_floor`]); its charge is not raised, since the
+    /// attachment is charged every page of its length already. The page the
+    /// copy takes then leaves `promised` as it was, and a detach, which
+    /// unpromises no data page of a shared attachment, keeps it exact.
+    ///
+    /// # Errors
+    /// [`ChargeError::Reserve`] when the free pages a commitment may still
+    /// promise leave no page above `reserve`; [`ChargeError::Limit`] when
+    /// `reg` holds no attachment or `rec` no record. Nothing changes then.
+    pub fn promise_copy(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        reserve: u64,
+    ) -> Result<(), ChargeError>
+    {
+        let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
+        match self.attachment(reg).ok_or(ChargeError::Limit)?.share
+        {
+            Share::Private => Ok(()),
+            Share::Shared =>
+            {
+                // No charge is admitted, only the page: one free page above
+                // the floor, which `admit` of no page over one page fewer
+                // reads.
+                let free = self.promise_free();
+                if free == 0
+                {
+                    return Err(ChargeError::Reserve);
+                }
+                budget::admit(&self.arena, node, 0, 0, free.saturating_sub(1), reserve)?;
+                self.promised = self.promised.saturating_add(1);
+                Ok(())
+            }
+        }
+    }
+
+    /// Take back the page [`Self::promise_copy`] promised for the attachment
+    /// `reg` when its copy was not made: one page out of `promised` for a
+    /// shared attachment, nothing for a private one.
+    pub fn unpromise_copy(&mut self, reg: NodeIdx)
+    {
+        if self
+            .attachment(reg)
+            .is_some_and(|a| a.share == Share::Shared)
+        {
+            self.promised = self.promised.saturating_sub(1);
+        }
     }
 
     /// The delegated address-space cap of `rec`, or `0` for none.
@@ -4019,7 +4179,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 }
                 else
                 {
-                    self.detach(source.object, &mut quiescent);
+                    self.detach(source.object);
                 }
             }
         }
@@ -7553,6 +7713,53 @@ mod tests
         }
     }
 
+    /// The first address of the object zone the object tests give the ledger.
+    const OWN_VA: u64 = 0x11_0000_0000;
+
+    /// A roomy ledger whose object zone holds 4096 pages from [`OWN_VA`].
+    fn object_ledger(pages: u64) -> Ledger<VecStore, VecWords>
+    {
+        let mut l = roomy_ledger(pages);
+        assert!(l.give_object_va(OWN_VA, 4096));
+        l
+    }
+
+    /// Seal the grants `ids` of `rec` under key 77 as memmgr does: a span of
+    /// the object zone for its own view first, given back when the seal is
+    /// refused.
+    fn seal(
+        l: &mut Ledger<VecStore, VecWords>,
+        rec: NodeIdx,
+        ids: &[u64],
+    ) -> Result<NodeIdx, SealError>
+    {
+        let pages: u64 = ids
+            .iter()
+            .filter_map(|&id| l.granted_frame(rec, id))
+            .map(|(_, f)| u64::from(f.page_count))
+            .sum();
+        let va = l.take_object_va(pages.max(1)).unwrap();
+        l.seal_object(rec, ids, 77, va).inspect_err(|_| {
+            assert!(l.give_object_va(va, pages.max(1)));
+        })
+    }
+
+    /// Retire every object waiting to, as memmgr's turn does once it has
+    /// unmapped its own view of each; returns how many retired.
+    fn retire_waiting(
+        l: &mut Ledger<VecStore, VecWords>,
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> usize
+    {
+        let mut n = 0;
+        while let Some((obj, _, _)) = l.retiring_object()
+        {
+            assert!(l.retire_object(obj, &mut quiescent));
+            n += 1;
+        }
+        n
+    }
+
     fn new_zero_frame(l: &mut Ledger<VecStore, VecWords>) -> NodeIdx
     {
         let (cap, _, phys) = take(l, 1, crate::Fit::Contiguous);
@@ -7566,20 +7773,32 @@ mod tests
     #[test]
     fn a_seal_takes_the_named_grants_in_order_and_keeps_their_charge()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let (rec, ids) = granted(&mut l, 1, 3, 2);
         let charged = usage(&l, rec);
         let before = l.arena.free_count();
         for bad in [&[][..], &[ids[0], ids[0]][..], &[ids[0], 999][..]]
         {
-            assert_eq!(l.seal_object(rec, bad, 77), Err(SealError::Grants));
+            assert_eq!(seal(&mut l, rec, bad), Err(SealError::Grants));
         }
         assert_eq!(l.arena.free_count(), before);
         let first = l.granted_frame(rec, ids[2]).unwrap().1;
-        let obj = l.seal_object(rec, &[ids[2], ids[0]], 77).unwrap();
+        let obj = seal(&mut l, rec, &[ids[2], ids[0]]).unwrap();
         assert_eq!(l.find_object(77), Some(obj));
         assert_eq!(l.object_pages(obj), 4);
-        assert_eq!(l.object_frame(obj, 1), Some((first, 1)));
+        // Each frame's va is its first page's address in memmgr's own view.
+        assert_eq!(
+            l.object_frame(obj, 1),
+            Some((
+                FrameDesc {
+                    va: OWN_VA,
+                    ..first
+                },
+                1
+            ))
+        );
+        assert_eq!(l.object_frame(obj, 3).unwrap().0.va, OWN_VA + 2 * PAGE_SIZE);
+        assert_eq!(l.object_va(obj), OWN_VA);
         assert_eq!(l.object_frame(obj, 4), None);
         // The sealed grants left the frame list; the third stays there.
         assert!(l.granted_frame(rec, ids[0]).is_none() && l.granted_frame(rec, ids[2]).is_none());
@@ -7595,21 +7814,21 @@ mod tests
     #[test]
     fn an_unsealed_object_gives_the_sealer_its_grants_back()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let (rec, ids) = granted(&mut l, 1, 2, 2);
         let other = l.insert_process(2, NodeSpec::TOP).unwrap();
         let charged = usage(&l, rec);
         let free = l.arena.free_count();
-        let obj = l.seal_object(rec, &ids, 77).unwrap();
-        assert!(!l.unseal_object(other, obj));
-        assert!(l.unseal_object(rec, obj));
-        assert!(!l.unseal_object(rec, obj));
+        let obj = seal(&mut l, rec, &ids).unwrap();
+        assert!(!l.unseal_object(other, obj, UNMAPPED));
+        assert!(l.unseal_object(rec, obj, UNMAPPED));
+        assert!(!l.unseal_object(rec, obj, UNMAPPED));
         assert_eq!(l.find_object(77), None);
         assert_eq!(l.arena.free_count(), free);
         assert_eq!(usage(&l, rec), charged);
         for id in ids
         {
-            assert!(l.granted_frame(rec, id).is_some());
+            assert_eq!(l.granted_frame(rec, id).unwrap().1.va, UNMAPPED);
             assert!(l.release_frame_by_region(rec, id, pool_all));
         }
         assert_eq!(usage(&l, rec), (0, 0));
@@ -7621,9 +7840,9 @@ mod tests
     #[test]
     fn an_object_retires_its_frames_once_released_and_no_longer_attached()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let (sealer, ids) = granted(&mut l, 1, 2, 4);
-        let obj = l.seal_object(sealer, &ids, 77).unwrap();
+        let obj = seal(&mut l, sealer, &ids).unwrap();
         let other = l.insert_process(2, NodeSpec::TOP).unwrap();
         let reg = l
             .attach_object(
@@ -7633,8 +7852,8 @@ mod tests
             )
             .unwrap();
         let free = l.pool.free_pages();
-        assert!(l.release_object(obj, pool_all));
-        assert!(!l.release_object(obj, pool_all));
+        assert!(l.release_object(obj));
+        assert!(!l.release_object(obj));
         assert_eq!(l.find_object(77), None);
         assert_eq!(l.pool.free_pages(), free);
         assert_eq!(usage(&l, sealer).0, 8);
@@ -7646,11 +7865,136 @@ mod tests
             ),
             Err(RegionError::NoObject)
         );
+        let zone = l.object_va_free();
         l.remove_region(other, reg, pool_all).unwrap();
+        // The object waits for memmgr to unmap its own view of the frames,
+        // which keeps them out of the pool until then.
+        assert_eq!(l.retiring_object(), Some((obj, OWN_VA, 8)));
+        assert_eq!(l.pool.free_pages(), free);
+        assert_eq!(usage(&l, sealer).0, 8);
+        assert!(!l.retire_object(NODE_NULL, pool_all));
+        assert_eq!(retire_waiting(&mut l, pool_all), 1);
         assert_eq!(l.pool.free_pages(), free + 8);
+        assert_eq!(l.object_va_free(), zone + 8);
         assert_eq!(usage(&l, sealer), (0, 0));
         assert_eq!(usage(&l, other), (0, 0));
         assert_eq!(l.object(obj), None);
+    }
+
+    // The defect caught: an object released with no attachment, or whose
+    // last attachment goes, that pools its frames while memmgr still maps
+    // its own view of them, or that is never offered for retiring, or whose
+    // retire leaves its slot or its span of the object zone behind.
+    #[test]
+    fn an_unnamed_object_waits_for_its_own_view_to_go_before_it_retires()
+    {
+        let mut l = object_ledger(1000);
+        let (sealer, ids) = granted(&mut l, 1, 2, 2);
+        let zone = l.object_va_free();
+        assert_eq!(
+            seal(&mut l, sealer, &[ids[0], ids[0]]),
+            Err(SealError::Grants)
+        );
+        assert_eq!(l.object_va_free(), zone);
+        let a = seal(&mut l, sealer, &ids[..1]).unwrap();
+        assert_eq!(l.object_va(a), OWN_VA);
+        assert_eq!(l.object_va_free(), zone - 2);
+        assert_eq!(l.retiring_object(), None);
+        let free = l.pool.free_pages();
+        let slots = l.arena.free_count();
+        assert!(l.release_object(a));
+        assert_eq!(l.retiring_object(), Some((a, OWN_VA, 2)));
+        assert_eq!(l.pool.free_pages(), free);
+        assert_eq!(usage(&l, sealer).0, 4);
+        assert_eq!(retire_waiting(&mut l, pool_all), 1);
+        assert_eq!(l.retiring_object(), None);
+        assert_eq!(l.object(a), None);
+        assert_eq!(l.pool.free_pages(), free + 2);
+        assert_eq!(l.object_va_free(), zone);
+        assert_eq!(l.arena.free_count(), slots + 1);
+        assert_eq!(usage(&l, sealer).0, 2);
+    }
+
+    // The defect caught: objects waiting together that lose one another, or
+    // a retire out of turn that frees an object still mapped by memmgr.
+    #[test]
+    fn objects_waiting_to_retire_go_one_by_one_in_turn()
+    {
+        let mut l = object_ledger(1000);
+        let (sealer, ids) = granted(&mut l, 1, 3, 1);
+        let objs: Vec<NodeIdx> = ids
+            .iter()
+            .map(|&id| {
+                let va = l.take_object_va(1).unwrap();
+                l.seal_object(sealer, &[id], 77 + id, va).unwrap()
+            })
+            .collect();
+        let free = l.pool.free_pages();
+        l.remove_process(1, pool_all, |_| {}).unwrap();
+        let first = l.retiring_object().unwrap().0;
+        assert!(objs.contains(&first));
+        let later = objs.iter().copied().find(|&o| o != first).unwrap();
+        assert!(!l.retire_object(later, pool_all));
+        assert_eq!(retire_waiting(&mut l, pool_all), 3);
+        assert!(objs.iter().all(|&o| l.object(o).is_none()));
+        assert_eq!(l.pool.free_pages(), free + 3);
+    }
+
+    // The defect caught: a make-private copy in a shared attachment that
+    // takes a page no promise covers, so a committed draw elsewhere finds
+    // the pool short, or one admitted into the reserve; a private one that
+    // promises its page twice; or a release that leaves the copy's promise
+    // or charge behind.
+    #[test]
+    fn a_copy_in_a_shared_attachment_is_promised_first_and_released_exactly()
+    {
+        let mut l = object_ledger(1000);
+        let (sealer, ids) = granted(&mut l, 1, 1, 4);
+        let obj = seal(&mut l, sealer, &ids).unwrap();
+        let rec = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let len = 4 * PAGE_SIZE;
+        let shared = l
+            .attach_object(rec, region(BASE, len), attachment(obj, 0, Share::Shared))
+            .unwrap();
+        let private = l
+            .attach_object(
+                rec,
+                region(BASE + CHUNK, len),
+                attachment(obj, 0, Share::Private),
+            )
+            .unwrap();
+        let charged = usage(&l, rec).0;
+        let base = promised(&l);
+        // A promise no region holds yet stands until the copy draws it, so
+        // these read `promised` itself.
+        assert_eq!(l.promise_copy(rec, private, 0), Ok(()));
+        assert_eq!(l.promised(), base);
+        assert_eq!(l.promise_copy(rec, shared, 0), Ok(()));
+        assert_eq!(l.promised(), base + 1);
+        l.unpromise_copy(shared);
+        l.unpromise_copy(private);
+        assert_eq!(promised(&l), base);
+        // No page above the floor: refused, nothing promised.
+        let floor = l.promise_free();
+        assert_eq!(
+            l.promise_copy(rec, shared, floor),
+            Err(ChargeError::Reserve)
+        );
+        assert_eq!(l.promise_copy(rec, NODE_NULL, 0), Err(ChargeError::Limit));
+        assert_eq!(promised(&l), base);
+        // The copy draws the page it promised.
+        assert_eq!(l.promise_copy(rec, shared, 0), Ok(()));
+        let (cap, _, phys) = take(&mut l, 1, crate::Fit::Contiguous);
+        l.back_chunk(rec, shared, frame(cap, 1, phys, BASE + PAGE_SIZE))
+            .unwrap();
+        assert_eq!(promised(&l), base);
+        assert_eq!(usage(&l, rec).0, charged);
+        let free = l.pool.free_pages();
+        l.remove_region(rec, shared, pool_all).unwrap();
+        l.remove_region(rec, private, pool_all).unwrap();
+        assert_eq!(usage(&l, rec), (0, 0));
+        assert_eq!(promised(&l), 0);
+        assert_eq!(l.pool.free_pages(), free + 1);
     }
 
     // The defect caught: a sealer's death that leaves its objects' handles
@@ -7659,9 +8003,9 @@ mod tests
     #[test]
     fn a_sealers_death_drops_its_objects_whose_frames_wait_for_the_last_attachment()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let (sealer, ids) = granted(&mut l, 1, 1, 4);
-        let obj = l.seal_object(sealer, &ids, 77).unwrap();
+        let obj = seal(&mut l, sealer, &ids).unwrap();
         let node = l.record(sealer).unwrap().budget;
         let other = l.insert_process(2, NodeSpec::TOP).unwrap();
         let reg = l
@@ -7678,6 +8022,7 @@ mod tests
         assert_eq!(held_by(&l, node), 4);
         // A frame still mapped somewhere waits on the deferred list, charged.
         l.remove_region(other, reg, |_| false).unwrap();
+        assert_eq!(retire_waiting(&mut l, |_| false), 1);
         assert_eq!(l.object(obj), None);
         assert_eq!(l.deferred.pages(), 4);
         assert_eq!(held_by(&l, node), 4);
@@ -7691,9 +8036,9 @@ mod tests
     #[test]
     fn an_attachment_is_charged_its_length_and_only_a_private_one_promises_its_pages()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let (sealer, ids) = granted(&mut l, 1, 1, 16);
-        let obj = l.seal_object(sealer, &ids, 77).unwrap();
+        let obj = seal(&mut l, sealer, &ids).unwrap();
         let rec = l.insert_process(2, NodeSpec::TOP).unwrap();
         let len = 16 * PAGE_SIZE;
         let need = commit::grow_need(0, len);
@@ -7745,7 +8090,7 @@ mod tests
     #[test]
     fn a_private_attachment_needs_the_max_and_the_promise_and_a_shared_one_the_max()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let rec = l.insert_process(1, spec_max(600)).unwrap();
         let big = 2000 * PAGE_SIZE;
         assert_eq!(
@@ -7774,7 +8119,7 @@ mod tests
     #[test]
     fn an_attachment_is_never_evicted_resized_or_discarded()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         let zero = new_zero_frame(&mut l);
         let reg = l
@@ -7805,9 +8150,9 @@ mod tests
     #[test]
     fn an_attachment_lies_inside_a_live_object()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let (rec, ids) = granted(&mut l, 1, 1, 4);
-        let obj = l.seal_object(rec, &ids, 77).unwrap();
+        let obj = seal(&mut l, rec, &ids).unwrap();
         let zero = new_zero_frame(&mut l);
         let before = l.arena.free_count();
         for (len, first, object, err) in [
@@ -7844,9 +8189,9 @@ mod tests
     #[test]
     fn no_attachment_maps_a_frame_past_the_bound()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let (rec, ids) = granted(&mut l, 1, 1, 4);
-        let obj = l.seal_object(rec, &ids, 77).unwrap();
+        let obj = seal(&mut l, rec, &ids).unwrap();
         l.set_object(obj, |o| o.attached = OBJECT_MAX_ATTACHMENTS - 1);
         let last = l
             .attach_object(
@@ -7927,7 +8272,7 @@ mod tests
     #[test]
     fn only_an_unused_zero_frame_is_removed()
     {
-        let mut l = roomy_ledger(1000);
+        let mut l = object_ledger(1000);
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         let oldest = new_zero_frame(&mut l);
         let middle = new_zero_frame(&mut l);

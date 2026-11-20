@@ -32,8 +32,10 @@ pub const NODE_NULL: NodeIdx = u64::MAX;
 /// One backing frame accounted to a process: a Memory cap memmgr holds,
 /// covering `page_count` pages at `phys_base`. `va` is the page base memmgr
 /// mapped it at (a run backing part of a demand chunk, kept on that chunk's
-/// run list in the region's chunk table), or the caller-owned-mapping marker
-/// the service chooses (a frame on the record's frame list).
+/// run list in the region's chunk table, or a frame of a memory object, in
+/// memmgr's own address space: [`MemObject::runs`]), or the
+/// caller-owned-mapping marker the service chooses (a frame on the record's
+/// frame list).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameDesc
 {
@@ -203,9 +205,10 @@ pub struct Commitment
 pub const ZERO_FRAME_SPAN: u64 = 1 << 31;
 
 /// The regions that may attach one memory object at once. Each maps an object
-/// frame at most once, and memmgr's scrub window once more while it copies
-/// the frame, so the kernel's per-frame mapping count of an object frame stays
-/// below its `u32` ceiling and no attacher can make another's read fail.
+/// frame at most once, and memmgr's own view of the frame once more
+/// ([`MemObject::runs`]), so the kernel's per-frame mapping count of an
+/// object frame stays below its `u32` ceiling and no attacher can make
+/// another's read fail.
 pub const OBJECT_MAX_ATTACHMENTS: u32 = 1 << 31;
 
 /// A zero frame (`services/memmgr/docs/memory-pool.md` § Memory objects,
@@ -256,7 +259,9 @@ pub enum Share
 /// files it by `key`, the badge its handles carry, and it is chained on the
 /// owner's list of handle states ([`ProcessCaps::handles`]). Its frames stay
 /// charged to the budget node they were charged to when sealed. It lives
-/// while it is live or attached, and its frames retire once it is neither.
+/// while it is live or attached; once it is neither it waits, chained through
+/// `owned_next`, for memmgr to unmap its own view of the frames, and then
+/// its frames retire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemObject
 {
@@ -265,10 +270,18 @@ pub struct MemObject
     /// The badge of the process that sealed it, whose record owns its handle
     /// state.
     pub owner: u64,
-    /// The next handle-state slot of the owner's list.
+    /// The next handle-state slot of the owner's list while it is live; once
+    /// nothing names it, the next object waiting to retire.
     pub owned_next: NodeIdx,
     /// The first [`Node::Frame`] slot of its frames, chained through the
-    /// slot `next` link in object page order.
+    /// slot `next` link in object page order. Each frame's `va` is where
+    /// memmgr maps its own read-only view of it, from the seal until the
+    /// object retires, in one span of memmgr's object zone that holds the
+    /// frames in object page order: the view keeps every frame's mapping
+    /// count above one while any process maps the frame, so the kernel
+    /// refuses a text write to it (`services/memmgr/docs/memory-pool.md`
+    /// § Memory objects, Own mapping), and it is the source a copy of the
+    /// page reads.
     pub runs: NodeIdx,
     /// The [`BudgetNode`] its frames are charged to.
     pub budget: NodeIdx,

@@ -1092,12 +1092,6 @@ value_enum! {
         Devmgr,
         /// vfsd's main thread.
         Vfsd,
-        /// devmgr's main thread, held at the stub's attach while svcmgr's
-        /// launches still call devmgr.
-        DevmgrLaunch,
-        /// vfsd's main thread, held at the stub's attach while svcmgr's
-        /// launches still call vfsd.
-        VfsdLaunch,
         /// logd's main thread, once per restart its budget allows and once
         /// more.
         Logd,
@@ -1107,15 +1101,13 @@ value_enum! {
 impl CoreDeathTarget
 {
     /// Every target, in the order a run without `--target` kills them.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 7] = [
         Self::Memmgr,
         Self::Procmgr,
         Self::ProcmgrReaper,
         Self::Svcmgr,
         Self::Devmgr,
         Self::Vfsd,
-        Self::DevmgrLaunch,
-        Self::VfsdLaunch,
         Self::Logd,
     ];
 }

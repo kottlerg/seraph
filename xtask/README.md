@@ -1319,9 +1319,7 @@ current sysroot once per target, headless, with a QMP socket, and kills the targ
 its threads to program counter 0. svcmgr, devmgr, vfsd and logd are reached through the GDB stub
 service, which the command stages naming the target and boots with the debug port, as
 `run --debug-target` does, removing it again and repacking the disk images in the layout they had,
-whatever the outcome; devmgr and vfsd are each killed in two boots, held at the stub's attach while
-svcmgr's launches still call them (`devmgr-launch`, `vfsd-launch`) and once the system is up
-(`devmgr`, `vfsd`); logd is killed four times, once more than svcmgr's restart budget allows,
+whatever the outcome; logd is killed four times, once more than svcmgr's restart budget allows,
 and when init-logd's last line, `handover complete; init-logd thread exiting`, has not appeared
 before the first kill (the first instance died before its bootstrap request or after it, before its
 release), the restart must produce it.
@@ -1345,7 +1343,7 @@ cargo xtask test-core-death [--arch x86_64|riscv64] [--target NAME[,NAME...]] [-
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture |
-| `--target` | every one | The services to kill, one boot each: `memmgr`, `procmgr` (a request worker), `procmgr-reaper` (procmgr's reaper thread), `svcmgr`, `devmgr`, `vfsd`, `devmgr-launch` and `vfsd-launch` (each held during svcmgr's launches), `logd`; repeatable, or comma-separated |
+| `--target` | every one | The services to kill, one boot each: `memmgr`, `procmgr` (a request worker), `procmgr-reaper` (procmgr's reaper thread), `svcmgr`, `devmgr`, `vfsd`, `logd`; repeatable, or comma-separated |
 | `--cpus` | `4` | vCPUs of the guest |
 | `--mem` | `512` | Guest memory size in MiB |
 

@@ -153,12 +153,11 @@ The path from a core or critical death to power-off MUST NOT depend on the servi
 svcmgr, devmgr, vfsd and logd (until svcmgr's restart budget for it is spent), one boot each, by a
 terminal fault made from outside the guest, and checks that the system powers off, on both
 architectures ([Testing § Core death](testing.md#core-death-test-core-death)). It kills devmgr and
-vfsd twice over, one boot each: during svcmgr's launches, which still call them, and once svcmgr has
-reconciled its recipes; and logd from the stub's first attach to it, which can fall before logd asks
-svcmgr for its bootstrap round. svcmgr does not wait for good on a service that dies after its start
-and before that request: its wait for the request ends at the death, which it routes by the
-service's restart policy, on the first launch and on a restart alike, and it goes on with its
-reconciliation or its
+vfsd once svcmgr has reconciled its recipes, and logd from the stub's first attach to it, which can
+fall before logd asks svcmgr for its bootstrap round. svcmgr does not wait for good on a service
+that dies after its start and before that request: its wait for the request ends at the death,
+which it routes by the service's restart policy, on the first launch and on a restart alike, and it
+goes on with its reconciliation or its
 supervision ([Restart Protocol § Death
 detection](../services/svcmgr/docs/restart-protocol.md#death-detection)). For a core death the path
 holds the requirement by construction. pwrmgr is pinned: svcmgr creates the shutdown actuator with

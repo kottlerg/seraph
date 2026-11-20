@@ -331,8 +331,7 @@ jobs:
             cargo xtask test-reboot --arch ${{ matrix.arch }}
             # Sixth boot set: the core-death test (#262). One boot per core or
             # critical service (memmgr, procmgr and its reaper thread, svcmgr,
-            # devmgr and vfsd during svcmgr's launches and once the system is
-            # up, logd until its restart budget is spent), each
+            # devmgr, vfsd, logd until its restart budget is spent), each
             # killed by a terminal fault made from outside the guest (the GDB
             # stub service, or QEMU's gdbstub for the init-created memmgr and
             # procmgr), and each must power the system off, read from QMP's

@@ -18,10 +18,7 @@
 //!   creates): the stub is staged naming the target, as `run --debug-target`
 //!   stages it (`crate::debug_stub`), and attaches to it during the boot; the
 //!   host connects over the debug port, moves the main thread, and detaches,
-//!   which gives the target its crash bindings back. devmgr and vfsd are
-//!   killed twice over, one boot each: held at the stub's attach, while
-//!   svcmgr's launches still call them, and once the system is up. logd is
-//!   killed at the
+//!   which gives the target its crash bindings back. logd is killed at the
 //!   stub's first attach, which can fall before logd asks svcmgr for its
 //!   bootstrap round, and as it restarts, it is killed again, through the
 //!   stub's attach to each new instance, until svcmgr's restart budget is
@@ -115,17 +112,11 @@ enum Route
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KillPoint
 {
-    /// Once the stub has attached, which stops every thread of its target.
-    /// svcmgr's, as the boot waits on svcmgr's launches to come up; and
-    /// devmgr's and vfsd's at their launch targets, while svcmgr's launches
-    /// still call them before its reconciliation records them, so a call
-    /// svcmgr makes to the held server waits unreceived until the kill
-    /// releases it (`NoReceiver`, once no capability with the Receive right
-    /// on the endpoint is left).
+    /// Once the stub has attached. svcmgr's: the stub stops every thread of
+    /// its target, and the boot waits on svcmgr's launches to come up.
     Attach,
     /// Once the boot is up and svcmgr has reconciled its recipes: the death
-    /// of a supervised service, after the launch window the
-    /// [`KillPoint::Attach`] targets of devmgr and vfsd cover.
+    /// of a supervised service.
     SystemUp,
     /// As [`KillPoint::Attach`], then again after each restart svcmgr makes,
     /// until its restart budget is spent and the death is permanent. The
@@ -226,11 +217,6 @@ fn route(target: CoreDeathTarget) -> Route
         CoreDeathTarget::Svcmgr => Route::Stub("svcmgr", KillPoint::Attach, Contact::Attached),
         CoreDeathTarget::Devmgr => Route::Stub("devmgr", KillPoint::SystemUp, Contact::Attached),
         CoreDeathTarget::Vfsd => Route::Stub("vfsd", KillPoint::SystemUp, Contact::Attached),
-        CoreDeathTarget::DevmgrLaunch =>
-        {
-            Route::Stub("devmgr", KillPoint::Attach, Contact::Attached)
-        }
-        CoreDeathTarget::VfsdLaunch => Route::Stub("vfsd", KillPoint::Attach, Contact::Attached),
         CoreDeathTarget::Logd => Route::Stub("logd", KillPoint::RestartsSpent, Contact::Launched),
     }
 }
@@ -658,10 +644,10 @@ mod tests
             assert!(matches!(route(target), Route::Hardware(_)), "{target:?}");
         }
         // svcmgr is killed held, since the boot waits on it; devmgr and vfsd
-        // held during svcmgr's launches and again once the system is up, and
-        // logd once it has taken its bootstrap round. Defect caught too: the stub's attach to
-        // logd, the log sink, awaited by its marker, which logd itself
-        // carries, so a stub holding logd never shows it.
+        // once the system is up, and logd once it has taken its bootstrap
+        // round. Defect caught too: the stub's attach to logd, the log sink,
+        // awaited by its marker, which logd itself carries, so a stub holding
+        // logd never shows it.
         for (target, name, point, contact) in [
             (
                 CoreDeathTarget::Svcmgr,
@@ -679,18 +665,6 @@ mod tests
                 CoreDeathTarget::Vfsd,
                 "vfsd",
                 KillPoint::SystemUp,
-                Contact::Attached,
-            ),
-            (
-                CoreDeathTarget::DevmgrLaunch,
-                "devmgr",
-                KillPoint::Attach,
-                Contact::Attached,
-            ),
-            (
-                CoreDeathTarget::VfsdLaunch,
-                "vfsd",
-                KillPoint::Attach,
                 Contact::Attached,
             ),
             (

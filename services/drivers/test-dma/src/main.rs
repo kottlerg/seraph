@@ -35,10 +35,18 @@
 //! which devmgr counts for the device; on `x86_64` interrupt remapping finds no
 //! entry for the forged handle, and the probe can observe only that the write
 //! is not delivered, since QEMU records no requester for the fault.
+//! `ipc::test_dma_labels::DMA_STREAM_START` maps one page for the device,
+//! which stays mapped, and starts a thread that copies through it in a loop
+//! (each round a fresh pattern to the page's first half, through the device's
+//! buffer, back to the second half, and a check); `DMA_STREAM_COUNT` reports
+//! the rounds so far and `DMA_STREAM_STOP` ends the thread and unmaps the
+//! page. While the stream runs the driver refuses the other probes, so only
+//! the thread drives the device's DMA engine.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use driver_binding::decl::{Declaration, Interrupt, InterruptNeed, Match, Reset, Tier};
@@ -149,6 +157,28 @@ struct Driver
     aspace: u64,
     /// The binding the probes use; the churn replaces it.
     irq: Cell<Option<Irq>>,
+    /// The running DMA stream, if any.
+    stream: RefCell<Option<Stream>>,
+}
+
+/// The counters a DMA stream's thread shares with the driver.
+struct StreamShared
+{
+    /// Rounds whose copy arrived.
+    arrived: AtomicU64,
+    /// Rounds whose copy did not arrive or whose transfer did not complete.
+    failed: AtomicU64,
+    /// Set to end the thread after its round.
+    stop: AtomicBool,
+}
+
+/// A running DMA stream (`test_dma_labels::DMA_STREAM_START`).
+struct Stream
+{
+    shared: Arc<StreamShared>,
+    thread: JoinHandle<()>,
+    /// The device address the stream's page is mapped at.
+    iova: u64,
 }
 
 /// The address of the register at `off` in the BAR page mapped at `regs`.
@@ -174,18 +204,6 @@ impl Driver
         unsafe { core::ptr::write_volatile(register(self.regs, off) as *mut u32, value) };
     }
 
-    fn read64(&self, off: u64) -> u64
-    {
-        // SAFETY: as in `read32`, for a 64-bit register.
-        unsafe { core::ptr::read_volatile(register(self.regs, off) as *const u64) }
-    }
-
-    fn write64(&self, off: u64, value: u64)
-    {
-        // SAFETY: as in `read64`.
-        unsafe { core::ptr::write_volatile(register(self.regs, off) as *mut u64, value) };
-    }
-
     /// Copy `PROBE_LEN` bytes from `src` to `dst` ([`Driver::transfer_bytes`]).
     #[expect(
         clippy::fn_params_excessive_bools,
@@ -205,21 +223,7 @@ impl Driver
     )]
     fn transfer_bytes(&self, src: u64, dst: u64, len: u64, to_memory: bool) -> bool
     {
-        self.write64(DMA_SRC, src);
-        self.write64(DMA_DST, dst);
-        self.write64(DMA_CNT, len);
-        let dir = if to_memory { CMD_TO_MEMORY } else { 0 };
-        self.write64(DMA_CMD, CMD_RUN | dir);
-        let start = Instant::now();
-        while self.read64(DMA_CMD) & CMD_RUN != 0
-        {
-            if start.elapsed() > TRANSFER_TIMEOUT
-            {
-                return false;
-            }
-            let _ = syscall::thread_yield();
-        }
-        true
+        dma_transfer(self.regs, src, dst, len, to_memory)
     }
 
     /// One page of memory from memmgr, mapped writable: its cap and address.
@@ -453,6 +457,249 @@ impl Driver
     }
 }
 
+/// Copy `len` bytes from `src` to `dst` through the DMA registers of the
+/// BAR page mapped at `regs`, from the device's buffer to memory when
+/// `to_memory`, and wait for the device to complete it; `false` when it
+/// does not within [`TRANSFER_TIMEOUT`].
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`to_memory` is the direction bit of the edu DMA command register"
+)]
+fn dma_transfer(regs: u64, src: u64, dst: u64, len: u64, to_memory: bool) -> bool
+{
+    let write = |off: u64, value: u64| {
+        // SAFETY: `regs` maps the device's first BAR page for the driver's
+        // life, `off` lies in it, and the register is 64-bit aligned; reached
+        // only through raw volatile accesses.
+        unsafe { core::ptr::write_volatile(register(regs, off) as *mut u64, value) };
+    };
+    let read = |off: u64| {
+        // SAFETY: as in `write`.
+        unsafe { core::ptr::read_volatile(register(regs, off) as *const u64) }
+    };
+    write(DMA_SRC, src);
+    write(DMA_DST, dst);
+    write(DMA_CNT, len);
+    let dir = if to_memory { CMD_TO_MEMORY } else { 0 };
+    write(DMA_CMD, CMD_RUN | dir);
+    let start = Instant::now();
+    while read(DMA_CMD) & CMD_RUN != 0
+    {
+        if start.elapsed() > TRANSFER_TIMEOUT
+        {
+            return false;
+        }
+        let _ = syscall::thread_yield();
+    }
+    true
+}
+
+/// The pattern byte at `i` of stream round `round`: none zero.
+fn stream_pattern(round: u64, i: usize) -> u8
+{
+    pattern(i).wrapping_add(round.to_le_bytes()[0]) | 0x80
+}
+
+/// One stream round on the page mapped at `va` and at the device address
+/// `iova`: write round `round`'s pattern to the first half, clear the
+/// second, copy through the device's buffer to the second half, and check
+/// it. `false` when a transfer does not complete or the copy differs.
+fn stream_round(regs: u64, va: u64, iova: u64, round: u64) -> bool
+{
+    // Every `i` passed lies inside the page, so the sum never saturates.
+    let byte = |i: usize| va.saturating_add(i as u64) as *mut u8;
+    for i in 0..PROBE_LEN
+    {
+        // SAFETY: `va` maps one writable page and `i` is inside it.
+        unsafe { core::ptr::write_volatile(byte(i), stream_pattern(round, i)) };
+        // SAFETY: as above, for the second half.
+        unsafe { core::ptr::write_volatile(byte(BACK_OFFSET.saturating_add(i)), 0) };
+    }
+    // Below `DMA_REACH`, as the page's end is.
+    let dst = iova.saturating_add(BACK_OFFSET as u64);
+    dma_transfer(regs, iova, DEVICE_BUFFER, PROBE_LEN as u64, false)
+        && dma_transfer(regs, DEVICE_BUFFER, dst, PROBE_LEN as u64, true)
+        && (0..PROBE_LEN).all(|i| {
+            // SAFETY: as above; the device writes it, so it is read volatile.
+            let got = unsafe { core::ptr::read_volatile(byte(BACK_OFFSET.saturating_add(i))) };
+            got == stream_pattern(round, i)
+        })
+}
+
+/// The `DMA_CONFINED` word of a reply for the device whose faults are `faults`.
+fn confined_word(faults: &ipc::DmaFaults) -> u64
+{
+    if faults.confined
+    {
+        ipc::devmgr_dma_labels::DMA_CONFINED
+    }
+    else
+    {
+        0
+    }
+}
+
+impl Driver
+{
+    /// Whether a DMA stream runs.
+    fn streaming(&self) -> bool
+    {
+        self.stream.borrow().is_some()
+    }
+
+    /// Whether the driver refuses `label` because a stream runs: the probes
+    /// that drive the device's DMA engine.
+    fn refuses(&self, label: u64) -> bool
+    {
+        self.streaming()
+            && matches!(
+                label,
+                test_dma_labels::DMA_PROBE
+                    | test_dma_labels::INTERRUPT_PROBE
+                    | test_dma_labels::INTERRUPT_CHURN
+                    | test_dma_labels::MSI_FORGE
+            )
+    }
+
+    /// Start the DMA stream (`test_dma_labels::DMA_STREAM_START`): the
+    /// reply's words `[started, device address, confined, faults]`. `None`
+    /// when a stream runs or the setup fails.
+    fn stream_start(&self, ipc_buf: *mut u64) -> Option<[u64; 4]>
+    {
+        if self.streaming()
+        {
+            return None;
+        }
+        let (cap, va) = self.page(ipc_buf)?;
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let iova = unsafe {
+            virtio_core::dma::map(
+                self.dma_ep,
+                cap,
+                virtio_core::dma::DEVICE_READS_WRITES,
+                ipc_buf,
+            )
+        }
+        .ok()?;
+        // SAFETY: as above.
+        let Ok(faults) = (unsafe { ipc::dma_faults(self.dma_ep, ipc_buf) })
+        else
+        {
+            // SAFETY: as above.
+            let _ = unsafe { virtio_core::dma::unmap(self.dma_ep, iova, ipc_buf) };
+            return None;
+        };
+        let words = |started: u64| [started, iova, confined_word(&faults), faults.count];
+        if !within_reach(iova)
+        {
+            // SAFETY: as above.
+            unsafe { virtio_core::dma::unmap(self.dma_ep, iova, ipc_buf) }.ok()?;
+            return Some(words(0));
+        }
+        let shared = Arc::new(StreamShared {
+            arrived: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+        });
+        let (regs, thread_shared) = (self.regs, Arc::clone(&shared));
+        let spawned = std::thread::Builder::new().spawn(move || {
+            let mut round: u64 = 0;
+            while !thread_shared.stop.load(Ordering::Acquire)
+            {
+                let counter = if stream_round(regs, va, iova, round)
+                {
+                    &thread_shared.arrived
+                }
+                else
+                {
+                    &thread_shared.failed
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                round = round.wrapping_add(1);
+                let _ = syscall::thread_yield();
+            }
+        });
+        let Ok(thread) = spawned
+        else
+        {
+            // SAFETY: as above.
+            let _ = unsafe { virtio_core::dma::unmap(self.dma_ep, iova, ipc_buf) };
+            return None;
+        };
+        *self.stream.borrow_mut() = Some(Stream {
+            shared,
+            thread,
+            iova,
+        });
+        Some(words(1))
+    }
+
+    /// The stream's rounds so far (`test_dma_labels::DMA_STREAM_COUNT`):
+    /// `[arrived, failed]`; `None` when no stream runs.
+    fn stream_count(&self) -> Option<[u64; 2]>
+    {
+        let stream = self.stream.borrow();
+        let s = stream.as_ref()?;
+        Some([
+            s.shared.arrived.load(Ordering::Relaxed),
+            s.shared.failed.load(Ordering::Relaxed),
+        ])
+    }
+
+    /// Stop the stream (`test_dma_labels::DMA_STREAM_STOP`): the reply's
+    /// words `[arrived, failed, device address, faults]`. `None` when no
+    /// stream runs or the unmap or the fault request fails.
+    fn stream_stop(&self, ipc_buf: *mut u64) -> Option<[u64; 4]>
+    {
+        let stream = self.stream.borrow_mut().take()?;
+        stream.shared.stop.store(true, Ordering::Release);
+        let _ = stream.thread.join();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { virtio_core::dma::unmap(self.dma_ep, stream.iova, ipc_buf) }.ok()?;
+        // SAFETY: as above.
+        let faults = unsafe { ipc::dma_faults(self.dma_ep, ipc_buf) }.ok()?;
+        Some([
+            stream.shared.arrived.load(Ordering::Relaxed),
+            stream.shared.failed.load(Ordering::Relaxed),
+            stream.iova,
+            faults.count,
+        ])
+    }
+}
+
+/// The reply to a `DMA_STREAM_*` `label`.
+fn stream_reply(driver: &Driver, label: u64, ipc_buf: *mut u64) -> IpcMessage
+{
+    match label
+    {
+        test_dma_labels::DMA_STREAM_START =>
+        {
+            words_reply(driver.stream_start(ipc_buf).as_ref().map(|w| &w[..]))
+        }
+        test_dma_labels::DMA_STREAM_COUNT =>
+        {
+            words_reply(driver.stream_count().as_ref().map(|w| &w[..]))
+        }
+        _ => words_reply(driver.stream_stop(ipc_buf).as_ref().map(|w| &w[..])),
+    }
+}
+
+/// A `SUCCESS` reply carrying `words`, or `INVALID_REQUEST` for `None`.
+fn words_reply(words: Option<&[u64]>) -> IpcMessage
+{
+    let Some(words) = words
+    else
+    {
+        return IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST);
+    };
+    let mut builder = IpcMessage::builder(ipc::devmgr_errors::SUCCESS);
+    for (i, &w) in words.iter().enumerate()
+    {
+        builder = builder.word(i, w);
+    }
+    builder.build()
+}
+
 /// What the forged-message probe found (`test_dma_labels::MSI_FORGE`).
 #[derive(Clone, Copy, Default)]
 struct Forge
@@ -680,6 +927,7 @@ fn main() -> !
         memmgr_ep: info.memmgr_endpoint,
         aspace: info.self_aspace,
         irq: Cell::new(irq.and_then(bind_interrupt)),
+        stream: RefCell::new(None),
     };
     if driver.read32(IDENT) != IDENT_EDU
     {
@@ -806,8 +1054,9 @@ fn forge_reply(forge: Option<Forge>) -> IpcMessage
         .build()
 }
 
-/// Answer `INTERRUPT_PROBE`, `INTERRUPT_CHURN`, `DMA_PROBE` and `MSI_FORGE` until a
-/// `FIXTURE_EXIT`, then exit.
+/// Answer `INTERRUPT_PROBE`, `INTERRUPT_CHURN`, `DMA_PROBE`, `MSI_FORGE` and the
+/// `DMA_STREAM_*` labels until a `FIXTURE_EXIT`, then exit. While a stream runs the
+/// four probes are refused.
 #[expect(
     clippy::large_stack_frames,
     reason = "the received `msg` and the `reply` `IpcMessage`s (568 B each) and the builder copies \
@@ -835,6 +1084,10 @@ fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
         }
         let reply = match msg.label
         {
+            label if driver.refuses(label) => IpcMessage::new(ipc::devmgr_errors::INVALID_REQUEST),
+            test_dma_labels::DMA_STREAM_START
+            | test_dma_labels::DMA_STREAM_COUNT
+            | test_dma_labels::DMA_STREAM_STOP => stream_reply(driver, msg.label, ipc_buf),
             test_dma_labels::INTERRUPT_PROBE =>
             {
                 let (delivered, kind) = driver.interrupt_probe();

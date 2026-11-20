@@ -64,6 +64,7 @@ use std::time::{Duration, Instant};
 use ipc::{memmgr_errors, procmgr_errors};
 use syscall_abi::PAGE_SIZE;
 
+use super::process_kill::{IOMMU_NAME, kill};
 use super::swap::{
     CHUNK_LEN, CHUNK_PAGES, HOG_TICK, Hog, Ready, StackPages, attach, await_swapped,
     baseline_totals, chunk_reads_pattern, detach, main_pages, make_resident, page_present, pool,
@@ -72,7 +73,6 @@ use super::swap::{
 use super::swap_client::{
     Buffer, Slots, await_normal, disk_and_free, done, isolate, restore, stored, take,
 };
-use crate::arch::current::{IP_OFFSET, REGS_SIZE};
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
@@ -97,14 +97,6 @@ const SWAPD_IMAGE: &str = "/services/swapd";
 /// `LIST_PROCESSES`: devmgr, which init creates from its boot module, and
 /// the block driver, which devmgr creates from its install path.
 const STORAGE_NAMES: [&str; 2] = ["devmgr", "/services/drivers/virtio-blk"];
-/// The IOMMU driver's name in `LIST_PROCESSES` on this architecture; it runs
-/// only where the platform has an IOMMU.
-#[cfg(target_arch = "x86_64")]
-const IOMMU_NAME: &str = "/services/drivers/iommu-vtd";
-/// The IOMMU driver's name in `LIST_PROCESSES` on this architecture; it runs
-/// only where the platform has an IOMMU.
-#[cfg(target_arch = "riscv64")]
-const IOMMU_NAME: &str = "/services/drivers/iommu-riscv";
 /// Chunks of the fixture's main region each part awaits swapped before it
 /// takes or writes any.
 const SWAPPED_CHUNKS: u64 = 6;
@@ -187,33 +179,6 @@ fn await_writes_ended()
             status.on_disk
         );
         std::thread::sleep(HOG_TICK);
-    }
-}
-
-/// Kill the process `process` through an attach: stop its main thread, set its
-/// instruction pointer to the first page, which no process maps, and start it,
-/// so it takes a fault no handler resolves.
-fn kill(authority: u64, process: u64, what: &str)
-{
-    let threads = attach(authority, process, what);
-    let main = *threads.first().expect("the attach returned a thread");
-    syscall::thread_stop(main).unwrap_or_else(|e| panic!("{PHASE}: stopping {what} ({e})"));
-    let mut regs = [0u8; REGS_SIZE];
-    syscall::thread_read_regs(main, &mut regs)
-        .unwrap_or_else(|e| panic!("{PHASE}: reading {what}'s registers ({e})"));
-    regs.get_mut(IP_OFFSET..IP_OFFSET.saturating_add(8))
-        .unwrap_or_else(|| panic!("{PHASE}: the instruction pointer within the register file"))
-        .copy_from_slice(&0u64.to_ne_bytes());
-    // SAFETY: the thread is the attached process's, bound to its address
-    // space, so the frame it resumes on touches none of svctest's memory; the
-    // write only makes it fault.
-    unsafe { syscall::thread_write_regs(main, &regs) }
-        .unwrap_or_else(|e| panic!("{PHASE}: writing {what}'s instruction pointer ({e})"));
-    syscall::thread_start(main)
-        .unwrap_or_else(|e| panic!("{PHASE}: starting {what}'s main thread ({e})"));
-    for cap in threads
-    {
-        let _ = syscall::cap_delete(cap);
     }
 }
 
@@ -407,7 +372,7 @@ fn part_b(
     let on_disk = pool().on_disk;
     let killed = super::crash::badge_named(authority, SWAPD_NAME)
         .unwrap_or_else(|| panic!("{PHASE}: LIST_PROCESSES lists no swapd"));
-    kill(authority, killed, "swapd");
+    kill(authority, killed, "swapd", PHASE);
     let start = Instant::now();
     while super::crash::badge_named(authority, SWAPD_NAME).is_none_or(|badge| badge == killed)
     {

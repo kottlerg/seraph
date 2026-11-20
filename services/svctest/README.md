@@ -179,7 +179,8 @@ framebuffer-killed and framebuffer-restarted cases (`caps[13]`), the svcmgr seed
 seed-only seed, plus the public `svcmgr`, `pwrmgr.deny` and `acpid.deny` names it resolves), the
 svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the vfsd and vfsd unmount phases
 (`caps[4]`, `caps[5]`), the `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`,
-`logd_sinks`, `entropyd_contribution`, and `devmgr_on_demand_bind` phases (`caps[6]`), the vfsd
+`logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, and `devmgr_iommu_restart` phases
+(`caps[6]`), the vfsd
 swap-partition phase (`caps[14]`), the `memmgr_swap_client` and `swapd` phases (`caps[18]`), the
 `sessiond_operator` phase and the `oom_policy` phase's session case (`caps[15]` and `caps[20]`),
 the `crash_endpoint`, `logd_reserve`, `logd_restart`, `logd_sinks`, `memmgr_swap`,
@@ -214,7 +215,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind` phases: read logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
@@ -227,7 +228,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[16]` | `devmgr.class.hwrng` | drivers hwrng read, hwrng restart, and stray-cap phases: the `hwrng` class SEND |
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
 | `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client` and `swapd` phases: memmgr's swap labels, as a second swap client beside swapd, registering nothing, over a RAM slot store |
-| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
+| `caps[19]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; svctest declares itself undebuggable at startup |
 | `caps[20]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy` and `logd_reserve` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -546,10 +547,19 @@ phase asks the fixture for `INTERRUPT_CHURN`: while a thread of the fixture has 
 MSI in a loop, the fixture deletes the `Interrupt` cap bound to it, and then the bound
 notification's last cap and the binding's cap; after each case a spare copy it binds to a new
 notification must receive the device's interrupt, the fixture must hold MSI, and the loop must have
-raised. The MSI release phase sends `FIXTURE_EXIT`, after which the fixture leaves its interrupt
-raised and exits; the phase polls `caps[9]` until devmgr answers `WITHDRAWN` and asserts
-`system_ram == kernel_reserved + pool_total`. devmgr releases the device, which frees the
-message-signaled target it minted for it, on its control thread right after the class answers
+raised. The IOMMU driver restart phase (`devmgr_iommu_restart`) has the fixture start a DMA stream
+(`DMA_STREAM_START`): a page of its memory stays mapped for the device while a thread of the fixture
+copies through it in a loop. Where an IOMMU confines the device, the phase waits for at least eight
+rounds, kills the IOMMU driver through the debug authority, and waits for a new instance of it and
+for the line devmgr logs when it restarted the driver, read from logd's history, which must report
+at least one mapping installed again and one hold released. The stream must then make further
+rounds with none failed, at the same device address, and with the device's fault count unchanged;
+the fixture's DMA probe and interrupt probe must pass as in the phases above, and a read of the
+bootstrap bundle's header from the root filesystem must succeed. Without an IOMMU confining the
+device the phase is skipped. The MSI release phase sends `FIXTURE_EXIT`, after which the fixture
+leaves its interrupt raised and exits; the phase polls `caps[9]` until devmgr answers `WITHDRAWN`
+and asserts `system_ram == kernel_reserved + pool_total`. devmgr releases the device, which frees
+the message-signaled target it minted for it, on its control thread right after the class answers
 `WITHDRAWN`, and no request svctest makes observes the release end, so the `ram_accounted_identity`
 phase that ends the run asserts the identity again after it. The release phase runs last of the
 phases that use the fixture, since no fixture serves the class again in that boot.

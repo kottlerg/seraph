@@ -69,6 +69,18 @@
 //! `x86_64` a remappable message naming a handle no remapping entry holds,
 //! after asserting the fixture's own message is remappable.
 //!
+//! The IOMMU driver restart phase has the fixture start a DMA stream
+//! (`DMA_STREAM_START`): a page of its memory stays mapped for the device while
+//! a thread copies through it in a loop. It kills the IOMMU driver through the
+//! debug authority and waits for a new instance of it and for the line devmgr
+//! logs when it restarted the driver (read from logd's history through
+//! `logd.query`), which must report at least one mapping installed again and one
+//! hold released. It asserts that the stream's rounds continue after the
+//! restart with none failed and no IOMMU fault taken for the device, that the
+//! fixture's DMA probe and interrupt probe pass as in the phases above, and that
+//! a read of the bootstrap bundle's header from the root filesystem succeeds.
+//! Without an IOMMU confining the device the phase is skipped.
+//!
 //! The MSI churn phase asks the fixture to delete, while the device raises
 //! its MSI in a loop, the `Interrupt` cap bound to it, and then the bound
 //! notification's last cap and the binding's cap, and asserts that after each
@@ -131,6 +143,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "devmgr_msi_churn",
             run: msi_churn_phase,
+        },
+        Phase {
+            name: "devmgr_iommu_restart",
+            run: iommu_restart_phase,
         },
         Phase {
             name: "devmgr_msi_release",
@@ -768,79 +784,114 @@ fn call_test_dma(caps: &Caps, label: u64, phase: &str) -> ipc::IpcMessage
 /// for it.
 fn dma_confinement_phase(caps: &Caps)
 {
-    use ipc::test_dma_labels::{DMA_PROBE, PROBE_PASSED, PROBE_SKIPPED};
-
-    let probe = call_test_dma(caps, DMA_PROBE, "devmgr_dma");
-    assert_eq!(probe.label, ipc::devmgr_errors::SUCCESS, "DMA_PROBE setup");
-    let (outcome, landed, iova) = (probe.word(0), probe.word(1) != 0, probe.word(2));
-    let confined = probe.word(3) == ipc::devmgr_dma_labels::DMA_CONFINED;
-    let (faults, last_fault) = (probe.word(4), probe.word(5));
-
-    if !confined
+    let probe = assert_dma_probe(caps, "devmgr_dma");
+    let (outcome, iova, faults) = (probe.outcome, probe.iova, probe.faults);
+    if !probe.confined
     {
-        assert!(
-            outcome == PROBE_PASSED || outcome == PROBE_SKIPPED,
-            "devmgr_dma: a mapped copy did not arrive (outcome {outcome})"
-        );
-        assert_eq!(
-            faults, 0,
-            "devmgr_dma: devmgr counted faults for an unconfined device"
-        );
         std::os::seraph::log!(
             "devmgr_dma_confinement passed unconfined: outcome {outcome}, device address {iova:#x}"
         );
         return;
     }
-    assert_eq!(
-        outcome, PROBE_PASSED,
-        "devmgr_dma: a copy through a mapped IOVA did not arrive"
-    );
-    assert!(
-        !landed,
-        "devmgr_dma: a copy to IOVA {iova:#x} after its unmap reached the page"
-    );
-    assert!(
-        faults >= 1,
-        "devmgr_dma: no IOMMU fault taken for the device after the unmapped copy"
-    );
-    assert_eq!(
-        last_fault,
-        iova & !0xfff,
-        "devmgr_dma: the latest fault names another IOVA"
-    );
     std::os::seraph::log!(
         "devmgr_dma_confinement passed: mapped copy arrived at IOVA {iova:#x}, \
          the copy after its unmap faulted ({faults} faults)"
     );
 }
 
+/// What `DMA_PROBE` found, asserted by [`assert_dma_probe`].
+struct DmaProbe
+{
+    outcome: u64,
+    iova: u64,
+    faults: u64,
+    confined: bool,
+}
+
+/// Run `DMA_PROBE` on the fixture and assert what the DMA confinement phase
+/// does: a copy through a mapped page arrives; for a device an IOMMU confines,
+/// a copy to the page's device address after its unmap does not reach the
+/// page, and devmgr took a fault for the device at that address; for one it
+/// does not, devmgr counted no fault. `phase` names the caller in a failure.
+fn assert_dma_probe(caps: &Caps, phase: &str) -> DmaProbe
+{
+    use ipc::test_dma_labels::{DMA_PROBE, PROBE_PASSED, PROBE_SKIPPED};
+
+    let probe = call_test_dma(caps, DMA_PROBE, phase);
+    assert_eq!(probe.label, ipc::devmgr_errors::SUCCESS, "DMA_PROBE setup");
+    let (outcome, landed, iova) = (probe.word(0), probe.word(1) != 0, probe.word(2));
+    let confined = probe.word(3) == ipc::devmgr_dma_labels::DMA_CONFINED;
+    let (faults, last_fault) = (probe.word(4), probe.word(5));
+    let found = DmaProbe {
+        outcome,
+        iova,
+        faults,
+        confined,
+    };
+
+    if !confined
+    {
+        assert!(
+            outcome == PROBE_PASSED || outcome == PROBE_SKIPPED,
+            "{phase}: a mapped copy did not arrive (outcome {outcome})"
+        );
+        assert_eq!(
+            faults, 0,
+            "{phase}: devmgr counted faults for an unconfined device"
+        );
+        return found;
+    }
+    assert_eq!(
+        outcome, PROBE_PASSED,
+        "{phase}: a copy through a mapped IOVA did not arrive"
+    );
+    assert!(
+        !landed,
+        "{phase}: a copy to IOVA {iova:#x} after its unmap reached the page"
+    );
+    assert!(
+        faults >= 1,
+        "{phase}: no IOMMU fault taken for the device after the unmapped copy"
+    );
+    assert_eq!(
+        last_fault,
+        iova & !0xfff,
+        "{phase}: the latest fault names another IOVA"
+    );
+    found
+}
+
 /// The `edu` device's MSI vector, which devmgr gave its driver, delivers: the
 /// fixture holds an MSI interrupt and the device's raise reaches it.
 fn msi_delivery_phase(caps: &Caps)
 {
-    let probe = call_test_dma(
-        caps,
-        ipc::test_dma_labels::INTERRUPT_PROBE,
-        "devmgr_msi_delivery",
-    );
+    assert_msi_delivered(caps, "devmgr_msi_delivery");
+    std::os::seraph::log!("devmgr_msi_delivery passed: the edu device's MSI was delivered");
+}
+
+/// Run `INTERRUPT_PROBE` on the fixture and assert that it holds the device's
+/// MSI vector and that the device's raise reached it; `phase` names the
+/// caller in a failure.
+fn assert_msi_delivered(caps: &Caps, phase: &str)
+{
+    let probe = call_test_dma(caps, ipc::test_dma_labels::INTERRUPT_PROBE, phase);
     assert_eq!(
         probe.label,
         ipc::devmgr_errors::SUCCESS,
-        "devmgr_msi_delivery: INTERRUPT_PROBE status"
+        "{phase}: INTERRUPT_PROBE status"
     );
     let (delivered, kind) = (probe.word(0) != 0, probe.word(1));
     assert_eq!(
         kind,
         driver_binding::resources::InterruptKind::Msi as u64,
-        "devmgr_msi_delivery: the fixture holds interrupt kind {kind} (0 none, 1 wired, 3 MSI-X), \
+        "{phase}: the fixture holds interrupt kind {kind} (0 none, 1 wired, 3 MSI-X), \
          not MSI"
     );
     assert!(
         delivered,
-        "devmgr_msi_delivery: the edu device's MSI did not reach the fixture within {} ms",
+        "{phase}: the edu device's MSI did not reach the fixture within {} ms",
         ipc::test_dma_labels::INTERRUPT_WAIT_MS
     );
-    std::os::seraph::log!("devmgr_msi_delivery passed: the edu device's MSI was delivered");
 }
 
 /// A confined device's message reaches only the targets devmgr gave it. The
@@ -949,6 +1000,197 @@ fn msi_churn_phase(caps: &Caps)
     );
     std::os::seraph::log!(
         "devmgr_msi_churn passed: both cases' next bindings received the MSI ({raises} raises)"
+    );
+}
+
+/// The line devmgr logs when it restarted the IOMMU driver
+/// (`Iommu::attempt` in `services/devmgr/src/iommu.rs`): the marker, then
+/// `{D} domains attached again, {M} mappings installed again, {H} holds
+/// released`.
+const IOMMU_RESTARTED: &str = "IOMMU driver restarted: ";
+
+/// The leading decimal number of `text`, when `text` ends with `suffix`.
+fn counted(text: &str, suffix: &str) -> Option<u64>
+{
+    text.strip_suffix(suffix)?.trim().parse().ok()
+}
+
+/// The counts of an [`IOMMU_RESTARTED`] line in `entry`: domains attached
+/// again, mappings installed again, holds released. `None` when the entry
+/// holds no such line.
+fn parse_restarted(entry: &[u8]) -> Option<(u64, u64, u64)>
+{
+    let text = std::str::from_utf8(entry).ok()?;
+    let rest = text.get(
+        text.find(IOMMU_RESTARTED)?
+            .checked_add(IOMMU_RESTARTED.len())?..,
+    )?;
+    let mut parts = rest.trim_end().split(", ");
+    let domains = counted(parts.next()?, " domains attached again")?;
+    let mappings = counted(parts.next()?, " mappings installed again")?;
+    let holds = counted(parts.next()?, " holds released")?;
+    Some((domains, mappings, holds))
+}
+
+/// A `DMA_STREAM_COUNT` or `DMA_STREAM_STOP` request `label`: the reply's
+/// first four words, `SUCCESS` asserted.
+fn stream_words(caps: &Caps, label: u64, phase: &str) -> [u64; 4]
+{
+    let reply = call_test_dma(caps, label, phase);
+    assert_eq!(
+        reply.label,
+        ipc::devmgr_errors::SUCCESS,
+        "{phase}: the stream request {label:#x} status"
+    );
+    [reply.word(0), reply.word(1), reply.word(2), reply.word(3)]
+}
+
+/// Poll `DMA_STREAM_COUNT` until `rounds` rounds arrived, for at most
+/// `bound`, asserting that none failed.
+fn await_stream_rounds(caps: &Caps, rounds: u64, bound: Duration, phase: &str)
+{
+    let begun = Instant::now();
+    loop
+    {
+        let [arrived, failed, ..] =
+            stream_words(caps, ipc::test_dma_labels::DMA_STREAM_COUNT, phase);
+        assert_eq!(
+            failed, 0,
+            "{phase}: {failed} stream rounds failed before the IOMMU driver was killed"
+        );
+        if arrived >= rounds
+        {
+            return;
+        }
+        assert!(
+            begun.elapsed() < bound,
+            "{phase}: only {arrived} stream rounds arrived within {bound:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Kill the IOMMU driver through `authority` and wait, for at most `bound`,
+/// for a live process of its name other than the killed one and for devmgr's
+/// [`IOMMU_RESTARTED`] line in logd's history (`logd.query`): the line's
+/// counts, domains attached again, mappings installed again, holds released.
+fn kill_and_await_restart(caps: &Caps, bound: Duration, phase: &str) -> (u64, u64, u64)
+{
+    let authority = caps.debug_authority;
+    let name = super::process_kill::IOMMU_NAME.as_bytes();
+    let killed = super::crash::badge_named(authority, name)
+        .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no IOMMU driver"));
+    super::process_kill::kill(authority, killed, "the IOMMU driver", phase);
+
+    let begun = Instant::now();
+    loop
+    {
+        let new_instance = super::crash::badges_named(authority, name)
+            .into_iter()
+            .any(|badge| badge != killed);
+        if new_instance
+        {
+            let line = super::procmgr::logd_history_with(caps.logd_query, None, |entry| {
+                parse_restarted(entry.bytes)
+            })
+            .into_iter()
+            .flatten()
+            .next();
+            if let Some(counts) = line
+            {
+                return counts;
+            }
+        }
+        assert!(
+            begun.elapsed() < bound,
+            "{phase}: no new IOMMU driver instance with a '{IOMMU_RESTARTED}' line from devmgr \
+             within {bound:?} (new instance listed: {new_instance})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A DMA stream through a page that stays mapped carries a confined device's
+/// copies through the death of the IOMMU driver, devmgr's restart of it and
+/// the new instance's commit, with no round failed and no fault; the new
+/// instance then serves a fresh mapping, an interrupt and a read from the
+/// root filesystem.
+fn iommu_restart_phase(caps: &Caps)
+{
+    use ipc::test_dma_labels::{DMA_STREAM_COUNT, DMA_STREAM_START, DMA_STREAM_STOP};
+
+    // A test wait bound: how long the stream may take to arrive at its first
+    // rounds.
+    const STREAM_BOUND: Duration = Duration::from_secs(5);
+    // A test wait bound: how long the restart may take.
+    const RESTART_BOUND: Duration = Duration::from_secs(30);
+    // Rounds the stream must have made before the kill.
+    const ROUNDS_BEFORE: u64 = 8;
+    const PHASE: &str = "devmgr_iommu_restart";
+
+    assert_ne!(caps.debug_authority, 0, "{PHASE}: no debug authority");
+    assert_ne!(caps.logd_query, 0, "{PHASE}: no logd.query cap seeded");
+
+    let [started, iova, confined, faults0] = {
+        let start = call_test_dma(caps, DMA_STREAM_START, PHASE);
+        assert_eq!(
+            start.label,
+            ipc::devmgr_errors::SUCCESS,
+            "{PHASE}: DMA_STREAM_START status"
+        );
+        [start.word(0), start.word(1), start.word(2), start.word(3)]
+    };
+    if confined != ipc::devmgr_dma_labels::DMA_CONFINED || started == 0
+    {
+        if started != 0
+        {
+            // The stream's thread would hold the fixture's DMA engine for the
+            // phases after this one.
+            let _ = stream_words(caps, DMA_STREAM_STOP, PHASE);
+        }
+        std::os::seraph::log!(
+            "{PHASE} skipped: no IOMMU confines the edu device (stream started {started})"
+        );
+        return;
+    }
+    await_stream_rounds(caps, ROUNDS_BEFORE, STREAM_BOUND, PHASE);
+    let (domains, mappings, holds) = kill_and_await_restart(caps, RESTART_BOUND, PHASE);
+    assert!(
+        holds >= 1,
+        "{PHASE}: devmgr released {holds} holds after the restart, expected at least one"
+    );
+    assert!(
+        mappings >= 1,
+        "{PHASE}: devmgr installed {mappings} mappings again, expected at least one"
+    );
+
+    let [before, ..] = stream_words(caps, DMA_STREAM_COUNT, PHASE);
+    std::thread::sleep(Duration::from_millis(200));
+    let [arrived, failed, stopped_iova, faults] = stream_words(caps, DMA_STREAM_STOP, PHASE);
+    assert!(
+        arrived > before,
+        "{PHASE}: the stream made no round after the restart (arrived {arrived}, {before} before)"
+    );
+    assert_eq!(
+        failed, 0,
+        "{PHASE}: {failed} stream rounds failed across the IOMMU driver's death and restart"
+    );
+    assert_eq!(
+        stopped_iova, iova,
+        "{PHASE}: the stream's device address changed"
+    );
+    assert_eq!(
+        faults, faults0,
+        "{PHASE}: devmgr took IOMMU faults for the device during the restart"
+    );
+
+    assert_dma_probe(caps, PHASE);
+    assert_msi_delivered(caps, PHASE);
+    super::fs_ipc::assert_bootstrap_bundle_header(PHASE);
+    std::os::seraph::log!(
+        "{PHASE} passed: {arrived} stream rounds arrived across the restart ({domains} domains \
+         attached again, {mappings} mappings installed again, {holds} holds released), none \
+         failed, no fault; DMA, interrupt and filesystem read served after it"
     );
 }
 

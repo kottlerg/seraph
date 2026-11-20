@@ -216,8 +216,11 @@ impl PoolLevels
     /// window took came back. An eviction of a chunk of `b` backed pages into
     /// `s` store pages raises `free` by `b - s`, `store` by `s` and
     /// `swapped` by `b`; a restore reverses it, and a write of the chunk to
-    /// the disk tier moves its `s` store pages to `free`. None of them moves
-    /// this sum, which an allocation or a free moves page for page.
+    /// the disk tier moves its `s` store pages to `free`. A chunk whose
+    /// stream gains nothing, held raw on its own frames for a swap slot, moves
+    /// none of them until its write, which raises `free` and `swapped` by
+    /// `b`. None of them moves this sum, which an allocation or a free moves
+    /// page for page.
     fn net_free(&self) -> i128
     {
         i128::from(self.free)

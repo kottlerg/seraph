@@ -54,8 +54,9 @@ use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use syscall_abi::{MAP_READ, MAP_WRITABLE, PAGE_SIZE};
 
 use super::swap::{
-    CHUNK_LEN, CHUNK_PAGES, HOG_TICK, Hog, Ready, attach, await_swapped, baseline_totals, detach,
-    listed_badges, main_pages, make_resident, page_present, pool, settle_resident, start_fixture,
+    CHUNK_LEN, CHUNK_PAGES, Fill, HOG_TICK, Hog, Ready, attach, await_swapped, baseline_totals,
+    detach, listed_badges, main_pages, make_resident, page_present, pool, settle_resident,
+    start_fixture,
 };
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -208,7 +209,7 @@ pub(super) fn take(swap: u64, buf: &mut Buffer, slots: &mut Slots, what: &str) -
     assert_eq!(
         (
             free_pool::disk::word_slot(word),
-            usize::from(free_pool::disk::word_len(word))
+            usize::try_from(free_pool::disk::word_len(word)).unwrap_or(usize::MAX)
         ),
         (slot, len),
         "{PHASE}: {what}: slot word {word:#x}"
@@ -419,7 +420,7 @@ fn swap_client_phase(caps: &Caps)
     let _ = settle_resident(authority, None);
     let baseline = baseline_totals();
     let reserve = pool().reserve_pages();
-    let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve));
+    let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
     hog.fill_to_low();
     await_swapped(&mut hog, &mut fixture, SWAPPED_CHUNKS * CHUNK_PAGES);
     hog.release_all();

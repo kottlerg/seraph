@@ -451,13 +451,13 @@ impl Heap {
     /// the free list: the first grow registers the region at `growth_base`
     /// with `REGION_COMMIT`, every later one extends it (`EXTEND_REGION`).
     /// memmgr admits and charges the whole growth before it answers, so the
-    /// pages are backed on first touch and no fault in them is declined for
-    /// budget, or for RAM outside the few cases
-    /// `services/memmgr/docs/ipc-interface.md` § Label 7 gives, while the
-    /// region's page-table reservation lasts, which only this process's own
-    /// mappings and unmaps can spend early: another thread's map that takes
-    /// the page-table pages memmgr donates in the middle of a fault's map, or
-    /// an unmap that reclaims page tables in the region's span; a refusal (`LIMIT` at this process's max,
+    /// pages are backed on first touch, and a fault in them is declined only
+    /// in the cases `services/memmgr/docs/ipc-interface.md` § Committed fault
+    /// declines lists, among them a spend of the region's page-table
+    /// reservation by this process's own mappings and unmaps: another thread's
+    /// map that takes the page-table pages memmgr donates in the middle of a
+    /// fault's map, or an unmap that reclaims page tables in the region's
+    /// span; a refusal (`LIMIT` at this process's max,
     /// `OUT_OF_MEMORY_BEST_EFFORT` when the RAM outside memmgr's promises is
     /// short) returns `false`, so an allocation fails where it is made, and
     /// `try_reserve` returns `Err`, rather than a later touch faulting with
@@ -513,10 +513,11 @@ impl Heap {
     /// held [`DISCARD_MIN`], discard (`DISCARD_RANGE`) the whole chunks it
     /// made free past the block's node. The pages of the floor, an
     /// uncommitted region, are never given back: a later touch of a discarded
-    /// floor page could be declined, where the committed region's commitment
-    /// keeps a discarded page's refault from being declined for budget, and
-    /// for RAM outside the few cases memmgr's interface gives
-    /// (docs/userspace-memory-model.md § Byte Heap).
+    /// floor page could be declined for budget or RAM, where the committed
+    /// region's commitment admits a discarded page's refault as its first
+    /// touch, declined only in the cases
+    /// `services/memmgr/docs/ipc-interface.md` § Committed fault declines
+    /// lists (docs/userspace-memory-model.md § Byte Heap).
     ///
     /// Called with the heap lock held, which the call to memmgr keeps: a
     /// thread that took the lock while memmgr clears the pages could allocate

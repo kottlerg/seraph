@@ -120,15 +120,9 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   multiples. memmgr charges each in full, budget and RAM, when it accepts
   it and backs chunks on first touch, so a grow is refused as an
   allocation error (null from `alloc`, `Err` from `try_reserve`), and
-  a touch of a grown page is declined as a fault only in these cases:
-  code 7 when the split of a run fails, code 11 for a commit overrun,
-  code 10 or 9 when the process's own mappings and unmaps spent its
-  page-table reservation early, code 9 when a map fails as any map can,
-  and code 6 or 8 when memmgr's metadata arena cannot grow for the run or
-  record it ([memmgr's interface](../services/memmgr/docs/ipc-interface.md)
-  § Kernel-origin fault message gives each code;
-  [memmgr Memory Pool § Commit](../services/memmgr/docs/memory-pool.md#commit),
-  Faults). The heap holds no Memory caps
+  a touch of a grown page is declined as a fault only in the cases
+  [memmgr's interface § Committed fault declines](../services/memmgr/docs/ipc-interface.md#committed-fault-declines)
+  lists. The heap holds no Memory caps
   ([memmgr Memory Pool § Commit](../services/memmgr/docs/memory-pool.md#commit)).
   A process with no pager keeps requesting Memory caps with
   `REQUEST_MEMORY_CAPS` and mapping them.
@@ -142,10 +136,10 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   for a free of at least `DISCARD_MIN` (four chunks), it discards
   (`DISCARD_RANGE`) each whole chunk of the free block past its node that the
   free made free: memmgr takes back their frames and keeps the region's
-  commitment, so a later touch of a discarded page is backed zero-filled and is
-  not declined for budget, and for RAM only in the cases
-  [memmgr's interface](../services/memmgr/docs/ipc-interface.md) § Label 7
-  gives for a committed region. The floor, an uncommitted region, is never
+  commitment, so a later touch of a discarded page is backed zero-filled, admitted as
+  its first touch was, and declined only in the cases
+  [memmgr's interface § Committed fault declines](../services/memmgr/docs/ipc-interface.md#committed-fault-declines)
+  lists. The floor, an uncommitted region, is never
   given back, since a later touch of one of its pages could be declined. The
   heap lock is held across the call, so no thread allocates from the pages
   memmgr clears.

@@ -13,7 +13,8 @@
 //! memmgr performs no device I/O and waits on no peer: every label here is a
 //! request the swap service makes, and the redirect is a fault reply. The
 //! bytes memmgr hands the swap service are sealed in memmgr's own buffer
-//! ([`free_pool::disk::seal`]) under a key drawn at start that never leaves
+//! ([`free_pool::disk::seal`], or [`free_pool::disk::seal_detached`] for a
+//! raw chunk's pages) under a key drawn at start that never leaves
 //! memmgr, and copied out only once sealed; the bytes the swap service hands
 //! back are copied into the same buffer before their tag is checked, so the
 //! check and the decryption read one snapshot the swap service can no longer
@@ -56,8 +57,8 @@ const MAX_SLOTS: u64 = (SWAP_SLOTS_END - SWAP_SLOTS_VA) / 8;
 const _: () = assert!(SLOT_WORDS_PER_PAGE * 8 == PAGE_SIZE);
 const _: () = assert!(MAX_SLOTS <= disk::WORD_SLOTS);
 
-/// Steps of the walk one `SWAP_TAKE` makes for a compressed chunk
-/// ([`free_pool::Ledger::next_compressed`]): a chunk visited, or a region or
+/// Steps of the walk one `SWAP_TAKE` makes for a compressed or raw chunk
+/// ([`free_pool::Ledger::next_to_write`]): a chunk visited, or a region or
 /// record passed. A tuning value that bounds the request's turn as a slice of
 /// the clock is bounded; a walk that finds none replies `NOTHING_TO_TAKE`,
 /// and the next request goes on from where it stopped.
@@ -72,8 +73,8 @@ pub(crate) const DETAIL_UNREGISTERED: u64 = 0;
 /// The decline detail of a chunk whose slot failed authentication: lost.
 pub(crate) const DETAIL_LOST: u64 = 1;
 
-/// memmgr's buffer for a slot's bytes: the chunk's stream sealed in place
-/// before it is copied out, or a slot's bytes copied in before they are opened
+/// memmgr's buffer for a slot's bytes: the chunk's stream, or a raw chunk's
+/// pages, sealed in place before it is copied out, or a slot's bytes copied in before they are opened
 /// in place. The receive loop's alone.
 #[repr(C, align(16))]
 struct Buf([u8; BUF_BYTES]);
@@ -209,6 +210,18 @@ pub(crate) fn post_want(l: &MemLedger, disk: Option<NodeIdx>) -> bool
     true
 }
 
+/// Whether an evicted chunk whose stream gains nothing is kept raw for a swap
+/// slot (services/memmgr/docs/memory-pool.md § Eviction, States): a swap
+/// service is registered, the key was drawn, and the free swap slots exceed
+/// the raw chunks waiting for one. `SWAP_TAKE` takes compressed chunks from
+/// the same slots and a new registration can lower them, so a raw chunk can
+/// still wait for a slot.
+pub(crate) fn takes_raw(l: &MemLedger) -> bool
+{
+    let s = state();
+    s.key.is_some() && s.endpoint != 0 && l.slots.free() > l.raw_chunks()
+}
+
 /// The swap slots free, `0` while no swap service is registered
 /// (`QUERY_POOL_STATUS` `data[13]`).
 pub(crate) fn free_slots(l: &MemLedger) -> u64
@@ -267,7 +280,7 @@ pub(crate) fn reply_fault(
             crate::decline_fault(ipc_buf, FaultDecline::OnDiskChunk, DETAIL_LOST);
             true
         }
-        FaultPath::Back | FaultPath::CancelEvict | FaultPath::RestoreFromStore => false,
+        FaultPath::Back | FaultPath::Remap | FaultPath::RestoreFromStore => false,
     }
 }
 
@@ -407,23 +420,25 @@ fn grow_slots(l: &mut MemLedger) -> bool
 }
 
 /// `SWAP_TAKE` (services/memmgr/docs/ipc-interface.md § Label 23): take the
-/// next compressed chunk for a swap slot. `caps[0]` is the swap service's buffer,
-/// a Memory cap of at least a chunk, moved back on every reply. memmgr copies
-/// the chunk's stream from its store runs into its own buffer, seals it there
-/// under the next nonce, takes a slot and a disk node, and only then writes
-/// the slot's bytes into the swap service's buffer, mapped at the swap
-/// window. The chunk is writing: its store runs stay until `SWAP_DONE`, so
-/// a fault meanwhile restores from them. Reply: `SUCCESS` with `data[0]` the
+/// next compressed or raw chunk for a swap slot. `caps[0]` is the swap
+/// service's buffer, a Memory cap of at least a chunk, moved back on every
+/// reply. memmgr copies the chunk's stream from its store runs, or a raw
+/// chunk's backed pages from its runs, into its own buffer, seals it there
+/// under the next nonce, a raw chunk's tag kept on its entry, takes a slot and
+/// a disk node, and only then writes the slot's bytes into the swap service's
+/// buffer, mapped at the swap window. The chunk is writing: its store runs, or
+/// its runs, stay until `SWAP_DONE`, so a fault meanwhile restores from them,
+/// or maps them back. Reply: `SUCCESS` with `data[0]` the
 /// slot, `data[1]` its byte count and `data[2]` its slot word
 /// ([`disk::slot_word`]); `INVALID_ARGUMENT` for a missing or
 /// small cap, one memmgr cannot map, or with no swap service registered;
 /// `SWAP_FULL` when every registered slot is taken; `NOTHING_TO_TAKE` when
-/// the walk finds no compressed chunk within [`TAKE_STEPS`]; `QUOTA` when the
+/// the walk finds no compressed or raw chunk within [`TAKE_STEPS`]; `QUOTA` when the
 /// arena or the slot map cannot grow.
 ///
 /// Its time in memmgr's loop is bounded: a walk of at most [`TAKE_STEPS`]
-/// steps, one copy of the stream (fewer than a chunk's bytes), one seal of it,
-/// and one copy of the sealed bytes out.
+/// steps, one copy of the stream or the pages (at most a chunk's bytes), one
+/// seal of it, and one copy of the sealed bytes out.
 fn handle_take(caps: &[u64], ipc_buf: *mut u64)
 {
     let Some(&cap) = caps.first()
@@ -458,14 +473,23 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
     {
         return (memmgr_errors::QUOTA, [0; 3]);
     }
-    let Some(v) = l.next_compressed(&mut state().hand, TAKE_STEPS)
+    let Some(v) = l.next_to_write(&mut state().hand, TAKE_STEPS)
     else
     {
         return (memmgr_errors::NOTHING_TO_TAKE, [0; 3]);
     };
     let entry = l.chunk_at(v.reg, v.page_base);
+    let raw = entry.is_raw();
     let buf = buf();
-    let Some(len) = evict::read_store(l, entry, buf)
+    let read = if raw
+    {
+        evict::read_raw(l, v.rec, v.reg, v.page_base, buf)
+    }
+    else
+    {
+        evict::read_store(l, entry, buf)
+    };
+    let Some(len) = read
     else
     {
         return (memmgr_errors::QUOTA, [0; 3]);
@@ -475,7 +499,15 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
     // A nonce is used once under the key, whatever follows: 2^64 seals never
     // run out within a boot.
     s.nonce = s.nonce.wrapping_add(1);
-    let Ok(total) = disk::seal(&key, nonce, buf, len)
+    let sealed = if raw
+    {
+        disk::seal_detached(&key, nonce, buf, len).map(|tag| (len, Some(tag)))
+    }
+    else
+    {
+        disk::seal(&key, nonce, buf, len).map(|total| (total, None))
+    };
+    let Ok((total, tag)) = sealed
     else
     {
         return (memmgr_errors::QUOTA, [0; 3]);
@@ -503,16 +535,20 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
         core::ptr::copy_nonoverlapping(sealed.as_ptr(), SWAP_WINDOW_VA as *mut u8, total);
     }
     unmap_window(pages);
-    // `total` is at most a slot's bytes, which fit a `u16` less one.
-    let len16 = u16::try_from(total).unwrap_or(u16::MAX);
-    match l.begin_write(v.rec, v.reg, v.page_base, nonce, len16)
+    // `total` is at most a slot's bytes.
+    let Ok(len32) = u32::try_from(total)
+    else
+    {
+        return (memmgr_errors::QUOTA, [0; 3]);
+    };
+    match l.begin_write(v.rec, v.reg, v.page_base, nonce, len32, tag)
     {
         Ok(slot) => (
             memmgr_errors::SUCCESS,
             [
                 u64::from(slot),
-                u64::from(len16),
-                disk::slot_word(slot, len16, nonce),
+                u64::from(len32),
+                disk::slot_word(slot, len32, nonce),
             ],
         ),
         Err(SwapError::NoSwapSlot) => (memmgr_errors::SWAP_FULL, [0; 3]),
@@ -522,9 +558,9 @@ fn take(l: &mut MemLedger, cap: u64) -> (u64, [u64; 3])
 
 /// `SWAP_DONE` (services/memmgr/docs/ipc-interface.md § Label 24): `data[0]`
 /// the slot, `data[1]` `0` when its write ended well. A written chunk is on
-/// disk and its store runs return to the pool
-/// ([`free_pool::Ledger::finish_write`]); an unwritten one is compressed again
-/// on them ([`free_pool::Ledger::abandon_write`]); a write a restore or a
+/// disk and its store runs, or a raw chunk's runs, return to the pool
+/// ([`free_pool::Ledger::finish_write`]); an unwritten one is compressed, or
+/// raw, again on them ([`free_pool::Ledger::abandon_write`]); a write a restore or a
 /// teardown cancelled meanwhile frees its slot either way. Reply: `SUCCESS`,
 /// or `INVALID_ARGUMENT` for a slot that holds no write in flight.
 fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
@@ -533,7 +569,7 @@ fn handle_done(req: &IpcMessage, ipc_buf: *mut u64)
     let done = u32::try_from(req.word(0)).is_ok_and(|slot| {
         if req.word(1) == 0
         {
-            l.finish_write(slot).is_ok()
+            l.finish_write(slot, crate::quiescent).is_ok()
         }
         else
         {
@@ -584,12 +620,14 @@ fn handle_wanted(ipc_buf: *mut u64)
 /// resumes the held fault, which faults again and is served as its chunk now
 /// stands. Otherwise memmgr maps the cap read-only at the swap
 /// window, copies the slot's bytes into its own buffer, and opens them there
-/// under the nonce of the chunk's last seal: on a tag failure the chunk is
+/// under the nonce of the chunk's last seal, a raw chunk's against the tag
+/// kept on its entry: on a tag failure the chunk is
 /// lost ([`free_pool::Ledger::lose_chunk`]), and the reply is
 /// `RESTORE_DECLINED` with `data[0]` the code-12 word of detail 1, which the
 /// swap service forwards the held fault with, so the faulting thread is
 /// killed, as every later fault on the chunk is. Otherwise the chunk is
-/// restored from the opened stream as from the store (`evict::restore`):
+/// restored from the opened stream as from the store, or from a raw chunk's
+/// opened pages (`evict::restore`):
 /// admitted, its pages filled and mapped, its slot freed. A restore memmgr
 /// cannot make replies `RESTORE_DECLINED` with that restore's decline word,
 /// the chunk staying on disk. Reply: `SUCCESS`; `RESTORE_DECLINED`;
@@ -622,7 +660,12 @@ fn restore(l: &mut MemLedger, word: u64, cap: u64) -> (u64, u64)
         return (memmgr_errors::RESTORE_STALE, 0);
     };
     let slot = n.slot;
-    let total = usize::from(n.len);
+    let tag = l.chunk_at(n.reg, n.page_base).tag();
+    let Ok(total) = usize::try_from(n.len)
+    else
+    {
+        return (memmgr_errors::INVALID_ARGUMENT, 0);
+    };
     let bytes = u64::from(n.len);
     if !is_memory_of(cap, bytes)
     {
@@ -649,7 +692,12 @@ fn restore(l: &mut MemLedger, word: u64, cap: u64) -> (u64, u64)
         }
     }
     unmap_window(pages);
-    let stream = match disk::open(&key, n.nonce, buf, total)
+    let opened = match tag
+    {
+        Some(tag) => disk::open_detached(&key, n.nonce, buf, total, &tag).map(|()| total),
+        None => disk::open(&key, n.nonce, buf, total),
+    };
+    let stream = match opened
     {
         Ok(len) => len,
         Err(SlotError::Tampered | SlotError::Size) =>
@@ -677,15 +725,16 @@ fn restore(l: &mut MemLedger, word: u64, cap: u64) -> (u64, u64)
             decline_word(FaultDecline::NoAspace, 0),
         );
     }
-    match evict::restore(
-        l,
-        n.rec,
-        reg,
-        &region,
-        n.page_base,
-        aspace,
-        buf.get(..stream),
-    )
+    let bytes = buf.get(..stream).unwrap_or(&[]);
+    let source = if tag.is_some()
+    {
+        evict::Source::Pages(bytes)
+    }
+    else
+    {
+        evict::Source::Stream(bytes)
+    };
+    match evict::restore(l, n.rec, reg, &region, n.page_base, aspace, source)
     {
         Ok(()) => (memmgr_errors::SUCCESS, 0),
         Err((reason, detail)) => (

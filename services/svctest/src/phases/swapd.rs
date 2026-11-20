@@ -65,7 +65,7 @@ use ipc::{memmgr_errors, procmgr_errors};
 use syscall_abi::PAGE_SIZE;
 
 use super::swap::{
-    CHUNK_LEN, CHUNK_PAGES, HOG_TICK, Hog, Ready, StackPages, attach, await_swapped,
+    CHUNK_LEN, CHUNK_PAGES, Fill, HOG_TICK, Hog, Ready, StackPages, attach, await_swapped,
     baseline_totals, chunk_reads_pattern, detach, main_pages, make_resident, page_present, pool,
     read_stack, require_stack, settle_resident, start_fixture,
 };
@@ -457,7 +457,7 @@ fn swapd_phase(caps: &Caps)
     let _ = settle_resident(authority, None);
     let baseline = baseline_totals();
     let reserve = pool().reserve_pages();
-    let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve));
+    let (mut fixture, ready, process) = start_fixture(authority, main_pages(reserve), Fill::Page);
 
     let swapd = super::crash::badge_named(authority, SWAPD_NAME)
         .unwrap_or_else(|| panic!("{PHASE}: LIST_PROCESSES lists no swapd"));

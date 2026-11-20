@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicU8, AtomicU16, AtomicUsize, Ordering};
 
 use free_pool::chunk::{ChunkEntry, ChunkState};
 use free_pool::compress::{HASH_ENTRIES, HashTable, PAGE_BYTES};
-use free_pool::store::{Decoder, encode_chunk, store_pages};
+use free_pool::store::{Decoder, PageReader, RawPages, encode_chunk, store_pages};
 use free_pool::{
     CHUNK_BYTES, COLD_SWEEPS, ClockHand, DEMAND_CHUNK_PAGES, DemandRegion, Fit, FrameDesc, FreeRun,
     NO_REGION_ID, NodeIdx, PressureLevel, Victim, chunk_for, reserve_pages,
@@ -541,7 +541,7 @@ fn spared(l: &MemLedger, v: &Victim, spare: Option<(NodeIdx, u64)>) -> bool
     })
 }
 
-/// The runs of the resident or evicting chunk holding `page_base` in region
+/// The runs of the resident, evicting or raw chunk holding `page_base` in region
 /// `reg`, copied from its run list, and their count: at most one per page.
 fn chunk_runs(l: &MemLedger, reg: NodeIdx, page_base: u64) -> ([FrameDesc; CHUNK_RUNS], usize)
 {
@@ -644,7 +644,8 @@ fn post(l: &mut MemLedger, v: &Victim, slot: usize)
 /// window ([`begin`]), compress it
 /// into the slot's buffer, unmap the window, and store the stream
 /// ([`store`]), which returns the chunk's runs to the pool. A stream that
-/// gains nothing, or a step that fails, maps the chunk back.
+/// gains nothing keeps the chunk raw while the disk tier takes one
+/// ([`keep_raw`]); otherwise, or when a step fails, the chunk is mapped back.
 fn evict_now(l: &mut MemLedger, v: &Victim)
 {
     if accessed_since_sweep(l, v)
@@ -667,10 +668,39 @@ fn evict_now(l: &mut MemLedger, v: &Victim)
     let len = unsafe { compress(backed, input_va(SYNC_SLOT), out, table) };
     // SAFETY: the window is memmgr's own zone, mapped for this eviction alone.
     let _ = unsafe { syscall::mem_unmap(self_aspace(), input_va(SYNC_SLOT), CHUNK_PAGES) };
-    if len == NO_GAIN || !store(l, &job, SYNC_SLOT, len)
+    if !finish(l, &job, SYNC_SLOT, len)
     {
         cancel(l, &job);
     }
+}
+
+/// End the eviction of `job`'s chunk through slot `slot`, whose stream is
+/// `len` bytes or [`NO_GAIN`]: store the stream ([`store`]), or keep a chunk
+/// whose stream gains nothing raw ([`keep_raw`]). `false` when neither is
+/// done, the chunk still evicting for the caller to map back.
+fn finish(l: &mut MemLedger, job: &Job, slot: usize, len: usize) -> bool
+{
+    if len == NO_GAIN
+    {
+        keep_raw(l, job, slot)
+    }
+    else
+    {
+        store(l, job, slot, len)
+    }
+}
+
+/// Keep `job`'s chunk, whose stream gains nothing, raw for a swap slot
+/// (services/memmgr/docs/memory-pool.md § Eviction, States) while the disk
+/// tier takes one ([`crate::disk::takes_raw`]): its runs stay on it,
+/// unmapped from the process, until the swap service takes and writes it or
+/// a fault maps them back ([`free_pool::Ledger::finish_raw`]). `false`
+/// when the disk tier takes none.
+fn keep_raw(l: &mut MemLedger, job: &Job, slot: usize) -> bool
+{
+    crate::disk::takes_raw(l)
+        && l.finish_raw(job.rec, job.reg, job.page_base, job_id(slot))
+            .is_ok()
 }
 
 /// Whether the victim `v`'s chunk was accessed since the sweep that aged it:
@@ -753,8 +783,9 @@ fn begin(l: &mut MemLedger, v: &Victim, slot: usize, idle: u8) -> Option<Job>
 }
 
 /// Drain every done job: unmap its input window, then store the chunk's
-/// stream and swap the chunk, or, for a stream that gains nothing or a step
-/// that fails, map the chunk's runs back and mark it resident. A job whose
+/// stream and swap the chunk, or keep a chunk whose stream gains nothing raw
+/// ([`finish`]); when neither is done, map the chunk's runs back and mark it
+/// resident. A job whose
 /// chunk a fault or a teardown took first is stale, and only frees its slot.
 fn drain(l: &mut MemLedger)
 {
@@ -772,7 +803,7 @@ fn drain(l: &mut MemLedger)
             .map_or(NO_GAIN, |r| r.load(Ordering::Relaxed));
         if let Some(job) = job
             && evicting(l, &job, slot)
-            && (len == NO_GAIN || !store(l, &job, slot, len))
+            && !finish(l, &job, slot, len)
         {
             cancel(l, &job);
         }
@@ -929,8 +960,10 @@ fn unmap_stream(pages: u64)
 
 /// Make the chunk holding `page_base` in region `reg` of `rec` resident, for a
 /// fault on it or a make-resident request: an evicting chunk's runs are
-/// mapped back and its job made stale; a compressed or writing chunk is restored
-/// from its store runs ([`restore`]), a writing one's write cancelled. A
+/// mapped back and its job made stale; a raw chunk's runs are mapped back,
+/// a write of them cancelled ([`free_pool::Ledger::remap_raw`]); a compressed
+/// chunk, writing or not, is restored from its store runs ([`restore`]), a
+/// write cancelled. A
 /// chunk in another state needs nothing here: one on disk or lost is routed by
 /// the caller before ([`free_pool::fault_path`]).
 ///
@@ -945,7 +978,8 @@ pub(crate) fn make_resident(
     aspace: u64,
 ) -> Result<(), (FaultDecline, u64)>
 {
-    match l.chunk_at(reg, page_base).state()
+    let entry = l.chunk_at(reg, page_base);
+    match entry.state()
     {
         ChunkState::Evicting =>
         {
@@ -955,9 +989,11 @@ pub(crate) fn make_resident(
             let _ = l.cancel_evict(rec, reg, page_base);
             Ok(())
         }
+        ChunkState::Raw => remap_raw(l, rec, reg, region, page_base, aspace),
+        ChunkState::Writing if entry.is_raw() => remap_raw(l, rec, reg, region, page_base, aspace),
         ChunkState::Compressed | ChunkState::Writing =>
         {
-            restore(l, rec, reg, region, page_base, aspace, None)
+            restore(l, rec, reg, region, page_base, aspace, Source::Store)
         }
         // A chunk on disk or lost is the caller's to route first
         // (`free_pool::fault_path`): memmgr cannot read a swap slot.
@@ -966,6 +1002,41 @@ pub(crate) fn make_resident(
             Ok(())
         }
     }
+}
+
+/// Map the runs of the raw chunk holding `page_base` in region `reg` of
+/// `rec`, raw or writing, back into the process and mark it resident on
+/// them, a write cancelled ([`free_pool::Ledger::remap_raw`]). Its pages are
+/// charged already and its frames its own, so nothing is drawn.
+///
+/// # Errors
+/// The map's [`FaultDecline`] and its detail word; the chunk stays raw.
+fn remap_raw(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    reg: NodeIdx,
+    region: &DemandRegion,
+    page_base: u64,
+    aspace: u64,
+) -> Result<(), (FaultDecline, u64)>
+{
+    let (runs, n) = chunk_runs(l, reg, page_base);
+    let target = remap_target(rec, aspace, region, page_base, 0);
+    map_runs(l, &target, runs.get(..n).unwrap_or(&[]))?;
+    let _ = l.remap_raw(rec, reg, page_base);
+    Ok(())
+}
+
+/// Where a restore reads a chunk's pages from ([`restore`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Source<'a>
+{
+    /// The chunk's store runs: a compressed chunk, writing or not.
+    Store,
+    /// A compressed chunk's stream, a swap slot's bytes opened.
+    Stream(&'a [u8]),
+    /// A raw chunk's backed pages in page order, a swap slot's bytes opened.
+    Pages(&'a [u8]),
 }
 
 /// Return each of `runs`, mapped nowhere, to the free pool.
@@ -985,24 +1056,26 @@ fn give_back(l: &mut MemLedger, runs: &[FrameDesc])
 }
 
 /// Restore the compressed, writing or on-disk chunk holding `page_base` in
-/// region `reg` of `rec` from its stream: `stream`, the bytes a swap slot
-/// held opened, for a chunk on disk (`crate::disk`), else its store runs
-/// (services/memmgr/docs/memory-pool.md § Eviction, States): admitted when the
+/// region `reg` of `rec` from `source`: the bytes a swap slot held opened,
+/// a stream or a raw chunk's pages, for a chunk on disk (`crate::disk`), else
+/// its store runs (services/memmgr/docs/memory-pool.md § Eviction, States): admitted when the
 /// free pages outside `promised` cover its backed pages and, for a node outside
 /// it, the system reserve, once direct reclaim has made room when needed
 /// ([`admit_restore`]), or, for a chunk of a committed region, which draws
 /// from `promised`, when the draw finds its frames ([`draw_room`]); then runs
 /// covering exactly its backed pages, each filled whole through the scrub
-/// window from the stream, mapped into the process, and the chunk resident on
+/// window from the source, mapped into the process, and the chunk resident on
 /// them, its store back in the pool. The chunk's pages are charged already.
 ///
 /// # Errors
 /// [`FaultDecline::NoFreePage`] when the restore is not admitted or the pool
 /// runs out, [`FaultDecline::CommitOverrun`] when a committed chunk's draw
-/// finds too few free pages, [`FaultDecline::NoArenaSlot`] when the arena cannot grow
-/// for the runs' descriptors, [`FaultDecline::MapFailed`] when a map fails or
-/// the stream is malformed (detail 0), and [`FaultDecline::FrameRecord`] when
-/// the ledger refuses the runs. The chunk then stays as it was.
+/// finds too few free pages, [`FaultDecline::NoArenaSlot`] when the arena
+/// cannot grow for the runs' descriptors, [`FaultDecline::BudgetLimit`] when a
+/// page-table donation the map needs is refused at a max,
+/// [`FaultDecline::MapFailed`] when a map fails, the floor refuses that
+/// donation, or the source is malformed (detail 0), and
+/// [`FaultDecline::FrameRecord`] when the ledger refuses the runs. The chunk then stays as it was.
 pub(crate) fn restore(
     l: &mut MemLedger,
     rec: NodeIdx,
@@ -1010,7 +1083,7 @@ pub(crate) fn restore(
     region: &DemandRegion,
     page_base: u64,
     aspace: u64,
-    stream: Option<&[u8]>,
+    source: Source<'_>,
 ) -> Result<(), (FaultDecline, u64)>
 {
     let backed = l.chunk_at(reg, page_base).backed();
@@ -1044,10 +1117,11 @@ pub(crate) fn restore(
         give_back(l, runs);
         return Err((FaultDecline::NoArenaSlot, 0));
     }
-    let filled = match stream
+    let filled = match source
     {
-        Some(stream) => decode_runs(l, stream, runs),
-        None => fill_runs(l, entry, runs),
+        Source::Store => fill_runs(l, entry, runs),
+        Source::Stream(stream) => decode_runs(l, &mut Decoder::new(stream), runs),
+        Source::Pages(pages) => decode_runs(l, &mut RawPages::new(pages), runs),
     };
     if let Err(e) = filled
     {
@@ -1258,6 +1332,62 @@ pub(crate) fn read_store(l: &mut MemLedger, entry: ChunkEntry, dst: &mut [u8]) -
     copied
 }
 
+/// Copy the backed pages of the raw chunk holding `page_base` in region
+/// `reg` of `rec`, in page order, into `dst`, for its write
+/// (`crate::disk`): its runs mapped at the stream window, each at its offset
+/// in the chunk. Returns the bytes copied, or `None`, nothing copied, when
+/// the chunk has no region, a map fails, or they do not fit `dst`.
+pub(crate) fn read_raw(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    reg: NodeIdx,
+    page_base: u64,
+    dst: &mut [u8],
+) -> Option<usize>
+{
+    let (_, region) = l.region_for(rec, page_base).filter(|(r, _)| *r == reg)?;
+    let (chunk_base, _) = chunk_for(&region, page_base);
+    let backed = l.chunk_at(reg, page_base).backed();
+    let (runs, n) = chunk_runs(l, reg, page_base);
+    let mut mapped = true;
+    for run in runs.get(..n).unwrap_or(&[])
+    {
+        let first = run.va.saturating_sub(chunk_base) / PAGE_SIZE;
+        let end = first.saturating_add(u64::from(run.page_count));
+        let va = STREAM_VA.saturating_add(first.saturating_mul(PAGE_SIZE));
+        if end > CHUNK_PAGES
+        {
+            mapped = false;
+            break;
+        }
+        // SAFETY: the stream window is memmgr's own zone, which every use
+        // leaves unmapped, and the check above keeps the run inside it.
+        if unsafe { map_self(l, run.cap_slot, va, 0, u64::from(run.page_count)) }.is_err()
+        {
+            mapped = false;
+            break;
+        }
+    }
+    let pages = backed.count_ones() as usize;
+    let bytes = pages.saturating_mul(PAGE_BYTES);
+    let copied = dst.get_mut(..bytes).filter(|_| mapped).map(|dst| {
+        let (out, _) = dst.as_chunks_mut::<PAGE_BYTES>();
+        let held =
+            (0..DEMAND_CHUNK_PAGES).filter(|p| backed.checked_shr(*p).is_some_and(|b| b & 1 != 0));
+        for (page, to) in held.zip(out.iter_mut())
+        {
+            let from = STREAM_VA.saturating_add(u64::from(page).saturating_mul(PAGE_SIZE));
+            // SAFETY: each backed page of the chunk lies in one of its runs,
+            // mapped above at its offset in the stream window; nothing writes
+            // the pages, which no process maps, while they are read.
+            to.copy_from_slice(unsafe { &*(from as *const [u8; PAGE_BYTES]) });
+        }
+        bytes
+    });
+    unmap_stream(CHUNK_PAGES);
+    copied
+}
+
 /// Write every byte of every page of `runs`, in page order, from the stream of
 /// the compressed or writing chunk `entry`, its store runs mapped at the stream
 /// window meanwhile ([`decode_runs`]).
@@ -1283,25 +1413,23 @@ fn fill_runs(
     // nothing writes while the stream is read; the empty stream maps none, and
     // a slice of no bytes reads nothing.
     let stream = unsafe { core::slice::from_raw_parts(STREAM_VA as *const u8, bytes) };
-    let result = decode_runs(l, stream, runs);
+    let result = decode_runs(l, &mut Decoder::new(stream), runs);
     unmap_stream(pages);
     result
 }
 
-/// Write every byte of every page of `runs`, in page order, from `stream`:
-/// each run mapped at the scrub window, its pages decoded there, a zero page
-/// zero-filled, and unmapped.
+/// Write every byte of every page of `runs`, in page order, from `reader`:
+/// each run mapped at the scrub window, its pages read there, and unmapped.
 ///
 /// # Errors
 /// [`FaultDecline::MapFailed`]: a map failed (its error's magnitude the
-/// detail), or the stream is malformed (detail 0).
+/// detail), or the reader's source is malformed (detail 0).
 fn decode_runs(
     l: &mut MemLedger,
-    stream: &[u8],
+    reader: &mut impl PageReader,
     runs: &[FrameDesc],
 ) -> Result<(), (FaultDecline, u64)>
 {
-    let mut reader = Decoder::new(stream);
     let mut result = Ok(());
     for run in runs
     {

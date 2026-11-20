@@ -327,10 +327,11 @@ the stub cannot bind; a new thread in its exited spawner's slot; stops during a 
 a stop GDB knows of, and the kernel's second delivery of one; a restart at a breakpoint built into
 the target; a thread's own upcall beside a stop that was not its; stops racing a resume or an
 all-stop, and an all-stop that holds no thread; an attach before the target's start, holding its
-main thread once started, and one whose target is not started within the all-stop; a continue
-that ends every thread; and a detach with a stop pending, with every thread exited, and with
-the step's thread exited or never stopped. `cargo xtask test-gdb` boots the `gdb-target` fixture
-(`programs/debugger --gdb-target`,
+main thread once started, and one whose target is not started within the all-stop, or starts after
+its last read; a start late in the all-stop, alone or beside a thread a refresh adds unstarted;
+a continue that ends every thread; and a detach with a stop pending, with every thread exited, and
+with the step's thread exited or never stopped. `cargo xtask test-gdb` boots the `gdb-target`
+fixture (`programs/debugger --gdb-target`,
 [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch
 GDB session over the debug port: it lists two threads, breaks on the fixture's tick function and
 continues to it, rewrites and reads back a variable and a register, single-steps, selects the

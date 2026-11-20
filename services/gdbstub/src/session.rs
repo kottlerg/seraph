@@ -225,8 +225,8 @@ struct Slot
     /// Repeats of the held stop, kept beside it once GDB has been told of
     /// it ([`Unclaimed::Keep`]), and answered with it.
     beside: Vec<Stop>,
-    /// An all-stop posted it an upcall that has not arrived.
-    posted: bool,
+    /// Where this all-stop's upcall to it stands.
+    upcall: Upcall,
     gone: bool,
 }
 
@@ -247,6 +247,28 @@ enum Unheld
     Pending,
     /// Undo the step's text anyway, and leave its registers (a detach).
     Abandon,
+}
+
+/// Where an all-stop's upcall to a thread stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Upcall
+{
+    /// Not posted yet.
+    Unposted,
+    /// Not posted: a read found its creator had not started it.
+    Unstarted,
+    /// Posted, and not arrived.
+    Posted,
+}
+
+/// What one read of an all-stop's posts found.
+#[derive(Clone, Copy, Debug)]
+struct Posted
+{
+    /// A live thread its creator has not started stays unposted.
+    unstarted: bool,
+    /// A thread an earlier read of the all-stop found unstarted was posted.
+    started: bool,
 }
 
 /// How a resume packet ended.
@@ -326,7 +348,7 @@ impl Session
             bound,
             held: None,
             beside: Vec::new(),
-            posted: false,
+            upcall: Upcall::Unposted,
             gone: !bound && !k.alive(cap),
         };
         if let Some(entry) = self.threads.get_mut(index)
@@ -408,24 +430,21 @@ impl Session
     {
         let mut deadline = k.now().saturating_add(STOP_WAIT);
         let mut refreshed = false;
-        let mut was_unstarted = 0;
         loop
         {
-            let now_unstarted = self.post_upcalls(k);
-            // A thread its creator started since the last read was posted
+            let Posted { unstarted, started } = self.post_upcalls(k);
+            // A thread its creator started since an earlier read was posted
             // just now: its upcall gets a whole wait from the post, not what
             // is left of the all-stop's.
-            if now_unstarted < was_unstarted
+            if started
             {
                 deadline = deadline.max(k.now().saturating_add(STOP_WAIT));
             }
-            was_unstarted = now_unstarted;
-            let unstarted = now_unstarted > 0;
             self.unstarted = unstarted;
             let waiting = self
                 .threads
                 .iter()
-                .any(|t| t.live() && t.held.is_none() && t.posted);
+                .any(|t| t.live() && t.held.is_none() && t.upcall == Upcall::Posted);
             if !waiting && !unstarted
             {
                 if refreshed || !self.refresh(k)
@@ -461,7 +480,7 @@ impl Session
         }
         for t in &mut self.threads
         {
-            t.posted = false;
+            t.upcall = Upcall::Unposted;
             if let Some(h) = &mut t.held
             {
                 h.reported = true;
@@ -486,23 +505,27 @@ impl Session
         k.next_stop(until)
     }
 
-    /// Post an upcall to every live thread not held and not yet posted;
-    /// returns how many of them have not been started by their creator,
-    /// which the kernel posts nothing to until it is, so they stay unposted.
-    fn post_upcalls(&mut self, k: &mut impl Kernel) -> usize
+    /// Post an upcall to every live thread not held and not yet posted,
+    /// except one its creator has not started, which the kernel posts
+    /// nothing to until it is, so it stays unposted.
+    fn post_upcalls(&mut self, k: &mut impl Kernel) -> Posted
     {
-        let mut unstarted: usize = 0;
+        let mut posted = Posted {
+            unstarted: false,
+            started: false,
+        };
         for t in self
             .threads
             .iter_mut()
-            .filter(|t| t.live() && t.held.is_none() && !t.posted)
+            .filter(|t| t.live() && t.held.is_none() && t.upcall != Upcall::Posted)
         {
             // Read before the post, since a thread its creator starts
             // between a refused post and a later read would be taken for
             // one with an upcall pending.
             if !k.started(t.cap) && k.alive(t.cap)
             {
-                unstarted = unstarted.saturating_add(1);
+                t.upcall = Upcall::Unstarted;
+                posted.unstarted = true;
             }
             else if !k.post_upcall(t.cap) && !k.alive(t.cap)
             {
@@ -512,10 +535,11 @@ impl Session
             {
                 // A refused post to a started live thread finds an upcall
                 // pending, which arrives as well.
-                t.posted = true;
+                posted.started |= t.upcall == Upcall::Unstarted;
+                t.upcall = Upcall::Posted;
             }
         }
-        unstarted
+        posted
     }
 
     /// Take `stop` as its thread's held stop and return the thread's slot,
@@ -658,7 +682,7 @@ impl Session
             stop,
             reported: false,
         });
-        t.posted = false;
+        t.upcall = Upcall::Unposted;
         true
     }
 
@@ -671,7 +695,7 @@ impl Session
     {
         let cap = self.threads.get_mut(index).map(|t| {
             t.held = None;
-            t.posted = false;
+            t.upcall = Upcall::Unposted;
             t.cap
         });
         if let Some(cap) = cap
@@ -709,7 +733,7 @@ impl Session
                 continue;
             };
             t.held = None;
-            t.posted = false;
+            t.upcall = Upcall::Unposted;
             let cap = t.cap;
             self.rewind_hit(k, cap, &[h.stop]);
             k.reply(h.stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
@@ -1284,6 +1308,9 @@ mod tests
         late: Vec<(usize, u64)>,
         /// The late upcalls posted, by thread and time due.
         due: Vec<(usize, u64)>,
+        /// At the given time the given thread registers a thread its creator
+        /// never starts, and a thread it spawned stops under its badge.
+        spawn_at: Vec<(u64, usize)>,
     }
 
     fn cap_of(t: usize) -> u64
@@ -1320,6 +1347,7 @@ mod tests
                 unstarted: Vec::new(),
                 late: Vec::new(),
                 due: Vec::new(),
+                spawn_at: Vec::new(),
             };
             sim.spawn(None, true);
             sim
@@ -1487,6 +1515,16 @@ mod tests
                 {
                     self.deliver(t, UPCALL, 0);
                 }
+            }
+            if self.queue.is_empty()
+                && let Some(i) = self.spawn_at.iter().position(|&(at, _)| at <= until)
+            {
+                let (at, parent) = self.spawn_at.remove(i);
+                self.time = self.time.max(at);
+                let u = self.spawn(Some(parent), true);
+                self.unstarted.push((u, u64::MAX));
+                let n = self.spawn(Some(parent), true);
+                self.deliver(n, UPCALL, 0);
             }
             // A delivery waits on the endpoint while every receiver holds one.
             let taken = if self.busy < self.receivers
@@ -2219,7 +2257,7 @@ mod tests
                     bound: false,
                     held: Some(held),
                     beside: Vec::new(),
-                    posted: false,
+                    upcall: Upcall::Unposted,
                     gone: true,
                 });
             }
@@ -2340,6 +2378,26 @@ mod tests
         assert!(s.is_held(0), "the main thread runs unheld");
         assert!(!s.awaits_start());
         assert_eq!(sim.time, STOP_WAIT + START_POLL, "the upcall came at once");
+        assert!(s.detach(&mut sim));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a start read beside a thread a refresh had just added
+    // unstarted left the count of unstarted threads as it was, so the
+    // started thread was posted with what was left of the wait, and was
+    // neither held nor recorded when its upcall came later.
+    #[test]
+    fn a_start_beside_a_new_unstarted_thread_gets_a_whole_wait()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        sim.unstarted.push((a, STOP_WAIT - 2 * START_POLL + 3));
+        sim.late.push((a, 2 * START_POLL));
+        sim.spawn_at.push((STOP_WAIT - 2 * START_POLL + 5, 0));
+        let page = sim.page();
+        let s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(s.is_held(1), "the started thread runs unheld");
+        assert!(s.awaits_start(), "the thread never started is not recorded");
         assert!(s.detach(&mut sim));
         sim.assert_sound();
     }

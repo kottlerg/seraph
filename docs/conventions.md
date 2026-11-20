@@ -366,8 +366,10 @@ after it.
   head (the builds and boots its `## Test plan` reports) and a run with the reviewer over the
   sync. An incoming diff is comment-only as [testing.md](testing.md#coverage-tiers)
   § Coverage tiers defines a comment-only change: Markdown aside, it alters only comment
-  lines, and no file a build embeds. An incoming diff that changes only Markdown is
-  comment-only, even in a file the PR's own diff touches.
+  lines, and no file a build embeds. Whether it is comment-only is judged over the whole
+  incoming diff, not only over the files both diffs touch: an incoming diff that changes only
+  Markdown is comment-only, even in a file the PR's own diff touches, and one that changes code
+  anywhere is not, even when it touches the PR's files only in Markdown.
 - Any other sync owes nothing more. The validated head before it stands, and the PR body's
   `## Validation` section states that the incoming diff touches none of the PR's files, or
   that it is comment-only.

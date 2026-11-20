@@ -243,8 +243,11 @@ when it reads the file from disk, as `master` holds it: a worker's worktree sits
 may predate the merge, so it reads the file with `git show origin/master:<path>` after
 `git fetch origin`. After such a merge:
 
-- Tell each live worker that reads a changed file to read it again that way. Respawn it instead
-  (§ Spawn, once its task has ended) when the change is to how it works on a PR in flight.
+- Tell each live worker the changed files it reads, and those that define an agent it spawns
+  (`pr-reviewer`, `pr-auditor`, `Explore`, `scribe`): it reads the first again that way, and
+  tells each such agent to read its own (`.claude/agents/worker.md` § Authorities). Respawn it
+  instead (§ Spawn, once its task has ended) when the change is to how it works on a PR in
+  flight.
 - Record the changed paths as a ruling (`orch ruling add spawns read from disk: <paths>`), and
   name them in the prompt of every later spawn (§ Spawn): the session's loaded copy of an agent
   file is the old one. The ruling stays in force until a new session starts (§ Failure modes),

@@ -29,8 +29,9 @@ merge that changed it; where it differs from the copy loaded for you, it governs
 when the orchestrator tells you later that a file changed: read it again that way before your
 next step. Tell an agent you spawn (a `pr-reviewer`, a `pr-auditor`, an `Explore`, a
 `scribe`) to read its own agent file the same way first only when that file is among those
-files: any other agent's loaded definition is current, and the read would cost it a turn. Then
-read each Issue (`gh issue view <N> --comments`) and what the change needs:
+files, named by your prompt or by a later message of the orchestrator; a prompt asks for no such
+read otherwise, since it costs the agent a turn. Then read each Issue
+(`gh issue view <N> --comments`) and what the change needs:
 
 - Every change: docs/conventions.md § Commit Messages and § Branch and PR Workflow, and the
   README and `docs/*.md` of each component you touch.

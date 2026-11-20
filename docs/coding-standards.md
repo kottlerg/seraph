@@ -19,6 +19,11 @@ The following tools are mandatory and authoritative. Each is configured at the r
 Formatters MUST be run before committing. Rules enforced by these tools are not
 restated in this document. Developers MUST NOT disable or bypass these tools.
 
+`cargo xtask build` and `cargo xtask test` enforce the Rust rule: each runs `cargo fmt --check`
+and fails on a file `cargo fmt` would change, naming its file and line, without rewriting it.
+CI runs both on every pull request ([build-system.md](build-system.md) § Continuous Integration).
+No check enforces the C rule.
+
 `.editorconfig` is authoritative for editor-level settings (indentation, line endings,
 trailing whitespace). Editors MUST respect it.
 
@@ -755,7 +760,8 @@ capacity: usize,
 `cargo xtask build` is the single mandatory build command; it runs Clippy with the
 mandated lint groups and treats all warnings as errors. The command's options are listed
 in [xtask/README.md](../xtask/README.md) § `cargo xtask build`. `cargo xtask test` runs Clippy
-over test code the same way (§ Clippy) before it runs the unit tests.
+over test code the same way (§ Clippy) before it runs the unit tests. Both check the formatting
+of the Rust source first (§ Formatters).
 
 ---
 

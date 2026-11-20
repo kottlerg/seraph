@@ -86,6 +86,13 @@ cargo xtask build [--arch x86_64|riscv64] [--release] \
 | `--component` | `all` | Build a single component: `boot`, the crate name of any component the build installs (an entry of the `SPECS` table in `xtask/src/commands/build.rs`: `kernel`, `init`, `ktest`, each service, driver, program, fixture, and tester crate), or `all` |
 | `--debug` | (none) | Emit debuginfo (`debug=2`, `opt-level=1`) for the named component(s) only, each named as `--component` names it, e.g. `--debug kernel,crashme`; applies within the active profile. See [Build Profiles](../docs/build-system.md#build-profiles). |
 
+Before it compiles, the build checks that the workspace's Rust source is formatted as
+`cargo fmt` formats it (`cargo fmt --all --check`) and fails on a file that is not, printing
+rustfmt's diff, each hunk headed by the file and line, and the command that fixes it
+(`cargo fmt --all`). It rewrites no source: running the formatter is the contributor's, as
+[docs/coding-standards.md](../docs/coding-standards.md) § Formatters requires. It then runs Clippy
+over the host crates, and over each component before it builds it.
+
 The sysroot is architecture-specific. Building for a different arch than the
 existing sysroot is an error — run `cargo xtask clean` first (per
 [docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot).
@@ -304,8 +311,8 @@ Default firmware search paths per host:
 Re-mirror `rootfs/` into `sysroot/`, re-synthesise test fixtures, and
 regenerate `disk.img` without invoking cargo. Use after editing
 `rootfs/` to refresh the boot image without paying for a full
-`cargo xtask build` (which would also run cargo fmt + clippy + check +
-binary install). Requires a populated, arch-tagged sysroot from a prior
+`cargo xtask build` (which would also check formatting, run clippy, and compile and
+install every binary). Requires a populated, arch-tagged sysroot from a prior
 `cargo xtask build`.
 
 The mirror is authoritative over the rootfs-managed subtrees (`config/`,
@@ -512,11 +519,16 @@ cargo xtask clean [--all]
 
 ### `cargo xtask test`
 
-Lint the test code, then run Seraph unit tests on the host target and under riscv64 emulation.
+Check the formatting of the selected packages, lint the test code, then run Seraph unit tests on
+the host target and under riscv64 emulation.
 
 ```
 cargo xtask test [--component boot|protocol|kernel|init|all]
 ```
+
+The formatting check runs `cargo fmt --check` over the selected packages (`--all` for `all`)
+and fails on unformatted source as `cargo xtask build`'s check does, rewriting nothing, so a change
+tested before its push is checked before CI reads it.
 
 The lint pass runs `cargo clippy --tests` over the selected packages, once for
 `x86_64-unknown-linux-gnu` and once for `riscv64gc-unknown-linux-gnu`, with all warnings treated as

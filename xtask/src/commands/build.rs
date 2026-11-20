@@ -641,7 +641,8 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     sysroot::check_arch(ctx, args.arch)?;
     if !args.skip_lints
     {
-        fmt_workspace(ctx)?;
+        step("Checking formatting");
+        crate::util::check_formatting(&ctx.root, &["--all"])?;
         clippy_host(ctx)?;
     }
 
@@ -1223,14 +1224,6 @@ pub(crate) fn install_names(arch: Arch) -> Vec<String>
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Run `cargo fmt` across the entire workspace before compilation.
-fn fmt_workspace(ctx: &BuildContext) -> Result<()>
-{
-    let mut cmd = cargo(&ctx.root);
-    cmd.args(["fmt", "--all"]);
-    run_cmd(&mut cmd)
-}
 
 /// Clippy-gate the host crates (`xtask`, `seraph-wrapper-shim`) under the
 /// workspace deny-lints. The sysroot crates are linted per-component via the

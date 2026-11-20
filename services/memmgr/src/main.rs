@@ -2289,30 +2289,35 @@ fn handle_discard_range(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
-/// Chunks one `MAKE_RESIDENT` request makes resident at most: a tuning value
-/// that bounds the request's turn to as many restores, each with its own
-/// bound on direct reclaim, so a debugger's request delays the faults and
+/// Chunks one `MAKE_RESIDENT` request makes resident at most, an
+/// attachment's origin map counting as one: a tuning value that bounds the
+/// request's turn to as many restores, each with its own bound on direct
+/// reclaim, or maps, so a debugger's request delays the faults and
 /// grants behind it no more than a few faults would.
 const MAKE_RESIDENT_CHUNKS: u32 = 4;
 
-/// Chunks with an entry, and regions with none, one `MAKE_RESIDENT` request
-/// visits at most: a tuning value that bounds the turn's walk over chunks
+/// Chunks with an entry or of an attachment, and regions with none, one
+/// `MAKE_RESIDENT` request visits at most: a tuning value that bounds the turn's walk over chunks
 /// that need nothing.
 const MAKE_RESIDENT_VISITS: u32 = 64;
 
 /// Make a range of a process's demand regions resident for a debugger's read
-/// (services/memmgr/docs/ipc-interface.md § Label 21): each evicted chunk the
-/// range meets is restored from the store, or mapped back while its eviction
-/// is in flight ([`evict::make_resident`]), which counts as an access in its
-/// age; a page no fault backed stays not present. A chunk on disk is posted
+/// (services/memmgr/docs/ipc-interface.md § Label 21), doing for each page
+/// what a read fault on it does when that read takes no page: each evicted
+/// chunk the range meets is restored from the store, or mapped back while its
+/// eviction is in flight ([`evict::make_resident`]), which counts as an
+/// access in its age, and an attachment's page with no copy of its own maps
+/// its origin read-only ([`resident_origin`]); a page of an ordinary region
+/// no fault backed stays not present. A chunk on disk is posted
 /// to the swap service to restore ahead of a fault ([`disk::post_want`]),
 /// when it registered a want Notification, and passed over otherwise, as a
 /// lost one is ([`free_pool::resident_path`]): memmgr reads no slot and waits
 /// on no swap service. procmgr alone sends it, for a holder of its debug
 /// authority. Words are `[badge, va, len]`, the process named by its memmgr
 /// badge. The walk visits only the chunks that have an entry
-/// ([`free_pool::Ledger::next_chunk_with_entry`]), and stops after
-/// [`MAKE_RESIDENT_CHUNKS`] chunks made resident or [`MAKE_RESIDENT_VISITS`]
+/// ([`free_pool::Ledger::next_chunk_with_entry`]), and an attachment's
+/// chunks in turn, and stops after [`MAKE_RESIDENT_CHUNKS`] chunks made
+/// resident, an origin map counting as one, or [`MAKE_RESIDENT_VISITS`]
 /// visits; the reply's word 0 is where it stopped, the range's end when it is
 /// all done, and the sender asks again from there. Word 1 is
 /// `RESIDENT_PENDING` when a chunk on disk was posted: word 0 is then the
@@ -2359,7 +2364,18 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         visits = visits.saturating_add(1);
         let region_end = node.region.va_base.saturating_add(node.region.len);
         let from = at.max(node.region.va_base);
-        let Some(next) = l.next_chunk_with_entry(reg, from)
+        // An attachment's page no write copied has no entry, yet a read maps
+        // its origin: the walk visits each of its chunks from `from`.
+        let attachment = l.attachment(reg);
+        let next = if attachment.is_some()
+        {
+            Some(from)
+        }
+        else
+        {
+            l.next_chunk_with_entry(reg, from)
+        };
+        let Some(next) = next
         else
         {
             at = region_end;
@@ -2372,7 +2388,8 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
             break;
         }
         let entry = l.chunk_at(reg, chunk_base);
-        match free_pool::resident_path(&entry, wants)
+        let path = free_pool::resident_path(&entry, wants);
+        match path
         {
             ResidentPath::Restore =>
             {
@@ -2396,17 +2413,39 @@ fn handle_make_resident(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
             {}
         }
         at = chunk_base.saturating_add(u64::from(chunk_pages).saturating_mul(PAGE_SIZE));
+        // In a resident chunk of an attachment, the read maps the origin over
+        // the span around `next` no copy backs, and the walk goes on from its
+        // end; a page with a copy is passed.
+        if let Some(att) = attachment
+            && matches!(path, ResidentPath::Skip | ResidentPath::Restore)
+        {
+            let Ok((resume, mapped)) =
+                resident_origin(l, rec, reg, &node.region, att, next, aspace)
+            else
+            {
+                reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
+                return;
+            };
+            made = made.saturating_add(u32::from(mapped));
+            at = resume;
+        }
     }
     // A walk that ran out of regions, or of the range, is done; one the
     // bounds stopped resumes at `at`.
-    let reached = if made < MAKE_RESIDENT_CHUNKS && visits < MAKE_RESIDENT_VISITS
-    {
-        end
-    }
-    else
-    {
-        at.min(end)
-    };
+    let bounded = made >= MAKE_RESIDENT_CHUNKS || visits >= MAKE_RESIDENT_VISITS;
+    reply_resident(
+        ipc_buf,
+        va,
+        if bounded { at.min(end) } else { end },
+        pending,
+    );
+}
+
+/// Reply to a `MAKE_RESIDENT` request from `va` whose walk stopped at
+/// `reached`, `pending` being the base of the first chunk it posted to the
+/// swap service, if any ([`handle_make_resident`]).
+fn reply_resident(ipc_buf: *mut u64, va: u64, reached: u64, pending: Option<u64>)
+{
     let (from, flag) = match pending
     {
         Some(base) => (pending_from(base, va), memmgr_labels::RESIDENT_PENDING),
@@ -2907,11 +2946,6 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, FaultDecline::NoAspace, 0);
         return;
     }
-    // The part of the faulting page's chunk no earlier run backs, read from
-    // the chunk's entry in the region's chunk table. None: the page itself is
-    // backed, because another thread's fault on it was served first, and that
-    // mapping satisfies this granted access. Resume.
-    let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
     // An evicting, compressed or writing chunk is made resident whole first: its
     // runs mapped back, or its pages restored from the store
     // (services/memmgr/docs/memory-pool.md § Eviction, States). Every backed
@@ -2935,43 +2969,28 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, reason, detail);
         return;
     }
-    let entry = l.chunk_at(reg, page_base);
-    // The page lies in its chunk, below `DEMAND_CHUNK_PAGES`.
-    let page = u32::try_from(page_base.saturating_sub(chunk_base) / PAGE_SIZE).unwrap_or(0);
-    let Some((first, end)) = entry.unbacked_span(page, chunk_pages)
-    else
+    // The part of the faulting page's chunk no earlier run backs. None: the
+    // page itself is backed, because another thread's fault on it was served
+    // first, and that mapping satisfies this granted access. Resume. Else
+    // back the span with one Memory cap: one run covering the span, else, on
+    // a fragmented pool, the largest free run, mapped over the part of the
+    // span around the faulting page (services/memmgr/docs/memory-pool.md
+    // § Demand faults).
+    let (target, span_pages) = match fault_target(l, rec, reg, &region, page_base, aspace_cap)
     {
-        reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
-        return;
+        Ok(Some(found)) => found,
+        Ok(None) =>
+        {
+            reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
+            return;
+        }
+        Err((reason, detail)) =>
+        {
+            decline_fault(ipc_buf, reason, detail);
+            return;
+        }
     };
-    let span_start = chunk_base.saturating_add(u64::from(first).saturating_mul(PAGE_SIZE));
-    let span_end = chunk_base.saturating_add(u64::from(end).saturating_mul(PAGE_SIZE));
-    // The span lies in the chunk, so its page count is at most
-    // `DEMAND_CHUNK_PAGES`, and at least 1, the faulting page.
-    let span_pages = end.saturating_sub(first);
-
-    // Back the span with one Memory cap, after securing the slots recording
-    // it takes (its descriptor, and the chunk's path in the table): one run
-    // covering the span, else, on a fragmented pool, the largest free run,
-    // mapped over the part of the span around the faulting page
-    // (services/memmgr/docs/memory-pool.md § Demand faults).
-    let need = l.back_slots(reg, page_base);
-    let committed = l.is_committed(reg).then_some(reg);
-    if !ensure_committed_slots(l, need, committed)
-    {
-        decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);
-        return;
-    }
-    let target = FaultTarget {
-        rec,
-        aspace_cap,
-        prot: region.prot,
-        span: (span_start, span_end),
-        page_base,
-        held: need,
-        committed,
-        charged: false,
-    };
+    let (need, committed) = (target.held, target.committed);
     let frame = match serve_span(l, &target, &region, reg, req.word(2), span_pages)
     {
         Ok(Some(frame)) => frame,
@@ -2994,6 +3013,87 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     }
     reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
+}
+
+/// The fault on `page_base` of the region `reg` (`region`) of the process
+/// `rec`, whose delegated address space is `aspace_cap`, and the pages of
+/// its span: the part of the page's chunk around it that no earlier run
+/// backs, read from the chunk's entry in the region's chunk table, once the
+/// arena slots recording a run there takes (its descriptor, and the chunk's
+/// path in the table) are secured. `None` when the page itself is backed.
+/// Shared by a fault ([`handle_fault`]) and `MAKE_RESIDENT`'s read of an
+/// attachment ([`resident_origin`]).
+///
+/// # Errors
+/// `FaultDecline::NoArenaSlot` when the slots cannot be secured.
+fn fault_target(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    reg: NodeIdx,
+    region: &DemandRegion,
+    page_base: u64,
+    aspace_cap: u64,
+) -> Result<Option<(FaultTarget, u32)>, (FaultDecline, u64)>
+{
+    let (chunk_base, chunk_pages) = chunk_for(region, page_base);
+    let entry = l.chunk_at(reg, page_base);
+    // The page lies in its chunk, below `DEMAND_CHUNK_PAGES`.
+    let page = u32::try_from(page_base.saturating_sub(chunk_base) / PAGE_SIZE).unwrap_or(0);
+    let Some((first, end)) = entry.unbacked_span(page, chunk_pages)
+    else
+    {
+        return Ok(None);
+    };
+    let span_start = chunk_base.saturating_add(u64::from(first).saturating_mul(PAGE_SIZE));
+    let span_end = chunk_base.saturating_add(u64::from(end).saturating_mul(PAGE_SIZE));
+    let need = l.back_slots(reg, page_base);
+    let committed = l.is_committed(reg).then_some(reg);
+    if !ensure_committed_slots(l, need, committed)
+    {
+        return Err((FaultDecline::NoArenaSlot, 0));
+    }
+    let target = FaultTarget {
+        rec,
+        aspace_cap,
+        prot: region.prot,
+        span: (span_start, span_end),
+        page_base,
+        held: need,
+        committed,
+        charged: false,
+    };
+    // The span lies in the chunk, so its page count is at most
+    // `DEMAND_CHUNK_PAGES`, and at least 1, the page.
+    Ok(Some((target, end.saturating_sub(first))))
+}
+
+/// Map the origin of the attachment `att`, the region `reg` (`region`) of
+/// the process `rec`, over the span around the page of `va` that no copy
+/// backs, as a read fault there does ([`fault_target`], [`map_origin`]), for
+/// `MAKE_RESIDENT`. Returns where the walk goes on, past what it mapped or
+/// past the page when the page has a copy of its own, and whether it mapped.
+///
+/// # Errors
+/// The [`FaultDecline`] and its detail word.
+fn resident_origin(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    reg: NodeIdx,
+    region: &DemandRegion,
+    att: Attachment,
+    va: u64,
+    aspace_cap: u64,
+) -> Result<(u64, bool), (FaultDecline, u64)>
+{
+    let page_base = va & !(PAGE_SIZE - 1);
+    let past = page_base.saturating_add(PAGE_SIZE);
+    let Some((target, _)) = fault_target(l, rec, reg, region, page_base, aspace_cap)?
+    else
+    {
+        return Ok((past, false));
+    };
+    let mapped_end = map_origin(l, &target, region, att)?;
+    Ok((mapped_end.max(past), true))
 }
 
 /// The demand fault [`back_span`] backs.
@@ -3404,7 +3504,7 @@ fn attachment_fault(
 {
     if access & FAULT_ACCESS_WRITE == 0
     {
-        return map_origin(l, target, region, att).map(|()| None);
+        return map_origin(l, target, region, att).map(|_| None);
     }
     if l.zero_frame(att.object).is_none()
     {
@@ -3436,7 +3536,8 @@ fn attachment_fault(
 /// read-only page whose frame no other leaf maps; memmgr's own view of every
 /// object frame is that other leaf, so the write is refused
 /// (services/memmgr/docs/memory-pool.md § Memory objects, Own view). The
-/// kernel keeps the mapping after the cap goes.
+/// kernel keeps the mapping after the cap goes. Returns the end of the pages
+/// it mapped.
 ///
 /// # Errors
 /// The [`FaultDecline`] and its detail word ([`decline_fault`]).
@@ -3445,7 +3546,7 @@ fn map_origin(
     target: &FaultTarget,
     region: &DemandRegion,
     att: Attachment,
-) -> Result<(), (FaultDecline, u64)>
+) -> Result<u64, (FaultDecline, u64)>
 {
     let (start, end) = target.span;
     let (cap, offset, va, pages, step) = if let Some(zero) = l.zero_frame(att.object)
@@ -3501,7 +3602,7 @@ fn map_origin(
         done = done.saturating_add(step);
     }
     let _ = syscall::cap_delete(map_cap);
-    mapped
+    mapped.map(|()| va.saturating_add(pages.saturating_mul(PAGE_SIZE)))
 }
 
 /// Give the faulting page of the private attachment `att` a copy of its

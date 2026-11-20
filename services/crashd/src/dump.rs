@@ -194,10 +194,23 @@ fn capture(
         Err(outcome) => return outcome,
     };
 
+    // The header lies on the image's shared read-only data, which the process
+    // may never have read, so memmgr maps it first when it is not present.
     let mut header = [0u8; EHDR_BYTES];
-    let auxv = syscall::thread_read_mem(reader, target.load_bias, &mut header)
-        .ok()
-        .and_then(|_| Auxv::from_header(&header, target.load_bias));
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let auxv = unsafe {
+        ipc::read_mem_resident_bounded(
+            authority,
+            target.process,
+            reader,
+            target.load_bias,
+            &mut header,
+            ipc_buf,
+            &mut bound,
+        )
+    }
+    .ok()
+    .and_then(|()| Auxv::from_header(&header, target.load_bias));
     let threads: Vec<Thread<'_>> = held
         .iter()
         .zip(1u32..)

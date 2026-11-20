@@ -453,7 +453,9 @@ pub const DISCARD_RANGE: u64 = 20;
 /// Procmgr-only: make a range of a process's demand regions resident, for a
 /// debugger's read (`procmgr_labels::MAKE_RESIDENT`). memmgr restores each
 /// evicted chunk of the range from its compressed store and maps it into
-/// the process; a page no fault has backed stays not present.
+/// the process, and maps an attachment's page with no copy of its own to its
+/// origin, read-only; a page of an ordinary region no fault has backed stays
+/// not present.
 ///
 /// Wire format:
 /// * `data[0]` — the process's memmgr badge (from its `REGISTER_PROCESS`

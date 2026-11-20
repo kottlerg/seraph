@@ -156,6 +156,12 @@ pub struct Command {
     /// no system pager. Set via `CommandExt::pinned`. Defaults to off — the
     /// child is demand-paged by the system default.
     pinned: bool,
+    /// When set, spawn ORs `procmgr_labels::CREATE_PRIVATE_IMAGE` into the
+    /// `CREATE_FROM_FILE` label so procmgr loads the child's image private
+    /// instead of attaching its text and read-only data shared with the
+    /// binary's other instances. Set via `CommandExt::private_image`. Defaults
+    /// to off.
+    private_image: bool,
     /// `CREATE_PRIORITY` label field for the next spawn. `0` (default) =
     /// procmgr's policy default, clamped to the child's band. Set via
     /// `CommandExt::priority`.
@@ -179,6 +185,7 @@ impl Command {
             namespace_cap: 0,
             cwd_dir_cap: 0,
             pinned: false,
+            private_image: false,
             priority: 0,
             sched_max: 0,
         }
@@ -196,6 +203,11 @@ impl Command {
     /// `ProcessInfo.current_dir_cap`. Called by `CommandExt::cwd_dir_cap`.
     pub fn set_cwd_dir_cap(&mut self, cap: u64) {
         self.cwd_dir_cap = cap;
+    }
+
+    /// Request a private-image child. Called by `CommandExt::private_image`.
+    pub fn set_private_image(&mut self, on: bool) {
+        self.private_image = on;
     }
 
     /// Request a pinned (eager-mapped, no pager) child. Called by
@@ -460,8 +472,14 @@ impl Command {
         } else {
             0
         };
+        let private_image_flag = if self.private_image {
+            procmgr_labels::CREATE_PRIVATE_IMAGE
+        } else {
+            0
+        };
         let label = procmgr_labels::CREATE_FROM_FILE
             | pinned_flag
+            | private_image_flag
             | procmgr_labels::CREATE_DEATH_RELAY
             | procmgr_labels::create_sched_bits(self.priority, self.sched_max)
             | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 };

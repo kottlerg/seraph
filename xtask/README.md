@@ -1517,9 +1517,10 @@ on either arch. Stages the `gdb-target` recipe (`programs/debugger --gdb-target`
 current sysroot once with the debug port attached (headless), and waits for the stub's
 `[gdbstub] attached; serving the debug port` line on the serial stream. It then runs
 `gdb -nx -batch` against the port with the symbols store's file of the target binary's build id
-for symbols: the session lists the threads, breaks on the target's tick function and continues to
-it, rewrites a variable and a register and reads each back, single-steps, selects the second
-thread and reads its registers, and detaches; the test then waits up to 30 s for the stub's
+for symbols: the session lists the threads, single-steps from where the attach stopped the main
+thread, breaks on the target's tick function and continues to it, rewrites a variable and a register
+and reads each back, single-steps again, selects the second thread and reads its registers, and
+detaches; the test then waits up to 30 s for the stub's
 `[gdbstub] detached from gdb-target (crash bindings restored: ...)` line. A restart round
 follows: the test connects to the stub, which attaches to the target anew, kills the port's
 driver through QEMU's gdbstub as `test-debug-port` does, waits for the stub's

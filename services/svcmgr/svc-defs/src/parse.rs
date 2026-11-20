@@ -228,6 +228,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut stop_authority: Option<bool> = None;
     let mut entropy_authority: Option<bool> = None;
     let mut reserve: Option<bool> = None;
+    let mut private_image: Option<bool> = None;
     let mut stop_source: Option<StopClass> = None;
     let mut shutdown_name: Option<String> = None;
     let mut priority: Option<u8> = None;
@@ -511,6 +512,16 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     "reserve must be yes or no",
                 )?;
             }
+            "private_image" =>
+            {
+                set_yes_no(
+                    &mut private_image,
+                    lineno,
+                    value,
+                    "private_image",
+                    "private_image must be yes or no",
+                )?;
+            }
             "shutdown_actuator" =>
             {
                 if shutdown_name.is_some()
@@ -652,6 +663,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     }
 
     let reserve = reserve.unwrap_or(false);
+    let private_image = private_image.unwrap_or(false);
     let oom_stop = oom_stop.unwrap_or(false);
     if oom_stop
     {
@@ -708,6 +720,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         stop_authority,
         entropy_authority,
         reserve,
+        private_image,
         stop_source,
         priority,
         sched_max,
@@ -1123,6 +1136,26 @@ sched_max = 12\n";
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn the_private_image_key_is_off_unless_the_recipe_sets_it()
+    {
+        assert!(!parse_with("").expect("default").private_image);
+        assert!(
+            supervised_with("private_image = yes\n")
+                .expect("yes")
+                .private_image
+        );
+        assert!(
+            !supervised_with("private_image = no\n")
+                .expect("no")
+                .private_image
+        );
+        assert!(matches!(
+            supervised_with("private_image = maybe\n"),
+            Err(ParseError::InvalidValue(_, _))
+        ));
     }
 
     #[test]

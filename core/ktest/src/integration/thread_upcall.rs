@@ -772,16 +772,15 @@ extern "C" fn call_entry(k: u64) -> !
     stage.store(1, Ordering::Release);
     let ep = call_ep.load(Ordering::Acquire);
     let msg = IpcMessage::new(0);
-    // SAFETY: `buf` was registered as this thread's IPC buffer above.
-    let called = unsafe {
-        if k == 2
-        {
-            ipc::ipc_call_masked(ep, &msg, buf)
-        }
-        else
-        {
-            ipc::ipc_call(ep, &msg, buf)
-        }
+    let called = if k == 2
+    {
+        // SAFETY: `buf` was registered as this thread's IPC buffer above.
+        unsafe { ipc::ipc_call_masked(ep, &msg, buf) }
+    }
+    else
+    {
+        // SAFETY: `buf` was registered as this thread's IPC buffer above.
+        unsafe { ipc::ipc_call(ep, &msg, buf) }
     };
     result.store(result_word(called.map(|_| 0)), Ordering::Release);
     stage.store(2, Ordering::Release);

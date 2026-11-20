@@ -140,7 +140,9 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 /// * `data[8]` — `promised_bytes`: what the committed regions
 ///   ([`REGION_COMMIT`]) can still take from the free runs: their pages
 ///   that hold no frame yet, with bounds on the page tables and metadata
-///   they can need. Every admission reads `data[3]` less this.
+///   they can need. A commitment is admitted against `data[3]` plus
+///   `data[15]` less this; every other admission reads the free pages
+///   outside `promised`, `data[17]`.
 /// * `data[9]` — `store_bytes`: the subset of `pool_total_bytes` the
 ///   compressed store holds, the stored pages of every evicted chunk.
 /// * `data[10]` — `swapped_bytes`: the pages of every evicted chunk, in
@@ -151,8 +153,9 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   `promised` a charge to a budget node outside the reserve may not take:
 ///   the system reserve and, while chunks are swapped, the restore headroom
 ///   above it, `data[6]` plus the lesser of `data[10]` and `data[6]`. What
-///   such a node can still be granted is `data[3]` less `data[8]` less
-///   this; the level is [`PRESSURE_CRITICAL`] at or below it.
+///   such a node can still be granted is the free pages outside `promised`
+///   (`data[17]`) less this; the level is [`PRESSURE_CRITICAL`] at or below
+///   it.
 /// * `data[12]` — `disk_bytes`: the pages of every chunk on disk, the
 ///   subset of `data[10]` the swap service's slots alone hold.
 /// * `data[13]` — `swap_slots_free`: the swap slots registered and not
@@ -165,11 +168,30 @@ pub const DONATE_MEMORY_CAPS: u64 = 5;
 ///   held raw, compressed or being written at the second read. A chunk on
 ///   disk or lost can remain: `data[10]` counts both, `data[12]` only a
 ///   chunk on disk.
+/// * `data[15]` — `allowance_bytes`: the overcommit allowance, what
+///   `promised` may exceed `data[3]` by: a chunk's pages for every free
+///   swap slot (`data[13]`), less the pages compression already freed from
+///   the chunks evicted and not on disk, plus the pages of the evicted
+///   chunks of committed regions, which `data[8]` holds again; `0` while
+///   no swap service is registered.
+/// * `data[16]` — `draw_room_bytes`: the free pages a fault on a committed
+///   page of a process outside the system reserve may take now: all of
+///   `data[3]` while `data[15]` is `0` or `data[3]` covers `data[8]`,
+///   else those above the growth floor, `data[11]`. memmgr declines such a
+///   fault as a commit overrun (decline code 11) when it finds none. The
+///   draw room is open at [`DEMAND_CHUNK_BYTES`] or more, room for any one
+///   committed draw (a fault's, or the restore of a committed chunk), and a
+///   [`REGISTER_PRESSURE`] bit says it opened.
+/// * `data[17]` — `uncommitted_free_bytes`: the free pages outside
+///   `promised`, which a charge that takes frames now may take and the
+///   pressure level reads: `data[3]` plus `data[15]` less `data[8]`, and
+///   at most `data[3]`. While `data[15]` is `0` it is `data[3]` less
+///   `data[8]`; with an allowance it can be all of `data[3]`.
 ///
 /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
 /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
 /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-/// "dark" memory. `data[3]` to `data[14]` are appended fields — readers
+/// "dark" memory. `data[3]` to `data[17]` are appended fields — readers
 /// needing only the identity may ignore them.
 pub const QUERY_POOL_STATUS: u64 = 6;
 /// Register a demand-paged anonymous region for the calling process.
@@ -274,9 +296,10 @@ pub const QUERY_MEMORY_USAGE: u64 = 10;
 /// * `caps[0]` — a Notification cap with Notify rights; ownership
 ///   transfers to memmgr.
 ///
-/// On every change of the pressure level memmgr sends the bits on the
-/// cap, without blocking; the receiver reads the level from
-/// [`QUERY_POOL_STATUS`] `data[7]`. A process holds one registration: a
+/// On every change of the pressure level, and every opening of the draw room
+/// (`QUERY_POOL_STATUS` `data[16]`), memmgr sends the bits on the cap, without blocking; the
+/// receiver reads the level from [`QUERY_POOL_STATUS`] `data[7]` and the
+/// draw room from `data[16]`. A process holds one registration: a
 /// second replaces the first, and `PROCESS_DIED` drops it. The std runtime
 /// registers every process at start.
 ///

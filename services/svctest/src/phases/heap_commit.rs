@@ -633,8 +633,12 @@ fn limited_child_main() -> !
     exit(0);
 }
 
-/// What memmgr can still promise a node outside the reserve, in pages: its
-/// free pages less `promised` and the growth floor.
+/// What the free frames can still back of a commitment of a node outside the
+/// reserve, in pages: memmgr's free pages less `promised` and the growth
+/// floor. With an overcommit allowance above 0 memmgr promises past them
+/// (services/memmgr/docs/memory-pool.md § Commit, Overcommit), and a fault
+/// past the free frames waits on eviction; a commitment within them has every
+/// fault backed by a free frame.
 pub(crate) fn uncommitted_available() -> u64
 {
     let Some((free, promised, floor)) = pool_totals()
@@ -646,16 +650,17 @@ pub(crate) fn uncommitted_available() -> u64
 }
 
 /// Child role: commit, through `try_reserve` on the heap, all but at most
-/// [`HOG_MARGIN_PAGES`] of what memmgr can still promise, halving an attempt
-/// it refuses. A best-effort grant of one page more than is then left is
-/// refused with `OUT_OF_MEMORY_BEST_EFFORT`, and its reply counts more free
-/// pages than the grant asked: the pool holds them, promised to the hog. The
-/// hog then writes every page it committed, and exits 0; a fault memmgr
-/// declined would kill it instead.
+/// [`HOG_MARGIN_PAGES`] of what the free frames can still back
+/// ([`uncommitted_available`]), halving an attempt it refuses. A best-effort
+/// grant of one page more than memmgr may then grant it is refused with
+/// `OUT_OF_MEMORY_BEST_EFFORT`, and its reply counts more free pages than the
+/// grant asked: the pool holds them, promised to the hog or kept as the growth
+/// floor. The hog then writes every page it committed, and exits 0; a fault
+/// memmgr declined would kill it instead.
 ///
 /// Other processes free pages while the hog runs (a file system gives back
 /// its cache when the hog's commitment raises memmgr's pressure level), so
-/// what is left can grow between the hog's read of it and its grant. memmgr
+/// what memmgr may grant can grow between the hog's read of it and its grant. memmgr
 /// then admits the grant; the hog gives it back, commits down to its margin
 /// again and asks again, up to [`HOG_REFUSAL_ATTEMPTS`] times. A memmgr that
 /// admits past what is left, by any number of pages, admits every attempt,
@@ -678,8 +683,8 @@ fn hog_main() -> !
     let mut rounds = HOG_MAX_ROUNDS;
     for _ in 0..HOG_REFUSAL_ATTEMPTS
     {
-        let left = commit_to_margin(&mut held, &mut rounds);
-        if past_grant_refused(left)
+        let _ = commit_to_margin(&mut held, &mut rounds);
+        if past_grant_refused()
         {
             touch_committed(&mut held);
             exit(0);
@@ -688,8 +693,33 @@ fn hog_main() -> !
     exit(HOG_GRANT_NOT_REFUSED);
 }
 
-/// Commit blocks into `held` until what memmgr can still promise is at most
-/// [`HOG_MARGIN_PAGES`], spending reservation attempts from `rounds`, and
+/// memmgr's free pages outside `promised` less its growth floor
+/// (`QUERY_POOL_STATUS` `data[17]` less `data[11]`), in pages: what it may
+/// grant a node outside the reserve. Exits with [`HOG_STATUS_FAILED`] when
+/// the call fails or is refused.
+fn grant_room() -> u64
+{
+    let req = IpcMessage::new(memmgr_labels::QUERY_POOL_STATUS);
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe {
+        ipc::ipc_call(
+            startup_info().memmgr_endpoint,
+            &req,
+            std::os::seraph::current_ipc_buf(),
+        )
+    };
+    match reply
+    {
+        Ok(r) if r.label == memmgr_errors::SUCCESS =>
+        {
+            r.word(17).saturating_sub(r.word(11)) / PAGE_SIZE
+        }
+        _ => exit(HOG_STATUS_FAILED),
+    }
+}
+
+/// Commit blocks into `held` until what the free frames can still back
+/// ([`uncommitted_available`]) is at most [`HOG_MARGIN_PAGES`], spending reservation attempts from `rounds`, and
 /// return what is then left; exit with [`HOG_NOT_COMMITTED`] when `rounds`
 /// runs out first.
 pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
@@ -717,15 +747,17 @@ pub(crate) fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u
     exit(HOG_NOT_COMMITTED)
 }
 
-/// Ask memmgr for a best-effort grant of one page more than `left`. Returns
+/// Ask memmgr for a best-effort grant of one page more than it may grant a
+/// node outside the reserve: the free pages outside `promised` less the
+/// growth floor (`QUERY_POOL_STATUS` `data[17]` less `data[11]`). Returns
 /// `true` when memmgr refuses it with `OUT_OF_MEMORY_BEST_EFFORT` and counts
 /// more free pages than the grant asked, and `false` when it grants it, once
 /// the grant is given back ([`give_back`]). Exits with [`HOG_NO_FREE_PAGES`] on a refusal that
 /// counts no more free pages than asked, and with [`HOG_GRANT_NOT_REFUSED`] on
 /// any other reply.
-fn past_grant_refused(left: u64) -> bool
+fn past_grant_refused() -> bool
 {
-    let past = left.saturating_add(1);
+    let past = grant_room().saturating_add(1);
     let grant = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, past)
         .build();

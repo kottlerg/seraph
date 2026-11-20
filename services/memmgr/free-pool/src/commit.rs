@@ -27,16 +27,40 @@ use crate::{CHUNK_BYTES, DEMAND_CHUNK_PAGES};
 
 use syscall_abi::PAGE_SIZE;
 
-/// The overcommit allowance: the pages `promised` may exceed the free pool by.
+/// The overcommit allowance: the pages `promised` may exceed the free pool by,
+/// derived from the swap tier (`services/memmgr/docs/memory-pool.md`
+/// § Commit, Overcommit). Each of the `free_slots` free swap slots takes one
+/// chunk, whose eviction and write together free at most a chunk's pages; a
+/// chunk evicted and not on disk (compressed, being written, or lost) already
+/// freed its backed pages less its store pages when it was compressed, and
+/// takes a slot for what is left, so those pages, `swapped` less `disk` less
+/// `store`, are not counted again. A raw chunk freed nothing before its write.
+/// The `committed` pages, those of the evicted chunks of committed regions,
+/// count again: `promised` holds them, since their restores draw from it, and
+/// the frames they freed or the slots they hold are what backs them, so an
+/// eviction moves a committed chunk's pages between tiers without spending
+/// the allowance. With no swap service registered no slot is free and no
+/// committed chunk is evicted, and the allowance is 0.
+///
 /// A commitment is admitted against the free pool and the allowance less
 /// `promised`, so with an allowance above 0 memmgr may promise pages it holds
 /// no frame for, and a committed fault that then finds no frame evicts a
 /// victim in its turn or is declined as a commit overrun; committed chunks
-/// become evictable (`services/memmgr/docs/memory-pool.md` § Commit,
-/// Overcommit). 0: every commitment is backed by a free page, short only of
-/// what memmgr's own metadata takes without admission, and a committed fault
-/// takes any free page (docs/limits.md § memmgr).
-pub const OVERCOMMIT_ALLOWANCE_PAGES: u64 = 0;
+/// become evictable. At 0 every commitment is backed by a free page, short only
+/// of what memmgr's own metadata takes without admission. Eviction leaves the
+/// free pool plus the allowance less `promised` as it was; a write lowers it
+/// by the pages its chunk's slot holds no frame for, at most a chunk's pages
+/// less one, so a partly backed chunk spends some of what the allowance
+/// promised.
+#[must_use]
+pub fn allowance(free_slots: u64, swapped: u64, disk: u64, store: u64, committed: u64) -> u64
+{
+    let freed = swapped.saturating_sub(disk).saturating_sub(store);
+    free_slots
+        .saturating_mul(u64::from(DEMAND_CHUNK_PAGES))
+        .saturating_add(committed)
+        .saturating_sub(freed)
+}
 
 /// Pages of each page-table donation a committed region's fault draws from
 /// the region's reservation, and the pages the reservation holds for each
@@ -175,6 +199,37 @@ pub const fn regrow_need(old_len: u64, high_len: u64, new_len: u64) -> CommitNee
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn the_allowance_is_a_chunk_a_free_slot_less_what_compression_freed()
+    {
+        // No swap service registered: no slot, no allowance.
+        assert_eq!(allowance(0, 0, 0, 0, 0), 0);
+        assert_eq!(allowance(4, 0, 0, 0, 0), 64);
+        // A compressed chunk of 16 pages in 3 store pages freed 13 already.
+        assert_eq!(allowance(4, 16, 0, 3, 0), 51);
+        // On disk it frees nothing more and is not counted.
+        assert_eq!(allowance(3, 16, 16, 0, 0), 48);
+        // A lost chunk freed its pages and holds no slot.
+        assert_eq!(allowance(3, 16, 0, 0, 0), 32);
+        // More freed than the free slots hold: none.
+        assert_eq!(allowance(1, 64, 0, 4, 0), 0);
+        assert_eq!(allowance(u64::MAX, 0, 0, 0, 0), u64::MAX);
+    }
+
+    #[test]
+    fn a_committed_chunk_evicted_counts_again_as_promised_holds_it()
+    {
+        // Compressed into 3 store pages: its 16 pages join `promised`, and the
+        // allowance rises by the store pages, so the free pool plus the
+        // allowance less `promised` moves by 13 + 3 - 16 = 0.
+        assert_eq!(allowance(4, 16, 0, 3, 16), 64 + 3);
+        // On disk: its slot taken, its store freed, the 16 pages still promised.
+        assert_eq!(allowance(3, 16, 16, 0, 16), 48 + 16);
+        // With every slot taken, what the committed chunks on disk hold
+        // still backs `promised`.
+        assert_eq!(allowance(0, 32, 32, 0, 32), 32);
+    }
 
     #[test]
     fn growth_in_steps_promises_what_one_registration_of_the_length_does()

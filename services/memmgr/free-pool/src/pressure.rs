@@ -23,6 +23,15 @@ pub const PRESSURE_LOW_DIVISOR: u64 = 16;
 /// (docs/limits.md § memmgr).
 pub const PRESSURE_BAND_DIVISOR: u64 = 128;
 
+/// The hysteresis band of a pool of `pool_total` pages:
+/// `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one.
+#[must_use]
+pub const fn band(pool_total: u64) -> u64
+{
+    let band = pool_total / PRESSURE_BAND_DIVISOR;
+    if band == 0 { 1 } else { band }
+}
+
 /// A memory-pressure level, ordered from the least pressure to the most.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PressureLevel
@@ -78,8 +87,7 @@ pub fn pressure_level(
     {
         return raw;
     }
-    let band = (pool_total / PRESSURE_BAND_DIVISOR).max(1);
-    classify(free.saturating_sub(band), pool_total, swapped).min(prev)
+    classify(free.saturating_sub(band(pool_total)), pool_total, swapped).min(prev)
 }
 
 #[cfg(test)]

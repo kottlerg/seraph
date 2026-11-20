@@ -162,8 +162,8 @@ The full memmgr IPC specification is in
   a later touch faults in a zero-filled page, and a committed region keeps its commitment
 - `QUERY_MEMORY_USAGE` — read the caller's own budget usage, its max, and its subtree's usage
 - `REGISTER_PRESSURE(bits, notification_cap)` — register the Notification memmgr signals on a
-  change of the memory-pressure level; a second replaces the first, and the std runtime
-  registers every process at start
+  change of the memory-pressure level and each opening of the draw room; a second replaces the
+  first, and the std runtime registers every process at start
 - `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
   address space (procmgr-only)
 - `CREATE_SUB_NODE(max) → max, node_handle` — make a sub-node of the caller's own budget node

@@ -8,15 +8,17 @@
 //!
 //! crashd holds such a fault (memmgr's decline codes 6, 7, 8 and 11,
 //! [`holdable`]) in one of [`SLOTS`] slots for at most its stall
-//! (`CRASHD_OOM_STALL_MS`, [`parse_stall`]), resumes it when memmgr's pressure
-//! level falls below `CRITICAL`, and reports and declines it when the stall
-//! passes first. A fault it resumed that faults again at the same page is a
-//! repeat: held again only until its first hold's deadline while the level is
-//! `CRITICAL`, and declined at once otherwise, so no fault loops and the holds
-//! of one fault total at most the stall
-//! (`services/crashd/docs/operation.md` § Hold). A redirected fault reaches
-//! its slot's endpoint only when its thread next runs, so a hold ends on a
-//! fall of the level only once its fault has arrived ([`Holds::arrived`]). A
+//! (`CRASHD_OOM_STALL_MS`, [`parse_stall`]), resumes it when the memory it
+//! waits for is there ([`Waits`]: for a commit overrun, code 11, memmgr's draw
+//! room opening; for the others, memmgr's pressure level falling below
+//! `CRITICAL`), and reports and declines it when the stall passes first. A
+//! fault it resumed that faults again at the same page is a repeat: held again
+//! only until its first hold's deadline while its memory is short, and
+//! declined at once otherwise, so no fault loops and the holds of one fault
+//! total at most the stall (`services/crashd/docs/operation.md` § Hold). A
+//! redirected fault reaches its slot's endpoint only when its thread next
+//! runs, so a hold ends when its memory is there only once its fault has
+//! arrived ([`Holds::arrived`]). A
 //! held fault the kernel withdraws from its slot after it arrived (a stop, a
 //! destroy, a rebind) ends with nothing to answer and is not remembered; one
 //! that has not arrived when its stall passes is undelivered, and its slot's
@@ -94,16 +96,71 @@ pub fn parse_stall(value: Option<&str>) -> Result<Stall, NotMilliseconds>
     })
 }
 
-/// memmgr's pressure level, as crashd's decisions read it.
+/// What a held fault waits for, by memmgr's decline code ([`waits_on`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Level
+pub enum Waits
 {
-    /// At or below memmgr's growth floor (the system reserve and, while pages
-    /// are swapped, the restore headroom): a page outside the reserve cannot be
-    /// had.
-    Critical,
-    /// `LOW` or `NORMAL`: the free pool holds pages above the growth floor.
-    BelowCritical,
+    /// memmgr's pressure level below `CRITICAL`: a fault memmgr declined
+    /// with code 6, 7 or 8, which a page outside the system reserve backs.
+    Level,
+    /// memmgr's draw room open, at a demand chunk's bytes or more
+    /// (`QUERY_POOL_STATUS` `data[16]`, room for any one committed draw): a commit
+    /// overrun, code 11, a committed page the free frames outside the system
+    /// reserve back, which write-out to swap can free while the level stays
+    /// `CRITICAL` (`services/memmgr/docs/memory-pool.md` § Commit,
+    /// Overcommit).
+    DrawRoom,
+}
+
+/// What the fault of decline reason word `reason` waits for: its code is the
+/// word's low 32 bits.
+#[must_use]
+pub const fn waits_on(reason: u64) -> Waits
+{
+    if reason & 0xffff_ffff == 11
+    {
+        Waits::DrawRoom
+    }
+    else
+    {
+        Waits::Level
+    }
+}
+
+/// Whether the memory a fault waits for is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Room
+{
+    /// It is not: the level is `CRITICAL` (at or below memmgr's growth floor,
+    /// the system reserve and, while pages are swapped, the restore headroom),
+    /// or the draw room is below a demand chunk.
+    Short,
+    /// It is: the level is `LOW` or `NORMAL`, or the draw room is open.
+    Open,
+}
+
+/// memmgr's memory as crashd last read it: the room for each kind of fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rooms
+{
+    /// For a fault that waits on the level.
+    pub level: Room,
+    /// For a fault that waits on the draw room.
+    pub draw: Room,
+}
+
+impl Rooms
+{
+    /// The room for a fault that waits for `waits`.
+    #[must_use]
+    pub const fn of(self, waits: Waits) -> Room
+    {
+        match waits
+        {
+            Waits::Level => self.level,
+            Waits::DrawRoom => self.draw,
+        }
+    }
 }
 
 /// The faulting thread and page a fault names: the fault message's badge,
@@ -124,7 +181,7 @@ pub enum Admit
     {
         slot: usize, deadline: u64
     },
-    /// Resume it at once: the level fell after memmgr declined it.
+    /// Resume it at once: its memory came back after memmgr declined it.
     Resume,
     /// Report and decline it now.
     Decline(Refusal),
@@ -136,7 +193,7 @@ pub enum Refusal
 {
     /// Every slot holds a fault.
     SlotsFull,
-    /// It repeats a fault crashd resumed, and the level is not `CRITICAL`.
+    /// It repeats a fault crashd resumed, and its memory is not short.
     Repeat,
     /// The stall is 0: no fault is held.
     NoStall,
@@ -147,6 +204,8 @@ pub enum Refusal
 pub struct Held
 {
     pub key: Key,
+    /// What it waits for.
+    pub waits: Waits,
     /// When the hold began.
     pub since: u64,
     /// When the stall passes: the hold's own, or for a repeat its first
@@ -160,8 +219,8 @@ pub struct Held
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why
 {
-    /// The level fell below `CRITICAL`.
-    LevelFell,
+    /// The memory it waits for is there ([`Rooms::of`]).
+    RoomOpened,
     /// The hold's deadline passed ([`Holds::due`]).
     Due,
 }
@@ -228,34 +287,35 @@ impl Holds
         }
     }
 
-    /// Decide a holdable fault of `key` that arrives at `now` with the pool at
-    /// `level`. A first fault is held until the stall passes at `CRITICAL` and
-    /// resumed at once below it; a repeat of a resumed one is held until its
-    /// first hold's deadline at `CRITICAL` and declined below it. A hold takes
-    /// the slot [`Admit::Hold`] names, which [`Self::end`] frees; an
-    /// [`Admit::Resume`] is remembered for the repeat rule.
-    pub fn admit(&mut self, now: u64, key: Key, level: Level) -> Admit
+    /// Decide a holdable fault of `key`, which waits for `waits`, that arrives
+    /// at `now` with memmgr's memory at `rooms`. A first fault is held until
+    /// the stall passes while its memory is short and resumed at once when it
+    /// is there; a repeat of a resumed one is held until its first hold's
+    /// deadline while its memory is short and declined when it is there. A
+    /// hold takes the slot [`Admit::Hold`] names, which [`Self::end`] frees;
+    /// an [`Admit::Resume`] is remembered for the repeat rule.
+    pub fn admit(&mut self, now: u64, key: Key, waits: Waits, rooms: Rooms) -> Admit
     {
         if self.stall_ms == 0
         {
             return Admit::Decline(Refusal::NoStall);
         }
         self.forget_expired(now);
-        match (self.take_resumed(key), level)
+        match (self.take_resumed(key), rooms.of(waits))
         {
-            (Some(_), Level::BelowCritical) => Admit::Decline(Refusal::Repeat),
-            (Some(deadline), Level::Critical) => self.hold(key, now, deadline),
-            (None, Level::BelowCritical) =>
+            (Some(_), Room::Open) => Admit::Decline(Refusal::Repeat),
+            (Some(deadline), Room::Short) => self.hold(key, waits, now, deadline),
+            (None, Room::Open) =>
             {
                 self.remember(key, now.saturating_add(self.stall_ms));
                 Admit::Resume
             }
-            (None, Level::Critical) => self.hold(key, now, now.saturating_add(self.stall_ms)),
+            (None, Room::Short) => self.hold(key, waits, now, now.saturating_add(self.stall_ms)),
         }
     }
 
-    /// Hold `key` in a free slot until `deadline`.
-    fn hold(&mut self, key: Key, now: u64, deadline: u64) -> Admit
+    /// Hold `key`, which waits for `waits`, in a free slot until `deadline`.
+    fn hold(&mut self, key: Key, waits: Waits, now: u64, deadline: u64) -> Admit
     {
         let Some((slot, free)) = self
             .held
@@ -270,6 +330,7 @@ impl Holds
         };
         *free = Some(Held {
             key,
+            waits,
             since: now,
             deadline,
             arrived: false,
@@ -306,10 +367,10 @@ impl Holds
 
     /// End the hold in `slot` because `why`, with what crashd's receive
     /// `found` on the slot's endpoint, and free the slot; `None` when it held
-    /// no fault, or when the level fell before the fault arrived, which keeps
-    /// the hold until the fault arrives or its deadline passes.
+    /// no fault, or when its memory came back before the fault arrived, which
+    /// keeps the hold until the fault arrives or its deadline passes.
     ///
-    /// A fault found is resumed when the level fell, and remembered for the
+    /// A fault found is resumed when its memory came back, and remembered for the
     /// repeat rule until its deadline, or declined when its deadline passed.
     /// Nothing found after the fault arrived means it was withdrawn: its
     /// thread was stopped (a debugger's attach), destroyed with its process,
@@ -320,7 +381,7 @@ impl Holds
     {
         let cell = self.held.get_mut(slot)?;
         let held = (*cell)?;
-        if let (Found::Nothing, false, Why::LevelFell) = (found, held.arrived, why)
+        if let (Found::Nothing, false, Why::RoomOpened) = (found, held.arrived, why)
         {
             return None;
         }
@@ -329,7 +390,7 @@ impl Holds
         {
             (Found::Nothing, _) if held.arrived => Ended::Withdrawn(held),
             (Found::Nothing, _) => Ended::Undelivered(held),
-            (Found::Fault, Why::LevelFell) =>
+            (Found::Fault, Why::RoomOpened) =>
             {
                 self.remember(held.key, held.deadline);
                 Ended::Resume(held)
@@ -345,6 +406,18 @@ impl Holds
             .iter()
             .enumerate()
             .filter_map(|(slot, held)| held.map(|_| slot))
+    }
+
+    /// The slots that hold a fault whose memory is there at `rooms`.
+    pub fn opened(&self, rooms: Rooms) -> impl Iterator<Item = usize> + '_
+    {
+        self.held
+            .iter()
+            .enumerate()
+            .filter_map(move |(slot, held)| {
+                held.filter(|h| rooms.of(h.waits) == Room::Open)
+                    .map(|_| slot)
+            })
     }
 
     /// A slot whose hold's deadline has passed at `now`, the earliest first;
@@ -424,6 +497,18 @@ mod tests
 
     const STALL: u64 = 5000;
 
+    /// Memory short for every fault.
+    const SHORT: Rooms = Rooms {
+        level: Room::Short,
+        draw: Room::Short,
+    };
+
+    /// Memory there for every fault.
+    const OPEN: Rooms = Rooms {
+        level: Room::Open,
+        draw: Room::Open,
+    };
+
     fn key(badge: u64) -> Key
     {
         Key {
@@ -490,7 +575,7 @@ mod tests
     {
         let mut holds = Holds::new(0);
         assert_eq!(
-            holds.admit(0, key(1), Level::Critical),
+            holds.admit(0, key(1), Waits::Level, SHORT),
             Admit::Decline(Refusal::NoStall)
         );
         assert_eq!(holds.next_deadline(), None);
@@ -501,7 +586,7 @@ mod tests
     {
         let mut holds = Holds::new(STALL);
         assert_eq!(
-            holds.admit(100, key(1), Level::Critical),
+            holds.admit(100, key(1), Waits::Level, SHORT),
             Admit::Hold {
                 slot: 0,
                 deadline: 100 + STALL
@@ -520,7 +605,7 @@ mod tests
         assert_eq!(holds.next_deadline(), None);
         // A fault declined at its deadline is not remembered: its thread died.
         assert_eq!(
-            holds.admit(200 + STALL, key(1), Level::BelowCritical),
+            holds.admit(200 + STALL, key(1), Waits::Level, OPEN),
             Admit::Resume
         );
     }
@@ -529,9 +614,9 @@ mod tests
     fn the_earliest_deadline_is_due_first()
     {
         let mut holds = Holds::new(STALL);
-        let _ = holds.admit(10, key(1), Level::Critical);
-        let _ = holds.admit(5, key(2), Level::Critical);
-        let _ = holds.admit(20, key(3), Level::Critical);
+        let _ = holds.admit(10, key(1), Waits::Level, SHORT);
+        let _ = holds.admit(5, key(2), Waits::Level, SHORT);
+        let _ = holds.admit(20, key(3), Waits::Level, SHORT);
         assert_eq!(holds.next_deadline(), Some(5 + STALL));
         assert_eq!(holds.due(30 + STALL), Some(1));
         let _ = holds.end(1, Why::Due, Found::Fault);
@@ -546,17 +631,17 @@ mod tests
         for badge in 0..SLOTS as u64
         {
             assert!(matches!(
-                holds.admit(0, key(badge), Level::Critical),
+                holds.admit(0, key(badge), Waits::Level, SHORT),
                 Admit::Hold { .. }
             ));
         }
         assert_eq!(
-            holds.admit(0, key(99), Level::Critical),
+            holds.admit(0, key(99), Waits::Level, SHORT),
             Admit::Decline(Refusal::SlotsFull)
         );
         let _ = holds.end(3, Why::Due, Found::Fault);
         assert_eq!(
-            holds.admit(1, key(99), Level::Critical),
+            holds.admit(1, key(99), Waits::Level, SHORT),
             Admit::Hold {
                 slot: 3,
                 deadline: 1 + STALL
@@ -569,19 +654,19 @@ mod tests
     {
         // The level fell between memmgr's decline and crashd's receive.
         let mut holds = Holds::new(STALL);
-        assert_eq!(holds.admit(0, key(1), Level::BelowCritical), Admit::Resume);
+        assert_eq!(holds.admit(0, key(1), Waits::Level, OPEN), Admit::Resume);
         assert_eq!(
-            holds.admit(1, key(1), Level::BelowCritical),
+            holds.admit(1, key(1), Waits::Level, OPEN),
             Admit::Decline(Refusal::Repeat)
         );
         // Another thread, or another page of the same one, is a first fault.
-        assert_eq!(holds.admit(2, key(2), Level::BelowCritical), Admit::Resume);
+        assert_eq!(holds.admit(2, key(2), Waits::Level, OPEN), Admit::Resume);
         let other_page = Key {
             badge: 1,
             page: 0x5000_0000,
         };
         assert_eq!(
-            holds.admit(2, other_page, Level::BelowCritical),
+            holds.admit(2, other_page, Waits::Level, OPEN),
             Admit::Resume
         );
     }
@@ -590,27 +675,27 @@ mod tests
     fn a_repeat_at_critical_is_held_only_until_its_first_deadline()
     {
         let mut holds = Holds::new(STALL);
-        let Admit::Hold { slot, deadline } = holds.admit(0, key(1), Level::Critical)
+        let Admit::Hold { slot, deadline } = holds.admit(0, key(1), Waits::Level, SHORT)
         else
         {
             panic!("not held");
         };
         // The level fell: crashd resumes it, and memmgr declines it again.
         assert!(matches!(
-            holds.end(slot, Why::LevelFell, Found::Fault),
+            holds.end(slot, Why::RoomOpened, Found::Fault),
             Some(Ended::Resume(_))
         ));
         assert_eq!(
-            holds.admit(1000, key(1), Level::Critical),
+            holds.admit(1000, key(1), Waits::Level, SHORT),
             Admit::Hold { slot, deadline }
         );
         // Resumed again, its next repeat below CRITICAL is declined.
         assert!(matches!(
-            holds.end(slot, Why::LevelFell, Found::Fault),
+            holds.end(slot, Why::RoomOpened, Found::Fault),
             Some(Ended::Resume(_))
         ));
         assert_eq!(
-            holds.admit(2000, key(1), Level::BelowCritical),
+            holds.admit(2000, key(1), Waits::Level, OPEN),
             Admit::Decline(Refusal::Repeat)
         );
     }
@@ -619,13 +704,13 @@ mod tests
     fn a_fault_after_its_first_holds_deadline_is_a_new_one()
     {
         let mut holds = Holds::new(STALL);
-        let _ = holds.admit(0, key(1), Level::Critical);
+        let _ = holds.admit(0, key(1), Waits::Level, SHORT);
         assert!(matches!(
-            holds.end(0, Why::LevelFell, Found::Fault),
+            holds.end(0, Why::RoomOpened, Found::Fault),
             Some(Ended::Resume(_))
         ));
         assert_eq!(
-            holds.admit(STALL, key(1), Level::Critical),
+            holds.admit(STALL, key(1), Waits::Level, SHORT),
             Admit::Hold {
                 slot: 0,
                 deadline: 2 * STALL
@@ -640,25 +725,19 @@ mod tests
         for badge in 0..SLOTS as u64
         {
             assert_eq!(
-                holds.admit(badge, key(badge), Level::BelowCritical),
+                holds.admit(badge, key(badge), Waits::Level, OPEN),
                 Admit::Resume
             );
         }
         // Badge 0's entry expires first and gives way to badge 99's.
+        assert_eq!(holds.admit(100, key(99), Waits::Level, OPEN), Admit::Resume);
+        assert_eq!(holds.admit(101, key(0), Waits::Level, OPEN), Admit::Resume);
         assert_eq!(
-            holds.admit(100, key(99), Level::BelowCritical),
-            Admit::Resume
-        );
-        assert_eq!(
-            holds.admit(101, key(0), Level::BelowCritical),
-            Admit::Resume
-        );
-        assert_eq!(
-            holds.admit(102, key(99), Level::BelowCritical),
+            holds.admit(102, key(99), Waits::Level, OPEN),
             Admit::Decline(Refusal::Repeat)
         );
         assert_eq!(
-            holds.admit(103, key(5), Level::BelowCritical),
+            holds.admit(103, key(5), Waits::Level, OPEN),
             Admit::Decline(Refusal::Repeat)
         );
     }
@@ -669,9 +748,9 @@ mod tests
         // destroyed: the slot's endpoint holds nothing when crashd ends the
         // hold, whichever way it ends.
         let mut holds = Holds::new(STALL);
-        for why in [Why::LevelFell, Why::Due]
+        for why in [Why::RoomOpened, Why::Due]
         {
-            let Admit::Hold { slot, .. } = holds.admit(0, key(1), Level::Critical)
+            let Admit::Hold { slot, .. } = holds.admit(0, key(1), Waits::Level, SHORT)
             else
             {
                 panic!("not held");
@@ -689,7 +768,7 @@ mod tests
         // The thread, started again, faults afresh: a first fault, held for
         // a full stall at CRITICAL and resumed at once below it.
         assert_eq!(
-            holds.admit(100, key(1), Level::Critical),
+            holds.admit(100, key(1), Waits::Level, SHORT),
             Admit::Hold {
                 slot: 0,
                 deadline: 100 + STALL
@@ -697,10 +776,7 @@ mod tests
         );
         holds.arrived(0);
         let _ = holds.end(0, Why::Due, Found::Nothing);
-        assert_eq!(
-            holds.admit(200, key(1), Level::BelowCritical),
-            Admit::Resume
-        );
+        assert_eq!(holds.admit(200, key(1), Waits::Level, OPEN), Admit::Resume);
     }
 
     #[test]
@@ -709,29 +785,29 @@ mod tests
         // crashd's redirect reply returned, but the faulting thread has not
         // run since: its fault is not queued on the slot's endpoint yet.
         let mut holds = Holds::new(STALL);
-        let Admit::Hold { slot, deadline } = holds.admit(0, key(1), Level::Critical)
+        let Admit::Hold { slot, deadline } = holds.admit(0, key(1), Waits::Level, SHORT)
         else
         {
             panic!("not held");
         };
-        assert_eq!(holds.end(slot, Why::LevelFell, Found::Nothing), None);
+        assert_eq!(holds.end(slot, Why::RoomOpened, Found::Nothing), None);
         assert_eq!(holds.held_slots().collect::<Vec<_>>(), [slot]);
         assert_eq!(holds.next_deadline(), Some(deadline));
         // The fault arrives and is resumed.
         holds.arrived(slot);
         assert!(matches!(
-            holds.end(slot, Why::LevelFell, Found::Fault),
+            holds.end(slot, Why::RoomOpened, Found::Fault),
             Some(Ended::Resume(_))
         ));
         // A receive that finds the fault before its arrival was seen resumes
         // it too.
-        let Admit::Hold { slot, .. } = holds.admit(10, key(2), Level::Critical)
+        let Admit::Hold { slot, .. } = holds.admit(10, key(2), Waits::Level, SHORT)
         else
         {
             panic!("not held");
         };
         assert!(matches!(
-            holds.end(slot, Why::LevelFell, Found::Fault),
+            holds.end(slot, Why::RoomOpened, Found::Fault),
             Some(Ended::Resume(_))
         ));
     }
@@ -740,7 +816,7 @@ mod tests
     fn a_fault_not_arrived_at_its_deadline_is_undelivered_and_not_remembered()
     {
         let mut holds = Holds::new(STALL);
-        let Admit::Hold { slot, .. } = holds.admit(0, key(1), Level::Critical)
+        let Admit::Hold { slot, .. } = holds.admit(0, key(1), Waits::Level, SHORT)
         else
         {
             panic!("not held");
@@ -756,7 +832,7 @@ mod tests
         // The slot is free again, its endpoint replaced by crashd; the same
         // thread faulting afresh is a first fault.
         assert_eq!(
-            holds.admit(STALL + 1, key(1), Level::Critical),
+            holds.admit(STALL + 1, key(1), Waits::Level, SHORT),
             Admit::Hold {
                 slot,
                 deadline: 2 * STALL + 1
@@ -769,7 +845,7 @@ mod tests
     {
         let mut holds = Holds::new(STALL);
         holds.retire(0);
-        let Admit::Hold { slot, .. } = holds.admit(0, key(1), Level::Critical)
+        let Admit::Hold { slot, .. } = holds.admit(0, key(1), Waits::Level, SHORT)
         else
         {
             panic!("not held");
@@ -778,7 +854,7 @@ mod tests
         assert_eq!(holds.cancel(slot).map(|h| h.key), Some(key(1)));
         assert_eq!(holds.held_slots().count(), 0);
         assert_eq!(
-            holds.admit(1, key(2), Level::Critical),
+            holds.admit(1, key(2), Waits::Level, SHORT),
             Admit::Hold {
                 slot: 1,
                 deadline: 1 + STALL
@@ -787,13 +863,71 @@ mod tests
         for badge in 3..=(SLOTS as u64)
         {
             assert!(matches!(
-                holds.admit(2, key(badge), Level::Critical),
+                holds.admit(2, key(badge), Waits::Level, SHORT),
                 Admit::Hold { .. }
             ));
         }
         assert_eq!(
-            holds.admit(3, key(99), Level::Critical),
+            holds.admit(3, key(99), Waits::Level, SHORT),
             Admit::Decline(Refusal::SlotsFull)
         );
+    }
+
+    #[test]
+    fn a_commit_overrun_waits_on_the_draw_room_and_the_others_on_the_level()
+    {
+        assert_eq!(waits_on(11), Waits::DrawRoom);
+        assert_eq!(waits_on((1 << 32) + 11), Waits::DrawRoom);
+        for code in [6, 7, 8]
+        {
+            assert_eq!(waits_on(code), Waits::Level);
+        }
+        // The level below CRITICAL, the draw room 0: a commit overrun is held,
+        // a fault of code 7 resumed at once.
+        let level_only = Rooms {
+            level: Room::Open,
+            draw: Room::Short,
+        };
+        let mut holds = Holds::new(STALL);
+        let Admit::Hold { slot: commit, .. } = holds.admit(0, key(1), waits_on(11), level_only)
+        else
+        {
+            panic!("a commit overrun with no draw room was not held");
+        };
+        assert_eq!(
+            holds.admit(0, key(2), waits_on(7), level_only),
+            Admit::Resume
+        );
+        // Held at CRITICAL, a fault of code 7 waits on the level alone.
+        let Admit::Hold { slot: level, .. } = holds.admit(1, key(3), waits_on(7), SHORT)
+        else
+        {
+            panic!("a fault of code 7 at CRITICAL was not held");
+        };
+        holds.arrived(commit);
+        holds.arrived(level);
+        // The draw room rising while the level stays CRITICAL opens the
+        // commit overrun's hold only.
+        let draw_only = Rooms {
+            level: Room::Short,
+            draw: Room::Open,
+        };
+        assert_eq!(holds.opened(draw_only).collect::<Vec<_>>(), [commit]);
+        assert_eq!(holds.opened(level_only).collect::<Vec<_>>(), [level]);
+        assert_eq!(holds.opened(SHORT).count(), 0);
+        assert!(matches!(
+            holds.end(commit, Why::RoomOpened, Found::Fault),
+            Some(Ended::Resume(Held {
+                waits: Waits::DrawRoom,
+                ..
+            }))
+        ));
+        // Its repeat with the draw room still open is declined; with it short,
+        // held until the first hold's deadline.
+        assert_eq!(
+            holds.admit(2, key(1), waits_on(11), draw_only),
+            Admit::Decline(Refusal::Repeat)
+        );
+        assert_eq!(holds.opened(OPEN).collect::<Vec<_>>(), [level]);
     }
 }

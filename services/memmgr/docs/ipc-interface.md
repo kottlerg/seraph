@@ -526,6 +526,9 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[12] | `disk_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
 | data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 26) |
 | data[14] | `evictions` — the evictions memmgr has begun, background or direct, a count (not bytes) that only moves up, wrapping ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
+| data[15] | `allowance_bytes` — the overcommit allowance, what `promised` may exceed `data[3]` by: a chunk's pages for every free swap slot (`data[13]`), less the pages compression already freed from the chunks evicted and not on disk, plus the pages of the evicted chunks of committed regions; `0` while no swap service is registered ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
+| data[16] | `draw_room_bytes` — the free pages a fault on a committed page of a process outside the system reserve may take now: all of `data[3]` while `data[15]` is `0` or `data[3]` covers `data[8]`, else those above the growth floor, `data[11]`; open at `DEMAND_CHUNK_BYTES` or more, room for any one committed draw ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
+| data[17] | `uncommitted_free_bytes` — the free pages outside `promised`, which every admission but a commitment's reads and the pressure level is computed from: the lesser of `data[3]` plus `data[15]` less `data[8]`, and `data[3]`; `data[3]` less `data[8]` while `data[15]` is `0` ([`memory-pool.md`](memory-pool.md#commit) § Commit, Promised) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -551,14 +554,15 @@ evicted or restored. `largest_free_bytes`
 backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
 (`data[6]`) is `pool_total / 64` pages. `growth_floor_bytes` (`data[11]`) is
 the reserve while nothing is swapped: a process outside the reserve has its
-grants refused, and its demand faults declined, once `data[3]` less
-`data[8]` less the request would fall below it, and the level is
+grants refused, and its demand faults declined, once `data[17]` less the
+request would fall below it, and the level is
 `PRESSURE_CRITICAL` at or below it. `pressure` (`data[7]`) is the
 level memmgr last signalled to the `REGISTER_PRESSURE` registrants, so a
 registrant woken by its bit reads here the level the bit announced, or a later
 one. `promised_bytes` (`data[8]`) is held for the committed regions' faults:
-every admission reads `data[3]` less it, so a free page it counts is refused to
-every other charge. `store_bytes` (`data[9]`) and `swapped_bytes`
+a commitment is admitted against `data[3]` plus `data[15]` less it, and every
+other admission reads `data[17]`, so while `data[15]` is `0` a free page it
+counts is refused to every other charge. `store_bytes` (`data[9]`) and `swapped_bytes`
 (`data[10]`) rise as memmgr evicts cold chunks under pressure and fall as
 faults restore them or their regions go; their ratio is the store's
 compression; a chunk on disk leaves `data[9]` and stays in `data[10]`, and
@@ -570,7 +574,7 @@ raw, compressed or being written at the second read, whatever was in flight
 at the first; a chunk held raw counts in no other word until it is written.
 A chunk on disk or lost can remain: `data[10]` counts both, `data[12]` only a
 chunk on disk.
-`data[3]` to `data[14]` are appended after the identity terms;
+`data[3]` to `data[17]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
@@ -626,7 +630,7 @@ on the next fault on it, which only a debugger's
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A committed region's charge would leave fewer free pages outside `promised` than the growth floor, for a caller outside the system reserve, or than none |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A committed region's charge would leave fewer of the free pages and the overcommit allowance outside `promised` than the growth floor, for a caller outside the system reserve, or than none ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) |
 | 4 | `INVALID_ARGUMENT` | Bad alignment, zero length, W^X violation, unknown prot or flag bit, unknown badge, or overlap |
 | 8 | `LIMIT` | A committed region's charge would take the subtree of the caller's budget node, or of an ancestor, over its max |
@@ -739,7 +743,8 @@ usage falls below it.
 ### Label 11: `REGISTER_PRESSURE`
 
 Register the Notification memmgr signals when the memory-pressure level
-changes ([`memory-pool.md`](memory-pool.md) § Memory pressure). Privilege:
+changes, or the draw room opens ([`memory-pool.md`](memory-pool.md) § Memory
+pressure). Privilege:
 universal — attributed to the caller by `recv.badge`. The std runtime
 registers every process at start (`runtime/ruststd/README.md` § Process
 Entry), so a process waits on the signal with no call of its own.
@@ -749,16 +754,18 @@ Entry), so a process waits on the signal with no call of its own.
 | Field | Value |
 |---|---|
 | label | 11 |
-| data[0] | `bits` — the bits to send on a change of level; nonzero |
+| data[0] | `bits` — the bits to send on a change of level or an opening of the draw room; nonzero |
 | cap[0] | a Notification cap with Notify rights; ownership transfers to memmgr |
 
 memmgr keeps one registration per process: a second replaces the first, and
 memmgr deletes the cap the first carried, so a client holds one slot of
 memmgr's `CSpace` however often it registers. `PROCESS_DIED` deletes the cap.
-On each change of level memmgr sends `bits` on the cap once, without
-blocking: a send to a Notification ORs the bits in and never waits, and bits
-not yet taken coalesce. The bit says that the level changed; the level is read
-from `QUERY_POOL_STATUS` `data[7]`. A send that fails, for a cap the client
+On each change of level, and each opening of the draw room (`QUERY_POOL_STATUS`
+`data[16]` rising to `DEMAND_CHUNK_BYTES` or more), memmgr sends `bits` on the
+cap once, without blocking: a send to a Notification ORs the bits in and never
+waits, and bits not yet taken coalesce. The bit says that the level changed or
+the draw room opened; the level is read from `QUERY_POOL_STATUS` `data[7]`,
+and the draw room from `data[16]`. A send that fails, for a cap the client
 revoked, is dropped.
 
 **Reply (success):** label 0, no words, no caps.
@@ -800,7 +807,7 @@ length.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The growth's charge would leave fewer free pages outside `promised` than the growth floor, for a caller outside the system reserve, or than none |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | The growth's charge would leave fewer of the free pages and the overcommit allowance outside `promised` than the growth floor, for a caller outside the system reserve, or than none ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit) |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow for the chunk table's new levels |
 | 4 | `INVALID_ARGUMENT` | Unknown badge, no committed region based at `va_base`, a length unaligned, smaller, or past the address space, or growth that meets another region |
 | 8 | `LIMIT` | The growth's charge would take the subtree of the caller's budget node, or of an ancestor, over its max |
@@ -1339,8 +1346,8 @@ code 12 ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 | 7 | No free page can back the faulting page: for a fault in an uncommitted region, the free pool is empty after the deferred runs are rechecked, every free page outside `promised` is in the growth floor and the process's budget node is outside the system reserve, or none is outside `promised`; for any fault, the split of a run larger than the pages to back failed. A fault in a committed region whose draw finds no page is code 11 |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
-| 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Committed fault declines); for a fault on a chunk memmgr is evicting, holds raw or evicted, in either kind of region, the page-table funding the map of the chunk's runs needs would; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
-| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the system reserve, for a process outside it, while the allowance is above 0 and the pool does not cover `promised`) even after memmgr evicted victims in its turn; only an overcommit allowance above 0, or memmgr's own metadata taking free pages without admission, makes it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it as it holds code 7 |
+| 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Committed fault declines); for a fault on a chunk memmgr is evicting, holds raw or evicted, in either kind of region, the page-table funding the map of the chunk's runs needs would, past what a committed region's page-table reservation still holds; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
+| 11 | A commit overrun: the faulting page lies in a committed region, or its chunk is an evicted chunk of one, and the free pool has no page for it (above the growth floor, for a process outside the system reserve, while the allowance is above 0 and the pool does not cover `promised`) even after memmgr evicted victims in its turn; only an overcommit allowance above 0, or memmgr's own metadata taking free pages without admission, makes it reachable ([`memory-pool.md`](memory-pool.md#commit) § Commit, Overcommit). crashd holds it until the draw room opens (`QUERY_POOL_STATUS` `data[16]`) |
 | 12 | The faulting page's chunk is on disk: detail 0 when no swap service is registered to restore it, detail 1 when its slot's bytes failed authentication and the chunk is lost, detail 2 when the swap service could not read the chunk's slot (swapd forwards a held fault with it) and the chunk stays on disk; memmgr itself produces details 0 and 1 only |
 
 Each demand run is recorded on its chunk in the region's chunk table, so

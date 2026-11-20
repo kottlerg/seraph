@@ -4,7 +4,7 @@
 // xtask/src/regex/mod.rs
 
 //! xtask's regular expressions: a Pike VM over a restricted syntax, for the patterns xtask's
-//! checks compile and those a caller passes to `run-parallel`.
+//! checks compile and those a caller passes to `run --runs`.
 //!
 //! The syntax is documented in `xtask/README.md` § Pattern syntax. A search costs at most a
 //! constant amount of work per instruction of the compiled pattern per character of the text,

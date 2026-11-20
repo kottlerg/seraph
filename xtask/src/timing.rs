@@ -16,7 +16,7 @@
 //! `ktest: --- Tier <id>: ... ---` marker, and the run by `ktest: starting` and
 //! `ktest: passed=`. The width is the kernel's `scheduler initialised, N CPUs`
 //! line, the architecture its `Seraph kernel v<version> (<arch>)` banner, and the
-//! host wall time the trailer `cargo xtask run-parallel --save-logs` appends.
+//! host wall time the trailer `cargo xtask run --runs N --save-logs` appends.
 //! The baseline format is documented in `xtask/README.md`
 //! (`cargo xtask ktest-timing`).
 
@@ -30,9 +30,9 @@ use crate::regex::Regex;
 /// `parse_baseline` accepts.
 pub const BASELINE_FORMAT: u32 = 1;
 
-/// Prefix of the trailer line `run-parallel --save-logs` appends to a saved
-/// log: `[run-parallel] key=value ...`.
-pub const TRAILER_PREFIX: &str = "[run-parallel] ";
+/// Prefix of the trailer line `run --runs N --save-logs` appends to a saved
+/// log: `[run] key=value ...`.
+pub const TRAILER_PREFIX: &str = "[run] ";
 
 /// How a cell ended in the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -647,7 +647,7 @@ type RunTime = fn(&Timing) -> Option<f64>;
 const RUN_TIMES: [(&str, RunTime); 3] = [
     ("boot (kernel to ktest: starting)", |t| t.boot_secs),
     ("ktest (starting to last stamp)", |t| t.ktest_secs),
-    ("host wall (run-parallel)", |t| t.wall_secs),
+    ("host wall (run)", |t| t.wall_secs),
 ];
 
 fn fmt_secs(v: Option<f64>) -> String
@@ -1282,7 +1282,7 @@ mod tests
     fn the_trailer_supplies_wall_time_and_fills_a_missing_width()
     {
         let text = "[1.000000] ktest: starting\n\
-                    [run-parallel] arch=riscv64 cpus=65 accel=tcg run=1 outcome=PASS wall_s=71.250\n";
+                    [run] arch=riscv64 cpus=65 accel=tcg run=1 outcome=PASS wall_s=71.250\n";
         let t = parse_log(text).unwrap();
         assert_eq!(t.arch.as_deref(), Some("riscv64"));
         assert_eq!(t.cpus, Some(65));

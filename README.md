@@ -60,15 +60,17 @@ cargo xtask mkdisk                           # repack disk.img after rootfs/ edi
 cargo xtask compose-bundle --harness ktest   # swap boot bundle to ktest harness
 cargo xtask run                              # launch existing sysroot under QEMU
 cargo xtask run --gdb                        # pause at start; GDB on :1234
-cargo xtask test                             # run host-side workspace tests
+cargo xtask run --runs 1 --timeout 300       # one unattended boot, judged by its log
+cargo xtask test                             # fmt, test lints, host and riscv64 unit tests
 cargo xtask lint-docs                        # check docs and source-header rules
-cargo xtask clean [--all]                    # remove sysroot/ and disk images (target/ with --all)
+cargo xtask clean [--all]                    # remove sysroot/, symbols, disk images (+target/)
 ```
 
 Testing spans host-side `cargo xtask test`, in-tree QEMU harnesses
 (`ktest`, `svctest`, `usertest`), host-driven boot tests (`test-kaslr`,
-`test-map-redo`, `test-vmgenid`, `test-terminal`, `test-wedge`, `test-reboot`, `test-signing`,
-`test-cet`, `test-tpm`, `test-debug-port`, `test-hotplug`, `test-gdb`, `test-core-death`), and
+`test-map-redo`, `test-log-level`, `test-vmgenid`, `test-terminal`, `test-wedge`, `test-reboot`,
+`test-powerbutton`, `test-signing`, `test-cet`, `test-tpm`, `test-debug-port`, `test-hotplug`,
+`test-gdb`, `test-core-death`), and
 `test-crash-report`, a host-side check of a boot's serial log; the default boot is interactive and
 runs no harness. See [docs/testing.md](docs/testing.md) for the full model.
 

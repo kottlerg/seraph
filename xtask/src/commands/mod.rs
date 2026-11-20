@@ -23,7 +23,6 @@ pub mod pr_check;
 pub mod release_scope;
 pub mod review;
 pub mod run;
-pub mod run_parallel;
 pub mod symbolize;
 pub mod test;
 pub mod test_cet;

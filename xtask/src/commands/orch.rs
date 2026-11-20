@@ -1153,7 +1153,7 @@ mod tests
         let mut state = fresh();
         let grant = |holder: &str| Change::GrantSet {
             holder: holder.to_owned(),
-            commands: "run-parallel --smp 8".to_owned(),
+            commands: "run --runs 1 --cpus 8".to_owned(),
         };
         let queue = |holder: &str| Change::Queue {
             holder: holder.to_owned(),
@@ -1387,14 +1387,14 @@ mod tests
     {
         let dir = scratch("host-grant");
         let lock_dir = scratch("host-grant-lock");
-        crate::host_lock::write_grant(&lock_dir, "W1", "run-parallel --smp 8").unwrap();
+        crate::host_lock::write_grant(&lock_dir, "W1", "run --runs 1 --cpus 8").unwrap();
         // No batch state at all.
         let line = grant_clear_everywhere(&dir, &lock_dir, SECS).unwrap();
         assert!(line.contains("host grant of W1 ended"));
         assert_eq!(crate::host_lock::read_grant(&lock_dir).unwrap(), None);
         // A batch whose state records no grant.
         start(&dir, "close out the milestone", SECS).unwrap();
-        crate::host_lock::write_grant(&lock_dir, "W2", "run-parallel --smp 8").unwrap();
+        crate::host_lock::write_grant(&lock_dir, "W2", "run --runs 1 --cpus 8").unwrap();
         grant_clear_everywhere(&dir, &lock_dir, SECS).unwrap();
         assert_eq!(crate::host_lock::read_grant(&lock_dir).unwrap(), None);
         // With no grant anywhere the state's refusal stands.
@@ -1577,8 +1577,10 @@ mod tests
             command: OrchGrantCommand::Set {
                 holder: "W1".to_owned(),
                 commands: vec![
-                    "run-parallel".to_owned(),
-                    "--smp".to_owned(),
+                    "run".to_owned(),
+                    "--runs".to_owned(),
+                    "1".to_owned(),
+                    "--cpus".to_owned(),
                     "8".to_owned(),
                 ],
             },
@@ -1587,7 +1589,7 @@ mod tests
             state_change(&command).unwrap(),
             Change::GrantSet {
                 holder: "W1".to_owned(),
-                commands: "run-parallel --smp 8".to_owned(),
+                commands: "run --runs 1 --cpus 8".to_owned(),
             }
         );
     }

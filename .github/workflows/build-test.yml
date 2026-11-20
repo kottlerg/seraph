@@ -89,7 +89,7 @@ jobs:
         # and lets a failing tier surface as a single named cell. The
         # usertest cell additionally runs the terminal interactive test as
         # a further boot — it needs the QMP `test-terminal` runner (not
-        # run-parallel), and colocating it (both programs-surface) avoids a
+        # `run --runs`), and colocating it (both programs-surface) avoids a
         # matrix dimension that would multiply with every arch. See
         # docs/testing.md.
         tester: [svctest, usertest, ktest]
@@ -175,10 +175,10 @@ jobs:
         # The svctest cell also drops crashd (the crash service, default-on), so
         # one boot per arch and profile runs an image without it: its faults,
         # crasher's among them, must kill as with no handler and leave no crash
-        # report (test-crash-report --expect none, below). The usertest cell keeps
-        # crashd and checks the crashme fixture's reports; it stages crashd's
-        # test recipe over the default one, so crashd also writes a core of each
-        # crashme death to /crash, which the crashme tester checks.
+        # report (`--crash-reports none` on its boot, below). The usertest cell
+        # keeps crashd and checks the crashme fixture's reports; it stages
+        # crashd's test recipe over the default one, so crashd also writes a
+        # core of each crashme death to /crash, which the crashme tester checks.
         #
         # The svctest cell also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` (svcmgr does not scan that directory)
@@ -221,9 +221,9 @@ jobs:
         run: cargo xtask check-disk
 
       - name: Run ${{ matrix.tester }}
-        # Per-cell run-parallel budget, for HANG classification, derived as
+        # Per-cell boot budget, for HANG classification, derived as
         # docs/build-system.md § Continuous Integration states from each
-        # cell's worst pass, over every boot the budget bounds (run-parallel,
+        # cell's worst pass, over every boot the budget bounds (run,
         # test-map-redo, test-log-level), in the 174 build-test runs from
         # 2026-11-17 22:44 to 2026-11-18 15:28 UTC (the latest attempt of
         # each); the worst passes are beside the values. riscv64 debug
@@ -262,29 +262,32 @@ jobs:
             "$@"
             took=$((SECONDS - started))
             if [ "$took" -gt $((budget / 2)) ]; then
-              echo "::warning title=run-parallel budget::$3 took ${took} s, over half of the cell's ${budget} s budget; re-derive the budgets (docs/build-system.md § Continuous Integration)."
+              echo "::warning title=boot budget::$3 took ${took} s, over half of the cell's ${budget} s budget; re-derive the budgets (docs/build-system.md § Continuous Integration)."
             fi
           }
           # --save-logs keeps every run's log, a PASS included, for the
-          # run-parallel-saved artifact below, so a cell's per-phase timings
+          # run-saved artifact below, so a cell's per-phase timings
           # can be compared across heads.
-          budgeted cargo xtask run-parallel \
+          # The boot also checks the crash service's report blocks in its log:
+          # the svctest image staged no crashd, so its log must hold no crash
+          # report; the usertest boot ran the crashme fixture with crashd
+          # staged, whose reports must be there and well-formed.
+          crash_reports=
+          case "${{ matrix.tester }}" in
+            svctest)  crash_reports="--crash-reports none" ;;
+            usertest) crash_reports="--crash-reports reports" ;;
+          esac
+          budgeted cargo xtask run \
             --arch ${{ matrix.arch }} \
-            --parallel 1 --runs 1 --timeout "$budget" \
-            --save-logs target/xtask/run-parallel-saved $test_devices
-          if [ "${{ matrix.tester }}" = "svctest" ]; then
-            # No extra boot: the image staged no crashd, so the log must hold
-            # no crash report.
-            cargo xtask test-crash-report --expect none \
-              --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
-          fi
+            --runs 1 --timeout "$budget" \
+            --save-logs target/xtask/run-saved $test_devices $crash_reports
           if [ "${{ matrix.tester }}" = "ktest" ]; then
             # Extra boots: the KASLR randomization test (#252). Boots the
             # ktest bundle already composed above twice and asserts the
             # image slide and direct-map base differ, then asserts the
             # --no-kaslr knob yields the deterministic layout. Host-side
             # (it must observe the layout differing across separate boots),
-            # so it cannot ride run-parallel; both arches.
+            # so it cannot ride `run --runs`; both arches.
             cargo xtask test-kaslr --arch ${{ matrix.arch }}
             # Extra boot: the steps 6 and 7 redo test (#754). Stages the
             # mapredo knob, so the bootloader redoes its first page-table and
@@ -293,11 +296,6 @@ jobs:
             budgeted cargo xtask test-map-redo --arch ${{ matrix.arch }} --timeout "$budget"
           fi
           if [ "${{ matrix.tester }}" = "usertest" ]; then
-            # No extra boot: the crash reports of the crashme fixture, which the
-            # usertest boot above ran with crashd staged, checked in the log it
-            # saved.
-            cargo xtask test-crash-report --expect reports \
-              --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
             # Second boot: the log-level configuration test (#936). Installs a
             # configuration setting vfsd to debug and packs the default-init
             # bundle, boots the usertest staging above under the cell's budget,
@@ -309,7 +307,7 @@ jobs:
             # input through the terminal, and keyboard input again after a
             # restart of the input driver, killed through the GDB stub the
             # test stages and removes). It needs the QMP `test-terminal` runner
-            # (host-side key injection) and so cannot ride run-parallel;
+            # (host-side key injection) and so cannot ride `run --runs`;
             # colocated here (both programs-surface) to avoid a separate
             # matrix dimension. Drop usertest.svc and repack with the rootfs
             # re-mirror, which restores terminal.svc — yielding exactly the
@@ -321,13 +319,13 @@ jobs:
             # idle AP, then the BSP, through QEMU's gdbstub and checks the
             # softlockup watchdog's report, on x86_64 with the wedged CPU's
             # own NMI frame; host-side over the gdbstub, so it cannot ride
-            # run-parallel. Reuses the default interactive boot.
+            # `run --runs`. Reuses the default interactive boot.
             cargo xtask test-wedge --arch ${{ matrix.arch }}
             # Fifth boot: the reboot test. Stages the reboot fixture, whose
             # pwrmgr REBOOT must reset the machine (through acpid's
             # RESET_REG write on x86_64, SBI on riscv64), read from QMP's
             # SHUTDOWN event; host-side over QMP, so it cannot ride
-            # run-parallel. Restores the default interactive boot after.
+            # `run --runs`. Restores the default interactive boot after.
             cargo xtask test-reboot --arch ${{ matrix.arch }}
             # Sixth boot set: the core-death test (#262). One boot per core or
             # critical service (memmgr, procmgr and its reaper thread, svcmgr,
@@ -335,7 +333,7 @@ jobs:
             # killed by a terminal fault made from outside the guest (the GDB
             # stub service, or QEMU's gdbstub for the init-created memmgr and
             # procmgr), and each must power the system off, read from QMP's
-            # SHUTDOWN event; host-side, so it cannot ride run-parallel.
+            # SHUTDOWN event; host-side, so it cannot ride `run --runs`.
             # Reuses the default interactive boot, and repacks it as it was
             # after each stub boot.
             cargo xtask test-core-death --arch ${{ matrix.arch }}
@@ -345,7 +343,7 @@ jobs:
             # tampered bundle entry, that bootloader, and tampered,
             # wrong-role and foreign-signed rootfs images, and checks each
             # verifier's refusal line; host-side, so it cannot ride
-            # run-parallel. Packs the default interactive boot again after.
+            # `run --runs`. Packs the default interactive boot again after.
             if [ "${{ matrix.profile }}" = "release" ]; then
               cargo xtask test-signing --arch ${{ matrix.arch }} --release
             else
@@ -355,27 +353,27 @@ jobs:
               # Eighth boot pair: the VMGENID snapshot-resume test (#395).
               # x86_64 only (QEMU's riscv64 virt machine has no VMGENID);
               # host-side QMP migrate/restore, so it cannot ride
-              # run-parallel. Reuses the default interactive boot the
+              # `run --runs`. Reuses the default interactive boot the
               # test-reboot restore left.
               cargo xtask test-vmgenid
               # Ninth boot: the power-button test. x86_64 only (QEMU's
               # riscv64 virt machine has no fixed power button); presses the
               # ACPI power button over QMP once acpid has armed its events,
               # and pwrmgr must power off through acpid. Host-side over QMP,
-              # so it cannot ride run-parallel. Reuses the default
+              # so it cannot ride `run --runs`. Reuses the default
               # interactive boot.
               cargo xtask test-powerbutton
             fi
           fi
 
-      - name: Upload run-parallel logs
+      - name: Upload run logs
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: run-parallel-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
+          name: run-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
           path: |
-            target/xtask/run-parallel/**/*.log
-            target/xtask/run-parallel/**/*.crash.txt
+            target/xtask/run/**/*.log
+            target/xtask/run/**/*.crash.txt
             target/xtask/test-signing/*/*.log
           if-no-files-found: ignore
 
@@ -386,9 +384,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: run-parallel-saved-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
+          name: run-saved-${{ matrix.arch }}-${{ matrix.profile }}-${{ matrix.tester }}
           path: |
-            target/xtask/run-parallel-saved/*.log
-            target/xtask/run-parallel-saved/*.crash.txt
+            target/xtask/run-saved/*.log
+            target/xtask/run-saved/*.crash.txt
           if-no-files-found: ignore
           retention-days: 14

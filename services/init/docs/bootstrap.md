@@ -251,7 +251,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     `programs/terminal` seeds `devmgr.class.input`, `devmgr.class.framebuffer`, and
     `devmgr.class.serial`; timed seeds `devmgr.class.rtc`; the `debug-echo` fixture, which
     only `cargo xtask test-debug-port` stages, and the GDB stub, which only the
-    `--debug-target` option of `cargo xtask run` and `run-parallel`, and
+    `--debug-target` option of `cargo xtask run`, and
     `test-gdb`, stage, are the only recipes seeding `devmgr.class.debug-port`.
   - `vfsd.mount` / `vfsd.deny` — the endowed `MOUNT_AUTHORITY`-badged and
     `DENY_BADGE`-badged SENDs on vfsd's service endpoint, published as

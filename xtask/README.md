@@ -19,6 +19,8 @@ xtask/
 │   ├── argparse/               # Command-line parser of the table; its reference corpus
 │   │                           #   (§ Command-line parsing)
 │   ├── context.rs              # Resolved workspace and build-output paths
+│   ├── crash_check.rs          # The check of a log's crash-report blocks (run --crash-reports,
+│   │                           #   test-crash-report)
 │   ├── crash_log.rs            # Symbolized crash reports from a serial log (symbolize --log)
 │   ├── debug_stub.rs           # GDB stub staging (--debug-target, test-gdb)
 │   ├── diag.rs                 # Diagnostics of the pull-request, record, and Issue checks
@@ -51,7 +53,8 @@ xtask/
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
-│   ├── commands/               # Subcommand modules (build, capture_acpi, run, run_parallel,
+│   ├── commands/               # Subcommand modules (build, capture_acpi, run (the
+│   │                           #   interactive boot; run/classified.rs, --runs),
 │   │                           #   ktest_timing, symbolize, mkdisk, check_disk, compose_bundle,
 │   │                           #   clean,
 │   │                           #   test, crypto_vectors, compare_images, test_crash_report,
@@ -177,25 +180,37 @@ bootloader embeds.
 
 ### `cargo xtask run`
 
-Launch Seraph under QEMU. `run` is a pure runner — it does not build.
+Boot Seraph under QEMU. `run` is a pure runner — it does not build.
 Run `cargo xtask build` first; `run` errors fast if the sysroot is empty
 or stamped for a different architecture.
 
+`run` has two modes, which launch the same machine from the same launch options. Without
+`--runs` it is one interactive boot: QEMU's serial output is the terminal's, and the guest has
+a display window unless `--display` says otherwise. With `--runs N` it boots N times unattended,
+in waves of `--parallel`, and classifies each run from its log (Classified boots below): how
+CI's cells, burn-in and the local and release host runs boot, and how timing-dependent bugs
+(races, lost wakeups, scheduling order) that one boot cannot reliably expose are shaken out.
+
 ```
-cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
+cargo xtask run [--arch x86_64|riscv64] \
     [--cpus N] [--threads-per-core N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] \
     [--riscv-zkr on|off] [--x86-paging 4|5] [--x86-shadow-stack off|on] \
     [--iommu attached|absent] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
-    [--debug-port PORT [--debug-target NAME]] [--test-devices]
+    [--debug-port PORT [--debug-target NAME]] [--test-devices] \
+    [--display window|framebuffer|headless] [--debug-listen] [--gdb] [--verbose]
+
+cargo xtask run --runs N [launch options] [--display framebuffer|headless] [--debug-listen] \
+    [--parallel N] [--timeout SECONDS] [--pass REGEX] [--fail REGEX] [--fail-also REGEX] \
+    [--require REGEX]... [--crash-reports reports|none] [--fail-grace-secs SECONDS] \
+    [--hold-on-hang] [--save-logs DIR]
 ```
+
+The launch options, the same in both modes:
 
 | Option | Description |
 |---|---|
 | `--arch` | Target architecture (default: `x86_64`) |
-| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39; see [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) § Image Placement): take the bias from the creator's log line (procmgr `spawn image bias=0x… (<argv0>)`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file symbols/<file> -o <bias>`, `<file>` being the store file `symbols/manifest` lists for the image's install path: the installed image is stripped and carries no symbols ([docs/build-system.md](../docs/build-system.md#symbols-store) § Symbols Store) |
-| `--headless` | Run without a display window (`-display none`) |
-| `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=8192`, `boot_protocol::MAX_CPUS`, the boot protocol's CPU ceiling) |
 | `--threads-per-core` | Logical CPUs per core in the guest's topology (default: `1`; must divide `--cpus`). Above 1 the launch passes `-smp <cpus>,threads=<n>`, and QEMU derives the cores from it. On x86_64 the guest's `CPUID` leaf 0BH reports the SMT level under TCG and KVM alike, so `2` boots SMT sibling pairs, which the kernel's placement spreads threads across ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md) § SMT Awareness); ktest's `integration::smt_siblings` logs the cores it finds. On riscv64 the kernel takes each hart as a core of its own whatever the topology says |
 | `--mem` | Guest memory size in MiB (default: `512`) |
@@ -210,6 +225,15 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--debug-port` | Attach the debug port (see Attached devices): a `virtio-serial-pci` device with one `virtconsole` port, which devmgr binds as the debug port ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)), its host end a TCP server on `127.0.0.1:PORT` that does not wait for a client. A host debugger connects with `target remote localhost:PORT`. The console keeps the UART on `-serial stdio` |
 | `--debug-target` | Stage the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) for this boot, attached to the process whose `argv[0]` is `NAME` (for a service, the first word of its recipe's `argv`): write the stub's template from `config/svcmgr/debug/` into `config/svcmgr/services/` with `NAME` appended to its `argv`, repack the disk images in the layout they have (`disk.img`'s block size, and `disk-data.img` when it is there), and print the host GDB command line, with the store file of the process binary's build id (`symbols/<build-id>.elf`) for symbols when a staged recipe or `programs/`/`services/` names it; the stub reports the load bias, so GDB relocates the symbols itself. `NAME` is one word of at most 64 bytes, procmgr's name length. The stub is removed and the images repacked in that layout when QEMU exits; a `run` interrupted before that leaves it staged until a `build` or a full `mkdisk` reinstalls the sysroot's recipes, or the next `run --debug-target`; `mkdisk --repack-only` keeps it. Requires `--debug-port` |
 | `--test-devices` | Attach the test devices (see Attached devices): `edu` and five `pci-testdev` functions, which svctest's devmgr phases drive and which no other launch attaches. svctest fails, naming this flag, when they are missing. The svctest boot also needs the test class files staged ([docs/testing.md](../docs/testing.md#gating) § Gating) |
+| `--display` | What the guest presents for display (see Attached devices): `window`, QEMU std VGA in a display window; `framebuffer`, the adapter with no window (`-display none`), on a host with or without a graphical backend, so the bootloader hands the kernel a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers); `headless`, no adapter, so devmgr spawns no framebuffer driver. Default: `window` for the interactive boot, `headless` with `--runs`, which refuses `window` |
+| `--debug-listen` | Expose the guest's gdbstub without pausing it (QEMU `-s`, tcp::1234), so a wedged guest can be attached to post hoc: `gdb -ex 'target remote :1234'`. With `--runs`, requires `--parallel 1` (one gdbstub port). Conflicts with `--gdb` |
+
+The interactive boot's own options, which `--runs` refuses:
+
+| Option | Description |
+|---|---|
+| `--gdb` | Start QEMU with a GDB server on localhost:1234; QEMU pauses at startup. Userspace binaries are PIE with a per-spawn randomized base (ASLR, #39; see [docs/userspace-memory-model.md](../docs/userspace-memory-model.md) § Image Placement): take the bias from the creator's log line (procmgr `spawn image bias=0x… (<argv0>)`, init `init: <svc> image bias=0x…`, kernel `init: PIE bias=0x…`) and load symbols with `add-symbol-file symbols/<file> -o <bias>`, `<file>` being the store file `symbols/manifest` lists for the image's install path: the installed image is stripped and carries no symbols ([docs/build-system.md](../docs/build-system.md#symbols-store) § Symbols Store) |
+| `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 
 **x86-64** selects an acceleration backend per host: KVM on Linux,
 HVF on macOS, WHPX on Windows, NVMM on NetBSD, or TCG everywhere else
@@ -257,10 +281,10 @@ driver binds ([services/drivers/test-fault/README.md](../services/drivers/test-f
 other launch attaches them, and no production driver binds them. On x86-64 a launch also attaches
 `-device vmgenid,guid=auto`, the VMGENID generation-ID device
 ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Whole-VM-snapshot detection
-(VMGENID)); QEMU's riscv64 `virt` machine has no VMGENID. A non-headless run adds QEMU std VGA: the
+(VMGENID)); QEMU's riscv64 `virt` machine has no VMGENID. `--display window` adds QEMU std VGA: the
 q35 default adapter on x86-64, and on riscv64 `-device VGA` with a `qemu-xhci`/`usb-kbd` pair, added
-only when a `gtk` or `sdl` display backend is available. `--headless` drops the display adapter, so
-no framebuffer is advertised. `run-parallel --display framebuffer` keeps the adapter with no display
+only when a `gtk` or `sdl` display backend is available. `--display headless` drops the display
+adapter, so no framebuffer is advertised. `--display framebuffer` keeps the adapter with no display
 window (`-display none`): the q35 default adapter on x86-64 and `-device VGA` alone on riscv64,
 whatever display backends QEMU has. `--debug-port` adds a `virtio-serial-pci` device, behind the
 IOMMU when one is attached, carrying one `virtconsole` port on the character device `seraph-debug`,
@@ -269,9 +293,9 @@ a TCP server on `127.0.0.1` at the given port (`server=on,wait=off`).
 The disk device presents the logical block size of the image it boots, 512 or 4096 bytes
 (`logical_block_size` and `physical_block_size`), read from the LBA its GPT header sits at, so a
 4Kn image from `mkdisk --block-size 4096` boots as a 4Kn disk with no launch option; every
-launcher (`run`, `run-parallel`, and the `test-*` runners) does the same. `run` and
-`run-parallel` attach `--second-disk` as a second `virtio-blk-pci` device on drive `hd1`, at its
-own image's block size unless `--second-disk-block-size` sets it. A two-disk launch pins the
+launcher (`run` and the `test-*` runners) does the same. `run` attaches `--second-disk` as a
+second `virtio-blk-pci` device on drive `hd1`, at its own image's block size unless
+`--second-disk-block-size` sets it. A two-disk launch pins the
 disks to PCI slots `0x10` and `0x12`, which OVMF (x86-64) and the `virt` host bridge (riscv64)
 route to distinct `INTx` lines, so each disk has a line of its own. With
 `--second-disk-shared-line` the second disk sits at slot `0x14` instead, which both machines route
@@ -303,6 +327,89 @@ Default firmware search paths per host:
 - **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`
 - **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`
 - **Windows / other**: no defaults; the relevant `SERAPH_*` env var is required.
+
+
+#### Classified boots (`--runs`)
+
+With `--runs N`, `run` boots the sysroot N times unattended and classifies each run's outcome
+from its log by patterns in the syntax of § Pattern syntax. Each run boots its own copy of the
+disk images (and of the riscv64 firmware variables), so the runs of a wave never share a writable
+drive. The options below require `--runs`; `--debug-port` requires `--parallel 1` (one host
+port), and `--debug-target` stages the GDB stub, repacking the images in the layout they have,
+before the runs copy them, and removes it after the last run.
+
+| Option | Default | Description |
+|---|---|---|
+| `--runs` | (interactive boot) | Total runs, dispatched in waves of `--parallel`; selects the classified boot |
+| `--parallel` | `1` | Concurrency: QEMU instances in flight at once |
+| `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
+| `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match, and every `--require` and `--crash-reports` check holding, the log is discarded and the run is classified `PASS` |
+| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
+| `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
+| `--require` | (none) | A regex a line of the log must match for the run to pass; repeatable, each must match a line. A run whose `--pass` matched but whose log has no line matching one of them is `FAIL`, its reason naming the pattern |
+| `--crash-reports` | (none) | Check the crash service's report blocks in each passing run's log as [`test-crash-report --expect`](#cargo-xtask-test-crash-report) checks a saved log: `reports`, every block well-formed and the `crashme` fixture's three reports present; `none`, no block at all. A run whose check fails is `FAIL`, its reason the check's; a `QEMU-CRASH` run is not checked. CI's svctest boot passes `none`, its usertest boot `reports` |
+| `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
+| `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
+| `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing` reads |
+
+The default `--fail` regex matches the cross-harness terminal marker
+`[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the
+kernel's own death markers: `KERNEL EXCEPTION` and `FATAL:` for a hardware trap,
+`PANIC at` or `PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler
+wedge-detector dump, and `entropy: SELFTEST FAIL` for a kernel entropy self-test
+failure ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Testing), so a crash
+classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these.
+Override with a never-matching pattern (for example `'$.^'`) to disable.
+
+**Mode-agnostic**: xtask does not know about ktest, svctest, or any other
+rootfs configuration. Pass/fail markers come from the invoker. The default
+`--pass` works for both modes because they emit the same terminal marker
+([docs/testing.md](../docs/testing.md) § Reporting marker). Override for other
+configurations:
+
+```sh
+# Default (works for ktest or svctest)
+cargo xtask run --arch x86_64 --parallel 4 --runs 100
+
+# Custom marker
+cargo xtask run --arch x86_64 --parallel 4 --runs 100 \
+    --pass 'my-app: shutdown clean' --fail 'PANIC'
+```
+
+**Output**: one line per completed run, plus a summary block. Logs for
+non-passing runs are preserved under `target/xtask/run/` as
+`OK-<run>.log`, `FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or `QEMU-CRASH-<run>.log`. PASS
+logs are discarded there (`--save-logs` keeps a copy of every log elsewhere). Beside each log it
+keeps, in either place, whose log holds a crash-report block, a run writes the block's symbolized
+report, `cargo xtask symbolize --log`'s output against the current sysroot and symbols store, as
+`<name>.crash.txt` for `<name>.log`, and removes a stale `<name>.crash.txt` of a log without one; it
+symbolizes only for a run that keeps its log, and a failure writing the report is a warning that
+changes no outcome. Each invocation first removes the run logs and crash reports
+an earlier one left under `target/xtask/run/`, so the preserved files are its own.
+
+**Outcome precedence**:
+1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
+   after `--fail-grace-secs`, bounded by `--timeout`; the verdict is unchanged)
+2. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
+   which is the normal case for kernels that idle after success), unless a `--require` pattern
+   matches no line of the log or the `--crash-reports` check fails → `FAIL`, its reason naming the
+   pattern or the defect
+3. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
+   (`[<seconds>] [<name>] ...`) after it → `FAIL`, its reason naming the lost console: real-logd,
+   which owns the console from the handover on, wrote nothing to it. A run with nothing at all
+   after that line, as one the watchdog cut off there, is not judged by it, nor is a run killed by
+   SIGSEGV or SIGABRT (rule 6), nor a boot with no handover (ktest)
+4. Watchdog timeout → `HANG`
+5. Exit code 0 with no marker → `OK`
+6. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator
+   crashed, not the guest. Tallied in the summary and preserved as
+   `QEMU-CRASH-<run>.log`, but does **not** fail the run (infrastructure flake,
+   not a regression in the OS under test; the recurring case is the QEMU 8.2.x
+   multi-threaded-TCG segfault,
+   [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
+   SIGKILL is excluded (the `--timeout` kill, or an OOM).
+7. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
+   e.g. `139` for SIGSEGV)
 
 ---
 
@@ -357,12 +464,12 @@ size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 `mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
 author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
 image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
-`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-reboot`, `test-hotplug`,
+`test-gdb`, `test-debug-port`, `test-reboot`, `test-hotplug`,
 `test-core-death`, `test-kaslr`, `test-map-redo`, `test-log-level`, and `test-signing` repack
 the images in the layout they find: `disk.img`'s block size, and the data partition on
 `disk-data.img` when that image is there. The nine test commands boot that layout, attaching
-`disk-data.img` as the second disk when it holds the data partition; `run` and `run-parallel`
-attach a second disk only as `--second-disk` names it.
+`disk-data.img` as the second disk when it holds the data partition; `run` attaches a
+second disk only as `--second-disk` names it.
 
 `src/fat.rs` writes each FAT volume in one pass, with its variant chosen by its cluster count as
 the FAT specification's type rule chooses it: at 4 KiB clusters the ESP (64 MiB), root
@@ -484,7 +591,7 @@ Example — switch to ktest, run, then switch back to regular init:
 
 ```sh
 cargo xtask compose-bundle --arch x86_64 --harness ktest
-cargo xtask run --arch x86_64 --headless
+cargo xtask run --arch x86_64 --display headless
 
 # Reset to default-init for the next boot:
 cargo xtask compose-bundle --arch x86_64 --harness init
@@ -655,133 +762,9 @@ each build and clean it runs, which are admitted on their own.
 
 ---
 
-### `cargo xtask run-parallel`
-
-Launch N QEMU instances in parallel against an already-built sysroot,
-classifying each run's outcome via user-supplied pass/fail patterns, in the syntax of
-§ Pattern syntax.
-Intended for shaking out timing-dependent bugs (races, lost wakeups,
-scheduling order) that single-shot `cargo xtask run` cannot reliably
-expose. Requires a populated sysroot — run `cargo xtask build` first.
-
-```
-cargo xtask run-parallel \
-    --arch x86_64|riscv64 \
-    --parallel N \
-    --runs M \
-    [--timeout SECONDS] \
-    [--cpus N] \
-    [--threads-per-core N] \
-    [--mem MIB] \
-    [--riscv-mmu sv39|sv48|sv57] \
-    [--riscv-zkr on|off] \
-    [--x86-paging 4|5] \
-    [--x86-shadow-stack off|on] \
-    [--iommu attached|absent] \
-    [--display headless|framebuffer] \
-    [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
-    [--debug-port PORT [--debug-target NAME]] \
-    [--test-devices] \
-    [--pass REGEX] \
-    [--fail REGEX] \
-    [--fail-also REGEX] \
-    [--fail-grace-secs SECONDS] \
-    [--debug-listen] \
-    [--hold-on-hang] \
-    [--save-logs DIR]
-```
-
-| Option | Default | Description |
-|---|---|---|
-| `--arch` | `x86_64` | Target architecture |
-| `--parallel` | (required) | Concurrency: QEMU instances in flight at once |
-| `--runs` | (required) | Total runs, dispatched in waves of `--parallel` |
-| `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
-| `--cpus` | `4` | vCPUs per guest (bounded by `1..=8192`, `boot_protocol::MAX_CPUS`) |
-| `--threads-per-core` | `1` | Logical CPUs per core in each guest's topology; must divide `--cpus`; same semantics as `cargo xtask run --threads-per-core` |
-| `--mem` | `512` | Guest memory size in MiB |
-| `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
-| `--riscv-zkr` | `on` | Whether the guest RISC-V CPU implements the Zkr entropy source (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-zkr` |
-| `--x86-paging` | `4` | Guest x86-64 paging depth (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-paging` |
-| `--x86-shadow-stack` | `off` | Whether the guest x86-64 CPU offers CET supervisor shadow stacks (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-shadow-stack` |
-| `--iommu` | `attached` | Whether the machine's IOMMU is attached; same semantics as `cargo xtask run --iommu` |
-| `--display` | `headless` | What each guest presents for display, never a window. `headless` drops the display adapter, as `cargo xtask run --headless` does, so devmgr spawns no framebuffer driver. `framebuffer` keeps QEMU std VGA (see Attached devices) with no display window (`-display none`), on a host with or without a graphical backend, so the bootloader hands the kernel a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers) |
-| `--second-disk` | (none) | Attach `PATH` as a second disk, as `cargo xtask run --second-disk` does; each slot boots its own copy, as it does of `disk.img` |
-| `--second-disk-block-size` | (the image's) | Block size of the second disk's device; same semantics as `cargo xtask run --second-disk-block-size` |
-| `--second-disk-shared-line` | off | Place the second disk on the first disk's `INTx` line; same semantics as `cargo xtask run --second-disk-shared-line` |
-| `--debug-port` | (none) | Attach the debug port, served on `127.0.0.1:PORT`; same semantics as `cargo xtask run --debug-port`. Requires `--parallel 1` (one host port) |
-| `--debug-target` | (none) | Stage the GDB stub for these boots, attached to the process named `NAME`, and print the host GDB command line; same semantics as `cargo xtask run --debug-target`. The stub is staged, and the images repacked in the layout they have, before the runs copy them, and removed after the last run. Requires `--debug-port` |
-| `--test-devices` | off | Attach the test devices to each guest; same semantics as `cargo xtask run --test-devices` |
-| `--pass` | `ALL TESTS PASSED` | Regex marking a successful run. The default matches the cross-harness terminal marker `[<harness>] ALL TESTS PASSED` standardised in [docs/testing.md](../docs/testing.md). On match the log is discarded and the run is classified `PASS` |
-| `--fail` | `SOME TESTS FAILED\|KERNEL EXCEPTION\|FATAL:\|PANIC( at \|: )\|=== WATCHDOG\|entropy: SELFTEST FAIL` | Regex marking a failed run; the **first** match wins, the log is preserved as `FAIL-<run>.log`, and failure takes precedence over success. The default's markers are explained below the table |
-| `--fail-also` | (none) | A further regex marking a failed run, matched beside `--fail` rather than in its place, so the default's markers still apply: a log matching either is `FAIL`, at `--fail`'s precedence and with its `--fail-grace-secs` kill. The framebuffer device cell passes `'framebuffer case skipped'`, so a boot in which svctest's framebuffer case skips fails |
-| `--fail-grace-secs` | `10` | After the first `--fail` match, wait this many seconds (bounded by `--timeout`) before SIGKILL, so the trailing fault dump still lands in the log. A crashed run thus aborts ~grace seconds after the first match instead of idling to `--timeout` |
-| `--debug-listen` | off | Expose each guest's gdbstub without pausing it (QEMU `-s`, tcp::1234) so a wedged guest can be attached post-hoc: `gdb -ex 'target remote :1234'`. Requires `--parallel 1` (one gdbstub port) |
-| `--hold-on-hang` | off | On a hard-timeout `HANG` (no `--fail` match), do not kill QEMU: print the attach instructions and block until the instance is terminated externally, preserving the wedged guest for a debugger. Pair with `--debug-listen`. Requires `--parallel 1` |
-| `--save-logs` | off | Also copy every run's log, whatever its outcome, to `DIR/<arch>-<cpus>cpu-<run>.log`, with a trailer line `[run-parallel] arch=<a> cpus=<n> accel=<kvm\|tcg\|...> run=<r> outcome=<STATUS> wall_s=<secs>` appended. DIR is created if absent and never purged, and a file of the same name is overwritten. The copies are what `ktest-timing` reads |
-
-The default `--fail` regex matches the cross-harness terminal marker
-`[<harness>] SOME TESTS FAILED` ([docs/testing.md](../docs/testing.md)) plus the
-kernel's own death markers: `KERNEL EXCEPTION` and `FATAL:` for a hardware trap,
-`PANIC at` or `PANIC:` for a Rust `panic!`, `=== WATCHDOG` for a scheduler
-wedge-detector dump, and `entropy: SELFTEST FAIL` for a kernel entropy self-test
-failure ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Testing), so a crash
-classifies `FAIL` rather than `HANG`. The benign `USERSPACE FAULT` path matches none of these.
-Override with a never-matching pattern (for example `'$.^'`) to disable.
-
-**Mode-agnostic**: xtask does not know about ktest, svctest, or any other
-rootfs configuration. Pass/fail markers come from the invoker. The default
-`--pass` works for both modes because they emit the same terminal marker
-([docs/testing.md](../docs/testing.md) § Reporting marker). Override for other
-configurations:
-
-```sh
-# Default (works for ktest or svctest)
-cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100
-
-# Custom marker
-cargo xtask run-parallel --arch x86_64 --parallel 4 --runs 100 \
-    --pass 'my-app: shutdown clean' --fail 'PANIC'
-```
-
-**Output**: one line per completed run, plus a summary block. Logs for
-non-passing runs are preserved under `target/xtask/run-parallel/` as
-`OK-<run>.log`, `FAIL-<run>.log`, `HANG-<run>.log`, `ERR-<run>.log`, or `QEMU-CRASH-<run>.log`. PASS
-logs are discarded there (`--save-logs` keeps a copy of every log elsewhere). Beside each log it
-keeps, in either place, whose log holds a crash-report block, a run writes the block's symbolized
-report, `cargo xtask symbolize --log`'s output against the current sysroot and symbols store, as
-`<name>.crash.txt` for `<name>.log`, and removes a stale `<name>.crash.txt` of a log without one; it
-symbolizes only for a run that keeps its log, and a failure writing the report is a warning that
-changes no outcome. Each invocation first removes the run logs and crash reports
-an earlier one left under `target/xtask/run-parallel/`, so the preserved files are its own.
-
-**Outcome precedence**:
-1. `--fail` regex matches → `FAIL` (a live match also triggers early abort
-   after `--fail-grace-secs`, bounded by `--timeout`; the verdict is unchanged)
-2. `--pass` regex matches → `PASS` (even if QEMU was watchdog-killed,
-   which is the normal case for kernels that idle after success)
-3. init-logd's last line, `handover complete; init-logd thread exiting`, with no userspace line
-   (`[<seconds>] [<name>] ...`) after it → `FAIL`, its reason naming the lost console: real-logd,
-   which owns the console from the handover on, wrote nothing to it. A run with nothing at all
-   after that line, as one the watchdog cut off there, is not judged by it, nor is a run killed by
-   SIGSEGV or SIGABRT (rule 6), nor a boot with no handover (ktest)
-4. Watchdog timeout → `HANG`
-5. Exit code 0 with no marker → `OK`
-6. Killed by SIGSEGV/SIGABRT with no marker → `QEMU-CRASH` — the host emulator
-   crashed, not the guest. Tallied in the summary and preserved as
-   `QEMU-CRASH-<run>.log`, but does **not** fail the run (infrastructure flake,
-   not a regression in the OS under test; the recurring case is the QEMU 8.2.x
-   multi-threaded-TCG segfault,
-   [QEMU gitlab #2220](https://gitlab.com/qemu-project/qemu/-/issues/2220)).
-   SIGKILL is excluded (the `--timeout` kill, or an OOM).
-7. Other exit code → `ERR rc=<n>` (a signal death is reported as `128 + signum`,
-   e.g. `139` for SIGSEGV)
-
----
-
 ### `cargo xtask ktest-timing`
 
-Read ktest boot logs saved by `run-parallel --save-logs` and report their wall times: the
+Read ktest boot logs saved by `run --runs --save-logs` and report their wall times: the
 measurement of the boundary runs of [docs/testing.md](../docs/testing.md) § Coverage tiers
 (Timing report). Report-only: a flagged row never fails the command.
 
@@ -947,7 +930,7 @@ attach failed, a sysroot file cannot be read, or the image is not an ELF image) 
 `load_bias`, gives the address-form command that resolves its addresses once the binary is known;
 its fields then print as logged. An incomplete or defective block is marked
 `defective block (<defect>)` and printed all the same. A log without a block prints that it has
-none. `run-parallel` writes the same report beside each log it keeps.
+none. `run --runs` writes the same report beside each log it keeps.
 
 ---
 
@@ -1167,11 +1150,11 @@ require, read with `shared/crash-report`, the crate crashd emits them with
 ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)).
 
 ```sh
-# A usertest boot with crashd staged (what CI's usertest cell runs):
-cargo xtask test-crash-report --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
+# A usertest boot with crashd staged (the check CI's usertest cell makes of its boot):
+cargo xtask test-crash-report --log target/xtask/run-saved/x86_64-4cpu-1.log
 
-# A boot of an image that stages no crashd (what CI's svctest cell runs):
-cargo xtask test-crash-report --expect none --log target/xtask/run-parallel-saved/x86_64-4cpu-1.log
+# A boot of an image that stages no crashd (the check CI's svctest cell makes of its boot):
+cargo xtask test-crash-report --expect none --log target/xtask/run-saved/x86_64-4cpu-1.log
 ```
 
 `--expect reports`, the default, also requires one `vm` and one `exception` block of the `crashme`
@@ -1181,8 +1164,8 @@ instruction pointer, matched by the kernel's `handler declined, reason=0x<id>` l
 the stack pointer the kernel's `USERSPACE FAULT` register dump of that line's thread prints, so the
 block read the thread the kernel killed. The `vm` block's `addr` must also be the faulting address
 that dump prints (`cr2` on x86_64, `stval` on riscv64). `--expect none` requires the log to hold
-no block. A log whose `[run-parallel]` trailer, its last line, records a `QEMU-CRASH`, a
-host-emulator crash that `run-parallel` does not count as a failure, is reported skipped, which
+no block. A log whose `[run]` trailer, its last line, records a `QEMU-CRASH`, a
+host-emulator crash that `run --runs` does not count as a failure, is reported skipped, which
 passes the command. The model is in
 [docs/testing.md](../docs/testing.md) § Crash reports.
 
@@ -1208,11 +1191,11 @@ cargo xtask test-map-redo [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [-
     [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] [--test-devices]
 ```
 
-The boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass and fail markers,
-`--timeout` defaulting to 900 s) with `--save-logs` into `target/xtask/test-map-redo/`, and the
-check reads the log saved there (a log an earlier boot left there is removed first). A boot that
-ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fails `run-parallel`;
-a `QEMU-CRASH` boot, a host-emulator crash that `run-parallel` does not count as a failure, is
+The boot runs as `run --runs 1` does (its default pass and fail markers, `--timeout` defaulting
+to 900 s) with `--save-logs` into `target/xtask/test-map-redo/`, and the check reads the log
+saved there (a log an earlier boot left there is removed first). A boot that
+ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fails `run --runs`;
+a `QEMU-CRASH` boot, a host-emulator crash that `run --runs` does not count as a failure, is
 reported skipped, which passes the command.
 
 See [docs/testing.md](../docs/testing.md) for the harness model.
@@ -1245,11 +1228,11 @@ cargo xtask test-log-level [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [
     [--test-devices]
 ```
 
-The boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass and fail markers,
-`--timeout` defaulting to 900 s) with `--save-logs` into `target/xtask/test-log-level/`, and the
-check reads the log saved there (a log an earlier boot left there is removed first). A boot that
-ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fails `run-parallel`;
-a `QEMU-CRASH` boot, a host-emulator crash that `run-parallel` does not count as a failure, is
+The boot runs as `run --runs 1` does (its default pass and fail markers, `--timeout` defaulting
+to 900 s) with `--save-logs` into `target/xtask/test-log-level/`, and the check reads the log
+saved there (a log an earlier boot left there is removed first). A boot that
+ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fails `run --runs`;
+a `QEMU-CRASH` boot, a host-emulator crash that `run --runs` does not count as a failure, is
 reported skipped, which passes the command.
 
 ---
@@ -2018,7 +2001,7 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
 `crypto-vectors`, `compare-images` and `test-signing` as builds (`CliCommand::build_host` in
-`src/cli.rs` names them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-tpm`,
+`src/cli.rs` names them); `run`, `test-terminal`, `test-vmgenid`, `test-tpm`,
 `test-wedge`, `test-reboot`, `test-powerbutton`, `test-core-death`, `test-cet`, `test-kaslr`,
 `test-map-redo`, `test-log-level`, `test-debug-port`, `test-hotplug`, `test-gdb`, `test-signing` and
 `capture-acpi` as boots.
@@ -2026,7 +2009,7 @@ themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`
 and as a boot before its first boot.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
-side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
+side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
 to itself, and so does a boot started with `--alone` or `--timing`.
 
 | Command | Admitted when | Load limit (1-minute average, below) |
@@ -2063,7 +2046,7 @@ The options:
 | `--wait-host <SECS>` | Builds and boots | On a refusal, ask again every 10 s until admitted, for at most SECS; at the bound, fail with the last refusal. Ctrl+C ends the wait at once, with the same failure. Without it a refusal fails at once. |
 | `--host-override` | Builds and boots | Start even when the rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers its record, so other commands see it. |
 | `--alone` | Boots | Run beside no other QEMU, and keep every other boot off the host: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts (`.claude/agents/worker.md` § Host runs). |
-| `--timing` | Boots | A timing-sensitive measurement: beside no other QEMU, under the 10 load limit, with builds refused while it runs. |
+| `--timing` | Boots | A timing-sensitive measurement: beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, with builds refused while it runs. |
 | `--grant <HOLDER>` | Boots | Boot under the exclusive grant of HOLDER. |
 
 The load is the host's `getloadavg` (`/proc/loadavg` on Linux); a host that reports none is not
@@ -2074,7 +2057,7 @@ printed line: each CI job is its own host.
 
 ## Pattern syntax
 
-Every regular expression xtask matches, those `run-parallel` takes (`--pass`, `--fail`,
+Every regular expression xtask matches, those `run --runs` takes (`--pass`, `--fail`,
 `--fail-also`) and those its checks compile (`commit-check`, `pr-check`, `lint-docs`,
 `ktest-timing`, `test-log-level`, `test-map-redo`), runs on xtask's own engine in `src/regex/`: a
 Pike VM over the syntax below. The match reported is the leftmost-first one: the earliest start,

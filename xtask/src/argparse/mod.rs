@@ -748,7 +748,7 @@ pub trait ValueEnum: Sized + Copy + 'static
 }
 
 /// The command-line name of a Rust identifier, as clap's derive wrote it:
-/// lower case, words joined with `-` (`RunParallel` is `run-parallel`,
+/// lower case, words joined with `-` (`KtestTiming` is `ktest-timing`,
 /// `X86Default` is `x86-default`).
 #[must_use]
 pub fn kebab(ident: &str) -> String
@@ -1015,8 +1015,8 @@ macro_rules! value_parser_of {
 pub(crate) use value_parser_of;
 
 /// Declare an enum whose variants are a command's subcommands, and implement
-/// [`Subcommand`] for it. A variant names its command (`RunParallel` is
-/// `run-parallel`) and its doc comment is the command's help. It is a unit
+/// [`Subcommand`] for it. A variant names its command (`KtestTiming` is
+/// `ktest-timing`) and its doc comment is the command's help. It is a unit
 /// variant, a tuple variant of one [`Args`] struct, or a struct variant
 /// whose fields are arguments as [`args!`] takes them.
 macro_rules! subcommands {

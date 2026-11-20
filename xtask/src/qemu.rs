@@ -5,15 +5,15 @@
 
 //! Shared QEMU argv construction and per-launch pflash cache for RISC-V.
 //!
-//! Every command that launches QEMU (`run`, `run-parallel`, `test-kaslr`,
-//! `test-terminal`, `test-vmgenid`) produces its command line from the same
+//! Every command that launches QEMU (`run`, `test-kaslr`, `test-terminal`,
+//! `test-vmgenid`) produces its command line from the same
 //! source of truth (`build_qemu_argv`). Firmware discovery lives in
 //! `firmware::{find_ovmf_code, find_riscv_firmware}`; the padding +
 //! caching of RISC-V pflash images stays here in `prepare_riscv_firmware`.
 //! Acceleration-backend selection lives in `accel::detect_for_arch`. The
 //! interactive launch loop (stdout filtering, terminal restore) stays in
-//! `commands/run.rs`; `run-parallel` spawns QEMU directly against per-slot
-//! log files.
+//! `commands/run/mod.rs`; `run --runs` spawns QEMU directly against per-slot
+//! log files (`commands/run/classified.rs`).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -578,48 +578,26 @@ impl Iommu
     }
 }
 
-/// What a QEMU launch presents for display: QEMU std VGA (the adapter whose
-/// UEFI GOP the bootloader hands the kernel as its framebuffer) with or
-/// without a window, or no adapter at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QemuDisplay
-{
-    /// The adapter and a display window: on `x86_64` q35's default adapter
-    /// with QEMU's default display; on riscv64 `-device VGA` with a
-    /// `qemu-xhci`/`usb-kbd` pair and the `gtk` or `sdl` backend, added only
-    /// when one is available (with no graphical backend QEMU would fall back
-    /// to VNC).
-    Window,
-    /// The adapter with no window (`-display none`), so a headless host still
-    /// boots with a GOP framebuffer and devmgr spawns the framebuffer driver:
-    /// the framebuffer device cell (docs/testing.md "Coverage tiers").
-    Framebuffer,
-    /// No adapter and no window: no GOP, so no framebuffer driver runs.
-    Headless,
-}
-
 crate::argparse::value_enum! {
-    /// The display of a `run-parallel` launch (`--display`): never a window, since
-    /// its guests run unattended and in parallel.
+    /// What a QEMU launch presents for display: QEMU std VGA (the adapter whose
+    /// UEFI GOP the bootloader hands the kernel as its framebuffer) with or
+    /// without a window, or no adapter at all.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum BatchDisplay
+    pub enum QemuDisplay
     {
-        /// No display adapter, the default ([`QemuDisplay::Headless`]).
-        Headless,
-        /// The adapter with no window ([`QemuDisplay::Framebuffer`]).
+        /// The adapter and a display window: on `x86_64` q35's default adapter
+        /// with QEMU's default display; on riscv64 `-device VGA` with a
+        /// `qemu-xhci`/`usb-kbd` pair and the `gtk` or `sdl` backend, added
+        /// only when one is available (with no graphical backend QEMU would fall
+        /// back to VNC).
+        Window,
+        /// The adapter with no window (`-display none`), so a headless host
+        /// still boots with a GOP framebuffer and devmgr spawns the framebuffer
+        /// driver: the framebuffer device cell (docs/testing.md "Coverage
+        /// tiers").
         Framebuffer,
-    }
-}
-
-impl From<BatchDisplay> for QemuDisplay
-{
-    fn from(display: BatchDisplay) -> Self
-    {
-        match display
-        {
-            BatchDisplay::Headless => Self::Headless,
-            BatchDisplay::Framebuffer => Self::Framebuffer,
-        }
+        /// No adapter and no window: no GOP, so no framebuffer driver runs.
+        Headless,
     }
 }
 
@@ -1323,8 +1301,8 @@ fn display_args(spec: &QemuLaunchSpec) -> Vec<String>
 ///   `target/xtask/firmware/riscv/` and regenerated only when the distro
 ///   source is newer or the cached copy is missing/wrong-sized.
 /// - `vars_template_path` is a fresh copy of the NVRAM template, overwritten
-///   on every call. `run` uses this path directly as the writable pflash;
-///   `run-parallel` copies it to per-slot VARS.fd files so concurrent QEMUs
+///   on every call. The interactive `run` uses this path directly as the writable pflash;
+///   `run --runs` copies it to per-slot VARS.fd files so concurrent QEMUs
 ///   don't race on the same NVRAM image.
 ///
 /// Source discovery is delegated to `firmware::find_riscv_firmware`,
@@ -1369,7 +1347,7 @@ pub fn prepare_riscv_firmware(ctx: &Context) -> Result<(PathBuf, PathBuf)>
 /// Validate that the sysroot is populated for `arch` and the disk image
 /// exists.
 ///
-/// Every launcher (`run`, `run-parallel`, and the `test-*` runners) is a
+/// Every launcher (`run` and the `test-*` runners) is a
 /// pure runner — it refuses to launch QEMU if the sysroot is missing
 /// (pointing the caller at `cargo xtask build`) or stamped for the wrong
 /// architecture (pointing the caller at `cargo xtask clean`).

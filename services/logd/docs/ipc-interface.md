@@ -121,7 +121,7 @@ a sender that sets no level logs at info.
     developing the component;
   - trace: per-message or hot-path lines (per IPC, per block, per packet).
 
-  A line that an xtask check or a CI `run-parallel` pattern matches stays
+  A line that an xtask check or a CI `run --runs` pattern matches stays
   at info, whatever the list above gives it, unless the check changes with
   it: a line below info is not sent in a default boot, and a tag after
   `[name] ` breaks a match anchored there. A line a document says a

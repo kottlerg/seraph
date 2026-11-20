@@ -59,6 +59,9 @@ enum Work
     Gpe(u16),
     /// A power request a receiver forwards, and where its status goes.
     Power(Request, SyncSender<u64>),
+    /// A `QUERY_SLEEP` of the state a receiver forwards, and where its
+    /// answer goes.
+    QuerySleep(u8, SyncSender<Result<SleepControl, u64>>),
     /// A power-button press was delivered: clear it and enable the button.
     Rearm,
     /// devmgr's job of the hotplug event of the slot device `.0` ended:
@@ -222,9 +225,18 @@ pub fn serve(
                         sleep(state, ns.as_deref_mut(), platform, power, events)
                     }
                     Request::Reset => reset(power),
-                    Request::WaitEvent => acpid_errors::INVALID_REQUEST,
+                    Request::QuerySleep(_) | Request::WaitEvent => acpid_errors::INVALID_REQUEST,
                 };
                 let _ = status.send(code);
+            }
+            Work::QuerySleep(state, answer) =>
+            {
+                let control = query_sleep(state, ns.as_deref_mut(), platform, power);
+                // A receiver that is gone leaves the derivation here.
+                if let Err(mpsc::SendError(Ok(control))) = answer.send(control)
+                {
+                    let _ = syscall::cap_delete(control.cap);
+                }
             }
             Work::Gpe(gpe) =>
             {
@@ -708,6 +720,7 @@ fn receive(service: u64, mailbox: &Mailbox, work: &Sender<Work>) -> !
         match power::decode(msg.label, msg.badge, msg.word(0), msg.word(1))
         {
             Ok(Request::WaitEvent) => wait_event(mailbox, work, ipc_buf),
+            Ok(Request::QuerySleep(state)) => reply_sleep_control(ask_sleep(state, work), ipc_buf),
             Ok(request) => reply(forward(request, work), ipc_buf),
             Err(code) => reply(code, ipc_buf),
         }
@@ -731,6 +744,40 @@ fn forward(request: Request, work: &Sender<Work>) -> u64
         return acpid_errors::NO_DEVICE;
     }
     answer.recv().unwrap_or(acpid_errors::NO_DEVICE)
+}
+
+/// Forward a `QUERY_SLEEP` of `state` to the evaluation thread and wait
+/// for its answer; `NO_DEVICE` when the thread cannot take it.
+fn ask_sleep(state: u8, work: &Sender<Work>) -> Result<SleepControl, u64>
+{
+    let (answer, answered) = mpsc::sync_channel(1);
+    if work.send(Work::QuerySleep(state, answer)).is_err()
+    {
+        return Err(acpid_errors::NO_DEVICE);
+    }
+    answered.recv().unwrap_or(Err(acpid_errors::NO_DEVICE))
+}
+
+/// Reply to a `QUERY_SLEEP` with `control`: its derivation, its port and
+/// its `SLP_TYPa`, or the status of its refusal. A derivation whose reply
+/// fails, the caller gone, is deleted.
+fn reply_sleep_control(control: Result<SleepControl, u64>, ipc_buf: *mut u64)
+{
+    let control = match control
+    {
+        Ok(control) => control,
+        Err(status) => return reply(status, ipc_buf),
+    };
+    let msg = IpcMessage::builder(acpid_errors::SUCCESS)
+        .word(0, u64::from(control.port))
+        .word(1, u64::from(control.slp_typ))
+        .cap(control.cap)
+        .build();
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
+    if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(control.cap);
+    }
 }
 
 /// `WAIT_EVENT`: wait until an event is pending, or a later `WAIT_EVENT`
@@ -835,32 +882,12 @@ fn sleep(
     armed: Option<SleepEvents<'_>>,
 ) -> u64
 {
-    if !power.can_sleep()
+    let (slp_typ, ns) = match sleep_type("SLEEP", state, ns, platform, power)
     {
-        std::os::seraph::log!(warn: "SLEEP({state}) refused: no PM1a control block");
-        return acpid_errors::NO_DEVICE;
-    }
-    let Some(ns) = ns
-    else
-    {
-        std::os::seraph::log!(warn: "SLEEP({state}) refused: no AML loaded");
-        return acpid_errors::NO_DEVICE;
+        Ok(found) => found,
+        Err(status) => return status,
     };
     let mut ev = Evaluator::new(ns, platform);
-    let slp_typ = match power::sleep_type(&mut ev, state)
-    {
-        Ok(Some(slp_typ)) => slp_typ,
-        Ok(None) =>
-        {
-            std::os::seraph::log!(warn: "SLEEP({state}) refused: no \\_S{state}_ package");
-            return acpid_errors::NO_DEVICE;
-        }
-        Err(why) =>
-        {
-            std::os::seraph::log!(warn: "SLEEP({state}) refused: \\_S{state}_ failed: {why:?}");
-            return acpid_errors::NO_DEVICE;
-        }
-    };
     if let Some(fault) = power::prepare(&mut ev, state)
     {
         std::os::seraph::log!(warn: "\\_PTS({state}) faulted: {fault:?}; sleeping anyway");
@@ -897,6 +924,77 @@ fn sleep(
     {
         acpid_errors::NO_DEVICE
     }
+}
+
+/// The `SLP_TYPa` of sleep state `state` for the request `request` (its
+/// name in the log), read from its `\_Sx_` package in `ns`, and `ns`
+/// back. Refused, logged, with `NO_DEVICE` when `power` holds no
+/// `PM1a_CNT`, no AML is loaded, or the package is absent or unusable.
+fn sleep_type<'n>(
+    request: &str,
+    state: u8,
+    ns: Option<&'n mut Namespace>,
+    platform: &mut Platform<'_>,
+    power: &Power,
+) -> Result<(u16, &'n mut Namespace), u64>
+{
+    if !power.can_sleep()
+    {
+        std::os::seraph::log!(warn: "{request}({state}) refused: no PM1a control block");
+        return Err(acpid_errors::NO_DEVICE);
+    }
+    let Some(ns) = ns
+    else
+    {
+        std::os::seraph::log!(warn: "{request}({state}) refused: no AML loaded");
+        return Err(acpid_errors::NO_DEVICE);
+    };
+    match power::sleep_type(&mut Evaluator::new(&mut *ns, platform), state)
+    {
+        Ok(Some(slp_typ)) => Ok((slp_typ, ns)),
+        Ok(None) =>
+        {
+            std::os::seraph::log!(warn: "{request}({state}) refused: no \\_S{state}_ package");
+            Err(acpid_errors::NO_DEVICE)
+        }
+        Err(why) =>
+        {
+            std::os::seraph::log!(
+                warn: "{request}({state}) refused: \\_S{state}_ failed: {why:?}"
+            );
+            Err(acpid_errors::NO_DEVICE)
+        }
+    }
+}
+
+/// What a `QUERY_SLEEP` hands its caller: a derivation of the `IoPort`
+/// over `PM1a_CNT`, the block's first port, and the state's `SLP_TYPa`.
+struct SleepControl
+{
+    cap: u64,
+    port: u16,
+    slp_typ: u16,
+}
+
+/// `QUERY_SLEEP` of `state`: its `SLP_TYPa`, as [`sleep`] reads it, and a
+/// derivation of the `PM1a_CNT` block `power` holds. The status to reply,
+/// logged, when [`sleep_type`] refuses or the derivation fails.
+fn query_sleep(
+    state: u8,
+    ns: Option<&mut Namespace>,
+    platform: &mut Platform<'_>,
+    power: &Power,
+) -> Result<SleepControl, u64>
+{
+    let (slp_typ, _) = sleep_type("QUERY_SLEEP", state, ns, platform, power)?;
+    let Some((cap, port)) = power.derive_control()
+    else
+    {
+        std::os::seraph::log!(warn: "QUERY_SLEEP({state}) refused: PM1a control block not derived");
+        return Err(acpid_errors::NO_DEVICE);
+    };
+    std::os::seraph::log!("QUERY_SLEEP({state}): PM1a_CNT {port:#x}, SLP_TYPa {slp_typ:#x}");
+    Ok(SleepControl { cap, port, slp_typ })
 }
 
 /// Reset through `RESET_REG`. The reply status when the platform keeps

@@ -59,6 +59,16 @@ impl Power
         false
     }
 
+    /// `None`: no `PM1a_CNT`.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Power`, whose methods read its blocks"
+    )]
+    pub const fn derive_control(&self) -> Option<(u64, u16)>
+    {
+        None
+    }
+
     /// False, with no write: no `RESET_REG`.
     #[expect(
         clippy::unused_self,

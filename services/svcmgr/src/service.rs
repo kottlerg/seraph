@@ -43,8 +43,9 @@ pub struct ServiceEntry
     pub instance: u32,
     /// A `Control`-only cap on the address space of a service init created by
     /// raw syscalls (memmgr, procmgr), from its endowment round: svcmgr bound
-    /// the death observer of the service's other threads with it, and reads
-    /// the space's retained terminal fault back through it in a resync. Zero
+    /// the service's address-space observer on the core-death queue with it,
+    /// and reads the space's retained terminal fault back through it in a
+    /// resync. Zero
     /// for every other service, whose address space procmgr observes for
     /// svcmgr through [`Self::process_handle`].
     pub aspace_cap: u64,
@@ -216,11 +217,12 @@ pub struct RestartRecipe
     /// stop-authority holder finds it, with a stop-badged SEND on its service
     /// endpoint, through `svcmgr_labels::LIST_STOP_SOURCES` (`crate::stop`).
     pub stop_source: Option<svcmgr_defs::stop::StopClass>,
-    /// The recognised shutdown actuator: a receive-only derivation of
-    /// svcmgr's own death queue rides the slot after its seeds and authority
-    /// caps on every launch, so each instance observes svcmgr. See
-    /// `restart::mint_self_death_recv`.
-    pub observes_svcmgr: bool,
+    /// The recognised shutdown actuator: each instance is created pinned
+    /// (`svcmgr_defs::create_flags`), and a receive-only derivation of the
+    /// core-death queue rides the slot after its seeds and authority caps on
+    /// every launch, so each instance observes the core set. See
+    /// `restart::mint_core_death_recv`.
+    pub shutdown_actuator: bool,
     /// Recipe `priority = ...` value; `0` = unspecified (procmgr default).
     /// Replayed on every restart so a respawned child lands at the same
     /// level it got on first launch.

@@ -36,10 +36,10 @@ restart policy ([docs/ipc-interface.md](docs/ipc-interface.md) § Stop authority
 
 svcmgr supervises the top-level services and is itself in the core set with
 memmgr and procmgr: none of the three restarts, and the death of memmgr or
-procmgr powers the system off, and so does svcmgr's own: svcmgr binds death
-observers on its own main thread and address space to a queue whose
-receive-only derivation it serves the shutdown actuator, pwrmgr, which powers
-the system off on an entry. svcmgr holds no
+procmgr powers the system off, and so does svcmgr's own: svcmgr binds the death
+observers of all three on one core-death queue, whose receive-only derivation
+it serves the shutdown actuator, pwrmgr, which powers the system off on an
+entry; svcmgr routes none of the three deaths. svcmgr holds no
 process-creation capabilities; every launch and restart goes through procmgr
 ([docs/supervision.md](../../docs/supervision.md)).
 

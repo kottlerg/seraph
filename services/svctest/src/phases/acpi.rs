@@ -218,8 +218,9 @@ fn authority_deny_phase(caps: &Caps)
     }
 }
 
-/// `SLEEP(5)`, `RESET` and `WAIT_EVENT` through the public `acpid.deny`
-/// reply `UNAUTHORIZED`. acpid serves its endpoint once its start-up is
+/// `SLEEP(5)`, `QUERY_SLEEP(5)`, `RESET` and `WAIT_EVENT` through the public
+/// `acpid.deny` reply `UNAUTHORIZED`, with no cap: `QUERY_SLEEP`'s answer
+/// carries a port block of the sleep register. acpid serves its endpoint once its start-up is
 /// done, which the host-bridge phase before this one waits for; on x86-64
 /// pwrmgr's `WAIT_EVENT` holds one of acpid's two receivers meanwhile, so
 /// these replies come from the other.
@@ -233,6 +234,11 @@ fn power_deny_phase(_caps: &Caps)
             ipc::acpid_labels::SLEEP,
             ipc::acpid_labels::STATE_S5,
             "SLEEP(5)",
+        ),
+        (
+            ipc::acpid_labels::QUERY_SLEEP,
+            ipc::acpid_labels::STATE_S5,
+            "QUERY_SLEEP(5)",
         ),
         (ipc::acpid_labels::RESET, 0, "RESET"),
         (ipc::acpid_labels::WAIT_EVENT, 0, "WAIT_EVENT"),
@@ -250,6 +256,10 @@ fn power_deny_phase(_caps: &Caps)
             ipc::acpid_errors::UNAUTHORIZED,
             "acpid {name} through acpid.deny must reply UNAUTHORIZED (got {:#x})",
             reply.label
+        );
+        assert!(
+            reply.caps().is_empty(),
+            "acpid {name} through acpid.deny must carry no cap"
         );
     }
     let _ = syscall::cap_delete(deny);

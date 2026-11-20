@@ -167,6 +167,13 @@ const HANDOVER_MARKER: &str = "handover complete; init-logd thread exiting";
 /// walk does not find the dying instance.
 const REAP_PAUSE: Duration = Duration::from_secs(2);
 
+/// pwrmgr's line once its power-off on a core death is armed: it observes the
+/// core-death queue, holds the architecture's immediate power-off, and is
+/// pinned, so the power-off after the kill runs with its allocation guard
+/// armed and takes no page fault on memmgr. Kept in sync with
+/// `services/pwrmgr/src/main.rs`.
+const ARMED_MARKER: &str = "pwrmgr] core-death power-off armed";
+
 /// svcmgr's line once its reconciliation has recorded every service. Kept in
 /// sync with `services/svcmgr/src/main.rs`.
 const RECONCILED_MARKER: &str = "service(s) after reconciliation";
@@ -343,6 +350,15 @@ fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Rout
             .collect_until(READY_MARKER, BOOT_TIMEOUT)
             .context("the boot")
             .and_then(|lines| {
+                // memmgr and procmgr are core members: their death is
+                // pwrmgr's alone, and the kill waits until pwrmgr has armed
+                // the power-off that needs neither.
+                if !lines.iter().any(|l| l.contains(ARMED_MARKER))
+                {
+                    guest
+                        .collect_until(ARMED_MARKER, BOOT_TIMEOUT)
+                        .context("pwrmgr's core-death power-off armed")?;
+                }
                 let bias = lines
                     .iter()
                     .find_map(|l| field_hex(l, bp.bias_line))

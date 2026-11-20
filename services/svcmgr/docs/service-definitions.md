@@ -65,7 +65,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). Any number of names; slots past one bootstrap round's `MSG_CAP_SLOTS_MAX` (4) caps ride in further rounds; see [`seed`](#seed). |
 | `provides` | no | Space-separated `name[:auth\|:grant\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
-| `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth` (not `:grant`). Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down, and serves it a receive-only derivation of svcmgr's own death queue in the bootstrap slot after its `seed` caps and its authority slots. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
+| `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth` (not `:grant`). Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down, and serves it a receive-only derivation of the core-death queue in the bootstrap slot after its `seed` caps and its authority slots. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
 | `entropy_authority` | no | `yes` or `no` (default `no`). Endows the service with the kernel's entropy-contribution authority, an `EntropyControl` capability carrying `Contribute`, in the bootstrap slot after its `seed` caps and its debug- and stop-authority slots. One service holds it: the first recipe in launch order that sets it. Mutually exclusive with `log_sink`. A core role. See [`entropy_authority`](#entropy_authority). |
@@ -77,10 +77,10 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 
 There is deliberately no paging key. Demand paging is procmgr's system-wide default
 (see [Fault Handling](../../../docs/fault-handling.md#default-system-pager)); every
-svcmgr-launched service is demand-paged. A pinned opt-out
-(`procmgr_labels::CREATE_PINNED`) exists for DMA drivers, which devmgr spawns — not svcmgr.
-A declarative paging key here is a reserved future extension, to be added only when the
-first pinned svcmgr-launched service exists.
+svcmgr-launched service is demand-paged except the shutdown actuator, which svcmgr creates
+pinned (`procmgr_labels::CREATE_PINNED`) by its role (see
+[`shutdown_actuator`](#shutdown_actuator)). The other pinned opt-out is for DMA drivers, which
+devmgr spawns.
 
 ## `argv` / `env`
 
@@ -394,14 +394,17 @@ or the recorded one is down (its own permanent death included), svcmgr logs `gra
 impossible` and the system continues degraded. An actuator that dies during the call still leaves
 svcmgr blocked.
 
-svcmgr also serves the recognised actuator the means to observe svcmgr's own death
-([Supervision § Observing svcmgr](../../../docs/supervision.md#observing-svcmgr)): on its first
-launch and on every restart, a derivation carrying only the receive right of the event queue
-svcmgr's own main thread and address space post their death to, in the bootstrap slot after the
-`seed` caps and after any debug-authority, stop-authority and entropy-authority slots (`cap[3]` for
-pwrmgr). A derive
-that fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the
-key but is not recognised gets no such slot.
+The recognised actuator owns the death of the core set
+([Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)).
+svcmgr creates it pinned, with `procmgr_labels::CREATE_PINNED`, on its first launch and on every
+restart, so it takes no page fault on memmgr ([Fault Handling § Default System
+Pager](../../../docs/fault-handling.md#default-system-pager)); the role sets the flag, and no
+recipe key does. On each launch it also serves the actuator a derivation carrying only the receive
+right of the core-death queue, which the death observers of svcmgr's, memmgr's and procmgr's main
+threads and address spaces post to, in the bootstrap slot after the `seed` caps and after any
+debug-authority, stop-authority and entropy-authority slots (`cap[3]` for pwrmgr). A derive that
+fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the key but
+is not recognised is created demand-paged and gets no such slot.
 
 ```
 binary            = /services/pwrmgr
@@ -637,7 +640,7 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop` and `reserve` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap (devmgr and vfsd; memmgr's and procmgr's are bound at svcmgr's start on the core-death queue, [Supervision § Observing the Core Set](../../../docs/supervision.md#observing-the-core-set)); record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, entropy-authority, `oom_stop` and `reserve` flags, `stop_source` class, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve`, `oom_stop` and `stop_source` ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`), `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 

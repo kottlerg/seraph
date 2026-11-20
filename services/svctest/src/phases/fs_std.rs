@@ -266,21 +266,22 @@ pub fn std_bulk_write_phase(_: &Caps)
 const FRAME_WRITES: u64 = 64;
 
 /// Recheck rounds [`std_frame_write_pool_phase`] gives the charge to return
-/// to its baseline after the writes.
+/// to its baseline, or below it, after the writes.
 const FRAME_POOL_RECHECKS: u32 = 16;
 
 /// Each frame-path write returns its source page to memmgr when it ends, so
 /// repeated writes leave svctest's own charge where it was.
 ///
 /// The measure is svctest's own budget charge (`QUERY_MEMORY_USAGE`
-/// `data[0]`), which no other process moves: memmgr charges the source page
-/// to svctest when it grants it and uncharges the run only when the run
-/// rejoins the free pool (services/memmgr/docs/ipc-interface.md § Label 10).
+/// `data[0]`), which no other process's allocation raises: memmgr charges the
+/// source page to svctest when it grants it and uncharges the run only when
+/// the run rejoins the free pool (services/memmgr/docs/ipc-interface.md
+/// § Label 10).
 /// The writes go to one offset, so the fs driver's cache does not grow, and a
 /// first write and a first recheck (below) before the baseline settle this
 /// process's heap, stack and `CSpace` slots, the page tables the frame's
-/// mapping funds, and the driver's cache page. A leak of
-/// one page per write leaves the charge [`FRAME_WRITES`] pages up.
+/// mapping funds, and the driver's cache page. A leak of one page per write
+/// leaves the charge [`FRAME_WRITES`] pages up.
 ///
 /// A released run that some mapping or capability still reaches waits on
 /// memmgr's deferred list, charged, until a recheck pools it, and memmgr
@@ -289,6 +290,9 @@ const FRAME_POOL_RECHECKS: u32 = 16;
 /// rechecks the runs before it; for the last ones the phase takes and releases
 /// a one-page grant of its own, which pools at once, up to
 /// [`FRAME_POOL_RECHECKS`] times, until the charge is back at its baseline.
+/// The check fails only a charge above the baseline: an earlier released run
+/// of svctest's that a recheck pools during the measure (the warm-up's among
+/// them) lowers the charge below the baseline, which no leak does.
 pub fn std_frame_write_pool_phase(_: &Caps)
 {
     use std::io::{Seek, SeekFrom, Write};
@@ -313,18 +317,22 @@ pub fn std_frame_write_pool_phase(_: &Caps)
     let (written, _, _) = super::memmgr::memory_usage();
     let mut now = written;
     let mut rechecks = 0;
-    while now != base && rechecks < FRAME_POOL_RECHECKS
+    for round in 1..=FRAME_POOL_RECHECKS
     {
+        if now <= base
+        {
+            break;
+        }
         recheck();
-        rechecks += 1;
+        rechecks = round;
         (now, _, _) = super::memmgr::memory_usage();
     }
     drop(f);
     std::fs::remove_file(path).expect("cleanup");
-    assert_eq!(
-        now, base,
-        "std_frame_write_pool: charge after {FRAME_WRITES} frame writes and {rechecks} \
-         rechecks (right after the writes: {written} pages)"
+    assert!(
+        now <= base,
+        "std_frame_write_pool: charge {now} pages after {FRAME_WRITES} frame writes and \
+         {rechecks} rechecks, above the baseline {base} (right after the writes: {written} pages)"
     );
     std::os::seraph::log!(
         "std_frame_write_pool phase passed (charge {base} pages, {written} after the writes, \

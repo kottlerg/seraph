@@ -16,7 +16,11 @@
 //! sink. While it is stalled, producers wait for nothing: a line is queued
 //! when it fits and dropped, counted, when it does not, until the writer next
 //! completes a write. The count travels with the queue, so the writer reports
-//! it at the point in the stream where the lines went missing.
+//! it at the point in the stream where the lines went missing. A sink with no
+//! driver to write to is unserved: its producers wait for nothing, as for a
+//! stalled one, and the writer holds the queued lines, and the count of those
+//! that did not fit, for the driver resolved next
+//! ([`SinkQueue::offer_unserved`]).
 //! See `services/logd/docs/ipc-interface.md` § Output sinks.
 
 /// Bytes of each of logd's output drivers' queues: how much rendered output
@@ -169,6 +173,18 @@ impl<const N: usize> SinkQueue<N>
             return Offer::Dropped;
         }
         Offer::Wait
+    }
+
+    /// Offer `line` to the queue of a sink that has no driver to write to:
+    /// queued when it fits, and otherwise dropped and counted at once, which
+    /// stalls the sink, as for a producer that waited out the stall bound
+    /// ([`Self::offer`]); never [`Offer::Wait`], since no writer frees space
+    /// until a driver is resolved. The writer writes the queued lines and the
+    /// count to that driver, and its first completed write ends the stall
+    /// ([`Self::written`]).
+    pub fn offer_unserved(&mut self, line: &[u8]) -> Offer
+    {
+        self.offer(line, true)
     }
 
     /// Queue `line`, which fits, carrying the tail's drop count.
@@ -395,6 +411,35 @@ mod tests
             [(b"bbbb".to_vec(), 0), (b"cccc".to_vec(), 2)]
         );
         assert_eq!(q.take_tail_drops(), 1);
+        assert_eq!(q.take_tail_drops(), 0);
+    }
+
+    // Defect caught: a sink with no driver dropping every line, so a driver
+    // resolved late (one whose start failed once, a restarted one) is written
+    // nothing from before it, or holding a producer for the stall bound on
+    // each line while no writer can free space.
+    #[test]
+    fn an_unserved_sink_queues_without_a_wait_and_counts_the_overflow()
+    {
+        let mut q: SinkQueue<20> = SinkQueue::new();
+        assert!(matches!(q.offer_unserved(b"aaaa"), Offer::Queued(_)));
+        assert!(!q.is_stalled());
+        assert!(matches!(q.offer_unserved(b"bbbb"), Offer::Queued(_)));
+        assert_eq!(q.offer_unserved(b"cccc"), Offer::Dropped);
+        assert_eq!(q.offer_unserved(b"dddd"), Offer::Dropped);
+        assert!(q.is_stalled());
+        // A driver is resolved: the writer takes the held lines in order, and
+        // its first completed write ends the stall, so a served sink's
+        // producers wait again.
+        let mut buf = [0u8; 8];
+        q.pop(&mut buf).unwrap();
+        q.written();
+        assert!(!q.is_stalled());
+        assert!(matches!(q.offer(b"eeee", false), Offer::Queued(_)));
+        assert_eq!(
+            drain(&mut q),
+            [(b"bbbb".to_vec(), 0), (b"eeee".to_vec(), 2)]
+        );
         assert_eq!(q.take_tail_drops(), 0);
     }
 

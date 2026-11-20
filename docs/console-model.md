@@ -62,11 +62,13 @@ direct console paths remain as fallbacks for the life of the system.
    has acknowledged the release, since the two writers share no lock and their lines would
    interleave on the UART byte by byte; init-logd writes its last line before that
    acknowledgement ([logd handover protocol](../services/logd/docs/handover-protocol.md)
-   § Startup ordering). The handover is unconditional, so if the serial driver never
-   comes up, userspace serial output after the handover is dropped (real-logd keeps the lines in
-   its history). init-logd has no direct-framebuffer path; before the framebuffer driver is
-   up, userspace output reaches only the UART, and the screen keeps what the kernel's console
-   drew there. Neither console driver is in the bootstrap bundle
+   § Startup ordering). The handover is unconditional: while devmgr serves no serial driver
+   (its start has not finished, or failed), real-logd's serial sink queues the lines after the
+   handover, up to the sink's queue (`SINK_QUEUE_BYTES`), and counts those past it, and writes
+   both once the driver comes up; if it never does, that output never reaches the UART
+   (real-logd keeps every line in its history). init-logd has no direct-framebuffer path; before
+   the framebuffer driver is up, userspace output reaches only the UART, and the screen keeps what
+   the kernel's console drew there. Neither console driver is in the bootstrap bundle
    ([boot-media.md](boot-media.md) § The Bootstrap Closure): devmgr starts both from the root
    filesystem, so a boot whose root does not mount ends with init-logd's lines on the UART and the
    kernel's console on the screen.

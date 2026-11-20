@@ -60,9 +60,11 @@ under its sender's name, the first after the restart included
   stopped by a debugger or dead does not hold the log stream; a sink whose writer could not be
   spawned is written by each line's producer, and a stopped driver then costs every line up to that
   bound (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Output sinks). The panic sink calls
-  the driver directly, each call bounded by the same bound. The emit path never calls devmgr: while
-  no driver is resolved, serial output is dropped while history still accrues; early-boot output is
-  covered by init-logd's direct-UART fallback. logd holds its own diagnostics until init-logd, which
+  the driver directly, each call bounded by the same bound, and drops its output while no driver is
+  resolved. The emit path never calls devmgr: while devmgr serves no driver of a sink's class, the
+  sink queues its lines without a wait, counts those past its queue, and writes both to the driver
+  its class watch resolves next, while history still accrues; early-boot output is covered by
+  init-logd's direct-UART fallback. logd holds its own diagnostics until init-logd, which
   writes the UART directly, has acknowledged the handover release, so the two never write a line at
   once (see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering). See
   [docs/console-model.md](../../docs/console-model.md).

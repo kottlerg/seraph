@@ -675,11 +675,20 @@ pub const SYS_ENDPOINT_BADGE: u64 = 69;
 /// joined range, consuming both. See `core/kernel/docs/syscalls.md`
 /// § `SYS_MMIO_MERGE` (70).
 pub const SYS_MMIO_MERGE: u64 = 70;
+/// `AddressSpace`: stop every thread of an address space without cancelling
+/// any park, and defer every start of one, until [`SYS_ASPACE_RELEASE`],
+/// through a capability carrying [`RIGHTS_AS_CONTROL`]. See
+/// `core/kernel/docs/syscalls.md` § `SYS_ASPACE_HOLD` (71).
+pub const SYS_ASPACE_HOLD: u64 = 71;
+/// `AddressSpace`: end a [`SYS_ASPACE_HOLD`], starting exactly the threads it
+/// stopped, through a capability carrying [`RIGHTS_AS_CONTROL`]. See
+/// `core/kernel/docs/syscalls.md` § `SYS_ASPACE_RELEASE` (72).
+pub const SYS_ASPACE_RELEASE: u64 = 72;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_MMIO_MERGE + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_ASPACE_RELEASE + 1;
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.
@@ -1104,9 +1113,10 @@ pub const RIGHTS_AS_MAP: u64 = 1 << 0;
 pub const RIGHTS_AS_READ: u64 = 1 << 1;
 
 /// `AddressSpace`: control authority — permits registering terminal-fault
-/// death observers (`aspace_bind_notification`). Held by the object's
-/// creator; mask it out of derived copies handed to components that only
-/// need to map within the space.
+/// death observers (`aspace_bind_notification`) and holding and releasing the
+/// space's threads (`SYS_ASPACE_HOLD`, `SYS_ASPACE_RELEASE`). Held by the
+/// object's creator; mask it out of derived copies handed to components that
+/// only need to map within the space.
 pub const RIGHTS_AS_CONTROL: u64 = 1 << 2;
 
 // Endpoint ──

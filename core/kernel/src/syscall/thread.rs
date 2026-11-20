@@ -187,7 +187,9 @@ pub fn sys_thread_configure(tf: UserFrame) -> Result<u64, SyscallError>
 /// The thread must have been configured via `SYS_THREAD_CONFIGURE` first
 /// (`trap_frame` must be non-null). Returns 0 on success, including a start
 /// that a concurrent `SYS_THREAD_STOP` overtakes after its commit (the thread
-/// is then left `Stopped`, unlinked).
+/// is then left `Stopped`, unlinked), and a start of a thread whose address
+/// space is held, which commits it `Stopped` for the release to start
+/// (core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space Hold).
 ///
 /// # Errors
 /// - `InvalidArgument`: arg1 sets a reserved bit (checked first).
@@ -195,8 +197,8 @@ pub fn sys_thread_configure(tf: UserFrame) -> Result<u64, SyscallError>
 /// - `InsufficientRights`: the cap lacks CONTROL.
 /// - `InvalidArgument`: the target is the caller, is not configured, or is not
 ///   `Created`/`Stopped` when the start commits (a concurrent start resumed it,
-///   or it exited or was killed); for a suspended start, is not `Created` when
-///   it commits.
+///   or it exited or was killed), or is stopped by an address-space hold; for a
+///   suspended start, is not `Created` when it commits.
 /// - `Interrupted`: the caller was itself stopped while the start waited for
 ///   the target to settle.
 #[cfg(not(test))]
@@ -291,6 +293,8 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
     {
         crate::sched::StartCommit::Committed(seq) => seq,
         crate::sched::StartCommit::Refused => return Err(SyscallError::InvalidArgument),
+        // The target's address space is held: the release starts it.
+        crate::sched::StartCommit::Deferred => return Ok(0),
         crate::sched::StartCommit::CallerStopped =>
         {
             // Deschedule now, as a self-stop does: the settle loop's
@@ -404,12 +408,11 @@ unsafe fn commit_stopped(
     match unsafe { crate::sched::commit_cancelling_park(tcb, ThreadState::Stopped, None) }
     {
         crate::sched::StateCommit::Committed(running_on) => Ok(running_on),
-        // RefusedState answers an expected-state predicate, which a stop
-        // commit does not pass.
-        crate::sched::StateCommit::RefusedExited | crate::sched::StateCommit::RefusedState =>
-        {
-            Err(SyscallError::InvalidState)
-        }
+        // RefusedState and Deferred answer a start commit, which a stop
+        // commit is not.
+        crate::sched::StateCommit::RefusedExited
+        | crate::sched::StateCommit::RefusedState
+        | crate::sched::StateCommit::Deferred => Err(SyscallError::InvalidState),
     }
 }
 
@@ -435,15 +438,15 @@ unsafe fn commit_stopped(
 /// # Errors
 /// - `InvalidCapability`: no current thread, or arg0 names no Thread cap.
 /// - `InsufficientRights`: the cap lacks CONTROL.
-/// - `InvalidState`: the target is `Created`, `Stopped`, or `Exited` when the
-///   call reads it, or exits before the commit. Two concurrent stops of one
-///   running thread can both succeed.
+/// - `InvalidState`: the target is `Created`, `Stopped` (other than by an
+///   address-space hold, whose stopped thread the stop leaves stopped past the
+///   release), or `Exited` when the call reads it, or exits before the
+///   commit. Two concurrent stops of one running thread can both succeed.
 #[cfg(not(test))]
 pub fn sys_thread_stop(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::ThreadObject;
     use crate::cap::slot::ThreadRights;
-    use crate::sched::thread::ThreadState;
     use crate::syscall::current_tcb;
 
     let thread_idx = tf.arg(0);
@@ -473,16 +476,25 @@ pub fn sys_thread_stop(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     }
 
-    // Unlocked precheck for the InvalidState answer; the commit
+    // Precheck for the InvalidState answer, read under the target's
+    // sched_lock, the owner of its state and hold mark; the commit
     // re-decides only `Exited`, so a stop racing another stop writes
-    // Stopped again and both succeed.
+    // Stopped again and both succeed. A thread stopped only by an
+    // address-space hold is running to its stopper: its stop succeeds and
+    // clears the mark, so the release leaves it stopped.
     // SAFETY: target_tcb validated non-null, the TCB of the Thread object
-    // `thread_slot` pins; state field always valid.
+    // `thread_slot` pins.
+    let target_lock = unsafe { &(*target_tcb).sched_lock };
+    // SAFETY: no lock is held; paired with the unlock_raw below.
+    let f = unsafe { target_lock.lock_raw() };
+    // SAFETY: target_tcb is valid (as above); state is written under its
+    // sched_lock, held here.
     let state = unsafe { (*target_tcb).state };
-    if matches!(
-        state,
-        ThreadState::Created | ThreadState::Exited | ThreadState::Stopped
-    )
+    // SAFETY: as for state; the hold mark is written under the same lock.
+    let mark = unsafe { (*target_tcb).hold };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { target_lock.unlock_raw(f) };
+    if crate::sched::hold::stop_refused(state, mark)
     {
         return Err(SyscallError::InvalidState);
     }

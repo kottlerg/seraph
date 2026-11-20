@@ -45,8 +45,8 @@ use core::prelude::rust_2024::*;
 
 use syscall_abi::{
     MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_EXIT,
-    SYS_ASPACE_HARVEST, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
-    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
+    SYS_ASPACE_HARVEST, SYS_ASPACE_HOLD, SYS_ASPACE_QUERY, SYS_ASPACE_RELEASE, SYS_CAP_COPY,
+    SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
     SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
     SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
     SYS_ENDPOINT_BADGE, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM,
@@ -2063,6 +2063,51 @@ pub unsafe fn aspace_harvest_raw(
     // call changes no mapping, IPC page, or thread entry state.
     let ret = unsafe { syscall4(SYS_ASPACE_HARVEST, aspace_cap, virt, pages, bitmap as u64) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Hold the address space `aspace_cap` names (`SYS_ASPACE_HOLD`): stop every
+/// thread of it without cancelling any park, and defer every start of one,
+/// until [`aspace_release`]. A thread running when the call is made stops
+/// when it next leaves its CPU, which the call waits for; a parked thread
+/// stays parked, and the wake that ends its park leaves it stopped with the
+/// park's outcome kept for its resume. On return no thread of the space runs,
+/// and none runs before the release. See `core/kernel/docs/syscalls.md`
+/// § `SYS_ASPACE_HOLD` (71).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (the capability lacks Control), `InvalidArgument`
+/// (the caller's own address space), `InvalidState` (the space is already
+/// held, or a hold or release of it is in progress), or `Interrupted` (the
+/// caller was stopped, killed or held while it waited; the hold was undone).
+#[inline]
+pub fn aspace_hold(aspace_cap: u64) -> Result<(), i64>
+{
+    // The second argument is unused; no syscall1 raw variant exists.
+    // SAFETY: syscall2 issues the raw syscall instruction; the cap index is a
+    // plain scalar.
+    let ret = unsafe { syscall2(SYS_ASPACE_HOLD, aspace_cap, 0) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
+}
+
+/// Release the held address space `aspace_cap` names
+/// (`SYS_ASPACE_RELEASE`): start exactly the threads [`aspace_hold`]
+/// stopped, including those started during the hold, and let the wakes of
+/// the threads still parked run them as usual. See
+/// `core/kernel/docs/syscalls.md` § `SYS_ASPACE_RELEASE` (72).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability`,
+/// `InsufficientRights` (the capability lacks Control), or `InvalidState`
+/// (the space is not held).
+#[inline]
+pub fn aspace_release(aspace_cap: u64) -> Result<(), i64>
+{
+    // The second argument is unused; no syscall1 raw variant exists.
+    // SAFETY: syscall2 issues the raw syscall instruction; the cap index is a
+    // plain scalar.
+    let ret = unsafe { syscall2(SYS_ASPACE_RELEASE, aspace_cap, 0) };
+    if ret < 0 { Err(ret) } else { Ok(()) }
 }
 
 // ── Event Queue wrappers ──────────────────────────────────────────────────────

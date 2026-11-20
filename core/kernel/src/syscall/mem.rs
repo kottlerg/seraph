@@ -689,6 +689,112 @@ pub fn sys_aspace_harvest(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Err(SyscallError::NotSupported)
 }
 
+// ── SYS_ASPACE_HOLD / SYS_ASPACE_RELEASE ──────────────────────────────────────
+
+/// Resolve the `AddressSpace` capability `idx` of the calling thread, which
+/// must carry `CONTROL`: the caller, the pinned slot, and the space.
+///
+/// # Errors
+/// `InvalidCapability` for no caller or a slot that names no `AddressSpace`,
+/// `InsufficientRights` for a capability without `CONTROL`.
+#[cfg(not(test))]
+fn lookup_control_aspace(
+    idx: u64,
+) -> Result<
+    (
+        *mut crate::sched::thread::ThreadControlBlock,
+        super::PinnedCap,
+        *mut crate::mm::address_space::AddressSpace,
+    ),
+    SyscallError,
+>
+{
+    use crate::cap::object::AddressSpaceObject;
+    use crate::cap::slot::AsRights;
+    use crate::syscall::current_tcb;
+
+    // SAFETY: current_tcb() returns the current thread in syscall context.
+    let caller = unsafe { current_tcb() };
+    if caller.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: caller validated non-null; cspace is set at thread creation.
+    let cspace = unsafe { (*caller).cspace };
+    // SAFETY: cspace is the calling thread's; lookup_cap validates the index,
+    // tag and rights, and pins the slot's object.
+    let slot = unsafe { super::lookup_cap(cspace, idx, AsRights::CONTROL) }?;
+    let obj = slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed AddressSpace; the slot pins the object for the
+    // call.
+    let aspace = unsafe { (*obj.as_ptr().cast::<AddressSpaceObject>()).address_space };
+    if aspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    Ok((caller, slot, aspace))
+}
+
+/// `SYS_ASPACE_HOLD` (71): stop every thread of an address space without
+/// cancelling any park, and defer every start of one, until
+/// `SYS_ASPACE_RELEASE` (`crate::sched::hold::hold_space`).
+///
+/// Arguments, return, and errors: `core/kernel/docs/syscalls.md`
+/// § `SYS_ASPACE_HOLD` (71).
+#[cfg(not(test))]
+pub fn sys_aspace_hold(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::sched::hold::{HoldOutcome, hold_space};
+
+    let (caller, slot, aspace) = lookup_control_aspace(tf.arg(0))?;
+    // A thread cannot hold its own space: the hold would wait for itself.
+    // SAFETY: caller is the running thread's valid TCB; address_space is
+    // read-only after creation.
+    if core::ptr::eq(aspace, unsafe { (*caller).address_space })
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // SAFETY: `slot` pins the space for the call, and it is not the caller's;
+    // caller is the running thread; no lock is held.
+    match unsafe { hold_space(aspace, caller) }
+    {
+        HoldOutcome::Held => Ok(0),
+        HoldOutcome::Busy => Err(SyscallError::InvalidState),
+        HoldOutcome::Cancelled =>
+        {
+            // The caller was stopped, killed or held while it waited, and the
+            // hold was undone: leave the CPU now, as a stopped start does (the
+            // wait's preempt-disabled window made the timer skip its
+            // reschedule). The pin goes first (the pin-before-park rule of
+            // `PinnedCap`).
+            drop(slot);
+            // SAFETY: syscall context on a valid kernel stack, no lock held.
+            unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
+            Err(SyscallError::Interrupted)
+        }
+    }
+}
+
+/// `SYS_ASPACE_RELEASE` (72): end a hold of an address space, starting
+/// exactly the threads it stopped (`crate::sched::hold::release_space`).
+///
+/// Arguments, return, and errors: `core/kernel/docs/syscalls.md`
+/// § `SYS_ASPACE_RELEASE` (72).
+#[cfg(not(test))]
+pub fn sys_aspace_release(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    let (_caller, _slot, aspace) = lookup_control_aspace(tf.arg(0))?;
+    // SAFETY: `_slot` pins the space for the call; no lock is held.
+    if unsafe { crate::sched::hold::release_space(aspace) }
+    {
+        Ok(0)
+    }
+    else
+    {
+        Err(SyscallError::InvalidState)
+    }
+}
+
 // ── SYS_MEMORY_SPLIT ───────────────────────────────────────────────────────────
 
 /// `SYS_MEMORY_SPLIT` (33): carve a virgin tail off a Memory cap.

@@ -17,10 +17,13 @@
 //! The rules and their invariants are stated in
 //! core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space Hold.
 //!
-//! This module holds only the decisions, as pure functions of the states, so
-//! the host tests below can drive them through every reachable state of a
-//! space; the code that applies them under `sched_lock` and the CPU locks
-//! is in `sched/mod.rs`.
+//! The decisions are pure functions of the states, so the host tests below
+//! can drive them through every reachable state of a space. The hold and the
+//! release that apply them to the threads of a space under `sched_lock` and
+//! the CPU locks are [`hold_space`] and [`release_space`] below; the
+//! diverts and the start commit that apply them to one thread are in
+//! `sched/mod.rs` (`enqueue_and_wake`, `schedule()`'s requeue,
+//! `commit_state_under_all_locks`).
 
 use super::thread::ThreadState;
 
@@ -92,12 +95,11 @@ pub enum HoldVisit
     /// `Ready`: commit `Stopped` under every CPU lock, draining its run-queue
     /// link, and mark it [`HoldMark::Stopped`].
     Stop,
-    /// `Running`: mark it [`HoldMark::Pending`] and prod its CPU, which
-    /// diverts it at its next `schedule()`.
-    MarkRunning,
-    /// `Blocked`: mark it [`HoldMark::Pending`]; the wake that ends its park
-    /// diverts it.
-    MarkBlocked,
+    /// `Running` or `Blocked`: mark it [`HoldMark::Pending`]. A running
+    /// thread is diverted when it next leaves its CPU runnable (its slice
+    /// expiry, a yield, a refused park), a parked one by the wake that ends its
+    /// park.
+    Mark,
     /// `Created`, `Stopped` or `Exited`: nothing. A `Created` thread's start
     /// is deferred, and a thread a debugger stopped stays stopped.
     Leave,
@@ -110,8 +112,7 @@ pub const fn hold_visit(state: ThreadState) -> HoldVisit
     match state
     {
         ThreadState::Ready => HoldVisit::Stop,
-        ThreadState::Running => HoldVisit::MarkRunning,
-        ThreadState::Blocked => HoldVisit::MarkBlocked,
+        ThreadState::Running | ThreadState::Blocked => HoldVisit::Mark,
         ThreadState::Created | ThreadState::Stopped | ThreadState::Exited => HoldVisit::Leave,
     }
 }
@@ -202,6 +203,474 @@ pub const fn stop_refused(state: ThreadState, mark: HoldMark) -> bool
     }
 }
 
+// ── Applying the decisions ────────────────────────────────────────────────────
+
+#[cfg(not(test))]
+use super::thread::ThreadControlBlock;
+#[cfg(not(test))]
+use crate::mm::address_space::AddressSpace;
+
+/// Outcome of [`hold_space`].
+#[cfg(not(test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldOutcome
+{
+    /// The space is held: none of its threads is current on any CPU, each
+    /// one's register save has published, and none runs before the release.
+    Held,
+    /// The space was not `Free`: it is held, or a hold or a release of it is
+    /// in progress. Nothing was done.
+    Busy,
+    /// The calling thread was itself stopped, killed, or marked by a hold of
+    /// its own space while it waited. The hold was undone, as a release undoes
+    /// it, and the caller must leave its CPU.
+    Cancelled,
+}
+
+/// Hold the address space `aspace`: stop every thread of it without
+/// cancelling any park, and defer every start of one, until
+/// [`release_space`] (core/kernel/docs/thread-lifecycle-and-sleep.md
+/// § Address-Space Hold).
+///
+/// The hold moves the space `Free` to `Holding`, then walks the thread
+/// registry under its lock and, under each thread's `sched_lock`, applies
+/// [`hold_visit`]: a `Ready` thread is committed `Stopped` under every CPU
+/// lock, its run-queue link drained, and a `Running` or `Blocked` one is
+/// marked [`HoldMark::Pending`]. It then waits, preempt-disabled with
+/// interrupts enabled, until no CPU runs a thread of the space and each one's
+/// register save has published (spin site `hold:settle`), and stores `Held`.
+/// A marked running thread leaves its CPU at its next reschedule (its slice
+/// expiry, at most one quantum, or its own park or yield), which diverts it.
+///
+/// A pass that must wait first reads the caller, under its `sched_lock`: a
+/// caller stopped, `Exited`, or marked by a hold of its own space is waited
+/// for by others, so its hold is undone (the release walk) and
+/// [`HoldOutcome::Cancelled`] returned; two threads holding each other's
+/// space would otherwise wait for each other forever.
+///
+/// The walk holds the registry lock across every live thread, with interrupts
+/// disabled on this CPU, and takes every CPU lock once per `Ready` thread of
+/// the space, as the object-teardown walk does.
+///
+/// # Safety
+/// `aspace` must be a valid address space that the caller keeps live for the
+/// call (its capability pinned), other than the caller's own; `caller` must
+/// be the running thread's TCB; no lock may be held.
+#[cfg(not(test))]
+pub unsafe fn hold_space(
+    aspace: *const AddressSpace,
+    caller: *mut ThreadControlBlock,
+) -> HoldOutcome
+{
+    // SAFETY: aspace is valid and live for the call (contract).
+    let space = unsafe { &*aspace };
+    if !space.swap_hold_state(HoldState::Free, HoldState::Holding)
+    {
+        return HoldOutcome::Busy;
+    }
+    let visit = |tcb| {
+        // SAFETY: the registry walk passes a registered TCB and holds only
+        // its own lock.
+        unsafe { hold_visit_thread(tcb, aspace) };
+    };
+    // SAFETY: no lock is held (contract); the visit registers no thread, takes
+    // only a sched_lock and the run-queue locks, and waits on no CPU.
+    unsafe { super::thread_registry::for_each(visit) };
+    // SAFETY: aspace is valid (contract), and settle_spin calls this with no
+    // lock held.
+    let done = || unsafe { held_settled(aspace) };
+    // SAFETY: caller is the running thread (contract), and settle_spin calls
+    // this with no lock held.
+    let abandon = || unsafe { caller_must_leave(caller) };
+    // SAFETY: no lock is held; the closures take only a sched_lock, a CPU lock
+    // or the registry lock, one at a time, and wait on nothing.
+    let settled = unsafe { settle_spin(super::SPIN_SITE_HOLD_SETTLE, "hold_space", done, abandon) };
+    if settled
+    {
+        space.set_hold_state(HoldState::Held);
+        return HoldOutcome::Held;
+    }
+    // Undo the hold. This hold owns the space's state until it stores `Free`,
+    // so no other hold or release runs meanwhile.
+    space.set_hold_state(HoldState::Releasing);
+    // SAFETY: aspace valid (contract); no lock is held.
+    unsafe { release_walk(aspace) };
+    space.set_hold_state(HoldState::Free);
+    HoldOutcome::Cancelled
+}
+
+/// Release the held address space `aspace`: start exactly the threads the
+/// hold stopped, diverted, or whose start it deferred, and clear the mark of
+/// each thread still parked; `false`, doing nothing, when the space is not
+/// `Held`.
+///
+/// The release moves the space `Held` to `Releasing`, walks the thread
+/// registry applying [`release_visit`] under each thread's `sched_lock`,
+/// and stores `Free`. A thread to start is committed `Ready` under every
+/// CPU lock, with its start generation advanced, only once it is settled
+/// (`start_ready_to_link`), then linked as a `SYS_THREAD_START` links it.
+/// One that is not yet (a thread diverted by a wake while still switching
+/// out, or a waker still releasing its pin) is left for another pass, made
+/// with interrupts enabled after a spin (spin site `release:settle`); each
+/// such wait is the tail of a switch or of a wake already under way, which no
+/// other thread's progress gates.
+///
+/// # Safety
+/// As for [`hold_space`], without the `caller`.
+#[cfg(not(test))]
+pub unsafe fn release_space(aspace: *const AddressSpace) -> bool
+{
+    // SAFETY: aspace is valid and live for the call (contract).
+    let space = unsafe { &*aspace };
+    if !space.swap_hold_state(HoldState::Held, HoldState::Releasing)
+    {
+        return false;
+    }
+    // SAFETY: aspace valid (contract); no lock is held.
+    unsafe { release_walk(aspace) };
+    space.set_hold_state(HoldState::Free);
+    true
+}
+
+/// Walk the registry applying [`release_visit`] to every thread of
+/// `aspace` until no thread to start is left unsettled.
+///
+/// # Safety
+/// `aspace` must be valid; no lock may be held.
+#[cfg(not(test))]
+unsafe fn release_walk(aspace: *const AddressSpace)
+{
+    let pass = || {
+        let mut unsettled = false;
+        let visit = |tcb| {
+            // SAFETY: the registry walk passes a registered TCB and holds
+            // only its own lock.
+            unsettled |= unsafe { release_visit_thread(tcb, aspace) };
+        };
+        // SAFETY: no lock is held (contract); the visit registers no thread,
+        // takes only a sched_lock and the run-queue locks, and waits on no
+        // CPU (the link sends at most an IPI).
+        unsafe { super::thread_registry::for_each(visit) };
+        !unsettled
+    };
+    if pass()
+    {
+        return;
+    }
+    // SAFETY: no lock is held.
+    unsafe {
+        settle_spin(
+            super::SPIN_SITE_RELEASE_SETTLE,
+            "release_space",
+            pass,
+            || false,
+        )
+    };
+}
+
+/// Apply [`hold_visit`] to `tcb` when it executes in `aspace`.
+///
+/// # Safety
+/// `tcb` must be a registered TCB (the registry walk's argument); the
+/// caller holds the registry lock and no other.
+#[cfg(not(test))]
+unsafe fn hold_visit_thread(tcb: *mut ThreadControlBlock, aspace: *const AddressSpace)
+{
+    // SAFETY: tcb is registered, so valid; address_space is read-only after
+    // creation.
+    if !core::ptr::eq(unsafe { (*tcb).address_space }, aspace)
+    {
+        return;
+    }
+    // SAFETY: tcb valid, as above.
+    let lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: only the registry lock is held, which orders before sched_lock;
+    // paired with the unlock_raw below.
+    let f = unsafe { lock.lock_raw() };
+    // SAFETY: tcb valid; state is written under its sched_lock, held here.
+    match hold_visit(unsafe { (*tcb).state })
+    {
+        HoldVisit::Stop =>
+        {
+            // SAFETY: tcb valid and `Ready` under its held sched_lock; no CPU
+            // lock is held.
+            unsafe { stop_ready_under_cpu_locks(tcb) };
+        }
+        HoldVisit::Mark =>
+        {
+            // SAFETY: tcb valid; the mark is written under its sched_lock, held.
+            unsafe { (*tcb).hold = HoldMark::Pending };
+        }
+        HoldVisit::Leave =>
+        {}
+    }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(f) };
+}
+
+/// Commit the `Ready` thread `tcb` `Stopped` and marked
+/// [`HoldMark::Stopped`] under every CPU lock, draining its run-queue link,
+/// as a `SYS_THREAD_STOP` commit does. A CPU whose dispatch has already
+/// dequeued it finds it `Stopped` at its dispatch flip and runs its idle
+/// thread instead.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold its `sched_lock` and no
+/// CPU lock.
+#[cfg(not(test))]
+unsafe fn stop_ready_under_cpu_locks(tcb: *mut ThreadControlBlock)
+{
+    let cpu_count = super::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; the scheduler slab is initialised.
+        let sched = unsafe { super::scheduler_for(cpu) };
+        // SAFETY: taken in ascending order after the sched_lock; paired with
+        // unlock_saved_flags below.
+        unsafe { sched.lock_saving_flags() };
+    }
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "fields of one valid TCB under its held sched_lock and every CPU lock"
+    )]
+    // SAFETY: tcb valid; state, hold and priority are written under its
+    // sched_lock, held.
+    let priority = unsafe {
+        (*tcb).state = ThreadState::Stopped;
+        (*tcb).hold = HoldMark::Stopped;
+        (*tcb).priority
+    };
+    // SAFETY: every CPU's lock is held; tcb valid.
+    unsafe { super::drain_from_every_queue(tcb, priority, cpu_count) };
+    for cpu in (0..cpu_count).rev()
+    {
+        // SAFETY: cpu < cpu_count; the scheduler slab is initialised.
+        let sched = unsafe { super::scheduler_for(cpu) };
+        // SAFETY: paired with lock_saving_flags above.
+        unsafe { sched.unlock_saved_flags() };
+    }
+}
+
+/// Apply [`release_visit`] to `tcb` when it executes in `aspace`; `true`
+/// when it is to be started but is not yet settled.
+///
+/// # Safety
+/// As for [`hold_visit_thread`].
+#[cfg(not(test))]
+unsafe fn release_visit_thread(tcb: *mut ThreadControlBlock, aspace: *const AddressSpace) -> bool
+{
+    // SAFETY: tcb is registered, so valid; address_space is read-only after
+    // creation.
+    if !core::ptr::eq(unsafe { (*tcb).address_space }, aspace)
+    {
+        return false;
+    }
+    // SAFETY: tcb valid, as above.
+    let lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: only the registry lock is held; paired with the unlock_raw below.
+    let f = unsafe { lock.lock_raw() };
+    let mut started = None;
+    let mut unsettled = false;
+    // SAFETY: tcb valid; the mark is written under its sched_lock, held here.
+    match release_visit(unsafe { (*tcb).hold })
+    {
+        ReleaseVisit::Start =>
+        {
+            // SAFETY: tcb valid; state is read under its held sched_lock.
+            let state = unsafe { (*tcb).state };
+            debug_assert!(
+                state == ThreadState::Stopped,
+                "release: a thread marked hold-stopped is not Stopped"
+            );
+            // SAFETY: tcb valid; its sched_lock is held and no CPU lock.
+            started = unsafe { start_under_cpu_locks(tcb) };
+            unsettled = started.is_none();
+        }
+        ReleaseVisit::Clear =>
+        {
+            // SAFETY: tcb valid; the mark is written under its sched_lock, held.
+            unsafe { (*tcb).hold = HoldMark::None };
+        }
+        ReleaseVisit::Leave =>
+        {}
+    }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(f) };
+    if let Some(seq) = started
+    {
+        // SAFETY: tcb valid, registered for the walk.
+        let cpu = unsafe { super::select_target_cpu(tcb) };
+        // A stop or an exit landing since the commit supersedes the link, and
+        // takes effect over the release's start, as over a SYS_THREAD_START.
+        // SAFETY: tcb valid; `Ready` at `seq` it is unlinked and current
+        // nowhere (the commit's checks); cpu is a started CPU; no run-queue
+        // lock is held.
+        let _ = unsafe { super::enqueue_ready_thread(tcb, cpu, seq) };
+    }
+    unsettled
+}
+
+/// Commit the hold-stopped `tcb` `Ready` under every CPU lock when it is
+/// settled (`start_ready_to_link`), advancing its start generation and
+/// clearing its mark; the new generation, or `None`, writing nothing, when it
+/// is not yet settled.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold its `sched_lock` and no
+/// CPU lock.
+#[cfg(not(test))]
+unsafe fn start_under_cpu_locks(tcb: *mut ThreadControlBlock) -> Option<u32>
+{
+    let cpu_count = super::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; the scheduler slab is initialised.
+        let sched = unsafe { super::scheduler_for(cpu) };
+        // SAFETY: taken in ascending order after the sched_lock; paired with
+        // unlock_saved_flags below.
+        unsafe { sched.lock_saving_flags() };
+    }
+    // SAFETY: tcb valid; its sched_lock and every CPU lock are held.
+    let seq = unsafe { super::start_ready_to_link(tcb, cpu_count) }.then(|| {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "fields of one valid TCB under its held sched_lock and every CPU lock"
+        )]
+        // SAFETY: tcb valid; start_seq, state and hold are written under its
+        // sched_lock, held.
+        unsafe {
+            (*tcb).start_seq = (*tcb).start_seq.wrapping_add(1);
+            (*tcb).state = ThreadState::Ready;
+            (*tcb).hold = HoldMark::None;
+            (*tcb).start_seq
+        }
+    });
+    for cpu in (0..cpu_count).rev()
+    {
+        // SAFETY: cpu < cpu_count; the scheduler slab is initialised.
+        let sched = unsafe { super::scheduler_for(cpu) };
+        // SAFETY: paired with lock_saving_flags above.
+        unsafe { sched.unlock_saved_flags() };
+    }
+    seq
+}
+
+/// Whether the hold of `aspace` may return: no CPU's `current` executes in
+/// it, and every thread of it has published its register save.
+///
+/// No thread of a space being held becomes `current` once the hold's walk
+/// has passed: it found none `Ready` that it did not stop, the starts it
+/// missed are deferred, and the diverts link none. So a check that finds both
+/// stays true until the release.
+///
+/// # Safety
+/// `aspace` must be valid; no lock may be held.
+#[cfg(not(test))]
+unsafe fn held_settled(aspace: *const AddressSpace) -> bool
+{
+    let cpu_count = super::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; the scheduler slab is initialised.
+        let sched = unsafe { super::scheduler_for(cpu) };
+        // SAFETY: no lock is held; paired with the unlock_raw below.
+        let f = unsafe { sched.lock.lock_raw() };
+        let cur = sched.current();
+        let bound = !cur.is_null()
+            // SAFETY: `current` is stable under its CPU's lock, held here, and
+            // a current thread is valid; address_space is read-only.
+            && core::ptr::eq(unsafe { (*cur).address_space }, aspace);
+        // SAFETY: paired with the lock_raw above.
+        unsafe { sched.lock.unlock_raw(f) };
+        if bound
+        {
+            return false;
+        }
+    }
+    let mut saved = true;
+    let check = |tcb: *mut ThreadControlBlock| {
+        // SAFETY: tcb is registered for the call, so valid; address_space is
+        // read-only after creation.
+        let bound = core::ptr::eq(unsafe { (*tcb).address_space }, aspace);
+        // SAFETY: as above; context_saved is atomic.
+        let flag = unsafe { &(*tcb).context_saved };
+        saved &= !bound || flag.load(core::sync::atomic::Ordering::Acquire) != 0;
+    };
+    // SAFETY: no lock is held; the closure only reads two fields of each
+    // registered TCB.
+    unsafe { super::thread_registry::for_each(check) };
+    saved
+}
+
+/// Whether the holding thread `caller` must leave its CPU instead of
+/// waiting: it is `Stopped` or `Exited`, or a hold of its own space marked
+/// it. Read under its `sched_lock`, which each of those writes holds.
+///
+/// # Safety
+/// `caller` must be the running thread's TCB; no lock may be held.
+#[cfg(not(test))]
+unsafe fn caller_must_leave(caller: *mut ThreadControlBlock) -> bool
+{
+    // SAFETY: caller is the running thread's valid TCB.
+    let lock = unsafe { &(*caller).sched_lock };
+    // SAFETY: no lock is held; paired with the unlock_raw below.
+    let f = unsafe { lock.lock_raw() };
+    // SAFETY: caller valid; state is written under its sched_lock, held.
+    let state = unsafe { (*caller).state };
+    // SAFETY: as for state.
+    let mark = unsafe { (*caller).hold };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(f) };
+    matches!(state, ThreadState::Stopped | ThreadState::Exited) || mark == HoldMark::Pending
+}
+
+/// Spin, preempt-disabled with interrupts enabled (the #207 envelope, so
+/// this CPU still takes the IPIs other CPUs wait on), until `done` holds,
+/// returning `true`, or a pass where it does not finds `abandon` true,
+/// returning `false`. Records `site` for the watchdog and warns once after
+/// 100 ms.
+///
+/// # Safety
+/// No lock may be held; `done` and `abandon` must not wait.
+#[cfg(not(test))]
+unsafe fn settle_spin(
+    site: u32,
+    what: &str,
+    mut done: impl FnMut() -> bool,
+    mut abandon: impl FnMut() -> bool,
+) -> bool
+{
+    crate::percpu::preempt_disable();
+    // SAFETY: ring 0; restored below.
+    let saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+    // SAFETY: ring 0; IDT loaded; preempt disabled.
+    unsafe { crate::arch::current::interrupts::enable() };
+    super::spin_site_enter(site);
+    let mut warn = super::SpinWarnOnce::new();
+    let finished = loop
+    {
+        if done()
+        {
+            break true;
+        }
+        if abandon()
+        {
+            break false;
+        }
+        if warn.due()
+        {
+            let cpu = crate::arch::current::cpu::current_cpu();
+            crate::kprintln!("kernel: {what} spin >100ms on cpu {cpu}");
+        }
+        core::hint::spin_loop();
+    };
+    super::spin_site_exit();
+    // SAFETY: saved_int from save_and_disable_interrupts above.
+    unsafe { crate::arch::current::cpu::restore_interrupts(saved_int) };
+    crate::percpu::preempt_enable();
+    finished
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -290,7 +759,7 @@ mod tests
                     {
                         (t.state, t.mark) = (ThreadState::Stopped, HoldMark::Stopped);
                     }
-                    HoldVisit::MarkRunning | HoldVisit::MarkBlocked => t.mark = HoldMark::Pending,
+                    HoldVisit::Mark => t.mark = HoldMark::Pending,
                     HoldVisit::Leave =>
                     {}
                 }

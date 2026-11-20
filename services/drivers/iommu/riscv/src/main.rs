@@ -8,20 +8,26 @@
 //! devmgr spawns it first at boot, before any DMA-capable driver, and
 //! delivers it in its resource list the register page of each RISC-V IOMMU
 //! PCI function it found through the ACPI RIMT, with the devices the IOMMU
-//! translates (`iommu_core::delivery`). The driver maps each IOMMU's
-//! register page, sets each up with empty command and fault queues and an
-//! empty device directory and turns translation on ([`backend::Riscv`]), so
-//! every device an IOMMU translates reaches nothing until devmgr attaches
-//! it; then it reports ready and serves `ipc::iommu_labels` for devmgr
+//! translates (`iommu_core::delivery`), and the anchor page devmgr keeps for
+//! each. The driver maps each IOMMU's register page and anchor, sets each up
+//! with empty command and fault queues and an empty device directory rooted
+//! at its anchor and turns translation on ([`backend::Riscv`]), so every
+//! device an IOMMU translates reaches nothing until devmgr attaches it; then
+//! it reports ready and serves `ipc::iommu_labels` for devmgr
 //! ([`iommu_core::service`]), with a second thread polling the fault
 //! queues. An IOMMU that cannot be set up returns every IOMMU to Bare and
 //! the driver exits without reporting ready, so devmgr runs DMA unconfined.
-//! See `docs/device-management.md` § IOMMU Discovery and Programming.
+//! A driver devmgr restarts after a death adopts the IOMMUs instead,
+//! translating through the dead instance's directories until devmgr's replay
+//! commits, and one that cannot adopt them exits leaving them as they stand,
+//! for devmgr to fail the IOMMU. See `docs/device-management.md` § IOMMU
+//! Discovery and Programming and § IOMMU Driver Restart.
 
 mod backend;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use iommu_core::Start;
 use iommu_core::delivery::{Delivery, Registers};
 use iommu_core::service::{self, KernelCaps, Lock, Service};
 use iommu_store::{Flush, Store};
@@ -107,6 +113,15 @@ fn faults_dropped(count: u64)
     std::os::seraph::log!(warn: "fault queue full: {} faults dropped", count);
 }
 
+fn log_started(start: Start, iommus: u64)
+{
+    match start
+    {
+        Start::Reset => std::os::seraph::log!("{} IOMMUs translating", iommus),
+        Start::Adopt => std::os::seraph::log!("{} IOMMUs adopted", iommus),
+    }
+}
+
 fn main() -> !
 {
     std::os::seraph::log::register_name(b"iommu-riscv");
@@ -149,20 +164,27 @@ fn main() -> !
             syscall::thread_exit();
         }
     };
+    // The IOMMU reads its structures coherently with the caches (the
+    // `backend` module doc): no table write needs writing back.
+    let mut store = Store::new(info.memmgr_endpoint, info.self_aspace, Flush::Coherent);
     let mut units = Vec::new();
-    for &r in &boot.registers
+    for (&r, unit) in boot.registers.iter().zip(&boot.units.0)
     {
         let Some(va) = map_registers(info.self_aspace, r)
         else
         {
             syscall::thread_exit();
         };
-        units.push(Unit::new(va));
+        let Some(anchor) = store.adopt(unit.anchor, 1)
+        else
+        {
+            std::os::seraph::log!(error: "anchor not mapped");
+            syscall::thread_exit();
+        };
+        units.push(Unit::new(va, anchor));
     }
     let count = units.len() as u64;
-    // The IOMMU reads its structures coherently with the caches (the
-    // `backend` module doc): no table write needs writing back.
-    let store = Store::new(info.memmgr_endpoint, info.self_aspace, Flush::Coherent);
+    let start = boot.units.start();
     // SAFETY: ipc_buf is this thread's registered IPC buffer.
     let Some(caps) = (unsafe { KernelCaps::new(info.memmgr_endpoint, ipc_buf) })
     else
@@ -170,7 +192,7 @@ fn main() -> !
         std::os::seraph::log!(error: "no physical-address credential");
         syscall::thread_exit();
     };
-    let Some(mut svc) = Service::new(Riscv::new(units, store), caps, boot.units)
+    let Some(mut svc) = Service::new(Riscv::new(units, store, start), caps, boot.units)
     else
     {
         std::os::seraph::log!(error: "no memory for the service");
@@ -178,10 +200,18 @@ fn main() -> !
     };
     if let Err((unit, e)) = svc.init()
     {
-        std::os::seraph::log!(error: "IOMMU {} not set up ({:?}); every IOMMU left Bare", unit, e);
+        match start
+        {
+            Start::Reset => std::os::seraph::log!(error:
+                "IOMMU {} not set up ({:?}); every IOMMU left Bare", unit, e
+            ),
+            Start::Adopt => std::os::seraph::log!(error:
+                "IOMMU {} not adopted ({:?}); IOMMUs left as they stand", unit, e
+            ),
+        }
         syscall::thread_exit();
     }
-    std::os::seraph::log!("{} IOMMUs translating", count);
+    log_started(start, count);
 
     let shared = Arc::new(Shared(Mutex::new(svc)));
     let poller = Arc::clone(&shared);
@@ -199,7 +229,7 @@ fn main() -> !
     if let Err(e) = unsafe { ipc::report_driver_ready(boot.devmgr_query, ipc_buf) }
     {
         std::os::seraph::log!(error:
-            "DRIVER_READY failed ({:?}); every IOMMU returned to Bare",
+            "DRIVER_READY failed ({:?}); driver exiting",
             e
         );
         shared.with(Service::disable);

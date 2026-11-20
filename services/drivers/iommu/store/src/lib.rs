@@ -16,11 +16,14 @@
 //! physical addresses: the IOMMU driver is the one driver class that reads
 //! them, and devmgr spawns it phys-class, so its grants carry the
 //! `RIGHTS_MEM_PHYS` the read needs (`docs/device-management.md` § Physical
-//! Addresses). No
-//! page is ever returned: a unit may walk any table page for as long as
-//! translation stays on, so the pages stay with the driver for the boot, and
-//! past its death, since devmgr spawns it `CREATE_DMA_HOLD` and never
-//! releases the hold.
+//! Addresses). Pages devmgr allocates and keeps for the boot (each unit's
+//! anchor, the interrupt remapping table) join the store whole through
+//! [`Store::adopt`], as they stand. No page is ever returned: a unit may walk
+//! any table page for as long as translation stays on, so the pages stay
+//! with the driver for its life, and past its death, since devmgr spawns it
+//! `CREATE_DMA_HOLD`; devmgr releases a dead instance's hold only once a
+//! restarted instance has committed tables of its own and no unit walks the
+//! dead one's pages (`docs/device-management.md` § IOMMU Driver Restart).
 
 use iommu_core::table::{TABLE_WORDS, TableStore};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
@@ -143,6 +146,31 @@ impl Store
         })
     }
 
+    /// Map the `pages` physically contiguous pages of the Memory cap `cap`,
+    /// which the caller allocated and keeps a cap to (a unit's anchor, the
+    /// interrupt remapping table devmgr keeps for the boot), as a chunk of
+    /// their own with every page handed out, their contents left as they
+    /// stand; their physical address, or `None`, logged, when the cap has
+    /// no physical base or cannot be mapped, the cap then deleted. The store
+    /// keeps the cap for the driver's life, as it keeps those of its own
+    /// chunks, and [`TableStore::alloc`] keeps drawing from the chunk it was
+    /// drawing from.
+    pub fn adopt(&mut self, cap: u64, pages: u64) -> Option<u64>
+    {
+        if pages == 0 || !self.add_chunk(cap, pages)
+        {
+            return None;
+        }
+        let chunk = self.chunks.last_mut()?;
+        chunk.used = pages;
+        let phys = chunk.phys;
+        if let [.., drawn, new] = self.chunks.as_mut_slice()
+        {
+            core::mem::swap(drawn, new);
+        }
+        Some(phys)
+    }
+
     /// Take `pages` physically contiguous pages, zeroed, for one structure a
     /// unit reads whole from its first page's physical address (an interrupt
     /// remapping table), and return that address; `None`, logged, when
@@ -212,6 +240,21 @@ impl Store
             std::os::seraph::log!(warn: "table pages: memmgr refused {} pages", pages);
             return false;
         };
+        self.add_chunk(cap, pages)
+    }
+
+    /// Map the `pages` pages of the Memory cap `cap` and record them as an
+    /// empty chunk; `false`, logged, with the cap deleted, when its physical
+    /// base cannot be read or the mapping fails. Room for the record is
+    /// reserved first.
+    fn add_chunk(&mut self, cap: u64, pages: u64) -> bool
+    {
+        if self.chunks.try_reserve(1).is_err()
+        {
+            std::os::seraph::log!(warn: "table pages: no memory for a chunk record");
+            let _ = syscall::cap_delete(cap);
+            return false;
+        }
         let Ok(phys) = syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_PHYS_BASE)
         else
         {

@@ -25,9 +25,16 @@
 ///
 /// Request: `data[1]` = the unit index, in the order the driver's
 /// bootstrap delivered the units; `data[2]` = the function's requester
-/// ID ([`requester_id`]). Reply: label `SUCCESS` with `data[0]` = the
-/// domain handle every later request for the function names; or an
-/// error code. A function attached twice keeps its first domain.
+/// ID ([`requester_id`]); `data[3]` = the domain handle to give it, or 0
+/// for one the driver chooses; `data[4]` = the domain ID to tag its
+/// translations with on its unit, or 0 for one the driver chooses. A
+/// restarted driver's replay names the handle and domain ID the function
+/// held under the instance before it ([`COMMIT`]). Reply: label `SUCCESS`
+/// with `data[0]` = the domain handle every later request for the
+/// function names and `data[1]` = its domain ID; or an error code,
+/// `INVALID_REQUEST` for a named handle or domain ID another domain holds
+/// or the unit does not have. A function attached twice keeps its first
+/// domain.
 pub const ATTACH: u64 = 1;
 /// Make the frames of a Memory cap reachable by a domain's function at an
 /// IOVA devmgr chose.
@@ -99,22 +106,28 @@ pub const MAP_RESERVED: u64 = 7;
 /// them).
 pub const MAP_MSI: u64 = 8;
 /// Turn interrupt remapping on or off for every unit, with one
-/// remapping table the driver allocates and every unit shares: with it
-/// on, an interrupt message reaches a CPU only through a table entry
-/// [`REMAP_SET`] made, and one in the compatibility format is blocked.
-/// devmgr sends it once, before any interrupt source exists, and turns
-/// remapping off again with it when the kernel does not take the
-/// remappable formats.
+/// remapping table devmgr allocates and keeps for the boot and every unit
+/// shares: with it on, an interrupt message reaches a CPU only through a
+/// table entry [`REMAP_SET`] made, and one in the compatibility format is
+/// blocked. devmgr sends it once, before any interrupt source exists, and
+/// turns remapping off again with it when the kernel does not take the
+/// remappable formats. A restarted driver finds remapping on from the
+/// table and adopts it as it stands, interrupts still delivered through
+/// its entries.
 ///
 /// Request: `data[1]` = the table's entries, a power of two from 2 to
 /// [`MAX_REMAP_ENTRIES`], or 0 to turn remapping off; `data[2]` = 1 to
-/// ask for 32-bit destinations, 0 for 8-bit ones. Reply: label
-/// `SUCCESS` with `data[0]` = 1 when the destinations are 32-bit, 0
-/// when they are 8-bit; or an error code, with remapping off:
-/// `INVALID_REQUEST` for a size outside the bound, a table already set
-/// up, units that translate more than one PCI segment (an entry names
-/// its requester by a source ID with no segment), or an IOMMU family or
-/// unit that does not remap interrupts.
+/// ask for 32-bit destinations, 0 for 8-bit ones; `caps[0]` = a Memory
+/// cap on the table, physically contiguous, zeroed when devmgr allocated
+/// it, and of at least 16 bytes an entry, which the driver keeps; none
+/// when turning remapping off. Reply: label `SUCCESS` with `data[0]` = 1
+/// when the destinations are 32-bit, 0 when they are 8-bit; or an error
+/// code, with remapping off (a restarted driver's left as it stood):
+/// `INVALID_REQUEST` for a size outside the bound, a missing or short
+/// table cap, a table already set up, units that translate more than
+/// one PCI segment (an entry names its requester by a source ID with no
+/// segment), an IOMMU family or unit that does not remap interrupts, or
+/// a restarted driver whose units do not remap from the table given.
 pub const REMAP_SETUP: u64 = 9;
 /// Make one entry of the remapping table deliver to a CPU's vector for
 /// one requester, replacing what it held; the reply follows the
@@ -136,6 +149,26 @@ pub const REMAP_SET: u64 = 10;
 ///
 /// Request: `data[1]` = the entry's handle. Reply: as [`REMAP_SET`].
 pub const REMAP_CLEAR: u64 = 11;
+/// Make a restarted driver's tables the ones the units translate through.
+///
+/// A driver devmgr restarts after its predecessor died finds every unit
+/// translating from the root page devmgr keeps for it (its anchor,
+/// `driver_binding::resources::FLAG_ADOPT`) through the dead instance's
+/// tables, and builds devmgr's replayed domains in tables of its own
+/// under a staging root. `COMMIT` copies each staged root entry into the
+/// anchor, one aligned 64-bit store for an entry whose old and new values
+/// differ in one word (every function sees its old or its new context,
+/// both holding the same ranges under the same domain ID), then
+/// invalidates every unit's translation caches, draining the device
+/// accesses in flight, and on VT-d makes not present every remapping
+/// entry not set since the restart. From the reply on no unit reaches a
+/// page of the dead instance's.
+///
+/// Request: no further words. Reply: empty body, label `SUCCESS`, or an
+/// error code: `INVALID_REQUEST` from a driver not started to adopt or
+/// one that has committed already, `HARDWARE_TIMEOUT` when a unit does
+/// not complete an invalidation.
+pub const COMMIT: u64 = 12;
 
 /// Entries one remapping table holds at most ([`REMAP_SETUP`]): a
 /// remappable interrupt message names its entry in 16 bits.

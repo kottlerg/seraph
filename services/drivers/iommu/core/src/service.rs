@@ -23,6 +23,12 @@
 //! destination, vector, and source ID against the table it set up, and a
 //! timeout fails the remapping as a whole.
 //!
+//! A driver devmgr restarts adopts its units ([`Units::adopting`]): devmgr
+//! replays every domain it holds, naming in each `ATTACH` the handle and
+//! domain ID the function held before ([`Service::handle`] takes exactly
+//! those), and then sends `COMMIT` once, which the backend carries out
+//! ([`Backend::commit`]).
+//!
 //! [`serve`] receives on the service endpoint for the rest of the driver's
 //! life and [`poll_faults`] polls the units' fault records on a thread of the
 //! driver's own; both reach the one [`Service`] through a [`Lock`] the
@@ -74,6 +80,10 @@ pub const MAX_REMAP_ENTRIES: u32 = iommu_labels::MAX_REMAP_ENTRIES as u32;
 /// The lowest vector a remapping entry may deliver: vectors below 16 are
 /// reserved for exceptions on x86-64 and invalid for a fixed interrupt.
 const MIN_REMAP_VECTOR: u64 = 16;
+/// Bytes one interrupt remapping table entry takes in every family that
+/// remaps interrupts (a VT-d IRTE), which a `REMAP_SETUP` table cap must
+/// cover for each entry.
+const REMAP_ENTRY_BYTES: u64 = 16;
 
 /// A Memory cap's frames and rights, as the kernel reports them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +260,9 @@ pub struct Service<B: Backend, C: CapOps>
     /// request is refused with `HARDWARE_TIMEOUT`.
     remap_failed: bool,
     faults: FaultQueue,
+    /// The driver adopts its units and has not yet committed its tables
+    /// (`COMMIT`).
+    uncommitted: bool,
 }
 
 /// An `iommu_errors` code for a backend failure.
@@ -273,6 +286,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
         let mut failed = Vec::new();
         failed.try_reserve_exact(units.0.len()).ok()?;
         failed.resize(units.0.len(), false);
+        let uncommitted = units.adopting();
         Some(Self {
             backend,
             caps,
@@ -283,13 +297,15 @@ impl<B: Backend, C: CapOps> Service<B, C>
             remap: None,
             remap_failed: false,
             faults: FaultQueue::new()?,
+            uncommitted,
         })
     }
 
-    /// Program every unit empty and turn its translation on
-    /// ([`Backend::init_unit`]). On a unit's failure every unit enabled
-    /// before it is turned off again ([`Backend::disable_all`]), so a driver
-    /// whose setup fails leaves no device blocked.
+    /// Program every unit empty and turn its translation on, or adopt it
+    /// from a dead instance ([`Backend::init_unit`]). On a unit's failure
+    /// every unit enabled before it is turned off again
+    /// ([`Backend::disable_all`]), so a driver whose setup fails leaves no
+    /// device blocked; adopted units are left as they stand.
     ///
     /// # Errors
     /// The index of the unit that failed and why.
@@ -308,7 +324,8 @@ impl<B: Backend, C: CapOps> Service<B, C>
 
     /// Turn translation off on every unit ([`Backend::disable_all`]): the
     /// driver could not report ready, so devmgr runs every device
-    /// unconfined.
+    /// unconfined. A backend that adopted its units leaves them as they
+    /// stand, for devmgr to fail the IOMMU.
     pub fn disable(&mut self)
     {
         self.backend.disable_all();
@@ -332,12 +349,13 @@ impl<B: Backend, C: CapOps> Service<B, C>
     }
 
     /// Answer one request, taking ownership of the caps it carries: a
-    /// mapped cap is kept while its range stands, and every other cap is
-    /// deleted. Returns the reply.
+    /// mapped cap is kept while its range stands, a remapping table's for
+    /// the driver's life, and every other cap is deleted. Returns the reply.
     pub fn handle(&mut self, msg: &IpcMessage) -> IpcMessage
     {
         let caps = msg.caps();
         let kept = if msg.label == iommu_labels::MAP
+            || msg.label == iommu_labels::REMAP_SETUP && msg.word(1) != 0
         {
             caps.first().copied()
         }
@@ -359,16 +377,21 @@ impl<B: Backend, C: CapOps> Service<B, C>
         }
         let code = match msg.label
         {
-            iommu_labels::ATTACH => match self.attach(msg.word(1), msg.word(2))
+            iommu_labels::ATTACH =>
             {
-                Ok(handle) =>
+                let named = (msg.word(3), msg.word(4));
+                match self.attach(msg.word(1), msg.word(2), named)
                 {
-                    return IpcMessage::builder(iommu_errors::SUCCESS)
-                        .word(0, handle)
-                        .build();
+                    Ok((handle, did)) =>
+                    {
+                        return IpcMessage::builder(iommu_errors::SUCCESS)
+                            .word(0, handle)
+                            .word(1, u64::from(did))
+                            .build();
+                    }
+                    Err(code) => code,
                 }
-                Err(code) => code,
-            },
+            }
             iommu_labels::MAP =>
             {
                 let Some(cap) = kept
@@ -404,7 +427,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
                 None => iommu_errors::INVALID_REQUEST,
             },
             iommu_labels::TAKE_FAULTS => return self.take_faults(),
-            iommu_labels::REMAP_SETUP => match self.remap_setup(msg.word(1), msg.word(2))
+            iommu_labels::REMAP_SETUP => match self.remap_setup(msg.word(1), msg.word(2), kept)
             {
                 Ok(extended) =>
                 {
@@ -425,6 +448,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
                 .remap_clear(msg.word(1))
                 .err()
                 .unwrap_or(iommu_errors::SUCCESS),
+            iommu_labels::COMMIT => self.commit().err().unwrap_or(iommu_errors::SUCCESS),
             _ => iommu_errors::UNKNOWN_OPCODE,
         };
         IpcMessage::new(code)
@@ -471,7 +495,48 @@ impl<B: Backend, C: CapOps> Service<B, C>
         (1..ids).find(|&did| !self.domains.iter().any(|d| d.unit == unit && d.did == did))
     }
 
-    fn attach(&mut self, unit_word: u64, rid: u64) -> Result<u64, u64>
+    /// The domain ID `named` names for a new domain of `unit`, or the lowest
+    /// free one for 0 ([`Self::free_did`]); `INVALID_REQUEST` for one the
+    /// unit does not have or another domain of it holds.
+    fn take_did(&self, unit: usize, named: u64) -> Result<u32, u64>
+    {
+        if named == 0
+        {
+            return self.free_did(unit).ok_or(iommu_errors::OUT_OF_RESOURCES);
+        }
+        let did = u32::try_from(named).map_err(|_| iommu_errors::INVALID_REQUEST)?;
+        if did >= self.backend.query(unit).domain_ids
+            || self.domains.iter().any(|d| d.unit == unit && d.did == did)
+        {
+            return Err(iommu_errors::INVALID_REQUEST);
+        }
+        Ok(did)
+    }
+
+    /// The handle `named` names for a new domain, or the next never given
+    /// for 0, with the next handle after it; `INVALID_REQUEST` for one
+    /// another domain holds. A named handle at or past the next moves the
+    /// next past it, so a handle the driver chooses is never one named.
+    fn take_handle(&self, named: u64) -> Result<(u64, u64), u64>
+    {
+        let exhausted = iommu_errors::OUT_OF_RESOURCES;
+        if named == 0
+        {
+            let handle = self.next_handle;
+            return Ok((handle, handle.checked_add(1).ok_or(exhausted)?));
+        }
+        if self.domains.iter().any(|d| d.handle == named)
+        {
+            return Err(iommu_errors::INVALID_REQUEST);
+        }
+        let past = named.checked_add(1).ok_or(exhausted)?;
+        Ok((named, past.max(self.next_handle)))
+    }
+
+    /// Attach the function `rid` of unit `unit_word` (`ATTACH`), under the
+    /// handle and domain ID `named` names, 0 for either chosen here; its
+    /// handle and domain ID.
+    fn attach(&mut self, unit_word: u64, rid: u64, named: (u64, u64)) -> Result<(u64, u32), u64>
     {
         let invalid = iommu_errors::INVALID_REQUEST;
         let unit = usize::try_from(unit_word).map_err(|_| invalid)?;
@@ -484,18 +549,22 @@ impl<B: Backend, C: CapOps> Service<B, C>
         self.unit_ok(unit)?;
         if let Some(d) = self.domains.iter().find(|d| d.unit == unit && d.bdf == bdf)
         {
-            return Ok(d.handle);
+            let held = |name: u64, value: u64| name == 0 || name == value;
+            if !held(named.0, d.handle) || !held(named.1, u64::from(d.did))
+            {
+                return Err(invalid);
+            }
+            return Ok((d.handle, d.did));
         }
         let exhausted = iommu_errors::OUT_OF_RESOURCES;
         if self.domains.len() >= MAX_DOMAINS
         {
             return Err(exhausted);
         }
-        let did = self.free_did(unit).ok_or(exhausted)?;
+        let did = self.take_did(unit, named.1)?;
         // Handles are never reused, so a driver that has handed out every
         // one attaches no further domain.
-        let handle = self.next_handle;
-        let next_handle = handle.checked_add(1).ok_or(exhausted)?;
+        let (handle, next_handle) = self.take_handle(named.0)?;
         self.domains.try_reserve(1).map_err(|_| exhausted)?;
         let domain = self
             .backend
@@ -510,7 +579,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
             domain,
             ranges: Vec::new(),
         });
-        Ok(handle)
+        Ok((handle, did))
     }
 
     fn map(&mut self, handle: u64, iova: u64, access: u64, cap: u64) -> Result<(), u64>
@@ -735,13 +804,52 @@ impl<B: Backend, C: CapOps> Service<B, C>
         backend_code(e)
     }
 
-    /// Set up interrupt remapping with a table of `entries` entries, or turn
-    /// it off for 0 (`REMAP_SETUP`); whether its destinations are 32-bit.
-    /// Refused while the units translate more than one PCI segment: the one
-    /// table they share names an entry's requester by a source ID with no
-    /// segment, so a function on one segment would pass the entries written
-    /// for the same-numbered function on another.
-    fn remap_setup(&mut self, entries: u64, extended: u64) -> Result<bool, u64>
+    /// Set up interrupt remapping with a table of `entries` entries in the
+    /// memory of the cap `table`, or turn it off for 0 (`REMAP_SETUP`);
+    /// whether its destinations are 32-bit. Refused while the units
+    /// translate more than one PCI segment: the one table they share names
+    /// an entry's requester by a source ID with no segment, so a function on
+    /// one segment would pass the entries written for the same-numbered
+    /// function on another. The table's cap goes to the backend once the
+    /// request is checked, and is deleted when it is refused before.
+    fn remap_setup(&mut self, entries: u64, extended: u64, table: Option<u64>)
+    -> Result<bool, u64>
+    {
+        let checked = self.remap_check(entries, extended, table);
+        let (entries, table) = match checked
+        {
+            Ok(Some(setup)) => setup,
+            Ok(None) =>
+            {
+                self.backend.remap_disable();
+                self.remap = None;
+                return Ok(false);
+            }
+            Err(code) =>
+            {
+                if let Some(cap) = table
+                {
+                    self.caps.delete(cap);
+                }
+                return Err(code);
+            }
+        };
+        let extended = self
+            .backend
+            .remap_enable(entries, extended == 1, table)
+            .map_err(|e| self.remap_failure(e))?;
+        self.remap = Some(Remap { entries, extended });
+        Ok(extended)
+    }
+
+    /// [`Self::remap_setup`]'s checks: the entries and the table cap of a
+    /// setup, `None` for a request to turn remapping off.
+    fn remap_check(
+        &self,
+        entries: u64,
+        extended: u64,
+        table: Option<u64>,
+    ) -> Result<Option<(u32, u64)>, u64>
     {
         let invalid = iommu_errors::INVALID_REQUEST;
         if extended > 1
@@ -750,9 +858,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
         }
         if entries == 0
         {
-            self.backend.remap_disable();
-            self.remap = None;
-            return Ok(false);
+            return Ok(None);
         }
         let entries = u32::try_from(entries).map_err(|_| invalid)?;
         let segments_differ = self
@@ -767,16 +873,35 @@ impl<B: Backend, C: CapOps> Service<B, C>
         {
             return Err(invalid);
         }
+        let table = table.ok_or(invalid)?;
+        let mem = self.caps.memory(table).ok_or(invalid)?;
+        let needed = RIGHTS_MEM_MAP | RIGHTS_MEM_WRITE;
+        if mem.rights & needed != needed
+            || mem.phys & (PAGE_SIZE - 1) != 0
+            || mem.len < u64::from(entries).saturating_mul(REMAP_ENTRY_BYTES)
+        {
+            return Err(invalid);
+        }
         if self.remap_failed
         {
             return Err(iommu_errors::HARDWARE_TIMEOUT);
         }
-        let extended = self
-            .backend
-            .remap_enable(entries, extended == 1)
-            .map_err(|e| self.remap_failure(e))?;
-        self.remap = Some(Remap { entries, extended });
-        Ok(extended)
+        Ok(Some((entries, table)))
+    }
+
+    /// Commit a restarted driver's tables (`COMMIT`, [`Backend::commit`]),
+    /// once: refused from a driver that did not adopt its units or has
+    /// committed already. A unit that times out fails the driver's commit,
+    /// which devmgr answers by ending the instance.
+    fn commit(&mut self) -> Result<(), u64>
+    {
+        if !self.uncommitted
+        {
+            return Err(iommu_errors::INVALID_REQUEST);
+        }
+        self.backend.commit().map_err(backend_code)?;
+        self.uncommitted = false;
+        Ok(())
     }
 
     /// The handle `word` names in the remapping set up, once it is checked
@@ -925,7 +1050,7 @@ where
 mod tests
 {
     use super::*;
-    use crate::UnitInfo;
+    use crate::{Start, UnitInfo};
     use core::cell::RefCell;
     use driver_binding::resources::{IommuUnit, Scope};
     use ipc::devmgr_dma_labels::ACCESS_DEVICE_READ;
@@ -957,6 +1082,10 @@ mod tests
         set: Vec<(u16, RemapEntry)>,
         /// Every remapping entry cleared, in order.
         cleared: Vec<u16>,
+        /// The cap of the table remapping was set up with.
+        table: Option<u64>,
+        /// Commits made.
+        commits: usize,
     }
 
     struct FakeDomain
@@ -1067,7 +1196,19 @@ mod tests
             }
         }
 
-        fn remap_enable(&mut self, entries: u32, extended: bool) -> Result<bool, BackendError>
+        fn commit(&mut self) -> Result<(), BackendError>
+        {
+            self.fail()?;
+            self.commits += 1;
+            Ok(())
+        }
+
+        fn remap_enable(
+            &mut self,
+            entries: u32,
+            extended: bool,
+            table: u64,
+        ) -> Result<bool, BackendError>
         {
             self.fail()?;
             if self.no_remap
@@ -1075,6 +1216,7 @@ mod tests
                 return Err(BackendError::Invalid);
             }
             self.remapping = Some(entries);
+            self.table = Some(table);
             Ok(extended && self.offers_extended)
         }
 
@@ -1099,7 +1241,8 @@ mod tests
     }
 
     /// Memory caps by slot (`phys = slot << 20`, 2 pages, read-write) except
-    /// slot 9 (read-only) and slot 13 (not a Memory cap); records deletes.
+    /// slot 9 (read-only), slot 13 (not a Memory cap), and slot [`TABLE`]
+    /// (1 MiB, a remapping table of the most entries); records deletes.
     #[derive(Default)]
     struct FakeCaps
     {
@@ -1112,7 +1255,7 @@ mod tests
         {
             (cap != 13).then_some(MemoryCap {
                 phys: cap << 20,
-                len: 2 * PAGE_SIZE,
+                len: if cap == TABLE { 1 << 20 } else { 2 * PAGE_SIZE },
                 rights: if cap == 9
                 {
                     RIGHTS_MEM_MAP
@@ -1130,21 +1273,42 @@ mod tests
         }
     }
 
-    fn service() -> Service<Fake, FakeCaps>
+    /// The remapping table's cap.
+    const TABLE: u64 = 21;
+
+    /// A unit of `segment`, translating every function no other unit names
+    /// when `include_pci_all`, and the functions `scopes` names; adopted when
+    /// `adopt`.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`include_pci_all` and `adopt` are the unit's fields of those names"
+    )]
+    fn unit(segment: u16, include_pci_all: bool, scopes: &[Scope], adopt: bool) -> IommuUnit
     {
+        IommuUnit {
+            segment,
+            include_pci_all,
+            scopes: scopes.to_vec(),
+            anchor: 30 + u64::from(segment),
+            adopt,
+        }
+    }
+
+    /// A service over a catch-all unit and a unit naming 00:04.0, set up as
+    /// `start` says.
+    fn service_starting(start: Start) -> Service<Fake, FakeCaps>
+    {
+        let adopt = start == Start::Adopt;
         let units = Units(vec![
-            IommuUnit {
-                segment: 0,
-                include_pci_all: true,
-                scopes: vec![],
-            },
-            IommuUnit {
-                segment: 0,
-                include_pci_all: false,
-                scopes: vec![Scope::Function(0x0020)],
-            },
+            unit(0, true, &[], adopt),
+            unit(0, false, &[Scope::Function(0x0020)], adopt),
         ]);
         Service::new(Fake::default(), FakeCaps::default(), units).unwrap()
+    }
+
+    fn service() -> Service<Fake, FakeCaps>
+    {
+        service_starting(Start::Reset)
     }
 
     fn req(label: u64, words: &[u64], caps: &[u64]) -> IpcMessage
@@ -1162,6 +1326,21 @@ mod tests
     fn attach(s: &mut Service<Fake, FakeCaps>, unit: u64, bdf: u64) -> IpcMessage
     {
         s.handle(&req(iommu_labels::ATTACH, &[unit, bdf], &[]))
+    }
+
+    /// Attach `bdf` of unit `unit` under the handle and domain ID `named`.
+    fn attach_named(
+        s: &mut Service<Fake, FakeCaps>,
+        unit: u64,
+        bdf: u64,
+        named: (u64, u64),
+    ) -> IpcMessage
+    {
+        s.handle(&req(
+            iommu_labels::ATTACH,
+            &[unit, bdf, named.0, named.1],
+            &[],
+        ))
     }
 
     fn domain(s: &mut Service<Fake, FakeCaps>) -> u64
@@ -1211,8 +1390,84 @@ mod tests
     {
         let mut s = service();
         let d = domain(&mut s);
-        assert_eq!(attach(&mut s, 0, 0x0018).word(0), d);
+        let r = attach(&mut s, 0, 0x0018);
+        assert_eq!((r.word(0), r.word(1)), (d, 1));
         assert_eq!(s.backend.attached, [(0, 0x0018, 1)]);
+        // Naming what it holds keeps it too; naming anything else is refused.
+        assert_eq!(attach_named(&mut s, 0, 0x0018, (d, 1)).word(0), d);
+        assert_eq!(
+            attach_named(&mut s, 0, 0x0018, (d + 1, 0)).label,
+            iommu_errors::INVALID_REQUEST
+        );
+        assert_eq!(
+            attach_named(&mut s, 0, 0x0018, (0, 2)).label,
+            iommu_errors::INVALID_REQUEST
+        );
+    }
+
+    #[test]
+    fn an_attach_takes_the_handle_and_domain_id_it_names()
+    {
+        let mut s = service();
+        let r = attach_named(&mut s, 0, 0x0018, (40, 3));
+        assert_eq!(
+            (r.label, r.word(0), r.word(1)),
+            (iommu_errors::SUCCESS, 40, 3)
+        );
+        assert_eq!(s.backend.attached, [(0, 0x0018, 3)]);
+        // A handle the driver chooses comes after every named one, and a
+        // domain ID it chooses is one no domain holds.
+        let r = attach(&mut s, 0, 0x0019);
+        assert_eq!((r.word(0), r.word(1)), (41, 1));
+        // A named handle below the next one is taken when free.
+        assert_eq!(attach_named(&mut s, 1, 0x0020, (7, 0)).word(0), 7);
+        assert_eq!(attach(&mut s, 0, 0x001a).word(0), 42);
+    }
+
+    #[test]
+    fn an_attach_naming_a_held_or_missing_handle_or_domain_id_is_refused()
+    {
+        let mut s = service();
+        assert_eq!(attach_named(&mut s, 0, 0x0018, (5, 2)).label, 0);
+        for named in [(5, 0), (0, 2), (0, 4), (0, 1 << 32), (u64::MAX, 0)]
+        {
+            assert_eq!(
+                attach_named(&mut s, 0, 0x0019, named).label,
+                if named.0 == u64::MAX
+                {
+                    iommu_errors::OUT_OF_RESOURCES
+                }
+                else
+                {
+                    iommu_errors::INVALID_REQUEST
+                },
+                "{named:?}"
+            );
+        }
+        // Domain ID 2 is unit 0's alone: unit 1 may take it.
+        assert_eq!(attach_named(&mut s, 1, 0x0020, (0, 2)).label, 0);
+        assert_eq!(s.backend.attached, [(0, 0x0018, 2), (1, 0x0020, 2)]);
+    }
+
+    #[test]
+    fn a_driver_that_did_not_adopt_refuses_a_commit()
+    {
+        let mut s = service();
+        let commit = req(iommu_labels::COMMIT, &[], &[]);
+        assert_eq!(s.handle(&commit).label, iommu_errors::INVALID_REQUEST);
+        assert_eq!(s.backend.commits, 0);
+    }
+
+    #[test]
+    fn an_adopting_driver_commits_once()
+    {
+        let mut s = service_starting(Start::Adopt);
+        let commit = req(iommu_labels::COMMIT, &[], &[]);
+        s.backend.fail_next = Some(BackendError::Timeout);
+        assert_eq!(s.handle(&commit).label, iommu_errors::HARDWARE_TIMEOUT);
+        assert_eq!(s.handle(&commit).label, iommu_errors::SUCCESS);
+        assert_eq!(s.handle(&commit).label, iommu_errors::INVALID_REQUEST);
+        assert_eq!(s.backend.commits, 1);
     }
 
     #[test]
@@ -1733,9 +1988,12 @@ mod tests
         assert_eq!(map(&mut s, d, next, RW, 3), iommu_errors::OUT_OF_RESOURCES);
     }
 
+    /// Set remapping up with `entries` entries in the table [`TABLE`], or
+    /// turn it off with no cap for 0.
     fn remap_setup(s: &mut Service<Fake, FakeCaps>, entries: u64, extended: u64) -> IpcMessage
     {
-        s.handle(&req(iommu_labels::REMAP_SETUP, &[entries, extended], &[]))
+        let table: &[u64] = if entries == 0 { &[] } else { &[TABLE] };
+        s.handle(&req(iommu_labels::REMAP_SETUP, &[entries, extended], table))
     }
 
     fn remap_set(s: &mut Service<Fake, FakeCaps>, fields: [u64; 5]) -> u64
@@ -1754,10 +2012,13 @@ mod tests
         let r = remap_setup(&mut s, 1024, 1);
         assert_eq!((r.label, r.word(0)), (iommu_errors::SUCCESS, 0));
         assert_eq!(s.backend.remapping, Some(1024));
+        assert_eq!(s.backend.table, Some(TABLE));
+        assert_eq!(deleted(&s), [] as [u64; 0]);
         assert_eq!(
             remap_setup(&mut s, 1024, 1).label,
             iommu_errors::INVALID_REQUEST
         );
+        assert_eq!(deleted(&s), [TABLE]);
         // Turned off, it may be set up again.
         assert_eq!(remap_setup(&mut s, 0, 0).label, iommu_errors::SUCCESS);
         assert_eq!(s.backend.remapping, None);
@@ -1788,29 +2049,37 @@ mod tests
         assert_eq!(r.label, iommu_errors::SUCCESS);
     }
 
+    #[test]
+    fn a_setup_without_a_table_that_holds_its_entries_is_refused_before_the_backend()
+    {
+        let mut s = service();
+        let setup = |caps: &[u64]| req(iommu_labels::REMAP_SETUP, &[1024, 0], caps);
+        // No cap; 2 pages for 1024 entries' 16 KiB; read-only; not Memory.
+        for caps in [&[][..], &[3], &[9], &[13]]
+        {
+            assert_eq!(s.handle(&setup(caps)).label, iommu_errors::INVALID_REQUEST);
+        }
+        assert_eq!(deleted(&s), [3, 9, 13]);
+        assert_eq!(s.backend.remapping, None);
+        // 2 pages hold 512 entries.
+        let r = s.handle(&req(iommu_labels::REMAP_SETUP, &[512, 0], &[3]));
+        assert_eq!(r.label, iommu_errors::SUCCESS);
+        assert_eq!(s.backend.table, Some(3));
+    }
+
     /// Defect caught: one shared table, whose entries name a requester with
     /// no segment, was set up for units on two segments.
     #[test]
     fn units_on_two_segments_refuse_the_setup()
     {
-        let units = Units(vec![
-            IommuUnit {
-                segment: 0,
-                include_pci_all: true,
-                scopes: vec![],
-            },
-            IommuUnit {
-                segment: 1,
-                include_pci_all: true,
-                scopes: vec![],
-            },
-        ]);
+        let units = Units(vec![unit(0, true, &[], false), unit(1, true, &[], false)]);
         let mut s = Service::new(Fake::default(), FakeCaps::default(), units).unwrap();
         assert_eq!(
             remap_setup(&mut s, 1024, 0).label,
             iommu_errors::INVALID_REQUEST
         );
         assert_eq!(s.backend.remapping, None);
+        assert_eq!(deleted(&s), [TABLE]);
     }
 
     #[test]

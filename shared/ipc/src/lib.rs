@@ -263,7 +263,7 @@ pub use devmgr_dma_client::{DmaError, DmaFaults, dma_faults, dma_map, dma_unmap}
 
 /// Wire-protocol version of [`iommu_labels`]; bumped as the block comment
 /// above the label modules describes, which also lists its runtime check.
-pub const IOMMU_LABELS_VERSION: u32 = 5;
+pub const IOMMU_LABELS_VERSION: u32 = 6;
 pub mod iommu_labels;
 
 pub mod iommu_errors;

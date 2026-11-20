@@ -124,6 +124,40 @@ impl DeviceDirectory
         self.format.words()
     }
 
+    /// Physical address of the root page.
+    #[must_use]
+    pub const fn root(&self) -> u64
+    {
+        self.root
+    }
+
+    /// 64-bit words of one entry of the root page: a device context in a
+    /// one-level directory, a non-leaf entry in a deeper one.
+    #[must_use]
+    pub const fn root_entry_words(&self) -> usize
+    {
+        if self.levels == 1
+        {
+            self.context_words()
+        }
+        else
+        {
+            1
+        }
+    }
+
+    /// The same directory rooted at the page `root`, which holds the same
+    /// entries.
+    #[must_use]
+    pub const fn rooted_at(&self, root: u64) -> Self
+    {
+        Self {
+            root,
+            levels: self.levels,
+            format: self.format,
+        }
+    }
+
     /// Whether the directory holds the device ID `id`.
     #[must_use]
     pub const fn holds(&self, id: u32) -> bool
@@ -501,6 +535,65 @@ mod tests
         let (leaf, word) = d.context(&mut s, 0xffff).unwrap();
         assert_eq!(word, 0x7f * 4);
         assert_eq!(page_of(s.table(root)[0x1ff]), leaf);
+    }
+
+    /// Copy the root page of `d` into the page `anchor` by the anchor
+    /// write rule, as a restarted driver's commit does, and return the
+    /// directory rooted at the anchor.
+    fn commit(s: &mut Heap, d: DeviceDirectory, anchor: u64) -> DeviceDirectory
+    {
+        let staged = s.table(d.root()).to_vec();
+        let held = s.table(anchor).to_vec();
+        for (_, step) in iommu_core::anchor::table_steps(&held, &staged, d.root_entry_words())
+        {
+            if let iommu_core::anchor::Step::Store { word, value } = step
+            {
+                s.table(anchor)[word] = value;
+            }
+        }
+        d.rooted_at(anchor)
+    }
+
+    #[test]
+    fn a_staged_directory_committed_into_its_anchor_holds_the_staged_contexts_alone()
+    {
+        for (levels, format) in [
+            (1, ContextFormat::Base),
+            (1, ContextFormat::Extended),
+            (2, ContextFormat::Extended),
+            (3, ContextFormat::Base),
+        ]
+        {
+            let mut s = Heap::default();
+            let anchor = s.alloc().unwrap();
+            // The dead instance attached device 0x10 under the anchor.
+            let old = DeviceDirectory::new(anchor, levels, format).unwrap();
+            let (page, word) = old.context(&mut s, 0x10).unwrap();
+            s.table(page)[word] = V;
+            // The restarted one staged 0x11 and 0x12 under a root of its own.
+            let staging = s.alloc().unwrap();
+            let d = DeviceDirectory::new(staging, levels, format).unwrap();
+            for id in [0x11u32, 0x12]
+            {
+                let (page, word) = d.context(&mut s, id).unwrap();
+                s.table(page)[word + 2] = u64::from(id) << 12;
+                s.table(page)[word] = V;
+            }
+            let committed = commit(&mut s, d, anchor);
+            assert_eq!(committed.root(), anchor);
+            let pages = s.pages.len();
+            for (id, valid) in [(0x10u32, false), (0x11, true), (0x12, true)]
+            {
+                let (page, word) = committed.context(&mut s, id).unwrap();
+                assert_eq!(s.table(page)[word] & V != 0, valid, "{levels} {id:#x}");
+                if valid
+                {
+                    assert_eq!(s.table(page)[word + 2], u64::from(id) << 12);
+                }
+            }
+            // Every context is reached through pages the staging built.
+            assert_eq!(s.pages.len(), pages);
+        }
     }
 
     #[test]

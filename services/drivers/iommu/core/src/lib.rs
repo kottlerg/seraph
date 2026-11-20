@@ -6,16 +6,20 @@
 //! The part of an IOMMU driver that does not depend on the IOMMU family.
 //!
 //! devmgr spawns one IOMMU driver per family (VT-d on x86-64; the RISC-V
-//! IOMMU), delivers it each remapping unit's register cap and the PCI
-//! functions the unit translates in its resource list
-//! (`driver_binding::resources`), and drives it over `ipc::iommu_labels`.
+//! IOMMU), delivers it each remapping unit's register cap, the root page it
+//! keeps for the unit (its anchor), and the PCI functions the unit
+//! translates in its resource list (`driver_binding::resources`), and drives
+//! it over `ipc::iommu_labels`; it restarts the driver after a death, the
+//! new instance adopting the units translating from their anchors.
 //! This crate holds what every family shares: what the driver takes from
 //! that list and the unit lookup over the units' scopes ([`delivery`]), the
 //! request handling with its version check, reply framing, and per-domain
 //! bookkeeping, which bounds each request and catches overlap and misuse
 //! before the family's code runs ([`service`]), the queue of polled faults
 //! ([`faults`]), the [`TableStore`] each family's translation structures are
-//! built in ([`table`]), and the [`Backend`] trait each family implements. A
+//! built in ([`table`]), the write rule a restarted driver's commit copies
+//! its staged root entries into the anchors by ([`anchor`]), and the
+//! [`Backend`] trait each family implements. A
 //! family binary is its `main` and its [`Backend`]. See
 //! `docs/device-management.md` § IOMMU Discovery and Programming.
 
@@ -23,6 +27,7 @@
 
 extern crate alloc;
 
+pub mod anchor;
 pub mod delivery;
 pub mod faults;
 pub mod service;
@@ -46,6 +51,20 @@ pub enum BackendError
     /// The unit did not complete a command within the backend's bound; the
     /// unit is treated as failed from then on.
     Timeout,
+}
+
+/// How a backend sets its units up ([`Backend::init_unit`]), from the resource
+/// list's restart flag ([`Units::start`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start
+{
+    /// Program each unit empty, its anchor the root, whatever an earlier
+    /// owner (the firmware) left on.
+    Reset,
+    /// Adopt each unit translating from its anchor through a dead
+    /// instance's tables, and stage this instance's tables until
+    /// [`Backend::commit`].
+    Adopt,
 }
 
 /// How a mapping lets the device reach its frames ([`Backend::map`]).
@@ -101,21 +120,45 @@ pub trait Backend
     /// One attached function's state: its place in the unit's tables.
     type Domain;
 
-    /// Program unit `unit` empty and turn translation on: from the return
-    /// on, every function the unit translates reaches nothing until it is
-    /// attached.
+    /// Program unit `unit` with its anchor as an empty root and turn
+    /// translation on: from the return on, every function the unit
+    /// translates reaches nothing until it is attached.
+    ///
+    /// A backend built to adopt (a restarted driver's) instead requires the
+    /// unit to be translating from its anchor, leaves translation and
+    /// interrupt remapping as they stand, replaces only the unit's queues,
+    /// and builds every later attach under a staging root of its own until
+    /// [`Self::commit`]: the unit keeps translating through the dead
+    /// instance's tables until then.
     ///
     /// # Errors
     /// [`BackendError::Timeout`] when the unit does not complete a command;
-    /// [`BackendError::OutOfMemory`] when no root structure can be had;
-    /// [`BackendError::Invalid`] when the unit offers no table format the
-    /// backend builds.
+    /// [`BackendError::OutOfMemory`] when no root structure or queue can be
+    /// had; [`BackendError::Invalid`] when the unit offers no table format
+    /// the backend builds, or, adopting, does not translate from its anchor
+    /// in the format the backend builds.
     fn init_unit(&mut self, unit: usize) -> Result<(), BackendError>;
 
     /// Turn translation off on every unit [`Self::init_unit`] turned it on
     /// for, so a driver that cannot finish its setup leaves no device
-    /// blocked behind a unit nothing programs.
+    /// blocked behind a unit nothing programs. A backend that adopted its
+    /// units turns nothing off: they keep translating through the tables
+    /// they hold.
     fn disable_all(&mut self);
+
+    /// Copy each staged root entry into every unit's anchor by the
+    /// [`anchor`] write rule, then invalidate each unit's translation
+    /// caches, draining the device accesses in flight; from the return on
+    /// every unit translates through this backend's tables alone, and every
+    /// later change is made to them in place (`iommu_labels::COMMIT`). On
+    /// VT-d, every remapping entry not set since the adoption is made not
+    /// present too.
+    ///
+    /// # Errors
+    /// [`BackendError::Invalid`] from a backend that did not adopt;
+    /// [`BackendError::Timeout`] when a unit does not complete an
+    /// invalidation.
+    fn commit(&mut self) -> Result<(), BackendError>;
 
     /// Point the function `bdf` (bus in bits 8..16, device and function
     /// below) of unit `unit` at a new empty domain with the domain ID `did`.
@@ -170,28 +213,39 @@ pub trait Backend
     fn poll_faults(&mut self, record: &mut dyn FnMut(Fault));
 
     /// Point every unit at one interrupt remapping table of `entries`
-    /// entries ([`service::MAX_REMAP_ENTRIES`] at most, a power of two),
-    /// none present, and turn interrupt remapping on with interrupts in the
-    /// compatibility format blocked: from the return on, an interrupt
-    /// message reaches a CPU only through an entry [`Self::remap_set`]
-    /// made. `extended` asks for 32-bit destinations; the return says
-    /// whether every unit gave them.
+    /// entries ([`service::MAX_REMAP_ENTRIES`] at most, a power of two) in
+    /// the zeroed, physically contiguous memory of the Memory cap `table`,
+    /// which the backend keeps, none present, and turn interrupt remapping
+    /// on with interrupts in the compatibility format blocked: from the
+    /// return on, an interrupt message reaches a CPU only through an entry
+    /// [`Self::remap_set`] made. `extended` asks for 32-bit destinations;
+    /// the return says whether every unit gave them. A backend that
+    /// adopted its units instead requires every unit to be remapping from
+    /// `table` already, in the destination width this call would give, and
+    /// adopts the table with its entries as they stand.
     ///
     /// # Errors
     /// [`BackendError::Invalid`] from a family that does not remap
-    /// interrupts, or when a unit offers no interrupt remapping;
-    /// [`BackendError::OutOfMemory`] when no table can be had;
+    /// interrupts, when a unit offers no interrupt remapping, or, adopting,
+    /// when a unit does not remap from `table`;
+    /// [`BackendError::OutOfMemory`] when the table cannot be mapped;
     /// [`BackendError::Timeout`] when a unit does not complete a command.
-    /// Interrupt remapping is off on every unit after an error.
+    /// Interrupt remapping is off on every unit after an error, except on
+    /// units the backend adopted, which are left as they stood.
     #[expect(
         clippy::fn_params_excessive_bools,
         reason = "`extended` is the units' extended interrupt mode, which each backend writes to \
                   its unit"
     )]
-    fn remap_enable(&mut self, entries: u32, extended: bool) -> Result<bool, BackendError>;
+    fn remap_enable(
+        &mut self,
+        entries: u32,
+        extended: bool,
+        table: u64,
+    ) -> Result<bool, BackendError>;
 
     /// Turn interrupt remapping off on every unit [`Self::remap_enable`]
-    /// turned it on for.
+    /// turned it on for; none on units the backend adopted.
     fn remap_disable(&mut self);
 
     /// Make entry `handle` of the remapping table deliver as `entry` says,

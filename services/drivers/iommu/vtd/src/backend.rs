@@ -12,12 +12,28 @@
 //! status write is polled within [`INVALIDATION_TIMEOUT`] before the request
 //! it serves is answered. Fault events stay masked; the fault recording
 //! registers are polled.
+//!
+//! Each unit's root table is its anchor, the page devmgr keeps for the boot.
+//! A driver devmgr restarts adopts the units: it requires each translating
+//! from its anchor in legacy mode, waits for the dead instance's queue to
+//! drain, replaces it with its own (`QIE` off and on again, translation and
+//! interrupt remapping left on, which queued invalidation's enable and
+//! disable sequences allow, VT-d specification § 6.5.2), and builds devmgr's
+//! replayed domains under a staging root table. [`Backend::commit`] copies
+//! each staged root entry into the anchor by the [`anchor`] write rule: a
+//! legacy root entry's upper word is reserved zero, so one aligned 64-bit
+//! store moves a bus to its new context table, whose entries carry the same
+//! domain IDs and the same ranges. The context-cache and then the IOTLB
+//! global invalidations, draining reads and writes, follow, as § 6.6 states
+//! for a root change under translation, and every remapping entry not set
+//! since the adoption is made not present.
 
 use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
 
+use iommu_core::anchor::{self, Step};
 use iommu_core::table::TABLE_WORDS;
-use iommu_core::{Access, Backend, BackendError, Fault, RemapEntry, UnitInfo};
+use iommu_core::{Access, Backend, BackendError, Fault, RemapEntry, Start, UnitInfo};
 use iommu_vtd::queue::{self, Descriptor, QUEUE_ENTRIES};
 use iommu_vtd::regs::{self, Capability};
 use iommu_vtd::remap;
@@ -62,7 +78,12 @@ pub struct Unit
     levels: u32,
     /// IOVA width the unit's domains translate, in bits.
     width_bits: u8,
-    /// Physical address of the root table; 0 before the unit is set up.
+    /// Physical address of the unit's anchor, the root table it translates
+    /// from.
+    anchor: u64,
+    /// Physical address of the root table attaches write: the anchor, or
+    /// an adopting driver's staging root until its commit; 0 before the
+    /// unit is set up.
     root: u64,
     /// Physical address of each bus's context table; 0 for none yet.
     context: [u64; 256],
@@ -71,12 +92,15 @@ pub struct Unit
 
 impl Unit
 {
-    /// A unit whose registers are mapped `regs_len` bytes from `regs`.
-    pub fn new(regs: u64, regs_len: u64) -> Self
+    /// A unit whose registers are mapped `regs_len` bytes from `regs`, with
+    /// its anchor at the physical address `anchor`, a page of the backend's
+    /// store.
+    pub fn new(regs: u64, regs_len: u64, anchor: u64) -> Self
     {
         Self {
             regs,
             regs_len,
+            anchor,
             cap: Capability::decode(0),
             ecap: 0,
             queue: 0,
@@ -203,6 +227,33 @@ impl Unit
         self.wait(|u| u.read32(regs::GSTS) & regs::G_WBF == 0)
     }
 
+    /// Read `CAP` and `ECAP` and the table depth and width the unit's
+    /// domains get, and check the registers the driver uses lie in the
+    /// mapped set. A unit without queued invalidation is refused: the driver
+    /// invalidates no other way.
+    fn probe(&mut self) -> Result<(), BackendError>
+    {
+        self.cap = Capability::decode(self.read64(regs::CAP));
+        self.ecap = self.read64(regs::ECAP);
+        let (levels, bits) = self.cap.table_depth().ok_or(BackendError::Invalid)?;
+        self.levels = levels;
+        self.width_bits = bits.min(self.cap.mgaw);
+        // The last fault recording register's high word (`fault_count` is 1
+        // at least); an offset past the register set is refused by
+        // `checked`, saturated or not.
+        let last_fault = self
+            .cap
+            .fault_record(self.cap.fault_count.saturating_sub(1))
+            .saturating_add(8);
+        if self.ecap & regs::ECAP_QI == 0
+            || self.checked(regs::IRTA, 8).is_none()
+            || self.checked(last_fault, 8).is_none()
+        {
+            return Err(BackendError::Invalid);
+        }
+        Ok(())
+    }
+
     /// Clear every fault recording register, the overflow flag, and an
     /// invalidation queue error.
     fn clear_faults(&self)
@@ -234,12 +285,17 @@ impl Unit
     }
 }
 
+/// The words of a legacy root entry.
+const ROOT_ENTRY_WORDS: usize = 2;
+
 /// The interrupt remapping table every unit points at.
 #[derive(Clone, Copy)]
 struct RemapTable
 {
     /// Physical address of its first page.
     base: u64,
+    /// Its entries.
+    entries: u32,
     /// 32-bit destinations (extended interrupt mode).
     extended: bool,
 }
@@ -289,17 +345,29 @@ pub struct Vtd
     units: Vec<Unit>,
     store: Store,
     remap: Option<RemapTable>,
+    /// How the units are set up: a restarted instance adopts them.
+    start: Start,
+    /// While adopted and not committed: one bit per remapping entry, set
+    /// once the entry is set or cleared, so the commit can clear every
+    /// entry the replay did not set; empty otherwise.
+    touched: Vec<u64>,
+    /// The adopted units translate through this instance's tables alone.
+    committed: bool,
 }
 
 impl Vtd
 {
-    /// A backend over `units`, building its tables in `store`.
-    pub fn new(units: Vec<Unit>, store: Store) -> Self
+    /// A backend over `units`, building its tables in `store`, setting the
+    /// units up as `start` says.
+    pub fn new(units: Vec<Unit>, store: Store, start: Start) -> Self
     {
         Self {
             units,
             store,
             remap: None,
+            start,
+            touched: Vec::new(),
+            committed: false,
         }
     }
 
@@ -463,42 +531,34 @@ impl Vtd
         self.submit(unit, &[queue::context_global(), queue::iotlb_domain(did)])
     }
 
-    /// Set unit `unit` up empty, with queued invalidation on, then turn
-    /// translation on. A unit without queued invalidation is refused: the
-    /// driver invalidates no other way.
+    /// Set unit `unit` up as the backend's `start` says.
     fn setup(&mut self, unit: usize) -> Result<(), BackendError>
     {
-        let u = self.unit_mut(unit)?;
-        u.cap = Capability::decode(u.read64(regs::CAP));
-        u.ecap = u.read64(regs::ECAP);
-        let (levels, bits) = u.cap.table_depth().ok_or(BackendError::Invalid)?;
-        u.levels = levels;
-        u.width_bits = bits.min(u.cap.mgaw);
-        // The last fault recording register's high word (`fault_count` is 1
-        // at least); an offset past the register set is refused by
-        // `checked`, saturated or not.
-        let last_fault = u
-            .cap
-            .fault_record(u.cap.fault_count.saturating_sub(1))
-            .saturating_add(8);
-        if u.ecap & regs::ECAP_QI == 0
-            || u.checked(regs::IRTA, 8).is_none()
-            || u.checked(last_fault, 8).is_none()
+        self.unit_mut(unit)?.probe()?;
+        let queue = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
+        let status = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
+        match self.start
         {
-            return Err(BackendError::Invalid);
+            Start::Reset => self.reset_unit(unit, queue, status),
+            Start::Adopt => self.adopt_unit(unit, queue, status),
         }
+    }
+
+    /// Turn every state an earlier owner left on off, start queued
+    /// invalidation on the page `queue`, its waits writing `status`, point
+    /// unit `unit` at its anchor, emptied, and turn translation on.
+    fn reset_unit(&mut self, unit: usize, queue: u64, status: u64) -> Result<(), BackendError>
+    {
+        let u = self.unit(unit)?;
         u.reset_states()?;
         u.write32(regs::FECTL, regs::FECTL_IM);
         u.clear_faults();
-        let queue = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
-        let status = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
-        let root = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
+        let anchor = u.anchor;
+        self.zero_pages(anchor, 1);
+        self.start_queue(unit, queue, status)?;
         let u = self.unit_mut(unit)?;
-        (u.queue, u.status, u.tail, u.token, u.root) = (queue, status, 0, 0, root);
-        u.write64(regs::IQT, queue::tail(0));
-        u.write64(regs::IQA, queue::iqa(queue));
-        u.enable(regs::G_QIE)?;
-        u.write64(regs::RTADDR, root);
+        u.root = anchor;
+        u.write64(regs::RTADDR, anchor);
         u.set_root()?;
         u.flush_write_buffer()?;
         self.submit(unit, &[queue::context_global(), queue::iotlb_global()])?;
@@ -506,6 +566,157 @@ impl Vtd
         u.enable(regs::G_TE)?;
         u.enabled = true;
         Ok(())
+    }
+
+    /// Adopt unit `unit` from a dead instance: require it translating from
+    /// its anchor in legacy mode with queued invalidation on and no
+    /// invalidation error recorded, wait for the dead instance's queue to
+    /// drain, and replace the queue with one on the page `queue`, its waits
+    /// writing `status`, translation and interrupt remapping staying on.
+    /// Later attaches build under a new staging root until
+    /// [`Backend::commit`]. The fault records stay as they stand, for the
+    /// poll to read.
+    fn adopt_unit(&mut self, unit: usize, queue: u64, status: u64) -> Result<(), BackendError>
+    {
+        let staging = self.store.alloc().ok_or(BackendError::OutOfMemory)?;
+        let u = self.unit(unit)?;
+        let on = regs::G_TE | regs::G_QIE;
+        // The root pointer's translation-table mode (bits 10..12) is legacy
+        // (0) when it equals the page-aligned anchor.
+        if u.read32(regs::GSTS) & on != on
+            || u.read64(regs::RTADDR) != u.anchor
+            || u.read32(regs::FSTS) & (regs::FSTS_IQE | regs::FSTS_ITE) != 0
+        {
+            return Err(BackendError::Invalid);
+        }
+        u.write32(regs::FECTL, regs::FECTL_IM);
+        // Queued invalidation is turned off only with every descriptor
+        // fetched (VT-d specification § 6.5.2), and the dead instance ended
+        // every batch with a wait descriptor.
+        u.wait(|u| u.read64(regs::IQH) == u.read64(regs::IQT))?;
+        u.disable(regs::G_QIE)?;
+        self.start_queue(unit, queue, status)?;
+        let u = self.unit_mut(unit)?;
+        u.root = staging;
+        u.enabled = true;
+        Ok(())
+    }
+
+    /// Point unit `unit`'s invalidation queue at the page `queue`, its
+    /// waits writing `status`, and turn queued invalidation on.
+    fn start_queue(&mut self, unit: usize, queue: u64, status: u64) -> Result<(), BackendError>
+    {
+        let u = self.unit_mut(unit)?;
+        (u.queue, u.status, u.tail, u.token) = (queue, status, 0, 0);
+        u.write64(regs::IQT, queue::tail(0));
+        u.write64(regs::IQA, queue::iqa(queue));
+        u.enable(regs::G_QIE)
+    }
+
+    /// Zero the `pages` contiguous pages of the store from `base`, which no
+    /// unit reads yet.
+    fn zero_pages(&mut self, base: u64, pages: u64)
+    {
+        let page_bytes = word_offset(TABLE_WORDS);
+        for page in 0..pages
+        {
+            // The pages are a chunk of the store, so the sum does not
+            // saturate.
+            let phys = base.saturating_add(page.saturating_mul(page_bytes));
+            *self.store.table(phys) = [0; TABLE_WORDS];
+            fence(Ordering::SeqCst);
+            self.store.flush(phys, 0, page_bytes);
+        }
+    }
+
+    /// Store `value` to word `word` of the table page `table` a unit may be
+    /// walking, as one volatile 64-bit store, and order it before every
+    /// later store, flushed.
+    fn store_word(&mut self, table: u64, word: usize, value: u64) -> Result<(), BackendError>
+    {
+        let slot = self
+            .store
+            .table(table)
+            .get_mut(word)
+            .ok_or(BackendError::Invalid)?;
+        // SAFETY: `slot` is a word of a table page the store maps for the
+        // driver's life, borrowed exclusively.
+        unsafe { core::ptr::write_volatile(slot, value) };
+        self.store.written(table, word);
+        Ok(())
+    }
+
+    /// Copy unit `unit`'s staged root table into its anchor by the
+    /// [`anchor`] write rule, then invalidate its context cache and IOTLB,
+    /// draining, so it translates through this instance's tables alone.
+    fn commit_unit(&mut self, unit: usize) -> Result<(), BackendError>
+    {
+        let u = self.unit(unit)?;
+        let (anchor, staging) = (u.anchor, u.root);
+        let staged = self.store.table(staging).to_vec();
+        for (_, step) in anchor::table_steps(self.store.table(anchor), &staged, ROOT_ENTRY_WORDS)
+        {
+            match step
+            {
+                Step::Store { word, value } => self.store_word(anchor, word, value)?,
+                Step::Invalidate =>
+                {
+                    self.unit(unit)?.flush_write_buffer()?;
+                    self.submit(unit, &[queue::context_global(), queue::iotlb_global()])?;
+                }
+            }
+        }
+        self.unit(unit)?.flush_write_buffer()?;
+        self.submit(unit, &[queue::context_global(), queue::iotlb_global()])?;
+        self.unit_mut(unit)?.root = anchor;
+        Ok(())
+    }
+
+    /// Make every present remapping entry not set or cleared since the
+    /// adoption not present, invalidating each unit's cached copy.
+    fn clear_untouched(&mut self) -> Result<(), BackendError>
+    {
+        let Some(table) = self.remap
+        else
+        {
+            return Ok(());
+        };
+        for handle in (0..table.entries).filter_map(|h| u16::try_from(h).ok())
+        {
+            if self.touched(handle)
+            {
+                continue;
+            }
+            let (page, index) = table.slot(handle);
+            let held = entry_words(self.store.table(page), index).ok_or(BackendError::Invalid)?[0];
+            if held & remap::IRTE_PRESENT != 0
+            {
+                self.clear_entry(page, index)?;
+                self.invalidate_remap_entry(handle)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether remapping entry `handle` was set or cleared since the
+    /// adoption.
+    fn touched(&self, handle: u16) -> bool
+    {
+        let handle = usize::from(handle);
+        self.touched
+            .get(handle / 64)
+            .is_some_and(|w| w & (1 << (handle % 64)) != 0)
+    }
+
+    /// Record remapping entry `handle` set or cleared, while adopted and
+    /// not committed.
+    fn touch(&mut self, handle: u16)
+    {
+        let handle = usize::from(handle);
+        if let Some(w) = self.touched.get_mut(handle / 64)
+        {
+            *w |= 1 << (handle % 64);
+        }
     }
 }
 
@@ -530,6 +741,10 @@ impl Backend for Vtd
 
     fn disable_all(&mut self)
     {
+        if self.start == Start::Adopt
+        {
+            return;
+        }
         self.remap_disable();
         for u in &mut self.units
         {
@@ -571,6 +786,22 @@ impl Backend for Vtd
             did,
             tables,
         })
+    }
+
+    fn commit(&mut self) -> Result<(), BackendError>
+    {
+        if self.start != Start::Adopt || self.committed
+        {
+            return Err(BackendError::Invalid);
+        }
+        for unit in 0..self.units.len()
+        {
+            self.commit_unit(unit)?;
+        }
+        self.clear_untouched()?;
+        self.touched = Vec::new();
+        self.committed = true;
+        Ok(())
     }
 
     fn map(
@@ -690,25 +921,65 @@ impl Backend for Vtd
         }
     }
 
-    fn remap_enable(&mut self, entries: u32, extended: bool) -> Result<bool, BackendError>
+    /// An adopting backend requires every unit's remapping table pointer to
+    /// be the one this call would write (the table's address, its size,
+    /// and the destination width), so the dead instance's entries stay
+    /// live through the replay.
+    fn remap_enable(
+        &mut self,
+        entries: u32,
+        extended: bool,
+        table: u64,
+    ) -> Result<bool, BackendError>
     {
         if self.remap.is_some() || self.units.iter().any(|u| u.ecap & regs::ECAP_IR == 0)
         {
+            let _ = syscall::cap_delete(table);
             return Err(BackendError::Invalid);
         }
+        let pages = remap::table_pages(entries);
         let table = RemapTable {
             base: self
                 .store
-                .alloc_contiguous(remap::table_pages(entries))
+                .adopt(table, pages)
                 .ok_or(BackendError::OutOfMemory)?,
+            entries,
             extended: extended && self.units.iter().all(|u| u.ecap & regs::ECAP_EIM != 0),
         };
-        for unit in 0..self.units.len()
+        match self.start
         {
-            if let Err(e) = self.remap_unit(unit, table, entries)
+            Start::Reset =>
             {
-                self.remap_disable();
-                return Err(e);
+                self.zero_pages(table.base, pages);
+                for unit in 0..self.units.len()
+                {
+                    if let Err(e) = self.remap_unit(unit, table, entries)
+                    {
+                        self.remap_disable();
+                        return Err(e);
+                    }
+                }
+            }
+            Start::Adopt =>
+            {
+                let irta = remap::irta(table.base, entries, table.extended);
+                if self.units.iter().any(|u| {
+                    u.read32(regs::GSTS) & regs::G_IRE == 0 || u.read64(regs::IRTA) != irta
+                })
+                {
+                    return Err(BackendError::Invalid);
+                }
+                if !self.committed
+                {
+                    let words =
+                        usize::try_from(entries.div_ceil(64)).map_err(|_| BackendError::Invalid)?;
+                    let mut touched = Vec::new();
+                    touched
+                        .try_reserve_exact(words)
+                        .map_err(|_| BackendError::OutOfMemory)?;
+                    touched.resize(words, 0);
+                    self.touched = touched;
+                }
             }
         }
         self.remap = Some(table);
@@ -717,11 +988,14 @@ impl Backend for Vtd
 
     fn remap_disable(&mut self)
     {
-        for u in &self.units
+        if self.start == Start::Reset
         {
-            if u.read32(regs::GSTS) & regs::G_IRE != 0
+            for u in &self.units
             {
-                let _ = u.disable(regs::G_IRE);
+                if u.read32(regs::GSTS) & regs::G_IRE != 0
+                {
+                    let _ = u.disable(regs::G_IRE);
+                }
             }
         }
         self.remap = None;
@@ -740,7 +1014,11 @@ impl Backend for Vtd
         let held = *entry_words(self.store.table(page), index).ok_or(BackendError::Invalid)?;
         match remap::update(held, words)
         {
-            remap::Update::Unchanged => return Ok(()),
+            remap::Update::Unchanged =>
+            {
+                self.touch(handle);
+                return Ok(());
+            }
             remap::Update::Replace =>
             {
                 self.clear_entry(page, index)?;
@@ -749,7 +1027,9 @@ impl Backend for Vtd
             remap::Update::Write => (),
         }
         self.write_entry(page, index, words)?;
-        self.invalidate_remap_entry(handle)
+        self.invalidate_remap_entry(handle)?;
+        self.touch(handle);
+        Ok(())
     }
 
     fn remap_clear(&mut self, handle: u16) -> Result<(), BackendError>
@@ -757,6 +1037,8 @@ impl Backend for Vtd
         let table = self.remap.ok_or(BackendError::Invalid)?;
         let (page, index) = table.slot(handle);
         self.clear_entry(page, index)?;
-        self.invalidate_remap_entry(handle)
+        self.invalidate_remap_entry(handle)?;
+        self.touch(handle);
+        Ok(())
     }
 }

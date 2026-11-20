@@ -525,6 +525,7 @@ universal — returns aggregate counts only, no caps and no state change.
 | data[11] | `growth_floor_bytes` — the free pages outside `promised` a charge to a budget node outside the reserve may not take: the system reserve and, while chunks are swapped, the restore headroom, `data[6]` plus the lesser of `data[10]` and `data[6]` ([`memory-pool.md`](memory-pool.md#eviction) § Eviction, Restore headroom) |
 | data[12] | `disk_bytes` — the pages of every chunk on disk, the subset of `data[10]` only the swap service's slots hold ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier) |
 | data[13] | `swap_slots_free` — the swap slots registered and not taken; `0` while no swap service is registered (§ Labels 22 to 26) |
+| data[14] | `evictions` — the evictions memmgr has begun, background or direct, a count (not bytes) that only moves up, wrapping ([`memory-pool.md`](memory-pool.md#eviction) § Eviction) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -561,7 +562,12 @@ every other charge. `store_bytes` (`data[9]`) and `swapped_bytes`
 (`data[10]`) rise as memmgr evicts cold chunks under pressure and fall as
 faults restore them or their regions go; their ratio is the store's
 compression; a chunk on disk leaves `data[9]` and stays in `data[10]`, and
-`data[12]` counts it. `data[3]` to `data[13]` are appended after the identity terms;
+`data[12]` counts it. An eviction is the one way a chunk leaves the resident
+state, so a reader that finds `evictions` (`data[14]`) the same before and
+after making a range resident knows that no chunk of the range was evicted,
+held raw or being evicted at the second read, whatever was in flight at the
+first: a chunk held raw counts in no other word until it is written.
+`data[3]` to `data[14]` are appended after the identity terms;
 readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`

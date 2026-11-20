@@ -246,6 +246,8 @@ pub(super) struct Pool
     pub(super) on_disk: u64,
     /// `data[13]`: the swap slots free.
     pub(super) free_slots: u64,
+    /// `data[14]`: the evictions memmgr has begun, a count.
+    pub(super) evictions: u64,
 }
 
 impl Pool
@@ -319,6 +321,7 @@ pub(super) fn pool() -> Pool
         floor: reply.word(11),
         on_disk: reply.word(12),
         free_slots: reply.word(13),
+        evictions: reply.word(14),
     }
 }
 

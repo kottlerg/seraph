@@ -33,11 +33,13 @@
 //! per boot, apart from devmgr's restart of a served driver that dies, which
 //! it serves at the class's next ordinal
 //! (`services/devmgr/docs/responsibilities.md` § Driver Restart): the RTC
-//! at ordinal 0 need not last the boot. While no RTC driver is served, an
-//! `rtc` query replies
+//! at ordinal 0 need not last the boot. A client finds the RTC as it finds
+//! any driver of its class, by probing the ordinals
+//! ([`first_device`](crate::first_device)): the ordinal of a driver that died replies
+//! [`devmgr_errors::WITHDRAWN`](crate::devmgr_errors::WITHDRAWN), and an
+//! ordinal past the last served driver replies
 //! [`devmgr_errors::NO_DEVICE`](crate::devmgr_errors::NO_DEVICE), whose retry
-//! rule (a later bind pass may serve the class) is `NO_DEVICE`'s. RTC drivers
-//! are **not** carried in the boot bundle.
+//! rule is `NO_DEVICE`'s. RTC drivers are **not** carried in the boot bundle.
 //!
 //! Adding a new RTC chip is a matter of writing a driver crate that
 //! answers this single label and binding it through devmgr's per-board

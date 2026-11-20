@@ -31,7 +31,7 @@ use ipc::bootstrap::ServeFailure;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use std::os::seraph::process::ArgvEnvCap;
 use svcmgr_defs::DeathTag;
-use svcmgr_defs::memory_wait::{AfterCreateFailure, CreateFailure, after_create_failure};
+use svcmgr_defs::memory_wait::{CreateFailure, MemoryWait, MemoryWaits, Refused, Retry};
 use syscall_abi::SyscallError;
 
 /// Outcome of [`handle_death`], routed by the caller (`dispatch_deaths`
@@ -49,8 +49,8 @@ pub enum DeathOutcome
     /// Caller must ask the shutdown actuator to power the system off.
     Unrecoverable,
     /// procmgr refused the restart's create for want of memory: the service
-    /// is inactive, holds no instance, and is retried once memmgr's level
-    /// changes to below `CRITICAL` ([`retry_memory_wait`]).
+    /// is inactive, holds no instance, and waits in the memory wait
+    /// (`svcmgr_defs::memory_wait`), which [`retry_memory_wait`] retries.
     WaitingForMemory,
 }
 
@@ -238,7 +238,7 @@ pub fn walk_and_create_from_file(
 
 /// [`walk_and_create_from_file`], telling a create procmgr refused with
 /// `OUT_OF_MEMORY` ([`CreateFailure::OutOfMemory`]) from every other failure,
-/// which the restart path decides on ([`after_create_failure`]).
+/// which the restart path decides on (`svcmgr_defs::memory_wait`).
 fn create_from_file(
     path: &str,
     blobs: StartupBlobs<'_>,
@@ -474,9 +474,12 @@ pub struct RestartCtx
     /// (`std::os::seraph::memory_pressure_notification`), in svcmgr's main
     /// wait set, which wakes a restart that waits for memory
     /// ([`retry_memory_wait`]). `0` when svcmgr has none, or could not add it
-    /// to the wait set; a create refused for want of memory then ends the
-    /// service down.
+    /// to the wait set; no restart then waits for memory.
     pub pressure_notification: u64,
+    /// svcmgr's side of the memory wait (`svcmgr_defs::memory_wait`): whether
+    /// it has the Notification, and memmgr's level as it last read it, which
+    /// arms the main loop's retry timer.
+    pub memory_waits: core::cell::Cell<MemoryWaits>,
 }
 
 /// Handle a service death detected via event queue notification.
@@ -498,10 +501,10 @@ pub struct RestartCtx
 /// same way, its restart charged to the same budget, so the budget bounds the
 /// repeats. Its late posts carry an instance already routed and are dropped.
 ///
-/// A create procmgr refuses for want of memory is decided by
-/// [`after_create_failure`]: the restart waits for memmgr's level to read below
-/// `CRITICAL` ([`retry_memory_wait`]), is decided again at once, once, when it
-/// already reads below, or ends the service down as any other failure does.
+/// A create procmgr refuses for want of memory moves the restart into the
+/// memory wait (`svcmgr_defs::memory_wait`), which [`retry_memory_wait`]
+/// retries, unless the service may not wait; every other failure ends the
+/// service down.
 ///
 /// Returns a [`DeathOutcome`] the caller routes:
 ///
@@ -511,8 +514,8 @@ pub struct RestartCtx
 /// * `Unrecoverable` — `system_critical` service that restart cannot
 ///   recover. Caller must initiate the graceful-shutdown path (the
 ///   shutdown request through the shutdown actuator's declared name).
-/// * `WaitingForMemory` — the service is down until memmgr's level reads
-///   below `CRITICAL`; the caller does nothing more.
+/// * `WaitingForMemory` — the restart waits for memory, the service down
+///   meanwhile; the caller does nothing more.
 pub fn handle_death(
     svc: &mut ServiceEntry,
     exit_reason: u64,
@@ -520,53 +523,6 @@ pub fn handle_death(
     tag: DeathTag,
     recipe: Option<&RestartRecipe>,
     registry: &mut registry::Registry,
-) -> DeathOutcome
-{
-    decide_restart(svc, exit_reason, ctx, tag.slot, recipe, registry, true)
-}
-
-/// Retry the restart of `svc`, in table slot `slot`, that waits for memory
-/// ([`ServiceEntry::memory_wait`]), once memmgr's level reads below
-/// `CRITICAL`: the death it waits on is decided again as [`handle_death`]
-/// decides it, the attempt charged to the budget, without the death's lines,
-/// which the death wrote. `None` when the service waits for nothing.
-pub fn retry_memory_wait(
-    svc: &mut ServiceEntry,
-    ctx: &RestartCtx,
-    slot: u32,
-    recipe: Option<&RestartRecipe>,
-    registry: &mut registry::Registry,
-) -> Option<DeathOutcome>
-{
-    let exit_reason = svc.memory_wait.take()?;
-    std::os::seraph::log!("memory freed; retrying the restart of {}", svc.name_str());
-    Some(decide_restart(
-        svc,
-        exit_reason,
-        ctx,
-        slot,
-        recipe,
-        registry,
-        false,
-    ))
-}
-
-/// The restart decision of [`handle_death`] and [`retry_memory_wait`] for
-/// the death of `svc`, in table slot `slot`, with `exit_reason`; `announce`
-/// is whether the death's lines are still to be written.
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`announce` is whether the death's lines are still owed, which the retry of a \
-              memory wait has written"
-)]
-fn decide_restart(
-    svc: &mut ServiceEntry,
-    exit_reason: u64,
-    ctx: &RestartCtx,
-    slot: u32,
-    recipe: Option<&RestartRecipe>,
-    registry: &mut registry::Registry,
-    announce: bool,
 ) -> DeathOutcome
 {
     // The log sink's death leaves the master log endpoint with no receiver
@@ -592,20 +548,14 @@ fn decide_restart(
     {
         DeathLines::Written
     };
-    // The log sink and a reserve service keep the permanent path when their
-    // create is refused (`svcmgr_defs::memory_wait::after_create_failure`).
-    let reserve_path = matches!(recipe, Some(r) if r.log_sink || r.reserve);
     // The routed death, and the deaths of the instances that died during
     // their bootstrap since, with the reason of the last.
     let routed_reason = exit_reason;
     let mut exit_reason = exit_reason;
     let mut bootstrap_deaths: u32 = 0;
-    let mut announce = announce;
-    // Whether this decision has retried a refusal for want of memory at once.
-    let mut retried = false;
     loop
     {
-        if lines == DeathLines::Written && announce
+        if lines == DeathLines::Written
         {
             log_death(svc, exit_reason);
         }
@@ -622,52 +572,25 @@ fn decide_restart(
             std::os::seraph::log!("restarting (attempt {attempt:#018x})");
         }
 
-        let respawn = restart_process(svc, ctx, slot, recipe, registry);
+        let respawn = restart_process(svc, ctx, tag.slot, recipe, registry);
         if let Respawn::Failed(failure) = respawn
         {
-            match after_create_failure(
-                failure,
-                reserve_path,
-                ctx.pressure_notification != 0,
-                pressure_level(),
-                retried,
-            )
+            svc.active = false;
+            let refused = Refused::Decided { exit_reason };
+            return match refused_create(ctx, refused, failure, recipe)
             {
-                AfterCreateFailure::Permanent =>
+                Some(wait) =>
                 {
-                    svc.active = false;
-                    return permanent_death_outcome(svc, lines);
-                }
-                AfterCreateFailure::RetryNow =>
-                {
-                    // The level may have fallen between procmgr's refusal and
-                    // the read, after which no later change need be signalled,
-                    // so the restart is decided again now, once, charged to
-                    // the budget again; a second refusal waits.
+                    svc.memory_wait = Some(wait);
                     std::os::seraph::log!(
-                        "create refused for want of memory, and the level no longer reads \
-                         CRITICAL; deciding the restart again"
-                    );
-                    announce = false;
-                    retried = true;
-                    continue;
-                }
-                AfterCreateFailure::WaitForMemory =>
-                {
-                    svc.active = false;
-                    svc.memory_wait = Some(exit_reason);
-                    std::os::seraph::log!(
-                        warn: "restart of {} waits for memory: create refused for want of \
-                         memory",
+                        warn: "restart of {} waits for memory: create refused for want of memory",
                         svc.name_str()
                     );
-                    return DeathOutcome::WaitingForMemory;
+                    DeathOutcome::WaitingForMemory
                 }
-            }
+                None => permanent_death_outcome(svc, lines),
+            };
         }
-        // The entry names the new instance, which routes its deaths; a retry
-        // of a memory wait starts from an inactive entry.
-        svc.active = true;
         // A restart count cannot meaningfully exceed its type, so it
         // saturates; an instance that started counts, whether or not it lived
         // through its bootstrap.
@@ -683,7 +606,6 @@ fn decide_restart(
         }
         bootstrap_deaths = bootstrap_deaths.saturating_add(1);
         exit_reason = reason;
-        announce = true;
     }
 
     if lines == DeathLines::Held
@@ -702,6 +624,99 @@ fn decide_restart(
     }
     std::os::seraph::log!("service restarted: {}", svc.name_str());
     DeathOutcome::Restarted
+}
+
+/// Retry the restart of `svc`, in table slot `slot`, that waits for memory
+/// ([`ServiceEntry::memory_wait`]), as `retry` (a signal's or the timer's)
+/// makes due: make its create again, charging the budget nothing, since the
+/// death it restarts was charged when the restart was decided
+/// (`svcmgr_defs::memory_wait`). A new instance that runs ends the wait; one
+/// that dies during its bootstrap is a new death, decided by [`handle_death`]
+/// and charged; a refusal for want of memory waits again, until the timed
+/// retries reach their limit; any other failure leaves the service
+/// permanently down. `None` when the service waits for nothing.
+pub fn retry_memory_wait(
+    svc: &mut ServiceEntry,
+    ctx: &RestartCtx,
+    slot: u32,
+    recipe: Option<&RestartRecipe>,
+    registry: &mut registry::Registry,
+    retry: Retry,
+) -> Option<DeathOutcome>
+{
+    let wait = svc.memory_wait.take()?;
+    if !retry.timed
+    {
+        std::os::seraph::log!(
+            "memory level fell; retrying the restart of {}",
+            svc.name_str()
+        );
+    }
+    match restart_process(svc, ctx, slot, recipe, registry)
+    {
+        Respawn::Failed(failure) =>
+        {
+            let refused = Refused::Retried { wait, retry };
+            if let Some(wait) = refused_create(ctx, refused, failure, recipe)
+            {
+                svc.memory_wait = Some(wait);
+                return Some(DeathOutcome::WaitingForMemory);
+            }
+            if failure == CreateFailure::OutOfMemory
+            {
+                std::os::seraph::log!(
+                    warn: "restart of {} given up: no memory for its create after {} timed \
+                     retries",
+                    svc.name_str(),
+                    svcmgr_defs::memory_wait::MEMORY_RETRY_LIMIT
+                );
+            }
+            Some(permanent_death_outcome(svc, DeathLines::Written))
+        }
+        Respawn::Started =>
+        {
+            svc.active = true;
+            svc.restart_count = svc.restart_count.saturating_add(1);
+            std::os::seraph::log!("service restarted: {}", svc.name_str());
+            Some(DeathOutcome::Restarted)
+        }
+        Respawn::DiedInBootstrap(reason) =>
+        {
+            svc.active = true;
+            svc.restart_count = svc.restart_count.saturating_add(1);
+            std::os::seraph::log!(
+                "  the new instance of {} died during its bootstrap",
+                svc.name_str()
+            );
+            let tag = DeathTag {
+                slot,
+                instance: svc.instance,
+            };
+            Some(handle_death(svc, reason, ctx, tag, recipe, registry))
+        }
+    }
+}
+
+/// Where procmgr's refusal of a restart's create leaves it
+/// (`svcmgr_defs::memory_wait::MemoryWaits::on_refusal`): `Some` the memory
+/// wait it is in, `None` permanently down. A refusal for want of memory
+/// records memmgr's level first, which arms or disarms the main loop's retry
+/// timer. The log sink and a reserve service never wait.
+fn refused_create(
+    ctx: &RestartCtx,
+    refused: Refused,
+    failure: CreateFailure,
+    recipe: Option<&RestartRecipe>,
+) -> Option<MemoryWait>
+{
+    let mut waits = ctx.memory_waits.get();
+    if failure == CreateFailure::OutOfMemory
+    {
+        waits.record_level(pressure_level());
+        ctx.memory_waits.set(waits);
+    }
+    let reserve_path = matches!(recipe, Some(r) if r.log_sink || r.reserve);
+    waits.on_refusal(refused, failure, reserve_path)
 }
 
 /// memmgr's memory-pressure level (`memmgr_labels::PRESSURE_*`), or `None`

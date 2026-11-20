@@ -43,6 +43,8 @@ use service::bootstrap_caps;
 use std::os::seraph::{StartupInfo, startup_info};
 use svcmgr_defs::DeathTag;
 use svcmgr_defs::drivers_dir;
+use svcmgr_defs::memory_wait::{MemoryWaits, Wake};
+use syscall_abi::SyscallError;
 
 /// Monotonic time since the first call, in nanoseconds, for the windowed
 /// restart budget. Saturates rather than wraps.
@@ -636,6 +638,7 @@ fn event_loop(
         entropy_source: caps.entropy_source,
         self_death_queue,
         pressure_notification,
+        memory_waits: core::cell::Cell::new(MemoryWaits::new(pressure_notification != 0)),
     };
 
     // One guard covers both spin shapes: a failing wait_set_wait, and a
@@ -644,11 +647,24 @@ fn event_loop(
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
+        // No timeout unless a restart waits for memory below CRITICAL
+        // (`MemoryWaits::wait_timeout_ms`), so svcmgr makes no idle wake-up.
+        let waiting = state
+            .table
+            .services
+            .iter()
+            .any(|svc| svc.memory_wait.is_some());
+        let timeout_ms = restart_ctx.memory_waits.get().wait_timeout_ms(waiting);
         // Read every time: a bind that grows the death queues may have
         // replaced the wait set.
-        let badge = match syscall::wait_set_wait(restart_ctx.deaths.ws_cap())
+        let badge = match syscall::wait_set_wait_timeout(restart_ctx.deaths.ws_cap(), timeout_ms)
         {
             Ok(badge) => badge,
+            Err(e) if timeout_ms != 0 && e == SyscallError::WouldBlock as i64 =>
+            {
+                retry_memory_waits(state, &restart_ctx, Wake::Timer);
+                continue;
+            }
             Err(e) =>
             {
                 guard.on_failure(e);
@@ -660,7 +676,13 @@ fn event_loop(
         {
             WS_BADGE_SERVICE => dispatch_ipc(caps.service_ep, state, &restart_ctx, &mut guard),
             WS_BADGE_DEATHS => dispatch_deaths(state, &restart_ctx),
-            WS_BADGE_PRESSURE => dispatch_pressure(state, &restart_ctx),
+            WS_BADGE_PRESSURE =>
+            {
+                // Take the bits before the read, so a change after the read
+                // signals again.
+                let _ = syscall::notification_try_wait(restart_ctx.pressure_notification);
+                retry_memory_waits(state, &restart_ctx, Wake::Signal);
+            }
             _ => std::os::seraph::log!(warn: "unexpected wait-set badge"),
         }
     }
@@ -669,9 +691,8 @@ fn event_loop(
 /// Add the Notification memmgr signals on a change of its pressure level
 /// (`std::os::seraph::memory_pressure_notification`) to the main wait set
 /// under [`WS_BADGE_PRESSURE`], and return it; `0`, logged, when svcmgr has no
-/// registration or the add fails. A restart that waits for memory is woken by
-/// it ([`dispatch_pressure`]); without it a create refused for want of memory
-/// ends the service down.
+/// registration or the add fails. Without it no restart waits for memory
+/// (`svcmgr_defs::memory_wait`).
 fn pressure_member(deaths: &death_set::DeathSet) -> u64
 {
     let Some(notification) = std::os::seraph::memory_pressure_notification()
@@ -691,19 +712,22 @@ fn pressure_member(deaths: &death_set::DeathSet) -> u64
     notification
 }
 
-/// Handle a signal of the memory-pressure Notification: take its bits, read
-/// memmgr's level, and once it reads below `CRITICAL`
-/// (`svcmgr_defs::memory_wait::retry_due`) retry the restart of every service
-/// that waits for memory (`restart::retry_memory_wait`), routing each outcome
-/// as a death's: an unrecoverable one starts the graceful shutdown. The bits
-/// are taken before the read, so a change after the read signals again.
-fn dispatch_pressure(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
+/// Handle `wake` for the restarts that wait for memory: read memmgr's level,
+/// record it (which arms or disarms the retry timer), and when it makes a
+/// retry due (`MemoryWaits::wake`: the level reads below `CRITICAL`) retry
+/// the restart of every waiting service (`restart::retry_memory_wait`),
+/// routing each outcome as a death's: an unrecoverable one starts the
+/// graceful shutdown once every retry is made.
+fn retry_memory_waits(state: &mut SvcmgrState, ctx: &restart::RestartCtx, wake: Wake)
 {
-    let _ = syscall::notification_try_wait(ctx.pressure_notification);
-    if !svcmgr_defs::memory_wait::retry_due(restart::pressure_level())
+    let mut waits = ctx.memory_waits.get();
+    waits.record_level(restart::pressure_level());
+    ctx.memory_waits.set(waits);
+    let Some(retry) = waits.wake(wake)
+    else
     {
         return;
-    }
+    };
     let mut unrecoverable = false;
     for idx in 0..state.table.services.len()
     {
@@ -716,7 +740,7 @@ fn dispatch_pressure(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
             continue;
         };
         let recipe = table.recipes.get(idx).and_then(Option::as_ref);
-        if restart::retry_memory_wait(entry, ctx, slot, recipe, registry)
+        if restart::retry_memory_wait(entry, ctx, slot, recipe, registry, retry)
             == Some(restart::DeathOutcome::Unrecoverable)
         {
             unrecoverable = true;

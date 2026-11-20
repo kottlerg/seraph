@@ -235,37 +235,50 @@ or below that floor and leaves it only once the free pool clears it by a hystere
 ([§ Memory pressure](../../memmgr/docs/memory-pool.md#memory-pressure)), so a restart made while
 the level reads `CRITICAL`, as when oomd stops a service that is not the one holding the memory,
 has its create refused with `OUT_OF_MEMORY`, and so does one that needs more than the margin above
-the floor below `CRITICAL`. Only memory coming free ends such a refusal. svcmgr reads the level
-after it, and `svcmgr_defs::memory_wait::after_create_failure` decides:
+the floor below `CRITICAL`. Only memory coming free ends such a refusal, and memmgr signals a
+change of level but not memory coming free within one. The wait is one state machine,
+`svcmgr_defs::memory_wait` (host-tested over every transition), which `restart.rs` and the main
+loop drive:
 
-* A service created in the reserve (`reserve = yes`), whose refusal means the reserve itself is
-  spent, and the log sink, whose death's lines svcmgr holds until a next instance runs, are
-  permanently down, as for any failure. So is every service when svcmgr has no memory-pressure
-  registration, since nothing would end its wait.
-* Read below `CRITICAL` for the first time in the decision, the level may have fallen between the
-  refusal and the read, after which no change need be signalled: the restart is decided again at
-  once, from step 1, charged to the budget again.
-* Otherwise (the level reads `CRITICAL`, memmgr does not answer the read, or the retry at once was
-  refused too, a create larger than the margin above the floor) the restart waits for memory,
-  charging the budget nothing more: the entry is inactive, holds no instance, and records the
-  death's exit reason (`ServiceEntry::memory_wait`), and `handle_death` returns
-  `WaitingForMemory`, on which the caller does nothing more: no shutdown follows, `critical = yes`
-  or not. svcmgr logs `restart of <name> waits for memory`.
+| State | Event | Next state |
+|---|---|---|
+| decided (step 1 charged the death's restart to the budget) | create refused `OUT_OF_MEMORY`, the service outside the reserve and not the log sink, svcmgr holding the pressure Notification | waiting |
+| decided | any other create failure, or one of a reserve service, of the log sink, or with no Notification | down |
+| waiting, level read `CRITICAL` or unread | a signal of a change of level read below `CRITICAL` | retry (on a signal) |
+| waiting, level read `CRITICAL` or unread | a signal read at `CRITICAL`, or unread | waiting; no timer |
+| waiting, level read below `CRITICAL` | the main loop's wait times out after `MEMORY_RETRY_MS` (1 s) | retry (timed) |
+| waiting, level read below `CRITICAL` | a signal read at `CRITICAL` | waiting; timer disarmed |
+| retry | the new instance runs | restarted |
+| retry | the new instance dies during its bootstrap | a new death: step 1, charged |
+| retry | create refused `OUT_OF_MEMORY` | waiting, a timed retry counted; down once the timed retries reach `MEMORY_RETRY_LIMIT` (60) |
+| retry | any other failure | down |
 
-The std runtime registers every process's Notification for memmgr's changes of level
-(`std::os::seraph::memory_pressure_notification`), and svcmgr waits on its own in its main wait set
-(badge 2). On each signal it takes the bits, then reads the level, so a change after the read
-signals again; once the level reads below `CRITICAL` it retries every waiting service
-(`restart::retry_memory_wait`, logged `memory freed; retrying the restart of <name>`) from step 1
-with the recorded exit reason, each attempt charged to the budget, and routes each outcome as a
-death's: a spent budget leaves the service permanently down, and an `Unrecoverable` one starts the
-graceful shutdown.
+- **Waiting.** The entry is inactive, holds no instance, and records the death's exit reason and
+  its timed retries (`ServiceEntry::memory_wait`); `handle_death` returns `WaitingForMemory`, on
+  which the caller does nothing more, `critical = yes` or not. svcmgr logs `restart of <name>
+  waits for memory`. svcmgr records memmgr's level after each refusal for want of memory and on
+  each wake. The main loop waits with no timeout unless a restart waits and the level last read is
+  below `CRITICAL`, so it makes no idle wake-up; at `CRITICAL` every such create is refused, and
+  memmgr signals the change.
+- **Retry.** Every waiting service is retried on the wake that makes a retry due: its create is made
+  again (`restart::retry_memory_wait`), charging the budget nothing, since the budget bounds deaths
+  and step 1 charged this one; a retry on a signal is logged `memory level fell; retrying the
+  restart of <name>`. Retries on signals are bounded by the changes of level, and timed retries by
+  `MEMORY_RETRY_LIMIT`, about a minute below `CRITICAL` with memory still short, after which svcmgr
+  logs `restart of <name> given up`.
+- **Down.** `permanent_death_outcome`: `critical` decides the rest, an `Unrecoverable` outcome
+  starting the graceful shutdown.
 
-During the wait the service is not running wherever svcmgr reports a service's state: a stop of it
-is refused `NO_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES` leave it out, and the shutdown
-path finds a waiting actuator down. Its provided endpoint outlives the wait, as it outlives any
-instance: a client's call on it waits, unreceived, until the next instance receives it, and waits
-for good if the service ends permanently down, as a call on any service that is down does.
+svcmgr waits on its own Notification (`std::os::seraph::memory_pressure_notification`, which the
+std runtime registers for every process) in its main wait set (badge 2), and takes its bits before
+it reads the level, so a change after the read signals again.
+
+A waiting service is not running wherever svcmgr reports a service's state: a stop of it is refused
+`NO_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES` leave it out, no death post routes to its
+inactive entry, and the shutdown path finds a waiting actuator down. Its provided endpoint outlives
+the wait, as it outlives any instance: a client's call on it waits, unreceived, until the next
+instance receives it, and waits for good if the service ends permanently down, as a call on any
+service that is down does.
 
 `route_death` reacts to `Unrecoverable` by calling
 `initiate_graceful_shutdown`, which derives a SEND from the service

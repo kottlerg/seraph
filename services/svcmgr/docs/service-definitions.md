@@ -574,9 +574,10 @@ without it. A reserve service has a core role, so no stop-authority holder stops
 A service is a reserve service when it acts to end a memory-pressure episode, or when a reserve
 service calls it on that path: outside the reserve, a first touch of its heap or stack while the
 free pool is at the reserve is declined and kills it, and svcmgr's create of its next instance is
-refused while the pool stays there. svcmgr then holds the restart until memmgr's level leaves
-`CRITICAL` and retries it, each attempt charged to the restart budget
-([Restart Protocol § Decision tree](restart-protocol.md#decision-tree), the memory wait); a reserve
+refused while the pool stays there. svcmgr then holds the restart in a memory wait and retries it
+as memory comes free, the death charged to the restart budget once, until the wait's limit of timed
+retries leaves it down ([Restart Protocol § Decision tree](restart-protocol.md#decision-tree), the
+memory wait); a reserve
 service's create refused for want of memory leaves it permanently down, and a `critical = yes` one
 shuts the system down.
 Five recipes of the default image set the key. oomd's lists and stops

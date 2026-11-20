@@ -80,7 +80,9 @@ pub enum Wake
 {
     /// A signal of the pressure Notification: the level changed.
     Signal,
-    /// The main loop's wait timed out after [`MEMORY_RETRY_MS`].
+    /// The retry deadline has passed ([`MemoryWaits::poll_timer`] returned
+    /// [`Timer::Due`]), whatever woke the main loop; an expiry of its wait
+    /// alone is not this wake.
     Timer,
 }
 

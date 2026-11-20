@@ -282,12 +282,12 @@ slow request: read of 8 blocks at sector 34816 (badge 0x2) took 43512 ms:
 
 The badge is the client's partition badge, or one with `MOUNT_AUTHORITY` set. A request lost
 after 50 seconds logs this line besides its own. A request takes milliseconds otherwise; the
-bound is a tenth of procmgr's bound on a call on a file cap (`FILE_CAP_CALL_TIMEOUT_MS`, 10 s,
-[services/procmgr/README.md](../../../procmgr/README.md)), the tightest bound a client puts on a
-call that waits on a filesystem driver and so on this driver, since a filesystem request makes
-several block calls. The fatfs driver logs a request it held too long, with the time its block
-calls took ([fat § Slow requests](../../../fs/fat/README.md#slow-requests)). The line adds four
-clock reads to a request and nothing else to its path.
+bound is a fifth of vfsd's bound on a filesystem driver's answer to `FS_UNMOUNT`
+(`FS_UNMOUNT_TIMEOUT_MS`, 5 s, [docs/limits.md](../../../../docs/limits.md)), the tightest bound a
+client puts on a call that waits on a filesystem driver and so on this driver, since a filesystem
+request makes several block calls. The fatfs driver logs a request it held too long, with the
+time its block calls took ([fat § Slow requests](../../../fs/fat/README.md#slow-requests)). The
+line adds four clock reads to a request and nothing else to its path.
 
 ---
 

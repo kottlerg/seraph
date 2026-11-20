@@ -95,7 +95,7 @@ device's logical blocks, 512 to 4096 bytes. Each component's behavior is specifi
 ## Slow requests
 
 One thread serves every request of a mount, so a request it holds delays every request queued
-behind it. A request held 10 seconds or longer, from its receipt to the end of its dispatch after
+behind it. A request held 5 seconds or longer, from its receipt to the end of its dispatch after
 the reply, is logged once that turn ends, as a warning naming its label and saying how much of
 its time its block calls took and how many it made:
 
@@ -103,9 +103,12 @@ its time its block calls took and how many it made:
 slow request: FS_REMOVE (label 14) held 12034 ms, 11870 ms of it in 2311 block calls
 ```
 
-The bound is procmgr's bound on a call on a file cap (`FILE_CAP_CALL_TIMEOUT_MS`,
-[services/procmgr/README.md](../../procmgr/README.md)), the tightest a client puts on a call to
-this driver: a request held that long has outlasted the bound of any such call queued behind it.
+The bound is vfsd's bound on the driver's answer to `FS_UNMOUNT` (`FS_UNMOUNT_TIMEOUT_MS`,
+[docs/limits.md](../../../docs/limits.md)), the tightest a client puts on a call to this driver: a
+request held that long has outlasted the bound of any such call queued behind it, and an unmount
+queued behind it has timed out, so vfsd tears the mount down without the driver's cooperation.
+The other bounds on a call to this driver, procmgr's on a call on a file cap and vfsd's on a
+fall-through call and on the mount probe, are 10 seconds.
 A request whose block calls took most of its time stalled in the block path, which the
 virtio-blk driver's own slow-request line splits further
 ([virtio/blk § Slow requests](../../drivers/virtio/blk/README.md#slow-requests)); one whose

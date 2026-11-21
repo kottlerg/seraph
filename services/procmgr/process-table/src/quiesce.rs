@@ -102,8 +102,9 @@ impl ProcessTable
     /// `INVALID_BADGE` when no live process carries the badge;
     /// `NOT_RESTORABLE` when it was created pinned or phys-class, or with a
     /// DMA hold; `INVALID_ARGUMENT` when it is at a point already. The
-    /// caller keeps `notify` on every error.
-    pub fn quiesce_enter(&mut self, badge: u64, restore_sp: u64, notify: u64) -> Result<(), u64>
+    /// caller keeps `notify` on every error. On success, the point's
+    /// generation.
+    pub fn quiesce_enter(&mut self, badge: u64, restore_sp: u64, notify: u64) -> Result<u64, u64>
     {
         let generation = self.quiesce_generation.wrapping_add(1);
         let entry = self
@@ -123,7 +124,24 @@ impl ProcessTable
             generation,
         });
         self.quiesce_generation = generation;
-        Ok(())
+        Ok(generation)
+    }
+
+    /// End the quiesce point numbered `generation` of the live process
+    /// `badge`, if it is still at that point, and return the slot of its
+    /// Notification for the caller to delete; `0` when it is at none, or at
+    /// a later one: the end of a point whose entry reply found no sender,
+    /// which must not end a point the process entered since.
+    pub fn quiesce_end_at(&mut self, badge: u64, generation: u64) -> u64
+    {
+        match self.find_mut_by_badge(badge)
+        {
+            Some(entry) if matches!(entry.quiesce, Quiesce::At(p) if p.generation == generation) =>
+            {
+                entry.end_quiesce()
+            }
+            _ => 0,
+        }
     }
 
     /// End the quiesce point of the live process `badge`, if it is at one,
@@ -263,6 +281,22 @@ mod tests
         );
         // Ending again finds no point and no Notification.
         assert_eq!(table.quiesce_end(0x50), Ok(0));
+    }
+
+    #[test]
+    fn an_undelivered_entry_ends_its_own_point_alone()
+    {
+        let mut table = table_with([quiescent(0x50)]);
+        let first = table.quiesce_enter(0x50, 0x7000, 33).unwrap();
+        assert_eq!(table.quiesce_end(0x50), Ok(33));
+        let second = table.quiesce_enter(0x50, 0x7000, 34).unwrap();
+        assert_ne!(first, second);
+        // The first entry's end finds a later point, and leaves it.
+        assert_eq!(table.quiesce_end_at(0x50, first), 0);
+        assert_eq!(table.quiesce_notify(0x50, second), Ok(34));
+        assert_eq!(table.quiesce_end_at(0x50, second), 34);
+        assert_eq!(table.quiesce_notify(0x50, second), Err(NOT_QUIESCED));
+        assert_eq!(table.quiesce_end_at(0x99, second), 0);
     }
 
     #[test]

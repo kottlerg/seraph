@@ -2477,13 +2477,15 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 /// it on a process handle, so the badge is the sender's own. Wire layout:
 /// [`procmgr_labels::QUIESCE`]. Caps past `caps[0]`, and the Notification
 /// of a refused request, are deleted; an ended point's Notification is
-/// deleted after the table lock.
+/// deleted after the table lock. A point whose entry reply cannot be
+/// delivered is ended again: its sender is no longer waiting at it.
 fn handle_quiesce(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
     let caps = req.caps();
     let notify = process::CapGuard::new(caps.first().copied().unwrap_or(0));
     release_caps(caps.get(1..).unwrap_or(&[]));
     let restore_sp = req.word(0);
+    let mut recorded = None;
     let code = match (restore_sp, notify.cap())
     {
         (0, 0) =>
@@ -2508,17 +2510,29 @@ fn handle_quiesce(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 .quiesce_enter(req.badge, restore_sp, cap);
             match entered
             {
-                Ok(()) =>
+                Ok(generation) =>
                 {
                     // The entry owns the Notification from here.
                     let _ = notify.disarm();
+                    recorded = Some(generation);
                     procmgr_errors::SUCCESS
                 }
                 Err(code) => code,
             }
         }
     };
-    reply_empty(ipc_buf, code);
+    let msg = IpcMessage::new(code);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let delivered = unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_ok();
+    if let Some(generation) = recorded.filter(|_| !delivered)
+    {
+        let freed = ctx
+            .tables
+            .lock()
+            .table
+            .quiesce_end_at(req.badge, generation);
+        drop(process::CapGuard::new(freed));
+    }
 }
 
 /// Whether `cap` is a Notification cap with the right to signal it.

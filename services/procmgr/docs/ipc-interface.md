@@ -1681,7 +1681,8 @@ stack pointer and a Notification, procmgr records the point in the sender's entr
 lock, holding the Notification in its own `CSpace`, and numbers it among every point it has
 recorded, so a checkpoint that found the point tells it from a later one (§ Label 35). With neither,
 it ends the sender's point, when it is at one, and deletes the point's Notification. A process's
-teardown ends its point too.
+teardown ends its point too, and so does a failed delivery of the reply that recorded it, whose
+sender is no longer waiting at it.
 
 Replies `SUCCESS`. Refusals, in order: `INVALID_ARGUMENT` when the request carries only one of the
 stack pointer and the Notification, or `caps[0]` is not a Notification cap with

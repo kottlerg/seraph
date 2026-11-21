@@ -42,11 +42,13 @@ use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::debug_stub;
 use crate::disk::DiskLayout;
+use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::{
     Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
     X86Paging, X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::Stub;
+use crate::socket_dir::SocketDir;
 use crate::symbolize::store::Store;
 use crate::util::{require_tool, step};
 
@@ -196,11 +198,9 @@ fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Resul
     // another process could take it short.
     let port = crate::util::debug_port_or_free(args.port)?;
     let driver = breakpoint_kill::resolve_installed(ctx, PORT_DRIVER_BINARY, PORT_DRIVER_FUNCTION)?;
-    let sock_dir = ctx.target_dir.join("xtask");
-    std::fs::create_dir_all(&sock_dir)
-        .with_context(|| format!("creating {}", sock_dir.display()))?;
-    let gdb_sock = sock_dir.join(format!("gdb-{}.gdb", std::process::id()));
-    let _ = std::fs::remove_file(&gdb_sock);
+    // Removed on every return, after QEMU is reaped below.
+    let sockets = SocketDir::create()?;
+    let gdb_sock = sockets.socket("gdb.gdb")?;
     // GDB reads the symbols of the stripped installed image from the symbols
     // store's file of its build id.
     let binary =
@@ -246,9 +246,10 @@ fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Resul
         .args(&qemu_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
+    let mut stderr = QemuStderr::take(&mut child);
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     let (tx, rx) = mpsc::channel::<Serial>();
     let reader = thread::spawn(move || forward_serial(stdout, &tx));
@@ -261,12 +262,19 @@ fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Resul
             Ok(Serial::DriverBias(b)) => bias = bias.or(Some(b)),
             Ok(Serial::Detached(_) | Serial::Followed) =>
             {}
-            Err(_) =>
+            Err(mpsc::RecvTimeoutError::Timeout) =>
             {
                 break Err(crate::error::err!(
                     "the stub's {READY_MARKER:?} line did not appear within {}s",
                     BOOT_TIMEOUT.as_secs()
                 ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) =>
+            {
+                let err = crate::error::err!(
+                    "the serial stream ended before the stub's {READY_MARKER:?} line"
+                );
+                break Err(explain_exit(err, &mut child, stderr.as_mut()));
             }
         }
     };
@@ -276,7 +284,6 @@ fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Resul
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
-    let _ = std::fs::remove_file(&gdb_sock);
     result
 }
 

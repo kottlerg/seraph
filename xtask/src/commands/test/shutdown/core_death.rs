@@ -65,6 +65,7 @@ use crate::qemu::{
 };
 use crate::qemu_gdb::{Stub, field_hex};
 use crate::qmp;
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// The terminal's line once the default boot is up. Kept in sync with
@@ -263,14 +264,10 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Res
         )?),
         Route::Stub(..) => None,
     };
-    let sock_dir = ctx.target_dir.join("xtask");
-    std::fs::create_dir_all(&sock_dir)
-        .with_context(|| format!("creating {}", sock_dir.display()))?;
-    let pid = std::process::id();
-    let qmp_sock = sock_dir.join(format!("core-death-{pid}.qmp"));
-    let gdb_sock = sock_dir.join(format!("core-death-{pid}.gdb"));
-    let _ = std::fs::remove_file(&qmp_sock);
-    let _ = std::fs::remove_file(&gdb_sock);
+    // Declared before the guest, so it is removed after QEMU is reaped.
+    let sockets = SocketDir::create()?;
+    let qmp_sock = sockets.socket("core-death.qmp")?;
+    let gdb_sock = sockets.socket("core-death.gdb")?;
     let debug_port = match route
     {
         Route::Stub(..) => Some(crate::util::debug_port_or_free(None)?),
@@ -308,11 +305,12 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Res
             let killed = kill_through_stub(&mut guest, args.arch, port, name, point, contact);
             if killed.is_err()
             {
-                // Show the stub's lines on a refusal, which reach the serial
-                // line when its log sink is not the target it holds. With
+                // Give the stub's lines on a refusal time to reach the
+                // terminal before QEMU is killed; they reach the serial line
+                // when its log sink is not the target it holds. With
                 // logd held its lines are dropped, and the answer's `E`
                 // number carries the cause.
-                let _ = guest.echo_until_end(STUB_FAILURE_ECHO);
+                let _ = guest.wait_until_end(STUB_FAILURE_ECHO);
             }
             killed
         }
@@ -355,7 +353,7 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Res
         _ => Err(crate::error::err!("the route's launch is incomplete")),
     };
     let verdict = killed.and_then(|killed_at| {
-        let ended_at = guest.echo_until_end(POWER_OFF_TIMEOUT).then(Instant::now);
+        let ended_at = guest.wait_until_end(POWER_OFF_TIMEOUT).then(Instant::now);
         let (reason, shutdown_at) = rx
             .recv_timeout(EXIT_TIMEOUT)
             .context("QMP gave no SHUTDOWN event")?;
@@ -363,8 +361,6 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Res
     });
     let exited = verdict.and_then(|()| guest.wait_exit(EXIT_TIMEOUT));
     let _ = qmp_thread.join();
-    let _ = std::fs::remove_file(&qmp_sock);
-    let _ = std::fs::remove_file(&gdb_sock);
     exited
 }
 
@@ -419,7 +415,7 @@ fn launch(
         .args(&qemu_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
     let stdin = child.stdin.take();

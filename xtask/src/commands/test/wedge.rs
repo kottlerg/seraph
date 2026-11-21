@@ -46,6 +46,7 @@ use crate::qemu::{
     X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::{Span, Stub, field_hex, function_path, le_hex};
+use crate::socket_dir::SocketDir;
 use crate::util::{require_tool, step};
 
 /// Marker the guest `terminal` prints once the default boot is up. Kept in
@@ -146,11 +147,9 @@ fn boot_once(ctx: &Context, args: &CaseArgs, image: &Image, victim: Victim) -> R
     let firmware = Firmware::prepare(ctx, args.arch)?;
     let vars = firmware.launch_vars()?;
     let disk_path = ctx.disk_image();
-    let sock_dir = ctx.target_dir.join("xtask");
-    std::fs::create_dir_all(&sock_dir)
-        .with_context(|| format!("creating {}", sock_dir.display()))?;
-    let sock_path = sock_dir.join(format!("wedge-{}.gdb", std::process::id()));
-    let _ = std::fs::remove_file(&sock_path);
+    // Declared before the guest, so it is removed after QEMU is reaped.
+    let sockets = SocketDir::create()?;
+    let sock_path = sockets.socket("wedge.gdb")?;
 
     let spec = QemuLaunchSpec {
         arch: args.arch,
@@ -188,7 +187,7 @@ fn boot_once(ctx: &Context, args: &CaseArgs, image: &Image, victim: Victim) -> R
         .args(&qemu_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))?;
     let mut guest = Guest::from_child(child)?;
@@ -223,7 +222,6 @@ fn boot_once(ctx: &Context, args: &CaseArgs, image: &Image, victim: Victim) -> R
         )
     })();
     guest.shutdown();
-    let _ = std::fs::remove_file(&sock_path);
     result?;
     step(&format!("wedge test: {victim:?} reported"));
     Ok(())

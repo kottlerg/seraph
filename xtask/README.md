@@ -34,7 +34,8 @@ xtask/
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
 │   ├── gpt.rs                  # GPT writer: protective MBR, both headers, entry arrays
-│   ├── guest.rs                # A QEMU process a host-driven harness drives, and its serial reader
+│   ├── guest.rs                # A QEMU process a host-driven harness drives, its serial reader,
+│   │                           #   and the report of QEMU's exit under a harness
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── image_check.rs          # The check every pack makes of the images it wrote (fsck.fat, ESP)
 │   ├── qemu.rs                 # Shared QEMU argv construction
@@ -44,6 +45,7 @@ xtask/
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── signing/                # Signing of packed images, the signing identity, the trust
 │   │                           #   store (§ Signing); trust requests (request.rs)
+│   ├── socket_dir.rs           # Private short directory for the unix sockets QEMU and swtpm serve
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
 │   │                           #   symbols store (store.rs: build ids, the manifest); the
@@ -752,6 +754,16 @@ table of its § Coverage tiers
 state it (its `md-test-cells` rule, [§ `cargo xtask lint-docs`](#cargo-xtask-lint-docs)). See
 [docs/testing.md](../docs/testing.md) for the harness model.
 
+Every unix socket a case (or `capture-acpi`) has QEMU or `swtpm` serve, a QMP socket or QEMU's
+gdbstub, is in a directory of its own, `seraph-sock-<pid>-<n>` under the host's temporary directory
+(`TMPDIR`, else `/tmp`), mode 0700, which the case removes with its sockets when it returns; a
+process killed first leaves that directory behind and nothing else. The directory keeps a socket's
+path within the host's `sun_path` limit (108 bytes on Linux) whatever the checkout's path: a path
+past it, from a `TMPDIR` that long, is refused before QEMU starts, naming the path and its length,
+not shortened. A QEMU that exits under a case, its command line refused or the guest powered off
+early, is reported with its exit status and the last lines of its stderr, which the case echoes as
+QEMU writes them, not as a marker that did not appear.
+
 #### Cells
 
 `cargo xtask test --cell T` runs every case the registry assigns to CI tester T's cells (the Cell
@@ -809,8 +821,8 @@ See [docs/testing.md](../docs/testing.md#interactive-input-terminal-case) § Int
 
 Check the softlockup watchdog's report of a CPU wedged in the kernel with interrupts off, on either
 arch ([docs/testing.md](../docs/testing.md#interrupts-off-wedge-wedge-case) § Interrupts-off wedge).
-Boots the current sysroot's default boot headless twice, with QEMU's gdbstub on a unix socket under
-`target/xtask/`, and waits for the terminal's `terminal: READY for injection` line, reading the
+Boots the current sysroot's default boot headless twice, with QEMU's gdbstub on a unix socket
+([§ Cases](#cases)), and waits for the terminal's `terminal: READY for injection` line, reading the
 KASLR slide and each CPU's hardware id from the kernel's boot lines. It then stops the VM over the
 GDB remote serial protocol, moves the chosen CPU's program counter from the idle loop's halt to the
 kernel's `halt_loop`, which masks interrupts and halts for good, resumes the VM, and checks the
@@ -839,7 +851,7 @@ to its pass marker and requires the kernel's `shadow stacks: on` line before it 
 logs `shadow stacks: off` instead, which it does on a CPU reporting `CET_SS` without enhanced or
 Automatic IBRS, since it then takes the retpoline sequence, fails the case naming that cause);
 the second, with
-QEMU's gdbstub on a unix socket under `target/xtask/`, sets a hardware breakpoint at
+QEMU's gdbstub on a unix socket ([§ Cases](#cases)), sets a hardware breakpoint at
 `syscall::dispatch` once ktest has started, overwrites the return address at the stopped CPU's
 stack pointer, resumes, and requires the kernel's report of `#CP` (vector 21, error code 1) at an
 address inside `dispatch`, trying up to five calls.
@@ -974,8 +986,8 @@ layout again, whatever the outcome. It passes when the fixture's `reboot fixture
 REBOOT` line appears, on `x86_64` acpid's `RESET: RESET_REG` line too, the `SHUTDOWN` event's
 reason is `guest-reset` (a power-off gives `guest-shutdown`), and QEMU exits on its own with
 success within 30 seconds of the event; [docs/testing.md](../docs/testing.md#reboot-shutdown-case)
-§ Reboot says what each architecture's path is. The QMP socket is
-`target/xtask/reboot-test-<arch>.sock`.
+§ Reboot says what each architecture's path is. The QMP socket is `reboot.qmp` in the case's
+socket directory ([§ Cases](#cases)).
 
 **Power button** (x86_64 only: QEMU's riscv64 `virt` machine has no fixed power button). Boots the
 current sysroot, and waits up to five
@@ -985,7 +997,8 @@ event. It passes when acpid's `power button pressed` line, pwrmgr's `power butto
 line and acpid's `SLEEP(5): PM1a_CNT` line appear within a minute of the press, the `SHUTDOWN`
 event's reason is `guest-shutdown`, and QEMU exits on its own within 30 seconds;
 [docs/testing.md](../docs/testing.md#power-button-shutdown-case) § Power button says what the
-press runs through. The QMP socket is `target/xtask/powerbutton-test.sock`.
+press runs through. The QMP socket is `power-button.qmp` in the case's socket directory
+([§ Cases](#cases)).
 
 **Core death** (`memmgr`, `procmgr`, `procmgr-reaper`, `svcmgr`, `devmgr`, `vfsd`, `logd`: the
 death of a core or critical service powers the system off). Each boot kills its cause's service by
@@ -1004,8 +1017,8 @@ after the kill, gives reason `guest-shutdown`, and QEMU exits on its own within 
 kill; [docs/testing.md](../docs/testing.md#core-death-shutdown-case) § Core death says when each
 target is killed and which path powers the system off. A main thread whose program-counter write
 the stub refuses as held in a call (`E06`) has its program counter read and written again every
-100 ms until the call returns, for up to 60 s. The QMP and gdbstub sockets are
-`target/xtask/core-death-<pid>.qmp` and `.gdb`.
+100 ms until the call returns, for up to 60 s. The QMP and gdbstub sockets are `core-death.qmp` and
+`core-death.gdb` in the case's socket directory ([§ Cases](#cases)).
 
 #### The `debug-port` case
 
@@ -1029,9 +1042,9 @@ sysroot once with the debug port attached (as `run --debug-port` attaches it, he
 the fixture's `[debug-echo] READY on the debug port` line on the serial stream, connects to the
 port, and drives one GDB remote serial protocol exchange with the fixture, framed at both ends by
 `shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)), then a restart round
-on the same connection: through QEMU's gdbstub, which the boot attaches on a socket under
-`target/xtask/`, the host kills the port's `virtio-console` driver at a hardware breakpoint in its
-code, its bias taken from procmgr's `spawn image bias=0x… (/services/drivers/virtio-console)`
+on the same connection: through QEMU's gdbstub, which the boot attaches on a unix socket
+([§ Cases](#cases)), the host kills the port's `virtio-console` driver at a hardware breakpoint in
+its code, its bias taken from procmgr's `spawn image bias=0x… (/services/drivers/virtio-console)`
 line, waits for the fixture's `[debug-echo] debug port driver at ordinal 1` line, and echoes
 through the restarted driver. It then kills QEMU, removes the recipe, and repacks the images in
 that layout again, whatever the outcome. It passes when every answer of the exchange and of the

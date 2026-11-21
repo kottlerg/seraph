@@ -74,6 +74,7 @@ mod regex;
 mod rust_src;
 mod secure_boot;
 mod signing;
+mod socket_dir;
 mod stack_sizes;
 mod symbolize;
 mod sys;

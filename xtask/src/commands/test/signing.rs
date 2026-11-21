@@ -84,6 +84,7 @@ use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::{DiskLayout, Substitute};
 use crate::error::{Context as _, Result, bail, ensure, err};
+use crate::guest::{QemuStderr, explain_exit};
 use crate::qemu::{
     Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
     X86Paging, X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
@@ -986,6 +987,7 @@ pub(super) fn boot_case_on(
         Stdio::null()
     };
     let mut child = launch(ctx, args, layout, firmware, vars, input, iommu)?;
+    let mut stderr = QemuStderr::take(&mut child);
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     // The serial console's input, held open until QEMU is killed: the judge
     // writes the answer once the prompt appears.
@@ -1012,7 +1014,8 @@ pub(super) fn boot_case_on(
             }
         }
     });
-    let result = judge_serial(&rx, &mut log, case, &mut console);
+    let result = judge_serial(&rx, &mut log, case, &mut console)
+        .map_err(|e| explain_exit(e, &mut child, stderr.as_mut()));
     let _ = child.kill();
     let _ = child.wait();
     // The rest of the stream, after the kill, still goes to the log.
@@ -1129,7 +1132,7 @@ fn launch(
         .args(&qemu_args)
         .stdin(input)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", args.arch.qemu_binary()))
 }

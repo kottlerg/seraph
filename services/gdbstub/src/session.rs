@@ -40,6 +40,14 @@
 //!    breakpoint back through a live thread when one is left, answers the
 //!    stops that arrive before procmgr's rebind, and has procmgr restore the
 //!    crash bindings.
+//! 6. A resume runs only the threads GDB resumed: a thread its plan does not
+//!    name stays held, or held in a call, its upcall at the call's return
+//!    held, and any stop of one the all-stop could not hold is held as it
+//!    arrives; only the stop of a thread GDB resumed is reported, so GDB is
+//!    never told of a stop it did not ask for. When no thread GDB resumed is
+//!    left running, the session reports that ([`Idle::NoResumed`]), or the
+//!    target's exit once every thread has exited and the table holds every
+//!    thread of the target.
 
 extern crate alloc;
 
@@ -48,7 +56,7 @@ use alloc::vec::Vec;
 use gdb_rsp::command::ThreadId;
 
 use crate::breakpoints::{Breakpoint, Breakpoints};
-use crate::control::{self, Credit, Named, Origin, Plan, Repeat, Unclaimed};
+use crate::control::{self, Credit, Named, Origin, Plan, Release, Repeat, Unclaimed};
 
 /// The most threads one session holds at once: each takes a receiver
 /// thread of the service while it is stopped ([`MAX_RECEIVERS`]). An exited
@@ -262,6 +270,11 @@ struct Held
 
 /// One thread of the target, in the table slot it was stored in.
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a slot's flags are independent states of its thread (bound, the main thread, \
+              exited, resumed by GDB) that the session reads one by one; they form no state machine"
+)]
 struct Slot
 {
     cap: u64,
@@ -278,6 +291,10 @@ struct Slot
     /// Where this all-stop's upcall to it stands.
     upcall: Upcall,
     gone: bool,
+    /// GDB's last resume ran it, or it was added while the target ran: a
+    /// stop of it can be reported. Any other thread stays held while the
+    /// target runs.
+    resumed: bool,
 }
 
 impl Slot
@@ -336,6 +353,21 @@ pub enum Resumed
     Exited,
 }
 
+/// What a look at a running target that took no stop found
+/// ([`Session::idle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Idle
+{
+    /// No thread GDB resumed runs on, and the all-stop that followed held a
+    /// thread spawned meanwhile: its stop is reported.
+    Stopped(usize, Stop),
+    /// No thread GDB resumed runs on: each has exited, and the others stay
+    /// held. The target is stopped.
+    NoResumed,
+    /// Every thread has exited; the session is over.
+    Exited,
+}
+
 /// One attached session.
 #[derive(Debug)]
 pub struct Session
@@ -355,6 +387,9 @@ pub struct Session
     unstarted: bool,
     /// The thread register and memory commands act on, by slot.
     pub current: usize,
+    /// The thread `Hc` selected for a `c` or `s` packet to resume alone,
+    /// by slot; `None` when it selected every thread.
+    pub resume_thread: Option<usize>,
     /// The breakpoints planted in the target's text.
     pub breakpoints: Breakpoints,
 }
@@ -401,6 +436,7 @@ impl Session
             running: true,
             unstarted: false,
             current: 0,
+            resume_thread: None,
             breakpoints: Breakpoints::new(),
         };
         for (index, cap) in page.caps.into_iter().enumerate()
@@ -438,6 +474,7 @@ impl Session
             beside: Vec::new(),
             upcall: Upcall::Unposted,
             gone: !bound && !k.alive(cap),
+            resumed: self.running,
         };
         if let Some(entry) = self.threads.get_mut(index)
         {
@@ -592,14 +629,16 @@ impl Session
         self.running = false;
     }
 
-    /// Let the target run: a thread held in a call is posted again at the
-    /// next all-stop, since the upcall it awaited arrives while it runs
-    /// and is resumed ([`Self::poll`]).
+    /// Let the target run: a thread GDB resumed that is held in a call is
+    /// posted again at the next all-stop, since the upcall it awaited
+    /// arrives while it runs and is resumed ([`Self::poll`]); one GDB did
+    /// not resume stays held in its call, and its upcall is held when it
+    /// arrives.
     fn run(&mut self)
     {
         for t in &mut self.threads
         {
-            if t.upcall == Upcall::InCall
+            if t.upcall == Upcall::InCall && t.resumed
             {
                 t.upcall = Upcall::Unposted;
             }
@@ -621,19 +660,9 @@ impl Session
         }
         while let Some(stop) = self.next_stop(k, until)
         {
-            let Some(index) = self.hold(k, stop)
-            else
+            if self.hold_known(k, stop).is_none()
             {
                 continue;
-            };
-            self.cancel_hit(k, index);
-            if let Some(t) = self.threads.get_mut(index)
-            {
-                t.upcall = Upcall::Unposted;
-                if let Some(h) = &mut t.held
-                {
-                    h.reported = true;
-                }
             }
             if until <= k.now()
             {
@@ -641,6 +670,33 @@ impl Session
             }
             // A wait ends once its thread is held.
             return;
+        }
+    }
+
+    /// Hold `stop`, which arrived while its thread is one GDB takes for
+    /// stopped, as a stop GDB has been told of, a breakpoint hit set back
+    /// ([`Self::cancel_hit`]); returns its slot, or `None` when it was
+    /// settled ([`Self::hold`]).
+    fn hold_known(&mut self, k: &mut impl Kernel, stop: Stop) -> Option<usize>
+    {
+        let index = self.hold(k, stop)?;
+        self.known(k, index);
+        Some(index)
+    }
+
+    /// Make slot `index`'s held stop one GDB has been told of, a breakpoint
+    /// hit set back ([`Self::cancel_hit`]), since GDB takes its thread for
+    /// stopped.
+    fn known(&mut self, k: &mut impl Kernel, index: usize)
+    {
+        self.cancel_hit(k, index);
+        if let Some(t) = self.threads.get_mut(index)
+        {
+            t.upcall = Upcall::Unposted;
+            if let Some(h) = &mut t.held
+            {
+                h.reported = true;
+            }
         }
     }
 
@@ -979,11 +1035,15 @@ impl Session
         })
     }
 
-    /// Take the stops that arrive while the target runs: an upcall then was
-    /// posted to a thread that stopped on a fault first, and is resumed;
-    /// the first other stop held stops the target. Returns the slot and
-    /// stop to report: the stopping thread's, or another held one's when a
-    /// restart released it during the all-stop.
+    /// Take the stops that arrive while the target runs. Any stop of a
+    /// thread GDB did not resume, which GDB takes for stopped, is held as a
+    /// stop GDB knows of, the target running on: the upcall of a thread held
+    /// in a call when the target ran, and any stop of one the all-stop could
+    /// not hold, as a thread still masking upcalls. An upcall of a thread
+    /// GDB resumed was posted to it when it stopped on a fault first, or
+    /// while it was held in a call, and is resumed; the first other stop
+    /// held stops the target. Returns the slot and stop to report
+    /// ([`Self::report`]).
     pub fn poll(&mut self, k: &mut impl Kernel) -> Option<(usize, Stop)>
     {
         if !self.running
@@ -996,22 +1056,105 @@ impl Session
         let stop = self.next_stop(k, now)?;
         if stop.kind == syscall_abi::FAULT_KIND_UPCALL
         {
-            k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
+            // The stub posts an upcall only to a thread of its table, so its
+            // badge names its thread.
+            let unresumed = control::thread_index(stop.badge)
+                .and_then(|i| self.threads.get(i))
+                .is_some_and(|t| !t.resumed);
+            if unresumed
+            {
+                let _ = self.hold_known(k, stop);
+            }
+            else
+            {
+                k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
+            }
             return None;
         }
+        // Any other stop is judged by the thread it is credited to, which
+        // can be a thread spawned while the target ran under its spawner's
+        // badge, bound by the hold in its exited spawner's slot.
         let index = self.hold(k, stop)?;
+        if !self.threads.get(index).is_some_and(|t| t.resumed)
+        {
+            self.known(k, index);
+            return None;
+        }
         self.stop_all(k);
-        let held = |i: usize| {
-            let t = self.threads.get(i)?;
-            Some((i, t.cap, t.held?.stop))
-        };
-        let Some((index, cap, stop)) =
-            held(index).or_else(|| (0..self.threads.len()).find_map(held))
-        else
+        let reported = self.report(k, Some(index));
+        if reported.is_none()
         {
             self.run();
+        }
+        reported
+    }
+
+    /// Look at a running target that took no stop. While a thread GDB
+    /// resumed runs on, nothing: `None`. Once none does, each having exited
+    /// or being held, the target has exited when every thread has and the
+    /// table holds every thread of the target ([`Idle::Exited`]); otherwise, when GDB takes a report that no
+    /// resumed thread is left (`no_resumed`), every thread is stopped and
+    /// the stop of a thread spawned meanwhile reported ([`Idle::Stopped`]),
+    /// or that none is left ([`Idle::NoResumed`]). Without `no_resumed` the
+    /// target is left as it is, as GDB's interrupt stops it.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`no_resumed` is whether GDB takes the `N` reply, which the look acts on"
+    )]
+    pub fn idle(&mut self, k: &mut impl Kernel, no_resumed: bool) -> Option<Idle>
+    {
+        if !self.running
+        {
             return None;
+        }
+        for t in self
+            .threads
+            .iter_mut()
+            .filter(|t| t.resumed && t.live() && t.held.is_none())
+        {
+            if k.alive(t.cap)
+            {
+                return None;
+            }
+            t.gone = true;
+        }
+        // A thread registered since the last refresh runs too, and one a
+        // table that could not take every thread left out may.
+        if self.complete
+            && self.alive_count(k) == 0
+            && !(self.refresh(k) && self.alive_count(k) != 0)
+        {
+            return Some(Idle::Exited);
+        }
+        if self
+            .threads
+            .iter()
+            .any(|t| t.resumed && t.live() && t.held.is_none())
+            || !no_resumed
+        {
+            return None;
+        }
+        self.stop_all(k);
+        Some(
+            self.report(k, None)
+                .map_or(Idle::NoResumed, |(index, stop)| Idle::Stopped(index, stop)),
+        )
+    }
+
+    /// The stop to report once an all-stop has ended, held by a thread GDB
+    /// resumed: slot `index`'s, the stopping thread's, or another held one's
+    /// when a restart released that one during the all-stop. A thread GDB
+    /// did not resume holds a stop GDB already knows of, which is never
+    /// reported again. The reported thread becomes the current one.
+    fn report(&mut self, k: &mut impl Kernel, index: Option<usize>) -> Option<(usize, Stop)>
+    {
+        let held = |i: usize| {
+            let t = self.threads.get(i).filter(|t| t.resumed)?;
+            Some((i, t.cap, t.held?.stop))
         };
+        let (index, cap, stop) = index
+            .and_then(held)
+            .or_else(|| (0..self.threads.len()).find_map(held))?;
         // The stop reported is its thread's last: one the all-stop took
         // after a restart was set back as unreported, and GDB, told of it,
         // reads the pointer the stop carries.
@@ -1026,8 +1169,11 @@ impl Session
     }
 
     /// GDB's interrupt: stop the target when it runs. Returns whether it
-    /// ran, so a stop is to be reported; `false` leaves the session as it
-    /// is.
+    /// ran, so a stop of the current thread is to be reported; `false`
+    /// leaves the session as it is. The current thread is one GDB resumed,
+    /// since GDB is told of no stop of a thread it did not resume: the one
+    /// it was when GDB resumed it, or else the first such thread held, or
+    /// else the first such thread alive, as one held in a call.
     pub fn interrupt(&mut self, k: &mut impl Kernel) -> bool
     {
         if !self.running
@@ -1035,22 +1181,43 @@ impl Session
             return false;
         }
         self.stop_all(k);
+        let resumed = |t: &Slot| t.resumed && t.live();
+        if !self.threads.get(self.current).is_some_and(resumed)
+            && let Some(index) = self
+                .threads
+                .iter()
+                .position(|t| resumed(t) && t.held.is_some())
+                .or_else(|| self.threads.iter().position(resumed))
+        {
+            self.current = index;
+        }
         true
     }
 
     // ── Resumes ──────────────────────────────────────────────────────────
 
-    /// Answer every held stop: `FAULT_REPLY_RESUME`, or, for slot
-    /// `signalled` stopped on a fault when GDB passes it a nonzero
-    /// `signal`, `FAULT_REPLY_KILL`, so the fault takes the outcome it has
-    /// with no handler.
-    fn resume_all(&mut self, k: &mut impl Kernel, signal: Option<u8>, signalled: usize)
+    /// Answer the held stop of each thread `releases` names, and let the
+    /// target run with every other thread held: `FAULT_REPLY_RESUME`, or,
+    /// for a thread stopped on a fault that GDB passes a nonzero signal,
+    /// `FAULT_REPLY_KILL`, so the fault takes the outcome it has with no
+    /// handler. The released threads are the ones GDB resumed.
+    fn release(&mut self, k: &mut impl Kernel, releases: &[Release])
     {
-        for (i, t) in self.threads.iter_mut().enumerate()
+        for t in &mut self.threads
         {
+            t.resumed = false;
+        }
+        for r in releases
+        {
+            let Some(t) = self.threads.get_mut(r.thread)
+            else
+            {
+                continue;
+            };
+            t.resumed = true;
             if let Some(h) = t.held.take()
             {
-                let pass = i == signalled && signal.is_some_and(|s| s != 0);
+                let pass = r.signal.is_some_and(|s| s != 0);
                 let label = if pass && h.stop.kind != syscall_abi::FAULT_KIND_UPCALL
                 {
                     syscall_abi::FAULT_REPLY_KILL
@@ -1102,10 +1269,10 @@ impl Session
                     Resumed::Refused
                 }
             }
-            Plan::Continue { thread, signal } =>
+            Plan::Continue { releases, .. } =>
             {
-                self.resume_all(k, signal, thread);
-                if self.alive_count(k) == 0
+                self.release(k, &releases);
+                if self.complete && self.alive_count(k) == 0
                 {
                     Resumed::Exited
                 }
@@ -1118,7 +1285,8 @@ impl Session
         }
     }
 
-    /// Step slot `index` one instruction, the others held.
+    /// Step slot `index` one instruction, the others held; it is the one
+    /// thread GDB resumed.
     fn step(&mut self, k: &mut impl Kernel, index: usize) -> bool
     {
         let Some(t) = self.threads.get_mut(index)
@@ -1142,6 +1310,10 @@ impl Session
         for b in beside
         {
             k.reply(b.receiver, syscall_abi::FAULT_REPLY_RESUME);
+        }
+        for (i, t) in self.threads.iter_mut().enumerate()
+        {
+            t.resumed = i == index;
         }
         self.run();
         true
@@ -1218,8 +1390,13 @@ impl Session
                 let _ = k.write_text(cap, bp.addr, bp.original());
             }
         }
-        let current = self.current;
-        self.resume_all(k, None, current);
+        let every: Vec<Release> = (0..self.threads.len())
+            .map(|thread| Release {
+                thread,
+                signal: None,
+            })
+            .collect();
+        self.release(k, &every);
         self.drain(k, &taken);
         let detached = k.detach_process();
         for t in &self.threads
@@ -1297,6 +1474,17 @@ impl Session
             .filter(|t| !t.gone)
             .or_else(|| self.threads.iter().find(|t| !t.gone))
             .map(|t| t.cap)
+    }
+
+    /// The slots of the live threads, which a resume plan names
+    /// ([`control::plan_vcont`]).
+    pub fn live_slots(&self) -> impl Iterator<Item = usize> + '_
+    {
+        self.threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.live())
+            .map(|(i, _)| i)
     }
 
     /// GDB's ids of the live threads: slots plus one.
@@ -1535,6 +1723,7 @@ mod tests
     extern crate std;
 
     use alloc::collections::VecDeque;
+    use gdb_rsp::command::{Resume, VContAction};
     use std::format;
     use std::string::String;
 
@@ -2243,17 +2432,285 @@ mod tests
         (sim, s)
     }
 
+    /// GDB's `vCont;c`: every live thread continues.
+    fn continue_all(s: &Session) -> Plan
+    {
+        Plan::Continue {
+            thread: s.current,
+            releases: s
+                .live_slots()
+                .map(|thread| Release {
+                    thread,
+                    signal: None,
+                })
+                .collect(),
+        }
+    }
+
     fn resume(sim: &mut Sim, s: &mut Session)
     {
-        let r = s.resume(
-            sim,
-            Plan::Continue {
-                thread: s.current,
-                signal: None,
-            },
-            None,
-        );
+        let r = s.resume(sim, continue_all(s), None);
         assert_eq!(r, Resumed::Running);
+    }
+
+    /// The plan of a `vCont` packet with `actions` ([`control::plan_vcont`]).
+    fn vcont(s: &Session, actions: &[(Resume, Option<u64>)]) -> Plan
+    {
+        let actions: Vec<VContAction> = actions
+            .iter()
+            .map(|&(resume, id)| VContAction {
+                resume,
+                signal: None,
+                thread: id.map(ThreadId::Id),
+            })
+            .collect();
+        control::plan_vcont(actions.into_iter(), s.current, s.live_slots(), |t| {
+            s.select(t)
+        })
+    }
+
+    // Defect caught: `vCont;c:2`, with which GDB steps thread 2 over a
+    // breakpoint in software, resumed every held thread, so thread 1, at
+    // the same instruction, took the breakpoint and its stop was reported
+    // to a GDB that had not resumed it (#1426).
+    #[test]
+    fn a_continue_of_one_thread_leaves_the_others_held_and_reports_its_stop()
+    {
+        let mut sim = Sim::new();
+        let other = sim.spawn(Some(0), true);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        let first = s.threads[0].held.unwrap().stop.receiver;
+        // Both threads at one instruction, where GDB planted a breakpoint.
+        sim.plant(&mut s, 0x100);
+        sim.threads[0].pc = 0x100;
+        sim.threads[other].pc = 0x100;
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        let (index, stop) = s.poll(&mut sim).expect("thread 2's stop");
+        assert_eq!((index, stop.detail), (1, BP), "the stop of thread 2");
+        assert!(
+            sim.ds[first].live && sim.ds[first].answers == 0,
+            "thread 1 stays held"
+        );
+        assert!(sim.held_live(&s));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread GDB did not resume, held in a call when the
+    // target ran, ran on once the call returned, its upcall resumed.
+    #[test]
+    fn a_thread_gdb_did_not_resume_stays_held_when_its_call_returns()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        let reply = STOP_WAIT * 3;
+        sim.calls.push((a, 0, reply));
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(!s.is_held(a));
+        let plan = vcont(&s, &[(Resume::Continue, Some(1))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        sim.time = reply;
+        assert_eq!(s.poll(&mut sim), None);
+        assert!(s.is_held(a), "its upcall resumed it");
+        assert!(matches!(sim.threads[a].run, Run::Blocked(_)));
+        assert!(s.threads[a].held.unwrap().reported);
+        assert!(s.running, "the thread GDB resumed runs on");
+        assert_eq!(s.idle(&mut sim, true), None);
+        sim.assert_sound();
+    }
+
+    // Defect caught: a continue or a step whose one resumed thread exited
+    // left GDB waiting for ever for a stop, the other threads held.
+    #[test]
+    fn a_resume_whose_threads_all_exit_reports_none_left_running()
+    {
+        for step in [false, true]
+        {
+            let mut sim = Sim::new();
+            let other = sim.spawn(Some(0), true);
+            let page = sim.page();
+            let mut s = Session::attach(&mut sim, ADVANCE, page);
+            let held = s.threads[other].held.unwrap().stop.receiver;
+            sim.exit_on_resume.push(0);
+            let plan = if step
+            {
+                Plan::Step { thread: 0 }
+            }
+            else
+            {
+                vcont(&s, &[(Resume::Continue, Some(1))])
+            };
+            assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+            assert_eq!(s.poll(&mut sim), None);
+            assert_eq!(s.idle(&mut sim, false), None, "GDB takes no `N`");
+            assert!(s.running);
+            assert_eq!(s.idle(&mut sim, true), Some(Idle::NoResumed));
+            assert!(!s.running);
+            assert!(sim.ds[held].live && sim.ds[held].answers == 0);
+            assert!(!sim.step_text, "the step's text is undone");
+            sim.assert_sound();
+        }
+    }
+
+    // Defect caught: a target whose threads all exited while it ran was
+    // never reported exited, so GDB waited for ever.
+    #[test]
+    fn a_target_whose_threads_all_exit_while_it_runs_is_reported_exited()
+    {
+        let (mut sim, mut s) = attached();
+        resume(&mut sim, &mut s);
+        assert_eq!(s.idle(&mut sim, true), None);
+        sim.exit(0);
+        assert_eq!(s.poll(&mut sim), None);
+        assert_eq!(s.idle(&mut sim, false), Some(Idle::Exited));
+        s.drop_all(&mut sim);
+        sim.assert_sound();
+    }
+
+    // Defect caught: GDB's interrupt after a continue of one thread was
+    // reported as a stop of the current thread, which GDB had not resumed.
+    #[test]
+    fn an_interrupt_reports_a_thread_gdb_resumed()
+    {
+        let mut sim = Sim::new();
+        let _other = sim.spawn(Some(0), true);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert_eq!(s.current, 0);
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        assert!(s.interrupt(&mut sim));
+        assert_eq!(s.current, 1);
+        assert!(s.is_held(0) && s.is_held(1));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread the all-stop could not hold, its upcall
+    // masked, ran while GDB resumed another thread alone; its breakpoint hit
+    // stopped the target and was reported as an interrupt of the resumed
+    // thread, the hit itself left past its breakpoint.
+    #[test]
+    fn a_stop_of_a_thread_gdb_did_not_resume_is_held_unreported_and_set_back()
+    {
+        let mut sim = Sim::new();
+        let other = sim.spawn(Some(0), true);
+        let masked = sim.spawn(Some(0), true);
+        sim.deaf.push(masked);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(!s.is_held(masked), "the all-stop cannot hold it");
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        sim.plant(&mut s, 0x100);
+        sim.hit(masked, 0x100);
+        assert_eq!(s.poll(&mut sim), None, "a stop GDB did not ask for");
+        assert!(s.running, "the thread GDB resumed runs on");
+        assert!(s.is_held(masked));
+        assert!(s.threads[masked].held.unwrap().reported);
+        assert_eq!(sim.threads[masked].pc, 0x100, "set back to its breakpoint");
+        assert!(s.is_held(0), "thread 1 stays held");
+        assert!(!s.is_held(other));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread spawned while the target ran, by a thread the
+    // all-stop could not hold and GDB did not resume, that exited, took its
+    // stop under the spawner's badge in the spawner's slot; the stop was
+    // taken for the spawner's, held and never reported.
+    #[test]
+    fn a_stop_of_a_new_thread_in_an_unresumed_spawner_s_slot_is_reported()
+    {
+        let mut sim = Sim::new();
+        let other = sim.spawn(Some(0), true);
+        let masked = sim.spawn(Some(0), true);
+        sim.deaf.push(masked);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(!s.is_held(masked));
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        sim.plant(&mut s, 0x100);
+        let child = sim.spawn(Some(masked), true);
+        sim.exit(masked);
+        sim.hit(child, 0x100);
+        let (index, stop) = s.poll(&mut sim).expect("the new thread's stop");
+        assert_eq!(
+            (index, stop.detail),
+            (masked, BP),
+            "the child in its spawner's slot"
+        );
+        assert_eq!(s.threads[index].cap, cap_of(child));
+        assert!(!s.running);
+        assert!(!s.is_held(other) || s.threads[other].held.unwrap().reported);
+        sim.assert_sound();
+    }
+
+    // Defect caught: a target whose table could not take every thread was
+    // reported exited, and the session dropped, once the threads of the
+    // table had exited, while the others ran on.
+    #[test]
+    fn a_target_beyond_its_table_is_never_reported_exited()
+    {
+        let (mut sim, mut s) = attached();
+        s.complete = false;
+        resume(&mut sim, &mut s);
+        sim.exit(0);
+        assert_eq!(s.poll(&mut sim), None);
+        assert_eq!(s.idle(&mut sim, false), None);
+        assert!(s.running);
+        assert_eq!(s.idle(&mut sim, true), Some(Idle::NoResumed));
+        let (mut sim, mut s) = attached();
+        s.complete = false;
+        sim.exit_on_resume.push(0);
+        assert_eq!(s.resume(&mut sim, continue_all(&s), None), Resumed::Running);
+        sim.assert_sound();
+    }
+
+    // Defect caught: GDB's interrupt kept the current thread, one GDB had
+    // not resumed, when the threads it resumed were all held in calls.
+    #[test]
+    fn an_interrupt_reports_a_resumed_thread_held_in_a_call()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        sim.calls.push((a, 0, STOP_WAIT * 100));
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(!s.is_held(a));
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        assert!(s.interrupt(&mut sim));
+        assert_eq!(s.current, a);
+        sim.assert_sound();
+    }
+
+    // Defect caught: once the restart of the stop of the one thread GDB
+    // resumed released it, another held thread's stop, one GDB already knew
+    // of, was reported in its place.
+    #[test]
+    fn a_stop_released_by_a_restart_is_never_replaced_by_an_unresumed_one()
+    {
+        let mut sim = Sim::new();
+        let other = sim.spawn(Some(0), true);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        let first = s.threads[0].held.unwrap().stop.receiver;
+        sim.plant(&mut s, 0x100);
+        sim.threads[other].pc = 0x100;
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        // Thread 2 takes the breakpoint; a thread it spawned, whose upcall
+        // never arrives, makes the all-stop's refresh restart that stop, and
+        // thread 2 exits as it resumes.
+        sim.exit_on_resume.push(other);
+        let n = sim.spawn(Some(0), true);
+        sim.deaf.push(n);
+        assert_eq!(s.poll(&mut sim), None, "a stop GDB did not ask for");
+        assert!(sim.ds[first].live && sim.ds[first].answers == 0);
+        assert!(s.running);
+        sim.assert_sound();
     }
 
     // Defect caught: a spawner and a thread it spawned after the attach
@@ -2662,14 +3119,7 @@ mod tests
     {
         let (mut sim, mut s) = attached();
         sim.exit_on_resume.push(0);
-        let r = s.resume(
-            &mut sim,
-            Plan::Continue {
-                thread: 0,
-                signal: None,
-            },
-            None,
-        );
+        let r = s.resume(&mut sim, continue_all(&s), None);
         assert_eq!(r, Resumed::Exited);
         s.drop_all(&mut sim);
         sim.assert_sound();
@@ -2694,6 +3144,7 @@ mod tests
                     beside: Vec::new(),
                     upcall: Upcall::Unposted,
                     gone: true,
+                    resumed: false,
                 });
             }
         };

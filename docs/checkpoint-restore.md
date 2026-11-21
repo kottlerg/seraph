@@ -7,12 +7,18 @@ one boot, as a new process created from its signed image.
 
 ## Implementation Status
 
-Design intent; not yet implemented. Every section below specifies behaviour no code implements
-yet: the runtime's quiesce point and restore entry, procmgr's `QUIESCE` and `CHECKPOINT` labels and
-its restore creation, the snapshot layout's checkpoint section, memmgr's `OBJECT_READ`,
-`FILL_REGION` and `MARK_CHECKPOINT` labels and its checkpoint mark, and `ProcessInfo`'s restore
-word. The live capture this protocol builds on
-is implemented: procmgr's debug-authority `SNAPSHOT` and the snapshot object layout
+Partly implemented. The quiesce point and the checkpoint are implemented: the runtime's
+`quiesce` and `take` ([runtime/ruststd/README.md](../runtime/ruststd/README.md#checkpoint)
+§ Checkpoint), procmgr's `QUIESCE` and `CHECKPOINT` labels
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 34: `QUIESCE`, § Label
+35: `CHECKPOINT`), and the snapshot layout's checkpoint section (§ Snapshot object layout there).
+Design intent, which no code implements yet: memmgr's `OBJECT_READ`, `FILL_REGION` and
+`MARK_CHECKPOINT` labels and its checkpoint mark, procmgr's restore creation, `ProcessInfo`'s
+restore word, and the runtime's resume record and restore entry. Until the mark exists, procmgr
+marks no checkpoint and signals a quiesced process on a complete, delivered checkpoint alone, and
+the restore stack pointer `quiesce` gives is an address in its own frame rather than below a
+resume record. The live capture this protocol builds on is implemented: procmgr's
+debug-authority `SNAPSHOT` and the snapshot object layout
 ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 33: `SNAPSHOT`,
 § Snapshot object layout), and the kernel's address-space hold
 ([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_ASPACE_HOLD` (71)).

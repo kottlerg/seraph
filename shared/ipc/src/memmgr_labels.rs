@@ -74,15 +74,24 @@ pub const REGISTER_CHARGE_NODE: u64 = 1 << 4;
 pub const PHYS_CLASS_BADGE_BIT: u64 = 1 << 63;
 /// Badge bit of a node handle: a SEND on memmgr's endpoint badged with
 /// this bit and a random key, which names one budget node and is the
-/// authority to serve the node labels ([`NODE_SET_MAX`] to
-/// [`NODE_RELEASE`]) on it. No process badge carries it, so memmgr serves
-/// the node labels only on a badge carrying it and the other labels only
-/// on one without it, and refuses the rest with `UNAUTHORIZED`. Specified
-/// in `services/memmgr/docs/ipc-interface.md` § Node Handles.
+/// authority to serve the node labels ([`is_node_label`]) on it. No process
+/// badge carries it, so memmgr serves the node labels only on a badge
+/// carrying it and the other labels only on one without it, and refuses the
+/// rest with `UNAUTHORIZED`. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Node Handles.
 pub const NODE_HANDLE_TAG: u64 = 1 << 62;
 const _: () = core::assert!(
     NODE_HANDLE_TAG & crate::VERB_BIT_MASK != 0 && NODE_HANDLE_TAG != PHYS_CLASS_BADGE_BIT
 );
+/// Whether `opcode` is a node label, which memmgr serves only on a node
+/// handle ([`NODE_HANDLE_TAG`]): [`NODE_SET_MAX`] to [`NODE_RELEASE`], and
+/// [`NODE_SET_RECLAIM`]. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Badge Discipline.
+#[must_use]
+pub const fn is_node_label(opcode: u64) -> bool
+{
+    matches!(opcode, NODE_SET_MAX..=NODE_RELEASE | NODE_SET_RECLAIM)
+}
 /// Badge bit of the swap authority: a SEND on memmgr's endpoint badged with
 /// this bit alone, which init mints, is the authority to serve the swap
 /// labels ([`SWAP_REGISTER`] to [`SWAP_WANTED`]), the swap service's
@@ -729,3 +738,29 @@ pub const PRESSURE_CRITICAL: u64 = 2;
 /// `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS`. Bit position 0 within
 /// the flags half of `data[0]`.
 pub const REQUIRE_CONTIGUOUS: u32 = 1 << 0;
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn the_node_labels_are_node_set_max_to_node_release_and_node_set_reclaim()
+    {
+        for op in NODE_SET_MAX..=NODE_RELEASE
+        {
+            assert!(is_node_label(op), "label {op}");
+        }
+        assert!(is_node_label(NODE_SET_RECLAIM));
+        for op in [
+            NODE_SET_MAX - 1,
+            CREATE_SUB_NODE,
+            SWAP_REGISTER,
+            OBJECT_RELEASE,
+            NODE_SET_RECLAIM + 1,
+        ]
+        {
+            assert!(!is_node_label(op), "label {op}");
+        }
+    }
+}

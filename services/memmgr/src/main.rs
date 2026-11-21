@@ -4864,8 +4864,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     // `OBJECT_RELEASE` and nothing else, and every other badge everything else
     // (services/memmgr/docs/ipc-interface.md § Node Handles, § Object Handles,
     // § Badge Discipline).
-    let node_label = (memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE).contains(&opcode)
-        || opcode == memmgr_labels::NODE_SET_RECLAIM;
+    let node_label = memmgr_labels::is_node_label(opcode);
     let swap_label = (memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED).contains(&opcode);
     let object_label = opcode == memmgr_labels::OBJECT_RELEASE;
     if node_label != (req.badge & memmgr_labels::NODE_HANDLE_TAG != 0)

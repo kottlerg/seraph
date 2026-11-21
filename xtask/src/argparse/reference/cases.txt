@@ -2874,7 +2874,7 @@ help xtask test --help
 ["test","bogus"]
 InvalidValue
 error: invalid value 'bogus' for '[CASE]'
-  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["test","--bogus"]
 UnknownArgument
@@ -2883,7 +2883,7 @@ error: unexpected argument '--bogus' found
 ["test","--","x"]
 InvalidValue
 error: invalid value 'x' for '[CASE]'
-  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["test","-h","bogus"]
 help xtask test -h
@@ -2891,7 +2891,7 @@ help xtask test -h
 ["test","bogus","-h"]
 InvalidValue
 error: invalid value 'bogus' for '[CASE]'
-  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["help","test"]
 help xtask test --help
@@ -3068,12 +3068,12 @@ ok test case=["debug-port"]
 ["test","7"]
 InvalidValue
 error: invalid value '7' for '[CASE]'
-  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["test",""]
 InvalidValue
 error: a value is required for '[CASE]' but none was supplied
-  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["test","terminal","kaslr"]
 UnknownArgument
@@ -26813,3 +26813,81 @@ error: the following required arguments were not provided:
 ["run-parallel","--parallel","1","--runs","1"]
 InvalidSubcommand
 error: unrecognized subcommand 'run-parallel'
+
+["trust-request"]
+ok trust-request
+
+["trust-request","-h"]
+help xtask trust-request -h
+
+["trust-request","--help"]
+help xtask trust-request --help
+
+["trust-request","bogus"]
+UnknownArgument
+error: unexpected argument 'bogus' found
+
+["trust-request","--bogus"]
+UnknownArgument
+error: unexpected argument '--bogus' found
+
+["trust-request","--","x"]
+UnknownArgument
+error: unexpected argument 'x' found
+
+["help","trust-request"]
+help xtask trust-request --help
+
+["trust-request","--arch","riscv64"]
+ok trust-request arch=["riscv64"]
+
+["trust-request","--arch","bogus"]
+InvalidValue
+error: invalid value 'bogus' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["trust-request","--arch"]
+InvalidValue
+error: a value is required for '--arch <ARCH>' but none was supplied
+  [possible values: x86_64, riscv64]
+
+["trust-request","--add"]
+InvalidValue
+error: a value is required for '--add <FILE>' but none was supplied
+
+["trust-request","--add","a","--add","b"]
+ok trust-request add=["a","b"]
+
+["trust-request","--revoke","00"]
+ok trust-request revoke=["00"]
+
+["trust-request","--revoke","00","--revoke","11"]
+ok trust-request revoke=["00","11"]
+
+["trust-request","--sign"]
+ok trust-request sign
+
+["trust-request","--sign","--sign"]
+ArgumentConflict
+error: the argument '--sign' cannot be used multiple times
+
+["trust-request","--sign=x"]
+TooManyValues
+error: unexpected value 'x' for '--sign' found; no more were expected
+
+["trust-request","--out","f"]
+ok trust-request out=["f"]
+
+["trust-request","--out"]
+InvalidValue
+error: a value is required for '--out <FILE>' but none was supplied
+
+["trust-request","--out","f","--out","g"]
+ArgumentConflict
+error: the argument '--out <FILE>' cannot be used multiple times
+
+["trust-request","--clear"]
+ok trust-request clear
+
+["trust-request","--add","s","--revoke","00","--sign","--out","f","--arch","riscv64"]
+ok trust-request arch=["riscv64"] add=["s"] revoke=["00"] sign out=["f"]

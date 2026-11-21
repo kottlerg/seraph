@@ -509,32 +509,33 @@ a fault or kill reason — defined once in `syscall_abi`:
 | `0` (`EXIT_VOLUNTARY`) | Voluntary, clean | success — `sys_aspace_exit(0)`, `sys_thread_exit`, `ExitCode::SUCCESS` |
 | `1 ..= 0x0FFF` | Voluntary, code | `sys_aspace_exit(code)` via `encode_exit_code` (saturating); `std::process::exit(n)` / non-zero `ExitCode` |
 | `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) | Fault | unhandled CPU/VM fault; kernel-terminated |
-| `0x2000` (`EXIT_KILLED`) | Killed | recorded by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown (that stop posts no death event; an observer bound afterwards receives the retained reason through the bind); posted by userspace (`Child::kill`) |
+| `0x2000` (`EXIT_KILLED`) | Killed | recorded by the kernel as the retained reason of a thread stopped by its `CSpace`/`AddressSpace` teardown (that stop posts no death event; an observer bound afterwards receives the retained reason through the bind); posted by procmgr to a death relay and an end queue for a process a destroy stopped |
 
 The address space's death surface is the process's terminal-end surface. A process ends at the first
 terminal end of any of its threads, a terminal fault or a `sys_aspace_exit`, whichever thread makes
 it; the kernel has no notion of a main thread. `sys_aspace_exit` from any thread records the encoded
 reason (zero for `exit(0)`) as the address space's terminal end, as a terminal fault does (the first
 end wins, and a later one changes nothing), and as the calling thread's exit reason; it then posts
-the reason to that thread's death observers (a parent that bound the main thread, so
-`ExitStatus::code()` carries it when the main thread exits), and to the address space's death
-observers when this end is its first: procmgr's observer, which reaps the process whichever thread
-ended it, and a supervisor's. The address-space post walks the observers the kernel read when it
-recorded the end, without touching the address space, and the address space's teardown waits until
-the calling thread runs on no CPU, so procmgr's reap on the first post cannot free what the later
-post reads. procmgr folds the two posts of a main thread's end into one reap, and gives the process
-one reason whichever post it takes first: the address space's end once the space has ended, else the
-main thread's (a `sys_thread_exit` of the main thread ends no address space), read at the first
-`QUERY_PROCESS` that finds the process ended, which fixes it, or else at the reap or destroy. Its
-reap, `QUERY_PROCESS`, a destroy, the death relay, the end queue and logd all carry it. The kernel
-only *notifies*; it does not enumerate or stop sibling threads at that point — they are stopped when
-procmgr's cap-revoke teardown below deletes the process's `CSpace` (every thread bound to it is
-stopped before its storage is reclaimed, wherever their thread caps are held) and reaped through
-their own thread caps. `sys_thread_exit` ends the calling thread alone and posts only its thread
-observers. `ExitStatus::success()`/`code()` decode the reason on the consumer side. This is a
-Seraph-native encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are native
-fault classes, not signals. See [`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md) §
-`SYS_ASPACE_EXIT`.
+the reason to that thread's death observers (a supervisor that bound the thread), and to the
+address space's death observers when this end is its first: procmgr's observer, which reaps the
+process whichever thread ended it, and a supervisor's. The address-space post walks the observers
+the kernel read when it recorded the end, without touching the address space, and the address
+space's teardown waits until the calling thread runs on no CPU, so procmgr's reap on the first post
+cannot free what the later post reads. procmgr folds the two posts of a main thread's end into one
+reap, and gives the process one reason whichever post it takes first: the address space's end once
+the space has ended, else the main thread's (a `sys_thread_exit` of the main thread ends no address
+space), read at the first `QUERY_PROCESS` that finds the process ended, which fixes it, or else at
+the reap or destroy. Its reap, `QUERY_PROCESS`, a destroy, the death relay, the end queue and logd
+all carry it. The kernel only *notifies*; it does not enumerate or stop sibling threads at that
+point — they are stopped when procmgr's cap-revoke teardown below deletes the process's `CSpace`
+(every thread bound to it is stopped before its storage is reclaimed, wherever their thread caps are
+held) and reaped through their own thread caps. `sys_thread_exit` ends the calling thread alone and
+posts only its thread observers. `ExitStatus::success()`/`code()` decode the reason on the consumer
+side; std's `Child::wait` and `try_wait` return the one reason procmgr posts to the child's death
+relay and bind no thread, since a thread's own end is the process's only when it is the first. This
+is a Seraph-native encoding, not POSIX: codes are not 8-bit `WEXITSTATUS`-truncated and faults are
+native fault classes, not signals. See
+[`core/kernel/docs/syscalls.md`](../core/kernel/docs/syscalls.md) § `SYS_ASPACE_EXIT`.
 
 The death-notification flow:
 

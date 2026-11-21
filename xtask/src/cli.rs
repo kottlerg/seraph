@@ -112,6 +112,14 @@ subcommands! {
         /// prior `cargo xtask build`.
         Mkdisk(MkdiskArgs),
 
+        /// Write a trust request: roots to enrol and key ids to revoke in the
+        /// trust store the bootloader keeps in firmware storage, signed by the
+        /// build's signing identity in the enrolment role or unsigned, for the
+        /// console to confirm. Staged in the sysroot's ESP for the next pack,
+        /// or written to a file to copy onto a machine's ESP as
+        /// `\EFI\seraph\trust-request` (see xtask/README.md).
+        TrustRequest(TrustRequestArgs),
+
         /// Capture the ACPI tables of one QEMU configuration into the `shared/aml`
         /// fixtures: boot the firmware alone on a blank disk, save the guest's
         /// memory over QMP once the firmware has installed its tables, find the
@@ -209,6 +217,7 @@ impl CliCommand
             | Self::KtestTiming(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
+            | Self::TrustRequest(_)
             | Self::CaptureAcpi(_)
             | Self::LintDocs(_)
             | Self::CommitCheck(_)
@@ -745,6 +754,45 @@ args! {
     }
 }
 
+// ── TrustRequest ──────────────────────────────────────────────────────────────
+
+args! {
+    pub struct TrustRequestArgs
+    {
+        /// Target architecture the request is signed for: the sysroot's.
+        #[arg(long, default_value = "x86_64")]
+        pub arch: Arch,
+
+        /// Enrol every anchor of the trust store FILE (the format of
+        /// docs/signing.md § Trust Store), with its roles and label.
+        /// Repeatable.
+        #[arg(long, value_name = "FILE")]
+        pub add: Vec<PathBuf>,
+
+        /// Revoke the key id HEX, 32 hex digits as the bootloader logs it.
+        /// Repeatable.
+        #[arg(long, value_name = "HEX")]
+        pub revoke: Vec<String>,
+
+        /// Sign the request with the build's signing identity in the
+        /// enrolment role, which a bootloader trusting its root applies with
+        /// no one present. Without it the request is unsigned, and is applied
+        /// only once confirmed at the console.
+        #[arg(long)]
+        pub sign: bool,
+
+        /// Write the request to FILE instead of staging it in the sysroot's
+        /// ESP.
+        #[arg(long, value_name = "FILE")]
+        pub out: Option<PathBuf>,
+
+        /// Remove the request staged in the sysroot's ESP; takes no other
+        /// option.
+        #[arg(long)]
+        pub clear: bool,
+    }
+}
+
 // ── CaptureAcpi ──────────────────────────────────────────────────────────────
 
 value_enum! {
@@ -943,6 +991,10 @@ value_enum! {
         /// The bootloader writes the machine's security floor in firmware
         /// storage, raises it, and refuses itself below it.
         Rollback,
+        /// The bootloader enrols roots and revokes the build's through trust
+        /// requests on the ESP, signed for enrolment or confirmed at the
+        /// console, and the revocation holds on the next boot.
+        Enrolment,
         /// The firmware boots the bootloader signed with an enrolled key and
         /// refuses it tampered or unsigned, under UEFI Secure Boot.
         Secureboot,

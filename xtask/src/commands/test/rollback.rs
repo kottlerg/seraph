@@ -136,18 +136,21 @@ fn prepare(ctx: &Context, args: &CaseArgs, dir: &Path) -> Result<Vec<Case>>
             substitutes: Vec::new(),
             expect: vec![floor_line(None, floor), raised_line(floor)],
             timeout: BOOTLOADER_TIMEOUT,
+            answer: None,
         },
         Case {
             name: "raised",
             substitutes,
             expect: vec![floor_line(Some(floor), raised), raised_line(raised)],
             timeout: BOOTLOADER_TIMEOUT,
+            answer: None,
         },
         Case {
             name: "older",
             substitutes: Vec::new(),
             expect: vec![refusal_line(raised, floor)],
             timeout: BOOTLOADER_TIMEOUT,
+            answer: None,
         },
     ])
 }
@@ -182,7 +185,7 @@ fn refusal_line(machine: u32, carried: u32) -> String
 /// # Errors
 /// When `object` is not a signed object, or the errors of
 /// [`Signer::sign_at`].
-fn sign_again(object: &[u8], signer: &Signer, security_version: u32) -> Result<Vec<u8>>
+pub(super) fn sign_again(object: &[u8], signer: &Signer, security_version: u32) -> Result<Vec<u8>>
 {
     let parsed = objsig::split(object).map_err(|e| err!("not a signed object ({e:?})"))?;
     let record = parsed
@@ -201,7 +204,11 @@ fn sign_again(object: &[u8], signer: &Signer, security_version: u32) -> Result<V
 /// # Errors
 /// When `bundle` does not parse, an entry is not a signed object, or one
 /// signed again is of another length.
-fn bundle_signed_again(bundle: &[u8], signer: &Signer, security_version: u32) -> Result<Vec<u8>>
+pub(super) fn bundle_signed_again(
+    bundle: &[u8],
+    signer: &Signer,
+    security_version: u32,
+) -> Result<Vec<u8>>
 {
     use boot_protocol::bundle as fmt;
     let header =

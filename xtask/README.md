@@ -43,7 +43,7 @@ xtask/
 │   ├── regex/                  # Pattern matching: Pike VM over the syntax of § Pattern syntax
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── signing/                # Signing of packed images, the signing identity, the trust
-│   │                           #   store (§ Signing)
+│   │                           #   store (§ Signing); trust requests (request.rs)
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
 │   │                           #   symbols store (store.rs: build ids, the manifest); the
@@ -57,13 +57,13 @@ xtask/
 │   │   │                       #   interactive boot; run/classified.rs, --runs),
 │   │   │                       #   ktest_timing, symbolize, mkdisk, clean, crypto_vectors,
 │   │   │                       #   compare_images, lint_docs, pr_check, review, release_scope,
-│   │   │                       #   issue, orch, hook, host)
+│   │   │                       #   issue, orch, hook, host, trust_request)
 │   │   └── test/               # `test`: the unit tests, the cases, the cells
 │   │       ├── mod.rs          # Dispatch: the unit tests, a case, a cell
 │   │       ├── cases.rs        # The case registry; the runners of a case and of a cell
 │   │       ├── host.rs         # The unit tests (TEST_RELAXED_LINTS)
 │   │       ├── terminal.rs     # One module per case: terminal, wedge, cet, vmgenid, tpm,
-│   │       │                   #   kaslr, signing, hotplug
+│   │       │                   #   kaslr, signing, rollback, enrolment, secureboot, hotplug
 │   │       ├── debug_port/     # The debug-port case: mod.rs; echo.rs (the transport boot),
 │   │       │                   #   gdb.rs (the GDB stub boot)
 │   │       └── shutdown/       # The shutdown case: mod.rs; reboot.rs, power_button.rs,
@@ -152,17 +152,18 @@ composes the bundle by copying the installed files the harness's list in `config
 (`src/bundle.rs`). The composition signs nothing and reads no key; it verifies the kernel and each
 bundle entry as the bootloader will before it writes them, and once it has written the ESP, reads it
 back and refuses it unless every object on it equals its installed file and it holds no other file
-than a presence-only knob ([docs/boot-media.md](../docs/boot-media.md) § The ESP; [§ The image
-check](#the-image-check) makes the same check of the image the pack writes). Every signed object is
-verified under the build's trust store, with each of its roles, its name and the architecture its
-loaders expect, before it is written. Each command derives the store from the signing identity and
-the deployer's store its environment names. `cargo xtask build` passes the store's path to the
-bootloader's build in `SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader
-embeds it. Every pack after that (the build's own, `mkdisk` including `--repack-only`, and the
-harness commands that repack) reads the store out of the installed bootloader, `boot/boot.efi`, and
-refuses to sign when it is missing, holds no marker or two, or embeds another store; the error names
-the image and tells to run `cargo xtask build` (docs/signing.md § Signing). Signing a pack's images
-takes about half a second (`src/signing/`).
+than a presence-only knob or a staged trust request ([§ `cargo xtask
+trust-request`](#cargo-xtask-trust-request); [docs/boot-media.md](../docs/boot-media.md) § The ESP;
+[§ The image check](#the-image-check) makes the same check of the image the pack writes). Every
+signed object is verified under the build's trust store, with each of its roles, its name and the
+architecture its loaders expect, before it is written. Each command derives the store from the
+signing identity and the deployer's store its environment names. `cargo xtask build` passes the
+store's path to the bootloader's build in `SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user),
+and the bootloader embeds it. Every pack after that (the build's own, `mkdisk` including
+`--repack-only`, and the harness commands that repack) reads the store out of the installed
+bootloader, `boot/boot.efi`, and refuses to sign when it is missing, holds no marker or two, or
+embeds another store; the error names the image and tells to run `cargo xtask build`
+(docs/signing.md § Signing). Signing a pack's images takes about half a second (`src/signing/`).
 
 The build also Authenticode-signs the installed bootloader for UEFI Secure Boot, in place once it is
 compiled, when `SERAPH_SECURE_BOOT_KEY` and `SERAPH_SECURE_BOOT_CERT` name a db key (the table
@@ -190,7 +191,7 @@ bootloader embeds.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65-roles-1-8` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused, and so is a signing key the build's trust store does not trust for every role, the error naming the roles it lacks. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
+| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65-roles-1-9` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused, and so is a signing key the build's trust store does not trust for every role, the error naming the roles it lacks. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
 | `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 3,373-byte composite signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
 | `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
 | `SERAPH_SECURE_BOOT_KEY` | (none) | The PEM private key of the db key `build` Authenticode-signs the installed bootloader, `/boot/boot.efi`, with (`sbsign`, then `sbverify` against the certificate), so a firmware that enrols its certificate in db boots it under UEFI Secure Boot ([docs/signing.md](../docs/signing.md) § Secure Boot). Set together with `SERAPH_SECURE_BOOT_CERT`; with neither set the bootloader is not signed, and one alone is refused |
@@ -369,8 +370,9 @@ Default firmware search paths per host:
 Every launch, on both architectures, boots on a variable store of its own: a fresh copy of the
 firmware's template, `target/xtask/vars/<pid>-<serial>.fd`, writable pflash unit 1 beside the
 read-only code image, removed once its QEMU has exited. A variable the firmware or the bootloader
-writes (the bootloader's security floor, [docs/signing.md](../docs/signing.md) § Rollback Floor)
-is therefore seen by no later launch; the `rollback` case alone boots several times on one store.
+writes (the bootloader's security floor, [docs/signing.md](../docs/signing.md) § Rollback Floor,
+and its enrolled trust store, § Trust Store) is therefore seen by no later launch; the `rollback`
+and `enrolment` cases alone boot several times on one store.
 
 
 #### Classified boots (`--runs`)
@@ -551,18 +553,18 @@ writer in `src/fat.rs` that changes nothing, on the copy. The pack fails on the 
 `PATH`, naming the package to install.
 
 It then reads the ESP and the root partition of `disk.img` with xtask's FAT reader
-(`src/fat_read.rs`, built on the `fatfs` service's decoders) and makes the check every pack
-makes of the ESP it composes (`src/esp.rs`), of the image this time
+(`src/fat_read.rs`, built on the `fatfs` service's decoders) and makes the check every pack makes of
+the ESP it composes (`src/esp.rs`), of the image this time
 ([docs/boot-media.md](../docs/boot-media.md) § The ESP): the bootloader at both of its paths equals
-`/boot/boot.efi`, the kernel `/boot/kernel`, and each entry of the bundle the installed file
-its bundle list names, the list read from the root partition's `/config/bundle/` and the
-harness chosen by the bundle's entries; the bundle holds every entry its list names and no other;
-and the ESP holds no other file than an empty presence-only knob in `\EFI\seraph\`. The
-architecture is the root partition's type. It fails naming every object that differs, is missing,
-or copies a file the root partition does not install. A pack that writes substitutes in place of
-installed files, as the `signing` case's refusal images do, makes the `fsck.fat` check alone, since
-its ESP is by design no copy of its root partition. The check adds about half a second to a pack
-at 512-byte blocks, and under a second at 4096.
+`/boot/boot.efi`, the kernel `/boot/kernel`, and each entry of the bundle the installed file its
+bundle list names, the list read from the root partition's `/config/bundle/` and the harness chosen
+by the bundle's entries; the bundle holds every entry its list names and no other; and the ESP holds
+no other file than an empty presence-only knob in `\EFI\seraph\` or a trust request at
+`\EFI\seraph\trust-request`. The architecture is the root partition's type. It fails naming every
+object that differs, is missing, or copies a file the root partition does not install. A pack that
+writes substitutes in place of installed files, as the `signing` case's refusal images do, makes the
+`fsck.fat` check alone, since its ESP is by design no copy of its root partition. The check adds
+about half a second to a pack at 512-byte blocks, and under a second at 4096.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--harness init|ktest] \
@@ -716,8 +718,9 @@ options it takes:
 | `kaslr` | x86_64 (3), riscv64 (3) | ktest | ktest | `--riscv-mmu`, `--x86-paging` |
 | `shutdown` | x86_64 (9), riscv64 (8) | init | usertest | `--cause` |
 | `debug-port` | x86_64 (2), riscv64 (2) | init | host run | `--port`, `--gdb` |
-| `signing` | x86_64 (4), riscv64 (4) | init | usertest | `--release` |
+| `signing` | x86_64 (6), riscv64 (6) | init | usertest | `--release` |
 | `rollback` | x86_64 (3), riscv64 (3) | init | usertest | `--release` |
+| `enrolment` | x86_64 (6), riscv64 (6) | init | usertest | none |
 | `secureboot` | x86_64 (4), riscv64 (4) | init | usertest | none |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
 
@@ -1130,6 +1133,46 @@ cargo xtask test rollback [--arch x86_64|riscv64] [--release] [--cpus N] [--mem 
 |---|---|---|
 | `--release` | `false` | Build the `raised` boot's bootloader in release mode, as the sysroot's was built; a cell passes it on |
 
+#### The `enrolment` case
+
+Check that the bootloader enrols roots in the trust store it keeps in firmware storage, and revokes
+the build's, through trust requests on the ESP, with no rebuild of the bootloader, on either arch
+([docs/signing.md](../docs/signing.md) § Trust Store). The case packs the disk images once with the
+default-init bundle, so the sysroot is signed; generates two local identities `E` and `F`, as the
+`signing` case generates its untrusted one, whose roots no built-in anchor trusts; writes the
+`revoked` boot's objects into `target/xtask/test/enrolment/<arch>/`; and boots the current sysroot
+six times on one variable store, one fresh copy of the firmware's template kept across the six boots
+and removed after the last, so each boot reads the enrolled store the one before it left. `R` is the
+build's identity. Before each boot the case stages its trust request in the sysroot's ESP ([§ `cargo
+xtask trust-request`](#cargo-xtask-trust-request)), and the boot's pack carries it:
+
+| Boot | Trust request | Objects in place of the sysroot's | Console | Owed lines |
+|---|---|---|---|---|
+| `signed` | adds `E`'s root, signed by `R` for enrolment | none | nothing typed | `boot: trust request: applied, signed for enrolment by key id <R's root>: 1 anchors added, 0 removed, 0 key ids revoked`, `E`'s root as enrolled, the store's one enrolled anchor, the bundle verified |
+| `unanswered` | adds `F`'s root, unsigned | none | nothing typed | the request shown, the question, `boot: trust request: refused: no confirmation came within 60 seconds; this boot runs on the current trust store`, the bundle verified |
+| `confirmed` | the same | none | `yes` and Enter once the question appears | `boot: trust request: applied, confirmed at the console: 1 anchors added, 0 removed, 0 key ids revoked`, both roots as enrolled, the bundle verified |
+| `commit-refused` | revokes `R`'s roots, unsigned | none | `yes` and Enter, never asked | `boot: trust request: refused: the boot set does not verify under the trust store it would give: signature verification refused: kernel: Failed(Revoked); ...`, the bundle verified |
+| `revoked` | revokes `R`'s roots, signed by `E` for enrolment | the kernel and every bundle entry signed again by `E` | nothing typed | the request applied by `E`'s root with `R`'s roots revoked, `R`'s roots as built in and revoked, the bundle verified |
+| `holds` | the same | none | nothing typed | `boot: trust request: changes nothing (already applied); skipped`, `R`'s roots revoked, `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(Revoked)` |
+
+Every boot also owes each built-in root's line with its source, and the store's line with its
+anchor, enrolled and revoked counts and floor. A boot is judged as the `signing` case judges one,
+with a deadline of three minutes, and the `unanswered` boot waits out the bootloader's 60 seconds
+within it; a boot after a failed one is not made, since it would read a store its predecessor did
+not leave. The case types at the console through QEMU's serial input, writing the answer once the
+question's line appears. Every boot's serial log is saved as
+`target/xtask/test/enrolment/<arch>/<boot>.log`. The staged request the case found, or its
+absence, is restored, and the images are packed again from the sysroot in the layout they had,
+with the recorded harness's bundle, whatever the outcome. A request past the enrolled store's
+bound, one whose write the firmware refuses, and a malformed enrolled store are not reached by any
+QEMU firmware on demand; the bootloader's host tests cover them (`core/boot/src/enrolment.rs`).
+The case compiles nothing, and requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test enrolment [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
 #### The `secureboot` case
 
 Check UEFI Secure Boot of the bootloader on either arch ([docs/signing.md](../docs/signing.md)
@@ -1234,6 +1277,40 @@ by three minutes after their hot-add. The boots are the hotplug device cell of t
 host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
 
 ---
+
+### `cargo xtask trust-request`
+
+Write a trust request, which the bootloader applies to the trust store it keeps in firmware storage
+([docs/signing.md](../docs/signing.md) § Trust Store): enrol roots and revoke key ids with no
+rebuild of the bootloader. The request adds every anchor of each trust store file `--add` names,
+with its roles, flags and label (an identity's `trust.store`, [§ Signing](#signing)), and revokes
+each key id `--revoke` names, as the bootloader logs it. With `--sign`, the build's signing
+identity signs it in the enrolment role under `trust-request`, and a bootloader whose store trusts
+that identity's root applies it with no one present; without it, the request is unsigned, and the
+bootloader shows it and applies it only when `yes` and Enter are typed at the console within 60
+seconds.
+
+The request is staged in the sysroot's ESP as `EFI/seraph/trust-request`, so every later pack's
+image carries it (`mkdisk` keeps it, as it does not a knob) until `--clear` removes it, or, with
+`--out`, written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request`. A request
+left on the ESP once applied changes nothing on later boots, which skip it. The command refuses a
+request that adds and revokes nothing, a store file that does not parse, and a key id that is not
+32 hex digits.
+
+```sh
+cargo xtask trust-request [--arch x86_64|riscv64] [--add FILE]... [--revoke HEX]... [--sign]
+    [--out FILE]
+cargo xtask trust-request --clear
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | The architecture a signed request is signed for, the sysroot's; an unsigned request names none |
+| `--add FILE` | none | Enrol every anchor of the trust store `FILE`; repeatable |
+| `--revoke HEX` | none | Revoke the key id `HEX`; repeatable |
+| `--sign` | `false` | Sign the request with the build's signing identity in the enrolment role |
+| `--out FILE` | none | Write the request to `FILE` instead of staging it |
+| `--clear` | `false` | Remove the staged request; takes no other option |
 
 ### `cargo xtask crypto-vectors`
 

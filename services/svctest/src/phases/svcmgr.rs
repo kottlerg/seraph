@@ -535,7 +535,7 @@ fn check_source_contained(authority: u64, phase: &str)
     use ipc::stopsrc_labels as src;
     assert_ne!(
         authority, 0,
-        "{phase}: no debug-authority cap in slot 19 (debug_authority = yes)"
+        "{phase}: no debug-authority cap in slot 20 (debug_authority = yes)"
     );
     let fixture = provided_endpoint(src::NAME, phase);
     let before = badges_named(authority, STOPSRC_PATH);
@@ -612,7 +612,7 @@ fn svcmgr_stop_service_phase(caps: &Caps)
     let stop_cap = caps.stop_authority;
     assert_ne!(
         stop_cap, 0,
-        "{phase}: no stop-authority cap in slot 20 (stop_authority = yes)"
+        "{phase}: no stop-authority cap in slot 21 (stop_authority = yes)"
     );
 
     for (label, want, what) in [
@@ -887,7 +887,7 @@ const PUBLIC_NAMES: &[&[u8]] = &[
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show eighteen of the refused names are
+/// cap. svctest's own non-zero seeds show nineteen of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.acpi`,
 /// which only acpid seeds, are published by the same loop as
 /// `devmgr.registry` and `devmgr.bind`, `acpid.power`,
@@ -919,6 +919,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.hwrng_class, "devmgr.class.hwrng"),
         (caps.hwrng_deny_class, "devmgr.class.hwrng-deny"),
         (caps.memmgr_swap, "memmgr.swap"),
+        (caps.rtc_class, "devmgr.class.rtc"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");

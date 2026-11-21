@@ -458,7 +458,10 @@ that finds a request, the bootloader, once it has read the kernel and the bundle
 verifies either for loading:
 
 1. Skips a request that changes nothing, which every replay of an applied request does, and logs
-   that it was skipped. A request is therefore left on the ESP without harm.
+   that it was skipped. On a machine whose variable store persists, a request is therefore left
+   on the ESP without harm. A launch of `cargo xtask run` boots a fresh variable store, so each of
+   its boots decides a staged request again
+   ([xtask/README.md](../xtask/README.md#cargo-xtask-trust-request)).
 2. Refuses a request whose result would pass the bound.
 3. Refuses a request under whose resulting store the kernel or a bundle entry would not verify
    (the commit rule), so no request leaves the bootloader unable to load the kernel and the

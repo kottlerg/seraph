@@ -10,8 +10,11 @@
 //! `ExitStatus`: `success()` reflects the zero/non-zero verdict and
 //! `code()` carries the value. A spawned thread's `std::process::exit` ends
 //! the whole process with its code, though the main thread runs on
-//! (docs/process-lifecycle.md § Exit reason). Hosts the child-mode entries
-//! spawned by `exit_code_phase` and `exit_code_thread_phase`.
+//! (docs/process-lifecycle.md § Exit reason), and the parent's `ExitStatus`
+//! carries the one reason procmgr gives the process even when the main thread
+//! ends too before procmgr reaps it. Hosts the child-mode entries spawned by
+//! `exit_code_phase`, `exit_code_thread_phase` and
+//! `exit_code_thread_race_phase`.
 
 use std::os::seraph::process::ChildExt;
 use std::time::Duration;
@@ -27,8 +30,10 @@ const NONZERO_CODE: i32 = 42;
 const THREAD_CODE: i32 = 43;
 
 /// Code the `exit-code-thread` child's main thread exits with once
-/// [`MAIN_BOUND`] passes: the parent sees it only when the spawned thread's
-/// exit ended that thread alone.
+/// [`MAIN_BOUND`] passes, and the `exit-code-thread-race` child's once its
+/// address space has ended: the parent sees it only when the spawned thread's
+/// exit ended that thread alone, or when the main thread's own end, and not
+/// the process's, reaches the parent's `ExitStatus`.
 const MAIN_CODE: i32 = 44;
 
 /// How long the `exit-code-thread` child's main thread sleeps before it
@@ -47,6 +52,10 @@ pub fn phases() -> &'static [Phase]
             name: "exit_code_thread",
             run: exit_code_thread_phase,
         },
+        Phase {
+            name: "exit_code_thread_race",
+            run: exit_code_thread_race_phase,
+        },
     ]
 }
 
@@ -62,6 +71,12 @@ pub fn reentry_main(role: &str)
         {
             let _worker = std::thread::spawn(|| std::process::exit(THREAD_CODE));
             std::thread::sleep(MAIN_BOUND);
+            std::process::exit(MAIN_CODE);
+        }
+        "exit-code-thread-race" =>
+        {
+            let _worker = std::thread::spawn(|| std::process::exit(THREAD_CODE));
+            await_own_end();
             std::process::exit(MAIN_CODE);
         }
         _ =>
@@ -134,6 +149,60 @@ pub fn exit_code_thread_phase(_: &Caps)
     drop(child);
 
     std::os::seraph::log!("exit_code_thread phase passed (code={THREAD_CODE})");
+}
+
+/// Spawn the `exit-code-thread-race` child twice, once with its stdio
+/// inherited (`wait` reads the child's death queue itself) and once with its
+/// stdout piped (the death bridge reads it). Its spawned thread calls
+/// `std::process::exit(THREAD_CODE)`, and its main thread, which sees the
+/// address space end, exits with [`MAIN_CODE`] at once, before procmgr's
+/// teardown stops it. The process ended at the spawned thread's exit, so the
+/// parent's `ExitStatus` and `QUERY_PROCESS` both carry [`THREAD_CODE`];
+/// a parent that took the main thread's own end as the process's would read
+/// [`MAIN_CODE`].
+pub fn exit_code_thread_race_phase(_: &Caps)
+{
+    use std::process::{Command, Stdio};
+
+    for (what, stdout) in [("inherited", Stdio::inherit()), ("piped", Stdio::piped())]
+    {
+        let mut child = Command::new("/tests/svctest")
+            .arg("exit-code-thread-race")
+            .stdout(stdout)
+            .spawn()
+            .expect("spawn /tests/svctest exit-code-thread-race failed");
+        let id = child.process_handle();
+        let status = child.wait().expect("exit-code-thread-race wait failed");
+        std::os::seraph::log!("exit-code-thread-race ({what} stdout) exited: {status}");
+        assert_eq!(
+            status.code(),
+            Some(THREAD_CODE),
+            "{what} stdout: the parent read the main thread's end, not the process's: {status:?}"
+        );
+        assert_reaped_with(id, THREAD_CODE);
+        drop(child);
+    }
+
+    std::os::seraph::log!("exit_code_thread_race phase passed (code={THREAD_CODE})");
+}
+
+/// Spin until this process's address space has ended, which a spawned
+/// thread's `std::process::exit` does while the calling thread runs on until
+/// procmgr's teardown stops it. Spins rather than yields, so the caller acts
+/// inside the window before that teardown.
+fn await_own_end()
+{
+    let aspace = std::os::seraph::startup_info().self_aspace;
+    loop
+    {
+        let answer = syscall::cap_info(aspace, syscall_abi::CAP_INFO_ASPACE_END)
+            .expect("CAP_INFO_ASPACE_END on the own address space failed");
+        if syscall_abi::aspace_end_reason(answer).is_some()
+        {
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Assert procmgr answers `QUERY_PROCESS` on the exited child `id` names

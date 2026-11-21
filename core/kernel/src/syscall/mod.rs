@@ -640,8 +640,8 @@ fn sys_aspace_exit(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: tcb validated non-null.
         let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
 
-        // Notify the calling thread's observers (a parent that bound the
-        // main thread; procmgr's per-thread observer of a main thread).
+        // Notify the calling thread's observers (a supervisor that bound the
+        // thread; procmgr's per-thread observer of a main thread).
         // SAFETY: tcb is valid; post_death_notification handles null eq check.
         unsafe {
             crate::sched::post_death_notification(tcb, reason);

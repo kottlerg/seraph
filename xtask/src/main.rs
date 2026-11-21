@@ -51,6 +51,7 @@ mod bundle;
 mod cli;
 mod commands;
 mod context;
+mod crash_check;
 mod crash_log;
 mod debug_stub;
 mod diag;
@@ -120,7 +121,6 @@ fn main()
         CliCommand::Clean(args) => commands::clean::run(&ctx, args),
         CliCommand::Test(args) => commands::test::run(&ctx, args),
         CliCommand::CryptoVectors(args) => commands::crypto_vectors::run(&ctx, args),
-        CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),

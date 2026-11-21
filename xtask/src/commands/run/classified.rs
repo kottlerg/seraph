@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/run_parallel.rs
+// xtask/src/commands/run/classified.rs
 
-//! Run-parallel command: launch N QEMU instances concurrently against an
-//! already-built sysroot, classifying each run's outcome via user-supplied
-//! pass/fail regexes. Intended for shaking out timing-dependent bugs that
-//! single-shot `cargo xtask run` cannot reliably expose.
+//! The classified boot of `cargo xtask run --runs N`: N QEMU instances, in
+//! waves of `--parallel`, against an already-built sysroot, each run's
+//! outcome classified from its log. It is how every unattended boot of the
+//! sysroot is judged: CI's cells, burn-in, and the local and release host
+//! runs.
 //!
 //! Mode-agnostic by design: xtask does not know about ktest, svctest, or
 //! any other rootfs configuration. The caller supplies success and failure
-//! regexes (`--pass`, `--fail`); xtask only classifies outcomes by matching
-//! those patterns against per-run logs, plus exit-code and watchdog state, and
-//! one fact of every userspace boot: the console's output after init-logd's
-//! handover line (`console_lost_after_handover`).
+//! regexes (`--pass`, `--fail`, `--fail-also`) and the lines a passing log
+//! must hold (`--require`); xtask classifies outcomes by matching those
+//! patterns against per-run logs, plus exit-code and watchdog state, one fact
+//! of every userspace boot: the console's output after init-logd's handover
+//! line (`console_lost_after_handover`), and, with `--crash-reports`, the
+//! crash service's report blocks ([`crate::crash_check`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -28,7 +31,7 @@ use crate::error::{Context as _, Result, bail};
 
 use crate::accel::detect_for_arch;
 use crate::arch::Arch;
-use crate::cli::RunParallelArgs;
+use crate::cli::{CrashReportExpect, RunArgs};
 use crate::context::Context as BuildContext;
 use crate::crash_log::{SysrootImages, symbolize_log};
 use crate::disk::{logical_block_size, second_disk_block_size};
@@ -66,8 +69,8 @@ enum Status
     /// guest-side pass/fail marker — a *host-emulator* crash, not a guest
     /// failure. The recurring instance is the QEMU 8.2.x multi-threaded-TCG
     /// segfault (issue #350 / QEMU gitlab #2220), which is TCG-only and fixed
-    /// in newer QEMU. Tallied and preserved, but does NOT fail the run-parallel
-    /// gate (it is infrastructure flake, not a regression in the OS under test).
+    /// in newer QEMU. Tallied and preserved, but does NOT fail the classified
+    /// boot's gate (it is infrastructure flake, not a regression in the OS under test).
     /// The `i32` is the `128 + signum` code.
     QemuCrash(i32),
 }
@@ -139,29 +142,30 @@ struct FirmwareSet
     vars_template: Option<PathBuf>,
 }
 
-pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
+/// Entry point for `cargo xtask run --runs <runs>`.
+pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
 {
-    validate_args(args)?;
+    let display = validate_args(args, runs)?;
     // Held until the command returns, after the last wave's QEMUs have
     // exited; a wave runs `--parallel` QEMUs side by side.
     let _host =
-        crate::host_lock::admit_boot(ctx, &args.host, args.cpus, args.parallel.min(args.runs))?;
-    let (Some(target), Some(port)) = (&args.debug_target, args.debug_port)
+        crate::host_lock::admit_boot(ctx, &args.host, args.launch.cpus, args.parallel.min(runs))?;
+    let (Some(target), Some(port)) = (&args.launch.debug_target, args.launch.debug_port)
     else
     {
-        return run_waves(ctx, args);
+        return run_waves(ctx, args, runs, display);
     };
     // The stub is staged into `disk.img` before the slots copy it, and
     // unstaged after the last run, whatever its outcome.
-    validate_sysroot_for_launch(ctx, args.arch)?;
-    let layout = crate::debug_stub::stage(ctx, args.arch, target)?;
+    validate_sysroot_for_launch(ctx, args.launch.arch)?;
+    let layout = crate::debug_stub::stage(ctx, args.launch.arch, target)?;
     let binary = crate::debug_stub::binary_for(ctx, target);
     step(&format!(
         "GDB stub staged for {target}; connect with:\n    {}",
-        crate::debug_stub::gdb_command(args.arch, port, binary.as_deref())
+        crate::debug_stub::gdb_command(args.launch.arch, port, binary.as_deref())
     ));
-    let ran = run_waves(ctx, args);
-    crate::debug_stub::unstage(ctx, args.arch, layout)?;
+    let ran = run_waves(ctx, args, runs, display);
+    crate::debug_stub::unstage(ctx, args.launch.arch, layout)?;
     ran
 }
 
@@ -172,22 +176,23 @@ pub fn run(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
               summary). Splitting it would scatter the shared per-run state across helpers without \
               reducing complexity"
 )]
-fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
+fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay) -> Result<()>
 {
     let pass_re =
         Regex::new(&args.pass).with_context(|| format!("invalid --pass regex {:?}", args.pass))?;
     let fail_re = fail_regex(&args.fail, args.fail_also.as_deref())?;
+    let checks = Arc::new(PassChecks::new(&args.require, args.crash_reports)?);
 
-    validate_sysroot_for_launch(ctx, args.arch)?;
+    validate_sysroot_for_launch(ctx, args.launch.arch)?;
 
     // Resolve qemu binary once, up front: missing-tool errors should
-    // surface at run-parallel startup, not N times mid-wave inside
+    // surface at startup, not N times mid-wave inside
     // worker threads.
-    let qemu_binary = require_tool(args.arch.qemu_binary())?;
+    let qemu_binary = require_tool(args.launch.arch.qemu_binary())?;
 
-    let firmware = resolve_firmware(ctx, args.arch)?;
+    let firmware = resolve_firmware(ctx, args.launch.arch)?;
 
-    let workdir = ctx.target_dir.join("xtask").join("run-parallel");
+    let workdir = ctx.target_dir.join("xtask").join("run");
     std::fs::create_dir_all(&workdir)
         .with_context(|| format!("creating workdir {}", workdir.display()))?;
     purge_prior_logs(&workdir);
@@ -196,13 +201,13 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating --save-logs dir {}", dir.display()))?;
     }
-    let accel = detect_for_arch(args.arch).name();
+    let accel = detect_for_arch(args.launch.arch).name();
 
     step(&format!(
-        "Starting run-parallel: arch={:?} parallel={} runs={} timeout={}s workdir={}",
-        args.arch,
+        "Starting run: arch={:?} parallel={} runs={} timeout={}s workdir={}",
+        args.launch.arch,
         args.parallel,
-        args.runs,
+        runs,
         args.timeout,
         workdir.display()
     ));
@@ -211,19 +216,19 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     let disk_block_size = logical_block_size(&disk_src)?;
     // Each slot boots its own copy of the second image too, so concurrent
     // QEMUs never share a writable drive.
-    let second_src = match &args.second_disk
+    let second_src = match &args.launch.second_disk
     {
         Some(path) => Some((
             path.clone(),
-            second_disk_block_size(path, args.second_disk_block_size)?,
+            second_disk_block_size(path, args.launch.second_disk_block_size)?,
         )),
         None => None,
     };
-    let second_line = args.second_disk_line();
+    let second_line = args.launch.second_disk_line();
     let next_run = Arc::new(AtomicU32::new(1));
-    let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(args.runs as usize);
+    let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(runs as usize);
 
-    let total_runs = args.runs;
+    let total_runs = runs;
     let mut dispatched: u32 = 0;
     while dispatched < total_runs
     {
@@ -244,18 +249,17 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let second_src = second_src.clone();
             let firmware_code = firmware.code.clone();
             let firmware_vars_template = firmware.vars_template.clone();
-            let arch = args.arch;
-            let cpus = args.cpus;
-            let threads_per_core = args.threads_per_core;
-            let mem_mib = args.mem;
-            let riscv_mmu = args.riscv_mmu;
-            let riscv_zkr = args.riscv_zkr;
-            let x86_paging = args.x86_paging;
-            let x86_shadow_stack = args.x86_shadow_stack;
-            let iommu = args.iommu;
-            let debug_port = args.debug_port;
-            let test_devices = args.test_devices;
-            let display = QemuDisplay::from(args.display);
+            let arch = args.launch.arch;
+            let cpus = args.launch.cpus;
+            let threads_per_core = args.launch.threads_per_core;
+            let mem_mib = args.launch.mem;
+            let riscv_mmu = args.launch.riscv_mmu;
+            let riscv_zkr = args.launch.riscv_zkr;
+            let x86_paging = args.launch.x86_paging;
+            let x86_shadow_stack = args.launch.x86_shadow_stack;
+            let iommu = args.launch.iommu;
+            let debug_port = args.launch.debug_port;
+            let test_devices = args.launch.test_devices;
             let debug_listen = args.debug_listen;
             let on_hang = if args.hold_on_hang
             {
@@ -269,6 +273,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let fail_grace = Duration::from_secs(args.fail_grace_secs);
             let pass_re = pass_re.clone();
             let fail_re = fail_re.clone();
+            let checks = Arc::clone(&checks);
             let workdir = workdir.clone();
             let qemu_binary = qemu_binary.clone();
             let save_logs = args.save_logs.clone();
@@ -392,6 +397,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
 
                 let log_text = read_log(&log_path).unwrap_or_default();
                 let (status, matched) = classify(exit_rc, hung, &log_text, &pass_re, &fail_re);
+                let (status, matched) = checks.judge(status, matched, &log_text);
 
                 let outcome = RunOutcome {
                     run: run_id,
@@ -443,7 +449,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
         dispatched = dispatched.saturating_add(wave_size);
     }
 
-    let summary = print_summary(args, &workdir, &outcomes);
+    let summary = print_summary(args, runs, &workdir, &outcomes);
     print_failing_tails(&workdir, &outcomes);
     // A QEMU host-emulator crash (Status::QemuCrash) is infrastructure flake,
     // not a regression in the OS under test, so it does NOT fail the gate (it
@@ -457,9 +463,9 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
     if real_failures > 0
     {
         bail!(
-            "run-parallel: {}/{} runs passed (ok={} fail={} hang={} err={} qemu_crash={})",
+            "run: {}/{} runs passed (ok={} fail={} hang={} err={} qemu_crash={})",
             summary.pass,
-            args.runs,
+            runs,
             summary.ok,
             summary.fail,
             summary.hang,
@@ -480,13 +486,14 @@ struct Summary
     qemu_crash: u32,
 }
 
-fn validate_args(args: &RunParallelArgs) -> Result<()>
+/// Check the classified boot's arguments; the display its guests present.
+fn validate_args(args: &RunArgs, runs: u32) -> Result<QemuDisplay>
 {
     if args.parallel == 0
     {
         bail!("--parallel must be >= 1");
     }
-    if args.runs == 0
+    if runs == 0
     {
         bail!("--runs must be >= 1");
     }
@@ -498,11 +505,20 @@ fn validate_args(args: &RunParallelArgs) -> Result<()>
     {
         bail!("--debug-listen / --hold-on-hang require --parallel 1 (one gdbstub port)");
     }
-    if args.debug_port.is_some() && args.parallel != 1
+    if args.launch.debug_port.is_some() && args.parallel != 1
     {
         bail!("--debug-port requires --parallel 1 (one host port)");
     }
-    Ok(())
+    match args.display.unwrap_or(QemuDisplay::Headless)
+    {
+        QemuDisplay::Window =>
+        {
+            bail!(
+                "--display window is the interactive boot's; --runs takes framebuffer or headless"
+            )
+        }
+        display @ (QemuDisplay::Framebuffer | QemuDisplay::Headless) => Ok(display),
+    }
 }
 
 /// The regex that marks a failed run: `--fail`, or, with `--fail-also`, a
@@ -520,6 +536,64 @@ fn fail_regex(fail: &str, fail_also: Option<&str>) -> Result<Regex>
     // The groups keep each side's own alternations, and any flags it sets,
     // to that side.
     Ok(Regex::new(&format!("(?:{fail})|(?:{also})"))?)
+}
+
+/// The checks a run whose `--pass` pattern matched must also pass: each
+/// `--require` pattern matching a line of its log, and the
+/// `--crash-reports` check of its report blocks.
+struct PassChecks
+{
+    /// Each `--require` pattern, as given and compiled.
+    require: Vec<(String, Regex)>,
+    crash_reports: Option<CrashReportExpect>,
+}
+
+impl PassChecks
+{
+    fn new(require: &[String], crash_reports: Option<CrashReportExpect>) -> Result<Self>
+    {
+        let require = require
+            .iter()
+            .map(|pattern| {
+                Regex::new(pattern)
+                    .with_context(|| format!("invalid --require regex {pattern:?}"))
+                    .map(|re| (pattern.clone(), re))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            require,
+            crash_reports,
+        })
+    }
+
+    /// `classify`'s verdict, with a PASS that a check refuses made FAIL and
+    /// the refusal its reason. Any other verdict stands: the checks judge a
+    /// completed boot, and a QEMU-CRASH run's log ends where the emulator
+    /// died.
+    fn judge(&self, status: Status, matched: Option<String>, log: &str)
+    -> (Status, Option<String>)
+    {
+        if !matches!(status, Status::Pass)
+        {
+            return (status, matched);
+        }
+        if let Some((pattern, _)) = self
+            .require
+            .iter()
+            .find(|(_, re)| !log.lines().any(|line| re.is_match(line)))
+        {
+            return (
+                Status::Fail,
+                Some(format!("no line matches --require {pattern:?}")),
+            );
+        }
+        if let Some(expect) = self.crash_reports
+            && let Err(err) = crate::crash_check::check_log(log, expect)
+        {
+            return (Status::Fail, Some(format!("--crash-reports: {err:#}")));
+        }
+        (status, matched)
+    }
 }
 
 fn resolve_firmware(ctx: &BuildContext, arch: Arch) -> Result<FirmwareSet>
@@ -708,10 +782,10 @@ fn wait_with_timeout(
             if on_hang == OnHang::Hold && grace_deadline.is_none()
             {
                 eprintln!(
-                    "run-parallel: HANG at timeout; holding QEMU (pid {}) for inspection.\n\
-                     run-parallel:   log: {}\n\
-                     run-parallel:   attach: gdb -ex 'target remote :1234' (with --debug-listen)\n\
-                     run-parallel:   resume the harness by terminating QEMU (kill {})",
+                    "run: HANG at timeout; holding QEMU (pid {}) for inspection.\n\
+                     run:   log: {}\n\
+                     run:   attach: gdb -ex 'target remote :1234' (with --debug-listen)\n\
+                     run:   resume the harness by terminating QEMU (kill {})",
                     child.id(),
                     log_path.display(),
                     child.id()
@@ -942,7 +1016,7 @@ pub(crate) fn saved_log_file(arch: Arch, cpus: u32, run: u32) -> String
     format!("{arch}-{cpus}cpu-{run}.log")
 }
 
-/// The `outcome=` field of a saved log's `run-parallel` trailer, when it has
+/// The `outcome=` field of a saved log's `run` trailer, when it has
 /// one. `--save-logs` appends the trailer as the log's last line, so only
 /// that line is read: a guest line with the same prefix cannot stand in for
 /// it.
@@ -1084,7 +1158,7 @@ fn format_outcome_line(outcome: &RunOutcome) -> String
     }
 }
 
-fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]) -> Summary
+fn print_summary(args: &RunArgs, runs: u32, workdir: &Path, outcomes: &[RunOutcome]) -> Summary
 {
     let mut summary = Summary {
         pass: 0,
@@ -1116,7 +1190,7 @@ fn print_summary(args: &RunParallelArgs, workdir: &Path, outcomes: &[RunOutcome]
     println!("===== summary =====");
     println!(
         "arch={:?}  parallel={}  runs={}  timeout={}s",
-        args.arch, args.parallel, args.runs, args.timeout
+        args.launch.arch, args.parallel, runs, args.timeout
     );
     println!(
         "pass={}  ok={}  fail={}  hang={}  err={}  qemu_crash={}",
@@ -1574,6 +1648,77 @@ mod tests
             classify(0, false, ran, &pass, &fail).0,
             Status::Pass
         ));
+    }
+
+    // Defect caught: a passing run whose log lacks a line a --require pattern
+    // names, or holds a malformed or missing crash report, gating as PASS.
+    #[test]
+    fn a_pass_without_a_required_line_is_a_fail_naming_the_pattern()
+    {
+        let checks = PassChecks::new(&["mapredo knob present".to_owned()], None).unwrap();
+        let log = "[0.1] boot: memory map: mapredo knob present\n[2.0] [ktest] ALL TESTS PASSED\n";
+        assert!(matches!(
+            checks.judge(Status::Pass, None, log).0,
+            Status::Pass
+        ));
+        let (status, reason) = checks.judge(Status::Pass, None, "[2.0] [ktest] ALL TESTS PASSED\n");
+        assert!(matches!(status, Status::Fail));
+        assert!(reason.unwrap().contains("mapredo knob present"));
+    }
+
+    #[test]
+    fn every_required_pattern_must_match_its_own_line()
+    {
+        let checks = PassChecks::new(
+            &[
+                "\\[vfsd\\] DEBUG ".to_owned(),
+                "\\[fatfs\\] DEBUG ".to_owned(),
+            ],
+            None,
+        )
+        .unwrap();
+        let one = "[1.0] [vfsd] DEBUG mounted\n[2.0] [usertest] ALL TESTS PASSED\n";
+        let (status, reason) = checks.judge(Status::Pass, None, one);
+        assert!(matches!(status, Status::Fail));
+        assert!(reason.unwrap().contains("fatfs"));
+        let both = "[1.0] [vfsd] DEBUG mounted\n[1.1] [fatfs] DEBUG read\n";
+        assert!(matches!(
+            checks.judge(Status::Pass, None, both).0,
+            Status::Pass
+        ));
+    }
+
+    #[test]
+    fn the_crash_report_check_fails_a_pass_and_leaves_other_verdicts()
+    {
+        let checks = PassChecks::new(&[], Some(CrashReportExpect::Reports)).unwrap();
+        let no_reports = "[2.0] [usertest] ALL TESTS PASSED\n";
+        let (status, reason) = checks.judge(Status::Pass, None, no_reports);
+        assert!(matches!(status, Status::Fail));
+        assert!(reason.unwrap().starts_with("--crash-reports: "));
+        // A host-emulator crash and a hang keep their own verdicts.
+        assert!(matches!(
+            checks
+                .judge(Status::QemuCrash(RC_SIGSEGV), None, no_reports)
+                .0,
+            Status::QemuCrash(_)
+        ));
+        assert!(matches!(
+            checks.judge(Status::Hang, None, no_reports).0,
+            Status::Hang
+        ));
+        let none = PassChecks::new(&[], Some(CrashReportExpect::None)).unwrap();
+        assert!(matches!(
+            none.judge(Status::Pass, None, no_reports).0,
+            Status::Pass
+        ));
+    }
+
+    #[test]
+    fn an_invalid_require_regex_is_refused()
+    {
+        let err = PassChecks::new(&["(".to_owned()], None).err().unwrap();
+        assert!(err.to_string().contains("--require"), "{err}");
     }
 
     #[test]

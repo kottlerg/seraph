@@ -938,7 +938,7 @@ mod tests
     {
         Holder {
             pid: 7,
-            command: "cargo xtask run-parallel".into(),
+            command: "cargo xtask run".into(),
             checkout: "/w".into(),
             vcpus,
             qemus,
@@ -1021,7 +1021,7 @@ mod tests
             qemus: vec![4, 2, 1],
         };
         assert!(decide(&small, &[], &observed, None).is_err());
-        // A run-parallel wave takes as many places as it starts QEMUs.
+        // A `run --runs` wave takes as many places as it starts QEMUs.
         let pair = boot(4, 2, BootMode::Shared);
         decide(&pair, &[], &quiet(), None).unwrap();
         decide(&pair, &one, &quiet(), None).unwrap();
@@ -1356,7 +1356,7 @@ mod tests
     {
         let dir = scratch("grant");
         assert_eq!(read_grant(&dir).unwrap(), None);
-        write_grant(&dir, "W3", "run-parallel --cpus 16").unwrap();
+        write_grant(&dir, "W3", "run --runs 1 --cpus 16").unwrap();
         assert_eq!(read_grant(&dir).unwrap().as_deref(), Some("W3"));
         clear_grant(&dir).unwrap();
         assert_eq!(read_grant(&dir).unwrap(), None);

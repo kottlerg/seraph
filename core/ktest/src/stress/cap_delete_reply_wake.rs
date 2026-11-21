@@ -50,7 +50,7 @@
 //! idle, which the kernel's softlockup watchdog does not report (an idle
 //! system is not a stall, and a `BlockedOnReply` client matches no owed-wake
 //! rule), so the boot hangs until the harness's timeout fails it
-//! (`run-parallel` classifies it HANG). The failure is the hang, not a test
+//! (`run --runs` classifies it HANG). The failure is the hang, not a test
 //! assertion — `BIT_SERVER_ARMED` proves the race armed, and a wake on every
 //! cycle proves the liveness path actually ran on every cycle rather than
 //! passing vacuously.

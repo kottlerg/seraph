@@ -24,7 +24,7 @@ stage it has no attach path through it. `cargo xtask run --debug-port <PORT> --d
 <NAME>` writes the template into `/config/svcmgr/services/` with `<NAME>` appended to its `argv`,
 repacks the disk images in the layout they have, prints the host GDB command line, and removes it
 again after QEMU exits;
-`cargo xtask run-parallel --parallel 1 --debug-port <PORT> --debug-target <NAME>` does the same
+`cargo xtask run --runs 1 --debug-port <PORT> --debug-target <NAME>` does the same
 around its runs, and `cargo xtask test-gdb` stages it the same way
 ([xtask/README.md](../../xtask/README.md)). The
 recipe sets `debug_authority = yes` and seeds `devmgr.class.debug-port`

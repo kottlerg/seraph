@@ -12,7 +12,7 @@
 //! leaves every CPU on its idle thread with nothing queued for the whole
 //! span, and no CPU dispatches a non-idle thread. A kernel that reports such
 //! a system as stalled prints a dump headed `=== WATCHDOG`, which
-//! `cargo xtask run-parallel` and CI count as a failed boot: the failure is
+//! `cargo xtask run --runs` and CI count as a failed boot: the failure is
 //! raised by the kernel, not by an assertion here, as in the Tier S cells
 //! whose liveness gates the kernel raises.
 

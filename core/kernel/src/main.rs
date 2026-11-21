@@ -941,7 +941,7 @@ unsafe fn kernel_entry_post_rebase(
 
     // Validate the entropy subsystem now that every CPU's generator is live:
     // per-CPU independence + sanity (a power-on self-test). The PASS/FAIL marker
-    // is scraped by the run-parallel fail-regex.
+    // is scraped by the `run --runs` fail-regex.
     #[cfg(not(test))]
     entropy::selftest::run(cpu_count as usize);
 

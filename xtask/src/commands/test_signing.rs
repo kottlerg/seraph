@@ -76,7 +76,7 @@ const BOOT_FATAL: &str = "SERAPH BOOT FATAL: ";
 const REFUSAL_MARKERS: [&str; 2] = ["signature verification refused", "signature did not verify"];
 
 /// Text of a line that ends a boot in failure: the fatal markers of
-/// `run-parallel`'s default fail pattern. A test harness's own verdict is
+/// `run --runs`'s default fail pattern. A test harness's own verdict is
 /// not one: a staged harness may fail its tests of the services this command
 /// refuses.
 const DEATH_MARKERS: [&str; 6] = [

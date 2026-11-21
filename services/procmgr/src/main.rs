@@ -815,6 +815,16 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
             handle_snapshot(&req, ipc_buf, ctx);
         }
 
+        procmgr_labels::QUIESCE =>
+        {
+            handle_quiesce(&req, ipc_buf, ctx);
+        }
+
+        procmgr_labels::CHECKPOINT =>
+        {
+            handle_checkpoint(&req, ipc_buf, ctx);
+        }
+
         procmgr_labels::CONFIGURE_PIPE =>
         {
             // Maps the child's ProcessInfo page and copies caps into its
@@ -2450,47 +2460,252 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         process_table::snapshot_target(table, req.badge, req.word(0), account.cap())
             .map_err(process_table::SnapshotRefusal::code)
             .and_then(|entry| {
-                let derive = |cap| {
-                    process::CapGuard::new(
-                        syscall::cap_derive(cap, syscall::RIGHTS_ALL).unwrap_or(0),
-                    )
-                };
-                let (aspace, thread) = (derive(entry.aspace_cap), derive(entry.thread_cap));
-                if aspace.cap() == 0 || thread.cap() == 0
-                {
-                    return Err(procmgr_errors::OUT_OF_MEMORY);
-                }
                 image_ref = entry.image_ref;
-                Ok(snapshot::Target {
-                    aspace,
-                    thread,
-                    registered: derive_registered(entry)?,
-                    memmgr_badge: entry.memmgr_badge,
-                    load_bias: entry.image.load_bias,
-                    image: None,
-                })
+                capture_target(entry)
             })
     };
-    // The image, by the target's reference, under the cache's lock alone: a
-    // teardown meanwhile drops the reference, and the capture then names no
-    // image, memmgr writing the pages it attaches as any other object's.
-    let target = target.map(|mut target| {
-        target.image =
-            image_cache::snapshot_image(image_ref).map(|(handle, key)| snapshot::TargetImage {
-                handle: process::CapGuard::new(handle),
-                image: ipc::procmgr_snapshot::Image {
-                    hash: key.hash,
-                    len: key.len,
-                },
-            });
-        target
+    let target = target.map(|target| with_image(target, image_ref));
+    let captured = target.and_then(|target| {
+        snapshot::capture(&capture_context(ctx, ipc_buf), &target, account.cap(), None)
     });
-    let capture = snapshot::Context {
+    let _ = reply_captured(captured, ipc_buf);
+}
+
+/// Handle `QUIESCE`: record or end the sender's quiesce point
+/// (`services/procmgr/docs/ipc-interface.md` § Label 34: `QUIESCE`;
+/// docs/checkpoint-restore.md § Quiesce point). `dispatch_ipc` has refused
+/// it on a process handle, so the badge is the sender's own. Wire layout:
+/// [`procmgr_labels::QUIESCE`]. Caps past `caps[0]`, and the Notification
+/// of a refused request, are deleted; an ended point's Notification is
+/// deleted after the table lock. A point whose entry reply cannot be
+/// delivered is ended again: its sender is no longer waiting at it.
+fn handle_quiesce(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+{
+    let caps = req.caps();
+    let notify = process::CapGuard::new(caps.first().copied().unwrap_or(0));
+    release_caps(caps.get(1..).unwrap_or(&[]));
+    let restore_sp = req.word(0);
+    let mut recorded = None;
+    let code = match (restore_sp, notify.cap())
+    {
+        (0, 0) =>
+        {
+            let ended = ctx.tables.lock().table.quiesce_end(req.badge);
+            ended.map_or_else(
+                |code| code,
+                |freed| {
+                    drop(process::CapGuard::new(freed));
+                    procmgr_errors::SUCCESS
+                },
+            )
+        }
+        (0, _) | (_, 0) => procmgr_errors::INVALID_ARGUMENT,
+        (_, cap) if !is_notify_cap(cap) => procmgr_errors::INVALID_ARGUMENT,
+        (_, cap) =>
+        {
+            let entered = ctx
+                .tables
+                .lock()
+                .table
+                .quiesce_enter(req.badge, restore_sp, cap);
+            match entered
+            {
+                Ok(generation) =>
+                {
+                    // The entry owns the Notification from here.
+                    let _ = notify.disarm();
+                    recorded = Some(generation);
+                    procmgr_errors::SUCCESS
+                }
+                Err(code) => code,
+            }
+        }
+    };
+    let msg = IpcMessage::new(code);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let delivered = unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_ok();
+    if let Some(generation) = recorded.filter(|_| !delivered)
+    {
+        let freed = ctx
+            .tables
+            .lock()
+            .table
+            .quiesce_end_at(req.badge, generation);
+        drop(process::CapGuard::new(freed));
+    }
+}
+
+/// Whether `cap` is a Notification cap with the right to signal it.
+fn is_notify_cap(cap: u64) -> bool
+{
+    syscall::cap_info(cap, syscall_abi::CAP_INFO_TAG_RIGHTS).is_ok_and(|packed| {
+        let tag = (packed >> 32) & 0xFF;
+        tag == u64::from(syscall_abi::CAP_TAG_NOTIFICATION)
+            && packed & syscall_abi::RIGHTS_NTF_NOTIFY != 0
+    })
+}
+
+/// Handle `CHECKPOINT`: capture the process the handle names at its quiesce
+/// point into a memory object sealed on the account `caps[0]`, as
+/// [`handle_snapshot`] captures, with a checkpoint section
+/// (`services/procmgr/docs/ipc-interface.md` § Label 35: `CHECKPOINT`;
+/// docs/checkpoint-restore.md § Checkpoint). `dispatch_ipc` has refused it on
+/// any cap but a process handle. Wire layout: [`procmgr_labels::CHECKPOINT`].
+///
+/// The point is found, and the target's caps derived, under the table lock.
+/// Under the hold the capture checks, under the table lock again, that the
+/// point it found is still recorded, and takes a copy of its Notification. A
+/// complete capture whose reply is delivered signals that copy, so the process
+/// learns a checkpoint of its point reached its controller; any other outcome
+/// signals nothing. The copy is deleted on every path.
+fn handle_checkpoint(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+{
+    use ipc::procmgr_snapshot::{
+        CHECKPOINT_NO_CORE, CHECKPOINT_NO_DEBUG, CHECKPOINT_PRIVATE_IMAGE, Checkpoint, Image,
+    };
+    let caps = req.caps();
+    let account = process::CapGuard::new(caps.first().copied().unwrap_or(0));
+    release_caps(caps.get(1..).unwrap_or(&[]));
+    let mut image_ref = 0;
+    let found = {
+        let table = &mut ctx.tables.lock().table;
+        process_table::quiesce::checkpoint_target(table, req.badge, account.cap())
+            .map_err(process_table::quiesce::CheckpointRefusal::code)
+            .and_then(|(entry, point)| {
+                image_ref = entry.image_ref;
+                let mut declarations = 0;
+                for (set, bit) in [
+                    (entry.no_debug, CHECKPOINT_NO_DEBUG),
+                    (entry.no_core, CHECKPOINT_NO_CORE),
+                    (entry.image_ref == 0, CHECKPOINT_PRIVATE_IMAGE),
+                ]
+                {
+                    if set
+                    {
+                        declarations |= bit;
+                    }
+                }
+                let section = Checkpoint {
+                    restore_sp: point.restore_sp,
+                    process_info_va: entry.process_info_va,
+                    // Read from the process's `ProcessInfo` under the hold.
+                    ipc_buffer_va: 0,
+                    stack_top: entry.stack_top_vaddr,
+                    tls_base: entry.tls_base_va,
+                    args_offset: 0,
+                    args_bytes: 0,
+                    args_count: 0,
+                    env_offset: 0,
+                    env_bytes: 0,
+                    env_count: 0,
+                    declarations,
+                    image: Image {
+                        hash: entry.image_key.hash,
+                        len: entry.image_key.len,
+                    },
+                };
+                Ok((capture_target(entry)?, section, point.generation))
+            })
+    };
+    let captured = found.and_then(|(target, section, generation)| {
+        let target = with_image(target, image_ref);
+        let mut check = || {
+            let table = &ctx.tables.lock().table;
+            table.quiesce_notify(req.badge, generation).and_then(|cap| {
+                syscall::cap_derive(cap, syscall_abi::RIGHTS_NTF_NOTIFY)
+                    .map(process::CapGuard::new)
+                    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)
+            })
+        };
+        let mut consent = snapshot::Consent {
+            check: &mut check,
+            section,
+        };
+        snapshot::capture(
+            &capture_context(ctx, ipc_buf),
+            &target,
+            account.cap(),
+            Some(&mut consent),
+        )
+    });
+    // The copy is taken out before the reply consumes the capture, and is
+    // deleted when it drops, after the signal.
+    let (captured, notify) = match captured
+    {
+        Ok(mut c) =>
+        {
+            let notify = core::mem::replace(&mut c.notify, process::CapGuard::new(0));
+            (Ok(c), notify)
+        }
+        Err(code) => (Err(code), process::CapGuard::new(0)),
+    };
+    let complete = captured.as_ref().is_ok_and(|c| c.complete);
+    if reply_captured(captured, ipc_buf) && complete
+    {
+        let _ = syscall::notification_send(notify.cap(), 1);
+    }
+}
+
+/// The context a capture on this worker runs in.
+fn capture_context(ctx: &ProcmgrCtx, ipc_buf: *mut u64) -> snapshot::Context
+{
+    snapshot::Context {
         self_aspace: ctx.self_aspace,
         memmgr_ep: ctx.memmgr_ep,
         ipc_buf,
-    };
-    match target.and_then(|target| snapshot::capture(&capture, &target, account.cap()))
+    }
+}
+
+/// The capture target of `entry`, its caps derived under the table lock the
+/// caller holds: its address space and main thread, and its registered
+/// threads ([`derive_registered`]). The image is attached after the lock
+/// ([`with_image`]).
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when a cap cannot be derived or the heap refuses the
+/// thread list.
+fn capture_target(entry: &mut process::ProcessEntry) -> Result<snapshot::Target, u64>
+{
+    let derive =
+        |cap| process::CapGuard::new(syscall::cap_derive(cap, syscall::RIGHTS_ALL).unwrap_or(0));
+    let (aspace, thread) = (derive(entry.aspace_cap), derive(entry.thread_cap));
+    if aspace.cap() == 0 || thread.cap() == 0
+    {
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    }
+    Ok(snapshot::Target {
+        aspace,
+        thread,
+        registered: derive_registered(entry)?,
+        memmgr_badge: entry.memmgr_badge,
+        load_bias: entry.image.load_bias,
+        image: None,
+    })
+}
+
+/// `target` with the image it attaches, by its reference `image_ref`, taken
+/// under the image cache's lock alone: a teardown meanwhile drops the
+/// reference, and the capture then names no image, memmgr writing the pages
+/// it attaches as any other object's.
+fn with_image(mut target: snapshot::Target, image_ref: u64) -> snapshot::Target
+{
+    target.image =
+        image_cache::snapshot_image(image_ref).map(|(handle, key)| snapshot::TargetImage {
+            handle: process::CapGuard::new(handle),
+            image: ipc::procmgr_snapshot::Image {
+                hash: key.hash,
+                len: key.len,
+            },
+        });
+    target
+}
+
+/// Reply to a capture's sender with its object, or with its error; return
+/// whether a reply with the object was delivered. An object the reply cannot
+/// deliver is released: the sender is gone or could not take the handle.
+fn reply_captured(captured: Result<snapshot::Captured, u64>, ipc_buf: *mut u64) -> bool
+{
+    match captured
     {
         Ok(captured) =>
         {
@@ -2508,14 +2723,18 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 .cap(captured.handle)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page.
-            if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+            let delivered = unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_ok();
+            if !delivered
             {
-                // The handle stayed in procmgr's CSpace: the sender is gone or
-                // could not take it, so the object goes.
                 snapshot::release_object(captured.handle, ipc_buf);
             }
+            delivered
         }
-        Err(code) => reply_empty(ipc_buf, code),
+        Err(code) =>
+        {
+            reply_empty(ipc_buf, code);
+            false
+        }
     }
 }
 
@@ -2669,14 +2888,13 @@ fn create_child(
         paging: process::Paging::of_label(request.label),
         self_memmgr_ep: ctx.memmgr_ep,
     };
-    // A creator's private image shares nothing; the others name the binary by
-    // its signed body (services/procmgr/README.md § Image Sharing).
-    let image_key = (request.label & procmgr_labels::CREATE_PRIVATE_IMAGE == 0).then_some(
-        process_table::image_share::ImageKey {
-            hash: verified.attrs.body_hash,
-            len: verified.attrs.body_len,
-        },
-    );
+    // The binary is named by its signed body, which the child's entry keeps; a
+    // creator's private image shares nothing (services/procmgr/README.md
+    // § Image Sharing).
+    let image_key = process_table::image_share::ImageKey {
+        hash: verified.attrs.body_hash,
+        len: verified.attrs.body_len,
+    };
     let mut result = process::create_process_from_bytes(
         verified.body,
         ctx.self_aspace,
@@ -2688,7 +2906,8 @@ fn create_child(
         &ctx.deaths,
         request.relay,
         *sched,
-        image_key.as_ref(),
+        &image_key,
+        process::Sharing::of_label(request.label),
         ipc_buf,
     );
     // The segments are copied into the child's own frames or the image

@@ -337,8 +337,12 @@ static CALL_DEADLINE: Cell<Option<crate::time::Instant>> = Cell::new(None);
 /// which a spawn that failed tears its child down, and the one with which a
 /// `Child` dropped without a wait tears its child down, which nothing else
 /// can do, so a spawn whose deadline passed, or such a drop, may still wait
-/// for that teardown (`Child::kill` is bounded, and fails `TimedOut`); and
-/// every wait that is not an IPC call (a thread join, a child's
+/// for that teardown (`Child::kill` is bounded, and fails `TimedOut`); the
+/// `QUIESCE` calls with which [`checkpoint::quiesce`] enters and ends its
+/// point, since a call the deadline cut could leave procmgr recording a
+/// point the thread has left, and the release of a [`checkpoint::Checkpoint`]
+/// on its drop, which nothing else releases; and every wait that is not an
+/// IPC call (a thread join, a child's
 /// wait, a pipe, a sleep, a lock). A caller that needs a bound on its own
 /// calls takes [`call_time_left`] for them, as `ipc::ipc_call_within` does.
 ///
@@ -2403,6 +2407,27 @@ pub mod thread {
         SPAWN_PRIORITY.get()
     }
 
+    /// Whether the spawn in progress on the current thread is one of the
+    /// runtime's own threads ([`runtime_spawn`]).
+    #[thread_local]
+    static RUNTIME_SPAWN: Cell<bool> = Cell::new(false);
+
+    /// Run `spawn`, which spawns one of the runtime's own threads (the fs
+    /// release handler, a child's death bridge), so that thread is not
+    /// counted among the application's (`checkpoint::quiesce`).
+    pub(crate) fn runtime_spawn<R>(spawn: impl FnOnce() -> R) -> R {
+        let previous = RUNTIME_SPAWN.replace(true);
+        let spawned = spawn();
+        RUNTIME_SPAWN.set(previous);
+        spawned
+    }
+
+    /// Whether the spawn in progress on the current thread is the runtime's
+    /// own ([`runtime_spawn`]); read by `sys::thread::Thread::new`.
+    pub(crate) fn spawning_runtime_thread() -> bool {
+        RUNTIME_SPAWN.get()
+    }
+
     /// The calling thread's own Thread capability, in the process's `CSpace`:
     /// the cap the runtime created a spawned thread with (`RIGHTS_THREAD`),
     /// or the process's initial thread's (`StartupInfo::self_thread`). 0
@@ -2456,6 +2481,355 @@ pub mod thread {
             let spawned = self.spawn(f);
             SPAWN_PRIORITY.set(previous);
             spawned
+        }
+    }
+}
+
+// ── Checkpoint (quiesce point and checkpoint) ────────────────────────────────
+
+/// The cooperative checkpoint protocol (docs/checkpoint-restore.md): a
+/// process quiesces at a point it chooses ([`quiesce`]), and its controller
+/// captures it there ([`take`]) into a memory object a restore can later
+/// create it from.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub mod checkpoint {
+    use crate::io;
+    use crate::sync::atomic::{AtomicUsize, Ordering};
+    use crate::time::{Duration, Instant};
+
+    /// [`Held`] kind: a thread the application spawned that has not ended;
+    /// the runtime's own threads are not counted
+    /// ([`super::thread::runtime_spawn`]).
+    pub(crate) const THREAD: usize = 0;
+    /// [`Held`] kind: an open `std::fs::File`.
+    pub(crate) const FILE: usize = 1;
+    /// [`Held`] kind: a held `std::process::Child`.
+    pub(crate) const CHILD: usize = 2;
+    /// [`Held`] kind: an open pipe end, the process's own stdio among them
+    /// ([`STDIO_PIPES`]).
+    pub(crate) const PIPE: usize = 3;
+
+    /// The count of each [`Held`] kind.
+    static HELD: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+    /// The process's own stdio pipe ends, attached at startup and never
+    /// dropped, which a quiesce point allows.
+    pub(crate) static STDIO_PIPES: AtomicUsize = AtomicUsize::new(0);
+
+    /// One resource of kind `KIND` a quiesce point refuses, counted for the
+    /// life of the value. It takes no room in the value that holds it.
+    pub(crate) struct Held<const KIND: usize>(());
+
+    impl<const KIND: usize> Held<KIND> {
+        /// Count one more of `KIND` until the value drops.
+        pub(crate) fn new() -> Self {
+            HELD[KIND].fetch_add(1, Ordering::Relaxed);
+            Held(())
+        }
+    }
+
+    impl<const KIND: usize> Drop for Held<KIND> {
+        fn drop(&mut self) {
+            HELD[KIND].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// How a quiesce point ended.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Quiesced {
+        /// A complete checkpoint of the point reached the process's
+        /// controller.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        Captured,
+        /// No checkpoint was delivered before the point ended. A capture
+        /// whose hold began before the end may still deliver one.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        NotCaptured,
+    }
+
+    /// Quiesce the process at this call for at most `timeout`, so its
+    /// controller can take a checkpoint of it ([`take`];
+    /// docs/checkpoint-restore.md § Quiesce point).
+    ///
+    /// The call is refused, capturing nothing, unless the caller is the main
+    /// thread, the process is demand-paged, and no thread the application
+    /// spawned is alive, no `std::fs::File` is open, no
+    /// `std::process::Child` is held, and no pipe but stdio is open. While
+    /// it waits the thread writes no memory but its own stack below this
+    /// call's frame and its IPC buffer, and it returns only after procmgr
+    /// ended the point.
+    ///
+    /// # Errors
+    /// `ResourceBusy` when a thread, file, child or pipe above is held;
+    /// `InvalidInput` off the main thread; `Unsupported` for a process that
+    /// is not demand-paged, or that procmgr refuses as one no restore can
+    /// reproduce (created pinned, phys-class or with a DMA hold);
+    /// `OutOfMemory` when the Notification cannot be had; a failed call's
+    /// error.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn quiesce(timeout: Duration) -> io::Result<Quiesced> {
+        let info = super::startup_info();
+        if super::current_thread_cap() != info.self_thread {
+            return Err(io::const_error!(
+                io::ErrorKind::InvalidInput,
+                "seraph: quiesce off the main thread"
+            ));
+        }
+        if info.pager_endpoint_cap == 0 {
+            return Err(io::const_error!(
+                io::ErrorKind::Unsupported,
+                "seraph: quiesce of a process that is not demand-paged"
+            ));
+        }
+        let held = HELD[THREAD].load(Ordering::Relaxed)
+            | HELD[FILE].load(Ordering::Relaxed)
+            | HELD[CHILD].load(Ordering::Relaxed)
+            | HELD[PIPE]
+                .load(Ordering::Relaxed)
+                .saturating_sub(STDIO_PIPES.load(Ordering::Relaxed));
+        if held != 0 {
+            return Err(io::const_error!(
+                io::ErrorKind::ResourceBusy,
+                "seraph: quiesce with a thread, file, child or pipe held"
+            ));
+        }
+        let ipc_buf = super::current_ipc_buf();
+        let notification = crate::sys::alloc::seraph::object_slab_retype(
+            syscall_abi::NOTIFICATION_RETYPE_BYTES,
+            |slab| syscall::cap_create_notification(slab).ok(),
+        )
+        .ok_or(io::const_error!(io::ErrorKind::OutOfMemory, "seraph: quiesce notification"))?;
+        let Ok(notify) = syscall::cap_derive(notification, syscall_abi::RIGHTS_NTF_NOTIFY) else {
+            let _ = syscall::cap_delete(notification);
+            return Err(io::const_error!(
+                io::ErrorKind::OutOfMemory,
+                "seraph: quiesce notification"
+            ));
+        };
+        // A stack address of this call's own frame, below every frame of its
+        // callers.
+        let marker = 0u8;
+        let restore_sp = crate::ptr::addr_of!(marker) as u64;
+        let enter = ipc::IpcMessage::builder(ipc::procmgr_labels::QUIESCE)
+            .word(0, restore_sp)
+            .cap(notify)
+            .build();
+        // Outside any call deadline, as the end below: a deadline that cut
+        // the entry's wait for its reply would leave procmgr recording a point
+        // the thread has left.
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        let entered = unsafe { quiesce_call(info.procmgr_endpoint, &enter, ipc_buf) };
+        match entered {
+            Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS => {}
+            other => {
+                if other.is_err() {
+                    // The call may have reached procmgr before it failed:
+                    // end any point it recorded. An end with none is
+                    // answered `SUCCESS`.
+                    // SAFETY: ipc_buf is the calling thread's registered IPC
+                    // buffer page.
+                    let _ = unsafe { end_point(info.procmgr_endpoint, ipc_buf) };
+                }
+                // A call refused before procmgr received the cap leaves it
+                // here; procmgr deletes one it received.
+                let _ = syscall::cap_delete(notify);
+                let _ = syscall::cap_delete(notification);
+                return Err(match other {
+                    Ok(reply) if reply.label == ipc::procmgr_errors::NOT_RESTORABLE => {
+                        io::const_error!(
+                            io::ErrorKind::Unsupported,
+                            "seraph: quiesce of a process no restore can reproduce"
+                        )
+                    }
+                    Ok(_) => io::const_error!(io::ErrorKind::Other, "seraph: quiesce refused"),
+                    Err(e) => super::call_failed(e, "seraph: quiesce IPC failed"),
+                });
+            }
+        }
+        // At the point: from here to the end's reply nothing but this frame
+        // and the IPC buffer is written, and nothing is allocated.
+        let signalled = wait_signal(notification, timeout);
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        let ended = unsafe { end_point(info.procmgr_endpoint, ipc_buf) };
+        let signalled =
+            signalled || syscall::notification_try_wait(notification).is_ok_and(|bits| bits != 0);
+        let _ = syscall::cap_delete(notification);
+        match ended {
+            Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS => {}
+            Ok(_) => {
+                return Err(io::const_error!(io::ErrorKind::Other, "seraph: quiesce end refused"));
+            }
+            Err(e) => return Err(super::call_failed(e, "seraph: quiesce end IPC failed")),
+        }
+        Ok(if signalled { Quiesced::Captured } else { Quiesced::NotCaptured })
+    }
+
+    /// A `QUIESCE` on the process's own procmgr cap, outside any call
+    /// deadline: the entry of a quiesce point and its end
+    /// (`super::with_call_deadline`).
+    ///
+    /// # Safety
+    /// `ipc_buf` is the calling thread's registered IPC buffer page.
+    unsafe fn quiesce_call(
+        procmgr_ep: u64,
+        msg: &ipc::IpcMessage,
+        ipc_buf: *mut u64,
+    ) -> Result<ipc::IpcMessage, i64> {
+        // SAFETY: the caller passes the registered IPC buffer page.
+        unsafe { ipc::ipc_call(procmgr_ep, msg, ipc_buf) }
+    }
+
+    /// The `QUIESCE` that ends the process's quiesce point, outside any call
+    /// deadline and made again while it is `Interrupted`: the thread must not
+    /// return while procmgr still records the point
+    /// (`super::with_call_deadline`).
+    ///
+    /// # Safety
+    /// `ipc_buf` is the calling thread's registered IPC buffer page.
+    unsafe fn end_point(procmgr_ep: u64, ipc_buf: *mut u64) -> Result<ipc::IpcMessage, i64> {
+        let end = ipc::IpcMessage::builder(ipc::procmgr_labels::QUIESCE).build();
+        loop {
+            // SAFETY: the caller passes the registered IPC buffer page.
+            match unsafe { quiesce_call(procmgr_ep, &end, ipc_buf) } {
+                Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// Whether `notification` is signalled within `timeout`, an interrupted
+    /// wait waiting again for the time left.
+    fn wait_signal(notification: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            // `0` waits without bound and `u64::MAX` is `WAIT_TRY_ONCE`, so a
+            // deadline past `Instant`'s range waits with `0`, and a finite
+            // one waits at most `u64::MAX - 1` ms at a time.
+            let wait_ms = match deadline {
+                None => 0,
+                Some(d) => {
+                    let left = d.saturating_duration_since(Instant::now()).as_millis();
+                    if left == 0 {
+                        return false;
+                    }
+                    u64::try_from(left).unwrap_or(u64::MAX).min(u64::MAX - 1)
+                }
+            };
+            match syscall::notification_wait_timeout(notification, wait_ms) {
+                Ok(bits) if bits != 0 => return true,
+                Ok(_) => {}
+                Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// A checkpoint of a process at its quiesce point: a memory object
+    /// charged to the taker's memmgr account, whose layout is the snapshot
+    /// layout with a checkpoint section (`ipc::procmgr_snapshot`). Dropping
+    /// it releases the object.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[derive(Debug)]
+    pub struct Checkpoint {
+        handle: u64,
+        pages: u64,
+        complete: bool,
+    }
+
+    impl Checkpoint {
+        /// The object's pages.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn pages(&self) -> u64 {
+            self.pages
+        }
+
+        /// Whether the capture is complete (`SNAPSHOT_COMPLETE`): no page of
+        /// the process is absent. Only a complete checkpoint signals the
+        /// process.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn is_complete(&self) -> bool {
+            self.complete
+        }
+
+        /// The object's handle, a memmgr object handle the caller now owns
+        /// and releases (`OBJECT_RELEASE`), and its pages.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn into_raw(self) -> (u64, u64) {
+            let raw = (self.handle, self.pages);
+            crate::mem::forget(self);
+            raw
+        }
+    }
+
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    impl Drop for Checkpoint {
+        fn drop(&mut self) {
+            let release = ipc::IpcMessage::builder(ipc::memmgr_labels::OBJECT_RELEASE).build();
+            let ipc_buf = super::current_ipc_buf();
+            // Outside any call deadline and made again while a stop
+            // interrupts it: nothing else releases the object, whose frames
+            // stay charged to the account until it is released
+            // (`super::with_call_deadline`). A repeat after memmgr released it
+            // is refused.
+            // SAFETY: the IPC buffer is the calling thread's registered page.
+            let _ = unsafe { super::memmgr_call_until_answered(self.handle, &release, ipc_buf) };
+            let _ = syscall::cap_delete(self.handle);
+        }
+    }
+
+    /// Take a checkpoint of the process `process_handle` names, a process
+    /// handle (`std::os::seraph::process::ChildExt::process_handle`), at its
+    /// quiesce point, charged to the caller's own memmgr account
+    /// (`procmgr_labels::CHECKPOINT`; docs/checkpoint-restore.md
+    /// § Checkpoint).
+    ///
+    /// # Errors
+    /// `ResourceBusy` when the process is at no quiesce point
+    /// (`NOT_QUIESCED`); `NotFound` when it ended; `PermissionDenied` when
+    /// the cap is not a process handle; `QuotaExceeded` when the account's
+    /// max refused the frames; `OutOfMemory` otherwise; a failed call's error.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn take(process_handle: u64) -> io::Result<Checkpoint> {
+        use ipc::procmgr_errors as e;
+        let info = super::startup_info();
+        let account =
+            syscall::cap_copy(info.memmgr_endpoint, info.self_cspace, syscall::RIGHTS_EP_SEND)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let msg = ipc::IpcMessage::builder(ipc::procmgr_labels::CHECKPOINT).cap(account).build();
+        let ipc_buf = super::current_ipc_buf();
+        // SAFETY: the IPC buffer is the calling thread's registered page.
+        let reply = match unsafe { super::deadline_call(process_handle, &msg, ipc_buf) } {
+            Ok(reply) => reply,
+            Err(code) => {
+                // A call refused before procmgr received the account leaves it
+                // here; procmgr deletes one it received.
+                let _ = syscall::cap_delete(account);
+                return Err(super::call_failed(code, "seraph: checkpoint IPC failed"));
+            }
+        };
+        let caps = reply.caps();
+        let refused = match reply.label {
+            e::SUCCESS => None,
+            e::NOT_QUIESCED => Some(io::ErrorKind::ResourceBusy),
+            e::INVALID_BADGE => Some(io::ErrorKind::NotFound),
+            e::UNAUTHORIZED => Some(io::ErrorKind::PermissionDenied),
+            e::LIMIT => Some(io::ErrorKind::QuotaExceeded),
+            _ => Some(io::ErrorKind::OutOfMemory),
+        };
+        match (refused, caps) {
+            (None, &[handle]) => Ok(Checkpoint {
+                handle,
+                pages: reply.word(0),
+                complete: reply.word(1) & ipc::procmgr_snapshot::SNAPSHOT_COMPLETE != 0,
+            }),
+            (kind, caps) => {
+                for &cap in caps {
+                    let _ = syscall::cap_delete(cap);
+                }
+                let kind = kind.unwrap_or(io::ErrorKind::Other);
+                Err(io::Error::new(kind, "seraph: checkpoint refused"))
+            }
         }
     }
 }

@@ -23,7 +23,9 @@ bootloader runs on, memory map acquisition, `ExitBootServices`, and error handli
 | `EFI_RNG_PROTOCOL` | `LocateProtocol` | Draw the 32-byte entropy-pool seed and an independent 16-byte KASLR draw (two words; step 5c) | No |
 | `EFI_RISCV_BOOT_PROTOCOL` | `LocateProtocol` | Read the boot hart ID (RISC-V only; 0 when absent) | No |
 | All handles | `LocateHandleBuffer(AllHandles)` + `ConnectController` | Bind drivers (e.g. virtio-gpu to GOP) not auto-connected during BDS, before the GOP query | No |
-| Variable services | `RuntimeServices->GetVariable` / `SetVariable` | Read the firmware's Secure Boot state; read and raise the machine's security floor (§ Variable Services) | No |
+| Variable services | `RuntimeServices->GetVariable` / `SetVariable` / `QueryVariableInfo` | Read the firmware's Secure Boot state; read and raise the machine's security floor; read and write the enrolled trust store (§ Variable Services) | No |
+| `EFI_SIMPLE_TEXT_INPUT_PROTOCOL` | `SystemTable->ConIn` | Read the console's answer to a trust request no signature authorizes (§ Console Input) | No |
+| Timer events | `BootServices->CreateEvent` / `SetTimer` / `WaitForEvent` / `CloseEvent` | Bound the wait for that answer (§ Console Input) | No |
 
 `EFI_GRAPHICS_OUTPUT_PROTOCOL` is optional — its absence is handled gracefully by
 zeroing the `framebuffer.physical_base` field in `BootInfo`. A headless system or a
@@ -55,20 +57,22 @@ The EFI System Partition is accessed as follows:
 3. SimpleFileSystem->OpenVolume() → root EFI_FILE_PROTOCOL handle
 4. root->Open("\EFI\seraph\bootstrap.bundle") → bundle file handle (step 2)
 5. root->Open("\EFI\seraph\kernel") → kernel file handle (step 3)
-6. root->Open("\EFI\seraph\nokaslr") → presence probe only; the handle is closed at once (step 5d)
-7. root->Open("\EFI\seraph\mapredo") → presence probe only; the handle is closed at once (step 6)
+6. root->Open("\EFI\seraph\trust-request") → optional; read whole when present (step 3)
+7. root->Open("\EFI\seraph\nokaslr") → presence probe only; the handle is closed at once (step 5d)
+8. root->Open("\EFI\seraph\mapredo") → presence probe only; the handle is closed at once (step 6)
 ```
 
 All files are opened as read-only. Sizes are determined via `EFI_FILE_INFO` before
 reading. Files are read into physical memory allocated by `AllocatePages`; see
 [elf-loading.md](elf-loading.md) for how segment placement works.
 
-The bootloader carries four ESP path constants — `\EFI\seraph\kernel`,
+The bootloader carries five ESP path constants — `\EFI\seraph\kernel`,
 `\EFI\seraph\bootstrap.bundle`, the presence-only KASLR override knob
-`\EFI\seraph\nokaslr`, and the presence-only steps 6 and 7 redo test knob
-`\EFI\seraph\mapredo` — all hardcoded in [`core/boot/src/main.rs`](../src/main.rs) (see
-[elf-loading.md](elf-loading.md) § File Paths). There is no on-disk
-boot configuration file; the bundle is the single composed artifact
+`\EFI\seraph\nokaslr`, the presence-only steps 6 and 7 redo test knob
+`\EFI\seraph\mapredo`, and the optional trust request `\EFI\seraph\trust-request`
+([docs/signing.md](../../../docs/signing.md) § Trust Store) — all hardcoded in
+[`core/boot/src/main.rs`](../src/main.rs) (see [elf-loading.md](elf-loading.md) § File Paths).
+There is no on-disk boot configuration file; the bundle is the single composed artifact
 that carries init plus every userspace module the system needs (see
 [elf-loading.md](elf-loading.md) for how its entries are loaded). The
 bundle format itself is specified in
@@ -188,14 +192,18 @@ type in Seraph's memory model is authoritative there.
 ## Variable Services
 
 The bootloader reads the firmware's UEFI Secure Boot state
-([docs/signing.md](../../../docs/signing.md) § Secure Boot), and reads and writes the machine's
-security floor ([docs/signing.md](../../../docs/signing.md) § Rollback Floor), through the
+([docs/signing.md](../../../docs/signing.md) § Secure Boot), reads and writes the machine's security
+floor ([docs/signing.md](../../../docs/signing.md) § Rollback Floor), and reads and writes the
+enrolled trust store ([docs/signing.md](../../../docs/signing.md) § Trust Store), through the
 `VariableServices` trait of [`core/boot/src/uefi.rs`](../src/uefi.rs). `FirmwareVariables`
-implements it over the system table's `RuntimeServices->GetVariable` and `SetVariable`; host
-tests implement it over a store in memory. `GetVariable` returns one of four outcomes
-(`VariableRead`): the variable and its attributes, no such variable, a variable larger than the
-caller's buffer (with its length), or a failure status. A system table with no runtime services,
-or a name without its terminating NUL, fails without a call.
+implements it over the system table's `RuntimeServices->GetVariable`, `SetVariable` and
+`QueryVariableInfo`; host tests implement it over a store in memory. `GetVariable` returns one of
+four outcomes (`VariableRead`): the variable and its attributes, no such variable, a variable larger
+than the caller's buffer (with its length), or a failure status. A system table with no runtime
+services, or a name without its terminating NUL, fails without a call. `QueryVariableInfo` reports
+the storage the firmware has for variables of the given attributes: its total, what remains, and its
+largest variable. A runtime services table whose header size does not reach the entry lacks it, and
+the call fails without being made.
 
 Every Seraph variable is named under the Seraph vendor GUID (`SERAPH_VENDOR_GUID`) and carries
 `NON_VOLATILE | BOOTSERVICE_ACCESS` and never `RUNTIME_ACCESS`, so nothing reaches it once boot
@@ -207,10 +215,14 @@ copy among them, reads as `unknown`, never as `on`; with `SecureBoot` at 0, a `S
 another shape, or none, reads as `off` with that as its reason
 (`core/boot/src/secure_boot.rs`). Every variable call is made before `ExitBootServices`, and none
 after it: the state is read right after step 1 of [boot-flow.md](boot-flow.md), the floor
-once the trust store parses and written once every object has verified (step 4), ahead of the
-memory-map reads of steps 6 and 7. A variable service the firmware lacks or fails is a warning or
-a logged state, not a halt; only a floor that refuses the bootloader, or a malformed one, is
-fatal.
+once the trust store parses, the enrolled store once the kernel and the bundle are read (step 3),
+the enrolled store written when a trust request is applied, before any object is verified for
+loading, and the floor written once every object has verified (step 4), ahead of the memory-map
+reads of steps 6 and 7. The enrolled store is the variable `TrustStore`; before writing it the
+bootloader queries the firmware's largest variable, where `QueryVariableInfo` answers, and refuses
+the request when the store would not fit. A variable service the firmware lacks or fails is a
+warning, a logged state or a refused request, not a halt; only a floor that refuses the
+bootloader, a malformed floor, or a malformed enrolled store is fatal.
 
 ---
 
@@ -267,12 +279,15 @@ The bootloader performs no allocation-dependent operations after `ExitBootServic
 
 ## Error Handling Strategy
 
-Every `BootError` that reaches `efi_main` is fatal. Three sites consume a `BootError` instead of
+Every `BootError` that reaches `efi_main` is fatal. Five sites consume a `BootError` instead of
 returning it: a failed open of `\EFI\seraph\nokaslr` reads as an absent knob
 ([boot-flow.md § Step 5d](boot-flow.md#step-5d-apply-the-kaslr-slide)), as does a failed open of
 `\EFI\seraph\mapredo`
-([memory-map.md § Sizing the Entry Array](memory-map.md#sizing-the-entry-array)), and a failed
-AP-trampoline allocation is logged as a warning and records zero
+([memory-map.md § Sizing the Entry Array](memory-map.md#sizing-the-entry-array)); a failed open
+of `\EFI\seraph\trust-request` reads as no request, and a kernel or bundle entry that would not
+verify under the store a trust request gives refuses the request
+([boot-flow.md § Step 3](boot-flow.md#step-3-load-kernel-elf)); and a failed AP-trampoline
+allocation is logged as a warning and records zero
 ([boot-flow.md § Step 5b](boot-flow.md#step-5b-allocate-the-ap-trampoline-page)). Optional
 resources degrade instead of failing: an absent GOP leaves the system headless, and an absent or
 failing entropy source falls back as
@@ -288,7 +303,8 @@ Every fatal error returned through `Result` is a `BootError` (`Result<T, BootErr
 [`core/boot/src/error.rs`](../src/error.rs). The variant set covers protocol-location failure, UEFI
 status-code propagation, ESP file-not-found, ELF validation failure, W^X violation, allocation
 failure, `ExitBootServices` failure after the bounded retry loop, bundle parse/validation failure
-(`InvalidBundle`), an embedded trust store that does not parse (`TrustStore`), the verifier's
+(`InvalidBundle`), an embedded trust store that does not parse (`TrustStore`), a malformed enrolled
+trust store (`EnrolledMalformed`, naming the recovery), the verifier's
 refusal of the kernel or a bundle entry (`SignatureRefused`, naming the object;
 [docs/signing.md](../../../docs/signing.md) § Verifier Discipline), on RISC-V no supported paging
 mode passing the satp probe (`PagingModeUnsupported`), a firmware memory map that violates the UEFI
@@ -320,6 +336,21 @@ No elaborate formatting, no stack traces, no recovery prompts. The message is
 sufficient to identify which step failed and why.
 
 ---
+
+## Console Input
+
+The bootloader reads the console once, and only to confirm a trust request that no signature
+authorizes ([docs/signing.md](../../../docs/signing.md) § Trust Store). It reads through the
+`ConsoleInput` trait of [`core/boot/src/uefi.rs`](../src/uefi.rs); `FirmwareConsole` implements it
+over the system table's `ConIn` (`EFI_SIMPLE_TEXT_INPUT_PROTOCOL`), which the firmware feeds from
+every console it has, the serial port among them; host tests implement it over keys in memory. It
+resets `ConIn`, discarding keys typed before the question, prints the question, and waits on
+`ConIn`'s key event and a relative timer event of 60 seconds with `WaitForEvent`. Each printable key
+read with `ReadKeyStroke` is added to the line and echoed, Backspace removes the last character,
+other keys are ignored, and Enter ends the line, which confirms the request only when it is exactly
+`yes`; the timer's firing ends the wait as no answer. The timer, not `Stall`, bounds the wait, since
+a firmware may run `Stall` on no clock. The timer event is closed on every path. A `ConIn` that is
+absent, or a call that fails, refuses the request.
 
 ## Console Output
 

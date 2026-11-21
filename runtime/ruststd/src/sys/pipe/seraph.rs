@@ -85,11 +85,11 @@ const RING_RELEASED: u8 = 4;
 ///
 /// Returning the page is safe only once neither side can write through
 /// it: the parent end must be dropped (unmapped, caps deleted) AND the
-/// child must be torn down or never wired. A death post alone does not
-/// stop the child's other threads (docs/process-lifecycle.md § Exit
-/// reason), so the death bridge reports the death only after its
-/// `DESTROY_PROCESS` has returned, by which point procmgr has revoked the
-/// child's address space. `Pipe::Drop` and the death bridge each report
+/// child must be torn down or never wired. The death bridge reports the
+/// death on procmgr's relay post of the child's end, which procmgr makes
+/// only after its teardown revoked the child's address space
+/// (docs/process-lifecycle.md § Process Death), so no child thread is left
+/// to write. `Pipe::Drop` and the death bridge each report
 /// their side's completion here; whichever observes the other side
 /// already done gets `true` back and sends the release. A parent end
 /// whose ring unmap fails never reports, so its grant stays accounted to
@@ -216,6 +216,8 @@ pub struct Pipe {
     /// requested the grant (`create_for_child`); child-side ends map a
     /// page they do not own.
     ring_release: Option<Arc<RingRelease>>,
+    /// The end among the open ones (`os::seraph::checkpoint::PIPE`).
+    _held: crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::PIPE }>,
 }
 
 // SAFETY: Pipe holds raw cap-slot indices and a process-local VA; no
@@ -423,6 +425,7 @@ impl Pipe {
                 reserved_va: Some(reserved),
                 peer_dead: None,
                 ring_release: Some(Arc::new(RingRelease::new(ring_region_id))),
+                _held: crate::os::seraph::checkpoint::Held::new(),
             },
             PipeCaps {
                 memory: memory_handoff,
@@ -484,6 +487,7 @@ impl Pipe {
             reserved_va: Some(reserved),
             peer_dead: None,
             ring_release: None,
+            _held: crate::os::seraph::checkpoint::Held::new(),
         })
     }
 
@@ -560,10 +564,10 @@ impl Pipe {
             // Order matters: observe the EOF flags BEFORE draining the ring.
             // Each flag is Release-stored after the closing thread's last ring
             // write (`closed`: the peer's `Pipe::close`, run by its `Drop` or
-            // stdio's `close_all`; `peer_dead`: child death -> kernel death
-            // post -> bridge), so a drain performed after observing a set
-            // flag sees every byte the closing thread wrote before the flag,
-            // and an empty one means none remain. The reverse
+            // stdio's `close_all`; `peer_dead`: child death -> procmgr's
+            // teardown and relay post -> bridge), so a drain performed after
+            // observing a set flag sees every byte the closing thread wrote
+            // before the flag, and an empty one means none remain. The reverse
             // order loses bytes the peer writes between the drain and the
             // flag load. Bytes another thread writes after a concurrent
             // close may go unseen (module doc).

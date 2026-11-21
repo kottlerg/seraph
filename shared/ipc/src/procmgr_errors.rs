@@ -79,5 +79,13 @@ pub const SPACE_HELD: u64 = 20;
 /// creator chose allows, where `OUT_OF_MEMORY` is the system's own
 /// shortage. Nothing the request took is kept.
 pub const LIMIT: u64 = 21;
+/// `procmgr_labels::CHECKPOINT` refused: the process is at no quiesce point
+/// (`procmgr_labels::QUIESCE`), or left it before the capture's hold;
+/// nothing was captured.
+pub const NOT_QUIESCED: u64 = 22;
+/// `procmgr_labels::QUIESCE` refused: the sender was created pinned,
+/// phys-class or with a DMA hold, so no restore can reproduce it
+/// (docs/checkpoint-restore.md § Quiesce point).
+pub const NOT_RESTORABLE: u64 = 23;
 /// Unknown opcode on procmgr endpoint.
 pub const UNKNOWN_OPCODE: u64 = 0xFFFF;

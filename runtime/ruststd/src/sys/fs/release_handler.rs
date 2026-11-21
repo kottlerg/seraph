@@ -153,10 +153,12 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
         aspace,
     });
     let handler_state = Arc::clone(&state);
-    if thread::Builder::new()
-        .name("seraph-fs-release".into())
-        .spawn(move || handler_main(&handler_state))
-        .is_err()
+    if crate::os::seraph::thread::runtime_spawn(|| {
+        thread::Builder::new()
+            .name("seraph-fs-release".into())
+            .spawn(move || handler_main(&handler_state))
+    })
+    .is_err()
     {
         let _ = syscall::cap_delete(release_ep);
         return Err(io::Error::other("seraph fs: release-handler spawn failed"));

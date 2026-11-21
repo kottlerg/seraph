@@ -1,15 +1,17 @@
 # shared/objsig
 
-Codec and verifier of Seraph's signed objects: the signature trailer, the certificate and the
-trust store whose formats [docs/signing.md](../../docs/signing.md) specifies byte by byte, and the
-verification policy of its § Verification.
+Codec and verifier of Seraph's signed objects: the signature trailer, the certificate, the trust
+store, the enrolled trust store and the trust request whose formats
+[docs/signing.md](../../docs/signing.md) specifies byte by byte, and the verification policy of its
+§ Verification.
 
 `no_std`, no allocation; its one dependency is [`shared/crypto`](../crypto/README.md) (SHA-512,
 `ed25519_verify` and `ml_dsa::verify`, and, behind the `sign` feature, their signers). xtask links
-it, to sign and to verify each signed object before writing it; the bootloader links it to verify
-the kernel and every bundle entry, procmgr to parse the trust store it receives and verify against
-it, and init-log-levels and devmgr-firmware to take the body of a data module through `split`. No
-stability obligation; internal code reuse only.
+it, to sign and to verify each signed object before writing it, and to build trust requests; the
+bootloader links it to verify the kernel and every bundle entry and to keep the enrolled store,
+procmgr to parse the trust store it receives and verify against it, and init-log-levels and
+devmgr-firmware to take the body of a data module through `split`. No stability obligation; internal
+code reuse only.
 
 ---
 
@@ -26,6 +28,7 @@ stability obligation; internal code reuse only.
 | `encode_trailer`, `TrustStore::encode` | Write a trailer and a store into a caller's buffer, for the host signer |
 | `embed::{MARKER, Embedded, find}` | The layout that embeds a trust store in a bootloader image, `MARKER` (16 bytes) `\|\| len` (`u32` LE) `\|\| store`, and `find`, which locates the one `Embedded` store in an image's bytes |
 | `key_id` | The key id of a composite public key: the first 16 bytes of the SHA-512 of all 1,984 bytes |
+| `enrol::{EnrolledStore, TrustRequest, merge, apply}` | The trust store enrolled in firmware storage and the trust request that changes it ([docs/signing.md](../../docs/signing.md) § Trust Store): each type parses and encodes its format; `merge` writes the store a boot runs on from the built-in and the enrolled store (both stores' anchors and revoked key ids, the built-in floor); `apply` writes the enrolled store a request gives, or reports that it changes nothing or passes the bound (`MAX_ANCHORS`, 3; `MAX_REVOKED`, 120; `MAX_STORE_LEN`, 8,006 bytes). `REQUEST_NAME` is the name a request is signed under in the enrolment role |
 | `index::{Index, encode}` | The signed index of a configuration directory ([docs/signing.md](../../docs/signing.md) § Configuration): `Index::parse` checks the format (one line per file, `\n`-terminated: a canonical path component, a space and the lowercase hex SHA-512 of the file's body (`body_digest`); names strictly ascending byte for byte, never `index` itself), `Index::matches` compares a body with its line, and `encode` writes it, refusing what the parser refuses |
 
 A `Refusal` is a parse error, `Untrusted` when no record names an anchor of the store (by
@@ -36,7 +39,8 @@ Every parser is a total function over an arbitrary byte slice: it reads byte-wis
 the slice, never panics, and refuses anything the format does not define, so each is a fuzz entry
 point as it stands. Every encoder refuses what the parsers refuse, so what it writes parses.
 
-`MAX_RECORDS` (8) and `CERTIFICATE_CACHE_LEN` (4) are the crate's bounds beside the formats'
+`MAX_RECORDS` (8), `CERTIFICATE_CACHE_LEN` (4) and the enrolled store's `MAX_ANCHORS` (3) and
+`MAX_REVOKED` (120) are the crate's bounds beside the formats'
 field widths ([docs/limits.md](../../docs/limits.md)); the codec holds no array sized from a count.
 
 ## Tests
@@ -65,6 +69,7 @@ shared/objsig/
     ├── cert.rs                 # Certificate
     ├── composite.rs            # Composite signature: Ed25519 and ML-DSA-65
     ├── embed.rs                # Trust store embedded in a bootloader image: marker, find
+    ├── enrol.rs                # Enrolled trust store, trust request, merge and apply
     ├── index.rs                # Signed index of a configuration directory
     ├── store.rs                # Trust store
     ├── trailer.rs              # Signed object: split, records, trailer encoder

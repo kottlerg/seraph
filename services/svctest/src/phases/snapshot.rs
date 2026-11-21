@@ -21,6 +21,8 @@
 //!   the object's release gives them back;
 //! - the child runs on: its writer passes the value the snapshot holds;
 //! - the header flags are complete and image, and its image has a length;
+//!   memmgr reports the object unmarked (`OBJECT_READ`): a `SNAPSHOT` is no
+//!   checkpoint;
 //! - the regions hold the child's object attachment (class object, three
 //!   pages from object page 0), its private zero attachment (class zero) and
 //!   its demand region (class demand), and at least one image region;
@@ -48,8 +50,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ipc::procmgr_snapshot::{
-    Header, REGION_DEMAND, REGION_IMAGE, REGION_OBJECT, REGION_PRIVATE, REGION_ZERO, RUN_IMAGE,
-    RUN_ZERO, RegionEntry, Run, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE, ThreadRecord, threads_offset,
+    Checkpoint, Header, REGION_DEMAND, REGION_IMAGE, REGION_OBJECT, REGION_PRIVATE, REGION_ZERO,
+    RUN_IMAGE, RUN_ZERO, RegionEntry, Run, SNAPSHOT_CHECKPOINT, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE,
+    ThreadRecord, checkpoint_offset, threads_offset,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use syscall_abi::{MAP_READ, MAP_WRITABLE, PAGE_SIZE};
@@ -404,16 +407,7 @@ impl Snapped
         snapped.object_va = *object_va;
         snapped.zero_va = *zero_va;
         snapped.demand_va = *demand_va;
-        let new: Vec<u64> = listed_badges(authority)
-            .into_iter()
-            .filter(|badge| !before.contains(badge))
-            .collect();
-        let [badge] = new[..]
-        else
-        {
-            panic!("{PHASE}: LIST_PROCESSES lists {new:#x?} as new since the child's spawn");
-        };
-        snapped.badge = badge;
+        snapped.badge = super::swap::spawned_badge(authority, &before, PHASE);
         snapped
     }
 
@@ -569,6 +563,8 @@ pub(super) struct Attached
     regions: Vec<RegionEntry>,
     runs: Vec<Run>,
     threads: Vec<Recorded>,
+    /// The checkpoint section, when the header marks the layout a checkpoint.
+    checkpoint: Option<Checkpoint>,
     /// The caller's phase, which a failure names.
     phase: String,
 }
@@ -632,6 +628,16 @@ impl Attached
             })
             .collect();
         let threads = decode_threads(layout, &header, phase);
+        let checkpoint = (header.flags & SNAPSHOT_CHECKPOINT != 0).then(|| {
+            checkpoint_offset(
+                header.region_count.saturating_add(header.run_count),
+                header.thread_bytes,
+            )
+            .and_then(|at| Checkpoint::decode(layout, at))
+            .unwrap_or_else(|| {
+                panic!("{phase}: the checkpoint section of {header:?} does not decode")
+            })
+        });
         Self {
             handle,
             va,
@@ -641,8 +647,15 @@ impl Attached
             regions,
             runs,
             threads,
+            checkpoint,
             phase: phase.to_owned(),
         }
+    }
+
+    /// The object's checkpoint section, when it is a checkpoint.
+    pub(super) fn checkpoint(&self) -> Option<&Checkpoint>
+    {
+        self.checkpoint.as_ref()
     }
 
     /// The object's thread records, in the layout's order.
@@ -778,6 +791,11 @@ fn decode_threads(layout: &[u8], header: &Header, phase: &str) -> Vec<Recorded>
 /// pages from it to `values`, detach it and release it.
 fn read_object(authority: u64, handle: u64, pages: u64, child: &Snapped, values: &mut Vec<u64>)
 {
+    assert_eq!(
+        crate::phases::object_io::object_flags(handle, PHASE),
+        (0, pages),
+        "{PHASE}: OBJECT_READ of a SNAPSHOT's object, which carries no checkpoint mark"
+    );
     let object = Attached::attach(handle, pages, PHASE);
     assert_eq!(
         object.header().flags,

@@ -40,7 +40,7 @@ use gdb_rsp::command::{
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
 use gdb_rsp::target::TARGET_XML_ANNEX;
 use gdbstub::breakpoints;
-use gdbstub::control::{self, Plan};
+use gdbstub::control::{self, Plan, ResumeSelect};
 use gdbstub::session::{self, Idle, Kernel, Page, RegisterAccess, Resumed, Session, Stop};
 use gdbstub::{regs, signal, stop_signal};
 use ipc::{
@@ -1096,43 +1096,41 @@ impl Stub
                     w.current_thread(thread);
                 });
             }
-            Command::SetThread { op, thread } => match (op, thread, self.select(thread))
+            Command::SetThread { op, thread } =>
             {
-                (ThreadOp::General, _, Some(i)) =>
+                let selected = self.select(thread);
+                let accepted = match op
                 {
-                    if let Some(s) = &mut self.session
+                    ThreadOp::General => selected.map(|i| {
+                        if let Some(s) = &mut self.session
+                        {
+                            s.current = i;
+                        }
+                    }),
+                    ThreadOp::Resume => match control::resume_select(thread, selected)
                     {
-                        s.current = i;
+                        // `Hc0` and `Hc-1`: a `c` or `s` resumes every thread.
+                        ResumeSelect::Every => Some(None),
+                        ResumeSelect::Thread(i) => Some(Some(i)),
+                        ResumeSelect::Refused => None,
                     }
-                    self.ok(ipc_buf);
-                }
-                // `Hc0` and `Hc-1`: a `c` or `s` resumes every thread.
-                (ThreadOp::Resume, ThreadId::Any | ThreadId::All, _) =>
-                {
-                    if let Some(s) = &mut self.session
-                    {
-                        s.resume_thread = None;
-                    }
-                    self.ok(ipc_buf);
-                }
-                (ThreadOp::Resume, ThreadId::Id(_), Some(i)) =>
-                {
-                    if let Some(s) = &mut self.session
-                    {
-                        s.resume_thread = Some(i);
-                    }
-                    self.ok(ipc_buf);
-                }
-                (ThreadOp::Resume, ThreadId::Id(_), None) if self.session.is_none() =>
+                    .map(|resume| {
+                        if let Some(s) = &mut self.session
+                        {
+                            s.resume_thread = resume;
+                        }
+                    }),
+                };
+                if accepted.is_some()
                 {
                     self.ok(ipc_buf);
                 }
-                (_, _, None) =>
+                else
                 {
                     let code = self.log_refused_select(op, thread);
                     self.error(ipc_buf, code);
                 }
-            },
+            }
             Command::ThreadAlive(thread) => match self.select(thread)
             {
                 Some(_) => self.ok(ipc_buf),

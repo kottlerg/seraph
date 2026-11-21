@@ -199,6 +199,7 @@ fn prepare(ctx: &Context, arch: Arch, dir: &Path) -> Result<(DevKeys, Vec<(On, C
                 substitutes: copies(image)?,
                 expect: vec![FIRMWARE_REFUSAL.to_owned()],
                 timeout: BOOTLOADER_TIMEOUT,
+                answer: None,
             },
         ))
     };
@@ -212,6 +213,7 @@ fn prepare(ctx: &Context, arch: Arch, dir: &Path) -> Result<(DevKeys, Vec<(On, C
                     substitutes: copies(&signed)?,
                     expect: vec![STATE_ON.to_owned()],
                     timeout: BOOTLOADER_TIMEOUT,
+                    answer: None,
                 },
             ),
             refused("tampered", &tampered)?,
@@ -223,6 +225,7 @@ fn prepare(ctx: &Context, arch: Arch, dir: &Path) -> Result<(DevKeys, Vec<(On, C
                     substitutes: Vec::new(),
                     expect: vec![STATE_OFF.to_owned()],
                     timeout: BOOTLOADER_TIMEOUT,
+                    answer: None,
                 },
             ),
         ],

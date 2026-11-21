@@ -402,6 +402,11 @@ mod tests
             self.floor = Some((attributes, data.to_vec()));
             Ok(())
         }
+
+        fn query(&mut self, _attributes: u32) -> Result<crate::uefi::VariableInfo, EfiStatus>
+        {
+            Err(EFI_UNSUPPORTED)
+        }
     }
 
     /// One boot's floor handling, by a bootloader whose store carries

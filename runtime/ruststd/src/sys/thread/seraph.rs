@@ -114,6 +114,9 @@ struct SpawnArgs {
     self_thread_cap: u64,
     init: *mut ThreadInit,
     done_notification: u64,
+    /// The thread among the application's live threads, until it ends
+    /// (`os::seraph::checkpoint::THREAD`); none for one of the runtime's own.
+    held: Option<crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::THREAD }>>,
 }
 
 /// The reclaimable resources a spawned thread owns. Moved as a unit between the
@@ -466,6 +469,8 @@ impl Thread {
             self_thread_cap: 0,
             init: Box::into_raw(init),
             done_notification,
+            held: (!crate::os::seraph::thread::spawning_runtime_thread())
+                .then(crate::os::seraph::checkpoint::Held::new),
         }));
 
         // Dedicated slab for the Thread retype slot, sized to the kernel's
@@ -734,8 +739,7 @@ impl Drop for Thread {
 /// and heap/VA resources needs a surviving thread to act *after* the child
 /// leaves user-mode. The kernel already provides that signal —
 /// `SYS_THREAD_BIND_NOTIFICATION` posts a thread's death (exit or fault) to a
-/// bound `EventQueue` — so no new syscall is required; this mirrors how
-/// `std::process::Child` reaps child processes.
+/// bound `EventQueue` — so no new syscall is required.
 ///
 /// Every spawned thread binds a death observer (before `thread_start`) to one
 /// of the process's death `EventQueue`s, with a generation-tagged correlator
@@ -1043,7 +1047,7 @@ fn register_with_procmgr(self_thread_cap: u64, ipc_buf: *mut u64) {
 extern "C" fn thread_entry(arg: u64) -> ! {
     // SAFETY: arg was produced via `Box::into_raw(Box::new(SpawnArgs {..}))`
     // in Thread::new; this is the sole consumer.
-    let args = unsafe { Box::from_raw(arg as *mut SpawnArgs) };
+    let mut args = unsafe { Box::from_raw(arg as *mut SpawnArgs) };
     crate::os::seraph::set_current_thread_cap(args.self_thread_cap);
     // SAFETY: `ipc_buffer_vaddr` is the page Thread::new mapped from a grant
     // for this thread alone; no Rust object lives in it, and std
@@ -1066,6 +1070,7 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // the entry point.
     let rust_start = init_box.init();
     let done_notification = args.done_notification;
+    let held = args.held.take();
     drop(args);
     rust_start();
 
@@ -1077,6 +1082,9 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // reference to its TLS variables is live.
     unsafe { crate::sys::thread_local::destructors::run() };
     crate::rt::thread_cleanup();
+    // Uncounted before the done signal, so a join that returns finds the
+    // thread ended.
+    drop(held);
 
     // `thread_exit` diverges without unwinding, so every local is dropped
     // above; only the plain cap slot crosses into the tail.

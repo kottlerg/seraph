@@ -20,7 +20,8 @@ use objsig::{Role, RoleSet};
 /// (`objsig::name_is_install_path`). `None`, which procmgr refuses
 /// `INVALID_ARGUMENT` before it reads any object, when the block is missing
 /// or malformed or the name is not a canonical install path: the slot names
-/// `kernel` and `init` name objects the bootloader alone loads.
+/// `kernel`, `init` and `trust-request` name objects the bootloader alone
+/// loads.
 #[must_use]
 pub fn requested_name(req: &IpcMessage) -> Option<&[u8]>
 {
@@ -255,7 +256,7 @@ mod tests
             let request = role_request(64, role as u64, b"/data/x");
             assert_eq!(verified_read(&request).is_some(), readable, "{role:?}");
         }
-        for word in [0, 9, 31, u64::MAX]
+        for word in [0, 10, 31, u64::MAX]
         {
             assert_eq!(readable_role(word), None, "{word}");
         }

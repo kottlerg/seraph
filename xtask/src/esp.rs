@@ -272,6 +272,8 @@ fn read_tree(dir: &Path, path: &str, out: &mut BTreeMap<String, Vec<u8>>) -> Res
 ///   order, and each entry equals the installed file the list names for it.
 ///   The list is the one of `lists` whose entries the bundle's are, or the one
 ///   list `lists` holds;
+/// - `\EFI\seraph\trust-request`, when present, is a trust request
+///   (`crate::signing::request::is_request`);
 /// - every other file is empty and in `\EFI\seraph\`: a presence-only knob of
 ///   the bootloader, which carries no content and so is no object.
 ///
@@ -318,10 +320,13 @@ pub fn check(
                 .strip_prefix(VENDOR_DIR)
                 .and_then(|rest| rest.strip_prefix('/'))
                 .is_some_and(|name| !name.contains('/'));
-        if !knob && !objects.contains(path)
+        let request = *path == format!("{VENDOR_DIR}/{}", crate::signing::request::FILE_NAME)
+            && crate::signing::request::is_request(bytes);
+        if !knob && !request && !objects.contains(path)
         {
             faults.push(format!(
-                "{path} is no object the ESP copies from an installed file, nor a knob"
+                "{path} is no object the ESP copies from an installed file, nor a knob, nor a \
+                 trust request"
             ));
         }
     }
@@ -715,6 +720,35 @@ mod tests
             esp.insert(path.to_owned(), bytes.to_vec());
             let error = checked(&esp, &installed, &lists).unwrap_err();
             assert!(error.contains(&format!("{path} is no object")), "{error}");
+        }
+    }
+
+    // Defect caught: a trust request staged for the bootloader refused, so no
+    // image could carry one, or any file accepted under its name, or a request
+    // accepted at another path, where no bootloader reads it.
+    #[test]
+    fn a_trust_request_is_accepted_at_its_path_alone()
+    {
+        let (installed, lists) = installed_files();
+        let good = esp_of(&installed, &lists[1]);
+        let revoke = [[1u8; objsig::KEY_ID_LEN]];
+        let mut request = vec![0u8; objsig::enrol::encoded_len(0, revoke.len()).unwrap()];
+        objsig::enrol::TrustRequest::encode(&[], &revoke, &mut request).unwrap();
+        let path = format!("{VENDOR_DIR}/{}", crate::signing::request::FILE_NAME);
+
+        let mut esp = good.clone();
+        esp.insert(path.clone(), request.clone());
+        checked(&esp, &installed, &lists).unwrap();
+
+        for (at, bytes) in [
+            (path.as_str(), b"not a request".as_slice()),
+            ("/EFI/seraph/trust-request.old", request.as_slice()),
+        ]
+        {
+            let mut esp = good.clone();
+            esp.insert(at.to_owned(), bytes.to_vec());
+            let error = checked(&esp, &installed, &lists).unwrap_err();
+            assert!(error.contains(&format!("{at} is no object")), "{error}");
         }
     }
 

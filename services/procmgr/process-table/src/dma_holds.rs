@@ -237,6 +237,11 @@ mod tests
             end_correlator: 0,
             image_ref: 0,
             ended_with: None,
+            image_key: crate::image_share::ImageKey {
+                hash: [0; 64],
+                len: 0,
+            },
+            quiesce: crate::quiesce::Quiesce::Idle,
         }
     }
 

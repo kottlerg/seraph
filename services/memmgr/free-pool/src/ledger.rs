@@ -1752,6 +1752,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             budget: r.budget,
             attached: 0,
             live: true,
+            checkpoint: false,
         });
         let obj = self
             .arena
@@ -1915,6 +1916,26 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             f(cur, &frame);
             cur = self.arena.get(cur).next;
         }
+    }
+
+    /// Mark the live memory object `obj` as a checkpoint, when `account` is
+    /// the badge of the process record that sealed it: procmgr seals its
+    /// capture on the account the checkpoint's caller presents, so the mark
+    /// names that seal (`services/memmgr/docs/memory-pool.md` § Memory
+    /// objects, Checkpoint mark). The mark stays for the object's life.
+    /// Returns `false`, changing nothing, for an object that is not live or
+    /// that another record sealed, and for a badge that names no record.
+    pub fn mark_checkpoint(&mut self, obj: NodeIdx, account: u64) -> bool
+    {
+        let sealed = self
+            .object(obj)
+            .is_some_and(|o| o.live && o.owner == account);
+        if !sealed || self.find(account).is_none()
+        {
+            return false;
+        }
+        self.set_object(obj, |o| o.checkpoint = true);
+        true
     }
 
     /// Drop the handle state of the live memory object `obj`: unindex it, so
@@ -8780,6 +8801,40 @@ mod tests
         assert_eq!(usage(&l, rec), charged);
         assert_eq!(l.find(77), None);
         assert_eq!(l.find_handle(77), None);
+    }
+
+    // The defect caught: a mark set on an object its account did not seal, on
+    // one whose handle state is gone, or set at the seal; or a mark lost once
+    // the object is released while a region attaches it.
+    #[test]
+    fn only_the_sealers_account_marks_a_live_object_and_the_mark_stays()
+    {
+        let mut l = object_ledger(1000);
+        let (sealer, ids) = granted(&mut l, 1, 3, 2);
+        let other = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let obj = seal(&mut l, sealer, &ids[..2]).unwrap();
+        assert!(!l.object(obj).unwrap().checkpoint);
+        assert!(!l.mark_checkpoint(obj, 2));
+        assert!(!l.mark_checkpoint(obj, 99));
+        assert!(!l.object(obj).unwrap().checkpoint);
+        assert!(l.mark_checkpoint(obj, 1));
+        assert!(l.object(obj).unwrap().checkpoint);
+        let reg = l
+            .attach_object(
+                other,
+                region(BASE, 4 * PAGE_SIZE),
+                attachment(obj, 0, Share::Shared),
+            )
+            .unwrap();
+        assert!(l.release_object(obj));
+        assert!(l.object(obj).unwrap().checkpoint);
+        assert!(l.remove_region(other, reg, pool_all).is_some());
+        // A released object takes no mark.
+        let fresh = l
+            .seal_object(sealer, &ids[2..], 78, OWN_VA + 8 * PAGE_SIZE)
+            .unwrap();
+        assert!(l.release_object(fresh));
+        assert!(!l.mark_checkpoint(fresh, 1));
     }
 
     // The defect caught: a seal whose reply failed that leaves the sealer

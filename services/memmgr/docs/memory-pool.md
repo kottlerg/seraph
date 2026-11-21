@@ -104,11 +104,12 @@ unable to grow.
 
 ## Allocation
 
-`REQUEST_MEMORY_CAPS(want_pages, flags)` first admits `want_pages` against the caller's budget node
-(§ Distribution policy): a request over the max of the node or of an ancestor fails `LIMIT`, and one
-that would leave fewer free pages outside `promised` ([Commit](#commit)) than the growth floor (the
-system reserve and, while chunks are swapped, the restore headroom; § Distribution policy), from a
-caller outside the reserve, or than none, fails with the out-of-memory code of its flags, before any
+`REQUEST_MEMORY_CAPS(want_pages, flags)` first admits `want_pages` against the budget node the grant
+is charged to, the caller's own or, with `REQUEST_CHARGE_NODE`, the handle's (§ Distribution
+policy): a request over the max of the node or of an ancestor fails `LIMIT`, and one that would
+leave fewer free pages outside `promised` ([Commit](#commit)) than the growth floor (the system
+reserve and, while chunks are swapped, the restore headroom; § Distribution policy), charged to a
+node outside the reserve, or than none, fails with the out-of-memory code of its flags, before any
 run leaves the pool. An admitted request then selects:
 
 1. **`REQUIRE_CONTIGUOUS` set.** Select the smallest run that covers
@@ -625,8 +626,9 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
 5. Return every chunk-table node, every region node, the commitment node of
    each committed region, the record's own node, and its caps node to the
    arena free list, and drop the record's reference
-   to its budget node, which is freed with it unless a deferred run or a
-   memory object's frames are still charged to it.
+   to its budget node, which is freed with it unless a node below it refers
+   to it, or a deferred run, a grant another process holds or a memory
+   object's frames are still charged to it.
 6. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
@@ -778,12 +780,12 @@ parent outside the reserve; procmgr relays the max the node took to the creator 
 usage with `QUERY_MEMORY_USAGE`.
 
 **Server-side charges.** Memory a server spends on a client's behalf is charged to the server's
-node, not to the client's. procmgr keeps, for each live process, its process-table entry (336
-bytes), 6 to 12 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
-(24 bytes each), about 0.8 to 1.6 KiB with the growth of their containers, and 96 bytes for each
+node, not to the client's. procmgr keeps, for each live process, its process-table entry (440
+bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
+(24 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and 96 bytes for each
 thread it registers. Every page of the process itself, at least 55 (its address-space and `CSpace`
 slabs, its thread, its `ProcessInfo` page and the rest of its image), is requested on its own
-account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.75%
+account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.85%
 of what that node pays, and it goes with the process. A create the max of the child's node or of an
 ancestor refuses fails with procmgr's `LIMIT`
 ([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 1, **Memory
@@ -1157,6 +1159,26 @@ and the attachment's release stay exact. The charge does not move, since the cop
 pages the attachment is charged for. A copy is never evicted, as no page of an attachment is, and
 is freed with its attachment.
 
+**Read and fill.** `OBJECT_READ` ([ipc-interface.md](ipc-interface.md) § Label 35) copies pages of
+an object, over its handle, from memmgr's own view into Memory caps the caller presents, mapped at
+the scrub window only while the copy runs; a process with no pager, procmgr among them, reads an
+object so. `FILL_REGION` (§ Label 36) backs pages of the caller's own demand regions, or of its
+private zero-object attachments, with copies of an object's pages, as a write fault backs a page:
+the run selection, the charge to the caller's budget node, the page-table funding and the chunk
+record are the fault's ([Demand faults](#demand-faults)), with the copy from the own view in place
+of the scrub. A named page that holds data already is left as it is, so a repeated request, after a
+failure part way or a lost reply, backs only the pages still holding none; a chunk the clock has
+taken takes no run, and a request naming a page of it that holds no data is refused. The pages are
+the caller's own, sharing no frame with the object, so the object can be released once the fill
+replies.
+
+**Checkpoint mark.** An object carries a checkpoint mark (`MemObject.checkpoint`) once procmgr's
+`MARK_CHECKPOINT` (§ Label 37) sets it: procmgr marks the object it sealed from a complete
+checkpoint of a quiesced process, presenting the account it sealed it on, and memmgr marks it only
+when that account's badge is the record that sealed it
+([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#checkpoint) § Checkpoint). The
+mark is set once, kept for the object's life, and read by `OBJECT_READ`; no label clears it.
+
 **Zero frames.** A zero frame is a page taken from the free pool when no zero frame's span takes a
 new zero-object attachment, which is refused when the pool cannot spare it, zeroed, and recorded
 in an arena node on the ledger's list of zero frames. A request refused after it took the frame
@@ -1176,14 +1198,14 @@ no other way: it only signals, and kills nothing.
 **Levels.** The level is computed from the free pool's pages outside `promised` ([Commit](#commit)),
 deferred pages excluded, against `pool_total`. It is `CRITICAL` at or below the growth floor, the
 system reserve and, while chunks of uncommitted regions are swapped, the restore headroom (§
-Distribution policy; § Eviction, Restore headroom), where a grant to a process outside the reserve
-is refused; `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A worse
-level applies at once. A better one applies only once the free pool clears that level's threshold by
-a hysteresis band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a pool that
-hovers at a threshold does not flip the level on every turn: the level becomes the one the free pool
-less the band gives, and no worse than before. The constants are tuning values proportional to RAM
-([docs/limits.md](../../../docs/limits.md) § memmgr); the computation is the host-tested `free-pool`
-module `pressure`.
+Distribution policy; § Eviction, Restore headroom), where a grant charged to a node outside the
+reserve is refused; `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A
+worse level applies at once. A better one applies only once the free pool clears that level's
+threshold by a hysteresis band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a
+pool that hovers at a threshold does not flip the level on every turn: the level becomes the one the
+free pool less the band gives, and no worse than before. The constants are tuning values
+proportional to RAM ([docs/limits.md](../../../docs/limits.md) § memmgr); the computation is the
+host-tested `free-pool` module `pressure`.
 
 **Signal.** A process registers a Notification cap and the bits to send on it with
 `REGISTER_PRESSURE` ([ipc-interface.md](ipc-interface.md) § Label 11), one mask for a change of
@@ -1522,9 +1544,9 @@ and the slot map's pages are memmgr's metadata.
 
 | Failure | Cause | Caller observation |
 |---|---|---|
-| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the growth floor from a caller outside the system reserve | Reply with error label; caller may retry without the flag, or fail |
-| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the growth floor from a caller outside the system reserve ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `LIMIT` | `want_pages`, or a committed registration's or growth's charge, would take the subtree of the caller's budget node, or of an ancestor, over its max | Reply with error label; caller treats as its own budget refusing, not as RAM exhaustion |
+| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the growth floor by a charge to a node outside the system reserve | Reply with error label; caller may retry without the flag, or fail |
+| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the growth floor by a charge to a node outside the system reserve ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `LIMIT` | `want_pages`, or a committed registration's or growth's charge, would take the subtree of the budget node it is charged to (the caller's own, or with `REQUEST_CHARGE_NODE` the handle's), or of an ancestor, over its max | Reply with error label; caller treats as that node's budget refusing, not as RAM exhaustion |
 | `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `TOO_MANY_PROCESSES` | A process record, its caps node or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 

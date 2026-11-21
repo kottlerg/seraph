@@ -36,7 +36,7 @@ pub const NODE_NULL: NodeIdx = u64::MAX;
 /// memmgr's own address space: [`MemObject::runs`]), or the
 /// caller-owned-mapping marker the service chooses (a frame on the record's
 /// frame list).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameDesc
 {
     pub cap_slot: u64,
@@ -48,6 +48,27 @@ pub struct FrameDesc
     /// [`NO_REGION_ID`] for a frame no caller can release (a demand chunk, a
     /// bootstrap arena).
     pub region_id: u64,
+    /// The budget node a grant `REQUEST_MEMORY_CAPS` charged to a node
+    /// handle's node is charged to (`REQUEST_CHARGE_NODE`;
+    /// [`crate::Ledger::push_grant`]), or [`NODE_NULL`] for a frame charged
+    /// where its holder's frames are: the budget node of its record, of its
+    /// region's record or of its memory object.
+    pub charge: NodeIdx,
+}
+
+impl Default for FrameDesc
+{
+    fn default() -> Self
+    {
+        Self {
+            cap_slot: 0,
+            page_count: 0,
+            phys_base: 0,
+            va: 0,
+            region_id: NO_REGION_ID,
+            charge: NODE_NULL,
+        }
+    }
 }
 
 /// [`FrameDesc::region_id`] of a frame no release names. No grant takes it:
@@ -97,7 +118,9 @@ pub struct ProcessCaps
     /// record ([`crate::Ledger::remove_process`]).
     pub handles: NodeIdx,
     /// The first [`Node::Limit`] slot of the limit registrations the process
-    /// made, chained through [`LimitReg::by_next`]; [`NODE_NULL`] for none.
+    /// made, and of its donation-end registration (a [`LimitReg`] on no
+    /// handle state: [`crate::Ledger::set_donation_end`]), chained through
+    /// [`LimitReg::by_next`]; [`NODE_NULL`] for none.
     /// Each registration goes with the record
     /// ([`crate::Ledger::remove_process`]).
     pub limits: NodeIdx,
@@ -130,6 +153,24 @@ pub struct NodeHandle
     pub limit: NodeIdx,
     /// The next handle slot of the owner's list ([`ProcessCaps::handles`]).
     pub owned_next: NodeIdx,
+    /// The first [`Node::Holder`] slot of the processes holding grants
+    /// charged to the node, chained through the slots' `next` links;
+    /// [`NODE_NULL`] for none. The links go with the state
+    /// ([`crate::Ledger::drop_handle`]).
+    pub holders: NodeIdx,
+}
+
+/// One process holding grants charged to a node through its handle state
+/// ([`crate::Ledger::push_grant`]): a slot of its own on the state's
+/// [`NodeHandle::holders`] list, made with the process's first such grant and
+/// freed with its last, or with the state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HolderLink
+{
+    /// The memmgr badge of the holding process.
+    pub badge: u64,
+    /// The frames charged to the node the process holds.
+    pub frames: u64,
 }
 
 /// A limit-event registration on one handle state: the Notification and bits
@@ -143,7 +184,9 @@ pub struct LimitReg
     pub cap: u64,
     /// The bits a limit event sends on [`LimitReg::cap`].
     pub bits: u64,
-    /// The [`Node::Handle`] slot the registration is on.
+    /// The [`Node::Handle`] slot the registration is on, or [`NODE_NULL`]
+    /// for a donation-end registration
+    /// ([`crate::Ledger::set_donation_end`]).
     pub handle: NodeIdx,
     /// The record slot of the process that made the registration.
     pub by: NodeIdx,
@@ -304,6 +347,8 @@ const _: () = assert!(size_of::<DiskNode>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<MemObject>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<ZeroFrame>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<Reclaim>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<FrameDesc>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<HolderLink>() <= size_of::<ProcessRecord>());
 
 /// Where a write stands ([`DiskNode`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,6 +424,9 @@ pub enum Node
     ZeroFrame(ZeroFrame),
     /// The reclaim state of the budget node whose slot names this slot.
     Reclaim(Reclaim),
+    /// A process holding grants charged to the node of the handle state
+    /// whose holder list this slot is on.
+    Holder(HolderLink),
 }
 
 /// An arena slot: a payload plus the index of the next slot on whichever

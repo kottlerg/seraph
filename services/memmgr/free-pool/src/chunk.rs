@@ -749,7 +749,8 @@ fn child<S: SlotStore>(arena: &Arena<S>, dir: NodeIdx, pos: usize) -> NodeIdx
         | Node::Disk(_)
         | Node::Object(_)
         | Node::ZeroFrame(_)
-        | Node::Reclaim(_) => NODE_NULL,
+        | Node::Reclaim(_)
+        | Node::Holder(_) => NODE_NULL,
     }
 }
 
@@ -807,7 +808,8 @@ pub fn entry<S: SlotStore>(arena: &Arena<S>, root: NodeIdx, height: u32, index: 
             | Node::Disk(_)
             | Node::Object(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_),
+            | Node::Reclaim(_)
+            | Node::Holder(_),
         )
         | None => ChunkEntry::UNBACKED,
     }
@@ -946,7 +948,8 @@ pub fn release<S: SlotStore>(
             | Node::Disk(_)
             | Node::Object(_)
             | Node::ZeroFrame(_)
-            | Node::Reclaim(_) =>
+            | Node::Reclaim(_)
+            | Node::Holder(_) =>
             {
                 continue;
             }
@@ -1533,6 +1536,7 @@ mod tests
                     phys_base: 0,
                     va,
                     region_id: NO_REGION_ID,
+                    charge: NODE_NULL,
                 })
             };
             let r0 = a.alloc(frame(i * 2), NODE_NULL).unwrap();
@@ -1573,6 +1577,7 @@ mod tests
                         phys_base: 0,
                         va: 0,
                         region_id: NO_REGION_ID,
+                        charge: NODE_NULL,
                     }),
                     NODE_NULL,
                 )
@@ -1763,6 +1768,7 @@ mod tests
                         phys_base: 0,
                         va: 0,
                         region_id: NO_REGION_ID,
+                        charge: NODE_NULL,
                     }),
                     NODE_NULL,
                 )
@@ -2075,6 +2081,7 @@ mod tests
                 phys_base: cap_slot * 0x1000,
                 va: 0,
                 region_id: NO_REGION_ID,
+                charge: NODE_NULL,
             })
         };
         let second = a.alloc(frame(2), NODE_NULL).unwrap();

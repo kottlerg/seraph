@@ -254,9 +254,10 @@ stub's endpoint.
   naming every thread and one with `0` the current thread, and a thread no action names stays held;
   a step runs alone, as above. `c`, `C`, `s`, and `S` act on the thread `Hc` selected, alone, or,
   after `Hc0` or `Hc-1`, on the current thread with every other thread continuing; an address the
-  packet gives becomes that thread's pointer first. `Hc` of a thread `Hg` would refuse is refused
-  as `Hg` is. A signal passed to a thread stopped on a fault declines the fault
-  (`FAULT_REPLY_KILL`), so a step that passes one is a continue passing it. A thread GDB did not
+  packet gives becomes that thread's pointer first. `Hc` of a thread id `Hg` would refuse is refused
+  as `Hg` is, with no target attached too; `Hc0` and `Hc-1` name no thread and are accepted. A
+  signal passed to a thread stopped on a fault declines the fault (`FAULT_REPLY_KILL`), so a step
+  that passes one is a continue passing it. A thread GDB did not
   resume stays held while the target runs, one the all-stop could not hold from its next stop on,
   and a stop is reported only for a thread GDB resumed, or one spawned while the target ran: a stop
   GDB did not ask for would break its own run control, as a software step's breakpoint taken by

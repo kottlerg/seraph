@@ -487,6 +487,27 @@ fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<()
     r
 }
 
+/// Admit a grant of `pages` charged to the budget node `node` of a node
+/// handle (`REQUEST_CHARGE_NODE`), as [`admit`] admits one to a record's:
+/// against the max of the node and its ancestors and against the free pages
+/// outside `promised` less, for a node outside the reserve, the growth floor
+/// (`free_pool::Ledger::admit_node`), the deferred runs rechecked once on a
+/// refusal. The node's chain is marked for the turn's limit check.
+fn admit_node(l: &mut MemLedger, node: NodeIdx, pages: u64) -> Result<(), ChargeError>
+{
+    let reserve = l.growth_floor(pool_total_pages());
+    let r = l.admit_node(node, pages, 0, reserve).or_else(|e| {
+        if recheck_deferred(l) == 0
+        {
+            return Err(e);
+        }
+        coalesce(l);
+        l.admit_node(node, pages, 0, reserve)
+    });
+    note_limit_check(node, if r.is_ok() { 0 } else { pages });
+    r
+}
+
 /// Admit the commitment `need` of a committed region of `rec`, or of its
 /// growth (`free_pool::Ledger::admit_commit`): its data pages and page-table
 /// reservation against the max of the budget node and its ancestors, and
@@ -1332,15 +1353,18 @@ fn pop_frames(l: &mut MemLedger, rec: NodeIdx, n: usize)
     }
 }
 
-/// Admit a grant of `want_pages` to the budget node of `rec` ([`admit`]), then
-/// select its runs, as one run when `flags` carries `REQUIRE_CONTIGUOUS`, else
-/// best-effort. The whole request is admitted before any run leaves the pool: a
-/// charge over a max fails `LIMIT`, whatever part of it the pool could serve;
-/// one that would take the growth floor fails as exhaustion, with the
-/// out-of-memory code of the fit, as a failed selection does.
+/// Admit a grant of `want_pages` to the budget node `charge` of a node
+/// handle ([`admit_node`]), or to that of `rec` for [`NODE_NULL`]
+/// ([`admit`]), then select its runs, as one run when `flags` carries
+/// `REQUIRE_CONTIGUOUS`, else best-effort. The whole request is admitted
+/// before any run leaves the pool: a charge over a max fails `LIMIT`,
+/// whatever part of it the pool could serve; one that would take the growth
+/// floor fails as exhaustion, with the out-of-memory code of the fit, as a
+/// failed selection does.
 fn select_admitted(
     l: &mut MemLedger,
     rec: NodeIdx,
+    charge: NodeIdx,
     want_pages: u32,
     flags: u32,
 ) -> Result<Grant, u64>
@@ -1353,7 +1377,15 @@ fn select_admitted(
     {
         Fit::Contiguous
     };
-    match admit(l, rec, u64::from(want_pages), 0)
+    let admitted = if charge == NODE_NULL
+    {
+        admit(l, rec, u64::from(want_pages), 0)
+    }
+    else
+    {
+        admit_node(l, charge, u64::from(want_pages))
+    };
+    match admitted
     {
         Ok(()) => select(l, want_pages, fit),
         Err(ChargeError::Limit) => Err(memmgr_errors::LIMIT),
@@ -1365,7 +1397,46 @@ fn select_admitted(
     }
 }
 
-fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
+/// The budget node a grant with `REQUEST_CHARGE_NODE` is charged to: the
+/// node of the live handle state the node handle badge `badge`, full or
+/// charge-only, names. `None` for a badge that is no node handle's or whose
+/// state is gone.
+fn charge_node_of(l: &MemLedger, badge: u64) -> Option<NodeIdx>
+{
+    if badge & memmgr_labels::NODE_HANDLE_TAG == 0
+    {
+        return None;
+    }
+    charge_handle_of(l, badge).map(|(_, s)| s.node)
+}
+
+/// The record of the requester `badge` and the budget node its grant is
+/// charged to: [`NODE_NULL`] (the record's own node) without
+/// `REQUEST_CHARGE_NODE` in `flags`, else the node of the node handle whose
+/// badge `charge_badge` is ([`charge_node_of`]). `None` for an unknown
+/// requester, or a charge node that is missing or gone.
+fn request_target(
+    l: &MemLedger,
+    badge: u64,
+    flags: u32,
+    charge_badge: Option<u64>,
+) -> Option<(NodeIdx, NodeIdx)>
+{
+    let rec = l.find(badge)?;
+    if flags & memmgr_labels::REQUEST_CHARGE_NODE == 0
+    {
+        return Some((rec, NODE_NULL));
+    }
+    charge_badge
+        .and_then(|b| charge_node_of(l, b))
+        .map(|charge| (rec, charge))
+}
+
+/// `REQUEST_MEMORY_CAPS`: grant `want_pages` pages to the caller, charged to
+/// its own budget node, or with `REQUEST_CHARGE_NODE` to the node of the node
+/// handle in `caps[0]` (services/memmgr/docs/ipc-interface.md § Label 1). A
+/// cap in `caps[0]` is deleted on every path.
+fn handle_request_memory_caps(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
 {
     let arg = req.word(0);
     // `data[0]` packs `want_pages` in its low half and the flags in its high
@@ -1373,29 +1444,34 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     // takes more requests.
     let want_pages = (arg & 0xFFFF_FFFF) as u32;
     let flags = (arg >> 32) as u32;
+    // The charge node's handle is read and deleted first, so no path keeps it.
+    let charge_badge = caps.first().and_then(|&cap| cap_badge(service_ep, cap));
 
-    if want_pages == 0 || flags & !memmgr_labels::REQUIRE_CONTIGUOUS != 0
+    let known = memmgr_labels::REQUIRE_CONTIGUOUS | memmgr_labels::REQUEST_CHARGE_NODE;
+    if want_pages == 0 || flags & !known != 0
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     }
 
     let l = ledger_mut();
-    let Some(rec) = l.find(req.badge)
+    let Some((rec, charge)) = request_target(l, req.badge, flags, charge_badge)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    // Every slot the grant's frame descriptors take, before any run leaves the
-    // pool, so a full arena fails the request whole.
-    if !ensure_slots(l, MAX_GRANT_RUNS as u64)
+    // Every slot the grant's frame descriptors take, and a charged grant's
+    // holder link, before any run leaves the pool, so a full arena fails the
+    // request whole.
+    let link = u64::from(charge != NODE_NULL);
+    if !ensure_slots(l, (MAX_GRANT_RUNS as u64).saturating_add(link))
     {
         reply_label(ipc_buf, memmgr_errors::QUOTA);
         return;
     }
 
-    let grant = match select_admitted(l, rec, want_pages, flags)
+    let grant = match select_admitted(l, rec, charge, want_pages, flags)
     {
         Ok(g) => g,
         Err(memmgr_errors::LIMIT) =>
@@ -1436,7 +1512,7 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     let mut region_ids = [0u64; MAX_GRANT_RUNS];
     for (i, &(outer, pages, phys)) in grant.entries().iter().enumerate()
     {
-        let Some(region_id) = l.push_grant(rec, outer, pages, phys, FRAME_VA_UNMAPPED)
+        let Some(region_id) = l.push_grant(rec, outer, pages, phys, FRAME_VA_UNMAPPED, charge)
         else
         {
             // Entries before `i` already have frame descriptors on the record;
@@ -1798,9 +1874,17 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // limit Notification of each node handle state the process owns goes the
     // same way: `remove_process` drops those states, and hands `delete_cap`
     // each limit cap, before it reclaims a frame.
+    //
+    // Each process holding grants charged to a node whose handle state the
+    // dead process owns is signalled on its donation-end registration before
+    // the states go: their charge stays on the nodes until each holder
+    // releases its grants.
     let l = ledger_mut();
     if let Some(rec) = l.find(dead_badge)
     {
+        l.for_each_owned_donation_end(rec, |cap, bits| {
+            let _ = syscall::notification_send(cap, bits);
+        });
         let pressure = l.take_pressure(rec);
         if pressure != 0
         {
@@ -3152,6 +3236,7 @@ fn back_span(
             phys_base: phys,
             va: fault_window(target.span.0, target.span.1, target.page_base, pages),
             region_id: NO_REGION_ID,
+            charge: NODE_NULL,
         };
 
         // Zero the run before the process can read it (services/memmgr/docs/
@@ -3404,6 +3489,7 @@ fn fund_client_page_tables(
         phys_base: phys,
         va: FRAME_VA_UNMAPPED,
         region_id: NO_REGION_ID,
+        charge: NODE_NULL,
     };
     if !l.push_frame(rec, frame)
     {
@@ -3598,6 +3684,7 @@ fn map_origin(
             phys_base: 0,
             va: va.saturating_add(done.saturating_mul(PAGE_SIZE)),
             region_id: NO_REGION_ID,
+            charge: NODE_NULL,
         };
         mapped = map_client(l, target, &frame, offset, prot).map_err(|r| r.decline());
         done = done.saturating_add(step);
@@ -3661,6 +3748,7 @@ fn copy_object_page(
         phys_base: phys,
         va: target.page_base,
         region_id: NO_REGION_ID,
+        charge: NODE_NULL,
     };
     if let Err(refusal) = map_client_chunk(l, target, &frame)
     {
@@ -3865,6 +3953,16 @@ fn handle_of(l: &MemLedger, badge: u64) -> Option<(NodeIdx, NodeHandle)>
     Some((h, l.handle(h)?))
 }
 
+/// The handle state a node handle's badge names, full or charge-only
+/// (`memmgr_labels::NODE_CHARGE_ONLY`), for the labels a charge-only handle
+/// is served and the charge of a grant. Every other node label looks the
+/// badge up whole ([`handle_of`]), so a charge-only badge names no state
+/// there.
+fn charge_handle_of(l: &MemLedger, badge: u64) -> Option<(NodeIdx, NodeHandle)>
+{
+    handle_of(l, badge & !memmgr_labels::NODE_CHARGE_ONLY)
+}
+
 /// `NODE_SET_MAX`: set the max of the handle's node to `data[0]`, clamped to
 /// its usage plus its parent chain's headroom, and reply the max it took
 /// (services/memmgr/docs/ipc-interface.md § Label 14). Lowering it reclaims
@@ -4018,7 +4116,7 @@ fn handle_create_sub_node(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
 fn handle_node_query_usage(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let l = ledger_mut();
-    let found = handle_of(l, req.badge).and_then(|(_, s)| {
+    let found = charge_handle_of(l, req.badge).and_then(|(_, s)| {
         Some((
             free_pool::budget::node(&l.arena, s.node)?,
             l.node_reclaim(s.node)?,
@@ -4137,11 +4235,97 @@ fn handle_node_release(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     }
+    // A grant charged to the node keeps its charge there until its holder
+    // releases it; each holder is told the state ended.
+    l.for_each_donation_end(h, |cap, bits| {
+        let _ = syscall::notification_send(cap, bits);
+    });
     if let Some(cap) = l.drop_handle(h).filter(|&cap| cap != 0)
     {
         let _ = syscall::cap_delete(cap);
     }
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
+}
+
+/// `NODE_CHARGE_HANDLE`: derive and reply a charge-only handle
+/// (`memmgr_labels::NODE_CHARGE_ONLY`) to the node of the handle, full or
+/// charge-only, which names the same handle state and is refused once it
+/// goes (services/memmgr/docs/ipc-interface.md § Label 33). A reply that does
+/// not reach the caller deletes the cap.
+fn handle_node_charge_handle(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
+{
+    let l = ledger_mut();
+    let Some((_, s)) = charge_handle_of(l, req.badge)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let key = s.key | memmgr_labels::NODE_CHARGE_ONLY;
+    let Ok(cap) = syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, key)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS).cap(cap).build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+}
+
+/// `REGISTER_DONATION_END`: register `caps[0]`, a Notification with Notify,
+/// to receive the bits `data[0]` when the handle state of a node the caller
+/// holds grants charged to ends, in place of its earlier registration, whose
+/// cap is deleted (services/memmgr/docs/ipc-interface.md § Label 34). A
+/// refused cap is deleted.
+fn handle_register_donation_end(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
+{
+    let Some(&cap) = caps.first()
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let bits = req.word(0);
+    let l = ledger_mut();
+    let rec = l.find(req.badge);
+    let Some(rec) = rec.filter(|_| bits != 0 && is_notify_cap(cap))
+    else
+    {
+        let _ = syscall::cap_delete(cap);
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    if !ensure_slots(l, 1)
+    {
+        let _ = syscall::cap_delete(cap);
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    }
+    match l.set_donation_end(rec, cap, bits)
+    {
+        Ok(prior) =>
+        {
+            if prior != 0
+            {
+                let _ = syscall::cap_delete(prior);
+            }
+            reply_label(ipc_buf, memmgr_errors::SUCCESS);
+        }
+        Err(e) =>
+        {
+            let _ = syscall::cap_delete(cap);
+            let label = match e
+            {
+                NodeError::NoSlot => memmgr_errors::QUOTA,
+                NodeError::Parent => memmgr_errors::INVALID_ARGUMENT,
+            };
+            reply_label(ipc_buf, label);
+        }
+    }
 }
 
 /// Whether `cap` is a Notification cap with Notify rights.
@@ -4778,6 +4962,7 @@ fn ingest_in_use(boot: &InitBootstrap)
                     phys_base: entry.phys_base,
                     va: FRAME_VA_UNMAPPED,
                     region_id: NO_REGION_ID,
+                    charge: NODE_NULL,
                 },
             );
         }
@@ -4816,21 +5001,23 @@ fn delete_caps(caps: &[u64])
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
 /// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS` and
 /// `CAPTURE_CHUNKS`, the first two for `NODE_REGISTER_LIMIT` and
-/// `SWAP_REGISTER`, the first for `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
-/// `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE` and `ATTACH_OBJECT`, none
-/// for any other label.
+/// `SWAP_REGISTER`, the first for `REQUEST_MEMORY_CAPS`, `DELEGATE_ASPACE`,
+/// `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE`,
+/// `ATTACH_OBJECT` and `REGISTER_DONATION_END`, none for any other label.
 /// [`dispatch`] deletes the rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
     match opcode
     {
         memmgr_labels::DONATE_MEMORY_CAPS | memmgr_labels::CAPTURE_CHUNKS => attached,
-        memmgr_labels::DELEGATE_ASPACE
+        memmgr_labels::REQUEST_MEMORY_CAPS
+        | memmgr_labels::DELEGATE_ASPACE
         | memmgr_labels::REGISTER_PRESSURE
         | memmgr_labels::REGISTER_PROCESS
         | memmgr_labels::SWAP_TAKE
         | memmgr_labels::SWAP_RESTORE
-        | memmgr_labels::ATTACH_OBJECT => attached.min(1),
+        | memmgr_labels::ATTACH_OBJECT
+        | memmgr_labels::REGISTER_DONATION_END => attached.min(1),
         memmgr_labels::NODE_REGISTER_LIMIT | memmgr_labels::SWAP_REGISTER => attached.min(2),
         _ => 0,
     }
@@ -4859,17 +5046,20 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     let opcode = req.label & 0xFFFF;
     let (kept, stray) = attached.split_at(contract_cap_count(opcode, attached.len()));
     delete_caps(stray);
-    // A node handle is served the node labels and nothing else, the swap
-    // authority the swap labels and nothing else, an object handle
-    // `OBJECT_RELEASE` and nothing else, and every other badge everything else
+    // A node handle is served the node labels and nothing else, a
+    // charge-only one only the charge-only labels, the swap authority the
+    // swap labels and nothing else, an object handle `OBJECT_RELEASE` and
+    // nothing else, and every other badge everything else
     // (services/memmgr/docs/ipc-interface.md § Node Handles, § Object Handles,
     // § Badge Discipline).
     let node_label = memmgr_labels::is_node_label(opcode);
     let swap_label = (memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED).contains(&opcode);
     let object_label = opcode == memmgr_labels::OBJECT_RELEASE;
+    let charge_only = req.badge & memmgr_labels::NODE_CHARGE_ONLY != 0;
     if node_label != (req.badge & memmgr_labels::NODE_HANDLE_TAG != 0)
         || swap_label != (req.badge & memmgr_labels::SWAP_AUTHORITY != 0)
         || object_label != (req.badge & memmgr_labels::OBJECT_HANDLE_TAG != 0)
+        || (charge_only && !memmgr_labels::is_charge_only_label(opcode))
     {
         delete_caps(kept);
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
@@ -4908,6 +5098,10 @@ fn route_node(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, se
         {
             handle_node_set_reclaim(req, ipc_buf);
         }
+        memmgr_labels::NODE_CHARGE_HANDLE =>
+        {
+            handle_node_charge_handle(req, ipc_buf, service_ep);
+        }
         _ =>
         {
             reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -4923,7 +5117,7 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
     {
         memmgr_labels::REQUEST_MEMORY_CAPS =>
         {
-            handle_request_memory_caps(req, ipc_buf);
+            handle_request_memory_caps(req, kept, ipc_buf, boot.service_ep);
         }
         memmgr_labels::RELEASE_MEMORY_CAPS =>
         {
@@ -4985,9 +5179,14 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         }
         memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE
         | memmgr_labels::CREATE_SUB_NODE
-        | memmgr_labels::NODE_SET_RECLAIM =>
+        | memmgr_labels::NODE_SET_RECLAIM
+        | memmgr_labels::NODE_CHARGE_HANDLE =>
         {
             route_node(opcode, req, kept, ipc_buf, boot.service_ep);
+        }
+        memmgr_labels::REGISTER_DONATION_END =>
+        {
+            handle_register_donation_end(req, kept, ipc_buf);
         }
         memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED =>
         {

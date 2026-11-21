@@ -37,9 +37,9 @@ pub mod store;
 
 pub use arena::{
     Arena, ArenaLayout, Attachment, Commitment, DeferredRun, DiskNode, DiskState, FrameDesc,
-    MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx, OBJECT_MAX_ATTACHMENTS,
-    ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE, Share, SlotStore, ZERO_FRAME_SPAN,
-    ZeroFrame,
+    HolderLink, MemObject, NO_REGION_ID, NODE_NULL, Node, NodeHandle, NodeIdx,
+    OBJECT_MAX_ATTACHMENTS, ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE, Share,
+    SlotStore, ZERO_FRAME_SPAN, ZeroFrame,
 };
 pub use budget::{
     BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, growth_floor,

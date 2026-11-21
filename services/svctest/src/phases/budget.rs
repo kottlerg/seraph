@@ -449,7 +449,28 @@ pub(crate) fn create_role(
     what: &str,
 ) -> ipc::IpcMessage
 {
-    use ipc::{procmgr_errors, procmgr_labels};
+    let reply = try_create_role(role, flags, max, charge, None, what);
+    assert_eq!(
+        reply.label,
+        ipc::procmgr_errors::SUCCESS,
+        "CREATE_FROM_FILE of {what} refused"
+    );
+    reply
+}
+
+/// [`create_role`], with the endpoint cap `creator` (moved to procmgr) as the
+/// child's creator endpoint when it is given, returning procmgr's reply,
+/// whatever its label.
+pub(crate) fn try_create_role(
+    role: &str,
+    flags: u64,
+    max: Option<u64>,
+    charge: Option<u64>,
+    creator: Option<u64>,
+    what: &str,
+) -> ipc::IpcMessage
+{
+    use ipc::procmgr_labels;
     use std::os::seraph::process::ArgvEnvCap;
 
     let args = format!("/tests/svctest\0{role}\0");
@@ -480,9 +501,9 @@ pub(crate) fn create_role(
         | flags;
     let mut words = with_head(size, &argv_env.header_words());
     words.extend(max);
-    // The tail caps in the order procmgr reads them: the file, the charge
-    // node's handle, the argv/env cap.
-    let caps: Vec<u64> = [Some(file), charge, Some(argv_env.cap())]
+    // The caps in the order procmgr reads them: the file, the creator
+    // endpoint, the charge node's handle, the argv/env cap.
+    let caps: Vec<u64> = [Some(file), creator, charge, Some(argv_env.cap())]
         .into_iter()
         .flatten()
         .collect();
@@ -494,13 +515,7 @@ pub(crate) fn create_role(
         &caps,
     );
     argv_env.settle(reply.as_ref().map_or(0, |r| r.label));
-    let reply = reply.unwrap_or_else(|e| panic!("CREATE_FROM_FILE of {what} failed ({e})"));
-    assert_eq!(
-        reply.label,
-        procmgr_errors::SUCCESS,
-        "CREATE_FROM_FILE of {what} refused"
-    );
-    reply
+    reply.unwrap_or_else(|e| panic!("CREATE_FROM_FILE of {what} failed ({e})"))
 }
 
 /// Poll `QUERY_PROCESS` on `handle` (`what`, for the messages) until the

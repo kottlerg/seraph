@@ -1057,7 +1057,7 @@ mod tests
     }
 
     // Defect caught: a revoking store that does not revoke the signing key, or
-    // that drops an anchor or lowers the floor, so test-signing's
+    // that drops an anchor or lowers the floor, so the signing case's
     // revoked-signer boot would refuse nothing or refuse for another reason.
     #[test]
     fn the_store_revoking_the_signing_key_refuses_its_records_and_keeps_the_rest()

@@ -1,9 +1,9 @@
 # debug-echo
 
 Test-tier fixture that proves the debug port's transport: it answers fixed GDB remote serial
-protocol packets on the debug port, so `cargo xtask test-debug-port` drives a round trip from
+protocol packets on the debug port, so the `debug-port` case drives a round trip from
 the host to a guest service and back without a debugger stub. It is gated and opt-in: its
-recipe lives in `/config/svcmgr/tests/`, and only `test-debug-port` stages it, for its own boot.
+recipe lives in `/config/svcmgr/tests/`, and only the `debug-port` case stages it, for its own boot.
 
 ---
 
@@ -28,7 +28,7 @@ driver (the virtio-console driver loads with devmgr's on-disk batch), and logs
 `READY on the debug port`. It exits, logging why, when the seed is absent; on a boot without
 `--debug-port` it waits. The device's tracker keeps the port across devmgr's restart of its driver
 (logged `debug port driver at ordinal <n>`), and before each read or write the fixture registers
-its RX notification with a driver instance it has not registered with; `test-debug-port` kills
+its RX notification with a driver instance it has not registered with; the `debug-port` case kills
 the driver under it and echoes through the restarted one.
 
 It then frames the bytes it reads with `shared/gdb-rsp`

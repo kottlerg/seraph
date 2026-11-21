@@ -547,7 +547,7 @@ fn handle_definition(
 /// Log the death of a service launched from `def` before its bootstrap
 /// request. The line reaches the serial line through whichever logger serves
 /// the log endpoint: a dead log sink's first launch leaves init-logd serving
-/// it. `cargo xtask test-core-death` matches the line's `died during its
+/// it. The `shutdown` case's death boots match the line's `died during its
 /// bootstrap`.
 fn log_boot_death(def: &Definition, exit_reason: u64)
 {

@@ -814,8 +814,8 @@ The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) puts 
 a host GDB: it attaches to the process its host names, binds each listed thread's exception and
 upcall classes to its own endpoint, stops every thread with an `UPCALL_ANY_INSTRUCTION` upcall
 whenever one stops (all-stop), and serves the GDB remote serial protocol on the debug port
-([device-management.md](device-management.md)). `cargo xtask test-gdb` drives it from a batch GDB
-session on both architectures ([testing.md](testing.md) § GDB stub (`test-gdb`)).
+([device-management.md](device-management.md)). `cargo xtask test debug-port` drives it from a batch
+GDB session on both architectures ([testing.md](testing.md) § GDB stub (`debug-port` case)).
 
 The `debugger` fixture drives the breakpoint, the single-step on both architectures, register and
 same-process memory access, and the asynchronous break end to end, then reads and writes a debuggee

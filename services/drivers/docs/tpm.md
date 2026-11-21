@@ -149,10 +149,10 @@ its host tests run it against a simulated TPM 2.0 behind a FIFO window and a CRB
 buffers outside the window, and the verb-bit gate. The bootloader's host tests cover the `TPM2`
 table's seed.
 
-`cargo xtask test-tpm` (x86-64) boots the default boot set once with QEMU's `tpm-tis` device
+`cargo xtask test tpm` (x86-64) boots the default boot set once with QEMU's `tpm-tis` device
 and once with `tpm-crb`, each backed by `swtpm` on a fresh state, and passes when the driver
 names the interface, answers its first `READ` with bytes, and `entropyd` has a contribution
-from it accepted ([docs/testing.md](../../../docs/testing.md#tpm-test-tpm) § TPM). On real
+from it accepted ([docs/testing.md](../../../docs/testing.md#tpm-tpm-case) § TPM). On real
 hardware, an x86-64 machine whose firmware enables a TPM 2.0 and reports it with start method 6
 or 7 binds the driver the same way: a discrete TPM on the FIFO interface, or a firmware TPM on the
 CRB interface with its buffers in locality 0.

@@ -5,11 +5,11 @@ removal paths, native and through acpid: it waits for devmgr to serve the `test-
 `edu` device the host hot-adds behind a root port and checks that the device's DMA and its MSI
 work; then that devmgr withdraws the driver when the host removes the device, and that the device
 added again is served anew, works, and is charged none of its predecessor's IOMMU faults. So
-`cargo xtask test-hotplug` follows an arrival from the slot to a bound driver, and a removal back to
+`cargo xtask test hotplug` follows an arrival from the slot to a bound driver, and a removal back to
 an empty slot, under each hotplug control. The disk mode (`hotplug-check disk`) proves vfsd's
 handling of a disk removed and added again behind a root port, its role lookup across a disk added
 after start, and the loss of its root filesystem's driver. It is gated and opt-in: its recipes live
-in `/config/svcmgr/tests/`, and only `test-hotplug` stages them, each for its own boots.
+in `/config/svcmgr/tests/`, and only the `hotplug` case stages them, each for its own boots.
 
 ---
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test.rs
+// xtask/src/commands/test/host.rs
 
 //! Test command: check the formatting of the selected packages, lint the
 //! test code, then run the unit tests on the host and under riscv64
@@ -31,7 +31,7 @@ use std::process::Command;
 
 use crate::error::{Result, bail};
 
-use crate::cli::{TestArgs, TestComponent};
+use crate::cli::TestComponent;
 use crate::context::Context as BuildContext;
 use crate::util::{check_formatting, require_tool, run_cmd, run_cmd_capture, step};
 
@@ -96,10 +96,10 @@ const TEST_RELAXED_LINTS: [&str; 9] = [
     "clippy::arithmetic_side_effects",
 ];
 
-/// Entry point for `cargo xtask test`.
-pub fn run(ctx: &BuildContext, args: &TestArgs) -> Result<()>
+/// Run the unit tests of `component`: `cargo xtask test` without a case.
+pub fn run(ctx: &BuildContext, component: TestComponent) -> Result<()>
 {
-    let packages = packages(args.component);
+    let packages = packages(component);
 
     step("Checking formatting");
     check_formatting(&ctx.root, &fmt_selection(packages))?;

@@ -1645,9 +1645,9 @@ observer waits up to 1 s for the frame, so the frame's lines come before its own
 `own_frame=true` when the frame was printed in time and `own_frame=false` otherwise. On RISC-V
 there is no S-mode NMI, and a hart wedged with `sstatus.SIE` clear takes no supervisor interrupt,
 so the report is the observer's alone and its line ends with `own_frame=false`.
-`cargo xtask test-wedge` wedges an idle AP, then the BSP, with interrupts masked on both
+`cargo xtask test wedge` wedges an idle AP, then the BSP, with interrupts masked on both
 architectures and checks this report (see
-[testing.md § Interrupts-off wedge](../../../docs/testing.md#interrupts-off-wedge-test-wedge)).
+[testing.md § Interrupts-off wedge](../../../docs/testing.md#interrupts-off-wedge-wedge-case)).
 
 The heartbeat checks measure staleness in wall time, so their grace scales
 with CPU count (`heartbeat_stall_ticks`, stepping at multiples of 128 CPUs:

@@ -25,7 +25,7 @@ Three harnesses exercise three surfaces:
 |---|---|---|---|
 | `ktest` | Kernel | [`core/ktest/`](../core/ktest/README.md) | Bootloader-loaded init replacement (`cargo xtask mkdisk --harness ktest`) |
 | `svctest` | Services | [`services/svctest/`](../services/svctest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe |
-| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (`cargo xtask test-terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
+| `usertest` | Programs | [`services/usertest/`](../services/usertest/README.md) | `svcmgr` spawns from `/config/svcmgr/services/` recipe; drives binaries under `programs/` through their real I/O surfaces. The terminal interactive test (the `terminal` case, `cargo xtask test terminal`) runs as a separate boot in the `usertest` CI cell; it drives the autostarted terminal through both input sources — keys over QMP through the live virtio-input driver, then the same sequence over the guest serial RX — and then keys again after a restart of the virtio-input driver |
 
 `ktest` and `svctest` are authoritative for their own surface; the harness
 itself owns its phases. `usertest` is an orchestrator that runs per-program
@@ -133,8 +133,8 @@ sysroot/
     ├── svctest               # services-surface harness
     ├── usertest              # programs-surface orchestrator
     ├── crasher               # svcmgr restart-path fixture
-    ├── debug-echo            # debug-port fixture (test-debug-port)
-    ├── hotplug-check         # PCI Express hotplug fixture (test-hotplug)
+    ├── debug-echo            # debug-port fixture (`debug-port` case)
+    ├── hotplug-check         # PCI Express hotplug fixture (`hotplug` case)
     ├── drivers/              # test-only drivers bound only on demand
     │   └── test-fault        # fault-injection driver, bound by BIND_DRIVERS
     └── programs/
@@ -192,15 +192,15 @@ rootfs/config/svcmgr/
 │   ├── memhog.svc            # out-of-memory policy fixture; co-staged with svctest
 │   ├── stopsrc.svc           # stop-source fixture; co-staged with svctest
 │   ├── crashd.svc            # crashd naming crashme, holding 3 s; co-staged with usertest
-│   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
-│   ├── hotplug-check.svc     # hotplug fixture; staged by test-hotplug
-│   ├── hotplug-check-disk.svc # hotplug fixture's disk mode; staged by test-hotplug
-│   ├── reboot.svc            # reboot fixture; staged by test-reboot
-│   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
+│   ├── debug-echo.svc        # debug-port fixture; staged by `debug-port` case
+│   ├── hotplug-check.svc     # hotplug fixture; staged by `hotplug` case
+│   ├── hotplug-check-disk.svc # hotplug fixture's disk mode; staged by `hotplug` case
+│   ├── reboot.svc            # reboot fixture; staged by `shutdown` case
+│   └── gdb-target.svc        # GDB stub's target; staged by `debug-port` case
 └── debug/                    # NOT loaded by svcmgr
     └── gdbstub.svc           # GDB stub template; staged, naming its target,
                               # by run --debug-target, and
-                              # by test-gdb
+                              # by `debug-port` case
 
 rootfs/config/devmgr/
 ├── classes/                  # device class files, scanned
@@ -235,9 +235,9 @@ attaches and no production driver binds. svctest fails, naming the flag, when th
 The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
 the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
 `CRASHD_OOM_STALL_MS=3000`, so crashd holds a fault declined for want of memory for up to 3 s,
-both of which the fixture's tester checks ([Crash reports](#crash-reports-test-crash-report)). Its
-`crashd.core` name is the authority the usertest recipe seeds to the crashme tester for its live
-cores. A usertest boot without it fails the crashme tester:
+both of which the fixture's tester checks ([Crash reports](#crash-reports)). Its `crashd.core`
+name is the authority the usertest recipe seeds to the crashme tester for its live cores. A
+usertest boot without it fails the crashme tester:
 
 ```sh
 cargo xtask build
@@ -262,7 +262,7 @@ Reset to the default-init bundle by re-running `cargo xtask build` or
 compile-time defaults in `core/ktest/src/cmdline.rs::KtestConfig::DEFAULT`
 (see [xtask/README.md](../xtask/README.md#cargo-xtask-mkdisk)).
 
-### Interactive input (`test-terminal`)
+### Interactive input (`terminal` case)
 
 Interactive input cannot be exercised by an autonomous recipe: keysyms must come
 from real `EV_KEY` events on the virtio-input device, and serial bytes from a
@@ -272,10 +272,10 @@ system's input consumer (it autostarts from
 `/config/svcmgr/services/terminal.svc`), and each device delivers a given event
 to one reader. So input is tested *through* the terminal.
 
-`cargo xtask test-terminal` boots QEMU with a QMP control socket, waits for the
+`cargo xtask test terminal` boots QEMU with a QMP control socket, waits for the
 terminal's `terminal: READY for injection` marker, then drives both input
 sources and a restart of the input driver in one boot (command reference:
-[xtask/README.md § test-terminal](../xtask/README.md#cargo-xtask-test-terminal)):
+[xtask/README.md § The `terminal` case](../xtask/README.md#the-terminal-case)):
 
 1. **Keyboard round** — inject a known key sequence via QMP `input-send-event`
    (through the live `virtio-keyboard-pci`), assert the terminal's local echo
@@ -305,7 +305,7 @@ the host driver (not `run --runs`, which cannot inject):
 ```sh
 cargo xtask build
 cargo xtask mkdisk
-cargo xtask test-terminal
+cargo xtask test terminal
 ```
 
 This is the reusable foundation for interactive tests of the terminal, the
@@ -313,16 +313,15 @@ shell (#112), and future consumers — they reuse the runner by swapping the
 terminal's session leader and the expected strings. It subsumes the keysym-decode
 coverage of the former standalone input smoke test: the echoed `help` proves
 lowercase keysym decode, and Return/Backspace prove the named-key decodes. In
-CI it runs as a further boot inside the `usertest` cell (after usertest's own
-run and `test-log-level`), rather than as a separate matrix dimension that would multiply with each
-arch.
+CI the `usertest` cell runs it as the first case of `cargo xtask test --cell usertest`, after the
+cell's own boot, rather than as a separate matrix dimension that would multiply with each arch.
 
-### Snapshot resume (`test-vmgenid`)
+### Snapshot resume (`vmgenid` case)
 
 Whole-VM-snapshot reseed (#395) cannot be exercised by an in-guest recipe: the
 generation change only happens when the hypervisor restores saved state, and
 QEMU deliberately exposes no QMP/HMP way to change the GUID at runtime.
-`cargo xtask test-vmgenid` (x86_64 only — QEMU's riscv64 `virt` machine has no
+`cargo xtask test vmgenid` (x86_64 only — QEMU's riscv64 `virt` machine has no
 VMGENID) drives QEMU's save/restore recipe host-side:
 
 1. Boot with a fixed generation GUID; wait for the kernel's
@@ -338,19 +337,19 @@ VMGENID) drives QEMU's save/restore recipe host-side:
    the resumed guest still draws randomness and schedules normally after the
    forced reseed.
 
-See [xtask/README.md § test-vmgenid](../xtask/README.md#cargo-xtask-test-vmgenid)
+See [xtask/README.md § The `vmgenid` case](../xtask/README.md#the-vmgenid-case)
 for the command and [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)
 for the snapshot-detection design.
 
-Same boot requirements as `test-terminal` (default boot set, terminal
-autostarted); the host computes the verdict and kills QEMU. In CI it runs as
-an additional boot inside the x86_64 `usertest` cell, after `test-terminal`,
-`test-wedge`, `test-reboot`, `test-core-death` and `test-signing`.
+Same boot requirements as the `terminal` case (default boot set, terminal
+autostarted); the host computes the verdict and kills QEMU. In CI the x86_64 `usertest` cell's
+`cargo xtask test --cell usertest` runs it after the `terminal`, `signing` and `wedge` cases and
+before the `shutdown` case.
 
-### KASLR randomization (`test-kaslr`)
+### KASLR randomization (`kaslr` case)
 
 KASLR (#252) cannot be verified from inside the guest: it must observe that the
-layout *differs* across separate boots. `cargo xtask test-kaslr [--arch]` (both
+layout *differs* across separate boots. `cargo xtask test kaslr [--arch]` (both
 arches) drives this host-side against the ktest bundle:
 
 1. Boot twice with KASLR enabled; scrape the kernel's serial-only
@@ -363,46 +362,49 @@ arches) drives this host-side against the ktest bundle:
    image at its link base, direct map at the mode floor); the KASLR-enabled
    images are always restored in that layout afterward.
 
-See [xtask/README.md § test-kaslr](../xtask/README.md#cargo-xtask-test-kaslr) for
+See [xtask/README.md § The `kaslr` case](../xtask/README.md#the-kaslr-case) for
 the command and [memory-model.md](memory-model.md) for the randomized layout.
 
 Requires a populated sysroot with the ktest bundle composed
 (`cargo xtask mkdisk --harness ktest`). The `kaslr:` line is emitted only
 through the kernel's serial-only console class (see
 [cross-boundary-disclosure.md § Kernel console diagnostics](../core/kernel/docs/cross-boundary-disclosure.md#kernel-console-diagnostics)).
-In CI it runs as extra boots inside each `ktest` cell (both arches, both
-profiles), after the `ktest` `run --runs` boot.
+In CI the `ktest` cell's `cargo xtask test --cell ktest` runs it (both arches, both profiles),
+after the cell's own boot and a plain `cargo xtask mkdisk`, which drops the `mapredo` knob of the
+cell's staging.
 
-### Steps 6 and 7 redo (`test-map-redo`)
+### Steps 6 and 7 redo (ktest cell)
 
 The bootloader redoes its steps 6 and 7 (frees every allocation of both and
 runs them again with twice the slack) only when the final memory map's buffer
 outgrows the entry array step 6 sized, which QEMU's firmware never makes it do (see
 [memory-map.md § Sizing the Entry Array](../core/boot/docs/memory-map.md#sizing-the-entry-array)).
-`cargo xtask test-map-redo [--arch]` (both arches) stages the
-`\EFI\seraph\mapredo` test knob, which makes the first attempt redo whatever
-its map's size, repacks the disk images in the layout they have, and boots the
-current sysroot once, as `run --runs 1` does. It passes when the boot reaches its
-harness's pass marker and the bootloader logged the knob's redo exactly once;
-the knob is always removed and the images repacked in that layout afterward. See
-[xtask/README.md § test-map-redo](../xtask/README.md#cargo-xtask-test-map-redo)
-for the command.
+CI's `ktest` cell stages the `\EFI\seraph\mapredo` test knob
+(`cargo xtask mkdisk --harness ktest --knob mapredo`), which makes the first attempt redo whatever
+its map's size, and its own boot, on the ktest bundle and under the cell's boot budget, requires the
+bootloader's `mapredo knob present; redoing steps 6 and 7` line. The boot host test
+`the_mapredo_knob_redoes_the_first_attempt_alone` (`core/boot`) holds the redo to one. Locally:
 
-In CI it runs as an extra boot inside each `ktest` cell (both arches, both
-profiles), after `test-kaslr`, on the ktest bundle the cell composed and under
-the cell's boot budget.
+```sh
+cargo xtask build --arch <arch>
+cargo xtask mkdisk --arch <arch> --harness ktest --knob mapredo
+cargo xtask run --arch <arch> --runs 1 --timeout <seconds> \
+    --require 'mapredo knob present; redoing steps 6 and 7'
+```
 
-### Crash reports (`test-crash-report`)
+A plain `cargo xtask mkdisk` removes the knob.
+
+### Crash reports
 
 The crash service, crashd, is in the default service set
 (`rootfs/config/svcmgr/services/crashd.svc`) and logs a report block for each process that dies
 on a fault ([services/crashd/README.md](../services/crashd/README.md)). No harness reads the
-system log from inside the guest, so `cargo xtask test-crash-report --log <file>` checks the blocks
-in a boot's saved serial log, with the parser of the format crashd emits
+system log from inside the guest, so `cargo xtask run --runs N --crash-reports reports|none`
+checks the blocks in each boot's serial log, with the parser of the format crashd emits
 ([services/crashd/docs/block-format.md](../services/crashd/docs/block-format.md)): every block
 must be complete and hold the fields its kind, thread, and status require.
 
-- `--expect reports` reads a usertest boot, which runs the `crashme` fixture's tester
+- `--crash-reports reports` reads a usertest boot, which runs the `crashme` fixture's tester
   ([programs/crashme/README.md](../programs/crashme/README.md)): the log must also hold one `vm`
   and one `exception` block of `crashme`'s main thread and one `exception` block of a `spawned`
   thread, whose fault the fixture takes while a sibling is held blocked on a fault at the same
@@ -412,8 +414,8 @@ must be complete and hold the fields its kind, thread, and status require.
   thread prints, so the block read the thread that faulted. The `vm` block's `addr`, the fault
   message's address, must also be the faulting address that dump prints (`cr2` on x86_64, `stval`
   on riscv64), so the dump names the access that faulted.
-- `--expect none` reads a boot of an image that stages no crashd: the log must hold no block, the
-  check that the absent service changes nothing a fault does.
+- `--crash-reports none` reads a boot of an image that stages no crashd: the log must hold no block,
+  the check that the absent service changes nothing a fault does.
 
 The usertest boot's crashd names `crashme` in its `CORE_DUMP` ([Gating](#gating)), so each of the
 fixture's faulting deaths also leaves an ELF core in `/crash`, which the crashme tester checks in
@@ -436,8 +438,8 @@ filler keeps it past the stall, and the fixture dies of the fault with no core w
 In CI the usertest cell keeps crashd, and its boot passes `--crash-reports reports` to
 `cargo xtask run --runs 1`; the svctest cell drops `crashd.svc` with `terminal.svc`, and its boot
 passes `--crash-reports none`, while crasher's faults go unreported. Each makes the first or the
-second check on its boot's own log, as `test-crash-report` makes it on a saved log
-([xtask/README.md § test-crash-report](../xtask/README.md#cargo-xtask-test-crash-report)).
+second check on its boot's own log
+([xtask/README.md](../xtask/README.md#classified-boots---runs)).
 
 The crash service cannot cover every process. init, memmgr, and procmgr are not created by procmgr,
 and the debug port's virtio-console driver and crashd declare themselves undebuggable, as svctest
@@ -446,28 +448,29 @@ the kernel's `fault unhandled` and `USERSPACE FAULT` lines. A thread that never 
 procmgr is reported without registers or a stack walk ([crashd Operation §
 Limits](../services/crashd/docs/operation.md#limits)).
 
-### Log levels (`test-log-level`)
+### Log levels (usertest cell)
 
 The log level of each service init spawns comes from the boot bundle's log-level configuration,
 and a driver devmgr spawns and a fatfs instance vfsd spawns inherit their spawner's
 ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels). The
 committed configuration sets no level, so no default boot shows whether a level reaches its
-service. `cargo xtask test-log-level [--arch]` (both arches) installs a configuration setting vfsd
-to debug, repacks the disk images in the layout they have with the default-init bundle, and boots
-the current sysroot once, as `run --runs 1` does. It passes when the boot reaches its harness's
-pass marker, vfsd's and fatfs's debug lines appear, and devmgr's and procmgr's do not; the
-installed configuration is always put back and the images repacked in that layout, with the
-recorded harness's bundle, afterward. See
-[xtask/README.md § test-log-level](../xtask/README.md#cargo-xtask-test-log-level) for the
-command.
+service. CI's `usertest` cell packs a configuration setting vfsd to debug
+(`services/init/log-levels-vfsd-debug.conf`, `vfsd = debug`) with its staging, and its own boot
+requires vfsd's and fatfs's debug lines and fails on devmgr's or procmgr's. Locally, after the
+usertest staging of [Gating](#gating):
 
-In CI it runs as an extra boot inside each `usertest` cell (both arches, both profiles), after
-the cell's `run --runs` boot, on the cell's usertest staging and under the cell's boot budget.
+```sh
+cargo xtask mkdisk --arch <arch> --repack-only \
+    --log-levels services/init/log-levels-vfsd-debug.conf
+cargo xtask run --arch <arch> --runs 1 --require '\[vfsd\] DEBUG ' \
+    --require '\[fatfs\] DEBUG ' --fail-also '\[(devmgr|procmgr)\] DEBUG '
+```
 
-### Reboot (`test-reboot`)
+### Reboot (`shutdown` case)
 
 A reboot ends the boot that makes it, so no in-guest harness can check it, and every harness boot
-ends in a power-off instead. `cargo xtask test-reboot [--arch]` (both arches) checks it host-side:
+ends in a power-off instead. `cargo xtask test shutdown --cause reboot [--arch]` (both arches), the
+`shutdown` case's reboot boot, checks it host-side:
 
 1. Stage the `reboot` fixture's recipe (svctest's `reboot` role, seeded with
    `pwrmgr.shutdown`) from `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and repack the
@@ -481,14 +484,14 @@ ends in a power-off instead. `cargo xtask test-reboot [--arch]` (both arches) ch
    `guest-shutdown`), and QEMU's own exit.
 4. Remove the recipe and repack the images in that layout again, whatever the outcome.
 
-See [xtask/README.md § test-reboot](../xtask/README.md#cargo-xtask-test-reboot) for the command.
-In CI it runs as a further boot inside each `usertest` cell (both arches, both profiles), after
-`test-wedge`, on the default boot `test-terminal` restored.
+See [xtask/README.md § The `shutdown` case](../xtask/README.md#the-shutdown-case) for the command.
+In CI it is the first boot of the `shutdown` case, the last case of each `usertest` cell (both
+arches, both profiles), on the default boot the cell's `cargo xtask mkdisk` restored.
 
-### Power button (`test-powerbutton`)
+### Power button (`shutdown` case)
 
 A press of the power button comes from outside the guest, so no in-guest harness can make one.
-`cargo xtask test-powerbutton` (x86_64 only: QEMU's riscv64 `virt` machine has a
+`cargo xtask test shutdown --cause power-button` (x86_64 only: QEMU's riscv64 `virt` machine has a
 hardware-reduced ACPI with no fixed power button) checks it host-side:
 
 1. Boot the current sysroot once with a QMP socket, and wait for acpid's `events armed` line,
@@ -501,19 +504,20 @@ hardware-reduced ACPI with no fixed power button) checks it host-side:
 3. The test passes on the three lines, a QMP `SHUTDOWN` event whose reason is `guest-shutdown`, and
    QEMU's own exit.
 
-See [xtask/README.md § test-powerbutton](../xtask/README.md#cargo-xtask-test-powerbutton) for the
+See [xtask/README.md § The `shutdown` case](../xtask/README.md#the-shutdown-case) for the
 command and [services/acpid/README.md](../services/acpid/README.md) § Events for the event path.
-Same boot requirements as `test-terminal` (default boot set, terminal autostarted). In CI it runs
-as a further boot inside the x86_64 `usertest` cells, after `test-vmgenid`.
+Same boot requirements as the `terminal` case (default boot set, terminal autostarted). In CI it is
+the `shutdown` case's second boot in the x86_64 `usertest` cells, after the reboot boot.
 
-### Core death (`test-core-death`)
+### Core death (`shutdown` case)
 
 The death of a core service, or the permanent death of a critical one, powers the system off
 ([supervision.md § Core Set and System Death](supervision.md#core-set-and-system-death)). No
-service carries a hook that could make it die, so `cargo xtask test-core-death [--arch]` (both
-arches) kills each one from outside the guest, one boot per target, by moving one of its threads to
-program counter 0, which no process maps; the thread's instruction fetch faults, and the fault is
-terminal. Two routes reach the thread:
+service carries a hook that could make it die, so `cargo xtask test shutdown --cause
+<cause>[,<cause>...] [--arch]` (both arches; the causes memmgr, procmgr, procmgr-reaper, svcmgr,
+devmgr, vfsd and logd) kills each one from outside the guest, one boot per cause, by moving one of
+its threads to program counter 0, which no process maps; the thread's instruction fetch faults, and
+the fault is terminal. Two routes reach the thread:
 
 - **The GDB stub service**, for the services procmgr creates: svcmgr, devmgr, vfsd and logd. The
   command stages the stub naming the target, as `run --debug-target` stages it, and boots with the
@@ -556,10 +560,10 @@ memmgr, procmgr and svcmgr (the core-death queue, and the address-space observer
 thread other than the main one; [supervision.md § Observing the Core
 Set](supervision.md#observing-the-core-set)), and svcmgr's `critical service unrecoverable`
 shutdown through the actuator for devmgr, vfsd and logd. See
-[xtask/README.md § test-core-death](../xtask/README.md#cargo-xtask-test-core-death) for the command.
-Same boot requirements as `test-terminal` (default boot set, terminal autostarted). In CI it runs
-as a further boot set inside each `usertest` cell (both arches, both profiles), after
-`test-reboot`.
+[xtask/README.md § The `shutdown` case](../xtask/README.md#the-shutdown-case) for the command.
+Same boot requirements as the `terminal` case (default boot set, terminal autostarted). In CI they
+run as the `shutdown` case's boots after the reboot boot (after the power-button boot on x86_64)
+inside each `usertest` cell (both arches, both profiles).
 
 ### Hardware-reduced power-off
 
@@ -589,20 +593,21 @@ Space](../services/devmgr/docs/pci-enumeration.md#ecam-configuration-space)):
 
 The procedure passes when all three hold. The core-death write itself, pwrmgr's store to
 `SLEEP_CONTROL_REG`, is not run: no route kills a core member on real hardware, since no core
-service carries a hook that could make it die (§ Core death), and `test-core-death` runs on q35.
-Host tests cover what the write depends on: devmgr's sleep registers read from a hardware-reduced
-FADT (`services/devmgr/firmware`), the value written (`ipc::acpid_labels::sleep_control_value`),
-acpid's writes (`acpid::power`) and pwrmgr's reading of the `QUERY_SLEEP` answer
-(`pwrmgr::power_off`).
+service carries a hook that could make it die (§ Core death), and the `shutdown` case's death boots
+run on q35. Host tests cover what the write depends on: devmgr's sleep registers read from a
+hardware-reduced FADT (`services/devmgr/firmware`), the value written
+(`ipc::acpid_labels::sleep_control_value`), acpid's writes (`acpid::power`) and pwrmgr's reading of
+the `QUERY_SLEEP` answer (`pwrmgr::power_off`).
 
-### Debug port (`test-debug-port`)
+### Debug port (`debug-port` case)
 
 The debug port, the byte transport a debugger stub speaks to a host debugger over, is a
 `virtio-console` device that a launch attaches only with `--debug-port`, and whose host end QEMU
 serves as a TCP port
 ([services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md)).
 No guest-side check can show that bytes cross it, since its far end is the host.
-`cargo xtask test-debug-port [--arch]` (both arches) checks the transport host-side:
+`cargo xtask test debug-port [--arch] [--port]` (both arches) checks the transport host-side in
+the case's first boot:
 
 1. Stage the [`debug-echo`](../services/debug-echo/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and repack the disk images in the
@@ -625,15 +630,15 @@ No guest-side check can show that bytes cross it, since its far end is the host.
 5. Kill QEMU, remove the recipe, and repack the images in that layout again, whatever the
    outcome.
 
-The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
-shutdown. See [xtask/README.md § test-debug-port](../xtask/README.md#cargo-xtask-test-debug-port)
+The host computes the verdict and kills QEMU, as for the `terminal` case; the fixture invokes no
+shutdown. See [xtask/README.md § The `debug-port` case](../xtask/README.md#the-debug-port-case)
 for the command. No canonical CI cell attaches the debug port, so the boot is the `debug-port`
 device cell of the local and release host runs (Coverage tiers below).
 
-### Signature refusals (`test-signing`)
+### Signature refusals (`signing` case)
 
 Every verifier of [signing.md](signing.md) § Which Stage Verifies What refuses an object that
-does not verify, and a refusal path no boot takes is not shown to work. `cargo xtask test-signing
+does not verify, and a refusal path no boot takes is not shown to work. `cargo xtask test signing
 [--arch] [--release]` (both arches) boots the current sysroot four times from disk images that
 carry objects no build makes, written in place of the sysroot's files at pack time, so the
 sysroot itself is never changed:
@@ -655,15 +660,16 @@ sysroot itself is never changed:
 
 A boot passes when every line it owes appears, and fails on any other refusal or fatal line, or at
 its deadline. The images are packed again from the sysroot afterwards, whatever the outcome. See
-[xtask/README.md § test-signing](../xtask/README.md#cargo-xtask-test-signing) for the lines, the
-deadlines and the logs. CI runs it in each usertest cell after `test-reboot`, in the cell's
+[xtask/README.md § The `signing` case](../xtask/README.md#the-signing-case) for the lines, the
+deadlines and the logs. CI runs it in each usertest cell after the `terminal` case, in the cell's
 profile.
 
-### GDB stub (`test-gdb`)
+### GDB stub (`debug-port` case)
 
 The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs a guest process
 from a host GDB over the debug port, so its check is a host GDB session.
-`cargo xtask test-gdb [--arch] [--port] [--gdb]` (both arches) runs it:
+`cargo xtask test debug-port [--arch] [--port] [--gdb]` (both arches) runs it as the case's second
+boot, whatever the first boot's outcome:
 
 1. Stage the `gdb-target` recipe (`programs/debugger --gdb-target`, a process of two threads with
    an exported counter and tick function;
@@ -685,7 +691,7 @@ from a host GDB over the debug port, so its check is a host GDB session.
    true)` line: procmgr took the target's crash bindings back.
 5. Restart the port's driver under the stub: connect again, `qSupported` (the stub attaches to
    the target anew), and kill the `virtio-console` driver through QEMU's gdbstub as
-   `test-debug-port` does, at the function the stub's reads reach; wait for the stub's
+   the case's transport boot does, at the function the stub's reads reach; wait for the stub's
    `[gdbstub] debug port driver at ordinal 1` line once devmgr has restarted the driver, and
    require the session to go on through the restarted driver on the same connection: `?` a stop,
    `Hg1`, the pointer read, and `D`.
@@ -694,19 +700,19 @@ from a host GDB over the debug port, so its check is a host GDB session.
 
 It needs a host GDB that debugs the guest architecture (`gdb` built with every target, or
 `gdb-multiarch` through `--gdb`). The host computes the verdict and kills QEMU, as for
-`test-debug-port`, and its boot is part of the same `debug-port` device cell (Coverage tiers
-below). See [xtask/README.md § test-gdb](../xtask/README.md#cargo-xtask-test-gdb) for the
-command.
+the case's transport boot, and this boot is part of the same `debug-port` device cell (Coverage
+tiers below). See [xtask/README.md § The `debug-port` case](../xtask/README.md#the-debug-port-case)
+for the command.
 
-### Interrupts-off wedge (`test-wedge`)
+### Interrupts-off wedge (`wedge` case)
 
 The softlockup watchdog's heartbeat cross-checks report a CPU wedged in the kernel with interrupts
 masked while another CPU still ticks, and on x86_64 the wedged CPU prints its own frame from the
 NMI the observer sends it (see
 [scheduling-internals.md § Softlockup Watchdog](../core/kernel/docs/scheduling-internals.md#softlockup-watchdog)).
 No harness can make that state: ktest and the other harnesses run in user mode, which cannot mask
-interrupts, and the kernel carries no test hooks. `cargo xtask test-wedge [--arch]` (both arches)
-makes it at the hardware boundary instead, as `test-terminal` injects input, so the production
+interrupts, and the kernel carries no test hooks. `cargo xtask test wedge [--arch]` (both arches)
+makes it at the hardware boundary instead, as the `terminal` case injects input, so the production
 kernel is what runs:
 
 1. Boot the current sysroot's default boot with QEMU's gdbstub on a unix socket, wait for the
@@ -727,13 +733,13 @@ kernel is what runs:
 The command boots twice: the first boot wedges the highest-numbered AP, which the BSP reports, and
 the second wedges the BSP, which an AP reports. A gdbstub that cannot be reached, a CPU never found
 in the idle halt, or a missing report line fails it. The host computes the verdict and kills
-QEMU, as for `test-terminal`. See
-[xtask/README.md § test-wedge](../xtask/README.md#cargo-xtask-test-wedge) for the command.
+QEMU, as for the `terminal` case. See
+[xtask/README.md § The `wedge` case](../xtask/README.md#the-wedge-case) for the command.
 
-In CI it runs as a further boot pair inside each `usertest` cell (both arches, both profiles),
-after `test-terminal`, on the default boot `test-terminal` restored.
+In CI it runs as a boot pair inside each `usertest` cell (both arches, both profiles), after the
+`signing` case, on the default boot the cell's `cargo xtask mkdisk` restored.
 
-### CET shadow stacks (`test-cet`)
+### CET shadow stacks (`cet` case)
 
 On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them and its
 transient-execution selection rewrites no return (it does on a CPU that takes the retpoline
@@ -745,7 +751,7 @@ guest CPU's `cet-ss` property off unless the run asks for it (`--x86-shadow-stac
 without the property, the CI image's among them, cannot offer the feature, so no boot
 runs on shadow stacks because its host offers them, and these boots are where they are tested. No
 harness can corrupt a kernel return address either, and the kernel carries no test hooks.
-`cargo xtask test-cet` (x86_64) runs both checks under KVM with the guest CPU
+`cargo xtask test cet` (x86_64) runs both checks under KVM with the guest CPU
 `-cpu host,cet-ss=on,enforce`, on a sysroot holding the composed ktest bundle:
 
 1. Boot once and run ktest to its pass marker, with the kernel's `shadow stacks: on` line before
@@ -760,9 +766,9 @@ harness can corrupt a kernel return address either, and the kernel carries no te
 On a host without KVM, or whose CPU or KVM cannot give the guest CET shadow stacks (QEMU then
 refuses to start under `enforce`), the command fails, naming what is missing: it never passes
 without running the shadow stacks. The host computes the verdict and kills QEMU, as for
-`test-wedge`. It is the cet device cell of the local and release host runs (Coverage tiers below),
-not a CI boot. See [xtask/README.md § test-cet](../xtask/README.md#cargo-xtask-test-cet) for the
-command.
+the `wedge` case. It is the cet device cell of the local and release host runs (Coverage tiers
+below), not a CI boot. See [xtask/README.md § The `cet` case](../xtask/README.md#the-cet-case) for
+the command.
 
 A boot whose kernel exception report shows `CR4.CET` set, `SH_STK_EN` clear and a zero interrupt
 SSP table address ran on a host that lost the guest's CET state: the kernel writes those registers
@@ -774,14 +780,14 @@ inconclusive: the command boots again, up to four runs of each boot, and the boo
 a run without it; four such runs fail the command as inconclusive. On a host that is not a guest
 the same report fails the command, as does every other fault.
 
-### PCI Express hotplug (`test-hotplug`)
+### PCI Express hotplug (`hotplug` case)
 
 devmgr's PCI Express hotplug
 ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)), native and through acpid
 from the firmware's, runs only when a device arrives in or leaves a hotplug slot, which no boot of
 a fixed device set makes, and vfsd's handling of a disk's loss and of its root filesystem's ([vfsd
 namespace composition](../services/vfsd/docs/namespace-composition.md#driver-death-and-device-loss)
-§ Driver death and device loss) runs only when a disk leaves. `cargo xtask test-hotplug [--arch]`
+§ Driver death and device loss) runs only when a disk leaves. `cargo xtask test hotplug [--arch]`
 (both arches) makes a device arrive, leave, and arrive again, then makes a disk arrive, in one boot
 per hotplug control, and then makes a disk leave and arrive again and a second disk arrive:
 
@@ -851,18 +857,18 @@ per hotplug control, and then makes a disk leave and arrive again and a second d
 11. Kill QEMU, remove the staged files, and repack the images in their layout again, whatever the
     outcome.
 
-The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
+The host computes the verdict and kills QEMU, as for the `terminal` case; the fixture invokes no
 shutdown, and the storage boots end in the shutdown svcmgr makes at vfsd's exit. See
-[xtask/README.md § test-hotplug](../xtask/README.md#cargo-xtask-test-hotplug) for the
+[xtask/README.md § The `hotplug` case](../xtask/README.md#the-hotplug-case) for the
 command. No canonical CI cell attaches a hotplug port, so the boots are the `hotplug` device cell
 of the local and release host runs (Coverage tiers below).
 
-### TPM (`test-tpm`)
+### TPM (`tpm` case)
 
 The TPM 2.0 driver ([services/drivers/docs/tpm.md](../services/drivers/docs/tpm.md)) binds only
 on a machine whose firmware reports a TPM, and the reference boot set has none: the CI runners
 have no TPM emulator, and a TPM in every boot would make `swtpm` a requirement of every launch.
-`cargo xtask test-tpm` (x86_64; QEMU's TPM devices sit in the PC Client TPM range, which the
+`cargo xtask test tpm` (x86_64; QEMU's TPM devices sit in the PC Client TPM range, which the
 riscv64 `virt` machine does not decode) boots the default boot set twice, each time with a TPM 2.0
 backed by an `swtpm` emulator the command starts on a fresh state directory:
 
@@ -876,8 +882,8 @@ A TPM launch leaves `virtio-rng-pci` out, so the TPM driver is the `hwrng` class
 the contribution entropyd names can only be the TPM's. Each boot exercises the bootloader's `TPM2`
 table seed, devmgr's bind of the `MSFT0101` record, and `TPM2_GetRandom` over the interface, on a
 TPM the firmware or, failing it, the driver started. The host computes the verdict and kills QEMU
-and the emulator, as for `test-terminal`. See [xtask/README.md §
-test-tpm](../xtask/README.md#cargo-xtask-test-tpm) for the command. No canonical CI cell attaches a
+and the emulator, as for the `terminal` case. See [xtask/README.md § The `tpm`
+case](../xtask/README.md#the-tpm-case) for the command. No canonical CI cell attaches a
 TPM, so the boots are the `tpm` device cell of the local and release host runs (Coverage tiers
 below).
 
@@ -922,22 +928,22 @@ services/programs surface under test). Because `terminal.svc` lives in the
 default service set, the harness staging removes it and repacks with
 `cargo xtask mkdisk --repack-only` (a normal repack re-mirrors `rootfs/`,
 which would restore it). The terminal is exercised in its own boot
-(`test-terminal`) and runs in the real default boot. The svctest boot also
+(the `terminal` case) and runs in the real default boot. The svctest boot also
 drops `crashd.svc`, so one boot per cell runs the image without the crash
 service (see Crash reports above).
 
-CI matrix cells follow these rules per boot. The `usertest` cell runs its
-boots in sequence — `usertest` (via `run --runs`, terminal dropped), then
-the terminal interactive test (via `test-terminal`) after dropping
-`usertest.svc` and repacking to restore the default boot (terminal present),
-then the `test-wedge` boot pair, then the `test-reboot` boot, then the seven `test-core-death`
-boots, then the four `test-signing` boots, then on x86_64 the `test-vmgenid` save/restore boot
-pair and the `test-powerbutton` boot. The terminal and wedge test boots have *no*
-shutdown-invoking harness: `test-terminal` and `test-wedge` compute the verdict host-side and kill
-QEMU themselves. The `test-reboot` boot's fixture invokes `REBOOT`, the host reads the reset over
-QMP, and QEMU exits on its own. Each `test-core-death` boot is powered off by the death it makes,
-read over QMP, and QEMU exits on its own. The `test-powerbutton` boot is powered off by its press:
-the host presses the button over QMP, reads the power-off there, and QEMU exits on its own.
+CI matrix cells follow these rules per boot. The `usertest` cell runs its boots in sequence:
+`usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
+default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
+`terminal` case's boot, the `signing` case's four boots, the `wedge` case's boot pair, on x86_64
+the `vmgenid` case's save/restore boot pair, and the `shutdown` case's boots, nine on x86_64 (the
+reboot, the power button and the seven core deaths) and eight on riscv64. The `ktest` cell's cases
+are the `kaslr` case's three boots; the `svctest` cell has none. The terminal and wedge boots have
+*no* shutdown-invoking harness: the `terminal` and `wedge` cases compute the verdict host-side and
+kill QEMU themselves. The reboot boot's fixture invokes `REBOOT`, the host reads the reset over
+QMP, and QEMU exits on its own. Each core-death boot is powered off by the death it makes, read over
+QMP, and QEMU exits on its own. The power-button boot is powered off by its press: the host presses
+the button over QMP, reads the power-off there, and QEMU exits on its own.
 
 ---
 
@@ -957,37 +963,33 @@ also attach the test devices (`--test-devices`): QEMU's `edu` DMA test device, w
 confinement and MSI forge phases drive, and five `pci-testdev` functions, which its
 on-demand-bind phase drives through the test-only test-fault driver; CI boots headless, so no
 framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
-the framebuffer boot, `--display framebuffer`, and the debug-port boots, `test-debug-port` and
-`test-gdb`, are device cells (CI's `test-terminal` boots, and `test-core-death`'s boots of the
-targets it kills through the GDB stub, attach the debug port too, to reach the stub over it), see
-Device surfaces, Framebuffer cell, Debug-port cell, and Release host runs below), filesystem
-(FAT), riscv64
-paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
-are manual, same posture as CPU-count variations), riscv64 Zkr entropy source (on —
-runs without it via `cargo xtask run --riscv-zkr off` are manual, same posture), x86_64
-paging depth (4-level — 5-level runs via `cargo xtask run --x86-paging 5`, under TCG
-(`SERAPH_ACCEL=tcg`) on a host whose CPU lacks LA57, are manual, same posture), x86_64 CET
-shadow stacks (off: the launchers pin `cet-ss=off` on a QEMU that has the property, and neither
-the CI runners nor TCG offer them; the boots on them, `test-cet`, are the cet device cell, see CET
-cell below, and other boots on them, via `cargo xtask run --x86-shadow-stack on` under KVM, are
-manual, same posture), disk
-logical block size (512 bytes — the 4Kn boot, a 4096-byte-block image on a 4096-byte-block
-device, is a storage cell, see Device surfaces and Disk variations below), and disk count (one
-— the second-disk boots are storage cells too). The `virtio-rng` device is
-a boot-entropy source for the pool seed and KASLR: the firmware's RNG driver
-binds it and exposes `EFI_RNG_PROTOCOL`, which the bootloader draws from (OVMF
-also backs the protocol with RDRAND on x86_64; on riscv64 the device is the
-only firmware source under the EDK2 firmware CI boots, and the pool mixes
-the Zkr `seed` CSR and jitter besides; see
-[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
-A driver or filesystem joins the default boot set, and with it the canonical cells, only by
-replacing the main device of its type (Driver coverage below); any other driver adds cells to
-its own device surface, and variants belong to the tiers below.
+the framebuffer boot, `--display framebuffer`, and the debug-port boots, the `debug-port` case's
+two, are device cells (CI's `terminal` case boots, and the `shutdown` case's boots of the targets it
+kills through the GDB stub, attach the debug port too, to reach the stub over it), see Device
+surfaces, Framebuffer cell, Debug-port cell, and Release host runs below), filesystem (FAT), riscv64
+paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57` are manual, same
+posture as CPU-count variations), riscv64 Zkr entropy source (on — runs without it via `cargo xtask
+run --riscv-zkr off` are manual, same posture), x86_64 paging depth (4-level — 5-level runs via
+`cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a host whose CPU lacks LA57, are
+manual, same posture), x86_64 CET shadow stacks (off: the launchers pin `cet-ss=off` on a QEMU that
+has the property, and neither the CI runners nor TCG offer them; the boots on them, the `cet` case,
+are the cet device cell, see CET cell below, and other boots on them, via `cargo xtask run
+--x86-shadow-stack on` under KVM, are manual, same posture), disk logical block size (512 bytes —
+the 4Kn boot, a 4096-byte-block image on a 4096-byte-block device, is a storage cell, see Device
+surfaces and Disk variations below), and disk count (one — the second-disk boots are storage cells
+too). The `virtio-rng` device is a boot-entropy source for the pool seed and KASLR: the firmware's
+RNG driver binds it and exposes `EFI_RNG_PROTOCOL`, which the bootloader draws from (OVMF also backs
+the protocol with RDRAND on x86_64; on riscv64 the device is the only firmware source under the EDK2
+firmware CI boots, and the pool mixes the Zkr `seed` CSR and jitter besides; see
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)). A driver or filesystem joins the
+default boot set, and with it the canonical cells, only by replacing the main device of its type
+(Driver coverage below); any other driver adds cells to its own device surface, and variants belong
+to the tiers below.
 
 | Tier | Where | When | Coverage |
 |---|---|---|---|
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
-| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` and `stopsrc` co-staged in the svctest cell, no host-driven `test-*` boots) |
+| Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run --runs` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, `memhog` and `stopsrc` co-staged in the svctest cell, no `cargo xtask test` case or cell boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
 
@@ -1012,13 +1014,13 @@ surface.
     reads its disk through;
   - console: the machine's 16550-compatible UART (COM1 on `q35`, the NS16550 on `virt`), through
     the serial driver: the output of every svctest and usertest boot, and the serial receive round
-    of `test-terminal`;
+    of the `terminal` case;
   - input: `virtio-keyboard-pci`, through the virtio-input driver: the keyboard and input
-    restart rounds of `test-terminal`, and svctest's input checks (the drivers phase's input case
-    and the devmgr phase's input ordinal);
+    restart rounds of the `terminal` case, and svctest's input checks (the drivers phase's input
+    case and the devmgr phase's input ordinal);
   - entropy: `virtio-rng-pci`, which the firmware's RNG driver drives first, and from which the
     bootloader draws the pool seed and the KASLR words through its `EFI_RNG_PROTOCOL`: the
-    `test-kaslr` boots of the ktest cells, and svctest's random phase; and at run time through the
+    `kaslr` case's boots of the ktest cells, and svctest's random phase; and at run time through the
     virtio-rng driver: svctest's hwrng checks (the drivers phases' hwrng read, restart, deny, and
     stray-cap cases);
   - DMA confinement: the machine's IOMMU (`intel-iommu` on `q35`, `riscv-iommu-pci` on `virt`),
@@ -1034,7 +1036,7 @@ surface.
     (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
     confinement and MSI delivery, forge, churn, and release phases, five `pci-testdev` functions,
     which the test-only test-fault driver serves in svctest's on-demand-bind phase, and, on x86_64,
-    `vmgenid`, the generation source the kernel's snapshot detection reads: `test-vmgenid`.
+    `vmgenid`, the generation source the kernel's snapshot detection reads: the `vmgenid` case.
 
   The canonical boots are headless, so the main set holds no framebuffer. Every code PR's CI cells
   boot the main set. A driver joins it only by replacing the main device of its type; any other
@@ -1045,10 +1047,10 @@ surface.
   device, QEMU std VGA, is outside the main set because the canonical boots are headless; the
   framebuffer cell (Framebuffer cell below) boots it. The virtio-console driver's device, the debug
   port, is outside it because only a launch that asks for a debug port attaches it: the
-  debug-port cell (Debug-port cell below) boots it, and in CI the `test-terminal` boots and
-  `test-core-death`'s GDB-stub boots attach it to reach the stub over it. The TPM driver's
+  debug-port cell (Debug-port cell below) boots it, and in CI the `terminal` case's boots and
+  the `shutdown` case's GDB-stub boots attach it to reach the stub over it. The TPM driver's
   device, a TPM 2.0 behind QEMU's `tpm-tis` or `tpm-crb` and backed by `swtpm`, is outside it
-  because only `test-tpm` attaches it; the tpm cell (TPM cell below) boots it.
+  because only the `tpm` case attaches it; the tpm cell (TPM cell below) boots it.
 - **Hardware only.** A driver whose device QEMU cannot present has no QEMU cell in either set; its
   README documents a hardware test procedure, and it is exercised on real hardware by that
   procedure. No in-tree driver is in this tier.
@@ -1419,14 +1421,14 @@ the cells of every surface a non-inert line of its own diff is on.
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-rng and the `hwrng` class | `services/drivers/virtio/rng/`, its class protocol crate (`shared/hwrng-protocol/`), and svctest's hwrng checks, which drive it (by definition alone: `hwrng_read_phase`, `hwrng_restart_phase`, `hwrng_read`, and `hwrng_denied`) | no-iommu |
-| virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
+| virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test/debug_port/echo.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test/debug_port/gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module, a file (`shared/ipc/src/test_dma_labels.rs`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, `iommu_restart_phase`, and `call_test_dma`) | no-iommu, and hotplug |
-| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
+| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test/hotplug.rs`), and the launchers' hotplug ports (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `HOTPLUG_DISK_PORT_DEVICE`, `HOTPLUG_DISK_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, `HotplugPort`, `PortDisk`, `PORT_DISK_ID`, `PORT_DISK_NODE`, `port_disk_properties`, `port_disk_block_size`, `boot_disk_behind_port`, and `EDU_DMA_MASK`) and QMP's `blockdev-add`, `device_add` and `device_del` (`blockdev_add_raw`, `blockdev_add_raw_message`, `device_add`, `device_add_message`, `Property`, `device_del`, `device_del_message`, `device_del_request`, and `device_deleted`); and acpid's side of the firmware's ACPI PCI hotplug, which only the hotplug cell's firmware boot drives: its hotplug module (`services/acpid/src/hotplug.rs`), whose `HotplugSlots`, `HotplugJob`, and `HotplugNote` the server and the host hold, and the slots start-up hands to the evaluation thread (`hotplug_slots`); the hotplug thread and the evaluation thread's handling of a hotplug `Notify` and of a hotplug job's end (`HotplugServer`, `start_hotplug`, `route_hotplug_notes`, `ask_hotplug`, `end_hotplug_job`, `run_hotplug_methods`, and `Work::Hotplug`); the host's keeping of a hotplug `Notify` (`take_hotplug_notes`, and by definition alone: `notify` in `services/acpid/src/platform.rs`); and the `ACPI_HOTPLUG` call (`acpi_hotplug`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay` and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
-| TPM 2.0, and the bootloader's seed of its registers | `services/drivers/tpm/`, its class protocol crate (`shared/hwrng-protocol/`), which the virtio-rng row lists too, the host test that drives it (`xtask/src/commands/test_tpm.rs`), and the launchers' TPM attachment (`Tpm`, `TpmInterface`, and `tpm_args`); and the bootloader's `TPM2` table seed, which only a boot with a TPM takes (`tpm2_register_window`, `tpm_register_window`, `TPM2_OFF_CONTROL_AREA`, `TPM2_OFF_START_METHOD`, `TPM2_MIN_LEN`, `TPM2_START_FIFO`, and `TPM2_START_CRB`) | tpm |
+| TPM 2.0, and the bootloader's seed of its registers | `services/drivers/tpm/`, its class protocol crate (`shared/hwrng-protocol/`), which the virtio-rng row lists too, the host test that drives it (`xtask/src/commands/test/tpm.rs`), and the launchers' TPM attachment (`Tpm`, `TpmInterface`, and `tpm_args`); and the bootloader's `TPM2` table seed, which only a boot with a TPM takes (`tpm2_register_window`, `tpm_register_window`, `TPM2_OFF_CONTROL_AREA`, `TPM2_OFF_START_METHOD`, `TPM2_MIN_LEN`, `TPM2_START_FIFO`, and `TPM2_START_CRB`) | tpm |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
-| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); the code that runs on the supervisor shadow stack at every entry from user mode, or decides whether shadow stacks are on (`seraph_enter_from_user`, `__x86_indirect_thunk_r11`, `rewrites_returns`, and `RETURN_REWRITING`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
+| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test/cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); the code that runs on the supervisor shadow stack at every entry from user mode, or decides whether shadow stacks are on (`seraph_enter_from_user`, `__x86_indirect_thunk_r11`, `rewrites_returns`, and `RETURN_REWRITING`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
 shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies what
@@ -1456,17 +1458,19 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/virtio/rng/ shared/hwrng-protocol/ \
     services/drivers/test-dma/ services/drivers/framebuffer/ \
-    services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
-    services/hotplug-check/ xtask/src/commands/test_hotplug.rs services/acpid/src/hotplug.rs \
-    shared/gdb-rsp/ services/gdbstub/ xtask/src/debug_stub.rs xtask/src/commands/test_gdb.rs \
+    services/drivers/virtio/console/ services/debug-echo/ \
+    xtask/src/commands/test/debug_port/echo.rs \
+    services/hotplug-check/ xtask/src/commands/test/hotplug.rs services/acpid/src/hotplug.rs \
+    shared/gdb-rsp/ services/gdbstub/ xtask/src/debug_stub.rs \
+    xtask/src/commands/test/debug_port/gdb.rs \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/ \
-    core/kernel/src/arch/x86_64/shadow_stack.rs xtask/src/commands/test_cet.rs \
+    core/kernel/src/arch/x86_64/shadow_stack.rs xtask/src/commands/test/cet.rs \
     xtask/src/qemu_gdb.rs shared/ipc/src/devmgr_labels.rs shared/ipc/src/devmgr_errors.rs \
     shared/ipc/src/devmgr_dma_labels.rs shared/ipc/src/devmgr_dma_errors.rs \
     shared/ipc/src/device_info_kind.rs shared/ipc/src/vfsd_labels.rs shared/ipc/src/vfsd_errors.rs \
     shared/ipc/src/fs_labels.rs shared/ipc/src/fs_errors.rs shared/ipc/src/blk_labels.rs \
     shared/ipc/src/blk_errors.rs shared/ipc/src/test_dma_labels.rs services/drivers/tpm/ \
-    xtask/src/commands/test_tpm.rs
+    xtask/src/commands/test/tpm.rs
 D='sys_irq_(register|ack|split|msg_alloc|route|remap)|(un)?route_device_irq|irq_line_count'
 D="$D|dispatch_device_irq|set_remap|remap_entry|remap_handles"
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
@@ -1621,25 +1625,24 @@ cargo xtask run --arch <arch> --runs 1 --timeout 360 \
 ```
 
 **Debug-port cell.** Two boots, on each architecture, each of which attaches the debug port's
-`virtio-console` device, so devmgr binds it and the virtio-console driver runs: one of
-`cargo xtask test-debug-port` (Debug port (`test-debug-port`) above), in which the `debug-echo`
-fixture answers the host over the port, and one of `cargo xtask test-gdb` (GDB stub (`test-gdb`)
-above), in which the GDB stub serves a host GDB session against the `gdb-target` process. The cell
-passes when both host checks pass; each command stages and unstages its own recipes on the
-current sysroot, a debug-profile build. `test-debug-port` bounds the boot to the fixture's ready
-line by five minutes and each answer by twenty seconds; `test-gdb` bounds the boot to the stub's
-ready line by five minutes, the GDB session by three, and the stub's detach line by 30 s after
-it. Neither has a boot budget. The
-two boots are the debug-port device cell (Device surfaces above).
+`virtio-console` device, so devmgr binds it and the virtio-console driver runs: the `debug-port`
+case's first boot (Debug port (`debug-port` case) above), in which the `debug-echo` fixture answers
+the host over the port, and its second (GDB stub (`debug-port` case) above), in which the GDB stub
+serves a host GDB session against the `gdb-target` process. The case runs both boots, the second
+whatever the first's outcome, and the cell passes when both host checks pass; the case stages and
+unstages its own recipes on the current sysroot, a debug-profile build. The first boot is bounded to
+the fixture's ready line by five minutes and each answer by twenty seconds; the second is bounded to
+the stub's ready line by five minutes, the GDB session by three, and the stub's detach line by 30 s
+after it. Neither has a boot budget. The two boots are the debug-port device cell (Device surfaces
+above).
 
 ```sh
 # Debug-port cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
-cargo xtask test-debug-port --arch <arch>
-cargo xtask test-gdb --arch <arch>
+cargo xtask test debug-port --arch <arch>
 ```
 
-**Hotplug cell.** The boots of `cargo xtask test-hotplug` (PCI Express hotplug (`test-hotplug`)
+**Hotplug cell.** The boots of `cargo xtask test hotplug` (PCI Express hotplug (`hotplug` case)
 above) on each architecture, four on x86_64 and three on riscv64, at 4 vCPUs. In the device boots,
 two on x86_64 (the firmware's ACPI PCI hotplug, then native control) and one on riscv64, devmgr
 takes two empty root ports' events, binds the `test-dma` fixture to the `edu` device the host
@@ -1657,10 +1660,10 @@ minute from `device_del`; it has no boot budget. The boots are the hotplug devic
 ```sh
 # Hotplug cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
-cargo xtask test-hotplug --arch <arch>
+cargo xtask test hotplug --arch <arch>
 ```
 
-**CET cell.** One boot pair on x86_64, `cargo xtask test-cet` (CET shadow stacks (`test-cet`)
+**CET cell.** One boot pair on x86_64, `cargo xtask test cet` (CET shadow stacks (`cet` case)
 above), whose first boot runs ktest with the kernel on CET shadow stacks and whose second checks
 that a corrupted kernel return address raises `#CP`, on a sysroot holding the composed ktest
 bundle, a debug-profile build, at 4 vCPUs. It runs only under KVM on a host whose CPU reports CET
@@ -1668,17 +1671,17 @@ shadow stacks and enhanced or Automatic IBRS: on any other host the command fail
 missing, and never passes, so a PR that owes the cell runs it on such a host. On a host that is
 itself a guest, a run that ends in the host's loss of the guest's CET state is inconclusive and run
 again, up to four runs of each boot, and the cell passes only on runs without it (CET shadow stacks
-(`test-cet`) above). Each boot is bounded by five minutes and each gdbstub answer by 30 s; it has no
+(`cet` case) above). Each boot is bounded by five minutes and each gdbstub answer by 30 s; it has no
 boot budget. The pair is the cet device cell (Device surfaces above).
 
 ```sh
 # CET cell, x86_64 only:
 cargo xtask build --arch x86_64
 cargo xtask mkdisk --harness ktest
-cargo xtask test-cet
+cargo xtask test cet
 ```
 
-**TPM cell.** One boot pair on x86_64, `cargo xtask test-tpm` (TPM (`test-tpm`) above), at 4
+**TPM cell.** One boot pair on x86_64, `cargo xtask test tpm` (TPM (`tpm` case) above), at 4
 vCPUs, on the default boot set of a debug-profile sysroot, each boot backed by `swtpm`: one with
 `tpm-tis` and one with `tpm-crb`. The command fails before the boots when `swtpm` is not
 installed, naming the package. Each boot is bounded by three minutes; it has no boot
@@ -1688,7 +1691,7 @@ budget. The pair is the tpm device cell (Device surfaces above).
 # TPM cell, x86_64 only:
 cargo xtask build --arch x86_64
 cargo xtask mkdisk
-cargo xtask test-tpm
+cargo xtask test tpm
 ```
 
 **Release host runs.** Before each tag ([conventions.md](conventions.md#release-production) §
@@ -1938,7 +1941,8 @@ the attach, and a process procmgr did not create (init,
 memmgr, procmgr) is not listed.
 
 ```sh
-# Debug the `gdb-target` fixture (staged by hand here; test-gdb does the same):
+# Debug the `gdb-target` fixture (staged by hand here; the `debug-port` case's GDB stub
+# boot does the same):
 cargo xtask build
 cp sysroot/config/svcmgr/tests/gdb-target.svc sysroot/config/svcmgr/services/
 cargo xtask mkdisk --repack-only

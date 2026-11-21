@@ -18,6 +18,8 @@ init/
 ├── log-levels.conf             # Log level of each service init spawns; installed at, and
 │                               # bundled as, /config/init/log-levels.conf
 │                               # (docs/bootstrap.md § Log levels)
+├── log-levels-vfsd-debug.conf  # The configuration CI's usertest cell packs: vfsd at debug
+│                               # (docs/testing.md § Log levels (usertest cell))
 ├── docs/
 │   └── bootstrap.md            # Authoritative stage enumeration;
 │                               # init's side of the capability flow

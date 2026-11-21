@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_reboot.rs
+// xtask/src/commands/test/shutdown/reboot.rs
 
 //! Reboot test: pwrmgr's `REBOOT` resets the machine.
 //!
@@ -29,13 +29,13 @@ use std::time::{Duration, Instant};
 use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
-use crate::cli::TestRebootArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::DiskLayout;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
     GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
-    X86ShadowStack, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    X86ShadowStack, build_qemu_argv, prepare_riscv_firmware,
 };
 use crate::qmp;
 use crate::util::{require_tool, step};
@@ -61,11 +61,10 @@ const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Budget for QEMU to exit after its `SHUTDOWN` event.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn run(ctx: &Context, args: &TestRebootArgs) -> Result<()>
+/// The reboot cause's boot. The caller has checked the sysroot and admitted
+/// the boot.
+pub(super) fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
-    validate_sysroot_for_launch(ctx, args.arch)?;
-    // Held until the command returns, after its last QEMU has exited.
-    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let services = ctx.sysroot.join("config").join("svcmgr");
     let staged = services.join("services").join(RECIPE);
     let source = services.join("tests").join(RECIPE);
@@ -97,7 +96,7 @@ struct Seen
 
 /// Boot the images of `layout` with a QMP socket, wait for the `SHUTDOWN`
 /// event and QEMU's exit, and judge them and the serial stream.
-fn boot(ctx: &Context, args: &TestRebootArgs, layout: DiskLayout) -> Result<()>
+fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
 {
     let (firmware_code, firmware_vars) = match args.arch
     {

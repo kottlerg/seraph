@@ -6,10 +6,10 @@
 //! The kill of a guest process from outside the guest at a hardware
 //! breakpoint, through QEMU's gdbstub: the CPU that runs a function of the
 //! process's binary is moved to program counter 0, an address no process
-//! maps, so the process takes a fault no handler resolves. `test-core-death`
-//! kills memmgr and procmgr so, and `test-debug-port` and `test-gdb` the
-//! debug port's driver, which declares itself undebuggable and so is out of
-//! every in-guest debugger's reach.
+//! maps, so the process takes a fault no handler resolves. The `shutdown`
+//! case's death boots kill memmgr and procmgr so, and the `debug-port` case's
+//! boots the debug port's driver, which declares itself undebuggable and so is
+//! out of every in-guest debugger's reach.
 
 use std::path::Path;
 use std::thread;
@@ -118,7 +118,7 @@ pub fn kill_at_breakpoint<T: Send + 'static>(
         })?;
         stub.expect_ok(format!("Hg{thread:x}").as_bytes())?;
         // Reading the whole register block has QEMU fetch the CPU's state
-        // from the accelerator and write it back on resume (`test-wedge`).
+        // from the accelerator and write it back on resume (the `wedge` case).
         stub.request(b"g")?;
         let pc = stub.read_register(pc_reg)?;
         let code = stub.read_memory(pc, CODE_CHECK_BYTES)?;

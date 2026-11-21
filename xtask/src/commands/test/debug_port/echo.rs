@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_debug_port.rs
+// xtask/src/commands/test/debug_port/echo.rs
 
 //! Debug-port transport test: GDB remote serial protocol packets reach a
 //! guest service over the debug port and its answers come back.
@@ -19,7 +19,7 @@
 //! once devmgr has restarted the driver at the class's next ordinal, and
 //! drives an echo through the restarted driver. The fixture's
 //! recipe is always removed and the images repacked in that layout afterwards. The verdict
-//! is computed here and the host kills QEMU, as `test-terminal` does.
+//! is computed here and the host kills QEMU, as the `terminal` case does.
 //!
 //! A pure runner: requires a populated sysroot from `cargo xtask build`.
 
@@ -37,7 +37,7 @@ use gdb_rsp::frame::{Event, PacketReader, PacketWriter, unescape};
 
 use crate::arch::Arch;
 use crate::breakpoint_kill;
-use crate::cli::TestDebugPortArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::DiskLayout;
 use crate::firmware::find_ovmf_code;
@@ -77,10 +77,10 @@ const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Budget for each answer of the exchange.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub fn run(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let staged = ctx
         .sysroot
@@ -117,7 +117,7 @@ pub fn run(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
 
 /// Boot the images of `layout` with the debug port, wait for the fixture,
 /// drive the exchange, and kill QEMU.
-fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<()>
+fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
 {
     // Picked here, right before QEMU binds it, to keep the window in which
     // another process could take it short.

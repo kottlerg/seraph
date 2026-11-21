@@ -5,8 +5,7 @@
 
 //! Shared QEMU argv construction and per-launch pflash cache for RISC-V.
 //!
-//! Every command that launches QEMU (`run`, `test-kaslr`, `test-terminal`,
-//! `test-vmgenid`) produces its command line from the same
+//! Every command that launches QEMU (`run`, `test`) produces its command line from the same
 //! source of truth (`build_qemu_argv`). Firmware discovery lives in
 //! `firmware::{find_ovmf_code, find_riscv_firmware}`; the padding +
 //! caching of RISC-V pflash images stays here in `prepare_riscv_firmware`.
@@ -152,7 +151,7 @@ crate::argparse::value_enum! {
     /// them) cannot offer the feature at all, so the default gets no pin there
     /// and a request for the feature is refused ([`qemu_knows_cet_ss`]). The
     /// default leaves them off; the cet cell boots them on
-    /// (`cargo xtask test-cet`, docs/testing.md "Coverage tiers").
+    /// (`cargo xtask test cet`, docs/testing.md "Coverage tiers").
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum X86ShadowStack
     {
@@ -246,7 +245,7 @@ impl X86Host
 const EDU_DEVICE: &str = "edu,dma_mask=0xffffffff";
 
 /// The DMA mask of [`EDU_DEVICE`], which a hot-added `edu` is given too
-/// (`test-hotplug`).
+/// (the `hotplug` case).
 pub const EDU_DMA_MASK: u64 = 0xFFFF_FFFF;
 
 /// The QEMU `pci-testdev` functions (PCI `1b36:0005`) a test launch attaches
@@ -293,7 +292,7 @@ const HOTPLUG_PORT_DEVICE: &str = "pcie-root-port,id=hotplug-port,chassis=1,slot
 
 /// The id of the second PCI Express root port a hotplug launch attaches,
 /// which `device_add` names as the bus of the disk it hot-adds
-/// (`test-hotplug`).
+/// (the `hotplug` case).
 pub const HOTPLUG_DISK_PORT_ID: &str = "hotplug-disk-port";
 
 /// The second PCI Express root port a hotplug launch attaches, empty at
@@ -708,7 +707,7 @@ pub struct QemuLaunchSpec<'a>
     /// test-only drivers ([`test_device_args`]).
     pub test_devices: bool,
     /// When set, attach the two PCI Express root ports devices can be
-    /// hot-added behind or removed from (`test-hotplug`:
+    /// hot-added behind or removed from (the `hotplug` case:
     /// `HOTPLUG_PORT_DEVICE` and `HOTPLUG_DISK_PORT_DEVICE`), their hotplug
     /// under the port's control, with the disk it places behind the first
     /// ([`hotplug_port_args`]).
@@ -772,7 +771,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
     build_qemu_argv_with_tpm(spec, None)
 }
 
-/// [`build_qemu_argv`], with `tpm` attached when it is set (`test-tpm`
+/// [`build_qemu_argv`], with `tpm` attached when it is set (the `tpm` case
 /// alone), in place of the `virtio-rng-pci` device, so the TPM driver is the
 /// `hwrng` class's only member. `x86_64` only: QEMU's TPM devices sit in the
 /// PC Client TPM range, which the riscv64 `virt` machine does not decode.

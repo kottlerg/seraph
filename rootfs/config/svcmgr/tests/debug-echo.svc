@@ -1,7 +1,7 @@
 # /tests/debug-echo — the debug port's transport fixture.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
-# `cargo xtask test-debug-port` stages it into /config/svcmgr/services/ for
+# the `debug-port` case stages it into /config/svcmgr/services/ for
 # one boot with `--debug-port`, which attaches the virtio-console device
 # devmgr binds as the debug port. See services/debug-echo/README.md.
 #

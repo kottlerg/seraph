@@ -25,7 +25,7 @@ stage it has no attach path through it. `cargo xtask run --debug-port <PORT> --d
 repacks the disk images in the layout they have, prints the host GDB command line, and removes it
 again after QEMU exits;
 `cargo xtask run --runs 1 --debug-port <PORT> --debug-target <NAME>` does the same
-around its runs, and `cargo xtask test-gdb` stages it the same way
+around its runs, and the `debug-port` case's second boot stages it the same way
 ([xtask/README.md](../../xtask/README.md)). The
 recipe sets `debug_authority = yes` and seeds `devmgr.class.debug-port`
 ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)).
@@ -392,8 +392,8 @@ exit while the target runs; a continue of one thread with another held at the sa
 whose stop alone is reported, a held thread's call returning meanwhile, an interrupt meanwhile, the
 restart of the resumed thread's stop, and a continue or step whose one thread exits; and a detach
 with a stop pending, with every thread exited, and
-with the step's thread exited or never stopped. `cargo xtask test-gdb` boots the `gdb-target`
-fixture (`programs/debugger --gdb-target`,
+with the step's thread exited or never stopped. The `debug-port` case's second boot boots the
+`gdb-target` fixture (`programs/debugger --gdb-target`,
 [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch
 GDB session over the debug port: it lists two threads, single-steps the main thread from where the
 attach stopped it, on text the fixture attaches shared, breaks on the fixture's tick function and
@@ -401,10 +401,9 @@ continues to it, rewrites and reads back a variable and a register, single-steps
 second thread and reads its registers, and detaches, and the stub's detach line reports the crash
 bindings restored; it then has the port's driver killed under the stub and requires the stub to
 answer through the restarted driver ([docs/testing.md](../../docs/testing.md) § GDB stub
-(`test-gdb`)). svctest's
-`debug_authority_refused` phase checks that `LIST_PROCESSES` and `DETACH_PROCESS` refuse a caller
-without the authority, and its `crash_endpoint` phase drives both for a holder of it, with the
-restore after a watch thread's exit.
+(`debug-port` case)). svctest's `debug_authority_refused` phase checks that `LIST_PROCESSES` and
+`DETACH_PROCESS` refuse a caller without the authority, and its `crash_endpoint` phase drives both
+for a holder of it, with the restore after a watch thread's exit.
 
 ---
 

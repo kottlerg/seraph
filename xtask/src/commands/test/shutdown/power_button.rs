@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_powerbutton.rs
+// xtask/src/commands/test/shutdown/power_button.rs
 
 //! Power-button test (`x86_64` only): a press of the ACPI fixed power button
 //! powers the machine off.
@@ -18,7 +18,7 @@
 //! hardware-reduced ACPI with no fixed power button, so the test has no
 //! `riscv64` form.
 //!
-//! A pure runner like `test-terminal`: requires a populated `x86_64` sysroot
+//! A pure runner like the `terminal` case: requires a populated `x86_64` sysroot
 //! with the default boot set (terminal + shell) and a repacked `disk.img`.
 
 use std::path::Path;
@@ -28,13 +28,13 @@ use std::time::Duration;
 use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
-use crate::cli::TestPowerbuttonArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
     GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
-    build_qemu_argv, validate_sysroot_for_launch,
+    build_qemu_argv,
 };
 use crate::qmp;
 use crate::util::{require_tool, step};
@@ -72,11 +72,10 @@ const PRESS_TIMEOUT: Duration = Duration::from_mins(1);
 /// Budget for QEMU to exit after its `SHUTDOWN` event.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn run(ctx: &Context, args: &TestPowerbuttonArgs) -> Result<()>
+/// The power-button cause's boot (`x86_64` only). The caller has checked the
+/// sysroot and admitted the boot.
+pub(super) fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
-    validate_sysroot_for_launch(ctx, Arch::X86_64)?;
-    // Held until the command returns, after its QEMU has exited.
-    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
     let sock_dir = ctx.target_dir.join("xtask");
     std::fs::create_dir_all(&sock_dir)
@@ -112,12 +111,7 @@ pub fn run(ctx: &Context, args: &TestPowerbuttonArgs) -> Result<()>
 }
 
 /// Launch QEMU for the boot, with its QMP socket at `sock`.
-fn launch(
-    qemu_binary: &Path,
-    ctx: &Context,
-    args: &TestPowerbuttonArgs,
-    sock: &Path,
-) -> Result<Guest>
+fn launch(qemu_binary: &Path, ctx: &Context, args: &CaseArgs, sock: &Path) -> Result<Guest>
 {
     let disk_path = ctx.disk_image();
     let firmware_code = find_ovmf_code()?;

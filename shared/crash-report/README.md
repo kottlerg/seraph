@@ -32,7 +32,7 @@ crash-report/
 | `Arch::register_names` | The register file's word names per architecture, asserted at compile time against the register-file sizes `abi/syscall` publishes. |
 
 The format is [services/crashd/docs/block-format.md](../../services/crashd/docs/block-format.md);
-this crate implements it on both sides, so crashd, which emits it, and xtask's `test-crash-report`
+this crate implements it on both sides, so crashd, which emits it, and xtask's `run --crash-reports`
 and `symbolize --log`, which read it, cannot drift apart.
 
 ---

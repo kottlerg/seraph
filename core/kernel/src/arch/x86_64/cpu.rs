@@ -1026,7 +1026,7 @@ pub unsafe fn disable_interrupts()
 /// an uncontrolled jump; interrupts remain disabled.
 ///
 /// Never inlined, so the kernel image has a `halt_loop` symbol:
-/// `cargo xtask test-wedge` moves an idle CPU's program counter to it to wedge
+/// `cargo xtask test wedge` moves an idle CPU's program counter to it to wedge
 /// that CPU with interrupts off, and checks the NMI frame falls inside it.
 #[inline(never)]
 pub fn halt_loop() -> !

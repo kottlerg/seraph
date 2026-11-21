@@ -163,7 +163,7 @@ fn eprint_line(msg: &str)
 }
 
 /// `help` — list the built-ins. The first line is a stable marker the terminal
-/// interactive test (`xtask/src/commands/test_terminal.rs`) asserts on.
+/// interactive test (`xtask/src/commands/test/terminal.rs`) asserts on.
 fn help(out: &mut std::io::Stdout)
 {
     let text = "shell built-ins:\n\

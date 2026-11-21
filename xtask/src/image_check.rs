@@ -21,7 +21,7 @@
 //! it writes (`crate::esp::check`): the bundle list is read from the root
 //! partition's `/config/bundle/`, and the bundle's entries choose the harness. A
 //! pack that wrote one side alone fails, naming the object. A pack that writes
-//! substitutes in place of installed files (`test-signing`'s refusal images,
+//! substitutes in place of installed files (the `signing` case's refusal images,
 //! `crate::disk::create_disk_image_substituting`) makes the `fsck.fat` check
 //! alone, since its ESP is by design no copy of its root partition.
 
@@ -482,7 +482,7 @@ mod tests
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // Defect caught: a substituting pack (a refusal image of test-signing) refused for the
+    // Defect caught: a substituting pack (a refusal image of the signing case) refused for the
     // ESP it writes on purpose, or its volumes left unchecked.
     #[test]
     fn a_substituted_image_is_checked_by_fsck_alone()

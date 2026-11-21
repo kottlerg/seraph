@@ -2412,12 +2412,13 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 }
 
 /// Handle `SNAPSHOT`: capture the live process `data[0]` names into a memory
-/// object sealed on the account `caps[0]`, the sender's own memmgr SEND
+/// object sealed on the account `caps[0]`, a memmgr SEND the sender presents
 /// ([`snapshot::capture`]; `services/procmgr/docs/ipc-interface.md`
 /// § Label 33: `SNAPSHOT`). Wire layout: [`procmgr_labels::SNAPSHOT`].
 ///
-/// The request is checked, and the target's address-space and main-thread
-/// caps derived, under the table lock, so a teardown of the target meanwhile
+/// The request is checked, and the target's address-space and thread caps
+/// derived (the main thread, then each registered thread the sweep leaves
+/// listed), under the table lock, so a teardown of the target meanwhile
 /// leaves caps that name its objects or that the kernel refuses, never
 /// another cap that took the slot. The capture holds no lock, and takes this
 /// worker for its length. The account cap is deleted on every path, and
@@ -2447,7 +2448,9 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 Ok(snapshot::Target {
                     aspace,
                     thread,
+                    registered: derive_registered(entry)?,
                     memmgr_badge: entry.memmgr_badge,
+                    load_bias: entry.image.load_bias,
                     image: None,
                 })
             })
@@ -2498,6 +2501,41 @@ fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         }
         Err(code) => reply_empty(ipc_buf, code),
     }
+}
+
+/// Observe caps to `entry`'s registered threads, swept first so no thread
+/// that exited is listed, each with its `ATTACH_PROCESS` index, for a
+/// `SNAPSHOT` to record their state. A thread whose cap the runtime revoked
+/// since the sweep has none, as one that exited.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when the heap refuses the list.
+fn derive_registered(entry: &mut process::ProcessEntry)
+-> Result<Vec<snapshot::TargetThread>, u64>
+{
+    entry.threads.sweep(
+        |t| process::thread_is_listed(t.cap),
+        process::release_registered_thread,
+    );
+    let mut out = Vec::new();
+    out.try_reserve_exact(entry.threads.len())
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    for i in 0..entry.threads.len()
+    {
+        let Some(thread) = entry.threads.get(i)
+        else
+        {
+            break;
+        };
+        if let Ok(cap) = syscall::cap_derive(thread.cap, syscall_abi::RIGHTS_THREAD_OBSERVE)
+        {
+            out.push(snapshot::TargetThread {
+                index: (i as u64).saturating_add(1),
+                cap: process::CapGuard::new(cap),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// What [`create_child`] takes from a checked create request.

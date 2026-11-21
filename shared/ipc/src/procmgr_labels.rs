@@ -1022,7 +1022,9 @@ pub const MAKE_PRIVATE: u64 = 32;
 /// badge carrying [`DEBUG_AUTHORITY`]. `data[0]` is the target's process
 /// badge; `caps[0]` the sender's own memmgr SEND, the account procmgr
 /// requests the frames on and seals through, each call on it bounded. The
-/// object starts with a layout of the space's regions and runs, laid out as
+/// object starts with a layout of the space's regions and runs, the state of
+/// each thread procmgr holds a cap to (the main thread and each registered
+/// one) as the hold left it, and the image's load bias, laid out as
 /// `crate::procmgr_snapshot` states. Replies `SUCCESS` with `caps[0]` the
 /// object's handle, `data[0]` the object's pages and `data[1]`
 /// `crate::procmgr_snapshot::SNAPSHOT_COMPLETE` when no run is absent, else

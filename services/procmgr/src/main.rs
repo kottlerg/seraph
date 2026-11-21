@@ -426,24 +426,29 @@ pub fn register_with_memmgr(
 }
 
 /// Allocate exactly one page from memmgr. Returns the cap slot of the
-/// (single-page) Memory cap in procmgr's `CSpace`, or zero on any failure
-/// (memmgr not wired, OOM, derive failure). Caller is responsible for
+/// (single-page) Memory cap in procmgr's `CSpace`. Caller is responsible for
 /// `mem_map`-ping it where appropriate.
 ///
 /// Memory caps allocated against `child_send_cap` are accounted to that child's
 /// memmgr record and reclaimed on `PROCESS_DIED`. Memory caps allocated against
 /// procmgr's own `pi.memmgr_endpoint_cap` are accounted to procmgr.
+///
+/// # Errors
+/// `LIMIT` when memmgr refuses the page for the max of the account's budget
+/// node or of an ancestor ([`process_table::memmgr_refusal`]), and
+/// `OUT_OF_MEMORY` on any other failure (memmgr unwired, its other refusals,
+/// a failed call, a malformed reply).
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "procmgr is a binary, not a library, and every caller passes its thread's registered \
               IPC buffer page as `ipc_buf`"
 )]
-pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
+pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Result<u64, u64>
 {
     if memmgr_send == 0
     {
         std::os::seraph::log!(warn: "alloc_page: memmgr_send=0");
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     }
     let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, 1)
@@ -455,7 +460,7 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
         Err(e) =>
         {
             std::os::seraph::log!(warn: "alloc_page: ipc_call err={}", e);
-            return None;
+            return Err(procmgr_errors::OUT_OF_MEMORY);
         }
     };
     if reply.label != memmgr_errors::SUCCESS
@@ -467,7 +472,7 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
             reply.word(1),
             reply.word(2)
         );
-        return None;
+        return Err(process_table::memmgr_refusal(reply.label));
     }
     if reply.word(0) != 1
     {
@@ -477,32 +482,47 @@ pub fn memmgr_alloc_page(memmgr_send: u64, ipc_buf: *mut u64) -> Option<u64>
             reply.caps().len()
         );
         release_grant(memmgr_send, &reply, ipc_buf);
-        return None;
+        return Err(procmgr_errors::OUT_OF_MEMORY);
     }
-    reply.caps().first().copied()
+    reply
+        .caps()
+        .first()
+        .copied()
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)
 }
 
 /// Allocate exactly `pages` contiguous pages from `memmgr_send` as a
-/// single Memory cap. Returns the cap slot in procmgr's `CSpace`, or
-/// `None` on any failure (memmgr unwired, OOM, malformed reply).
+/// single Memory cap. Returns the cap slot in procmgr's `CSpace`.
 ///
 /// Used to back kernel-object retypes whose source Memory cap must be
 /// contiguous (e.g. `Thread`, `AddressSpace`, `CSpace`); as
 /// [`memmgr_alloc_contig_grant`], without the region id.
-pub fn memmgr_alloc_pages_contig(memmgr_send: u64, pages: u64, ipc_buf: *mut u64) -> Option<u64>
+///
+/// # Errors
+/// [`memmgr_alloc_contig_grant`]'s.
+pub fn memmgr_alloc_pages_contig(
+    memmgr_send: u64,
+    pages: u64,
+    ipc_buf: *mut u64,
+) -> Result<u64, u64>
 {
     memmgr_alloc_contig_grant(memmgr_send, pages, ipc_buf).map(|(cap, _)| cap)
 }
 
 /// Allocate exactly `pages` contiguous pages from `memmgr_send` as a
 /// single Memory cap. Returns the cap slot in procmgr's `CSpace` and the
-/// grant's region id, which names the run to `RELEASE_MEMORY_CAPS`, or
-/// `None` on any failure (memmgr unwired, OOM, malformed reply).
+/// grant's region id, which names the run to `RELEASE_MEMORY_CAPS`.
 ///
 /// The request sets `REQUIRE_CONTIGUOUS`, so memmgr answers with one cap of
 /// exactly `pages` pages or an error. A reply of any other shape is refused,
 /// and every cap it carried is returned to memmgr's pool ([`release_grant`])
 /// rather than left billed to the account behind `memmgr_send`.
+///
+/// # Errors
+/// `LIMIT` when memmgr refuses the pages for the max of the account's budget
+/// node or of an ancestor ([`process_table::memmgr_refusal`]), and
+/// `OUT_OF_MEMORY` on any other failure (memmgr unwired, its other refusals,
+/// a failed call, a malformed reply).
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "procmgr is a binary, not a library, and every caller passes its thread's registered \
@@ -512,22 +532,23 @@ pub fn memmgr_alloc_contig_grant(
     memmgr_send: u64,
     pages: u64,
     ipc_buf: *mut u64,
-) -> Option<(u64, u64)>
+) -> Result<(u64, u64), u64>
 {
+    let oom = procmgr_errors::OUT_OF_MEMORY;
     if memmgr_send == 0 || pages == 0 || pages > u64::from(u32::MAX)
     {
-        return None;
+        return Err(oom);
     }
     let flags = u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32;
     let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, pages | flags)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(memmgr_send, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { ipc::ipc_call(memmgr_send, &msg, ipc_buf) }.map_err(|_| oom)?;
     if reply.label != memmgr_errors::SUCCESS
     {
         release_caps(reply.caps());
-        return None;
+        return Err(process_table::memmgr_refusal(reply.label));
     }
     let caps = reply.caps();
     if let Some((_, &[region_id])) = ipc::memmgr_grant_layout(&reply)
@@ -535,10 +556,10 @@ pub fn memmgr_alloc_contig_grant(
         && syscall::cap_info(first_cap, syscall_abi::CAP_INFO_MEMORY_SIZE)
             .is_ok_and(|size| pages.checked_mul(4096) == Some(size))
     {
-        return Some((first_cap, region_id));
+        return Ok((first_cap, region_id));
     }
     release_grant(memmgr_send, &reply, ipc_buf);
-    None
+    Err(oom)
 }
 
 /// Return every cap of a `REQUEST_MEMORY_CAPS` success reply procmgr does not

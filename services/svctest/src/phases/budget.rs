@@ -16,7 +16,9 @@
 //! destroy. It also checks procmgr's refusals: `CREATE_RESERVE` from svctest,
 //! whose node is outside the system reserve; `CREATE_MEMORY_MAX` without its
 //! data word; a create on a destroyed child's process handle, whose badge
-//! names no live process; and a max too small for the image to load under.
+//! names no live process; and a max too small for the image to load under,
+//! the create's own or that of the node a `CREATE_CHARGE_NODE` handle names,
+//! which procmgr answers with its `LIMIT`.
 
 use std::os::seraph::startup_info;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -138,7 +140,7 @@ fn memory_max_phase(_: &Caps)
 {
     create_reserve_refused();
     memory_max_word_refused();
-    max_below_image_refused();
+    max_refusals_answer_limit();
     let reclaimed = (0..POOL_WINDOWS).any(|_| {
         let before = settled_pool_free();
         run_budget_child();
@@ -253,23 +255,79 @@ fn memory_max_word_refused()
     );
 }
 
-/// A max too small for the child's image fails its create as any failed
-/// allocation does, with `OUT_OF_MEMORY`: memmgr refuses procmgr the child's
-/// pages with `LIMIT`.
-fn max_below_image_refused()
+/// A max too small for the child's image fails its create with procmgr's
+/// `LIMIT`, not `OUT_OF_MEMORY`, whether it is the create's own max or the
+/// max of the sub-node a `CREATE_CHARGE_NODE` handle names: memmgr refuses
+/// procmgr the child's pages with its `LIMIT`. A create charged to another
+/// sub-node, with no max, then succeeds.
+fn max_refusals_answer_limit()
 {
-    use ipc::{procmgr_errors, procmgr_labels};
+    use super::node_handle::{expect, handle_copy, handle_of, release_refused};
+    use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 
+    let procmgr = startup_info().procmgr_endpoint;
     let (file, size) = file_at(b"programs", b"hello");
     expect_create(
-        startup_info().procmgr_endpoint,
+        procmgr,
         procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_MEMORY_MAX,
         &[size, 1],
         HELLO_PATH,
         &[file],
-        procmgr_errors::OUT_OF_MEMORY,
+        procmgr_errors::LIMIT,
         "CREATE_FROM_FILE with a one-page max",
     );
+    let sub_node = |max: u64, what: &str| {
+        let reply = expect(
+            startup_info().memmgr_endpoint,
+            memmgr_labels::CREATE_SUB_NODE,
+            &[max],
+            memmgr_errors::SUCCESS,
+            what,
+        );
+        handle_of(&reply, what)
+    };
+    let small = sub_node(1, "CREATE_SUB_NODE of one page");
+    let roomy = sub_node(u64::MAX, "CREATE_SUB_NODE with no max");
+    let charged = procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_CHARGE_NODE;
+    let (file, size) = file_at(b"programs", b"hello");
+    expect_create(
+        procmgr,
+        charged,
+        &[size],
+        HELLO_PATH,
+        &[file, handle_copy(small)],
+        procmgr_errors::LIMIT,
+        "CREATE_FROM_FILE charged to a one-page sub-node",
+    );
+    let what = "CREATE_FROM_FILE charged to a sub-node with no max";
+    let (file, size) = file_at(b"programs", b"hello");
+    let reply = create_call(
+        procmgr,
+        charged,
+        &[size],
+        HELLO_PATH,
+        &[file, handle_copy(roomy)],
+    )
+    .unwrap_or_else(|e| panic!("{what}: ipc_call failed ({e})"));
+    let (procmgr_errors::SUCCESS, &[handle, thread]) = (reply.label, reply.caps())
+    else
+    {
+        panic!(
+            "{what}: procmgr replied {} with {} caps",
+            reply.label,
+            reply.caps().len()
+        );
+    };
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
+        procmgr_errors::SUCCESS,
+        "DESTROY_PROCESS of the child charged to a sub-node with no max",
+    );
+    let _ = syscall::cap_delete(thread);
+    let _ = syscall::cap_delete(handle);
+    release_refused(small, "the one-page sub-node");
+    release_refused(roomy, "the sub-node with no max");
 }
 
 /// Create a `budget-child` with a max of [`CHILD_MAX_PAGES`], run it to its

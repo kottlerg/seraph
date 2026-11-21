@@ -311,14 +311,17 @@ pub(crate) unsafe fn load_elf_segment_into_child(
 
     for i in 0..num_pages
     {
-        let Some(memory_cap) = crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
-        else
+        let memory_cap = match crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
         {
-            std::os::seraph::log!(
-                warn: "load_elf_segment: alloc None vaddr=0x{:x}",
-                first_page_vaddr.saturating_add(i.saturating_mul(PAGE_SIZE))
-            );
-            return Err(procmgr_errors::OUT_OF_MEMORY);
+            Ok(cap) => cap,
+            Err(code) =>
+            {
+                std::os::seraph::log!(
+                    warn: "load_elf_segment: alloc refused ({code}) vaddr=0x{:x}",
+                    first_page_vaddr.saturating_add(i.saturating_mul(PAGE_SIZE))
+                );
+                return Err(code);
+            }
         };
         scratch.caps.push(memory_cap);
         // SAFETY: page `i` of the `num_pages`-page reservation taken above,

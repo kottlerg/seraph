@@ -985,7 +985,8 @@ pub const MAKE_RESIDENT: u64 = 30;
 /// on its own memmgr cap) when done; its death releases it with its
 /// record. Refusals: `INVALID_ARGUMENT` for a missing cap, a length of zero
 /// or past the bound, or a missing or non-canonical name, before any read;
-/// `SIGNATURE_REFUSED` when the copy does not verify; `IO_ERROR`,
+/// `SIGNATURE_REFUSED` when the copy does not verify; `LIMIT` when the max of
+/// the sender's budget node or of an ancestor refuses the run; `IO_ERROR`,
 /// `OUT_OF_MEMORY` and `MAP_FAILED` as for [`CREATE_FROM_FILE`]'s read.
 /// Specified in `services/procmgr/docs/ipc-interface.md` § `READ_VERIFIED`.
 pub const READ_VERIFIED: u64 = 31;
@@ -1032,10 +1033,11 @@ pub const MAKE_PRIVATE: u64 = 32;
 /// `0`; `UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` without
 /// `caps[0]`; `INVALID_BADGE` when no live process carries the badge, or it
 /// ended during the capture; `NOT_ATTACHABLE` when it declared itself
-/// undebuggable; `SPACE_HELD` when its space is held already;
-/// `OUT_OF_MEMORY` when the account refused or failed a call, granted a run
-/// procmgr refuses, or the object would take more grants than one seal
-/// names. Specified in `services/procmgr/docs/ipc-interface.md` § Label 33:
+/// undebuggable; `SPACE_HELD` when its space is held already; `LIMIT` when
+/// the max of the account's budget node or of an ancestor refused its frames;
+/// `OUT_OF_MEMORY` when the account refused otherwise or failed a call,
+/// granted a run procmgr refuses, or the object would take more grants than
+/// one seal names. Specified in `services/procmgr/docs/ipc-interface.md` § Label 33:
 /// `SNAPSHOT`.
 pub const SNAPSHOT: u64 = 33;
 

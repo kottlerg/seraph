@@ -176,7 +176,9 @@ pub struct Captured
 /// # Errors
 /// `SPACE_HELD` when the target's space is held already or the hold was
 /// interrupted; `INVALID_BADGE` when the target ended before or during the
-/// capture; `OUT_OF_MEMORY` when the account refused or failed a call,
+/// capture; `LIMIT` when the max of the account's budget node or of an
+/// ancestor refused its frames ([`Grants::cover`]); `OUT_OF_MEMORY` when
+/// the account refused otherwise or failed a call,
 /// granted a run procmgr refuses, or the object would take more grants than
 /// one seal names, when memmgr failed a request, or when procmgr's heap or
 /// address space refused the capture's own memory.
@@ -402,8 +404,8 @@ impl Capture
     /// each descriptor.
     ///
     /// # Errors
-    /// As [`memmgr_call`]; `OUT_OF_MEMORY` when the account refuses the
-    /// frames, procmgr's heap refuses the descriptors, or memmgr's reply
+    /// As [`memmgr_call`]; [`Grants::cover`]'s code when the account refuses
+    /// the frames; `OUT_OF_MEMORY` when procmgr's heap refuses the descriptors, or memmgr's reply
     /// names one out of order or of no kind, or pages it did not write.
     fn walk(
         &mut self,
@@ -509,8 +511,9 @@ impl Capture
     /// unused in the object.
     ///
     /// # Errors
-    /// `OUT_OF_MEMORY` when the account refuses the frames, or the grants
-    /// would be more than one seal names.
+    /// [`Grants::cover`]'s: `LIMIT` or `OUT_OF_MEMORY` when the account
+    /// refuses the frames, `OUT_OF_MEMORY` when the grants would be more than
+    /// one seal names.
     fn make_room(&mut self, need: u64, data: &mut Grants<'_>) -> Result<(), u64>
     {
         data.cover(self.filled.saturating_add(need))?;
@@ -929,9 +932,11 @@ impl<'a> Grants<'a>
     /// pages, as many runs as memmgr has.
     ///
     /// # Errors
-    /// `OUT_OF_MEMORY` when a call fails, memmgr refuses a request, a grant's
-    /// cap does not cover the pages its reply names, or the grants would be
-    /// more than one seal names.
+    /// `LIMIT` when memmgr refuses a request for the max of the account's
+    /// budget node or of an ancestor ([`process_table::memmgr_refusal`]);
+    /// `OUT_OF_MEMORY` when a call fails, memmgr refuses a request otherwise, a
+    /// grant's cap does not cover the pages its reply names, or the grants would
+    /// be more than one seal names.
     fn cover(&mut self, pages: u64) -> Result<(), u64>
     {
         while self.pages < pages
@@ -941,17 +946,17 @@ impl<'a> Grants<'a>
                 .word(0, want)
                 .build();
             let reply = self.account.call(&msg)?;
+            if reply.label != memmgr_errors::SUCCESS
+            {
+                crate::release_caps(reply.caps());
+                return Err(process_table::memmgr_refusal(reply.label));
+            }
             let Some((counts, regions)) = ipc::memmgr_grant_layout(&reply)
             else
             {
                 crate::release_caps(reply.caps());
                 return Err(procmgr_errors::OUT_OF_MEMORY);
             };
-            if reply.label != memmgr_errors::SUCCESS
-            {
-                crate::release_caps(reply.caps());
-                return Err(procmgr_errors::OUT_OF_MEMORY);
-            }
             if reply.caps().len() != regions.len() || self.list.try_reserve(regions.len()).is_err()
             {
                 // The grants of a reply that is not kept go back at once:

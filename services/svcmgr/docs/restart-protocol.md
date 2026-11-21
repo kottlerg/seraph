@@ -74,8 +74,13 @@ routes each payload to its `ServiceEntry` via the correlator, then
 dispatches through [`restart::handle_death`](../src/restart.rs). The service
 table grows on the heap and never reuses a slot, so a slot names one
 service for svcmgr's lifetime. `route_death` routes a post only when the
-slot is active and the tag's instance is the slot's current one, and the exit
-reason is the post's. Any other post is dropped: a late post of an instance
+slot is active and the tag's instance is the slot's current one. The exit reason
+it routes is the one procmgr gives the process, asked through the service's process handle
+(`procmgr_labels::QUERY_PROCESS`, while memmgr and procmgr are active and alive), since a post
+of the main thread's own `sys_thread_exit` carries the process's reason only when it is the
+process's first end ([process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)); the
+post's own reason stands when procmgr does not answer `EXITED` and for a service svcmgr holds no
+process handle of. Any other post is dropped: a late post of an instance
 already routed, and the second of the two posts a main-thread fault or exit makes when
 it is the address space's first terminal end.
 

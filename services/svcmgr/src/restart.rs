@@ -1372,19 +1372,31 @@ pub(crate) fn caps_death(thread_cap: u64, aspace_cap: u64) -> Option<u64>
 /// answers.
 pub(crate) fn queried_death(process_handle: u64, ipc_buf: *mut u64) -> Option<u64>
 {
+    match query_process(process_handle, ipc_buf)?
+    {
+        (ipc::procmgr_process_state::EXITED, reason) => Some(reason),
+        (ipc::procmgr_process_state::UNKNOWN, _) => Some(syscall_abi::EXIT_KILLED),
+        _ => None,
+    }
+}
+
+/// The exit reason to route the death post `posted` of the process
+/// `process_handle` names with: procmgr's, from its `QUERY_PROCESS` answer,
+/// as `ipc::procmgr_process_state::process_reason` chooses. The caller holds
+/// procmgr alive, since the call blocks until procmgr answers.
+pub(crate) fn process_reason(process_handle: u64, posted: u64, ipc_buf: *mut u64) -> u64
+{
+    ipc::procmgr_process_state::process_reason(query_process(process_handle, ipc_buf), posted)
+}
+
+/// procmgr's `QUERY_PROCESS` answer for `process_handle`: its state word
+/// and its reason word; `None` for a failed or refused call.
+fn query_process(process_handle: u64, ipc_buf: *mut u64) -> Option<(u64, u64)>
+{
     let msg = IpcMessage::new(procmgr_labels::QUERY_PROCESS);
     // SAFETY: `ipc_buf` is svcmgr's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }.ok()?;
-    if reply.label != procmgr_errors::SUCCESS
-    {
-        return None;
-    }
-    match reply.word(0)
-    {
-        ipc::procmgr_process_state::EXITED => Some(reply.word(1)),
-        ipc::procmgr_process_state::UNKNOWN => Some(syscall_abi::EXIT_KILLED),
-        _ => None,
-    }
+    (reply.label == procmgr_errors::SUCCESS).then(|| (reply.word(0), reply.word(1)))
 }
 
 /// Have procmgr bind one of svcmgr's death queues as a terminal-end death

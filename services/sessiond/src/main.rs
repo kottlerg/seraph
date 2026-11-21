@@ -848,23 +848,18 @@ impl Sessiond
     /// The exit reason of the ended leader `handle` names: the one procmgr
     /// gives the process, which `QUERY_PROCESS` answers once it has ended
     /// and the relay, logd and the end queue carry (docs/process-lifecycle.md
-    /// § Exit reason), or `posted`, the death entry's, when procmgr does not
-    /// answer `EXITED`.
+    /// § Exit reason), or `posted`, the death entry's, as
+    /// `ipc::procmgr_process_state::process_reason` chooses.
     #[inline(never)]
     fn leader_end(&self, handle: u64, posted: u64) -> u64
     {
         let query = IpcMessage::new(procmgr_labels::QUERY_PROCESS);
         // SAFETY: ipc_buf is the registered IPC buffer page.
-        match unsafe { ipc::ipc_call(handle, &query, self.ipc_buf) }
-        {
-            Ok(reply)
-                if reply.label == procmgr_errors::SUCCESS
-                    && reply.word(0) == ipc::procmgr_process_state::EXITED =>
-            {
-                reply.word(1)
-            }
-            Ok(_) | Err(_) => posted,
-        }
+        let answer = unsafe { ipc::ipc_call(handle, &query, self.ipc_buf) }
+            .ok()
+            .filter(|reply| reply.label == procmgr_errors::SUCCESS)
+            .map(|reply| (reply.word(0), reply.word(1)));
+        ipc::procmgr_process_state::process_reason(answer, posted)
     }
 
     // ── Stop source ──────────────────────────────────────────────────────

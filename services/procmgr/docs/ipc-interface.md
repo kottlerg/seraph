@@ -1558,27 +1558,32 @@ svctest itself.
 A debugger or a core writer that needs a consistent copy of a live process's memory asks for one
 here. procmgr finds the target under the table lock and derives copies of its `AddressSpace` cap
 and its main thread's cap there, so a teardown meanwhile leaves caps that name the same objects or
-that the kernel refuses. After the lock:
+that the kernel refuses. It reads there too the target's reference to its image object, when procmgr
+shares one with it ([README.md](../README.md#image-sharing) § Image Sharing), and after the table
+lock takes, under the image cache's lock, a copy of the object's handle and the key of the binary's
+body: every request to memmgr below names the image with it (`CAPTURE_IMAGE`). A teardown that
+dropped the reference meanwhile leaves a capture that names no image, memmgr then writing the pages
+the target attaches of it as those of any other object. After the locks:
 
-1. procmgr asks memmgr to count the target's evicted pages over the whole user half and to post
-   each of its chunks on disk to the swap service
+1. procmgr asks memmgr to count the pages of the target's regions it would write that no mapping
+   shows, over the whole user half, and to post each of its chunks on disk to the swap service
    ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 31:
    `CAPTURE_CHUNKS`, `CAPTURE_COUNT`), and asks again after each pause of `CAPTURE_PAUSE_MS`
    (10 ms) while chunks on disk remain, until none does or `CAPTURE_STALL_PAUSES` (100) pauses in
    a row leave no fewer. It lists the pages the space maps (`SYS_THREAD_LIST_PAGES`) and requests
-   frames on the account for them and the evicted pages.
+   frames on the account for them and the pages memmgr counted.
 2. It holds the target's address space (`SYS_ASPACE_HOLD`,
    [core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md) § `SYS_ASPACE_HOLD`
    (71)): no thread of the target runs in user mode until the release, whether it registered with
-   procmgr (Label 22) or not. Under the hold it lists the pages again and has memmgr write the
-   content of every demand chunk of the target into the first data frames
+   procmgr (Label 22) or not. Under the hold it lists the pages again and has memmgr describe every
+   region of the target and write what it holds of each into the first data frames
    (`CAPTURE_CHUNKS`), from wherever memmgr holds each chunk in that turn, carrying caps derived
    from its grants and requesting more frames on the account when memmgr needs them. memmgr reads
    a chunk once, from one place, so an eviction of the target's chunks meanwhile cannot take a
    chunk's content out of the capture. A chunk on disk memmgr posts to the swap service: procmgr
    asks for each such chunk again after each pause of `CAPTURE_PAUSE_MS` until the swap service
    has restored it, or `CAPTURE_STALL_PAUSES` pauses in a row restore none. It then copies every
-   listed page outside the chunks, but those of `PAGE_RUN_NO_COPY` runs, with
+   listed page outside the regions, but those of `PAGE_RUN_NO_COPY` runs, with
    `SYS_THREAD_READ_MEM` into the next data frame, in address order, through a window of 64 pages
    of its own address space, and releases the space.
 3. It builds the layout (§ Snapshot object layout), returns to the account each data grant the
@@ -1596,6 +1601,14 @@ hold procmgr calls only memmgr, on its own endpoint and on the account, waits on
 for at most `CAPTURE_STALL_PAUSES` pauses in a row that restore nothing, and writes no log line,
 so a held target that serves procmgr or the swap service, logd among them, cannot stall the
 capture.
+
+The capture has two authorities over the target's user half. memmgr's ledger holds every page of a
+region the target registered or attached, mapped or not, so memmgr describes each such page, and
+procmgr copies none of them from the space. The kernel's page table holds every page outside the
+regions: grants, shared memory and device memory, which no pager backs and which the space maps
+whenever it holds them, so the listing finds each. A frame the target maps itself into a region's
+range is outside the region's contract, and the capture takes the region's pages as memmgr holds
+them.
 
 The copy is one point in time for every page only the target writes. A page another process maps
 writable too, or a device writes, is copied as it stands when the copy reads it: the snapshot holds
@@ -1625,34 +1638,65 @@ refusals without the authority, without an account, and for an exited child.
 ### Snapshot object layout
 
 The object's first `layout_pages` pages are the layout, its next `data_pages` pages the captured
-bytes; any page past both is padding. The layout is a header at byte 0, then `run_count` run
-entries from byte 48, 32 bytes each, in ascending address order. Every field is a little-endian
-`u64`. [`shared/ipc/src/procmgr_snapshot.rs`](../../../shared/ipc/src/procmgr_snapshot.rs) defines
-the constants and the encoder and decoder procmgr and a reader share.
+bytes; any page past both is padding. The layout is a header at byte 0, then `region_count` region
+entries from byte 128, then `run_count` run entries, each entry 32 bytes, both lists in ascending
+address order. Every field is a little-endian `u64`, the image's hash aside.
+[`shared/ipc/src/procmgr_snapshot.rs`](../../../shared/ipc/src/procmgr_snapshot.rs) defines the
+constants and the encoder and decoder procmgr and a reader share.
 
 | Header word | Content |
 |---|---|
 | 0 | `MAGIC`, the bytes `SRPHSNAP` |
-| 1 | `LAYOUT_VERSION`, `1`; a reader refuses any other |
-| 2 | flags: bit 0 `SNAPSHOT_COMPLETE`, as in the reply's `data[1]` |
+| 1 | `LAYOUT_VERSION`, `2`; a reader refuses any other |
+| 2 | flags: bit 0 `SNAPSHOT_COMPLETE`, as in the reply's `data[1]`; bit 1 `SNAPSHOT_IMAGE`, the header names the target's image |
 | 3 | `layout_pages`: pages of the layout, at least 1 |
 | 4 | `data_pages`: data pages the runs use, from object page `layout_pages` |
-| 5 | `run_count`: run entries after the header |
+| 5 | `region_count`: region entries after the header |
+| 6 | `run_count`: run entries after the regions |
+| 7 | with `SNAPSHOT_IMAGE`, the length of the image's signed body, else 0 |
+| 8 to 15 | with `SNAPSHOT_IMAGE`, the body's SHA-512, its 64 bytes in order, else zero |
+
+A region entry is one region the target registered (`REGISTER_REGION`) or attached
+(`ATTACH_OBJECT`), by the arguments a restore replays to make it again
+([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 31):
+
+| Region word | Content |
+|---|---|
+| 0 | the region's base, page-aligned |
+| 1 | its pages, at least 1 |
+| 2 | its `MAP_*` protection in bits 0 to 7; its class in bits 8 to 11: `REGION_DEMAND` (0), `REGION_IMAGE` (1, an attachment of the image the header names), `REGION_ZERO` (2, of the zero object), `REGION_OBJECT` (3, of another object); bit 16 `REGION_COMMIT`, bit 17 `REGION_NO_EVICT`, bit 18 `REGION_PRIVATE` (an `ATTACH_PRIVATE` attachment) |
+| 3 | an attachment's object page at its base; 0 for a demand region |
 
 | Run word | Content |
 |---|---|
 | 0 | the run's first address in the captured space, page-aligned |
 | 1 | its pages, at least 1 |
-| 2 | flags: the `PAGE_RUN_*` protection bits of `SYS_THREAD_LIST_PAGES`, and bit 8 `RUN_ABSENT` |
-| 3 | the object page holding the run's first page, its other pages following; `NO_OBJECT_PAGE` (`u64::MAX`) for a run with no bytes in the object |
+| 2 | flags: the `PAGE_RUN_*` protection bits of `SYS_THREAD_LIST_PAGES`, and at most one of bit 8 `RUN_ABSENT`, bit 9 `RUN_ZERO` and bit 10 `RUN_IMAGE` |
+| 3 | for a run with bytes, the object page holding its first page; for a `RUN_IMAGE` run, the image object's page holding its first page; its other pages following in either; else `NO_OBJECT_PAGE` (`u64::MAX`) |
 
-A run with bytes is a run of listed pages that were copied. A `PAGE_RUN_NO_COPY` run, device memory
-`SYS_THREAD_READ_MEM` refuses, has no bytes and is not absent. The pages of a demand chunk memmgr
-supplied are a run with bytes too, with its region's write and execute bits and `PAGE_RUN_READ`, as
-the kernel lists every page memmgr maps, whether the chunk was mapped at the capture or not.
+Every page of the target's user half is either covered by exactly one run, or outside its content:
+in no region and not mapped, so that a read of it faults. Each page of a region is in one run of
+that region, which never reaches past it, with the region's write and execute bits and
+`PAGE_RUN_READ`; a page outside the regions that the listing shows is in one run with its listed
+protection. A run's pages are one of five forms:
 
-An absent run has no bytes: a range of the target's pages, mapped or backed at the capture, whose
-content the object does not hold. A page is absent for one of these reasons, and for no other:
+- **Bytes**: the object holds them. A page of a region memmgr wrote: the target's own page, or an
+  attachment's own copy of a page, or the page of an attached object other than the image and the
+  zero object. Outside the regions, a listed page whose copy succeeded.
+- **Zero** (`RUN_ZERO`): every byte is zero. A page of a demand region no fault backed, or of a
+  zero-object attachment with no copy of its own.
+- **Image** (`RUN_IMAGE`): the page of the image object the header names, at the run's object page,
+  which the target attaches and has no copy of its own of. The image object is sealed, so its
+  pages are the bytes of the binary the header names whatever the target did; a page the target
+  wrote is a copy of its own, and bytes. A reader that has the binary of that SHA-512 and length,
+  in the layout procmgr's image sharing seals it ([README.md](../README.md#image-sharing) § Image
+  Sharing), reads the page there. A reader without it, such as crashd writing a core, records the
+  run's pages with no bytes (`filesz` 0) and names the image.
+- **No copy** (`PAGE_RUN_NO_COPY`): device memory `SYS_THREAD_READ_MEM` refuses, outside the
+  regions. It has no bytes and is not absent.
+- **Absent** (`RUN_ABSENT`): the target's pages whose content the object does not hold.
+
+A page is absent for one of these reasons, and for no other:
 
 - its chunk was on disk, and the swap service did not restore it within the capture's wait: none
   is registered with a want Notification, it did not answer, or it is the held target or waits on
@@ -1660,11 +1704,13 @@ content the object does not hold. A page is absent for one of these reasons, and
 - its chunk was lost, its swap slot's bytes having failed authentication;
 - its chunk's stored bytes failed to decode, or memmgr could not map the chunk's frames or store
   runs to read them;
-- it is a listed page outside the chunks whose copy failed.
+- it is a page of a region of a class procmgr does not know, a page memmgr described no form of,
+  or a page of an attachment of another object that memmgr did not write;
+- it is a listed page outside the regions whose copy failed.
 
-An absent run of a chunk carries the chunk's protection as a supplied one does; an absent listed
-page carries its listed protection. Adjacent runs with the same flags whose bytes follow one
-another in the object, or which have none, are one run.
+The capture is complete, `SNAPSHOT_COMPLETE` set, when no run is absent. Adjacent runs of one
+region, or both outside every region, with the same flags whose pages follow one another in the
+object or in the image, or which have none, are one run.
 
 ---
 

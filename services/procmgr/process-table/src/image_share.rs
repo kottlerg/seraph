@@ -234,6 +234,17 @@ impl ImageCache
         Some(Inserted::New(ImageRef { id, handle, pages }))
     }
 
+    /// The key and the object handle of the entry `id`, or `None` for an id
+    /// the cache does not hold.
+    #[must_use]
+    pub fn find(&self, id: u64) -> Option<(ImageKey, u64)>
+    {
+        self.entries
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| (e.key, e.handle))
+    }
+
     /// Drop one reference to the entry `id`. Returns the object handle when
     /// that was the last, the entry then gone from the cache, so the caller
     /// releases the object (`memmgr_labels::OBJECT_RELEASE`) and deletes the
@@ -409,5 +420,20 @@ mod tests
         };
         assert_eq!(cache.release(one.id.wrapping_add(1)), None);
         assert_eq!(cache.release(one.id), Some(40));
+    }
+
+    #[test]
+    fn a_reference_finds_its_key_and_handle_until_the_entry_goes()
+    {
+        let mut cache = ImageCache::new();
+        let Some(Inserted::New(one)) = cache.insert(key(1), 40, 7)
+        else
+        {
+            panic!("new");
+        };
+        assert_eq!(cache.find(one.id), Some((key(1), 40)));
+        assert_eq!(cache.find(one.id.wrapping_add(1)), None);
+        assert_eq!(cache.release(one.id), Some(40));
+        assert_eq!(cache.find(one.id), None);
     }
 }

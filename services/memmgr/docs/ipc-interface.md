@@ -1492,21 +1492,25 @@ regions visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
 
 ### Label 31: `CAPTURE_CHUNKS`
 
-Copy the content of a process's demand chunks into Memory caps the request carries, for procmgr's
-`SNAPSHOT` of a process whose address space it holds
-(`services/procmgr/docs/ipc-interface.md` § Label 33: `SNAPSHOT`). memmgr reads each chunk where it
-holds it in that turn: from its frames when it is resident, being evicted, or held raw, and decoded
-from its store when it is held compressed, a chunk being written to disk read from where it is held
-meanwhile ([`memory-pool.md`](memory-pool.md#eviction) § Eviction). It maps nothing into the
-process, draws no frame, and evicts nothing, so no eviction of the held process's chunks, before
-or after the request, can take a chunk's content out of the capture: each chunk is read once, from
-one place. A chunk on disk it posts to the swap service as
+Describe every page of a process's regions, and copy the content memmgr holds of them into Memory
+caps the request carries, for procmgr's `SNAPSHOT` of a process whose address space it holds
+(`services/procmgr/docs/ipc-interface.md` § Label 33: `SNAPSHOT`). memmgr's ledger is the authority
+on every page of a region it registered, mapped or not, so the walk names each region with the
+arguments that made it, and each of its pages by what memmgr holds of it; a page outside every
+region is the kernel's page table's, which procmgr reads from the process. memmgr reads a chunk's
+own pages where it holds them in that turn: from its frames when it is resident, being evicted, or
+held raw, and decoded from its store when it is held compressed, a chunk being written to disk read
+from where it is held meanwhile ([`memory-pool.md`](memory-pool.md#eviction) § Eviction). The pages
+of an attachment of an object other than the process's image and the zero object it reads from its
+own view of the object ([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects, Own
+view). It maps nothing into the process, draws no frame, and evicts nothing, so no eviction of the
+held process's chunks, before or after the request, can take a chunk's content out of the capture:
+each chunk is read once, from one place. A chunk on disk it posts to the swap service as
 `MAKE_RESIDENT` does (§ Label 21), when the registered swap service gave a want Notification
 (§ Label 22), and reports it pending: the swap service restores it into the process
 (`SWAP_RESTORE`, § Label 25), and procmgr asks for that chunk again. A lost chunk, and a chunk on
-disk with no swap service to ask, it reports absent ([`memory-pool.md`](memory-pool.md#disk-tier)
-§ Disk tier). An attachment's chunks are passed over: no eviction takes them, and procmgr reads
-their pages from the process. Privilege: procmgr only.
+disk with no swap service to ask, it reports with no page written
+([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier). Privilege: procmgr only.
 
 **Request:**
 
@@ -1514,24 +1518,33 @@ their pages from the process. Privilege: procmgr only.
 |---|---|
 | label | 31 |
 | data[0] | the process's memmgr badge (from its `REGISTER_PROCESS` reply) |
-| data[1] | the cursor, where the walk starts |
-| data[2] | the end, past the cursor |
-| data[3] | flags: `CAPTURE_COUNT` (1), or 0 |
+| data[1] | the cursor, where the walk starts: page-aligned, and inside a region a chunk's base |
+| data[2] | the end, past the cursor: page-aligned, and inside a region a chunk's base |
+| data[3] | flags: `CAPTURE_COUNT` (1), `CAPTURE_IMAGE` (2), or 0 |
 | data[4] | the page offset into `caps[0]` at which the destination starts |
 | data[5 + i] | the destination pages of `caps[i]`, from that offset for `caps[0]` |
-| caps[0..4] | Memory caps with the map and write rights: the destination, in order. memmgr deletes them once it has served the request, whatever the reply |
+| caps | Memory caps with the map and write rights: the destination, in order; with `CAPTURE_IMAGE`, then the handle of the process's image object (`SEAL_OBJECT`, § Label 27), so at most three destination caps. memmgr deletes them once it has served the request, whatever the reply |
 
-memmgr walks the chunks that have an entry in the process's demand regions in `[cursor, end)`, in
-address order. For each chunk it has the content of, it writes the chunk's backed pages, in page
-order, into the next pages of the destination; a chunk whose pages the rest of the destination
-cannot hold ends the walk at that chunk, the reply naming the pages it needs. It stops after
-`CAPTURE_SUPPLIED` (4) chunks written, `DESCRIPTORS_MAX` (16) chunks described, or
-`CAPTURE_VISITS` (64) chunks and regions visited ([docs/limits.md](../../../docs/limits.md)
-§ memmgr).
+memmgr walks the process's regions that `[cursor, end)` meets, in address order. A region whose
+base the walk reaches it describes first; then the region's chunks from there, each chunk that has
+an entry, and the chunks with none between as one range. In an attachment of an object other than
+the image and the zero object it describes each chunk, and writes each of its pages. A region's
+class is that of its `REGISTER_REGION` (a demand region) or its `ATTACH_OBJECT`: an attachment of
+the object `CAPTURE_IMAGE` names (the image), of the zero object, or of any other object. Of a
+chunk it has the content of, it writes the pages it holds, in page order, into the next pages of
+the destination: the chunk's backed pages (the process's own, and in an attachment its own
+copies), and in an attachment of another object each other page from the object. A chunk whose
+pages the rest of the destination cannot hold ends the walk at that chunk, the reply naming the
+pages it needs. It stops after `CAPTURE_SUPPLIED` (4) chunks written, `DESCRIPTORS_MAX` (15)
+descriptors, or `CAPTURE_VISITS` (64) regions, chunks and ranges visited
+([docs/limits.md](../../../docs/limits.md) § memmgr), never between a region and its first chunk or
+range: a walk that stops there stops at the region's base, before its descriptor.
 
-With `CAPTURE_COUNT`, the request carries no cap and memmgr writes nothing: it counts the backed
-pages of the evicted chunks of the range, those on disk included and lost ones aside, so procmgr can
-take frames for them before it holds the process, and posts each chunk on disk to the swap service,
+With `CAPTURE_COUNT`, the request carries no destination cap and memmgr writes nothing: it counts
+the pages it would write that no mapping of the process shows, the backed pages of the evicted
+chunks of the range, those on disk included and lost ones aside, and the pages of attachments of
+an object other than the image and the zero object with no copy of their own, so procmgr can take
+frames for them before it holds the process; and it posts each chunk on disk to the swap service,
 counting those it posted.
 
 **Reply (success):**
@@ -1540,17 +1553,37 @@ counting those it posted.
 |---|---|
 | label | 0 |
 | data[0] | the cursor the next request goes on from: the end when the walk is done |
-| data[1] | the destination pages written; with `CAPTURE_COUNT`, the backed pages of the evicted chunks walked |
+| data[1] | the destination pages written; with `CAPTURE_COUNT`, the pages counted |
 | data[2] | the destination pages the chunk at `data[0]` needs, when the walk stopped for want of them, else 0; with `CAPTURE_COUNT`, the chunks on disk walked whose slot word memmgr posted |
-| data[3] | the count of descriptors, at most `DESCRIPTORS_MAX` (16); absent with `CAPTURE_COUNT` |
-| data[4 + 2i], data[5 + 2i] | descriptor `i` (`ipc::memmgr_capture::Descriptor`): the chunk's base; then its backed pages in bits 0 to 15, one bit a page, its page count in bits 16 to 23, its region's `MAP_*` protection in bits 24 to 31, and what memmgr did with it in bits 32 and 33: `SUPPLIED` (0, its backed pages written, in page order, after the chunk's before it), `PENDING` (1, on disk, its slot word posted to the swap service), or `ABSENT` (2: lost, on disk with no swap service to ask, its stored bytes failed to decode, or memmgr could not map its frames or store runs to read them) |
+| data[3] | the count of descriptors, at most `DESCRIPTORS_MAX` (15); absent with `CAPTURE_COUNT` |
+| data[4 + 4i] to data[7 + 4i] | descriptor `i` (`ipc::memmgr_capture::Descriptor`), in address order: its address, its pages, its kind in bits 0 to 3 of its third word and the kind's fields, and a fourth word |
+
+A descriptor is one of three kinds:
+
+- `REGION` (0): a region's base and pages; its `MAP_*` protection in bits 8 to 15, its class in
+  bits 16 to 19 (0 demand, 1 the image, 2 the zero object, 3 another object), and `COMMIT`,
+  `NO_EVICT` and `PRIVATE` (an `ATTACH_PRIVATE` attachment) in bits 20 to 22; the fourth word, an
+  attachment's first object page, else 0. A reader treats a class it does not know as a region no
+  page of which it can read.
+- `CHUNK` (1): a chunk's base and pages (16, or fewer for a region's last); its backed pages in
+  bits 16 to 31, one bit a page; the pages memmgr wrote, in bits 32 to 47, in page order after
+  those of the chunk before it; bit 48 set when the chunk is on disk and memmgr posted its slot
+  word to the swap service; the fourth word 0. A backed page memmgr did not write it could not
+  read: the chunk is lost, on disk, or held where memmgr could not decode or map it.
+- `RANGE` (2): whole chunks of one region with no entry, by their first page and their pages: no
+  fault backed a page of them, so each is what the region's class gives: zero for a demand region
+  or the zero object, the image's page at its offset for the image.
+
+A page of a `CHUNK` neither backed nor written is, likewise, what its region's class gives; in an
+attachment of another object memmgr writes every page its object holds, so such a page is one it
+could not read.
 
 **Error codes:**
 
 | Code | Name | Meaning |
 |---|---|---|
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A destination page could not be mapped |
-| 4 | `INVALID_ARGUMENT` | Unknown badge, an end not past the cursor, a flag bit not defined, or a destination page count missing for a cap |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, an end not past the cursor, a cursor or end not on a page or inside a region off a chunk's base, a flag bit not defined, `CAPTURE_IMAGE` without a cap or with one that names no object, or a destination page count missing for a cap |
 | 5 | `UNAUTHORIZED` | The caller is not procmgr |
 
 ### Kernel-origin fault message (`FAULT_LABEL`)

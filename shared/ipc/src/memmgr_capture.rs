@@ -5,24 +5,27 @@
 
 //! The wire shapes of memmgr's `CAPTURE_CHUNKS` (`memmgr_labels::CAPTURE_CHUNKS`):
 //! the destination pages a request names across the Memory caps it carries,
-//! and the chunk descriptors a reply carries. Specified in
+//! and the descriptors a reply carries. Specified in
 //! `services/memmgr/docs/ipc-interface.md` § Label 31: `CAPTURE_CHUNKS`.
 //!
 //! A request's destination is one run of pages: from page `data[4]` of
 //! `caps[0]` to the end of the pages `data[5]` gives it, then the pages of
 //! each later cap from its first, as `data[5 + i]` gives them for `caps[i]`
-//! ([`dest_spans`]). memmgr writes the backed pages of each chunk it supplies
-//! there, in page order, after those of the chunk before it. A reply names
-//! each chunk it reached in a [`Descriptor`] of [`DESCRIPTOR_WORDS`] words,
-//! from `data[REPLY_WORDS]`, in ascending address order.
+//! ([`dest_spans`]). A reply describes every page of the process's regions
+//! it reached, in [`Descriptor`]s of [`DESCRIPTOR_WORDS`] words from
+//! `data[REPLY_WORDS]`, in ascending address order: each region's extent and
+//! the arguments that made it ([`Region`]), then its chunks, each a
+//! [`Chunk`] or, for chunks with no entry, a [`Descriptor::Range`]. memmgr
+//! writes the pages a chunk's [`Chunk::written`] names into the destination,
+//! in page order, after those of the chunk before it.
 
 // Under `rustc-dep-of-std` the crate root is `no_core`, and a submodule needs
 // its own prelude import (see `recv_guard.rs`).
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-/// Request words before the page count of each cap: the badge, the cursor,
-/// the end, the flags, and the page offset into `caps[0]`.
+/// Request words before the page count of each destination cap: the badge,
+/// the cursor, the end, the flags, and the page offset into `caps[0]`.
 pub const REQUEST_WORDS: usize = 5;
 
 /// Reply words before the descriptors: the next cursor, the destination
@@ -32,135 +35,275 @@ pub const REQUEST_WORDS: usize = 5;
 pub const REPLY_WORDS: usize = 4;
 
 /// Words of one [`Descriptor`].
-pub const DESCRIPTOR_WORDS: usize = 2;
+pub const DESCRIPTOR_WORDS: usize = 4;
 
-/// Descriptors one reply carries at most: a bound memmgr's walk keeps, well
-/// inside the message's data words.
-pub const DESCRIPTORS_MAX: usize = 16;
+/// Descriptors one reply carries at most: as many as the message's data
+/// words hold after the reply's own.
+pub const DESCRIPTORS_MAX: usize =
+    (syscall_abi::MSG_DATA_WORDS_MAX - REPLY_WORDS) / DESCRIPTOR_WORDS;
 
-const _: () =
-    assert!(REPLY_WORDS + DESCRIPTORS_MAX * DESCRIPTOR_WORDS <= syscall_abi::MSG_DATA_WORDS_MAX);
-
-/// What a reply says of a chunk's pages.
+/// What a region of the process is, as memmgr registered it: the class of
+/// the region and, for an attachment, of its origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Supply
+pub enum RegionClass
 {
-    /// memmgr wrote the chunk's backed pages into the destination, in page
-    /// order, at the place [`Descriptor::backed`]'s count of pages takes after
-    /// the chunks supplied before it.
-    Supplied,
-    /// The chunk is on disk and memmgr posted its slot word to the swap
-    /// service, which restores it ahead of a fault: the sender may ask again
-    /// for the chunk once the swap service has had time to restore it.
-    Pending,
-    /// memmgr holds no bytes it can give: a lost chunk, a chunk on disk with
-    /// no swap service to ask, or a chunk whose stored bytes failed to decode
-    /// or whose frames could not be mapped.
-    Absent,
+    /// A demand region (`REGISTER_REGION`): a page no fault backed reads zero.
+    Demand,
+    /// An attachment of the object the request named as the process's image
+    /// (`CAPTURE_IMAGE`): a page with no copy of its own is the object's page
+    /// at its offset from [`Region::first_page`].
+    Image,
+    /// An attachment of the zero object: a page with no copy of its own reads
+    /// zero.
+    Zero,
+    /// An attachment of any other object: memmgr writes each of its pages.
+    Object,
+    /// A class this side does not know, by its code: a reader records the
+    /// region's every page absent.
+    Unknown(u64),
 }
 
-impl Supply
+impl RegionClass
 {
     const fn code(self) -> u64
     {
         match self
         {
-            Self::Supplied => 0,
-            Self::Pending => 1,
-            Self::Absent => 2,
+            Self::Demand => 0,
+            Self::Image => 1,
+            Self::Zero => 2,
+            Self::Object => 3,
+            Self::Unknown(code) => code & CLASS_MASK,
         }
     }
 
-    const fn from_code(code: u64) -> Option<Self>
+    const fn from_code(code: u64) -> Self
     {
         match code
         {
-            0 => Some(Self::Supplied),
-            1 => Some(Self::Pending),
-            2 => Some(Self::Absent),
-            _ => None,
+            0 => Self::Demand,
+            1 => Self::Image,
+            2 => Self::Zero,
+            3 => Self::Object,
+            other => Self::Unknown(other),
         }
+    }
+
+    /// Whether the class is an attachment's, whose `first_page` names an
+    /// object page.
+    #[must_use]
+    pub const fn attached(self) -> bool
+    {
+        matches!(self, Self::Image | Self::Zero | Self::Object)
     }
 }
 
-/// One chunk a reply reached: its range, its backed pages, its region's
-/// protection, and what memmgr did with it.
+/// [`Region::flags`] bit: a committed region (`REGION_COMMIT`).
+pub const REGION_COMMITTED: u64 = 1 << 0;
+/// [`Region::flags`] bit: a region registered no-evict (`REGION_NO_EVICT`).
+pub const REGION_NO_EVICT: u64 = 1 << 1;
+/// [`Region::flags`] bit: a private attachment (`ATTACH_PRIVATE`).
+pub const REGION_PRIVATE: u64 = 1 << 2;
+/// The [`Region::flags`] bits.
+pub const REGION_FLAGS: u64 = REGION_COMMITTED | REGION_NO_EVICT | REGION_PRIVATE;
+
+/// One region of the process: its extent and the arguments of the
+/// `REGISTER_REGION` or `ATTACH_OBJECT` that made it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Descriptor
+pub struct Region
+{
+    /// The region's base, page-aligned.
+    pub va: u64,
+    /// Its pages, at least 1.
+    pub pages: u64,
+    /// Its class.
+    pub class: RegionClass,
+    /// Its `MAP_*` protection.
+    pub prot: u64,
+    /// [`REGION_COMMITTED`], [`REGION_NO_EVICT`], [`REGION_PRIVATE`].
+    pub flags: u64,
+    /// For an attachment, the object page at its base; else 0.
+    pub first_page: u64,
+}
+
+impl Region
+{
+    /// The region's end, exclusive.
+    #[must_use]
+    pub const fn end(&self) -> u64
+    {
+        self.va
+            .saturating_add(self.pages.saturating_mul(syscall_abi::PAGE_SIZE))
+    }
+}
+
+/// One chunk of a region that has an entry, or, for an attachment of
+/// another object, any chunk: what memmgr holds of each of its pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunk
 {
     /// The chunk's base: a page boundary, a whole number of chunks above its
     /// region's base.
     pub va: u64,
-    /// The chunk's pages: `DEMAND_CHUNK_BYTES` of pages, or fewer for the
-    /// last chunk of a region.
+    /// The chunk's pages: `DEMAND_CHUNK_PAGES`, or fewer for the last chunk
+    /// of a region.
     pub pages: u64,
-    /// The chunk's backed pages, bit `i` for its page `i`.
+    /// The pages a run backs, bit `i` for page `i`: the process's own pages.
     pub backed: u16,
-    /// The protection of the chunk's region, `MAP_*` bits.
-    pub prot: u64,
-    /// What memmgr did with the chunk.
-    pub supply: Supply,
+    /// The pages memmgr wrote into the destination, in page order: its
+    /// backed pages it could read, and for an attachment of another object
+    /// each page with no copy of its own, from the object.
+    pub written: u16,
+    /// The chunk is on disk and memmgr posted its slot word to the swap
+    /// service: the sender may ask again for it once the swap service has had
+    /// time to restore it.
+    pub pending: bool,
 }
 
-/// Bit offset of [`Descriptor::pages`] in the second word.
-const PAGES_SHIFT: u32 = 16;
-/// Bit offset of [`Descriptor::prot`] in the second word.
-const PROT_SHIFT: u32 = 24;
-/// Bit offset of [`Descriptor::supply`] in the second word.
-const SUPPLY_SHIFT: u32 = 32;
-/// The mask of an 8-bit field.
+impl Chunk
+{
+    /// Pages of the destination the chunk takes: its written pages.
+    #[must_use]
+    pub const fn written_pages(&self) -> u64
+    {
+        self.written.count_ones() as u64
+    }
+
+    /// The chunk's end, exclusive.
+    #[must_use]
+    pub const fn end(&self) -> u64
+    {
+        self.va
+            .saturating_add(self.pages.saturating_mul(syscall_abi::PAGE_SIZE))
+    }
+}
+
+/// One descriptor of a reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Descriptor
+{
+    /// A region, before the first of its chunks a walk reaches from its base.
+    Region(Region),
+    /// A chunk.
+    Chunk(Chunk),
+    /// `pages` pages from `va`, whole chunks of one region with no entry:
+    /// no fault backed a page of them, so each is what the region's origin
+    /// gives (`RegionClass`).
+    Range
+    {
+        va: u64, pages: u64
+    },
+}
+
+/// The kind codes of a descriptor's third word, bits 0 to 3.
+const KIND_REGION: u64 = 0;
+const KIND_CHUNK: u64 = 1;
+const KIND_RANGE: u64 = 2;
+const KIND_MASK: u64 = 0xF;
+/// A region's protection, bits 8 to 15 of its third word.
+const PROT_SHIFT: u32 = 8;
+/// A region's class, bits 16 to 19.
+const CLASS_SHIFT: u32 = 16;
+const CLASS_MASK: u64 = 0xF;
+/// A region's flags, bits 20 to 22.
+const RFLAGS_SHIFT: u32 = 20;
+/// A chunk's backed mask, bits 16 to 31; its written mask, bits 32 to 47;
+/// its pending bit, 48.
+const BACKED_SHIFT: u32 = 16;
+const WRITTEN_SHIFT: u32 = 32;
+const PENDING_BIT: u64 = 1 << 48;
 const BYTE: u64 = 0xFF;
+const MASK16: u64 = 0xFFFF;
 
 impl Descriptor
 {
-    /// The descriptor's words: the base, then the backed mask in bits 0 to
-    /// 15, the pages in bits 16 to 23, the protection in bits 24 to 31, and
-    /// the supply in bits 32 to 33.
+    /// The descriptor's words: its address, its pages, its kind and fields,
+    /// and a region's first object page.
     #[must_use]
     pub const fn encode(&self) -> [u64; DESCRIPTOR_WORDS]
     {
-        [
-            self.va,
-            (self.backed as u64)
-                | ((self.pages & BYTE) << PAGES_SHIFT)
-                | ((self.prot & BYTE) << PROT_SHIFT)
-                | (self.supply.code() << SUPPLY_SHIFT),
-        ]
+        match *self
+        {
+            Self::Region(r) => [
+                r.va,
+                r.pages,
+                KIND_REGION
+                    | ((r.prot & BYTE) << PROT_SHIFT)
+                    | (r.class.code() << CLASS_SHIFT)
+                    | ((r.flags & REGION_FLAGS) << RFLAGS_SHIFT),
+                r.first_page,
+            ],
+            Self::Chunk(c) => [
+                c.va,
+                c.pages,
+                KIND_CHUNK
+                    | ((c.backed as u64) << BACKED_SHIFT)
+                    | ((c.written as u64) << WRITTEN_SHIFT)
+                    | if c.pending { PENDING_BIT } else { 0 },
+                0,
+            ],
+            Self::Range { va, pages } => [va, pages, KIND_RANGE, 0],
+        }
     }
 
-    /// The descriptor `words` hold, or `None` when they name no supply, a
-    /// chunk of no page or of more than the backed mask holds, a backed page
-    /// past the chunk's pages, or set a bit past the supply's.
+    /// The descriptor `words` hold, or `None` when they name no kind, set
+    /// a bit no field of the kind has, describe no page, are not
+    /// page-aligned, or name a chunk of more pages than its masks hold or a
+    /// page of a mask past them. A region class this side does not know
+    /// decodes, as [`RegionClass::Unknown`].
     #[must_use]
     pub const fn decode(words: [u64; DESCRIPTOR_WORDS]) -> Option<Self>
     {
-        let [va, flags] = words;
-        let pages = (flags >> PAGES_SHIFT) & BYTE;
-        let backed = (flags & 0xFFFF) as u16;
-        let Some(supply) = Supply::from_code(flags >> SUPPLY_SHIFT)
-        else
-        {
-            return None;
-        };
-        if pages == 0 || pages > u16::BITS as u64 || (backed as u64) >> pages != 0
+        let [va, pages, flags, extra] = words;
+        if pages == 0 || va % syscall_abi::PAGE_SIZE != 0
         {
             return None;
         }
-        Some(Self {
-            va,
-            pages,
-            backed,
-            prot: (flags >> PROT_SHIFT) & BYTE,
-            supply,
-        })
-    }
-
-    /// Pages of the destination the chunk takes when supplied: its backed
-    /// pages.
-    #[must_use]
-    pub const fn backed_pages(&self) -> u64
-    {
-        self.backed.count_ones() as u64
+        match flags & KIND_MASK
+        {
+            KIND_REGION =>
+            {
+                let known = KIND_MASK
+                    | (BYTE << PROT_SHIFT)
+                    | (CLASS_MASK << CLASS_SHIFT)
+                    | (REGION_FLAGS << RFLAGS_SHIFT);
+                if flags & !known != 0
+                {
+                    return None;
+                }
+                Some(Self::Region(Region {
+                    va,
+                    pages,
+                    class: RegionClass::from_code((flags >> CLASS_SHIFT) & CLASS_MASK),
+                    prot: (flags >> PROT_SHIFT) & BYTE,
+                    flags: (flags >> RFLAGS_SHIFT) & REGION_FLAGS,
+                    first_page: extra,
+                }))
+            }
+            KIND_CHUNK =>
+            {
+                let known =
+                    KIND_MASK | (MASK16 << BACKED_SHIFT) | (MASK16 << WRITTEN_SHIFT) | PENDING_BIT;
+                let backed = ((flags >> BACKED_SHIFT) & MASK16) as u16;
+                let written = ((flags >> WRITTEN_SHIFT) & MASK16) as u16;
+                if flags & !known != 0
+                    || extra != 0
+                    || pages > u16::BITS as u64
+                    || ((backed | written) as u64) >> pages != 0
+                {
+                    return None;
+                }
+                Some(Self::Chunk(Chunk {
+                    va,
+                    pages,
+                    backed,
+                    written,
+                    pending: flags & PENDING_BIT != 0,
+                }))
+            }
+            KIND_RANGE if flags == KIND_RANGE && extra == 0 => Some(Self::Range { va, pages }),
+            _ => None,
+        }
     }
 }
 
@@ -209,54 +352,122 @@ mod tests
 
     extern crate alloc;
 
-    #[test]
-    fn descriptor_round_trips()
+    fn region(class: RegionClass, flags: u64, first_page: u64) -> Descriptor
     {
-        for supply in [Supply::Supplied, Supply::Pending, Supply::Absent]
-        {
-            let d = Descriptor {
-                va: 0x7fff_0001_3000,
+        Descriptor::Region(Region {
+            va: 0x7fff_0000_0000,
+            pages: 1 << 30,
+            class,
+            prot: 0b101,
+            flags,
+            first_page,
+        })
+    }
+
+    #[test]
+    fn descriptors_round_trip()
+    {
+        let all = [
+            region(RegionClass::Demand, REGION_COMMITTED | REGION_NO_EVICT, 0),
+            region(RegionClass::Image, 0, 7),
+            region(RegionClass::Zero, REGION_PRIVATE, 0),
+            region(RegionClass::Object, REGION_PRIVATE, u64::MAX),
+            region(RegionClass::Unknown(9), 0, 3),
+            Descriptor::Chunk(Chunk {
+                va: 0x7fff_0001_0000,
                 pages: 16,
                 backed: 0b1000_0000_0000_0101,
-                prot: 0b11,
-                supply,
-            };
+                written: 0b1000_0000_0000_0001,
+                pending: true,
+            }),
+            Descriptor::Chunk(Chunk {
+                va: 0x4000,
+                pages: 3,
+                backed: 0,
+                written: 0b111,
+                pending: false,
+            }),
+            Descriptor::Range {
+                va: 0x10_0000,
+                pages: u64::MAX >> 12,
+            },
+        ];
+        for d in all
+        {
             assert_eq!(Descriptor::decode(d.encode()), Some(d));
         }
-        let short = Descriptor {
-            va: 0x4000,
-            pages: 3,
-            backed: 0b101,
-            prot: 0b101,
-            supply: Supply::Supplied,
+        let Descriptor::Chunk(c) = all[5]
+        else
+        {
+            unreachable!()
         };
-        assert_eq!(Descriptor::decode(short.encode()), Some(short));
-        assert_eq!(short.backed_pages(), 2);
+        assert_eq!(c.written_pages(), 2);
+        assert_eq!(c.end(), 0x7fff_0002_0000);
     }
 
     #[test]
     fn decode_refuses_malformed_words()
     {
-        let good = Descriptor {
+        let chunk = Descriptor::Chunk(Chunk {
             va: 0x1_0000,
             pages: 4,
             backed: 0b1111,
-            prot: 1,
-            supply: Supply::Supplied,
-        }
+            written: 0b0011,
+            pending: false,
+        })
         .encode();
-        // No supply 3.
-        assert_eq!(Descriptor::decode([good[0], good[1] | (3 << 32)]), None);
-        // A bit past the supply.
-        assert_eq!(Descriptor::decode([good[0], good[1] | (1 << 40)]), None);
-        // A backed page past the chunk's four.
-        assert_eq!(Descriptor::decode([good[0], good[1] | (1 << 4)]), None);
-        // A chunk of no page, and of more than the mask holds.
-        assert_eq!(Descriptor::decode([good[0], good[1] & !(0xFF << 16)]), None);
+        // No kind 3, and a bit past a chunk's fields.
+        assert_eq!(Descriptor::decode([chunk[0], chunk[1], 3, 0]), None);
         assert_eq!(
-            Descriptor::decode([good[0], (good[1] & !(0xFF << 16)) | (17 << 16)]),
+            Descriptor::decode([chunk[0], chunk[1], chunk[2] | (1 << 50), 0]),
             None
         );
+        // A backed or written page past the chunk's four.
+        assert_eq!(
+            Descriptor::decode([chunk[0], chunk[1], chunk[2] | (1 << 20), 0]),
+            None
+        );
+        assert_eq!(
+            Descriptor::decode([chunk[0], chunk[1], chunk[2] | (1 << 36), 0]),
+            None
+        );
+        // A chunk of more pages than the masks hold, of no page, or unaligned.
+        assert_eq!(Descriptor::decode([chunk[0], 17, chunk[2], 0]), None);
+        assert_eq!(Descriptor::decode([chunk[0], 0, chunk[2], 0]), None);
+        assert_eq!(Descriptor::decode([chunk[0] + 1, 4, chunk[2], 0]), None);
+        // A chunk or a range with a fourth word.
+        assert_eq!(Descriptor::decode([chunk[0], chunk[1], chunk[2], 1]), None);
+        assert_eq!(Descriptor::decode([0x1000, 1, KIND_RANGE, 1]), None);
+        // A region with a bit past its flags.
+        let r = region(RegionClass::Demand, 0, 0).encode();
+        assert_eq!(Descriptor::decode([r[0], r[1], r[2] | (1 << 23), 0]), None);
+    }
+
+    #[test]
+    fn an_unknown_region_class_decodes_as_unknown()
+    {
+        let r = region(RegionClass::Demand, 0, 0).encode();
+        let d = Descriptor::decode([r[0], r[1], r[2] | (15 << CLASS_SHIFT), 0]);
+        assert!(matches!(
+            d,
+            Some(Descriptor::Region(Region {
+                class: RegionClass::Unknown(15),
+                ..
+            }))
+        ));
+        assert!(!RegionClass::Unknown(15).attached());
+        assert!(RegionClass::Image.attached());
+    }
+
+    #[test]
+    fn a_reply_holds_its_descriptors()
+    {
+        assert_eq!(DESCRIPTORS_MAX, 15);
+        const {
+            assert!(
+                REPLY_WORDS + DESCRIPTORS_MAX * DESCRIPTOR_WORDS <= syscall_abi::MSG_DATA_WORDS_MAX
+            );
+        };
     }
 
     fn spans(offset: u64, pages: &[u64], from: u64, count: u64) -> Option<Vec<(usize, u64, u64)>>

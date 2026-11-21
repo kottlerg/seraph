@@ -631,30 +631,38 @@ pub const OBJECT_RELEASE: u64 = 29;
 /// could not be made or mapped). Specified in `services/memmgr/docs/ipc-interface.md` § Label 30:
 /// `MAKE_PRIVATE`.
 pub const MAKE_PRIVATE: u64 = 30;
-/// Procmgr-only: copy the content of a process's demand chunks into Memory
-/// caps the request carries, wherever memmgr holds it, for `SNAPSHOT`
-/// (`procmgr_labels::SNAPSHOT`). memmgr walks the chunks with an entry of the
-/// process's demand regions in `[cursor, end)`, attachments passed over, and
-/// for each writes its backed pages, in page order, into the next pages of the
-/// destination: from its frames when it is resident, being evicted, or raw,
-/// and decoded from its store when it is compressed. It maps nothing into the
-/// process, draws no frame, and evicts nothing. A chunk on disk it posts to
-/// the swap service, as [`MAKE_RESIDENT`] does, and reports pending; a lost
-/// one, one on disk with no swap service to ask, and one it cannot read (its
-/// stored bytes fail to decode, or its frames or store runs cannot be mapped)
-/// it reports absent.
+/// Procmgr-only: describe every page of a process's regions, and copy the
+/// content memmgr holds of them into Memory caps the request carries, for
+/// `SNAPSHOT` (`procmgr_labels::SNAPSHOT`). memmgr walks the process's
+/// regions in `[cursor, end)`, demand regions and attachments alike, and
+/// describes each region (its extent and the arguments that made it), then
+/// each of its chunks: a chunk with an entry, and each chunk of an attachment
+/// of an object other than the image the request names, by what memmgr holds
+/// of each page; whole chunks with no entry by one range, whose pages are what
+/// the region's origin gives. It writes the pages it holds bytes of into the
+/// next pages of the destination, in page order: a chunk's backed pages from
+/// its frames when it is resident, being evicted, or raw, decoded from its
+/// store when it is compressed, and an attachment's pages with no copy of their
+/// own from the object, for an object other than the image. It maps nothing
+/// into the process, draws no frame, and evicts nothing. A chunk on disk it
+/// posts to the swap service, as [`MAKE_RESIDENT`] does, and reports
+/// pending; a lost one, one on disk with no swap service to ask, and one it
+/// cannot read (its stored bytes fail to decode, or its frames or store runs
+/// cannot be mapped) it reports with its backed pages unwritten.
 ///
 /// Wire format (`crate::memmgr_capture`):
 /// * `data[0]` — the process's memmgr badge (from its `REGISTER_PROCESS`
 ///   reply).
-/// * `data[1]` — the cursor, where the walk starts.
-/// * `data[2]` — the end, past the cursor.
-/// * `data[3]` — flags: [`CAPTURE_COUNT`], or 0.
+/// * `data[1]` — the cursor, where the walk starts: page-aligned, and the
+///   base of a chunk when it lies in a region.
+/// * `data[2]` — the end, past the cursor, aligned as the cursor is.
+/// * `data[3]` — flags: [`CAPTURE_COUNT`], [`CAPTURE_IMAGE`], or 0.
 /// * `data[4]` — the page offset into `caps[0]` where the destination starts.
 /// * `data[5 + i]` — the destination pages of `caps[i]`, from that offset for
 ///   `caps[0]`.
-/// * `caps[0..4]` — Memory caps with the map and write rights, which memmgr
-///   deletes once it has served the request.
+/// * `caps` — Memory caps with the map and write rights, then, with
+///   [`CAPTURE_IMAGE`], the process's image object handle; memmgr deletes
+///   each once it has served the request.
 ///
 /// Reply: `memmgr_errors::SUCCESS` with `data[0]` the cursor the next
 /// request goes on from (the end when the walk is done), `data[1]` the
@@ -662,18 +670,24 @@ pub const MAKE_PRIVATE: u64 = 30;
 /// `data[0]` needs when the walk stopped for want of them (else 0),
 /// `data[3]` the descriptor count, and the descriptors from `data[4]`
 /// (`memmgr_capture::Descriptor`). With [`CAPTURE_COUNT`]: `data[0]` the
-/// cursor, `data[1]` the backed pages of the evicted chunks walked, lost ones
-/// aside, and `data[2]` the chunks on disk walked whose slot word memmgr
-/// posted. `UNAUTHORIZED` (caller is not procmgr); `INVALID_ARGUMENT`
-/// (unknown badge, an end not past the cursor, a flag bit not defined, or a
-/// page count missing for a cap); `OUT_OF_MEMORY_BEST_EFFORT` (a destination
-/// page could not be mapped). Specified in
+/// cursor, `data[1]` the pages a copy request would write that the process
+/// does not map, and `data[2]` the chunks on disk walked whose slot word
+/// memmgr posted. `UNAUTHORIZED` (caller is not procmgr); `INVALID_ARGUMENT`
+/// (unknown badge, an end not past the cursor, a cursor or an end inside a
+/// chunk, a flag bit not defined, a page count missing for a cap, or an image
+/// handle that names no live object); `OUT_OF_MEMORY_BEST_EFFORT` (a
+/// destination page could not be mapped). Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 31: `CAPTURE_CHUNKS`.
 pub const CAPTURE_CHUNKS: u64 = 31;
-/// [`CAPTURE_CHUNKS`] request `data[3]` bit: copy nothing, count the backed
-/// pages of the evicted chunks and the chunks on disk, posting each chunk on
-/// disk to the swap service. The request carries no cap.
+/// [`CAPTURE_CHUNKS`] request `data[3]` bit: copy nothing, count the pages a
+/// copy would write that the process does not map and the chunks on disk,
+/// posting each chunk on disk to the swap service. The request carries no
+/// destination cap.
 pub const CAPTURE_COUNT: u64 = 1;
+/// [`CAPTURE_CHUNKS`] request `data[3]` bit: the last cap is the process's
+/// image object handle, whose attachments memmgr describes as the image's
+/// pages and does not copy.
+pub const CAPTURE_IMAGE: u64 = 1 << 1;
 
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.

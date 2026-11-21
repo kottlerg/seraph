@@ -46,7 +46,8 @@ procmgr/
 │   │                           #   read's file, its verification, the read-only hand-over;
 │   │                           #   an image object's frames and its seal
 │   ├── image_cache.rs          # The shared image objects, the image store, attachment
-│   ├── snapshot.rs             # SNAPSHOT: the held capture, the account's grants, the seal
+│   ├── snapshot.rs             # SNAPSHOT: the held capture, the image it names, the
+│   │                           #   account's grants, the seal
 │   ├── trust_store.rs          # The trust store the bootloader hands forward
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
@@ -155,7 +156,7 @@ procmgr/
   `MAKE_PRIVATE`, which have memmgr make a range of a process resident, or
   give its memory-object pages copies of their own, for a holder about to
   read or patch it; `SNAPSHOT`, which holds a process's address space while
-  it copies the pages into a memory object charged to the holder; and
+  it records its pages in a memory object charged to the holder; and
   `DECLARE_NO_DEBUG`, by which
   a process opts out of the crash endpoint and the attach. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § Crash Endpoint and Debug

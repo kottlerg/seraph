@@ -3,23 +3,28 @@
 
 // services/procmgr/src/snapshot.rs
 
-//! `SNAPSHOT`: capture a live process's mapped pages into a memory object
-//! charged to the snapshotter (services/procmgr/docs/ipc-interface.md
-//! § Label 33: `SNAPSHOT`).
+//! `SNAPSHOT`: capture a live process's pages into a memory object charged to
+//! the snapshotter (services/procmgr/docs/ipc-interface.md § Label 33:
+//! `SNAPSHOT`).
 //!
-//! Before the hold, procmgr has memmgr post the target's chunks on disk to the
-//! swap service and count its evicted pages (`memmgr_labels::CAPTURE_COUNT`),
-//! waits a bounded time while the swap service restores them, lists the
-//! target's mapped pages, and requests frames for both on the snapshotter's
-//! account. It then holds the target's address space (`SYS_ASPACE_HOLD`), so
-//! no thread of it runs, registered or not, and lists the pages again. memmgr
-//! writes the content of every demand chunk of the target into the frames
+//! Every request to memmgr names the target's image object, when procmgr
+//! shares one with it (`memmgr_labels::CAPTURE_IMAGE`), so memmgr reports the
+//! pages the target attaches of it, and has no copy of, by their image page
+//! instead of their bytes. Before the hold, procmgr has memmgr post the
+//! target's chunks on disk to the swap service and count the pages of its
+//! regions it would write that no mapping shows
+//! (`memmgr_labels::CAPTURE_COUNT`), waits a bounded time while the swap
+//! service restores them, lists the target's mapped pages, and requests frames
+//! for both on the snapshotter's account. It then holds the target's address
+//! space (`SYS_ASPACE_HOLD`), so no thread of it runs, registered or not, and
+//! lists the pages again. memmgr describes every region of the target and
+//! writes what it holds of each into the frames
 //! (`memmgr_labels::CAPTURE_CHUNKS`), from wherever it holds each chunk in that
 //! turn, so no eviction meanwhile can move a chunk's content out of the
 //! capture; a chunk still on disk it posts to the swap service, and procmgr
 //! asks for it again after a pause, waiting a bounded time while the swap
-//! service restores it. procmgr copies every other listed page with
-//! `SYS_THREAD_READ_MEM` into the next frames and releases the space. After
+//! service restores it. procmgr copies every listed page outside the regions
+//! with `SYS_THREAD_READ_MEM` into the next frames and releases the space. After
 //! the release it builds the layout (`process_table::snapshot::layout`),
 //! writes it into frames of its own grant, and seals the layout and the data,
 //! in that order, into one memory object on the account.
@@ -35,11 +40,11 @@
 
 use crate::process::CapGuard;
 use ipc::memmgr_capture::{
-    DESCRIPTOR_WORDS, DESCRIPTORS_MAX, Descriptor, REPLY_WORDS, REQUEST_WORDS, Supply,
+    Chunk, DESCRIPTOR_WORDS, DESCRIPTORS_MAX, Descriptor, REPLY_WORDS, REQUEST_WORDS,
 };
-use ipc::procmgr_snapshot::{Header, SNAPSHOT_COMPLETE};
+use ipc::procmgr_snapshot::{Header, IMAGE_HASH_BYTES, Image, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
-use process_table::snapshot::{Chunk, Layout, Listing, copied_pages, layout, outside};
+use process_table::snapshot::{Described, Layout, Listing, Placed, copied_pages, layout, outside};
 use std::collections::TryReserveError;
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use std::time::Duration;
@@ -64,6 +69,10 @@ const WINDOW_PAGES: u64 = 64;
 // `SYS_THREAD_READ_MEM` copies at most `MAX_THREAD_MEM_COPY` bytes a call,
 // and the copy reads a page a call.
 const _: () = assert!(MAX_THREAD_MEM_COPY as u64 == PAGE_SIZE);
+
+/// Destination caps one `CAPTURE_CHUNKS` request carries at most: all of a
+/// message's cap slots but the last, which carries the image's handle.
+const DEST_CAPS: usize = MSG_CAP_SLOTS_MAX - 1;
 
 /// Region ids one `RELEASE_MEMORY_CAPS` names: every data word after the count.
 const RELEASE_IDS_PER_CALL: usize = syscall_abi::MSG_DATA_WORDS_MAX - 1;
@@ -102,6 +111,19 @@ pub struct Target
     pub thread: CapGuard,
     /// The target's memmgr badge, which names it to `CAPTURE_CHUNKS`.
     pub memmgr_badge: u64,
+    /// The image the target attaches, when procmgr shares one with it.
+    pub image: Option<TargetImage>,
+}
+
+/// The image a target attaches (services/procmgr/README.md § Image
+/// Sharing): a copy of its object's handle, taken under the image cache's
+/// lock, and the body it is the image of, which the layout's header names.
+pub struct TargetImage
+{
+    /// A SEND copy of the object's handle.
+    pub handle: CapGuard,
+    /// The body's SHA-512 and length.
+    pub image: Image,
 }
 
 /// A capture's object: its handle, its pages, and whether no run is absent.
@@ -135,37 +157,38 @@ pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured,
     // Before the hold: the chunks on disk asked for and waited on, and the
     // frames for what is mapped and what memmgr holds evicted then. Each
     // chunk is read under the hold, wherever memmgr holds it then.
-    let evicted = survey(ctx, target.memmgr_badge, top)?;
+    let unmapped = survey(ctx, target, top)?;
     let mut data = Grants::new(&account);
     data.cover(
         list(target.thread.cap(), top)?
             .copied_pages()
-            .saturating_add(evicted),
+            .saturating_add(unmapped),
     )?;
     let mut window = Window::new(ctx.self_aspace)?;
 
     let hold = Hold::take(target.aspace.cap())?;
     let listing = list(target.thread.cap(), top)?;
-    let mut chunks = Chunks::default();
-    chunks.walk(ctx, target.memmgr_badge, (0, top), &mut data)?;
-    chunks.await_disk(ctx, target.memmgr_badge, &mut data)?;
-    let outside = outside(listing.runs(), &chunks.list).map_err(runs_code)?;
-    data.cover(chunks.filled.saturating_add(copied_pages(&outside)))?;
+    let mut inside = Capture::default();
+    inside.walk(ctx, target, (0, top), &mut data)?;
+    inside.await_disk(ctx, target, &mut data)?;
+    let outside = outside(listing.runs(), &inside.described.regions).map_err(runs_code)?;
+    data.cover(inside.filled.saturating_add(copied_pages(&outside)))?;
     let failed = copy(
         target.thread.cap(),
         &outside,
-        chunks.filled,
+        inside.filled,
         &data,
         &mut window,
     )?;
     drop(hold);
     drop(window);
 
-    let layout = layout(&outside, chunks.filled, &failed, &chunks.list).map_err(runs_code)?;
+    let layout = layout(&outside, inside.filled, &failed, &inside.described).map_err(runs_code)?;
     data.keep(layout.data_pages);
     let mut head = Grants::new(&account);
     head.cover(layout.layout_pages)?;
-    write_layout(ctx.self_aspace, &head, &layout)?;
+    let image = target.image.as_ref().map(|i| i.image);
+    write_layout(ctx.self_aspace, &head, &layout, image)?;
     let (handle, pages) = seal(&account, head, data)?;
     Ok(Captured {
         handle,
@@ -213,17 +236,17 @@ fn memmgr_call(ctx: &Context, msg: &IpcMessage) -> Result<IpcMessage, u64>
 }
 
 /// Have memmgr post every chunk of the target on disk to the swap service and
-/// count its evicted pages (`CAPTURE_COUNT`), over the user half up to `top`,
-/// again after each pause of [`CAPTURE_PAUSE_MS`] while chunks on disk
-/// remain, until none does or [`CAPTURE_STALL_PAUSES`] pauses in a row leave
-/// no fewer. Returns the backed pages of the evicted chunks memmgr counted
-/// last, those on disk among them.
-fn survey(ctx: &Context, memmgr_badge: u64, top: u64) -> Result<u64, u64>
+/// count the pages it would write that no mapping shows (`CAPTURE_COUNT`),
+/// over the user half up to `top`, again after each pause of
+/// [`CAPTURE_PAUSE_MS`] while chunks on disk remain, until none does or
+/// [`CAPTURE_STALL_PAUSES`] pauses in a row leave no fewer. Returns the pages
+/// memmgr counted last.
+fn survey(ctx: &Context, target: &Target, top: u64) -> Result<u64, u64>
 {
     let (mut fewest, mut stalled) = (u64::MAX, 0u32);
     loop
     {
-        let (evicted, on_disk) = count(ctx, memmgr_badge, top)?;
+        let (unmapped, on_disk) = count(ctx, target, top)?;
         if on_disk < fewest
         {
             fewest = on_disk;
@@ -235,63 +258,111 @@ fn survey(ctx: &Context, memmgr_badge: u64, top: u64) -> Result<u64, u64>
         }
         if on_disk == 0 || stalled >= CAPTURE_STALL_PAUSES
         {
-            return Ok(evicted);
+            return Ok(unmapped);
         }
         std::thread::sleep(Duration::from_millis(CAPTURE_PAUSE_MS));
     }
 }
 
-/// One `CAPTURE_COUNT` pass over the user half up to `top`: the backed pages
-/// of the target's evicted chunks, and its chunks on disk memmgr posted.
-fn count(ctx: &Context, memmgr_badge: u64, top: u64) -> Result<(u64, u64), u64>
+/// One `CAPTURE_COUNT` pass over the user half up to `top`: the pages memmgr
+/// would write of the target's regions that no mapping shows, and its chunks
+/// on disk memmgr posted.
+fn count(ctx: &Context, target: &Target, top: u64) -> Result<(u64, u64), u64>
 {
-    let (mut evicted, mut on_disk, mut at) = (0u64, 0u64, 0u64);
+    let (mut unmapped, mut on_disk, mut at) = (0u64, 0u64, 0u64);
     while at < top
     {
-        let msg = IpcMessage::builder(memmgr_labels::CAPTURE_CHUNKS)
-            .word(0, memmgr_badge)
-            .word(1, at)
-            .word(2, top)
-            .word(3, memmgr_labels::CAPTURE_COUNT)
-            .build();
-        let reply = memmgr_call(ctx, &msg)?;
-        evicted = evicted.saturating_add(reply.word(1));
-        on_disk = on_disk.saturating_add(reply.word(2));
+        let (flags, image) = image_arg(target)?;
+        let words = [
+            target.memmgr_badge,
+            at,
+            top,
+            memmgr_labels::CAPTURE_COUNT | flags,
+        ];
+        let reply = call_with(ctx, &words, &[], image)?;
+        let (next, pages, posted) = (reply.word(0), reply.word(1), reply.word(2));
+        unmapped = unmapped.saturating_add(pages);
+        on_disk = on_disk.saturating_add(posted);
         // memmgr moves forward on every reply; one that did not would loop.
-        if reply.word(0) <= at
+        if next <= at
         {
             return Err(procmgr_errors::OUT_OF_MEMORY);
         }
-        at = reply.word(0);
+        at = next;
     }
-    Ok((evicted, on_disk))
+    Ok((unmapped, on_disk))
 }
 
-/// The target's demand chunks memmgr reached under the hold, in address
-/// order, and the data pages before the next chunk's: those the supplied
-/// chunks took, and any passed over because the grants that held them could
+/// Call memmgr on procmgr's own endpoint ([`memmgr_call`]) with a
+/// `CAPTURE_CHUNKS` request of the data words `words`, carrying the caps
+/// `caps`, then `image` when there is one, and return the reply. A call that fails deletes the caps: one refused before memmgr
+/// received it leaves them procmgr's, and a handle the call moved is stale,
+/// its delete failing harmlessly.
+fn call_with(
+    ctx: &Context,
+    words: &[u64],
+    caps: &[u64],
+    image: Option<u64>,
+) -> Result<IpcMessage, u64>
+{
+    let mut msg = IpcMessage::builder(memmgr_labels::CAPTURE_CHUNKS).words(0, words);
+    for &cap in caps.iter().chain(image.as_slice())
+    {
+        msg = msg.cap(cap);
+    }
+    let reply = memmgr_call(ctx, &msg.build());
+    if reply.is_err()
+    {
+        crate::release_caps(caps);
+        crate::release_caps(image.as_slice());
+    }
+    reply
+}
+
+/// The `CAPTURE_IMAGE` flag and a SEND copy of the image's handle for one
+/// `CAPTURE_CHUNKS` request on `target`, which memmgr deletes; no flag and
+/// no cap for a target with no image.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when the handle cannot be copied.
+fn image_arg(target: &Target) -> Result<(u64, Option<u64>), u64>
+{
+    let Some(image) = &target.image
+    else
+    {
+        return Ok((0, None));
+    };
+    let cap = syscall::cap_derive(image.handle.cap(), syscall::RIGHTS_EP_SEND)
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    Ok((memmgr_labels::CAPTURE_IMAGE, Some(cap)))
+}
+
+/// What memmgr described of the target's regions under the hold, in address
+/// order, and the data pages before the next chunk's: those the chunks it
+/// wrote took, and any passed over because the grants that held them could
 /// not hold a chunk in one request.
 #[derive(Default)]
-struct Chunks
+struct Capture
 {
-    list: Vec<Chunk>,
+    described: Described,
     filled: u64,
 }
 
-impl Chunks
+impl Capture
 {
-    /// Have memmgr supply every chunk of `range` into the data frames after
-    /// those filled (`CAPTURE_CHUNKS`), covering more frames on the account
-    /// when memmgr needs them, and add each chunk it names.
+    /// Have memmgr describe every region of `range` and write what it holds
+    /// of each into the data frames after those filled (`CAPTURE_CHUNKS`),
+    /// covering more frames on the account when memmgr needs them, and add
+    /// each descriptor.
     ///
     /// # Errors
     /// As [`memmgr_call`]; `OUT_OF_MEMORY` when the account refuses the
-    /// frames, procmgr's heap refuses the chunks, or memmgr's reply names a
-    /// chunk out of order, of no descriptor, or pages it did not write.
+    /// frames, procmgr's heap refuses the descriptors, or memmgr's reply
+    /// names one out of order or of no kind, or pages it did not write.
     fn walk(
         &mut self,
         ctx: &Context,
-        memmgr_badge: u64,
+        target: &Target,
         range: (u64, u64),
         data: &mut Grants<'_>,
     ) -> Result<(), u64>
@@ -299,28 +370,20 @@ impl Chunks
         let (mut at, end) = range;
         while at < end
         {
-            let reply = self.request(ctx, memmgr_badge, (at, end), data)?;
+            let reply = self.request(ctx, target, (at, end), data)?;
             let (next, used, need) = (reply.word(0), reply.word(1), reply.word(2));
             let count = usize::try_from(reply.word(3)).unwrap_or(usize::MAX);
             if count > DESCRIPTORS_MAX
             {
                 return Err(procmgr_errors::OUT_OF_MEMORY);
             }
-            self.list
-                .try_reserve(count)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-            let mut page = self.filled;
+            let (mut page, mut reached) = (self.filled, at);
             for i in 0..count
             {
                 let word = REPLY_WORDS.saturating_add(i.saturating_mul(DESCRIPTOR_WORDS));
-                let d = Descriptor::decode([reply.word(word), reply.word(word.saturating_add(1))])
-                    .filter(|d| d.va >= self.list.last().map_or(at, Chunk::end))
-                    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
-                self.list.push(Chunk::new(&d, page));
-                if d.supply == Supply::Supplied
-                {
-                    page = page.saturating_add(d.backed_pages());
-                }
+                let words = [0, 1, 2, 3].map(|k| reply.word(word.saturating_add(k)));
+                let d = Descriptor::decode(words).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+                reached = self.add(d, reached, &mut page)?;
             }
             if page != self.filled.saturating_add(used)
             {
@@ -348,10 +411,54 @@ impl Chunks
         Ok(())
     }
 
+    /// Add the descriptor `d`, which starts at or past `reached`, its
+    /// written pages from data page `page`, which moves past them. Returns
+    /// where the next descriptor starts at the earliest: a region's base, for
+    /// its first chunk or range, or the end of a chunk or range.
+    ///
+    /// # Errors
+    /// `OUT_OF_MEMORY` when `d` starts below `reached` or procmgr's heap
+    /// refuses it.
+    fn add(&mut self, d: Descriptor, reached: u64, page: &mut u64) -> Result<u64, u64>
+    {
+        let list = &mut self.described;
+        let reserved = match d
+        {
+            Descriptor::Region(_) => list.regions.try_reserve(1),
+            Descriptor::Chunk(_) => list.chunks.try_reserve(1),
+            Descriptor::Range { .. } => list.ranges.try_reserve(1),
+        };
+        reserved.map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        let (va, past) = match d
+        {
+            Descriptor::Region(r) => (r.va, r.va),
+            Descriptor::Chunk(c) => (c.va, c.end()),
+            Descriptor::Range { va, pages } =>
+            {
+                (va, va.saturating_add(pages.saturating_mul(PAGE_SIZE)))
+            }
+        };
+        if va < reached
+        {
+            return Err(procmgr_errors::OUT_OF_MEMORY);
+        }
+        match d
+        {
+            Descriptor::Region(r) => list.regions.push(r),
+            Descriptor::Chunk(chunk) =>
+            {
+                list.chunks.push(Placed { chunk, data: *page });
+                *page = page.saturating_add(chunk.written_pages());
+            }
+            Descriptor::Range { va, pages } => list.ranges.push((va, pages)),
+        }
+        Ok(past)
+    }
+
     /// Cover frames on the account, and pass over the data pages up to the
     /// next grant's first while needed, until the grants one request carries
     /// from the next data page hold `need` pages: a request carries at most
-    /// as many caps as a message does, so a chunk can need more pages than the
+    /// [`DEST_CAPS`] destination caps, so a chunk can need more pages than the
     /// grants from a page in a short grant hold, its rest passed over and left
     /// unused in the object.
     ///
@@ -371,33 +478,43 @@ impl Chunks
 
     /// One `CAPTURE_CHUNKS` request over `[at, end)`, carrying caps derived
     /// from the grants that hold the data pages after those filled, at most
-    /// as many as a message carries, and memmgr's reply.
+    /// [`DEST_CAPS`], then the image's handle when the target has one, and
+    /// memmgr's reply.
     fn request(
         &self,
         ctx: &Context,
-        memmgr_badge: u64,
+        target: &Target,
         (at, end): (u64, u64),
         data: &Grants<'_>,
     ) -> Result<IpcMessage, u64>
     {
         let (grants, offset) = data.at_page(self.filled);
-        let mut msg = IpcMessage::builder(memmgr_labels::CAPTURE_CHUNKS)
-            .word(0, memmgr_badge)
-            .word(1, at)
-            .word(2, end)
-            .word(3, 0)
-            .word(4, offset);
-        let mut derived = [0u64; MSG_CAP_SLOTS_MAX];
-        for (i, (grant, slot)) in grants.iter().zip(derived.iter_mut()).enumerate()
+        let (flags, image) = image_arg(target)?;
+        // The request's words: the target, the range, the flags, the offset
+        // into the first grant, then the pages of each grant from there.
+        let mut words = [0u64; REQUEST_WORDS + DEST_CAPS];
+        let (head, pages) = words.split_at_mut(REQUEST_WORDS);
+        for (slot, word) in head
+            .iter_mut()
+            .zip([target.memmgr_badge, at, end, flags, offset])
+        {
+            *slot = word;
+        }
+        let mut derived = [0u64; DEST_CAPS];
+        for (i, (grant, (slot, count))) in grants
+            .iter()
+            .zip(derived.iter_mut().zip(pages.iter_mut()))
+            .enumerate()
         {
             let Ok(cap) = syscall::cap_derive(grant.cap, syscall::RIGHTS_MEM_MAP_RW)
             else
             {
                 crate::release_caps(&derived);
+                crate::release_caps(image.as_slice());
                 return Err(procmgr_errors::OUT_OF_MEMORY);
             };
             *slot = cap;
-            let pages = if i == 0
+            *count = if i == 0
             {
                 grant.pages.saturating_sub(offset)
             }
@@ -405,65 +522,70 @@ impl Chunks
             {
                 grant.pages
             };
-            msg = msg.word(REQUEST_WORDS.saturating_add(i), pages).cap(cap);
         }
-        let reply = memmgr_call(ctx, &msg.build());
-        if reply.is_err()
-        {
-            // A call refused before memmgr received it leaves the caps
-            // procmgr's; a handle the call moved is stale, and its delete
-            // fails harmlessly.
-            crate::release_caps(&derived);
-        }
-        reply
+        let n = grants.len().min(DEST_CAPS);
+        call_with(
+            ctx,
+            words.get(..REQUEST_WORDS.saturating_add(n)).unwrap_or(&[]),
+            derived.get(..n).unwrap_or(&[]),
+            image,
+        )
     }
 
     /// Ask memmgr again, after each pause of [`CAPTURE_PAUSE_MS`], for each
     /// chunk on disk it posted to the swap service, until none is left or
     /// [`CAPTURE_STALL_PAUSES`] pauses in a row restore none; one still on disk
-    /// then is absent.
+    /// then has its backed pages absent.
     fn await_disk(
         &mut self,
         ctx: &Context,
-        memmgr_badge: u64,
+        target: &Target,
         data: &mut Grants<'_>,
     ) -> Result<(), u64>
     {
         let mut stalled = 0u32;
         while stalled < CAPTURE_STALL_PAUSES
-            && self.list.iter().any(|c| c.supply == Supply::Pending)
+            && self.described.chunks.iter().any(|p| p.chunk.pending)
         {
             std::thread::sleep(Duration::from_millis(CAPTURE_PAUSE_MS));
             let mut restored = false;
-            for i in 0..self.list.len()
+            for i in 0..self.described.chunks.len()
             {
-                let Some(chunk) = self
-                    .list
+                let Some(placed) = self
+                    .described
+                    .chunks
                     .get(i)
                     .copied()
-                    .filter(|c| c.supply == Supply::Pending)
+                    .filter(|p| p.chunk.pending)
                 else
                 {
                     continue;
                 };
+                let chunk = placed.chunk;
                 let mut again = Self {
-                    list: Vec::new(),
+                    described: Described::default(),
                     filled: self.filled,
                 };
-                again.walk(ctx, memmgr_badge, (chunk.va, chunk.end()), data)?;
+                again.walk(ctx, target, (chunk.va, chunk.end()), data)?;
                 self.filled = again.filled;
-                // A chunk memmgr names no more holds nothing to capture.
+                // A chunk memmgr names no more holds no page of its own: each
+                // is what its region's origin gives.
                 let now = again
-                    .list
+                    .described
+                    .chunks
                     .into_iter()
-                    .find(|c| c.va == chunk.va)
-                    .unwrap_or(Chunk {
-                        backed: 0,
-                        supply: Supply::Absent,
-                        ..chunk
+                    .find(|p| p.chunk.va == chunk.va)
+                    .unwrap_or(Placed {
+                        chunk: Chunk {
+                            backed: 0,
+                            written: 0,
+                            pending: false,
+                            ..chunk
+                        },
+                        data: placed.data,
                     });
-                restored |= now.supply != Supply::Pending;
-                if let Some(slot) = self.list.get_mut(i)
+                restored |= !now.chunk.pending;
+                if let Some(slot) = self.described.chunks.get_mut(i)
                 {
                     *slot = now;
                 }
@@ -724,8 +846,8 @@ impl<'a> Grants<'a>
     }
 
     /// The grants from the one holding page `index` of the grants, at most
-    /// as many as a message carries, and the page's offset in the first: none
-    /// when the grants hold no page `index`.
+    /// [`DEST_CAPS`], and the page's offset in the first: none when the
+    /// grants hold no page `index`.
     fn at_page(&self, index: u64) -> (&[Grant], u64)
     {
         let mut base = 0u64;
@@ -733,7 +855,7 @@ impl<'a> Grants<'a>
         {
             if index < base.saturating_add(grant.pages)
             {
-                let end = i.saturating_add(MSG_CAP_SLOTS_MAX).min(self.list.len());
+                let end = i.saturating_add(DEST_CAPS).min(self.list.len());
                 return (
                     self.list.get(i..end).unwrap_or(&[]),
                     index.saturating_sub(base),
@@ -932,8 +1054,14 @@ impl Drop for Window
     }
 }
 
-/// Write `layout` into the frames of `head`, mapped together for the write.
-fn write_layout(self_aspace: u64, head: &Grants<'_>, layout: &Layout) -> Result<(), u64>
+/// Write `layout`, of a capture that names `image`, into the frames of
+/// `head`, mapped together for the write.
+fn write_layout(
+    self_aspace: u64,
+    head: &Grants<'_>,
+    layout: &Layout,
+    image: Option<Image>,
+) -> Result<(), u64>
 {
     let pages = head.pages;
     let range = reserve_pages(pages).map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
@@ -968,7 +1096,7 @@ fn write_layout(self_aspace: u64, head: &Grants<'_>, layout: &Layout) -> Result<
         // SAFETY: the reservation's `pages` pages are mapped writable to frames
         // procmgr alone holds, and the slice ends before they are unmapped.
         let bytes = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, len) };
-        result = encode(bytes, layout);
+        result = encode(bytes, layout, image);
     }
     // SAFETY: the span is this reservation, and the slice over it has ended.
     if unsafe { syscall::mem_unmap(self_aspace, va, pages) }.is_ok()
@@ -982,26 +1110,45 @@ fn write_layout(self_aspace: u64, head: &Grants<'_>, layout: &Layout) -> Result<
     result
 }
 
-/// Encode `layout` at the start of `bytes`.
-fn encode(bytes: &mut [u8], layout: &Layout) -> Result<(), u64>
+/// Encode `layout`, of a capture that names `image`, at the start of
+/// `bytes`.
+fn encode(bytes: &mut [u8], layout: &Layout, image: Option<Image>) -> Result<(), u64>
 {
+    let mut flags = if layout.complete
+    {
+        SNAPSHOT_COMPLETE
+    }
+    else
+    {
+        0
+    };
+    if image.is_some()
+    {
+        flags |= SNAPSHOT_IMAGE;
+    }
+    let regions = layout.regions.len() as u64;
     let header = Header {
-        flags: if layout.complete
-        {
-            SNAPSHOT_COMPLETE
-        }
-        else
-        {
-            0
-        },
+        flags,
         layout_pages: layout.layout_pages,
         data_pages: layout.data_pages,
+        region_count: regions,
         run_count: layout.runs.len() as u64,
+        image: image.unwrap_or(Image {
+            hash: [0; IMAGE_HASH_BYTES],
+            len: 0,
+        }),
     };
     header.encode(bytes).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    for (i, region) in layout.regions.iter().enumerate()
+    {
+        region
+            .encode(bytes, i)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    }
     for (i, run) in layout.runs.iter().enumerate()
     {
-        run.encode(bytes, i).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        run.encode(bytes, regions, i)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
     }
     Ok(())
 }

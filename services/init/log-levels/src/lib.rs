@@ -234,7 +234,7 @@ mod tests
             attrs: objsig::Attributes {
                 body_len: u64::try_from(body.len()).unwrap(),
                 security_version: 1,
-                roles: objsig::RoleSet::of(&[objsig::Role::BootModule]),
+                roles: objsig::RoleSet::of(&[objsig::Role::Configuration]),
                 arch: objsig::Arch::X86_64,
                 body_hash: [0; 64],
                 name: b"/config/init/log-levels.conf",

@@ -37,8 +37,10 @@ nothing and reads no key; the bundle's entries are chosen by a list per harness 
 checks, once it has composed the ESP, that each object on it equals its installed file, and
 the pack then checks the same of the image it wrote, its ESP against its root partition
 (§ The ESP); the
-bootloader refuses an entry without the boot-module role; the default bundle is the bootstrap
-closure, the consoles' drivers and the platform description tables loaded from the root
+bootloader refuses an entry without the boot-module role, or, under `/config/` (a platform table
+excepted), without the configuration role, and a bundle without the boot-time policy
+`/config/boot/policy.conf` ([signing.md](signing.md) § Configuration); the default bundle is the
+bootstrap closure, the consoles' drivers and the platform description tables loaded from the root
 filesystem (§ The Bootstrap Closure); the bundle is used during bootstrap alone, apart from the
 IOMMU driver's image, which devmgr keeps for the driver's restart (§ Bootstrap-Only Boot Copies);
 the loss of the root filesystem's driver or of its disk is system death; and the ESP holds no
@@ -79,8 +81,9 @@ Composing the ESP copies files. It never signs, needs no key, and writes nothing
 object on the ESP is signed and public, and the trust stores the bootloader verifies against are
 built into it or kept in firmware storage ([signing.md](signing.md) § Trust Store). The build
 composes the ESP this way, and so does any later recomposition on a running system. The list names
-only objects that carry the boot-module role; the bootloader refuses an entry without it, so writing
-the list cannot make an object bootable that its signer did not permit.
+only objects that carry the boot-module role, or, under `/config/` (a platform table excepted), the
+configuration role; the bootloader refuses an entry without it, so writing the list cannot make an
+object bootable that its signer did not permit.
 
 An ESP whose objects all equal their installed files verifies as those files do. Composition
 checks that equality once it has written the ESP, and refuses an ESP it cannot establish it for:
@@ -102,6 +105,8 @@ loading from it, and nothing else. On the default boot that is:
 
 - `init`, which starts the bootstrap services, and the log-level configuration it reads before
   the root is mounted;
+- the boot-time policy, `/config/boot/policy.conf`, which every bundle carries: the bootloader
+  refuses a bundle without it ([signing.md](signing.md) § Configuration);
 - memmgr and procmgr, which init loads itself, and devmgr and vfsd, which it starts through
   procmgr ([process-lifecycle.md](process-lifecycle.md) § Userspace Boot Order);
 - the IOMMU driver of the architecture, which devmgr binds before any DMA-capable driver maps a
@@ -109,15 +114,15 @@ loading from it, and nothing else. On the default boot that is:
 - the driver of the root filesystem's disk (`virtio-blk`) and the root filesystem's driver
   (`fatfs`).
 
-A test harness in the `init` slot (ktest) is its own closure. Anything else is loaded from the root
-filesystem once vfsd has mounted it: by svcmgr from its recipes, by devmgr from
-`/services/drivers/`, the serial and framebuffer drivers of the consoles included, by vfsd from
-`/services/fs/`. Each is verified before it is used: an image by procmgr as it creates the process,
-and a data file by procmgr at its reader's request, the platform description tables devmgr reads
-from `/config/devmgr/platform/` among them ([driver-binding.md](driver-binding.md) § Platform
-Description Tables) and svcmgr's recipes and class files, in the configuration role
-([signing.md](signing.md) § Configuration). An object outside the closure costs memory on every
-boot and is a second path by which the same object starts.
+A test harness in the `init` slot (ktest) is its own closure together with the boot-time policy
+every bundle carries. Anything else is loaded from the root filesystem once vfsd has mounted it: by
+svcmgr from its recipes, by devmgr from `/services/drivers/`, the serial and framebuffer drivers of
+the consoles included, by vfsd from `/services/fs/`. Each is verified before it is used: an image by
+procmgr as it creates the process, and a data file by procmgr at its reader's request, the platform
+description tables devmgr reads from `/config/devmgr/platform/` among them
+([driver-binding.md](driver-binding.md) § Platform Description Tables) and svcmgr's recipes and
+class files, in the configuration role ([signing.md](signing.md) § Configuration). An object outside
+the closure costs memory on every boot and is a second path by which the same object starts.
 
 Until the root mount, the only console is init-logd's: it writes the UART directly, and the
 kernel's console stays on a framebuffer, since no driver has claimed it

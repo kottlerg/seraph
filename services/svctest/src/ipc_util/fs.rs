@@ -177,6 +177,65 @@ pub fn fs_open_live(node_cap: u64, release: u64, ipc_buf: *mut u64) -> Result<(u
     }
 }
 
+/// `FS_SESSION` on node cap `node_cap`, carrying `handle`, a charge-only
+/// node handle (moved to fatfs), in `caps[0]`, or no cap when `handle` is 0.
+/// Returns `(session cap, liveness cap)`, the reply's `caps[0]` and
+/// `caps[1]` (services/fs/docs/fs-driver-protocol.md § Label 23), or the wire
+/// error code.
+pub fn fs_session(node_cap: u64, handle: u64, ipc_buf: *mut u64) -> Result<(u64, u64), u64>
+{
+    let mut builder = ipc::IpcMessage::builder(ipc::fs_labels::FS_SESSION);
+    if handle != 0
+    {
+        builder = builder.cap(handle);
+    }
+    let msg = builder.build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    match *reply.caps()
+    {
+        [session, liveness] => Ok((session, liveness)),
+        _ => panic!("FS_SESSION success without a session cap and a liveness cap"),
+    }
+}
+
+/// `FS_OPEN` on file node cap `node_cap` in the session `session` names: a
+/// copy of the session cap in `caps[0]`, and `release` (a release endpoint
+/// SEND, moved to fatfs) in `caps[1]` when it is non-zero. Returns the open
+/// cap, the reply's one cap (services/fs/docs/fs-driver-protocol.md
+/// § Label 18), or the wire error code.
+pub fn fs_open_in(node_cap: u64, session: u64, release: u64, ipc_buf: *mut u64)
+-> Result<u64, u64>
+{
+    let copy = syscall::cap_copy(
+        session,
+        std::os::seraph::startup_info().self_cspace,
+        syscall::RIGHTS_EP_SEND,
+    )
+    .map_err(|_| u64::MAX)?;
+    let mut builder = ipc::IpcMessage::builder(ipc::fs_labels::FS_OPEN).cap(copy);
+    if release != 0
+    {
+        builder = builder.cap(release);
+    }
+    let msg = builder.build();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }.map_err(|_| u64::MAX)?;
+    if reply.label != ipc::fs_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
+    match *reply.caps()
+    {
+        [open] => Ok(open),
+        _ => panic!("FS_OPEN in a session succeeded without exactly one open cap"),
+    }
+}
+
 /// `FS_CLOSE` on `cap`; returns the reply label (`u64::MAX` when the call
 /// fails).
 pub fn fs_close(cap: u64, ipc_buf: *mut u64) -> u64

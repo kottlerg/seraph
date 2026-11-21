@@ -109,10 +109,15 @@ off at once, by a path that needs no other service and none of the dead member's
   `\_PTS(5)`, the event quiescing and the clearing of `WAK_STS` acpid runs first. Nothing on that
   path allocates, frees, logs or calls a service; an allocation there fails, which ends pwrmgr
   without a power-off.
-- Only when the platform keeps running, or no immediate power-off is held, does pwrmgr log
-  `<member> died (exit reason <reason>); powering off` at error level and power off as `SHUTDOWN`
-  does. A power-off that does not take effect, or the absence of an actuator, is logged, and pwrmgr
-  serves on.
+- Only when the platform keeps running, or no immediate power-off is held, does pwrmgr drain what
+  was posted since, log each entry of the dead member as the end it is, `<member>: its main thread
+  ended (exit reason <reason>)` or `<member>: its address space ended (exit reason <reason>)`, then
+  `<member> died; powering off`, at error level, and power off as `SHUTDOWN` does. An entry states
+  only what the kernel posted: the two ends can carry different reasons, a main thread's
+  `sys_thread_exit` ending no address space, and nothing gives a core member one exit reason
+  ([docs/process-lifecycle.md](../../docs/process-lifecycle.md#exit-reason) § Exit reason). A
+  power-off that does not take effect, or the absence of an actuator, is logged, and pwrmgr serves
+  on.
 
 Without the queue, or when the wait set cannot be made, pwrmgr logs that a core death is
 unobserved and receives on its endpoint alone. `cargo xtask test shutdown --cause

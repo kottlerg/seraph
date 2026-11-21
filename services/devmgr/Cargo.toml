@@ -11,6 +11,8 @@ test = false
 
 [dependencies]
 boot-protocol = { path = "../../abi/boot-protocol" }
+# The boot-time policy module's parser, read before the first driver starts.
+boot-policy = { path = "../../shared/boot-policy" }
 # The driver death queues and the control thread's wait set (`DeathSet`).
 death-set = { path = "../../shared/death-set" }
 # Driver declarations, decoded from each candidate driver's note, and the

@@ -8,7 +8,7 @@
 //! Implements read-write FAT16/FAT32 filesystem support. Serves the
 //! cap-native namespace protocol (`NS_LOOKUP` / `NS_STAT` /
 //! `NS_READDIR`) for directory walks; per-node badged caps carry
-//! `FS_OPEN`, the stateless file labels (`FS_READ`, `FS_WRITE`,
+//! `FS_SESSION`, `FS_OPEN`, the stateless file labels (`FS_READ`, `FS_WRITE`,
 //! `FS_WRITE_MEMORY`, `FS_TRUNCATE`), and directory mutation (`FS_CREATE`,
 //! `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`); per-open caps carry the open's
 //! `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`, and the stateless
@@ -21,14 +21,21 @@
 //! ([`cache::block_call`]).
 //!
 //! Per-node badges are minted by `NS_LOOKUP` (badge = `(NodeId,
-//! NamespaceRights)`); per-node ops look the node up in `NodeTable`. Per-open
-//! badges are minted by `FS_OPEN` (badge = `(open id, NamespaceRights)` with
-//! `namespace_protocol::OPEN_INSTANCE` set): each names one `OpenFile` in the
-//! `OpenTable`, which holds that open's read-side memory caps, release SEND,
-//! and liveness Notification, and resolves to its node for the stateless file
-//! ops. An open whose client holds no copy of its liveness cap any more is
-//! swept out of the table (`sweep_dead_opens`). Write-side metadata patching
-//! uses the node's cached `DirEntryLocation`.
+//! NamespaceRights)`); per-node ops look the node up in `NodeTable`. Session
+//! badges are minted by `FS_SESSION` (badge = the session's id with
+//! `namespace_protocol::SESSION` set): each names one session, whose records
+//! live in pages charged to the node its client passed (`session`,
+//! `file::Opens`). Per-open badges are minted by `FS_OPEN` (badge = `(open id,
+//! NamespaceRights)` with `namespace_protocol::OPEN_INSTANCE` set, and
+//! `SESSION` too for an open made in a session): each names one open, which
+//! holds that open's read-side memory caps and release SEND, and resolves to
+//! its node for the stateless file ops. An open made without a session keeps
+//! a liveness Notification of its own and is swept out once its client holds
+//! no copy of it (`file::Opens::sweep_unpaid`); a session keeps one for all
+//! its opens, and ends, with them, the same way (`file::Opens::sweep_sessions`),
+//! at the latest when memmgr signals the end of a donation (module docs,
+//! Session end). Write-side metadata patching uses the node's cached
+//! `DirEntryLocation`.
 //!
 //! Memory pressure: a pressure thread waits for a change of memmgr's level
 //! (`std::os::seraph::wait_memory_pressure`). Each wake at which the level
@@ -42,6 +49,18 @@
 //! serving; the cache grows again on demand, within what memmgr grants. The
 //! loop itself receives on the service endpoint alone, so a revocation of
 //! the endpoint ends the driver at its next receive.
+//!
+//! Session end: the donation-end thread waits on a Notification registered
+//! with memmgr (`memmgr_labels::REGISTER_DONATION_END`), which memmgr
+//! signals when the handle state of a node fatfs holds a charged grant on
+//! ends: the node's release, or its owner's death. The thread marks a sweep
+//! pending and wakes the dispatch loop as the pressure thread does; the loop,
+//! at the top of its next turn, ends every session whose client holds no
+//! copy of its liveness cap any more, with one `CAP_INFO_SOLE_REFERENCE`
+//! inquiry per live session, and gives their pages back. Signals that come
+//! while a sweep is pending coalesce into it. Sessions are swept too on a
+//! schedule of `FS_SESSION` requests, as unpaid opens are on one of
+//! `FS_OPEN`s (`fat_parse::open_slab::SweepSchedule`).
 //!
 //! Cache coherence: writes go through write-through
 //! ([`cache::PageCache::write_sector`]) so any outstanding
@@ -60,6 +79,7 @@ mod eviction;
 mod fat;
 mod file;
 mod held;
+mod session;
 
 use core::num::NonZeroU64;
 use std::os::seraph::{MemoryPressure, StartupInfo, startup_info};
@@ -74,16 +94,20 @@ use dir::{
     DeviceSlotState, NewEntryKind, RemovedEntry, directory_is_empty, free_entry_data, insert_entry,
     remove_entry, update_entry_metadata, write_dot_entries,
 };
-use eviction::{EvictReq, EvictionState};
+use eviction::EvictionState;
 use fat::{chain_next, next_cluster, read_file_data};
 use fat_parse::open_slab::SweepSchedule;
-use file::{OpenFile, OpenTable, OutstandingPage};
+use file::{OpenFile, Opens, OutstandingPage, SessionRefusal, release_open_file};
 use ipc::{IpcMessage, fs_labels, ns_labels};
 use namespace_protocol::{
-    GateError, NamespaceRights, NodeId, NodeKind, gate, gate_open, is_open_instance,
-    pack as pack_badge, pack_open,
+    GateError, NamespaceRights, NodeId, NodeKind, OpenRef, gate, gate_open, is_open_instance,
+    pack as pack_badge, pack_open, pack_session, pack_session_open, session_id,
 };
+use session::SessionPages;
 use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE, RIGHTS_MEM_MAP};
+
+// A session's ids and the badges that carry them are one width.
+const _: () = assert!(fat_parse::session_pool::ID_BITS == namespace_protocol::KIND_ID_BITS);
 
 /// [`PAGE_SIZE`] as a `usize`, for buffer and offset arithmetic.
 #[expect(clippy::cast_possible_truncation, reason = "PAGE_SIZE is 4096")]
@@ -154,7 +178,10 @@ fn main() -> !
     let mut state = FatState::new();
     let mut nodes = NodeTable::new();
 
-    let files = Arc::new(Mutex::new(OpenTable::new()));
+    // The window session pages map into, sized to the machine's RAM.
+    let ram_pages = cache::query_system_ram_pages(info.memmgr_endpoint, ipc_buf).unwrap_or(0);
+    let pages = SessionPages::reserve(ram_pages, info.self_aspace);
+    let opens = Arc::new(Mutex::new(Opens::new(pages)));
 
     let eviction = Arc::new(EvictionState::new());
 
@@ -166,7 +193,7 @@ fn main() -> !
     // every slot is held.
     {
         let ev = eviction.clone();
-        let f = files.clone();
+        let f = opens.clone();
         if std::thread::Builder::new()
             .name("fatfs-eviction-worker".into())
             .spawn(move || eviction::worker_loop(&ev, &f, cache))
@@ -178,9 +205,10 @@ fn main() -> !
     }
 
     spawn_pressure_thread(caps.service);
+    spawn_donation_end_thread(caps.service, ipc_buf);
 
     service_loop(
-        &caps, &mut state, &mut nodes, &files, cache, ipc_buf, &eviction,
+        &caps, &mut state, &mut nodes, &opens, cache, ipc_buf, &eviction,
     );
 }
 
@@ -191,12 +219,12 @@ fn main() -> !
 /// ([`release_under_pressure`]).
 static RELEASE_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// Label of the pressure thread's wake call, sent unbadged on the service
-/// endpoint. No service-level request uses it, so the dispatch loop refuses
-/// it with `UNKNOWN_OPCODE`; the turn the call costs the loop is the wake.
-const PRESSURE_WAKE: u64 = 0;
-const _: () =
-    assert!(PRESSURE_WAKE != fs_labels::FS_MOUNT && PRESSURE_WAKE != fs_labels::FS_UNMOUNT);
+/// Label of the pressure and donation-end threads' wake call, sent unbadged
+/// on the service endpoint. No service-level request uses it, so the
+/// dispatch loop refuses it with `UNKNOWN_OPCODE`; the turn the call costs
+/// the loop is the wake.
+const LOOP_WAKE: u64 = 0;
+const _: () = assert!(LOOP_WAKE != fs_labels::FS_MOUNT && LOOP_WAKE != fs_labels::FS_UNMOUNT);
 
 /// Start the pressure thread (module docs, Memory pressure) on an unbadged
 /// SEND derived from `service`. Logged and skipped when the process is not
@@ -226,12 +254,10 @@ fn spawn_pressure_thread(service: u64)
 }
 
 /// Wait for memmgr's level to change; at `Low` or `Critical`, mark a release
-/// pending and wake the dispatch loop with a call on `wake`. A wake at the
-/// level the last one read is acted on too, since the changes it carries
-/// can have passed through `Normal`, the cache growing again meanwhile. A call
-/// that a stop interrupts is made again, since a second wake costs the loop
-/// one more refused request. Ends when the wait fails, or
-/// when the call fails otherwise, as it does once vfsd has revoked the
+/// pending and wake the dispatch loop ([`wake_loop`]). A wake at the level
+/// the last one read is acted on too, since the changes it carries can have
+/// passed through `Normal`, the cache growing again meanwhile. Ends when the
+/// wait fails, or when the wake fails, as it does once vfsd has revoked the
 /// service endpoint: the dispatch loop's receive then fails too and ends the
 /// driver.
 fn pressure_thread(wake: u64)
@@ -251,24 +277,33 @@ fn pressure_thread(wake: u64)
             }
         }
         RELEASE_PENDING.store(true, Ordering::Release);
-        let msg = IpcMessage::builder(PRESSURE_WAKE).build();
-        let ipc_buf = std::os::seraph::current_ipc_buf();
-        let woken = loop
-        {
-            // SAFETY: ipc_buf is this thread's registered IPC buffer.
-            match unsafe { ipc::ipc_call(wake, &msg, ipc_buf) }
-            {
-                Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
-                {}
-                result => break result.is_ok(),
-            }
-        };
-        if !woken
+        if !wake_loop(wake)
         {
             break;
         }
     }
     let _ = syscall::cap_delete(wake);
+}
+
+/// Wake the dispatch loop with a [`LOOP_WAKE`] call on `wake`, an unbadged
+/// SEND on the service endpoint. A call that a stop interrupts is made
+/// again, since a second wake costs the loop one more refused request.
+/// `false` when the call fails otherwise, as it does once vfsd has revoked
+/// the service endpoint.
+fn wake_loop(wake: u64) -> bool
+{
+    let msg = IpcMessage::builder(LOOP_WAKE).build();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    loop
+    {
+        // SAFETY: ipc_buf is this thread's registered IPC buffer.
+        match unsafe { ipc::ipc_call(wake, &msg, ipc_buf) }
+        {
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
+            {}
+            result => break result.is_ok(),
+        }
+    }
 }
 
 /// Read memmgr's level again, since it can have recovered since the
@@ -285,6 +320,109 @@ fn release_under_pressure(cache: &PageCache, ipc_buf: *mut u64)
     };
     let released = cache.release_idle_pages(ipc_buf);
     std::os::seraph::log!("memory pressure {level:?}: {released} cache pages given back");
+}
+
+// ── Session end ────────────────────────────────────────────────────────────
+
+/// Set by the donation-end thread when memmgr signals the end of a donation;
+/// the dispatch loop takes it at the top of a turn and sweeps the sessions
+/// (module docs, Session end).
+static SESSION_SWEEP_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// The bit memmgr signals on the donation-end Notification.
+const DONATION_END_BIT: u64 = 1;
+
+/// Register a Notification with memmgr for the end of the donations fatfs
+/// holds grants on (`memmgr_labels::REGISTER_DONATION_END`), and start the
+/// donation-end thread (module docs, Session end) on it and on an unbadged
+/// SEND derived from `service`. Logged and skipped when the Notification,
+/// the registration, the cap, or the thread cannot be had: sessions whose
+/// client is gone are then ended only by the sweeps `FS_SESSION` and
+/// `FS_UNMOUNT` make.
+fn spawn_donation_end_thread(service: u64, ipc_buf: *mut u64)
+{
+    let Some(signal) =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+    else
+    {
+        std::os::seraph::log!(warn: "no donation-end Notification; sessions swept on schedule only");
+        return;
+    };
+    if !register_donation_end(signal, ipc_buf)
+    {
+        std::os::seraph::log!(warn: "donation-end registration refused; sessions swept on schedule only");
+        let _ = syscall::cap_delete(signal);
+        return;
+    }
+    let Ok(wake) = syscall::cap_derive(service, syscall::RIGHTS_EP_SEND)
+    else
+    {
+        std::os::seraph::log!(warn: "no wake cap; sessions swept on schedule only");
+        let _ = syscall::cap_delete(signal);
+        return;
+    };
+    if std::thread::Builder::new()
+        .name("fatfs-donation-end".into())
+        .spawn(move || donation_end_thread(signal, wake))
+        .is_err()
+    {
+        std::os::seraph::log!(warn: "donation-end thread spawn failed; sessions swept on schedule only");
+        let _ = syscall::cap_delete(wake);
+        let _ = syscall::cap_delete(signal);
+    }
+}
+
+/// Hand memmgr a Notify copy of `signal` to signal [`DONATION_END_BIT`] on.
+/// `false` when the copy cannot be had or memmgr refuses it.
+fn register_donation_end(signal: u64, ipc_buf: *mut u64) -> bool
+{
+    let Ok(notify) = syscall::cap_derive(signal, syscall::RIGHTS_NTF_NOTIFY)
+    else
+    {
+        return false;
+    };
+    let msg = IpcMessage::builder(ipc::memmgr_labels::REGISTER_DONATION_END)
+        .word(0, DONATION_END_BIT)
+        .cap(notify)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let Ok(reply) = (unsafe { ipc::ipc_call(startup_info().memmgr_endpoint, &msg, ipc_buf) })
+    else
+    {
+        // A call that fails moves no cap: the copy is still fatfs's.
+        let _ = syscall::cap_delete(notify);
+        return false;
+    };
+    reply.label == ipc::memmgr_errors::SUCCESS
+}
+
+/// Wait on `signal`; at each signal, mark a session sweep pending and wake
+/// the dispatch loop ([`wake_loop`]). Signals that arrive before the loop
+/// takes the mark are one sweep. Ends when the wait or the wake fails.
+fn donation_end_thread(signal: u64, wake: u64)
+{
+    loop
+    {
+        match syscall::notification_wait(signal)
+        {
+            Ok(_) =>
+            {}
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => continue,
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "donation-end wait failed ({e}); sessions swept on schedule only");
+                break;
+            }
+        }
+        if !SESSION_SWEEP_PENDING.swap(true, Ordering::AcqRel) && !wake_loop(wake)
+        {
+            break;
+        }
+    }
+    let _ = syscall::cap_delete(wake);
+    let _ = syscall::cap_delete(signal);
 }
 
 /// Issue a single bootstrap round against the creator endpoint and assemble
@@ -392,25 +530,31 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
 ///   the protocol crate.
 /// - Per-node `FS_*` requests — badge packs `(NodeId, NamespaceRights)`
-///   and the node is resolved through `NodeTable`: `FS_OPEN`, the stateless
+///   and the node is resolved through `NodeTable`: `FS_SESSION`, `FS_OPEN`, the stateless
 ///   file ops (`FS_READ`, `FS_WRITE`, `FS_WRITE_MEMORY`, `FS_TRUNCATE`), and
 ///   directory mutation (`FS_CREATE`, `FS_REMOVE`, `FS_MKDIR`,
 ///   `FS_RENAME`).
 /// - Per-open `FS_*` requests — badge packs `(open id, NamespaceRights)`
-///   with `OPEN_INSTANCE` set and the open is resolved through the
-///   `OpenTable`: the open's own `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and
-///   `FS_CLOSE`, and the stateless file ops on the open's node.
+///   with `OPEN_INSTANCE` set and the open is resolved through [`Opens`]:
+///   the open's own `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`, and
+///   the stateless file ops on the open's node. A session cap, whose badge
+///   sets `SESSION` alone, carries no request of its own: the gate refuses
+///   it, and `FS_OPEN` reads it from the cap it carries.
 ///
 /// A release under memory pressure runs at the top of a turn, once the
 /// pressure thread has marked one pending and woken the loop
-/// ([`release_under_pressure`]). A request held `held::SLOW_REQUEST` or
-/// longer, from its receipt to the end of its turn, is logged
-/// ([`held::HeldRequest`]).
+/// ([`release_under_pressure`]), and so does a session sweep the
+/// donation-end thread marked (module docs, Session end). A request held
+/// `held::SLOW_REQUEST` or longer, from its receipt to the end of its turn,
+/// is logged ([`held::HeldRequest`]).
 ///
-/// The open table is shared with the eviction worker via a `Mutex`. Main
-/// takes the lock to resolve an open cap, `FS_OPEN` takes it only around a
-/// sweep and its table update, and `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`
-/// hold it for the whole dispatch. Lock contention with the worker is only material during
+/// The opens are shared with the eviction worker via a `Mutex`. Main takes
+/// the lock to resolve an open cap; `FS_SESSION` and `FS_OPEN` take it only
+/// around a sweep and their records' update, and release it for each memmgr
+/// call that takes a session a page; `FS_READ_MEMORY` releases it the same
+/// way before it holds it for the whole dispatch, as `FS_RELEASE_MEMORY` and
+/// `FS_CLOSE` do. A session page given back is returned to memmgr under the
+/// lock. Lock contention with the worker is only material during
 /// cache-pressure releases.
 #[expect(
     clippy::too_many_lines,
@@ -421,7 +565,7 @@ fn service_loop(
     caps: &FatCaps,
     state: &mut FatState,
     nodes: &mut NodeTable,
-    files: &Arc<Mutex<OpenTable>>,
+    opens: &Arc<Mutex<Opens>>,
     cache: &'static PageCache,
     ipc_buf: *mut u64,
     eviction: &EvictionState,
@@ -429,6 +573,7 @@ fn service_loop(
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     let mut sweeps = SweepSchedule::new();
+    let mut session_sweeps = SweepSchedule::new();
     loop
     {
         // The last request found the block device capability revoked and
@@ -442,11 +587,20 @@ fn service_loop(
         // not hold the open table's lock (relieve_pressure).
         if cache.take_pressure()
         {
-            let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(req) = pick_eviction_candidate(&mut files_g)
+            let req = opens
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pick_eviction_candidate();
+            if let Some(req) = req
             {
                 eviction.enqueue(req);
             }
+        }
+        // The donation-end thread marked a session sweep and woke the loop
+        // (module docs, Session end).
+        if SESSION_SWEEP_PENDING.swap(false, Ordering::AcqRel)
+        {
+            sweep_sessions(opens, &mut session_sweeps, cache);
         }
         // The pressure thread marked a release and woke the loop with a
         // call (module docs, Memory pressure).
@@ -479,7 +633,7 @@ fn service_loop(
             let unmounted = handle_unmount(
                 &msg,
                 state,
-                files,
+                opens,
                 &mut sweeps,
                 cache,
                 caps.block_dev,
@@ -562,19 +716,19 @@ fn service_loop(
         }
         let gated = if kind == CapKind::Open
         {
-            gate_open(msg.label, msg.badge).map(|(id, rights)| (None, rights, Some(id)))
+            gate_open(msg.label, msg.badge).map(|(open, rights)| (None, rights, Some(open)))
         }
         else
         {
             gate(msg.label, msg.badge).map(|(node, rights)| (Some(node), rights, None))
         };
-        let (node_id, parent_rights, open_id) = match gated
+        let (node_id, parent_rights, open_ref) = match gated
         {
             Ok((node, rights, open)) =>
             {
                 let node = node.or_else(|| {
-                    let files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-                    open.and_then(|id| files_g.get(id)).map(|f| f.node_id)
+                    let opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
+                    open.and_then(|open| opens_g.node(open))
                 });
                 let Some(node) = node
                 else
@@ -597,11 +751,15 @@ fn service_loop(
             }
         };
 
-        // Only FS_OPEN (a release SEND) and FS_WRITE_MEMORY (the source
-        // page) take caps; their handlers keep, return, or delete each one.
-        // Every other label's caps are deleted here, so no cap a request
-        // carries stays in fatfs's CSpace.
-        if opcode != fs_labels::FS_OPEN && opcode != fs_labels::FS_WRITE_MEMORY
+        // Only FS_SESSION (a charge-only handle), FS_OPEN (a session cap and
+        // a release SEND) and FS_WRITE_MEMORY (the source page) take caps;
+        // their handlers keep, return, or delete each one. Every other
+        // label's caps are deleted here, so no cap a request carries stays in
+        // fatfs's CSpace.
+        if !matches!(
+            opcode,
+            fs_labels::FS_SESSION | fs_labels::FS_OPEN | fs_labels::FS_WRITE_MEMORY
+        )
         {
             drop_caps(msg.caps());
         }
@@ -617,17 +775,34 @@ fn service_loop(
         // + cache write-through.
         match opcode
         {
+            fs_labels::FS_SESSION =>
+            {
+                // Takes the opens' lock itself, only around a sweep and the
+                // session's start: its page request, CSpace top-up, and
+                // liveness object's retype call memmgr.
+                handle_session_node_cap(
+                    node_id,
+                    &msg,
+                    nodes,
+                    opens,
+                    &mut session_sweeps,
+                    caps,
+                    cache,
+                    ipc_buf,
+                );
+                continue;
+            }
             fs_labels::FS_OPEN =>
             {
-                // Takes the open table's lock itself, only around a sweep
-                // and the table update: its CSpace top-up and its liveness
-                // object's retype may call memmgr.
+                // Takes the opens' lock itself, only around a sweep and the
+                // records' update: its CSpace top-up, its liveness object's
+                // retype, and a session's page request may call memmgr.
                 handle_open_node_cap(
                     node_id,
                     parent_rights,
                     &msg,
                     nodes,
-                    files,
+                    opens,
                     &mut sweeps,
                     caps,
                     cache,
@@ -662,7 +837,7 @@ fn service_loop(
             fs_labels::FS_REMOVE =>
             {
                 handle_remove_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
-                release_orphaned_open_files(nodes, files, cache);
+                release_orphaned_open_files(nodes, opens, cache);
                 continue;
             }
             fs_labels::FS_MKDIR =>
@@ -682,7 +857,7 @@ fn service_loop(
             fs_labels::FS_RENAME =>
             {
                 handle_rename_node_cap(node_id, &msg, state, nodes, cache, caps.block_dev, ipc_buf);
-                release_orphaned_open_files(nodes, files, cache);
+                release_orphaned_open_files(nodes, opens, cache);
                 continue;
             }
             fs_labels::FS_TRUNCATE =>
@@ -694,8 +869,17 @@ fn service_loop(
             {}
         }
 
-        let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-        match (opcode, open_id)
+        // A memory-cap read in a session first makes room for the record of
+        // the page it holds, taking the session a page with the lock released.
+        if opcode == fs_labels::FS_READ_MEMORY
+            && let Some(open) = open_ref
+            && let Err(code) = fund_held_page(open, opens, ipc_buf)
+        {
+            reply_err(code, ipc_buf);
+            continue;
+        }
+        let mut opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
+        match (opcode, open_ref)
         {
             (fs_labels::FS_READ_MEMORY, Some(open)) =>
             {
@@ -705,7 +889,7 @@ fn service_loop(
                     &msg,
                     state,
                     nodes,
-                    &mut files_g,
+                    &mut opens_g,
                     caps,
                     cache,
                     ipc_buf,
@@ -714,11 +898,11 @@ fn service_loop(
             }
             (fs_labels::FS_RELEASE_MEMORY, Some(open)) =>
             {
-                handle_release_memory_open_cap(open, &msg, &mut files_g, cache, ipc_buf);
+                handle_release_memory_open_cap(open, &msg, &mut opens_g, cache, ipc_buf);
             }
             (fs_labels::FS_CLOSE, Some(open)) =>
             {
-                handle_close_open_cap(open, &mut files_g, cache, ipc_buf);
+                handle_close_open_cap(open, &mut opens_g, cache, ipc_buf);
             }
             _ =>
             {
@@ -745,8 +929,10 @@ enum CapKind
 /// services/fs/docs/fs-driver-protocol.md § Label 18. An open's own labels
 /// (`FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`) need an open cap;
 /// `FS_OPEN` and directory mutation need a node cap; the stateless file
-/// labels take either. Any other opcode passes, so the rights gate answers
-/// it `UNKNOWN_OPCODE`. A misdirected label is answered `INVALID_BADGE`.
+/// labels take either. `FS_SESSION` needs a node cap
+/// (services/fs/docs/fs-driver-protocol.md § Label 23). Any other opcode
+/// passes, so the rights gate answers it `UNKNOWN_OPCODE`. A misdirected
+/// label is answered `INVALID_BADGE`.
 fn label_accepts(opcode: u64, kind: CapKind) -> bool
 {
     match opcode
@@ -755,7 +941,8 @@ fn label_accepts(opcode: u64, kind: CapKind) -> bool
         {
             kind == CapKind::Open
         }
-        fs_labels::FS_OPEN
+        fs_labels::FS_SESSION
+        | fs_labels::FS_OPEN
         | fs_labels::FS_CREATE
         | fs_labels::FS_REMOVE
         | fs_labels::FS_MKDIR
@@ -843,7 +1030,7 @@ fn handle_read(
 }
 
 /// `FS_READ_MEMORY` body, parameterised by the resolved node and the open
-/// the page is read for. `handle_read_memory_open_cap` checks both and
+/// the page is read for, of either kind. `handle_read_memory_open_cap` checks both and
 /// delegates here for the cluster walk, cache acquisition, two-step cap
 /// derivation, and outstanding-page tracking on that open. The file's size
 /// and first cluster come from `node`, the node table's current view, so a
@@ -856,7 +1043,7 @@ fn handle_read(
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, its node and open, and each piece of driver state the memory-cap read \
-              touches (FAT state, open table, cache, block device, IPC buffer, eviction state)"
+              touches (FAT state, opens, cache, block device, IPC buffer, eviction state)"
 )]
 #[expect(
     clippy::large_stack_frames,
@@ -866,9 +1053,9 @@ fn handle_read(
 fn read_memory_for_open(
     msg: &IpcMessage,
     node: &backend::FatNode,
-    open_id: u64,
+    open: OpenRef,
     state: &mut FatState,
-    files: &mut OpenTable,
+    opens: &mut Opens,
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
@@ -913,7 +1100,7 @@ fn read_memory_for_open(
     // Walk the cluster chain to find the sector at `offset`, from the open's
     // cursor when it still serves (storage-layout.md, Open table).
     let (walked, mut cluster) = fat_parse::walk_start(
-        files.get(open_id).and_then(|f| f.cursor),
+        opens.cursor(open),
         state.chain_epoch,
         node.cluster,
         pos.cluster_index,
@@ -929,20 +1116,18 @@ fn read_memory_for_open(
         else
         {
             // A FAT sector read that met a full cache fails the walk.
-            relieve_pressure(files, cache, eviction);
+            relieve_pressure(opens, cache, eviction);
             reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
             return;
         }
     }
-    let sequential = files.get_mut(open_id).is_some_and(|f| {
-        f.cursor = Some(fat_parse::ChainCursor {
-            epoch: state.chain_epoch,
-            first_cluster: node.cluster,
-            cluster_index: pos.cluster_index,
-            cluster,
-        });
-        f.next_read == offset
-    });
+    let cursor = fat_parse::ChainCursor {
+        epoch: state.chain_epoch,
+        first_cluster: node.cluster,
+        cluster_index: pos.cluster_index,
+        cluster,
+    };
+    let sequential = opens.note_read(open, cursor, offset);
     let sector = u64::from(
         state
             .cluster_to_sector(cluster)
@@ -994,7 +1179,7 @@ fn read_memory_for_open(
     {
         // Cache pressure, when every slot is held by an outstanding page:
         // the client retries this read on IO_ERROR.
-        relieve_pressure(files, cache, eviction);
+        relieve_pressure(opens, cache, eviction);
         let reply = IpcMessage::new(ipc::fs_errors::IO_ERROR);
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1050,15 +1235,9 @@ fn read_memory_for_open(
     // None bounds a file: the client reads on with further calls.
     let bytes_valid = left_in_file.min(pos.left_in_cluster).min(page_left);
     let ceiling = cache.slot_ceiling();
-    if !files.get_mut(open_id).is_some_and(|f| {
-        let tracked = f.track_outstanding(entry, ceiling);
-        if tracked
-        {
-            // Below the `u32` file size, so it never saturates.
-            f.next_read = offset.saturating_add(bytes_valid);
-        }
-        tracked
-    })
+    // Below the `u32` file size, so it never saturates.
+    let next_read = offset.saturating_add(bytes_valid);
+    if !opens.track(open, entry, ceiling, next_read)
     {
         let _ = syscall::cap_delete(child);
         let _ = syscall::cap_delete(ancestor);
@@ -1134,74 +1313,161 @@ fn read_run_pages(
 
 /// When a page acquisition found every cache slot held since the last check
 /// ([`PageCache::take_pressure`]), queue one held page for eviction
-/// ([`pick_eviction_candidate`]): the eviction worker frees its slot within
-/// `eviction::RELEASE_TIMEOUT_MS`, and the client retries the request it was
-/// answered `IO_ERROR`. Called before the reply on the memory-cap read path,
-/// and before each receive for every other path that reads through the
-/// cache (FAT walks, directory reads, inline reads).
-fn relieve_pressure(files: &mut OpenTable, cache: &PageCache, eviction: &EvictionState)
+/// ([`Opens::pick_eviction_candidate`]): the eviction worker frees its slot
+/// within `eviction::RELEASE_TIMEOUT_MS`, and the client retries the request
+/// it was answered `IO_ERROR`. Called before the reply on the memory-cap read
+/// path, and before each receive for every other path that reads through the
+/// cache (FAT walks, directory reads, inline reads). `None` from the pick
+/// means every held page is queued already, or none is held (then the
+/// acquisition's failure is a cache-state bug rather than client-held
+/// pressure).
+fn relieve_pressure(opens: &mut Opens, cache: &PageCache, eviction: &EvictionState)
 {
     if cache.take_pressure()
-        && let Some(req) = pick_eviction_candidate(files)
+        && let Some(req) = opens.pick_eviction_candidate()
     {
         eviction.enqueue(req);
     }
 }
 
-/// Scan the open table for an outstanding cache page not yet queued
-/// for eviction, mark it queued, and return it as an [`EvictReq`], so
-/// repeated cache misses under pressure queue distinct pages rather than
-/// one page many times. `None` when every outstanding page is already
-/// queued, or none is outstanding (then `acquire_page` failure is a
-/// cache-state bug rather than client-held pressure).
-fn pick_eviction_candidate(files: &mut OpenTable) -> Option<EvictReq>
+/// `FS_SESSION` against a node cap (services/fs/docs/fs-driver-protocol.md
+/// § Label 23): start a session charged through the charge-only handle
+/// `caps[0]` carries (any further cap is deleted), in a first page memmgr
+/// charges to that handle's node, which the session keeps for its life; reply
+/// with a session cap whose badge names it and the session's liveness cap.
+/// The sessions are swept for those whose client is gone when
+/// `session_sweeps` says a sweep is due. A reply the client cannot take moves
+/// no cap, so the session is ended at once.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its node, and the driver state a session touches (node table, opens and \
+              their sweep schedule, endpoint caps, cache, IPC buffer)"
+)]
+fn handle_session_node_cap(
+    node_id: NodeId,
+    msg: &IpcMessage,
+    nodes: &NodeTable,
+    opens: &Mutex<Opens>,
+    session_sweeps: &mut SweepSchedule,
+    caps: &FatCaps,
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+)
 {
-    for (open_id, file) in files.iter_mut()
+    let opcode = fs_labels::FS_SESSION;
+    if nodes.get(node_id).is_none()
     {
-        if let Some(entry) = file
-            .outstanding
-            .iter_mut()
-            .flatten()
-            .find(|e| !e.eviction_queued)
-        {
-            entry.eviction_queued = true;
-            return Some(EvictReq {
-                open_id,
-                cookie: entry.cookie,
-                slot_idx: entry.slot_idx,
-                ancestor_cap: entry.ancestor_cap,
-            });
-        }
+        reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        return;
     }
-    None
+    let Some((&handle, rest)) = msg.caps().split_first()
+    else
+    {
+        reply_err(ipc::fs_errors::INVALID_ARGUMENT, ipc_buf);
+        return;
+    };
+    drop_caps(rest);
+    let refuse = |code: u64| {
+        let _ = syscall::cap_delete(handle);
+        reply_err(code, ipc_buf);
+    };
+    if session_sweeps.note_open()
+    {
+        sweep_sessions(opens, session_sweeps, cache);
+    }
+    if !cache.fund_run_time_headroom(startup_info().self_cspace)
+    {
+        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        return;
+    }
+    let grant = match session::request_page(handle, ipc_buf)
+    {
+        Ok(grant) => grant,
+        Err(code) =>
+        {
+            refuse(code);
+            return;
+        }
+    };
+    let Some(liveness) = Liveness::create()
+    else
+    {
+        session::release_page(grant);
+        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        return;
+    };
+    let started = opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .start_session(grant, handle, liveness.parent);
+    let Ok(id) = started
+    else
+    {
+        liveness.discard();
+        session::release_page(grant);
+        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        return;
+    };
+    let end = || {
+        opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .end_session_by_id(id, cache);
+    };
+    // A session cap carries no rights: it names the session, and FS_OPEN
+    // reads it from the cap the open carries.
+    let minted = pack_session(id).and_then(|badge| {
+        syscall::cap_derive_badge(caps.service, syscall::RIGHTS_EP_SEND, badge).ok()
+    });
+    let Some(session_cap) = minted
+    else
+    {
+        // Ending the session revokes the liveness child with its parent.
+        end();
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    };
+    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .cap(session_cap)
+        .cap(liveness.child)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(session_cap);
+        end();
+    }
 }
 
-/// `FS_OPEN` against a file node cap: insert a new [`OpenFile`] for the
-/// node, recording the release SEND `caps[0]` carries (any further cap is
-/// deleted) and the parent of a new liveness cap, and reply with an open cap
-/// whose badge names it and the liveness cap
-/// (services/fs/docs/fs-driver-protocol.md § Label 18). The open cap
-/// carries the node cap's rights and `SEND_GRANT`, as a node cap does, so
-/// `FS_WRITE_MEMORY` can carry its source page on it. Before recording the
-/// SEND it tops the `CSpace` up ([`PageCache::fund_run_time_headroom`]),
-/// with the open table unlocked, since the top-up may call memmgr; the lock
-/// is held only to sweep, to insert the open, and to remove it if the mint
-/// or the reply fails. The open table is swept for opens whose client is gone
-/// ([`sweep_dead_opens`]) when `sweeps` says a sweep is due, and when the
-/// `CSpace` cannot grow or the table is full, before that step is retried
-/// once. A reply the client cannot take (it died mid-call, or its `CSpace` is
-/// full) moves no cap, so the open is released at once.
+/// End every session whose client holds no copy of its liveness cap any
+/// more, and restart `session_sweeps` from the sessions left.
+fn sweep_sessions(opens: &Mutex<Opens>, session_sweeps: &mut SweepSchedule, cache: &PageCache)
+{
+    let left = opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .sweep_sessions(cache);
+    session_sweeps.swept(left);
+}
+
+/// `FS_OPEN` against a file node cap (services/fs/docs/fs-driver-protocol.md
+/// § Label 18). A `caps[0]` that is a cap on the driver's own endpoint is a
+/// session cap: the open is made in that session ([`open_in_session`]),
+/// with the release SEND `caps[1]` carries. Any other `caps[0]` is the
+/// release SEND of an open made without a session, the unpaid path
+/// ([`open_unpaid`]). A cap on the endpoint that names no live session is
+/// refused `INVALID_BADGE`. Caps past those are deleted.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request, its node and rights, and the driver state an open touches (node table, \
-              open table and its sweep schedule, endpoint caps, cache, IPC buffer)"
+              opens and their sweep schedule, endpoint caps, cache, IPC buffer)"
 )]
 fn handle_open_node_cap(
     node_id: NodeId,
     rights: NamespaceRights,
     msg: &IpcMessage,
     nodes: &NodeTable,
-    files: &Mutex<OpenTable>,
+    opens: &Mutex<Opens>,
     sweeps: &mut SweepSchedule,
     caps: &FatCaps,
     cache: &PageCache,
@@ -1214,69 +1480,297 @@ fn handle_open_node_cap(
         reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     }
-    let (release_send, rest) = match msg.caps().split_first()
-    {
-        Some((&send, rest)) => (send, rest),
-        None => (0, &[][..]),
+    let all = msg.caps();
+    let first = all.first().copied();
+    // A cap on another endpoint (or none) leaves the badge read refused.
+    let session = first.map(|cap| syscall::endpoint_badge(caps.service, cap).map(session_id));
+    let open = OpenRequest {
+        node_id,
+        rights,
+        service: caps.service,
+        release_send: 0,
     };
-    drop_caps(rest);
-    let refuse = |code: u64| {
-        if release_send != 0
+    match session
+    {
+        Some(Ok(Some(id))) =>
         {
-            let _ = syscall::cap_delete(release_send);
+            let _ = first.map(syscall::cap_delete);
+            let (release_send, rest) = match all.get(1..).and_then(<[u64]>::split_first)
+            {
+                Some((&send, rest)) => (send, rest),
+                None => (0, &[][..]),
+            };
+            drop_caps(rest);
+            open_in_session(
+                id,
+                OpenRequest {
+                    release_send,
+                    ..open
+                },
+                opens,
+                cache,
+                ipc_buf,
+            );
+        }
+        Some(Ok(None)) =>
+        {
+            // A cap on the driver's endpoint that is no session cap.
+            reply_dropping_caps(msg, opcode, ipc::fs_errors::INVALID_BADGE, ipc_buf);
+        }
+        _ =>
+        {
+            let (release_send, rest) = match all.split_first()
+            {
+                Some((&send, rest)) => (send, rest),
+                None => (0, &[][..]),
+            };
+            drop_caps(rest);
+            open_unpaid(
+                OpenRequest {
+                    release_send,
+                    ..open
+                },
+                opens,
+                sweeps,
+                cache,
+                ipc_buf,
+            );
+        }
+    }
+}
+
+/// What an `FS_OPEN` asks for: the node, the rights the open cap carries,
+/// the release SEND the open keeps (0 for none), and the service endpoint the
+/// open cap is minted on. The open cap carries the node cap's rights and
+/// `SEND_GRANT`, as a node cap does, so `FS_WRITE_MEMORY` can carry its
+/// source page on it.
+#[derive(Clone, Copy)]
+struct OpenRequest
+{
+    node_id: NodeId,
+    rights: NamespaceRights,
+    service: u64,
+    release_send: u64,
+}
+
+impl OpenRequest
+{
+    /// Delete the release SEND and reply `code`: a refusal before the open
+    /// keeps the SEND.
+    fn refuse(self, code: u64, ipc_buf: *mut u64)
+    {
+        if self.release_send != 0
+        {
+            let _ = syscall::cap_delete(self.release_send);
         }
         reply_err(code, ipc_buf);
-    };
-    if !fund_open_slots(files, sweeps, cache)
+    }
+}
+
+/// An `FS_OPEN` in the session `session` names: record the open in the
+/// session's pages, taking the session another page when they are full, with
+/// the opens unlocked, since the request calls memmgr; reply with an open cap
+/// whose badge names the open. The open's state lives in pages its client
+/// pays for; what stays on fatfs is the release SEND's slot and the open
+/// cap's. `LIMIT` when the page would exceed the max of the session's node or
+/// an ancestor's; `INVALID_BADGE` when the session has ended. A reply the
+/// client cannot take moves no cap, so the open is closed at once.
+fn open_in_session(
+    session: u64,
+    open: OpenRequest,
+    opens: &Mutex<Opens>,
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+)
+{
+    if !cache.fund_run_time_headroom(startup_info().self_cspace)
     {
-        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        open.refuse(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
+        return;
+    }
+    let room = opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .room_for_open(session);
+    if let Err(refusal) = room.or_else(|r| take_page(session, r, opens, ipc_buf))
+    {
+        open.refuse(refusal_code(refusal), ipc_buf);
+        return;
+    }
+    let recorded = opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .open_in_session(session, open.node_id, open.release_send);
+    let id = match recorded
+    {
+        Ok(id) => id,
+        Err(refusal) =>
+        {
+            open.refuse(refusal_code(refusal), ipc_buf);
+            return;
+        }
+    };
+    let close = || {
+        opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .close(OpenRef::Session(id), cache);
+    };
+    let minted = pack_session_open(id, open.rights).and_then(|badge| {
+        syscall::cap_derive_badge(open.service, syscall::RIGHTS_EP_SEND_GRANT, badge).ok()
+    });
+    let Some(open_cap) = minted
+    else
+    {
+        // Closing the open deletes its release SEND.
+        close();
+        reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
+        return;
+    };
+    let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
+        .cap(open_cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(open_cap);
+        close();
+    }
+}
+
+/// When `refusal` asks for a page, take the session `session` names one,
+/// charged through the handle the refusal carries, with the opens unlocked
+/// for the memmgr call, and add it. The `fs_errors` code to answer when no
+/// page could be added.
+fn take_page(
+    session: u64,
+    refusal: SessionRefusal,
+    opens: &Mutex<Opens>,
+    ipc_buf: *mut u64,
+) -> Result<(), SessionRefusal>
+{
+    let SessionRefusal::NeedPage(handle) = refusal
+    else
+    {
+        return Err(refusal);
+    };
+    // Only this thread ends a session, so the handle outlives the call.
+    let grant = session::request_page(handle, ipc_buf).map_err(SessionRefusal::Memmgr)?;
+    let added = opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .add_page(session, grant);
+    if added.is_err()
+    {
+        session::release_page(grant);
+    }
+    added
+}
+
+/// The `fs_errors` code a request a session refused is answered.
+const fn refusal_code(refusal: SessionRefusal) -> u64
+{
+    match refusal
+    {
+        SessionRefusal::Gone => ipc::fs_errors::INVALID_BADGE,
+        SessionRefusal::Memmgr(code) => code,
+        // A page was just added, or none can be: the driver is spent.
+        SessionRefusal::NeedPage(_) | SessionRefusal::Spent => ipc::fs_errors::TOO_MANY_OPEN,
+    }
+}
+
+/// Before a memory-cap read on `open`, make room in its session for the
+/// record of the page the read holds ([`take_page`]). `Ok` for an unpaid
+/// open, and for one that is not live, which the read refuses. The error is
+/// the `fs_errors` code to answer.
+fn fund_held_page(open: OpenRef, opens: &Mutex<Opens>, ipc_buf: *mut u64) -> Result<(), u64>
+{
+    let (room, session) = {
+        let opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
+        (opens_g.room_for_held(open), opens_g.session_of(open))
+    };
+    match (room, session)
+    {
+        (Err(refusal), Some(session)) =>
+        {
+            take_page(session, refusal, opens, ipc_buf).map_err(refusal_code)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// An `FS_OPEN` with no session, the unpaid path: insert a new [`OpenFile`]
+/// for the node, recording the release SEND and the parent of a new liveness
+/// cap, and reply with an open cap whose badge names it and the liveness cap.
+/// Before recording the SEND it tops the `CSpace` up
+/// ([`PageCache::fund_run_time_headroom`]), with the opens unlocked, since
+/// the top-up may call memmgr; the lock is held only to sweep, to insert the
+/// open, and to remove it if the mint or the reply fails. The unpaid opens
+/// are swept for those whose client is gone ([`Opens::sweep_unpaid`]) when
+/// `sweeps` says a sweep is due, and when the `CSpace` cannot grow or the
+/// table is full, before that step is retried once. A reply the client
+/// cannot take (it died mid-call, or its `CSpace` is full) moves no cap, so
+/// the open is released at once.
+fn open_unpaid(
+    open: OpenRequest,
+    opens: &Mutex<Opens>,
+    sweeps: &mut SweepSchedule,
+    cache: &PageCache,
+    ipc_buf: *mut u64,
+)
+{
+    if !fund_open_slots(opens, sweeps, cache)
+    {
+        open.refuse(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
         return;
     }
     let Some(liveness) = Liveness::create()
     else
     {
-        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        open.refuse(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
         return;
     };
-    let inserted = insert_open(files, sweeps, cache, || {
-        OpenFile::new(node_id, release_send, liveness.parent)
+    let inserted = insert_open(opens, sweeps, cache, || {
+        OpenFile::new(open.node_id, open.release_send, liveness.parent)
     });
     let Some(open_id) = inserted
     else
     {
         liveness.discard();
-        refuse(ipc::fs_errors::TOO_MANY_OPEN);
+        open.refuse(ipc::fs_errors::TOO_MANY_OPEN, ipc_buf);
         return;
     };
-    let minted = pack_open(open_id, rights).and_then(|badge| {
-        syscall::cap_derive_badge(caps.service, syscall::RIGHTS_EP_SEND_GRANT, badge).ok()
+    let minted = pack_open(open_id, open.rights).and_then(|badge| {
+        syscall::cap_derive_badge(open.service, syscall::RIGHTS_EP_SEND_GRANT, badge).ok()
     });
     let Some(open_cap) = minted
     else
     {
-        files
+        opens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .unpaid
             .remove(open_id);
         liveness.discard();
-        refuse(ipc::fs_errors::IO_ERROR);
+        open.refuse(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    reply_open(open_id, open_cap, liveness.child, files, cache, ipc_buf);
+    reply_open(open_id, open_cap, liveness.child, opens, cache, ipc_buf);
 }
 
-/// Count an `FS_OPEN` on `sweeps`, sweeping when one is due, and top the
-/// `CSpace` up for the open ([`PageCache::fund_run_time_headroom`]), sweeping
-/// and retrying once when it cannot grow. The release SEND and the liveness
-/// parent hold slots for the open's lifetime, so the `CSpace` grows with the
-/// opens rather than leaving a later read no slot for its page's caps.
-/// `false` when the `CSpace` still cannot grow.
-fn fund_open_slots(files: &Mutex<OpenTable>, sweeps: &mut SweepSchedule, cache: &PageCache)
--> bool
+/// Count an unpaid `FS_OPEN` on `sweeps`, sweeping when one is due, and top
+/// the `CSpace` up for the open ([`PageCache::fund_run_time_headroom`]),
+/// sweeping and retrying once when it cannot grow. The release SEND and the
+/// liveness parent hold slots for the open's lifetime, so the `CSpace` grows
+/// with the opens rather than leaving a later read no slot for its page's
+/// caps. `false` when the `CSpace` still cannot grow.
+fn fund_open_slots(opens: &Mutex<Opens>, sweeps: &mut SweepSchedule, cache: &PageCache) -> bool
 {
     let sweep = |sweeps: &mut SweepSchedule| {
-        let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-        sweep_dead_opens(&mut files_g, sweeps, cache);
+        opens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sweep_unpaid(sweeps, cache);
     };
     if sweeps.note_open()
     {
@@ -1291,32 +1785,32 @@ fn fund_open_slots(files: &Mutex<OpenTable>, sweeps: &mut SweepSchedule, cache: 
     cache.fund_run_time_headroom(cspace)
 }
 
-/// Insert the open `open` builds into the table, sweeping and retrying once
-/// when the table is full. Returns its identifier, or `None` when the table
-/// is still full or the heap cannot grow it.
+/// Insert the unpaid open `open` builds into the table, sweeping and
+/// retrying once when the table is full. Returns its identifier, or `None`
+/// when the table is still full or the heap cannot grow it.
 fn insert_open(
-    files: &Mutex<OpenTable>,
+    opens: &Mutex<Opens>,
     sweeps: &mut SweepSchedule,
     cache: &PageCache,
     open: impl Fn() -> OpenFile,
 ) -> Option<u64>
 {
-    let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    files_g.insert(open()).or_else(|| {
-        sweep_dead_opens(&mut files_g, sweeps, cache);
-        files_g.insert(open())
+    let mut opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
+    opens_g.unpaid.insert(open()).or_else(|| {
+        opens_g.sweep_unpaid(sweeps, cache);
+        opens_g.unpaid.insert(open())
     })
 }
 
-/// Reply to an `FS_OPEN` with the open cap and the liveness child. A reply
-/// the client cannot take moves none of its caps, so both are still fatfs's:
-/// the open is then removed and released, which revokes the liveness child
-/// with its parent, and the open cap is deleted.
+/// Reply to an unpaid `FS_OPEN` with the open cap and the liveness child. A
+/// reply the client cannot take moves none of its caps, so both are still
+/// fatfs's: the open is then removed and released, which revokes the
+/// liveness child with its parent, and the open cap is deleted.
 fn reply_open(
     open_id: u64,
     open_cap: u64,
     liveness_child: u64,
-    files: &Mutex<OpenTable>,
+    opens: &Mutex<Opens>,
     cache: &PageCache,
     ipc_buf: *mut u64,
 )
@@ -1331,9 +1825,10 @@ fn reply_open(
         return;
     }
     let _ = syscall::cap_delete(open_cap);
-    let removed = files
+    let removed = opens
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+        .unpaid
         .remove(open_id);
     if let Some(file) = removed
     {
@@ -1341,9 +1836,10 @@ fn reply_open(
     }
 }
 
-/// The two caps of a new open's liveness Notification: the parent fatfs keeps
-/// on the open, and the zero-rights child the `FS_OPEN` reply hands the
-/// client (services/fs/docs/fs-driver-protocol.md § Label 18).
+/// The two caps of a liveness Notification of a new session or unpaid open:
+/// the parent fatfs keeps on it, and the zero-rights child the `FS_SESSION`
+/// or `FS_OPEN` reply hands the client (services/fs/docs/fs-driver-protocol.md
+/// § Label 23, § Label 18).
 struct Liveness
 {
     parent: u64,
@@ -1374,8 +1870,8 @@ impl Liveness
         }
     }
 
-    /// Delete both caps of a liveness object no open kept, which frees the
-    /// Notification.
+    /// Delete both caps of a liveness object no session or open kept, which
+    /// frees the Notification.
     fn discard(self)
     {
         let _ = syscall::cap_delete(self.child);
@@ -1383,30 +1879,22 @@ impl Liveness
     }
 }
 
-/// Release every open whose client holds no copy of its liveness cap any more
-/// ([`OpenFile::client_gone`]), as `FS_CLOSE` would, and restart `sweeps`
-/// from the opens left. Called with the open-table lock held, which the
-/// eviction worker shares.
-fn sweep_dead_opens(files: &mut OpenTable, sweeps: &mut SweepSchedule, cache: &PageCache)
-{
-    files.remove_where(OpenFile::client_gone, |f| release_open_file(&f, cache));
-    sweeps.swept(files.len());
-}
-
 /// `FS_UNMOUNT` (services/fs/docs/fs-driver-protocol.md § Label 19): sweep
-/// the opens whose client is gone, then refuse with `BUSY` and the count of
-/// live opens, unless none is left or the request carries `UNMOUNT_FORCE`.
-/// Otherwise release every open as `FS_CLOSE` would, which revokes the
-/// client's liveness and page caps, write the `FSInfo` hints of a mounted
+/// the unpaid opens and the sessions whose client is gone, then refuse with
+/// `BUSY` and the count of live opens of both kinds, unless none is left or
+/// the request carries `UNMOUNT_FORCE`; a session with no open does not
+/// count. Otherwise release every open as `FS_CLOSE` would and end every
+/// session, which revokes the client's liveness and page caps and gives the
+/// session pages back, write the `FSInfo` hints of a mounted
 /// volume, reply, and return `true`, after which the caller ends its turn
 /// and exits the process; a refused unmount returns `false`. The single
 /// dispatch thread runs this between requests, so no request of this driver
 /// is in flight; the eviction worker finds the opens gone when it next takes
-/// the table's lock.
+/// their lock.
 fn handle_unmount(
     msg: &IpcMessage,
     state: &mut FatState,
-    files: &Mutex<OpenTable>,
+    opens: &Mutex<Opens>,
     sweeps: &mut SweepSchedule,
     cache: &PageCache,
     block_dev: u64,
@@ -1418,12 +1906,13 @@ fn handle_unmount(
         reply_err(ipc::fs_errors::LABEL_VERSION_MISMATCH, ipc_buf);
         return false;
     }
-    let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    sweep_dead_opens(&mut files_g, sweeps, cache);
-    let live = files_g.len();
+    let mut opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
+    opens_g.sweep_unpaid(sweeps, cache);
+    opens_g.sweep_sessions(cache);
+    let live = opens_g.live_opens();
     if live != 0 && msg.label & fs_labels::UNMOUNT_FORCE == 0
     {
-        drop(files_g);
+        drop(opens_g);
         let reply = IpcMessage::builder(ipc::fs_errors::BUSY)
             .word(0, live as u64)
             .build();
@@ -1431,8 +1920,8 @@ fn handle_unmount(
         let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
         return false;
     }
-    files_g.remove_where(|_| true, |f| release_open_file(&f, cache));
-    drop(files_g);
+    opens_g.release_all(cache);
+    drop(opens_g);
     if state.fat_size != 0
     {
         alloc::flush_fsinfo(state, cache, block_dev, ipc_buf);
@@ -1443,8 +1932,8 @@ fn handle_unmount(
     true
 }
 
-/// `FS_READ_MEMORY` against an open cap: the page is tracked on that open
-/// and its cooperative release goes to that open's release SEND. Delegates
+/// `FS_READ_MEMORY` against an open cap, of either kind: the page is tracked
+/// on that open and its cooperative release goes to that open's release SEND. Delegates
 /// to [`read_memory_for_open`].
 #[expect(
     clippy::too_many_arguments,
@@ -1453,11 +1942,11 @@ fn handle_unmount(
 )]
 fn handle_read_memory_open_cap(
     node_id: NodeId,
-    open_id: u64,
+    open: OpenRef,
     msg: &IpcMessage,
     state: &mut FatState,
     nodes: &NodeTable,
-    files: &mut OpenTable,
+    opens: &mut Opens,
     caps: &FatCaps,
     cache: &PageCache,
     ipc_buf: *mut u64,
@@ -1470,7 +1959,7 @@ fn handle_read_memory_open_cap(
         reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
     };
-    if node.kind != NodeKind::File || files.get(open_id).is_none()
+    if node.kind != NodeKind::File || opens.node(open).is_none()
     {
         reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
         return;
@@ -1478,9 +1967,9 @@ fn handle_read_memory_open_cap(
     read_memory_for_open(
         msg,
         &node,
-        open_id,
+        open,
         state,
-        files,
+        opens,
         cache,
         caps.block_dev,
         ipc_buf,
@@ -1490,8 +1979,8 @@ fn handle_read_memory_open_cap(
 
 /// Reply `code` holding none of the caps the request carried: an
 /// `FS_WRITE_MEMORY` source page goes back in the reply, as § Label 12
-/// promises in every outcome, and any other cap (an `FS_OPEN`
-/// release SEND) is deleted. Used for requests refused before any cap they
+/// promises in every outcome, and any other cap (an `FS_OPEN` session cap or
+/// release SEND, an `FS_SESSION` handle) is deleted. Used for requests refused before any cap they
 /// carry is recorded or consumed (the dispatch loop's rights-gate and
 /// unknown or unbadged label refusals, the cap-kind refusal, and the
 /// `FS_OPEN` handler's refusals before it records the SEND) and for
@@ -1519,95 +2008,56 @@ fn reply_dropping_caps(msg: &IpcMessage, opcode: u64, code: u64, ipc_buf: *mut u
 /// page `data[0]` names. A cookie matching no page of the open is a no-op
 /// success (release is idempotent); a closed open is `INVALID_BADGE`.
 fn handle_release_memory_open_cap(
-    open_id: u64,
+    open: OpenRef,
     msg: &IpcMessage,
-    files: &mut OpenTable,
+    opens: &mut Opens,
     cache: &PageCache,
     ipc_buf: *mut u64,
 )
 {
-    let cookie = msg.word(0);
-    let Some(file) = files.get_mut(open_id)
+    let code = if opens.release_held(open, msg.word(0), cache)
+    {
+        ipc::fs_errors::SUCCESS
+    }
     else
     {
-        reply_err(ipc::fs_errors::INVALID_BADGE, ipc_buf);
-        return;
+        ipc::fs_errors::INVALID_BADGE
     };
-    for slot in &mut file.outstanding
-    {
-        if let Some(entry) = slot
-            && entry.cookie == cookie
-        {
-            let _ = syscall::cap_revoke_all(entry.ancestor_cap);
-            let _ = syscall::cap_delete(entry.ancestor_cap);
-            cache.release_slot(entry.slot_idx);
-            *slot = None;
-            break;
-        }
-    }
-    let reply = IpcMessage::new(ipc::fs_errors::SUCCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply_err(code, ipc_buf);
 }
 
-/// `FS_CLOSE` against an open cap: remove the open from the table, which
-/// retires its identifier, and release its pages and release SEND. Other
-/// opens of the node are untouched, and the node lives until its entry is
-/// removed ([`NodeTable`]). The kernel-side cap reference is dropped by the
-/// caller's paired `cap_delete`.
-fn handle_close_open_cap(open_id: u64, files: &mut OpenTable, cache: &PageCache, ipc_buf: *mut u64)
+/// `FS_CLOSE` against an open cap: remove the open, which retires its
+/// identifier, and release its pages and release SEND. Other opens of the
+/// node are untouched, and the node lives until its entry is removed
+/// ([`NodeTable`]); a session lives on with its other opens. The kernel-side
+/// cap reference is dropped by the caller's paired `cap_delete`.
+fn handle_close_open_cap(open: OpenRef, opens: &mut Opens, cache: &PageCache, ipc_buf: *mut u64)
 {
-    let code = match files.remove(open_id)
+    let code = if opens.close(open, cache)
     {
-        Some(file) =>
-        {
-            release_open_file(&file, cache);
-            ipc::fs_errors::SUCCESS
-        }
-        None => ipc::fs_errors::INVALID_BADGE,
+        ipc::fs_errors::SUCCESS
+    }
+    else
+    {
+        ipc::fs_errors::INVALID_BADGE
     };
-    let reply = IpcMessage::new(code);
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    reply_err(code, ipc_buf);
 }
 
-/// Release an open taken out of the table: revoke and drop each outstanding
-/// page, delete the recorded release SEND (leaving it in the `CSpace`
-/// would accumulate a stale SEND per open across the fs's lifetime), and
-/// revoke the copies of the liveness cap before deleting its parent, so the
-/// client's copy dies with the open and the Notification's bytes return to
-/// fatfs's object slab. A copy derived from another holder's copy is out of
-/// the revoke's reach once a `CSpace` holding a copy on its derivation path
-/// is torn down, and holds the bytes until its holder deletes it
-/// (services/fs/docs/fs-driver-protocol.md § Label 18).
-fn release_open_file(file: &OpenFile, cache: &PageCache)
-{
-    let _ = syscall::cap_revoke_all(file.liveness_cap);
-    let _ = syscall::cap_delete(file.liveness_cap);
-    for entry in file.outstanding.iter().flatten()
-    {
-        let _ = syscall::cap_revoke_all(entry.ancestor_cap);
-        let _ = syscall::cap_delete(entry.ancestor_cap);
-        cache.release_slot(entry.slot_idx);
-    }
-    if file.release_endpoint_cap != 0
-    {
-        let _ = syscall::cap_delete(file.release_endpoint_cap);
-    }
-}
-
-/// Release every open of the node an `FS_REMOVE` or `FS_RENAME` freed
-/// ([`NodeTable::take_orphaned_node`]), under the open-table lock the
-/// eviction worker shares.
-fn release_orphaned_open_files(nodes: &mut NodeTable, files: &Mutex<OpenTable>, cache: &PageCache)
+/// Release every open, of either kind, of the node an `FS_REMOVE` or
+/// `FS_RENAME` freed ([`NodeTable::take_orphaned_node`]), under the opens'
+/// lock the eviction worker shares.
+fn release_orphaned_open_files(nodes: &mut NodeTable, opens: &Mutex<Opens>, cache: &PageCache)
 {
     let Some(node_id) = nodes.take_orphaned_node()
     else
     {
         return;
     };
-    let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    files_g.remove_where(|f| f.node_id == node_id, |f| release_open_file(&f, cache));
+    opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .close_node(node_id, cache);
 }
 
 // ── Write / mutation handlers ──────────────────────────────────────────────

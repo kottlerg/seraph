@@ -934,7 +934,8 @@ fn bundle_body(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]>
 }
 
 /// Walk the bundle header twice. The first walk verifies every entry through
-/// `verifier` under its entry name (`init` as init, every other entry, which
+/// `verifier` under its entry name in the role [`verify_bundle`] chooses
+/// (`init` as init, configuration as configuration, every other entry, which
 /// an install path names, as a boot module); the second, once
 /// every entry has passed, ELF-loads the body of the entry named
 /// [`bundle::INIT_ENTRY_NAME`] into a fresh set of segment pages and exposes
@@ -1050,17 +1051,21 @@ fn parse_bundle_header(bytes: &[u8]) -> Result<bundle::BundleHeader, BootError>
 }
 
 /// The first walk of [`step4_parse_bundle`]: verify each of the bundle's
-/// `entry_count` entries through `verifier` under its entry name, `init` as init
-/// and every other entry as a boot module, before any is parsed or exposed
-/// (docs/signing.md § Verifier Discipline). Every entry but init is named by an
-/// install path, so none takes [`TRUST_STORE_MODULE`], the name the bootloader
-/// gives the module it adds. Returns init's verified body.
+/// `entry_count` entries through `verifier` under its entry name, `init` as init,
+/// an entry under `/config/` as configuration (`bundle::is_configuration`),
+/// save a platform description table, and every other entry, the tables
+/// included, as a boot module, before any is parsed or exposed
+/// (docs/signing.md § Verifier Discipline), and require the boot-time policy
+/// entry `bundle::POLICY_ENTRY_NAME` (docs/signing.md § Configuration). Every
+/// entry but init is named by an install path, so none takes
+/// [`TRUST_STORE_MODULE`], the name the bootloader gives the module it adds.
+/// Returns init's verified body.
 ///
 /// # Errors
 /// [`BootError::SignatureRefused`] for the first entry the verifier refuses;
 /// [`BootError::InvalidBundle`] for an entry other than init not named by an
-/// install path, a second `init` entry or none, or an entry past the end of
-/// `bytes`.
+/// install path, a second `init` entry or none, a second policy entry or none,
+/// or an entry past the end of `bytes`.
 fn verify_bundle<'a>(
     bytes: &'a [u8],
     entry_count: u32,
@@ -1068,6 +1073,7 @@ fn verify_bundle<'a>(
 ) -> Result<&'a [u8], BootError>
 {
     let mut init_body: Option<&[u8]> = None;
+    let mut policy = false;
     for i in 0..entry_count
     {
         let (entry, object) = bundle_entry(bytes, i)?;
@@ -1084,7 +1090,25 @@ fn verify_bundle<'a>(
         }
         else if objsig::name_is_install_path(name)
         {
-            verifier.object(object, Role::BootModule, name)?;
+            let role = if bundle::is_configuration(name)
+            {
+                Role::Configuration
+            }
+            else
+            {
+                Role::BootModule
+            };
+            verifier.object(object, role, name)?;
+            if name == bundle::POLICY_ENTRY_NAME
+            {
+                if policy
+                {
+                    return Err(BootError::InvalidBundle(
+                        "bundle has multiple `/config/boot/policy.conf` entries",
+                    ));
+                }
+                policy = true;
+            }
         }
         else
         {
@@ -1093,7 +1117,14 @@ fn verify_bundle<'a>(
             ));
         }
     }
-    init_body.ok_or(BootError::InvalidBundle("bundle missing `init` entry"))
+    let init_body = init_body.ok_or(BootError::InvalidBundle("bundle missing `init` entry"))?;
+    if !policy
+    {
+        return Err(BootError::InvalidBundle(
+            "bundle missing `/config/boot/policy.conf` entry",
+        ));
+    }
+    Ok(init_body)
 }
 
 /// The header of bundle entry `index` and its object: the `size` bytes at its
@@ -2996,11 +3027,11 @@ mod tests
         push_reclaim_range, scrub, step6_and_7_spans, uefi, verify_bundle,
     };
     use crate::signing::Verifier;
-    use crate::signing::testing::{ROOT_SEED, STRANGER_SEED, signed, store_of};
+    use crate::signing::testing::{ROOT_SEED, STRANGER_SEED, signed, store_of, store_scoped};
     use boot_protocol::{
         KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED, bundle,
     };
-    use objsig::{RecordFailure, Refusal, Role, TrustStore};
+    use objsig::{RecordFailure, Refusal, Role, RoleSet, TrustStore};
 
     /// A bundle of `(name, object)` entries, bodies at 4 KiB-aligned
     /// offsets, as xtask writes one.
@@ -3033,11 +3064,50 @@ mod tests
     /// `verify_bundle` of `entries` under the root's store.
     fn verified(entries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>, BootError>
     {
-        let store = store_of(&ROOT_SEED);
-        let mut verifier = Verifier::new(TrustStore::parse(&store).unwrap());
+        verified_under(&store_of(&ROOT_SEED), entries)
+    }
+
+    /// `verify_bundle` of `entries` under the encoded store `store`.
+    fn verified_under(store: &[u8], entries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>, BootError>
+    {
+        let mut verifier = Verifier::new(TrustStore::parse(store).unwrap());
         let bytes = bundle_of(entries);
         let header = bundle::parse_header(&bytes).unwrap();
         verify_bundle(&bytes, header.entry_count, &mut verifier).map(<[u8]>::to_vec)
+    }
+
+    /// The name of the boot-time policy entry.
+    fn policy_name() -> &'static str
+    {
+        core::str::from_utf8(bundle::POLICY_ENTRY_NAME).unwrap()
+    }
+
+    /// The boot-time policy entry every bundle carries, signed by the root
+    /// with `roles`.
+    fn policy(roles: &[Role]) -> (&'static str, Vec<u8>)
+    {
+        let name = policy_name();
+        let object = signed(
+            &ROOT_SEED,
+            b"dma-confinement = opportunistic\n",
+            roles,
+            name.as_bytes(),
+        );
+        (name, object)
+    }
+
+    /// The bootloader's refusal of `entries`: the object it names and the
+    /// verifier's reason.
+    fn refusal_under(store: &[u8], entries: &[(&str, Vec<u8>)]) -> (std::string::String, Refusal)
+    {
+        match verified_under(store, entries)
+        {
+            Err(BootError::SignatureRefused { object, refusal }) => (
+                std::string::String::from_utf8(object.as_bytes().to_vec()).unwrap(),
+                refusal,
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     // Defect caught: a boot module body outside the bundle allocation (the
@@ -3089,7 +3159,7 @@ mod tests
         let table = signed(
             &ROOT_SEED,
             b"oem_table_id = X\n",
-            &[Role::BootModule],
+            &[Role::Data, Role::BootModule],
             TABLE.as_bytes(),
         );
         let longest = std::format!("/{}", "x".repeat(objsig::NAME_MAX - 1));
@@ -3105,19 +3175,14 @@ mod tests
                 (DEVMGR, devmgr.clone()),
                 (TABLE, table),
                 (&longest, long),
+                policy(&[Role::Configuration]),
             ])
             .unwrap(),
             b"init image"
         );
 
-        let refusal = |entries: &[(&str, Vec<u8>)]| match verified(entries)
-        {
-            Err(BootError::SignatureRefused { object, refusal }) => (
-                std::string::String::from_utf8(object.as_bytes().to_vec()).unwrap(),
-                refusal,
-            ),
-            other => panic!("expected a refusal, got {other:?}"),
-        };
+        let store = store_of(&ROOT_SEED);
+        let refusal = |entries: &[(&str, Vec<u8>)]| refusal_under(&store, entries);
         // A module after init is verified before init is returned.
         let untrusted = signed(
             &STRANGER_SEED,
@@ -3185,6 +3250,116 @@ mod tests
             verified(&[("init", init.clone()), ("init", init)]),
             Err(BootError::InvalidBundle(_))
         ));
+    }
+
+    // Defect caught: a bundle that boots without its boot-time policy, or
+    // with two, which the unsigned container lets an attacker arrange to turn
+    // a requirement off; or a configuration entry verified in the boot-module
+    // role, or under a key not trusted for configuration.
+    #[test]
+    fn the_policy_and_every_configuration_entry_verify_as_configuration()
+    {
+        const LEVELS: &str = "/config/init/log-levels.conf";
+        let init = signed(&ROOT_SEED, b"init image", &[Role::Init], b"init");
+        assert!(matches!(
+            verified(&[("init", init.clone())]),
+            Err(BootError::InvalidBundle(
+                "bundle missing `/config/boot/policy.conf` entry"
+            ))
+        ));
+        assert!(matches!(
+            verified(&[
+                ("init", init.clone()),
+                policy(&[Role::Configuration]),
+                policy(&[Role::Configuration]),
+            ]),
+            Err(BootError::InvalidBundle(
+                "bundle has multiple `/config/boot/policy.conf` entries"
+            ))
+        ));
+        let store = store_of(&ROOT_SEED);
+        assert_eq!(
+            refusal_under(
+                &store,
+                &[("init", init.clone()), policy(&[Role::BootModule])]
+            ),
+            (policy_name().into(), Refusal::Failed(RecordFailure::Role))
+        );
+        let levels = signed(
+            &ROOT_SEED,
+            b"vfsd = debug\n",
+            &[Role::BootModule],
+            LEVELS.as_bytes(),
+        );
+        assert_eq!(
+            refusal_under(
+                &store,
+                &[
+                    ("init", init.clone()),
+                    (LEVELS, levels),
+                    policy(&[Role::Configuration])
+                ]
+            ),
+            (LEVELS.into(), Refusal::Failed(RecordFailure::Role))
+        );
+        let without_configuration: Vec<Role> = Role::ALL
+            .into_iter()
+            .filter(|&role| role != Role::Configuration)
+            .collect();
+        let scoped = store_scoped(&ROOT_SEED, RoleSet::of(&without_configuration));
+        assert_eq!(
+            refusal_under(&scoped, &[("init", init), policy(&[Role::Configuration])]),
+            (
+                policy_name().into(),
+                Refusal::Failed(RecordFailure::KeyUsage)
+            )
+        );
+    }
+
+    // Defect caught: a platform description table verified in the
+    // configuration role, so a key trusted for configuration alone supplies
+    // a table devmgr applies.
+    #[test]
+    fn a_platform_table_verifies_as_a_boot_module_alone()
+    {
+        const TABLE: &str = "/config/devmgr/platform/qemu-virt.platform";
+        let init = signed(&ROOT_SEED, b"init image", &[Role::Init], b"init");
+        let as_configuration = signed(
+            &ROOT_SEED,
+            b"oem_table_id = X\n",
+            &[Role::Data, Role::Configuration],
+            TABLE.as_bytes(),
+        );
+        let store = store_of(&ROOT_SEED);
+        assert_eq!(
+            refusal_under(
+                &store,
+                &[
+                    ("init", init.clone()),
+                    (TABLE, as_configuration),
+                    policy(&[Role::Configuration])
+                ]
+            ),
+            (TABLE.into(), Refusal::Failed(RecordFailure::Role))
+        );
+        let configuration_only = store_scoped(&ROOT_SEED, RoleSet::of(&[Role::Configuration]));
+        let as_module = signed(
+            &ROOT_SEED,
+            b"oem_table_id = X\n",
+            &[Role::Data, Role::BootModule],
+            TABLE.as_bytes(),
+        );
+        assert_eq!(
+            refusal_under(
+                &configuration_only,
+                &[
+                    (TABLE, as_module),
+                    ("init", init),
+                    policy(&[Role::Configuration])
+                ]
+            ),
+            (TABLE.into(), Refusal::Failed(RecordFailure::KeyUsage))
+        );
     }
 
     const IMAGE: u64 = 8 << 20;

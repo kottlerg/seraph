@@ -25,9 +25,8 @@
 //! fatfs is never handed the whole-disk cap and cannot escape the partition
 //! regardless of what sector number it computes.
 //!
-//! Each driver gets a death queue its main thread is bound to before it
-//! starts and to whose relay procmgr posts the driver's end
-//! (`docs/namespace-composition.md` § Mount record); both spawn paths
+//! Each driver gets a death queue to whose relay procmgr posts the driver's
+//! end (`docs/namespace-composition.md` § Mount record); both spawn paths
 //! return the driver's process handle.
 
 use std::os::seraph::process::ArgvEnvCap;
@@ -65,22 +64,19 @@ pub struct FatfsDriver
     pub send: u64,
     /// procmgr's process handle for the driver.
     pub process: u64,
-    /// `RECV` on the driver's death queue ([`new_death_queue`]): the
-    /// driver's main thread is bound to it, and procmgr posts the driver's
-    /// end to the relay derived from it, so its main thread's exit and its
-    /// end, a terminal fault in any of its threads among them, post to it.
+    /// `RECV` on the driver's death queue ([`new_death_queue`]): procmgr
+    /// posts the driver's end, with the one exit reason it gives the
+    /// process, to the relay derived from it, whichever thread ended it.
     pub death_queue: u64,
 }
 
-/// Entries a driver's death queue holds. The main-thread binding posts once,
-/// on the main thread's exit or terminal fault, and procmgr posts the
-/// driver's end to the relay once, at its reap or destroy, so a driver's
-/// death posts one or two entries, and the queue holds every post.
-const DEATH_QUEUE_CAPACITY: u32 = 2;
-
-/// Death-observer nodes of a driver's death queue: the main-thread binding.
-/// procmgr's post to the relay is a post, not a binding, and takes none.
-const DEATH_QUEUE_OBSERVERS: u32 = 1;
+/// Entries a driver's death queue holds: procmgr posts the driver's end to
+/// the relay once, at its reap or destroy, and nothing else posts to it. No
+/// thread of the driver is bound to the queue: a thread's own end is the
+/// process's only when it is the first (`docs/process-lifecycle.md` § Exit
+/// reason), so a binding could post a reason procmgr does not give the
+/// driver, ahead of the relay's.
+const DEATH_QUEUE_CAPACITY: u32 = 1;
 
 /// Spawn a fatfs driver instance for a partition, to be mounted at
 /// `mount_path`, which names it ([`driver_argv`]), and return it.
@@ -336,18 +332,15 @@ fn new_bootstrap_order(
     Some((bootstrap, badged_creator))
 }
 
-/// A driver's death queue: an event queue with room for every post the
-/// main-thread binding and the relay can take ([`DEATH_QUEUE_CAPACITY`]) and
-/// an observer node for the binding ([`DEATH_QUEUE_OBSERVERS`]). Returns the original, or `None`
-/// when the queue cannot be created.
+/// A driver's death queue: an event queue with room for the relay's post
+/// ([`DEATH_QUEUE_CAPACITY`]) and no death-observer node, since nothing is
+/// bound to it. Returns the original, or `None` when the queue cannot be
+/// created.
 fn new_death_queue() -> Option<u64>
 {
-    let bytes = syscall_abi::event_queue_retype_bytes(
-        u64::from(DEATH_QUEUE_CAPACITY),
-        u64::from(DEATH_QUEUE_OBSERVERS),
-    );
+    let bytes = syscall_abi::event_queue_retype_bytes(u64::from(DEATH_QUEUE_CAPACITY), 0);
     std::os::seraph::object_slab_retype(bytes, |slab| {
-        syscall::event_queue_create_observed(slab, DEATH_QUEUE_CAPACITY, DEATH_QUEUE_OBSERVERS).ok()
+        syscall::event_queue_create(slab, DEATH_QUEUE_CAPACITY).ok()
     })
 }
 
@@ -359,40 +352,30 @@ pub fn derive_death_relay(death_queue: u64) -> Option<u64>
     syscall::cap_derive(death_queue, syscall::RIGHTS_EQ_POST).ok()
 }
 
-/// Bind a process procmgr created to its death queue and start it.
+/// Start a process procmgr created with a death relay
+/// ([`derive_death_relay`]).
 ///
 /// `reply_caps` are the caps of the `CREATE_PROCESS` / `CREATE_FROM_FILE`
-/// success reply: `[process_handle, child Thread cap]`. The Thread cap binds
-/// `death_queue` to the child's main thread (correlator 0: each driver has a
-/// queue of its own) before `START_PROCESS`, so no exit precedes the
-/// binding, and is then deleted, as is any further cap. The process handle
-/// is returned for the mount record. A process that cannot be bound or
-/// started is destroyed (`DESTROY_PROCESS`) so procmgr does not keep it,
-/// and its handle deleted. Returns `None` without any call when the reply
+/// success reply: `[process_handle, child Thread cap]`. Every cap but the
+/// process handle is deleted unused: procmgr holds the relay from the create
+/// on, so the driver's end posts to its death queue whenever it comes. The
+/// process handle is returned for the mount record. A process that cannot be
+/// started is destroyed (`DESTROY_PROCESS`) so procmgr does not keep it, and
+/// its handle deleted. Returns `None` without any call when the reply
 /// carried no process handle.
-pub fn start_child(reply_caps: &[u64], death_queue: u64, ipc_buf: *mut u64) -> Option<u64>
+pub fn start_child(reply_caps: &[u64], ipc_buf: *mut u64) -> Option<u64>
 {
     let mut reply = reply_caps.iter().copied();
     let process_handle = reply.next()?;
-    let thread = reply.next();
     for cap in reply
     {
         let _ = syscall::cap_delete(cap);
     }
-    let bound = thread
-        .is_some_and(|thread| syscall::thread_bind_notification(thread, death_queue, 0).is_ok());
-    if let Some(thread) = thread
-    {
-        let _ = syscall::cap_delete(thread);
-    }
 
-    let started = bound && {
-        let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
-        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        let start_reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) };
-        matches!(start_reply, Ok(ref r) if r.label == 0)
-    };
-    if started
+    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+    let start_reply = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) };
+    if matches!(start_reply, Ok(ref r) if r.label == 0)
     {
         return Some(process_handle);
     }
@@ -521,7 +504,7 @@ fn spawn_via_module(
         return None;
     }
 
-    let Some(process) = start_child(create_reply.caps(), driver.death_queue, ipc_buf)
+    let Some(process) = start_child(create_reply.caps(), ipc_buf)
     else
     {
         std::os::seraph::log!(warn: "fatfs START_PROCESS failed");

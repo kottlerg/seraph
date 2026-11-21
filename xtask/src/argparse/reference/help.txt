@@ -395,7 +395,7 @@ Run Seraph's tests: without a case, check formatting and lint the test code, the
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
-  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, dma-confinement, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 Options:
       --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
@@ -425,19 +425,20 @@ Arguments:
           The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests
 
           Possible values:
-          - terminal:   Keyboard and serial input through the terminal, and keyboard input again after a restart of the input driver
-          - kaslr:      The kernel's randomized layout differs between boots, and the `nokaslr` knob gives the deterministic one
-          - signing:    Each signature verifier refuses a tampered kernel, a tampered bundle entry, a revoked key, and tampered, wrong-role and foreign-signed rootfs images
-          - rollback:   The bootloader writes the machine's security floor in firmware storage, raises it, and refuses itself below it
-          - enrolment:  The bootloader enrols roots and revokes the build's through trust requests on the ESP, signed for enrolment or confirmed at the console, and the revocation holds on the next boot
-          - secureboot: The firmware boots the bootloader signed with an enrolled key and refuses it tampered or unsigned, under UEFI Secure Boot
-          - wedge:      The softlockup watchdog reports a CPU wedged with interrupts off
-          - vmgenid:    The kernel detects a VM generation change across a snapshot restore (`x86_64` only)
-          - hotplug:    PCI Express hotplug of a device and of a disk behind root ports
-          - cet:        The kernel's CET supervisor shadow stacks, under KVM (`x86_64` only)
-          - tpm:        The TPM 2.0 driver behind `tpm-tis` and `tpm-crb` (`x86_64` only)
-          - shutdown:   The machine shuts down for each cause: a reboot, the power button, and the death of each core or critical service
-          - debug-port: The debug port's transport, then the GDB stub driven by the host's GDB over it
+          - terminal:        Keyboard and serial input through the terminal, and keyboard input again after a restart of the input driver
+          - kaslr:           The kernel's randomized layout differs between boots, and the `nokaslr` knob gives the deterministic one
+          - signing:         Each signature verifier refuses a tampered kernel, a tampered bundle entry, a bundle without its boot-time policy or with one signed by a key not trusted for configuration, a revoked key, and tampered, wrong-role and foreign-signed rootfs images
+          - dma-confinement: With the boot policy requiring DMA confinement, devmgr gives no driver to a device no IOMMU unit confines, and the boot set runs behind the IOMMU
+          - rollback:        The bootloader writes the machine's security floor in firmware storage, raises it, and refuses itself below it
+          - enrolment:       The bootloader enrols roots and revokes the build's through trust requests on the ESP, signed for enrolment or confirmed at the console, and the revocation holds on the next boot
+          - secureboot:      The firmware boots the bootloader signed with an enrolled key and refuses it tampered or unsigned, under UEFI Secure Boot
+          - wedge:           The softlockup watchdog reports a CPU wedged with interrupts off
+          - vmgenid:         The kernel detects a VM generation change across a snapshot restore (`x86_64` only)
+          - hotplug:         PCI Express hotplug of a device and of a disk behind root ports
+          - cet:             The kernel's CET supervisor shadow stacks, under KVM (`x86_64` only)
+          - tpm:             The TPM 2.0 driver behind `tpm-tis` and `tpm-crb` (`x86_64` only)
+          - shutdown:        The machine shuts down for each cause: a reboot, the power button, and the death of each core or critical service
+          - debug-port:      The debug port's transport, then the GDB stub driven by the host's GDB over it
 
 Options:
       --cell <TESTER>
@@ -643,7 +644,7 @@ Options:
 
           Possible values:
           - init:  The userspace init, `/services/init`, with every module the system needs to bootstrap userspace (`init.<arch>.list`)
-          - ktest: The kernel-test harness, `/tests/ktest`, as the `"init"` entry alone: ktest is monolithic and spawns no module (`ktest.list`)
+          - ktest: The kernel-test harness, `/tests/ktest`, as the `"init"` entry, with the boot-time policy every bundle carries: ktest is monolithic and spawns no module (`ktest.list`)
 
       --knob <KNOB>
           Stage a bootloader knob in `\EFI\seraph\`: `nokaslr` boots the kernel at its deterministic (un-randomized) layout, for GDB and symbolization; `mapredo` makes the bootloader redo the first attempt of its steps 6 and 7. Repeatable, or comma-separated. The image carries exactly the knobs named: every other is removed

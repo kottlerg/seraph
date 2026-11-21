@@ -107,9 +107,11 @@ can reach any physical address the device can address.
 devmgr is responsible for detecting the platform IOMMU situation and deciding per-device policy;
 the IOMMU itself is programmed by a separate IOMMU driver devmgr directs (§ IOMMU Discovery and
 Programming). The IOMMU is preferred but not required
-([platform-requirements.md](platform-requirements.md#iommu-and-dma-confinement)): when none is
-present, or the one present cannot be programmed, devmgr logs once that DMA runs unconfined and
-spawns every DMA-capable driver in the DMA-unsafe mode, refusing and restricting none. devmgr
+([platform-requirements.md](platform-requirements.md#iommu-and-dma-confinement)), unless the
+system's signed boot-time policy requires it (§ Required DMA Confinement): under the default
+policy, when none is present, or the one present cannot be programmed, devmgr logs once that DMA
+runs unconfined and spawns every DMA-capable driver in the DMA-unsafe mode, refusing and
+restricting none. devmgr
 programs VT-d on x86-64 through the `iommu-vtd` driver and the RISC-V IOMMU on riscv64 through the
 `iommu-riscv` driver; every device a remapping unit translates runs IOMMU-isolated, and a device
 no unit translates runs DMA-unsafe.
@@ -117,6 +119,34 @@ no unit translates runs DMA-unsafe.
 The kernel is agnostic to DMA mode: it does not read or write IOMMU
 registers, does not track per-device DMA state, and does not return a
 DMA-safety verdict.
+
+### Required DMA Confinement
+
+The boot-time policy's `dma-confinement` setting ([signing.md](signing.md#configuration)
+§ Configuration; its format in [`shared/boot-policy`](../shared/boot-policy/README.md)) is
+`opportunistic`, the default and the behaviour above, or `required`. devmgr reads it from the
+policy boot module init forwards, before it starts the IOMMU driver or any other driver, and logs
+it (`boot policy: dma-confinement = <value>`); no policy module, or one that does not parse, reads
+as `required`.
+
+Under `required`, devmgr gives a DMA-capable device its DMA grant, and so starts its driver, only
+when a remapping unit confines the device in a domain of its own (`firmware::dma::admits`, applied
+where every DMA grant is made). It refuses every other DMA-capable device with a console line
+naming the driver, the device's segment, bus, device and function, and the setting, and starts no
+driver for it. Each way a device can be left unconfined ends in that refusal: no IOMMU found, no
+IOMMU driver module, no unit that can be programmed, an IOMMU driver not ready within the settle
+bound or dead before its ready report (each logged once, saying that no DMA-capable device is given
+a driver), and a device no unit translates. A device whose unit is not programmed, and every
+confined device once the IOMMU driver has failed closed (§ IOMMU Driver Restart), are refused under
+either setting. No device is given unconfined DMA under `required`; a device that takes no DMA is
+bound as before.
+
+The machine does not boot when a device the boot needs is refused: with the root disk's controller
+refused, vfsd cannot mount the root filesystem and init halts, after devmgr's line naming the device
+and the setting. Such a machine is recovered in either of two ways: give it an IOMMU that confines
+the device (enable VT-d or the RISC-V IOMMU in firmware, or restore the firmware's DMAR or RIMT),
+or boot it from a bundle whose policy sets `dma-confinement = opportunistic`, signed in the
+configuration role by a key the machine's trust store trusts for it.
 
 ### DMA-Safe Teardown
 
@@ -353,7 +383,9 @@ RISC-V IOMMU's MSI page tables stay off is specified in
 § MSI Confinement.
 
 When no unit is found, no IOMMU driver module was delivered, or the driver does not report ready
-within the settle bound, devmgr logs once that DMA runs unconfined and every device runs so. A
+within the settle bound, devmgr logs once that DMA runs unconfined and every device runs so, unless
+the boot-time policy requires confinement, when it refuses every DMA-capable device instead
+(§ Required DMA Confinement). A
 driver that fails its own setup turns translation off again before it exits, so it leaves no device
 blocked. A driver that dies or hangs after it turned a unit's translation on, before it reported
 ready, leaves that unit blocking every device behind it, which devmgr does not undo: it releases
@@ -725,12 +757,13 @@ devmgr loads driver binaries from one of two places:
   bootstrap rounds, with any platform description table a root mount needs; each module's round
   words carry its size and its bundle entry name, which devmgr gives procmgr to verify the module
   under. devmgr tells a module by its content: it reads the declaration of each ELF image, parses
-  valid UTF-8 text as a platform description table, and logs and releases anything else. It binds
-  the PCI and platform records those declarations match in the boot settle batch (the IOMMU family
-  record in a batch of its own before it), and spawns every driver via
-  `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only in the pass that binds it, apart from
-  devmgr's copy of the IOMMU driver's image, from which every restart of that driver starts
-  (§ IOMMU Driver Restart); a device added later, a disk included, binds the copy under
+  valid UTF-8 text named under `/config/devmgr/platform/` as a platform description table (a
+  bundled table keeps the boot-module role, [signing.md](signing.md) § Configuration), and logs and
+  releases anything else. It binds the PCI and platform records those declarations match in the
+  boot settle batch (the IOMMU family record in a batch of its own before it), and spawns every
+  driver via `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only in the pass that binds it,
+  apart from devmgr's copy of the IOMMU driver's image, from which every restart of that driver
+  starts (§ IOMMU Driver Restart); a device added later, a disk included, binds the copy under
   `/services/drivers/` at the auxiliary tier ([driver-binding.md](driver-binding.md) § Declaration
   Bounds).
 - **On-disk rootfs** — non-essentials (the serial and framebuffer drivers of the consoles, the

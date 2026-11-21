@@ -343,8 +343,8 @@ for the snapshot-detection design.
 
 Same boot requirements as the `terminal` case (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI the x86_64 `usertest` cell's
-`cargo xtask test --cell usertest` runs it after the `terminal`, `signing` and `wedge` cases and
-before the `shutdown` case.
+`cargo xtask test --cell usertest` runs it after the `terminal`, `signing`, `dma-confinement`,
+`rollback`, `enrolment`, `secureboot` and `wedge` cases and before the `shutdown` case.
 
 ### KASLR randomization (`kaslr` case)
 
@@ -639,7 +639,7 @@ device cell of the local and release host runs (Coverage tiers below).
 
 Every verifier of [signing.md](signing.md) § Which Stage Verifies What refuses an object that
 does not verify, and a refusal path no boot takes is not shown to work. `cargo xtask test signing
-[--arch] [--release]` (both arches) boots the current sysroot six times from disk images that
+[--arch] [--release]` (both arches) boots the current sysroot eight times from disk images that
 carry objects no build makes, written in place of the sysroot's files at pack time, so the
 sysroot itself is never changed:
 
@@ -647,9 +647,11 @@ sysroot itself is never changed:
    `Failed(BodyHash)`.
 2. `bundle`: the bundle's `/services/drivers/virtio-blk` entry with a body byte flipped. The
    bootloader refuses it, `Failed(BodyHash)`.
-3. `revoked`: a bootloader built under the build's trust store with the signing key revoked. It
+3. `policy-missing`: the bundle without its boot-time policy entry, `/config/boot/policy.conf`.
+   The bootloader refuses the bundle, naming the entry it lacks.
+4. `revoked`: a bootloader built under the build's trust store with the signing key revoked. It
    refuses the kernel, `Failed(Revoked)`.
-4. `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr` signed with the data
+5. `rootfs`: `/services/timed` with a body byte flipped, `/services/pwrmgr` signed with the data
    role alone, and `/services/crashd` signed by a key no anchor holds. procmgr refuses each
    (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr reports each refused launch.
    The kernel and `/programs/terminal` each carry a record of that key before their own, which
@@ -657,7 +659,7 @@ sysroot itself is never changed:
    the platform description table `/config/devmgr/platform/qemu-virt.platform` also has a body
    byte flipped: procmgr refuses devmgr's verified read of it, `Failed(BodyHash)`, and devmgr
    passes it over and adds no platform-table record.
-5. `configuration`: a bootloader built under the build's trust store with two more anchors, one
+6. `configuration`: a bootloader built under the build's trust store with two more anchors, one
    trusted for every role but configuration and one for configuration alone, and, in
    `/config/svcmgr/services/`, `timed.svc` with a body byte flipped, `pwrmgr.svc` unsigned,
    `crashd.svc` signed by the first anchor's key, and `oomd.svc` by the second's, which signs
@@ -670,7 +672,10 @@ sysroot itself is never changed:
    line; procmgr refuses the service `oomd.svc`'s anchor signs (`Failed(KeyUsage)`); svcmgr reports
    the file the index names but the directory lacks, and the file it does not name; the boot reaches
    the terminal's READY line.
-6. `index`: the indexes of `/config/svcmgr/services/` and `/config/devmgr/classes/` each with a
+7. `policy-key`: the `configuration` boot's bootloader, and the bundle's policy entry signed in
+   the configuration role by the key its store trusts for every role but configuration. The
+   bootloader refuses the entry, `Failed(KeyUsage)`.
+8. `index`: the indexes of `/config/svcmgr/services/` and `/config/devmgr/classes/` each with a
    body byte flipped. procmgr refuses both (`Failed(BodyHash)`), svcmgr reports that it read no
    recipe and configured no class, and reports every service init registered as one without a
    definition.
@@ -680,6 +685,28 @@ its deadline. The images are packed again from the sysroot afterwards, whatever 
 [xtask/README.md § The `signing` case](../xtask/README.md#the-signing-case) for the lines, the
 deadlines and the logs. CI runs it in each usertest cell after the `terminal` case, in the cell's
 profile.
+
+### Required DMA confinement (`dma-confinement` case)
+
+With the boot policy's `dma-confinement = required`, devmgr gives no driver to a DMA-capable
+device no IOMMU unit confines ([device-management.md](device-management.md) § Required DMA
+Confinement), which only a boot whose bundle carries that policy shows. `cargo xtask test
+dma-confinement [--arch]` (both arches) boots the current sysroot twice, its bundle carrying in
+place of the sysroot's policy one that sets `dma-confinement = required`, signed in the
+configuration role by the build's key:
+
+1. `absent`: a machine with no IOMMU (`--iommu absent`). devmgr logs that no DMA-capable device
+   is given a driver, and refuses each such device's driver, naming the device and the setting;
+   with no block device, vfsd mounts no root and the boot stops.
+2. `attached`: the default machine, every `virtio-pci` device behind the IOMMU. devmgr refuses no
+   device, and the boot reaches the terminal's READY line.
+
+A boot passes when every line it owes appears, and fails on a refusal it does not owe, a DMA
+refusal among them, a fatal line, or its deadline. A device that no unit translates beside one that
+a unit does, and an IOMMU driver not ready within the settle bound or dead, take the same refusal,
+which devmgr's host tests show (`firmware::dma::admits`), since no QEMU machine presents them.
+See [xtask/README.md § The `dma-confinement` case](../xtask/README.md#the-dma-confinement-case)
+for the lines and the logs. CI runs it in each usertest cell after the `signing` case.
 
 ### Rollback floor (`rollback` case)
 
@@ -699,8 +726,8 @@ with the build's trust store floor `F`:
 A boot passes when every line it owes appears; a boot after a failed one is not made. A firmware
 that refuses the write is covered by the bootloader's host tests, since no QEMU firmware refuses
 it on demand. See [xtask/README.md § The `rollback` case](../xtask/README.md#the-rollback-case)
-for the lines and the logs. CI runs it in each usertest cell after the `signing` case, in the
-cell's profile.
+for the lines and the logs. CI runs it in each usertest cell after the `dma-confinement` case, in
+the cell's profile.
 
 ### Root enrolment (`enrolment` case)
 
@@ -1023,7 +1050,8 @@ service (see Crash reports above).
 CI matrix cells follow these rules per boot. The `usertest` cell runs its boots in sequence:
 `usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
 default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
-`terminal` case's boot, the `signing` case's six boots, the `rollback` case's three boots, the
+`terminal` case's boot, the `signing` case's eight boots, the `dma-confinement` case's two boots,
+the `rollback` case's three boots, the
 `enrolment` case's six boots, the `secureboot` case's four boots, the
 `wedge` case's boot pair, on x86_64 the `vmgenid` case's save/restore boot pair, and the `shutdown`
 case's boots, nine on x86_64 (the reboot, the power button and the seven core deaths) and eight on
@@ -1095,7 +1123,7 @@ registry runs it on (its `md-test-cells` rule).
 | Cell | Tier | Architectures | Launch | Cases | Covers |
 |---|---|---|---|---|---|
 | `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
-| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
+| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
 | `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
 | boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
 | memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |

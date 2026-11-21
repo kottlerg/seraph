@@ -780,6 +780,7 @@ mod tests
                 fs::write(&path, format!("\x7fELF {install}")).unwrap();
             }
         }
+        crate::signing::testing::install_policy(&ctx);
         let mut image = b"MZ bootloader".to_vec();
         image.extend_from_slice(&objsig::embed::MARKER);
         image.extend_from_slice(&u32::try_from(signer.store().len()).unwrap().to_le_bytes());

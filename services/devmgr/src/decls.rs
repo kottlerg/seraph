@@ -10,8 +10,14 @@
 //! hands it at `SET_DRIVERS_DIR`.
 //!
 //! init forwards its boot modules untagged; [`classify_modules`] tells each
-//! by its content: an ELF executable is a driver module, anything else a
-//! platform description table (`firmware::platform`).
+//! by its content: an ELF executable is a driver module, and text named
+//! under `boot_protocol::bundle::PLATFORM_TABLE_PREFIX` a platform
+//! description table (`firmware::platform`), the name binding it to the
+//! boot-module role the bootloader verified it in (docs/signing.md
+//! § Configuration); anything else is released. The one exception is the
+//! boot-time policy (`boot_protocol::bundle::POLICY_ENTRY_NAME`), which
+//! it tells by its name and reads into `caps::DevmgrCaps::dma_confinement`
+//! (docs/device-management.md § DMA Safety Model).
 //!
 //! The reads are bounded, as § Declaration Bounds requires: the ELF header
 //! page, the section header table, the section name table, and the one note
@@ -203,22 +209,39 @@ pub struct BootModules
     pub tables: Vec<PlatformTable>,
 }
 
-/// Take every boot module of `caps` and tell each by its content: an ELF
-/// executable is a driver module, kept with its declaration; any other
-/// module is a platform description table, parsed from its body
-/// ([`firmware::platform::parse_module`]) and released. A driver module with
+/// Take every boot module of `caps` and tell each by its content and
+/// name: an ELF executable is a driver module, kept with its declaration; a
+/// module named under `boot_protocol::bundle::PLATFORM_TABLE_PREFIX` is a
+/// platform description table, parsed from its body
+/// ([`firmware::platform::parse_module`]) and released. The name binds a
+/// table to the boot-module role the bootloader verified it in, so a key
+/// trusted for configuration alone supplies none. A driver module with
 /// no declaration, and a module that is neither, are logged and released, as
-/// is every module when the lists cannot grow.
+/// is every module when the lists cannot grow. The boot-time policy module,
+/// told by its name, sets `caps.dma_confinement` and is released; with none,
+/// or one that does not parse, the setting stays required
+/// (`boot_policy::Policy::FAIL_CLOSED`). The setting is logged.
 pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
 {
     let mut out = BootModules {
         drivers: Vec::new(),
         tables: Vec::new(),
     };
+    let mut policy = None;
+    let mut policy_seen = false;
     for module in core::mem::take(&mut caps.modules)
     {
         let module_cap = module.cap;
-        match with_module(caps, module_cap, module.size, classify)
+        if *module.name == *boot_protocol::bundle::POLICY_ENTRY_NAME
+        {
+            policy_seen = true;
+            policy = with_module(caps, module_cap, module.size, read_policy).flatten();
+            let _ = syscall::cap_delete(module_cap);
+            continue;
+        }
+        match with_module(caps, module_cap, module.size, |bytes| {
+            classify(&module.name, bytes)
+        })
         {
             Some(Classified::Driver(decl)) if out.drivers.try_reserve(1).is_ok() =>
             {
@@ -245,7 +268,41 @@ pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
         }
         let _ = syscall::cap_delete(module_cap);
     }
+    if !policy_seen
+    {
+        std::os::seraph::log!(error: "boot policy: no policy module; every requirement on");
+    }
+    let policy = policy.unwrap_or(boot_policy::Policy::FAIL_CLOSED);
+    caps.dma_confinement = policy.dma_confinement;
+    std::os::seraph::log!(
+        "boot policy: {} = {}",
+        boot_policy::DmaConfinement::KEY,
+        policy.dma_confinement.value()
+    );
     out
+}
+
+/// The boot-time policy the policy module `bytes` holds; `None`, logged,
+/// when it is refused, so every requirement holds.
+fn read_policy(bytes: &[u8]) -> Option<boot_policy::Policy>
+{
+    match boot_policy::parse_module(bytes)
+    {
+        Ok(policy) => Some(policy),
+        Err(boot_policy::ModuleError::Trailer(e)) =>
+        {
+            std::os::seraph::log!(
+                error: "boot policy: not a signed object ({:?}); every requirement on",
+                e
+            );
+            None
+        }
+        Err(boot_policy::ModuleError::Policy(e)) =>
+        {
+            std::os::seraph::log!(error: "boot policy: refused ({}); every requirement on", e);
+            None
+        }
+    }
 }
 
 /// What a boot module's content is.
@@ -262,10 +319,11 @@ enum Classified
     Neither,
 }
 
-/// Tell a boot module by its bytes: an ELF executable by its magic, its
-/// declaration read within § Declaration Bounds; anything else as a
-/// platform description table, the body of a signed object.
-fn classify(bytes: &[u8]) -> Classified
+/// Tell the boot module `name` by its bytes: an ELF executable by its
+/// magic, its declaration read within § Declaration Bounds; a module named
+/// as a platform description table (`bundle::is_platform_table`) as one,
+/// the body of a signed object; anything else as neither.
+fn classify(name: &[u8], bytes: &[u8]) -> Classified
 {
     if bytes.starts_with(ELF_MAGIC)
     {
@@ -281,6 +339,13 @@ fn classify(bytes: &[u8]) -> Classified
             return Classified::Driver(decl);
         }
         std::os::seraph::log!(warn: "boot module: an executable with no declaration; released");
+        return Classified::Neither;
+    }
+    if !boot_protocol::bundle::is_platform_table(name)
+    {
+        std::os::seraph::log!(
+            warn: "boot module: neither an executable nor named as a platform table; released"
+        );
         return Classified::Neither;
     }
     match firmware::platform::parse_module(bytes)

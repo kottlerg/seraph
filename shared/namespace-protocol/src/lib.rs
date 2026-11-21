@@ -40,7 +40,9 @@ pub mod rights;
 pub mod wire;
 
 pub use badge::{
-    NODE_ID_BITS, NODE_ID_MASK, NodeId, OPEN_INSTANCE, is_open_instance, pack, pack_open,
+    KIND_ID_BITS, KIND_ID_MASK, NODE_ID_BITS, NODE_ID_MASK, NodeId, OPEN_INSTANCE, OpenRef,
+    SESSION, is_kind_flagged, is_open_instance, pack, pack_open, pack_session, pack_session_open,
+    session_id,
 };
 pub use gate::{GateError, compose_forward_lookup_rights, gate, gate_open};
 pub use name::{MAX_NAME_LEN, MIN_NAME_LEN, NameError, validate_name};
@@ -324,8 +326,8 @@ pub trait NamespaceBackend
 /// handle.
 ///
 /// `received.badge` MUST be the badge the kernel delivered with the
-/// request. A `pack(node_id, rights)` badge is dispatched; an
-/// open-instance badge ([`badge::OPEN_INSTANCE`]) is answered
+/// request. A `pack(node_id, rights)` badge is dispatched; a badge with a
+/// kind flag ([`badge::OPEN_INSTANCE`] or [`badge::SESSION`]) is answered
 /// [`NsError::NotSupported`]. Backends do not see the wire
 /// layer — they only see decoded `NodeId` / `&[u8]` / `u64`
 /// arguments.
@@ -354,10 +356,10 @@ fn request_reply<B: NamespaceBackend>(
     namespace_endpoint: u64,
 ) -> ipc::IpcMessage
 {
-    // An open-instance badge's low bits are an open id, not a NodeId
-    // (badge::OPEN_INSTANCE): decoding one as a node would act on whichever
-    // node shares the number.
-    if badge::is_open_instance(received.badge)
+    // A kind-flagged badge's low bits are an open or session id, not a
+    // NodeId (badge::is_kind_flagged): decoding one as a node would act on
+    // whichever node shares the number.
+    if badge::is_kind_flagged(received.badge)
     {
         return ipc::IpcMessage::new(NsError::NotSupported.as_label());
     }

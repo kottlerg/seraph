@@ -15,7 +15,8 @@
 //!
 //! The module also names the correlators of the core-death queue's entries
 //! ([`CORE_DEATH_SVCMGR`], [`CORE_DEATH_MEMMGR`], [`CORE_DEATH_PROCMGR`]),
-//! which svcmgr binds the death observers of the core set under and pwrmgr
+//! which svcmgr binds the death observers of the core set under, with
+//! [`CORE_DEATH_ADDRESS_SPACE`] on each address-space observer's, and pwrmgr
 //! reads.
 //!
 //! See `services/pwrmgr/README.md` for the authoritative description.
@@ -47,6 +48,17 @@ pub const CORE_DEATH_MEMMGR: u64 = 1;
 /// The correlator of the death observers svcmgr binds on procmgr's main
 /// thread and address space, on the same queue.
 pub const CORE_DEATH_PROCMGR: u64 = 2;
+/// The flag svcmgr ORs into a member's correlator for the observer it binds
+/// on the member's address space, and leaves clear for the one on its main
+/// thread, so an entry says which end it is: the main thread's own end, or
+/// the address space's first terminal end, of any of its threads. The two
+/// can carry different reasons (`docs/process-lifecycle.md` § Exit reason).
+pub const CORE_DEATH_ADDRESS_SPACE: u64 = 1 << 8;
+
+// The flag is clear in every member's correlator.
+const _: () = core::assert!(
+    (CORE_DEATH_SVCMGR | CORE_DEATH_MEMMGR | CORE_DEATH_PROCMGR) & CORE_DEATH_ADDRESS_SPACE == 0
+);
 
 /// Authority bit in the pwrmgr-service-endpoint badge's high u64
 /// bit. Set on caps minted for consumers permitted to call

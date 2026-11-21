@@ -607,7 +607,8 @@ pub const INIT_SLOT: &str = "init";
 /// with, where `slots` holds the objects signed into the `init` slot and
 /// `boot_modules` the entries the bundle lists name: an object of `slots`,
 /// `init` with the init role alone; every other image, its install path with
-/// its [`location_role`], and the boot-module role when a list names it
+/// its [`location_role`], and the role the bootloader verifies its bundle
+/// entry in (`crate::bundle::entry_role`) when a list names it
 /// (docs/signing.md § Signing).
 fn image_signature(
     install: &str,
@@ -623,7 +624,7 @@ fn image_signature(
     let role = location_role(relative);
     let roles = if boot_modules.iter().any(|module| module == install)
     {
-        RoleSet::of(&[role, Role::BootModule])
+        RoleSet::of(&[role, crate::bundle::entry_role(install)])
     }
     else
     {
@@ -654,15 +655,15 @@ fn install_name(path: &Path) -> Result<String>
 /// (`crate::bundle::read_list`): the installed kernel, `kernel` with the
 /// kernel role alone; every ELF image under [`SIGNED_TREES`] as
 /// [`image_signature`] says; every regular file under [`DATA_TREES`] under
-/// its install path in the data role, and the boot-module role beside it
-/// when a list names it; every regular file of each directory of
-/// [`CONFIG_TREES`] under its install path in the configuration role, and the
-/// boot-module role beside it when a list names it, with the directory's index
-/// written from the files it holds ([`write_index`]) and signed in the
-/// configuration role under `<directory>/index`; and every other installed file a list names,
-/// `init` with the init role alone when it is the object of a signed
-/// `init` slot, under its install path with the boot-module role alone
-/// otherwise. The `init` slot objects signed are the init harness's, always,
+/// its install path in the data role, and beside it, when a list names it,
+/// the role the bootloader verifies its bundle entry in
+/// (`crate::bundle::entry_role`); every regular file of each directory of
+/// [`CONFIG_TREES`] under its install path in the configuration role, the
+/// role of its bundle entry too, with the directory's index written from the
+/// files it holds ([`write_index`]) and signed in the configuration role
+/// under `<directory>/index`; and every other installed file a list names,
+/// `init` with the init role alone when it is the object of a signed `init`
+/// slot, under its install path with its bundle entry's role alone otherwise. The `init` slot objects signed are the init harness's, always,
 /// and `harness`'s. A file a list names that the sysroot does not install is
 /// left to the compose of a bundle that names it, which refuses it. Returns how
 /// many objects were signed and how many of them changed.
@@ -723,7 +724,7 @@ pub fn sign_sysroot(
             let install = install_name(&relative)?;
             let roles = if boot_modules.contains(&install)
             {
-                RoleSet::of(&[Role::Data, Role::BootModule])
+                RoleSet::of(&[Role::Data, crate::bundle::entry_role(&install)])
             }
             else
             {
@@ -733,7 +734,7 @@ pub fn sign_sysroot(
             done.insert(install);
         }
     }
-    sign_config_trees(ctx, signer, &boot_modules, &mut done, &mut count)?;
+    sign_config_trees(ctx, signer, &mut done, &mut count)?;
     for install in slots.iter().chain(&boot_modules)
     {
         let path = ctx.sysroot.join(install.trim_start_matches('/'));
@@ -747,7 +748,7 @@ pub fn sign_sysroot(
         }
         else
         {
-            (install.as_str(), Role::BootModule)
+            (install.as_str(), crate::bundle::entry_role(install))
         };
         count(signer.sign_file(&path, RoleSet::of(&[role]), name)?);
     }
@@ -755,11 +756,11 @@ pub fn sign_sysroot(
 }
 
 /// Sign every file of each directory of [`CONFIG_TREES`] in `ctx`'s sysroot
-/// in the configuration role under its install path, with the boot-module
-/// role beside it when `boot_modules` names it, and write the directory's
-/// index of their names and body digests ([`write_index`]); each install
-/// path signed goes into `done`, and
-/// each object signed to `count`, with whether it changed.
+/// in the configuration role under its install path, which is also the role
+/// the bootloader verifies it in when a bundle list names it
+/// (`crate::bundle::entry_role`), and write the directory's index of their
+/// names and body digests ([`write_index`]); each install path signed goes
+/// into `done`, and each object signed to `count`, with whether it changed.
 ///
 /// # Errors
 ///
@@ -767,7 +768,6 @@ pub fn sign_sysroot(
 fn sign_config_trees(
     ctx: &BuildContext,
     signer: &Signer,
-    boot_modules: &[String],
     done: &mut std::collections::HashSet<String>,
     count: &mut dyn FnMut(bool),
 ) -> Result<()>
@@ -783,14 +783,7 @@ fn sign_config_trees(
         {
             let relative = Path::new(tree).join(name);
             let install = install_name(&relative)?;
-            let roles = if boot_modules.contains(&install)
-            {
-                RoleSet::of(&[Role::Configuration, Role::BootModule])
-            }
-            else
-            {
-                RoleSet::of(&[Role::Configuration])
-            };
+            let roles = RoleSet::of(&[Role::Configuration]);
             count(signer.sign_file(&ctx.sysroot.join(&relative), roles, &install)?);
             done.insert(install);
         }
@@ -1123,6 +1116,16 @@ pub mod testing
             let entry = entry.unwrap();
             std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
         }
+    }
+
+    /// Install the repository's boot-time policy in `ctx`'s sysroot, unsigned,
+    /// over any file there: the body a pack accepts.
+    pub fn install_policy(ctx: &BuildContext)
+    {
+        let name = String::from_utf8_lossy(boot_protocol::bundle::POLICY_ENTRY_NAME);
+        let to = ctx.sysroot.join(&name[1..]);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(work_tree().join("rootfs").join(&name[1..]), to).unwrap();
     }
 
     /// The work tree the tests' identities lie outside of: the repository.
@@ -1557,7 +1560,7 @@ mod tests
         let ktest = fs::read(ctx.sysroot.join("tests/ktest")).unwrap();
         assert!(verifies(&signer, &ktest, Role::Service, "/tests/ktest"));
         assert!(!verifies(&signer, &ktest, Role::Init, "init"));
-        for (install, role) in [(table, Role::Data), (listed, Role::BootModule)]
+        for (install, role) in [(table, Role::Data), (listed, Role::Configuration)]
         {
             let object = fs::read(ctx.sysroot.join(&install[1..])).unwrap();
             let attrs = objsig::split(&object)

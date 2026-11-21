@@ -210,6 +210,12 @@ pub struct DevmgrCaps
     /// calls it through; `None` when DMA runs unconfined (no unit, no driver
     /// module, or a driver that did not report ready).
     pub iommu: Option<std::sync::Arc<crate::iommu::Iommu>>,
+
+    /// The boot-time policy's `dma-confinement` setting, which
+    /// [`crate::decls::classify_modules`] reads from the policy module before
+    /// the first driver starts; required until then, and when no policy
+    /// module is handed over or it does not parse.
+    pub dma_confinement: boot_policy::DmaConfinement,
 }
 
 impl DevmgrCaps
@@ -234,6 +240,7 @@ impl DevmgrCaps
             fb_info: None,
             dma: None,
             iommu: None,
+            dma_confinement: boot_policy::Policy::FAIL_CLOSED.dma_confinement,
         }
     }
 }

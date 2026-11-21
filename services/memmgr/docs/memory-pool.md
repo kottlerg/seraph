@@ -788,16 +788,28 @@ slabs, its thread, its `ProcessInfo` page and the rest of its image), is request
 account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.85%
 of what that node pays, and it goes with the process. A create the max of the child's node or of an
 ancestor refuses fails with procmgr's `LIMIT`
-([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 1,
-**Memory max and reserve**). vfsd keeps no per-client state: the capability a lookup derives
-leaves with its reply. A server can charge such state to its client instead, with a grant charged
-to the node of a charge-only handle the client hands it (Node handles, below); none does yet. fatfs
-keeps about 0.3 to 0.4 KiB for each open, and 104 bytes for each page
-of an open that is mapped and not yet returned, with no bound for one client; the client pays 144
-bytes of its own `CSpace` for the two capabilities an open hands it. A client can therefore make
-fatfs spend memory beyond the client's own max, bounded only by fatfs's node and the reserve. This
-is a known gap; charging that state to the client is
-[#1100](https://github.com/kottlerg/seraph/issues/1100).
+([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 1, **Memory
+max and reserve**). vfsd keeps no per-client state: the capability a lookup derives leaves with its
+reply. A server can charge such state to its client instead, with a grant charged to the node of a
+charge-only handle the client hands it (Node handles, below). fatfs does so for a filesystem session
+([services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) § Label 23): the
+records of the session, of each open made in it (128 bytes) and of each page such an open holds
+mapped (64 bytes) live in pages charged to the session's node, the first held for the session's life
+and each later one given back when its last record goes, and a session or an open the node's max
+refuses fails with fatfs's `LIMIT` while other clients' requests go on. What stays on fatfs's own
+node is, for each session, about 0.35 KiB (three 72-byte capability slots and a 128-byte
+Notification) against the 4 KiB first page the client pays; a 72-byte capability slot for each
+further page; for each open in a session the 72-byte slot of its release SEND, and for each page
+it holds the slot of the page's capability, each matched by the 72-byte slot the client's own
+`CSpace` gives the capability it receives; and the index from ids to records, at most 8 bytes per
+live session or open, which halves as they go. The page tables that map session pages into fatfs
+stay at the most pages mapped at once, at most 8 bytes per page. An open made without a session,
+fatfs's unpaid path, which std and procmgr still take, keeps about 0.3 to 0.4 KiB on fatfs, and 104
+bytes for each page of the open that is mapped and not yet returned, with no bound for one client;
+the client pays 144 bytes of its own `CSpace` for the two capabilities such an open hands it. A
+client can therefore make fatfs spend memory beyond the client's own max through that path, bounded
+only by fatfs's node and the reserve. This is a known gap until those clients make sessions and
+fatfs refuses an open without one ([#1100](https://github.com/kottlerg/seraph/issues/1100)).
 
 **Node handles.** Authority over a node is a capability: a node handle, a SEND on memmgr's
 endpoint badged with the node-handle verb bit and a random key that names one node

@@ -80,7 +80,7 @@ pub struct CreateFromFileOrder
     pub badged_creator: u64,
     /// The child's death queue (`crate::driver::FatfsDriver::death_queue`).
     /// Stays the caller's: the worker derives the relay it sends under
-    /// `CREATE_DEATH_RELAY` from it and binds the child's main thread to it.
+    /// `CREATE_DEATH_RELAY` from it.
     pub death_queue: u64,
     /// The child's argv and env (`crate::driver`'s `driver_argv_env`),
     /// which the worker's `CREATE_FROM_FILE` carries; `None` creates it

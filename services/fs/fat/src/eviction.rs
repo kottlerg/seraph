@@ -7,16 +7,16 @@
 //!
 //! When a request cannot acquire a cache slot (every slot has
 //! `refcount > 0`), whether for a memory-cap read's page or for a FAT,
-//! directory, or inline-read sector, main scans the per-open
-//! outstanding-page tables for a page not already queued, marks it
-//! queued, and enqueues an [`EvictReq`] for it (`relieve_pressure`); the
-//! request is answered `IO_ERROR` and the client retries. The eviction worker
-//! pops the request and first checks that the page is still
+//! directory, or inline-read sector, main scans the pages the opens hold
+//! for one not already queued, marks it queued, and enqueues an
+//! [`EvictReq`] for it (`relieve_pressure`, `Opens::pick_eviction_candidate`);
+//! the request is answered `IO_ERROR` and the client retries. The eviction
+//! worker pops the request and first checks that the page is still
 //! outstanding, skipping it if the client's synchronous release or the
 //! release of its open already cleaned it up. An open is released, its
-//! pages with it, by `release_open_file`, which `FS_CLOSE`, the removal of
-//! the open's node, the sweep of opens whose client is gone, and an
-//! `FS_OPEN` whose reply failed call. When the open that read the page
+//! pages with it, by `FS_CLOSE`, the removal of the open's node, the sweep
+//! of opens whose client is gone, the end of the open's session, and an
+//! `FS_OPEN` whose reply failed (`crate::file::Opens`). When the open that read the page
 //! carried a release SEND on its `FS_OPEN`, the worker sends
 //! `FS_RELEASE_MEMORY` on its own derived copy of that open's SEND, so
 //! each page's release reaches the client that read it, and waits up to
@@ -62,8 +62,10 @@ use std::time::Duration;
 
 use ipc::{IpcMessage, fs_labels};
 
+use namespace_protocol::OpenRef;
+
 use crate::cache::PageCache;
-use crate::file::OpenTable;
+use crate::file::{Opens, OutstandingPage};
 
 /// Cooperative release watchdog: how long the worker waits for the
 /// client's reply before revoking the ancestor cap anyway. The worker
@@ -81,25 +83,39 @@ pub const MAX_WATCHDOGS: usize = 4;
 static LIVE_WATCHDOGS: AtomicUsize = AtomicUsize::new(0);
 
 /// One queued eviction: the outstanding page as it stood when queued.
-/// The worker checks it against the open-file table before the
+/// The worker checks it against the opens before the
 /// cooperative round-trip and again before the cleanup, since the main
 /// thread may have cleaned the page up meanwhile.
 #[derive(Clone, Copy)]
 pub struct EvictReq
 {
-    /// Identifier of the open this entry belongs to in the [`OpenTable`].
-    /// Generation-checked: once the open is closed, it names no open, even
-    /// after its index is reused.
-    pub open_id: u64,
+    /// The open this entry belongs to. Once the open is closed it names no
+    /// open: an unpaid open's id is generation-checked, and a session open's
+    /// id is never reused.
+    pub open: OpenRef,
     /// Caller-visible cookie originally returned in
     /// `FS_READ_MEMORY`. Carried in `FS_RELEASE_MEMORY`'s `data[0]`
-    /// and used to disambiguate cleanup against `open_id`.
+    /// and used to disambiguate cleanup against `open`.
     pub cookie: u64,
     /// Cache slot whose refcount is held by this entry.
     pub slot_idx: usize,
     /// Per-cookie ancestor cap derived under the cache slot's
     /// memory cap. Revoking it kills only the caller's child cap.
     pub ancestor_cap: u64,
+}
+
+impl EvictReq
+{
+    /// The request for `page`, held by `open`.
+    pub const fn new(open: OpenRef, page: &OutstandingPage) -> Self
+    {
+        Self {
+            open,
+            cookie: page.cookie,
+            slot_idx: page.slot_idx,
+            ancestor_cap: page.ancestor_cap,
+        }
+    }
 }
 
 pub struct EvictionState
@@ -138,8 +154,8 @@ impl EvictionState
         {
             drop(q);
             std::os::seraph::log!(
-                warn: "eviction enqueue: no memory; dropped req (open={:#x}, cookie={}, slot={})",
-                req.open_id,
+                warn: "eviction enqueue: no memory; dropped req (open={:?}, cookie={}, slot={})",
+                req.open,
                 req.cookie,
                 req.slot_idx
             );
@@ -150,10 +166,9 @@ impl EvictionState
 /// Eviction worker entry point. Runs forever.
 ///
 /// The spawning closure owns `Arc` clones of the `EvictionState` and the
-/// open table and lends them here; since this never returns, they
-/// stay alive for the lifetime of the fs process.
-pub fn worker_loop(state: &EvictionState, files: &Mutex<OpenTable>, cache: &'static PageCache)
--> !
+/// opens and lends them here; since this never returns, they stay alive for
+/// the lifetime of the fs process.
+pub fn worker_loop(state: &EvictionState, opens: &Mutex<Opens>, cache: &'static PageCache) -> !
 {
     loop
     {
@@ -161,7 +176,7 @@ pub fn worker_loop(state: &EvictionState, files: &Mutex<OpenTable>, cache: &'sta
         // The client's synchronous FS_RELEASE_MEMORY and the release of its
         // open clean an outstanding page up on the main thread, before or during the
         // cooperative round-trip. A page already gone is skipped.
-        let Some(endpoint) = live_release_endpoint(files, &req)
+        let Some(endpoint) = live_release_endpoint(opens, &req)
         else
         {
             continue;
@@ -172,11 +187,11 @@ pub fn worker_loop(state: &EvictionState, files: &Mutex<OpenTable>, cache: &'sta
             Endpoint::NoSend => Release::NoEndpoint,
             Endpoint::DeriveFailed => Release::DeriveFailed,
         };
-        // Whichever path takes the entry out of the open-file table owns
+        // Whichever path takes the entry off its open owns
         // the cleanup: revoke the ancestor (invalidates the client's derived
         // child cap), delete it from fs's CSpace, and drop the cache-slot
         // refcount, once.
-        let owned = take_outstanding(files, &req);
+        let owned = take_outstanding(opens, &req);
         if owned
         {
             let _ = syscall::cap_revoke_all(req.ancestor_cap);
@@ -237,11 +252,11 @@ fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
         "page already released"
     };
     std::os::seraph::log!(
-        warn: "{} (label={}); {} (open={:#x}, slot={})",
+        warn: "{} (label={}); {} (open={:?}, slot={})",
         what,
         label,
         action,
-        req.open_id,
+        req.open,
         req.slot_idx
     );
 }
@@ -367,68 +382,40 @@ enum Endpoint
     DeriveFailed,
 }
 
-/// Under the open-file lock, check that `req`'s outstanding page is still
-/// in the table (same open, cookie, cache slot, and ancestor cap) and return
+/// Under the opens' lock, check that `req`'s outstanding page is still held
+/// by its open (same open, cookie, cache slot, and ancestor cap) and return
 /// a derived copy of its open's release SEND. The copy is the worker's own,
 /// so an open's release that deletes the slot's SEND meanwhile cannot free or
 /// reuse the slot the worker calls on. `None` means the page was already
 /// cleaned up.
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "`file` borrows through the guard to the derive: the hold serialises the check that \
-              the page is outstanding and the derive of its open's release SEND against the main \
-              thread's release and close paths, which delete that SEND"
-)]
-fn live_release_endpoint(files: &Mutex<OpenTable>, req: &EvictReq) -> Option<Endpoint>
+fn live_release_endpoint(opens: &Mutex<Opens>, req: &EvictReq) -> Option<Endpoint>
 {
-    let files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    let file = files_g.get(req.open_id)?;
-    let present = file.outstanding.iter().flatten().any(|e| {
-        e.cookie == req.cookie && e.slot_idx == req.slot_idx && e.ancestor_cap == req.ancestor_cap
-    });
-    if !present
+    let opens_g = opens.lock().unwrap_or_else(PoisonError::into_inner);
+    let send = opens_g.release_endpoint_if_held(req)?;
+    // The derive runs under the lock, which serialises it against the main
+    // thread's release and close paths that delete the SEND.
+    let endpoint = if send == 0
     {
-        return None;
+        Endpoint::NoSend
     }
-    if file.release_endpoint_cap == 0
-    {
-        return Some(Endpoint::NoSend);
-    }
-    Some(
-        syscall::cap_derive(file.release_endpoint_cap, syscall::RIGHTS_EP_SEND)
-            .map_or(Endpoint::DeriveFailed, Endpoint::Copy),
-    )
-}
-
-/// Take `req`'s outstanding-page entry out of the open-file table, under
-/// the table lock the main thread's release and close paths hold. Returns
-/// whether the entry was still there (same open, cookie, cache slot, and
-/// ancestor cap), in which case the caller owns its cleanup; `false` means
-/// another path already cleaned it up.
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "`file` borrows through the guard to the entry's removal: the hold serialises the \
-              removal against the main thread's release and close paths, so one path alone owns \
-              the page's cleanup"
-)]
-fn take_outstanding(files: &Mutex<OpenTable>, req: &EvictReq) -> bool
-{
-    let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(file) = files_g.get_mut(req.open_id)
     else
     {
-        return false;
+        syscall::cap_derive(send, syscall::RIGHTS_EP_SEND)
+            .map_or(Endpoint::DeriveFailed, Endpoint::Copy)
     };
-    for slot in &mut file.outstanding
-    {
-        if let Some(entry) = slot
-            && entry.cookie == req.cookie
-            && entry.slot_idx == req.slot_idx
-            && entry.ancestor_cap == req.ancestor_cap
-        {
-            *slot = None;
-            return true;
-        }
-    }
-    false
+    drop(opens_g);
+    Some(endpoint)
+}
+
+/// Take `req`'s outstanding page off its open, under the lock the main
+/// thread's release and close paths hold. Returns whether the page was still
+/// held (same open, cookie, cache slot, and ancestor cap), in which case the
+/// caller owns its cleanup; `false` means another path already cleaned it
+/// up.
+fn take_outstanding(opens: &Mutex<Opens>, req: &EvictReq) -> bool
+{
+    opens
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take_held(req)
 }

@@ -106,13 +106,15 @@ pub struct TrapFrame
 }
 
 // ABI contract: `SYS_THREAD_READ_REGS` / `SYS_THREAD_WRITE_REGS` copy this struct
-// as the user register file, whose size and IP, SP, and flags offsets
-// `abi/syscall` publishes; userspace edits the frame at those offsets.
+// as the user register file, whose size and IP, SP, flags, rax and rdi
+// offsets `abi/syscall` publishes; userspace edits the frame at those offsets.
 const _: () = {
     assert!(core::mem::size_of::<TrapFrame>() == syscall::REGS_X86_64_SIZE);
     assert!(core::mem::offset_of!(TrapFrame, rip) == syscall::REGS_X86_64_IP_OFFSET);
     assert!(core::mem::offset_of!(TrapFrame, rsp) == syscall::REGS_X86_64_SP_OFFSET);
     assert!(core::mem::offset_of!(TrapFrame, rflags) == syscall::REGS_X86_64_FLAGS_OFFSET);
+    assert!(core::mem::offset_of!(TrapFrame, rax) == syscall::REGS_X86_64_RAX_OFFSET);
+    assert!(core::mem::offset_of!(TrapFrame, rdi) == syscall::REGS_X86_64_RDI_OFFSET);
 };
 
 /// Length of the `syscall` instruction (`0F 05`).

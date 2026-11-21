@@ -37,6 +37,7 @@ parser, which keeps its own error type over this one.
 |---|---|
 | [`services/svcmgr/svc-defs`](../../services/svcmgr/README.md) | The `.svc` service definitions and the device class files (`/config/devmgr/classes/<class>.class`) |
 | [`services/devmgr/firmware`](../../services/devmgr/README.md) | The platform description tables (`firmware::platform::parse_table`) |
+| [`shared/boot-policy`](../boot-policy/README.md) | The boot-time policy, `/config/boot/policy.conf` (`boot_policy::parse`) |
 
 ---
 

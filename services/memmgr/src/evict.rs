@@ -33,7 +33,7 @@ use free_pool::compress::{HASH_ENTRIES, HashTable, PAGE_BYTES};
 use free_pool::store::{Decoder, PageReader, RawPages, encode_chunk, store_pages};
 use free_pool::{
     CHUNK_BYTES, COLD_SWEEPS, ClockHand, DEMAND_CHUNK_PAGES, DemandRegion, Fit, FrameDesc, FreeRun,
-    NO_REGION_ID, NodeIdx, PressureLevel, Victim, band, chunk_for, reserve_pages,
+    NO_REGION_ID, NODE_NULL, NodeIdx, PressureLevel, Victim, band, chunk_for, reserve_pages,
 };
 use syscall_abi::PAGE_SIZE;
 
@@ -1356,6 +1356,7 @@ fn select_restore_runs(
                 phys_base,
                 va: chunk_base.saturating_add(u64::from(page).saturating_mul(PAGE_SIZE)),
                 region_id: NO_REGION_ID,
+                charge: NODE_NULL,
             };
             n = n.saturating_add(1);
             page = page.saturating_add(got);

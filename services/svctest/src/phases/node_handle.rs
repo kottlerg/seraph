@@ -121,7 +121,7 @@ pub(super) fn expect(target: u64, label: u64, words: &[u64], want: u64, what: &s
 }
 
 /// `NODE_QUERY_USAGE` over `handle`: `(own, max, subtree)`.
-fn node_usage(handle: u64, what: &str) -> (u64, u64, u64)
+pub(super) fn node_usage(handle: u64, what: &str) -> (u64, u64, u64)
 {
     let reply = expect(
         handle,
@@ -144,7 +144,7 @@ pub(super) fn handle_of(reply: &IpcMessage, what: &str) -> u64
 }
 
 /// A new Notification, and a Notify-only copy of it to register with memmgr.
-fn notification() -> (u64, u64)
+pub(super) fn notification() -> (u64, u64)
 {
     let sig =
         std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {

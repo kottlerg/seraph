@@ -19,7 +19,8 @@
 /// `want_pages`, or a failure. Callable from any badged cap;
 /// [`super::memmgr_grant_layout`] checks the reply shape. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 1:
-/// `REQUEST_MEMORY_CAPS`.
+/// `REQUEST_MEMORY_CAPS`. With [`REQUEST_CHARGE_NODE`] the grant is
+/// charged to the node of the node handle in `caps[0]`.
 pub const REQUEST_MEMORY_CAPS: u64 = 1;
 /// Return previously granted regions to the pool mid-life, named by the
 /// opaque region id the grant reply reported, from any badged cap.
@@ -83,14 +84,42 @@ pub const NODE_HANDLE_TAG: u64 = 1 << 62;
 const _: () = core::assert!(
     NODE_HANDLE_TAG & crate::VERB_BIT_MASK != 0 && NODE_HANDLE_TAG != PHYS_CLASS_BADGE_BIT
 );
+/// Badge bit of a charge-only node handle, beside [`NODE_HANDLE_TAG`] and
+/// the key of the node's handles: [`NODE_CHARGE_HANDLE`] returns one. It
+/// names the same node, which a grant may be charged to
+/// ([`REQUEST_CHARGE_NODE`]) and whose usage it may read, but it serves only
+/// the charge-only labels ([`is_charge_only_label`]), refusing the other node
+/// labels with `UNAUTHORIZED`, and is no node handle to `REGISTER_PROCESS`
+/// ([`REGISTER_CHARGE_NODE`]). Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Node Handles.
+pub const NODE_CHARGE_ONLY: u64 = 1 << 59;
+const _: () = core::assert!(
+    NODE_CHARGE_ONLY & crate::VERB_BIT_MASK != 0
+        && NODE_CHARGE_ONLY != NODE_HANDLE_TAG
+        && NODE_CHARGE_ONLY != PHYS_CLASS_BADGE_BIT
+        && NODE_CHARGE_ONLY != SWAP_AUTHORITY
+        && NODE_CHARGE_ONLY != OBJECT_HANDLE_TAG
+);
 /// Whether `opcode` is a node label, which memmgr serves only on a node
-/// handle ([`NODE_HANDLE_TAG`]): [`NODE_SET_MAX`] to [`NODE_RELEASE`], and
-/// [`NODE_SET_RECLAIM`]. Specified in
+/// handle ([`NODE_HANDLE_TAG`]): [`NODE_SET_MAX`] to [`NODE_RELEASE`],
+/// [`NODE_SET_RECLAIM`] and [`NODE_CHARGE_HANDLE`]. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Badge Discipline.
 #[must_use]
 pub const fn is_node_label(opcode: u64) -> bool
 {
-    core::matches!(opcode, NODE_SET_MAX..=NODE_RELEASE | NODE_SET_RECLAIM)
+    core::matches!(
+        opcode,
+        NODE_SET_MAX..=NODE_RELEASE | NODE_SET_RECLAIM | NODE_CHARGE_HANDLE
+    )
+}
+/// Whether `opcode` is a node label memmgr serves on a charge-only node
+/// handle ([`NODE_CHARGE_ONLY`]): [`NODE_QUERY_USAGE`] and
+/// [`NODE_CHARGE_HANDLE`]. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Badge Discipline.
+#[must_use]
+pub const fn is_charge_only_label(opcode: u64) -> bool
+{
+    core::matches!(opcode, NODE_QUERY_USAGE | NODE_CHARGE_HANDLE)
 }
 /// Badge bit of the swap authority: a SEND on memmgr's endpoint badged with
 /// this bit alone, which init mints, is the authority to serve the swap
@@ -425,7 +454,9 @@ pub const NODE_REGISTER_LIMIT: u64 = 17;
 /// Release a sub-node's handle state, on a node handle to a node made by
 /// [`NODE_CREATE`] or [`CREATE_SUB_NODE`]: every handle to the node is
 /// refused from then on, and the node goes once no process or charge
-/// refers to it. Refused for a process's own node, whose handle state
+/// refers to it. A grant charged to the node ([`REQUEST_CHARGE_NODE`])
+/// stays charged there until its holder releases it; each holder's
+/// [`REGISTER_DONATION_END`] registration is signalled. Refused for a process's own node, whose handle state
 /// goes with the process. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 18: `NODE_RELEASE`.
 pub const NODE_RELEASE: u64 = 18;
@@ -739,28 +770,68 @@ pub const PRESSURE_CRITICAL: u64 = 2;
 /// the flags half of `data[0]`.
 pub const REQUIRE_CONTIGUOUS: u32 = 1 << 0;
 
+/// `REQUEST_MEMORY_CAPS` flag (bit 1 of the flags half of `data[0]`):
+/// `caps[0]` is a node handle, full or charge-only ([`NODE_CHARGE_ONLY`]),
+/// and the grant is charged to its node, admitted against that node's chain
+/// (`memmgr_errors::LIMIT` at a max), not to the caller's. The pages are the
+/// caller's to map and release as any grant's; the caller is counted a holder
+/// of the node, signalled by [`REGISTER_DONATION_END`] when the node's handle
+/// state ends. memmgr reads the handle's badge with `SYS_ENDPOINT_BADGE` and
+/// deletes it, and refuses a cap that is not a SEND on its endpoint carrying
+/// a live node handle's key. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 1.
+pub const REQUEST_CHARGE_NODE: u32 = 1 << 1;
+
+/// Return a charge-only handle ([`NODE_CHARGE_ONLY`]) to the handle's budget
+/// node, on a node handle, full or charge-only. Reply (`SUCCESS`): `caps[0]`
+/// the charge-only handle, which lives as the handle state does. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 33: `NODE_CHARGE_HANDLE`.
+pub const NODE_CHARGE_HANDLE: u64 = 33;
+
+/// Register `caps[0]`, a Notification cap with Notify rights whose ownership
+/// transfers to memmgr, to receive the bits `data[0]`, nonzero, when the
+/// handle state of a node the caller holds grants charged to
+/// ([`REQUEST_CHARGE_NODE`]) ends: on [`NODE_RELEASE`] or at its owner's
+/// death. One registration per process: a second replaces the first, whose
+/// cap memmgr deletes; it goes when the process does. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 34:
+/// `REGISTER_DONATION_END`.
+pub const REGISTER_DONATION_END: u64 = 34;
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
 
     #[test]
-    fn the_node_labels_are_node_set_max_to_node_release_and_node_set_reclaim()
+    fn the_node_labels_are_node_set_max_to_node_release_node_set_reclaim_and_node_charge_handle()
     {
         for op in NODE_SET_MAX..=NODE_RELEASE
         {
             assert!(is_node_label(op), "label {op}");
         }
         assert!(is_node_label(NODE_SET_RECLAIM));
+        assert!(is_node_label(NODE_CHARGE_HANDLE));
         for op in [
             NODE_SET_MAX - 1,
             CREATE_SUB_NODE,
             SWAP_REGISTER,
             OBJECT_RELEASE,
-            NODE_SET_RECLAIM + 1,
+            REGISTER_DONATION_END,
         ]
         {
             assert!(!is_node_label(op), "label {op}");
+        }
+    }
+
+    #[test]
+    fn a_charge_only_handle_is_served_node_query_usage_and_node_charge_handle_alone()
+    {
+        for op in 0..=REGISTER_DONATION_END
+        {
+            let served = op == NODE_QUERY_USAGE || op == NODE_CHARGE_HANDLE;
+            assert_eq!(is_charge_only_label(op), served, "label {op}");
+            assert!(!is_charge_only_label(op) || is_node_label(op), "label {op}");
         }
     }
 }

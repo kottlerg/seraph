@@ -421,7 +421,8 @@ zones disjoint and inside the address space for every supported mode.
 memmgr serves frame requests over IPC. The contract:
 
 - **Request shape.** `REQUEST_MEMORY_CAPS(want_pages, flags)`. `flags`
-  carries `REQUIRE_CONTIGUOUS`; unset means best-effort.
+  carries `REQUIRE_CONTIGUOUS`; unset means best-effort. `REQUEST_CHARGE_NODE` takes a node
+  handle as cap[0] and charges the grant to that node instead of the caller's own.
 - **`REQUIRE_CONTIGUOUS` reply.** A single Memory cap covering exactly
   `want_pages`, or a `memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS` error.
 - **Best-effort reply.** One or more Memory caps whose page counts sum

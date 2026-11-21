@@ -129,6 +129,32 @@ impl core::fmt::Display for KeyIdHex<'_>
     }
 }
 
+/// An anchor's label written for the console: printable ASCII as it is, and
+/// a backslash, a double quote and every other character as a `\u{..}`
+/// escape. A label from a trust request is untrusted, and a control
+/// character or a terminal escape sequence in it could hide the lines that
+/// follow it, the changes a console confirmation is asked about among them.
+pub struct LabelText<'a>(pub &'a str);
+
+impl core::fmt::Display for LabelText<'_>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        for c in self.0.chars()
+        {
+            if (' '..='~').contains(&c) && c != '\\' && c != '"'
+            {
+                core::fmt::Write::write_char(f, c)?;
+            }
+            else
+            {
+                write!(f, "\\u{{{:x}}}", u32::from(c))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Fixtures of the host tests here and in `main.rs`: stores and signed
 /// objects of fixed test keys.
 #[cfg(test)]
@@ -200,6 +226,19 @@ mod tests
 
     use super::testing::{ROOT_SEED, STRANGER_SEED, signed, store_of};
     use super::*;
+
+    // Defect caught: a label from a trust request that reaches the console
+    // with a terminal escape sequence or a line break in it, which can hide
+    // the changes the confirmation prompt shows.
+    #[test]
+    fn a_label_reaches_the_console_as_printable_ascii()
+    {
+        assert_eq!(LabelText("deployer root 2").to_string(), "deployer root 2");
+        assert_eq!(
+            LabelText("a\u{1b}[8m\r\n\"\\\u{e9}\u{202e}").to_string(),
+            "a\\u{1b}[8m\\u{d}\\u{a}\\u{22}\\u{5c}\\u{e9}\\u{202e}"
+        );
+    }
 
     // Defect caught: a bootloader that loads anything but the verified body
     // of an object the store accepts.

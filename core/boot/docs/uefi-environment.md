@@ -57,20 +57,22 @@ The EFI System Partition is accessed as follows:
 3. SimpleFileSystem->OpenVolume() → root EFI_FILE_PROTOCOL handle
 4. root->Open("\EFI\seraph\bootstrap.bundle") → bundle file handle (step 2)
 5. root->Open("\EFI\seraph\kernel") → kernel file handle (step 3)
-6. root->Open("\EFI\seraph\nokaslr") → presence probe only; the handle is closed at once (step 5d)
-7. root->Open("\EFI\seraph\mapredo") → presence probe only; the handle is closed at once (step 6)
+6. root->Open("\EFI\seraph\trust-request") → optional; read whole when present (step 3)
+7. root->Open("\EFI\seraph\nokaslr") → presence probe only; the handle is closed at once (step 5d)
+8. root->Open("\EFI\seraph\mapredo") → presence probe only; the handle is closed at once (step 6)
 ```
 
 All files are opened as read-only. Sizes are determined via `EFI_FILE_INFO` before
 reading. Files are read into physical memory allocated by `AllocatePages`; see
 [elf-loading.md](elf-loading.md) for how segment placement works.
 
-The bootloader carries four ESP path constants — `\EFI\seraph\kernel`,
+The bootloader carries five ESP path constants — `\EFI\seraph\kernel`,
 `\EFI\seraph\bootstrap.bundle`, the presence-only KASLR override knob
-`\EFI\seraph\nokaslr`, and the presence-only steps 6 and 7 redo test knob
-`\EFI\seraph\mapredo` — all hardcoded in [`core/boot/src/main.rs`](../src/main.rs) (see
-[elf-loading.md](elf-loading.md) § File Paths). There is no on-disk
-boot configuration file; the bundle is the single composed artifact
+`\EFI\seraph\nokaslr`, the presence-only steps 6 and 7 redo test knob
+`\EFI\seraph\mapredo`, and the optional trust request `\EFI\seraph\trust-request`
+([docs/signing.md](../../../docs/signing.md) § Trust Store) — all hardcoded in
+[`core/boot/src/main.rs`](../src/main.rs) (see [elf-loading.md](elf-loading.md) § File Paths).
+There is no on-disk boot configuration file; the bundle is the single composed artifact
 that carries init plus every userspace module the system needs (see
 [elf-loading.md](elf-loading.md) for how its entries are loaded). The
 bundle format itself is specified in

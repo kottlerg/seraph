@@ -37,6 +37,8 @@ override knob
 the optional presence-only `\EFI\seraph\mapredo` test knob, which makes the
 first memory-map attempt redo
 ([memory-map.md § Sizing the Entry Array](../core/boot/docs/memory-map.md#sizing-the-entry-array)),
+the optional trust request `\EFI\seraph\trust-request`, which enrols roots and revokes key ids
+([signing.md § Trust Store](signing.md#trust-store)),
 and the bootloader binary itself, a copy of its installed file `/boot/boot.efi`
 both at `\EFI\seraph\boot.efi` and at the EFI fallback path
 ([build-system.md § Build Output: the Sysroot](build-system.md#build-output-the-sysroot)).

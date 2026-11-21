@@ -455,11 +455,14 @@ verifies either for loading:
    that it was skipped. A request is therefore left on the ESP without harm.
 2. Refuses a request whose result would pass the bound.
 3. Refuses a request under whose resulting store the kernel or a bundle entry would not verify
-   (the commit rule), so no request leaves the machine unbootable.
+   (the commit rule), so no request leaves the bootloader unable to load the kernel and the
+   bundle. The rule checks only the objects the bootloader loads: an object procmgr verifies later
+   (svcmgr, a service, a configuration file) must already verify under the resulting store before
+   a request revokes the key that signed it.
 4. Applies a request the current store verifies in the enrolment role. Otherwise it shows the
-   request at the console, why no signature authorizes it, each root it adds with its roles and
-   key id, and each key id it revokes, and applies it only when `yes` and Enter are typed within
-   60 seconds; any other answer, no answer, or a console it cannot read refuses it.
+   request at the console, why no signature authorizes it, each root it adds with its label,
+   roles and key id, and each key id it revokes, and applies it only when `yes` and Enter are
+   typed within 60 seconds; any other answer, no answer, or a console it cannot read refuses it.
 5. Writes the new enrolled store before the security floor (§ Rollback Floor), and boots on the new
    merged store. A write the firmware refuses refuses the request, and the log reports the
    firmware's free space and largest variable.
@@ -479,7 +482,9 @@ no process.
 **On every boot** the bootloader logs what it read of the enrolled store, then each anchor of the
 store it runs on with its label, key id and source (built in, or enrolled), marking an anchor with
 `LOCAL` as locally generated and one whose key id is revoked as revoked, then the store's counts
-and floor.
+and floor. Here and at the console prompt a label is written in printable ASCII, with a backslash,
+a double quote and every other character escaped as `\u{..}`, since a request's label is
+untrusted input that a terminal escape sequence could otherwise turn into hidden lines.
 
 ---
 

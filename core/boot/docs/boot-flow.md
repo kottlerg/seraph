@@ -90,7 +90,8 @@ runs on ([docs/signing.md](../../../docs/signing.md) § Trust Store):
   console confirms within 60 seconds ([uefi-environment.md](uefi-environment.md) § Console
   Input), and writes the new enrolled store. A refused request is logged and the boot runs on the
   current store; no outcome of a request is fatal.
-- It logs each anchor of the resulting store with its label, key id and source (built in or
+- It logs each anchor of the resulting store with its label (escaped to printable ASCII,
+  [docs/signing.md](../../../docs/signing.md) § Trust Store), key id and source (built in or
   enrolled), an anchor marked `LOCAL` as locally generated and one whose key id is revoked as
   revoked, then the store's counts and security floor.
 

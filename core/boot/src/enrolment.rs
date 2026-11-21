@@ -37,7 +37,7 @@ use objsig::{
 
 use crate::bprintln;
 use crate::error::BootError;
-use crate::signing::{ARCH, KeyIdHex};
+use crate::signing::{ARCH, KeyIdHex, LabelText};
 use crate::uefi::{
     ConsoleInput, EFI_VARIABLE_BOOTSERVICE_ACCESS, EFI_VARIABLE_NON_VOLATILE, EfiStatus, LineRead,
     SERAPH_VENDOR_GUID, VariableInfo, VariableRead, VariableServices,
@@ -258,7 +258,7 @@ pub fn log_store(effective: &TrustStore<'_>, builtin: &TrustStore<'_>)
         };
         bprintln!(
             "[--------] boot: trust anchor \"{}\" key id {}: {source}{local}{revoked}",
-            anchor.label,
+            LabelText(anchor.label),
             KeyIdHex(&anchor.key_id),
         );
     }
@@ -608,7 +608,7 @@ fn show(request: &TrustRequest<'_>, refusal: Option<Refusal>)
         };
         bprintln!(
             "[--------] boot: trust request: add root \"{}\" key id {}, roles {:#x}{certify}",
-            anchor.label,
+            LabelText(anchor.label),
             KeyIdHex(&anchor.key_id),
             anchor.usage.roles.bits()
         );

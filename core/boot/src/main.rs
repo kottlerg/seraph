@@ -36,9 +36,9 @@ use crate::paging::{PageTableBuilder, build_initial_tables};
 use crate::signing::{Verifier, parse_store};
 use crate::uefi::{
     EFI_RNG_PROTOCOL_GUID, EFI_SUCCESS, EfiBootServices, EfiFileProtocol, EfiGuid, EfiHandle,
-    EfiRngProtocol, EfiSystemTable, FirmwareConsole, FirmwareVariables, allocate_pages,
-    connect_all_controllers, exit_boot_services, file_read, file_size, free_pages,
-    get_loaded_image, get_memory_map, open_esp_volume, open_file, query_gop,
+    EfiRngProtocol, EfiSystemTable, FirmwareVariables, allocate_pages, connect_all_controllers,
+    exit_boot_services, file_read, file_size, free_pages, get_loaded_image, get_memory_map,
+    open_esp_volume, open_file, query_gop,
 };
 use boot_protocol::{
     BOOT_MODULE_NAME_LEN, BOOT_PROTOCOL_VERSION, BootInfo, BootModule, FramebufferInfo, InitImage,
@@ -1235,7 +1235,7 @@ unsafe fn decide_request(
     let request = unsafe { read_request(ctx) }?;
     // SAFETY: ctx.st is the valid system table, and boot services do not
     // exit while the console lives, this call.
-    let mut console = unsafe { FirmwareConsole::new(ctx.st) };
+    let mut console = unsafe { uefi::FirmwareConsole::new(ctx.st) };
     // SAFETY: the request's pages were allocated and read by read_request,
     // and this is their only view.
     let file = unsafe { request.bytes_mut() };

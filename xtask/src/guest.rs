@@ -203,7 +203,10 @@ impl Guest
         };
 
         // Read serial on a worker thread so the caller can enforce timeouts
-        // via recv_timeout (std pipes have no read deadline).
+        // via recv_timeout (std pipes have no read deadline). The thread
+        // echoes each line as it arrives, so the guest's log reaches the
+        // terminal while the harness does other work, and a line no wait
+        // took before a failure is still shown.
         let (tx, rx) = mpsc::channel::<String>();
         let reader = thread::spawn(move || {
             let buf = BufReader::new(stdout);
@@ -214,10 +217,9 @@ impl Guest
                 {
                     break;
                 };
-                if tx.send(l).is_err()
-                {
-                    break;
-                }
+                println!("{l}");
+                // A harness that stopped reading still has its lines echoed.
+                let _ = tx.send(l);
             }
         });
 
@@ -239,8 +241,8 @@ impl Guest
         self
     }
 
-    /// Echo serial lines until every marker has appeared (in any order) or
-    /// `timeout` passes.
+    /// Wait until every marker has appeared (in any order) or `timeout`
+    /// passes.
     pub fn wait_for_markers(&mut self, markers: &[&str], timeout: Duration) -> Result<()>
     {
         let start = Instant::now();
@@ -256,8 +258,7 @@ impl Guest
         }
     }
 
-    /// Echo serial lines until one line holds any of `markers` or `timeout`
-    /// passes.
+    /// Wait until one line holds any of `markers` or `timeout` passes.
     pub fn wait_for_any(&mut self, markers: &[&str], timeout: Duration) -> Result<()>
     {
         let start = Instant::now();
@@ -271,15 +272,15 @@ impl Guest
         }
     }
 
-    /// Echo serial lines until one holds `marker` or `timeout` passes, and
-    /// return every line read, the marker's last.
+    /// Wait until a line holds `marker` or `timeout` passes, and return
+    /// every line read, the marker's last.
     pub fn collect_until(&mut self, marker: &str, timeout: Duration) -> Result<Vec<String>>
     {
         self.collect_until_any(&[marker], timeout)
     }
 
-    /// Echo serial lines until one holds any of `markers` or `timeout`
-    /// passes, and return every line read, that line last.
+    /// Wait until a line holds any of `markers` or `timeout` passes, and
+    /// return every line read, that line last.
     pub fn collect_until_any(&mut self, markers: &[&str], timeout: Duration)
     -> Result<Vec<String>>
     {
@@ -297,28 +298,30 @@ impl Guest
         }
     }
 
-    /// The next serial line, echoed, waiting at most `remaining`; the error
-    /// names the `markers` still awaited, and QEMU's exit when the stream
-    /// ended with it ([`explain_exit`]).
+    /// The next serial line, waiting at most `remaining`; the error names the
+    /// `markers` still awaited, and, when the stream ended, QEMU's exit
+    /// ([`explain_exit`]).
     fn next_line(&mut self, remaining: Duration, markers: &[&str]) -> Result<String>
     {
-        if remaining.is_zero()
+        match self.lines.recv_timeout(remaining)
         {
-            bail!("timed out waiting for markers: {markers:?}");
+            Ok(line) => Ok(line),
+            Err(mpsc::RecvTimeoutError::Timeout) =>
+            {
+                bail!("timed out waiting for markers: {markers:?}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) =>
+            {
+                let err =
+                    crate::error::err!("serial stream ended waiting for markers: {markers:?}");
+                Err(explain_exit(err, &mut self.child, self.stderr.as_mut()))
+            }
         }
-        let Ok(line) = self.lines.recv_timeout(remaining)
-        else
-        {
-            let err = crate::error::err!("serial stream ended waiting for markers: {markers:?}");
-            return Err(explain_exit(err, &mut self.child, self.stderr.as_mut()));
-        };
-        println!("{line}");
-        Ok(line)
     }
 
-    /// Echo serial lines until the stream ends, as QEMU's exit ends it, or
+    /// Wait until the serial stream ends, as QEMU's exit ends it, or
     /// `timeout` passes; whether it ended.
-    pub fn echo_until_end(&mut self, timeout: Duration) -> bool
+    pub fn wait_until_end(&mut self, timeout: Duration) -> bool
     {
         let start = Instant::now();
         loop
@@ -327,7 +330,8 @@ impl Guest
                 .lines
                 .recv_timeout(timeout.saturating_sub(start.elapsed()))
             {
-                Ok(line) => println!("{line}"),
+                Ok(_) =>
+                {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return true,
                 Err(mpsc::RecvTimeoutError::Timeout) => return false,
             }
@@ -501,6 +505,19 @@ mod tests
         assert!(report.contains("exit status: 3"), "{report}");
         assert!(report.contains("UNIX socket path is too long"), "{report}");
         assert!(report.contains("READY"), "{report}");
+    }
+
+    // Defect caught: a marker that misses its deadline while QEMU still runs
+    // reported as a serial stream that ended.
+    #[test]
+    fn a_marker_past_its_deadline_is_reported_as_a_timeout()
+    {
+        let mut guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
+        let err = guest
+            .wait_for_any(&["READY"], Duration::from_millis(100))
+            .unwrap_err();
+        let report = format!("{err:#}");
+        assert!(report.contains("timed out waiting for markers"), "{report}");
     }
 
     // Defect caught: a harness failure while QEMU still runs (its own

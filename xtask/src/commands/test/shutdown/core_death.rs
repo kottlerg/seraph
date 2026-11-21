@@ -305,11 +305,12 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Res
             let killed = kill_through_stub(&mut guest, args.arch, port, name, point, contact);
             if killed.is_err()
             {
-                // Show the stub's lines on a refusal, which reach the serial
-                // line when its log sink is not the target it holds. With
+                // Give the stub's lines on a refusal time to reach the
+                // terminal before QEMU is killed; they reach the serial line
+                // when its log sink is not the target it holds. With
                 // logd held its lines are dropped, and the answer's `E`
                 // number carries the cause.
-                let _ = guest.echo_until_end(STUB_FAILURE_ECHO);
+                let _ = guest.wait_until_end(STUB_FAILURE_ECHO);
             }
             killed
         }
@@ -352,7 +353,7 @@ fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Res
         _ => Err(crate::error::err!("the route's launch is incomplete")),
     };
     let verdict = killed.and_then(|killed_at| {
-        let ended_at = guest.echo_until_end(POWER_OFF_TIMEOUT).then(Instant::now);
+        let ended_at = guest.wait_until_end(POWER_OFF_TIMEOUT).then(Instant::now);
         let (reason, shutdown_at) = rx
             .recv_timeout(EXIT_TIMEOUT)
             .context("QMP gave no SHUTDOWN event")?;

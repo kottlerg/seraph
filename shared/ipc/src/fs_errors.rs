@@ -48,5 +48,14 @@ pub const IS_A_DIRECTORY: u64 = 12;
 /// `FS_UNMOUNT` without `UNMOUNT_FORCE` refused: live opens remain;
 /// `data[0]` carries their count.
 pub const BUSY: u64 = 13;
+/// Refused at a memory bound of the client: the page a session needs is
+/// over the max of the session's node, or of an ancestor
+/// (`FS_SESSION`, `FS_OPEN` and `FS_READ_MEMORY` in a session).
+pub const LIMIT: u64 = 14;
+/// A capability the request carries is not what the label takes: memmgr
+/// refuses the node handle of an `FS_SESSION`, or of the session an
+/// `FS_OPEN` or `FS_READ_MEMORY` needs a page for, or the handle is
+/// missing.
+pub const INVALID_ARGUMENT: u64 = 15;
 /// Unknown opcode on fs-driver endpoint.
 pub const UNKNOWN_OPCODE: u64 = 0xFF;

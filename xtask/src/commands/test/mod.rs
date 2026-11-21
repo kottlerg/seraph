@@ -9,6 +9,7 @@
 pub mod cases;
 mod cet;
 mod debug_port;
+mod dma_confinement;
 mod enrolment;
 mod host;
 mod hotplug;

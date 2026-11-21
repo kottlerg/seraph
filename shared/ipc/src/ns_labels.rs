@@ -5,9 +5,9 @@
 
 //! IPC labels for the namespace protocol (cap-as-namespace surface).
 //!
-//! Numbered in a reserved range above the [`fs_labels`](crate::fs_labels) codes (2 through
-//! 18) so node-cap and per-file requests share one fs-driver endpoint with
-//! no opcode collisions.
+//! Numbered in a reserved range (20 through 22) that no
+//! [`fs_labels`](crate::fs_labels) code takes, so node-cap and per-file
+//! requests share one fs-driver endpoint with no opcode collisions.
 //! [`fs_labels::END_OF_DIR`](crate::fs_labels::END_OF_DIR) is reused unchanged as the readdir
 //! terminator.
 //!

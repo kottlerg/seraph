@@ -52,6 +52,12 @@ addressed node:
   open's `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE` go to it
   ([services/fs/docs/fs-driver-protocol.md](../services/fs/docs/fs-driver-protocol.md)
   § Label 18).
+- **Session capability** — minted by `FS_SESSION`, which any node
+  capability of a filesystem driver takes: names one session, whose
+  opens' records live in pages charged to a memory node of its client.
+  It carries no request of its own; `FS_OPEN` carries it
+  ([services/fs/docs/fs-driver-protocol.md](../services/fs/docs/fs-driver-protocol.md)
+  § Label 23).
 
 The kernel layer holds no notion of "directory" or "file." Type
 distinctions are server-private and surface to clients via the

@@ -18,8 +18,8 @@
 //!   `ResourceBusy`, and once the file is closed the fs release handler, the
 //!   runtime's own thread, does not refuse it;
 //! - a checkpoint of the child quiesced with no time bound
-//!   (`Duration::MAX`) is complete, its header marks it a
-//!   checkpoint, and its section holds the child's bootstrap layout: two
+//!   (`Duration::MAX`) is complete, memmgr reports its object marked a
+//!   checkpoint (`OBJECT_READ`), its header marks it a checkpoint, and its section holds the child's bootstrap layout: two
 //!   argv entries, a page-aligned IPC buffer, a restore stack pointer below
 //!   the stack top in a page the object holds bytes of, the `ProcessInfo`
 //!   page among the pages it holds, and the image the header names, which
@@ -44,12 +44,13 @@ use std::time::{Duration, Instant};
 use ipc::procmgr_snapshot::{
     CHECKPOINT_PRIVATE_IMAGE, SNAPSHOT_CHECKPOINT, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE,
 };
-use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+use ipc::{IpcMessage, memmgr_labels, procmgr_errors, procmgr_labels};
 use syscall_abi::PAGE_SIZE;
 
 use crate::bootstrap::Caps;
 use crate::phases::heap_commit::own_usage;
 use crate::phases::memory_objects::call;
+use crate::phases::object_io::object_flags;
 use crate::phases::snapshot::{Attached, account};
 use crate::runner::Phase;
 
@@ -264,6 +265,11 @@ fn checkpoint_phase(_: &Caps)
     assert_eq!(child.line("quiescing"), "quiescing");
     let checkpoint = take_at_point(handle);
     let (object, pages) = checkpoint.into_raw();
+    assert_eq!(
+        object_flags(object, PHASE),
+        (memmgr_labels::OBJECT_CHECKPOINT, pages),
+        "{PHASE}: OBJECT_READ of a complete checkpoint's object"
+    );
     let object = Attached::attach(object, pages, PHASE);
     check_section(&object);
     object.release();

@@ -34,6 +34,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-policy"
+version = "0.1.4"
+dependencies = [
+ "objsig",
+ "svc-grammar",
+]
+
+[[package]]
 name = "boot-protocol"
 version = "0.1.4"
 
@@ -196,6 +204,7 @@ dependencies = [
 name = "devmgr"
 version = "0.1.4"
 dependencies = [
+ "boot-policy",
  "boot-protocol",
  "death-set",
  "devmgr-firmware",
@@ -217,6 +226,7 @@ name = "devmgr-firmware"
 version = "0.1.4"
 dependencies = [
  "aml",
+ "boot-policy",
  "driver-binding",
  "ipc",
  "objsig",
@@ -1111,6 +1121,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.4"
 dependencies = [
+ "boot-policy",
  "boot-protocol",
  "crash-report",
  "crypto",

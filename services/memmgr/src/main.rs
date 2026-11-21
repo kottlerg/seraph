@@ -36,6 +36,7 @@ use syscall_abi::{
 mod capture;
 mod disk;
 mod evict;
+mod object;
 
 // memmgr's handlers grow the arena and fund its page tables from inside a
 // request (a grant, a fault), nesting the growth path under the handler's
@@ -3224,6 +3225,29 @@ fn back_span(
     span_pages: u32,
 ) -> Result<FrameDesc, (FaultDecline, u64)>
 {
+    // Zero the run before the process can read it (services/memmgr/docs/
+    // memory-pool.md § Frame contents).
+    back_span_with(l, target, span_pages, |l, cap, _, pages| {
+        scrub_run(l, cap, u64::from(pages))
+    })
+}
+
+/// Back the span of `target` as [`back_span`] does, with `content` writing
+/// each run selected before it is mapped: `content(l, cap, va, pages)` for
+/// the run's Memory cap, the address it will map at and its pages, every
+/// page of which it writes. A run is mapped nowhere while `content` runs, so
+/// one it refuses returns to the pool as it is. `FILL_REGION` passes a copy
+/// of an object's pages ([`object::handle_fill_region`]).
+///
+/// # Errors
+/// The [`FaultDecline`] and its detail word ([`decline_fault`]).
+fn back_span_with(
+    l: &mut MemLedger,
+    target: &FaultTarget,
+    span_pages: u32,
+    mut content: impl FnMut(&mut MemLedger, u64, u64, u32) -> Result<(), i64>,
+) -> Result<FrameDesc, (FaultDecline, u64)>
+{
     let mut cap = span_pages;
     loop
     {
@@ -3239,10 +3263,9 @@ fn back_span(
             charge: NODE_NULL,
         };
 
-        // Zero the run before the process can read it (services/memmgr/docs/
-        // memory-pool.md § Frame contents). It is mapped nowhere yet, so a
-        // failure returns it to the pool as it is.
-        if let Err(e) = scrub_run(l, outer, u64::from(pages))
+        // Write the run before the process can read it. It is mapped nowhere
+        // yet, so a failure returns it to the pool as it is.
+        if let Err(e) = content(l, outer, frame.va, pages)
         {
             insert_run(
                 l,
@@ -4785,14 +4808,16 @@ fn drop_zero_frame(l: &mut MemLedger, zero: NodeIdx)
     }
 }
 
-/// Hand a memory-object label (`SEAL_OBJECT` to `OBJECT_RELEASE`) to its
-/// handler, as [`route`] does.
+/// Hand a memory-object label (`SEAL_OBJECT` to `OBJECT_RELEASE`,
+/// `OBJECT_READ`, `FILL_REGION`) to its handler, as [`route`] does.
 fn route_object(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, service_ep: u64)
 {
     match opcode
     {
         memmgr_labels::SEAL_OBJECT => handle_seal_object(req, ipc_buf, service_ep),
         memmgr_labels::ATTACH_OBJECT => handle_attach_object(req, kept, ipc_buf, service_ep),
+        memmgr_labels::OBJECT_READ => object::handle_object_read(req, kept, ipc_buf),
+        memmgr_labels::FILL_REGION => object::handle_fill_region(req, kept, ipc_buf, service_ep),
         _ => handle_object_release(req, ipc_buf),
     }
 }
@@ -4999,17 +5024,20 @@ fn delete_caps(caps: &[u64])
 
 /// Number of attached caps, counted from `caps[0]`, that the contract of the
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
-/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS` and
-/// `CAPTURE_CHUNKS`, the first two for `NODE_REGISTER_LIMIT` and
-/// `SWAP_REGISTER`, the first for `REQUEST_MEMORY_CAPS`, `DELEGATE_ASPACE`,
-/// `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE`,
-/// `ATTACH_OBJECT` and `REGISTER_DONATION_END`, none for any other label.
+/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`,
+/// `CAPTURE_CHUNKS` and `OBJECT_READ`, the first two for
+/// `NODE_REGISTER_LIMIT`, `SWAP_REGISTER` and `MARK_CHECKPOINT`, the first
+/// for `REQUEST_MEMORY_CAPS`, `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
+/// `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE`, `ATTACH_OBJECT`,
+/// `REGISTER_DONATION_END` and `FILL_REGION`, none for any other label.
 /// [`dispatch`] deletes the rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
     match opcode
     {
-        memmgr_labels::DONATE_MEMORY_CAPS | memmgr_labels::CAPTURE_CHUNKS => attached,
+        memmgr_labels::DONATE_MEMORY_CAPS
+        | memmgr_labels::CAPTURE_CHUNKS
+        | memmgr_labels::OBJECT_READ => attached,
         memmgr_labels::REQUEST_MEMORY_CAPS
         | memmgr_labels::DELEGATE_ASPACE
         | memmgr_labels::REGISTER_PRESSURE
@@ -5017,8 +5045,11 @@ fn contract_cap_count(opcode: u64, attached: usize) -> usize
         | memmgr_labels::SWAP_TAKE
         | memmgr_labels::SWAP_RESTORE
         | memmgr_labels::ATTACH_OBJECT
-        | memmgr_labels::REGISTER_DONATION_END => attached.min(1),
-        memmgr_labels::NODE_REGISTER_LIMIT | memmgr_labels::SWAP_REGISTER => attached.min(2),
+        | memmgr_labels::REGISTER_DONATION_END
+        | memmgr_labels::FILL_REGION => attached.min(1),
+        memmgr_labels::NODE_REGISTER_LIMIT
+        | memmgr_labels::SWAP_REGISTER
+        | memmgr_labels::MARK_CHECKPOINT => attached.min(2),
         _ => 0,
     }
 }
@@ -5048,13 +5079,14 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     delete_caps(stray);
     // A node handle is served the node labels and nothing else, a
     // charge-only one only the charge-only labels, the swap authority the
-    // swap labels and nothing else, an object handle `OBJECT_RELEASE` and
-    // nothing else, and every other badge everything else
+    // swap labels and nothing else, an object handle the object labels
+    // (`OBJECT_RELEASE`, `OBJECT_READ`) and nothing else, and every other
+    // badge everything else
     // (services/memmgr/docs/ipc-interface.md § Node Handles, § Object Handles,
     // § Badge Discipline).
     let node_label = memmgr_labels::is_node_label(opcode);
     let swap_label = (memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED).contains(&opcode);
-    let object_label = opcode == memmgr_labels::OBJECT_RELEASE;
+    let object_label = memmgr_labels::is_object_label(opcode);
     let charge_only = req.badge & memmgr_labels::NODE_CHARGE_ONLY != 0;
     if node_label != (req.badge & memmgr_labels::NODE_HANDLE_TAG != 0)
         || swap_label != (req.badge & memmgr_labels::SWAP_AUTHORITY != 0)
@@ -5173,7 +5205,8 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         }
         memmgr_labels::MAKE_RESIDENT
         | memmgr_labels::MAKE_PRIVATE
-        | memmgr_labels::CAPTURE_CHUNKS =>
+        | memmgr_labels::CAPTURE_CHUNKS
+        | memmgr_labels::MARK_CHECKPOINT =>
         {
             route_procmgr(opcode, req, kept, ipc_buf, boot);
         }
@@ -5192,7 +5225,9 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             disk::route(opcode, req, kept, ipc_buf, boot.service_ep);
         }
-        memmgr_labels::SEAL_OBJECT..=memmgr_labels::OBJECT_RELEASE =>
+        memmgr_labels::SEAL_OBJECT..=memmgr_labels::OBJECT_RELEASE
+        | memmgr_labels::OBJECT_READ
+        | memmgr_labels::FILL_REGION =>
         {
             route_object(opcode, req, kept, ipc_buf, boot.service_ep);
         }
@@ -5204,7 +5239,8 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
 }
 
 /// Hand a request of a label only procmgr's badge may send (`MAKE_RESIDENT`,
-/// `MAKE_PRIVATE`, `CAPTURE_CHUNKS`) to its handler, which checks the badge.
+/// `MAKE_PRIVATE`, `CAPTURE_CHUNKS`, `MARK_CHECKPOINT`) to its handler,
+/// which checks the badge.
 fn route_procmgr(
     opcode: u64,
     req: &IpcMessage,
@@ -5218,6 +5254,10 @@ fn route_procmgr(
     {
         memmgr_labels::MAKE_RESIDENT => handle_make_resident(req, ipc_buf, procmgr_badge),
         memmgr_labels::MAKE_PRIVATE => handle_make_private(req, ipc_buf, procmgr_badge),
+        memmgr_labels::MARK_CHECKPOINT =>
+        {
+            object::handle_mark_checkpoint(req, kept, ipc_buf, procmgr_badge, boot.service_ep);
+        }
         _ => capture::handle_capture_chunks(req, kept, ipc_buf, procmgr_badge, boot.service_ep),
     }
 }

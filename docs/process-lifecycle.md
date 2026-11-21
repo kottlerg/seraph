@@ -289,8 +289,9 @@ loading, consumed as read-only sources) and the Memory caps init streams to
 it for the init-reap donation (forwarded to memmgr via
 `DONATE_MEMORY_CAPS`), every Memory cap procmgr holds originates in memmgr.
 
-Procmgr is the privileged caller for memmgr's four procmgr-only labels
-(`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`).
+Procmgr is the privileged caller for memmgr's eight procmgr-only labels
+(`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`, `MAKE_RESIDENT`,
+`MAKE_PRIVATE`, `CAPTURE_CHUNKS`, `MARK_CHECKPOINT`).
 No other service can mint or retire process badges against memmgr, or donate
 Memory caps into its pool. See
 [`memmgr/docs/ipc-interface.md`](../services/memmgr/docs/ipc-interface.md)

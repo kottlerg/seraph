@@ -514,7 +514,8 @@ procmgr and memmgr are sister tier-1 services with disjoint authority.
 memmgr owns the memory-cap pool; procmgr owns process lifecycle. procmgr is
 the only privileged caller of memmgr's procmgr-only labels
 (`REGISTER_PROCESS`, `PROCESS_DIED`, `DONATE_MEMORY_CAPS`,
-`DELEGATE_ASPACE`); no other service can mint or retire process badges
+`DELEGATE_ASPACE`, `MAKE_RESIDENT`, `MAKE_PRIVATE`, `CAPTURE_CHUNKS`,
+`MARK_CHECKPOINT`); no other service can mint or retire process badges
 against memmgr, or donate Memory caps into its pool. See
 [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Authority
 Boundaries Between memmgr and procmgr" for the full split.

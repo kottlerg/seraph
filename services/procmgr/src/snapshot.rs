@@ -192,11 +192,14 @@ pub struct Captured
 /// Capture `target` into a memory object sealed on `account`, a memmgr
 /// SEND the snapshotter presents, which stays the caller's. With `consent`
 /// the capture is a checkpoint: right after the hold is taken it calls
-/// [`Consent::check`] and reads the target's `ProcessInfo`, and the layout
-/// carries the checkpoint section.
+/// [`Consent::check`] and reads the target's `ProcessInfo`, the layout
+/// carries the checkpoint section, and a complete capture's object is
+/// marked as a checkpoint ([`mark_checkpoint`]), released when memmgr
+/// refuses the mark.
 ///
 /// # Errors
-/// [`Consent::check`]'s code; `SPACE_HELD` when the target's space is held already or the hold was
+/// [`Consent::check`]'s code; `NOT_RESTORABLE` when memmgr refused a
+/// complete checkpoint's mark; `SPACE_HELD` when the target's space is held already or the hold was
 /// interrupted; `INVALID_BADGE` when the target ended before or during the
 /// capture; `LIMIT` when the max of the account's budget node or of an
 /// ancestor refused its frames ([`Grants::cover`]); `OUT_OF_MEMORY` when
@@ -287,8 +290,16 @@ pub fn capture(
         threads: &threads,
         checkpoint,
     };
+    // A complete checkpoint's object is marked as one before any reply names
+    // it (docs/checkpoint-restore.md § Checkpoint).
+    let mark = about.checkpoint.is_some() && layout.complete;
     write_layout(ctx.self_aspace, &head, &layout, &about)?;
     let (handle, pages) = seal(&account, head, data)?;
+    if mark && let Err(code) = mark_checkpoint(ctx, handle, account.cap)
+    {
+        release_object(handle, ctx.ipc_buf);
+        return Err(code);
+    }
     Ok(Captured {
         handle,
         pages,
@@ -1487,8 +1498,49 @@ fn seal(account: &Account, mut head: Grants<'_>, mut data: Grants<'_>) -> Result
     }
 }
 
+/// Have memmgr mark the object `handle` names as a checkpoint
+/// (`memmgr_labels::MARK_CHECKPOINT`), on procmgr's own memmgr endpoint,
+/// with SEND copies of the handle and of `account`, which memmgr deletes.
+///
+/// # Errors
+/// `NOT_RESTORABLE` when memmgr refuses the mark: the account is not a SEND
+/// on memmgr's endpoint naming the record that sealed the object;
+/// `OUT_OF_MEMORY` when a copy cannot be derived or the call fails.
+fn mark_checkpoint(ctx: &Context, handle: u64, account: u64) -> Result<(), u64>
+{
+    let copy = |cap| {
+        syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND)
+            .map(CapGuard::new)
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)
+    };
+    let (handle, account) = (copy(handle)?, copy(account)?);
+    let msg = IpcMessage::builder(memmgr_labels::MARK_CHECKPOINT)
+        .cap(handle.cap())
+        .cap(account.cap())
+        .build();
+    // SAFETY: `ipc_buf` is the calling worker's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(ctx.memmgr_ep, &msg, ctx.ipc_buf) };
+    // The guards delete both copies whatever the outcome: a copy the call
+    // moved to memmgr is stale, its delete failing harmlessly even when its
+    // slot holds another cap by now (docs/capability-model.md), and one a
+    // failed call or a refused transfer left procmgr's is freed.
+    drop((handle, account));
+    let Ok(reply) = reply
+    else
+    {
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    };
+    match reply.label
+    {
+        memmgr_errors::SUCCESS => Ok(()),
+        memmgr_errors::INVALID_ARGUMENT => Err(procmgr_errors::NOT_RESTORABLE),
+        _ => Err(procmgr_errors::OUT_OF_MEMORY),
+    }
+}
+
 /// Drop the object `handle` names (`OBJECT_RELEASE`) and delete the handle:
-/// the reply that would have carried it did not reach the snapshotter.
+/// the reply that would have carried it did not reach the snapshotter, or
+/// memmgr refused a checkpoint's mark ([`mark_checkpoint`]).
 pub fn release_object(handle: u64, ipc_buf: *mut u64)
 {
     let _ = bounded_call(

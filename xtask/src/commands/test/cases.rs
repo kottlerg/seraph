@@ -14,9 +14,15 @@
 //! it found them. Before it runs, the runner checks that the case runs on the
 //! architecture, that the sysroot was built for it, and that the recorded
 //! harness is the case's bundle, so a case never boots an image it was not
-//! written for.
+//! written for. A trust request a developer staged in the sysroot's ESP
+//! (`cargo xtask trust-request`) is set aside while the cases run
+//! ([`without_staged_request`]): every launch boots a fresh variable store, so
+//! each boot would decide the request again, and its refusal or its console
+//! prompt would change what a case's boots log.
 
-use crate::error::{Result, bail};
+use std::fs;
+
+use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::argparse::ValueEnum as _;
@@ -24,6 +30,7 @@ use crate::bundle::Harness;
 use crate::cli::{BootHostArgs, ShutdownCause, TestArgs, TestCase, Tester};
 use crate::context::Context;
 use crate::qemu::{RiscvMmu, X86Paging};
+use crate::signing::request;
 use crate::util::step;
 
 /// The cell that runs a case.
@@ -103,8 +110,14 @@ impl Case
 /// `cargo xtask lint-docs` fails until xtask/README.md § `cargo xtask test`
 /// and docs/testing.md state it (its `md-test-cells` rule).
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the registry is one match arm per case, read as one table; splitting it would \
+              scatter the cases the match must name"
+)]
 pub fn case(case: TestCase) -> Case
 {
+    use super::dma_confinement;
     use super::{
         cet, debug_port, enrolment, hotplug, kaslr, rollback, secureboot, shutdown, signing,
         terminal, tpm, vmgenid, wedge,
@@ -126,13 +139,22 @@ pub fn case(case: TestCase) -> Case
             options: &[CaseOption::RiscvMmu, CaseOption::X86Paging],
             run: kaslr::run,
         },
-        // The kernel, bundle, revoked and rootfs boots.
+        // The kernel, bundle, policy-missing, revoked, rootfs, configuration,
+        // policy-key and index boots.
         TestCase::Signing => Case {
-            arches: &[(Arch::X86_64, 6), (Arch::Riscv64, 6)],
+            arches: &[(Arch::X86_64, 8), (Arch::Riscv64, 8)],
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Release],
             run: signing::run,
+        },
+        // The boot with no IOMMU, refused, then the boot behind one.
+        TestCase::DmaConfinement => Case {
+            arches: &[(Arch::X86_64, 2), (Arch::Riscv64, 2)],
+            bundle: Harness::Init,
+            cell: Cell::Ci(Tester::Usertest),
+            options: &[],
+            run: dma_confinement::run,
         },
         // The floor written, raised, and refusing the older bootloader, on
         // one variable store.
@@ -366,7 +388,111 @@ pub fn run_case(ctx: &Context, name: TestCase, args: &TestArgs) -> Result<()>
     let resolved = CaseArgs::of(args);
     check_options(name, &entry, args, resolved.arch)?;
     check_ready(ctx, name, &entry, resolved.arch)?;
-    (entry.run)(ctx, &resolved)
+    let staged = read_staged(ctx)?;
+    let mut staging = SysrootStaging::new(ctx, resolved.arch);
+    without_staged_request(staged, &mut staging, || (entry.run)(ctx, &resolved))
+}
+
+/// The changes [`without_staged_request`] makes to the sysroot's staged trust
+/// request and to the images.
+trait Staging
+{
+    /// Refuse before anything changes when the images cannot be packed for
+    /// the cases: a sysroot built for another architecture, which a pack
+    /// would sign for the wrong one and leave unable to pack.
+    fn check(&mut self) -> Result<()>;
+    /// Remove the staged request.
+    fn clear(&mut self) -> Result<()>;
+    /// Stage `bytes`, a request, again.
+    fn stage(&mut self, bytes: &[u8]) -> Result<()>;
+    /// Pack the images again from the sysroot.
+    fn repack(&mut self) -> Result<()>;
+}
+
+/// [`Staging`] on the sysroot and the images of `arch`, packed in the
+/// layout the current image has.
+struct SysrootStaging<'a>
+{
+    ctx: &'a Context,
+    arch: Arch,
+}
+
+impl<'a> SysrootStaging<'a>
+{
+    fn new(ctx: &'a Context, arch: Arch) -> Self
+    {
+        Self { ctx, arch }
+    }
+}
+
+impl Staging for SysrootStaging<'_>
+{
+    fn check(&mut self) -> Result<()>
+    {
+        crate::sysroot::check_arch(self.ctx, self.arch)
+    }
+
+    fn clear(&mut self) -> Result<()>
+    {
+        request::clear(self.ctx)
+    }
+
+    fn stage(&mut self, bytes: &[u8]) -> Result<()>
+    {
+        request::stage(self.ctx, bytes).map(|_| ())
+    }
+
+    fn repack(&mut self) -> Result<()>
+    {
+        let layout = crate::disk::current_layout(self.ctx)?;
+        crate::disk::create_disk_image(self.ctx, self.arch, layout)
+    }
+}
+
+/// The trust request staged in the sysroot's ESP, or `None` when there is
+/// none.
+fn read_staged(ctx: &Context) -> Result<Option<Vec<u8>>>
+{
+    match fs::read(request::staged_path(ctx))
+    {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("reading the staged trust request"),
+    }
+}
+
+/// Run `cases` on images that carry no trust request, and leave `staged`,
+/// the request a developer staged, staged and packed again afterwards,
+/// whatever the cases' outcome. A case's boots each start on a fresh variable
+/// store, so a staged request would be decided on every one: refused by the
+/// commit rule in a boot that tampers with the kernel or the bundle, which
+/// logs a refusal the case does not owe, or asked about at the console for
+/// 60 seconds when it is unsigned. A case that boots requests of its own
+/// (`enrolment`) stages them itself. A failure to restore is reported ahead
+/// of the cases' outcome, since every later pack would then lack the request.
+/// Nothing changes when [`Staging::check`] refuses the images first.
+fn without_staged_request<T>(
+    staged: Option<Vec<u8>>,
+    staging: &mut impl Staging,
+    cases: impl FnOnce() -> Result<T>,
+) -> Result<T>
+{
+    let Some(bytes) = staged
+    else
+    {
+        return cases();
+    };
+    staging.check()?;
+    step("setting the staged trust request aside for the cases");
+    let ran = staging
+        .clear()
+        .and_then(|()| staging.repack())
+        .and_then(|()| cases());
+    staging
+        .stage(&bytes)
+        .and_then(|()| staging.repack())
+        .context("restoring the staged trust request")?;
+    ran
 }
 
 /// The cases `tester`'s CI cells run on `arch`, in the registry's order.
@@ -418,19 +544,24 @@ pub fn run_cell(ctx: &Context, tester: Tester, args: &TestArgs) -> Result<()>
         ));
         return Ok(());
     }
-    let mut failed = Vec::new();
-    for &name in &names
-    {
-        step(&format!("{} cell: {} case", tester.name(), name.name()));
-        let entry = case(name);
-        let result =
-            check_ready(ctx, name, &entry, arch).and_then(|()| (entry.run)(ctx, &resolved));
-        if let Err(e) = result
+    let staged = read_staged(ctx)?;
+    let mut staging = SysrootStaging::new(ctx, arch);
+    let failed = without_staged_request(staged, &mut staging, || {
+        let mut failed = Vec::new();
+        for &name in &names
         {
-            eprintln!("{} cell: {} case: FAIL: {e:#}", tester.name(), name.name());
-            failed.push(name.name());
+            step(&format!("{} cell: {} case", tester.name(), name.name()));
+            let entry = case(name);
+            let result =
+                check_ready(ctx, name, &entry, arch).and_then(|()| (entry.run)(ctx, &resolved));
+            if let Err(e) = result
+            {
+                eprintln!("{} cell: {} case: FAIL: {e:#}", tester.name(), name.name());
+                failed.push(name.name());
+            }
         }
-    }
+        Ok(failed)
+    })?;
     if !failed.is_empty()
     {
         bail!(
@@ -478,13 +609,28 @@ mod tests
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::X86_64),
             [
-                Terminal, Signing, Rollback, Enrolment, Secureboot, Wedge, Vmgenid, Shutdown
+                Terminal,
+                Signing,
+                DmaConfinement,
+                Rollback,
+                Enrolment,
+                Secureboot,
+                Wedge,
+                Vmgenid,
+                Shutdown
             ]
         );
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::Riscv64),
             [
-                Terminal, Signing, Rollback, Enrolment, Secureboot, Wedge, Shutdown
+                Terminal,
+                Signing,
+                DmaConfinement,
+                Rollback,
+                Enrolment,
+                Secureboot,
+                Wedge,
+                Shutdown
             ]
         );
         for arch in [Arch::X86_64, Arch::Riscv64]
@@ -604,5 +750,142 @@ mod tests
             "wedge", "--arch", "riscv64", "--cpus", "2", "--mem", "1024",
         ]));
         assert_eq!((args.arch, args.cpus, args.mem), (Arch::Riscv64, 2, 1024));
+    }
+
+    /// A [`Staging`] that records each change in `log`, failing the check
+    /// when `fail_check` holds and the restaging when `fail_stage` holds.
+    struct Recorder
+    {
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail_check: bool,
+        fail_stage: bool,
+    }
+
+    impl Staging for Recorder
+    {
+        fn check(&mut self) -> Result<()>
+        {
+            self.log.borrow_mut().push("check".into());
+            if self.fail_check
+            {
+                bail!("the sysroot was built for riscv64");
+            }
+            Ok(())
+        }
+
+        fn clear(&mut self) -> Result<()>
+        {
+            self.log.borrow_mut().push("clear".into());
+            Ok(())
+        }
+
+        fn stage(&mut self, bytes: &[u8]) -> Result<()>
+        {
+            self.log
+                .borrow_mut()
+                .push(format!("stage {}", String::from_utf8_lossy(bytes)));
+            if self.fail_stage
+            {
+                bail!("disk full");
+            }
+            Ok(())
+        }
+
+        fn repack(&mut self) -> Result<()>
+        {
+            self.log.borrow_mut().push("repack".into());
+            Ok(())
+        }
+    }
+
+    fn recorder() -> Recorder
+    {
+        Recorder {
+            log: std::rc::Rc::default(),
+            fail_check: false,
+            fail_stage: false,
+        }
+    }
+
+    // Defect caught: cases booting an image that carries a trust request a
+    // developer staged, which each boot decides again on its fresh variable
+    // store, so the signing case's tampered boots log a refusal they do not
+    // owe and an unsigned request stops every boot at the console.
+    #[test]
+    fn the_cases_run_with_the_staged_request_set_aside_and_restored()
+    {
+        let mut staging = recorder();
+        let log = staging.log.clone();
+        let ran = without_staged_request(Some(b"req".to_vec()), &mut staging, || {
+            log.borrow_mut().push("cases".into());
+            Ok(7)
+        });
+        assert_eq!(ran.unwrap(), 7);
+        assert_eq!(
+            *staging.log.borrow(),
+            ["check", "clear", "repack", "cases", "stage req", "repack"]
+        );
+    }
+
+    #[test]
+    fn with_no_staged_request_the_cases_run_on_the_images_as_they_are()
+    {
+        let mut staging = recorder();
+        let log = staging.log.clone();
+        let ran = without_staged_request(None, &mut staging, || {
+            log.borrow_mut().push("cases".into());
+            Ok(())
+        });
+        ran.unwrap();
+        assert_eq!(*staging.log.borrow(), ["cases"]);
+    }
+
+    // Defect caught: a failed case leaving the developer's request unstaged,
+    // so every later pack lacks it.
+    #[test]
+    fn the_request_is_restored_when_a_case_fails()
+    {
+        let mut staging = recorder();
+        let ran: Result<()> =
+            without_staged_request(Some(b"req".to_vec()), &mut staging, || bail!("case failed"));
+        assert!(format!("{:#}", ran.unwrap_err()).contains("case failed"));
+        assert_eq!(
+            *staging.log.borrow(),
+            ["check", "clear", "repack", "stage req", "repack"]
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_is_reported_ahead_of_the_cases_outcome()
+    {
+        let mut staging = Recorder {
+            fail_stage: true,
+            ..recorder()
+        };
+        let ran = without_staged_request(Some(b"req".to_vec()), &mut staging, || Ok(()));
+        let message = format!("{:#}", ran.unwrap_err());
+        assert!(
+            message.contains("restoring the staged trust request"),
+            "{message}"
+        );
+    }
+
+    // Defect caught: a cell run for an architecture the sysroot was not built
+    // for, which packed the sysroot for the wrong one before any case's
+    // readiness check refused it, and left it unable to pack.
+    #[test]
+    fn a_sysroot_of_another_architecture_is_refused_before_anything_changes()
+    {
+        let mut staging = Recorder {
+            fail_check: true,
+            ..recorder()
+        };
+        let log = staging.log.clone();
+        let ran = without_staged_request(Some(b"req".to_vec()), &mut staging, || {
+            log.borrow_mut().push("cases".into());
+            Ok(())
+        });
+        assert!(format!("{:#}", ran.unwrap_err()).contains("built for riscv64"));
+        assert_eq!(*staging.log.borrow(), ["check"]);
     }
 }

@@ -156,7 +156,9 @@ fn main() -> !
     // The IOMMU driver, spawned and settled before any DMA-capable driver:
     // once it reports ready every device behind a remapping unit is blocked
     // until devmgr attaches it, which a bind does before each DMA grant.
-    // `None` runs every device unconfined, logged once.
+    // `None` runs every device unconfined, logged once, or, when the boot
+    // policy requires DMA confinement, refuses every DMA-capable device
+    // (`bind`'s DMA grant).
     let mut boot_modules = modules.drivers;
     caps.iommu = iommu::bring_up(
         &mut records.pci,

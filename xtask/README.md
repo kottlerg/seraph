@@ -63,7 +63,8 @@ xtask/
 │   │       ├── cases.rs        # The case registry; the runners of a case and of a cell
 │   │       ├── host.rs         # The unit tests (TEST_RELAXED_LINTS)
 │   │       ├── terminal.rs     # One module per case: terminal, wedge, cet, vmgenid, tpm,
-│   │       │                   #   kaslr, signing, rollback, enrolment, secureboot, hotplug
+│   │       │                   #   kaslr, signing, dma_confinement, rollback, enrolment,
+│   │       │                   #   secureboot, hotplug
 │   │       ├── debug_port/     # The debug-port case: mod.rs; echo.rs (the transport boot),
 │   │       │                   #   gdb.rs (the GDB stub boot)
 │   │       └── shutdown/       # The shutdown case: mod.rs; reboot.rs, power_button.rs,
@@ -138,14 +139,18 @@ under `services/`, `programs/` and `tests/` (under its install path with the rol
 and the boot-module role when a bundle list names it as an entry; `/services/init` as `init` with
 the init role, and `/tests/ktest` too when the pack composes the ktest harness's bundle), every
 regular file under a data tree (`DATA_TREES` in `src/signing/mod.rs`: `config/devmgr/platform/` and
-`data/svctest/signed/`), under its install path with the data role alone, which procmgr's verified
-read accepts, every regular file of a configuration directory (`CONFIG_TREES` in
-`src/signing/mod.rs`: `config/svcmgr/services/`, whose files are `.svc` recipes, and
-`config/devmgr/classes/`, whose files are `.class` files) under its install path in the
-configuration role, the directory's `index`, which the pack writes from the files the directory
-holds and signs in the configuration role under `<dir>/index` (a subdirectory or a file of another
-suffix in those directories fails the pack), and every other file a bundle list names, the data
-files installed under `/config/` (the boot-module role). A pack signs for the harness recorded in
+`data/svctest/signed/`), under its install path with the data role, which procmgr's verified read
+accepts, and the role of its bundle entry when a bundle list names it, every regular file of a
+configuration directory (`CONFIG_TREES` in `src/signing/mod.rs`: `config/svcmgr/services/`, whose
+files are `.svc` recipes, and `config/devmgr/classes/`, whose files are `.class` files) under its
+install path in the configuration role, the directory's `index`, which the pack writes from the
+files the directory holds and signs in the configuration role under `<dir>/index` (a subdirectory or
+a file of another suffix in those directories fails the pack), and every other file a bundle list
+names, the configuration files installed under `/config/` (the configuration role, in which the
+bootloader verifies a bundle entry under `/config/`, a platform table excepted). A pack refuses a
+bundle whose list does not name the boot-time policy `/config/boot/policy.conf`, or whose policy
+[`shared/boot-policy`](../shared/boot-policy/README.md) refuses. A pack signs for the harness
+recorded in
 `sysroot/.harness` ([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot),
 then composes the ESP (`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and
 composes the bundle by copying the installed files the harness's list in `config/bundle/` names
@@ -523,15 +528,14 @@ two authorings of one layout from one sysroot write identical images.
 (vfsd's fall-through would also serve `/data` from a root-fs directory,
 so a dedicated partition is a disk-authoring choice — the in-tree image
 uses the partition, per [docs/storage.md](../docs/storage.md) § GPT Role-GUID Discovery.)
-The images' logical block size, the unit of their GPT LBAs and the sector
-size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
-`mkdisk --block-size 4096`. `build` and `mkdisk` both author the partitions above; `build`
-authors them at 512 bytes on a single image, so a 4Kn or split boot runs `mkdisk` after it.
-`run --debug-target` and the `terminal`, `debug-port`, `shutdown`, `hotplug`, `kaslr` and `signing`
-cases repack the images in the layout they find: `disk.img`'s block size, and the data partition on
-`disk-data.img` when that image is there. The cases boot that layout, attaching
-`disk-data.img` as the second disk when it holds the data partition; `run` attaches a
-second disk only as `--second-disk` names it.
+The images' logical block size, the unit of their GPT LBAs and the sector size of their FAT volumes,
+is 512 bytes, or 4096 bytes (4Kn) from `mkdisk --block-size 4096`. `build` and `mkdisk` both author
+the partitions above; `build` authors them at 512 bytes on a single image, so a 4Kn or split boot
+runs `mkdisk` after it. `run --debug-target` and the `terminal`, `debug-port`, `shutdown`,
+`hotplug`, `kaslr`, `signing` and `dma-confinement` cases repack the images in the layout they find:
+`disk.img`'s block size, and the data partition on `disk-data.img` when that image is there. The
+cases boot that layout, attaching `disk-data.img` as the second disk when it holds the data
+partition; `run` attaches a second disk only as `--second-disk` names it.
 
 `src/fat.rs` writes each FAT volume in one pass, with its variant chosen by its cluster count as
 the FAT specification's type rule chooses it: at 4 KiB clusters the ESP (64 MiB), root
@@ -704,6 +708,13 @@ options are `--wait-host SECS`, `--host-override`, `--alone`, `--timing` and `--
 case option it does not take, and `--cause`, `--port`, `--gdb`, `--riscv-mmu` and `--x86-paging`
 require a case.
 
+A case or a cell boots images that carry no trust request: when one is staged in the sysroot's ESP
+([`cargo xtask trust-request`](#cargo-xtask-trust-request)), the runner checks that the sysroot was
+built for the architecture, changing nothing when it was not, then removes the request and packs the
+images again before the cases, then stages it and packs them again after them, whatever their
+outcome, since each boot of a case starts on a fresh variable store and would decide the request
+again. The `enrolment` case stages requests of its own for its boots.
+
 The registry is `src/commands/test/cases.rs`. Each case's entry states the architectures it runs
 on with its boots on each, the bundle its image must compose, the cell that runs it, and the case
 options it takes:
@@ -718,22 +729,24 @@ options it takes:
 | `kaslr` | x86_64 (3), riscv64 (3) | ktest | ktest | `--riscv-mmu`, `--x86-paging` |
 | `shutdown` | x86_64 (9), riscv64 (8) | init | usertest | `--cause` |
 | `debug-port` | x86_64 (2), riscv64 (2) | init | host run | `--port`, `--gdb` |
-| `signing` | x86_64 (6), riscv64 (6) | init | usertest | `--release` |
+| `signing` | x86_64 (8), riscv64 (8) | init | usertest | `--release` |
+| `dma-confinement` | x86_64 (2), riscv64 (2) | init | usertest | none |
 | `rollback` | x86_64 (3), riscv64 (3) | init | usertest | `--release` |
 | `enrolment` | x86_64 (6), riscv64 (6) | init | usertest | none |
 | `secureboot` | x86_64 (4), riscv64 (4) | init | usertest | none |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
 
-Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was
-built for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`,
-`init` for every other), and when it is not, names the `cargo xtask mkdisk --arch A --harness X`
-that records it. A case is a pure runner: it builds nothing but the `signing` case's revoking
-bootloader and the `rollback` case's raising one, boots the sysroot as the last pack left it,
-stages and removes only what it needs itself, and leaves the images in the layout it found them
-in; the sections below state each one's staging. A new host-driven QEMU test is a case, added to
-the registry and to `TestCase` in `src/cli.rs`, not a command; `cargo xtask lint-docs` fails until
-the table above, a section of its own below, a heading of
-[docs/testing.md](../docs/testing.md#gating) § Gating, and the cell table of its § Coverage tiers
+Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was built
+for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`, `init`
+for every other), and when it is not, names the `cargo xtask mkdisk --arch A --harness X` that
+records it. A case is a pure runner: it builds nothing but the `signing` case's revoking and
+role-scoped bootloaders and the `rollback` case's raising one, boots the sysroot as the last pack
+left it but for a staged trust request, which the runner sets aside (above), stages and removes only
+what it needs itself, and leaves the images in the layout it found them in; the sections below state
+each one's staging. A new host-driven QEMU test is a case, added to the registry and to `TestCase`
+in `src/cli.rs`, not a command; `cargo xtask lint-docs` fails until the table above, a section of
+its own below, a heading of [docs/testing.md](../docs/testing.md#gating) § Gating, and the cell
+table of its § Coverage tiers
 state it (its `md-test-cells` rule, [§ `cargo xtask lint-docs`](#cargo-xtask-lint-docs)). See
 [docs/testing.md](../docs/testing.md) for the harness model.
 
@@ -1058,7 +1071,7 @@ Check that every signature verifier refuses an object that does not verify, with
 owes, on either arch ([docs/signing.md](../docs/signing.md) § Which Stage Verifies What). The
 case packs the disk images once with the default-init bundle, so the sysroot is signed and the
 ESP holds that bundle, composed from the installed files; writes each boot's objects into
-`target/xtask/test/signing/<arch>/` from the signed ones; and boots the current sysroot six
+`target/xtask/test/signing/<arch>/` from the signed ones; and boots the current sysroot eight
 times, each from images packed with the default-init bundle and those objects in place of the
 ESP's or the sysroot's files (`disk::create_disk_image_substituting`):
 
@@ -1066,9 +1079,11 @@ ESP's or the sysroot's files (`disk::create_disk_image_substituting`):
 |---|---|---|
 | `kernel` | the kernel with a body byte flipped | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(BodyHash)` |
 | `bundle` | the bundle with a body byte of its `/services/drivers/virtio-blk` entry flipped | `SERAPH BOOT FATAL: signature verification refused: /services/drivers/virtio-blk: Failed(BodyHash)` |
+| `policy-missing` | the bundle without its `/config/boot/policy.conf` entry | `` SERAPH BOOT FATAL: bootstrap.bundle is malformed or missing: bundle missing `/config/boot/policy.conf` entry `` |
 | `revoked` | both ESP copies of the bootloader, built under the build's trust store with the signing key's id revoked | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(Revoked)` |
 | `rootfs` | `/services/timed` with a body byte flipped, `/services/pwrmgr` signed with the data role alone, `/services/crashd` signed by a key no anchor holds; the kernel and `/programs/terminal` each with a record of that key before their own; on riscv64 also `/config/devmgr/platform/qemu-virt.platform` with a body byte flipped | procmgr's `signature verification refused: <path>: <refusal>` (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr's `create: "<path>" refused: its signature did not verify` for each of the three, and `terminal: READY for injection`; on riscv64 also procmgr's `signature verification refused: /config/devmgr/platform/qemu-virt.platform: Failed(BodyHash)` and devmgr's `platform table /config/devmgr/platform/qemu-virt.platform: procmgr's verified read refused it (InvalidData); passed over` and `no platform description table for this machine; no platform-table records` |
 | `configuration` | a bootloader built under the build's trust store with two more anchors, one trusted for every role but configuration and one for configuration alone; in `/config/svcmgr/services/`, `timed.svc` with a body byte flipped, `pwrmgr.svc` unsigned, `crashd.svc` signed by the first anchor's key, `oomd.svc` signed by the second's, which signs `/services/oomd` as a service too, `entropyd.svc` validly signed over a body other than the one the index holds, and an index, validly signed, that names a `removed.svc` the directory lacks and omits the `swapd.svc` it holds; `/config/devmgr/classes/rtc.class` with a body byte flipped | procmgr's `signature verification refused: <path>: <refusal>` for `timed.svc` (`Failed(BodyHash)`), `pwrmgr.svc` (`Parse(Magic)`), `crashd.svc` (`Failed(KeyUsage)`) and `rtc.class` (`Failed(BodyHash)`), each followed by svcmgr's `<path>: named by the index, not read (InvalidData); dropped` (for `rtc.class`, `...; class not configured`); procmgr's refusal of `/services/oomd` (`Failed(KeyUsage)`) and svcmgr's `create: "/services/oomd" refused: its signature did not verify`; svcmgr's `/config/svcmgr/services/entropyd.svc: its body is not the one the directory's index was signed with; refused`, followed by its `named by the index, not read (InvalidData); dropped`; `/config/svcmgr/services/removed.svc: named by the index, not read (NotFound); dropped`; `/config/svcmgr/services/swapd.svc: not named by the directory's index; not read`; and `terminal: READY for injection` |
+| `policy-key` | the `configuration` boot's bootloader; the bundle with its `/config/boot/policy.conf` entry signed in the configuration role by the key that bootloader's store trusts for every role but configuration | `SERAPH BOOT FATAL: signature verification refused: /config/boot/policy.conf: Failed(KeyUsage)` |
 | `index` | the indexes of `/config/svcmgr/services/` and `/config/devmgr/classes/` each with a body byte flipped | procmgr's `signature verification refused: <index path>: Failed(BodyHash)` for each, svcmgr's `<index path> not read (InvalidData); no recipe is read` and `<index path> not read (InvalidData); no device class configured`, and `svcmgr: registered without definition: ` |
 
 The untrusted key is a local identity generated for the run in a directory under the host's
@@ -1082,10 +1097,10 @@ fails. The images are packed again from the sysroot in the layout they had, with
 harness's bundle, whatever the outcome; no boot changes a sysroot file, so a later pack cannot sign
 a tampered body.
 
-The case compiles the bootloader of the `revoked` boot, so the host admits it as a build and
-then each boot as one boot of `--cpus` vCPUs (§ Host launch rules). The compile reuses the
-bootloader's cargo output directory, so the next `cargo xtask build` compiles the bootloader
-again.
+The case compiles two bootloaders, the `revoked` boot's and the one the `configuration` and
+`policy-key` boots share, so the host admits each compile as a build and then each boot as one boot
+of `--cpus` vCPUs (§ Host launch rules). The compile reuses the bootloader's cargo output directory,
+so the next `cargo xtask build` compiles the bootloader again.
 
 It requires a populated sysroot of the profile `--release` names:
 
@@ -1096,7 +1111,36 @@ cargo xtask test signing [--arch x86_64|riscv64] [--release] [--cpus N] [--mem M
 
 | Option | Default | Description |
 |---|---|---|
-| `--release` | `false` | Build the `revoked` boot's bootloader in release mode, as the sysroot's was built; a cell passes it on |
+| `--release` | `false` | Build the `revoked`, `configuration` and `policy-key` boots' bootloaders in release mode, as the sysroot's was built; a cell passes it on |
+
+#### The `dma-confinement` case
+
+Check that, with the boot policy's `dma-confinement = required`, devmgr gives no driver to a
+DMA-capable device no IOMMU unit confines, and that the boot set runs when every device is
+confined, on either arch ([docs/device-management.md](../docs/device-management.md) § Required DMA
+Confinement). The case packs the disk images once with the default-init bundle; writes into
+`target/xtask/test/dma-confinement/<arch>/` that bundle with its `/config/boot/policy.conf` entry
+replaced by one that sets `dma-confinement = required`, signed in the configuration role by the
+build's key; and boots the current sysroot twice from images carrying it:
+
+| Boot | Machine | Owed lines |
+|---|---|---|
+| `absent` | no IOMMU (`--iommu absent`) | devmgr's `boot policy: dma-confinement = required`, its `no DMA-capable device is given a driver, as the boot policy sets dma-confinement = required`, a device's `<driver>: device <BDF> is confined by no IOMMU unit and the boot policy sets dma-confinement = required; not bound`, and vfsd's `no block device available` |
+| `attached` | the default, every `virtio-pci` device behind the IOMMU | devmgr's `boot policy: dma-confinement = required` and `terminal: READY for injection` |
+
+A boot is judged as the `signing` case judges one, with a line holding `the boot policy sets
+dma-confinement = required` a refusal: the `attached` boot fails on one. Each boot's deadline is
+six minutes. Every boot's serial log is saved as
+`target/xtask/test/dma-confinement/<arch>/<boot>.log`, and the images are packed again from the
+sysroot in the layout they had, with the recorded harness's bundle, whatever the outcome. The case
+builds nothing; the host admits each boot as one boot of `--cpus` vCPUs (§ Host launch rules).
+
+It requires a populated sysroot whose recorded harness is `init`:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test dma-confinement [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
 
 #### The `rollback` case
 
@@ -1292,8 +1336,13 @@ seconds.
 
 The request is staged in the sysroot's ESP as `EFI/seraph/trust-request`, so every later pack's
 image carries it (`mkdisk` keeps it, as it does not a knob) until `--clear` removes it, or, with
-`--out`, written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request`. A request
-left on the ESP once applied changes nothing on later boots, which skip it. The command refuses a
+`--out`, written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request`. On a
+machine whose variable store persists, a request left on the ESP once applied changes nothing on
+later boots, which skip it. Every launch of `cargo xtask run`, `--runs` included, boots a fresh
+copy of the firmware's variable template
+([docs/build-system.md](../docs/build-system.md#qemu-and-firmware)), so each of its boots decides a
+staged request again, and an unsigned one waits at the console prompt for 60 seconds on every boot.
+The cases set a staged request aside while they run ([Cases](#cases)). The command refuses a
 request that adds and revokes nothing, a store file that does not parse, and a key id that is not
 32 hex digits.
 
@@ -2049,8 +2098,8 @@ themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `crypt
 `compare-images` and `test` without a case or a cell (the unit tests) as builds
 (`CliCommand::build_host` in `src/cli.rs` names them); `run`, `capture-acpi`, and `test` with a case
 or a cell as boots, each boot admitted as above (the `shutdown` case admits once for its boots,
-which it runs one at a time). The `signing` case, which compiles its revoking bootloader before it
-boots, is admitted as a build for that compile and then each boot as a boot.
+which it runs one at a time). The `signing` case, which compiles its revoking and role-scoped
+bootloaders before it boots, is admitted as a build for each compile and then each boot as a boot.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run --runs` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

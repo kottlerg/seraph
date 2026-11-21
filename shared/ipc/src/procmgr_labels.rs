@@ -1065,13 +1065,16 @@ pub const QUIESCE: u64 = 34;
 /// handle naming the target. `caps[0]` is the account, a memmgr SEND the
 /// sender presents. Under the hold procmgr checks that the point it found is
 /// still recorded. The layout carries `crate::procmgr_snapshot::SNAPSHOT_CHECKPOINT`
-/// and a `crate::procmgr_snapshot::Checkpoint` section. Replies as
+/// and a `crate::procmgr_snapshot::Checkpoint` section, and memmgr marks a
+/// complete capture's object a checkpoint
+/// (`crate::memmgr_labels::MARK_CHECKPOINT`) before the reply. Replies as
 /// [`SNAPSHOT`] does, and then signals the process's Notification when the
 /// capture is complete and the reply was delivered; `UNAUTHORIZED` on a cap
 /// other than a process handle; `INVALID_ARGUMENT` without `caps[0]`;
 /// `INVALID_BADGE` when the process ended before or during the capture;
 /// `NOT_QUIESCED` when it is at no quiesce point, or left it before the
-/// hold; `SPACE_HELD`, `LIMIT` and `OUT_OF_MEMORY` as for [`SNAPSHOT`].
+/// hold; `SPACE_HELD`, `LIMIT` and `OUT_OF_MEMORY` as for [`SNAPSHOT`];
+/// `NOT_RESTORABLE` when memmgr refused the mark, the object released.
 /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 35:
 /// `CHECKPOINT`.
 pub const CHECKPOINT: u64 = 35;

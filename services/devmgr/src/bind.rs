@@ -1764,8 +1764,9 @@ fn carve_bars(
 /// which the domain maps at their own addresses and no mapping's IOVA
 /// overlaps. `None`, logged under `name`, when the device is refused (its
 /// unit is not programmed, its reserved regions cannot be mapped, or its
-/// `ATTACH` fails) or the grant fails; an attached device is blocked again
-/// then.
+/// `ATTACH` fails, or no unit confines it while the boot-time policy
+/// requires confinement, `firmware::dma::admits`) or the grant fails; an
+/// attached device is blocked again then.
 fn grant_dma(
     name: &str,
     pci_dev: &pci::PciDevice,
@@ -1779,6 +1780,21 @@ fn grant_dma(
         Some(i) => i.confine(name, pci_dev, dma_width).ok()?,
         None => (Confinement::Unconfined, Vec::new()),
     };
+    if !firmware::dma::admits(caps.dma_confinement, confinement)
+    {
+        std::os::seraph::log!(
+            error: "{}: device {:04x}:{:02x}:{:02x}.{} is confined by no IOMMU unit and the boot \
+                    policy sets {} = {}; not bound",
+            name,
+            pci_dev.segment,
+            pci_dev.bus,
+            pci_dev.dev,
+            pci_dev.func,
+            boot_policy::DmaConfinement::KEY,
+            caps.dma_confinement.value()
+        );
+        return None;
+    }
     let grant = caps.dma.as_ref().and_then(|d| {
         d.grant(
             device_badge,

@@ -38,6 +38,7 @@ extern crate alloc;
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
+use boot_policy::DmaConfinement;
 use ipc::devmgr_dma_labels::{ACCESS_DEVICE_WRITE, ACCESS_MASK};
 use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP, RIGHTS_MEM_WRITE};
 
@@ -121,6 +122,16 @@ pub enum Confinement
         /// a VT-d unit.
         interrupt_range: bool,
     },
+}
+
+/// Whether a DMA-capable device of `confinement` is given its DMA grant under
+/// the boot-time policy's `requirement` (`docs/device-management.md` § DMA
+/// Safety Model): a confined device always, an unconfined one only while the
+/// policy does not require confinement.
+#[must_use]
+pub fn admits(requirement: DmaConfinement, confinement: Confinement) -> bool
+{
+    requirement == DmaConfinement::Opportunistic || confinement != Confinement::Unconfined
 }
 
 /// One mapping of a device: `len` bytes of physically contiguous frames,
@@ -947,6 +958,25 @@ mod tests
 {
     use super::*;
     use ipc::devmgr_dma_labels::ACCESS_DEVICE_READ;
+
+    // Defect caught: an unconfined device granted DMA while the policy
+    // requires confinement, or a device refused under the default policy.
+    #[test]
+    fn only_a_required_confinement_refuses_and_only_an_unconfined_device()
+    {
+        let domain = Confinement::Domain {
+            handle: 1,
+            limit: 1 << 39,
+            interrupt_range: true,
+        };
+        assert!(admits(
+            DmaConfinement::Opportunistic,
+            Confinement::Unconfined
+        ));
+        assert!(admits(DmaConfinement::Opportunistic, domain));
+        assert!(admits(DmaConfinement::Required, domain));
+        assert!(!admits(DmaConfinement::Required, Confinement::Unconfined));
+    }
 
     #[test]
     fn a_fault_is_counted_only_for_a_tracked_device_and_a_new_record_starts_at_zero()

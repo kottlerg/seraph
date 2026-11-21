@@ -1558,7 +1558,7 @@ pub unsafe fn block_call(block_dev: u64, msg: &IpcMessage, ipc_buf: *mut u64)
 
 /// The pages of system RAM memmgr reports (`QUERY_POOL_STATUS` `data[0]`), or
 /// `None` when the query fails.
-fn query_system_ram_pages(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
+pub(crate) fn query_system_ram_pages(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     let req = IpcMessage::builder(memmgr_labels::QUERY_POOL_STATUS).build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
@@ -1685,7 +1685,7 @@ impl ReleaseBatch
 /// ids, whose caps the cache has already unmapped and deleted. Returns
 /// whether memmgr took them. A refused or failed release is logged: the
 /// pages stay charged to the fs, unreachable from it, until it exits.
-fn release_regions(memmgr_ep: u64, ids: &[u64], ipc_buf: *mut u64) -> bool
+pub(crate) fn release_regions(memmgr_ep: u64, ids: &[u64], ipc_buf: *mut u64) -> bool
 {
     let mut req = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS).word(0, ids.len() as u64);
     for (i, &id) in ids.iter().enumerate()

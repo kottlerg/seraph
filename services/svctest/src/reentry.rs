@@ -61,6 +61,7 @@ pub fn dispatch(role: &str)
     phases::memory_object_text::reentry_main(role);
     phases::image_sharing::reentry_main(role);
     phases::snapshot::reentry_main(role);
+    phases::checkpoint::reentry_main(role);
     phases::swap::reentry_main(role);
     phases::swap_commit::reentry_main(role);
     phases::unmount::reentry_main(role);

@@ -4917,6 +4917,13 @@ unsafe fn dealloc_thread(
             // SAFETY: tcb validated non-null and live; sched_lock and every
             // scheduler lock held.
             unsafe { (*tcb).state = ThreadState::Exited };
+            // An Exited commit clears any address-space hold mark, so a
+            // release walk that meets this thread before it is unregistered
+            // never starts it (core/kernel/docs/thread-lifecycle-and-sleep.md
+            // § Address-Space Hold).
+            // SAFETY: tcb validated non-null and live; the mark is written
+            // under its sched_lock, held.
+            unsafe { (*tcb).hold = crate::sched::hold::HoldMark::None };
 
             // Remove from whichever queue it's actually in.
             for cpu in 0..cpu_count

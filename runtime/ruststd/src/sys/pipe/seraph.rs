@@ -216,6 +216,8 @@ pub struct Pipe {
     /// requested the grant (`create_for_child`); child-side ends map a
     /// page they do not own.
     ring_release: Option<Arc<RingRelease>>,
+    /// The end among the open ones (`os::seraph::checkpoint::PIPE`).
+    _held: crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::PIPE }>,
 }
 
 // SAFETY: Pipe holds raw cap-slot indices and a process-local VA; no
@@ -423,6 +425,7 @@ impl Pipe {
                 reserved_va: Some(reserved),
                 peer_dead: None,
                 ring_release: Some(Arc::new(RingRelease::new(ring_region_id))),
+                _held: crate::os::seraph::checkpoint::Held::new(),
             },
             PipeCaps {
                 memory: memory_handoff,
@@ -484,6 +487,7 @@ impl Pipe {
             reserved_va: Some(reserved),
             peer_dead: None,
             ring_release: None,
+            _held: crate::os::seraph::checkpoint::Held::new(),
         })
     }
 

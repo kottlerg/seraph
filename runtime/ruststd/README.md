@@ -845,6 +845,42 @@ signals no more.
 
 ---
 
+## Checkpoint
+
+`std::os::seraph::checkpoint` is the process's side of the checkpoint protocol
+([docs/checkpoint-restore.md](../../docs/checkpoint-restore.md) § Quiesce point, § Checkpoint):
+
+- `quiesce(timeout)` quiesces the process at the call, for its controller to take a checkpoint
+  of it. It is refused, capturing nothing, off the main thread (`InvalidInput`), in a process that
+  is not demand-paged or that procmgr refuses as one no restore can reproduce (`Unsupported`), and
+  while a resource a restore cannot reproduce is held (`ResourceBusy`). Otherwise it creates a
+  Notification, sends procmgr `QUIESCE` with a Notify-only derivation of it and an address in its
+  own frame as the restore stack pointer, waits on the Notification for at most `timeout`, and
+  then sends the `QUIESCE` that ends the point, outside any call deadline, so the thread returns
+  only after procmgr has ended it. It returns `Quiesced::Captured` when the Notification was
+  signalled, its controller then holding a complete checkpoint of the point, and
+  `Quiesced::NotCaptured` otherwise.
+- `take(process_handle)` sends procmgr `CHECKPOINT` on a process handle
+  ([Child process handles](#child-process-handles)), with a copy of the caller's own memmgr
+  endpoint as the account the checkpoint is charged to, and returns a `Checkpoint`: the object's
+  pages, whether the capture is complete, and its handle, which `into_raw` hands over and a drop
+  releases (`OBJECT_RELEASE`). A process at no quiesce point is refused `ResourceBusy`.
+
+The resources `quiesce` refuses are counted by values that live as long as each resource: a
+thread the application spawned, until its cleanup has run (`src/sys/thread/seraph.rs`), an open
+`std::fs::File`, a held `std::process::Child`, and an open pipe end other than the process's own
+stdio, which `_start` attaches for the life of the process. The counter is a zero-sized field of
+the resource, so it adds no bytes to it. The runtime's own threads, the fs release handler and a
+child's death bridge, are spawned through `thread::runtime_spawn` and not counted: they are idle
+at their wait whenever the counters are zero.
+
+The runtime keeps no resume record yet, and `quiesce` returns no `Restored`: the restore entry
+comes with procmgr's restore creation
+([docs/checkpoint-restore.md](../../docs/checkpoint-restore.md#implementation-status)
+§ Implementation Status).
+
+---
+
 ## Implementation order
 
 ruststd is implemented before [`libc/`](../libc/README.md), which is design intent and not

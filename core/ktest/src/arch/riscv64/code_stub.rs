@@ -4,8 +4,9 @@
 // core/ktest/src/arch/riscv64/code_stub.rs
 
 //! RISC-V machine-code encoders for the stubs `crate::unit::retype` and
-//! `crate::integration::aspace_exit_notification` map executable in a fresh
-//! address space and run a child thread from. Each returns the stub's bytes.
+//! `crate::integration::aspace_exit_notification` and
+//! `crate::integration::aspace_hold` map executable in a fresh address space
+//! and run a child thread from. Each returns the stub's bytes.
 
 use syscall_abi::{SYS_ASPACE_EXIT, SYS_CAP_DELETE};
 
@@ -32,6 +33,45 @@ pub fn self_delete(handle: u64) -> [u8; 32]
 pub fn aspace_exit(code: u64) -> [u8; 32]
 {
     syscall1_then_spin(SYS_ASPACE_EXIT, code)
+}
+
+/// Encode the syscall program runner: entered with the address of a record
+/// array in its first argument register, it makes the syscall each
+/// eight-word record names in turn (word 0 the number,
+/// words 1 to 6 the arguments) and stores its primary return value in the
+/// record's word 7, until a record whose number is `u64::MAX`. It then
+/// increments that record's word 1 forever, the progress count a test reads
+/// to tell a running thread from a stopped one.
+#[must_use]
+pub fn syscall_program() -> [u8; 72]
+{
+    let words: [u32; 18] = [
+        0x0005_0413, // addi s0, a0, 0
+        0x0004_3883, // ld a7, 0(s0)
+        0xFFF0_0293, // addi t0, zero, -1
+        0x0258_8663, // beq a7, t0, done (+44)
+        0x0084_3503, // ld a0, 8(s0)
+        0x0104_3583, // ld a1, 16(s0)
+        0x0184_3603, // ld a2, 24(s0)
+        0x0204_3683, // ld a3, 32(s0)
+        0x0284_3703, // ld a4, 40(s0)
+        0x0304_3783, // ld a5, 48(s0)
+        0x0000_0073, // ecall
+        0x02A4_3C23, // sd a0, 56(s0)
+        0x0404_0413, // addi s0, s0, 64
+        0xFD1F_F06F, // jal zero, top (-48)
+        0x0084_3283, // ld t0, 8(s0)
+        0x0012_8293, // addi t0, t0, 1
+        0x0054_3423, // sd t0, 8(s0)
+        0xFF5F_F06F, // jal zero, done (-12)
+    ];
+    let mut out = [0u8; 72];
+    let (slots, _) = out.as_chunks_mut::<4>();
+    for (slot, word) in slots.iter_mut().zip(words)
+    {
+        *slot = word.to_le_bytes();
+    }
+    out
 }
 
 /// Encode syscall `nr` with its first argument `arg`, then `loop {}`.

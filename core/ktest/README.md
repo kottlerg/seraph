@@ -82,8 +82,9 @@ instruction-pointer offset from `crate::arch::TRAP_FRAME_BYTES` and
 `REGS_<ARCH>_IP_OFFSET` constants). A cell that binds an I/O port runs only
 where `crate::arch::HAS_IO_PORTS` holds. The register-file probes of the FPU
 and callee-saved-register tests are `crate::arch::fpu` and
-`crate::arch::callee_saved`, the machine-code stubs of `unit::retype` and
-`integration::aspace_exit_notification` `crate::arch::code_stub`, and the harness's UART, I/O
+`crate::arch::callee_saved`, the machine-code stubs of `unit::retype`,
+`integration::aspace_exit_notification` and `integration::aspace_hold` `crate::arch::code_stub`,
+and the harness's UART, I/O
 port seed, shutdown, and cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
 `cycles_now`.
 
@@ -107,6 +108,7 @@ respectively. Files are grouped by kernel subsystem, mirroring the kernel's own 
 | File | Syscalls / behaviour exercised |
 |---|---|
 | `cap.rs` | `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (incl. the `cap_insert` explicit-slot form), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`, `SYS_ENDPOINT_BADGE` (the badge read back, and the refusals: no Receive, another endpoint, a non-endpoint cap, a deleted handle), `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, and the bounds of handle resolution (`lookup_bounds`) |
+| `aspace_hold.rs` | `SYS_ASPACE_HOLD` and `SYS_ASPACE_RELEASE` on spaces holding no thread: a non-address-space cap, the null handle and a stale handle are `InvalidCapability`; a cap without `Control` is `InsufficientRights` for both calls; release of an unheld space and hold of a held one are `InvalidState`, and the pair repeats; deleting a held, empty space succeeds and returns its memory |
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, sole reference, type-specific fields); the `InitInfo` RAM Memory descriptors against their caps; the `Phys` gate on the physical base and on an address space's `Read` right |
 | `retype.rs` | Retype primitive: augmentation and donation spill, `CSpace` growth into the indirect and double-indirect directory regions by explicit placement, PT walk budget, kernel PT pool, and the page-pool latency cases: a TLB shootdown of a CPU deleting a pool of ten thousand donations, or seeding one large donation, is acknowledged within a bound while the call runs; and the machine-code stubs the address-space stop cases run, each written through a data mapping and then mapped executable, with `SYS_SYSTEM_INFO(InstructionCacheSyncs)` rising across that map (the instruction-fetch synchronisation of [docs/memory-model.md § Instruction-Fetch Coherence](../../docs/memory-model.md#instruction-fetch-coherence), which QEMU does not need to pass) |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_ASPACE_QUERY`; `SYS_ASPACE_HARVEST`: the bitmap of a range reports exactly the pages touched since the last harvest (an unmapped page reads 0), a cap without `Map`, an unaligned or kernel-half range, and a count of 0 or past `MAX_HARVEST_PAGES` are refused, a bitmap the copy-out cannot write clears no accessed bit, and a kernel copy (`SYS_GETRANDOM`) into a page whose accessed bit a harvest cleared succeeds and sets it again |
@@ -158,6 +160,7 @@ concurrent notification and queue events.
 | `aspace_fault_notification_late_bind.rs` | An address-space terminal-end observer bound after a thread in that space already faulted still receives the retained fault reason, which `CAP_INFO_ASPACE_END` reads back (not ended before the fault) as soon as the thread reads `Exited`; with 2+ CPUs, 16 rounds, each with a fresh space, pin the controller and the faulting thread to different CPUs and poll the thread's state without sleeping (bounded by elapsed time), and the thread carries 32 death observers whose posts follow its `Exited` commit, so a kernel that recorded the space's fault only after those posts would read the space as not ended |
 | `aspace_fault_notification_once.rs` | An address space posts its terminal-end observers once: with one observer bound, two threads of a fresh space fault, the second only once the first reads `Exited`, and, with 3+ CPUs, in 8 further rounds with the controller on CPU 0 and the threads pinned to CPUs 1 and 2 and started back to back; after the threads and the space are deleted (a thread's deletion waits until it runs on no CPU, which a faulting thread leaves only after its posts), the queue holds exactly one entry, carrying the reason `CAP_INFO_ASPACE_END` read back, the first fault's |
 | `aspace_exit_notification.rs` | `SYS_ASPACE_EXIT` from one thread of a fresh space, with code `0` and with code `7`, ends the space as a terminal fault does: the thread reads `Exited` with the encoded code, `CAP_INFO_ASPACE_END` reads the space ended with that reason (`0` included), a spinning thread of the space still runs, a third thread's later terminal fault leaves the reason as it was, and once the threads are deleted the space's observer and the exiting thread's observer each hold exactly one entry with the reason; an observer bound after the end receives it at once, once |
+| `aspace_hold.rs` | `SYS_ASPACE_HOLD` and `SYS_ASPACE_RELEASE` on a fresh space whose threads run `crate::arch::code_stub::syscall_program` and are told running from stopped by a progress counter: the hold stops its thread and the release runs it again; a start of a hold-stopped thread is `InvalidArgument`, and a thread stopped by `thread_stop` before or during the hold stays stopped by the release; a thread created and started during the hold runs at the release; a reply to a parked call, a fault resumed, and a call timeout that expires, each during the hold, take effect for the thread only after the release; a thread's hold of its own space is `InvalidArgument`; deleting the last cap of a held space kills its thread |
 | `death_observer_outlives_queue_caps.rs` | An event queue bound as a thread's death observer and one bound as its address space's terminal-end observer stay allocated after their last caps are deleted and through the thread's terminal fault, which posts to both, and are freed when the thread and the address space are torn down (each binding holds a reference on its queue) |
 | `cap_transfer.rs` | Cap rights flow through an IPC endpoint round-trip |
 | `cap_transfer_large.rs` | IPC transfer of a cap with a multi-batch child list, both directions |
@@ -315,7 +318,8 @@ the still-waiting window, the receivers' settle and the fault-exit polls of
 event and memory polls of `integration::fault_kills_thread`,
 `integration::fault_exception_no_handler_kills`, `integration::fault_handler_declines_kills`,
 `integration::aspace_fault_notification_late_bind`, `integration::aspace_fault_notification_once`,
-`integration::aspace_exit_notification`, `integration::death_notification_late_bind`,
+`integration::aspace_exit_notification`, `integration::aspace_hold`,
+`integration::death_notification_late_bind`,
 `integration::death_observer_outlives_queue_caps`, `integration::reply_binding_displaced`,
 `integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
 `integration::mmio_revoke_unmaps`, `integration::ioport_revoke`,

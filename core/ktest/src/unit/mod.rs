@@ -10,6 +10,7 @@
 //! [core/ktest/README.md](../../README.md) § Tier 1 — `src/unit/`; how
 //! architecture-specific tests are dispatched is in its § Test structure.
 
+pub mod aspace_hold;
 pub mod boot_reclaim;
 pub mod cap;
 pub mod cap_info;
@@ -594,6 +595,24 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "ipc::recv_succeeds_on_exhausted_general_slots",
         ipc::recv_succeeds_on_exhausted_general_slots(ctx)
+    );
+
+    // ── Address-space hold ────────────────────────────────────────────────────
+    run_test!(
+        "aspace_hold::invalid_capability",
+        aspace_hold::invalid_capability(ctx)
+    );
+    run_test!(
+        "aspace_hold::insufficient_rights",
+        aspace_hold::insufficient_rights(ctx)
+    );
+    run_test!(
+        "aspace_hold::state_machine",
+        aspace_hold::state_machine(ctx)
+    );
+    run_test!(
+        "aspace_hold::delete_held_space",
+        aspace_hold::delete_held_space(ctx)
     );
 
     // ── Thread syscalls ───────────────────────────────────────────────────────

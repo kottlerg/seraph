@@ -16,6 +16,7 @@ pub mod aspace_exit_notification;
 pub mod aspace_fault_notification_late_bind;
 pub mod aspace_fault_notification_once;
 pub mod aspace_harvest_no_fault;
+pub mod aspace_hold;
 pub mod busy_cpu_placement;
 pub mod cap_delegation_chain;
 pub mod cap_generation_stale_handle;
@@ -118,6 +119,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::aspace_exit_notification",
         aspace_exit_notification::run(ctx)
     );
+    run_integration_test!("integration::aspace_hold", aspace_hold::run(ctx));
     run_integration_test!(
         "integration::death_observer_outlives_queue_caps",
         death_observer_outlives_queue_caps::run(ctx)

@@ -90,7 +90,7 @@ const _: () = core::assert!(
 #[must_use]
 pub const fn is_node_label(opcode: u64) -> bool
 {
-    matches!(opcode, NODE_SET_MAX..=NODE_RELEASE | NODE_SET_RECLAIM)
+    core::matches!(opcode, NODE_SET_MAX..=NODE_RELEASE | NODE_SET_RECLAIM)
 }
 /// Badge bit of the swap authority: a SEND on memmgr's endpoint badged with
 /// this bit alone, which init mints, is the authority to serve the swap

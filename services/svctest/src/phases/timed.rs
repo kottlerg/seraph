@@ -32,8 +32,10 @@
 //! fixture holds every page a driver outside the system reserve could take,
 //! so procmgr refuses it. The phase requires devmgr's line for the refusal
 //! and its first retry, stamped after the kill, then, once the fixture is
-//! stopped and the level falls, a new RTC driver listed, and devmgr's line for
-//! the retry that started it. Without the retry devmgr logs the restart as
+//! stopped and the level falls, devmgr serving the retried driver at the
+//! `rtc` class's next ordinal, so the next phase's kill of it is a served
+//! driver's death, which devmgr restarts, and devmgr's line for the retry that
+//! started it. Without the retry devmgr logs the restart as
 //! failed and leaves the record with no driver, and the phase fails. Its
 //! restart leaves timed holding the withdrawn ordinal, which the RTC restart
 //! phase's kill of timed resolves again.
@@ -202,6 +204,12 @@ pub fn rtc_create_retry_phase(caps: &Caps)
         .next()
         .unwrap_or(RTC_DRIVER_NAME);
 
+    assert_ne!(caps.rtc_class, 0, "{phase}: no devmgr.class.rtc seed");
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+    let (ordinal, served) = unsafe { ipc::first_device_from(caps.rtc_class, 0, ipc_buf) }
+        .unwrap_or_else(|e| panic!("{phase}: devmgr serves no RTC driver ({e:?})"));
+    let _ = syscall::cap_delete(served);
     let devmgr = super::crash::badge_named(authority, DEVMGR_NAME)
         .unwrap_or_else(|| panic!("{phase}: LIST_PROCESSES lists no devmgr"));
     let rtc = super::crash::badge_named(authority, RTC_DRIVER_NAME)
@@ -230,15 +238,11 @@ pub fn rtc_create_retry_phase(caps: &Caps)
         killed_us,
         phase,
     );
-    let start_at = Instant::now();
-    while super::crash::badge_named(authority, RTC_DRIVER_NAME).is_none_or(|b| b == rtc)
-    {
-        assert!(
-            start_at.elapsed() < RETRY_TIMEOUT,
-            "{phase}: devmgr's retries did not start the RTC driver"
-        );
-        std::thread::sleep(POLL_INTERVAL);
-    }
+    await_served(caps.rtc_class, ordinal.saturating_add(1), phase);
+    assert!(
+        super::crash::badge_named(authority, RTC_DRIVER_NAME).is_some_and(|b| b != rtc),
+        "{phase}: devmgr serves an RTC driver LIST_PROCESSES does not list as a new process"
+    );
     let retried_us = await_line(
         caps.logd_query,
         &[driver, b": create retry "],
@@ -250,6 +254,39 @@ pub fn rtc_create_retry_phase(caps: &Caps)
         "rtc_create_retry phase passed (the RTC driver's restart refused while memory was \
          critical; its first create retry {took} ms later)"
     );
+}
+
+/// Wait until devmgr serves a driver at the `rtc` class's ordinal `next`,
+/// through `class`, the class's SEND, for up to [`RETRY_TIMEOUT`]: the
+/// retried driver, which the next phase kills at once, and whose death devmgr
+/// restarts only once its batch has settled and served it
+/// (services/devmgr/docs/responsibilities.md § When a driver restarts). A
+/// listed driver can still be in its batch. The query waits while a retry's
+/// settle runs and answers `NO_DEVICE` between the retries.
+fn await_served(class: u64, next: u64, phase: &str)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let start_at = Instant::now();
+    loop
+    {
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+        match unsafe { ipc::query_device(class, next, ipc_buf) }
+        {
+            Ok(served) =>
+            {
+                let _ = syscall::cap_delete(served);
+                return;
+            }
+            Err(ipc::ClassCallError::Refused(ipc::devmgr_errors::NO_DEVICE)) =>
+            {}
+            Err(e) => panic!("{phase}: querying the RTC class at ordinal {next} ({e:?})"),
+        }
+        assert!(
+            start_at.elapsed() < RETRY_TIMEOUT,
+            "{phase}: devmgr's retries did not serve the RTC driver at ordinal {next}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 /// Attach to devmgr, `process`: the caps of its threads, main thread first.

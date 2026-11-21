@@ -393,7 +393,7 @@ After every run:
   finding yourself.
 
 The review records stay under `target/xtask/review/pr<N>/` in your worktree. Each record file is
-saved as its own step, a plain file write with nothing else in it, and `review-check` and the
+saved as its own step, a plain file write with nothing else in it, and `review-ledger` and the
 gate run in a later step, never in the script that writes a record (the `pr-review` skill § The
 record says why). The gate report names that path and each run's mode and head, and the
 orchestrator copies them: the harness refuses your own file writes outside your worktree and the

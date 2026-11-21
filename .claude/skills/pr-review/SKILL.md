@@ -22,8 +22,8 @@ needs green CI at the head.
 3. `cargo xtask pr-check <N>`, and fix what it reports. It checks the commits, the body's boxes
    and validated head, the ticks of each Issue the PR closes or references, and the milestone
    of each it closes, so the audit spends its run on what needs a reader.
-4. For every run after the first: `cargo xtask review-ledger <N>`, which writes
-   `target/xtask/review/pr<N>/ledger.json` from the saved run records.
+4. For every run after the first: `cargo xtask review-ledger <N>`, which validates the saved run
+   records and writes `target/xtask/review/pr<N>/ledger.json` from them.
 
 ## The run
 
@@ -79,7 +79,7 @@ Save both agents' prose as `target/xtask/review/pr<N>/<mode>-<head>.md` and the 
 `<mode>-<head>.json` beside it. `<mode>` is `full` for the first run, `delta` for a later run
 with the reviewer, and `audit` for an auditor-only run, the audit that completes a run of the
 reviewer alone (a re-audit after it included), or a re-audit; a further run at the same head
-takes the suffix `-<n>`, counting from 2. `xtask/README.md` § `cargo xtask review-check`
+takes the suffix `-<n>`, counting from 2. `xtask/README.md` § `cargo xtask review-ledger`
 defines the record. Six points it leaves to you:
 
 - `stats.form` is `defects`, and each finding carries `file`, `line`, `status`, `issue`,
@@ -101,12 +101,12 @@ defines the record. Six points it leaves to you:
   record there.
 
 Save each record file, the `.md` and the `.json`, as its own step: a plain file write with
-nothing else in it, never inside a script that also runs `review-check` or the gate. The
+nothing else in it, never inside a script that also runs `review-ledger` or the gate. The
 statement of a verdict and its use are then separate, visible actions, and the harness's
 permission check refuses the two bundled in one.
 
-Run `cargo xtask review-check <N>` and fix the record until it passes: the ledger and the gate
-read these files. Its `error record-run-kind` means the audit of a `full` or `delta` run
+Run `cargo xtask review-ledger <N>` and fix the record until it passes: it writes the ledger only
+from well-formed records, and the gate reads these files. Its `error record-run-kind` means the audit of a `full` or `delta` run
 applied the checks of another run kind: run `pr-auditor` again with `Run kind: with-reviewer`,
 put its result in place of that record's `audit` and `audit_verdict`, and append its prose to
 the record's `.md` under a heading that says why. Then give both verdict lines verbatim to the

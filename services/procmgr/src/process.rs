@@ -1021,8 +1021,9 @@ impl Drop for CopyWindows
 /// [`ArgvEnvCopyError::Reply`] with `INVALID_ARGUMENT` when the copy fails
 /// its string check or the kernel refuses the caller's pages for a reason
 /// other than procmgr's memory (no map right, retyped bytes in the range),
-/// and with `OUT_OF_MEMORY` when memmgr cannot supply the pages or procmgr
-/// cannot derive its caps or reserve or map its windows;
+/// with `LIMIT` when the max of the child's budget node or of an ancestor
+/// refuses the pages, and with `OUT_OF_MEMORY` when memmgr cannot otherwise
+/// supply them or procmgr cannot derive its caps or reserve or map its windows;
 /// [`ArgvEnvCopyError::StillMapped`] when a window's unmap failed.
 pub fn copy_argv_env(
     self_aspace: u64,
@@ -1083,8 +1084,9 @@ pub fn copy_argv_env(
 /// caller's `request_cap`, and a writable derivation of the child's run.
 ///
 /// # Errors
-/// [`ArgvEnvCopyError::Reply`] with `OUT_OF_MEMORY` when memmgr cannot
-/// supply the run or a derivation fails. A derivation masks rights the
+/// [`ArgvEnvCopyError::Reply`] with [`crate::memmgr_alloc_pages_contig`]'s
+/// code when memmgr does not supply the run, and with `OUT_OF_MEMORY` when a
+/// derivation fails. A derivation masks rights the
 /// source lacks rather than refusing them, so its failure is procmgr's own
 /// slot shortfall; a caller's cap without the map right is refused when its
 /// window is mapped.
@@ -1097,7 +1099,8 @@ fn copy_caps(
 {
     let oom = ArgvEnvCopyError::Reply(procmgr_errors::OUT_OF_MEMORY);
     let memory = CapGuard::new(
-        crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf).ok_or(oom)?,
+        crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)
+            .map_err(ArgvEnvCopyError::Reply)?,
     );
     let src =
         CapGuard::new(syscall::cap_derive(request_cap, syscall::RIGHTS_MEM_MAP).map_err(|_| oom)?);
@@ -1194,7 +1197,8 @@ const ARGV_ENV_SEED_COVERED_PAGES: u64 = 512;
 /// [`ARGV_ENV_SEED_COVERED_PAGES`] adds nothing.
 ///
 /// # Errors
-/// `OUT_OF_MEMORY` when memmgr cannot supply the pages or the augment fails.
+/// [`crate::memmgr_alloc_pages_contig`]'s code when memmgr does not supply the
+/// pages; `OUT_OF_MEMORY` when the augment fails.
 fn fund_child_page_tables(
     child_aspace: u64,
     child_memmgr_send: u64,
@@ -1208,10 +1212,11 @@ fn fund_child_page_tables(
     }
     // `pages` is a page count of a 64-bit byte total, so the sum cannot overflow.
     let table_pages = pages.div_ceil(512).saturating_add(4);
-    let frame = CapGuard::new(
-        crate::memmgr_alloc_pages_contig(child_memmgr_send, table_pages, ipc_buf)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?,
-    );
+    let frame = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        child_memmgr_send,
+        table_pages,
+        ipc_buf,
+    )?);
     // The address space's donation record holds its own reference on the
     // frames, so procmgr's slot is deleted when `frame` drops.
     syscall::cap_create_aspace(frame.cap(), child_aspace, table_pages)
@@ -1224,7 +1229,8 @@ fn fund_child_page_tables(
 /// child's page tables for them first.
 ///
 /// # Errors
-/// `OUT_OF_MEMORY` when the funding, the derivation, or the map fails.
+/// [`fund_child_page_tables`]'s code when the funding fails; `OUT_OF_MEMORY`
+/// when the derivation or the map fails.
 ///
 /// # Safety
 /// `child_aspace` must name a child's address space, never procmgr's own:
@@ -1305,10 +1311,12 @@ impl ChildInfoCaps
 /// spawners pipe each direction independently.
 ///
 /// # Errors
+/// `procmgr_errors::LIMIT` when the max of the child's budget node or of an
+/// ancestor refuses the page or the argv/env region's page tables;
 /// `procmgr_errors::OUT_OF_MEMORY` when the page's allocation, its
 /// mapping, a capability derivation or copy into the child, or the
-/// argv/env region's funding or mapping fails: every create label names
-/// that code for these failures
+/// argv/env region's funding or mapping fails otherwise: every create label
+/// names these codes for these failures
 /// (`services/procmgr/docs/ipc-interface.md` § Label 1 and § Label 13).
 ///
 /// # Safety
@@ -1347,10 +1355,10 @@ unsafe fn populate_child_info(
 ) -> Result<ChildInfoCaps, u64>
 {
     // Guarded from allocation: every early `Err` below deletes the slot.
-    let pi_memory = CapGuard::new(
-        crate::memmgr_alloc_page(universals.memmgr_endpoint, ipc_buf)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?,
-    );
+    let pi_memory = CapGuard::new(crate::memmgr_alloc_page(
+        universals.memmgr_endpoint,
+        ipc_buf,
+    )?);
     let scratch = ScratchMapping::map(self_aspace, pi_memory.cap(), 1, syscall::MAP_WRITABLE)
         .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
     let scratch_va = scratch.va();
@@ -1700,7 +1708,8 @@ impl MainTlsAlloc
 /// `INVALID_ELF` when the binary has no TLS, when the block exceeds
 /// `PROCESS_MAIN_TLS_MAX_PAGES` (the region the layout leaves after the TLS
 /// draw), or when alignment demands would outrun the page mapping;
-/// `OUT_OF_MEMORY` when memmgr cannot supply the pages; and
+/// [`crate::memmgr_alloc_page`]'s or [`crate::memmgr_alloc_pages_contig`]'s
+/// code when memmgr does not supply the pages; and
 /// [`ScratchMapping::map`]'s code when the scratch mapping fails.
 fn alloc_main_tls_memory(
     self_aspace: u64,
@@ -1722,13 +1731,11 @@ fn alloc_main_tls_memory(
     let tls_memory = CapGuard::new(
         if pages == 1
         {
-            crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
-                .ok_or(procmgr_errors::OUT_OF_MEMORY)?
+            crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?
         }
         else
         {
-            crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)
-                .ok_or(procmgr_errors::OUT_OF_MEMORY)?
+            crate::memmgr_alloc_pages_contig(child_memmgr_send, pages, ipc_buf)?
         },
     );
     let scratch = ScratchMapping::map(self_aspace, tls_memory.cap(), pages, syscall::MAP_WRITABLE)?;
@@ -1939,7 +1946,7 @@ unsafe fn map_child_stack_and_ipc(
 /// `PROCESS_DIED`.
 ///
 /// # Errors
-/// `procmgr_errors::OUT_OF_MEMORY` when memmgr grants no page;
+/// [`crate::memmgr_alloc_page`]'s code when memmgr grants no page;
 /// `procmgr_errors::INSUFFICIENT_RIGHTS` when its RW cap cannot be derived;
 /// `procmgr_errors::MAP_FAILED` when it cannot be mapped into the child.
 ///
@@ -1954,10 +1961,7 @@ unsafe fn map_fresh_child_page(
     va: u64,
 ) -> Result<(), u64>
 {
-    let memory = CapGuard::new(
-        crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)
-            .ok_or(procmgr_errors::OUT_OF_MEMORY)?,
-    );
+    let memory = CapGuard::new(crate::memmgr_alloc_page(child_memmgr_send, ipc_buf)?);
     let rw = CapGuard::new(
         syscall::cap_derive(memory.cap(), syscall::RIGHTS_MEM_MAP_RW)
             .map_err(|_| procmgr_errors::INSUFFICIENT_RIGHTS)?,
@@ -2707,11 +2711,14 @@ fn relro_page_range(va: u64, size: u64, bias: u64) -> Option<(u64, u64)>
 /// all land, its stack note is out of range, its `PT_TLS` reaches past the
 /// image, or its TLS block is oversized, overaligned, or smaller than its
 /// template ([`alloc_main_tls_memory`], [`prepare_main_tls_from_bytes`]);
-/// `OUT_OF_MEMORY` when a kernel object, memory cap, badge, page, or the
-/// table entry cannot be had; a segment load's `OUT_OF_MEMORY` (its pages),
+/// `LIMIT` when the max of the child's budget node or of an ancestor refuses
+/// a charge on the child's account (a kernel object's slab, a page, an
+/// attachment); `OUT_OF_MEMORY` when a kernel object, memory cap, badge,
+/// page, or the table entry cannot be had otherwise; a segment load's
+/// `LIMIT` or `OUT_OF_MEMORY` (its pages),
 /// `MAP_FAILED` (a scratch or child mapping), or `INSUFFICIENT_RIGHTS` (a
 /// rights derivation) ([`loader::load_elf_segment_into_child`]); an attachment's
-/// `OUT_OF_MEMORY` or `MAP_FAILED` ([`image_cache::attach`]); and the main
+/// `LIMIT`, `OUT_OF_MEMORY` or `MAP_FAILED` ([`image_cache::attach`]); and the main
 /// TLS block's and [`populate_child_info`]'s other codes.
 #[expect(
     clippy::similar_names,
@@ -3343,11 +3350,13 @@ impl Drop for ChildKernelObjects
 /// returned guard owns the three kernel objects until disarmed.
 ///
 /// # Errors
-/// `procmgr_errors::OUT_OF_MEMORY` when memmgr grants no retype slab, the
-/// address-space slab's derivation without `RIGHTS_MEM_PHYS` fails, the
-/// thread-retype size cannot be read, or a retype fails: § Label 1 and
-/// § Label 13 of `services/procmgr/docs/ipc-interface.md` name every
-/// kernel-object allocation failure so.
+/// [`crate::memmgr_alloc_pages_contig`]'s code (`LIMIT` or
+/// `OUT_OF_MEMORY`) when memmgr grants no retype slab;
+/// `procmgr_errors::OUT_OF_MEMORY` when the address-space slab's derivation
+/// without `RIGHTS_MEM_PHYS` fails, the thread-retype size cannot be read, or
+/// a retype fails: § Label 1 and § Label 13 of
+/// `services/procmgr/docs/ipc-interface.md` name every kernel-object
+/// allocation failure so.
 fn create_child_kernel_objects(
     memmgr_send: u64,
     sched_baseline: u64,
@@ -3356,10 +3365,11 @@ fn create_child_kernel_objects(
 ) -> Result<ChildKernelObjects, u64>
 {
     let oom = procmgr_errors::OUT_OF_MEMORY;
-    let slab = CapGuard::new(
-        crate::memmgr_alloc_pages_contig(memmgr_send, crate::ASPACE_RETYPE_PAGES, ipc_buf)
-            .ok_or(oom)?,
-    );
+    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        memmgr_send,
+        crate::ASPACE_RETYPE_PAGES,
+        ipc_buf,
+    )?);
     // Retype through a derivation without `RIGHTS_MEM_PHYS`, so the address
     // space is minted without `RIGHTS_AS_READ` even for a phys-class child,
     // whose slab carries `PHYS`: procmgr keeps this cap for the child's life,
@@ -3375,22 +3385,20 @@ fn create_child_kernel_objects(
     // The retype keeps its own reference on the region; drop the slab slots.
     drop(narrowed);
     drop(slab);
-    let slab = CapGuard::new(
-        crate::memmgr_alloc_pages_contig(memmgr_send, crate::CSPACE_RETYPE_PAGES, ipc_buf)
-            .ok_or(oom)?,
-    );
+    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        memmgr_send,
+        crate::CSPACE_RETYPE_PAGES,
+        ipc_buf,
+    )?);
     let cspace = CapGuard::new(
         syscall::cap_create_cspace(slab.cap(), 0, crate::CSPACE_RETYPE_PAGES).map_err(|_| oom)?,
     );
     drop(slab);
-    let slab = CapGuard::new(
-        crate::memmgr_alloc_pages_contig(
-            memmgr_send,
-            crate::thread_retype_pages().ok_or(oom)?,
-            ipc_buf,
-        )
-        .ok_or(oom)?,
-    );
+    let slab = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        memmgr_send,
+        crate::thread_retype_pages().ok_or(oom)?,
+        ipc_buf,
+    )?);
     let (sched_cap, create_priority) = if sched_baseline != 0
     {
         (sched_baseline, priority)

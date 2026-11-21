@@ -405,6 +405,7 @@ fn refusal(code: u64) -> &'static str
     {
         procmgr_errors::NOT_ATTACHABLE => "the process declared itself undebuggable",
         procmgr_errors::SPACE_HELD => "the process is held by another capture",
+        procmgr_errors::LIMIT => "the account's max refused the snapshot's frames",
         procmgr_errors::OUT_OF_MEMORY => "the account did not fund the snapshot",
         _ => "the snapshot was refused",
     }

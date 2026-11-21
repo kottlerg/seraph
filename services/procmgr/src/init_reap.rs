@@ -87,7 +87,7 @@ impl ReleaseProbe
     /// steps that succeeded; the reap then reports no probe result.
     fn place(memmgr_ep: u64, cspace: u64, ipc_buf: *mut u64) -> Option<Self>
     {
-        let (page, region_id) = crate::memmgr_alloc_contig_grant(memmgr_ep, 1, ipc_buf)?;
+        let (page, region_id) = crate::memmgr_alloc_contig_grant(memmgr_ep, 1, ipc_buf).ok()?;
         let Ok(endpoint) = syscall::cap_create_endpoint(page)
         else
         {

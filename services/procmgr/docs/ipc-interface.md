@@ -156,12 +156,13 @@ holds a handle to it.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[37..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded or before procmgr's reply delivers it, or a destroy marked the child itself (`DESTROY_CHILD`, or a destroy of a subtree it is in) before procmgr's reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below) |
 | 11 | `MAP_FAILED` | The module cap, a copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | The module cap lacks the map right, or a rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 | 18 | `SIGNATURE_REFUSED` | The object does not verify under the name, in a role of the creator's signature policy, for this architecture (§ Image Verification) |
+| 21 | `LIMIT` | The max of the child's budget node or of an ancestor refused a charge procmgr made on the child's account (`memmgr_errors::LIMIT`): a kernel-object slab, a page, the argv and env copy, the copy of the object or a shared attachment, against the node's `CREATE_MEMORY_MAX`, the node a `CREATE_CHARGE_NODE` handle names, or the creator's own node (**Memory max and reserve**, § Label 1); the child is not created and its pages are returned |
 
 **argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
 `CREATE_FROM_FILE`) marks a request that carries the child's argv and env in a Memory cap the caller
@@ -181,7 +182,8 @@ blobs' size. That copy also refuses the create with `INVALID_ARGUMENT` when the 
 be mapped (it lacks the map right, or the kernel refuses its pages for a reason other than procmgr's
 memory), and when, on the copy, a blob's NULs disagree with its count or a nonempty blob does not
 end in a NUL; a caller that rewrites its pages meanwhile changes only the copy that is checked. A
-shortfall of procmgr's or the child's memory replies `OUT_OF_MEMORY`. Should procmgr fail to unmap a
+shortfall of procmgr's or the child's memory replies `OUT_OF_MEMORY`, and a refusal by the max of
+the child's node `LIMIT`. Should procmgr fail to unmap a
 copy window, which may then still map the caller's pages read-only and the child's writable, it
 replies `ARGV_ENV_STILL_MAPPED` (14), keeps the window's VA reserved, and withholds the child's
 memmgr record (sends no `PROCESS_DIED` for it); the caller MUST then withhold its run too (not
@@ -312,11 +314,22 @@ procmgr passes the max to memmgr, which clamps it to what the creator's node and
 left, and the reply's data[0] carries the max the node took. Without the flag, or with a max of
 `u64::MAX`, the node has no max of its own, only its ancestors and the system reserve limit it, and
 data[0] is `u64::MAX`. A max too small for the pages procmgr allocates on the child's account fails
-the create with `OUT_OF_MEMORY`, as any failed allocation does. Once the child runs, a grant past
+the create with `LIMIT` (21), as does a max of the node's ancestors (the creator's node, or the node
+a `CREATE_CHARGE_NODE` handle names), so a creator tells its own bound from the system's shortage,
+which replies `OUT_OF_MEMORY`. Once the child runs, a grant past
 the max fails with `memmgr_errors::LIMIT`, and a demand fault past it is declined with code 10,
 which the kernel forwards to the faulting thread's exception handler
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md)
 § Kernel-origin fault message).
+
+procmgr's own state for a child is charged to procmgr's node, not to the child's: its process-table
+entry (336 bytes), 6 to 12 capability slots in procmgr's `CSpace` (72 bytes each) and two
+death-observer nodes (24 bytes each), about 0.8 to 1.6 KiB with the growth of their containers, and
+96 bytes for each thread it registers (Label 22). Every page of the child itself, at least 55, is
+charged to the child's node, so that state is at most 0.75% of what the child's node already pays,
+and it goes with the child
+([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md) § Distribution policy,
+Server-side charges).
 
 The label's bit 32 (`CREATE_RESERVE`) makes the child's node a system-reserve node, which may take
 the free pages memmgr keeps in reserve. procmgr honours it only from a creator whose own node is a
@@ -620,13 +633,14 @@ included, as for `CREATE_PROCESS`.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
-| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them (a max too small for the child among its causes), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
 | 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[37..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, a destroy that marked the child itself before the reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | A copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
 | 18 | `SIGNATURE_REFUSED` | As for `CREATE_PROCESS` (§ Image Verification) |
+| 21 | `LIMIT` | As for `CREATE_PROCESS` (§ Label 1) |
 
 ### Label 25: `BIND_DEATH_OBSERVER`
 
@@ -1502,12 +1516,13 @@ its own memmgr cap; its death releases the run with its record.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account (a max too small for it among the causes), the sender has no memmgr SEND, or the map-only cap could not be derived |
+| 2 | `OUT_OF_MEMORY` | The run could not be had on the sender's account for a reason other than a max (`LIMIT`), the sender has no memmgr SEND, or the map-only cap could not be derived |
 | 4 | `INVALID_BADGE` | Sent on a process handle, or no live process carries the badge |
 | 7 | `INVALID_ARGUMENT` | No file cap, a length of zero or past `READ_VERIFIED_MAX`, or no name block or a name not in the canonical form |
 | 10 | `IO_ERROR` | As for `CREATE_FROM_FILE` (§ Label 13) |
 | 11 | `MAP_FAILED` | The run could not be mapped in procmgr, or its mapping would not come down |
 | 18 | `SIGNATURE_REFUSED` | The copy does not verify in the data role under the name |
+| 21 | `LIMIT` | The max of the sender's budget node or of an ancestor refused the run (`memmgr_errors::LIMIT`) |
 
 svctest's `procmgr_read_verified` phase reads its data-role fixture back and checks the copy's
 charge, and the refusal of the fixture under another name, of a copy with a flipped byte, of an
@@ -1637,10 +1652,11 @@ Refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` wit
 `INVALID_BADGE` when no live process carries the badge, or the target ended during the capture;
 `NOT_ATTACHABLE` for a process that declared itself undebuggable (Label 21); `SPACE_HELD` (20)
 when the target's space is held already, by another capture of it, or the hold was interrupted,
-when nothing was captured and the sender may ask again; and `OUT_OF_MEMORY` when the account
-refused a request, failed a call or did not answer within the bound, granted a cap whose size is not
-the pages its reply names, or the object would take more than `SEAL_OBJECT_MAX_GRANTS` (63) grants,
-or when procmgr's heap or address space refused the capture's own memory. svctest's
+when nothing was captured and the sender may ask again; `LIMIT` (21) when the max of the account's
+budget node or of an ancestor refused its frames; and `OUT_OF_MEMORY` when the account refused a
+request otherwise, failed a call or did not answer within the bound, granted a cap whose size is
+not the pages its reply names, or the object would take more than `SEAL_OBJECT_MAX_GRANTS` (63)
+grants, or when procmgr's heap or address space refused the capture's own memory. svctest's
 `procmgr_snapshot` phase snapshots a child whose writer thread never registered, and checks the
 refusals without the authority, without an account, and for an exited child.
 

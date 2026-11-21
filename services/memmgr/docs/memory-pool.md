@@ -771,10 +771,22 @@ parent outside the reserve; procmgr relays the max the node took to the creator 
 § Label 1, **Memory max and reserve**). A process reads its node's usage, its max and its subtree's
 usage with `QUERY_MEMORY_USAGE`.
 
-**Server-side charges.** Memory a server spends on a client's behalf (procmgr's process-table
-entry, vfsd's and fatfs's per-client state) is charged to the server's node, not to the client's.
-A client can therefore make a server spend memory beyond the client's own max, bounded only by the
-server's node and the reserve. This is a known gap; charging that state to the client is
+**Server-side charges.** Memory a server spends on a client's behalf is charged to the server's
+node, not to the client's. procmgr keeps, for each live process, its process-table entry (336
+bytes), 6 to 12 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
+(24 bytes each), about 0.8 to 1.6 KiB with the growth of their containers, and 96 bytes for each
+thread it registers. Every page of the process itself, at least 55 (its address-space and `CSpace`
+slabs, its thread, its `ProcessInfo` page and the rest of its image), is requested on its own
+account and charged to its own node, in its creator's subtree, so procmgr's share is at most 0.75%
+of what that node pays, and it goes with the process. A create the max of the child's node or of an
+ancestor refuses fails with procmgr's `LIMIT`
+([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md) § Label 1,
+**Memory max and reserve**). vfsd keeps no per-client state: the capability a lookup derives
+leaves with its reply. fatfs keeps about 0.3 to 0.4 KiB for each open, and 104 bytes for each page
+of an open that is mapped and not yet returned, with no bound for one client; the client pays 144
+bytes of its own `CSpace` for the two capabilities an open hands it. A client can therefore make
+fatfs spend memory beyond the client's own max, bounded only by fatfs's node and the reserve. This
+is a known gap; charging that state to the client is
 [#1100](https://github.com/kottlerg/seraph/issues/1100).
 
 **Node handles.** Authority over a node is a capability: a node handle, a SEND on memmgr's

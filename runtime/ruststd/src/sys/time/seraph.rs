@@ -31,7 +31,9 @@ pub const UNIX_EPOCH: SystemTime = SystemTime(Duration::from_secs(0));
 
 /// Cached SEND cap on `timed`'s service endpoint. Zero means "not yet
 /// resolved or resolution failed"; any non-zero value is a valid slot in
-/// this process's CSpace for the rest of its lifetime.
+/// this process's CSpace for the rest of its lifetime, or until a restore
+/// ([`rebind_timed`]).
+// restore: rebound
 static TIMED_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Resolution state machine for `TIMED_CAP`:
@@ -40,7 +42,19 @@ static TIMED_CAP: AtomicU64 = AtomicU64::new(0);
 /// thread is doing the registry lookup), `2` = resolved (success or
 /// terminal failure; readers should load `TIMED_CAP` and accept it as
 /// final).
+// restore: rebound
 static TIMED_RESOLVED: AtomicU32 = AtomicU32::new(0);
+
+/// Forget `timed`'s cap in the process a restore created
+/// (docs/checkpoint-restore.md § Restore entry and handle rebinding): it names
+/// a slot of the captured process. The next `SystemTime::now` resolves it
+/// again.
+// restore: reset
+pub(crate) fn rebind_timed()
+{
+    TIMED_CAP.store(0, Ordering::Release);
+    TIMED_RESOLVED.store(0, Ordering::Release);
+}
 
 /// How long a thread waits on another thread's in-flight `timed` lookup
 /// before doing its own, in microseconds: 100 ms, many registry round trips,

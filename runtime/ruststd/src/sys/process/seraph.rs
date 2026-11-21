@@ -177,6 +177,11 @@ pub struct Command {
     /// the child inherits a copy of the spawner's band. Set via
     /// `CommandExt::sched_max`.
     sched_max: u8,
+    /// The memmgr object handle of the checkpoint the next spawn restores
+    /// (`CREATE_RESTORE`), borrowed: the spawn sends a copy. Zero (the
+    /// default) creates the child from its binary. Set via
+    /// `CommandExt::restore`.
+    restore: u64,
     /// Caps the child takes over the bootstrap protocol, positional, `0`
     /// for an absent slot. Set via `CommandExt::bootstrap_caps`; empty (the
     /// default) gives the child no creator endpoint.
@@ -197,6 +202,7 @@ impl Command {
             cwd_dir_cap: 0,
             pinned: false,
             private_image: false,
+            restore: 0,
             priority: 0,
             sched_max: 0,
             bootstrap: BootstrapCaps(Vec::new()),
@@ -215,6 +221,12 @@ impl Command {
     /// `ProcessInfo.current_dir_cap`. Called by `CommandExt::cwd_dir_cap`.
     pub fn set_cwd_dir_cap(&mut self, cap: u64) {
         self.cwd_dir_cap = cap;
+    }
+
+    /// Restore the checkpoint `object` names on the next spawn, or create
+    /// the child from its binary for `0`. Called by `CommandExt::restore`.
+    pub fn set_restore(&mut self, object: u64) {
+        self.restore = object;
     }
 
     /// Request a private-image child. Called by `CommandExt::private_image`.
@@ -419,9 +431,14 @@ impl Command {
         // with nothing to unwind. `ArgvEnvCap::settle` after the create call
         // returns its run to memmgr (procmgr has copied the blobs by then),
         // or withholds it on `ARGV_ENV_STILL_MAPPED`.
-        let argv_env = crate::os::seraph::process::ArgvEnvCap::new(
-            &args_blob, args_count, &env_blob, env_count,
-        )?;
+        // A restore carries no argv or env: the child takes the checkpoint's.
+        let argv_env = if self.restore == 0 {
+            crate::os::seraph::process::ArgvEnvCap::new(
+                &args_blob, args_count, &env_blob, env_count,
+            )?
+        } else {
+            None
+        };
 
         // Walk the spawner's namespace cap to the binary node. The
         // resulting badged SEND on the owning fs driver's namespace
@@ -498,11 +515,30 @@ impl Command {
             }
         };
 
-        // Caps: [file_cap, creator_endpoint?, argv_env?, death_relay]. The
-        // creator endpoint is present only for a child given bootstrap caps;
-        // the argv/env cap (flagged by `CREATE_ARGV_ENV`) and the death relay
-        // (flagged by `CREATE_DEATH_RELAY`) are the trailing caps, the relay
-        // last.
+        // The copy of the checkpoint's object handle a restore sends, which
+        // procmgr owns from the call on.
+        let restore_copy = match self.restore {
+            0 => 0,
+            object => match syscall::cap_derive(object, syscall::RIGHTS_EP_SEND) {
+                Ok(copy) => copy,
+                Err(_) => {
+                    let _ = syscall::cap_delete(death_relay);
+                    let _ = syscall::cap_delete(death_eq);
+                    let _ = syscall::cap_delete(file_cap);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Command::spawn: the restore's object handle cannot be copied",
+                    ));
+                }
+            },
+        };
+
+        // Caps: [file_cap, creator_endpoint?, argv_env? | object?,
+        // death_relay]. The creator endpoint is present only for a child
+        // given bootstrap caps; the argv/env cap (flagged by
+        // `CREATE_ARGV_ENV`) or a restore's object handle (flagged by
+        // `CREATE_RESTORE`) and the death relay (flagged by
+        // `CREATE_DEATH_RELAY`) are the trailing caps, the relay last.
         let pinned_flag = if self.pinned {
             procmgr_labels::CREATE_PINNED
         } else {
@@ -518,7 +554,8 @@ impl Command {
             | private_image_flag
             | procmgr_labels::CREATE_DEATH_RELAY
             | procmgr_labels::create_sched_bits(self.priority, self.sched_max)
-            | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 };
+            | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 }
+            | if restore_copy != 0 { procmgr_labels::CREATE_RESTORE } else { 0 };
         let builder = ipc::IpcMessage::builder(label).word(0, file_size).cap(file_cap);
         let builder = match &creator {
             Some(creator) => builder.cap(creator.send),
@@ -528,11 +565,13 @@ impl Command {
             Some(memory) => builder
                 .words(procmgr_labels::CREATE_FIRST_WORD, &memory.header_words())
                 .cap(memory.cap()),
+            None if restore_copy != 0 => builder.cap(restore_copy),
             None => builder,
         };
         // The binary's path, the name procmgr verifies it was signed under,
         // rides in the name block after the header.
         let Some(builder) = procmgr_labels::with_create_name(builder, label, &name) else {
+            let _ = syscall::cap_delete(restore_copy);
             let _ = syscall::cap_delete(death_relay);
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(file_cap);
@@ -561,6 +600,7 @@ impl Command {
             // it carried are still here; a handle that moved is stale and
             // its delete fails harmlessly.
             let _ = syscall::cap_delete(file_cap);
+            let _ = syscall::cap_delete(restore_copy);
             let _ = syscall::cap_delete(death_relay);
             let _ = syscall::cap_delete(death_eq);
             call_failed(e, "CREATE_FROM_FILE syscall failed")
@@ -1714,6 +1754,9 @@ fn map_procmgr_error(code: u64) -> io::Error {
         }
         procmgr_errors::ARGV_ENV_STILL_MAPPED => {
             io::Error::new(io::ErrorKind::OutOfMemory, "ARGV_ENV_STILL_MAPPED")
+        }
+        procmgr_errors::NOT_RESTORABLE => {
+            io::Error::new(io::ErrorKind::Unsupported, "NOT_RESTORABLE")
         }
         procmgr_errors::UNKNOWN_OPCODE => io::Error::other("UNKNOWN_OPCODE"),
         other => io::Error::other(format!("procmgr error {other}")),

@@ -33,14 +33,16 @@
 //!
 //! The endpoint and the handler thread are created lazily on the first
 //! [`super::File::open`] call; until then the cost is one
-//! `OnceLock` load. The state is published only once the handler thread
+//! atomic load. The state is published only once the handler thread
 //! is running, so a failed spawn is retried by the next call.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use crate::collections::BTreeMap;
 use crate::io;
-use crate::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use crate::ptr;
+use crate::sync::atomic::{AtomicPtr, Ordering};
+use crate::sync::{Arc, Condvar, Mutex, PoisonError};
 use crate::thread;
 use crate::time::Duration;
 use crate::vec::Vec;
@@ -113,16 +115,21 @@ pub(super) struct ReleaseState
     aspace: u64,
 }
 
-/// Published only after the handler thread serving it has spawned.
-static STATE: OnceLock<Arc<ReleaseState>> = OnceLock::new();
+/// Published only after the handler thread serving it has spawned: a state
+/// from `Arc::into_raw`, never released, so the `&'static` borrows
+/// [`state`] hands out stay valid; null until then, and again after a
+/// restore ([`rebind_release_handler`]).
+// restore: rebound
+static STATE: AtomicPtr<ReleaseState> = AtomicPtr::new(ptr::null_mut());
 
 /// Serialises initialisers, so at most one endpoint and one handler
 /// thread are ever created.
+// restore: none
 static INIT: Mutex<()> = Mutex::new(());
 
 /// Lazy-init: ensure the release endpoint exists and the handler thread
-/// is running. Returns the singleton state. Subsequent calls hit the
-/// `OnceLock` fast path. A failed endpoint creation or handler spawn
+/// is running. Returns the singleton state. Subsequent calls take the
+/// published state's fast path. A failed endpoint creation or handler spawn
 /// publishes nothing and deletes the endpoint, so the next call retries.
 pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
 {
@@ -164,7 +171,23 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
         return Err(io::Error::other("seraph fs: release-handler spawn failed"));
     }
 
-    Ok(&**STATE.get_or_init(|| state))
+    let raw = Arc::into_raw(state).cast_mut();
+    STATE.store(raw, Ordering::Release);
+    // SAFETY: `raw` came from `Arc::into_raw` just above and is never
+    // released.
+    Ok(unsafe { &*raw })
+}
+
+/// Forget the release state in the process a restore created
+/// (docs/checkpoint-restore.md § Restore entry and handle rebinding): its
+/// endpoint names a slot of the captured process, and its handler thread is
+/// not in the new one. The state is left unreleased and unused; the next
+/// `File::open` starts another. A quiesce point has no `File` open, so
+/// nothing refers to the old state.
+// restore: reset
+pub(crate) fn rebind_release_handler()
+{
+    STATE.store(ptr::null_mut(), Ordering::Release);
 }
 
 /// Read the singleton release state if it has been initialised. Used by
@@ -172,7 +195,11 @@ pub(super) fn ensure_started() -> io::Result<&'static ReleaseState>
 /// ran (e.g. failure during `OpenOptions` validation).
 pub(super) fn state() -> Option<&'static ReleaseState>
 {
-    STATE.get().map(|s| &**s)
+    let raw = STATE.load(Ordering::Acquire);
+    // SAFETY: a non-null `STATE` came from `Arc::into_raw` in
+    // `ensure_started` and is never released; the Acquire load pairs with
+    // its Release store, after the state was built.
+    (!raw.is_null()).then(|| unsafe { &*raw })
 }
 
 /// Unbadged endpoint cap the per-`File` SEND derivation hangs off.

@@ -117,6 +117,9 @@ services/svctest/
         ├── checkpoint.rs      # procmgr CHECKPOINT of a child at its quiesce point: the
         │                      #   runtime's refusals, the section read back, Captured; the
         │                      #   refusals of a child at no point and of a pinned child
+        ├── restore.rs         # Command::restore of a checkpoint: each held value refusing the
+        │                      #   quiesce, two restores resumed with their state and every
+        │                      #   handle rebound, distinct HashMap keys; the refusals
         ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
         │                      #   held `LOW` level and restores them: debugger reads and
         │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
@@ -545,6 +548,7 @@ through to the normal run.
 | `snapshot-child`            | `snapshot`     | `procmgr_snapshot` (an unregistered writer thread, an object, a zero and a demand fixture, reports their addresses) |
 | `checkpoint-child`          | `checkpoint`   | `procmgr_checkpoint` (quiesces on command, reports each outcome) |
 | `checkpoint-pinned`         | `checkpoint`   | `procmgr_checkpoint` (pinned; sends `QUIESCE`, reports the reply) |
+| `restore-child`             | `restore`      | `procmgr_restore` (holds each value on command, quiesces, reports its restore) |
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the free frames) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`shutdown` case) |

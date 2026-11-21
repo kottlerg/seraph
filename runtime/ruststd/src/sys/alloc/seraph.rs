@@ -703,10 +703,12 @@ impl Heap {
 
 // ── Global heap ─────────────────────────────────────────────────────────────
 
+// restore: rebound
 static HEAP: SpinMutex<Heap> = SpinMutex::new(Heap::new());
 
 /// [`heap_bootstrap`] progress: unclaimed, claimed by the first call and
 /// running, or finished with the heap installed or not.
+// restore: none
 static BOOTSTRAP: AtomicU8 = AtomicU8::new(BOOTSTRAP_UNCLAIMED);
 const BOOTSTRAP_UNCLAIMED: u8 = 0;
 const BOOTSTRAP_RUNNING: u8 = 1;
@@ -895,23 +897,31 @@ struct SlabPool {
 /// One size class's pool, under the lock its retypes run under.
 type ObjectSlab = SpinMutex<SlabPool>;
 
-const fn empty_slab() -> ObjectSlab {
-    SpinMutex::new(SlabPool {
+/// A pool that holds no page: the first retype refills it.
+const fn empty_pool() -> SlabPool {
+    SlabPool {
         cap: 0,
         local_avail: 0,
         cur_region_id: 0,
         cur_size: 0,
         shelf: [ShelfEntry { cap: 0, region_id: 0, size: 0 }; SLAB_SHELF_SIZE],
         shelf_len: 0,
-    })
+    }
+}
+
+const fn empty_slab() -> ObjectSlab {
+    SpinMutex::new(empty_pool())
 }
 
 /// Slab serving sub-page requests `<= 128 B` (Endpoint, Notification).
+// restore: rebound
 static SLAB_BIN_128: ObjectSlab = empty_slab();
 /// Slab serving sub-page requests `> 128 B && <= 512 B` (WaitSet).
+// restore: rebound
 static SLAB_BIN_512: ObjectSlab = empty_slab();
 
 /// memmgr endpoint shared by every slab path. Set once at process start.
+// restore: rebound
 static SLAB_MEMMGR_EP: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
 
 /// Set the memmgr endpoint backing the object-slab refill path. `_start` sets
@@ -920,6 +930,27 @@ static SLAB_MEMMGR_EP: crate::sync::atomic::AtomicU64 = crate::sync::atomic::Ato
 /// endpoint) before installing the floor.
 pub fn object_slab_init(memmgr_ep: u64) {
     SLAB_MEMMGR_EP.store(memmgr_ep, Ordering::Release);
+}
+
+/// Rebind the allocator to the process a restore created
+/// (docs/checkpoint-restore.md § Restore entry and handle rebinding): drop
+/// the object slabs' pages, the slot reserve and the pressure registration,
+/// whose caps name slots of the captured process, without using them, and
+/// point the heap and the slab refill path at the new process's memmgr
+/// endpoint and address space. The heap's pages are kept as captured; the
+/// restore holds its regions. Runs on the restore entry's one thread.
+// restore: reset
+pub fn rebind_alloc(memmgr_ep: u64, self_aspace: u64) {
+    for slab in [&SLAB_BIN_128, &SLAB_BIN_512] {
+        slab.with(|pool| *pool = empty_pool());
+    }
+    CSPACE_RESERVE.with(|reserve| *reserve = None);
+    PRESSURE_SIG.store(0, Ordering::Release);
+    SLAB_MEMMGR_EP.store(memmgr_ep, Ordering::Release);
+    HEAP.with(|heap| {
+        heap.memmgr_ep = memmgr_ep;
+        heap.self_aspace = self_aspace;
+    });
 }
 
 /// Round `bytes` up to the same size class the kernel's retype primitive
@@ -1136,6 +1167,7 @@ struct ReserveGrant {
 /// The process's slot reserve, `None` while it holds none. The lock is held
 /// only to take or place the grant, never across a syscall, so it nests inside
 /// the heap's and the object slabs' locks, under which a grant is requested.
+// restore: rebound
 static CSPACE_RESERVE: SpinMutex<Option<ReserveGrant>> = SpinMutex::new(None);
 
 /// Take a slot reserve from memmgr when the process holds none: a contiguous
@@ -1600,6 +1632,7 @@ pub const DRAW_ROOM_BIT: u64 = 2;
 
 /// The Notification [`register_pressure`] registered with memmgr, with every
 /// right, or `0` when the process holds no registration.
+// restore: rebound
 static PRESSURE_SIG: AtomicU64 = AtomicU64::new(0);
 
 /// The Notification memmgr signals with [`PRESSURE_BIT`] on a change of the

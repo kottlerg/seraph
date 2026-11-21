@@ -218,6 +218,7 @@ mod tests
             entry_point: 0,
             tls_base_va: 0,
             stack_top_vaddr: 0,
+            start_sp: 0,
             process_info_va: 0,
             started,
             dma_hold,

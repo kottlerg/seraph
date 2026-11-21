@@ -50,7 +50,7 @@ The struct MUST be `#[repr(C)]` with stable layout. The process MUST check
 The authoritative field list, with per-field doc comments and exact order, is
 [`src/lib.rs`](src/lib.rs) (`struct ProcessInfo`). This README summarises the
 field groups rather than mirroring every field, so the two cannot drift. As of
-`PROCESS_ABI_VERSION` 24 the groups are (every `*_cap` field a `u64` capability
+`PROCESS_ABI_VERSION` 25 the groups are (every `*_cap` field a `u64` capability
 handle):
 
 - **Process identity** — `version`, `self_thread_cap`, `self_aspace_cap`,
@@ -90,6 +90,11 @@ handle):
   handler to this endpoint at creation, and the runtime copies the spawning thread's
   bindings onto every thread it spawns (`SYS_THREAD_INHERIT_FAULT_HANDLER`), which
   carries it on. Consumers must tolerate zero.
+- **Restore word** (v25, #232) — `restore_sp`: zero in a process created fresh; in one procmgr
+  restored from a checkpoint, the address of the resume record the process saved at its quiesce
+  point, from which the runtime resumes it once it has rebound every handle
+  ([docs/checkpoint-restore.md](../../docs/checkpoint-restore.md) § Restore entry and handle
+  rebinding).
 
 Every cap field names a `CSpace` slot (`0` = absent); `*_vaddr` / size / count
 fields are plain values.

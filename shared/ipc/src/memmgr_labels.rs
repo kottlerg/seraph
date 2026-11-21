@@ -800,27 +800,34 @@ pub const NODE_CHARGE_HANDLE: u64 = 33;
 /// `REGISTER_DONATION_END`.
 pub const REGISTER_DONATION_END: u64 = 34;
 
-/// Copy pages of a memory object into Memory caps the request carries, on an
-/// object handle ([`OBJECT_HANDLE_TAG`]), which is the authority to read it.
+/// Copy pages of a memory object into Memory caps the request carries, sent
+/// on the caller's own memmgr SEND. `caps[0]` is the object handle
+/// ([`OBJECT_HANDLE_TAG`]), the authority to read the object, which memmgr
+/// reads with `SYS_ENDPOINT_BADGE`, so the reply comes from memmgr whoever
+/// handed the caller the handle.
 ///
 /// Wire format:
 /// * `data[0]` — the first object page to copy.
-/// * `data[1]` — the page offset into `caps[0]` at which the destination
+/// * `data[1]` — the page offset into `caps[1]` at which the destination
 ///   starts.
-/// * `data[2 + i]` — the destination pages of `caps[i]`, from that offset
-///   for `caps[0]`.
-/// * `caps` — Memory caps with the map and write rights, at most
-///   `syscall_abi::MSG_CAP_SLOTS_MAX`; none to read only the reply's words.
-///   memmgr deletes them, whatever the reply.
+/// * `data[2 + i]` — the destination pages of `caps[1 + i]`, from that
+///   offset for `caps[1]`.
+/// * `caps[0]` — the object handle.
+/// * `caps[1..]` — Memory caps with the map and write rights, at most
+///   `syscall_abi::MSG_CAP_SLOTS_MAX` less one; none to read only the
+///   reply's words.
+///
+/// memmgr deletes every cap, whatever the reply.
 ///
 /// memmgr copies the object's pages from `data[0]` on, in order, into the
 /// destination, at most [`OBJECT_READ_PAGES`] of them and none past the
 /// object's end. Reply: `SUCCESS` with `data[0]` the pages copied,
 /// `data[1]` the object's flags ([`OBJECT_CHECKPOINT`]) and `data[2]` its
-/// pages; `INVALID_ARGUMENT` (a handle already released, a first page past
-/// the object's end, or a destination page count missing for a cap);
-/// `UNAUTHORIZED` (no object handle); or `OUT_OF_MEMORY_BEST_EFFORT` (a
-/// destination page could not be mapped). Specified in
+/// pages; `INVALID_ARGUMENT` (no cap, a cap that is no live object handle,
+/// a first page past the object's end, or a destination page count missing
+/// for a cap); `UNAUTHORIZED` (a badge that is a handle or the swap
+/// authority); or `OUT_OF_MEMORY_BEST_EFFORT` (a destination page could not
+/// be mapped). Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 35: `OBJECT_READ`.
 pub const OBJECT_READ: u64 = 35;
 /// The most pages one [`OBJECT_READ`] copies.
@@ -879,11 +886,14 @@ pub const FILL_CHUNKS: u64 = 4;
 pub const MARK_CHECKPOINT: u64 = 37;
 
 /// Whether `opcode` is an object label, served only over an object handle
-/// ([`OBJECT_HANDLE_TAG`]): [`OBJECT_RELEASE`] and [`OBJECT_READ`].
+/// ([`OBJECT_HANDLE_TAG`]): [`OBJECT_RELEASE`] alone. The labels that
+/// answer about an object (`OBJECT_READ`, `FILL_REGION`) take its handle
+/// as a cap on the caller's own memmgr SEND instead, so a process never
+/// relies on an answer from a cap another party handed it.
 #[must_use]
 pub const fn is_object_label(opcode: u64) -> bool
 {
-    opcode == OBJECT_RELEASE || opcode == OBJECT_READ
+    opcode == OBJECT_RELEASE
 }
 
 #[cfg(test)]
@@ -912,12 +922,15 @@ mod tests
         }
     }
 
+    // Defect guarded: a label that answers about an object served over a
+    // handle another party handed the caller, which may be a SEND on that
+    // party's own endpoint answering in memmgr's place.
     #[test]
-    fn the_object_labels_are_object_release_and_object_read()
+    fn the_only_object_label_is_object_release()
     {
         assert!(is_object_label(OBJECT_RELEASE));
-        assert!(is_object_label(OBJECT_READ));
         for op in [
+            OBJECT_READ,
             SEAL_OBJECT,
             ATTACH_OBJECT,
             FILL_REGION,

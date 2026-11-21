@@ -10,11 +10,13 @@
 //! The phase seals the three-page pattern object of `memmgr_memory_objects`
 //! ([`seal`]) and requires:
 //!
-//! - `OBJECT_READ` with no cap replies the object's pages and no checkpoint
-//!   mark; with a two-page grant it copies object pages 1 and 2 into it; it
-//!   is refused `INVALID_ARGUMENT` from a page past the object's end or with
-//!   a cap and no page count for it, and `UNAUTHORIZED` over a process badge
-//!   ([`object_read`]);
+//! - `OBJECT_READ` on svctest's own memmgr cap with the handle alone replies
+//!   the object's pages and no checkpoint mark; with the handle and a
+//!   two-page grant it copies object pages 1 and 2 into it; it is refused
+//!   `INVALID_ARGUMENT` from a page past the object's end, with a grant and
+//!   no page count for it, without a handle, and with a SEND on an endpoint
+//!   of svctest's own in the handle's place, which memmgr cannot read; and
+//!   `UNAUTHORIZED` sent on the object handle itself ([`object_read`]);
 //! - `FILL_REGION` into a two-chunk demand region of svctest's backs the
 //!   pages the masks name, three, with object pages 0 to 2 in mask order,
 //!   grows svctest's usage by at least those pages, and leaves a page no mask
@@ -77,20 +79,22 @@ fn object_io_phase(_: &Caps)
     std::os::seraph::log!("memmgr_object_io phase passed");
 }
 
-/// The `OBJECT_READ` flags and pages of the object `handle` names, read with
-/// no cap; panics, naming `phase`, on any reply but `SUCCESS` or one that
-/// reports a page copied.
+/// The `OBJECT_READ` flags and pages of the object `handle` names, read
+/// with the handle alone; panics, naming `phase`, on any reply but
+/// `SUCCESS` or one that reports a page copied.
 pub(super) fn object_flags(handle: u64, phase: &str) -> (u64, u64)
 {
     let reply = call(
-        handle,
-        &IpcMessage::builder(memmgr_labels::OBJECT_READ).build(),
+        startup_info().memmgr_endpoint,
+        &IpcMessage::builder(memmgr_labels::OBJECT_READ)
+            .cap(handle_copy(handle))
+            .build(),
         "OBJECT_READ",
     );
     assert_eq!(
         (reply.label, reply.word(0)),
         (memmgr_errors::SUCCESS, 0),
-        "{phase}: OBJECT_READ with no cap replied {:#x}, {} pages copied",
+        "{phase}: OBJECT_READ with the handle alone replied {:#x}, {} pages copied",
         reply.label,
         reply.word(0)
     );
@@ -119,18 +123,63 @@ fn holds(va: u64, page: u64) -> bool
     read_word(va, 0) == pattern(page, 0) && read_word(va, LAST_WORD) == pattern(page, LAST_WORD)
 }
 
-/// `OBJECT_READ` over `target` with the words `words` and, when given, the
-/// cap `cap`: the reply's label and its first three words.
-fn read(target: u64, words: &[u64], cap: Option<u64>, what: &str) -> (u64, u64, u64, u64)
+/// An endpoint of svctest's own, whose SEND stands in for an object handle
+/// a forger hands over: a cap memmgr cannot read the badge of. The endpoint
+/// is deleted on drop.
+pub(super) struct Foreign(u64);
+
+impl Foreign
 {
-    let b = IpcMessage::builder(memmgr_labels::OBJECT_READ).words(0, words);
-    let msg = match cap
+    /// A new endpoint; panics, naming `phase`, when none can be made.
+    pub(super) fn new(phase: &str) -> Self
     {
-        Some(cap) => b.cap(cap).build(),
-        None => b.build(),
-    };
-    let reply = call(target, &msg, what);
+        let endpoint =
+            std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
+                syscall::cap_create_endpoint(slab).ok()
+            })
+            .unwrap_or_else(|| panic!("{phase}: an endpoint of svctest's own"));
+        Self(endpoint)
+    }
+
+    /// A SEND on the endpoint, for the receiver to delete.
+    pub(super) fn send(&self) -> u64
+    {
+        syscall::cap_derive(self.0, syscall::RIGHTS_EP_SEND).expect("object_io: a SEND copy")
+    }
+}
+
+impl Drop for Foreign
+{
+    fn drop(&mut self)
+    {
+        let _ = syscall::cap_delete(self.0);
+    }
+}
+
+/// `OBJECT_READ` sent on `target` with the words `words` and the caps
+/// `caps`, which memmgr deletes: the reply's label and its first three
+/// words.
+fn read_on(target: u64, words: &[u64], caps: &[u64]) -> (u64, u64, u64, u64)
+{
+    let mut b = IpcMessage::builder(memmgr_labels::OBJECT_READ).words(0, words);
+    for &cap in caps
+    {
+        b = b.cap(cap);
+    }
+    let reply = call(target, &b.build(), "OBJECT_READ");
     (reply.label, reply.word(0), reply.word(1), reply.word(2))
+}
+
+/// `OBJECT_READ` on svctest's own memmgr cap with the words `words`, a copy
+/// of `handle` and, when given, the destination cap `cap`.
+fn read(handle: u64, words: &[u64], cap: Option<u64>) -> (u64, u64, u64, u64)
+{
+    let own = startup_info().memmgr_endpoint;
+    match cap
+    {
+        Some(cap) => read_on(own, words, &[handle_copy(handle), cap]),
+        None => read_on(own, words, &[handle_copy(handle)]),
+    }
 }
 
 /// `OBJECT_READ`'s reply and copy, and its refusals.
@@ -141,33 +190,42 @@ fn object_read(handle: u64)
         (0, OBJECT_PAGES),
         "{PHASE}: OBJECT_READ of a sealed object"
     );
-    let past = read(
-        handle,
-        &[OBJECT_PAGES.saturating_add(1)],
-        None,
-        "OBJECT_READ",
-    );
+    let past = read(handle, &[OBJECT_PAGES.saturating_add(1)], None);
     assert_eq!(
         past.0,
         memmgr_errors::INVALID_ARGUMENT,
         "{PHASE}: OBJECT_READ from a page past the object's end"
     );
-    let unauthorized = read(startup_info().memmgr_endpoint, &[], None, "OBJECT_READ");
+    let own = startup_info().memmgr_endpoint;
+    let unnamed = read_on(own, &[], &[]);
+    assert_eq!(
+        unnamed.0,
+        memmgr_errors::INVALID_ARGUMENT,
+        "{PHASE}: OBJECT_READ without a handle"
+    );
+    let foreign = Foreign::new(PHASE);
+    let forged = read_on(own, &[], &[foreign.send()]);
+    assert_eq!(
+        forged.0,
+        memmgr_errors::INVALID_ARGUMENT,
+        "{PHASE}: OBJECT_READ with a SEND on svctest's own endpoint as the handle"
+    );
+    let unauthorized = read_on(handle, &[], &[]);
     assert_eq!(
         unauthorized.0,
         memmgr_errors::UNAUTHORIZED,
-        "{PHASE}: OBJECT_READ over svctest's own memmgr cap"
+        "{PHASE}: OBJECT_READ sent on the object handle"
     );
 
     let (grant, id) = try_request_contiguous(2)
         .unwrap_or_else(|l| panic!("{PHASE}: two-page grant status {l:#x}"));
-    let uncounted = read(handle, &[1, 0], Some(memory_copy(grant)), "OBJECT_READ");
+    let uncounted = read(handle, &[1, 0], Some(memory_copy(grant)));
     assert_eq!(
         uncounted.0,
         memmgr_errors::INVALID_ARGUMENT,
         "{PHASE}: OBJECT_READ with a cap and no page count for it"
     );
-    let copied = read(handle, &[1, 0, 2], Some(memory_copy(grant)), "OBJECT_READ");
+    let copied = read(handle, &[1, 0, 2], Some(memory_copy(grant)));
     assert_eq!(
         copied,
         (memmgr_errors::SUCCESS, 2, 0, OBJECT_PAGES),

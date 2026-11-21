@@ -17,7 +17,7 @@ use crate::runner::Phase;
 
 /// The data-role fixture xtask synthesises and the pack signs under its
 /// install path (`xtask/src/sysroot.rs`, `synthesise_svctest_verified`).
-const VERIFIED_PATH: &str = "/data/svctest/signed/verified.dat";
+pub(super) const VERIFIED_PATH: &str = "/data/svctest/signed/verified.dat";
 
 /// The fixture's body. Kept in sync with `xtask/src/sysroot.rs`,
 /// `SVCTEST_VERIFIED_BODY`.

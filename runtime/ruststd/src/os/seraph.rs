@@ -273,6 +273,7 @@ unsafe impl Sync for StartupInfo {}
 // pointer user code passes in.
 
 #[thread_local]
+// restore: none
 static IPC_BUF_TLS: Cell<*mut u64> = Cell::new(core::ptr::null_mut());
 
 /// Record the current thread's IPC buffer VA. Called by `_start` and by the
@@ -309,6 +310,7 @@ pub fn current_ipc_buf() -> *mut u64 {
 // only the thread that set it.
 
 #[thread_local]
+// restore: none
 static CALL_DEADLINE: Cell<Option<crate::time::Instant>> = Cell::new(None);
 
 /// Run `f` with `deadline` as the calling thread's call deadline, and
@@ -437,6 +439,7 @@ pub(crate) unsafe fn destroy_process_call(
 }
 
 #[thread_local]
+// restore: rebound
 static SELF_THREAD_TLS: Cell<u64> = Cell::new(0);
 
 /// Record the current thread's own Thread capability. Called by the thread
@@ -475,6 +478,7 @@ pub fn set_panic_sink(sink: fn(&[u8])) {
 /// Exclusive top of this process's user half, read once by `_start` through
 /// `SystemInfoType::UserVaTop` before any heap or reservation zone is placed.
 /// Zero before `_start` reads it, or when the kernel did not answer.
+// restore: none
 static USER_VA_TOP: AtomicU64 = AtomicU64::new(0);
 
 /// Exclusive top of this process's user half: the first virtual address the
@@ -503,7 +507,9 @@ struct StartupCell(UnsafeCell<MaybeUninit<StartupInfo>>);
 // `STARTUP_READY`.
 unsafe impl Sync for StartupCell {}
 
+// restore: rebound
 static STARTUP: StartupCell = StartupCell(UnsafeCell::new(MaybeUninit::uninit()));
+// restore: none
 static STARTUP_READY: AtomicBool = AtomicBool::new(false);
 
 /// Returns a reference to the captured [`StartupInfo`] for this process.
@@ -659,6 +665,12 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
         main_tls_vaddr: info.main_tls_vaddr,
     };
 
+    // A process a restore created resumes its checkpoint's quiesce point
+    // instead of running `main` (`restore_entry`).
+    if info.restore_sp != 0 {
+        restore_entry(info, startup);
+    }
+
     // SAFETY: single writer; we are the only code running at this point.
     unsafe { STARTUP.0.as_mut_unchecked().write(startup) };
     STARTUP_READY.store(true, Ordering::Release);
@@ -790,6 +802,63 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     syscall::process_exit(code as u32);
 }
 
+/// The restore entry (docs/checkpoint-restore.md § Restore entry and handle
+/// rebinding): in a process a restore created, rebind each runtime state that
+/// names a capability of the captured process to the new process's caps,
+/// using none of the captured ones, then resume the quiesce point the
+/// checkpoint was taken at, where `checkpoint::quiesce` returns
+/// `Restored`. `_start` runs it below the restore stack pointer, on the
+/// restored stack, once it has registered the IPC buffer and read `startup`
+/// from the new `ProcessInfo`. It runs on the process's one thread, and no
+/// runtime lock is held: the quiesce point holds none, and the threads of
+/// the captured process are not in this one. Every runtime static the
+/// restore must not keep as captured is reset here or by a function called
+/// here, which the `src-restore-class` rule of `cargo xtask lint-docs` checks
+/// (runtime/ruststd/README.md § Restore classes).
+// restore: entry
+fn restore_entry(info: &process_abi::ProcessInfo, startup: StartupInfo) -> ! {
+    // SAFETY: the one thread; the startup info is read through
+    // `startup_info`, and none of its borrows is live across the write
+    // (docs/checkpoint-restore.md § Restore entry and handle rebinding).
+    unsafe { STARTUP.0.as_mut_unchecked().write(startup) };
+    checkpoint::count_restore();
+    SELF_THREAD_TLS.set(0);
+    // The allocator first: the steps after it retype and map through its
+    // slabs, which then draw on the new process's memmgr.
+    pal_alloc::rebind_alloc(info.memmgr_endpoint_cap, info.self_aspace_cap);
+    pal_stdio::rebind_stdio(
+        info.stdin_memory_cap,
+        info.stdin_data_notification_cap,
+        info.stdin_space_notification_cap,
+        info.stdout_memory_cap,
+        info.stdout_data_notification_cap,
+        info.stdout_space_notification_cap,
+        info.stderr_memory_cap,
+        info.stderr_data_notification_cap,
+        info.stderr_space_notification_cap,
+        info.self_aspace_cap,
+    );
+    crate::sys::thread::rebind_threads();
+    crate::sys::fs::rebind_release_handler();
+    crate::sys::time::rebind_timed();
+    ::log::rebind_log(info.log_send_cap);
+    ::registry_client::install_registry_cap(info.service_registry_cap);
+    ROOT_DIR_CAP.store(info.system_root_cap, Ordering::Release);
+    CURRENT_DIR_CAP.store(info.current_dir_cap, Ordering::Release);
+    // The path named the captured process's cwd cap, as at a fresh start.
+    *CURRENT_DIR_PATH.lock().unwrap_or_else(crate::sync::PoisonError::into_inner) = None;
+    crate::sys::random::reseed_hashmap_keys();
+    // Take anew what a fresh `_start` takes after the heap bootstrap; the
+    // heap itself is kept.
+    if info.memmgr_endpoint_cap != 0 {
+        pal_alloc::register_pressure();
+        pal_alloc::refill_cspace_reserve();
+    }
+    // SAFETY: `restore_sp` is the resume record `quiesce` saved on this
+    // stack, which the restore brought back with the frames above it.
+    unsafe { checkpoint::__seraph_checkpoint_resume(info.restore_sp, checkpoint::RESUMED) }
+}
+
 // Force the linker to keep `_start` in the final binary even when the std
 // rlib is otherwise dead-code-stripped. Rlibs are archives of object files
 // pulled in by undefined-symbol resolution; the linker does resolve `_start`
@@ -799,6 +868,7 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
 // reference into `.data` and guarantees retention.
 #[used]
 #[cfg_attr(target_os = "seraph", unsafe(link_section = ".data.rel.ro"))]
+// restore: none
 static _START_REF: unsafe extern "C" fn(u64) -> ! = _start;
 
 // ── Public helpers surfaced on std::os::seraph ──────────────────────────────
@@ -844,9 +914,11 @@ pub fn abort_thread() -> ! {
 // service code) reads it via [`root_dir_cap`]. Zero means "no system
 // root attached" — the reading side degrades.
 
+// restore: rebound
 static ROOT_DIR_CAP: crate::sync::atomic::AtomicU64 =
     crate::sync::atomic::AtomicU64::new(0);
 
+// restore: rebound
 static CURRENT_DIR_CAP: crate::sync::atomic::AtomicU64 =
     crate::sync::atomic::AtomicU64::new(0);
 
@@ -859,6 +931,7 @@ static CURRENT_DIR_CAP: crate::sync::atomic::AtomicU64 =
 // path string — the spawner has no obligation to label it. Until a
 // process calls `set_current_dir`, `current_dir_path()` returns
 // `None` and `std::env::current_dir()` reports `Unsupported`.
+// restore: rebound
 static CURRENT_DIR_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Install the process-wide root-directory namespace cap. Called by
@@ -1019,6 +1092,8 @@ pub struct VerifiedData {
     len: usize,
     cap: u64,
     region: u64,
+    /// The run's cap, which a quiesce point refuses.
+    _held: checkpoint::Held<{ checkpoint::CAP }>,
 }
 
 #[stable(feature = "seraph_ext", since = "1.0.0")]
@@ -1177,7 +1252,8 @@ pub fn read_verified(
     };
     // From here the value owns the cap and the region, so every exit
     // releases them.
-    let mut data = VerifiedData { range: None, pages, len: 0, cap, region };
+    let mut data =
+        VerifiedData { range: None, pages, len: 0, cap, region, _held: checkpoint::Held::new() };
     let bytes = pages.checked_mul(syscall_abi::PAGE_SIZE);
     let whole = bytes.is_some_and(|bytes| {
         syscall::cap_info(cap, syscall::CAP_INFO_MEMORY_SIZE) == Ok(bytes) && body_len <= bytes
@@ -1904,6 +1980,7 @@ pub(crate) const DEFAULT_DEMAND_STACK_PAGES: u64 = 512;
 // lld synthesises `__ehdr_start` at the image's ELF header, which the
 // image's first load segment maps read-only for the process's lifetime.
 unsafe extern "C" {
+    // restore: none
     static __ehdr_start: [u8; 18];
 }
 
@@ -2375,6 +2452,7 @@ macro_rules! __seraph_stack_pages {
     ($pages:expr) => {
         #[used]
         #[unsafe(link_section = ".note.seraph.stack")]
+        // restore: none
         static __SERAPH_STACK_NOTE: $crate::os::seraph::StackNote =
             $crate::os::seraph::StackNote::new($pages);
     };
@@ -2399,6 +2477,7 @@ pub mod thread {
     /// creates the kernel thread (`sys::thread::Thread::new`) on the spawning
     /// thread before it returns.
     #[thread_local]
+    // restore: none
     static SPAWN_PRIORITY: Cell<u8> = Cell::new(0);
 
     /// The level a [`BuilderExt::spawn_at_priority`] in progress on the
@@ -2410,6 +2489,7 @@ pub mod thread {
     /// Whether the spawn in progress on the current thread is one of the
     /// runtime's own threads ([`runtime_spawn`]).
     #[thread_local]
+    // restore: none
     static RUNTIME_SPAWN: Cell<bool> = Cell::new(false);
 
     /// Run `spawn`, which spawns one of the runtime's own threads (the fs
@@ -2494,7 +2574,7 @@ pub mod thread {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub mod checkpoint {
     use crate::io;
-    use crate::sync::atomic::{AtomicUsize, Ordering};
+    use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use crate::time::{Duration, Instant};
 
     /// [`Held`] kind: a thread the application spawned that has not ended;
@@ -2508,16 +2588,46 @@ pub mod checkpoint {
     /// [`Held`] kind: an open pipe end, the process's own stdio among them
     /// ([`STDIO_PIPES`]).
     pub(crate) const PIPE: usize = 3;
+    /// [`Held`] kind: any other std value that holds a capability of the
+    /// process: the join handle of a thread the application spawned, until
+    /// it is joined or dropped, a `std::fs::ReadDir`, a
+    /// [`super::VerifiedData`], a [`Checkpoint`].
+    pub(crate) const CAP: usize = 4;
 
     /// The count of each [`Held`] kind.
-    static HELD: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+    // restore: none
+    static HELD: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 
     /// The process's own stdio pipe ends, attached at startup and never
     /// dropped, which a quiesce point allows.
+    // restore: none
     pub(crate) static STDIO_PIPES: AtomicUsize = AtomicUsize::new(0);
 
+    /// The restores the process has run: 0 in a process no restore created,
+    /// one more for each restore entry (`super::restore_entry`). A runtime
+    /// value that holds a capability past a quiesce point, which only the
+    /// main thread's `Parker` does, records the count it was made under and
+    /// drops the capability unused once the count moved on.
+    // restore: none
+    static RESTORES: AtomicU64 = AtomicU64::new(0);
+
+    /// The restores the process has run ([`RESTORES`]).
+    pub(crate) fn restores() -> u64 {
+        RESTORES.load(Ordering::Acquire)
+    }
+
+    /// Count the restore entry running now ([`RESTORES`]).
+    pub(super) fn count_restore() {
+        RESTORES.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// One resource of kind `KIND` a quiesce point refuses, counted for the
-    /// life of the value. It takes no room in the value that holds it.
+    /// life of the value: its constructor counts it, and its `Drop`, which
+    /// runs whenever the value that holds it is dropped, releases the count.
+    /// A value leaked with `mem::forget` keeps its count, and every later
+    /// quiesce of the process is refused. It takes no room in the value that
+    /// holds it.
+    #[derive(Debug)]
     pub(crate) struct Held<const KIND: usize>(());
 
     impl<const KIND: usize> Held<KIND> {
@@ -2546,6 +2656,30 @@ pub mod checkpoint {
         /// whose hold began before the end may still deliver one.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         NotCaptured,
+        /// The process is a new one, restored from a checkpoint of this
+        /// point (docs/checkpoint-restore.md § Rollback notice): every
+        /// capability it held before the point is gone, every request it
+        /// made is void, the checkpoint may have been restored any number of
+        /// times, and time moved on.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        Restored(RollbackNotice),
+    }
+
+    /// What a restored process learns of the point it resumed from
+    /// ([`Quiesced::Restored`]).
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RollbackNotice {
+        quiesced_at: Instant,
+    }
+
+    impl RollbackNotice {
+        /// The monotonic time of the quiesce point, on the clock the process
+        /// now reads on from the time of the restore.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn quiesced_at(&self) -> Instant {
+            self.quiesced_at
+        }
     }
 
     /// Quiesce the process at this call for at most `timeout`, so its
@@ -2553,20 +2687,26 @@ pub mod checkpoint {
     /// docs/checkpoint-restore.md § Quiesce point).
     ///
     /// The call is refused, capturing nothing, unless the caller is the main
-    /// thread, the process is demand-paged, and no thread the application
-    /// spawned is alive, no `std::fs::File` is open, no
-    /// `std::process::Child` is held, and no pipe but stdio is open. While
-    /// it waits the thread writes no memory but its own stack below this
-    /// call's frame and its IPC buffer, and it returns only after procmgr
-    /// ended the point.
+    /// thread, the process is demand-paged, and no std value that holds a
+    /// capability of the process is alive but its stdio pipes: no thread the
+    /// application spawned is alive or unjoined, no `std::fs::File` or
+    /// `std::fs::ReadDir` is open, no `std::process::Child`,
+    /// [`super::VerifiedData`] or [`Checkpoint`] is held, and no other pipe
+    /// is open. While it waits the thread writes no memory but its own stack
+    /// below this call's resume record and its IPC buffer, and it returns
+    /// only after procmgr ended the point.
+    ///
+    /// It returns [`Quiesced::Restored`] in a process restored from a
+    /// checkpoint of the point, once the runtime has rebound itself to the
+    /// new process (docs/checkpoint-restore.md § Restore entry and handle
+    /// rebinding).
     ///
     /// # Errors
-    /// `ResourceBusy` when a thread, file, child or pipe above is held;
-    /// `InvalidInput` off the main thread; `Unsupported` for a process that
-    /// is not demand-paged, or that procmgr refuses as one no restore can
-    /// reproduce (created pinned, phys-class or with a DMA hold);
-    /// `OutOfMemory` when the Notification cannot be had; a failed call's
-    /// error.
+    /// `ResourceBusy` when a value above is held; `InvalidInput` off the
+    /// main thread; `Unsupported` for a process that is not demand-paged, or
+    /// that procmgr refuses as one no restore can reproduce (created pinned,
+    /// phys-class or with a DMA hold); `OutOfMemory` when the Notification
+    /// cannot be had; a failed call's error.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn quiesce(timeout: Duration) -> io::Result<Quiesced> {
         let info = super::startup_info();
@@ -2585,16 +2725,16 @@ pub mod checkpoint {
         let held = HELD[THREAD].load(Ordering::Relaxed)
             | HELD[FILE].load(Ordering::Relaxed)
             | HELD[CHILD].load(Ordering::Relaxed)
+            | HELD[CAP].load(Ordering::Relaxed)
             | HELD[PIPE]
                 .load(Ordering::Relaxed)
                 .saturating_sub(STDIO_PIPES.load(Ordering::Relaxed));
         if held != 0 {
             return Err(io::const_error!(
                 io::ErrorKind::ResourceBusy,
-                "seraph: quiesce with a thread, file, child or pipe held"
+                "seraph: quiesce with a thread, file, child, pipe or other capability held"
             ));
         }
-        let ipc_buf = super::current_ipc_buf();
         let notification = crate::sys::alloc::seraph::object_slab_retype(
             syscall_abi::NOTIFICATION_RETYPE_BYTES,
             |slab| syscall::cap_create_notification(slab).ok(),
@@ -2607,10 +2747,224 @@ pub mod checkpoint {
                 "seraph: quiesce notification"
             ));
         };
-        // A stack address of this call's own frame, below every frame of its
-        // callers.
-        let marker = 0u8;
-        let restore_sp = crate::ptr::addr_of!(marker) as u64;
+        let quiesced_at = Instant::now();
+        let mut point = Point {
+            procmgr: info.procmgr_endpoint,
+            notification,
+            notify,
+            timeout,
+            ipc_buf: super::current_ipc_buf(),
+            outcome: None,
+        };
+        // SAFETY: `point` lives in this frame, above the resume record, for
+        // the whole call; `at_point_body` is the body the routine runs.
+        let resumed =
+            unsafe { __seraph_checkpoint_at_point((&raw mut point).cast(), at_point_body) };
+        if resumed == RESUMED {
+            // A new process: `point` holds the captured process's caps, which
+            // name nothing here.
+            return Ok(Quiesced::Restored(RollbackNotice { quiesced_at }));
+        }
+        point.outcome.unwrap_or_else(|| {
+            Err(io::const_error!(io::ErrorKind::Other, "seraph: quiesce point lost its outcome"))
+        })
+    }
+
+    /// What [`__seraph_checkpoint_at_point`] returns to a quiesce resumed
+    /// in a restored process ([`super::restore_entry`]); the body returns
+    /// 0.
+    pub(super) const RESUMED: u64 = 1;
+
+    /// The quiesce point's inputs and outcome, in [`quiesce`]'s frame above
+    /// the resume record.
+    struct Point {
+        procmgr: u64,
+        notification: u64,
+        notify: u64,
+        timeout: Duration,
+        ipc_buf: *mut u64,
+        outcome: Option<io::Result<Quiesced>>,
+    }
+
+    unsafe extern "C" {
+        /// Save the resume record on the stack, the callee-saved registers
+        /// and the return address, and call `body(ctx, restore_sp)` below
+        /// it, `restore_sp` the record's address; return `body`'s value,
+        /// or, in a process restored from a checkpoint taken while `body`
+        /// ran, the value [`__seraph_checkpoint_resume`] passes.
+        fn __seraph_checkpoint_at_point(
+            ctx: *mut u8,
+            body: unsafe extern "C" fn(*mut u8, u64) -> u64,
+        ) -> u64;
+
+        /// Load the resume record at `restore_sp` and return from the
+        /// [`__seraph_checkpoint_at_point`] call that saved it, with
+        /// `value`.
+        pub(super) fn __seraph_checkpoint_resume(restore_sp: u64, value: u64) -> !;
+    }
+
+    // The resume record, at the restore stack pointer and 16-aligned, holds
+    // the callee-saved state the calling convention keeps across the call
+    // and, above it, the return address the call pushed: on x86-64 MXCSR and
+    // the x87 control word, r15, r14, r13, r12, rbx and rbp; on riscv64 ra,
+    // s0 to s11, fs0 to fs11 and fcsr.
+    #[cfg(target_arch = "x86_64")]
+    core::arch::global_asm!(
+        ".pushsection .text.__seraph_checkpoint,\"ax\",@progbits",
+        ".globl __seraph_checkpoint_at_point",
+        ".type __seraph_checkpoint_at_point,@function",
+        "__seraph_checkpoint_at_point:",
+        "    push rbp",
+        "    push rbx",
+        "    push r12",
+        "    push r13",
+        "    push r14",
+        "    push r15",
+        "    sub rsp, 8",
+        "    stmxcsr dword ptr [rsp]",
+        "    fnstcw word ptr [rsp + 4]",
+        "    mov rax, rsi",
+        "    mov rsi, rsp",
+        "    call rax",
+        "    add rsp, 8",
+        "    pop r15",
+        "    pop r14",
+        "    pop r13",
+        "    pop r12",
+        "    pop rbx",
+        "    pop rbp",
+        "    ret",
+        ".size __seraph_checkpoint_at_point, . - __seraph_checkpoint_at_point",
+        ".globl __seraph_checkpoint_resume",
+        ".type __seraph_checkpoint_resume,@function",
+        "__seraph_checkpoint_resume:",
+        "    mov rsp, rdi",
+        "    ldmxcsr dword ptr [rsp]",
+        "    fldcw word ptr [rsp + 4]",
+        "    mov rax, rsi",
+        "    add rsp, 8",
+        "    pop r15",
+        "    pop r14",
+        "    pop r13",
+        "    pop r12",
+        "    pop rbx",
+        "    pop rbp",
+        "    ret",
+        ".size __seraph_checkpoint_resume, . - __seraph_checkpoint_resume",
+        ".popsection",
+    );
+
+    #[cfg(target_arch = "riscv64")]
+    core::arch::global_asm!(
+        ".pushsection .text.__seraph_checkpoint,\"ax\",@progbits",
+        ".globl __seraph_checkpoint_at_point",
+        ".type __seraph_checkpoint_at_point,@function",
+        "__seraph_checkpoint_at_point:",
+        "    addi sp, sp, -208",
+        "    sd ra, 0(sp)",
+        "    sd s0, 8(sp)",
+        "    sd s1, 16(sp)",
+        "    sd s2, 24(sp)",
+        "    sd s3, 32(sp)",
+        "    sd s4, 40(sp)",
+        "    sd s5, 48(sp)",
+        "    sd s6, 56(sp)",
+        "    sd s7, 64(sp)",
+        "    sd s8, 72(sp)",
+        "    sd s9, 80(sp)",
+        "    sd s10, 88(sp)",
+        "    sd s11, 96(sp)",
+        "    fsd fs0, 104(sp)",
+        "    fsd fs1, 112(sp)",
+        "    fsd fs2, 120(sp)",
+        "    fsd fs3, 128(sp)",
+        "    fsd fs4, 136(sp)",
+        "    fsd fs5, 144(sp)",
+        "    fsd fs6, 152(sp)",
+        "    fsd fs7, 160(sp)",
+        "    fsd fs8, 168(sp)",
+        "    fsd fs9, 176(sp)",
+        "    fsd fs10, 184(sp)",
+        "    fsd fs11, 192(sp)",
+        "    frcsr t0",
+        "    sd t0, 200(sp)",
+        "    mv t1, a1",
+        "    mv a1, sp",
+        "    jalr t1",
+        "    ld ra, 0(sp)",
+        "    ld s0, 8(sp)",
+        "    ld s1, 16(sp)",
+        "    ld s2, 24(sp)",
+        "    ld s3, 32(sp)",
+        "    ld s4, 40(sp)",
+        "    ld s5, 48(sp)",
+        "    ld s6, 56(sp)",
+        "    ld s7, 64(sp)",
+        "    ld s8, 72(sp)",
+        "    ld s9, 80(sp)",
+        "    ld s10, 88(sp)",
+        "    ld s11, 96(sp)",
+        "    addi sp, sp, 208",
+        "    ret",
+        ".size __seraph_checkpoint_at_point, . - __seraph_checkpoint_at_point",
+        ".globl __seraph_checkpoint_resume",
+        ".type __seraph_checkpoint_resume,@function",
+        "__seraph_checkpoint_resume:",
+        "    mv sp, a0",
+        "    ld t0, 200(sp)",
+        "    fscsr t0",
+        "    ld ra, 0(sp)",
+        "    ld s0, 8(sp)",
+        "    ld s1, 16(sp)",
+        "    ld s2, 24(sp)",
+        "    ld s3, 32(sp)",
+        "    ld s4, 40(sp)",
+        "    ld s5, 48(sp)",
+        "    ld s6, 56(sp)",
+        "    ld s7, 64(sp)",
+        "    ld s8, 72(sp)",
+        "    ld s9, 80(sp)",
+        "    ld s10, 88(sp)",
+        "    ld s11, 96(sp)",
+        "    fld fs0, 104(sp)",
+        "    fld fs1, 112(sp)",
+        "    fld fs2, 120(sp)",
+        "    fld fs3, 128(sp)",
+        "    fld fs4, 136(sp)",
+        "    fld fs5, 144(sp)",
+        "    fld fs6, 152(sp)",
+        "    fld fs7, 160(sp)",
+        "    fld fs8, 168(sp)",
+        "    fld fs9, 176(sp)",
+        "    fld fs10, 184(sp)",
+        "    fld fs11, 192(sp)",
+        "    mv a0, a1",
+        "    addi sp, sp, 208",
+        "    ret",
+        ".size __seraph_checkpoint_resume, . - __seraph_checkpoint_resume",
+        ".popsection",
+    );
+
+    /// The quiesce point itself, run by [`__seraph_checkpoint_at_point`]
+    /// below the resume record: send procmgr `QUIESCE` with `restore_sp`,
+    /// the record's address, wait, end the point, and leave the outcome in
+    /// the [`Point`] `ctx` addresses. Returns 0.
+    ///
+    /// # Safety
+    /// `ctx` addresses a live [`Point`] no other reference reaches.
+    unsafe extern "C" fn at_point_body(ctx: *mut u8, restore_sp: u64) -> u64 {
+        // SAFETY: the caller's contract.
+        let point = unsafe { &mut *ctx.cast::<Point>() };
+        let outcome = at_point(point, restore_sp);
+        // From the end's reply on the thread may write above the record.
+        point.outcome = Some(outcome);
+        0
+    }
+
+    /// [`at_point_body`]'s point: until the end's reply it writes nothing
+    /// but its own frame, below the record, and the IPC buffer.
+    fn at_point(point: &Point, restore_sp: u64) -> io::Result<Quiesced> {
+        let (ipc_buf, notification, notify) = (point.ipc_buf, point.notification, point.notify);
         let enter = ipc::IpcMessage::builder(ipc::procmgr_labels::QUIESCE)
             .word(0, restore_sp)
             .cap(notify)
@@ -2619,7 +2973,7 @@ pub mod checkpoint {
         // the entry's wait for its reply would leave procmgr recording a point
         // the thread has left.
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        let entered = unsafe { quiesce_call(info.procmgr_endpoint, &enter, ipc_buf) };
+        let entered = unsafe { quiesce_call(point.procmgr, &enter, ipc_buf) };
         match entered {
             Ok(reply) if reply.label == ipc::procmgr_errors::SUCCESS => {}
             other => {
@@ -2629,7 +2983,7 @@ pub mod checkpoint {
                     // answered `SUCCESS`.
                     // SAFETY: ipc_buf is the calling thread's registered IPC
                     // buffer page.
-                    let _ = unsafe { end_point(info.procmgr_endpoint, ipc_buf) };
+                    let _ = unsafe { end_point(point.procmgr, ipc_buf) };
                 }
                 // A call refused before procmgr received the cap leaves it
                 // here; procmgr deletes one it received.
@@ -2649,9 +3003,9 @@ pub mod checkpoint {
         }
         // At the point: from here to the end's reply nothing but this frame
         // and the IPC buffer is written, and nothing is allocated.
-        let signalled = wait_signal(notification, timeout);
+        let signalled = wait_signal(notification, point.timeout);
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        let ended = unsafe { end_point(info.procmgr_endpoint, ipc_buf) };
+        let ended = unsafe { end_point(point.procmgr, ipc_buf) };
         let signalled =
             signalled || syscall::notification_try_wait(notification).is_ok_and(|bits| bits != 0);
         let _ = syscall::cap_delete(notification);
@@ -2735,6 +3089,8 @@ pub mod checkpoint {
         handle: u64,
         pages: u64,
         complete: bool,
+        /// The object handle, which a quiesce point refuses.
+        _held: Held<CAP>,
     }
 
     impl Checkpoint {
@@ -2752,12 +3108,24 @@ pub mod checkpoint {
             self.complete
         }
 
+        /// The object's handle, borrowed: the cap a restore takes
+        /// (`std::os::seraph::process::CommandExt::restore`), which stays
+        /// the checkpoint's.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        pub fn handle(&self) -> u64 {
+            self.handle
+        }
+
         /// The object's handle, a memmgr object handle the caller now owns
         /// and releases (`OBJECT_RELEASE`), and its pages.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         pub fn into_raw(self) -> (u64, u64) {
             let raw = (self.handle, self.pages);
-            crate::mem::forget(self);
+            let this = crate::mem::ManuallyDrop::new(self);
+            // The value is consumed without its `Drop`: its count is released
+            // here, as the drop would.
+            // SAFETY: `this` is never used or dropped again.
+            drop(unsafe { crate::ptr::read(&this._held) });
             raw
         }
     }
@@ -2788,7 +3156,9 @@ pub mod checkpoint {
     /// `ResourceBusy` when the process is at no quiesce point
     /// (`NOT_QUIESCED`); `NotFound` when it ended; `PermissionDenied` when
     /// the cap is not a process handle; `QuotaExceeded` when the account's
-    /// max refused the frames; `OutOfMemory` otherwise; a failed call's error.
+    /// max refused the frames; `Unsupported` when memmgr refused the
+    /// checkpoint mark, so no restore would accept the object
+    /// (`NOT_RESTORABLE`); `OutOfMemory` otherwise; a failed call's error.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     pub fn take(process_handle: u64) -> io::Result<Checkpoint> {
         use ipc::procmgr_errors as e;
@@ -2815,6 +3185,7 @@ pub mod checkpoint {
             e::INVALID_BADGE => Some(io::ErrorKind::NotFound),
             e::UNAUTHORIZED => Some(io::ErrorKind::PermissionDenied),
             e::LIMIT => Some(io::ErrorKind::QuotaExceeded),
+            e::NOT_RESTORABLE => Some(io::ErrorKind::Unsupported),
             _ => Some(io::ErrorKind::OutOfMemory),
         };
         match (refused, caps) {
@@ -2822,6 +3193,7 @@ pub mod checkpoint {
                 handle,
                 pages: reply.word(0),
                 complete: reply.word(1) & ipc::procmgr_snapshot::SNAPSHOT_COMPLETE != 0,
+                _held: Held::new(),
             }),
             (kind, caps) => {
                 for &cap in caps {
@@ -2920,6 +3292,21 @@ pub mod process {
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         fn private_image(&mut self, on: bool) -> &mut Self;
 
+        /// Make the next spawn a restore of the checkpoint whose memmgr
+        /// object handle `object` is (the `CREATE_RESTORE` label flag;
+        /// docs/checkpoint-restore.md § Restore creation), such as
+        /// [`super::checkpoint::Checkpoint::handle`]. The spawn sends a copy
+        /// of the handle, which stays the caller's. The child is a new
+        /// process of the program, which must be the checkpoint's binary; it
+        /// takes the checkpoint's argv and env, so the `Command`'s are not
+        /// sent, and resumes the quiesce point. `0` (the default) creates
+        /// the child from its binary. A spawn refused because the object is
+        /// no checkpoint of the program fails `Unsupported`
+        /// (`NOT_RESTORABLE`); one that also asks for a pinned child fails
+        /// `InvalidInput`.
+        #[stable(feature = "seraph_ext", since = "1.0.0")]
+        fn restore(&mut self, object: u64) -> &mut Self;
+
         /// Request the priority level the child's initial thread is created
         /// at (the `CREATE_PRIORITY` label field). `0` (the default)
         /// reverts to procmgr's policy default, clamped to the child's
@@ -2987,6 +3374,11 @@ pub mod process {
 
         fn private_image(&mut self, on: bool) -> &mut Command {
             self.as_inner_mut().set_private_image(on);
+            self
+        }
+
+        fn restore(&mut self, object: u64) -> &mut Command {
+            self.as_inner_mut().set_restore(object);
             self
         }
 

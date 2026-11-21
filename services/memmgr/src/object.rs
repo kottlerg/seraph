@@ -8,7 +8,10 @@
 //! object's pages into Memory caps its handle's holder presents and reports
 //! the object's checkpoint mark, `FILL_REGION` backs pages of the caller's
 //! own regions with copies of an object's pages as a write fault backs a
-//! page, and procmgr's `MARK_CHECKPOINT` sets the mark
+//! page, and procmgr's `MARK_CHECKPOINT` sets the mark. Each takes the object
+//! handle as a cap on the caller's own memmgr SEND and reads its badge with
+//! `SYS_ENDPOINT_BADGE`, so its answer comes from memmgr whoever handed the
+//! caller the handle
 //! (services/memmgr/docs/ipc-interface.md § Label 35 to § Label 37). Each
 //! reads the object's pages from memmgr's own read-only view of it
 //! ([`free_pool::MemObject::runs`]), which stays mapped while the turn runs.
@@ -34,15 +37,20 @@ const PAGE_BYTES: usize = PAGE_SIZE as usize;
 /// Words of an `OBJECT_READ` request before the destination page counts.
 const READ_WORDS: usize = 2;
 
-/// `OBJECT_READ`, on an object handle: copy the object's pages from
-/// `data[0]` on into the Memory caps `caps`, at most
-/// `memmgr_labels::OBJECT_READ_PAGES`, and report the object's pages and
-/// whether it carries the checkpoint mark. Deletes `caps` before the reply,
-/// whatever it is.
-pub(crate) fn handle_object_read(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
+/// `OBJECT_READ`: copy the pages, from `data[0]` on, of the object whose
+/// handle is `caps[0]`, a SEND on `service_ep` read and deleted first, into
+/// the Memory caps after it, at most `memmgr_labels::OBJECT_READ_PAGES`, and
+/// report the object's pages and whether it carries the checkpoint mark.
+/// Deletes every cap before the reply, whatever it is.
+pub(crate) fn handle_object_read(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
 {
-    let served = read(req, caps);
-    delete_caps(caps);
+    let (handle, dest) = match caps.split_first()
+    {
+        Some((&cap, dest)) => (cap_badge(service_ep, cap), dest),
+        None => (None, caps),
+    };
+    let served = read(req, handle, dest);
+    delete_caps(dest);
     match served
     {
         Ok(reply) =>
@@ -54,13 +62,14 @@ pub(crate) fn handle_object_read(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u
     }
 }
 
-/// The reply to the `OBJECT_READ` `req`, whose destination caps are
-/// `caps`, or its error label.
-fn read(req: &IpcMessage, caps: &[u64]) -> Result<IpcMessage, u64>
+/// The reply to the `OBJECT_READ` `req`, whose object handle's badge is
+/// `handle` and whose destination caps are `caps`, or its error label.
+fn read(req: &IpcMessage, handle: Option<u64>, caps: &[u64]) -> Result<IpcMessage, u64>
 {
     let l = ledger_mut();
-    let obj = l
-        .find_object(req.badge)
+    let obj = handle
+        .filter(|b| b & memmgr_labels::OBJECT_HANDLE_TAG != 0)
+        .and_then(|b| l.find_object(b))
         .ok_or(memmgr_errors::INVALID_ARGUMENT)?;
     let marked = l.object(obj).is_some_and(|o| o.checkpoint);
     let total = l.object_pages(obj);

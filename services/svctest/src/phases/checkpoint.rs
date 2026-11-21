@@ -95,6 +95,7 @@ fn outcome(result: std::io::Result<Quiesced>) -> String
     {
         Ok(Quiesced::Captured) => "captured".to_owned(),
         Ok(Quiesced::NotCaptured) => "not-captured".to_owned(),
+        Ok(Quiesced::Restored(_)) => "restored".to_owned(),
         Err(e) => format!("refused {:?}", e.kind()),
     }
 }
@@ -170,16 +171,16 @@ fn pinned_main() -> !
 }
 
 /// The child the phase checkpoints, with its stdio.
-struct Quiescer
+pub(super) struct Quiescer
 {
-    child: Child,
+    pub(super) child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
 impl Quiescer
 {
-    fn spawn() -> Self
+    pub(super) fn spawn() -> Self
     {
         let mut child = Command::new("/tests/svctest")
             .arg(CHILD_ROLE)
@@ -199,7 +200,7 @@ impl Quiescer
     }
 
     /// The child's next line, trimmed.
-    fn line(&mut self, what: &str) -> String
+    pub(super) fn line(&mut self, what: &str) -> String
     {
         let mut line = String::new();
         let read = self
@@ -214,7 +215,7 @@ impl Quiescer
     }
 
     /// Send `cmd`.
-    fn say(&mut self, cmd: &str)
+    pub(super) fn say(&mut self, cmd: &str)
     {
         self.stdin
             .write_all(format!("{cmd}\n").as_bytes())
@@ -223,7 +224,7 @@ impl Quiescer
     }
 
     /// Close the child's stdin and require its exit with status 0.
-    fn finish(mut self)
+    pub(super) fn finish(mut self)
     {
         drop(self.stdin);
         let status = self.child.wait().expect("wait of the child");
@@ -322,7 +323,7 @@ fn checkpoint_phase(_: &Caps)
 
 /// A complete checkpoint of the child `handle` names, taken once the child
 /// has entered its point.
-fn take_at_point(handle: u64) -> Checkpoint
+pub(super) fn take_at_point(handle: u64) -> Checkpoint
 {
     let start = Instant::now();
     let checkpoint = loop

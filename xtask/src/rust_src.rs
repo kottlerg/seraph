@@ -901,7 +901,7 @@ fn apply_random_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
     let a1r = "    target_os = \"zkvm\" => {\n        mod zkvm;\n        pub use zkvm::fill_bytes;\n    }\n    \
                // seraph-overlay: seraph random via SYS_GETRANDOM (see sys/random/seraph.rs)\n    \
                target_os = \"seraph\" => {\n        mod seraph;\n        \
-               pub use seraph::{fill_bytes, hashmap_random_keys};\n    }\n";
+               pub use seraph::{HASHMAP_KEYS, fill_bytes, hashmap_random_keys, reseed_hashmap_keys};\n    }\n";
 
     let a2 = ")))]\npub fn hashmap_random_keys()";
     let a2r = "    target_os = \"seraph\",\n)))]\npub fn hashmap_random_keys()";
@@ -916,6 +916,41 @@ fn apply_random_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
     let patched = orig.replace(a1, a1r).replace(a2, a2r);
     write_new_file(&mod_rs, &patched)?;
     step(&format!("seraph-toolchain: patched {}", mod_rs.display()));
+
+    // `RandomState`'s per-thread key cell becomes seraph's `HASHMAP_KEYS`,
+    // which the restore entry draws again (`reseed_hashmap_keys`), so maps the
+    // restores of one checkpoint create take distinct keys.
+    let random_rs = rust_src.join("library/std/src/hash/random.rs");
+    let text = fs::read_to_string(&random_rs)
+        .with_context(|| format!("reading {}", random_rs.display()))?;
+    let k1 = "use crate::cell::Cell;\n";
+    let k1r = "#[cfg(not(target_os = \"seraph\"))]\nuse crate::cell::Cell;\n";
+    let k2 = "use crate::sys::random::hashmap_random_keys;\n";
+    let k2r = "#[cfg(not(target_os = \"seraph\"))]\nuse crate::sys::random::hashmap_random_keys;\n";
+    let k3 = "        thread_local!(static KEYS: Cell<(u64, u64)> = {\n            \
+              Cell::new(hashmap_random_keys())\n        });\n";
+    let k3r = "        // seraph-overlay: the key cell the restore entry draws again\n        \
+               #[cfg(target_os = \"seraph\")]\n        \
+               use crate::sys::random::HASHMAP_KEYS as KEYS;\n        \
+               #[cfg(not(target_os = \"seraph\"))]\n        \
+               thread_local!(static KEYS: Cell<(u64, u64)> = {\n            \
+               Cell::new(hashmap_random_keys())\n        });\n";
+    if !text.contains(k1) || !text.contains(k2) || !text.contains(k3)
+    {
+        bail!(
+            "hash/random.rs anchors not found — upstream layout changed at {}",
+            random_rs.display()
+        );
+    }
+    let patched = text
+        .replacen(k1, k1r, 1)
+        .replacen(k2, k2r, 1)
+        .replacen(k3, k3r, 1);
+    write_new_file(&random_rs, &patched)?;
+    step(&format!(
+        "seraph-toolchain: patched {}",
+        random_rs.display()
+    ));
     Ok(())
 }
 
@@ -1136,7 +1171,8 @@ fn apply_thread_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "    target_os = \"xous\" => {\n        mod xous;\n        pub use xous::{DEFAULT_MIN_STACK_SIZE, Thread, available_parallelism, sleep, yield_now};\n\n        #[expect(dead_code)]\n        mod unsupported;\n        pub use unsupported::{current_os_id, set_name};\n    }\n    \
          // seraph-overlay: seraph thread via Notification caps\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
-         pub use seraph::{Thread, available_parallelism, current_os_id, set_name, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};\n    }\n",
+         pub use seraph::{Thread, available_parallelism, current_os_id, set_name, sleep, yield_now, DEFAULT_MIN_STACK_SIZE};\n        \
+         pub(crate) use seraph::rebind_threads;\n    }\n",
     )?;
 
     // seraph stays off the cfg list that excludes platforms with their own
@@ -1251,7 +1287,8 @@ fn apply_time_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
         "    target_os = \"xous\" => {\n        mod xous;\n        use xous as imp;\n    }\n    \
          // seraph-overlay: Instant via SYS_SYSTEM_INFO ElapsedUs\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
-         use seraph as imp;\n    }\n",
+         use seraph as imp;\n        \
+         pub(crate) use seraph::rebind_timed;\n    }\n",
     )
 }
 
@@ -1304,7 +1341,7 @@ fn apply_fs_overlay(rust_src: &Path, overlay_root: &Path) -> Result<()>
          // seraph-overlay: std::fs::File via vfsd OPEN + fs-driver FS_READ/FS_READ_FRAME\n    \
          target_os = \"seraph\" => {\n        mod seraph;\n        \
          use seraph as imp;\n        \
-         pub(crate) use seraph::{close_open_files, walk_path_to_file, walk_path_to_dir, walk_path_to_dir_with_rights, WalkedFile, WalkedDir};\n    }\n",
+         pub(crate) use seraph::{close_open_files, rebind_release_handler, walk_path_to_file, walk_path_to_dir, walk_path_to_dir_with_rights, WalkedFile, WalkedDir};\n    }\n",
     )
 }
 

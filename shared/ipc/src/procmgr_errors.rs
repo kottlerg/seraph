@@ -83,9 +83,14 @@ pub const LIMIT: u64 = 21;
 /// (`procmgr_labels::QUIESCE`), or left it before the capture's hold;
 /// nothing was captured.
 pub const NOT_QUIESCED: u64 = 22;
-/// `procmgr_labels::QUIESCE` refused: the sender was created pinned,
-/// phys-class or with a DMA hold, so no restore can reproduce it
-/// (docs/checkpoint-restore.md § Quiesce point).
+/// No restore can be made of the process or object the request names
+/// (docs/checkpoint-restore.md § Refusals): `procmgr_labels::QUIESCE` from a
+/// process created pinned, phys-class or with a DMA hold; a
+/// `procmgr_labels::CHECKPOINT` whose account memmgr does not recognise as
+/// its own, so it refused the checkpoint mark; and a
+/// `procmgr_labels::CREATE_RESTORE` create whose object carries no
+/// checkpoint mark or is not a checkpoint of the verified body. Nothing is
+/// created or kept.
 pub const NOT_RESTORABLE: u64 = 23;
 /// Unknown opcode on procmgr endpoint.
 pub const UNKNOWN_OPCODE: u64 = 0xFFFF;

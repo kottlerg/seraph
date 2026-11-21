@@ -43,6 +43,7 @@ use syscall_abi::{FAULT_CLASS_ALL, PAGE_SIZE, SyscallError, SystemInfoType};
 /// once and cached; `None` if the query fails.
 fn thread_retype_bytes() -> Option<u64> {
     use crate::sync::atomic::{AtomicU64, Ordering};
+    // restore: none
     static CACHED: AtomicU64 = AtomicU64::new(0);
     let cached = CACHED.load(Ordering::Relaxed);
     if cached != 0 {
@@ -148,6 +149,26 @@ struct ThreadResources {
 unsafe impl Send for ThreadResources {}
 
 impl ThreadResources {
+    /// Give up the resources of a thread of the captured process in the
+    /// process a restore created, where its caps, its slab run and its
+    /// grants name nothing and are not used: free its TLS block, unregister
+    /// its demand stack on the new process's memmgr, which the restore gave
+    /// the stack's region as captured, and release the reservations of its
+    /// stack and IPC buffer, whose grant pages the restore does not map.
+    fn discard_restored(self) {
+        if let Some(l) = self.tls_layout {
+            // SAFETY: the thread is not in this process, so nothing reads or
+            // writes its TLS block, which `alloc_thread_tls` allocated with
+            // `l` in the heap the restore kept.
+            unsafe { dealloc(self.tls_block, l) };
+        }
+        crate::sys::reserve::unreserve_pages(self.ipc_buf.range);
+        match self.stack {
+            StackAlloc::Demand(g) => crate::os::seraph::unregister_guarded_stack(g),
+            StackAlloc::Eager(e) => crate::sys::reserve::unreserve_pages(e.range),
+        }
+    }
+
     /// Reclaim every owned resource: delete the Thread cap (drives
     /// `dealloc_object(Thread)` — drain + `retype_free` + ancestor `dec_ref`),
     /// delete the done-notification cap, free the TLS block, and release the
@@ -191,6 +212,10 @@ pub struct Thread {
     /// the fallback when the reaper was unavailable at spawn — then a detached
     /// (un-joined) handle leaks its resources until process death, as before.
     reaper: Option<(u32, u32)>,
+    /// The handle of a thread the application spawned, which a quiesce point
+    /// refuses until it is joined or dropped; `None` for the runtime's own
+    /// threads.
+    held: Option<crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CAP }>>,
 }
 
 // SAFETY: every resource is a plain cap slot, an owned pointer to a distinct
@@ -624,6 +649,8 @@ impl Thread {
                 tls_layout,
             },
             reaper,
+            held: (!crate::os::seraph::thread::spawning_runtime_thread())
+                .then(crate::os::seraph::checkpoint::Held::new),
         })
     }
 
@@ -633,6 +660,8 @@ impl Thread {
         // SAFETY: `res`/`reaper` are valid initialised fields; `forget(self)`
         // below suppresses the destructor, so these reads are not double-frees.
         let res = unsafe { core::ptr::read(&self.res) };
+        // SAFETY: as `res`; the count is released when this call returns.
+        let _held = unsafe { core::ptr::read(&self.held) };
         let reaper = self.reaper;
         core::mem::forget(self);
 
@@ -804,12 +833,14 @@ mod reaper {
     // each further queue twice the last.
 
     /// The reaper's slot registry.
+    // restore: rebound
     static SLOTS: SpinMutex<Registry<ThreadResources>> = SpinMutex::new(Registry::new());
 
     /// The process's death queues. No wait set holds them, so the set is
     /// created as wide as the kernel allows and `DeathQueues::grow` refuses
     /// a further queue past `WAIT_SET_MAX_MEMBERS - 1` queues without asking
     /// for a wider one.
+    // restore: rebound
     static QUEUES: SpinMutex<DeathQueues> =
         SpinMutex::new(DeathQueues::new(FIRST_POOL_OBSERVERS, WAIT_SET_MAX_MEMBERS));
 
@@ -936,6 +967,24 @@ mod reaper {
         }
     }
 
+    /// Rebind the reaper to the process a restore created
+    /// (docs/checkpoint-restore.md § Restore entry and handle rebinding):
+    /// empty the registry and the death queues, whose caps name slots of the
+    /// captured process and are not used, and discard the resources of the
+    /// threads the registry held ([`ThreadResources::discard_restored`]).
+    /// A quiesce point leaves no thread of the application alive or joinable,
+    /// so the registry holds every thread the captured process had.
+    // restore: reset
+    pub(crate) fn rebind_threads() {
+        let held = SLOTS.with(|slots| core::mem::replace(slots, Registry::new()));
+        QUEUES.with(|queues| {
+            *queues = DeathQueues::new(FIRST_POOL_OBSERVERS, WAIT_SET_MAX_MEMBERS);
+        });
+        for res in held.into_held() {
+            res.discard_restored();
+        }
+    }
+
     /// Drain every death queue (non-blocking) and reclaim, once the queues
     /// are released, any detached thread whose death-post has landed. Called
     /// on every spawn, join, and detach.
@@ -945,6 +994,8 @@ mod reaper {
         reclaim_all(drained);
     }
 }
+
+pub(crate) use reaper::rebind_threads;
 
 /// Allocate a per-thread TLS block according to the architecture's variant,
 /// populate it from the PT_TLS template recorded in `StartupInfo`, and
@@ -994,6 +1045,7 @@ fn alloc_thread_tls(
 /// Set once procmgr refuses a registration `NOT_ATTACHABLE`: the process
 /// declared itself undebuggable, which is one-way, so no later thread of it
 /// sends one.
+// restore: none
 static REGISTRY_REFUSED: crate::sync::atomic::AtomicBool =
     crate::sync::atomic::AtomicBool::new(false);
 

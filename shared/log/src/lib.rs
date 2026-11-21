@@ -96,11 +96,13 @@ pub const LOG_CALL_UNANSWERED_TIMEOUT_MS: u32 = 10;
 /// [`LOG_CALL_TIMEOUT_MS`] ([`call_bound`]). Process-wide because every thread of a process logs on
 /// the same badged endpoint, so one thread's timeout says the receiver is
 /// answering none of them.
+// restore: rebound
 static RECEIVER_UNANSWERED: AtomicBool = AtomicBool::new(false);
 
 /// The source of the time left of the calling thread's call deadline, as
 /// std's `_start` installs it ([`install_time_left`]): null until then, else
 /// a `fn() -> Option<Duration>` stored as a pointer.
+// restore: none
 static TIME_LEFT: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Install `source`, which returns the time left of the calling thread's
@@ -433,6 +435,7 @@ impl NameCell
 /// process's stream messages on that cap carry [`SENDER_NAMED`], and
 /// [`log_call`] sends the name again to a receiver that answers
 /// [`NAME_UNKNOWN`].
+// restore: none
 static REGISTERED_NAME: NameCell = NameCell::new();
 
 /// The `STREAM_REGISTER_NAME` message carrying `name`, cut at
@@ -466,6 +469,7 @@ fn named_flag(cap: u64) -> u64
 /// reachable (a process spawned before the log endpoint exists);
 /// [`emit`] drops in that case. `AtomicU64` because a cap handle is `u64` in
 /// the syscall ABI.
+// restore: rebound
 static BADGEED_CAP: AtomicU64 = AtomicU64::new(0);
 
 /// Pre-install a badged SEND cap on the log endpoint. Called by
@@ -474,6 +478,18 @@ static BADGEED_CAP: AtomicU64 = AtomicU64::new(0);
 pub fn install_badged_cap(cap: u64)
 {
     BADGEED_CAP.store(cap, Ordering::Release);
+}
+
+/// Rebind the log surface to the process a restore created
+/// (docs/checkpoint-restore.md § Restore entry and handle rebinding): install
+/// `cap`, the new process's badged SEND, and forget what was learned of the
+/// captured process's receiver. The registered name is kept: the new
+/// receiver answers [`NAME_UNKNOWN`] and [`log_call`] sends it again.
+// restore: reset
+pub fn rebind_log(cap: u64)
+{
+    BADGEED_CAP.store(cap, Ordering::Release);
+    RECEIVER_UNANSWERED.store(false, Ordering::Relaxed);
 }
 
 /// Return the pre-installed badged SEND cap, or zero. Caller is
@@ -490,6 +506,7 @@ pub fn ensure_badged_cap(_ipc_buf: *mut u64) -> u64
 /// code; a message at a more verbose level is neither formatted nor sent.
 /// [`LEVEL_INFO`] until std's `_start` installs the level the process's
 /// `SERAPH_LOG` environment entry names ([`set_max_level`]).
+// restore: none
 static MAX_LEVEL: AtomicU64 = AtomicU64::new(LEVEL_INFO);
 
 /// The environment entry std's `_start` reads, once, for the process's

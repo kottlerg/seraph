@@ -92,7 +92,10 @@ use core::prelude::rust_2024::*;
 ///      remainder. [`ProcessInfo::args_offset`], `args_bytes`, `args_count`,
 ///      `env_offset`, `env_bytes` and `env_count` widen from `u32` to `u64`,
 ///      so every field after them moves.
-pub const PROCESS_ABI_VERSION: u32 = 24;
+/// v25: [`ProcessInfo::restore_sp`], the restore word, is appended
+///      (docs/checkpoint-restore.md § Restore entry and handle rebinding);
+///      every other field offset is unchanged.
+pub const PROCESS_ABI_VERSION: u32 = 25;
 
 // ── Address space constants ──────────────────────────────────────────────────
 
@@ -634,6 +637,15 @@ pub struct ProcessInfo
     /// `process-layout`; the kernel installs the thread pointer, so `_start`
     /// reads this only for introspection.
     pub main_tls_vaddr: u64,
+
+    /// The restore word: zero in a process created fresh; in a process
+    /// restored from a checkpoint (`procmgr_labels::CREATE_RESTORE`), the
+    /// checkpoint's restore stack pointer, the address of the resume record
+    /// the process saved at its quiesce point, where the main thread starts.
+    /// The runtime's entry rebinds every handle from this page and resumes
+    /// the record when it is set (docs/checkpoint-restore.md § Restore entry
+    /// and handle rebinding).
+    pub restore_sp: u64,
 }
 
 // Hard size budget: creators write `ProcessInfo` into the one page below

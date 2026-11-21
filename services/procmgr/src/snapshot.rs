@@ -7,33 +7,45 @@
 //! charged to the snapshotter (services/procmgr/docs/ipc-interface.md
 //! § Label 33: `SNAPSHOT`).
 //!
-//! procmgr asks memmgr to make the target's evicted pages resident, lists its
-//! mapped pages and requests frames for them on the snapshotter's account,
-//! all before the hold. It then holds the target's address space
-//! (`SYS_ASPACE_HOLD`), so no thread of it runs, registered or not, makes
-//! resident what was evicted meanwhile, lists the pages again, requests the
-//! frames the second listing adds, copies every page with
-//! `SYS_THREAD_READ_MEM` into the frames, and releases the space. After the
-//! release it builds the layout (`process_table::snapshot::layout`), writes it
-//! into frames of its own grant, and seals the layout and the data, in that
-//! order, into one memory object on the account.
+//! Before the hold, procmgr has memmgr post the target's chunks on disk to the
+//! swap service and count its evicted pages (`memmgr_labels::CAPTURE_COUNT`),
+//! waits a bounded time while the swap service restores them, lists the
+//! target's mapped pages, and requests frames for both on the snapshotter's
+//! account. It then holds the target's address space (`SYS_ASPACE_HOLD`), so
+//! no thread of it runs, registered or not, and lists the pages again. memmgr
+//! writes the content of every demand chunk of the target into the frames
+//! (`memmgr_labels::CAPTURE_CHUNKS`), from wherever it holds each chunk in that
+//! turn, so no eviction meanwhile can move a chunk's content out of the
+//! capture; a chunk still on disk it posts to the swap service, and procmgr
+//! asks for it again after a pause, waiting a bounded time while the swap
+//! service restores it. procmgr copies every other listed page with
+//! `SYS_THREAD_READ_MEM` into the next frames and releases the space. After
+//! the release it builds the layout (`process_table::snapshot::layout`),
+//! writes it into frames of its own grant, and seals the layout and the data,
+//! in that order, into one memory object on the account.
 //!
 //! The account is the snapshotter's own memmgr SEND, which the request
 //! carries: procmgr cannot tell that it names memmgr, so every call on it
 //! is bounded ([`ACCOUNT_CALL_TIMEOUT_MS`]), and the first failure fails the
 //! capture, releasing the hold and every grant taken. Under the hold procmgr
-//! calls only memmgr, on its own endpoint and on the account, and writes no
-//! log line, so a held target that serves procmgr (logd among them) cannot
-//! stall the capture.
+//! calls only memmgr, on its own endpoint and on the account, waits on the
+//! swap service at most [`CAPTURE_STALL_PAUSES`] pauses in a row that restore
+//! nothing, and writes no log line, so a held target that serves procmgr
+//! (logd among them) or the swap service cannot stall the capture.
 
 use crate::process::CapGuard;
+use ipc::memmgr_capture::{
+    DESCRIPTOR_WORDS, DESCRIPTORS_MAX, Descriptor, REPLY_WORDS, REQUEST_WORDS, Supply,
+};
 use ipc::procmgr_snapshot::{Header, SNAPSHOT_COMPLETE};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
-use process_table::snapshot::{Layout, Listing, Reported, layout};
+use process_table::snapshot::{Chunk, Layout, Listing, copied_pages, layout, outside};
 use std::collections::TryReserveError;
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
+use std::time::Duration;
 use syscall_abi::{
-    MAX_PAGE_RUNS, MAX_THREAD_MEM_COPY, PAGE_RUN_NO_COPY, PAGE_SIZE, PageRun, SyscallError,
+    MAX_PAGE_RUNS, MAX_THREAD_MEM_COPY, MSG_CAP_SLOTS_MAX, PAGE_RUN_NO_COPY, PAGE_SIZE, PageRun,
+    SyscallError,
 };
 
 /// How long procmgr waits, at most, on each call it makes on the
@@ -56,12 +68,24 @@ const _: () = assert!(MAX_THREAD_MEM_COPY as u64 == PAGE_SIZE);
 /// Region ids one `RELEASE_MEMORY_CAPS` names: every data word after the count.
 const RELEASE_IDS_PER_CALL: usize = syscall_abi::MSG_DATA_WORDS_MAX - 1;
 
+/// Milliseconds procmgr pauses before it asks memmgr again for the target's
+/// chunks on disk, whose slot words memmgr posted to the swap service: a
+/// tuning value of the order of a swap slot's read and restore.
+const CAPTURE_PAUSE_MS: u64 = 10;
+
+/// Pauses in a row that restore no chunk on disk after which procmgr waits
+/// no longer for the swap service, the chunks still on disk then absent: 100,
+/// a second of [`CAPTURE_PAUSE_MS`]. It bounds how long a swap service that
+/// does not answer, or is the held target or waits on it, holds a capture,
+/// before the hold and under it.
+const CAPTURE_STALL_PAUSES: u32 = 100;
+
 /// What a capture needs of procmgr.
 pub struct Context
 {
     /// procmgr's own address space, where the frames are mapped to be filled.
     pub self_aspace: u64,
-    /// procmgr's SEND on memmgr, for `MAKE_RESIDENT`.
+    /// procmgr's SEND on memmgr, for `CAPTURE_CHUNKS`.
     pub memmgr_ep: u64,
     /// The calling worker's IPC buffer.
     pub ipc_buf: *mut u64,
@@ -76,7 +100,7 @@ pub struct Target
     pub aspace: CapGuard,
     /// The target's main thread, through which its space is listed and read.
     pub thread: CapGuard,
-    /// The target's memmgr badge, which names it to `MAKE_RESIDENT`.
+    /// The target's memmgr badge, which names it to `CAPTURE_CHUNKS`.
     pub memmgr_badge: u64,
 }
 
@@ -99,8 +123,8 @@ pub struct Captured
 /// interrupted; `INVALID_BADGE` when the target ended before or during the
 /// capture; `OUT_OF_MEMORY` when the account refused or failed a call,
 /// granted a run procmgr refuses, or the object would take more grants than
-/// one seal names, or when procmgr's heap or address space refused the
-/// capture's own memory.
+/// one seal names, when memmgr failed a request, or when procmgr's heap or
+/// address space refused the capture's own memory.
 pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured, u64>
 {
     let account = Account {
@@ -108,22 +132,36 @@ pub fn capture(ctx: &Context, target: &Target, account: u64) -> Result<Captured,
         ipc_buf: ctx.ipc_buf,
     };
     let top = syscall::user_va_top().map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-    // Before the hold: what can be made resident, and the frames for what is
-    // mapped then. The reports are taken again under the hold.
-    make_resident(ctx, target.memmgr_badge, top)?;
+    // Before the hold: the chunks on disk asked for and waited on, and the
+    // frames for what is mapped and what memmgr holds evicted then. Each
+    // chunk is read under the hold, wherever memmgr holds it then.
+    let evicted = survey(ctx, target.memmgr_badge, top)?;
     let mut data = Grants::new(&account);
-    data.cover(list(target.thread.cap(), top)?.copied_pages())?;
+    data.cover(
+        list(target.thread.cap(), top)?
+            .copied_pages()
+            .saturating_add(evicted),
+    )?;
     let mut window = Window::new(ctx.self_aspace)?;
 
     let hold = Hold::take(target.aspace.cap())?;
-    let reported = make_resident(ctx, target.memmgr_badge, top)?;
     let listing = list(target.thread.cap(), top)?;
-    data.cover(listing.copied_pages())?;
-    let failed = copy(target.thread.cap(), listing.runs(), &data, &mut window)?;
+    let mut chunks = Chunks::default();
+    chunks.walk(ctx, target.memmgr_badge, (0, top), &mut data)?;
+    chunks.await_disk(ctx, target.memmgr_badge, &mut data)?;
+    let outside = outside(listing.runs(), &chunks.list).map_err(runs_code)?;
+    data.cover(chunks.filled.saturating_add(copied_pages(&outside)))?;
+    let failed = copy(
+        target.thread.cap(),
+        &outside,
+        chunks.filled,
+        &data,
+        &mut window,
+    )?;
     drop(hold);
     drop(window);
 
-    let layout = layout(listing.runs(), &failed, &reported).map_err(runs_code)?;
+    let layout = layout(&outside, chunks.filled, &failed, &chunks.list).map_err(runs_code)?;
     data.keep(layout.data_pages);
     let mut head = Grants::new(&account);
     head.cover(layout.layout_pages)?;
@@ -157,49 +195,290 @@ fn target_code(err: i64) -> u64
     }
 }
 
-/// Have memmgr make every evicted page of the target resident that it can
-/// in its turn (`memmgr_labels::RESIDENT_REPORT`), over the user half up to
-/// `top`, and return the ranges it reported it could not, in address order.
-fn make_resident(ctx: &Context, memmgr_badge: u64, top: u64) -> Result<Vec<Reported>, u64>
+/// Call memmgr with `msg` on procmgr's own endpoint: its reply when it
+/// succeeded; `INVALID_BADGE` when memmgr knows the target's badge no more,
+/// the target torn down; else `OUT_OF_MEMORY`.
+fn memmgr_call(ctx: &Context, msg: &IpcMessage) -> Result<IpcMessage, u64>
 {
-    let mut reported = Vec::new();
-    let mut at = 0u64;
+    // SAFETY: `ipc_buf` is the calling worker's registered IPC buffer.
+    match unsafe { ipc::ipc_call(ctx.memmgr_ep, msg, ctx.ipc_buf) }
+    {
+        Ok(reply) if reply.label == memmgr_errors::SUCCESS => Ok(reply),
+        Ok(reply) if reply.label == memmgr_errors::INVALID_ARGUMENT =>
+        {
+            Err(procmgr_errors::INVALID_BADGE)
+        }
+        _ => Err(procmgr_errors::OUT_OF_MEMORY),
+    }
+}
+
+/// Have memmgr post every chunk of the target on disk to the swap service and
+/// count its evicted pages (`CAPTURE_COUNT`), over the user half up to `top`,
+/// again after each pause of [`CAPTURE_PAUSE_MS`] while chunks on disk
+/// remain, until none does or [`CAPTURE_STALL_PAUSES`] pauses in a row leave
+/// no fewer. Returns the backed pages of the evicted chunks memmgr counted
+/// last, those on disk among them.
+fn survey(ctx: &Context, memmgr_badge: u64, top: u64) -> Result<u64, u64>
+{
+    let (mut fewest, mut stalled) = (u64::MAX, 0u32);
+    loop
+    {
+        let (evicted, on_disk) = count(ctx, memmgr_badge, top)?;
+        if on_disk < fewest
+        {
+            fewest = on_disk;
+            stalled = 0;
+        }
+        else
+        {
+            stalled = stalled.saturating_add(1);
+        }
+        if on_disk == 0 || stalled >= CAPTURE_STALL_PAUSES
+        {
+            return Ok(evicted);
+        }
+        std::thread::sleep(Duration::from_millis(CAPTURE_PAUSE_MS));
+    }
+}
+
+/// One `CAPTURE_COUNT` pass over the user half up to `top`: the backed pages
+/// of the target's evicted chunks, and its chunks on disk memmgr posted.
+fn count(ctx: &Context, memmgr_badge: u64, top: u64) -> Result<(u64, u64), u64>
+{
+    let (mut evicted, mut on_disk, mut at) = (0u64, 0u64, 0u64);
     while at < top
     {
-        let msg = IpcMessage::builder(memmgr_labels::MAKE_RESIDENT)
+        let msg = IpcMessage::builder(memmgr_labels::CAPTURE_CHUNKS)
             .word(0, memmgr_badge)
             .word(1, at)
-            .word(2, top.saturating_sub(at))
-            .word(3, memmgr_labels::RESIDENT_REPORT)
+            .word(2, top)
+            .word(3, memmgr_labels::CAPTURE_COUNT)
             .build();
-        // SAFETY: `ipc_buf` is the calling worker's registered IPC buffer.
-        let reply = match unsafe { ipc::ipc_call(ctx.memmgr_ep, &msg, ctx.ipc_buf) }
-        {
-            Ok(reply) if reply.label == memmgr_errors::SUCCESS => reply,
-            // memmgr knows the badge no more: the target is torn down.
-            Ok(reply) if reply.label == memmgr_errors::INVALID_ARGUMENT =>
-            {
-                return Err(procmgr_errors::INVALID_BADGE);
-            }
-            _ => return Err(procmgr_errors::OUT_OF_MEMORY),
-        };
-        let (reached, start, len, prot) =
-            (reply.word(2), reply.word(3), reply.word(4), reply.word(5));
-        if len != 0
-        {
-            reported
-                .try_reserve(1)
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-            reported.push(Reported::new(start, len, prot));
-        }
+        let reply = memmgr_call(ctx, &msg)?;
+        evicted = evicted.saturating_add(reply.word(1));
+        on_disk = on_disk.saturating_add(reply.word(2));
         // memmgr moves forward on every reply; one that did not would loop.
-        if reached <= at
+        if reply.word(0) <= at
         {
             return Err(procmgr_errors::OUT_OF_MEMORY);
         }
-        at = reached;
+        at = reply.word(0);
     }
-    Ok(reported)
+    Ok((evicted, on_disk))
+}
+
+/// The target's demand chunks memmgr reached under the hold, in address
+/// order, and the data pages before the next chunk's: those the supplied
+/// chunks took, and any passed over because the grants that held them could
+/// not hold a chunk in one request.
+#[derive(Default)]
+struct Chunks
+{
+    list: Vec<Chunk>,
+    filled: u64,
+}
+
+impl Chunks
+{
+    /// Have memmgr supply every chunk of `range` into the data frames after
+    /// those filled (`CAPTURE_CHUNKS`), covering more frames on the account
+    /// when memmgr needs them, and add each chunk it names.
+    ///
+    /// # Errors
+    /// As [`memmgr_call`]; `OUT_OF_MEMORY` when the account refuses the
+    /// frames, procmgr's heap refuses the chunks, or memmgr's reply names a
+    /// chunk out of order, of no descriptor, or pages it did not write.
+    fn walk(
+        &mut self,
+        ctx: &Context,
+        memmgr_badge: u64,
+        range: (u64, u64),
+        data: &mut Grants<'_>,
+    ) -> Result<(), u64>
+    {
+        let (mut at, end) = range;
+        while at < end
+        {
+            let reply = self.request(ctx, memmgr_badge, (at, end), data)?;
+            let (next, used, need) = (reply.word(0), reply.word(1), reply.word(2));
+            let count = usize::try_from(reply.word(3)).unwrap_or(usize::MAX);
+            if count > DESCRIPTORS_MAX
+            {
+                return Err(procmgr_errors::OUT_OF_MEMORY);
+            }
+            self.list
+                .try_reserve(count)
+                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            let mut page = self.filled;
+            for i in 0..count
+            {
+                let word = REPLY_WORDS.saturating_add(i.saturating_mul(DESCRIPTOR_WORDS));
+                let d = Descriptor::decode([reply.word(word), reply.word(word.saturating_add(1))])
+                    .filter(|d| d.va >= self.list.last().map_or(at, Chunk::end))
+                    .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+                self.list.push(Chunk::new(&d, page));
+                if d.supply == Supply::Supplied
+                {
+                    page = page.saturating_add(d.backed_pages());
+                }
+            }
+            if page != self.filled.saturating_add(used)
+            {
+                return Err(procmgr_errors::OUT_OF_MEMORY);
+            }
+            self.filled = page;
+            if need > 0
+            {
+                // memmgr stopped at a chunk that needs more frames than the
+                // caps it was given hold. One that stopped with room for it,
+                // having written nothing, would loop; after chunks it wrote,
+                // the next request's caps start further on.
+                if used == 0 && data.holds(self.filled, need)
+                {
+                    return Err(procmgr_errors::OUT_OF_MEMORY);
+                }
+                self.make_room(need, data)?;
+            }
+            else if next <= at
+            {
+                return Err(procmgr_errors::OUT_OF_MEMORY);
+            }
+            at = next;
+        }
+        Ok(())
+    }
+
+    /// Cover frames on the account, and pass over the data pages up to the
+    /// next grant's first while needed, until the grants one request carries
+    /// from the next data page hold `need` pages: a request carries at most
+    /// as many caps as a message does, so a chunk can need more pages than the
+    /// grants from a page in a short grant hold, its rest passed over and left
+    /// unused in the object.
+    ///
+    /// # Errors
+    /// `OUT_OF_MEMORY` when the account refuses the frames, or the grants
+    /// would be more than one seal names.
+    fn make_room(&mut self, need: u64, data: &mut Grants<'_>) -> Result<(), u64>
+    {
+        data.cover(self.filled.saturating_add(need))?;
+        while !data.holds(self.filled, need)
+        {
+            self.filled = data.next_grant(self.filled);
+            data.cover(self.filled.saturating_add(need))?;
+        }
+        Ok(())
+    }
+
+    /// One `CAPTURE_CHUNKS` request over `[at, end)`, carrying caps derived
+    /// from the grants that hold the data pages after those filled, at most
+    /// as many as a message carries, and memmgr's reply.
+    fn request(
+        &self,
+        ctx: &Context,
+        memmgr_badge: u64,
+        (at, end): (u64, u64),
+        data: &Grants<'_>,
+    ) -> Result<IpcMessage, u64>
+    {
+        let (grants, offset) = data.at_page(self.filled);
+        let mut msg = IpcMessage::builder(memmgr_labels::CAPTURE_CHUNKS)
+            .word(0, memmgr_badge)
+            .word(1, at)
+            .word(2, end)
+            .word(3, 0)
+            .word(4, offset);
+        let mut derived = [0u64; MSG_CAP_SLOTS_MAX];
+        for (i, (grant, slot)) in grants.iter().zip(derived.iter_mut()).enumerate()
+        {
+            let Ok(cap) = syscall::cap_derive(grant.cap, syscall::RIGHTS_MEM_MAP_RW)
+            else
+            {
+                crate::release_caps(&derived);
+                return Err(procmgr_errors::OUT_OF_MEMORY);
+            };
+            *slot = cap;
+            let pages = if i == 0
+            {
+                grant.pages.saturating_sub(offset)
+            }
+            else
+            {
+                grant.pages
+            };
+            msg = msg.word(REQUEST_WORDS.saturating_add(i), pages).cap(cap);
+        }
+        let reply = memmgr_call(ctx, &msg.build());
+        if reply.is_err()
+        {
+            // A call refused before memmgr received it leaves the caps
+            // procmgr's; a handle the call moved is stale, and its delete
+            // fails harmlessly.
+            crate::release_caps(&derived);
+        }
+        reply
+    }
+
+    /// Ask memmgr again, after each pause of [`CAPTURE_PAUSE_MS`], for each
+    /// chunk on disk it posted to the swap service, until none is left or
+    /// [`CAPTURE_STALL_PAUSES`] pauses in a row restore none; one still on disk
+    /// then is absent.
+    fn await_disk(
+        &mut self,
+        ctx: &Context,
+        memmgr_badge: u64,
+        data: &mut Grants<'_>,
+    ) -> Result<(), u64>
+    {
+        let mut stalled = 0u32;
+        while stalled < CAPTURE_STALL_PAUSES
+            && self.list.iter().any(|c| c.supply == Supply::Pending)
+        {
+            std::thread::sleep(Duration::from_millis(CAPTURE_PAUSE_MS));
+            let mut restored = false;
+            for i in 0..self.list.len()
+            {
+                let Some(chunk) = self
+                    .list
+                    .get(i)
+                    .copied()
+                    .filter(|c| c.supply == Supply::Pending)
+                else
+                {
+                    continue;
+                };
+                let mut again = Self {
+                    list: Vec::new(),
+                    filled: self.filled,
+                };
+                again.walk(ctx, memmgr_badge, (chunk.va, chunk.end()), data)?;
+                self.filled = again.filled;
+                // A chunk memmgr names no more holds nothing to capture.
+                let now = again
+                    .list
+                    .into_iter()
+                    .find(|c| c.va == chunk.va)
+                    .unwrap_or(Chunk {
+                        backed: 0,
+                        supply: Supply::Absent,
+                        ..chunk
+                    });
+                restored |= now.supply != Supply::Pending;
+                if let Some(slot) = self.list.get_mut(i)
+                {
+                    *slot = now;
+                }
+            }
+            stalled = if restored
+            {
+                0
+            }
+            else
+            {
+                stalled.saturating_add(1)
+            };
+        }
+        Ok(())
+    }
 }
 
 /// The mapped pages of the space `thread` executes in, below `top`, the top
@@ -230,17 +509,19 @@ fn list(thread: u64, top: u64) -> Result<Listing, u64>
 }
 
 /// Copy every page of `runs` but those of `PAGE_RUN_NO_COPY` runs into the
-/// data frames, in address order, each into the next data page; a page whose
-/// copy fails takes none. Returns the addresses of those pages, ascending.
+/// data frames, in address order, each into the next data page from `first`;
+/// a page whose copy fails takes none. Returns the addresses of those pages,
+/// ascending.
 fn copy(
     thread: u64,
     runs: &[PageRun],
+    first: u64,
     data: &Grants<'_>,
     window: &mut Window,
 ) -> Result<Vec<u64>, u64>
 {
     let mut failed = Vec::new();
-    let mut dst = 0u64;
+    let mut dst = first;
     for run in runs.iter().filter(|r| r.prot & PAGE_RUN_NO_COPY == 0)
     {
         for i in 0..run.pages
@@ -254,8 +535,7 @@ fn copy(
             match unsafe { syscall::thread_read_mem_raw(thread, va, page, MAX_THREAD_MEM_COPY) }
             {
                 Ok(_) => dst = dst.saturating_add(1),
-                // A page unmapped since the listing, memmgr having evicted it
-                // again: recorded absent.
+                // A page unmapped since the listing: recorded absent.
                 Err(e) if e == SyscallError::InvalidAddress as i64 =>
                 {
                     failed
@@ -441,6 +721,55 @@ impl<'a> Grants<'a>
             .saturating_sub(rest.iter().fold(0, |n, g| n.saturating_add(g.pages)));
         release(self.account, rest);
         self.list.truncate(first);
+    }
+
+    /// The grants from the one holding page `index` of the grants, at most
+    /// as many as a message carries, and the page's offset in the first: none
+    /// when the grants hold no page `index`.
+    fn at_page(&self, index: u64) -> (&[Grant], u64)
+    {
+        let mut base = 0u64;
+        for (i, grant) in self.list.iter().enumerate()
+        {
+            if index < base.saturating_add(grant.pages)
+            {
+                let end = i.saturating_add(MSG_CAP_SLOTS_MAX).min(self.list.len());
+                return (
+                    self.list.get(i..end).unwrap_or(&[]),
+                    index.saturating_sub(base),
+                );
+            }
+            base = base.saturating_add(grant.pages);
+        }
+        (&[], 0)
+    }
+
+    /// Whether the grants one request carries from page `index` ([`at_page`])
+    /// hold `count` pages from it.
+    fn holds(&self, index: u64, count: u64) -> bool
+    {
+        let (grants, offset) = self.at_page(index);
+        grants
+            .iter()
+            .fold(0u64, |n, g| n.saturating_add(g.pages))
+            .saturating_sub(offset)
+            >= count
+    }
+
+    /// The first page of the grant after the one holding page `index`: the
+    /// grants' pages when it is in the last, or past them.
+    fn next_grant(&self, index: u64) -> u64
+    {
+        let mut end = 0u64;
+        for grant in &self.list
+        {
+            end = end.saturating_add(grant.pages);
+            if index < end
+            {
+                return end;
+            }
+        }
+        self.pages.max(index.saturating_add(1))
     }
 
     /// The grant holding page `index` of the grants, and the page's offset in

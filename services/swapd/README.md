@@ -58,9 +58,10 @@ its bounds), the reply to a held fault for each `SWAP_RESTORE` outcome, the bloc
 write-out's sweep, back-off and full partition. The svctest `swapd` phase drives swapd end to end on
 both architectures with a swap partition in `disk.img`: under pressure it writes chunks out, a fault
 on a chunk on disk is restored with its pattern intact, a `MAKE_RESIDENT` of chunks on disk is
-served through the want thread, the storage path's pages are never evicted, memmgr serves faults,
-grants and `MAKE_RESIDENT` while a write and a restore are in flight, and a restarted swapd restores
-the chunks an earlier instance wrote (services/svctest/README.md).
+served through the want thread, and so is a `SNAPSHOT` of a process with chunks on disk, which is
+complete, the storage path's pages are never evicted, memmgr serves faults, grants and
+`MAKE_RESIDENT` while a write and a restore are in flight, and a restarted swapd restores the chunks
+an earlier instance wrote (services/svctest/README.md).
 
 ---
 

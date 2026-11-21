@@ -238,6 +238,17 @@ pub fn send_destroy(process_handle: u64, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) };
 }
 
+/// procmgr's `QUERY_PROCESS` answer for the child `process_handle` names:
+/// its state word and its reason word
+/// (`ipc::procmgr_process_state`); `None` for a failed or refused call.
+pub fn query_process(process_handle: u64, ipc_buf: *mut u64) -> Option<(u64, u64)>
+{
+    let msg = IpcMessage::new(procmgr_labels::QUERY_PROCESS);
+    // SAFETY: every caller passes devmgr's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }.ok()?;
+    (reply.label == ipc::procmgr_errors::SUCCESS).then(|| (reply.word(0), reply.word(1)))
+}
+
 /// Have procmgr bind `eq` as a terminal-end death observer on the address
 /// space of the child `process_handle` names, with `correlator`
 /// (`procmgr_labels::BIND_DEATH_OBSERVER`), through a `POST` copy of `eq`

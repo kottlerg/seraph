@@ -300,7 +300,7 @@ devmgr's responsibilities are:
      VirtIO reset for a device whose status byte no delivered BAR holds, is
      never confirmed.
   5. devmgr sends `DESTROY_PROCESS` on the driver's process handle, which it
-     keeps for the rest of the boot; procmgr tears a live driver down, and a
+     keeps while the driver is served; procmgr tears a live driver down, and a
      dead one it has reaped already is a no-op. Every driver of a DMA
      declaration is created `CREATE_DMA_HOLD`, so procmgr holds the driver's
      memory on its memmgr record, out of the free pool, whether the driver
@@ -356,8 +356,8 @@ devmgr's responsibilities are:
   § Removal). A
   withdrawn driver of a platform record has its copies of the record's caps
   revoked, the `Mmio`, `IoPort`, and wired-line caps devmgr carved and keeps,
-  and is destroyed through its process handle while devmgr still keeps it (until
-  its batch settles); none of them drives a DMA-capable device, and none is
+  and is destroyed through its process handle, which devmgr keeps while the
+  driver is served; none of them drives a DMA-capable device, and none is
   created `CREATE_DMA_HOLD`.
 
   Every svctest boot runs this order on PCI functions without DMA: its
@@ -790,10 +790,14 @@ second, which names a driver already dead or withdrawn. A `SYS_THREAD_EXIT` of t
 posts only the thread observer, since the kernel fires an address space's observers on a terminal
 end alone, so neither observer covers the other. A served driver that dies is restarted as § Driver
 Restart describes (the supervision hierarchy is in
-[docs/supervision.md](../../../docs/supervision.md)). After
-discovering a device, devmgr requests procmgr to create the driver process and then delegates
-the per-device capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
-[`drivers/README.md`](../../drivers/README.md) for the driver model.
+[docs/supervision.md](../../../docs/supervision.md)), on the exit reason procmgr gives the driver's
+process (`QUERY_PROCESS` on the process handle devmgr keeps for every served driver, answered
+`EXITED`), the post's own reason when the call fails or procmgr answers otherwise: a post can be
+the end of the main thread alone, which is the process's end only when it is the first terminal end
+of any of its threads ([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)
+§ Exit reason). After discovering a device, devmgr requests procmgr to create the driver process
+and then delegates the per-device capability set via IPC. Drivers MUST NOT be started
+independently of devmgr. See [`drivers/README.md`](../../drivers/README.md) for the driver model.
 
 ---
 
@@ -846,8 +850,9 @@ Restart](../../../docs/device-management.md#iommu-driver-restart)).
 
 The death is restarted when every check passes, in this order:
 
-1. **A fault or a kill.** The exit reason is `EXIT_FAULT_BASE` or above. A driver that exits with
-   a code of its own has decided to stop serving, and is not restarted.
+1. **A fault or a kill.** The driver process's exit reason, as procmgr gives it on the process
+   handle (the post's own reason when that fails), is `EXIT_FAULT_BASE` or above. A driver that
+   exits with a code of its own has decided to stop serving, and is not restarted.
 2. **Not declined.** The driver's consumer has not declined its restart (§ Root disk below).
 3. **Installed.** `SET_DRIVERS_DIR` has installed the drivers directory, and the driver's install
    path is an entry of it. A boot module is named by its install path

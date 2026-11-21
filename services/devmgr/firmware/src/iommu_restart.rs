@@ -30,6 +30,8 @@ use core::fmt;
 
 use syscall_abi::EXIT_FAULT_BASE;
 
+use crate::restart::Death;
+
 /// Why the IOMMU driver is not restarted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal
@@ -56,15 +58,16 @@ impl fmt::Display for Refusal
     }
 }
 
-/// Whether the death of the IOMMU driver, with exit reason `reason`, may be
-/// followed by a restart: a fault or a kill (`EXIT_FAULT_BASE` and above)
-/// may, an exit of its own may not.
+/// Whether the death of the IOMMU driver, `death`, may be followed by a
+/// restart: a fault or a kill (`EXIT_FAULT_BASE` and above, read from
+/// [`Death::reason`], the reason procmgr gives the process) may, an exit of
+/// its own may not.
 ///
 /// # Errors
 /// [`Refusal::Exited`].
-pub fn after_death(reason: u64) -> Result<(), Refusal>
+pub fn after_death(death: Death) -> Result<(), Refusal>
 {
-    if reason < EXIT_FAULT_BASE
+    if death.reason() < EXIT_FAULT_BASE
     {
         return Err(Refusal::Exited);
     }
@@ -636,10 +639,36 @@ mod tests
     #[test]
     fn only_a_fault_or_a_kill_is_followed_by_a_restart()
     {
-        assert_eq!(after_death(0), Err(Refusal::Exited));
-        assert_eq!(after_death(EXIT_FAULT_BASE - 1), Err(Refusal::Exited));
-        assert_eq!(after_death(EXIT_FAULT_BASE), Ok(()));
-        assert_eq!(after_death(u64::MAX), Ok(()));
+        let posted = |reason| Death {
+            posted: reason,
+            answer: None,
+        };
+        assert_eq!(after_death(posted(0)), Err(Refusal::Exited));
+        assert_eq!(
+            after_death(posted(EXIT_FAULT_BASE - 1)),
+            Err(Refusal::Exited)
+        );
+        assert_eq!(after_death(posted(EXIT_FAULT_BASE)), Ok(()));
+        assert_eq!(after_death(posted(u64::MAX)), Ok(()));
+    }
+
+    #[test]
+    fn the_restart_follows_the_reason_procmgr_gives_the_process()
+    {
+        use ipc::procmgr_process_state::EXITED;
+
+        // The main thread's sys_thread_exit posted 0; another thread's fault
+        // ended the process.
+        let fault = Death {
+            posted: 0,
+            answer: Some((EXITED, EXIT_FAULT_BASE + 14)),
+        };
+        assert_eq!(after_death(fault), Ok(()));
+        let exited = Death {
+            posted: EXIT_FAULT_BASE + 14,
+            answer: Some((EXITED, 0)),
+        };
+        assert_eq!(after_death(exited), Err(Refusal::Exited));
     }
 
     #[test]

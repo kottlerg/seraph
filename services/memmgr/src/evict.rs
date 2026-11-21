@@ -1403,8 +1403,12 @@ pub(crate) fn read_store(l: &mut MemLedger, entry: ChunkEntry, dst: &mut [u8]) -
 /// `rec`, whose runs hold them (a resident chunk, one being evicted, or a raw
 /// one), in page order, into `dst`, for a raw chunk's write (`crate::disk`)
 /// or a capture (`crate::capture`): its runs mapped at the stream window,
-/// each at its offset in the chunk. Returns the bytes copied, or `None`, nothing copied, when
-/// the chunk has no region, a map fails, or they do not fit `dst`.
+/// each at its offset in the chunk. A resident chunk's pages the process maps:
+/// the capture's caller holds its space (`SYS_ASPACE_HOLD`), so no thread of
+/// it writes them, but a device may, and the copy reads each page word by word
+/// with volatile reads, taking what stands. Returns the bytes copied, or
+/// `None`, nothing copied, when the chunk has no region, a map fails, or they
+/// do not fit `dst`.
 pub(crate) fn read_raw(
     l: &mut MemLedger,
     rec: NodeIdx,
@@ -1445,10 +1449,16 @@ pub(crate) fn read_raw(
         for (page, to) in held.zip(out.iter_mut())
         {
             let from = STREAM_VA.saturating_add(u64::from(page).saturating_mul(PAGE_SIZE));
-            // SAFETY: each backed page of the chunk lies in one of its runs,
-            // mapped above at its offset in the stream window; nothing writes
-            // the pages, which no process maps, while they are read.
-            to.copy_from_slice(unsafe { &*(from as *const [u8; PAGE_BYTES]) });
+            for (word, bytes) in to.as_chunks_mut::<8>().0.iter_mut().enumerate()
+            {
+                let at = from.saturating_add((word as u64).saturating_mul(8));
+                // SAFETY: each backed page of the chunk lies in one of its
+                // runs, mapped above at its offset in the stream window, and
+                // `at` is an aligned word of it. A process or a device that
+                // maps the page may write it meanwhile: the volatile read makes
+                // no reference to it and takes the word as it stands.
+                *bytes = unsafe { core::ptr::read_volatile(at as *const u64) }.to_ne_bytes();
+            }
         }
         bytes
     });

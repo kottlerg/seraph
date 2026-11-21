@@ -640,7 +640,9 @@ pub const MAKE_PRIVATE: u64 = 30;
 /// and decoded from its store when it is compressed. It maps nothing into the
 /// process, draws no frame, and evicts nothing. A chunk on disk it posts to
 /// the swap service, as [`MAKE_RESIDENT`] does, and reports pending; a lost
-/// one, or one on disk with no swap service to ask, it reports absent.
+/// one, one on disk with no swap service to ask, and one it cannot read (its
+/// stored bytes fail to decode, or its frames or store runs cannot be mapped)
+/// it reports absent.
 ///
 /// Wire format (`crate::memmgr_capture`):
 /// * `data[0]` — the process's memmgr badge (from its `REGISTER_PROCESS`

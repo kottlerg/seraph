@@ -45,7 +45,8 @@ pub const SNAPSHOT_COMPLETE: u64 = 1 << 0;
 /// for one of these reasons only: its demand chunk was on disk and the swap
 /// service did not restore it within the capture's wait (none registered, it
 /// did not answer, or it is the held target or waits on it); its chunk was
-/// lost; its chunk's stored bytes failed to decode; or it is a listed page
+/// lost; its chunk's stored bytes failed to decode, or memmgr could not map
+/// its frames or store runs to read them; or it is a listed page
 /// outside the chunks whose copy failed
 /// (`services/procmgr/docs/ipc-interface.md` § Snapshot object layout).
 pub const RUN_ABSENT: u64 = 1 << 8;

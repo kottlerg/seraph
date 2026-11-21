@@ -361,7 +361,9 @@ impl Dest<'_>
             // in it.
             if unsafe { map_self(l, cap, va, offset, pages) }.is_err()
             {
-                unmap_scrub(mapped);
+                // A map that failed part way leaves the span's first pages
+                // mapped: unmap them with the spans before it.
+                unmap_scrub(mapped.saturating_add(pages));
                 return None;
             }
             mapped = mapped.saturating_add(pages);

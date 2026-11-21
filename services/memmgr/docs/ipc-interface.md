@@ -1543,7 +1543,7 @@ counting those it posted.
 | data[1] | the destination pages written; with `CAPTURE_COUNT`, the backed pages of the evicted chunks walked |
 | data[2] | the destination pages the chunk at `data[0]` needs, when the walk stopped for want of them, else 0; with `CAPTURE_COUNT`, the chunks on disk walked whose slot word memmgr posted |
 | data[3] | the count of descriptors, at most `DESCRIPTORS_MAX` (16); absent with `CAPTURE_COUNT` |
-| data[4 + 2i], data[5 + 2i] | descriptor `i` (`ipc::memmgr_capture::Descriptor`): the chunk's base; then its backed pages in bits 0 to 15, one bit a page, its page count in bits 16 to 23, its region's `MAP_*` protection in bits 24 to 31, and what memmgr did with it in bits 32 and 33: `SUPPLIED` (0, its backed pages written, in page order, after the chunk's before it), `PENDING` (1, on disk, its slot word posted to the swap service), or `ABSENT` (2: lost, on disk with no swap service to ask, or its stored bytes failed to decode) |
+| data[4 + 2i], data[5 + 2i] | descriptor `i` (`ipc::memmgr_capture::Descriptor`): the chunk's base; then its backed pages in bits 0 to 15, one bit a page, its page count in bits 16 to 23, its region's `MAP_*` protection in bits 24 to 31, and what memmgr did with it in bits 32 and 33: `SUPPLIED` (0, its backed pages written, in page order, after the chunk's before it), `PENDING` (1, on disk, its slot word posted to the swap service), or `ABSENT` (2: lost, on disk with no swap service to ask, its stored bytes failed to decode, or memmgr could not map its frames or store runs to read them) |
 
 **Error codes:**
 

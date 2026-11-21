@@ -1658,7 +1658,8 @@ content the object does not hold. A page is absent for one of these reasons, and
   is registered with a want Notification, it did not answer, or it is the held target or waits on
   it;
 - its chunk was lost, its swap slot's bytes having failed authentication;
-- its chunk's stored bytes failed to decode;
+- its chunk's stored bytes failed to decode, or memmgr could not map the chunk's frames or store
+  runs to read them;
 - it is a listed page outside the chunks whose copy failed.
 
 An absent run of a chunk carries the chunk's protection as a supplied one does; an absent listed

@@ -508,18 +508,23 @@ Seraph boots via its own UEFI bootloader on both architectures. This requires
 UEFI firmware in QEMU — SeaBIOS cannot load UEFI applications.
 
 **x86-64:** Requires OVMF (`edk2-ovmf` / `ovmf` / `edk2-x86_64-code.fd`,
-distro-dependent). `cargo xtask run` searches per-platform default paths
-(Linux FHS, macOS Homebrew, BSD ports), or honours the `SERAPH_OVMF_CODE`
-env var for direct override on non-FHS or unsupported hosts. The bootloader
+distro-dependent): a code image and the variable-store template of the same build.
+`cargo xtask run` searches per-platform default paths (Linux FHS, macOS Homebrew, BSD ports)
+for the pair, or honours `SERAPH_OVMF_CODE` and `SERAPH_OVMF_VARS`, an all-or-nothing pair,
+for direct override on non-FHS or unsupported hosts. The bootloader
 `.efi` reaches OVMF via the GPT image's ESP partition, attached to the
 guest as a virtio-blk-pci device.
 
 **RISC-V:** Requires `edk2-riscv64` firmware. `cargo xtask run` searches
 per-platform default paths and pads `RISCV_VIRT_CODE.fd` / `RISCV_VIRT_VARS.fd`
-to 32 MiB in cached copies under `target/xtask/firmware/riscv/` (the code image
-regenerated only when stale, the vars template re-copied every launch); QEMU virt
-≥ 9.0 requires exactly 32 MiB. `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS` override discovery;
-they are an all-or-nothing pair (setting only one is rejected).
+to 32 MiB in cached copies under `target/xtask/firmware/riscv/`, regenerated only when
+stale; QEMU virt ≥ 9.0 requires exactly 32 MiB. `SERAPH_RISCV_CODE` and `SERAPH_RISCV_VARS`
+override discovery; they are an all-or-nothing pair (setting only one is rejected).
+
+**Variable store:** every launch, on both architectures, boots on a writable variable store of
+its own, a fresh copy of the firmware's template beside the read-only code image, so no launch
+sees a variable another wrote; the `rollback` case keeps one store across its boots
+([xtask/README.md](../xtask/README.md#environment-variables)).
 
 **TPM (opt-in):** `cargo xtask test tpm` (x86-64) attaches a TPM 2.0 to the guest, QEMU's
 `tpm-tis` or `tpm-crb` device backed by `swtpm`, a software TPM 2.0 emulator, which it

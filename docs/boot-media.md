@@ -191,8 +191,8 @@ The model sets these constraints for work it does not design. Each is met by the
   needs to be on a machine, since nothing is signed there
   ([#1073](https://github.com/kottlerg/seraph/issues/1073)).
 - **Anti-rollback and enrolment.** A composed ESP is as old as the installed files it copies, so
-  the floor that refuses an older image is not state composition writes
-  ([#1070](https://github.com/kottlerg/seraph/issues/1070)); nor is a root enrolled without
+  the floor that refuses an older image is not state composition writes: the bootloader keeps it in
+  firmware storage ([signing.md](signing.md) § Rollback Floor). Nor is a root enrolled without
   rebuilding the bootloader ([#1074](https://github.com/kottlerg/seraph/issues/1074)).
 
 ---

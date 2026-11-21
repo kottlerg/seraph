@@ -659,6 +659,27 @@ its deadline. The images are packed again from the sysroot afterwards, whatever 
 deadlines and the logs. CI runs it in each usertest cell after the `terminal` case, in the cell's
 profile.
 
+### Rollback floor (`rollback` case)
+
+The bootloader keeps the machine's security floor in a boot-services-only UEFI variable
+([signing.md](signing.md) § Rollback Floor), which only a boot after another on the same variable
+store can show. `cargo xtask test rollback [--arch] [--release]` (both arches) boots the current
+sysroot three times on one store, a copy of the firmware's template kept across the three boots,
+with the build's trust store floor `F`:
+
+1. `first`: the sysroot's images. The bootloader finds no floor and writes `F`.
+2. `raised`: a bootloader built under the build's trust store with the floor `F + 1`, with the
+   kernel and every bundle entry signed again at security version `F + 1`. It finds `F` and
+   raises the floor to `F + 1`.
+3. `older`: the sysroot's images again. The bootloader finds `F + 1` above its store's `F` and
+   refuses itself.
+
+A boot passes when every line it owes appears; a boot after a failed one is not made. A firmware
+that refuses the write is covered by the bootloader's host tests, since no QEMU firmware refuses
+it on demand. See [xtask/README.md § The `rollback` case](../xtask/README.md#the-rollback-case)
+for the lines and the logs. CI runs it in each usertest cell after the `signing` case, in the
+cell's profile.
+
 ### GDB stub (`debug-port` case)
 
 The GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) debugs a guest process
@@ -930,15 +951,16 @@ service (see Crash reports above).
 CI matrix cells follow these rules per boot. The `usertest` cell runs its boots in sequence:
 `usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
 default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
-`terminal` case's boot, the `signing` case's four boots, the `wedge` case's boot pair, on x86_64
-the `vmgenid` case's save/restore boot pair, and the `shutdown` case's boots, nine on x86_64 (the
-reboot, the power button and the seven core deaths) and eight on riscv64. The `ktest` cell's cases
-are the `kaslr` case's three boots; the `svctest` cell has none. The terminal and wedge boots have
-*no* shutdown-invoking harness: the `terminal` and `wedge` cases compute the verdict host-side and
-kill QEMU themselves. The reboot boot's fixture invokes `REBOOT`, the host reads the reset over
-QMP, and QEMU exits on its own. Each core-death boot is powered off by the death it makes, read over
-QMP, and QEMU exits on its own. The power-button boot is powered off by its press: the host presses
-the button over QMP, reads the power-off there, and QEMU exits on its own.
+`terminal` case's boot, the `signing` case's four boots, the `rollback` case's three boots, the
+`wedge` case's boot pair, on x86_64 the `vmgenid` case's save/restore boot pair, and the `shutdown`
+case's boots, nine on x86_64 (the reboot, the power button and the seven core deaths) and eight on
+riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the `svctest` cell has none.
+The terminal and wedge boots have *no* shutdown-invoking harness: the `terminal` and `wedge` cases
+compute the verdict host-side and kill QEMU themselves. The reboot boot's fixture invokes `REBOOT`,
+the host reads the reset over QMP, and QEMU exits on its own. Each core-death boot is powered off by
+the death it makes, read over QMP, and QEMU exits on its own. The power-button boot is powered off
+by its press: the host presses the button over QMP, reads the power-off there, and QEMU exits on its
+own.
 
 ---
 

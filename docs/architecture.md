@@ -198,9 +198,9 @@ live in the component scope:
 Boot modules (the files the init harness's bundle list of the architecture in
 [`rootfs/config/bundle/`](../rootfs/config/bundle/) names: procmgr, memmgr,
 devmgr, vfsd, virtio-blk, fatfs, the architecture's IOMMU driver, iommu-vtd on
-x86-64 and iommu-riscv on riscv64, and the log-level configuration),
-each named by its install path (`/services/drivers/virtio-blk`) and copied
-from its installed file, are packed into
+x86-64 and iommu-riscv on riscv64, the log-level configuration, and the boot-time policy
+`/config/boot/policy.conf`), each named by its install path (`/services/drivers/virtio-blk`) and
+copied from its installed file, are packed into
 `\EFI\seraph\bootstrap.bundle` by every pack of the disk image (see
 [`xtask/README.md`](../xtask/README.md) for the producer side and
 [`abi/boot-protocol`](../abi/boot-protocol/README.md)'s

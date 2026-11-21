@@ -626,8 +626,9 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
 5. Return every chunk-table node, every region node, the commitment node of
    each committed region, the record's own node, and its caps node to the
    arena free list, and drop the record's reference
-   to its budget node, which is freed with it unless a deferred run, a grant
-   another process holds or a memory object's frames are still charged to it.
+   to its budget node, which is freed with it unless a node below it refers
+   to it, or a deferred run, a grant another process holds or a memory
+   object's frames are still charged to it.
 6. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
@@ -1165,14 +1166,14 @@ no other way: it only signals, and kills nothing.
 **Levels.** The level is computed from the free pool's pages outside `promised` ([Commit](#commit)),
 deferred pages excluded, against `pool_total`. It is `CRITICAL` at or below the growth floor, the
 system reserve and, while chunks of uncommitted regions are swapped, the restore headroom (§
-Distribution policy; § Eviction, Restore headroom), where a grant to a process outside the reserve
-is refused; `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A worse
-level applies at once. A better one applies only once the free pool clears that level's threshold by
-a hysteresis band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a pool that
-hovers at a threshold does not flip the level on every turn: the level becomes the one the free pool
-less the band gives, and no worse than before. The constants are tuning values proportional to RAM
-([docs/limits.md](../../../docs/limits.md) § memmgr); the computation is the host-tested `free-pool`
-module `pressure`.
+Distribution policy; § Eviction, Restore headroom), where a grant charged to a node outside the
+reserve is refused; `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A
+worse level applies at once. A better one applies only once the free pool clears that level's
+threshold by a hysteresis band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a
+pool that hovers at a threshold does not flip the level on every turn: the level becomes the one the
+free pool less the band gives, and no worse than before. The constants are tuning values
+proportional to RAM ([docs/limits.md](../../../docs/limits.md) § memmgr); the computation is the
+host-tested `free-pool` module `pressure`.
 
 **Signal.** A process registers a Notification cap and the bits to send on it with
 `REGISTER_PRESSURE` ([ipc-interface.md](ipc-interface.md) § Label 11), one mask for a change of

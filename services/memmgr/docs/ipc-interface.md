@@ -628,9 +628,9 @@ evicted or restored. `largest_free_bytes`
 `DEMAND_CHUNK_PAGES` pages while `data[3]` is not zero, a demand fault is
 backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
 (`data[6]`) is `pool_total / 64` pages. `growth_floor_bytes` (`data[11]`) is
-the reserve while nothing is swapped: a process outside the reserve has its
-grants refused, and its demand faults declined, once `data[17]` less the
-request would fall below it, and the level is
+the reserve while nothing is swapped: a grant charged to a node outside the
+reserve is refused, and a demand fault of a process outside the reserve
+declined, once `data[17]` less the request would fall below it, and the level is
 `PRESSURE_CRITICAL` at or below it. `pressure` (`data[7]`) is the
 level memmgr last signalled to the `REGISTER_PRESSURE` registrants, so a
 registrant woken by its bit reads here the level the bit announced, or a later

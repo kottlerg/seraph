@@ -329,6 +329,59 @@ impl Command
         self.args.iter().position(|arg| arg.id == id)
     }
 
+    /// Its name with those of the commands above it (`xtask orch grant`).
+    #[must_use]
+    pub fn path(&self) -> &str
+    {
+        &self.path
+    }
+
+    /// Its subcommands.
+    #[must_use]
+    pub fn children(&self) -> &[Command]
+    {
+        &self.subcommands
+    }
+
+    /// The subcommand `name`.
+    #[must_use]
+    pub fn child(&self, name: &str) -> Option<&Command>
+    {
+        self.subcommands.iter().find(|sub| sub.name == name)
+    }
+
+    /// Whether it takes the long option `--name`, and with it a value:
+    /// `None` when it has no such option. `--help` is every command's.
+    #[must_use]
+    pub fn long_takes_value(&self, name: &str) -> Option<bool>
+    {
+        if name == "help"
+        {
+            return Some(false);
+        }
+        self.find_long(name)
+            .and_then(|at| self.args.get(at))
+            .map(|arg| arg.kind != Kind::Flag)
+    }
+
+    /// The values its first positional accepts, with that positional's value
+    /// name; `None` when its first positional takes any value, or it has none.
+    #[must_use]
+    pub fn first_positional_values(&self) -> Option<(String, Vec<&str>)>
+    {
+        let arg = self.args.iter().find(|arg| arg.is_positional())?;
+        if arg.possible.is_empty()
+        {
+            return None;
+        }
+        let values = arg
+            .possible
+            .iter()
+            .map(|value| value.name.as_str())
+            .collect();
+        Some((arg.value_name_text(), values))
+    }
+
     /// Set each command's path below this one's.
     fn set_paths(&mut self)
     {

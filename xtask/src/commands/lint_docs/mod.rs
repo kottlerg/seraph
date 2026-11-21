@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/lint_docs.rs
+// xtask/src/commands/lint_docs/mod.rs
 
 //! Lint-docs command: mechanical checks of the documentation and source-header
 //! rules in `docs/coding-standards.md` and `docs/documentation-standards.md`.
@@ -10,10 +10,16 @@
 //! per violation; any error-level diagnostic fails the command. The rules
 //! check only what a script can decide: column widths, header layout, the
 //! `## Summarized By` section's shape, forward links, order, and labels, document
-//! reachability, and that every name docs/testing.md § Coverage tiers lists
-//! for its surface screens still names code, a file, or a directory in the
-//! tree. Whether a passage is a summary, or any other statement matches the
-//! code, stays with the pre-merge review.
+//! reachability, that every name docs/testing.md § Coverage tiers lists for its
+//! surface screens still names code, a file, or a directory in the tree, that
+//! the documents stating the case registry of `cargo xtask test` state it as it
+//! is ([`cells`]), and that every `cargo xtask` command line names a command,
+//! case, and option the command table has ([`commands`]). Whether a passage is
+//! a summary, or any other statement matches the code, stays with the pre-merge
+//! review.
+
+mod cells;
+mod commands;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -61,6 +67,8 @@ const RULES: &[(&str, Level)] = &[
     ("md-summarized-by-label", Level::Error),
     ("md-reachable", Level::Error),
     ("md-coverage-symbols", Level::Error),
+    ("md-test-cells", Level::Error),
+    ("xtask-commands", Level::Error),
     ("md-bare-cite", Level::Warning),
 ];
 
@@ -124,6 +132,9 @@ pub fn run(ctx: &BuildContext, _args: &LintDocsArgs) -> Result<()>
     diags.extend(check_summarized_by(&pat, &markdown));
     diags.extend(check_reachable(&pat, &markdown));
     diags.extend(check_coverage_symbols(&markdown, &sources, &paths));
+    diags.extend(cells::check(&markdown));
+    let commands: Vec<&SourceFile> = files.iter().collect();
+    diags.extend(commands::check(&commands));
 
     report(&diags)
 }
@@ -179,7 +190,7 @@ fn read_files(root: &Path, paths: &[String]) -> Result<Vec<SourceFile>>
     let mut files = Vec::new();
     for path in paths
     {
-        if !(is_markdown(path) || is_source(path))
+        if !(is_markdown(path) || is_source(path) || commands::reads(path))
         {
             continue;
         }
@@ -306,15 +317,24 @@ fn check_bare_cites(pat: &Patterns, file: &SourceFile) -> Vec<Diagnostic>
     diags
 }
 
-/// Lines outside fenced code blocks, with their zero-based index. A fence
-/// opens with a run of three or more backticks or tildes (a backtick run whose
-/// info string contains a backtick is not a fence) and closes only on a run of
-/// the same character at least as long with nothing after it but whitespace (a
-/// line carrying an info string is content).
+/// Lines outside fenced code blocks, with their zero-based index.
 fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)>
 {
+    marked_lines(text)
+        .filter(|&(_, _, prose)| prose)
+        .map(|(idx, line, _)| (idx, line))
+}
+
+/// Every line with its zero-based index and whether it is prose: outside a
+/// fenced code block, and no fence's opening or closing line. A fence opens
+/// with a run of three or more backticks or tildes (a backtick run whose info
+/// string contains a backtick is not a fence) and closes only on a run of the
+/// same character at least as long with nothing after it but whitespace (a
+/// line carrying an info string is content).
+fn marked_lines(text: &str) -> impl Iterator<Item = (usize, &str, bool)>
+{
     let mut open: Option<(char, usize)> = None;
-    text.lines().enumerate().filter(move |(_, line)| {
+    text.lines().enumerate().map(move |(idx, line)| {
         let trimmed = line.trim_start();
         let fence = trimmed
             .chars()
@@ -324,7 +344,7 @@ fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)>
                 let after = trimmed.trim_start_matches(c);
                 (c, trimmed.chars().take_while(|x| *x == c).count(), after)
             });
-        match (open, fence)
+        let prose = match (open, fence)
         {
             (None, Some((c, n, after))) if n >= 3 && (c != '`' || !after.contains('`')) =>
             {
@@ -339,7 +359,8 @@ fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)>
             }
             (Some(_), _) => false,
             (None, _) => true,
-        }
+        };
+        (idx, line, prose)
     })
 }
 
@@ -933,9 +954,9 @@ const SURFACE_END: &str = "**Repeat count.**";
 /// launcher's disk options), which resolve in `xtask/` sources too.
 const DEVICE_START: &str = "**Device surfaces.**";
 
-/// This rule's own source, whose fixtures name items that exist nowhere else, so
-/// no listed name resolves in it.
-const LINT_SOURCE: &str = "xtask/src/commands/lint_docs.rs";
+/// The lint's own sources, whose fixtures name items that exist nowhere else, so
+/// no listed name resolves in them.
+const LINT_SOURCES: &str = "xtask/src/commands/lint_docs/";
 
 /// What a listed name must resolve to.
 #[derive(Debug, PartialEq, Eq)]
@@ -963,7 +984,7 @@ struct ListedName
     pattern: String,
     kind: NameKind,
     /// Whether the name is stated from the Device surfaces paragraph on, so a
-    /// symbol also resolves in `xtask/` sources other than `LINT_SOURCE`.
+    /// symbol also resolves in `xtask/` sources other than `LINT_SOURCES`.
     xtask: bool,
 }
 
@@ -1435,7 +1456,7 @@ struct Code
 {
     /// Every tracked Rust source outside `xtask/`.
     outside_xtask: String,
-    /// Every tracked Rust source in `xtask/` but `LINT_SOURCE`.
+    /// Every tracked Rust source in `xtask/` but `LINT_SOURCES`.
     xtask: String,
 }
 
@@ -1474,7 +1495,7 @@ fn check_coverage_symbols(
             .filter(|f| {
                 has_ext(&f.path, "rs")
                     && f.path.starts_with("xtask/") == in_xtask
-                    && f.path != LINT_SOURCE
+                    && !f.path.starts_with(LINT_SOURCES)
             })
             .map(|f| strip_line_comments(&f.text))
             .collect()
@@ -2020,7 +2041,10 @@ mod tests
                  // only_in_a_comment is named here and nowhere else.\n",
             ),
             md("xtask/src/x.rs", "fn only_in_xtask() {}\n"),
-            md(LINT_SOURCE, "fn only_in_the_lint() {}\n"),
+            md(
+                "xtask/src/commands/lint_docs/mod.rs",
+                "fn only_in_the_lint() {}\n",
+            ),
         ]
     }
 
@@ -2035,7 +2059,7 @@ mod tests
             "core/b/x86_tramp_entry.rs",
             "core/b/x86_trampoline.S",
             "xtask/src/x.rs",
-            LINT_SOURCE,
+            "xtask/src/commands/lint_docs/mod.rs",
             "services/blk/src/main.rs",
         ]
         .map(str::to_owned)

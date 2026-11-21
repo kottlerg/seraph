@@ -988,6 +988,33 @@ to the tiers below.
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
 | Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, the hotplug cell, the CET cell, and the TPM cell) once, whatever the release's PRs touched (see Release host runs below) |
 
+**Cells.** A cell is one launch configuration and the boots made on it; each differs from every
+other cell in that configuration, which is why it stands alone. The table states every cell, its
+tier, and what it alone covers; the paragraphs below and [Gating](#gating) give each one's
+commands, staging, and budget. Its Cases column lists the `cargo xtask test` cases the cell runs, as
+the case registry assigns them ([xtask/README.md](../xtask/README.md#cases)), a case on fewer
+architectures than its row's carrying them after its name: `cargo xtask lint-docs` fails when a
+registered case is missing, listed in another cell, or listed on other architectures than the
+registry runs it on (its `md-test-cells` rule).
+
+| Cell | Tier | Architectures | Launch | Cases | Covers |
+|---|---|---|---|---|---|
+| `svctest` | Canonical | x86_64, riscv64; debug, release | the main set with the test devices (`--test-devices`); svctest staged with its fixtures (`crasher`, `crasher-worker`, `crasher-boot`, `memhog`, `stopsrc`) | none | the services harness: the main set's drivers and the test devices, DMA confinement and MSI delivery, the filesystem, and the restart, out-of-memory, and stop-source paths its fixtures drive |
+| `usertest` | Canonical | x86_64, riscv64; debug, release | the main set; usertest staged with crashd's test recipe; vfsd at debug (`mkdisk --log-levels`) | `terminal`, `signing`, `wedge`, `vmgenid` (x86_64), `shutdown` | the programs surface, the crash reports of its boot ([Crash reports](#crash-reports)), the delivery of log levels ([Log levels](#log-levels-usertest-cell)), and what each case covers (Gating) |
+| `ktest` | Canonical | x86_64, riscv64; debug, release | the composed ktest bundle with the `mapredo` knob | `kaslr` | the kernel tests, the bootloader's redo of steps 6 and 7 ([Steps 6 and 7 redo](#steps-6-and-7-redo-ktest-cell)), and KASLR |
+| boundary | Local and release host runs | x86_64, riscv64; debug, and release at release runs | the ktest bundle at 16 and at 128 CPUs | none | the CPU-count surface (Boundary surface below) |
+| memory | Local and release host runs | x86_64 or riscv64; debug | the current sysroot at 4 CPUs and 1024 MiB | none | the memory surface (Memory surface below) |
+| 4kn | Local and release host runs | x86_64, riscv64; debug | svctest from a 4Kn disk (`mkdisk --block-size 4096`) | none | 4096-byte logical blocks (Disk variations below) |
+| second-disk | Local and release host runs | x86_64, riscv64; debug | svctest with `/data` on a second disk (`mkdisk --split-data`, `--second-disk`) | none | the data partition on its own disk |
+| shared-line | Local and release host runs | x86_64, riscv64; debug | as second-disk, both disks on one `INTx` line (`--second-disk-shared-line`) | none | two virtio-blk devices served on one interrupt line |
+| oversize-block | Local and release host runs | x86_64, riscv64; debug | svctest with a second disk at 8192-byte blocks (`--second-disk-block-size 8192`) | none | the refusal of a disk above virtio-blk's largest block size |
+| no-iommu | Local and release host runs | x86_64, riscv64; debug | svctest with the IOMMU detached (`--iommu absent`) | none | devmgr's unconfined path (Release host runs below) |
+| framebuffer | Local and release host runs | x86_64, riscv64; debug | svctest with QEMU std VGA and no window (`--display framebuffer`) | none | the framebuffer driver (Framebuffer cell below) |
+| debug-port | Local and release host runs | x86_64, riscv64; debug | the debug port's `virtio-console` device | `debug-port` | the virtio-console driver, the debug port, and the GDB stub (Debug-port cell below) |
+| hotplug | Local and release host runs | x86_64, riscv64; debug | two empty PCI Express root ports | `hotplug` | PCI Express hotplug (Hotplug cell below) |
+| cet | Local and release host runs | x86_64; debug | KVM on CET shadow stacks, the ktest bundle | `cet` | CET shadow stacks (CET cell below) |
+| tpm | Local and release host runs | x86_64; debug | a TPM 2.0 backed by `swtpm`, behind `tpm-tis` then `tpm-crb` | `tpm` | the TPM driver (TPM cell below) |
+
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
 ~32×. High `-smp` coverage is local by design, not an oversight. The local

@@ -205,8 +205,8 @@ The full memmgr IPC specification is in
 ## Sizing constants
 
 memmgr's bookkeeping is RAM-bound, not capped by a constant: free runs,
-process records, their budget nodes and the nodes' reclaim states, node handle states and limit
-registrations, memory
+process records, their budget nodes and the nodes' reclaim states, node handle states, their holder
+links and limit registrations, memory
 objects, per-process region, commitment and frame descriptors, and the regions' chunk-table nodes
 are nodes in a self-hosted metadata arena carved from memmgr's own pool, indexed by `u64` (see
 [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records are

@@ -404,7 +404,7 @@ process's entry until `PROCESS_DIED`.
 ## Metadata Arena
 
 All of memmgr's bookkeeping — free runs, deferred runs, process records and
-their budget nodes and the nodes' reclaim states, node handle states and limit
+their budget nodes and the nodes' reclaim states, node handle states, their holder links and limit
 registrations, per-process frame and region descriptors, and the regions' chunk tables — is
 nodes drawn from a self-hosted arena rather than fixed `.bss` arrays. memmgr
 is `no_std` and cannot bootstrap
@@ -412,7 +412,7 @@ a general heap against itself, but it *can* host fixed-size nodes in pages
 carved from its own pool:
 
 - Nodes are fixed-size `Slot`s (a tagged run, deferred run, budget, reclaim state, process,
-  process caps, node handle, limit registration, memory object, region,
+  process caps, node handle, holder link, limit registration, memory object, region,
   commitment, frame, chunk-directory, chunk, or free payload plus a `next`
   index)
   reached by a

@@ -279,9 +279,10 @@ one that would leave fewer free pages outside `promised` ([`memory-pool.md`](mem
 headroom; `memory-pool.md` § Distribution policy), charged to a node outside the reserve, or than
 none, fails as exhaustion, with code 1 or 2.
 
-A grant charged to a handle's node is the caller's grant in every other respect: it takes a region
-id of the caller's, `RELEASE_MEMORY_CAPS` and the caller's `PROCESS_DIED` return it, and each
-returns its charge to the node. The charge stays on the node when the node's handle state goes
+A grant charged to a handle's node is the caller's grant: it takes a region id of the caller's,
+`RELEASE_MEMORY_CAPS` and the caller's `PROCESS_DIED` return it, and each returns its charge to the
+node. `SEAL_OBJECT` refuses it (§ Label 27): an object outlives its sealer and could not return the
+charge. The charge stays on the node when the node's handle state goes
 (§ Node Handles).
 
 **Reply (error):**

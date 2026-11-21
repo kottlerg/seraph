@@ -791,16 +791,25 @@ struct StrayCapCase
     expected: u64,
 }
 
-/// Every label whose contract carries no caps, the two cap-carrying labels
-/// from a caller that is not procmgr, a forged `FAULT_LABEL`, and an unknown
-/// label. Each request is refused or has no lasting effect, so the flood
-/// changes no memmgr state but its `CSpace`.
-const STRAY_CAP_CASES: [StrayCapCase; 12] = [
-    // want_pages == 0.
+/// Every label whose contract carries no caps, `REQUEST_MEMORY_CAPS` and
+/// `REGISTER_DONATION_END`, whose handlers delete a refused `cap[0]`, the two
+/// procmgr-only cap-carrying labels from a caller that is not procmgr, a forged
+/// `FAULT_LABEL`, and an unknown label. Each request is refused or has no
+/// lasting effect, so the flood changes no memmgr state but its `CSpace`.
+const STRAY_CAP_CASES: [StrayCapCase; 13] = [
+    // want_pages == 0: `cap[0]` reaches the handler, which reads its badge
+    // and deletes it before it refuses.
     StrayCapCase {
         label: ipc::memmgr_labels::REQUEST_MEMORY_CAPS,
         words: [0, 0, 0],
-        kept: 0,
+        kept: 1,
+        expected: ipc::memmgr_errors::INVALID_ARGUMENT,
+    },
+    // Zero bits: `cap[0]` reaches the handler, which refuses and deletes it.
+    StrayCapCase {
+        label: ipc::memmgr_labels::REGISTER_DONATION_END,
+        words: [0, 0, 0],
+        kept: 1,
         expected: ipc::memmgr_errors::INVALID_ARGUMENT,
     },
     // count == 0: nothing to release.

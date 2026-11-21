@@ -275,6 +275,9 @@ Its steps, in order, under the dump's bound ([Bounds](#bounds)):
    capture, so a declaration the process made before the capture's hold is always seen. A process
    that declared itself on the core path (`DECLARE_NO_CORE`) gets no core: crashd replies
    `NO_CORE`. A process that ended before the attach gets `NOT_FOUND`, its declarations unknown.
+   One that declared itself undebuggable since the capture is refused as at step 3,
+   `SNAPSHOT_REFUSED` with procmgr's `NOT_ATTACHABLE` in `data[0]`, and any other refusal of the
+   attach, with its label, the same way; a failed call is `NOT_WRITTEN`.
    Through the process's main thread crashd then reads the image's ELF header at the load bias the
    snapshot's header records, for the core's `NT_AUXV` (`ipc::read_mem_resident_bounded`); a
    read that fails, the process having ended since the attach among the causes, leaves the core
@@ -285,8 +288,8 @@ Its steps, in order, under the dump's bound ([Bounds](#bounds)):
    from the object's pages, a window of 64 pages (`WINDOW_PAGES`) attached at a time, and renames
    it.
 7. It releases the object (`OBJECT_RELEASE`). Every path after a snapshot was taken releases it
-   before the reply, a refusal included, so no live core leaves the capture charged to the
-   account.
+   before the reply, a refusal and a request past its bound included, the release not bounded by
+   it, so no live core leaves the capture charged to the account.
 
 crashd replies `SUCCESS` with `data[0]` the process badge, `data[1]` the core's sequence number,
 `data[2]` its bytes, and `data[3]` `LIVE_CORE_COMPLETE` when the snapshot holds every page it

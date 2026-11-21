@@ -1553,7 +1553,7 @@ svctest itself.
 | label | `procmgr_labels::SNAPSHOT` (33) |
 | caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
 | `data[0]` | The target's process badge |
-| `caps[0]` | The sender's own memmgr SEND, the **account**: procmgr requests the snapshot's frames on it and seals them through it. procmgr deletes it, and any further cap the message carried, before it replies |
+| `caps[0]` | A memmgr SEND the sender presents, its own or one handed to it (crashd forwards its live-core requester's, services/crashd/docs/operation.md § Live Core), the **account**: procmgr requests the snapshot's frames on it and seals them through it. procmgr deletes it, and any further cap the message carried, before it replies |
 
 A debugger or a core writer that needs a consistent copy of a live process's memory asks for one
 here. procmgr finds the target under the table lock and derives copies of its `AddressSpace` cap,
@@ -1623,7 +1623,7 @@ it at one point in time only when every space that writes it is held too. A page
 capture could not take is absent (§ Snapshot object layout).
 
 Every frame of the object is granted on the account, so the snapshot is charged in full to the
-sender, as a seal leaves its frames charged to the sealer
+account, as a seal leaves its frames charged to the sealer
 ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#memory-objects) § Memory
 objects), and the target's usage does not change. procmgr's own cost is one capture's listing,
 thread state and layout on its heap, a heap refusal failing the capture, and the window's page

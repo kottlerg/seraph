@@ -362,7 +362,7 @@ fn hold_threads(
         {
             Ok(reply) => reply,
             Err(AttachFailed::Expired) => return Err(Outcome::Cancelled),
-            Err(AttachFailed::Refused) => return Err(Outcome::Failed("the attach was refused")),
+            Err(AttachFailed::Refused(_)) => return Err(Outcome::Failed("the attach was refused")),
         };
         let count = reply.word(0);
         let named = reply.word(procmgr_labels::ATTACH_WORD_NAMED_THREAD);

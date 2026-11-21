@@ -19,8 +19,11 @@ pub const NOT_FOUND: u64 = 3;
 /// memmgr's pressure level reads `CRITICAL`: a core's buffers and file
 /// writes would need pages, so crashd writes none.
 pub const MEMORY_CRITICAL: u64 = 4;
-/// procmgr refused the snapshot; `data[0]` carries its label
-/// (services/procmgr/docs/ipc-interface.md § Label 33: `SNAPSHOT`).
+/// procmgr refused the snapshot, or the attach crashd makes after it to read
+/// the process's declarations (`NOT_ATTACHABLE` when the process declared
+/// itself undebuggable since the capture); `data[0]` carries its label
+/// (services/procmgr/docs/ipc-interface.md § Label 33: `SNAPSHOT`, § Label
+/// 20: `ATTACH_PROCESS`).
 pub const SNAPSHOT_REFUSED: u64 = 5;
 /// The core was not written: the core directory, its budget, or a write
 /// failed. A `.part` file may remain until the next core.

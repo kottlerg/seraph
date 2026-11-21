@@ -567,8 +567,8 @@ struct Gathered
 /// Why [`attach`] returned no reply.
 pub(crate) enum AttachFailed
 {
-    /// procmgr refused, or the call failed.
-    Refused,
+    /// procmgr refused with this label, or the call failed (`None`).
+    Refused(Option<u64>),
     /// The calling thread's call deadline passed first.
     Expired,
 }
@@ -605,10 +605,10 @@ pub(crate) fn attach(
         Ok(r) =>
         {
             delete_caps(r.caps());
-            Err(AttachFailed::Refused)
+            Err(AttachFailed::Refused(Some(r.label)))
         }
         Err(e) if e == SyscallError::WouldBlock as i64 => Err(AttachFailed::Expired),
-        Err(_) => Err(AttachFailed::Refused),
+        Err(_) => Err(AttachFailed::Refused(None)),
     }
 }
 
@@ -638,7 +638,7 @@ fn gather(badge: u64, ip: u64, authority: u64, ipc_buf: *mut u64) -> Gathered
             out.status = Status::Timeout;
             return out;
         }
-        Err(AttachFailed::Refused) => return out,
+        Err(AttachFailed::Refused(_)) => return out,
     };
     out.status = Status::Complete;
     out.badge = reply.word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE);
@@ -679,7 +679,7 @@ fn gather(badge: u64, ip: u64, authority: u64, ipc_buf: *mut u64) -> Gathered
                 out.status = Status::Timeout;
                 None
             }
-            Err(AttachFailed::Refused) => None,
+            Err(AttachFailed::Refused(_)) => None,
         },
     };
     match thread

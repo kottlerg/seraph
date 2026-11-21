@@ -62,7 +62,7 @@ enum Fail
     /// The process declared that no core of it is written
     /// (`DECLARE_NO_CORE`).
     NoCore,
-    /// procmgr refused the snapshot with this label.
+    /// procmgr refused the snapshot, or the attach after it, with this label.
     Refused(u64),
     /// The core was not written, for this reason; a `.part` file may remain.
     NotWritten(&'static str),
@@ -322,18 +322,22 @@ impl Object
     /// pages go back to the account once no window attaches them.
     fn release(self, ipc_buf: *mut u64)
     {
-        // A release the deadline cut off leaves the object to the account's
-        // owner: memmgr drops it when the requester exits.
+        // The release is not bounded by the dump's deadline, as a window's
+        // detach is not: the handle is crashd's only one, so a request past
+        // its bound still returns the capture's pages to the account. An
+        // interrupted call is sent again; a second release of a released
+        // object is refused, and changes nothing.
         let msg = IpcMessage::new(memmgr_labels::OBJECT_RELEASE);
-        // SAFETY: ipc_buf is the registered IPC buffer page.
-        let _ = unsafe {
-            ipc::ipc_call_within(
-                self.handle,
-                &msg,
-                ipc_buf,
-                std::os::seraph::call_time_left(),
-            )
-        };
+        loop
+        {
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            match unsafe { ipc::ipc_call(self.handle, &msg, ipc_buf) }
+            {
+                Err(e) if e == SyscallError::Interrupted as i64 =>
+                {}
+                _ => break,
+            }
+        }
         let _ = syscall::cap_delete(self.handle);
     }
 }
@@ -492,14 +496,25 @@ fn read_layout(object: &Object, ipc_buf: *mut u64) -> Result<(Snapshot, Window),
 /// # Errors
 /// [`Fail::NoCore`] when the process declared no core; [`Fail::NotFound`]
 /// when it ended before the attach, its declarations then unknown;
-/// [`Fail::TimedOut`] when the bound passed first.
+/// [`Fail::Refused`] with procmgr's label when procmgr refused the attach
+/// otherwise (`NOT_ATTACHABLE` for a process that declared itself
+/// undebuggable since the capture); [`Fail::NotWritten`] when the call
+/// failed; [`Fail::TimedOut`] when the bound passed first.
 fn vet(process: u64, bias: u64, authority: u64, ipc_buf: *mut u64) -> Result<Option<Auxv>, Fail>
 {
     let reply = match crate::attach(process, 0, authority, ipc_buf)
     {
         Ok(reply) => reply,
         Err(crate::AttachFailed::Expired) => return Err(Fail::TimedOut),
-        Err(crate::AttachFailed::Refused) => return Err(Fail::NotFound),
+        Err(crate::AttachFailed::Refused(Some(procmgr_errors::INVALID_BADGE))) =>
+        {
+            return Err(Fail::NotFound);
+        }
+        Err(crate::AttachFailed::Refused(Some(label))) => return Err(Fail::Refused(label)),
+        Err(crate::AttachFailed::Refused(None)) =>
+        {
+            return Err(Fail::NotWritten("the process's declarations were not read"));
+        }
     };
     let no_core =
         reply.word(procmgr_labels::ATTACH_WORD_FLAGS) & procmgr_labels::ATTACH_FLAG_NO_CORE != 0;

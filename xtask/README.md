@@ -1522,8 +1522,7 @@ cargo xtask review-ledger --release <X.Y.Z> --from <previous tag> [--file <path>
 With a pull request's number it checks every run record of `target/xtask/review/pr<N>/` against
 the record shape below, then writes `ledger.json` beside them. A record that departs from the
 shape fails the command, which then writes nothing, so the ledger and the merge gate read only
-what they expect. With `--check` it validates alone and writes nothing, for a reader that does
-not write (the auditor).
+what they expect. With `--check` it validates alone and writes nothing.
 
 A run record is `target/xtask/review/pr<N>/<mode>-<head>.json`, where `<mode>` is `full`, `delta`,
 or `audit` and `<head>` is the head the run reviewed, at least its first 8 hexadecimal digits. A

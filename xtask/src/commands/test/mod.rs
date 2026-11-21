@@ -9,6 +9,7 @@
 pub mod cases;
 mod cet;
 mod debug_port;
+mod enrolment;
 mod host;
 mod hotplug;
 mod kaslr;

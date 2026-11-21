@@ -12,7 +12,8 @@
 pub const NAME_MAX: usize = 256;
 
 /// Whether `name` is in the canonical form: 1 to [`NAME_MAX`] bytes of
-/// UTF-8, and either a slot name (`kernel`, `init`) or an install path,
+/// UTF-8, and either a slot name (`kernel`, `init`, `trust-request`) or
+/// an install path,
 /// `/` followed by one or more components separated by single `/`.
 /// A component is nonempty, holds no `/` and no NUL, and is neither `.`
 /// nor `..`. So an install path has no empty component, no trailing `/`
@@ -26,7 +27,10 @@ pub fn name_is_canonical(name: &[u8]) -> bool
     {
         return false;
     }
-    name == b"kernel" || name == b"init" || name_is_install_path(name)
+    name == b"kernel"
+        || name == b"init"
+        || name == crate::enrol::REQUEST_NAME
+        || name_is_install_path(name)
 }
 
 /// Whether `name` is an install path in the canonical form
@@ -75,6 +79,7 @@ mod tests
         for name in [
             &b"kernel"[..],
             b"init",
+            b"trust-request",
             b"/services/svcmgr",
             b"/services/fs/fatfs",
             b"/programs/a.b",
@@ -83,7 +88,7 @@ mod tests
         ]
         {
             assert!(name_is_canonical(name), "{name:?}");
-            let slot = name == b"kernel" || name == b"init";
+            let slot = name == b"kernel" || name == b"init" || name == b"trust-request";
             assert_eq!(name_is_install_path(name), !slot, "{name:?}");
         }
         let mut longest = [b'x'; NAME_MAX];
@@ -115,7 +120,13 @@ mod tests
     #[test]
     fn a_bare_component_other_than_a_slot_name_is_not_canonical()
     {
-        for name in [&b"trust-store"[..], b"devmgr", b"Kernel", b"init2"]
+        for name in [
+            &b"trust-store"[..],
+            b"devmgr",
+            b"Kernel",
+            b"init2",
+            b"trust-requests",
+        ]
         {
             assert!(!name_is_canonical(name), "{name:?}");
             assert!(!name_is_install_path(name), "{name:?}");

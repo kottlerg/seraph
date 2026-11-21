@@ -22,6 +22,8 @@
 //! - [`attrs`]: the signed attributes a record's signature covers.
 //! - [`cert`]: the fixed-layout certificate a root issues to a signing key.
 //! - [`store`]: the trust store: anchors, revoked key ids, security floor.
+//! - [`enrol`]: the trust store enrolled in firmware storage, the change
+//!   request that alters it, and its merge with the built-in store.
 //! - [`embed`]: the trust store as the bootloader image embeds it.
 //! - [`name`]: the canonical form of the name an object is signed under.
 //! - [`index`]: the signed index of a configuration directory's files.
@@ -33,6 +35,7 @@ pub mod attrs;
 pub mod cert;
 pub mod composite;
 pub mod embed;
+pub mod enrol;
 pub mod index;
 pub mod name;
 pub mod store;
@@ -106,12 +109,16 @@ pub enum Role
     /// A policy-bearing configuration file procmgr verifies for its
     /// consumer, or the index of a directory of them.
     Configuration = 8,
+    /// A change request to the trust store enrolled in firmware storage,
+    /// which the bootloader applies with no one present
+    /// ([`enrol`]).
+    Enrolment = 9,
 }
 
 impl Role
 {
     /// Every role, in bit order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Kernel,
         Self::Init,
         Self::BootModule,
@@ -120,6 +127,7 @@ impl Role
         Self::Program,
         Self::Data,
         Self::Configuration,
+        Self::Enrolment,
     ];
 
     /// The role's bit in a [`RoleSet`] and in a usage mask.
@@ -169,7 +177,7 @@ impl RoleSet
     pub const EMPTY: Self = Self(0);
 
     /// Every role.
-    pub const ALL: Self = Self(0x1fe);
+    pub const ALL: Self = Self(0x3fe);
 
     /// The set of the given roles.
     #[must_use]
@@ -187,7 +195,7 @@ impl RoleSet
 
     /// The set a signed `roles` field encodes; `None` unless it obeys
     /// docs/signing.md § Signed Attributes: no bit outside the roles', at
-    /// least one role, and kernel or init only alone.
+    /// least one role, and kernel, init or enrolment only alone.
     #[must_use]
     pub const fn from_signed(bits: u32) -> Option<Self>
     {
@@ -196,12 +204,12 @@ impl RoleSet
     }
 
     /// Whether the set may be a record's `roles`: no bit outside the
-    /// roles', not empty, and a set holding kernel or init holds no other
-    /// role.
+    /// roles', not empty, and a set holding kernel, init or enrolment holds
+    /// no other role.
     #[must_use]
     pub const fn is_signable(self) -> bool
     {
-        let slot = Self::of(&[Role::Kernel, Role::Init]).0;
+        let slot = Self::of(&[Role::Kernel, Role::Init, Role::Enrolment]).0;
         self.0 & !Self::ALL.0 == 0
             && self.0 != 0
             && (self.0 & slot == 0 || self.0.is_power_of_two())

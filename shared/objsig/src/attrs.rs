@@ -278,17 +278,17 @@ mod tests
 
     /// The parser's rule for the role field: every set of roles is accepted
     /// but an empty one, one with bit 0 or a bit no role has, and one holding
-    /// kernel or init beside another role.
+    /// kernel, init or enrolment beside another role.
     #[test]
     fn accepts_exactly_the_signable_role_sets()
     {
-        let accepted = (0..=0x3ffu32)
+        let accepted = (0..=0x7ffu32)
             .filter(|bits| RoleSet::from_signed(*bits).is_some())
             .count();
-        // The 63 nonempty sets of the six roles past init, and kernel and
-        // init alone.
-        assert_eq!(accepted, 63 + 2);
-        for bit in 9..32
+        // The 63 nonempty sets of the six roles from boot module to
+        // configuration, and kernel, init and enrolment alone.
+        assert_eq!(accepted, 63 + 3);
+        for bit in 10..32
         {
             let service = RoleSet::of(&[Role::Service]).bits();
             assert_eq!(
@@ -321,6 +321,7 @@ mod tests
             RoleSet::EMPTY,
             RoleSet::of(&[Role::Init, Role::BootModule]),
             RoleSet::of(&[Role::Kernel, Role::Init]),
+            RoleSet::of(&[Role::Enrolment, Role::Configuration]),
         ]
         {
             let attrs = Attributes {

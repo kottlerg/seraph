@@ -17,15 +17,14 @@
 
 use objsig::{Arch, CertificateCache, Expectation, Role, RoleSet, TrustStore, verify_cached};
 
-use crate::bprintln;
 use crate::error::{BootError, ObjectName};
 
 /// The architecture every object this bootloader loads is signed for.
 #[cfg(target_arch = "riscv64")]
-const ARCH: Arch = Arch::Riscv64;
+pub const ARCH: Arch = Arch::Riscv64;
 /// The architecture every object this bootloader loads is signed for.
 #[cfg(not(target_arch = "riscv64"))]
-const ARCH: Arch = Arch::X86_64;
+pub const ARCH: Arch = Arch::X86_64;
 
 /// The trust store's bytes, from the file the build names.
 #[cfg(not(test))]
@@ -54,37 +53,15 @@ pub fn embedded_store() -> &'static [u8]
     &[]
 }
 
-/// Parse the trust store `bytes` holds, and log each anchor's label and key
-/// id, marking one generated on the build machine (`LOCAL`) as locally
-/// generated.
+/// Parse the built-in trust store `bytes` holds. The store the boot runs
+/// on, this one merged with the enrolled one, is logged once it is settled
+/// (`crate::enrolment::log_store`).
 ///
 /// # Errors
 /// [`BootError::TrustStore`] when the store does not parse.
 pub fn parse_store(bytes: &[u8]) -> Result<TrustStore<'_>, BootError>
 {
-    let store = TrustStore::parse(bytes).map_err(BootError::TrustStore)?;
-    for anchor in store.anchors()
-    {
-        let origin = if anchor.local
-        {
-            " (locally generated)"
-        }
-        else
-        {
-            ""
-        };
-        bprintln!(
-            "[--------] boot: trust anchor \"{}\" key id {}{}",
-            anchor.label,
-            KeyIdHex(&anchor.key_id),
-            origin
-        );
-    }
-    bprintln!(
-        "[--------] boot: trust store: security floor {}",
-        store.security_floor()
-    );
-    Ok(store)
+    TrustStore::parse(bytes).map_err(BootError::TrustStore)
 }
 
 /// The bootloader's verifier: the trust store, and the certificates whose
@@ -138,7 +115,7 @@ impl<'s> Verifier<'s>
 }
 
 /// A key id written as lowercase hex.
-struct KeyIdHex<'a>(&'a objsig::KeyId);
+pub struct KeyIdHex<'a>(pub &'a objsig::KeyId);
 
 impl core::fmt::Display for KeyIdHex<'_>
 {
@@ -147,6 +124,32 @@ impl core::fmt::Display for KeyIdHex<'_>
         for byte in self.0
         {
             write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// An anchor's label written for the console: printable ASCII as it is, and
+/// a backslash, a double quote and every other character as a `\u{..}`
+/// escape. A label from a trust request is untrusted, and a control
+/// character or a terminal escape sequence in it could hide the lines that
+/// follow it, the changes a console confirmation is asked about among them.
+pub struct LabelText<'a>(pub &'a str);
+
+impl core::fmt::Display for LabelText<'_>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        for c in self.0.chars()
+        {
+            if (' '..='~').contains(&c) && c != '\\' && c != '"'
+            {
+                core::fmt::Write::write_char(f, c)?;
+            }
+            else
+            {
+                write!(f, "\\u{{{:x}}}", u32::from(c))?;
+            }
         }
         Ok(())
     }
@@ -223,6 +226,19 @@ mod tests
 
     use super::testing::{ROOT_SEED, STRANGER_SEED, signed, store_of};
     use super::*;
+
+    // Defect caught: a label from a trust request that reaches the console
+    // with a terminal escape sequence or a line break in it, which can hide
+    // the changes the confirmation prompt shows.
+    #[test]
+    fn a_label_reaches_the_console_as_printable_ascii()
+    {
+        assert_eq!(LabelText("deployer root 2").to_string(), "deployer root 2");
+        assert_eq!(
+            LabelText("a\u{1b}[8m\r\n\"\\\u{e9}\u{202e}").to_string(),
+            "a\\u{1b}[8m\\u{d}\\u{a}\\u{22}\\u{5c}\\u{e9}\\u{202e}"
+        );
+    }
 
     // Defect caught: a bootloader that loads anything but the verified body
     // of an object the store accepts.

@@ -405,16 +405,7 @@ impl Snapped
         snapped.object_va = *object_va;
         snapped.zero_va = *zero_va;
         snapped.demand_va = *demand_va;
-        let new: Vec<u64> = listed_badges(authority)
-            .into_iter()
-            .filter(|badge| !before.contains(badge))
-            .collect();
-        let [badge] = new[..]
-        else
-        {
-            panic!("{PHASE}: LIST_PROCESSES lists {new:#x?} as new since the child's spawn");
-        };
-        snapped.badge = badge;
+        snapped.badge = super::swap::spawned_badge(authority, &before, PHASE);
         snapped
     }
 

@@ -40,13 +40,9 @@ missing or not of the shape the firmware gives it), or `unknown` when `SecureBoo
 that shape ([docs/signing.md](../../../docs/signing.md) § Secure Boot). No state stops the boot.
 
 It then parses the trust store its build embedded
-([docs/signing.md](../../../docs/signing.md) § Trust Store), against which steps 3 and 4
-verify every object they load, and logs each anchor's label and key id, an anchor marked
-`LOCAL` as locally generated, and the store's security floor. The verifier holds each
-certificate whose signature verifies for the rest of the boot, so the certificate every object
-of one signing key carries is verified once ([docs/signing.md](../../../docs/signing.md)
-§ Verification). A store that does not parse
-is fatal (`BootError::TrustStore`).
+([docs/signing.md](../../../docs/signing.md) § Trust Store), the built-in half of the store
+steps 3 and 4 verify every object against (step 3). A store that does not parse is fatal
+(`BootError::TrustStore`).
 
 The bootloader then reads the machine's security floor from its UEFI variable
 ([docs/signing.md](../../../docs/signing.md) § Rollback Floor) and logs it beside the store's.
@@ -80,7 +76,29 @@ Detail: [uefi-environment.md](uefi-environment.md)
 ### Step 3: Load Kernel ELF
 
 The kernel is read whole from the hardcoded path `\EFI\seraph\kernel` into one
-allocation and verified against the trust store as the kernel named `kernel`
+allocation. Before it or the bundle is verified, the bootloader settles the trust store the boot
+runs on ([docs/signing.md](../../../docs/signing.md) § Trust Store):
+
+- It reads the enrolled store from its UEFI variable and merges it with the built-in store. A
+  malformed variable is fatal (`BootError::EnrolledMalformed`, whose message names the
+  recovery); a read the firmware fails is one warning, and the boot runs on the built-in store
+  and applies no request.
+- When the ESP holds a trust request, `\EFI\seraph\trust-request` of at most 64 KiB, it decides
+  it against the kernel and the bundle as read: it skips one that changes nothing, refuses one
+  past the enrolled store's bound or under whose resulting store the kernel or a bundle entry
+  would not verify, applies one the current store verifies in the enrolment role or that the
+  console confirms within 60 seconds ([uefi-environment.md](uefi-environment.md) § Console
+  Input), and writes the new enrolled store. A refused request is logged and the boot runs on the
+  current store; no outcome of a request is fatal.
+- It logs each anchor of the resulting store with its label (escaped to printable ASCII,
+  [docs/signing.md](../../../docs/signing.md) § Trust Store), key id and source (built in or
+  enrolled), an anchor marked `LOCAL` as locally generated and one whose key id is revoked as
+  revoked, then the store's counts and security floor.
+
+The verifier holds each certificate whose signature verifies for the rest of the boot, so the
+certificate every object of one signing key carries is verified once
+([docs/signing.md](../../../docs/signing.md) § Verification). The kernel is then verified against
+that store as the kernel named `kernel`
 ([docs/signing.md](../../../docs/signing.md) § Verifier Discipline); a refusal is fatal
 (`BootError::SignatureRefused`, naming the object). Only the body the verifier returns is
 parsed: its ELF header is validated, the LOAD segments are placed in a single
@@ -135,9 +153,10 @@ log-level configuration `/config/init/log-levels.conf` (the authoritative lists 
 harness's bundle lists, `init.x86_64.list` and `init.riscv64.list` in
 [`rootfs/config/bundle/`](../../../rootfs/config/bundle/)).
 
-Last, the bootloader copies the trust store into a page allocation of its own, the slack
-after it zeroed, and describes it as the boot module `trust-store` (`TRUST_STORE_MODULE`),
-which step 9 lists after the bundle's modules (docs/signing.md § Trust Store).
+Last, the bootloader copies the trust store the boot verified with into a page allocation of its
+own, the slack after it zeroed, and describes it as the boot module `trust-store`
+(`TRUST_STORE_MODULE`), which step 9 lists after the bundle's modules (docs/signing.md § Trust
+Store).
 
 Step 6 identity-maps the whole bundle allocation, of which the bundle's module bodies are
 slices, and the `trust-store` module's own pages.

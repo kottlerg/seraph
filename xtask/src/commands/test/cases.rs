@@ -106,8 +106,8 @@ impl Case
 pub fn case(case: TestCase) -> Case
 {
     use super::{
-        cet, debug_port, hotplug, kaslr, rollback, secureboot, shutdown, signing, terminal, tpm,
-        vmgenid, wedge,
+        cet, debug_port, enrolment, hotplug, kaslr, rollback, secureboot, shutdown, signing,
+        terminal, tpm, vmgenid, wedge,
     };
     match case
     {
@@ -128,7 +128,7 @@ pub fn case(case: TestCase) -> Case
         },
         // The kernel, bundle, revoked and rootfs boots.
         TestCase::Signing => Case {
-            arches: &[(Arch::X86_64, 4), (Arch::Riscv64, 4)],
+            arches: &[(Arch::X86_64, 6), (Arch::Riscv64, 6)],
             bundle: Harness::Init,
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Release],
@@ -142,6 +142,16 @@ pub fn case(case: TestCase) -> Case
             cell: Cell::Ci(Tester::Usertest),
             options: &[CaseOption::Release],
             run: rollback::run,
+        },
+        // A root enrolled signed, one refused at the timeout then confirmed,
+        // a revocation refused by the commit rule, the build's roots revoked,
+        // and the revocation holding, on one variable store.
+        TestCase::Enrolment => Case {
+            arches: &[(Arch::X86_64, 6), (Arch::Riscv64, 6)],
+            bundle: Harness::Init,
+            cell: Cell::Ci(Tester::Usertest),
+            options: &[],
+            run: enrolment::run,
         },
         // The signed bootloader on enrolled keys, the tampered and the
         // unsigned one refused, and the default firmware's boot.
@@ -468,12 +478,14 @@ mod tests
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::X86_64),
             [
-                Terminal, Signing, Rollback, Secureboot, Wedge, Vmgenid, Shutdown
+                Terminal, Signing, Rollback, Enrolment, Secureboot, Wedge, Vmgenid, Shutdown
             ]
         );
         assert_eq!(
             cell_cases(Tester::Usertest, Arch::Riscv64),
-            [Terminal, Signing, Rollback, Secureboot, Wedge, Shutdown]
+            [
+                Terminal, Signing, Rollback, Enrolment, Secureboot, Wedge, Shutdown
+            ]
         );
         for arch in [Arch::X86_64, Arch::Riscv64]
         {

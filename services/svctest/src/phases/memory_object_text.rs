@@ -103,15 +103,7 @@ fn memory_object_text_phase(caps: &Caps)
     let before = super::swap::listed_badges(authority);
     let mut patched = TextChild::spawn(handle);
     let va = patched.ready();
-    let new: Vec<u64> = super::swap::listed_badges(authority)
-        .into_iter()
-        .filter(|badge| !before.contains(badge))
-        .collect();
-    let [process] = new[..]
-    else
-    {
-        panic!("memory_object_text: LIST_PROCESSES lists {new:#x?} as new since the spawn");
-    };
+    let process = super::swap::spawned_badge(authority, &before, "memory_object_text");
     let thread = patched.child.main_thread_cap();
     // SAFETY: the write lands in the child's address space, not svctest's.
     let refused =

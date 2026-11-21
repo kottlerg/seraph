@@ -19,6 +19,7 @@ Commands:
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
+  trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
   capture-acpi    Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
   lint-docs       Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
@@ -49,6 +50,7 @@ Commands:
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
+  trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
   capture-acpi    Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
   lint-docs       Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
@@ -393,7 +395,7 @@ Run Seraph's tests: without a case, check formatting and lint the test code, the
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
-  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, rollback, enrolment, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 Options:
       --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
@@ -427,6 +429,7 @@ Arguments:
           - kaslr:      The kernel's randomized layout differs between boots, and the `nokaslr` knob gives the deterministic one
           - signing:    Each signature verifier refuses a tampered kernel, a tampered bundle entry, a revoked key, and tampered, wrong-role and foreign-signed rootfs images
           - rollback:   The bootloader writes the machine's security floor in firmware storage, raises it, and refuses itself below it
+          - enrolment:  The bootloader enrols roots and revokes the build's through trust requests on the ESP, signed for enrolment or confirmed at the console, and the revocation holds on the next boot
           - secureboot: The firmware boots the bootloader signed with an enrolled key and refuses it tampered or unsigned, under UEFI Secure Boot
           - wedge:      The softlockup watchdog reports a CPU wedged with interrupts off
           - vmgenid:    The kernel detects a VM generation change across a snapshot restore (`x86_64` only)
@@ -663,6 +666,51 @@ Options:
 
       --split-data
           Author the data partition alone on a second image, `disk-data.img`, and only the ESP, root and swap partitions on `disk.img`; boot the pair with `--second-disk disk-data.img`. Without it `disk.img` carries all four and a `disk-data.img` an earlier authoring left is removed
+
+  -h, --help
+          Print help (see a summary with '-h')
+=== xtask trust-request -h
+Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
+
+Usage: xtask trust-request [OPTIONS]
+
+Options:
+      --arch <ARCH>   Target architecture the request is signed for: the sysroot's [default: x86_64] [possible values: x86_64, riscv64]
+      --add <FILE>    Enrol every anchor of the trust store FILE (the format of docs/signing.md § Trust Store), with its roles and label. Repeatable
+      --revoke <HEX>  Revoke the key id HEX, 32 hex digits as the bootloader logs it. Repeatable
+      --sign          Sign the request with the build's signing identity in the enrolment role, which a bootloader trusting its root applies with no one present. Without it the request is unsigned, and is applied only once confirmed at the console
+      --out <FILE>    Write the request to FILE instead of staging it in the sysroot's ESP
+      --clear         Remove the request staged in the sysroot's ESP; takes no other option
+  -h, --help          Print help (see more with '--help')
+=== xtask trust-request --help
+Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
+
+Usage: xtask trust-request [OPTIONS]
+
+Options:
+      --arch <ARCH>
+          Target architecture the request is signed for: the sysroot's
+
+          Possible values:
+          - x86_64:  x86-64 (Intel/AMD 64-bit)
+          - riscv64: RISC-V 64-bit
+          
+          [default: x86_64]
+
+      --add <FILE>
+          Enrol every anchor of the trust store FILE (the format of docs/signing.md § Trust Store), with its roles and label. Repeatable
+
+      --revoke <HEX>
+          Revoke the key id HEX, 32 hex digits as the bootloader logs it. Repeatable
+
+      --sign
+          Sign the request with the build's signing identity in the enrolment role, which a bootloader trusting its root applies with no one present. Without it the request is unsigned, and is applied only once confirmed at the console
+
+      --out <FILE>
+          Write the request to FILE instead of staging it in the sysroot's ESP
+
+      --clear
+          Remove the request staged in the sysroot's ESP; takes no other option
 
   -h, --help
           Print help (see a summary with '-h')
@@ -1504,6 +1552,7 @@ Commands:
   ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
   symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
   mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
+  trust-request   Write a trust request: roots to enrol and key ids to revoke in the trust store the bootloader keeps in firmware storage, signed by the build's signing identity in the enrolment role or unsigned, for the console to confirm. Staged in the sysroot's ESP for the next pack, or written to a file to copy onto a machine's ESP as `\EFI\seraph\trust-request` (see xtask/README.md)
   capture-acpi    Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
   lint-docs       Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels

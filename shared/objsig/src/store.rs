@@ -162,6 +162,12 @@ impl<'a> TrustStore<'a>
         self.revoked.binary_search(id).is_ok()
     }
 
+    /// The anchors' encodings, in key-id order.
+    pub(crate) const fn raw_anchors(&self) -> &'a [[u8; ANCHOR_LEN]]
+    {
+        self.anchors
+    }
+
     /// The revoked key ids, ascending.
     #[must_use]
     pub const fn revoked(&self) -> &'a [KeyId]
@@ -233,12 +239,7 @@ impl<'a> TrustStore<'a>
         writer.put(&security_floor.to_le_bytes())?;
         for anchor in anchors
         {
-            let flags = if anchor.local { FLAG_LOCAL } else { 0 };
-            let label: [u8; LABEL_LEN] = concat(&[anchor.label.as_bytes()]);
-            writer.put(anchor.key)?;
-            writer.put(&anchor.usage.to_bits().to_le_bytes())?;
-            writer.put(&flags.to_le_bytes())?;
-            writer.put(&label)?;
+            put_anchor(&mut writer, anchor)?;
         }
         for id in revoked
         {
@@ -249,21 +250,35 @@ impl<'a> TrustStore<'a>
     }
 }
 
+/// Write the 2,024-byte encoding of `anchor`.
+pub(crate) fn put_anchor(
+    writer: &mut Writer<'_>,
+    anchor: &AnchorSpec<'_>,
+) -> Result<(), EncodeError>
+{
+    let flags = if anchor.local { FLAG_LOCAL } else { 0 };
+    let label: [u8; LABEL_LEN] = concat(&[anchor.label.as_bytes()]);
+    writer.put(anchor.key)?;
+    writer.put(&anchor.usage.to_bits().to_le_bytes())?;
+    writer.put(&flags.to_le_bytes())?;
+    writer.put(&label)
+}
+
 /// Whether `label` is 1 to [`LABEL_LEN`] bytes with no NUL.
-fn label_is_valid(label: &str) -> bool
+pub(crate) fn label_is_valid(label: &str) -> bool
 {
     !label.is_empty() && label.len() <= LABEL_LEN && !label.as_bytes().contains(&0)
 }
 
 /// The key of an anchor's encoding: its first [`PUBLIC_KEY_LEN`] bytes,
 /// which [`ANCHOR_LEN`] always holds.
-fn anchor_key(raw: &[u8; ANCHOR_LEN]) -> Option<&PublicKey>
+pub(crate) fn anchor_key(raw: &[u8; ANCHOR_LEN]) -> Option<&PublicKey>
 {
     raw.first_chunk::<PUBLIC_KEY_LEN>()
 }
 
 /// Decode and check one anchor.
-fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
+pub(crate) fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
 {
     let mut reader = Reader::new(raw);
     // The reads cannot run short: their lengths add up to ANCHOR_LEN.
@@ -387,7 +402,7 @@ mod tests
         assert_eq!(&bytes[12..14], &2u16.to_le_bytes());
         assert_eq!(&bytes[14..18], &0x0a0b_0c0du32.to_le_bytes());
         assert_eq!(&bytes[18..2002], &specs[0].key[..]);
-        assert_eq!(&bytes[2002..2006], &(0x1feu32 | (1 << 31)).to_le_bytes());
+        assert_eq!(&bytes[2002..2006], &(0x3feu32 | (1 << 31)).to_le_bytes());
         assert_eq!(&bytes[2006..2010], &1u32.to_le_bytes());
         assert_eq!(&bytes[2010..2020], b"local root");
         assert_eq!(&bytes[2020..2042], &[0u8; 22]);
@@ -458,8 +473,8 @@ mod tests
         refuse(&|b| b[8] = 3, StoreError::Version);
         refuse(&|b| b[10] = 0, StoreError::NoAnchor);
         refuse(&|b| b[anchor(1, usage)] |= 1, StoreError::AnchorUsage);
-        // Bit 9, which no role has yet.
-        refuse(&|b| b[anchor(1, usage + 1)] |= 2, StoreError::AnchorUsage);
+        // Bit 10, which no role has yet.
+        refuse(&|b| b[anchor(1, usage + 1)] |= 4, StoreError::AnchorUsage);
         refuse(
             &|b| b[anchor(1, usage + 3)] |= 0x40,
             StoreError::AnchorUsage,

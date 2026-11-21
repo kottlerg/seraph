@@ -22,7 +22,7 @@
 //! attachment of a memory object, its call of an executable one, and what a mapped cache page reads across a forced
 //! unmount. The
 //! `reboot` role is the one not spawned by a phase: svcmgr launches it from
-//! the `reboot` test recipe `cargo xtask test-reboot` stages.
+//! the `reboot` test recipe the `shutdown` case's reboot boot stages.
 //! The child-mode function for each role lives in the phase module that
 //! spawns it; `dispatch` consults each module's `reentry_main(role)` so a
 //! new role is registered alongside its phase, not in a central switch.

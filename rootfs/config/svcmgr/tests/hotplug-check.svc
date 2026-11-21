@@ -1,7 +1,7 @@
 # /tests/hotplug-check — the PCI Express hotplug add path's fixture.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
-# `cargo xtask test-hotplug` stages it into /config/svcmgr/services/, with
+# the `hotplug` case stages it into /config/svcmgr/services/, with
 # /config/devmgr/tests/test-dma.class into /config/devmgr/classes/, for its
 # boots, which attach a pcie-root-port the host hot-adds an edu device
 # behind. See services/hotplug-check/README.md.

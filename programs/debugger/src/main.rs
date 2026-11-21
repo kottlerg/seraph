@@ -202,7 +202,7 @@ static GDB_TARGET_COUNTER: AtomicU64 = AtomicU64::new(0);
 static GDB_TARGET_WORKER: AtomicU64 = AtomicU64::new(0);
 
 /// The `--gdb-target` process, the GDB stub's batch-test target
-/// (`cargo xtask test-gdb`): a second thread, which registers with procmgr
+/// (`cargo xtask test debug-port`): a second thread, which registers with procmgr
 /// as every `std` thread does, loops in [`gdb_target_worker_step`], and the
 /// main thread calls [`gdb_target_tick`] for ever, each on a short sleep, so
 /// a breakpoint on either is taken and both threads are listed.

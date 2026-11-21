@@ -170,8 +170,8 @@ redo: when the presence-only `\EFI\seraph\mapredo` file is on the ESP (read befo
 step 6's size query, a failed open reading as absent), the first attempt is redone
 whether its buffer fits or not, logging `mapredo knob present; redoing steps 6 and 7`
 in place of the line for a buffer past its array, and later attempts are checked as
-above. `cargo xtask test-map-redo` stages the knob and boots with it
-([testing.md](../../../docs/testing.md#steps-6-and-7-redo-test-map-redo)).
+above. `cargo xtask mkdisk --knob mapredo` stages the knob and the ktest cell boots with it
+([testing.md](../../../docs/testing.md#steps-6-and-7-redo-ktest-cell)).
 
 The check bounds the buffer, not the map in it, because a map can still grow after
 step 7: when `ExitBootServices` refuses a stale key, step 8 re-queries the map into

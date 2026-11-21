@@ -99,7 +99,7 @@ shell over piped stdio across two invocations — built-ins plus an external
 `/programs/hello` spawn, and an `/programs/stdiotest` run fed one line to prove
 stdin forwarding — and exits non-zero on any mismatch. The terminal interactive
 path (the `$ ` prompt rendered via the terminal) is covered by
-`cargo xtask test-terminal`. See [docs/testing.md](../../docs/testing.md).
+`cargo xtask test terminal`. See [docs/testing.md](../../docs/testing.md).
 
 ## Relevant Design Documents
 

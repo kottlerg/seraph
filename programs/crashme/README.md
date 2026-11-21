@@ -59,8 +59,8 @@ that the bytes at the instruction pointer are the illegal instruction in the `ex
 `worker` modes, and that the `worker` core records more than one thread. That the crash service
 declined the fault, and the thread still died with a fault reason, is what it shows; the report
 blocks themselves are checked host-side, in the boot's serial log, by `cargo xtask
-test-crash-report` ([docs/testing.md](../../docs/testing.md) § Crash reports), which ties each block
-to `crashme` through the badge logd's `reclaim:` line names.
+run --crash-reports` ([docs/testing.md](../../docs/testing.md) § Crash reports), which ties each
+block to `crashme` through the badge logd's `reclaim:` line names.
 
 ---
 

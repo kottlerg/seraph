@@ -129,7 +129,7 @@ and a further source would be just another producer.
 
 ## Testing
 
-Driven host-side by `cargo xtask test-terminal`, which boots with a QMP control
+Driven host-side by `cargo xtask test terminal`, which boots with a QMP control
 socket and the GDB stub staged on the virtio-input driver, waits for the
 `terminal: READY for injection` marker, then exercises both input sources and a
 restart of the input driver in one boot: a keyboard round (key sequence
@@ -139,8 +139,8 @@ an input restart round (the host kills the virtio-input driver through the stub,
 the terminal must hold devmgr's restarted instance at ordinal 1, and the key
 sequence is injected again). Each round asserts the echoed input and the relayed
 leader output appear on the serial stream. It runs as a boot in the `usertest` cell. See
-[xtask/README.md](../../xtask/README.md#cargo-xtask-test-terminal) for the command and
-[docs/testing.md](../../docs/testing.md#interactive-input-test-terminal) for the test.
+[xtask/README.md](../../xtask/README.md#the-terminal-case) for the command and
+[docs/testing.md](../../docs/testing.md#interactive-input-terminal-case) for the test.
 
 ---
 
@@ -151,8 +151,8 @@ leader output appear on the serial stream. It runs as a boot in the `usertest` c
 | [docs/console-model.md](../../docs/console-model.md) | Console output ownership; the terminal as the production console path |
 | [docs/session-supervision.md](../../docs/session-supervision.md) | Sessions, sessiond, the terminal as an interface |
 | [services/sessiond/docs/ipc-interface.md](../../services/sessiond/docs/ipc-interface.md) | The labels the terminal opens its sessions with |
-| [docs/testing.md](../../docs/testing.md) | The `test-terminal` interactive input test |
-| [xtask/README.md](../../xtask/README.md) | `cargo xtask test-terminal` and the devices `run` attaches |
+| [docs/testing.md](../../docs/testing.md) | The `terminal` case's interactive input test |
+| [xtask/README.md](../../xtask/README.md) | `cargo xtask test terminal` and the devices `run` attaches |
 | [serial driver](../../services/drivers/serial/README.md) | `SERIAL_WRITE_BYTES`, `SERIAL_READ_BYTES`, `SERIAL_REGISTER_RX_NOTIFY` |
 | [framebuffer driver](../../services/drivers/framebuffer/README.md) | `FB_WRITE_BYTES` and `FB_SET_ATTRS` |
 | [shared/ansi/README.md](../../shared/ansi/README.md) | SGR parser for the framebuffer path |

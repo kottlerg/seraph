@@ -259,7 +259,7 @@ fn install_hint_for(name: &str) -> String
             macOS (Homebrew): brew install dosfstools\n  \
             FreeBSD:          pkg install dosfstools"
             .into(),
-        "swtpm" => "`cargo xtask test-tpm` backs QEMU's TPM device with the swtpm \
+        "swtpm" => "`cargo xtask test tpm` backs QEMU's TPM device with the swtpm \
             TPM 2.0 emulator. Install with:\n  \
             Fedora:           dnf install swtpm swtpm-tools\n  \
             Debian / Ubuntu:  apt install swtpm swtpm-tools\n  \

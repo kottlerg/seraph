@@ -3,7 +3,7 @@
 # Lives under /config/svcmgr/debug/, which svcmgr does NOT scan: an image
 # that does not stage the stub has no attach path through it. `cargo xtask
 # run --debug-port PORT --debug-target NAME` (and `run --runs` with the
-# same options, and `test-gdb`) writes it into /config/svcmgr/services/ with
+# same options, and the `debug-port` case's GDB stub boot) writes it into /config/svcmgr/services/ with
 # the target's name appended to `argv`, and repacks disk.img. See
 # services/gdbstub/README.md.
 #

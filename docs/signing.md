@@ -50,7 +50,7 @@ file in the data role at its reader's request (`procmgr_labels::READ_VERIFIED`, 
 Discipline), which svctest's `procmgr_read_verified` phase exercises on both architectures, and
 which devmgr uses for the platform description tables. The override that § Signature Policy in
 procmgr describes is design intent, not yet implemented: no creator can hold it, so procmgr creates
-no process from an image that does not verify. `cargo xtask test-signing` boots each refusal on both
+no process from an image that does not verify. `cargo xtask test signing` boots each refusal on both
 architectures: a tampered kernel, a tampered bundle entry and a revoked signing key in the
 bootloader, and a tampered service, one signed without a role its creator's policy admits and one
 signed by an untrusted key in procmgr, beside a kernel and a program whose untrusted record both

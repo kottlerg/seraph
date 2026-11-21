@@ -524,7 +524,7 @@ through to the normal run.
 | `image-sharing`             | `image_sharing` | `procmgr_image_sharing` (reports its image base, waits) |
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the free frames) |
-| `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
+| `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`shutdown` case) |
 
 ---
 

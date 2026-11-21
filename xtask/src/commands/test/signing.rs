@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_signing.rs
+// xtask/src/commands/test/signing.rs
 
 //! Signature refusal test: each verifier of docs/signing.md refuses an object
 //! that does not verify, and the boot reports the refusal it is owed.
 //!
-//! The command boots the current sysroot four times, each from disk images
+//! The case boots the current sysroot four times, each from disk images
 //! that carry objects no build makes, written in place of the sysroot's
 //! through [`crate::disk::create_disk_image_substituting`]:
 //!
@@ -32,7 +32,7 @@
 //! A boot passes when every line it is owed appears; it fails at once on any
 //! other refusal or a fatal marker, and at its deadline naming the lines
 //! missing ([`Judge`]). Every boot's serial log is saved under
-//! `target/xtask/test-signing/<arch>/`. The sysroot is left as it was, apart
+//! `target/xtask/test/signing/<arch>/`. The sysroot is left as it was, apart
 //! from the signing every pack does, and the disk images are packed again in
 //! the layout they had, with the recorded harness's bundle.
 //!
@@ -51,7 +51,8 @@ use objsig::{Role, RoleSet};
 
 use crate::arch::Arch;
 use crate::bundle::Harness;
-use crate::cli::{BuildArgs, BuildComponent, TestSigningArgs};
+use crate::cli::{BuildArgs, BuildComponent};
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::{DiskLayout, Substitute};
 use crate::error::{Context as _, Result, bail, ensure, err};
@@ -77,7 +78,7 @@ const REFUSAL_MARKERS: [&str; 2] = ["signature verification refused", "signature
 
 /// Text of a line that ends a boot in failure: the fatal markers of
 /// `run --runs`'s default fail pattern. A test harness's own verdict is
-/// not one: a staged harness may fail its tests of the services this command
+/// not one: a staged harness may fail its tests of the services this case
 /// refuses.
 const DEATH_MARKERS: [&str; 6] = [
     "KERNEL EXCEPTION",
@@ -127,13 +128,14 @@ struct Case
     timeout: Duration,
 }
 
-pub fn run(ctx: &Context, args: &TestSigningArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
     let dir = ctx
         .target_dir
         .join("xtask")
-        .join("test-signing")
+        .join("test")
+        .join("signing")
         .join(args.arch.to_string());
     match fs::remove_dir_all(&dir)
     {
@@ -192,7 +194,7 @@ pub fn run(ctx: &Context, args: &TestSigningArgs) -> Result<()>
 
 /// Build every case's objects under `dir`, from the sysroot a pack of the
 /// default-init bundle signed and the bundle it composed.
-fn prepare(ctx: &Context, args: &TestSigningArgs, dir: &Path) -> Result<Vec<Case>>
+fn prepare(ctx: &Context, args: &CaseArgs, dir: &Path) -> Result<Vec<Case>>
 {
     let signer = Signer::open(ctx, args.arch)?;
     let kernel = read_sysroot(ctx, KERNEL)?;
@@ -229,8 +231,7 @@ fn prepare(ctx: &Context, args: &TestSigningArgs, dir: &Path) -> Result<Vec<Case
 
 /// The `revoked` case: a bootloader built under the build's store with
 /// `signer`'s key revoked, in place of both ESP copies of the installed one.
-fn revoked_case(ctx: &Context, args: &TestSigningArgs, dir: &Path, signer: &Signer)
--> Result<Case>
+fn revoked_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> Result<Case>
 {
     let revoking = stage(
         dir,
@@ -248,6 +249,9 @@ fn revoked_case(ctx: &Context, args: &TestSigningArgs, dir: &Path, signer: &Sign
         host: args.host.common.clone(),
     };
     step("signature test: building a bootloader under a store revoking the signing key");
+    // The case boots, so `main` admitted no build: the compile is admitted
+    // here, as a build.
+    crate::host_lock::admit_build(ctx, &args.host.common)?;
     crate::commands::build::compile_boot(ctx, &build, &revoking, &boot)?;
     let mut substitutes = Vec::new();
     for image in crate::esp::bootloader_copies(ctx, args.arch)
@@ -526,7 +530,7 @@ impl Judge
 /// Pack `case`'s images, boot them, judge the serial lines, and kill QEMU.
 fn boot_case(
     ctx: &Context,
-    args: &TestSigningArgs,
+    args: &CaseArgs,
     layout: DiskLayout,
     dir: &Path,
     case: &Case,
@@ -620,8 +624,7 @@ fn judge_serial(rx: &mpsc::Receiver<String>, log: &mut fs::File, case: &Case) ->
 }
 
 /// Start QEMU on the images of `layout`, its serial stream on its stdout.
-fn launch(ctx: &Context, args: &TestSigningArgs, layout: DiskLayout)
--> Result<std::process::Child>
+fn launch(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<std::process::Child>
 {
     let (firmware_code, firmware_vars) = match args.arch
     {

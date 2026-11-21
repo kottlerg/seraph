@@ -22,9 +22,9 @@ The terminal follows its input, framebuffer and serial classes with it, and gdbs
 
 The crate spawns a `std` thread and logs through `std::os::seraph`, so its contents compile only
 for seraph and no host test reaches them; the decision it applies is `ipc::refresh_device`'s,
-host-tested in [shared/ipc](../ipc/README.md). `cargo xtask test-terminal`,
-`test-debug-port` and `test-gdb` restart a driver under each client. It depends on
-`shared/ipc`, `shared/syscall` and `abi/syscall`.
+host-tested in [shared/ipc](../ipc/README.md). `cargo xtask test terminal` and `test debug-port`
+restart a driver under each client. It depends on `shared/ipc`, `shared/syscall` and
+`abi/syscall`.
 
 ---
 

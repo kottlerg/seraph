@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_wedge.rs
+// xtask/src/commands/test/wedge.rs
 
 //! Interrupts-off wedge test (#33): one CPU of a running system is wedged in
 //! the kernel with interrupts off, and the softlockup watchdog's heartbeat
@@ -25,7 +25,7 @@
 //! printed from the NMI the observer sends it, with its `rip` inside
 //! `halt_loop`; on riscv64, which has no supervisor-mode NMI, it holds none.
 //!
-//! A pure runner like `test-terminal`: it neither builds nor stages, and boots
+//! A pure runner like the `terminal` case: it neither builds nor stages, and boots
 //! the default boot set (`terminal.svc` autostarted), idle once the terminal
 //! prints its READY marker. A gdbstub that cannot be reached fails the test.
 
@@ -38,7 +38,7 @@ use crate::error::{Context as _, Result, bail};
 use object::{Object as _, ObjectSymbol as _, SymbolKind};
 
 use crate::arch::Arch;
-use crate::cli::TestWedgeArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
@@ -118,11 +118,11 @@ struct Boot
     cpus: Vec<(u32, u32)>,
 }
 
-pub fn run(ctx: &Context, args: &TestWedgeArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     if args.cpus < 2
     {
-        bail!("test-wedge needs at least 2 CPUs: the wedged CPU is reported by another");
+        bail!("the wedge case needs at least 2 CPUs: the wedged CPU is reported by another");
     }
     validate_sysroot_for_launch(ctx, args.arch)?;
     let kernel_path = ctx.sysroot_efi_seraph().join("kernel");
@@ -130,7 +130,7 @@ pub fn run(ctx: &Context, args: &TestWedgeArgs) -> Result<()>
         .with_context(|| format!("reading {}", kernel_path.display()))?;
     let image = image_spans(&kernel)
         .with_context(|| format!("finding the kernel functions in {}", kernel_path.display()))?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
 
     for victim in [Victim::Ap, Victim::Bsp]
@@ -142,7 +142,7 @@ pub fn run(ctx: &Context, args: &TestWedgeArgs) -> Result<()>
 }
 
 /// One boot: wait for the idle system, wedge `victim`, check the report.
-fn boot_once(ctx: &Context, args: &TestWedgeArgs, image: &Image, victim: Victim) -> Result<()>
+fn boot_once(ctx: &Context, args: &CaseArgs, image: &Image, victim: Victim) -> Result<()>
 {
     let (firmware_code, firmware_vars) = match args.arch
     {

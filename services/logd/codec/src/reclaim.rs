@@ -15,7 +15,7 @@
 //! escaped when it holds a space, `=`, a control character, or invalid
 //! UTF-8: it cannot read as a further field. A reader of the serial log finds
 //! a crashed process's name in the death drain's line for its badge
-//! (`cargo xtask symbolize --log`, `test-crash-report`), so the line is a
+//! (`cargo xtask symbolize --log`, `run --crash-reports`), so the line is a
 //! contract, stated in `services/logd/docs/ipc-interface.md`
 //! § Death-notification cascade.
 

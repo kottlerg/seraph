@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_terminal.rs
+// xtask/src/commands/test/terminal.rs
 
 //! Terminal interactive test (#111, #291). Launches QEMU (headless) with a QMP
 //! control socket and the debug port, with the GDB stub staged on the
@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
-use crate::cli::TestTerminalArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::debug_stub;
 use crate::firmware::find_ovmf_code;
@@ -163,10 +163,10 @@ impl Round
     }
 }
 
-pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let layout = debug_stub::stage(ctx, args.arch, INPUT_DRIVER)?;
     let tested = boot(ctx, args);
@@ -176,7 +176,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
 }
 
 /// Boot the staged images and run the rounds (see the module documentation).
-fn boot(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
+fn boot(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     let (firmware_code, firmware_vars) = match args.arch
     {

@@ -95,15 +95,15 @@ fixture, a non-clean exit.
 ## GDB Stub Target (`--gdb-target`)
 
 With `--gdb-target` the binary is the process the GDB stub's host test debugs
-([services/gdbstub/README.md](../../services/gdbstub/README.md), `cargo xtask test-gdb`,
-[docs/testing.md](../../docs/testing.md) § GDB stub (`test-gdb`)). Its recipe,
+([services/gdbstub/README.md](../../services/gdbstub/README.md), `cargo xtask test debug-port`,
+[docs/testing.md](../../docs/testing.md) § GDB stub (`debug-port` case)). Its recipe,
 `rootfs/config/svcmgr/tests/gdb-target.svc`, runs it as a service named `gdb-target` (its
-`argv[0]`), and only `test-gdb` stages it. It takes the empty bootstrap round svcmgr serves a
-recipe with no seeds, spawns a worker thread, which registers with procmgr as every `std` thread
-does, prints `gdb-target: running`, and runs for ever: the main thread calls `gdb_target_tick` and
-the worker `gdb_target_worker_step`, each every 5 ms, and each bumps an exported counter
-(`GDB_TARGET_COUNTER`, `GDB_TARGET_WORKER`). The functions and counters are unmangled, so a host GDB
-finds them in the binary's symbol table, which the symbols store keeps
+`argv[0]`), and only the `debug-port` case stages it. It takes the empty bootstrap round svcmgr
+serves a recipe with no seeds, spawns a worker thread, which registers with procmgr as every `std`
+thread does, prints `gdb-target: running`, and runs for ever: the main thread calls
+`gdb_target_tick` and the worker `gdb_target_worker_step`, each every 5 ms, and each bumps an
+exported counter (`GDB_TARGET_COUNTER`, `GDB_TARGET_WORKER`). The functions and counters are
+unmangled, so a host GDB finds them in the binary's symbol table, which the symbols store keeps
 ([docs/build-system.md](../../docs/build-system.md#symbols-store)), without debug information. It
 never exits; the host test kills QEMU.
 
@@ -118,7 +118,7 @@ never exits; the host test kills QEMU.
 | [shared/riscv-step/README.md](../../shared/riscv-step/README.md) | The successor decoder of the riscv64 step |
 | [core/kernel/docs/syscalls.md](../../core/kernel/docs/syscalls.md) | `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_POST_UPCALL`, `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` |
 | [runtime/ruststd/README.md](../../runtime/ruststd/README.md) | § Child process handles: `ChildExt::main_thread_cap` |
-| [docs/testing.md](../../docs/testing.md) | § Per-program tester protocol, § GDB stub (`test-gdb`) |
+| [docs/testing.md](../../docs/testing.md) | § Per-program tester protocol, § GDB stub (`debug-port` case) |
 | [services/gdbstub/README.md](../../services/gdbstub/README.md) | The stub `--gdb-target` is the target of |
 
 ---

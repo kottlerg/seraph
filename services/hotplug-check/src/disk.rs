@@ -7,7 +7,7 @@
 //! and added again behind a PCI Express root port, and of the loss of its
 //! root filesystem's driver.
 //!
-//! `cargo xtask test-hotplug` boots the split-data layout with the data disk
+//! `cargo xtask test hotplug` boots the split-data layout with the data disk
 //! behind the root port, so vfsd mounts its data partition at `/data` at
 //! startup. The fixture finds the root mount's driver by its name
 //! (`fatfs:/`, `LIST_PROCESSES`), writes a file under `/data` and keeps it
@@ -46,17 +46,17 @@ use crate::{FAIL_MARKER, PASS_MARKER};
 
 /// Logged once the fixture knows the root mount's driver and holds a file
 /// open under `/data`: the host removes the disk behind the port on seeing
-/// it. Kept in sync with `xtask/src/commands/test_hotplug.rs`.
+/// it. Kept in sync with `xtask/src/commands/test/hotplug.rs`.
 const REMOVE_MARKER: &str = "HOLDING a file open on /data; READY for the removal of its disk";
 
 /// Logged once vfsd marked the removed disk removed and tore its mount
 /// down: the host adds the disk again on seeing it. Kept in sync with
-/// `xtask/src/commands/test_hotplug.rs`.
+/// `xtask/src/commands/test/hotplug.rs`.
 const READD_MARKER: &str = "TORN DOWN /data, its disk removed; READY for the re-added disk";
 
 /// Logged once the fixture mounted `/data` on the re-added disk: the host
 /// adds a copy of the disk on seeing it. Kept in sync with
-/// `xtask/src/commands/test_hotplug.rs`.
+/// `xtask/src/commands/test/hotplug.rs`.
 const TIE_MARKER: &str = "MOUNTED /data on the re-added disk; READY for a copy of the disk";
 
 /// The process name vfsd gives the root mount's driver: `fatfs:` and the

@@ -9,7 +9,7 @@
 //! crashd logs are checked on the host, in a boot's serial log
 //! (docs/testing.md § Crash reports): by `cargo xtask run --runs N
 //! --crash-reports` on each passing run's log, and by `cargo xtask
-//! test-crash-report` on a saved one. Every block in the log must be complete
+//! run --crash-reports` on a saved one. Every block in the log must be complete
 //! and hold the fields its kind, thread, and status require
 //! (`crash_report::Block::check`, the parser of the format crashd emits,
 //! services/crashd/docs/block-format.md).

@@ -43,7 +43,7 @@ use output::Sink;
 
 /// Printed once all driver caps are held and the keyboard thread is running;
 /// the host test harness injects keys on seeing it. Kept in sync with
-/// `xtask/src/commands/test_terminal.rs`.
+/// `xtask/src/commands/test/terminal.rs`.
 const READY_MARKER: &str = "terminal: READY for injection";
 
 /// Channel message: a decoded input byte run, a leader output byte run, or the

@@ -231,7 +231,7 @@ const SPECS: &[Spec] = &[
         arch_only: Some(Arch::X86_64),
     },
     // The TPM 2.0 driver: devmgr binds it to the ACPI `MSFT0101` device, an
-    // x86-64 PC Client TPM, which a launch attaches only for `test-tpm`.
+    // x86-64 PC Client TPM, which a launch attaches only for the `tpm` case.
     Spec {
         name: "tpm",
         install_name: None,
@@ -314,7 +314,7 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     // The GDB stub: installed on every image, started only on a boot that
-    // stages its recipe (`--debug-target` of `run`, `test-gdb`).
+    // stages its recipe (`--debug-target` of `run`, the `debug-port` case).
     Spec {
         name: "gdbstub",
         install_name: None,
@@ -322,7 +322,7 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::Services,
         arch_only: None,
     },
-    // The debug-port fixture `test-debug-port` stages: it answers fixed GDB
+    // The debug-port fixture the `debug-port` case stages: it answers fixed GDB
     // remote serial protocol packets on the debug port.
     Spec {
         name: "debug-echo",
@@ -331,7 +331,7 @@ const SPECS: &[Spec] = &[
         dest: InstallDest::Tests,
         arch_only: None,
     },
-    // The hotplug fixture `test-hotplug` stages: it waits for the `test-dma`
+    // The hotplug fixture the `hotplug` case stages: it waits for the `test-dma`
     // fixture on a hot-added `edu` device and checks its DMA and MSI, its
     // withdrawal at the device's removal, and the device added again.
     Spec {
@@ -742,7 +742,7 @@ const BOOTLOADER_INSTALL: &str = "/boot/boot.efi";
 
 /// Compile the bootloader for `args.arch` in `args`'s profile, embedding the
 /// trust store in the file `store`, and write its PE image to `out`; the
-/// clippy pass runs first unless `args.skip_lints`. `test-signing` builds a
+/// clippy pass runs first unless `args.skip_lints`. the `signing` case builds a
 /// bootloader under a store of its own this way, outside the sysroot.
 ///
 /// # Errors

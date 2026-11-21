@@ -432,12 +432,12 @@ validates the API once per boot.
   check each refusal path: a null or wrong-type handle, a derivation without
   `Contribute`, a length past the cap, and a null, kernel-half or unmapped
   buffer.
-- **Snapshot-resume test** (`cargo xtask test-vmgenid`, x86_64): boots with a
+- **Snapshot-resume test** (`cargo xtask test vmgenid`, x86_64): boots with a
   fixed generation GUID, saves the guest via QMP migrate-to-file, restores it
   under a different GUID with `-incoming`, and asserts the kernel's
   `entropy: VM generation change detected` line plus a post-resume
   interactive liveness round. See
-  [xtask/README.md § test-vmgenid](../../../xtask/README.md#cargo-xtask-test-vmgenid)
+  [xtask/README.md § The `vmgenid` case](../../../xtask/README.md#the-vmgenid-case)
   and [docs/testing.md](../../../docs/testing.md).
 
 ---

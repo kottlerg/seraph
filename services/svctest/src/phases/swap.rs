@@ -846,6 +846,33 @@ fn procmgr_call(authority: u64, msg: &IpcMessage, what: &str) -> IpcMessage
         .unwrap_or_else(|e| panic!("{PHASE}: {what}: ipc_call failed ({e})"))
 }
 
+/// The name `LIST_PROCESSES` lists a child svctest spawns of itself under: the
+/// first string of its argv, which `Command` makes the program path.
+pub(super) const SVCTEST_CHILD_NAME: &[u8] = b"/tests/svctest";
+
+/// The badge of the child of svctest's own binary spawned since `before`, a
+/// [`listed_badges`] taken before the spawn: the one process
+/// `LIST_PROCESSES` lists under [`SVCTEST_CHILD_NAME`] that `before` does
+/// not hold. Any other process can be spawned meanwhile (the terminal's next
+/// session's shell once oomd has stopped a session, say), so a new entry under
+/// another name is not the child's. `what` names the phase in a panic.
+pub(super) fn spawned_badge(authority: u64, before: &[u64], what: &str) -> u64
+{
+    let new: Vec<u64> = super::crash::badges_named(authority, SVCTEST_CHILD_NAME)
+        .into_iter()
+        .filter(|badge| !before.contains(badge))
+        .collect();
+    let [badge] = new[..]
+    else
+    {
+        panic!(
+            "{what}: LIST_PROCESSES lists {new:#x?} under {:?} as new since the spawn",
+            String::from_utf8_lossy(SVCTEST_CHILD_NAME)
+        );
+    };
+    badge
+}
+
 /// The badges `LIST_PROCESSES` lists.
 pub(super) fn listed_badges(authority: u64) -> Vec<u64>
 {
@@ -1243,23 +1270,15 @@ pub(super) fn main_pages(reserve: u64) -> u64
 }
 
 /// Spawn the fixture with a main region of `main_pages` pages filled as
-/// `fill` says, wait for its ready line, and find its process badge as the
-/// one entry `LIST_PROCESSES` lists that it did not before the spawn.
+/// `fill` says, wait for its ready line, and find its process badge
+/// ([`spawned_badge`]).
 pub(super) fn start_fixture(authority: u64, main_pages: u64, fill: Fill) -> (Fixture, Ready, u64)
 {
     let before = listed_badges(authority);
     let mut fixture = Fixture::spawn(main_pages, fill);
     let line = fixture.line(None, "ready");
     let ready = parse_ready(&line);
-    let new: Vec<u64> = listed_badges(authority)
-        .into_iter()
-        .filter(|badge| !before.contains(badge))
-        .collect();
-    let [process] = new[..]
-    else
-    {
-        panic!("{PHASE}: LIST_PROCESSES lists {new:#x?} as new since the fixture's spawn");
-    };
+    let process = spawned_badge(authority, &before, PHASE);
     (fixture, ready, process)
 }
 

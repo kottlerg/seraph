@@ -346,15 +346,7 @@ impl ImageChild
             let status = child.wait();
             panic!("image_sharing: the child printed {line:?}, then exited {status:?}")
         };
-        let new: Vec<u64> = super::swap::listed_badges(authority)
-            .into_iter()
-            .filter(|badge| !before.contains(badge))
-            .collect();
-        let [process] = new[..]
-        else
-        {
-            panic!("image_sharing: LIST_PROCESSES lists {new:#x?} as new since the spawn");
-        };
+        let process = super::swap::spawned_badge(authority, &before, "image_sharing");
         let thread = child.main_thread_cap();
         Box::new(Self {
             child,

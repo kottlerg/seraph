@@ -799,7 +799,7 @@ and each later one given back when its last record goes, and a session or an ope
 refuses fails with fatfs's `LIMIT` while other clients' requests go on. What stays on fatfs's own
 node is, for each session, about 0.35 KiB (three 72-byte capability slots and a 128-byte
 Notification) against the 4 KiB first page the client pays; a 72-byte capability slot for each
-further page; for each open in a session the 72-byte slot of its release SEND, and and for each page
+further page; for each open in a session the 72-byte slot of its release SEND, and for each page
 it holds the slot of the page's capability, each matched by the 72-byte slot the client's own
 `CSpace` gives the capability it receives; and the index from ids to records, at most 8 bytes per
 live session or open, which halves as they go. The page tables that map session pages into fatfs

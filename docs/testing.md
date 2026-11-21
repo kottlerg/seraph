@@ -235,8 +235,9 @@ attaches and no production driver binds. svctest fails, naming the flag, when th
 The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
 the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
 `CRASHD_OOM_STALL_MS=3000`, so crashd holds a fault declined for want of memory for up to 3 s,
-both of which the fixture's tester checks ([Crash reports](#crash-reports-test-crash-report)). A
-usertest boot without it fails the crashme tester:
+both of which the fixture's tester checks ([Crash reports](#crash-reports-test-crash-report)). Its
+`crashd.core` name is the authority the usertest recipe seeds to the crashme tester for its live
+cores. A usertest boot without it fails the crashme tester:
 
 ```sh
 cargo xtask build
@@ -416,10 +417,14 @@ must be complete and hold the fields its kind, thread, and status require.
 
 The usertest boot's crashd names `crashme` in its `CORE_DUMP` ([Gating](#gating)), so each of the
 fixture's faulting deaths also leaves an ELF core in `/crash`, which the crashme tester checks in
-the guest: its machine, the faulting thread's signal, instruction pointer and stack pointer
-against the page runs it holds, the illegal instruction's bytes, and the `worker` core's threads
-([programs/crashme/README.md](../programs/crashme/README.md)). A core is checked in the boot, not
-in the log; `gdb` reading one is checked by hand
+the guest: its machine, the faulting thread's signal, instruction pointer and stack pointer against
+the page runs it holds, the illegal instruction's bytes, and the `worker` core's threads
+([programs/crashme/README.md](../programs/crashme/README.md)). The tester also asks crashd for a
+live core of the running fixture and checks that the fixture ran on unchanged and that the core
+records its threads, their stacks and a page it marked, and none of the binary's text, and asks for
+one of a fixture on the core path and checks the refusal released the capture ([crashd Operation §
+Live Core](../services/crashd/docs/operation.md#live-core)). A core is checked in the boot, not in
+the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to

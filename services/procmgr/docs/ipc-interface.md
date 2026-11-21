@@ -1698,13 +1698,13 @@ protection. A run's pages are one of five forms:
 - **Zero** (`RUN_ZERO`): every byte is zero. A page of a demand region no fault backed, or of a
   zero-object attachment with no copy of its own.
 - **Image** (`RUN_IMAGE`): the page of the image object the header names, at the run's object page,
-  which the target attaches and has no copy of its own of. The image object is sealed, so its
-  pages are the bytes of the binary the header names whatever the target did; a page the target
-  wrote is a copy of its own, and bytes. A reader that has the binary of that SHA-512 and length,
-  in the layout procmgr's image sharing seals it ([README.md](../README.md#image-sharing) § Image
-  Sharing), reads the page there. A reader without it, such as crashd writing a core, records the
-  run's pages with no bytes (`filesz` 0), which a debugger reads from the binary
-  ([services/crashd/docs/core-format.md](../../crashd/docs/core-format.md) § Reading a Core).
+  which the target attaches and has no copy of its own of. The image object is sealed, so its pages
+  are the bytes of the binary the header names whatever the target did; a page the target wrote is a
+  copy of its own, and bytes. A reader that has the binary of that SHA-512 and length, in the layout
+  procmgr's image sharing seals it ([README.md](../README.md#image-sharing) § Image Sharing), reads
+  the page there. A reader without it, such as crashd writing a core, lists none of the run's pages,
+  which a debugger then reads from the binary
+  ([services/crashd/docs/core-format.md](../../crashd/docs/core-format.md) § Live cores).
 - **No copy** (`PAGE_RUN_NO_COPY`): device memory `SYS_THREAD_READ_MEM` refuses, outside the
   regions. It has no bytes and is not absent.
 - **Absent** (`RUN_ABSENT`): the target's pages whose content the object does not hold.

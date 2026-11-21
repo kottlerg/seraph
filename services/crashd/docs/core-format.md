@@ -123,6 +123,27 @@ The signal is the one Linux delivers for the fault, which `gdb` reports the core
 | Alignment | `SIGBUS` |
 | Any other exception | `SIGSEGV` |
 
+### Live cores
+
+A live core ([operation.md](operation.md) § Live Core) has the same file layout and notes, written
+from a procmgr snapshot of the process
+([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Snapshot object layout) rather
+than from the process itself:
+
+- Its page runs are the snapshot's runs, in address order. A run whose bytes the snapshot holds is
+  kept as the budget allows, and a run of zero pages or of device memory keeps its `PT_LOAD` with
+  `p_filesz` 0, read as zeros. A run of the image's shared pages, or an absent one, has no
+  `PT_LOAD`: a debugger reads the image's pages from the binary, and reports an absent page
+  unreadable. A `PT_LOAD` with no bytes would read as zeros, and `gdb`, finding zeros at the
+  auxiliary vector's `AT_PHDR` rather than the binary's program headers, would not relocate the
+  executable. The budget keeps first the run holding the main thread's instruction pointer, then
+  those holding each recorded thread's stack pointer, in thread order.
+- Its threads are the snapshot's thread records, the main thread first, at most 256: each
+  `NT_PRSTATUS` carries signal 0, and its thread id is the thread's index in procmgr's attach list
+  plus 1, the main thread's 1. The registers are those the capture's hold left.
+- Its `NT_AUXV` comes from the image's ELF header read at the load bias the snapshot's header
+  records, through the running process after the capture.
+
 ---
 
 ## Reading a Core
@@ -140,8 +161,8 @@ hosts needs `set architecture riscv:rv64` before it loads the binary. `gdb` list
 thread, the faulting one current, and its stack, registers and floating-point and vector state.
 
 The code is `services/crashd/core-file`, host-tested: the notes, the layout and the budget's
-choice of runs, the policy, and the directory's names and eviction. crashd reads the process and
-writes the file.
+choice of runs, the policy, the directory's names and eviction, and the decoding of a snapshot's
+runs and thread records. crashd reads the process, or the snapshot, and writes the file.
 
 ---
 

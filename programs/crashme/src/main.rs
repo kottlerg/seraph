@@ -24,7 +24,11 @@
 //! `crashme oom-touch` drive the crash service's hold of a fault memmgr
 //! declined for want of memory, under the log name `crashme-oom` (the `oom`
 //! module), and `crashme oom-hold` holds memory as a job of an operator
-//! session for oomd to stop. See programs/crashme/README.md.
+//! session for oomd to stop. `crashme live` does not fault: it runs with
+//! threads registered and known bytes in memory while the crash service writes
+//! a live core of it, and checks that it ran on unchanged; `crashme
+//! live-no-core` declares itself on the core path first, so the crash service
+//! refuses that core. See programs/crashme/README.md.
 
 mod arch;
 mod oom;
@@ -80,6 +84,8 @@ fn main()
         "registry-worker" => registry_worker(&arg),
         "registry-declare" => registry_declare(),
         "debugger-tag" => debugger_tag(),
+        "live" => live(),
+        "live-no-core" => live_no_core(),
         "oom-fill" => oom::fill(std::env::args().nth(2).as_deref()),
         "oom-touch" => oom::touch(std::env::args().nth(2).as_deref()),
         "oom-hold" => oom::hold(std::env::args().nth(2).as_deref()),
@@ -87,7 +93,7 @@ fn main()
         {
             println!(
                 "usage: crashme vm|exception|worker|registry-main|registry-worker|registry-declare\
-                 |debugger-tag|oom-fill <ms>|oom-touch <pages>|oom-hold <pages>"
+                 |debugger-tag|live|live-no-core|oom-fill <ms>|oom-touch <pages>|oom-hold <pages>"
             );
             std::process::exit(2);
         }
@@ -332,6 +338,67 @@ fn debugger_tag()
     let _ = stop.send(());
     let _ = worker.join();
     std::process::exit(i32::from(!(taken_back && unbound)));
+}
+
+/// Threads `live` parks beside its main thread, each registered with
+/// procmgr, so a live core of it records more than one thread.
+const LIVE_PARKED: usize = 2;
+
+/// The word `live` fills its marked page with, which its core holds.
+const LIVE_MARK: u64 = 0x4c49_5645_434f_5245;
+
+/// Run while a crash service writes a live core of this process: park
+/// [`LIVE_PARKED`] registered threads, fill a page of the heap with
+/// [`LIVE_MARK`], print `ready mark=<address>`, and wait for a line on
+/// stdin. Then check that every parked thread is still parked and the page
+/// still holds the mark, print `live: PASS` or `live: FAIL`, and exit 0 when
+/// both hold, 1 when either does not.
+fn live()
+{
+    let parked: Vec<_> = (0..LIVE_PARKED).map(|_| park()).collect();
+    let words = usize::try_from(syscall_abi::PAGE_SIZE / 8).unwrap_or(512);
+    let mark = std::hint::black_box(vec![LIVE_MARK; words]);
+    println!("ready mark={:#x}", mark.as_ptr() as u64);
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    let held = mark.iter().all(|&w| w == LIVE_MARK);
+    let running = parked.iter().all(|(_, handle)| !handle.is_finished());
+    let pass = held && running;
+    println!(
+        "live: {} (mark held {held}, threads parked {running})",
+        if pass { "PASS" } else { "FAIL" }
+    );
+    for (stop, handle) in parked
+    {
+        drop(stop);
+        let _ = handle.join();
+    }
+    std::process::exit(i32::from(!pass));
+}
+
+/// Run while a crash service is asked for a live core of this process after
+/// it declared itself on the core path: send `DECLARE_NO_CORE`, print
+/// `ready` when procmgr took it, and wait for a line on stdin, then exit 0.
+/// Exits 1 when procmgr refused the declaration.
+fn live_no_core()
+{
+    // SAFETY: the main thread's registered IPC buffer page.
+    let declared = unsafe {
+        ipc::ipc_call(
+            std::os::seraph::startup_info().procmgr_endpoint,
+            &IpcMessage::new(procmgr_labels::DECLARE_NO_CORE),
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .is_ok_and(|r| r.label == procmgr_errors::SUCCESS);
+    if !declared
+    {
+        fail("live-no-core: DECLARE_NO_CORE was refused");
+    }
+    println!("ready");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    std::process::exit(0);
 }
 
 /// Fault on a spawned thread after joining its sibling, which the attach

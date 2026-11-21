@@ -1,8 +1,8 @@
 # crashd Operation
 
 How crashd registers as the crash service, handles each fault, holds a fault declined for want of
-memory, writes a core of a process its policy names, bounds that handling, and what it cannot
-report.
+memory, writes a core of a process its policy names, writes a live core of a running process on
+request, bounds that handling, and what it cannot report.
 
 ---
 
@@ -10,9 +10,12 @@ report.
 
 1. crashd declares itself undebuggable to procmgr (`DECLARE_NO_DEBUG`), so no debug-authority
    holder stops it and its own threads are not bound to the endpoint it receives on.
-2. Its bootstrap round delivers one cap, a `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which
-   its recipe's `debug_authority = yes` has svcmgr mint
-   ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `debug_authority`).
+2. Its bootstrap round delivers two caps: the `RECV` on its live-core endpoint, which its recipe's
+   `provides = crashd.core:grant` has svcmgr create ([Live Core](#live-core)), and a
+   `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which its recipe's `debug_authority = yes`
+   has svcmgr mint ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
+   § `provides`, § `debug_authority`). Without the authority it reports nothing and exits; without
+   the endpoint it logs a warning and writes no live core.
 3. It reads its core-dump policy from the `CORE_DUMP` entry of its environment and logs it
    ([Core Dump](#core-dump)), and its stall from `CRASHD_OOM_STALL_MS` ([Hold](#hold)).
 4. It sends `REGISTER_CRASH_SERVICE` with a Thread cap of its main thread, and receives a `RECV` cap
@@ -21,7 +24,8 @@ report.
    Authority).
 5. With a stall set, it makes its hold endpoints and wait set and touches its stack and heap
    ([Hold](#hold)), and logs `holding faults declined for want of memory up to <stall> ms`. It
-   logs `reporting crashes` and receives faults.
+   logs `reporting crashes` and receives faults, and live-core requests, one at a time from a wait
+   set of both endpoints.
 
 When crashd dies, procmgr declines the faults on the endpoint until a respawned crashd registers.
 
@@ -241,6 +245,67 @@ A process the policy does not name gets no line.
 
 ---
 
+## Live Core
+
+A holder of the `crashd.core` name asks crashd for an ELF core of a process that keeps running
+(`LIVE_CORE`, [`shared/ipc/src/crashd_labels.rs`](../../../shared/ipc/src/crashd_labels.rs)).
+svcmgr publishes the name seed-only, as a `:grant` entry, badged `LIVE_CORE_AUTHORITY`: a live
+core copies the process's memory, and the request moves the account the capture is charged to. The
+request names the process in a name block, matched as `CORE_DUMP` matches a name
+([Core Dump](#core-dump)), and carries as `caps[0]` the requester's own memmgr `SEND`, the
+account. `CORE_DUMP` does not apply: the authority is the policy. crashd serves one request at a
+time, between faults, and deletes every cap the request carried before it replies.
+
+Its steps, in order, under the dump's bound ([Bounds](#bounds)):
+
+1. It refuses an unknown label (`UNKNOWN_OPCODE`), a badge without the authority
+   (`UNAUTHORIZED`), a missing, empty or too long name, or a `caps[0]` that is not an endpoint
+   `SEND` (`INVALID_ARGUMENT`), and any request while memory is critical, as for a crash core
+   (`MEMORY_CRITICAL`).
+2. It finds the first live process, in badge order, that the name names (`LIST_PROCESSES`), or
+   replies `NOT_FOUND`.
+3. It asks procmgr, through its debug authority, for a snapshot of the process charged to the
+   account ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 33: `SNAPSHOT`).
+   procmgr holds the process for the capture alone and records each thread's registers as the
+   hold left them; crashd stops no thread and copies none of the process's pages itself. A refusal
+   is replied `SNAPSHOT_REFUSED`, with procmgr's label in `data[0]`, and `NOT_FOUND` when the
+   process ended first.
+4. It attaches the object's layout pages read-only and checks the layout.
+5. It attaches the process (`ATTACH_PROCESS`) to read its declarations as they stand after the
+   capture, so a declaration the process made before the capture's hold is always seen. A process
+   that declared itself on the core path (`DECLARE_NO_CORE`) gets no core: crashd replies
+   `NO_CORE`. A process that ended before the attach gets `NOT_FOUND`, its declarations unknown.
+   Through the process's main thread crashd then reads the image's ELF header at the load bias the
+   snapshot's header records, for the core's `NT_AUXV` (`ipc::read_mem_resident_bounded`); a
+   read that fails, the process having ended since the attach among the causes, leaves the core
+   without `NT_AUXV`, as it leaves a crash core.
+6. It lays the core out within the per-core budget from the snapshot's runs and thread records
+   ([core-format.md](core-format.md) § Live cores), deletes the `.part` files and the oldest
+   cores as step 6 of [Core Dump](#core-dump) does, and writes the core under its `.part` name
+   from the object's pages, a window of 64 pages (`WINDOW_PAGES`) attached at a time, and renames
+   it.
+7. It releases the object (`OBJECT_RELEASE`). Every path after a snapshot was taken releases it
+   before the reply, a refusal included, so no live core leaves the capture charged to the
+   account.
+
+crashd replies `SUCCESS` with `data[0]` the process badge, `data[1]` the core's sequence number,
+`data[2]` its bytes, and `data[3]` `LIVE_CORE_COMPLETE` when the snapshot holds every page it
+listed. A core it could not write is `NOT_WRITTEN`, a `.part` file then perhaps remaining until
+the next core, and a request that passed its bound `TIMED_OUT`
+([`shared/ipc/src/crashd_errors.rs`](../../../shared/ipc/src/crashd_errors.rs)). It logs one line
+of the outcome:
+
+```
+live core of <name> badge=<badge> written /crash/<file> bytes=<size>[ (incomplete)]
+live core of <name> not written: <reason>
+```
+
+The capture's pages are the requester's. crashd's own cost is the layout and the window, attached
+in its address space, which count against its budget node's max while attached
+([memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) § Label 28: `ATTACH_OBJECT`).
+
+---
+
 ## Bounds
 
 Handling one fault, its reading and its block's logging, runs under a call deadline 2 s ahead
@@ -265,21 +330,21 @@ and none is asked for once the deadline has passed. The log lines crashd writes 
 does not stop crashd serving faults and ending holds.
 
 A dump runs under a call deadline of its own, 60 s (`DUMP_BOUND`), after the report's and outside
-it. Its calls, the attach, the process list, the resident requests, and the runtime's file-system
-calls, each carry the time left, and the one it waits in ends at the deadline: crashd's own end
-`WouldBlock`, and the runtime's file calls fail `TimedOut`. crashd then starts no further
-request, writes no core, logs `not written: the dump passed its bound`, and declines. What the
-dump leaves: a request the driver had received before the deadline may still be carried out (a
+it, and so does a live core ([Live Core](#live-core)), which delays the faults that arrive meanwhile
+by at most that bound. Its calls, the attach, the process list, the resident requests, and the
+runtime's file-system calls, each carry the time left, and the one it waits in ends at the deadline:
+crashd's own end `WouldBlock`, and the runtime's file calls fail `TimedOut`. crashd then starts no
+further request, writes no core, logs `not written: the dump passed its bound`, and declines. What
+the dump leaves: a request the driver had received before the deadline may still be carried out (a
 write lands, a file is created); the core file's close, as it is dropped, is not sent past the
 deadline, and the driver releases that open once it finds the open's liveness cap gone, which the
 drop deletes ([fs driver protocol](../../fs/docs/fs-driver-protocol.md) § Label 18: `FS_OPEN`); the
-`.part` file stays,
-and the next dump deletes it (step 6 of [Core Dump](#core-dump)); and the threads it stopped stay
-stopped until the decline ends the process. The faulting thread is held while the dump runs, so
-the bound is the most a dump delays the process's teardown and crashd's next fault, which crashd
-then handles with no deadline left set. It covers a core of the per-core budget, 2 MiB
-(`CORE_BYTES_MAX`), at half the slowest rate measured writing through the FAT driver, about
-75 KB/s on a riscv64 debug build under QEMU, where each 4 KiB write allocates a cluster: the 0.9 MiB
+`.part` file stays, and the next dump deletes it (step 6 of [Core Dump](#core-dump)); and the
+threads it stopped stay stopped until the decline ends the process. The faulting thread is held
+while the dump runs, so the bound is the most a dump delays the process's teardown and crashd's next
+fault, which crashd then handles with no deadline left set. It covers a core of the per-core budget,
+2 MiB (`CORE_BYTES_MAX`), at half the slowest rate measured writing through the FAT driver, about 75
+KB/s on a riscv64 debug build under QEMU, where each 4 KiB write allocates a cluster: the 0.9 MiB
 core of crashme's `worker` mode took 8 s to 12 s on debug builds of both architectures.
 
 ---

@@ -30,6 +30,7 @@ mod image_cache;
 mod init_reap;
 mod loader;
 mod process;
+mod snapshot;
 mod trust_store;
 
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
@@ -786,6 +787,11 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         procmgr_labels::READ_VERIFIED =>
         {
             handle_read_verified(&req, ipc_buf, ctx);
+        }
+
+        procmgr_labels::SNAPSHOT =>
+        {
+            handle_snapshot(&req, ipc_buf, ctx);
         }
 
         procmgr_labels::CONFIGURE_PIPE =>
@@ -2399,6 +2405,78 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                     .build();
                 // SAFETY: ipc_buf is the registered IPC buffer page.
                 let _ = unsafe { ipc::ipc_call(memmgr.cap(), &msg, ipc_buf) };
+            }
+        }
+        Err(code) => reply_empty(ipc_buf, code),
+    }
+}
+
+/// Handle `SNAPSHOT`: capture the live process `data[0]` names into a memory
+/// object sealed on the account `caps[0]`, the sender's own memmgr SEND
+/// ([`snapshot::capture`]; `services/procmgr/docs/ipc-interface.md`
+/// § Label 33: `SNAPSHOT`). Wire layout: [`procmgr_labels::SNAPSHOT`].
+///
+/// The request is checked, and the target's address-space and main-thread
+/// caps derived, under the table lock, so a teardown of the target meanwhile
+/// leaves caps that name its objects or that the kernel refuses, never
+/// another cap that took the slot. The capture holds no lock, and takes this
+/// worker for its length. The account cap is deleted on every path, and
+/// every cap past it at once. An object the reply cannot deliver is released.
+fn handle_snapshot(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+{
+    let caps = req.caps();
+    let account = process::CapGuard::new(caps.first().copied().unwrap_or(0));
+    release_caps(caps.get(1..).unwrap_or(&[]));
+    let target = {
+        let table = &mut ctx.tables.lock().table;
+        process_table::snapshot_target(table, req.badge, req.word(0), account.cap())
+            .map_err(process_table::SnapshotRefusal::code)
+            .and_then(|entry| {
+                let derive = |cap| {
+                    process::CapGuard::new(
+                        syscall::cap_derive(cap, syscall::RIGHTS_ALL).unwrap_or(0),
+                    )
+                };
+                let (aspace, thread) = (derive(entry.aspace_cap), derive(entry.thread_cap));
+                if aspace.cap() == 0 || thread.cap() == 0
+                {
+                    return Err(procmgr_errors::OUT_OF_MEMORY);
+                }
+                Ok(snapshot::Target {
+                    aspace,
+                    thread,
+                    memmgr_badge: entry.memmgr_badge,
+                })
+            })
+    };
+    let capture = snapshot::Context {
+        self_aspace: ctx.self_aspace,
+        memmgr_ep: ctx.memmgr_ep,
+        ipc_buf,
+    };
+    match target.and_then(|target| snapshot::capture(&capture, &target, account.cap()))
+    {
+        Ok(captured) =>
+        {
+            let complete = if captured.complete
+            {
+                ipc::procmgr_snapshot::SNAPSHOT_COMPLETE
+            }
+            else
+            {
+                0
+            };
+            let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+                .word(0, captured.pages)
+                .word(1, complete)
+                .cap(captured.handle)
+                .build();
+            // SAFETY: ipc_buf is the registered IPC buffer page.
+            if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+            {
+                // The handle stayed in procmgr's CSpace: the sender is gone or
+                // could not take it, so the object goes.
+                snapshot::release_object(captured.handle, ipc_buf);
             }
         }
         Err(code) => reply_empty(ipc_buf, code),

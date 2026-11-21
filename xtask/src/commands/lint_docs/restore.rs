@@ -169,15 +169,14 @@ fn scan<'a>(
 {
     let lines: Vec<&str> = file.text.lines().collect();
     let mut i = 0;
-    while i < lines.len()
+    while let Some(&line) = lines.get(i)
     {
-        let line = lines[i];
         if line.trim() == "#[cfg(test)]"
             && lines
-                .get(i + 1)
+                .get(i.saturating_add(1))
                 .is_some_and(|next| item_after_vis(next.trim()).starts_with("mod "))
         {
-            i = block_end(&lines, i + 1) + 1;
+            i = block_end(&lines, i.saturating_add(1)).saturating_add(1);
             continue;
         }
         if let Some(name) = static_name(line)
@@ -218,7 +217,7 @@ fn scan<'a>(
                     name: name.to_owned(),
                     path: &file.path,
                     line: one_based(i),
-                    body: lines[i..=end.min(lines.len() - 1)].join("\n"),
+                    body: lines.get(i..=end).unwrap_or_default().join("\n"),
                 };
                 if kind == RESET
                 {
@@ -230,7 +229,7 @@ fn scan<'a>(
                 }
             }
         }
-        i += 1;
+        i = i.saturating_add(1);
     }
 }
 
@@ -283,7 +282,7 @@ fn fn_name(line: &str) -> Option<&str>
     let end = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
         .unwrap_or(rest.len());
-    let name = &rest[..end];
+    let name = rest.get(..end)?;
     (!name.is_empty()).then_some(name)
 }
 
@@ -293,7 +292,12 @@ fn fn_name(line: &str) -> Option<&str>
 fn mark_above<'l>(lines: &[&'l str], at: usize) -> Option<&'l str>
 {
     let mut in_attribute = false;
-    for line in lines[..at].iter().rev().map(|l| l.trim())
+    for line in lines
+        .get(..at)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .map(|l| l.trim())
     {
         if in_attribute
         {
@@ -334,7 +338,7 @@ fn block_end(lines: &[&str], at: usize) -> usize
             {
                 '{' =>
                 {
-                    depth += 1;
+                    depth = depth.saturating_add(1);
                     opened = true;
                 }
                 '}' => depth = depth.saturating_sub(1),
@@ -359,8 +363,10 @@ fn names_word(text: &str, word: &str) -> bool
 {
     let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
     text.match_indices(word).any(|(at, _)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + word.len()..].chars().next();
+        let before = text.get(..at).and_then(|s| s.chars().next_back());
+        let after = text
+            .get(at.saturating_add(word.len())..)
+            .and_then(|s| s.chars().next());
         !before.is_some_and(is_word) && !after.is_some_and(is_word)
     })
 }

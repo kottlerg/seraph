@@ -66,10 +66,17 @@ pub const BODY_ALIGNMENT: u64 = 4096;
 pub const INIT_ENTRY_NAME: &[u8] = b"init";
 
 /// The prefix of the name of every bundle entry that is configuration: the
-/// bootloader verifies an entry whose install path lies under `/config/` in
-/// the configuration role, and every other entry but [`INIT_ENTRY_NAME`] in
-/// the boot-module role (docs/signing.md § Which Stage Verifies What).
+/// bootloader verifies an entry whose install path lies under `/config/`,
+/// outside [`PLATFORM_TABLE_PREFIX`], in the configuration role, and every
+/// other entry but [`INIT_ENTRY_NAME`] in the boot-module role
+/// (docs/signing.md § Which Stage Verifies What).
 pub const CONFIG_PREFIX: &[u8] = b"/config/";
+
+/// The prefix of the name of every platform description table a bundle
+/// carries: a data object devmgr applies, which keeps the boot-module role a
+/// bundle entry has, so a key trusted for configuration alone supplies none.
+/// devmgr takes a boot module as a table only under this prefix.
+pub const PLATFORM_TABLE_PREFIX: &[u8] = b"/config/devmgr/platform/";
 
 /// Name of the bundle entry that holds the boot-time policy
 /// (docs/signing.md § Configuration), a configuration entry
@@ -80,11 +87,20 @@ pub const CONFIG_PREFIX: &[u8] = b"/config/";
 pub const POLICY_ENTRY_NAME: &[u8] = b"/config/boot/policy.conf";
 
 /// Whether the bundle entry `name` (NUL-trimmed) is configuration, verified
-/// in the configuration role: an install path under [`CONFIG_PREFIX`].
+/// in the configuration role: an install path under [`CONFIG_PREFIX`] that
+/// is not a platform description table ([`is_platform_table`]).
 #[must_use]
 pub fn is_configuration(name: &[u8]) -> bool
 {
-    name.starts_with(CONFIG_PREFIX)
+    name.starts_with(CONFIG_PREFIX) && !is_platform_table(name)
+}
+
+/// Whether the bundle entry `name` (NUL-trimmed) is a platform description
+/// table: an install path under [`PLATFORM_TABLE_PREFIX`].
+#[must_use]
+pub fn is_platform_table(name: &[u8]) -> bool
+{
+    name.starts_with(PLATFORM_TABLE_PREFIX)
 }
 
 /// On-disk size of [`BundleHeader`] in bytes.
@@ -309,6 +325,28 @@ mod tests
         ]
         {
             assert!(!is_configuration(name), "{name:?}");
+        }
+    }
+
+    // Defect caught: a platform description table verified in the
+    // configuration role, so a key trusted for configuration alone supplies
+    // a table devmgr applies, or a configuration file taken as a table.
+    #[test]
+    fn a_platform_table_is_a_boot_module_and_nothing_else_is_a_table()
+    {
+        let table = b"/config/devmgr/platform/qemu-virt.platform";
+        assert!(is_platform_table(table));
+        assert!(!is_configuration(table));
+        for name in [
+            POLICY_ENTRY_NAME,
+            b"/config/init/log-levels.conf",
+            b"/config/svcmgr/services/x.svc",
+            b"/config/devmgr/platform",
+            b"/config/devmgr/platformx/t",
+            b"/services/drivers/virtio-blk",
+        ]
+        {
+            assert!(!is_platform_table(name), "{name:?}");
         }
     }
 

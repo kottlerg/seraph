@@ -48,8 +48,9 @@ once, in the sysroot, under the role set and the name of § Signed Attributes, t
 files of § Configuration with the index of each of their directories, composes the ESP by
 copying the installed files, builds the trust store at the path § Signing names, and embeds it in
 the bootloader. The bootloader verifies the kernel and every bundle entry against that store, each
-entry under `/config/` in the configuration role, refuses a bundle without the boot-time policy (§
-Configuration), and hands the store to procmgr (§ Trust Store), which parses it and keeps it.
+entry under `/config/` but a platform table in the configuration role, refuses a bundle without the
+boot-time policy (§ Configuration), and hands the store to procmgr (§ Trust Store), which parses it
+and keeps it.
 procmgr verifies every
 image it creates against that store before it parses it (§ Verifier Discipline), under its creator's
 signature policy and the name the creator gives (§ Signature Policy in procmgr), and verifies a data
@@ -134,7 +135,7 @@ trusted to execute as built.
 | Bootloader (PE) | Firmware, when Secure Boot is enabled | The firmware's db (§ Secure Boot) | Not applicable |
 | Kernel (`\EFI\seraph\kernel`) | Bootloader | The trust store built into it | kernel, `kernel` |
 | The bundle entry `init` | Bootloader | The same store | init, `init` |
-| A bundle entry whose name lies under `/config/`, the boot-time configuration (§ Configuration) | Bootloader | The same store | configuration, its entry name: the file's install path |
+| A bundle entry whose name lies under `/config/`, the boot-time configuration, a platform table excepted (§ Configuration) | Bootloader | The same store | configuration, its entry name: the file's install path |
 | Every other bundle entry | Bootloader | The same store | boot module, its entry name: the object's install path |
 | (nothing) | Kernel | Not applicable | Not applicable |
 | memmgr, procmgr | init loads them from boot modules the bootloader verified | Nothing further | Not applicable |
@@ -251,7 +252,7 @@ holds no other role.
 | 5 | driver | A driver image |
 | 6 | program | A program image |
 | 7 | data | A data file procmgr verifies for its reader (§ Verifier Discipline) |
-| 8 | configuration | A policy-bearing configuration file, or a configuration directory's index, procmgr verifies for its consumer, or the bootloader as a bundle entry under `/config/` (§ Configuration) |
+| 8 | configuration | A policy-bearing configuration file, or a configuration directory's index, procmgr verifies for its consumer, or the bootloader as a bundle entry under `/config/` but a platform table (§ Configuration) |
 | 9 | enrolment | A trust request the bootloader applies to the enrolled trust store with no one present (§ Trust Store) |
 
 A role is a permission the signer grants, not a place: an installed service the bootstrap needs
@@ -728,8 +729,12 @@ travels in the bundle: a file on the root filesystem is read through drivers its
 The bootloader verifies a bundle entry whose name lies under `/config/`
 (`boot_protocol::bundle::is_configuration`) in the configuration role, under its name, before it
 exposes any module, so a key whose usage lacks the configuration role cannot sign one
-(`Failed(KeyUsage)`). All boot-time policy is one file, `/config/boot/policy.conf`
-(`boot_protocol::bundle::POLICY_ENTRY_NAME`), whose format and keys
+(`Failed(KeyUsage)`). A platform description table a bundle carries, named under
+`/config/devmgr/platform/` (`boot_protocol::bundle::PLATFORM_TABLE_PREFIX`), is the exception: it
+keeps the boot-module role of every other entry, since a table shapes what devmgr trusts before the
+root filesystem exists, and devmgr takes a boot module as a table only under that name, so a key
+trusted for configuration alone supplies none. All boot-time policy is one file,
+`/config/boot/policy.conf` (`boot_protocol::bundle::POLICY_ENTRY_NAME`), whose format and keys
 [`shared/boot-policy`](../shared/boot-policy/README.md) defines; its one key is `dma-confinement`
 ([device-management.md](device-management.md) § DMA Safety Model). init forwards it to devmgr with
 the other boot modules outside its bootstrap set, and devmgr reads it before the first driver
@@ -858,14 +863,16 @@ every other image as the service its location makes it, so an image that does no
 carries no second object that boots as init. The configuration files a bundle list names (the
 log-level configuration, `/config/init/log-levels.conf`, and the boot-time policy,
 `/config/boot/policy.conf`) are installed files, each signed with the configuration role, in which
-the bootloader verifies a bundle entry under `/config/` (§ Which Stage Verifies What), and their
+the bootloader verifies a bundle entry under `/config/` but a platform table (§ Which Stage
+Verifies What), and their
 readers take the body through the parse-only split (§ Verifier Discipline). A platform
 table, installed at `/config/devmgr/platform/`, is signed with the data role alone, and procmgr
 verifies it for devmgr before devmgr parses it (§ Which Stage Verifies What). Every regular file
 under a data tree (`DATA_TREES` in `xtask/src/signing/mod.rs`: `/config/devmgr/platform/` and
 `/data/svctest/signed/`, svctest's fixture of the verified read) is signed with the data role under
 its install path, beside the role the bootloader verifies its bundle entry in when a bundle list
-names it (configuration under `/config/`, boot module elsewhere). Every regular file of a
+names it (configuration under `/config/` but a platform table, boot module elsewhere). Every
+regular file of a
 configuration directory (`CONFIG_TREES` in `xtask/src/signing/mod.rs`: `/config/svcmgr/services/`,
 whose files are `.svc` recipes, and `/config/devmgr/classes/`, whose files are `.class` files) is
 signed with the configuration role under its install path, and the pack writes the directory's index

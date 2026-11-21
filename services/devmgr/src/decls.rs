@@ -207,9 +207,12 @@ pub struct BootModules
 }
 
 /// Take every boot module of `caps` and tell each by its content: an ELF
-/// executable is a driver module, kept with its declaration; any other
-/// module is a platform description table, parsed from its body
-/// ([`firmware::platform::parse_module`]) and released. A driver module with
+/// executable is a driver module, kept with its declaration; a module named
+/// under `boot_protocol::bundle::PLATFORM_TABLE_PREFIX` is a platform
+/// description table, parsed from its body
+/// ([`firmware::platform::parse_module`]) and released. The name binds a
+/// table to the boot-module role the bootloader verified it in, so a key
+/// trusted for configuration alone supplies none. A driver module with
 /// no declaration, and a module that is neither, are logged and released, as
 /// is every module when the lists cannot grow. The boot-time policy module,
 /// told by its name, sets `caps.dma_confinement` and is released; with none,
@@ -233,7 +236,9 @@ pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
             let _ = syscall::cap_delete(module_cap);
             continue;
         }
-        match with_module(caps, module_cap, module.size, classify)
+        match with_module(caps, module_cap, module.size, |bytes| {
+            classify(&module.name, bytes)
+        })
         {
             Some(Classified::Driver(decl)) if out.drivers.try_reserve(1).is_ok() =>
             {
@@ -311,10 +316,11 @@ enum Classified
     Neither,
 }
 
-/// Tell a boot module by its bytes: an ELF executable by its magic, its
-/// declaration read within § Declaration Bounds; anything else as a
-/// platform description table, the body of a signed object.
-fn classify(bytes: &[u8]) -> Classified
+/// Tell the boot module `name` by its bytes: an ELF executable by its
+/// magic, its declaration read within § Declaration Bounds; a module named
+/// as a platform description table (`bundle::is_platform_table`) as one,
+/// the body of a signed object; anything else as neither.
+fn classify(name: &[u8], bytes: &[u8]) -> Classified
 {
     if bytes.starts_with(ELF_MAGIC)
     {
@@ -330,6 +336,13 @@ fn classify(bytes: &[u8]) -> Classified
             return Classified::Driver(decl);
         }
         std::os::seraph::log!(warn: "boot module: an executable with no declaration; released");
+        return Classified::Neither;
+    }
+    if !boot_protocol::bundle::is_platform_table(name)
+    {
+        std::os::seraph::log!(
+            warn: "boot module: neither an executable nor named as a platform table; released"
+        );
         return Classified::Neither;
     }
     match firmware::platform::parse_module(bytes)

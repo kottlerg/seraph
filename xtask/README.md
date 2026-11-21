@@ -147,8 +147,8 @@ install path in the configuration role, the directory's `index`, which the pack 
 files the directory holds and signs in the configuration role under `<dir>/index` (a subdirectory or
 a file of another suffix in those directories fails the pack), and every other file a bundle list
 names, the configuration files installed under `/config/` (the configuration role, in which the
-bootloader verifies a bundle entry under `/config/`). A pack refuses a bundle whose list does not
-name the boot-time policy `/config/boot/policy.conf`, or whose policy
+bootloader verifies a bundle entry under `/config/`, a platform table excepted). A pack refuses a
+bundle whose list does not name the boot-time policy `/config/boot/policy.conf`, or whose policy
 [`shared/boot-policy`](../shared/boot-policy/README.md) refuses. A pack signs for the harness
 recorded in
 `sysroot/.harness` ([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot),

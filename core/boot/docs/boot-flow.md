@@ -123,7 +123,8 @@ Detail: [elf-loading.md](elf-loading.md)
 
 The bootloader walks the bundle header from step 2 twice. The first walk verifies every
 entry against the trust store under its entry name, `init` as init, an entry under `/config/`
-(`bundle::is_configuration`) as configuration, and every other entry as a boot module
+but a platform table (`bundle::is_configuration`) as configuration, and every other entry, the
+tables included, as a boot module
 ([docs/signing.md](../../../docs/signing.md) § Which Stage Verifies What), before any entry is
 parsed or exposed; a refusal is fatal (`BootError::SignatureRefused`, naming the entry), and so
 is an entry named `trust-store` (`BootError::InvalidBundle`), a name the bootloader reserves,

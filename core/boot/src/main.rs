@@ -934,7 +934,8 @@ fn bundle_body(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]>
 }
 
 /// Walk the bundle header twice. The first walk verifies every entry through
-/// `verifier` under its entry name (`init` as init, every other entry, which
+/// `verifier` under its entry name in the role [`verify_bundle`] chooses
+/// (`init` as init, configuration as configuration, every other entry, which
 /// an install path names, as a boot module); the second, once
 /// every entry has passed, ELF-loads the body of the entry named
 /// [`bundle::INIT_ENTRY_NAME`] into a fresh set of segment pages and exposes
@@ -1051,8 +1052,9 @@ fn parse_bundle_header(bytes: &[u8]) -> Result<bundle::BundleHeader, BootError>
 
 /// The first walk of [`step4_parse_bundle`]: verify each of the bundle's
 /// `entry_count` entries through `verifier` under its entry name, `init` as init,
-/// an entry under `/config/` as configuration (`bundle::is_configuration`), and
-/// every other entry as a boot module, before any is parsed or exposed
+/// an entry under `/config/` as configuration (`bundle::is_configuration`),
+/// save a platform description table, and every other entry, the tables
+/// included, as a boot module, before any is parsed or exposed
 /// (docs/signing.md § Verifier Discipline), and require the boot-time policy
 /// entry `bundle::POLICY_ENTRY_NAME` (docs/signing.md § Configuration). Every
 /// entry but init is named by an install path, so none takes
@@ -3157,7 +3159,7 @@ mod tests
         let table = signed(
             &ROOT_SEED,
             b"oem_table_id = X\n",
-            &[Role::Data, Role::Configuration],
+            &[Role::Data, Role::BootModule],
             TABLE.as_bytes(),
         );
         let longest = std::format!("/{}", "x".repeat(objsig::NAME_MAX - 1));
@@ -3311,6 +3313,52 @@ mod tests
                 policy_name().into(),
                 Refusal::Failed(RecordFailure::KeyUsage)
             )
+        );
+    }
+
+    // Defect caught: a platform description table verified in the
+    // configuration role, so a key trusted for configuration alone supplies
+    // a table devmgr applies.
+    #[test]
+    fn a_platform_table_verifies_as_a_boot_module_alone()
+    {
+        const TABLE: &str = "/config/devmgr/platform/qemu-virt.platform";
+        let init = signed(&ROOT_SEED, b"init image", &[Role::Init], b"init");
+        let as_configuration = signed(
+            &ROOT_SEED,
+            b"oem_table_id = X\n",
+            &[Role::Data, Role::Configuration],
+            TABLE.as_bytes(),
+        );
+        let store = store_of(&ROOT_SEED);
+        assert_eq!(
+            refusal_under(
+                &store,
+                &[
+                    ("init", init.clone()),
+                    (TABLE, as_configuration),
+                    policy(&[Role::Configuration])
+                ]
+            ),
+            (TABLE.into(), Refusal::Failed(RecordFailure::Role))
+        );
+        let configuration_only = store_scoped(&ROOT_SEED, RoleSet::of(&[Role::Configuration]));
+        let as_module = signed(
+            &ROOT_SEED,
+            b"oem_table_id = X\n",
+            &[Role::Data, Role::BootModule],
+            TABLE.as_bytes(),
+        );
+        assert_eq!(
+            refusal_under(
+                &configuration_only,
+                &[
+                    (TABLE, as_module),
+                    ("init", init),
+                    policy(&[Role::Configuration])
+                ]
+            ),
+            (TABLE.into(), Refusal::Failed(RecordFailure::KeyUsage))
         );
     }
 

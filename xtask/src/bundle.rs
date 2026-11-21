@@ -203,7 +203,7 @@ pub fn parse_list(text: &str) -> Result<BundleList>
 
 /// The install path of every entry but `init` that a bundle list of `arch`
 /// names, over every harness, each once, in list order: the objects signed
-/// with the boot-module role (docs/signing.md § Signing).
+/// in their entry's role ([`entry_role`], docs/signing.md § Signing).
 ///
 /// # Errors
 ///
@@ -291,9 +291,9 @@ impl Entry
 }
 
 /// The role the bootloader verifies the bundle entry `name` in: init for the
-/// `init` slot, configuration for an install path under `/config/`
-/// ([`fmt::is_configuration`]), boot module for every other entry
-/// (docs/signing.md § Which Stage Verifies What).
+/// `init` slot, configuration for an install path under `/config/` save a
+/// platform table ([`fmt::is_configuration`], [`fmt::is_platform_table`]),
+/// boot module for every other entry/// (docs/signing.md § Which Stage Verifies What).
 pub fn entry_role(name: &str) -> Role
 {
     if name == INIT_SLOT
@@ -857,7 +857,8 @@ mod tests
     const POLICY: &str = "/config/boot/policy.conf";
 
     // Defect caught: a configuration entry signed or checked in the
-    // boot-module role, which the bootloader refuses; a bundle written
+    // boot-module role, or a platform table in the configuration role,
+    // which the bootloader refuses; a bundle written
     // without the boot-time policy, which the bootloader refuses, or with a
     // policy devmgr refuses, which puts every requirement on.
     #[test]
@@ -871,6 +872,10 @@ mod tests
             Role::Configuration
         );
         assert_eq!(entry_role("/services/vfsd"), Role::BootModule);
+        assert_eq!(
+            entry_role("/config/devmgr/platform/qemu-virt.platform"),
+            Role::BootModule
+        );
 
         let arch = Arch::X86_64;
         let (root, ctx, signer) = fixture("policy", arch);

@@ -237,6 +237,13 @@ fn refusals(top: u64, node: u64, ipc_buf: *mut u64)
     let _ = syscall::cap_delete(unpaid);
 
     end_session(&[], liveness, one, "the one-page node");
+    // The session ends in the sweep fatfs makes when memmgr signals the
+    // node's release; its page leaving the phase's subtree shows the sweep
+    // ran, and fatfs serves the next request after it.
+    assert!(
+        settles_to(top, 0, "NODE_QUERY_USAGE of the phase's node"),
+        "the one-page node's session ended but its page is still charged"
+    );
     assert_eq!(
         fs_open_in(node, session, 0, ipc_buf).err(),
         Some(fs_errors::INVALID_BADGE),

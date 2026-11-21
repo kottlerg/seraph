@@ -67,6 +67,7 @@ pub const fn key_of(node: &Node) -> Option<u64>
         Node::Object(o) => Some(o.key),
         Node::Free
         | Node::ZeroFrame(_)
+        | Node::Reclaim(_)
         | Node::Run(_)
         | Node::Deferred(_)
         | Node::Budget(_)

@@ -391,7 +391,10 @@ pub const NODE_CREATE: u64 = 15;
 
 /// Read the usage of the handle's budget node, on a node handle. Reply
 /// (`SUCCESS`): as [`QUERY_MEMORY_USAGE`], `data[0]` its own pages,
-/// `data[1]` its max, `data[2]` its subtree's pages. Specified in
+/// `data[1]` its max, `data[2]` its subtree's pages; `data[3]` its floor
+/// and `data[4]` its weight ([`NODE_SET_RECLAIM`]), and `data[5]` its
+/// subtree's evictable resident pages, which the floor is held against.
+/// Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 16: `NODE_QUERY_USAGE`.
 pub const NODE_QUERY_USAGE: u64 = 16;
 
@@ -688,6 +691,26 @@ pub const CAPTURE_COUNT: u64 = 1;
 /// image object handle, whose attachments memmgr describes as the image's
 /// pages and does not copy.
 pub const CAPTURE_IMAGE: u64 = 1 << 1;
+
+/// Set the floor and the weight of the handle's budget node, on a node
+/// handle ([`NODE_HANDLE_TAG`]). `data[0]` is the floor in pages, 0 for
+/// none: eviction never takes the evictable resident pages of the node's
+/// subtree below it. `data[1]` is the weight, [`NODE_WEIGHT_MIN`] to
+/// [`NODE_WEIGHT_MAX`]: above its floor the subtree is reclaimed from in
+/// proportion to the pages it holds above the floor over its weight. Neither
+/// reserves a free page or changes admission. Reply (`SUCCESS`): `data[0]`
+/// the floor and `data[1]` the weight the node took. `INVALID_ARGUMENT` (no
+/// live handle state, or a weight out of range). Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 32: `NODE_SET_RECLAIM`.
+pub const NODE_SET_RECLAIM: u64 = 32;
+/// The least weight [`NODE_SET_RECLAIM`] takes: reclaimed from fastest.
+pub const NODE_WEIGHT_MIN: u32 = 1;
+/// The weight of a node none was set on.
+pub const NODE_WEIGHT_DEFAULT: u32 = 100;
+/// The greatest weight [`NODE_SET_RECLAIM`] takes: reclaimed from
+/// `NODE_WEIGHT_MAX` times slower than a node of [`NODE_WEIGHT_MIN`] holding
+/// as much above its floor.
+pub const NODE_WEIGHT_MAX: u32 = 10_000;
 
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or above the low threshold.

@@ -1415,7 +1415,7 @@ pub enum MemoryPressure {
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     Low,
     /// The free pool is at or below the growth floor: memmgr refuses a grant
-    /// to a process outside the reserve.
+    /// charged to a budget node outside the reserve.
     #[stable(feature = "seraph_ext", since = "1.0.0")]
     Critical,
 }

@@ -765,8 +765,8 @@ pub const PRESSURE_NORMAL: u64 = 0;
 pub const PRESSURE_LOW: u64 = 1;
 /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
 /// promised are at or below the growth floor (the system reserve and, while
-/// chunks are swapped, the restore headroom), so a grant to a process outside
-/// the reserve is refused.
+/// chunks are swapped, the restore headroom), so a grant charged to a budget
+/// node outside the reserve is refused.
 pub const PRESSURE_CRITICAL: u64 = 2;
 
 /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap

@@ -40,9 +40,14 @@ pub const TOO_MANY_PROCESSES: u64 = 6;
 /// caller's version as `data[0]`; mismatch here means the caller was
 /// built against a different revision of `shared/ipc`.
 pub const LABEL_VERSION_MISMATCH: u64 = 7;
-/// The request would take the subtree of the caller's budget node, or of
-/// an ancestor, over its max. Distinct from the out-of-memory codes: the
-/// RAM may exist, and the caller's budget refuses it.
+/// The request would take the subtree of the budget node it is charged to,
+/// or of an ancestor, over its max: the caller's own node, or for a
+/// `REQUEST_MEMORY_CAPS` with `memmgr_labels::REQUEST_CHARGE_NODE` the node
+/// of the node handle in `caps[0]`. Distinct from the out-of-memory codes:
+/// the RAM may exist, and that node's budget refuses it. `ATTACH_OBJECT`
+/// also returns it for an attachment past the bound memmgr keeps its
+/// mappings under (an object attached as often as memmgr lets one be, or a
+/// zero-object region longer than one zero frame backs).
 pub const LIMIT: u64 = 8;
 /// `SWAP_TAKE`: memmgr's walk found no evicted chunk to take within its bound;
 /// a later call goes on from where it stopped.

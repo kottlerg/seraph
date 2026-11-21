@@ -68,8 +68,8 @@
 //! every spare page of the quarantine, all but the `RELEASE_KEEP` (4) most
 //! recently used slot pages (`fat_parse::keep_most_recent`). The kept pages
 //! are what a miss evicts when memmgr refuses the fs a page, as it does at
-//! `Critical`, at or below its growth floor, to a process outside the system
-//! reserve, so the fs keeps
+//! `Critical`, at or below its growth floor, to a grant charged to a node
+//! outside the system reserve, as the fs's grants are, so the fs keeps
 //! serving: a request holds one slot reference at a time. The cache is
 //! write-through, so an idle page holds nothing the device lacks and goes back
 //! without a write. A slot whose page went to a client passes the check of

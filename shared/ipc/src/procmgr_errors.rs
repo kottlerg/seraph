@@ -68,5 +68,9 @@ pub const SIGNATURE_REFUSED: u64 = 18;
 /// `procmgr_labels::REGISTER_END_QUEUE` refused: the sender registered
 /// an end queue before.
 pub const END_QUEUE_PRESENT: u64 = 19;
+/// `procmgr_labels::SNAPSHOT` refused: the target's address space is held
+/// already, by another capture of it, or the hold was interrupted; nothing
+/// was captured, and the sender may ask again.
+pub const SPACE_HELD: u64 = 20;
 /// Unknown opcode on procmgr endpoint.
 pub const UNKNOWN_OPCODE: u64 = 0xFFFF;

@@ -1118,7 +1118,8 @@ has backed stays not present, since a read fault there would take a fresh zeroed
 zero and nothing holds them. So does a page of a lost chunk, or of a chunk on disk with no swap
 service to ask, which memmgr passes over ([`memory-pool.md`](memory-pool.md#disk-tier) § Disk tier).
 Privilege: procmgr only, which sends it for a holder of its debug authority
-(`services/procmgr/docs/ipc-interface.md` § `MAKE_RESIDENT`).
+(`services/procmgr/docs/ipc-interface.md` § `MAKE_RESIDENT`), and for itself, in report mode,
+while it captures a process (`services/procmgr/docs/ipc-interface.md` § Label 33: `SNAPSHOT`).
 
 **Request:**
 
@@ -1128,6 +1129,15 @@ Privilege: procmgr only, which sends it for a holder of its debug authority
 | data[0] | the process's memmgr badge (from its `REGISTER_PROCESS` reply) |
 | data[1] | `va` |
 | data[2] | `len_bytes` (nonzero) |
+| data[3] | optional flags: bit 0 `RESIDENT_REPORT`; `0`, or absent, for none. Every other bit is reserved and MUST be zero |
+
+With `RESIDENT_REPORT` the request waits on no other process, for a sender that holds the target's
+address space, whose threads, and any server among them, run again only once it is done. memmgr
+posts no chunk to the swap service and fails no restore: it stops at the first chunk of the range
+it cannot make resident in this request's turn, a chunk on disk or lost, or one whose restore was
+not admitted or whose map failed, and reports it in `data[3]` to `data[5]` of the reply, with
+`data[0]` and `data[2]` the chunk's end, from which the sender asks again. A chunk memmgr holds in
+its store, compressed, raw, writing or being evicted, it restores as without the flag.
 
 Each restore is admitted and made as a fault's on the chunk
 ([`memory-pool.md`](memory-pool.md#eviction) § Eviction), and counts as an access in the chunk's
@@ -1146,6 +1156,9 @@ origin map counting as one, or `MAKE_RESIDENT_VISITS` (64) chunks and regions vi
 | data[0] | where memmgr stopped: `va + len_bytes` when the whole range is done, else the address to send the request again from, with the rest of the range |
 | data[1] | `RESIDENT_PENDING` (1) when memmgr posted a chunk on disk of the range to the swap service: `data[0]` is then the first such chunk's base (or `va`, when that is above it), and the reader asks again from there after a pause, once the swap service has had time to restore it; else `0` |
 | data[2] | where the walk stopped: `data[0]` when `data[1]` is `0`, else past every chunk on disk memmgr posted; a reader that will wait no longer asks again from there, passing those chunks over |
+| data[3] | with `RESIDENT_REPORT`: the reported chunk's first address within the range |
+| data[4] | with `RESIDENT_REPORT`: the reported chunk's length in bytes within the range, nonzero; `0` when no chunk is reported, the other report words then `0` |
+| data[5] | with `RESIDENT_REPORT`: the protection of the reported chunk's region, `MAP_*` bits |
 
 memmgr walks on past a chunk it posts, posting each chunk on disk and restoring
 each chunk in RAM it meets within its bounds. A word stays posted until the swap
@@ -1163,8 +1176,11 @@ reads them as such, while the rest of the range is still made resident.
 | Code | Name | Meaning |
 |---|---|---|
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A chunk could not be restored: its restore was not admitted, or a map failed; the chunks before it are resident |
-| 4 | `INVALID_ARGUMENT` | Unknown badge, zero length, or a range past the address space |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, zero length, a range past the address space, or a reserved flag bit set |
 | 5 | `UNAUTHORIZED` | The caller is not procmgr |
+
+With `RESIDENT_REPORT`, memmgr replies no `OUT_OF_MEMORY_BEST_EFFORT`: a chunk it could not restore
+is reported instead.
 
 ### Labels 22 to 26: the swap labels
 

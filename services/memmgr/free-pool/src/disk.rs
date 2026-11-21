@@ -514,27 +514,50 @@ pub enum ResidentPath
     /// Passed over: a lost chunk, or a chunk on disk with no swap service to
     /// ask; its pages stay not present.
     PassOver,
+    /// Reported (`ResidentMode::Report`): a chunk on disk or a lost one, which
+    /// the request's turn cannot make resident; the request stops at it and
+    /// names it in its reply, posting nothing to the swap service.
+    Report,
+}
+
+/// How a `MAKE_RESIDENT` request treats the chunks its turn cannot make
+/// resident (`memmgr_labels::RESIDENT_REPORT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentMode
+{
+    /// A chunk on disk is posted to the swap service for the sender to wait
+    /// on, a lost one passed over, and a restore that fails fails the request.
+    Wait,
+    /// The first such chunk, and the first whose restore fails, is reported
+    /// and ends the request's turn: the sender, which holds the target's
+    /// space, waits on no other process.
+    Report,
 }
 
 /// The path `MAKE_RESIDENT` takes for a chunk whose entry is `entry`, with
 /// `wants` saying whether a registered swap service can be asked for a chunk
-/// on disk.
+/// on disk, in the request's `mode`.
 #[must_use]
-pub const fn resident_path(entry: &ChunkEntry, wants: Registered) -> ResidentPath
+pub const fn resident_path(
+    entry: &ChunkEntry,
+    wants: Registered,
+    mode: ResidentMode,
+) -> ResidentPath
 {
-    match entry.state()
+    match (entry.state(), mode)
     {
-        ChunkState::Unbacked | ChunkState::Resident => ResidentPath::Skip,
-        ChunkState::Evicting | ChunkState::Compressed | ChunkState::Raw | ChunkState::Writing =>
-        {
-            ResidentPath::Restore
-        }
-        ChunkState::OnDisk => match wants
+        (ChunkState::Unbacked | ChunkState::Resident, _) => ResidentPath::Skip,
+        (
+            ChunkState::Evicting | ChunkState::Compressed | ChunkState::Raw | ChunkState::Writing,
+            _,
+        ) => ResidentPath::Restore,
+        (ChunkState::OnDisk | ChunkState::Lost, ResidentMode::Report) => ResidentPath::Report,
+        (ChunkState::OnDisk, ResidentMode::Wait) => match wants
         {
             Registered::Yes => ResidentPath::Want,
             Registered::No => ResidentPath::PassOver,
         },
-        ChunkState::Lost => ResidentPath::PassOver,
+        (ChunkState::Lost, ResidentMode::Wait) => ResidentPath::PassOver,
     }
 }
 
@@ -985,21 +1008,89 @@ mod tests
             .unwrap();
         let raw_writing = raw.begin_write(6, Some([3; TAG_BYTES])).unwrap();
         let raw_on_disk = raw_writing.finish_write().unwrap();
-        for (entry, yes, no) in [
-            (ChunkEntry::UNBACKED, ResidentPath::Skip, ResidentPath::Skip),
-            (resident, ResidentPath::Skip, ResidentPath::Skip),
-            (evicting, ResidentPath::Restore, ResidentPath::Restore),
-            (compressed, ResidentPath::Restore, ResidentPath::Restore),
-            (writing, ResidentPath::Restore, ResidentPath::Restore),
-            (raw, ResidentPath::Restore, ResidentPath::Restore),
-            (raw_writing, ResidentPath::Restore, ResidentPath::Restore),
-            (on_disk, ResidentPath::Want, ResidentPath::PassOver),
-            (raw_on_disk, ResidentPath::Want, ResidentPath::PassOver),
-            (lost, ResidentPath::PassOver, ResidentPath::PassOver),
+        // The path with a swap service registered, without one, and in report
+        // mode, which is the same either way.
+        for (entry, yes, no, report) in [
+            (
+                ChunkEntry::UNBACKED,
+                ResidentPath::Skip,
+                ResidentPath::Skip,
+                ResidentPath::Skip,
+            ),
+            (
+                resident,
+                ResidentPath::Skip,
+                ResidentPath::Skip,
+                ResidentPath::Skip,
+            ),
+            (
+                evicting,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+            ),
+            (
+                compressed,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+            ),
+            (
+                writing,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+            ),
+            (
+                raw,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+            ),
+            (
+                raw_writing,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+                ResidentPath::Restore,
+            ),
+            (
+                on_disk,
+                ResidentPath::Want,
+                ResidentPath::PassOver,
+                ResidentPath::Report,
+            ),
+            (
+                raw_on_disk,
+                ResidentPath::Want,
+                ResidentPath::PassOver,
+                ResidentPath::Report,
+            ),
+            (
+                lost,
+                ResidentPath::PassOver,
+                ResidentPath::PassOver,
+                ResidentPath::Report,
+            ),
         ]
         {
-            assert_eq!(resident_path(&entry, Registered::Yes), yes, "{entry:?}");
-            assert_eq!(resident_path(&entry, Registered::No), no, "{entry:?}");
+            assert_eq!(
+                resident_path(&entry, Registered::Yes, ResidentMode::Wait),
+                yes,
+                "{entry:?}"
+            );
+            assert_eq!(
+                resident_path(&entry, Registered::No, ResidentMode::Wait),
+                no,
+                "{entry:?}"
+            );
+            for wants in [Registered::Yes, Registered::No]
+            {
+                assert_eq!(
+                    resident_path(&entry, wants, ResidentMode::Report),
+                    report,
+                    "{entry:?}"
+                );
+            }
         }
     }
 

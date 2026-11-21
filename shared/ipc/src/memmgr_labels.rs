@@ -462,6 +462,7 @@ pub const DISCARD_RANGE: u64 = 20;
 ///   reply).
 /// * `data[1]` — `va`.
 /// * `data[2]` — `len_bytes` (nonzero).
+/// * `data[3]` — optional flags: [`RESIDENT_REPORT`], or 0 when absent.
 ///
 /// memmgr makes at most a few chunks resident per request and walks only
 /// the chunks that have an entry. A chunk on disk it cannot restore itself:
@@ -479,8 +480,8 @@ pub const DISCARD_RANGE: u64 = 20;
 /// else past every chunk on disk memmgr posted, from which a reader that will
 /// wait no longer asks again, passing those chunks over;
 /// `UNAUTHORIZED` (caller is not procmgr);
-/// `INVALID_ARGUMENT` (unknown badge, zero length, or a range
-/// past the address space); or `OUT_OF_MEMORY_BEST_EFFORT` (a chunk could
+/// `INVALID_ARGUMENT` (unknown badge, zero length, a range
+/// past the address space, or a flag bit not defined); or `OUT_OF_MEMORY_BEST_EFFORT` (a chunk could
 /// not be restored, for want of free RAM or a map). Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 21: `MAKE_RESIDENT`.
 pub const MAKE_RESIDENT: u64 = 21;
@@ -488,6 +489,18 @@ pub const MAKE_RESIDENT: u64 = 21;
 /// slot word it posted to the swap service; the sender asks again from
 /// `data[0]` once the swap service has had time to restore it.
 pub const RESIDENT_PENDING: u64 = 1;
+/// [`MAKE_RESIDENT`] request `data[3]` bit: report each chunk memmgr cannot
+/// make resident in the request's turn instead of waiting on it or failing.
+/// memmgr posts no chunk on disk to the swap service and replies no
+/// `OUT_OF_MEMORY_BEST_EFFORT`: it stops at the first chunk of the range that
+/// is on disk or lost, or whose restore or origin map fails, and replies it in
+/// `data[3]` (its first address within the range), `data[4]` (its length in
+/// bytes within the range, nonzero) and `data[5]` (its region's protection,
+/// `MAP_*` bits), with `data[0]` and `data[2]` the chunk's end, from which
+/// the sender asks again; `data[4]` is `0` when no chunk is reported. procmgr
+/// sets it while it holds the target's space for `SNAPSHOT`, which waits on
+/// no other process.
+pub const RESIDENT_REPORT: u64 = 1;
 /// Swap authority only ([`SWAP_AUTHORITY`]): register the swap service.
 /// `caps[0`] is a SEND on the endpoint memmgr redirects each fault on an
 /// on-disk chunk to; `data[0]` the swap slots the service's partition holds,

@@ -14,12 +14,12 @@
 //! configuration of its own that sets vfsd to debug, repacks the disk images
 //! in the layout they have with the default-init bundle, which the pack
 //! composes from the installed files, boots the current sysroot once through
-//! `run-parallel`, and always puts the saved configuration back and repacks
+//! `run --runs 1`, and always puts the saved configuration back and repacks
 //! again in that layout, with the recorded harness's bundle, afterwards. It
 //! passes when the boot reaches its harness's pass marker, its log holds a
 //! debug line of vfsd and one of fatfs, which vfsd spawns, and none of devmgr
-//! or procmgr, which log at info. A boot whose `run-parallel` outcome is a
-//! `QEMU-CRASH` is skipped, not failed, as `run-parallel` itself tolerates
+//! or procmgr, which log at info. A boot whose `run` outcome is a
+//! `QEMU-CRASH` is skipped, not failed, as `run` itself tolerates
 //! it.
 //!
 //! A pure runner: requires a populated sysroot with the default-init bundle's
@@ -33,10 +33,10 @@ use crate::error::{Context as _, Result, bail};
 
 use crate::bundle::Harness;
 use crate::cli::{
-    DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, RunParallelArgs,
+    DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, LaunchArgs, RunArgs,
     TestLogLevelArgs,
 };
-use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
+use crate::commands::run::classified::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
 use crate::regex::Regex;
 use crate::sysroot::LOG_LEVELS;
@@ -61,7 +61,7 @@ enum Verdict
 {
     /// The configured level reached vfsd and fatfs and no other service.
     Pass,
-    /// The boot's `run-parallel` outcome, a host-emulator crash: the log
+    /// The boot's `run` outcome, a host-emulator crash: the log
     /// holds the guest's output only up to the crash, so nothing is checked.
     Skipped(String),
 }
@@ -150,14 +150,14 @@ pub fn run(ctx: &Context, args: &TestLogLevelArgs) -> Result<()>
              procmgr at info)",
         ),
         Verdict::Skipped(outcome) => step(&format!(
-            "log level test: SKIPPED (the boot's run-parallel outcome is {outcome}, a \
+            "log level test: SKIPPED (the boot's run outcome is {outcome}, a \
              host-emulator crash; nothing to check)"
         )),
     }
     Ok(())
 }
 
-/// Boot the current sysroot once through `run-parallel`, with `data_image` as
+/// Boot the current sysroot once through `run --runs 1`, with `data_image` as
 /// its second disk when the layout has one, saving the run's log into `dir`.
 fn boot(
     ctx: &Context,
@@ -168,41 +168,47 @@ fn boot(
 {
     let run = run_args(args, dir, data_image);
     step("log level test: booting the current sysroot with vfsd at debug");
-    crate::commands::run_parallel::run(ctx, &run)
+    crate::commands::run::classified::run(ctx, &run, 1)
 }
 
-/// The `run-parallel` arguments of the boot: one run of `args`'s machine,
+/// The `run` arguments of the boot: one run of `args`'s machine,
 /// `data_image` attached as the second disk when there is one, its log saved
 /// into `dir`.
-fn run_args(args: &TestLogLevelArgs, dir: &Path, data_image: Option<PathBuf>) -> RunParallelArgs
+fn run_args(args: &TestLogLevelArgs, dir: &Path, data_image: Option<PathBuf>) -> RunArgs
 {
-    RunParallelArgs {
-        arch: args.arch,
+    RunArgs {
+        launch: LaunchArgs {
+            arch: args.arch,
+            cpus: args.cpus,
+            threads_per_core: 1,
+            mem: args.mem,
+            riscv_mmu: crate::qemu::RiscvMmu::Sv48,
+            riscv_zkr: crate::qemu::RiscvZkr::On,
+            x86_paging: crate::qemu::X86Paging::Four,
+            x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
+            iommu: crate::qemu::Iommu::Attached,
+            second_disk: data_image,
+            second_disk_block_size: None,
+            second_disk_shared_line: false,
+            debug_port: None,
+            debug_target: None,
+            test_devices: args.test_devices,
+        },
+        runs: Some(1),
+        display: None,
+        gdb: false,
+        debug_listen: false,
+        verbose: false,
         parallel: 1,
-        runs: 1,
         timeout: args.timeout,
-        cpus: args.cpus,
-        threads_per_core: 1,
-        mem: args.mem,
-        riscv_mmu: crate::qemu::RiscvMmu::Sv48,
-        riscv_zkr: crate::qemu::RiscvZkr::On,
-        x86_paging: crate::qemu::X86Paging::Four,
-        x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
-        iommu: crate::qemu::Iommu::Attached,
-        debug_port: None,
-        debug_target: None,
-        test_devices: args.test_devices,
-        display: crate::qemu::BatchDisplay::Headless,
         pass: DEFAULT_PASS_REGEX.to_string(),
         fail: DEFAULT_FAIL_REGEX.to_string(),
         fail_also: None,
-        debug_listen: false,
+        require: Vec::new(),
+        crash_reports: None,
         hold_on_hang: false,
         fail_grace_secs: DEFAULT_FAIL_GRACE_SECS,
         save_logs: Some(dir.to_path_buf()),
-        second_disk: data_image,
-        second_disk_block_size: None,
-        second_disk_shared_line: false,
         host: args.host.clone(),
     }
 }
@@ -213,8 +219,7 @@ mod tests
     use super::*;
 
     const PASS: &str = "[52.1] [usertest] ALL TESTS PASSED";
-    const TRAILER: &str =
-        "[run-parallel] arch=riscv64 cpus=4 accel=tcg run=1 outcome=PASS wall_s=60.000";
+    const TRAILER: &str = "[run] arch=riscv64 cpus=4 accel=tcg run=1 outcome=PASS wall_s=60.000";
     const VFSD: &str = "[1.204311] [vfsd] DEBUG disk 0: block device endpoint acquired";
     const FATFS: &str = "[1.310022] [fatfs] DEBUG sectors_per_cluster=0x0000000000000008";
     const DEVMGR_INFO: &str = "[0.912000] [devmgr] driver bound";
@@ -266,13 +271,13 @@ mod tests
         check_log(&log).unwrap_err();
     }
 
-    // Defect caught: a host-emulator crash, which run-parallel tolerates,
+    // Defect caught: a host-emulator crash, which run tolerates,
     // failing the test.
     #[test]
     fn a_host_emulator_crash_is_skipped()
     {
         let log = "[--------] boot: step 6/10\n\
-                   [run-parallel] arch=riscv64 cpus=4 accel=tcg run=1 outcome=QEMU-CRASH_rc=139 \
+                   [run] arch=riscv64 cpus=4 accel=tcg run=1 outcome=QEMU-CRASH_rc=139 \
                    wall_s=12.000\n";
         assert_eq!(
             check_log(log).expect("skipped"),

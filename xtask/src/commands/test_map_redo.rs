@@ -13,12 +13,12 @@
 //! firmware never makes it do. The `\EFI\seraph\mapredo` test knob makes the
 //! first attempt redo whatever its map's size. This command stages the knob,
 //! repacks the disk images in the layout they have, boots the current sysroot
-//! once through `run-parallel`, and always removes the knob and repacks again
+//! once through `run --runs 1`, and always removes the knob and repacks again
 //! in that layout afterwards. It passes when
 //! the boot reaches its harness's pass marker and its log holds the
 //! bootloader's knob line [`KNOB_LINE`] exactly once. A boot whose
-//! `run-parallel` outcome is a `QEMU-CRASH` is skipped, not failed, as
-//! `run-parallel` itself tolerates it.
+//! `run` outcome is a `QEMU-CRASH` is skipped, not failed, as
+//! `run` itself tolerates it.
 //!
 //! A pure runner: requires a populated sysroot with a harness staged (CI runs
 //! it in each `ktest` cell, on the ktest bundle that cell composed), and
@@ -30,11 +30,11 @@ use std::path::{Path, PathBuf};
 use crate::error::{Context as _, Result, bail};
 
 use crate::cli::{
-    DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, RunParallelArgs,
+    DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, LaunchArgs, RunArgs,
     TestMapRedoArgs,
 };
 use crate::commands::mkdisk::{Knob, remove_knob, stage_knob};
-use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
+use crate::commands::run::classified::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
 use crate::regex::Regex;
 use crate::util::step;
@@ -49,7 +49,7 @@ enum Verdict
 {
     /// The boot redid steps 6 and 7 once for the knob and passed.
     Pass,
-    /// The boot's `run-parallel` outcome, a host-emulator crash: the log
+    /// The boot's `run` outcome, a host-emulator crash: the log
     /// holds the guest's output only up to the crash, so nothing is checked.
     Skipped(String),
 }
@@ -113,14 +113,14 @@ pub fn run(ctx: &Context, args: &TestMapRedoArgs) -> Result<()>
              boot completed)",
         ),
         Verdict::Skipped(outcome) => step(&format!(
-            "map redo test: SKIPPED (the boot's run-parallel outcome is {outcome}, a \
+            "map redo test: SKIPPED (the boot's run outcome is {outcome}, a \
              host-emulator crash; nothing to check)"
         )),
     }
     Ok(())
 }
 
-/// Boot the current sysroot once through `run-parallel`, with `data_image` as
+/// Boot the current sysroot once through `run --runs 1`, with `data_image` as
 /// its second disk when the layout has one, saving the run's log into `dir`.
 fn boot(
     ctx: &Context,
@@ -131,41 +131,47 @@ fn boot(
 {
     let run = run_args(args, dir, data_image);
     step("map redo test: booting the current sysroot with the mapredo knob staged");
-    crate::commands::run_parallel::run(ctx, &run)
+    crate::commands::run::classified::run(ctx, &run, 1)
 }
 
-/// The `run-parallel` arguments of the boot: one run of `args`'s machine,
+/// The `run` arguments of the boot: one run of `args`'s machine,
 /// `data_image` attached as the second disk when there is one, its log saved
 /// into `dir`.
-fn run_args(args: &TestMapRedoArgs, dir: &Path, data_image: Option<PathBuf>) -> RunParallelArgs
+fn run_args(args: &TestMapRedoArgs, dir: &Path, data_image: Option<PathBuf>) -> RunArgs
 {
-    RunParallelArgs {
-        arch: args.arch,
+    RunArgs {
+        launch: LaunchArgs {
+            arch: args.arch,
+            cpus: args.cpus,
+            threads_per_core: 1,
+            mem: args.mem,
+            riscv_mmu: args.riscv_mmu,
+            riscv_zkr: crate::qemu::RiscvZkr::On,
+            x86_paging: args.x86_paging,
+            x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
+            iommu: crate::qemu::Iommu::Attached,
+            second_disk: data_image,
+            second_disk_block_size: None,
+            second_disk_shared_line: false,
+            debug_port: None,
+            debug_target: None,
+            test_devices: args.test_devices,
+        },
+        runs: Some(1),
+        display: None,
+        gdb: false,
+        debug_listen: false,
+        verbose: false,
         parallel: 1,
-        runs: 1,
         timeout: args.timeout,
-        cpus: args.cpus,
-        threads_per_core: 1,
-        mem: args.mem,
-        riscv_mmu: args.riscv_mmu,
-        riscv_zkr: crate::qemu::RiscvZkr::On,
-        x86_paging: args.x86_paging,
-        x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
-        iommu: crate::qemu::Iommu::Attached,
-        debug_port: None,
-        debug_target: None,
-        test_devices: args.test_devices,
-        display: crate::qemu::BatchDisplay::Headless,
         pass: DEFAULT_PASS_REGEX.to_string(),
         fail: DEFAULT_FAIL_REGEX.to_string(),
         fail_also: None,
-        debug_listen: false,
+        require: Vec::new(),
+        crash_reports: None,
         hold_on_hang: false,
         fail_grace_secs: DEFAULT_FAIL_GRACE_SECS,
         save_logs: Some(dir.to_path_buf()),
-        second_disk: data_image,
-        second_disk_block_size: None,
-        second_disk_shared_line: false,
         host: args.host.clone(),
     }
 }
@@ -177,8 +183,7 @@ mod tests
 
     const REDO: &str = "[--------] boot: memory map: mapredo knob present; redoing steps 6 and 7";
     const PASS: &str = "[52.1] [ktest] ALL TESTS PASSED";
-    const TRAILER: &str =
-        "[run-parallel] arch=riscv64 cpus=4 accel=tcg run=1 outcome=PASS wall_s=60.000";
+    const TRAILER: &str = "[run] arch=riscv64 cpus=4 accel=tcg run=1 outcome=PASS wall_s=60.000";
 
     // Defect caught: a check that fails the boot the test exists to pass.
     #[test]
@@ -218,9 +223,9 @@ mod tests
 
         let dir = Path::new("target/xtask/test-map-redo");
         let plain = TestMapRedoArgs::try_parse_from(["test-map-redo"]).unwrap();
-        assert!(!run_args(&plain, dir, None).test_devices);
+        assert!(!run_args(&plain, dir, None).launch.test_devices);
         let asked = TestMapRedoArgs::try_parse_from(["test-map-redo", "--test-devices"]).unwrap();
-        assert!(run_args(&asked, dir, None).test_devices);
+        assert!(run_args(&asked, dir, None).launch.test_devices);
     }
 
     // Defect caught: a split layout's boot attaching disk.img alone, so a
@@ -244,13 +249,15 @@ mod tests
             data: DataPlacement::SecondImage,
         };
         let run = run_args(&args, dir, split.second_image(&ctx));
-        assert_eq!(run.second_disk, Some(ctx.data_disk_image()));
-        // The device's block size is read from the image, as for `run-parallel`.
-        assert_eq!(run.second_disk_block_size, None);
-        assert!(!run.second_disk_shared_line);
+        assert_eq!(run.launch.second_disk, Some(ctx.data_disk_image()));
+        // The device's block size is read from the image, as for `run`.
+        assert_eq!(run.launch.second_disk_block_size, None);
+        assert!(!run.launch.second_disk_shared_line);
         let single = DiskLayout::default();
         assert_eq!(
-            run_args(&args, dir, single.second_image(&ctx)).second_disk,
+            run_args(&args, dir, single.second_image(&ctx))
+                .launch
+                .second_disk,
             None
         );
     }
@@ -272,13 +279,13 @@ mod tests
         check_log(&log).unwrap_err();
     }
 
-    // Defect caught: a host-emulator crash, which run-parallel tolerates,
+    // Defect caught: a host-emulator crash, which run tolerates,
     // failing the test.
     #[test]
     fn a_host_emulator_crash_is_skipped()
     {
         let log = "[--------] boot: step 6/10\n\
-                   [run-parallel] arch=riscv64 cpus=4 accel=tcg run=1 outcome=QEMU-CRASH_rc=139 \
+                   [run] arch=riscv64 cpus=4 accel=tcg run=1 outcome=QEMU-CRASH_rc=139 \
                    wall_s=12.000\n";
         assert_eq!(
             check_log(log).expect("skipped"),

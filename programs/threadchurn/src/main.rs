@@ -181,7 +181,7 @@ fn main() -> ExitCode
     // VA (and its page tables) is reused. A per-spawn slab leak would surface as
     // a free-pool drop past POOL_SLACK_BYTES in the assertion below. The
     // periodic heartbeat keeps a HANG distinguishable from slow progress in the
-    // run-parallel log.
+    // `run --runs` log.
     for done in 1..=JOIN_CHURN
     {
         spawn_join(done);

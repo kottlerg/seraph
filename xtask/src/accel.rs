@@ -128,7 +128,7 @@ impl Accel
     const ALL: [Accel; 5] = [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg];
 
     /// The backend's lower-case name: the value `parse_explicit` accepts for
-    /// it, and the one `run-parallel --save-logs` records in its trailer.
+    /// it, and the one `run --runs N --save-logs` records in its trailer.
     pub fn name(self) -> &'static str
     {
         match self

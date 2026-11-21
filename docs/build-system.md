@@ -459,7 +459,7 @@ A host tool that resolves an address or a symbol of an installed image reads the
 symbols when it carries them (the kernel's), and otherwise the store file of the image's build
 id, which it refuses unless that file's own build-id note is the image's: an image rebuilt since
 a boot, or the store of another build, gives no symbols rather than wrong ones. The tools are
-`cargo xtask symbolize`, the crash reports `run-parallel` writes, `test-core-death`, `test-gdb`,
+`cargo xtask symbolize`, the crash reports `run --runs` writes, `test-core-death`, `test-gdb`,
 and the GDB command line `run --debug-target` prints
 ([xtask/README.md](../xtask/README.md#cargo-xtask-symbolize) § `cargo xtask symbolize`).
 
@@ -476,9 +476,11 @@ disk image ([conventions.md](conventions.md#release-production) § Release Produ
 
 ## Convenience Commands
 
-All build, run, clean, and test operations go through `cargo xtask`. The
-authoritative command reference — every subcommand, every flag, expected
-behavior — lives in [`xtask/README.md`](../xtask/README.md).
+All build, run, clean, and test operations go through `cargo xtask`. The four core commands are
+`build` (compile the components and pack the disk image), `run` (boot the sysroot under QEMU),
+`clean` (remove the sysroot, the symbols store and the disk images) and `test` (the host-side
+tests). [`xtask/README.md`](../xtask/README.md) is the one command reference: every command,
+every flag, expected behavior.
 
 `build` and `test` check that the Rust source is formatted (`cargo fmt --check`) and fail on
 a file that is not, naming its file and line; neither rewrites source, so a contributor runs
@@ -487,7 +489,8 @@ a file that is not, naming its file and line; neither rewrites source, so a cont
 
 `build` and `run` are intentionally decoupled: `run` is a pure runner and
 does not build, so a typical workflow is `cargo xtask build` followed by
-`cargo xtask run` (or `cargo xtask run-parallel` for stress).
+`cargo xtask run` (or `cargo xtask run --runs N` for unattended boots, each classified by its
+log).
 
 ---
 
@@ -617,8 +620,8 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which checks the formatting of the Rust source and lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`, `memhog` and `stopsrc` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, checks the staged images with `check-disk` (each FAT volume with `fsck.fat -n`, then that every object on the ESP equals its installed file on the root partition), and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes, which a pass taking more than half its budget flags with a warning annotation on the run; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run-parallel` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs and `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, `test-wedge`, `test-reboot`, `test-core-death` and `test-signing`, plus `test-vmgenid` and `test-powerbutton` on x86_64. |
-| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which checks the formatting of the Rust source and lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`, `crasher-worker`, `crasher-boot`, `memhog` and `stopsrc` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, checks the staged images with `check-disk` (each FAT volume with `fsck.fat -n`, then that every object on the ESP equals its installed file on the root partition), and runs one `run --runs 1` boot with `--save-logs`, under a per-cell `--timeout`, svctest's with `--crash-reports none` and usertest's with `--crash-reports reports`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes, which a pass taking more than half its budget flags with a warning annotation on the run; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, and usertest cells run `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, `test-wedge`, `test-reboot`, `test-core-death` and `test-signing`, plus `test-vmgenid` and `test-powerbutton` on x86_64. |
+| `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses each and the archive of its build's symbols store (§ Symbols Store) with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 

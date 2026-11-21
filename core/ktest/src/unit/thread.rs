@@ -277,12 +277,16 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
 
     // Read the register file.
     let mut reg_buf = [0u8; BUF_SIZE];
-    let bytes = thread_read_regs(child.th, &mut reg_buf[..BUF_SIZE])
+    let (bytes, held) = thread_read_regs(child.th, &mut reg_buf[..BUF_SIZE])
         .map_err(|_| "thread_read_regs failed")?;
 
     if bytes != TRAP_FRAME_BYTES
     {
         return Err("thread_read_regs returned unexpected byte count");
+    }
+    if held != syscall_abi::THREAD_REGS_STOPPED
+    {
+        return Err("thread_read_regs did not report the stopped child as stopped");
     }
 
     // Instruction pointer must be non-zero (child was executing user code).

@@ -28,17 +28,18 @@ use crate::qemu_gdb::{Stub, le_hex, le_u64};
 /// in sync with `services/gdbstub/src/main.rs`.
 pub const ATTACHED_MARKER: &str = "[gdbstub] attached; serving the debug port";
 
-/// The stub's answer to a register request of a thread held in a call, whose
-/// registers the kernel does not read until the call returns. Kept in sync
-/// with `IN_CALL_CODE` in `services/gdbstub/src/session.rs`.
+/// The stub's answer to a register write of a thread held in a call, whose
+/// registers the call's return still writes, so the kernel writes them only
+/// once the call returns. Kept in sync with `IN_CALL_CODE` in
+/// `services/gdbstub/src/session.rs`.
 const HELD_IN_CALL: &[u8] = b"E06";
 
-/// How long a kill reads again the program counter of a main thread held in
-/// a call: a server can answer late, as a file-system read stalled 43 s on a
+/// How long a kill reads and writes again the program counter of a main
+/// thread held in a call: a server can answer late, as a file-system read stalled 43 s on a
 /// loaded riscv64 host (#1382).
 const IN_CALL_WAIT: Duration = Duration::from_secs(60);
 
-/// The pause between two reads of a thread held in a call.
+/// The pause between two tries of a thread held in a call.
 const IN_CALL_PAUSE: Duration = Duration::from_millis(100);
 
 /// The stub's recipe file name, in the template directory and once staged.
@@ -228,8 +229,8 @@ pub fn rsp_arch(arch: Arch) -> gdb_rsp::target::Arch
 /// detach, which resumes it there. Returns the program counter it moved the
 /// thread from. A stub that holds no process (it exited, or the stub's walk
 /// found none) answers `?` as exited, which fails the kill. A main thread
-/// the stub reports held in a call is read again until the call returns
-/// ([`read_held_register`]).
+/// held in a call is read and written again until the call returns
+/// ([`move_held_register`]).
 pub fn kill_held(stub: &mut Stub, arch: Arch, name: &str) -> Result<u64>
 {
     let pc_reg = rsp_arch(arch).pc_regnum();
@@ -242,40 +243,52 @@ pub fn kill_held(stub: &mut Stub, arch: Arch, name: &str) -> Result<u64>
         );
     }
     stub.expect_ok(b"Hg1")?;
-    let pc = read_held_register(stub, pc_reg, IN_CALL_WAIT, IN_CALL_PAUSE)?;
-    stub.expect_ok(format!("P{pc_reg:x}={}", le_hex(0)).as_bytes())?;
+    let pc = move_held_register(stub, pc_reg, 0, IN_CALL_WAIT, IN_CALL_PAUSE)?;
     stub.expect_ok(b"D")?;
     Ok(pc)
 }
-/// Register `regnum` of the selected thread, read again every `pause` for
-/// up to `wait` while the stub answers that the thread is held in a call
-/// ([`HELD_IN_CALL`]): the stub counts such a thread stopped, and holds it
-/// once its call returns.
-fn read_held_register(
+/// Set register `regnum` of the selected thread to `value` and return the
+/// value it held: read it, then write it, both again every `pause` for up to
+/// `wait` while the stub refuses the write because the thread is held in a
+/// call ([`HELD_IN_CALL`]). The stub counts such a thread stopped and reads
+/// its registers, but writes them only once its call returns and the stub
+/// holds it, by when the register can hold another value.
+fn move_held_register(
     stub: &mut Stub,
     regnum: usize,
+    value: u64,
     wait: Duration,
     pause: Duration,
 ) -> Result<u64>
 {
     let start = Instant::now();
-    let request = format!("p{regnum:x}");
+    let read = format!("p{regnum:x}");
+    let write = format!("P{regnum:x}={}", le_hex(value));
     loop
     {
-        let reply = stub.exchange(request.as_bytes())?;
+        let reply = stub.exchange(read.as_bytes())?;
+        if reply.first() == Some(&b'E') && reply.len() == 3
+        {
+            bail!(
+                "the gdbstub refused `{read}`: {}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        let held = le_u64(&reply).with_context(|| format!("register {regnum}"))?;
+        let reply = stub.exchange(write.as_bytes())?;
         if reply == HELD_IN_CALL && start.elapsed() < wait
         {
             std::thread::sleep(pause);
             continue;
         }
-        if reply.first() == Some(&b'E') && reply.len() == 3
+        if reply != b"OK"
         {
             bail!(
-                "the gdbstub refused `{request}`: {}",
+                "the gdbstub refused `{write}`: {}",
                 String::from_utf8_lossy(&reply)
             );
         }
-        return le_u64(&reply).with_context(|| format!("register {regnum}"));
+        return Ok(held);
     }
 }
 
@@ -319,24 +332,29 @@ mod tests
     }
 
     // Defect caught: a kill whose target's main thread was held in a call
-    // failed on the stub's first `E06` instead of reading again once the
-    // call returned.
+    // failed on the stub's first `E06` instead of trying again once the call
+    // returned; and a kill that, the call returned, kept the program counter
+    // it read in the call instead of the one it moved the thread from.
     #[test]
-    fn a_register_read_waits_out_a_thread_held_in_a_call()
+    fn a_register_move_waits_out_a_thread_held_in_a_call()
     {
-        let value = le_hex(0x1234);
-        let value: &'static [u8] = value.leak().as_bytes();
-        let mut stub = fake_stub(vec![HELD_IN_CALL, HELD_IN_CALL, value]);
-        let pc = read_held_register(&mut stub, 16, Duration::from_secs(5), Duration::ZERO);
-        assert_eq!(pc.unwrap(), 0x1234);
+        let in_call: &'static [u8] = le_hex(0x1234).leak().as_bytes();
+        let returned: &'static [u8] = le_hex(0x5678).leak().as_bytes();
+        let mut stub = fake_stub(vec![in_call, HELD_IN_CALL, returned, b"OK"]);
+        let pc = move_held_register(&mut stub, 16, 0, Duration::from_secs(5), Duration::ZERO);
+        assert_eq!(pc.unwrap(), 0x5678);
 
         // Past the wait, the refusal stands; any other refusal at once.
-        let mut stub = fake_stub(vec![HELD_IN_CALL]);
-        let err = read_held_register(&mut stub, 16, Duration::ZERO, Duration::ZERO).unwrap_err();
+        let mut stub = fake_stub(vec![in_call, HELD_IN_CALL]);
+        let err = move_held_register(&mut stub, 16, 0, Duration::ZERO, Duration::ZERO).unwrap_err();
         assert!(err.to_string().contains("E06"), "{err}");
         let mut stub = fake_stub(vec![b"E01"]);
-        let err =
-            read_held_register(&mut stub, 16, Duration::from_secs(5), Duration::ZERO).unwrap_err();
+        let err = move_held_register(&mut stub, 16, 0, Duration::from_secs(5), Duration::ZERO)
+            .unwrap_err();
+        assert!(err.to_string().contains("E01"), "{err}");
+        let mut stub = fake_stub(vec![in_call, b"E01"]);
+        let err = move_held_register(&mut stub, 16, 0, Duration::from_secs(5), Duration::ZERO)
+            .unwrap_err();
         assert!(err.to_string().contains("E01"), "{err}");
     }
 

@@ -667,7 +667,7 @@ extern "C" fn caller_entry(arg: u64) -> !
         {
             // SAFETY: as for `Getrandom`.
             let r = unsafe { syscall::thread_read_regs_raw(a.helper, a.buf as *mut u8, a.len) };
-            r == Ok(FRAME_BYTES as u64)
+            r == Ok((FRAME_BYTES as u64, syscall_abi::THREAD_REGS_STOPPED))
         }
         Call::WriteRegs =>
         {

@@ -80,9 +80,9 @@ from the page, wires stdio, the log and service-registry caps, and the namespace
 level `seraph::log!` filters at from the env blob's `SERAPH_LOG` entry
 ([logd IPC interface](../../services/logd/docs/ipc-interface.md) § Levels), and, when the
 page carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP`
-if that fails) and registers the process for memmgr's memory-pressure signal, and, when the page
-carries a pager and the image is `ET_DYN`, registers the
-main-thread stack's demand-growth range
+if that fails), registers the process for memmgr's memory-pressure signal, and takes the `CSpace`
+slot reserve ([§ CSpace slot headroom](#cspace-slot-headroom)), and, when the page carries a
+pager and the image is `ET_DYN`, registers the main-thread stack's demand-growth range
 ([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). Last it runs the
 rustc-synthesised `main`, which drives `std::rt::lang_start` and the binary's idiomatic
 `fn main()`; when `main` returns, `_start` sends `FS_CLOSE` for every `std::fs::File` still open,
@@ -339,6 +339,26 @@ std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n o
 A process calls it before a known burst of capability acquisitions; fatfs funds its page cache
 this way.
 
+A grant's reply carries its caps into the process's `CSpace`, so a `CSpace` with no free slot
+cannot take the grant that would grow it: the kernel replaces the reply with
+`IPC_REPLY_TRANSFER_FAILED`, and memmgr undoes the grant. Every process whose `ProcessInfo`
+carries a memmgr endpoint therefore holds a slot reserve, one contiguous grant of
+`CSPACE_RESERVE_PAGES` (3) pages: the donation `syscall_abi::cspace_topup_pages` sizes for a
+`CSpace` with no free slot to regain its IPC receive reserve and a page of general slots past it,
+with the page it counts for a donation record or a directory page. `_start` takes it after the
+heap bootstrap, and the process holds its pages and one slot for its lifetime. Every grant the
+runtime requests (the top-ups, the heap's growth, the object slabs, pipe rings, thread stacks and
+IPC buffers, file pages) goes through one call, `request_memory_caps`: a reply that arrives as
+`IPC_REPLY_TRANSFER_FAILED` while the `CSpace` has fewer free slots than a reply carries caps
+(`MSG_CAP_SLOTS_MAX`) makes it donate the reserve to the `CSpace` with augment-mode
+`cap_create_cspace`, which carves a cap the caller holds and takes no slot, make the request again
+once, and take a new reserve with an ordinary grant. A `fund_cspace_slot_budget` that leaves the
+`CSpace` funded takes one too when the process holds none. So a `CSpace` with no free slot is
+topped up while memmgr can grant, with no cap deleted first; the reserve covers one exhaustion at a
+time, and after a refill memmgr refused, the next exhaustion waits for a top-up that succeeds while
+a slot is still free. memmgr, init, and the processes before them hold none; memmgr funds its own
+`CSpace` from its pool.
+
 A long-lived service whose capabilities grow with its load (a few per client, device, or child it
 serves) holds its headroom above a low-water mark instead, through a `static`
 `std::os::seraph::CSpaceHeadroom`:
@@ -361,7 +381,8 @@ if HEADROOM.failure_to_report() {     // once per run of refused top-ups
   the process's threads make while one tops up. A refused top-up is retried at the next hold.
   `hold` returns `false` when the headroom was short and its top-up was refused, and the result
   must be used: a capability received by IPC takes a general slot while one is free and then a
-  slot of the IPC receive reserve, which the next top-up's own reply needs, so after `false` an
+  slot of the IPC receive reserve, which the next top-up's own reply needs past the one
+  exhaustion the slot reserve above recovers, so after `false` an
   operation that receives capabilities goes on only while `cspace_slot_headroom` covers what it
   receives, and otherwise fails as if refused for memory. A caller whose intake it does not yet
   bound discards the result explicitly and says so where it does.

@@ -583,7 +583,7 @@ fn group(handle: u64, regs: &mut [u8; REGS_BUF]) -> bool
     if stopped.is_some()
     {
         let Ok(read) = call(READ_REGS, Some(refused), || {
-            thread_read_regs(handle, &mut regs[..REGS_BUF])
+            thread_read_regs(handle, &mut regs[..REGS_BUF]).map(|(bytes, _)| bytes)
         })
         else
         {

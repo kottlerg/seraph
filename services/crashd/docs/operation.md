@@ -41,14 +41,14 @@ Authority). crashd:
    from the first, its main thread, then each registered one, at most four a reply; the image's
    load bias and text bounds; the process badge; and the index of the thread the badge names;
 2. takes the named thread's cap, from that reply, or from a second attach whose page starts at the
-   index when the index lies past the first page, and reads its registers. The read succeeds only
-   for a thread that is stopped or fault-blocked, and crashd takes the thread as the faulting one
-   when it does and the register file's instruction pointer is the message's; the check catches a
-   thread that never registered, whose spawner's badge named another thread. The block's `thread`
-   is then `main` or `spawned`, and the block carries the registers and the stack walk; otherwise it
-   is `unidentified`. Another thread of the process blocked on a fault at the same instruction,
-   whose fault some other handler holds, is not taken for the faulting one: its badge is not the
-   message's;
+   index when the index lies past the first page, and reads its registers. The read succeeds for a
+   thread that is not running, and crashd takes the thread as the faulting one when it reads as
+   stopped or fault-blocked, not as blocked in a syscall, and the register file's instruction
+   pointer is the message's; the check catches a thread that never registered, whose spawner's
+   badge named another thread. The block's `thread` is then `main` or `spawned`, and the block
+   carries the registers and the stack walk; otherwise it is `unidentified`. Another thread of the
+   process blocked on a fault at the same instruction, whose fault some other handler holds, is not
+   taken for the faulting one: its badge is not the message's;
 3. reads the bytes at the instruction pointer through the same cap, since every thread of the
    process shares its address space;
 4. logs the block ([block-format.md](block-format.md));

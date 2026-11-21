@@ -3008,18 +3008,18 @@ pub fn sys_thread_list_pages(tf: UserFrame) -> Result<u64, RestartableError>
     Ok(count as u64)
 }
 
-/// `SYS_THREAD_READ_EXT_REGS` (68): copy part of a stopped or fault-blocked
-/// thread's extended register state (floating point, SIMD, vector).
+/// `SYS_THREAD_READ_EXT_REGS` (68): copy part of a stopped or blocked thread's
+/// extended register state (floating point, SIMD, vector).
 ///
 /// arg0 = Thread cap index (must have OBSERVE).
 /// arg1 = Byte offset into the state's image.
 /// arg2 = Destination buffer (caller's user VA).
 /// arg3 = Byte count, `1..=MAX_THREAD_MEM_COPY`.
 ///
-/// The thread must be fault-blocked, or `Stopped` and descheduled
-/// (`sched::with_held_frame`), as for `SYS_THREAD_READ_REGS`. The image is
-/// the thread's save area, which every switch-out writes, so a thread held
-/// still has its registers there. The bytes are staged in the CPU's syscall
+/// The thread must be held still as for `SYS_THREAD_READ_REGS`: `Stopped` and
+/// descheduled, or `Blocked` (`sched::with_held_frame`, a read).
+/// The image is the thread's save area, which every switch-out writes, so a
+/// thread held still has its registers there. The bytes are staged in the CPU's syscall
 /// scratch buffer under the thread's `sched_lock`, then copied out. Returns
 /// the bytes copied, 0 for an offset at or past the image's end, and in the
 /// secondary return register the image's size.
@@ -3034,6 +3034,7 @@ pub fn sys_thread_read_ext_regs(tf: UserFrame) -> Result<u64, RestartableError>
     use crate::cap::object::ThreadObject;
     use crate::cap::slot::ThreadRights;
     use crate::sched::thread_slot::{extended_bytes, extended_span};
+    use crate::sched::{FrameAccess, FrameHold};
 
     let offset = tf.arg(1);
     let buf = tf.arg(2);
@@ -3082,7 +3083,7 @@ pub fn sys_thread_read_ext_regs(tf: UserFrame) -> Result<u64, RestartableError>
     let stage = unsafe { super::scratch::thread_mem() };
     // n <= len <= the buffer's size.
     let staged = stage.get_mut(..n).ok_or(SyscallError::InvalidArgument)?;
-    let take = |_frame: *mut u8| {
+    let take = |_frame: *mut u8, _hold: FrameHold| {
         // SAFETY: target_tcb is valid while thread_slot pins its object; the
         // area pointer is set at thread creation and never changes.
         let area = unsafe { (*target_tcb).extended.area };
@@ -3101,7 +3102,7 @@ pub fn sys_thread_read_ext_regs(tf: UserFrame) -> Result<u64, RestartableError>
     };
     // SAFETY: target_tcb validated non-null; no lock is held; the closure only
     // copies kernel memory into the scratch buffer, which cannot fault.
-    match unsafe { crate::sched::with_held_frame(target_tcb, take) }
+    match unsafe { crate::sched::with_held_frame(target_tcb, FrameAccess::Read, take) }
     {
         None => return Err(SyscallError::InvalidState.into()),
         Some(false) => return Err(SyscallError::InvalidArgument.into()),
@@ -3118,22 +3119,27 @@ pub fn sys_thread_read_ext_regs(tf: UserFrame) -> Result<u64, RestartableError>
     Ok(n as u64)
 }
 
-/// `SYS_THREAD_READ_REGS` (39): read register state of a stopped or fault-blocked
+/// `SYS_THREAD_READ_REGS` (39): read register state of a stopped or blocked
 /// thread.
 ///
 /// arg0 = Thread cap index (must have OBSERVE).
 /// arg1 = Pointer to caller-supplied buffer (user VA).
 /// arg2 = Size of the buffer in bytes.
 ///
-/// The thread must be fault-blocked, or `Stopped` and descheduled
-/// (`sched::with_held_frame`). Copies the full `TrapFrame` to the caller's
-/// buffer. Returns the number of bytes written on success.
+/// The thread must be `Stopped` and descheduled, or `Blocked` in any IPC
+/// state (`sched::with_held_frame`, a read). Copies the full `TrapFrame` to
+/// the caller's buffer. Returns the number of bytes written, and in the
+/// secondary return register the state the thread was held in
+/// (`THREAD_REGS_STOPPED`, `THREAD_REGS_FAULT`, `THREAD_REGS_SYSCALL`), which
+/// the same `sched_lock` hold as the snapshot decides. The frame of a thread
+/// blocked in a syscall is the one its syscall entry built, whose result
+/// registers the syscall's return has not yet written.
 ///
 /// # Errors
 /// - `InvalidCapability`: no current thread, or arg0 names no Thread cap.
 /// - `InsufficientRights`: the cap lacks OBSERVE.
 /// - `InvalidState`: the thread is neither `Stopped` and descheduled nor
-///   fault-blocked.
+///   `Blocked`.
 /// - `InvalidArgument`: the buffer is too small or null, or the thread has no
 ///   register frame.
 /// - `InvalidAddress`: the buffer lies outside the user half or is not
@@ -3147,6 +3153,7 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::ThreadObject;
     use crate::cap::slot::ThreadRights;
+    use crate::sched::{FrameAccess, FrameHold};
     use crate::syscall::current_tcb;
     use core::mem::{MaybeUninit, size_of};
 
@@ -3182,16 +3189,17 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
 
     // Snapshot the frame while the target is held still, so the copy never
     // races the target's own trap entry or return. A fault-blocked thread
-    // (Blocked + BlockedOnFault) exposes its faulting frame for the bound
-    // handler to read and modify before replying, so the fault-handler
-    // protocol permits register access in that state too (see
-    // `docs/fault-handling.md` § Modifying the faulting thread).
+    // exposes its faulting frame for the bound handler to read and modify
+    // before replying (`docs/fault-handling.md` § Modifying the faulting
+    // thread); a thread blocked in a syscall is read only, since no path but
+    // the thread itself writes its frame before it runs again. The hold is
+    // taken from the same locked look as the frame, so the two agree.
     let copy_size = size_of::<ArchTF>();
     let mut frame: MaybeUninit<ArchTF> = MaybeUninit::zeroed();
-    let take_snapshot = |src: *mut u8| {
+    let take_snapshot = |src: *mut u8, hold: FrameHold| {
         if src.is_null()
         {
-            return false;
+            return None;
         }
         // SAFETY: src is the target's non-null trap_frame, valid for
         // copy_size reads; frame is valid for copy_size writes.
@@ -3202,18 +3210,18 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
                 copy_size,
             );
         };
-        true
+        Some(hold)
     };
     // SAFETY: target_tcb validated non-null; the closure only copies the
     // frame into a kernel stack buffer, which cannot fault.
-    let snapshot = unsafe { crate::sched::with_held_frame(target_tcb, take_snapshot) };
-    match snapshot
+    let snapshot =
+        unsafe { crate::sched::with_held_frame(target_tcb, FrameAccess::Read, take_snapshot) };
+    let hold = match snapshot
     {
         None => return Err(SyscallError::InvalidState.into()),
-        Some(false) => return Err(SyscallError::InvalidArgument.into()),
-        Some(true) =>
-        {}
-    }
+        Some(None) => return Err(SyscallError::InvalidArgument.into()),
+        Some(Some(hold)) => hold,
+    };
 
     if buf_size < copy_size || buf_ptr == 0
     {
@@ -3231,13 +3239,22 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
     // Copy the snapshot to the user buffer with fault recovery: an unbacked or
     // read-only buffer reaches the dispatcher as a restartable fault instead of
     // faulting the kernel. Nothing before the copy changed anything visible
-    // outside the call, so a re-execution reads the target afresh.
+    // outside the call, so a re-execution reads the target afresh; the
+    // secondary return register, an argument register, is written only after
+    // it.
     // SAFETY: frame holds copy_size initialised bytes; buf_ptr is the
     //         validated user destination span.
     unsafe {
         crate::uaccess::copy_to_user_restartable(buf_ptr, frame.as_ptr().cast::<u8>(), copy_size)?;
     }
 
+    let state_code = match hold
+    {
+        FrameHold::Stopped => syscall::THREAD_REGS_STOPPED,
+        FrameHold::Fault => syscall::THREAD_REGS_FAULT,
+        FrameHold::Syscall => syscall::THREAD_REGS_SYSCALL,
+    };
+    tf.set_ipc_return(copy_size as u64, state_code);
     Ok(copy_size as u64)
 }
 
@@ -3249,7 +3266,9 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
 /// arg2 = Size of the buffer in bytes.
 ///
 /// The thread must be fault-blocked, or `Stopped` and descheduled
-/// (`sched::with_held_frame`). The kernel sanitizes the frame per architecture
+/// (`sched::with_held_frame`, a write); a thread blocked in a syscall is
+/// refused, since the syscall's return still writes its frame. The kernel
+/// sanitizes the frame per architecture
 /// (`core/kernel/docs/arch-interface.md` § `trap_frame`) before writing; RISC-V
 /// replaces the supplied `sstatus` with the user-resume value. Returns 0 on
 /// success.
@@ -3271,6 +3290,7 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, RestartableError>
     use crate::arch::current::trap_frame::TrapFrame as ArchTF;
     use crate::cap::object::ThreadObject;
     use crate::cap::slot::ThreadRights;
+    use crate::sched::FrameAccess;
     use crate::syscall::current_tcb;
     use core::mem::{MaybeUninit, size_of};
 
@@ -3307,8 +3327,9 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, RestartableError>
     // register frame for the bound handler to read and modify before replying,
     // so the fault-handler protocol permits register access in that state too,
     // not only `Stopped` (see `docs/fault-handling.md` § Modifying the faulting
-    // thread). The state is decided only under the target's sched_lock, by the
-    // write below.
+    // thread). A thread blocked in a syscall is refused: the syscall's return
+    // writes the frame after any edit. The state is decided only under the
+    // target's sched_lock, by the write below.
 
     let copy_size = size_of::<ArchTF>();
     if buf_size < copy_size || buf_ptr == 0
@@ -3347,7 +3368,7 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, RestartableError>
 
     // Write the validated TrapFrame into the target while it is held still, so
     // the write never races the target's own trap entry or return.
-    let write_frame = |dst: *mut u8| {
+    let write_frame = |dst: *mut u8, _hold| {
         if dst.is_null()
         {
             return false;
@@ -3361,7 +3382,8 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, RestartableError>
     };
     // SAFETY: target_tcb validated non-null; the closure only copies a kernel
     // stack buffer into the frame, which cannot fault.
-    let written = unsafe { crate::sched::with_held_frame(target_tcb, write_frame) };
+    let written =
+        unsafe { crate::sched::with_held_frame(target_tcb, FrameAccess::Write, write_frame) };
     match written
     {
         None => Err(SyscallError::InvalidState.into()),

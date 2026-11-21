@@ -639,11 +639,11 @@ impl Heap {
             let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, want).build();
             // An interrupted request is made again within the same round: a
             // grant whose reply the cancelled call could not take is rolled
-            // back by memmgr, so the repeat is not charged twice.
+            // back by memmgr, so the repeat is not charged twice. A reply that
+            // found no free slot is recovered ([`request_memory_caps`]).
             // SAFETY: ipc_buf is the current thread's kernel-registered,
             // page-aligned IPC buffer.
-            let Ok(reply) = (unsafe { memmgr_call_until_answered(self.memmgr_ep, &msg, ipc_buf) })
-            else {
+            let Ok(reply) = (unsafe { request_memory_caps(self.memmgr_ep, &msg, ipc_buf) }) else {
                 break false;
             };
             let caps = reply.caps();
@@ -973,7 +973,7 @@ pub fn slab_request_pages(memmgr_ep: u64, min_pages: u64) -> Option<(u64, u64, u
         ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, u64::from(want) | flags).build();
     // An interrupted request is made again, as in `Heap::grow_exact`.
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { memmgr_call_until_answered(memmgr_ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { request_memory_caps(memmgr_ep, &msg, ipc_buf) }.ok()?;
     let caps = reply.caps();
     let layout = ipc::memmgr_grant_layout(&reply);
     let keep = layout.and_then(|(page_counts, _)| page_counts.iter().position(|&p| p >= min_pages));
@@ -1048,7 +1048,7 @@ fn request_runs(
     let msg = ipc::IpcMessage::builder(REQUEST_MEMORY_CAPS).word(0, u64::from(want)).build();
     // An interrupted request is made again, as in `slab_request_pages`.
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let reply = unsafe { memmgr_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { request_memory_caps(ep, &msg, ipc_buf) }.ok()?;
     let caps = reply.caps();
     let Some((counts, ids)) = ipc::memmgr_grant_layout(&reply) else {
         release_reply_caps(ep, ipc_buf, caps, &[], |_| false);
@@ -1105,6 +1105,134 @@ fn release_reply_caps(
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let _ = unsafe { memmgr_call_until_answered(memmgr_ep, &msg, ipc_buf) };
+}
+
+// ── CSpace slot reserve ─────────────────────────────────────────────────────
+//
+// A grant's reply carries its Memory caps into this process's `CSpace`, so a
+// `CSpace` with no free slot cannot take the grant that would grow it: the
+// kernel replaces the reply with `IPC_REPLY_TRANSFER_FAILED` and memmgr undoes
+// the grant. The process holds one grant of its own from start, the slot
+// reserve, and grows its `CSpace` from it when a reply finds no slot, since an
+// augment-mode `cap_create_cspace` carves a cap the caller holds and takes no
+// slot. runtime/ruststd/README.md § CSpace slot headroom describes it.
+
+/// Pages of the slot reserve: the donation `syscall_abi::cspace_topup_pages`
+/// sizes for a `CSpace` with no free slot to regain its IPC receive reserve
+/// (`CSPACE_IPC_RECV_RESERVE`) and a page of general slots past it, with the
+/// page it counts for a donation record or a directory page the donation may
+/// spend.
+const CSPACE_RESERVE_PAGES: u64 =
+    syscall_abi::cspace_topup_pages(0, 0, syscall_abi::CSPACE_IPC_RECV_RESERVE);
+
+/// The slot reserve's grant: its Memory cap, which carries `RETYPE`, and the
+/// region id memmgr names it by (`RELEASE_MEMORY_CAPS`).
+#[derive(Clone, Copy)]
+struct ReserveGrant {
+    cap: u64,
+    region_id: u64,
+}
+
+/// The process's slot reserve, `None` while it holds none. The lock is held
+/// only to take or place the grant, never across a syscall, so it nests inside
+/// the heap's and the object slabs' locks, under which a grant is requested.
+static CSPACE_RESERVE: SpinMutex<Option<ReserveGrant>> = SpinMutex::new(None);
+
+/// Take a slot reserve from memmgr when the process holds none: a contiguous
+/// grant of `CSPACE_RESERVE_PAGES` pages ([`slab_request_pages`]). `_start`
+/// calls it once, after the heap bootstrap; a recovery that spent the reserve
+/// ([`request_memory_caps`]) and a [`fund_cspace_slot_budget`] that left the
+/// `CSpace` funded call it again. A refused request leaves the process without
+/// a reserve until the next of those calls, and a grant another thread placed
+/// first is kept, this one deleted and returned to memmgr. Allocates nothing.
+pub fn refill_cspace_reserve() {
+    if CSPACE_RESERVE.with(|reserve| reserve.is_some()) {
+        return;
+    }
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    if ep == 0 {
+        return;
+    }
+    let Some((cap, _, region_id)) = slab_request_pages(ep, CSPACE_RESERVE_PAGES) else {
+        return;
+    };
+    let grant = ReserveGrant { cap, region_id };
+    let spare = CSPACE_RESERVE.with(|reserve| {
+        if reserve.is_none() {
+            *reserve = Some(grant);
+            None
+        } else {
+            Some(grant)
+        }
+    });
+    if let Some(spare) = spare {
+        let _ = syscall::cap_delete(spare.cap);
+        slab_release_fresh(spare.region_id);
+    }
+}
+
+/// Grow `self_cspace`, the process's own `CSpace`, from the slot reserve:
+/// donate every page of the reserve's grant with augment-mode
+/// `cap_create_cspace`, which takes no slot, and delete its cap. The pool holds
+/// the grant's Memory object, and the run stays charged to the process until it
+/// dies, as a donated run does ([`donate_pool_pages`]).
+///
+/// Returns whether the reserve was donated: `false` when the process holds
+/// none, or when the kernel refused the donation, whose grant is then deleted
+/// and returned to memmgr. Either way the process holds no reserve after it.
+fn augment_from_reserve(self_cspace: u64) -> bool {
+    let Some(grant) = CSPACE_RESERVE.with(Option::take) else {
+        return false;
+    };
+    let pages = syscall::cap_info(grant.cap, syscall_abi::CAP_INFO_MEMORY_AVAILABLE).unwrap_or(0)
+        / PAGE_SIZE;
+    let donated = pages != 0 && syscall::cap_create_cspace(grant.cap, self_cspace, pages).is_ok();
+    let _ = syscall::cap_delete(grant.cap);
+    if !donated {
+        slab_release_fresh(grant.region_id);
+    }
+    donated
+}
+
+/// A `REQUEST_MEMORY_CAPS` call to memmgr, `msg` on `ipc_buf`, made as
+/// [`memmgr_call_until_answered`] makes it, with the recovery of a reply that
+/// found no free slot: every grant the runtime requests goes through it.
+///
+/// A reply whose caps the process's `CSpace` cannot take arrives as
+/// `IPC_REPLY_TRANSFER_FAILED`, and memmgr has undone the grant, as it undoes
+/// every grant whose reply fails. While the `CSpace` has
+/// fewer free slots than a reply carries caps (`MSG_CAP_SLOTS_MAX`), it is
+/// grown from the slot reserve ([`augment_from_reserve`]). Once it has that
+/// many, the request is made again, once, and a reserve the recovery spent is
+/// taken again ([`refill_cspace_reserve`]); while it has fewer, the failed reply
+/// is returned, which every caller refuses ([`ipc::memmgr_grant_layout`]). A
+/// refill whose own reply finds no slot recurses only while another thread's
+/// refill has placed a reserve for it to spend. Allocates nothing.
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+unsafe fn request_memory_caps(
+    ep: u64,
+    msg: &ipc::IpcMessage,
+    ipc_buf: *mut u64,
+) -> Result<ipc::IpcMessage, i64> {
+    // SAFETY: the caller passes the registered IPC buffer page.
+    let reply = unsafe { memmgr_call_until_answered(ep, msg, ipc_buf) }?;
+    let self_cspace = crate::os::seraph::try_startup_info().map_or(0, |info| info.self_cspace);
+    if reply.label != syscall_abi::IPC_REPLY_TRANSFER_FAILED || self_cspace == 0 {
+        return Ok(reply);
+    }
+    let short = || cspace_free_slots(self_cspace) < syscall_abi::MSG_CAP_SLOTS_MAX as u64;
+    let spent = short() && augment_from_reserve(self_cspace);
+    if short() {
+        return Ok(reply);
+    }
+    // SAFETY: as above.
+    let retried = unsafe { memmgr_call_until_answered(ep, msg, ipc_buf) };
+    if spent {
+        refill_cspace_reserve();
+    }
+    retried
 }
 
 /// Bytes withheld from a fresh grant's local ledger as slack against any
@@ -1648,15 +1776,21 @@ pub unsafe fn mmio_map_funded(aspace: u64, mmio_cap: u64, va: u64, pages: u64) -
     )
 }
 
-/// General-allocation headroom of `self_cspace`: free slots the kernel lets a
-/// general allocation take, excluding the IPC receive reserve
-/// (`CSPACE_IPC_RECV_RESERVE`). Zero when the queries fail.
-pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
+/// Free slots of `self_cspace`, the IPC receive reserve's included: what the
+/// caps of a received message or reply can take. Zero when the queries fail.
+fn cspace_free_slots(self_cspace: u64) -> u64 {
     let capacity =
         syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_CAPACITY).unwrap_or(0);
     let used =
         syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_USED).unwrap_or(capacity);
-    capacity.saturating_sub(used).saturating_sub(syscall_abi::CSPACE_IPC_RECV_RESERVE)
+    capacity.saturating_sub(used)
+}
+
+/// General-allocation headroom of `self_cspace`: free slots the kernel lets a
+/// general allocation take, excluding the IPC receive reserve
+/// (`CSPACE_IPC_RECV_RESERVE`). Zero when the queries fail.
+pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
+    cspace_free_slots(self_cspace).saturating_sub(syscall_abi::CSPACE_IPC_RECV_RESERVE)
 }
 
 /// Fund `self_cspace`'s slot-page pool so at least `slots` general
@@ -1686,10 +1820,15 @@ pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
 ///
 /// `slots == 0` still keeps the arena's page. Returns `false` only when a
 /// top-up was needed and could not be had: memmgr is unreachable or refuses
-/// the grant, or the kernel refuses the donation. A granted run's cap takes a
-/// free slot, the IPC receive reserve's included, until it is donated, so a
-/// `CSpace` with no free slot cannot be topped up (#1328). A headroom that reads short after donations
-/// that were made is no failure, since another thread's allocations took it.
+/// the grant, or the kernel refuses the donation. A headroom that reads short
+/// after donations that were made is no failure, since another thread's
+/// allocations took it.
+///
+/// A granted run's cap takes a free slot, the IPC receive reserve's included,
+/// until it is donated, so a grant to a `CSpace` with no free slot is first
+/// recovered through the slot reserve ([`request_memory_caps`]). A call that
+/// leaves the `CSpace` funded takes a slot reserve when the process holds none
+/// ([`refill_cspace_reserve`]).
 pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     let short = || {
         let budget =
@@ -1699,7 +1838,11 @@ pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     let donate = |pages: u64| {
         donate_pool_pages(pages, |cap, n| syscall::cap_create_cspace(cap, self_cspace, n).is_ok())
     };
-    pool_funding::top_up(short, donate)
+    let funded = pool_funding::top_up(short, donate);
+    if funded {
+        refill_cspace_reserve();
+    }
+    funded
 }
 
 /// Whether `self_cspace`'s general headroom is below `low_water` slots plus a

@@ -437,10 +437,9 @@ pub fn restore_claim(
 /// (`rootfs/config/svcmgr/services/vfsd.svc`), so svcmgr shuts the system
 /// down.
 ///
-/// Called on the watch thread, which is vfsd's main thread: the exit
-/// syscall ends only the calling thread, and procmgr tears the process down
-/// at its main thread's death (`docs/process-lifecycle.md` § Exit reason),
-/// which is also the death svcmgr observes.
+/// `std::process::exit` is `sys_aspace_exit`, which ends the whole process
+/// whichever thread makes it (`docs/process-lifecycle.md` § Exit reason), so
+/// the end svcmgr observes carries this exit code.
 fn root_lost(why: core::fmt::Arguments<'_>) -> !
 {
     std::os::seraph::log!(error: "FATAL: root filesystem lost: {why}; vfsd exits");

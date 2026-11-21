@@ -237,8 +237,10 @@ fn observe_core_deaths(info: &StartupInfo, pending: &[PendingRegistration]) -> u
 
 /// Bind the core member `name`'s main-thread observer through `thread` and
 /// its address-space observer through `aspace` (`0`: none endowed) on
-/// `queue`, both under `correlator`. Each observer that does not bind is
-/// logged at error level; whether either bound.
+/// `queue`, under `correlator`, the address-space one with
+/// the flag `pwrmgr_labels::CORE_DEATH_ADDRESS_SPACE` set, so pwrmgr tells the
+/// two ends apart. Each observer that does not bind is logged at error level;
+/// whether either bound.
 fn bind_core_member(queue: u64, name: &str, thread: u64, aspace: u64, correlator: u64) -> bool
 {
     let thread_bound = syscall::thread_bind_notification(thread, queue, correlator).is_ok();
@@ -249,8 +251,13 @@ fn bind_core_member(queue: u64, name: &str, thread: u64, aspace: u64, correlator
              unobserved"
         );
     }
-    let aspace_bound =
-        aspace != 0 && syscall::aspace_bind_notification(aspace, queue, correlator).is_ok();
+    let aspace_bound = aspace != 0
+        && syscall::aspace_bind_notification(
+            aspace,
+            queue,
+            correlator | ipc::pwrmgr_labels::CORE_DEATH_ADDRESS_SPACE,
+        )
+        .is_ok();
     if !aspace_bound
     {
         std::os::seraph::log!(
@@ -1070,20 +1077,49 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
 /// from one queue may have followed a full queue, whose dropped posts leave a
 /// full queue's worth of events behind them for this drain or the next; the
 /// drain that crosses the capacity then runs [`resync_deaths`].
+///
+/// A death is routed with the reason procmgr gives the process
+/// ([`posted_death_reason`]), not the post's own.
 fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
     let full = ctx.deaths.drain(|death| {
-        route_death(
-            DeathTag::from_correlator(death.correlator),
-            death.exit_reason,
-            state,
-            ctx,
-        );
+        let tag = DeathTag::from_correlator(death.correlator);
+        let exit_reason = posted_death_reason(state, ctx, tag, death.exit_reason);
+        route_death(tag, exit_reason, state, ctx);
     });
     if full
     {
         std::os::seraph::log!(warn: "a death queue drained full; resyncing services");
         resync_deaths(state, ctx);
+    }
+}
+
+/// The reason to route the death post `posted` of `tag` with: for a
+/// procmgr-created service whose current instance `tag` names, the reason
+/// procmgr gives the process (`restart::process_reason`), since the post can
+/// be the main thread's own end, which is the process's only when it is the
+/// first (docs/process-lifecycle.md § Exit reason); `posted` when procmgr
+/// does not answer `EXITED`, for a post [`route_death`] drops or a service
+/// svcmgr holds no process handle of, and while the substrate is down
+/// ([`substrate_alive`]), since the call blocks until procmgr answers.
+fn posted_death_reason(
+    state: &SvcmgrState,
+    ctx: &restart::RestartCtx,
+    tag: DeathTag,
+    posted: u64,
+) -> u64
+{
+    match state.table.services.get(tag.index())
+    {
+        Some(svc)
+            if svc.process_handle != 0
+                && svc.aspace_cap == 0
+                && svcmgr_defs::death_tag::routes(tag, svc.active, svc.instance)
+                && substrate_alive(state) =>
+        {
+            restart::process_reason(svc.process_handle, posted, ctx.ipc_buf)
+        }
+        _ => posted,
     }
 }
 

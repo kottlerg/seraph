@@ -113,6 +113,7 @@ pub mod swap_client;
 pub mod swap_commit;
 pub mod swap_raw;
 pub mod swapd;
+pub mod thread_exits;
 pub mod threading;
 pub mod timed;
 pub mod unmount;

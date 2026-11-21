@@ -2024,11 +2024,11 @@ frame or `InvalidState`, never a torn frame, so an observer that meets `InvalidS
 thread again.
 The buffer receives the kernel's architecture-specific `TrapFrame`
 (`core/kernel/src/arch/x86_64/trap_frame.rs`, `core/kernel/src/arch/riscv64/trap_frame.rs`);
-`abi/syscall` publishes its size and its instruction- and stack-pointer offsets per architecture,
-on x86-64 its `rflags` offset, and on riscv64 its `x1` offset, the base of the integer registers
-(`REGS_X86_64_*`, `REGS_RISCV64_*`), and the kernel asserts its `TrapFrame` against them at compile
-time. If `buf_size` is smaller than the required size, the call
-fails with `InvalidArgument`.
+`abi/syscall` publishes its size and its instruction- and stack-pointer offsets per architecture, on
+x86-64 its `rflags`, `rax` and `rdi` offsets, and on riscv64 its `x1` offset, the base of the
+integer registers (`REGS_X86_64_*`, `REGS_RISCV64_*`), and the kernel asserts its `TrapFrame`
+against them at compile time. If `buf_size` is smaller than the required size, the call fails with
+`InvalidArgument`.
 
 A thread stopped while it runs on another CPU is `Stopped` from the stop's commit, but it executes
 until that CPU deschedules it, so the call refuses it with `InvalidState` until it is `current` on

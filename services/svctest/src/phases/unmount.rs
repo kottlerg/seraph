@@ -473,7 +473,10 @@ fn unmount_stale_mapping_phase(caps: &Caps)
 /// `/data` is mounted again, which gives it a whole budget, and its driver is
 /// found by name (`LIST_PROCESSES`): the one process named `fatfs:/data`
 /// not listed before. `RESTART_BURST` times, with a file open on the mount,
-/// svctest kills the driver through an attach (`logd_restart::kill`), and
+/// svctest kills the driver through an attach (`logd_restart::kill`), the
+/// first time by a worker thread's exit and then its main thread's, with
+/// another code (`thread_exits::end_two`), after which vfsd's line about the
+/// death must carry the worker's code, the driver's one exit reason; and
 /// vfsd starts another: a new `fatfs:/data` is listed and
 /// `/data/test.txt` reads again by its path, while `/data` is never
 /// resolved through the root filesystem meanwhile (it is never not found),
@@ -498,8 +501,19 @@ fn driver_death_phase(caps: &Caps)
     {
         let mut open = std::fs::File::open("/data/test.txt").expect("open /data/test.txt");
         seen.push(driver);
-        super::logd_restart::kill(authority, driver, "vfsd_driver_death: the /data fatfs");
+        if restart == 1
+        {
+            end_from_a_worker(authority, driver);
+        }
+        else
+        {
+            super::logd_restart::kill(authority, driver, "vfsd_driver_death: the /data fatfs");
+        }
         driver = await_restart(authority, &seen, restart);
+        if restart == 1
+        {
+            require_worker_reason(caps.logd_query);
+        }
         let mut bytes = [0u8; 8];
         assert_stale(
             open.read(&mut bytes),
@@ -529,6 +543,54 @@ fn driver_death_phase(caps: &Caps)
         "vfsd driver death passed ({} restarts in {restarted_in} ms, then the budget spent: /data \
          fell through in {fell_through} ms, the disk held, mounted again)",
         restart_budget::RESTART_BURST
+    );
+}
+
+/// The exit code the first death's worker thread ends the driver with.
+const WORKER_EXIT_CODE: u32 = 43;
+
+/// The exit code the first death's main thread exits with after the worker
+/// ended the driver.
+const MAIN_EXIT_CODE: u32 = 44;
+
+/// End the `/data` driver `driver` from a worker thread, with
+/// `SYS_ASPACE_EXIT` of [`WORKER_EXIT_CODE`], and then have its main thread
+/// exit with [`MAIN_EXIT_CODE`] (`thread_exits::end_two`): the driver's end
+/// is the worker's, and the main thread's own end, which posts to its
+/// thread's observers, carries the other code.
+fn end_from_a_worker(authority: u64, driver: u64)
+{
+    super::thread_exits::end_two(
+        authority,
+        driver,
+        MAIN_EXIT_CODE,
+        WORKER_EXIT_CODE,
+        "vfsd_driver_death: the /data fatfs",
+    );
+}
+
+/// Require vfsd's newest line about a mount's driver's death in logd's history,
+/// through `query`, to carry the reason of the worker's end,
+/// [`WORKER_EXIT_CODE`]: the driver's one exit reason, which procmgr posts
+/// to the relay, and not its main thread's.
+fn require_worker_reason(query: u64)
+{
+    const DIED: &[u8] = b"fs driver of the mount on disk index";
+    let history = super::procmgr::logd_history(query, None);
+    let line = history
+        .iter()
+        .map(|(_, bytes)| bytes)
+        .find(|bytes| bytes.windows(DIED.len()).any(|w| w == DIED))
+        .expect("vfsd_driver_death: no vfsd line about the driver's death in logd's history");
+    let want = format!(
+        "died (reason={:#x})",
+        syscall_abi::encode_exit_code(WORKER_EXIT_CODE)
+    );
+    assert!(
+        line.windows(want.len()).any(|w| w == want.as_bytes()),
+        "vfsd_driver_death: vfsd logged {:?} for a driver a worker ended with exit code \
+         {WORKER_EXIT_CODE}, before its main thread exited with {MAIN_EXIT_CODE}",
+        String::from_utf8_lossy(line)
     );
 }
 

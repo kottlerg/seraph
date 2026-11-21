@@ -49,6 +49,8 @@ services/svctest/
         ├── logd_sinks.rs      # logd's sinks: serial and framebuffer drivers attachable; lines
         │                      #   answered with either stopped, and with the framebuffer killed
         │                      #   and restarted
+        ├── thread_exits.rs    # Another process ended through an attach from a worker thread,
+        │                      #   then its main thread, each by an exit syscall it is pointed at
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
@@ -166,7 +168,7 @@ services/svctest/
         │                      #   RTC driver's create refused under memory pressure, retried
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
         │                      #   fall-through, remount, a mapped page across the unmount,
-        │                      #   a killed fs driver
+        │                      #   a killed fs driver, its death's reason from a worker's exit
         └── vfsd.rs            # `MOUNT` gate: deny, mounted-path and short-path rejections
 ```
 
@@ -257,7 +259,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
 | `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT`, the remounts, and the fs-driver death phase's remount |
 | `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
-| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`, `oom_policy`, `memmgr_swap_commit` phases: read logd's slots and history |
+| `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent`, `logd_reserve`, `logd_restart`, `logd_sinks`, `entropyd_contribution`, `devmgr_on_demand_bind`, `devmgr_iommu_restart`, `rtc_create_retry`, `oom_policy`, `memmgr_swap_commit`, `vfsd_driver_death` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
 | `caps[9]` | `devmgr.class.test-dma` | DMA confinement and MSI delivery, forge, churn, and release phases: the `test-dma` class SEND |
@@ -271,7 +273,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[17]` | `devmgr.class.hwrng-deny` | drivers deny phase: an `hwrng` class SEND without the driver's verb bits |
 | `caps[18]` | `memmgr.swap` (`SEND\|GRANT`) | `memmgr_swap_client`, `memmgr_swap_raw` and `swapd` phases: memmgr's swap labels, as a second swap client beside swapd, registering nothing, over a RAM slot store |
 | `caps[19]` | `devmgr.class.rtc` | `rtc_create_retry` phase: the `rtc` class SEND, on which it waits for devmgr to serve the RTC driver its create retry started |
-| `caps[20]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `rtc_create_retry` phase: finds devmgr and the RTC driver, attaches to devmgr, stops and starts its main thread, and kills the RTC driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_node_reclaim` phase: sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; `memmgr_memory_object_text` phase: finds its child and svctest itself, and sends `MAKE_PRIVATE` for each; `procmgr_image_sharing` phase: finds its children, and sends `MAKE_RESIDENT` and `MAKE_PRIVATE` for them; `procmgr_snapshot` phase: finds its child and sends `SNAPSHOT` for it, and for its badge once it has exited; `memmgr_swap` and `swapd` phases: send `SNAPSHOT` for the fixture child; svctest declares itself undebuggable at startup |
+| `caps[20]` | (`debug_authority`) | `crash_endpoint` phase; `logd_reserve` and `logd_restart` phases: find and attach to logd; `logd_sinks` phase: finds, attaches to, stops, and kills the sink drivers, and finds, attaches to, and stops the restarted framebuffer driver; drivers hwrng restart phase: kills the virtio-rng driver; `rtc_create_retry` phase: finds devmgr and the RTC driver, attaches to devmgr, stops and starts its main thread, and kills the RTC driver; `timed_rtc_restart` phase: finds and kills the RTC driver and timed; `vfsd_driver_death` phase: finds and kills the `/data` fatfs driver, `RESTART_BURST` plus one times, the first time by pointing two of its threads at exit syscalls; `memmgr_swap` phase: finds the fixture child and attaches to it and to logd, reads their memory, and sends `MAKE_RESIDENT` for every process; `memmgr_node_reclaim` phase: sends `MAKE_RESIDENT` for every process; `memmgr_swap_client` phase: the same for its fixture child, and every other process's ranges; `memmgr_swap_raw` phase: the same, and `MAKE_RESIDENT` of one chunk of its fixture child; `swapd` phase: the same, and attaches to, stops, and reads the stacks of swapd, devmgr, virtio-blk, and the IOMMU driver, and kills swapd; `devmgr_iommu_restart` phase: finds and kills the IOMMU driver; `svcmgr_stop_service` phase: `LIST_PROCESSES` for `stopsrc`'s job; `memmgr_memory_object_text` phase: finds its child and svctest itself, and sends `MAKE_PRIVATE` for each; `procmgr_image_sharing` phase: finds its children, and sends `MAKE_RESIDENT` and `MAKE_PRIVATE` for them; `procmgr_snapshot` phase: finds its child and sends `SNAPSHOT` for it, and for its badge once it has exited; `memmgr_swap` and `swapd` phases: send `SNAPSHOT` for the fixture child; svctest declares itself undebuggable at startup |
 | `caps[21]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_CANDIDATE`, `LIST_CANDIDATES` and `LIST_STOP_SOURCES`; `sessiond_operator` and `oom_policy` phases: `LIST_STOP_SOURCES` for sessiond's stop SEND; `oom_policy`, `logd_reserve` and `rtc_create_retry` phases, no-stop case: `LIST_CANDIDATES` and `STOP_CANDIDATE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
@@ -661,11 +663,13 @@ unforced and a forced unmount of `/data`, and a `stale-map-child` maps a cache p
 `test.txt` there, and after unmounting it read `/config/svcmgr/tests/svctest.svc` through the
 fall-through again. The `vfsd_driver_death` phase holds a file on `/data` open and kills the data
 mount's fs driver (found by its name `fatfs:/data`) through a debug attach `RESTART_BURST` times;
-each time vfsd restarts the driver, a new `fatfs:/data` is listed, `/data/test.txt` reads again,
-`/data` is never not found, and the open file is stale. One more kill finds the restart budget
-spent: vfsd tears the mount down, `/data` falls through and is not found, and a fresh `MOUNT` at
-`/data` succeeds on the same disk. They mount `/data` again and set svctest's cwd to it before
-they end.
+the first time a worker thread ends the driver with exit code 43 and its main thread then exits with
+44 (`phases/thread_exits.rs`), and vfsd's line about the death must carry the reason of code 43, the
+process's, which procmgr's relay gives. Each time vfsd restarts the driver, a new `fatfs:/data` is
+listed, `/data/test.txt` reads again, `/data` is never not found, and the open file is stale. One
+more kill finds the restart budget spent: vfsd tears the mount down, `/data` falls through and is
+not found, and a fresh `MOUNT` at `/data` succeeds on the same disk. They mount `/data` again and
+set svctest's cwd to it before they end.
 The sysroot placement of all of these is listed in [docs/testing.md § Sysroot
 layout](../../docs/testing.md#sysroot-layout).
 

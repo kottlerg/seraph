@@ -1565,6 +1565,12 @@ pub const REGS_X86_64_IP_OFFSET: usize = 120;
 pub const REGS_X86_64_SP_OFFSET: usize = 136;
 /// Byte offset of the flags register (`rflags`) in the x86-64 register file.
 pub const REGS_X86_64_FLAGS_OFFSET: usize = 128;
+/// Byte offset of `rax` in the x86-64 register file: the syscall number a
+/// `syscall` instruction carries, and the primary result.
+pub const REGS_X86_64_RAX_OFFSET: usize = 0;
+/// Byte offset of `rdi` in the x86-64 register file: a syscall's first
+/// argument.
+pub const REGS_X86_64_RDI_OFFSET: usize = 40;
 /// The x86-64 trap flag in `rflags`. A debugger single-steps a stopped thread
 /// by setting it with `SYS_THREAD_WRITE_REGS`: the thread takes `#DB` after
 /// each instruction, delivered to its exception handler as

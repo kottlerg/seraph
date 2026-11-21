@@ -136,8 +136,7 @@ fn take_next_active_job(active: &ActiveState) -> ActiveJob
 /// bootstrap delivery the bootstrap worker performs in parallel, or for the
 /// child's death, which ends the wait (`WorkHandle::wait_while_alive`).
 ///
-/// The child's main thread is bound to `order.death_queue` before it
-/// starts, and procmgr posts the child's end to a relay derived from it
+/// procmgr posts the child's end to a relay derived from `order.death_queue`
 /// (`CREATE_DEATH_RELAY`).
 ///
 /// Returns the child's process handle once the child holds its bootstrap
@@ -211,7 +210,7 @@ fn handle_create_from_file(
         return None;
     }
 
-    let Some(process) = crate::driver::start_child(create_reply.caps(), death_queue, ipc_buf)
+    let Some(process) = crate::driver::start_child(create_reply.caps(), ipc_buf)
     else
     {
         std::os::seraph::log!(warn: "active worker: START_PROCESS failed");

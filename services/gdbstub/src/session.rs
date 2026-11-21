@@ -680,6 +680,15 @@ impl Session
     fn hold_known(&mut self, k: &mut impl Kernel, stop: Stop) -> Option<usize>
     {
         let index = self.hold(k, stop)?;
+        self.known(k, index);
+        Some(index)
+    }
+
+    /// Make slot `index`'s held stop one GDB has been told of, a breakpoint
+    /// hit set back ([`Self::cancel_hit`]), since GDB takes its thread for
+    /// stopped.
+    fn known(&mut self, k: &mut impl Kernel, index: usize)
+    {
         self.cancel_hit(k, index);
         if let Some(t) = self.threads.get_mut(index)
         {
@@ -689,7 +698,6 @@ impl Session
                 h.reported = true;
             }
         }
-        Some(index)
     }
 
     /// Before a register read or write of slot `index` while the target is
@@ -1046,20 +1054,32 @@ impl Session
         }
         let now = k.now();
         let stop = self.next_stop(k, now)?;
-        let unresumed = control::thread_index(stop.badge)
-            .and_then(|i| self.threads.get(i))
-            .is_some_and(|t| !t.resumed);
-        if unresumed
-        {
-            let _ = self.hold_known(k, stop);
-            return None;
-        }
         if stop.kind == syscall_abi::FAULT_KIND_UPCALL
         {
-            k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
+            // The stub posts an upcall only to a thread of its table, so its
+            // badge names its thread.
+            let unresumed = control::thread_index(stop.badge)
+                .and_then(|i| self.threads.get(i))
+                .is_some_and(|t| !t.resumed);
+            if unresumed
+            {
+                let _ = self.hold_known(k, stop);
+            }
+            else
+            {
+                k.reply(stop.receiver, syscall_abi::FAULT_REPLY_RESUME);
+            }
             return None;
         }
+        // Any other stop is judged by the thread it is credited to, which
+        // can be a thread spawned while the target ran under its spawner's
+        // badge, bound by the hold in its exited spawner's slot.
         let index = self.hold(k, stop)?;
+        if !self.threads.get(index).is_some_and(|t| t.resumed)
+        {
+            self.known(k, index);
+            return None;
+        }
         self.stop_all(k);
         let reported = self.report(k, Some(index));
         if reported.is_none()
@@ -2592,6 +2612,38 @@ mod tests
         assert_eq!(sim.threads[masked].pc, 0x100, "set back to its breakpoint");
         assert!(s.is_held(0), "thread 1 stays held");
         assert!(!s.is_held(other));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a thread spawned while the target ran, by a thread the
+    // all-stop could not hold and GDB did not resume, that exited, took its
+    // stop under the spawner's badge in the spawner's slot; the stop was
+    // taken for the spawner's, held and never reported.
+    #[test]
+    fn a_stop_of_a_new_thread_in_an_unresumed_spawner_s_slot_is_reported()
+    {
+        let mut sim = Sim::new();
+        let other = sim.spawn(Some(0), true);
+        let masked = sim.spawn(Some(0), true);
+        sim.deaf.push(masked);
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        assert!(!s.is_held(masked));
+        let plan = vcont(&s, &[(Resume::Continue, Some(2))]);
+        assert_eq!(s.resume(&mut sim, plan, None), Resumed::Running);
+        sim.plant(&mut s, 0x100);
+        let child = sim.spawn(Some(masked), true);
+        sim.exit(masked);
+        sim.hit(child, 0x100);
+        let (index, stop) = s.poll(&mut sim).expect("the new thread's stop");
+        assert_eq!(
+            (index, stop.detail),
+            (masked, BP),
+            "the child in its spawner's slot"
+        );
+        assert_eq!(s.threads[index].cap, cap_of(child));
+        assert!(!s.running);
+        assert!(!s.is_held(other) || s.threads[other].held.unwrap().reported);
         sim.assert_sound();
     }
 

@@ -904,4 +904,6 @@ pub fn run_all(ctx: &TestContext)
         "crypto::chacha20_poly1305_kats",
         crypto::chacha20_poly1305_kats(ctx)
     );
+    run_test!("crypto::shake_kats", crypto::shake_kats(ctx));
+    run_test!("crypto::ml_dsa_kats", crypto::ml_dsa_kats(ctx));
 }

@@ -445,6 +445,7 @@ name = "kernel"
 version = "0.1.4"
 dependencies = [
  "boot-protocol",
+ "crypto",
  "elf",
  "font",
  "init-protocol",

@@ -109,7 +109,6 @@ core/kernel/
 │   │   └── transfer.rs         # Batched capability move (SYS_CAP_MOVE, IPC transfer)
 │   ├── entropy/                # Entropy subsystem and per-CPU CSPRNG
 │   │   ├── mod.rs              # Storage alloc, seeding, draw API (fill_bytes)
-│   │   ├── keccak.rs           # Keccak-f[1600] permutation (FIPS 202)
 │   │   ├── sponge.rs           # Forward-secure duplex PRNG
 │   │   ├── pool.rs             # Central multi-source entropy pool
 │   │   ├── cpurng.rs           # Per-CPU CSPRNG (acts on the reseed policy)

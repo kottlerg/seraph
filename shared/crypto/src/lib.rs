@@ -3,11 +3,11 @@
 
 // shared/crypto/src/lib.rs
 
-//! In-OS cryptographic primitives: SHA-512 hashing, Ed25519 signature
-//! verification and, for the host signer, key generation and signing, and
-//! ChaCha20-Poly1305 authenticated encryption.
+//! In-OS cryptographic primitives: SHA-512 hashing, Keccak-f[1600] and SHAKE,
+//! Ed25519 and ML-DSA-65 signature verification and, for the host signer, key
+//! generation and signing, and ChaCha20-Poly1305 authenticated encryption.
 //!
-//! `no_std`, no allocation, no external dependencies. Four primitives:
+//! `no_std`, no allocation, no external dependencies. The primitives:
 //!
 //! - [`sha512`] / [`Sha512`] — FIPS 180-4 SHA-512, one-shot and incremental.
 //!   The incremental form hashes large inputs (e.g. boot-module bodies)
@@ -25,15 +25,20 @@
 //!   in place with a detached tag. It handles secret data, so no branch and
 //!   no memory index depends on the key, the plaintext or a tag, and a tag is
 //!   compared in a time that does not depend on where it differs.
+//! - [`keccak`] — the FIPS 202 Keccak-f[1600] permutation, in constant time.
+//!   The kernel's entropy sponge runs it (the kernel depends on this crate
+//!   with no feature and calls nothing else), and so does [`shake`].
+//! - [`shake`] — FIPS 202 SHAKE128 and SHAKE256, one-shot and incremental
+//!   (absorb in pieces, then squeeze in pieces).
+//! - [`ml_dsa`] — FIPS 204 ML-DSA-65 signature verification, the pure form
+//!   with a context string. It allocates nothing and its stack does not grow
+//!   with the message; it operates only on public data, so it is
+//!   variable-time. Key derivation from a seed and deterministic signing
+//!   (`ml_dsa::public_key`, `ml_dsa::sign`) are compiled only with the `sign`
+//!   feature, as Ed25519's are.
 //!
-//! SHA-512 is the only hash provided because Ed25519 mandates it internally
-//! (RFC 8032 §5.1); one core serves both the public hash and the signature's
-//! internal hashing.
-//!
-//! Non-goal: the kernel's `entropy` subsystem carries its own Keccak/SHAKE256
-//! sponge for the CSPRNG. That primitive is kernel-internal and is not shared
-//! with or consumed by this crate; consolidating hash primitives is out of
-//! scope here.
+//! Each hash serves a signature scheme and is public too: SHA-512 the one
+//! Ed25519 mandates (RFC 8032 §5.1), SHAKE the ones ML-DSA does (FIPS 204).
 
 #![no_std]
 
@@ -41,7 +46,10 @@
 extern crate std;
 
 pub mod chacha20poly1305;
+pub mod keccak;
+pub mod ml_dsa;
 pub mod sha512;
+pub mod shake;
 
 mod chacha20;
 mod ed25519;
@@ -49,6 +57,7 @@ mod ed25519;
 mod ed25519_sign;
 mod edwards;
 mod field;
+mod kat_hex;
 mod poly1305;
 mod scalar;
 
@@ -56,4 +65,6 @@ pub use chacha20poly1305::run_chacha20_poly1305_kats;
 pub use ed25519::{VerifyError, ed25519_verify, run_ed25519_kats};
 #[cfg(any(test, feature = "sign"))]
 pub use ed25519_sign::{ed25519_public_key, ed25519_sign};
+pub use ml_dsa::run_ml_dsa_kats;
 pub use sha512::{Sha512, run_sha512_kats, sha512};
+pub use shake::run_shake_kats;

@@ -6,9 +6,11 @@
 //! The reference: the `openssl` command, which signs, verifies and hashes
 //! for the generator.
 //!
-//! Keys pass as DER files (RFC 8410), and a signature and a signed message
-//! as files (a one-shot Ed25519 operation reads no stream), in a working
-//! directory the generator owns; a hashed message passes on standard input.
+//! Keys pass as DER files (RFC 8410 for Ed25519, the IETF LAMPS encodings of
+//! OID 2.16.840.1.101.3.4.3.18 for ML-DSA-65), and a
+//! signature and a signed message as files (a one-shot signature operation
+//! reads no stream), in a working directory the generator owns; a hashed
+//! message passes on standard input.
 
 use std::fs;
 use std::io::Write as _;
@@ -27,6 +29,20 @@ const PKCS8_PREFIX: [u8; 16] = [
 /// raw bytes.
 const SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+
+/// The DER prefix of an ML-DSA-65 PKCS #8 private key in its seed-only form
+/// (`[0] IMPLICIT OCTET STRING`), followed by the 32-byte seed.
+const ML_DSA_65_PKCS8_PREFIX: [u8; 22] = [
+    0x30, 0x34, 0x02, 0x01, 0x00, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04,
+    0x03, 0x12, 0x04, 0x22, 0x80, 0x20,
+];
+
+/// The DER prefix of an ML-DSA-65 `SubjectPublicKeyInfo`, followed by the
+/// 1952-byte raw public key.
+const ML_DSA_65_SPKI_PREFIX: [u8; 22] = [
+    0x30, 0x82, 0x07, 0xb2, 0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03,
+    0x12, 0x03, 0x82, 0x07, 0xa1, 0x00,
 ];
 
 /// The `openssl` command, with its working directory.
@@ -171,7 +187,14 @@ impl OpenSsl
             "-in",
             &data.to_string_lossy(),
         ];
-        let out = Self::run(&args, &[])?;
+        Self::verdict(&args)
+    }
+
+    /// Run the `openssl pkeyutl -verify` of `args`: whether it accepts the
+    /// signature, or an error when it fails otherwise than by refusing it.
+    fn verdict(args: &[&str]) -> Result<bool, Error>
+    {
+        let out = Self::run(args, &[])?;
         let stdout = String::from_utf8_lossy(&out.stdout);
         if out.status.success() && stdout.contains("Signature Verified Successfully")
         {
@@ -185,5 +208,122 @@ impl OpenSsl
             "openssl pkeyutl -verify failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )))
+    }
+
+    /// The first `len` bytes of SHAKE128 or SHAKE256 (`function`, the
+    /// command's digest name) of `data`; `len` is at least one.
+    pub fn shake(function: &str, data: &[u8], len: usize) -> Result<Vec<u8>, Error>
+    {
+        let out = Self::output(
+            &[
+                "dgst",
+                &format!("-{function}"),
+                "-xoflen",
+                &len.to_string(),
+                "-binary",
+            ],
+            data,
+        )?;
+        if out.len() == len
+        {
+            Ok(out)
+        }
+        else
+        {
+            Err(Error(format!("openssl dgst -{function}: not {len} bytes")))
+        }
+    }
+
+    /// The `pkeyutl` options that pass the ML-DSA context string `context`,
+    /// none for an empty one.
+    fn context_options(context: &[u8]) -> Vec<String>
+    {
+        if context.is_empty()
+        {
+            return Vec::new();
+        }
+        vec![
+            "-pkeyopt".to_owned(),
+            format!("hexcontext-string:{}", crate::hex::encode(context)),
+        ]
+    }
+
+    /// The ML-DSA-65 public key of the key-generation seed `seed`, and its
+    /// deterministic signature over `message` with context string `context`
+    /// (FIPS 204 Algorithms 1 and 2).
+    pub fn ml_dsa_sign(
+        &self,
+        seed: &[u8; 32],
+        message: &[u8],
+        context: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), Error>
+    {
+        let mut der = ML_DSA_65_PKCS8_PREFIX.to_vec();
+        der.extend_from_slice(seed);
+        let key = self.file("ml-dsa-private.der", &der)?;
+        let key = key.to_string_lossy();
+        let data = self.file("message", message)?;
+        let data = data.to_string_lossy();
+        let mut args = vec![
+            "pkeyutl",
+            "-sign",
+            "-rawin",
+            "-keyform",
+            "DER",
+            "-inkey",
+            &key,
+            "-in",
+            &data,
+            "-pkeyopt",
+            "deterministic:1",
+        ];
+        let context = Self::context_options(context);
+        args.extend(context.iter().map(String::as_str));
+        let signature = Self::output(&args, &[])?;
+        let public = Self::output(
+            &[
+                "pkey", "-inform", "DER", "-in", &key, "-pubout", "-outform", "DER",
+            ],
+            &[],
+        )?;
+        let public = public
+            .strip_prefix(&ML_DSA_65_SPKI_PREFIX)
+            .filter(|raw| raw.len() == crate::ml_dsa::PUBLIC_KEY_LEN)
+            .ok_or_else(|| Error("openssl pkey: not an ML-DSA-65 public key".into()))?;
+        if signature.len() != crate::ml_dsa::SIGNATURE_LEN
+        {
+            return Err(Error(
+                "openssl pkeyutl -sign: not an ML-DSA-65 signature".into(),
+            ));
+        }
+        Ok((public.to_vec(), signature))
+    }
+
+    /// Whether OpenSSL's ML-DSA-65 verification accepts `signature` over
+    /// `message` with context string `context` under `public_key`; an error
+    /// when the command fails otherwise than by refusing the signature.
+    pub fn ml_dsa_verifies(
+        &self,
+        public_key: &[u8],
+        message: &[u8],
+        context: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error>
+    {
+        let mut der = ML_DSA_65_SPKI_PREFIX.to_vec();
+        der.extend_from_slice(public_key);
+        let key = self.file("ml-dsa-public.der", &der)?;
+        let key = key.to_string_lossy();
+        let sig = self.file("signature", signature)?;
+        let sig = sig.to_string_lossy();
+        let data = self.file("message", message)?;
+        let data = data.to_string_lossy();
+        let mut args = vec![
+            "pkeyutl", "-verify", "-pubin", "-rawin", "-keyform", "DER", "-inkey", &key,
+            "-sigfile", &sig, "-in", &data,
+        ];
+        let context = Self::context_options(context);
+        args.extend(context.iter().map(String::as_str));
+        Self::verdict(&args)
     }
 }

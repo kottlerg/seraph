@@ -318,20 +318,32 @@ and the distro ships standard firmware packages.
 
 | Var | Effect |
 |---|---|
-| `SERAPH_OVMF_CODE` | Direct path to the OVMF code firmware. Skips the per-platform default search. |
+| `SERAPH_OVMF_CODE` | Direct path to the OVMF code firmware. Must be set together with `SERAPH_OVMF_VARS`, as the RISC-V pair is; the two skip the per-platform default search. |
+| `SERAPH_OVMF_VARS` | Direct path to the OVMF variable-store template of the same build (`OVMF_VARS.fd`). See the pairing rule of `SERAPH_RISCV_CODE`. |
 | `SERAPH_RISCV_CODE` | Direct path to `RISCV_VIRT_CODE.fd`. Must be set together with `SERAPH_RISCV_VARS` — partial overrides are rejected (a custom code image paired against the system vars template corrupts NVRAM state). |
 | `SERAPH_RISCV_VARS` | Direct path to `RISCV_VIRT_VARS.fd`. See pairing rule above. |
 | `SERAPH_ACCEL` | One of `auto` / `tcg` / `kvm` / `hvf` / `whpx` / `nvmm`. `auto` (the default) runs per-host detection. Cross-arch guests (e.g. riscv64 on x86) always resolve to `tcg`; an explicit non-`tcg`/`auto` override in that case emits a stderr warning. Unrecognized values also warn and fall through to detection. |
 
 Default firmware search paths per host:
 
-- **Linux** OVMF: `/usr/share/edk2/ovmf/OVMF_CODE.fd`, `/usr/share/OVMF/OVMF_CODE.fd`,
-  `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd`, `/usr/share/ovmf/OVMF.fd`,
-  `/usr/share/edk2/x64/OVMF_CODE.4m.fd`
+- **Linux** OVMF, each a code image with the variable-store template beside it, the first pair
+  whose two files exist: `/usr/share/OVMF/OVMF_CODE_4M.fd` with `OVMF_VARS_4M.fd` (Debian,
+  Ubuntu), `/usr/share/edk2/ovmf/OVMF_CODE.fd` with `OVMF_VARS.fd` (Fedora),
+  `/usr/share/edk2/x64/OVMF_CODE.4m.fd` with `OVMF_VARS.4m.fd` (Arch),
+  `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd` with `OVMF_VARS.fd` (older Arch),
+  `/usr/share/OVMF/OVMF_CODE.fd` with `OVMF_VARS.fd` (older Debian and Ubuntu)
 - **Linux** RISC-V: `/usr/share/edk2/riscv`, `/usr/share/edk2-riscv`, `/usr/share/qemu-efi-riscv64`
-- **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`
-- **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`
-- **Windows / other**: no defaults; the relevant `SERAPH_*` env var is required.
+- **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`; OVMF is QEMU's
+  `edk2-x86_64-code.fd` with `edk2-i386-vars.fd`
+- **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`; OVMF is QEMU's pair
+  in `/usr/local/share/qemu`
+- **Windows / other**: no defaults; the relevant `SERAPH_*` env var pair is required.
+
+Every launch, on both architectures, boots on a variable store of its own: a fresh copy of the
+firmware's template, `target/xtask/vars/<pid>-<serial>.fd`, writable pflash unit 1 beside the
+read-only code image, removed once its QEMU has exited. A variable the firmware or the bootloader
+writes (the bootloader's security floor, [docs/signing.md](../docs/signing.md) § Rollback Floor)
+is therefore seen by no later launch; the `rollback` case alone boots several times on one store.
 
 
 #### Classified boots (`--runs`)
@@ -587,8 +599,9 @@ contract.
 
 ### `cargo xtask clean`
 
-Remove the sysroot, the symbols store `symbols/`, and the disk images `disk.img` and
-`disk-data.img` (and optionally `target/`).
+Remove the sysroot, the symbols store `symbols/`, the disk images `disk.img` and
+`disk-data.img`, and any per-launch variable store a killed launch left under
+`target/xtask/vars/` (and optionally `target/`).
 
 ```
 cargo xtask clean [--all]
@@ -677,29 +690,30 @@ options it takes:
 | `shutdown` | x86_64 (9), riscv64 (8) | init | usertest | `--cause` |
 | `debug-port` | x86_64 (2), riscv64 (2) | init | host run | `--port`, `--gdb` |
 | `signing` | x86_64 (4), riscv64 (4) | init | usertest | `--release` |
+| `rollback` | x86_64 (3), riscv64 (3) | init | usertest | `--release` |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
 
 Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was
 built for it, and that the recorded harness is the case's bundle (`ktest` for `kaslr` and `cet`,
 `init` for every other), and when it is not, names the `cargo xtask mkdisk --arch A --harness X`
 that records it. A case is a pure runner: it builds nothing but the `signing` case's revoking
-bootloader, boots the sysroot as the last pack left it, stages and removes only what it needs
-itself, and leaves the images in the layout it found them in; the sections below state each one's
-staging. A new host-driven QEMU test is a case, added to the registry and to `TestCase` in
-`src/cli.rs`, not a command; `cargo xtask lint-docs` fails until the table above, a section of its
-own below, a heading of [docs/testing.md](../docs/testing.md#gating) § Gating, and the cell table
-of its § Coverage tiers state it (its `md-test-cells` rule,
-[§ `cargo xtask lint-docs`](#cargo-xtask-lint-docs)). See [docs/testing.md](../docs/testing.md) for
-the harness model.
+bootloader and the `rollback` case's raising one, boots the sysroot as the last pack left it,
+stages and removes only what it needs itself, and leaves the images in the layout it found them
+in; the sections below state each one's staging. A new host-driven QEMU test is a case, added to
+the registry and to `TestCase` in `src/cli.rs`, not a command; `cargo xtask lint-docs` fails until
+the table above, a section of its own below, a heading of
+[docs/testing.md](../docs/testing.md#gating) § Gating, and the cell table of its § Coverage tiers
+state it (its `md-test-cells` rule, [§ `cargo xtask lint-docs`](#cargo-xtask-lint-docs)). See
+[docs/testing.md](../docs/testing.md) for the harness model.
 
 #### Cells
 
 `cargo xtask test --cell T` runs every case the registry assigns to CI tester T's cells (the Cell
 column above), on the architecture and in the registry's order, each whatever another's outcome,
 and fails naming the cases that failed; for a tester with no case, `svctest` today, it says so and
-succeeds. A cell takes no case option but `--release`, which it passes on to `signing`. The cell
-table of [docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers lists every cell
-with the cases it runs.
+succeeds. A cell takes no case option but `--release`, which it passes on to `signing` and
+`rollback`. The cell table of [docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers
+lists every cell with the cases it runs.
 
 CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot,
 `cargo xtask mkdisk --arch A` (the plain repack: the `rootfs/` re-mirror, the repository's log
@@ -1050,6 +1064,41 @@ cargo xtask test signing [--arch x86_64|riscv64] [--release] [--cpus N] [--mem M
 | Option | Default | Description |
 |---|---|---|
 | `--release` | `false` | Build the `revoked` boot's bootloader in release mode, as the sysroot's was built; a cell passes it on |
+
+#### The `rollback` case
+
+Check that the bootloader keeps the machine's security floor in firmware storage, raises it, and
+refuses itself below it, on either arch ([docs/signing.md](../docs/signing.md) § Rollback Floor).
+The case packs the disk images once with the default-init bundle, so the sysroot is signed; reads
+the floor `F` of the build's trust store; writes the `raised` boot's objects into
+`target/xtask/test/rollback/<arch>/`; and boots the current sysroot three times on one variable
+store, one fresh copy of the firmware's template kept across the three boots and removed after the
+last, so each boot reads the floor the one before it left:
+
+| Boot | Objects in place of the sysroot's | Owed lines |
+|---|---|---|
+| `first` | none | `boot: security floor: machine none, trust store F` and `boot: security floor: machine raised to F` |
+| `raised` | both ESP copies of the bootloader, built under the build's trust store with the floor `F + 1`; the kernel and every bundle entry signed again at security version `F + 1` | `boot: security floor: machine F, trust store F + 1` and `boot: security floor: machine raised to F + 1` |
+| `older` | none | `SERAPH BOOT FATAL: this bootloader is older than the machine's security floor: machine floor F + 1, trust store floor F` |
+
+A boot is judged as the `signing` case judges one, with a deadline of three minutes; a boot after
+a failed one is not made, since it would read a floor its predecessor did not leave. Every boot's
+serial log is saved as `target/xtask/test/rollback/<arch>/<boot>.log`. The images are packed
+again from the sysroot in the layout they had, with the recorded harness's bundle, whatever the
+outcome. A firmware that refuses the floor's write is not reached by any QEMU firmware on demand;
+the bootloader's host tests cover it (`core/boot/src/rollback.rs`).
+
+The case compiles the `raised` boot's bootloader, as the `signing` case compiles its own, and is
+admitted the same way. It requires a populated sysroot of the profile `--release` names:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64] [--release]
+cargo xtask test rollback [--arch x86_64|riscv64] [--release] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--release` | `false` | Build the `raised` boot's bootloader in release mode, as the sysroot's was built; a cell passes it on |
 
 #### The `hotplug` case
 

@@ -52,11 +52,10 @@ use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::debug_stub;
-use crate::firmware::find_ovmf_code;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack, build_qemu_argv,
-    prepare_riscv_firmware, validate_sysroot_for_launch,
+    Firmware, GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
+    build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::Stub;
 use crate::qmp;
@@ -178,15 +177,8 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 /// Boot the staged images and run the rounds (see the module documentation).
 fn boot(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
-    let (firmware_code, firmware_vars) = match args.arch
-    {
-        Arch::X86_64 => (find_ovmf_code()?, None),
-        Arch::Riscv64 =>
-        {
-            let (code, vars) = prepare_riscv_firmware(ctx)?;
-            (code, Some(vars))
-        }
-    };
+    let firmware = Firmware::prepare(ctx, args.arch)?;
+    let vars = firmware.launch_vars()?;
 
     let disk_path = ctx.disk_image();
     let sock_dir = ctx.target_dir.join("xtask");
@@ -201,8 +193,8 @@ fn boot(ctx: &Context, args: &CaseArgs) -> Result<()>
         disk_path: &disk_path,
         disk_block_size: crate::disk::logical_block_size(&disk_path)?,
         second_disk: None,
-        firmware_code_path: &firmware_code,
-        firmware_vars_path: firmware_vars.as_deref(),
+        firmware_code_path: &firmware.code,
+        firmware_vars_path: vars.path(),
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,

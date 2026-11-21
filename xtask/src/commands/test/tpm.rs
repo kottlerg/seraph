@@ -28,11 +28,10 @@ use crate::error::{Context as _, Result, bail};
 use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
-use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, Tpm, TpmInterface, X86Paging,
-    X86ShadowStack, build_qemu_argv_with_tpm, validate_sysroot_for_launch,
+    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, Tpm, TpmInterface,
+    X86Paging, X86ShadowStack, build_qemu_argv_with_tpm, validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
 
@@ -132,14 +131,15 @@ fn launch(
 ) -> Result<Guest>
 {
     let disk_path = ctx.disk_image();
-    let firmware_code = find_ovmf_code()?;
+    let firmware = Firmware::prepare(ctx, Arch::X86_64)?;
+    let vars = firmware.launch_vars()?;
     let spec = QemuLaunchSpec {
         arch: Arch::X86_64,
         disk_path: &disk_path,
         disk_block_size: crate::disk::logical_block_size(&disk_path)?,
         second_disk: None,
-        firmware_code_path: &firmware_code,
-        firmware_vars_path: None,
+        firmware_code_path: &firmware.code,
+        firmware_vars_path: vars.path(),
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,
@@ -165,7 +165,7 @@ fn launch(
         .stderr(Stdio::inherit())
         .spawn()
         .context("spawning qemu-system-x86_64")?;
-    Guest::from_child(child)
+    Ok(Guest::from_child(child)?.holding(vars))
 }
 
 /// The state directory and control socket of the emulator behind

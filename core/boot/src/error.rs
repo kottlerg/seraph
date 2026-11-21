@@ -100,6 +100,21 @@ pub enum BootError
         /// The verifier's refusal.
         refusal: objsig::Refusal,
     },
+
+    /// The machine's security floor, in firmware storage, is above the floor
+    /// of the trust store built into this bootloader: the machine has booted
+    /// a newer one (docs/signing.md § Rollback Floor).
+    FloorAboveStore
+    {
+        /// The machine's floor.
+        machine: u32,
+        /// The floor of this bootloader's trust store.
+        carried: u32,
+    },
+
+    /// The security floor variable has another length or other attributes
+    /// than the bootloader writes (docs/signing.md § Rollback Floor).
+    FloorMalformed(crate::rollback::Malformed),
 }
 
 /// The name of an object the verifier refused, copied, so a [`BootError`]
@@ -212,7 +227,9 @@ impl BootError
             | BootError::ReclaimRangesOverflow
             | BootError::MapAddressRange
             | BootError::TrustStore(_)
-            | BootError::SignatureRefused { .. } => None,
+            | BootError::SignatureRefused { .. }
+            | BootError::FloorAboveStore { .. }
+            | BootError::FloorMalformed(_) => None,
         }
     }
 
@@ -245,6 +262,11 @@ impl BootError
             BootError::MapAddressRange => "a range to map runs past the end of the address space",
             BootError::TrustStore(_) => "the trust store built into the bootloader does not parse",
             BootError::SignatureRefused { .. } => "signature verification refused",
+            BootError::FloorAboveStore { .. } =>
+            {
+                "this bootloader is older than the machine's security floor"
+            }
+            BootError::FloorMalformed(_) => "the security floor variable is malformed",
         }
     }
 }
@@ -273,6 +295,14 @@ impl core::fmt::Display for BootError
         if let BootError::SignatureRefused { object, refusal } = self
         {
             write!(f, ": {object}: {refusal:?}")?;
+        }
+        if let BootError::FloorAboveStore { machine, carried } = self
+        {
+            write!(f, ": machine floor {machine}, trust store floor {carried}")?;
+        }
+        if let BootError::FloorMalformed(how) = self
+        {
+            write!(f, ": {how}")?;
         }
         Ok(())
     }
@@ -322,6 +352,11 @@ mod tests
                 object: ObjectName::new(b"kernel"),
                 refusal: objsig::Refusal::Untrusted,
             },
+            BootError::FloorAboveStore {
+                machine: 2,
+                carried: 1,
+            },
+            BootError::FloorMalformed(crate::rollback::Malformed::Length(0)),
         ];
         for v in variants
         {

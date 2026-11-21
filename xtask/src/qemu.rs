@@ -3,12 +3,14 @@
 
 // xtask/src/qemu.rs
 
-//! Shared QEMU argv construction and per-launch pflash cache for RISC-V.
+//! Shared QEMU argv construction, and the firmware images and per-launch
+//! variable stores every launch boots on.
 //!
 //! Every command that launches QEMU (`run`, `test`) produces its command line from the same
 //! source of truth (`build_qemu_argv`). Firmware discovery lives in
-//! `firmware::{find_ovmf_code, find_riscv_firmware}`; the padding +
-//! caching of RISC-V pflash images stays here in `prepare_riscv_firmware`.
+//! `firmware::{find_ovmf_firmware, find_riscv_firmware}`; the padding and
+//! caching of RISC-V pflash images, and each launch's variable store, stay
+//! here in [`Firmware`].
 //! Acceleration-backend selection lives in `accel::detect_for_arch`. The
 //! interactive launch loop (stdout filtering, terminal restore) stays in
 //! `commands/run/mod.rs`; `run --runs` spawns QEMU directly against per-slot
@@ -646,9 +648,9 @@ impl<'a> SecondDisk<'a>
 
 /// Specification for one QEMU launch.
 ///
-/// `firmware_code_path` is the readonly pflash (OVMF on x86, `RISCV_VIRT_CODE`
-/// on riscv64). `firmware_vars_path` is the writable pflash and is only used
-/// on riscv64 — x86 runs with volatile NVRAM and leaves the field `None`.
+/// `firmware_code_path` is the read-only pflash (OVMF on x86, `RISCV_VIRT_CODE`
+/// on riscv64), and `firmware_vars_path` the launch's writable variable store
+/// ([`Firmware::launch_vars`]).
 pub struct QemuLaunchSpec<'a>
 {
     pub arch: Arch,
@@ -661,7 +663,7 @@ pub struct QemuLaunchSpec<'a>
     /// `hd1`), or `None` for the single-disk default.
     pub second_disk: Option<SecondDisk<'a>>,
     pub firmware_code_path: &'a Path,
-    pub firmware_vars_path: Option<&'a Path>,
+    pub firmware_vars_path: &'a Path,
     pub cpus: u32,
     /// Logical CPUs per core the guest's topology reports (QEMU
     /// `-smp <cpus>,threads=<n>`): 1 makes each vCPU a core of its own, 2 pairs
@@ -897,7 +899,7 @@ pub fn build_qemu_argv_with_tpm(spec: &QemuLaunchSpec, tpm: Option<Tpm<'_>>)
     match spec.arch
     {
         Arch::X86_64 => extend_x86(&mut args, spec, accel, X86Host::probe())?,
-        Arch::Riscv64 => extend_riscv(&mut args, spec)?,
+        Arch::Riscv64 => extend_riscv(&mut args, spec),
     }
 
     Ok(args)
@@ -1163,18 +1165,19 @@ fn extend_x86(
             "if=pflash,format=raw,readonly=on,file={}",
             spec.firmware_code_path.display()
         ),
+        "-drive".into(),
+        format!(
+            "if=pflash,format=raw,file={}",
+            spec.firmware_vars_path.display()
+        ),
     ]);
 
     args.extend(display_args(spec));
     Ok(())
 }
 
-fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
+fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec)
 {
-    let vars_path = spec
-        .firmware_vars_path
-        .context("riscv64 launch requires firmware_vars_path")?;
-
     // AIA is the only interrupt controller the kernel drives: `aia=aplic-imsic`
     // gives the machine an APLIC (MSI delivery) and per-hart IMSIC files in
     // place of the PLIC, and the kernel refuses to boot without them.
@@ -1225,7 +1228,10 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
             spec.firmware_code_path.display()
         ),
         "-drive".into(),
-        format!("if=pflash,format=raw,file={}", vars_path.display()),
+        format!(
+            "if=pflash,format=raw,file={}",
+            spec.firmware_vars_path.display()
+        ),
     ]);
 
     // The test devices: QEMU's `edu` device, whose DMA engine svctest's DMA
@@ -1242,8 +1248,6 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // After the test devices, so the adapter's auto-placed PCI slot follows
     // the devices above.
     args.extend(display_args(spec));
-
-    Ok(())
 }
 
 /// The display adapter and display arguments of a launch, for the
@@ -1293,54 +1297,143 @@ fn display_args(spec: &QemuLaunchSpec) -> Vec<String>
     args
 }
 
-/// Resolve and cache riscv64 firmware.
+/// One architecture's firmware for a command's launches: the read-only code
+/// image and the template of its variable store, from one EDK2 build.
 ///
-/// Returns `(code_path, vars_template_path)`:
-/// - `code_path` is the padded readonly pflash, cached under
-///   `target/xtask/firmware/riscv/` and regenerated only when the distro
-///   source is newer or the cached copy is missing/wrong-sized.
-/// - `vars_template_path` is a fresh copy of the NVRAM template, overwritten
-///   on every call. The interactive `run` uses this path directly as the writable pflash;
-///   `run --runs` copies it to per-slot VARS.fd files so concurrent QEMUs
-///   don't race on the same NVRAM image.
-///
-/// Source discovery is delegated to `firmware::find_riscv_firmware`,
-/// which is env-var-first and per-`cfg(target_os)` aware. This function
-/// owns only the padding/caching that QEMU's `virt` machine requires
-/// (exactly 32 MiB pflash images).
-pub fn prepare_riscv_firmware(ctx: &Context) -> Result<(PathBuf, PathBuf)>
+/// Every launch boots on a variable store of its own ([`Firmware::launch_vars`]):
+/// a firmware-written variable, the bootloader's security floor among them
+/// (docs/signing.md § Rollback Floor), is seen only by the launches the
+/// caller gives the same store.
+pub struct Firmware
 {
-    let (src_code, src_vars) = firmware::find_riscv_firmware()?;
+    /// The read-only code image, `-drive if=pflash` unit 0.
+    pub code: PathBuf,
+    /// The variable-store template each launch's store is copied from.
+    vars_template: PathBuf,
+    /// Where the per-launch stores are created.
+    vars_dir: PathBuf,
+}
 
-    let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
-    std::fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("creating firmware cache {}", cache_dir.display()))?;
+/// A launch's own variable store: a fresh copy of the firmware's template,
+/// `-drive if=pflash` unit 1, removed when this is dropped.
+///
+/// A caller that boots several times on one store (a test of state the
+/// firmware keeps across resets) holds one `LaunchVars` across the launches.
+pub struct LaunchVars
+{
+    path: PathBuf,
+}
 
-    let cached_code = cache_dir.join("RISCV_VIRT_CODE.32M.fd");
-    let cached_vars = cache_dir.join("RISCV_VIRT_VARS.fd");
-
-    if pflash_cache_stale(&cached_code, &src_code, PFLASH_SIZE)?
+impl LaunchVars
+{
+    /// The store's file, for [`QemuLaunchSpec::firmware_vars_path`].
+    pub fn path(&self) -> &Path
     {
-        std::fs::copy(&src_code, &cached_code).with_context(|| {
-            format!(
-                "copying {} to {}",
-                src_code.display(),
-                cached_code.display()
-            )
-        })?;
-        pad_file_to(&cached_code, PFLASH_SIZE)?;
+        &self.path
+    }
+}
+
+impl Drop for LaunchVars
+{
+    fn drop(&mut self)
+    {
+        // A store left by a command killed before this ran is overwritten by
+        // the next launch that draws its name, or removed by `cargo xtask clean`.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Serial of the next [`LaunchVars`] this process creates; with the process
+/// id it names a store no other launch, in this process or another, uses.
+static NEXT_LAUNCH_VARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The directory under the target directory that holds the per-launch
+/// variable stores.
+pub fn launch_vars_dir(ctx: &Context) -> PathBuf
+{
+    ctx.target_dir.join("xtask").join("vars")
+}
+
+impl Firmware
+{
+    /// Resolve `arch`'s firmware ([`firmware::find_ovmf_firmware`],
+    /// [`firmware::find_riscv_firmware`]).
+    ///
+    /// On riscv64, QEMU's `virt` machine needs pflash images of exactly
+    /// 32 MiB: the two images are copied padded under
+    /// `target/xtask/firmware/riscv/`, again only when the source is newer or
+    /// the copy is missing or of another size. The x86-64 images are used
+    /// where they are installed.
+    pub fn prepare(ctx: &Context, arch: Arch) -> Result<Self>
+    {
+        let vars_dir = launch_vars_dir(ctx);
+        std::fs::create_dir_all(&vars_dir)
+            .with_context(|| format!("creating {}", vars_dir.display()))?;
+        let (code, vars_template) = match arch
+        {
+            Arch::X86_64 => firmware::find_ovmf_firmware()?,
+            Arch::Riscv64 =>
+            {
+                let (src_code, src_vars) = firmware::find_riscv_firmware()?;
+                let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
+                std::fs::create_dir_all(&cache_dir)
+                    .with_context(|| format!("creating firmware cache {}", cache_dir.display()))?;
+                (
+                    padded_copy(&src_code, &cache_dir.join("RISCV_VIRT_CODE.32M.fd"))?,
+                    padded_copy(&src_vars, &cache_dir.join("RISCV_VIRT_VARS.32M.fd"))?,
+                )
+            }
+        };
+        Ok(Self {
+            code,
+            vars_template,
+            vars_dir,
+        })
     }
 
-    std::fs::copy(&src_vars, &cached_vars).with_context(|| {
-        format!(
-            "copying {} to {}",
-            src_vars.display(),
-            cached_vars.display()
-        )
-    })?;
-    pad_file_to(&cached_vars, PFLASH_SIZE)?;
+    /// A fresh variable store for one launch, or for the launches that share
+    /// it: `target/xtask/vars/<pid>-<serial>.fd`, unique to the call, so
+    /// launches side by side, in one command or several, never share one.
+    pub fn launch_vars(&self) -> Result<LaunchVars>
+    {
+        let serial = NEXT_LAUNCH_VARS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self
+            .vars_dir
+            .join(format!("{}-{serial}.fd", std::process::id()));
+        fresh_copy(&self.vars_template, &path)?;
+        Ok(LaunchVars { path })
+    }
+}
 
-    Ok((cached_code, cached_vars))
+/// `dest`, a new file holding `source`'s bytes, in place of any file of that
+/// name: created with the process's default mode, never the source's, so a
+/// read-only firmware image (a Nix store path) gives a store QEMU can write
+/// and a cache the padding can extend.
+fn fresh_copy(source: &Path, dest: &Path) -> Result<()>
+{
+    match std::fs::remove_file(dest)
+    {
+        Ok(()) =>
+        {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+        {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", dest.display())),
+    }
+    let bytes = std::fs::read(source).with_context(|| format!("reading {}", source.display()))?;
+    std::fs::write(dest, bytes)
+        .with_context(|| format!("copying {} to {}", source.display(), dest.display()))
+}
+
+/// `cached`, a copy of `source` padded to the pflash size, refreshed when
+/// stale.
+fn padded_copy(source: &Path, cached: &Path) -> Result<PathBuf>
+{
+    if pflash_cache_stale(cached, source, PFLASH_SIZE)?
+    {
+        fresh_copy(source, cached)?;
+        pad_file_to(cached, PFLASH_SIZE)?;
+    }
+    Ok(cached.to_path_buf())
 }
 
 /// Validate that the sysroot is populated for `arch` and the disk image
@@ -1473,7 +1566,7 @@ mod tests
             disk_block_size: 512,
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
-            firmware_vars_path: Some(Path::new("vars.fd")),
+            firmware_vars_path: Path::new("vars.fd"),
             cpus,
             threads_per_core: 1,
             mem_mib,
@@ -1640,7 +1733,7 @@ mod tests
             disk_block_size: 512,
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
-            firmware_vars_path: None,
+            firmware_vars_path: Path::new("vars.fd"),
             cpus: 4,
             threads_per_core: 1,
             mem_mib: 512,
@@ -1678,7 +1771,7 @@ mod tests
             disk_block_size: 512,
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
-            firmware_vars_path: None,
+            firmware_vars_path: Path::new("vars.fd"),
             cpus: 4,
             threads_per_core: 1,
             mem_mib: 512,
@@ -1696,6 +1789,92 @@ mod tests
             test_devices: false,
             hotplug_port: None,
         }
+    }
+
+    // Defect caught: a launch with no writable variable store (x86-64 ran on
+    // volatile NVRAM), so the bootloader's security floor is not kept across
+    // the boots of one store, or a code image QEMU may write.
+    #[test]
+    fn every_launch_boots_on_read_only_code_and_a_writable_variable_store()
+    {
+        for spec in [riscv_spec(4, 512), x86_spec(X86Paging::Four)]
+        {
+            let argv = build_qemu_argv(&spec).unwrap();
+            let pflash: Vec<&str> = argv
+                .iter()
+                .filter(|a| a.starts_with("if=pflash"))
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                pflash,
+                [
+                    "if=pflash,format=raw,readonly=on,file=code.fd",
+                    "if=pflash,format=raw,file=vars.fd"
+                ],
+                "{:?}",
+                spec.arch
+            );
+        }
+    }
+
+    // Defect caught: two launches handed one variable store, so a boot reads
+    // a floor another launch wrote, or a store left behind after its launch.
+    #[test]
+    fn each_launch_gets_a_fresh_copy_of_the_template_removed_on_drop()
+    {
+        let dir = std::env::temp_dir().join(format!("xtask-launch-vars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let template = dir.join("template.fd");
+        std::fs::write(&template, b"vars").unwrap();
+        let firmware = Firmware {
+            code: dir.join("code.fd"),
+            vars_template: template,
+            vars_dir: dir.clone(),
+        };
+        let (a, b) = (
+            firmware.launch_vars().unwrap(),
+            firmware.launch_vars().unwrap(),
+        );
+        assert_ne!(a.path(), b.path());
+        std::fs::write(a.path(), b"written").unwrap();
+        assert_eq!(std::fs::read(b.path()).unwrap(), b"vars");
+        let path = a.path().to_path_buf();
+        drop(a);
+        assert!(!path.exists());
+        drop(b);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Defect caught: a store or padded cache that keeps a read-only
+    // template's mode (a Nix store path), which QEMU cannot write the
+    // variables to and the padding cannot extend; or a read-only file a
+    // killed launch left that the next copy cannot replace.
+    #[cfg(unix)]
+    #[test]
+    fn copies_of_a_read_only_template_are_writable()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("xtask-ro-vars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let read_only = |path: &Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        };
+        let template = dir.join("template.fd");
+        std::fs::write(&template, b"vars").unwrap();
+        read_only(&template);
+        let stale = dir.join("stale.fd");
+        std::fs::write(&stale, b"left").unwrap();
+        read_only(&stale);
+        fresh_copy(&template, &stale).unwrap();
+        assert_eq!(std::fs::read(&stale).unwrap(), b"vars");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .unwrap();
+        let cached = dir.join("cached.fd");
+        padded_copy(&template, &cached).unwrap();
+        assert_eq!(std::fs::metadata(&cached).unwrap().len(), PFLASH_SIZE);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

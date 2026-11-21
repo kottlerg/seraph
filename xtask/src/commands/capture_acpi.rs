@@ -19,7 +19,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -28,11 +28,10 @@ use crate::error::{Context as _, Result, bail};
 use crate::arch::Arch;
 use crate::cli::{AcpiConfig, CaptureAcpiArgs};
 use crate::context::Context;
-use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
-    build_qemu_argv, prepare_riscv_firmware,
+    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging,
+    X86ShadowStack, build_qemu_argv,
 };
 use crate::qmp;
 use crate::util::{require_tool, step};
@@ -162,14 +161,17 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         .and_then(|f| f.set_len(BLANK_DISK_BYTES))
         .with_context(|| format!("creating {}", disk.display()))?;
 
-    let (code, vars) = firmware(ctx, arch, &work)?;
+    let firmware = Firmware::prepare(ctx, arch)?;
+    // Removed when the capture returns, after QEMU has exited.
+    let vars = firmware.launch_vars()?;
+    let code = &firmware.code;
     let spec = QemuLaunchSpec {
         arch,
         disk_path: &disk,
         disk_block_size: 512,
         second_disk: None,
-        firmware_code_path: &code,
-        firmware_vars_path: vars.as_deref(),
+        firmware_code_path: code,
+        firmware_vars_path: vars.path(),
         cpus: CPUS,
         threads_per_core: 1,
         mem_mib: MEM_MIB,
@@ -210,19 +212,16 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         base,
         bytes: &memory,
     })?;
-    let mut host_paths = vec![
+    let host_paths = [
         (disk.as_path(), "<disk>"),
         (code.as_path(), "<firmware-code>"),
+        (vars.path(), "<firmware-vars>"),
         (sock.as_path(), "<qmp-socket>"),
     ];
-    if let Some(v) = &vars
-    {
-        host_paths.push((v.as_path(), "<firmware-vars>"));
-    }
     let launch = Launch {
         command: format!("cargo xtask capture-acpi --config {name}"),
         qemu_version,
-        firmware: file_name(&code),
+        firmware: file_name(code),
         argv: redact(&qemu_args, &host_paths),
     };
     let written = write_fixtures(&out, &tables, &launch)?;
@@ -269,24 +268,6 @@ fn save_ram(
     qmp::save_memory(sock, base, size, dump).context("saving guest RAM")?;
     qmp::quit(sock).context("quitting QEMU")?;
     guest.wait_exit(Duration::from_secs(30))
-}
-
-/// The firmware's code image, and on riscv64 a fresh copy of its variable
-/// store in `work` (x86 runs with volatile NVRAM).
-fn firmware(ctx: &Context, arch: Arch, work: &Path) -> Result<(PathBuf, Option<PathBuf>)>
-{
-    match arch
-    {
-        Arch::X86_64 => Ok((find_ovmf_code()?, None)),
-        Arch::Riscv64 =>
-        {
-            let (code, template) = prepare_riscv_firmware(ctx)?;
-            let vars = work.join("VARS.fd");
-            fs::copy(&template, &vars)
-                .with_context(|| format!("copying {} to {}", template.display(), vars.display()))?;
-            Ok((code, Some(vars)))
-        }
-    }
 }
 
 /// The first line of `qemu --version`.

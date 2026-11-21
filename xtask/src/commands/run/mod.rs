@@ -25,11 +25,9 @@ use crate::arch::Arch;
 use crate::cli::RunArgs;
 use crate::context::Context as BuildContext;
 use crate::disk::{logical_block_size, second_disk_block_size};
-use crate::firmware::find_ovmf_code;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
-    validate_sysroot_for_launch,
+    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::term::filter::FilterWriter;
 use crate::term::guard::TerminalGuard;
@@ -74,15 +72,9 @@ fn interactive(ctx: &BuildContext, args: &RunArgs) -> Result<()>
     // serial during boot; TerminalGuard restores dimensions on drop.
     let _guard = TerminalGuard::capture();
 
-    let (firmware_code, firmware_vars) = match launch.arch
-    {
-        Arch::X86_64 => (find_ovmf_code()?, None),
-        Arch::Riscv64 =>
-        {
-            let (code, vars) = prepare_riscv_firmware(ctx)?;
-            (code, Some(vars))
-        }
-    };
+    let firmware = Firmware::prepare(ctx, launch.arch)?;
+    // Removed when the command returns, after QEMU has exited.
+    let vars = firmware.launch_vars()?;
 
     // The stub is staged, and the images repacked, before the launch reads
     // their block sizes.
@@ -100,7 +92,7 @@ fn interactive(ctx: &BuildContext, args: &RunArgs) -> Result<()>
         }
         _ => None,
     };
-    let launched = boot_qemu(ctx, args, &firmware_code, firmware_vars.as_deref());
+    let launched = boot_qemu(ctx, args, &firmware.code, vars.path());
     if let Some(layout) = staged
     {
         crate::debug_stub::unstage(ctx, launch.arch, layout)?;
@@ -113,7 +105,7 @@ fn boot_qemu(
     ctx: &BuildContext,
     args: &RunArgs,
     firmware_code: &std::path::Path,
-    firmware_vars: Option<&std::path::Path>,
+    firmware_vars: &std::path::Path,
 ) -> Result<()>
 {
     let launch = &args.launch;

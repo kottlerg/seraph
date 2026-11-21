@@ -57,10 +57,9 @@ use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::{DiskLayout, Substitute};
 use crate::error::{Context as _, Result, bail, ensure, err};
-use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
-    X86ShadowStack, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
+    X86Paging, X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::signing::{Config, Signer, os_random, prepend_records};
 use crate::util::{require_tool, step};
@@ -70,7 +69,7 @@ use crate::util::{require_tool, step};
 const TERMINAL_READY: &str = "terminal: READY for injection";
 
 /// The prefix of the bootloader's fatal line (`core/boot/src/error.rs`).
-const BOOT_FATAL: &str = "SERAPH BOOT FATAL: ";
+pub(super) const BOOT_FATAL: &str = "SERAPH BOOT FATAL: ";
 
 /// Text of every refusal line a verifier logs: the bootloader's and
 /// procmgr's (`services/procmgr/src/image.rs`), and svcmgr's and init's
@@ -91,7 +90,7 @@ const DEATH_MARKERS: [&str; 6] = [
 ];
 
 /// Budget for a boot the bootloader ends.
-const BOOTLOADER_TIMEOUT: Duration = Duration::from_mins(3);
+pub(super) const BOOTLOADER_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Budget for the boot that reaches the terminal.
 const ROOTFS_TIMEOUT: Duration = Duration::from_mins(6);
@@ -99,9 +98,9 @@ const ROOTFS_TIMEOUT: Duration = Duration::from_mins(6);
 /// The sysroot-relative paths of the objects the cases read or replace: the
 /// installed kernel, its ESP copy, the bundle on the ESP, and installed
 /// services and programs.
-const KERNEL: &str = "boot/kernel";
-const ESP_KERNEL: &str = "esp/EFI/seraph/kernel";
-const BUNDLE: &str = "esp/EFI/seraph/bootstrap.bundle";
+pub(super) const KERNEL: &str = "boot/kernel";
+pub(super) const ESP_KERNEL: &str = "esp/EFI/seraph/kernel";
+pub(super) const BUNDLE: &str = "esp/EFI/seraph/bootstrap.bundle";
 const TAMPERED: &str = "services/timed";
 const WRONG_ROLE: &str = "services/pwrmgr";
 const UNTRUSTED: &str = "services/crashd";
@@ -121,12 +120,12 @@ const BUNDLE_ENTRY: &str = "/services/drivers/virtio-blk";
 
 /// One boot: the files its images carry in place of the sysroot's, the lines
 /// it owes, and its deadline.
-struct Case
+pub(super) struct Case
 {
-    name: &'static str,
-    substitutes: Vec<Substitute>,
-    expect: Vec<String>,
-    timeout: Duration,
+    pub(super) name: &'static str,
+    pub(super) substitutes: Vec<Substitute>,
+    pub(super) expect: Vec<String>,
+    pub(super) timeout: Duration,
 }
 
 pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
@@ -159,9 +158,17 @@ pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
     let results = cases.and_then(|cases| {
         // Held until the last boot's QEMU has exited.
         let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
+        let firmware = Firmware::prepare(ctx, args.arch)?;
         Ok(cases
             .iter()
-            .map(|case| (case.name, boot_case(ctx, args, layout, &dir, case)))
+            .map(|case| {
+                // Each boot on a variable store of its own.
+                let booted = firmware.launch_vars().and_then(|vars| {
+                    step(&format!("signature test: {}: booting", case.name));
+                    boot_case(ctx, args, layout, &dir, case, &firmware, vars.path())
+                });
+                (case.name, booted)
+            })
             .collect::<Vec<_>>())
     });
     // Restore first, and surface its failure ahead of the boots': images
@@ -239,7 +246,24 @@ fn revoked_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> 
         "trust-store.revoking",
         &signer.store_revoking_own_key()?,
     )?;
-    let boot = dir.join("boot.efi.revoking");
+    step("signature test: building a bootloader under a store revoking the signing key");
+    Ok(Case {
+        name: "revoked",
+        substitutes: bootloader_under(ctx, args, &revoking, &dir.join("boot.efi.revoking"))?,
+        expect: vec![boot_refusal("kernel", "Failed(Revoked)")],
+        timeout: BOOTLOADER_TIMEOUT,
+    })
+}
+
+/// Build a bootloader embedding the trust store at `store` into `boot`, and
+/// return it as the substitute of both ESP copies of the installed one.
+pub(super) fn bootloader_under(
+    ctx: &Context,
+    args: &CaseArgs,
+    store: &Path,
+    boot: &Path,
+) -> Result<Vec<Substitute>>
+{
     let build = BuildArgs {
         arch: args.arch,
         release: args.release,
@@ -249,11 +273,10 @@ fn revoked_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> 
         skip_lints: true,
         host: args.host.common.clone(),
     };
-    step("signature test: building a bootloader under a store revoking the signing key");
     // The case boots, so `main` admitted no build: the compile is admitted
     // here, as a build.
     crate::host_lock::admit_build(ctx, &args.host.common)?;
-    crate::commands::build::compile_boot(ctx, &build, &revoking, &boot)?;
+    crate::commands::build::compile_boot(ctx, &build, store, boot)?;
     let mut substitutes = Vec::new();
     for image in crate::esp::bootloader_copies(ctx, args.arch)
     {
@@ -262,15 +285,10 @@ fn revoked_case(ctx: &Context, args: &CaseArgs, dir: &Path, signer: &Signer) -> 
             .with_context(|| format!("{} is outside the sysroot", image.display()))?;
         substitutes.push(Substitute {
             path: relative.to_path_buf(),
-            source: boot.clone(),
+            source: boot.to_path_buf(),
         });
     }
-    Ok(Case {
-        name: "revoked",
-        substitutes,
-        expect: vec![boot_refusal("kernel", "Failed(Revoked)")],
-        timeout: BOOTLOADER_TIMEOUT,
-    })
+    Ok(substitutes)
 }
 
 /// The `rootfs` case: three services procmgr refuses, and the kernel and
@@ -348,14 +366,14 @@ fn rootfs_case(ctx: &Context, arch: Arch, dir: &Path, signer: &Signer) -> Result
 }
 
 /// The bytes of the sysroot file at `relative`.
-fn read_sysroot(ctx: &Context, relative: &str) -> Result<Vec<u8>>
+pub(super) fn read_sysroot(ctx: &Context, relative: &str) -> Result<Vec<u8>>
 {
     let path = ctx.sysroot.join(relative);
     fs::read(&path).with_context(|| format!("reading {}", path.display()))
 }
 
 /// Write `bytes` to `dir/name`; returns its path.
-fn stage(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf>
+pub(super) fn stage(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf>
 {
     let path = dir.join(name);
     fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
@@ -363,7 +381,7 @@ fn stage(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf>
 }
 
 /// The substitute of `source` for the sysroot file at `path`.
-fn sub(path: &str, source: PathBuf) -> Substitute
+pub(super) fn sub(path: &str, source: PathBuf) -> Substitute
 {
     Substitute {
         path: PathBuf::from(path),
@@ -528,13 +546,16 @@ impl Judge
     }
 }
 
-/// Pack `case`'s images, boot them, judge the serial lines, and kill QEMU.
-fn boot_case(
+/// Pack `case`'s images, boot them on `firmware` with the variable store
+/// `vars`, judge the serial lines, and kill QEMU.
+pub(super) fn boot_case(
     ctx: &Context,
     args: &CaseArgs,
     layout: DiskLayout,
     dir: &Path,
     case: &Case,
+    firmware: &Firmware,
+    vars: &Path,
 ) -> Result<()>
 {
     crate::disk::create_disk_image_substituting(
@@ -547,8 +568,7 @@ fn boot_case(
     let log_path = dir.join(format!("{}.log", case.name));
     let mut log =
         fs::File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
-    step(&format!("signature test: {}: booting", case.name));
-    let mut child = launch(ctx, args, layout)?;
+    let mut child = launch(ctx, args, layout, firmware, vars)?;
     let stdout = child.stdout.take().context("QEMU stdout unavailable")?;
     // Serial lines on a worker thread, so the judge has a deadline. Bytes
     // that are not UTF-8 are read lossily rather than ending the stream.
@@ -624,18 +644,16 @@ fn judge_serial(rx: &mpsc::Receiver<String>, log: &mut fs::File, case: &Case) ->
     }
 }
 
-/// Start QEMU on the images of `layout`, its serial stream on its stdout.
-fn launch(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<std::process::Child>
+/// Start QEMU on the images of `layout`, `firmware` and the variable store
+/// `vars`, its serial stream on its stdout.
+fn launch(
+    ctx: &Context,
+    args: &CaseArgs,
+    layout: DiskLayout,
+    firmware: &Firmware,
+    vars: &Path,
+) -> Result<std::process::Child>
 {
-    let (firmware_code, firmware_vars) = match args.arch
-    {
-        Arch::X86_64 => (find_ovmf_code()?, None),
-        Arch::Riscv64 =>
-        {
-            let (code, vars) = prepare_riscv_firmware(ctx)?;
-            (code, Some(vars))
-        }
-    };
     let disk_path = ctx.disk_image();
     let data_image = layout.second_image(ctx);
     let spec = QemuLaunchSpec {
@@ -646,8 +664,8 @@ fn launch(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<std::pro
             .as_deref()
             .map(SecondDisk::of_image)
             .transpose()?,
-        firmware_code_path: &firmware_code,
-        firmware_vars_path: firmware_vars.as_deref(),
+        firmware_code_path: &firmware.code,
+        firmware_vars_path: vars,
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,

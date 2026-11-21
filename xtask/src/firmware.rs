@@ -5,24 +5,26 @@
 
 //! Host-side discovery of QEMU pflash firmware images.
 //!
-//! Two firmware surfaces are needed by the launch flow:
+//! Each architecture's firmware is a pair of images from one EDK2 build: the
+//! read-only code image and the template of its variable store, which every
+//! launch copies into a writable pflash file of its own
+//! (`qemu::Firmware::launch_vars`):
 //!
-//! - **OVMF (x86-64)** — a single readonly code image. x86 launches with
-//!   volatile NVRAM and don't ship a writable vars file.
-//! - **EDK2 RISC-V (riscv64)** — a paired (code, vars) source. The
-//!   readonly code image plus a vars template that is copied per-launch
-//!   into a writable pflash file.
+//! - **OVMF (x86-64)**: `OVMF_CODE` and `OVMF_VARS` in the distribution's
+//!   naming.
+//! - **EDK2 RISC-V (riscv64)**: `RISCV_VIRT_CODE.fd` and
+//!   `RISCV_VIRT_VARS.fd`.
 //!
 //! Discovery is env-var-first, then per-`cfg(target_os)` default path
 //! tables, then a structured error that enumerates the tried paths and
 //! the install commands for every supported host. The env vars
-//! (`SERAPH_OVMF_CODE`, `SERAPH_RISCV_CODE`, `SERAPH_RISCV_VARS`)
-//! exist for hosts that don't follow FHS conventions (NixOS, macOS,
-//! Windows, custom builds) and override the default search entirely
-//! when set.
+//! (`SERAPH_OVMF_CODE` with `SERAPH_OVMF_VARS`, `SERAPH_RISCV_CODE` with
+//! `SERAPH_RISCV_VARS`) exist for hosts that don't follow FHS conventions
+//! (NixOS, macOS, Windows, custom builds) and, set together, override the
+//! default search entirely.
 //!
-//! Padding and per-launch caching of the discovered images stays in
-//! `qemu.rs::prepare_riscv_firmware` — this module is pure discovery.
+//! Padding, caching and the per-launch copies of the discovered images stay
+//! in `qemu.rs::prepare_firmware` — this module is pure discovery.
 
 use std::ffi::OsStr;
 use std::fmt::Write;
@@ -32,20 +34,48 @@ use crate::error::{Result, err};
 
 // ── Default search tables ────────────────────────────────────────────────────
 
-/// OVMF code-image search paths (x86-64). First existing path wins.
+/// OVMF images (x86-64): each entry the code image and the variable-store
+/// template of one firmware build, which QEMU takes as a pair. The first
+/// entry whose two files exist wins.
 #[cfg(target_os = "linux")]
-const OVMF_CODE_DEFAULTS: &[&str] = &[
-    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-    "/usr/share/OVMF/OVMF_CODE.fd",
-    "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
-    "/usr/share/ovmf/OVMF.fd",
-    "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+const OVMF_DEFAULTS: &[(&str, &str)] = &[
+    // Debian and Ubuntu.
+    (
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+    ),
+    // Fedora.
+    (
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+        "/usr/share/edk2/ovmf/OVMF_VARS.fd",
+    ),
+    // Arch.
+    (
+        "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+        "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+    ),
+    // Older Arch.
+    (
+        "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
+        "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
+    ),
+    // Older Debian and Ubuntu.
+    (
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/OVMF/OVMF_VARS.fd",
+    ),
 ];
 
 #[cfg(target_os = "macos")]
-const OVMF_CODE_DEFAULTS: &[&str] = &[
-    "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
-    "/usr/local/share/qemu/edk2-x86_64-code.fd",
+const OVMF_DEFAULTS: &[(&str, &str)] = &[
+    (
+        "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
+        "/opt/homebrew/share/qemu/edk2-i386-vars.fd",
+    ),
+    (
+        "/usr/local/share/qemu/edk2-x86_64-code.fd",
+        "/usr/local/share/qemu/edk2-i386-vars.fd",
+    ),
 ];
 
 #[cfg(any(
@@ -54,10 +84,10 @@ const OVMF_CODE_DEFAULTS: &[&str] = &[
     target_os = "netbsd",
     target_os = "dragonfly",
 ))]
-const OVMF_CODE_DEFAULTS: &[&str] = &[
+const OVMF_DEFAULTS: &[(&str, &str)] = &[(
     "/usr/local/share/qemu/edk2-x86_64-code.fd",
-    "/usr/local/share/uefi-firmware/edk2-x86_64-code.fd",
-];
+    "/usr/local/share/qemu/edk2-i386-vars.fd",
+)];
 
 #[cfg(not(any(
     target_os = "linux",
@@ -67,7 +97,7 @@ const OVMF_CODE_DEFAULTS: &[&str] = &[
     target_os = "netbsd",
     target_os = "dragonfly",
 )))]
-const OVMF_CODE_DEFAULTS: &[&str] = &[];
+const OVMF_DEFAULTS: &[(&str, &str)] = &[];
 
 /// EDK2 RISC-V firmware directories (riscv64). The first directory
 /// containing `RISCV_VIRT_CODE.fd` is used as the source of both the
@@ -103,27 +133,35 @@ const RISCV_FIRMWARE_DIRS: &[&str] = &[];
 
 // ── Public discovery API ─────────────────────────────────────────────────────
 
-/// Env var that, when set, overrides the OVMF code-image search with a
-/// direct path.
+/// Env var that, set together with [`ENV_OVMF_VARS`], names the OVMF code
+/// image in place of the search.
 pub const ENV_OVMF_CODE: &str = "SERAPH_OVMF_CODE";
 
-/// Env var that, when set, overrides the RISC-V code-image search with
-/// a direct path.
+/// Env var that, set together with [`ENV_OVMF_CODE`], names the OVMF
+/// variable-store template in place of the search.
+pub const ENV_OVMF_VARS: &str = "SERAPH_OVMF_VARS";
+
+/// Env var that, set together with [`ENV_RISCV_VARS`], names the RISC-V code
+/// image in place of the search.
 pub const ENV_RISCV_CODE: &str = "SERAPH_RISCV_CODE";
 
-/// Env var that, when set, overrides the RISC-V vars-template search
-/// with a direct path.
+/// Env var that, set together with [`ENV_RISCV_CODE`], names the RISC-V
+/// variable-store template in place of the search.
 pub const ENV_RISCV_VARS: &str = "SERAPH_RISCV_VARS";
 
-/// Locate the OVMF code image.
+/// Locate the OVMF images, returning `(code, vars)`.
 ///
-/// Resolution order: `$SERAPH_OVMF_CODE`, then `OVMF_CODE_DEFAULTS`
-/// for the current `target_os`. On miss, returns a structured error
-/// enumerating the tried paths and install commands for every
-/// supported host.
-pub fn find_ovmf_code() -> Result<PathBuf>
+/// `SERAPH_OVMF_CODE` and `SERAPH_OVMF_VARS` are all-or-nothing, as the
+/// RISC-V pair is ([`find_riscv_firmware`]). When neither is set, the first
+/// entry of `OVMF_DEFAULTS` for the current `target_os` whose two files
+/// exist is used; on a miss, a structured error enumerates the tried paths
+/// and the install commands for every supported host.
+pub fn find_ovmf_firmware() -> Result<(PathBuf, PathBuf)>
 {
-    find_ovmf_code_impl(std::env::var_os(ENV_OVMF_CODE).as_deref())
+    find_ovmf_firmware_impl(
+        std::env::var_os(ENV_OVMF_CODE).as_deref(),
+        std::env::var_os(ENV_OVMF_VARS).as_deref(),
+    )
 }
 
 /// Locate the RISC-V EDK2 source images, returning `(code, vars)`.
@@ -143,18 +181,38 @@ pub fn find_riscv_firmware() -> Result<(PathBuf, PathBuf)>
     )
 }
 
-/// Implementation core of `find_ovmf_code`, parameterized on the env
-/// value so tests can exercise the env-override paths without
-/// mutating process-global env state.
-fn find_ovmf_code_impl(env_value: Option<&OsStr>) -> Result<PathBuf>
+/// Implementation core of `find_ovmf_firmware`, parameterized on the env
+/// values so tests can exercise the env-override paths without mutating
+/// process-global env state.
+fn find_ovmf_firmware_impl(
+    env_code: Option<&OsStr>,
+    env_vars: Option<&OsStr>,
+) -> Result<(PathBuf, PathBuf)>
 {
-    find_path(
-        env_value,
+    if let Some(pair) = env_pair(env_code, env_vars, ENV_OVMF_CODE, ENV_OVMF_VARS)?
+    {
+        return Ok(pair);
+    }
+    for (code, vars) in OVMF_DEFAULTS
+    {
+        let (code, vars) = (PathBuf::from(code), PathBuf::from(vars));
+        if code.is_file() && vars.is_file()
+        {
+            return Ok((code, vars));
+        }
+    }
+    let tried: Vec<String> = OVMF_DEFAULTS
+        .iter()
+        .map(|(code, vars)| format!("{code} with {vars}"))
+        .collect();
+    let tried: Vec<&str> = tried.iter().map(String::as_str).collect();
+    Err(not_found_error(
+        "OVMF firmware (x86-64)",
         ENV_OVMF_CODE,
-        OVMF_CODE_DEFAULTS,
-        "OVMF code firmware (x86-64)",
+        ENV_OVMF_VARS,
+        &tried,
         OVMF_INSTALL_HINTS,
-    )
+    ))
 }
 
 /// Implementation core of `find_riscv_firmware`, parameterized on
@@ -165,82 +223,62 @@ fn find_riscv_firmware_impl(
     env_vars: Option<&OsStr>,
 ) -> Result<(PathBuf, PathBuf)>
 {
-    let env_code = env_code.map(PathBuf::from);
-    let env_vars = env_vars.map(PathBuf::from);
+    if let Some(pair) = env_pair(env_code, env_vars, ENV_RISCV_CODE, ENV_RISCV_VARS)?
+    {
+        return Ok(pair);
+    }
+    let dir = find_riscv_firmware_dir()?;
+    let code = dir.join("RISCV_VIRT_CODE.fd");
+    let vars = dir.join("RISCV_VIRT_VARS.fd");
+    if !code.is_file()
+    {
+        return Err(missing_file_error("RISC-V code firmware", &code));
+    }
+    if !vars.is_file()
+    {
+        return Err(missing_file_error("RISC-V vars template", &vars));
+    }
+    Ok((code, vars))
+}
 
-    match (env_code, env_vars)
+/// The `(code, vars)` pair the two env values name, `None` when neither is
+/// set.
+///
+/// # Errors
+/// When only one is set, since a code image and a vars template from two
+/// firmware builds silently corrupt the variable store, or when either
+/// names no file.
+fn env_pair(
+    env_code: Option<&OsStr>,
+    env_vars: Option<&OsStr>,
+    code_var: &str,
+    vars_var: &str,
+) -> Result<Option<(PathBuf, PathBuf)>>
+{
+    match (env_code.map(PathBuf::from), env_vars.map(PathBuf::from))
     {
         (Some(code), Some(vars)) =>
         {
             if !code.is_file()
             {
-                return Err(missing_env_path_error(ENV_RISCV_CODE, &code));
+                return Err(missing_env_path_error(code_var, &code));
             }
             if !vars.is_file()
             {
-                return Err(missing_env_path_error(ENV_RISCV_VARS, &vars));
+                return Err(missing_env_path_error(vars_var, &vars));
             }
-            Ok((code, vars))
+            Ok(Some((code, vars)))
         }
         (Some(_), None) | (None, Some(_)) => Err(err!(
-            "${ENV_RISCV_CODE} and ${ENV_RISCV_VARS} must be set \
-                 together (or both left unset). Pairing a custom code \
-                 image with a system vars template (or vice versa) \
-                 silently corrupts NVRAM state.",
+            "${code_var} and ${vars_var} must be set together (or both left unset). Pairing a \
+             custom code image with a system vars template (or vice versa) silently corrupts \
+             NVRAM state."
         )),
-        (None, None) =>
-        {
-            let dir = find_riscv_firmware_dir()?;
-            let code = dir.join("RISCV_VIRT_CODE.fd");
-            let vars = dir.join("RISCV_VIRT_VARS.fd");
-            if !code.is_file()
-            {
-                return Err(missing_file_error("RISC-V code firmware", &code));
-            }
-            if !vars.is_file()
-            {
-                return Err(missing_file_error("RISC-V vars template", &vars));
-            }
-            Ok((code, vars))
-        }
+        (None, None) => Ok(None),
     }
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
-
-/// Resolve a single firmware file path: env value first (taken as
-/// parameter rather than read from the process env, so callers in
-/// tests can supply mock values without mutating global state), then
-/// default list, then structured error.
-fn find_path(
-    env_value: Option<&OsStr>,
-    env_var: &str,
-    defaults: &[&str],
-    label: &str,
-    hints: &str,
-) -> Result<PathBuf>
-{
-    if let Some(value) = env_value
-    {
-        let path = PathBuf::from(value);
-        if path.is_file()
-        {
-            return Ok(path);
-        }
-        return Err(missing_env_path_error(env_var, &path));
-    }
-
-    for candidate in defaults
-    {
-        let path = PathBuf::from(candidate);
-        if path.is_file()
-        {
-            return Ok(path);
-        }
-    }
-
-    Err(not_found_error(label, env_var, defaults, hints))
-}
 
 /// Locate the RISC-V firmware *directory* (containing
 /// `RISCV_VIRT_CODE.fd`). Used by `find_riscv_firmware` only when at
@@ -258,6 +296,7 @@ fn find_riscv_firmware_dir() -> Result<PathBuf>
     Err(not_found_error(
         "RISC-V EDK2 firmware directory",
         ENV_RISCV_CODE,
+        ENV_RISCV_VARS,
         RISCV_FIRMWARE_DIRS,
         RISCV_INSTALL_HINTS,
     ))
@@ -265,7 +304,13 @@ fn find_riscv_firmware_dir() -> Result<PathBuf>
 
 /// Build the standard "not found" error: label, env-var instruction,
 /// tried-paths list, per-platform install hints.
-fn not_found_error(label: &str, env_var: &str, tried: &[&str], hints: &str) -> crate::error::Error
+fn not_found_error(
+    label: &str,
+    code_var: &str,
+    vars_var: &str,
+    tried: &[&str],
+    hints: &str,
+) -> crate::error::Error
 {
     let mut msg = format!("{label} not found");
     msg.push_str("\n\nTried (none existed):\n");
@@ -284,7 +329,7 @@ fn not_found_error(label: &str, env_var: &str, tried: &[&str], hints: &str) -> c
     }
     let _ = write!(
         msg,
-        "\nSet ${env_var} to a direct path, or install the firmware:\n"
+        "\nSet ${code_var} and ${vars_var} to direct paths, or install the firmware:\n"
     );
     msg.push_str(hints);
     err!(msg)
@@ -312,7 +357,7 @@ const OVMF_INSTALL_HINTS: &str = "  Fedora:           dnf install edk2-ovmf\n  \
                                   Arch:             pacman -S edk2-ovmf\n  \
                                   macOS (Homebrew): brew install qemu\n  \
                                   FreeBSD:          pkg install edk2-qemu-x64\n  \
-                                  Windows:          set SERAPH_OVMF_CODE to a direct path\n";
+                                  Windows:          set SERAPH_OVMF_CODE and SERAPH_OVMF_VARS\n";
 
 /// Per-platform install hints for the EDK2 RISC-V firmware.
 const RISCV_INSTALL_HINTS: &str = "  Fedora:           dnf install edk2-riscv64\n  \
@@ -343,7 +388,8 @@ mod tests
     fn env_var_override_pointing_at_missing_file_returns_error()
     {
         let bogus = OsStr::new("/nonexistent/firmware/path.fd");
-        let err = find_ovmf_code_impl(Some(bogus)).unwrap_err();
+        let workspace = existing_workspace_file();
+        let err = find_ovmf_firmware_impl(Some(bogus), Some(workspace.as_os_str())).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("SERAPH_OVMF_CODE"),
@@ -353,14 +399,39 @@ mod tests
             msg.contains("/nonexistent/firmware/path.fd"),
             "error should include the bad path: {msg}",
         );
+        let err = find_ovmf_firmware_impl(Some(workspace.as_os_str()), Some(bogus)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("SERAPH_OVMF_VARS"),
+            "error should name the vars env var: {err:#}",
+        );
     }
 
     #[test]
-    fn env_var_override_pointing_at_existing_file_succeeds()
+    fn env_var_override_pointing_at_existing_files_succeeds()
     {
         let workspace = existing_workspace_file();
-        let resolved = find_ovmf_code_impl(Some(workspace.as_os_str())).unwrap();
-        assert_eq!(resolved, workspace);
+        let os = workspace.as_os_str();
+        let (code, vars) = find_ovmf_firmware_impl(Some(os), Some(os)).unwrap();
+        assert_eq!(code, workspace);
+        assert_eq!(vars, workspace);
+    }
+
+    // Defect caught: an OVMF code image paired with the system's vars template
+    // from another build, which silently corrupts the variable store the
+    // security floor lives in.
+    #[test]
+    fn ovmf_firmware_with_one_env_var_set_is_rejected()
+    {
+        let workspace = existing_workspace_file();
+        let os = workspace.as_os_str();
+        for (code, vars) in [(Some(os), None), (None, Some(os))]
+        {
+            let msg = format!("{:#}", find_ovmf_firmware_impl(code, vars).unwrap_err());
+            assert!(
+                msg.contains("must be set together"),
+                "expected pairing-error, got: {msg}",
+            );
+        }
     }
 
     #[test]

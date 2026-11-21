@@ -393,7 +393,7 @@ Run Seraph's tests: without a case, check formatting and lint the test code, the
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
-  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, rollback, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 Options:
       --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
@@ -404,7 +404,7 @@ Options:
       --cause <CAUSE>            The `shutdown` case's causes, one boot each (default: every cause the architecture has). Repeatable, or comma-separated [possible values: reboot, power-button, memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
       --port <PORT>              The `debug-port` case's host TCP port for the debug port; without it, a port free on `127.0.0.1` when each boot starts
       --gdb <GDB>                The host GDB the `debug-port` case runs, which must debug the architecture (default: `gdb`)
-      --release                  Build the `signing` case's revoking bootloader in release mode, as the sysroot's was built (default: debug)
+      --release                  Build the bootloader the `signing` case revokes under, or the `rollback` case raises the floor with, in release mode, as the sysroot's was built (default: debug)
       --riscv-mmu <RISCV_MMU>    The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`) [possible values: sv39, sv48, sv57]
       --x86-paging <X86_PAGING>  The `kaslr` case's guest x86-64 paging depth (default: 4; ignored on riscv64) [possible values: 4, 5]
       --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
@@ -426,6 +426,7 @@ Arguments:
           - terminal:   Keyboard and serial input through the terminal, and keyboard input again after a restart of the input driver
           - kaslr:      The kernel's randomized layout differs between boots, and the `nokaslr` knob gives the deterministic one
           - signing:    Each signature verifier refuses a tampered kernel, a tampered bundle entry, a revoked key, and tampered, wrong-role and foreign-signed rootfs images
+          - rollback:   The bootloader writes the machine's security floor in firmware storage, raises it, and refuses itself below it
           - wedge:      The softlockup watchdog reports a CPU wedged with interrupts off
           - vmgenid:    The kernel detects a VM generation change across a snapshot restore (`x86_64` only)
           - hotplug:    PCI Express hotplug of a device and of a disk behind root ports
@@ -483,7 +484,7 @@ Options:
           The host GDB the `debug-port` case runs, which must debug the architecture (default: `gdb`)
 
       --release
-          Build the `signing` case's revoking bootloader in release mode, as the sysroot's was built (default: debug)
+          Build the bootloader the `signing` case revokes under, or the `rollback` case raises the floor with, in release mode, as the sysroot's was built (default: debug)
 
       --riscv-mmu <RISCV_MMU>
           The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`)

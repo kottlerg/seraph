@@ -58,11 +58,10 @@ use crate::accel::{self, Accel};
 use crate::arch::Arch;
 use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
-use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
-    build_qemu_argv, validate_sysroot_for_launch,
+    Firmware, GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging,
+    X86ShadowStack, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::{Span, Stub, field_hex, function_path, stop_thread};
 use crate::util::{require_tool, step};
@@ -297,13 +296,21 @@ impl Launch
 
 fn launch(ctx: &Context, args: &CaseArgs, gdb: GdbMode<'_>, name: &str) -> Result<Launch>
 {
-    let firmware_code = find_ovmf_code()?;
+    let firmware = Firmware::prepare(ctx, Arch::X86_64)?;
+    let vars = firmware.launch_vars()?;
     let disk_path = ctx.disk_image();
     let dir = ctx.target_dir.join("xtask");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let stderr = dir.join(format!("cet-{name}-{}.stderr", std::process::id()));
     let block_size = crate::disk::logical_block_size(&disk_path)?;
-    let qemu_args = build_qemu_argv(&cet_spec(&disk_path, block_size, &firmware_code, args, gdb))?;
+    let qemu_args = build_qemu_argv(&cet_spec(
+        &disk_path,
+        block_size,
+        &firmware.code,
+        vars.path(),
+        args,
+        gdb,
+    ))?;
     let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
     let stderr_file =
         std::fs::File::create(&stderr).with_context(|| format!("creating {}", stderr.display()))?;
@@ -315,7 +322,7 @@ fn launch(ctx: &Context, args: &CaseArgs, gdb: GdbMode<'_>, name: &str) -> Resul
         .spawn()
         .with_context(|| format!("spawning {}", Arch::X86_64.qemu_binary()))?;
     Ok(Launch {
-        guest: Guest::from_child(child)?,
+        guest: Guest::from_child(child)?.holding(vars),
         stderr,
     })
 }
@@ -326,6 +333,7 @@ fn cet_spec<'a>(
     disk_path: &'a Path,
     disk_block_size: u32,
     firmware_code: &'a Path,
+    firmware_vars: &'a Path,
     args: &CaseArgs,
     gdb: GdbMode<'a>,
 ) -> QemuLaunchSpec<'a>
@@ -336,7 +344,7 @@ fn cet_spec<'a>(
         disk_block_size,
         second_disk: None,
         firmware_code_path: firmware_code,
-        firmware_vars_path: None,
+        firmware_vars_path: firmware_vars,
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,
@@ -618,6 +626,7 @@ mod tests
             Path::new("disk.img"),
             512,
             Path::new("code.fd"),
+            Path::new("vars.fd"),
             &args,
             GdbMode::Off,
         );

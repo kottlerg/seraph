@@ -30,6 +30,15 @@ pub type EfiBool = u8;
 pub const EFI_SUCCESS: EfiStatus = 0;
 pub const EFI_BUFFER_TOO_SMALL: EfiStatus = 0x8000_0000_0000_0005;
 pub const EFI_INVALID_PARAMETER: EfiStatus = 0x8000_0000_0000_0002;
+pub const EFI_UNSUPPORTED: EfiStatus = 0x8000_0000_0000_0003;
+pub const EFI_NOT_FOUND: EfiStatus = 0x8000_0000_0000_000E;
+
+/// `EFI_VARIABLE_NON_VOLATILE`: the variable is kept across resets.
+pub const EFI_VARIABLE_NON_VOLATILE: u32 = 0x0000_0001;
+/// `EFI_VARIABLE_BOOTSERVICE_ACCESS`: the variable is reachable before
+/// `ExitBootServices`. Without `EFI_VARIABLE_RUNTIME_ACCESS` (`0x4`), which
+/// no Seraph variable carries, it is reachable then alone.
+pub const EFI_VARIABLE_BOOTSERVICE_ACCESS: u32 = 0x0000_0002;
 
 /// Allocate pages at any available physical address.
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
@@ -109,6 +118,16 @@ pub static EFI_RNG_PROTOCOL_GUID: EfiGuid = EfiGuid {
     data4: [0x86, 0x2E, 0xC0, 0x1C, 0xDC, 0x29, 0x1F, 0x44],
 };
 
+/// The Seraph vendor GUID, which names every Seraph UEFI variable
+/// (docs/signing.md § Rollback Floor)
+/// `{A53C3964-9D31-4F44-843A-526BAA1271B8}`
+pub static SERAPH_VENDOR_GUID: EfiGuid = EfiGuid {
+    data1: 0xA53C_3964,
+    data2: 0x9D31,
+    data3: 0x4F44,
+    data4: [0x84, 0x3A, 0x52, 0x6B, 0xAA, 0x12, 0x71, 0xB8],
+};
+
 // ── Structs ────────────────────────────────────────────────────────────────────
 
 /// A 128-bit UEFI GUID.
@@ -154,10 +173,42 @@ pub struct EfiSystemTable
     pub con_out: *mut EfiSimpleTextOutput,
     pub standard_error_handle: EfiHandle,
     pub std_err: *mut core::ffi::c_void,
-    pub runtime_services: *mut core::ffi::c_void,
+    pub runtime_services: *mut EfiRuntimeServices,
     pub boot_services: *mut EfiBootServices,
     pub number_of_table_entries: usize,
     pub configuration_table: *mut EfiConfigurationTable,
+}
+
+/// Leading prefix of the UEFI Runtime Services table, through `SetVariable`:
+/// the six time and virtual-addressing services before `GetVariable` and
+/// `GetNextVariableName` as padding, and the services after `SetVariable`
+/// omitted. The bootloader calls the variable services before
+/// `ExitBootServices` alone ([`get_variable`], [`set_variable`];
+/// [`core/boot/docs/uefi-environment.md`](../docs/uefi-environment.md)
+/// § Variable Services).
+#[repr(C)]
+pub struct EfiRuntimeServices
+{
+    pub hdr: EfiTableHeader,
+    // GetTime, SetTime, GetWakeupTime, SetWakeupTime, SetVirtualAddressMap and
+    // ConvertPointer, not used by the bootloader.
+    _pad_time: [usize; 6],
+    pub get_variable: unsafe extern "efiapi" fn(
+        name: *const u16,
+        vendor: *const EfiGuid,
+        attributes: *mut u32,
+        data_size: *mut usize,
+        data: *mut core::ffi::c_void,
+    ) -> EfiStatus,
+    // GetNextVariableName, not used by the bootloader.
+    _pad_next_name: usize,
+    pub set_variable: unsafe extern "efiapi" fn(
+        name: *const u16,
+        vendor: *const EfiGuid,
+        attributes: u32,
+        data_size: usize,
+        data: *const core::ffi::c_void,
+    ) -> EfiStatus,
 }
 
 /// Leading function-pointer prefix of the UEFI Simple Text Output Protocol
@@ -1432,6 +1483,232 @@ pub unsafe fn connect_all_controllers(bs: *mut EfiBootServices)
     }
 }
 
+/// What `GetVariable` returned for one variable ([`get_variable`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VariableRead
+{
+    /// The variable exists: its `len` bytes are at the start of the buffer,
+    /// and it carries `attributes`.
+    Found
+    {
+        len: usize, attributes: u32
+    },
+    /// No variable of that name exists under that GUID.
+    NotFound,
+    /// The variable holds `len` bytes, more than the buffer: none was read.
+    TooLarge
+    {
+        len: usize
+    },
+    /// The read failed with this status: the firmware has no variable
+    /// services, or its store failed.
+    Failed(EfiStatus),
+}
+
+/// Classify a `GetVariable` call into a buffer of `capacity` bytes that
+/// returned `status`, `data_size` and `attributes`. A success that reports
+/// more bytes than the buffer holds breaks the UEFI contract, and is read as
+/// a variable too large for it.
+pub const fn classify_variable_read(
+    status: EfiStatus,
+    data_size: usize,
+    attributes: u32,
+    capacity: usize,
+) -> VariableRead
+{
+    match status
+    {
+        EFI_SUCCESS if data_size <= capacity => VariableRead::Found {
+            len: data_size,
+            attributes,
+        },
+        EFI_SUCCESS | EFI_BUFFER_TOO_SMALL => VariableRead::TooLarge { len: data_size },
+        EFI_NOT_FOUND => VariableRead::NotFound,
+        other => VariableRead::Failed(other),
+    }
+}
+
+/// Whether `name` is a variable name UEFI takes: UTF-16 that ends in its
+/// one NUL.
+fn variable_name_is_terminated(name: &[u16]) -> bool
+{
+    match name.split_last()
+    {
+        Some((&0, rest)) => !rest.contains(&0),
+        _ => false,
+    }
+}
+
+/// Read the variable `name` (NUL-terminated UTF-16) under `vendor` into
+/// `buffer` with `GetVariable`: [`FirmwareVariables::get`].
+///
+/// A name that is not NUL-terminated, or a system table with no runtime
+/// services, reads as [`VariableRead::Failed`], without a call.
+///
+/// # Safety
+/// `st` must be a valid pointer to the UEFI system table, and boot services
+/// must not have exited.
+unsafe fn get_variable(
+    st: *mut EfiSystemTable,
+    name: &[u16],
+    vendor: &EfiGuid,
+    buffer: &mut [u8],
+) -> VariableRead
+{
+    if !variable_name_is_terminated(name)
+    {
+        return VariableRead::Failed(EFI_INVALID_PARAMETER);
+    }
+    // SAFETY: st is valid (caller contract).
+    let rt = unsafe { (*st).runtime_services };
+    if rt.is_null()
+    {
+        return VariableRead::Failed(EFI_UNSUPPORTED);
+    }
+    // SAFETY: `rt` is the firmware's runtime services table, valid before
+    // ExitBootServices (caller contract), so the `get_variable` entry is readable.
+    let get_variable_fn = unsafe { (*rt).get_variable };
+    let mut attributes: u32 = 0;
+    let mut data_size = buffer.len();
+    // SAFETY: `name` is NUL-terminated (checked above); `vendor`, `attributes`
+    // and `data_size` are live for the call; `buffer` holds `data_size` writable
+    // bytes, the bound the firmware writes within.
+    let status = unsafe {
+        get_variable_fn(
+            name.as_ptr(),
+            core::ptr::from_ref(vendor),
+            core::ptr::addr_of_mut!(attributes),
+            core::ptr::addr_of_mut!(data_size),
+            buffer.as_mut_ptr().cast::<core::ffi::c_void>(),
+        )
+    };
+    classify_variable_read(status, data_size, attributes, buffer.len())
+}
+
+/// Write `data` to the variable `name` (NUL-terminated UTF-16) under
+/// `vendor` with `attributes`, through `SetVariable`:
+/// [`FirmwareVariables::set`].
+///
+/// # Errors
+/// The status the firmware refused the write with; `EFI_INVALID_PARAMETER`
+/// for a name that is not NUL-terminated, and `EFI_UNSUPPORTED` for a system
+/// table with no runtime services, without a call.
+///
+/// # Safety
+/// `st` must be a valid pointer to the UEFI system table, and boot services
+/// must not have exited.
+unsafe fn set_variable(
+    st: *mut EfiSystemTable,
+    name: &[u16],
+    vendor: &EfiGuid,
+    attributes: u32,
+    data: &[u8],
+) -> Result<(), EfiStatus>
+{
+    if !variable_name_is_terminated(name)
+    {
+        return Err(EFI_INVALID_PARAMETER);
+    }
+    // SAFETY: st is valid (caller contract).
+    let rt = unsafe { (*st).runtime_services };
+    if rt.is_null()
+    {
+        return Err(EFI_UNSUPPORTED);
+    }
+    // SAFETY: `rt` is the firmware's runtime services table, valid before
+    // ExitBootServices (caller contract), so the `set_variable` entry is readable.
+    let set_variable_fn = unsafe { (*rt).set_variable };
+    // SAFETY: `name` is NUL-terminated (checked above); `vendor` and `data`
+    // are live for the call, and the firmware reads `data.len()` bytes of it.
+    let status = unsafe {
+        set_variable_fn(
+            name.as_ptr(),
+            core::ptr::from_ref(vendor),
+            attributes,
+            data.len(),
+            data.as_ptr().cast::<core::ffi::c_void>(),
+        )
+    };
+    if status == EFI_SUCCESS
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(status)
+    }
+}
+
+/// The UEFI variable services as the bootloader uses them, before
+/// `ExitBootServices` alone: the firmware's ([`FirmwareVariables`]), or a
+/// host test's store. Every Seraph variable is read and written through it
+/// ([core/boot/docs/uefi-environment.md](../docs/uefi-environment.md)
+/// § Variable Services).
+pub trait VariableServices
+{
+    /// Read the variable `name` (NUL-terminated UTF-16) under `vendor` into
+    /// `buffer`. A name that is not NUL-terminated reads as
+    /// [`VariableRead::Failed`].
+    fn get(&mut self, name: &[u16], vendor: &EfiGuid, buffer: &mut [u8]) -> VariableRead;
+
+    /// Write `data` to the variable `name` (NUL-terminated UTF-16) under
+    /// `vendor` with `attributes`.
+    ///
+    /// # Errors
+    /// The status the write was refused with.
+    fn set(
+        &mut self,
+        name: &[u16],
+        vendor: &EfiGuid,
+        attributes: u32,
+        data: &[u8],
+    ) -> Result<(), EfiStatus>;
+}
+
+/// The firmware's variable services, reached through the system table's
+/// runtime services before `ExitBootServices`.
+pub struct FirmwareVariables
+{
+    st: *mut EfiSystemTable,
+}
+
+impl FirmwareVariables
+{
+    /// The variable services of the system table `st`.
+    ///
+    /// # Safety
+    /// `st` must be a valid pointer to the UEFI system table, and boot
+    /// services must not exit while the value lives: it is made where a call
+    /// is made, and dropped there.
+    pub const unsafe fn new(st: *mut EfiSystemTable) -> Self
+    {
+        Self { st }
+    }
+}
+
+impl VariableServices for FirmwareVariables
+{
+    fn get(&mut self, name: &[u16], vendor: &EfiGuid, buffer: &mut [u8]) -> VariableRead
+    {
+        // SAFETY: self.st is valid and boot services have not exited (the
+        // contract of FirmwareVariables::new).
+        unsafe { get_variable(self.st, name, vendor, buffer) }
+    }
+
+    fn set(
+        &mut self,
+        name: &[u16],
+        vendor: &EfiGuid,
+        attributes: u32,
+        data: &[u8],
+    ) -> Result<(), EfiStatus>
+    {
+        // SAFETY: self.st is valid and boot services have not exited (the
+        // contract of FirmwareVariables::new).
+        unsafe { set_variable(self.st, name, vendor, attributes, data) }
+    }
+}
+
 /// Search the UEFI configuration table for an entry matching `guid`.
 ///
 /// Returns the vendor table pointer on success, or `None` if not found.
@@ -1469,9 +1746,61 @@ pub unsafe fn find_config_table(
 mod tests
 {
     use super::{
-        BootError, EfiMemoryDescriptor, MAP_BUFFER_SLACK_DESCRIPTORS, check_descriptor_size,
-        map_buffer_bytes, map_buffer_descriptor_reach,
+        BootError, EFI_BUFFER_TOO_SMALL, EFI_NOT_FOUND, EFI_SUCCESS, EFI_UNSUPPORTED,
+        EfiMemoryDescriptor, MAP_BUFFER_SLACK_DESCRIPTORS, VariableRead, check_descriptor_size,
+        classify_variable_read, map_buffer_bytes, map_buffer_descriptor_reach,
+        variable_name_is_terminated,
     };
+
+    // Defect caught: a GetVariable outcome read as another (a missing
+    // variable as a failed read, a variable too large for the buffer as
+    // one read whole, or a success past the buffer trusted), so the floor
+    // logic decides on bytes the firmware never wrote.
+    #[test]
+    fn every_get_variable_outcome_is_classified()
+    {
+        assert_eq!(
+            classify_variable_read(EFI_SUCCESS, 4, 3, 4),
+            VariableRead::Found {
+                len: 4,
+                attributes: 3
+            }
+        );
+        assert_eq!(
+            classify_variable_read(EFI_SUCCESS, 2, 7, 4),
+            VariableRead::Found {
+                len: 2,
+                attributes: 7
+            }
+        );
+        assert_eq!(
+            classify_variable_read(EFI_BUFFER_TOO_SMALL, 9, 0, 4),
+            VariableRead::TooLarge { len: 9 }
+        );
+        assert_eq!(
+            classify_variable_read(EFI_SUCCESS, 5, 3, 4),
+            VariableRead::TooLarge { len: 5 }
+        );
+        assert_eq!(
+            classify_variable_read(EFI_NOT_FOUND, 4, 0, 4),
+            VariableRead::NotFound
+        );
+        assert_eq!(
+            classify_variable_read(EFI_UNSUPPORTED, 4, 0, 4),
+            VariableRead::Failed(EFI_UNSUPPORTED)
+        );
+    }
+
+    // Defect caught: a name passed to the firmware without its NUL, which it
+    // would read past, or with an embedded one, which names another variable.
+    #[test]
+    fn a_variable_name_ends_in_its_one_nul()
+    {
+        assert!(variable_name_is_terminated(&[u16::from(b'F'), 0]));
+        assert!(!variable_name_is_terminated(&[u16::from(b'F')]));
+        assert!(!variable_name_is_terminated(&[]));
+        assert!(!variable_name_is_terminated(&[0, u16::from(b'F'), 0]));
+    }
 
     // Defect caught: an entry array sized for a map that a buffer allocated
     // for a map no larger can outgrow (at the queried stride or any smaller

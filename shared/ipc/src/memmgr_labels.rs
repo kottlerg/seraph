@@ -16,15 +16,16 @@
 /// Allocate one or more Memory caps covering `want_pages` pages, or fewer
 /// for a best-effort partial grant, whose caller requests the remainder
 /// again; with `REQUIRE_CONTIGUOUS`, exactly one cap covering all
-/// `want_pages`, or a failure. Callable from any badged cap;
+/// `want_pages`, or a failure. Callable from any badged cap but a node
+/// handle, the swap authority or an object handle;
 /// [`super::memmgr_grant_layout`] checks the reply shape. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 1:
 /// `REQUEST_MEMORY_CAPS`. With [`REQUEST_CHARGE_NODE`] the grant is
 /// charged to the node of the node handle in `caps[0]`.
 pub const REQUEST_MEMORY_CAPS: u64 = 1;
 /// Return previously granted regions to the pool mid-life, named by the
-/// opaque region id the grant reply reported, from any badged cap.
-/// Specified in
+/// opaque region id the grant reply reported, from any badged cap but a
+/// node handle, the swap authority or an object handle. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Label 2:
 /// `RELEASE_MEMORY_CAPS`.
 pub const RELEASE_MEMORY_CAPS: u64 = 2;
@@ -138,13 +139,14 @@ const _: () = core::assert!(
 /// Badge bit of an object handle: a SEND on memmgr's endpoint badged with
 /// this bit and a random key, which names one memory object
 /// ([`SEAL_OBJECT`]). It is the authority to attach the object
-/// ([`ATTACH_OBJECT`], which takes it as a cap), to back the caller's own
-/// pages with copies of its pages ([`FILL_REGION`], likewise), and to serve
-/// the object labels ([`is_object_label`]: [`OBJECT_RELEASE`],
-/// [`OBJECT_READ`]) on it. No process badge, node handle or swap authority
-/// carries it, so memmgr serves the object labels only on a badge carrying it
-/// and the other labels only on one without it, and refuses the rest with
-/// `UNAUTHORIZED`. Specified in
+/// ([`ATTACH_OBJECT`]), to read its pages ([`OBJECT_READ`]) and to back the
+/// caller's own pages with copies of them ([`FILL_REGION`]), each of which
+/// is sent on the caller's own memmgr SEND and takes the handle as a cap, and
+/// to release the object's handle state ([`OBJECT_RELEASE`], the object label
+/// of [`is_object_label`]), which is sent on the handle itself. No process
+/// badge, node handle or swap authority carries it, so memmgr serves the
+/// object label only on a badge carrying it and the other labels only on one
+/// without it, and refuses the rest with `UNAUTHORIZED`. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Object Handles.
 pub const OBJECT_HANDLE_TAG: u64 = 1 << 60;
 const _: () = core::assert!(
@@ -165,7 +167,8 @@ pub const PROCESS_DIED: u64 = 4;
 /// `DONATE_MEMORY_CAPS`.
 pub const DONATE_MEMORY_CAPS: u64 = 5;
 /// Read-only query of the all-RAM-accounted identity. Callable from any
-/// badged cap; returns aggregate counts only — no caps, no state change.
+/// badged cap but a node handle, the swap authority or an object handle;
+/// returns aggregate counts only — no caps, no state change.
 ///
 /// Wire format: request carries no words. Reply (`SUCCESS`):
 ///

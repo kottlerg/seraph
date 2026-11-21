@@ -33,6 +33,7 @@ use syscall_abi::{
     FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError,
 };
 
+mod capture;
 mod disk;
 mod evict;
 
@@ -4768,16 +4769,17 @@ fn delete_caps(caps: &[u64])
 
 /// Number of attached caps, counted from `caps[0]`, that the contract of the
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
-/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first two
-/// for `NODE_REGISTER_LIMIT` and `SWAP_REGISTER`, the first for
-/// `DELEGATE_ASPACE`, `REGISTER_PRESSURE`, `REGISTER_PROCESS`, `SWAP_TAKE`,
-/// `SWAP_RESTORE` and `ATTACH_OBJECT`, none for any other label.
+/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS` and
+/// `CAPTURE_CHUNKS`, the first two for `NODE_REGISTER_LIMIT` and
+/// `SWAP_REGISTER`, the first for `DELEGATE_ASPACE`, `REGISTER_PRESSURE`,
+/// `REGISTER_PROCESS`, `SWAP_TAKE`, `SWAP_RESTORE` and `ATTACH_OBJECT`, none
+/// for any other label.
 /// [`dispatch`] deletes the rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
     match opcode
     {
-        memmgr_labels::DONATE_MEMORY_CAPS => attached,
+        memmgr_labels::DONATE_MEMORY_CAPS | memmgr_labels::CAPTURE_CHUNKS => attached,
         memmgr_labels::DELEGATE_ASPACE
         | memmgr_labels::REGISTER_PRESSURE
         | memmgr_labels::REGISTER_PROCESS
@@ -4893,9 +4895,11 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             handle_discard_range(req, ipc_buf);
         }
-        memmgr_labels::MAKE_RESIDENT =>
+        memmgr_labels::MAKE_RESIDENT
+        | memmgr_labels::MAKE_PRIVATE
+        | memmgr_labels::CAPTURE_CHUNKS =>
         {
-            handle_make_resident(req, ipc_buf, boot.procmgr_badge);
+            route_procmgr(opcode, req, kept, ipc_buf, boot.procmgr_badge);
         }
         memmgr_labels::NODE_SET_MAX =>
         {
@@ -4925,14 +4929,22 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             route_object(opcode, req, kept, ipc_buf, boot.service_ep);
         }
-        memmgr_labels::MAKE_PRIVATE =>
-        {
-            handle_make_private(req, ipc_buf, boot.procmgr_badge);
-        }
         _ =>
         {
             reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         }
+    }
+}
+
+/// Hand a request of a label only procmgr's badge may send (`MAKE_RESIDENT`,
+/// `MAKE_PRIVATE`, `CAPTURE_CHUNKS`) to its handler, which checks the badge.
+fn route_procmgr(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, procmgr_badge: u64)
+{
+    match opcode
+    {
+        memmgr_labels::MAKE_RESIDENT => handle_make_resident(req, ipc_buf, procmgr_badge),
+        memmgr_labels::MAKE_PRIVATE => handle_make_private(req, ipc_buf, procmgr_badge),
+        _ => capture::handle_capture_chunks(req, kept, ipc_buf, procmgr_badge),
     }
 }
 

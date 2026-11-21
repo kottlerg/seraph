@@ -36,7 +36,7 @@ Two privilege classes:
 
 - **Procmgr-only** labels (`REGISTER_PROCESS`, `PROCESS_DIED`,
   `DONATE_MEMORY_CAPS`, `DELEGATE_ASPACE`, `MAKE_RESIDENT`,
-  `MAKE_PRIVATE`) are callable only over the cap
+  `MAKE_PRIVATE`, `CAPTURE_CHUNKS`) are callable only over the cap
   that init transfers to procmgr at procmgr's bootstrap round. memmgr
   identifies this cap by badge and rejects procmgr-only calls received over
   any other badged cap, replying `UNAUTHORIZED`.
@@ -1189,18 +1189,17 @@ holds one chunk (`DEMAND_CHUNK_BYTES`).
 | data[0] | the slots the swap service's partition holds; nonzero |
 | data[1] | with `caps[1]`, the bits memmgr sends on it; nonzero |
 | caps[0] | a SEND on the endpoint memmgr redirects each fault on a chunk on disk to, with any rights; memmgr keeps it |
-| caps[1] | optional: a Notification with the Notify right memmgr sends `data[1]` on when `MAKE_RESIDENT` posts a slot word for the swap service (§ Label 21, § Label 26); memmgr keeps it |
+| caps[1] | optional: a Notification with the Notify right memmgr sends `data[1]` on when `MAKE_RESIDENT` or `CAPTURE_CHUNKS` posts a slot word for the swap service (§ Label 21, § Label 26, § Label 31); memmgr keeps it |
 
 Without `caps[1]`, `MAKE_RESIDENT` passes the chunks on disk over, as a lost
-chunk. A registration replaces the one before it, whose caps memmgr deletes, and
-ends every write in flight: each writing chunk is compressed again on its store runs, or
-raw again on its runs,
-and each slot whose write a restore or a teardown cancelled is freed. The
-chunks on disk stay, and so do the slot words posted for the swap service: memmgr
-sends on the new Notification at once when any are posted, so a restarted swap
-service restores them. The reply's `data[0]` is the slots memmgr uses: the count,
-clamped to the slot map's window ([docs/limits.md](../../../docs/limits.md)
-§ memmgr).
+chunk, and `CAPTURE_CHUNKS` reports them absent. A registration replaces the one
+before it, whose caps memmgr deletes, and ends every write in flight: each writing
+chunk is compressed again on its store runs, or raw again on its runs, and each
+slot whose write a restore or a teardown cancelled is freed. The chunks on disk
+stay, and so do the slot words posted for the swap service: memmgr sends on the
+new Notification at once when any are posted, so a restarted swap service restores
+them. The reply's `data[0]` is the slots memmgr uses: the count, clamped to the
+slot map's window ([docs/limits.md](../../../docs/limits.md) § memmgr).
 
 | Code | Name | Meaning |
 |---|---|---|
@@ -1291,9 +1290,9 @@ lost and frees its slot.
 
 #### Label 26: `SWAP_WANTED`
 
-Take the slot words of the chunks on disk `MAKE_RESIDENT` posted for the swap
-service since the last request (§ Label 21), oldest first, and empty memmgr's list
-of them. The swap service reads each slot and hands memmgr its bytes with
+Take the slot words of the chunks on disk `MAKE_RESIDENT` or `CAPTURE_CHUNKS` posted for
+the swap service since the last request (§ Label 21, § Label 31), oldest first, and empty
+memmgr's list of them. The swap service reads each slot and hands memmgr its bytes with
 `SWAP_RESTORE` (§ Label 25), ahead of a fault; a word whose use of its slot has
 ended since (the chunk restored by a fault, or torn down) replies `RESTORE_STALE`
 there and changes nothing.
@@ -1491,6 +1490,69 @@ regions visited ([docs/limits.md](../../../docs/limits.md) § memmgr).
 | 4 | `INVALID_ARGUMENT` | Unknown badge, zero length, or a range past the address space |
 | 5 | `UNAUTHORIZED` | The caller is not procmgr |
 
+### Label 31: `CAPTURE_CHUNKS`
+
+Copy the content of a process's demand chunks into Memory caps the request carries, for procmgr's
+`SNAPSHOT` of a process whose address space it holds
+(`services/procmgr/docs/ipc-interface.md` § Label 33: `SNAPSHOT`). memmgr reads each chunk where it
+holds it in that turn: from its frames when it is resident, being evicted, or held raw, and decoded
+from its store when it is held compressed, a chunk being written to disk read from where it is held
+meanwhile ([`memory-pool.md`](memory-pool.md#eviction) § Eviction). It maps nothing into the
+process, draws no frame, and evicts nothing, so no eviction of the held process's chunks, before
+or after the request, can take a chunk's content out of the capture: each chunk is read once, from
+one place. A chunk on disk it posts to the swap service as
+`MAKE_RESIDENT` does (§ Label 21), when the registered swap service gave a want Notification
+(§ Label 22), and reports it pending: the swap service restores it into the process
+(`SWAP_RESTORE`, § Label 25), and procmgr asks for that chunk again. A lost chunk, and a chunk on
+disk with no swap service to ask, it reports absent ([`memory-pool.md`](memory-pool.md#disk-tier)
+§ Disk tier). An attachment's chunks are passed over: no eviction takes them, and procmgr reads
+their pages from the process. Privilege: procmgr only.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 31 |
+| data[0] | the process's memmgr badge (from its `REGISTER_PROCESS` reply) |
+| data[1] | the cursor, where the walk starts |
+| data[2] | the end, past the cursor |
+| data[3] | flags: `CAPTURE_COUNT` (1), or 0 |
+| data[4] | the page offset into `caps[0]` at which the destination starts |
+| data[5 + i] | the destination pages of `caps[i]`, from that offset for `caps[0]` |
+| caps[0..4] | Memory caps with the map and write rights: the destination, in order. memmgr deletes them once it has served the request, whatever the reply |
+
+memmgr walks the chunks that have an entry in the process's demand regions in `[cursor, end)`, in
+address order. For each chunk it has the content of, it writes the chunk's backed pages, in page
+order, into the next pages of the destination; a chunk whose pages the rest of the destination
+cannot hold ends the walk at that chunk, the reply naming the pages it needs. It stops after
+`CAPTURE_SUPPLIED` (4) chunks written, `DESCRIPTORS_MAX` (16) chunks described, or
+`CAPTURE_VISITS` (64) chunks and regions visited ([docs/limits.md](../../../docs/limits.md)
+§ memmgr).
+
+With `CAPTURE_COUNT`, the request carries no cap and memmgr writes nothing: it counts the backed
+pages of the evicted chunks of the range, those on disk included and lost ones aside, so procmgr can
+take frames for them before it holds the process, and posts each chunk on disk to the swap service,
+counting those it posted.
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 |
+| data[0] | the cursor the next request goes on from: the end when the walk is done |
+| data[1] | the destination pages written; with `CAPTURE_COUNT`, the backed pages of the evicted chunks walked |
+| data[2] | the destination pages the chunk at `data[0]` needs, when the walk stopped for want of them, else 0; with `CAPTURE_COUNT`, the chunks on disk walked whose slot word memmgr posted |
+| data[3] | the count of descriptors, at most `DESCRIPTORS_MAX` (16); absent with `CAPTURE_COUNT` |
+| data[4 + 2i], data[5 + 2i] | descriptor `i` (`ipc::memmgr_capture::Descriptor`): the chunk's base; then its backed pages in bits 0 to 15, one bit a page, its page count in bits 16 to 23, its region's `MAP_*` protection in bits 24 to 31, and what memmgr did with it in bits 32 and 33: `SUPPLIED` (0, its backed pages written, in page order, after the chunk's before it), `PENDING` (1, on disk, its slot word posted to the swap service), or `ABSENT` (2: lost, on disk with no swap service to ask, its stored bytes failed to decode, or memmgr could not map its frames or store runs to read them) |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A destination page could not be mapped |
+| 4 | `INVALID_ARGUMENT` | Unknown badge, an end not past the cursor, a flag bit not defined, or a destination page count missing for a cap |
+| 5 | `UNAUTHORIZED` | The caller is not procmgr |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page fault the kernel cannot
@@ -1670,8 +1732,8 @@ reclaims. `RELEASE_MEMORY_CAPS` names each region by its region id, and
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
 
-Only nine labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
-attached cap), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE` (`cap[0]`),
+Only ten labels carry caps in their contract: `DONATE_MEMORY_CAPS` and
+`CAPTURE_CHUNKS` (every attached cap), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE` (`cap[0]`),
 `REGISTER_PROCESS` (`cap[0]`), `NODE_REGISTER_LIMIT` (`cap[0]` and
 `cap[1]`), the swap labels `SWAP_REGISTER` (`cap[0]` and `cap[1]`), `SWAP_TAKE` and
 `SWAP_RESTORE` (`cap[0]`), and `ATTACH_OBJECT` (`cap[0]`). memmgr deletes every other cap a
@@ -1683,7 +1745,8 @@ and `SWAP_WANTED`, and the caps after `cap[1]` on `NODE_REGISTER_LIMIT` and
 `SWAP_REGISTER`. It deletes the contract caps as well when a
 procmgr-only label's caller is not procmgr, when a label's class does not
 match the badge (§ Badge Discipline), and in the error cases the labels'
-sections state. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's
+sections state. `CAPTURE_CHUNKS` deletes its caps once it has served the request, whatever
+the reply. `SWAP_REGISTER` keeps its `cap[0]` as the swap service's
 endpoint, and its `cap[1]`, when present, as the swap service's want Notification;
 `SWAP_TAKE` and `SWAP_RESTORE` move their `cap[0]` back on every reply, and delete it
 only when that reply cannot reach the caller. `REGISTER_PROCESS` and `ATTACH_OBJECT` read the
@@ -1737,4 +1800,5 @@ reply-then-death ordering is therefore enforced by the kernel.
 [programs/threadstack/README.md](../../../programs/threadstack/README.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [services/memmgr/README.md](../README.md),
-[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md)
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
+[swapd Operation](../../swapd/docs/operation.md)

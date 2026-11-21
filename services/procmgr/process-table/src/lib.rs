@@ -53,6 +53,7 @@ pub mod init_reap;
 pub mod names;
 pub mod request_caps;
 pub mod sign_policy;
+pub mod snapshot;
 pub mod threads;
 
 pub use create_blobs::{ArgvEnvRefusal, ArgvEnvTally, checked_total, decode_header};
@@ -1731,6 +1732,69 @@ pub fn detach_target(
     Ok(entry)
 }
 
+/// Why a `SNAPSHOT` is refused before procmgr touches its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotRefusal
+{
+    /// The caller's badge lacks `procmgr_labels::DEBUG_AUTHORITY`
+    /// (`UNAUTHORIZED`).
+    Unauthorized,
+    /// The request carries no account to charge (`INVALID_ARGUMENT`).
+    NoAccount,
+    /// As [`AttachRefusal::Unknown`] and [`AttachRefusal::NotAttachable`].
+    Target(AttachRefusal),
+}
+
+impl SnapshotRefusal
+{
+    /// The reply code of the refusal.
+    #[must_use]
+    pub const fn code(self) -> u64
+    {
+        match self
+        {
+            SnapshotRefusal::Unauthorized
+            | SnapshotRefusal::Target(AttachRefusal::Unauthorized) =>
+            {
+                ipc::procmgr_errors::UNAUTHORIZED
+            }
+            SnapshotRefusal::NoAccount => ipc::procmgr_errors::INVALID_ARGUMENT,
+            SnapshotRefusal::Target(AttachRefusal::Unknown) => ipc::procmgr_errors::INVALID_BADGE,
+            SnapshotRefusal::Target(AttachRefusal::NotAttachable) =>
+            {
+                ipc::procmgr_errors::NOT_ATTACHABLE
+            }
+        }
+    }
+}
+
+/// The entry a `SNAPSHOT` from `caller_badge` for the process badge `target`
+/// reaches, or why it is refused: the caller's authority, then the account
+/// cap `account` (0 when the request carried none), then the target's
+/// presence and its no-debug mark, as for a detach ([`detach_target`]). The
+/// account is checked before the target, so a request without one learns
+/// nothing of the table.
+///
+/// # Errors
+/// The [`SnapshotRefusal`] that refuses it.
+pub fn snapshot_target(
+    table: &mut ProcessTable,
+    caller_badge: u64,
+    target: u64,
+    account: u64,
+) -> Result<&mut ProcessEntry, SnapshotRefusal>
+{
+    if !debug_authorized(caller_badge)
+    {
+        return Err(SnapshotRefusal::Unauthorized);
+    }
+    if account == 0
+    {
+        return Err(SnapshotRefusal::NoAccount);
+    }
+    detach_target(table, caller_badge, target).map_err(SnapshotRefusal::Target)
+}
+
 /// The entry a `REGISTER_THREAD` sent on a cap badged `sender_badge` registers
 /// its thread with, or why it is refused: the sender's presence, then its
 /// no-debug mark.
@@ -2259,6 +2323,39 @@ mod tests
             Err(AttachRefusal::Unknown)
         );
         assert_eq!(detached(&mut table, auth, 0x77), Ok(0x77));
+    }
+
+    #[test]
+    fn a_snapshot_is_refused_for_its_authority_then_its_account_then_its_target()
+    {
+        let auth = ipc::procmgr_labels::DEBUG_AUTHORITY;
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(0x77)).unwrap();
+        table.insert(entry_with_badge(0x78)).unwrap();
+        assert!(table.declare_no_debug(0x78).is_some());
+        let refused = |t: &mut ProcessTable, caller, target, account| {
+            snapshot_target(t, caller, target, account)
+                .map(|e| e.badge)
+                .map_err(SnapshotRefusal::code)
+        };
+        // Each refusal is the first that applies, whatever the later ones.
+        assert_eq!(
+            refused(&mut table, 0, 0x79, 0),
+            Err(ipc::procmgr_errors::UNAUTHORIZED)
+        );
+        assert_eq!(
+            refused(&mut table, auth, 0x79, 0),
+            Err(ipc::procmgr_errors::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            refused(&mut table, auth, 0x79, 5),
+            Err(ipc::procmgr_errors::INVALID_BADGE)
+        );
+        assert_eq!(
+            refused(&mut table, auth, 0x78, 5),
+            Err(ipc::procmgr_errors::NOT_ATTACHABLE)
+        );
+        assert_eq!(refused(&mut table, auth, 0x77, 5), Ok(0x77));
     }
 
     #[test]

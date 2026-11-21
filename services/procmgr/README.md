@@ -35,8 +35,9 @@ procmgr/
 │                                 span, the process names, the
 │                                 thread registry and crash badges,
 │                                 the process tree (parent links,
-│                                 destroy marks, re-parenting), and
-│                                 the image-sharing layout and cache
+│                                 destroy marks, re-parenting), the
+│                                 image-sharing layout and cache, and
+│                                 a snapshot's listing and layout
 ├── src/
 │   ├── main.rs                 # main() (std runtime), request workers, reaper
 │   ├── crash.rs                # Crash endpoint, its decliner, the handover
@@ -45,6 +46,7 @@ procmgr/
 │   │                           #   read's file, its verification, the read-only hand-over;
 │   │                           #   an image object's frames and its seal
 │   ├── image_cache.rs          # The shared image objects, the image store, attachment
+│   ├── snapshot.rs             # SNAPSHOT: the held capture, the account's grants, the seal
 │   ├── trust_store.rs          # The trust store the bootloader hands forward
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
@@ -152,7 +154,9 @@ procmgr/
   attached debugger's thread has exited; `MAKE_RESIDENT` and
   `MAKE_PRIVATE`, which have memmgr make a range of a process resident, or
   give its memory-object pages copies of their own, for a holder about to
-  read or patch it; and `DECLARE_NO_DEBUG`, by which
+  read or patch it; `SNAPSHOT`, which holds a process's address space while
+  it copies the pages into a memory object charged to the holder; and
+  `DECLARE_NO_DEBUG`, by which
   a process opts out of the crash endpoint and the attach. See
   [docs/ipc-interface.md](docs/ipc-interface.md) § Crash Endpoint and Debug
   Authority.
@@ -405,7 +409,11 @@ queues' wait set. A create that waits on a slow file server, on memmgr, or on th
 worker; the others go on serving, and the reaper goes on reaping. A file server is the creator's to
 choose, so each call on a caller-supplied file cap is bounded at `FILE_CAP_CALL_TIMEOUT_MS` (10 s),
 past which the create, or the verified read (`READ_VERIFIED`), fails with `IO_ERROR`
-([docs/ipc-interface.md](docs/ipc-interface.md) § Label 13: `CREATE_FROM_FILE`). A caller past the
+([docs/ipc-interface.md](docs/ipc-interface.md) § Label 13: `CREATE_FROM_FILE`). A `SNAPSHOT`
+holds one worker, and the target's address space, for its capture; each call on the account the
+sender presents is bounded at `ACCOUNT_CALL_TIMEOUT_MS` (10 s) in the same way, and under the hold
+the worker calls only memmgr and writes no log line, so no held target can stall it
+([docs/ipc-interface.md](docs/ipc-interface.md) § Label 33: `SNAPSHOT`). A caller past the
 four workers waits in the endpoint's queue. procmgr's own `ProcessInfo` names no procmgr endpoint,
 so its threads send no `REGISTER_THREAD` and start without waiting on one
 ([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Thread registration).

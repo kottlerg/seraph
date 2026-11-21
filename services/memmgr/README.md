@@ -35,6 +35,8 @@ memmgr/
 │   ├── main.rs                 # _start() entry point, IPC dispatch loop
 │   ├── evict.rs                # Eviction: the clock's slices, the compression
 │                               # worker, the store, restore
+│   ├── capture.rs              # CAPTURE_CHUNKS: a held target's chunks written
+│                               # into the frames procmgr's request carries
 │   └── disk.rs                # Disk tier: the swap labels, the per-boot
 │                               # key, the fault redirect to the swap service
 └── docs/
@@ -183,6 +185,9 @@ The full memmgr IPC specification is in
 - Over an object handle only: `OBJECT_RELEASE` — drop the object's handle state
 - `MAKE_PRIVATE(badge, va, len) → reached` — give each page of a range of a process's attachments
   that maps its origin a copy of its own, for a debugger (procmgr-only)
+- `CAPTURE_CHUNKS(badge, cursor, end, flags, offset, pages…) → cursor, written, need, chunks` —
+  write the content of a held target's demand chunks into the Memory caps the request carries, and
+  describe each chunk, for procmgr's `SNAPSHOT` (procmgr-only)
 - Over a node handle only: `NODE_SET_MAX(max) → max`, `NODE_CREATE(max) → max, node_handle`,
   `NODE_QUERY_USAGE`, `NODE_REGISTER_LIMIT(bits, notification_cap, registrant_send)` and
   `NODE_RELEASE` — set, divide, read and watch the budget node the handle names, and drop a

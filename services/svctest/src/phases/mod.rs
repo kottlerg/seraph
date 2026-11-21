@@ -100,6 +100,7 @@ pub mod recv_guard;
 pub mod recv_pool;
 pub mod sessiond;
 pub mod shmem;
+pub mod snapshot;
 pub mod startup;
 pub mod svcmgr;
 pub mod swap;
@@ -140,6 +141,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(memory_objects::phases());
     out.extend_from_slice(memory_object_text::phases());
     out.extend_from_slice(image_sharing::phases());
+    out.extend_from_slice(snapshot::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

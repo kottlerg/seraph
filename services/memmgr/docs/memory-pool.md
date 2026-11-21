@@ -1411,10 +1411,10 @@ chunk is. A fault on a chunk on disk with no swap service registered is declined
 detail 0. Detail 2 is the swap service's own: it could not read the chunk's slot, and it forwards
 the held fault with it; the chunk stays on disk. memmgr produces details 0 and 1 only.
 `SWAP_RESTORE` names a slot word, which `SWAP_TAKE`'s reply also carries, not a fault, so the swap
-service may also restore ahead of one, as it does for a debugger's `MAKE_RESIDENT` of a chunk on
-disk: memmgr posts the chunk's slot word to a list of at most `SWAP_WANTED_WORDS` words, sends on
-the Notification the swap service registered for it, and the swap service takes the words with
-`SWAP_WANTED` ([Eviction](#eviction), Debugger reads).
+service may also restore ahead of one, as it does for a debugger's `MAKE_RESIDENT` or procmgr's
+`CAPTURE_CHUNKS` of a chunk on disk: memmgr posts the chunk's slot word to a list of at most
+`SWAP_WANTED_WORDS` words, sends on the Notification the swap service registered for it, and the
+swap service takes the words with `SWAP_WANTED` ([Eviction](#eviction), Debugger reads).
 
 **Read-back is serial.** virtio-blk keeps one request in flight
 ([virtio-blk README](../../drivers/virtio/blk/README.md)), and one driver instance serves the root,

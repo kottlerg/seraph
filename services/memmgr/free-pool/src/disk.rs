@@ -538,6 +538,50 @@ pub const fn resident_path(entry: &ChunkEntry, wants: Registered) -> ResidentPat
     }
 }
 
+/// Where `CAPTURE_CHUNKS` reads a chunk's backed pages from, by its state,
+/// with a swap service that registered a want Notification or not
+/// (`services/memmgr/docs/ipc-interface.md` § Label 31: `CAPTURE_CHUNKS`). The
+/// capture reads every chunk where it is, so it maps nothing back and
+/// restores nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureSource
+{
+    /// Nothing: no page of the chunk holds data.
+    Skip,
+    /// Its runs, which hold its backed pages: a resident chunk, one being
+    /// evicted, or a raw one, writing or not.
+    Runs,
+    /// Its store runs, decoded: a compressed chunk, writing or not.
+    Store,
+    /// Posted to the swap service's want list, as `MAKE_RESIDENT` posts it,
+    /// and reported pending: a chunk on disk, with a swap service to ask.
+    Want,
+    /// Reported absent: a lost chunk, or a chunk on disk with no swap service
+    /// to ask.
+    Absent,
+}
+
+/// The source `CAPTURE_CHUNKS` reads a chunk whose entry is `entry` from,
+/// with `wants` saying whether a registered swap service can be asked for a
+/// chunk on disk.
+#[must_use]
+pub const fn capture_source(entry: &ChunkEntry, wants: Registered) -> CaptureSource
+{
+    match entry.state()
+    {
+        ChunkState::Unbacked => CaptureSource::Skip,
+        ChunkState::Resident | ChunkState::Evicting | ChunkState::Raw => CaptureSource::Runs,
+        ChunkState::Writing if entry.is_raw() => CaptureSource::Runs,
+        ChunkState::Compressed | ChunkState::Writing => CaptureSource::Store,
+        ChunkState::OnDisk => match wants
+        {
+            Registered::Yes => CaptureSource::Want,
+            Registered::No => CaptureSource::Absent,
+        },
+        ChunkState::Lost => CaptureSource::Absent,
+    }
+}
+
 /// The address a pending `MAKE_RESIDENT` reply names, from the base of the
 /// first chunk the request posted, `first_posted`, and the request's start,
 /// `va`: the chunk's base, or `va` when the chunk starts below it, so the
@@ -1000,6 +1044,46 @@ mod tests
         {
             assert_eq!(resident_path(&entry, Registered::Yes), yes, "{entry:?}");
             assert_eq!(resident_path(&entry, Registered::No), no, "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn capture_reads_runs_and_stores_wants_a_chunk_on_disk_and_reports_a_lost_one()
+    {
+        let resident = ChunkEntry::UNBACKED.back(0, 4, 7).unwrap();
+        let evicting = resident.begin_evict(1).unwrap();
+        let compressed = evicting.finish_evict(9).unwrap();
+        let writing = compressed.begin_write(5, None).unwrap();
+        let on_disk = writing.finish_write().unwrap();
+        let lost = on_disk.lose().unwrap();
+        let raw = ChunkEntry::UNBACKED
+            .back(0, 4, 8)
+            .unwrap()
+            .begin_evict(1)
+            .unwrap()
+            .finish_raw()
+            .unwrap();
+        let raw_writing = raw.begin_write(6, Some([3; TAG_BYTES])).unwrap();
+        let raw_on_disk = raw_writing.finish_write().unwrap();
+        for (entry, yes, no) in [
+            (
+                ChunkEntry::UNBACKED,
+                CaptureSource::Skip,
+                CaptureSource::Skip,
+            ),
+            (resident, CaptureSource::Runs, CaptureSource::Runs),
+            (evicting, CaptureSource::Runs, CaptureSource::Runs),
+            (raw, CaptureSource::Runs, CaptureSource::Runs),
+            (raw_writing, CaptureSource::Runs, CaptureSource::Runs),
+            (compressed, CaptureSource::Store, CaptureSource::Store),
+            (writing, CaptureSource::Store, CaptureSource::Store),
+            (on_disk, CaptureSource::Want, CaptureSource::Absent),
+            (raw_on_disk, CaptureSource::Want, CaptureSource::Absent),
+            (lost, CaptureSource::Absent, CaptureSource::Absent),
+        ]
+        {
+            assert_eq!(capture_source(&entry, Registered::Yes), yes, "{entry:?}");
+            assert_eq!(capture_source(&entry, Registered::No), no, "{entry:?}");
         }
     }
 

@@ -54,7 +54,7 @@
 //!
 //! [`shootdown_remote`]: AddressSpace::shootdown_remote
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 
 use boot_protocol::{InitSegment, SegmentFlags};
 
@@ -276,6 +276,14 @@ pub struct AddressSpace
     /// overwrites the reason nor posts the observers again. Owned by
     /// `death_lock`.
     ended: bool,
+    /// This space's address-space hold state, a
+    /// [`HoldState`](crate::sched::hold::HoldState) byte: moved from `Free` to
+    /// `Holding` by `SYS_ASPACE_HOLD` and from `Held` to `Releasing` by
+    /// `SYS_ASPACE_RELEASE` with compare-exchanges, so one hold and one release
+    /// run at a time, and read by the start commit under the started thread's
+    /// `sched_lock`, which defers a start while the space is held
+    /// (core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space Hold).
+    hold: AtomicU8,
     /// Retained terminal-end reason, valid when `ended`: `EXIT_FAULT_BASE +
     /// vector` for a fault, the encoded exit code (`0` for a clean exit) for
     /// an exit. Owned by `death_lock`.
@@ -284,7 +292,7 @@ pub struct AddressSpace
 
 // SAFETY: All mutable state is protected by pt_lock (page tables), death_lock
 // (death observers + retained terminal-end state), or atomic operations
-// (active_cpus). Safe to share across threads and CPUs.
+// (active_cpus, hold). Safe to share across threads and CPUs.
 unsafe impl Send for AddressSpace {}
 // SAFETY: pt_lock serializes page table modifications; death_lock serializes the
 // death-observer set; active_cpus is atomic.
@@ -737,6 +745,7 @@ impl AddressSpace
             death_lock: crate::sync::Spinlock::new(),
             ended: false,
             end_reason: 0,
+            hold: AtomicU8::new(crate::sched::hold::HoldState::Free as u8),
         }
     }
 
@@ -2046,6 +2055,41 @@ impl AddressSpace
     pub(crate) fn inactive_everywhere(&self) -> bool
     {
         self.active_cpus.is_empty(Ordering::Acquire)
+    }
+
+    /// This space's address-space hold state.
+    ///
+    /// Acquire pairs with the release of [`set_hold_state`](Self::set_hold_state)
+    /// and the compare-exchanges of [`swap_hold_state`](Self::swap_hold_state).
+    /// A start commit reads it under the started thread's `sched_lock`, after
+    /// the hold's walk set `Holding` and before it takes that same lock for the
+    /// thread, so a start that the walk does not find `Ready` or `Running` reads
+    /// the hold (core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space
+    /// Hold).
+    pub(crate) fn hold_state(&self) -> crate::sched::hold::HoldState
+    {
+        crate::sched::hold::HoldState::from_u8(self.hold.load(Ordering::Acquire))
+    }
+
+    /// Move the hold state from `from` to `to`; `false`, changing nothing,
+    /// when it is not `from`. One hold or release of a space runs at a time.
+    pub(crate) fn swap_hold_state(
+        &self,
+        from: crate::sched::hold::HoldState,
+        to: crate::sched::hold::HoldState,
+    ) -> bool
+    {
+        self.hold
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Store the hold state `to`, ending the hold's walk (`Held`) or the
+    /// release (`Free`) that the caller's [`swap_hold_state`](Self::swap_hold_state)
+    /// began.
+    pub(crate) fn set_hold_state(&self, to: crate::sched::hold::HoldState)
+    {
+        self.hold.store(to as u8, Ordering::Release);
     }
 
     /// Point the active-CPU set of the address space at `this` at the

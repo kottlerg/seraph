@@ -17,6 +17,7 @@
 )]
 
 pub mod deadline_heap;
+pub mod hold;
 pub mod run_queue;
 pub mod thread;
 #[cfg(not(test))]
@@ -649,6 +650,13 @@ pub const SPIN_SITE_IRQ_ROUTE_DRAIN: u32 = 10;
 /// Fault-handler rebind (`ipc::fault::redeliver_in_flight`): spinning until a
 /// faulting thread whose delivery a binding change cancels commits its park.
 pub const SPIN_SITE_FAULT_REBIND: u32 = 11;
+/// Address-space hold wait (`sched::hold::hold_space`): spinning until no
+/// thread of the held space is current on any CPU and every one's register
+/// save has published.
+pub const SPIN_SITE_HOLD_SETTLE: u32 = 12;
+/// Address-space release (`sched::hold::release_walk`): spinning between
+/// passes until every thread the hold stopped is settled enough to start.
+pub const SPIN_SITE_RELEASE_SETTLE: u32 = 13;
 
 /// Record that the current CPU has entered bounded protocol-spin `site`. The
 /// gates that call this run preempt-disabled, so the CPU index is stable across
@@ -693,6 +701,8 @@ fn spin_site_name(site: u32) -> &'static str
         SPIN_SITE_STOP_SAVE => "stop:save",
         SPIN_SITE_IRQ_ROUTE_DRAIN => "irq:route-drain",
         SPIN_SITE_FAULT_REBIND => "fault:rebind",
+        SPIN_SITE_HOLD_SETTLE => "hold:settle",
+        SPIN_SITE_RELEASE_SETTLE => "release:settle",
         _ => "none",
     }
 }
@@ -2896,6 +2906,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     park_started_tick: 0,
                     park_seq: core::sync::atomic::AtomicU32::new(0),
                     start_seq: 0,
+                    hold: crate::sched::hold::HoldMark::None,
                     ipc_state: IpcThreadState::None,
                     ipc_msg: crate::ipc::message::Message::default(),
                     reply_tcb: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -3521,6 +3532,9 @@ pub enum StartCommit
     /// Nothing was written: the calling thread was itself stopped (or killed)
     /// while the start waited for the target to settle.
     CallerStopped,
+    /// The target's address space is held: it is committed `Stopped`,
+    /// marked for the release to start, and must not be linked.
+    Deferred,
 }
 
 /// Commit `tcb` `Ready` for `SYS_THREAD_START` once it is safe to link,
@@ -3660,6 +3674,7 @@ pub unsafe fn start_under_all_locks(
         match commit
         {
             Some(StateCommit::Committed(_)) => break StartCommit::Committed(seq),
+            Some(StateCommit::Deferred) => break StartCommit::Deferred,
             Some(_) => break StartCommit::Refused,
             // Unsettled again under the locks; take another pass.
             None if caller_stopped() => break StartCommit::CallerStopped,
@@ -3796,7 +3811,8 @@ pub enum FrameAccess
     Read,
     /// A write: a `Stopped` thread, or a fault-blocked one. A thread blocked
     /// in a syscall is refused, since the syscall's return still writes its
-    /// frame.
+    /// frame, and so is a thread an address-space hold stopped, which resumes
+    /// its park or syscall at the release.
     Write,
 }
 
@@ -3808,10 +3824,88 @@ pub enum FrameHold
     Stopped,
     /// `Blocked` in a fault or an upcall delivery: awaiting its handler's
     /// reply (`BlockedOnFault`), or queued for its handler's receive
-    /// (`BlockedOnSend` with `in_fault_delivery` set).
+    /// (`BlockedOnSend` with `in_fault_delivery` set); or stopped by an
+    /// address-space hold inside such a delivery, which it finishes at the
+    /// release.
     Fault,
-    /// `Blocked` in a syscall, in any other IPC state.
+    /// `Blocked` in a syscall, in any other IPC state; or stopped by an
+    /// address-space hold inside a syscall, which it returns from at the
+    /// release.
     Syscall,
+}
+
+/// What [`with_held_frame`] decides of a thread from the fields its
+/// `sched_lock` serialises.
+#[cfg(not(test))]
+struct FrameLook
+{
+    /// The state reported with the frame.
+    hold: FrameHold,
+    /// An address-space hold stopped the thread (`HoldMark::Stopped`).
+    hold_stopped: bool,
+    /// The thread is `Blocked`.
+    blocked: bool,
+    /// `mode` admits the thread's state.
+    admitted: bool,
+}
+
+/// Decide what a register access in `mode` may do with `tcb`.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold its `sched_lock`.
+#[cfg(not(test))]
+unsafe fn frame_look(tcb: *mut ThreadControlBlock, mode: FrameAccess) -> FrameLook
+{
+    // SAFETY: tcb valid (contract); state is written under the held sched_lock.
+    let state = unsafe { (*tcb).state };
+    // SAFETY: tcb valid; ipc_state is written under the held sched_lock.
+    let ipc_state = unsafe { (*tcb).ipc_state };
+    // SAFETY: tcb valid; in_fault_delivery is written by the thread under
+    // its sched_lock, held here.
+    let in_delivery = unsafe { (*tcb).in_fault_delivery };
+    // SAFETY: tcb valid; the hold mark is written under the held sched_lock.
+    let hold_stopped = unsafe { (*tcb).hold } == hold::HoldMark::Stopped;
+    let blocked = state == thread::ThreadState::Blocked;
+    let fault_parked = ipc_state == thread::IpcThreadState::BlockedOnFault;
+    // A delivery no handler was receiving for waits on the send queue
+    // until a receive rebinds it to BlockedOnFault; its frame is the
+    // delivery's, as a fault-parked one's. A thread an address-space hold
+    // stopped is reported as the park or the run the hold ended, since it
+    // resumes there at the release: a fault delivery it has not finished
+    // is a fault, a syscall it has not returned from (refined below, once
+    // its save is seen) a syscall.
+    let hold = if blocked
+    {
+        if fault_parked || (ipc_state == thread::IpcThreadState::BlockedOnSend && in_delivery)
+        {
+            FrameHold::Fault
+        }
+        else
+        {
+            FrameHold::Syscall
+        }
+    }
+    else if hold_stopped && in_delivery
+    {
+        FrameHold::Fault
+    }
+    else
+    {
+        FrameHold::Stopped
+    };
+    // A write keeps the fault-parked set: a delivery its handler holds. A
+    // thread a hold stopped runs to its debugger, and the park or syscall
+    // it resumes at the release still writes its frame, so only a read
+    // admits it.
+    let admitted = (state == thread::ThreadState::Stopped
+        && (mode == FrameAccess::Read || !hold_stopped))
+        || (blocked && (mode == FrameAccess::Read || fault_parked));
+    FrameLook {
+        hold,
+        hold_stopped,
+        blocked,
+        admitted,
+    }
 }
 
 /// Run `access` on `tcb`'s register frame (`trap_frame`, possibly null) while
@@ -3820,8 +3914,9 @@ pub enum FrameHold
 /// thread's state, or the thread is `Stopped` but not yet settled.
 ///
 /// Held still means `current` on no CPU with the last register save
-/// published (`context_saved`), and in a state `mode` admits: `Stopped`,
-/// or `Blocked` (fault-blocked only, for a write). A thread stopped while it
+/// published (`context_saved`), and in a state `mode` admits: `Stopped`
+/// (not by an address-space hold, for a write), or `Blocked` (fault-blocked
+/// only, for a write). A thread stopped while it
 /// runs on another CPU is `Stopped` from the stop's commit but executes, and
 /// may enter or leave the kernel through its frame, until that CPU
 /// deschedules it; such a thread is refused. A `Blocked` thread is waited for
@@ -3866,34 +3961,13 @@ pub unsafe fn with_held_frame<R>(
         // SAFETY: the caller holds no sched_lock and no scheduler lock;
         // lock_raw paired with the unlock below.
         let saved = unsafe { tcb_lock.lock_raw() };
-        // SAFETY: tcb valid; state is written under the held sched_lock.
-        let state = unsafe { (*tcb).state };
-        // SAFETY: tcb valid; ipc_state is written under the held sched_lock.
-        let ipc_state = unsafe { (*tcb).ipc_state };
-        // SAFETY: tcb valid; in_fault_delivery is written by the thread under
-        // its sched_lock, held here.
-        let in_delivery = unsafe { (*tcb).in_fault_delivery };
-        let blocked = state == thread::ThreadState::Blocked;
-        let fault_parked = ipc_state == thread::IpcThreadState::BlockedOnFault;
-        // A delivery no handler was receiving for waits on the send queue
-        // until a receive rebinds it to BlockedOnFault; its frame is the
-        // delivery's, as a fault-parked one's.
-        let hold = if !blocked
-        {
-            FrameHold::Stopped
-        }
-        else if fault_parked
-            || (ipc_state == thread::IpcThreadState::BlockedOnSend && in_delivery)
-        {
-            FrameHold::Fault
-        }
-        else
-        {
-            FrameHold::Syscall
-        };
-        // A write keeps the fault-parked set: a delivery its handler holds.
-        let admitted = state == thread::ThreadState::Stopped
-            || (blocked && (mode == FrameAccess::Read || fault_parked));
+        // SAFETY: tcb valid; its sched_lock is held.
+        let FrameLook {
+            hold,
+            hold_stopped,
+            blocked,
+            admitted,
+        } = unsafe { frame_look(tcb, mode) };
         let look = if admitted
         {
             // No admitted state can become `current` while this sched_lock
@@ -3916,7 +3990,13 @@ pub unsafe fn with_held_frame<R>(
             let saved_regs = unsafe { (*tcb).context_saved.load(Ordering::Acquire) } != 0;
             if off_cpu && saved_regs
             {
-                Look::Held(hold)
+                // The thread stored its syscall number before the save the
+                // Acquire above observed.
+                let in_syscall = hold_stopped
+                    && hold == FrameHold::Stopped
+                    // SAFETY: tcb valid; syscall_nr is an atomic.
+                    && unsafe { (*tcb).syscall_nr.load(Ordering::Relaxed) } != u64::MAX;
+                Look::Held(if in_syscall { FrameHold::Syscall } else { hold })
             }
             else if blocked
             {
@@ -4043,6 +4123,55 @@ pub unsafe fn pin_thread_aspace(
     pinned
 }
 
+/// Unlink `tcb`, linked at `priority`, from whichever run queue holds it:
+/// the drain of a `Stopped` or `Exited` commit. A no-op on a queue that does
+/// not hold it.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold the scheduler lock of each
+/// of the `cpu_count` CPUs.
+#[cfg(not(test))]
+unsafe fn drain_from_every_queue(tcb: *mut ThreadControlBlock, priority: u8, cpu_count: usize)
+{
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
+        let sched = unsafe { scheduler_for(cpu) };
+        // SAFETY: this CPU's lock is held (contract); tcb valid.
+        unsafe { sched.remove_from_queue(tcb, priority) };
+    }
+}
+
+/// The [`hold::start_decision`] of a start of `tcb`: its state and hold mark,
+/// and the hold state of its space, which a hold sets before it takes this
+/// `sched_lock` to walk the thread (`hold::hold_space`), so a start the walk
+/// does not find reads the hold.
+///
+/// # Safety
+/// `tcb` must be valid and not `Exited`, and the caller must hold its
+/// `sched_lock`: a thread not `Exited` under its `sched_lock` keeps its
+/// space's wrapper page live (as in [`pin_thread_aspace`]).
+#[cfg(not(test))]
+unsafe fn start_decision_of(tcb: *mut ThreadControlBlock) -> hold::StartDecision
+{
+    // SAFETY: tcb valid (contract); address_space is read-only after creation.
+    let aspace = unsafe { (*tcb).address_space };
+    let space = if aspace.is_null()
+    {
+        hold::HoldState::Free
+    }
+    else
+    {
+        // SAFETY: aspace is the live space of tcb (contract).
+        unsafe { (*aspace).hold_state() }
+    };
+    // SAFETY: tcb valid; state is written under its sched_lock, held.
+    let state = unsafe { (*tcb).state };
+    // SAFETY: as for state.
+    let mark = unsafe { (*tcb).hold };
+    hold::start_decision(space, state, mark)
+}
+
 /// Shared body of [`set_state_under_all_locks`], [`exit_under_all_locks`],
 /// [`commit_cancelling_park`], and [`start_under_all_locks`].
 ///
@@ -4058,10 +4187,13 @@ pub unsafe fn pin_thread_aspace(
 /// `park_seq` differs under the locks (a park committed after the caller's
 /// snapshot); otherwise always `Some`. With `start` (a `SYS_THREAD_START`
 /// commit), refuses ([`StateCommit::RefusedState`]) a TCB that is neither
-/// `Created` nor `Stopped` under the locks, returns `None` without writing
-/// while the TCB is not yet safe to link ([`start_ready_to_link`]), and on a
-/// commit advances the TCB's `start_seq` and stores the new value through
-/// `start`.
+/// `Created` nor `Stopped` under the locks or that an address-space hold
+/// stopped, returns `None` without writing while the TCB is not yet safe to
+/// link ([`start_ready_to_link`]), commits `Stopped` with the hold mark
+/// set when the TCB's space is held ([`StateCommit::Deferred`]; the decision
+/// is [`hold::start_decision`]), and otherwise on a commit advances the TCB's
+/// `start_seq` and stores the new value through `start`. A `Stopped` or
+/// `Exited` commit clears the hold mark.
 ///
 /// # Safety
 /// As for [`set_state_under_all_locks`].
@@ -4104,23 +4236,42 @@ unsafe fn commit_state_under_all_locks(
     // `Exited` is terminal (see the function doc): read under the same locks
     // every writer of `state` on this path holds. `park_seq` is written only
     // under the held sched_lock.
-    let startable = matches!(
-        // SAFETY: tcb validated by caller; state is read under the held locks.
-        unsafe { (*tcb).state },
-        thread::ThreadState::Created | thread::ThreadState::Stopped
-    );
-    // SAFETY: as for startable.
+    // SAFETY: tcb validated by caller; state is read under the held locks.
     let exited = unsafe { (*tcb).state } == thread::ThreadState::Exited;
     let park_changed = expected_park_seq.is_some_and(|seq| {
         // SAFETY: tcb validated by caller; park_seq is atomic.
         seq != unsafe { (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed) }
     });
-    let wrong_state = start.is_some() && !startable;
+    // SAFETY: tcb is valid and its sched_lock is held; a thread not `Exited`
+    // keeps its space live.
+    let decision = start
+        .as_ref()
+        .filter(|_| !exited)
+        .map(|_| unsafe { start_decision_of(tcb) });
+    let wrong_state = decision == Some(hold::StartDecision::Refuse);
+    let deferred = decision == Some(hold::StartDecision::Defer);
+    // A deferred start, too, waits for the thread to settle: the release then
+    // finds every thread it starts off-CPU, its save published.
     let start_unsettled = start.is_some()
-        && startable
+        && !wrong_state
         // SAFETY: tcb is valid, and its sched_lock and every CPU's scheduler
         // lock are held.
         && !unsafe { start_ready_to_link(tcb, cpu_count) };
+    // A deferred start commits Stopped, marked for the release to start; a stop
+    // or an exit ends whatever a hold did to the thread, so the release leaves
+    // it as this commit leaves it.
+    let (state_out, mark_out) = if deferred
+    {
+        (thread::ThreadState::Stopped, Some(hold::HoldMark::Stopped))
+    }
+    else
+    {
+        let ends = matches!(
+            new_state,
+            thread::ThreadState::Stopped | thread::ThreadState::Exited
+        );
+        (new_state, ends.then_some(hold::HoldMark::None))
+    };
     let mut running_on: Option<usize> = None;
     if !exited && !park_changed && !wrong_state && !start_unsettled
     {
@@ -4141,12 +4292,16 @@ unsafe fn commit_state_under_all_locks(
             {
                 (*tcb).exit_reason = reason;
             }
-            if let Some(seq) = start
+            if let Some(seq) = start.filter(|_| !deferred)
             {
                 (*tcb).start_seq = (*tcb).start_seq.wrapping_add(1);
                 *seq = (*tcb).start_seq;
             }
-            (*tcb).state = new_state;
+            (*tcb).state = state_out;
+            if let Some(mark) = mark_out
+            {
+                (*tcb).hold = mark;
+            }
             (*tcb).priority
         };
 
@@ -4155,31 +4310,20 @@ unsafe fn commit_state_under_all_locks(
         // core/kernel/docs/scheduling-internals.md § ThreadState Transitions,
         // "Stopped/Exited drain".
         if matches!(
-            new_state,
+            state_out,
             thread::ThreadState::Stopped | thread::ThreadState::Exited
         )
         {
-            for cpu in 0..cpu_count
-            {
-                // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-                let sched = unsafe { scheduler_for(cpu) };
-                // SAFETY: this CPU's lock is held; tcb valid.
-                unsafe {
-                    sched.remove_from_queue(tcb, priority);
-                }
-            }
+            // SAFETY: every CPU's lock is held; tcb valid.
+            unsafe { drain_from_every_queue(tcb, priority, cpu_count) };
         }
 
         // Identify which CPU (if any) currently has tcb as `current`.
-        for cpu in 0..cpu_count
-        {
+        running_on = (0..cpu_count).find(|&cpu| {
             // SAFETY: cpu < cpu_count; scheduler slab initialised by init().
-            if unsafe { scheduler_for(cpu).current() } == tcb
-            {
-                running_on = Some(cpu);
-                break;
-            }
-        }
+            let sched = unsafe { scheduler_for(cpu) };
+            sched.current() == tcb
+        });
     }
 
     // Release all CPU locks in descending order, then (*tcb).sched_lock last.
@@ -4208,6 +4352,10 @@ unsafe fn commit_state_under_all_locks(
     {
         Some(StateCommit::RefusedState)
     }
+    else if deferred
+    {
+        Some(StateCommit::Deferred)
+    }
     else
     {
         Some(StateCommit::Committed(running_on))
@@ -4227,8 +4375,14 @@ pub enum StateCommit
     /// Nothing was written: the thread is `Exited`, which is terminal.
     RefusedExited,
     /// Nothing was written: a [`start_under_all_locks`] commit found the
-    /// thread neither `Created` nor `Stopped`.
+    /// thread neither `Created` nor `Stopped`, or stopped by an address-space
+    /// hold.
     RefusedState,
+    /// A [`start_under_all_locks`] commit found the thread's address space
+    /// held: the thread is committed `Stopped` and marked for the release to
+    /// start (core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space
+    /// Hold), linked nowhere.
+    Deferred,
 }
 
 /// Wait until `tcb` has left every CPU and its in-flight register save has
@@ -6411,6 +6565,41 @@ pub unsafe fn enqueue_and_wake(tcb: *mut ThreadControlBlock, target_cpu: usize)
         }
     }
 
+    // An address-space hold marked this thread while it was parked: the wake
+    // ends the park as usual, its outcome already deposited in the TCB, but
+    // commits `Stopped` instead of linking it, so the thread resumes, and reads
+    // that outcome, only when the release starts it
+    // (core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space Hold).
+    // The park's binding is cleared as on the link path below, and the pin is
+    // released before the unlock, as on the `Ready | Stopped` arm. A thread
+    // still `current` in its voluntary-block window leaves its CPU through the
+    // `schedule()` its park ends in, whose requeue skips a `Stopped` thread.
+    // SAFETY: tcb valid; the hold mark is written under sched_lock, held here.
+    if hold::diverts(unsafe { (*tcb).hold })
+    {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a field of `tcb` that its sched_lock, held, serialises"
+        )]
+        // SAFETY: tcb valid; these fields are written under sched_lock, held.
+        unsafe {
+            (*tcb).state = thread::ThreadState::Stopped;
+            (*tcb).hold = hold::HoldMark::Stopped;
+            (*tcb).ipc_state = thread::IpcThreadState::None;
+            (*tcb).blocked_on_object = core::ptr::null_mut();
+            (*tcb).wake_pending = false;
+        }
+        // SAFETY: tcb valid; wake_in_flight is atomic, released under sched_lock.
+        unsafe {
+            (*tcb)
+                .wake_in_flight
+                .store(0, core::sync::atomic::Ordering::Release);
+        }
+        // SAFETY: paired with the lock_raw above.
+        unsafe { tcb_lock.unlock_raw(sched_saved) };
+        return;
+    }
+
     // Link path (state was Blocked|Created). Acquire the target run-queue lock
     // UNDER sched_lock.
     // SAFETY: caller guarantees target_cpu is initialized.
@@ -7072,7 +7261,28 @@ pub unsafe fn schedule(requeue: Requeue)
             linked: already_queued,
             dispatched_on,
         };
-        if outgoing.requeue(requeue, cpu)
+        // A runnable `current` an address-space hold marked leaves its CPU
+        // `Stopped` instead of requeued, linked nowhere, for the release to
+        // start (core/kernel/docs/thread-lifecycle-and-sleep.md § Address-Space
+        // Hold). It is decided before the cross-CPU branch, so a thread with
+        // hard affinity elsewhere is not linked there either.
+        // SAFETY: current is a valid TCB; its hold mark is written under its
+        // sched_lock, held here.
+        let held = outgoing.requeue(requeue, cpu) && hold::diverts(unsafe { (*current).hold });
+        if held
+        {
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "both fields are of `current`, a valid TCB whose sched_lock this CPU holds"
+            )]
+            // SAFETY: current is a valid TCB; state and hold are written under
+            // its sched_lock, held here.
+            unsafe {
+                (*current).state = ThreadState::Stopped;
+                (*current).hold = hold::HoldMark::Stopped;
+            }
+        }
+        else if outgoing.requeue(requeue, cpu)
         {
             // SAFETY: current is a valid TCB; its priority is written under its
             // sched_lock, held here.

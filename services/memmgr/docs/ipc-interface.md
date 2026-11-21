@@ -296,8 +296,8 @@ charge. The charge stays on the node when the node's handle state goes
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant would take the growth floor from a caller outside the system reserve |
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant would take the growth floor from a caller outside the system reserve, or deriving the caller's copy failed |
+| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant, charged to a node outside the system reserve, would take the growth floor |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant, charged to a node outside the system reserve, would take the growth floor, or deriving the caller's copy failed |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), memmgr could not map a selected run to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
 | 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, badge unknown, or, with `REQUEST_CHARGE_NODE`, `cap[0]` missing, not a node handle, or naming no handle state |
 | 8 | `LIMIT` | `want_pages` would take the subtree of the node the grant is charged to, or of an ancestor, over its max |
@@ -628,9 +628,9 @@ evicted or restored. `largest_free_bytes`
 `DEMAND_CHUNK_PAGES` pages while `data[3]` is not zero, a demand fault is
 backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
 (`data[6]`) is `pool_total / 64` pages. `growth_floor_bytes` (`data[11]`) is
-the reserve while nothing is swapped: a process outside the reserve has its
-grants refused, and its demand faults declined, once `data[17]` less the
-request would fall below it, and the level is
+the reserve while nothing is swapped: a grant charged to a node outside the
+reserve is refused, and a demand fault of a process outside the reserve
+declined, once `data[17]` less the request would fall below it, and the level is
 `PRESSURE_CRITICAL` at or below it. `pressure` (`data[7]`) is the
 level memmgr last signalled to the `REGISTER_PRESSURE` registrants, so a
 registrant woken by its bit reads here the level the bit announced, or a later

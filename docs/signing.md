@@ -30,21 +30,23 @@ platform's firmware baseline in [platform-requirements.md](platform-requirements
 
 ## Implementation Status
 
-The primitives exist: [`shared/crypto`](../shared/crypto/README.md) provides `ed25519_verify` and
-`Sha512`, tested against known-answer vectors, Wycheproof, and reference vectors computed with
-OpenSSL, and, behind its `sign` feature, the key generation and signing that § Signing requires of
-it (`ed25519_public_key`, `ed25519_sign`), tested against the same reference vectors and the
-verifier; xtask, the host signer, enables the feature, and core/boot enables it as a dev-dependency
-only, since its host tests sign fixtures. The formats of § Signed Object Format, § Certificate
-Format and § Trust Store, and the verification of § Verification, are implemented and host-tested in
-[`shared/objsig`](../shared/objsig/README.md), which xtask and the bootloader link. xtask's keys and
-signing of § Signing are implemented: every build signs the kernel, every ELF image of the root
-filesystem, the files of its data trees and the data files the bundle lists name, each once, in the
-sysroot, under the role set and the name of § Signed Attributes, composes the ESP by copying the
-installed files, builds the trust store at the path § Signing names, and embeds it in the
-bootloader. The bootloader verifies the kernel and every bundle entry against that store and hands
-the store to procmgr (§ Trust Store), which parses it and keeps it. procmgr verifies every image it
-creates against that store before it parses it (§ Verifier Discipline), under its creator's
+The primitives exist: [`shared/crypto`](../shared/crypto/README.md) provides `ed25519_verify`,
+`ml_dsa::verify` and `Sha512`, tested against known-answer vectors, Wycheproof, and reference
+vectors computed with OpenSSL, and, behind its `sign` feature, the key generation and signing that
+§ Signing requires of it (`ed25519_public_key`, `ed25519_sign`, `ml_dsa::public_key`,
+`ml_dsa::sign`), tested against the same reference vectors and the verifiers. The composite
+signature of § Composite Signature, the formats of § Signed Object Format, § Certificate Format and
+§ Trust Store, and the verification of § Verification, are implemented and host-tested in
+[`shared/objsig`](../shared/objsig/README.md), which xtask and the bootloader link; its `sign`
+feature, which enables `shared/crypto`'s, composes the signers. xtask, the host signer, enables the
+feature, and core/boot enables it as a dev-dependency only, since its host tests sign fixtures.
+xtask's keys and signing of § Signing are implemented: every build signs the kernel, every ELF image
+of the root filesystem, the files of its data trees and the data files the bundle lists name, each
+once, in the sysroot, under the role set and the name of § Signed Attributes, composes the ESP by
+copying the installed files, builds the trust store at the path § Signing names, and embeds it in
+the bootloader. The bootloader verifies the kernel and every bundle entry against that store and
+hands the store to procmgr (§ Trust Store), which parses it and keeps it. procmgr verifies every
+image it creates against that store before it parses it (§ Verifier Discipline), under its creator's
 signature policy and the name the creator gives (§ Signature Policy in procmgr), and verifies a data
 file in the data role at its reader's request (`procmgr_labels::READ_VERIFIED`, § Verifier
 Discipline), which svctest's `procmgr_read_verified` phase exercises on both architectures, and
@@ -155,11 +157,11 @@ The footer is the object's last 16 bytes:
 |---|---|---|
 | 0 | 4 | `records_len`: the length in bytes of the record block |
 | 4 | 2 | `record_count`: the number of records, 1 to `MAX_RECORDS` (8) |
-| 6 | 2 | `version`: 1 |
+| 6 | 2 | `version`: 2 |
 | 8 | 8 | magic `SERAPHSG` |
 
 `MAX_RECORDS` bounds the work a verifier does for one object, since every record that chains to a
-trusted root costs up to two signature verifications.
+trusted root costs up to two composite signature verifications.
 
 ### Record
 
@@ -168,18 +170,19 @@ trusted root costs up to two signature verifications.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | `record_len`: the record's length in bytes, this field included |
-| 4 | 1 | `algorithm`: 1 = Ed25519 |
+| 4 | 1 | `algorithm`: 2 = the composite of Ed25519 and ML-DSA-65 (§ Composite Signature) |
 | 5 | 1 | `cert_count`: 0 or 1 |
 | 6 | 2 | `attrs_len`: the length of the signed attributes |
 | 8 | 16 | `signer_key_id`: the key id of the key that made `signature` |
 | 24 | `attrs_len` | The signed attributes |
-| 24 + `attrs_len` | 148 × `cert_count` | The certificate of the signing key, when it is not a root |
-| `record_len` − 64 | 64 | `signature`: Ed25519 (RFC 8032, pure) over the signed attributes |
+| 24 + `attrs_len` | 5,409 × `cert_count` | The certificate of the signing key, when it is not a root |
+| `record_len` − 3,373 | 3,373 | `signature`: the composite signature over the signed attributes |
 
-`record_len` is exactly 88 + `attrs_len` + 148 × `cert_count`, and the records' lengths add up
-exactly to `records_len`.
+`record_len` is exactly 3,397 + `attrs_len` + 5,409 × `cert_count`, and the records' lengths add
+up exactly to `records_len`. A record with a certificate and a name of 20 bytes is 8,925 bytes.
 
-A key id is the first 16 bytes of the SHA-512 of the key's 32-byte Ed25519 public key. It is always
+A key id is the first 16 bytes of the SHA-512 of the key's 1,984-byte composite public key, both
+halves. It is always
 computed from a key and never taken from the wire as the identity of one: a record's
 `signer_key_id` selects a key, and the verifier checks that the key it selected has that id.
 
@@ -189,24 +192,31 @@ The signature covers the encoded attributes and nothing else:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 16 | Domain tag: `seraph/obj/v2` padded with NUL bytes to 16 |
+| 0 | 16 | Domain tag: `seraph/obj/v3` padded with NUL bytes to 16 |
 | 16 | 8 | `body_len`: the body's length in bytes |
 | 24 | 4 | `security_version` |
-| 28 | 1 | `roles`: the set of roles the object may be loaded in (below) |
-| 29 | 1 | `arch`: 1 = x86-64, 2 = riscv64 |
-| 30 | 2 | `name_len`: 1 or more |
+| 28 | 4 | `roles`: the set of roles the object may be loaded in (below) |
 | 32 | 64 | `body_hash`: the SHA-512 of the body |
-| 96 | `name_len` | `name` |
+| 96 | 2 | `name_len`: 1 or more |
+| 98 | 1 | `arch`: 1 = x86-64, 2 = riscv64 |
+| 99 | `name_len` | `name` |
 
-`attrs_len` is exactly 96 + `name_len`. The domain tag keeps an object signature from ever being
-read as a certificate signature, whose signed bytes begin with another tag, and names the
-attributes' version: a record whose attributes carry the tag of another version does not parse,
-so a single kind of an older encoding is never read as a set.
+`attrs_len` is exactly 99 + `name_len`. The fixed fields lie at the offsets their widths would
+align them to, the one-byte `arch` last, though no decoder relies on it. The domain tag keeps an
+object signature from ever being read as a certificate signature, whose signed bytes begin with
+another tag, and names the attributes' version: a record whose attributes carry the tag of another
+version does not parse, so a single kind of an older encoding is never read as a set.
 
 An object has one identity: one record per signer states every role it may be loaded in, under
-one name. `roles` has bit `n` set for each role `n` of the table below, the bits a certificate's
-`usage` uses for the same roles (§ Certificate Format). Bit 0 is zero, at least one bit is set,
-and a set that holds kernel or init holds no other role.
+one name.
+
+**Role bits.** Every 32-bit set of roles in the system has one numbering: a record's `roles`, and
+the `usage` of a certificate (§ Certificate Format) and of an anchor (§ Trust Store). Bit `n` is
+role `n` of the table below, for bits 1 to 7. Bit 31 is `CERTIFY`, the right to issue
+certificates, valid in a `usage` alone and refused in a record's `roles`. Bit 0 and bits 8 to 30
+are no role: a set with any of them set is refused wherever it appears, until a role is defined for
+the bit. A record's `roles` has at least one role, and a set that holds kernel or init holds no
+other role.
 
 | Role `n` | Name | Objects |
 |---|---|---|
@@ -241,28 +251,68 @@ nothing is skipped, so the canonical form needs no knowledge of the body's forma
 
 ---
 
+## Composite Signature
+
+Implemented by [`shared/objsig`](../shared/objsig/README.md) (`objsig::composite`), on the
+primitives of [`shared/crypto`](../shared/crypto/README.md).
+
+Every signature in the system is one composite: an Ed25519 signature and an ML-DSA-65 signature
+over the same message, valid only when both verify. It is algorithm 2, the one algorithm a record
+names, and it signs every record and every certificate; every key a record, a certificate or an
+anchor holds is a composite key. There is no other algorithm, no transition state and no policy
+over algorithms: a record naming any algorithm but 2 does not parse, and refuses the object. The
+earlier format, Ed25519 alone (algorithm 1, footer version 1, certificate tag `seraph/cert/v1`,
+store version 1), is not read.
+
+| Part | Size | Layout |
+|---|---|---|
+| Public key | 1,984 | The Ed25519 public key (32) then the ML-DSA-65 public key (1,952) |
+| Signature | 3,373 | The Ed25519 signature (64) then the ML-DSA-65 signature (3,309) |
+| Secret | 64 | The Ed25519 secret seed (32) then the ML-DSA-65 key-generation seed (32) |
+
+- **The Ed25519 half** is RFC 8032 Ed25519, pure, over the message.
+- **The ML-DSA-65 half** is FIPS 204 ML-DSA-65, the pure form, over the message with the context
+  string `seraph/sig/ed25519+ml-dsa-65` (28 bytes), signed deterministically. The context string
+  binds the half to this construction: an ML-DSA-65 signature the same key made in any other use
+  does not verify as the half of a composite.
+- **Verification** checks the Ed25519 half, then the ML-DSA-65 half, and refuses the signature on
+  the first that fails. A forgery needs both schemes broken: Ed25519 falls to a quantum attacker,
+  and ML-DSA rests on a lattice assumption younger than Ed25519's and on the project's own code.
+  Against a quantum attacker the composite is as strong as ML-DSA-65.
+- **The secret** is two seeds, each drawn on its own from the host's random source: neither half's
+  key is derived from the other's, nor from a seed they share. Each half derives its key from its
+  seed as its standard specifies (RFC 8032 § 5.1.5, FIPS 204 Algorithm 6).
+
+The messages are short and carry their own domain tags (`seraph/obj/v3` for a record's signed
+attributes, `seraph/cert/v2` for a certificate's signed bytes), so neither half hashes the message
+first and the Ed25519 half needs no context of its own. Seraph's encoding of the composite is its
+own, like the formats above, and not the X.509 encoding of the IETF composite signature drafts.
+
+---
+
 ## Certificate Format
 
 Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign and the
 bootloader to verify.
 
-Seraph's certificate is a fixed 148-byte record, not X.509: no ASN.1 parser enters the bootloader,
-and Ed25519 is the only algorithm. A root (an anchor of the trust store) issues it to a signing key:
+Seraph's certificate is a fixed 5,409-byte record, not X.509: no ASN.1 parser enters the
+bootloader, and the composite is the only algorithm (§ Composite Signature). A root (an anchor of
+the trust store) issues it to a signing key:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 16 | Domain tag: `seraph/cert/v1` padded with NUL bytes to 16 |
-| 16 | 32 | `subject_key`: the signing key's Ed25519 public key |
-| 48 | 16 | `issuer_key_id`: the key id of the root that issued it |
-| 64 | 8 | `serial` |
-| 72 | 4 | `usage` (below) |
-| 76 | 4 | `min_security_version` |
-| 80 | 4 | `max_security_version`, at least `min_security_version` |
-| 84 | 64 | `signature`: Ed25519 by the issuer over bytes 0 to 83 |
+| 0 | 16 | Domain tag: `seraph/cert/v2` padded with NUL bytes to 16 |
+| 16 | 1,984 | `subject_key`: the signing key's composite public key |
+| 2,000 | 16 | `issuer_key_id`: the key id of the root that issued it |
+| 2,016 | 8 | `serial` |
+| 2,024 | 4 | `usage` (below) |
+| 2,028 | 4 | `min_security_version` |
+| 2,032 | 4 | `max_security_version`, at least `min_security_version` |
+| 2,036 | 3,373 | `signature`: the issuer's composite signature over bytes 0 to 2,035 |
 
-The `usage` mask has bit `n` set for each role `n` the key may sign (bits 1 to 7) and bit 31,
-`CERTIFY`, set when the key may issue certificates. Every other bit is zero. A certificate's
-`CERTIFY` bit is clear: the chain is at most two keys deep (a root, a signing key, the object), so
+The `usage` mask is a set of roles in the numbering of § Signed Attributes (Role bits): the roles
+the key may sign, and `CERTIFY` when the key may issue certificates. A certificate's `CERTIFY` bit
+is clear: the chain is at most two keys deep (a root, a signing key, the object), so
 a signing key certifies nothing. A root signs an object directly when its record carries no
 certificate.
 
@@ -285,21 +335,21 @@ lowest security version it runs.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | magic `SRPHTRST` |
-| 8 | 2 | `version`: 1 |
+| 8 | 2 | `version`: 2 |
 | 10 | 2 | `anchor_count`: 1 or more |
 | 12 | 2 | `revoked_count` |
 | 14 | 4 | `security_floor` |
-| 18 | 72 × `anchor_count` | The anchors |
-| 18 + 72 × `anchor_count` | 16 × `revoked_count` | The revoked key ids |
+| 18 | 2,024 × `anchor_count` | The anchors |
+| 18 + 2,024 × `anchor_count` | 16 × `revoked_count` | The revoked key ids |
 
-An anchor is 72 bytes:
+An anchor is 2,024 bytes:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 32 | `key`: the root's Ed25519 public key |
-| 32 | 4 | `usage`: as a certificate's, `CERTIFY` allowed |
-| 36 | 4 | `flags`: bit 0, `LOCAL`, marks a root generated on the build machine; every other bit is zero |
-| 40 | 32 | `label`: a nonempty UTF-8 name, padded with NUL bytes |
+| 0 | 1,984 | `key`: the root's composite public key |
+| 1,984 | 4 | `usage`: as a certificate's, `CERTIFY` allowed |
+| 1,988 | 4 | `flags`: bit 0, `LOCAL`, marks a root generated on the build machine; every other bit is zero |
+| 1,992 | 32 | `label`: a nonempty UTF-8 name, padded with NUL bytes |
 
 The anchors are sorted by key id, strictly ascending, so no two share one and a lookup is a binary
 search; the revoked key ids are sorted the same way. The blob's length is exactly the sum of its
@@ -335,7 +385,7 @@ the attributes and the anchor of the record that passed, or one refusal.
 1. **Footer.** The object is at least 16 bytes long; its footer's magic and version match;
    `record_count` is 1 to `MAX_RECORDS`; `records_len` is at most the object's length less 16.
 2. **Records.** Every record parses: its lengths obey § Record and § Signed Attributes, its
-   `algorithm` is 1, its attributes carry their domain tag, a `roles` set that obeys § Signed
+   `algorithm` is 2, its attributes carry their domain tag, a `roles` set that obeys § Signed
    Attributes and a defined `arch` value, its certificate (when present) carries its domain tag, a
    clear `CERTIFY` bit, no undefined usage bit and a range whose maximum is at least its minimum,
    and the records fill the record block exactly. A body whose last 8 bytes are the footer magic is
@@ -345,8 +395,8 @@ the attributes and the anchor of the record that passed, or one refusal.
    record passes when:
    - its signing key chains to an anchor: with no certificate, `signer_key_id` is an anchor's key
      id and the anchor is the signing key; with a certificate, `issuer_key_id` is an anchor's key
-     id, that anchor's `usage` has `CERTIFY`, the certificate's signature verifies under the
-     anchor's key, and `signer_key_id` is the key id of `subject_key`;
+     id, that anchor's `usage` has `CERTIFY`, the certificate's composite signature verifies under
+     the anchor's key, and `signer_key_id` is the key id of `subject_key`;
    - neither the anchor's key id nor the signing key's is revoked;
    - every role of `roles` is in the signing key's usage (with a certificate, in both the
      certificate's and the anchor's), and `roles` holds a role of the caller's set;
@@ -354,18 +404,20 @@ the attributes and the anchor of the record that passed, or one refusal.
    - `body_len` and `body_hash` equal the body's length and hash;
    - `security_version` is at least the store's floor and, with a certificate, inside the
      certificate's range;
-   - `signature` verifies under the signing key with
-     [`ed25519_verify`](../shared/crypto/README.md).
+   - `signature` verifies under the signing key as a composite signature, both halves
+     (§ Composite Signature).
 5. **Refusal.** When no record passes, the object is refused. The refusal says whether any record
    named an anchor (by `signer_key_id` without a certificate, by the certificate's
    `issuer_key_id` with one) and, when one did, the check the first such record failed, so a log
    tells an object from an untrusted root from one whose trusted record failed.
 
-A verifier that checks several objects MAY hold each certificate whose signature has verified,
-with the anchor key it verified under, and take the signature check of a record whose
-certificate and anchor key equal a held pair as passed. The check is a function of those bytes
-alone, so the result is the one a fresh verification gives, and every other check of step 4 is
-made for every record. The bootloader holds the certificates for the whole boot, so the
+A verifier that checks several objects MAY hold, for each certificate whose signature has
+verified, the SHA-512 of the anchor key it verified under followed by the certificate, and take
+the signature check of a record whose anchor key and certificate give a held digest as passed.
+The check is a function of those bytes alone, and a digest stands for them unless SHA-512
+collides, on which every signature already rests, so the result is the one a fresh verification
+gives; every other check of step 4 is made for every record. A digest is 64 bytes where the key
+and the certificate are 7,393. The bootloader holds the certificates for the whole boot, so the
 certificate every object of one signing key carries is verified once.
 
 A record that chains to no anchor is how one object carries the signatures of several parties:
@@ -450,13 +502,16 @@ a mode or a mount. How a deployer grants the override, and changes the grant on 
 is decided with the authority work of [#152](https://github.com/kottlerg/seraph/issues/152) and the
 package manager, and the record carries it from then.
 
-Each create therefore costs one Ed25519 verification of its image, with the SHA-512 of the image,
-and one more, of the signer's certificate, when procmgr's certificate cache
+Each create therefore costs one composite verification of its image, with the SHA-512 of the
+image, and one more, of the signer's certificate, when procmgr's certificate cache
 (`CERTIFICATE_CACHE_LEN`, 4, the oldest replaced first) does not hold it, or when another create's
-write-back of the cache lost it ([`shared/objsig`](../shared/objsig/README.md)). On
-riscv64 under QEMU's TCG emulation that verification is several times slower in procmgr than in
-the bootloader: about 50 to 70 ms per verification (a debug build at 4 vCPUs), against about 10 ms
-for the same code built without the vector extension. Userspace is built for
+write-back of the cache lost it ([`shared/objsig`](../shared/objsig/README.md)). A composite
+verification is one Ed25519 verification and one ML-DSA-65 verification (§ Composite Signature).
+The ML-DSA-65 half's cost is not yet measured
+([#1076](https://github.com/kottlerg/seraph/issues/1076)). On riscv64 under QEMU's TCG emulation
+the Ed25519 half is several times slower in procmgr than in the bootloader: about 50 to 70 ms per
+verification (a debug build at 4 vCPUs), against about 10 ms for the same code built without the
+vector extension. Userspace is built for
 `xtask/targets/riscv64a23-seraph.json`, which enables the vector extension (`+v`), so LLVM
 vectorizes the field multiplication, the conditional swap and the point addition of
 [`shared/crypto`](../shared/crypto/README.md) with RVV instructions; the bootloader's target has
@@ -472,22 +527,25 @@ Implemented in xtask; the options are in
 [xtask/README.md](../xtask/README.md#signing) § Signing.
 
 **Keys.** Every builder generates a local root and a signing key on its first build, in a per-user
-directory outside the work tree (`seraph/signing` in the user's data directory, or the directory
-`SERAPH_SIGNING_DIR` names); the root certifies the signing key, and the store lists the root
-with `LOCAL`. The root's secret key certifies the signing key once and is never written: the
-directory holds the signing key's secret seed, readable by its owner alone, its certificate, and
-the store of the anchors it contributes. xtask refuses a directory or a key file whose canonical
-path lies inside the work tree, `target/` included. CI generates its keys per job in the runner's
-temporary directory and discards them.
+directory outside the work tree (`seraph/signing/ed25519-ml-dsa-65` in the user's data directory,
+or the directory `SERAPH_SIGNING_DIR` names); the root certifies the signing key, and the store
+lists the root with `LOCAL`. The root's secret key certifies the signing key once and is never
+written: the directory holds the signing key's secret, its two seeds (§ Composite Signature),
+readable by its owner alone, its certificate, and the store of the anchors it contributes. The
+default directory's last component names the signature algorithm, so an identity of the earlier
+Ed25519 format, in the directory that format used, is never loaded; xtask refuses a directory
+`SERAPH_SIGNING_DIR` names that holds one, saying that its format is the reason. xtask refuses a
+directory or a key file whose canonical path lies inside the work tree, `target/` included. CI
+generates its keys per job in the runner's temporary directory and discards them.
 
 **External signer.** In place of a key file, xtask runs a configured signer command
 (`SERAPH_SIGNER`): it receives the encoded signed attributes on its standard input and writes the
-64-byte signature to its standard output, which is how a hardware token or a CI secret signs. The
-identity directory then holds the signing key's certificate, or its public key when it is a root,
-and the store, and no secret. xtask verifies every signed object under the trust store it builds,
-with each of its roles, its name and the architecture its loaders expect, before it writes it, so a
-faulty signer, or a store that does not trust the key, fails the pack instead of writing an object
-its loader would refuse.
+3,373-byte composite signature to its standard output, which is how a hardware token or a CI secret
+signs. The identity directory then holds the signing key's certificate, or its public key when it is
+a root, and the store, and no secret. xtask verifies every signed object under the trust store it
+builds, with each of its roles, its name and the architecture its loaders expect, before it writes
+it, so a faulty signer, or a store that does not trust the key, fails the pack instead of writing an
+object its loader would refuse.
 
 **Store and bootloader.** Each command derives the store from the signing identity and the
 deployer's store its environment names. The bootloader's build embeds the store in the image's
@@ -500,9 +558,11 @@ otherwise sign under a store that bootloader refuses.
 
 **Implementation.** The host signer is Seraph's own: no crate from a registry is a dependency
 ([coding-standards.md](coding-standards.md) § Dependencies). Ed25519 key generation and signing
-join verification in [`shared/crypto`](../shared/crypto/README.md). xtask, the host caller, draws
-each key's 32-byte secret seed from the host's operating-system random source and passes it in;
-`shared/crypto`, which does no I/O, guarantees:
+join verification in [`shared/crypto`](../shared/crypto/README.md), and ML-DSA-65's beside
+them; `objsig::composite` composes them. xtask, the host caller, draws each half's 32-byte seed
+from the host's operating-system random source and passes it in. For ML-DSA-65, `shared/crypto`
+guarantees what its README states (the key from FIPS 204 Algorithm 6, the deterministic signature
+of Algorithm 2, its timing). For Ed25519, `shared/crypto`, which does no I/O, guarantees:
 
 - a public key is derived from its seed as RFC 8032 § 5.1.5 specifies;
 - a signature is deterministic, as RFC 8032 § 5.1.6 specifies: one key and one message give one
@@ -581,9 +641,8 @@ When the root is created, its key is held offline by the maintainer and certifie
 signing key per minor-version line, held only as a secret of a protected CI environment whose every
 run the maintainer approves. A system that trusts the project root may trust other roots beside it,
 or none but its own: an object signed by both carries both records, and each system accepts the one
-it trusts. A move to a post-quantum scheme through the record's `algorithm` field is
-[#1076](https://github.com/kottlerg/seraph/issues/1076); on-box key enrolment for self-hosted builds
-is [#1072](https://github.com/kottlerg/seraph/issues/1072).
+it trusts. On-box key enrolment for self-hosted builds is
+[#1072](https://github.com/kottlerg/seraph/issues/1072).
 
 ---
 

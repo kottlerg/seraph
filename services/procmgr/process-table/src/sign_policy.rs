@@ -252,9 +252,10 @@ mod tests
         ];
         for creator in creators
         {
+            // Every defined role is a bit of the low byte (RoleSet::ALL).
             for bits in 0..=u8::MAX
             {
-                let Some(roles) = RoleSet::from_signed(bits)
+                let Some(roles) = RoleSet::from_signed(u32::from(bits))
                 else
                 {
                     continue;

@@ -10,6 +10,7 @@
 //! [`TrustStore::parse`] checks the whole blob once and keeps borrowed
 //! slices of it; a lookup decodes only the anchor it finds.
 
+use crate::composite::PUBLIC_KEY_LEN;
 use crate::wire::{Reader, Writer, concat};
 use crate::{EncodeError, KEY_ID_LEN, KeyId, PublicKey, StoreError, Usage, key_id};
 
@@ -17,16 +18,16 @@ use crate::{EncodeError, KEY_ID_LEN, KeyId, PublicKey, StoreError, Usage, key_id
 pub const MAGIC: [u8; 8] = *b"SRPHTRST";
 
 /// The store format's version.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// The length of the store's header.
 pub const HEADER_LEN: usize = 18;
 
-/// The length of an anchor.
-pub const ANCHOR_LEN: usize = 72;
-
 /// The length of an anchor's label field.
 pub const LABEL_LEN: usize = 32;
+
+/// The length of an anchor: its key, usage, flags and label, 2,024 bytes.
+pub const ANCHOR_LEN: usize = PUBLIC_KEY_LEN + 4 + 4 + LABEL_LEN;
 
 /// The anchor flag that marks a root generated on the build machine.
 pub const FLAG_LOCAL: u32 = 1;
@@ -35,8 +36,8 @@ pub const FLAG_LOCAL: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Anchor<'a>
 {
-    /// The root's Ed25519 public key.
-    pub key: PublicKey,
+    /// The root's composite public key, borrowed from the store.
+    pub key: &'a PublicKey,
     /// The key id of [`Self::key`], computed.
     pub key_id: KeyId,
     /// The roles the root may sign directly, and whether it may certify.
@@ -51,8 +52,8 @@ pub struct Anchor<'a>
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnchorSpec<'a>
 {
-    /// The root's Ed25519 public key.
-    pub key: PublicKey,
+    /// The root's composite public key.
+    pub key: &'a PublicKey,
     /// The root's usage.
     pub usage: Usage,
     /// Whether the root was generated on the build machine.
@@ -147,7 +148,9 @@ impl<'a> TrustStore<'a>
     {
         let index = self
             .anchors
-            .binary_search_by(|raw| key_id(&anchor_key(raw)).cmp(id))
+            .binary_search_by(|raw| {
+                anchor_key(raw).map_or(core::cmp::Ordering::Less, |key| key_id(key).cmp(id))
+            })
             .ok()?;
         decode_anchor(self.anchors.get(index)?).ok()
     }
@@ -215,7 +218,7 @@ impl<'a> TrustStore<'a>
             || anchors.iter().any(|anchor| !label_is_valid(anchor.label))
             || anchors
                 .windows(2)
-                .any(|pair| matches!(pair, [a, b] if key_id(&a.key) >= key_id(&b.key)))
+                .any(|pair| matches!(pair, [a, b] if key_id(a.key) >= key_id(b.key)))
             || revoked
                 .windows(2)
                 .any(|pair| matches!(pair, [a, b] if a >= b))
@@ -232,7 +235,7 @@ impl<'a> TrustStore<'a>
         {
             let flags = if anchor.local { FLAG_LOCAL } else { 0 };
             let label: [u8; LABEL_LEN] = concat(&[anchor.label.as_bytes()]);
-            writer.put(&anchor.key)?;
+            writer.put(anchor.key)?;
             writer.put(&anchor.usage.to_bits().to_le_bytes())?;
             writer.put(&flags.to_le_bytes())?;
             writer.put(&label)?;
@@ -252,10 +255,11 @@ fn label_is_valid(label: &str) -> bool
     !label.is_empty() && label.len() <= LABEL_LEN && !label.as_bytes().contains(&0)
 }
 
-/// The key of an anchor's encoding: its first 32 bytes.
-fn anchor_key(raw: &[u8; ANCHOR_LEN]) -> PublicKey
+/// The key of an anchor's encoding: its first [`PUBLIC_KEY_LEN`] bytes,
+/// which [`ANCHOR_LEN`] always holds.
+fn anchor_key(raw: &[u8; ANCHOR_LEN]) -> Option<&PublicKey>
 {
-    concat(&[raw])
+    raw.first_chunk::<PUBLIC_KEY_LEN>()
 }
 
 /// Decode and check one anchor.
@@ -263,7 +267,9 @@ fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
 {
     let mut reader = Reader::new(raw);
     // The reads cannot run short: their lengths add up to ANCHOR_LEN.
-    let key = reader.array::<32>().ok_or(StoreError::Length)?;
+    let key = reader
+        .array_ref::<PUBLIC_KEY_LEN>()
+        .ok_or(StoreError::Length)?;
     let usage = reader.u32().ok_or(StoreError::Length)?;
     let flags = reader.u32().ok_or(StoreError::Length)?;
     let label = reader.rest();
@@ -284,7 +290,7 @@ fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
     let label = core::str::from_utf8(text).map_err(|_| StoreError::Label)?;
     Ok(Anchor {
         key,
-        key_id: key_id(&key),
+        key_id: key_id(key),
         usage,
         local: flags & FLAG_LOCAL != 0,
         label,
@@ -295,6 +301,7 @@ fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
 mod tests
 {
     extern crate std;
+    use std::sync::OnceLock;
     use std::vec;
     use std::vec::Vec;
 
@@ -307,11 +314,18 @@ mod tests
     };
 
     /// Three keys, sorted by key id.
-    fn keys() -> [PublicKey; 3]
+    fn keys() -> &'static [PublicKey; 3]
     {
-        let mut keys = [[1u8; 32], [2u8; 32], [3u8; 32]];
-        keys.sort_by_key(key_id);
-        keys
+        static KEYS: OnceLock<[PublicKey; 3]> = OnceLock::new();
+        KEYS.get_or_init(|| {
+            let mut keys = [
+                [1u8; PUBLIC_KEY_LEN],
+                [2u8; PUBLIC_KEY_LEN],
+                [3u8; PUBLIC_KEY_LEN],
+            ];
+            keys.sort_by_key(key_id);
+            keys
+        })
     }
 
     fn specs() -> Vec<AnchorSpec<'static>>
@@ -363,21 +377,22 @@ mod tests
     #[test]
     fn layout_matches_the_specification()
     {
+        assert_eq!(ANCHOR_LEN, 2024);
         let specs = specs();
         let bytes = encode(0x0a0b_0c0d, &specs[..1], &revoked());
-        assert_eq!(bytes.len(), 18 + 72 + 2 * 16);
+        assert_eq!(bytes.len(), 18 + 2024 + 2 * 16);
         assert_eq!(&bytes[0..8], b"SRPHTRST");
-        assert_eq!(&bytes[8..10], &1u16.to_le_bytes());
+        assert_eq!(&bytes[8..10], &2u16.to_le_bytes());
         assert_eq!(&bytes[10..12], &1u16.to_le_bytes());
         assert_eq!(&bytes[12..14], &2u16.to_le_bytes());
         assert_eq!(&bytes[14..18], &0x0a0b_0c0du32.to_le_bytes());
-        assert_eq!(&bytes[18..50], &specs[0].key);
-        assert_eq!(&bytes[50..54], &(0xfeu32 | (1 << 31)).to_le_bytes());
-        assert_eq!(&bytes[54..58], &1u32.to_le_bytes());
-        assert_eq!(&bytes[58..68], b"local root");
-        assert_eq!(&bytes[68..90], &[0u8; 22]);
-        assert_eq!(&bytes[90..106], &revoked()[0]);
-        assert_eq!(&bytes[106..122], &revoked()[1]);
+        assert_eq!(&bytes[18..2002], &specs[0].key[..]);
+        assert_eq!(&bytes[2002..2006], &(0xfeu32 | (1 << 31)).to_le_bytes());
+        assert_eq!(&bytes[2006..2010], &1u32.to_le_bytes());
+        assert_eq!(&bytes[2010..2020], b"local root");
+        assert_eq!(&bytes[2020..2042], &[0u8; 22]);
+        assert_eq!(&bytes[2042..2058], &revoked()[0]);
+        assert_eq!(&bytes[2058..2074], &revoked()[1]);
     }
 
     #[test]
@@ -393,7 +408,7 @@ mod tests
         for (anchor, spec) in anchors.iter().zip(&specs)
         {
             assert_eq!(anchor.key, spec.key);
-            assert_eq!(anchor.key_id, key_id(&spec.key));
+            assert_eq!(anchor.key_id, key_id(spec.key));
             assert_eq!(anchor.usage, spec.usage);
             assert_eq!(anchor.local, spec.local);
             assert_eq!(anchor.label, spec.label);
@@ -422,7 +437,10 @@ mod tests
             edit(&mut bytes);
             assert_eq!(TrustStore::parse(&bytes), Err(error));
         };
-        let anchor = |index: usize, offset: usize| 18 + 72 * index + offset;
+        let anchor = |index: usize, offset: usize| 18 + ANCHOR_LEN * index + offset;
+        let usage = PUBLIC_KEY_LEN;
+        let flags = usage + 4;
+        let label = flags + 4;
         refuse(&|b| b.truncate(17), StoreError::Length);
         refuse(&|b| b.truncate(18), StoreError::Length);
         refuse(
@@ -435,15 +453,25 @@ mod tests
         refuse(&|b| b[12] = 3, StoreError::Length);
         refuse(&|b| b[10] = 4, StoreError::Length);
         refuse(&|b| b[0] = b's', StoreError::Magic);
-        refuse(&|b| b[8] = 2, StoreError::Version);
+        // Version 1, the retired Ed25519 format, and a version not defined.
+        refuse(&|b| b[8] = 1, StoreError::Version);
+        refuse(&|b| b[8] = 3, StoreError::Version);
         refuse(&|b| b[10] = 0, StoreError::NoAnchor);
-        refuse(&|b| b[anchor(1, 32)] |= 1, StoreError::AnchorUsage);
-        refuse(&|b| b[anchor(1, 35)] |= 0x40, StoreError::AnchorUsage);
-        refuse(&|b| b[anchor(1, 36)] |= 2, StoreError::AnchorFlags);
-        refuse(&|b| b[anchor(1, 39)] |= 0x80, StoreError::AnchorFlags);
-        refuse(&|b| b[anchor(0, 40)] = 0, StoreError::Label);
-        refuse(&|b| b[anchor(0, 71)] = b'x', StoreError::Label);
-        refuse(&|b| b[anchor(0, 40)] = 0xff, StoreError::Label);
+        refuse(&|b| b[anchor(1, usage)] |= 1, StoreError::AnchorUsage);
+        // Bit 8, which no role has yet.
+        refuse(&|b| b[anchor(1, usage + 1)] |= 1, StoreError::AnchorUsage);
+        refuse(
+            &|b| b[anchor(1, usage + 3)] |= 0x40,
+            StoreError::AnchorUsage,
+        );
+        refuse(&|b| b[anchor(1, flags)] |= 2, StoreError::AnchorFlags);
+        refuse(
+            &|b| b[anchor(1, flags + 3)] |= 0x80,
+            StoreError::AnchorFlags,
+        );
+        refuse(&|b| b[anchor(0, label)] = 0, StoreError::Label);
+        refuse(&|b| b[anchor(0, ANCHOR_LEN - 1)] = b'x', StoreError::Label);
+        refuse(&|b| b[anchor(0, label)] = 0xff, StoreError::Label);
         refuse(
             &|b| {
                 let first = b[anchor(0, 0)..anchor(1, 0)].to_vec();
@@ -480,9 +508,8 @@ mod tests
     fn encoder_refuses_what_the_parser_refuses()
     {
         let specs = specs();
-        let mut out = vec![0u8; 4096];
         let refuse = |anchors: &[AnchorSpec<'_>], revoked: &[KeyId], error| {
-            let mut out = vec![0u8; 4096];
+            let mut out = vec![0u8; 18 + ANCHOR_LEN * 4 + 16 * 4];
             assert_eq!(
                 TrustStore::encode(0, anchors, revoked, &mut out),
                 Err(error)
@@ -499,8 +526,9 @@ mod tests
         descending.reverse();
         refuse(&specs, &descending, EncodeError::Store);
         refuse(&specs, &[[1; 16], [1; 16]], EncodeError::Store);
+        let mut out = vec![0u8; 18 + ANCHOR_LEN * 3];
         assert_eq!(
-            TrustStore::encode(0, &specs, &[], &mut out[..18 + 72 * 3 - 1]),
+            TrustStore::encode(0, &specs, &[], &mut out[..18 + ANCHOR_LEN * 3 - 1]),
             Err(EncodeError::BufferTooSmall)
         );
         assert_eq!(
@@ -513,7 +541,7 @@ mod tests
         );
         assert_eq!(
             TrustStore::encoded_len(65_535, 65_535),
-            Ok(18 + 72 * 65_535 + 16 * 65_535)
+            Ok(18 + 2024 * 65_535 + 16 * 65_535)
         );
     }
 }

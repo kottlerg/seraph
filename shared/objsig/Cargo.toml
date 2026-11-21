@@ -12,12 +12,19 @@ publish.workspace = true
 [lib]
 doctest = false
 
+[features]
+# Composite key generation and signing (shared/crypto's `sign`), for a host
+# tool. No component built for the target may enable it, so that no loader
+# compiles signing code; the crate's own tests compile the signer without it.
+sign = ["crypto/sign"]
+
 [dependencies]
 crypto = { path = "../crypto" }
 
 [dev-dependencies]
-# Host-only: the seeded generator of the robustness tests, the hex decoder,
-# and the edwards25519 arithmetic the tests' signer is built on.
+# The tests sign their fixtures with the composite signer.
+crypto = { path = "../crypto", features = ["sign"] }
+# Host-only: the seeded generator of the robustness tests.
 crypto-testkit = { path = "../crypto/testkit" }
 
 [lints]

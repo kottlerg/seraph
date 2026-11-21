@@ -7,10 +7,9 @@
 //! anchor of the trust store and passes every check of the policy
 //! ([docs/signing.md](../../../docs/signing.md) § Verification).
 
-use crypto::ed25519_verify;
-
 use crate::attrs::{Attributes, HASH_LEN};
 use crate::cert::Certificate;
+use crate::composite;
 use crate::store::{Anchor, TrustStore};
 use crate::trailer::{Record, split};
 use crate::{Arch, ParseError, PublicKey, RoleSet, key_id};
@@ -83,9 +82,11 @@ pub enum RecordFailure
     SecurityFloor,
     /// The signed security version is outside the certificate's range.
     SecurityRange,
-    /// The certificate's signature does not verify under the anchor's key.
+    /// The certificate's composite signature does not verify under the
+    /// anchor's key: either half, or both, is invalid.
     CertificateSignature,
-    /// The record's signature does not verify under the signing key.
+    /// The record's composite signature does not verify under the signing
+    /// key: either half, or both, is invalid.
     Signature,
 }
 
@@ -191,7 +192,7 @@ fn check<'s>(
             {
                 return Err(fail(RecordFailure::IssuerCannotCertify));
             }
-            if key_id(&cert.subject_key) != record.signer_key_id
+            if key_id(cert.subject_key) != record.signer_key_id
             {
                 return Err(fail(RecordFailure::SignerMismatch));
             }
@@ -242,12 +243,12 @@ fn check<'s>(
         {
             return Err(fail(RecordFailure::SecurityRange));
         }
-        if !cache.verify(&anchor.key, certificate)
+        if !cache.verify(anchor.key, certificate)
         {
             return Err(fail(RecordFailure::CertificateSignature));
         }
     }
-    ed25519_verify(&signing_key, record.signed, &record.signature)
+    composite::verify(signing_key, record.signed, record.signature)
         .map_err(|_| fail(RecordFailure::Signature))?;
     Ok(anchor)
 }
@@ -258,15 +259,18 @@ pub const CERTIFICATE_CACHE_LEN: usize = 4;
 /// Certificates whose signature has verified, each with the issuer key it
 /// verified under ([`verify_cached`]).
 ///
-/// It holds [`CERTIFICATE_CACHE_LEN`] entries, the oldest replaced first. An
-/// entry matches only the same issuer key and the same decoded certificate,
-/// whose encoding is unique, so a match stands for the same signed bytes and
-/// signature. It holds no trust decision: the anchor, `CERTIFY`, revocation,
-/// usage and range checks are made for every record.
+/// It holds [`CERTIFICATE_CACHE_LEN`] entries, the oldest replaced first.
+/// An entry is the SHA-512 of the issuer key followed by the certificate's
+/// encoding, 64 bytes, so the cache holds no copy of a 1,984-byte key or a
+/// 5,409-byte certificate. An entry matches only the same issuer key and the
+/// same certificate, signed bytes and signature, unless SHA-512 collides, on
+/// which every signature already rests. It holds no trust decision: the
+/// anchor, `CERTIFY`, revocation, usage and range checks are made for every
+/// record.
 #[derive(Clone, Copy, Debug)]
 pub struct CertificateCache
 {
-    entries: [Option<(PublicKey, Certificate)>; CERTIFICATE_CACHE_LEN],
+    entries: [Option<[u8; HASH_LEN]>; CERTIFICATE_CACHE_LEN],
     next: usize,
 }
 
@@ -285,19 +289,14 @@ impl CertificateCache
     /// Whether `certificate`'s signature verifies under `issuer_key`: true
     /// at once for a pair the cache holds; otherwise verified, and held when
     /// it verifies.
-    fn verify(&mut self, issuer_key: &PublicKey, certificate: &Certificate) -> bool
+    fn verify(&mut self, issuer_key: &PublicKey, certificate: &Certificate<'_>) -> bool
     {
-        let entry = Some((*issuer_key, *certificate));
+        let entry = Some(Self::entry(issuer_key, certificate));
         if self.entries.contains(&entry)
         {
             return true;
         }
-        if ed25519_verify(
-            issuer_key,
-            &certificate.body.to_signed(),
-            &certificate.signature,
-        )
-        .is_err()
+        if composite::verify(issuer_key, certificate.signed(), certificate.signature).is_err()
         {
             return false;
         }
@@ -307,6 +306,19 @@ impl CertificateCache
         }
         self.next = self.next.wrapping_add(1) % CERTIFICATE_CACHE_LEN;
         true
+    }
+}
+
+impl CertificateCache
+{
+    /// The entry of `certificate` under `issuer_key`: the SHA-512 of the key
+    /// followed by the certificate's encoding.
+    fn entry(issuer_key: &PublicKey, certificate: &Certificate<'_>) -> [u8; HASH_LEN]
+    {
+        let mut state = crypto::Sha512::new();
+        state.update(issuer_key);
+        state.update(certificate.as_bytes());
+        state.finalize()
     }
 }
 
@@ -325,7 +337,7 @@ mod tests
     use std::vec::Vec;
 
     use super::*;
-    use crate::testutil::{ROOT, attrs, certify, keys, object, record, store};
+    use crate::testutil::{ROOT, attrs, certify, certify_as, keys, leak, object, record, store};
     use crate::trailer::RecordSpec;
     use crate::{Role, Usage};
     use crypto_testkit::rng::Rng;
@@ -394,7 +406,7 @@ mod tests
         let bytes = object(BODY, records);
         verify(&bytes, &store, expect).map(|verified| {
             assert_eq!(verified.body, BODY);
-            assert_eq!(verified.anchor.key, keys().root.public);
+            assert_eq!(verified.anchor.key, &keys().root.public);
         })
     }
 
@@ -442,7 +454,7 @@ mod tests
         let store_view = TrustStore::parse(&both).unwrap();
         let bytes = object(BODY, &[second]);
         let verified = verify(&bytes, &store_view, &EXPECT).unwrap();
-        assert_eq!(verified.anchor.key, keys().second_root.public);
+        assert_eq!(verified.anchor.key, &keys().second_root.public);
     }
 
     #[test]
@@ -707,18 +719,13 @@ mod tests
     fn refuses_a_bad_certificate_signature()
     {
         let k = keys();
-        let mut tampered = certified(3);
-        if let Some(cert) = tampered.certificate.as_mut()
-        {
-            cert.signature[0] ^= 1;
-        }
+        let tampered = with_certificate_byte_flipped(certified(3), 0);
         assert_eq!(
             run(&root_store(), &[tampered], &EXPECT),
             failed(RecordFailure::CertificateSignature)
         );
         // A certificate the stranger signed that names the root as issuer.
-        let mut forged = certify(&k.stranger, &k.signer, RoleSet::ALL, 0, 9);
-        forged.body.issuer_key_id = k.root.id();
+        let forged = certify_as(&k.stranger, k.root.id(), &k.signer, RoleSet::ALL, 0, 9);
         let spec = record(
             &k.signer,
             Some(forged),
@@ -730,13 +737,24 @@ mod tests
         );
     }
 
-    /// The certificate of a record that passes, with the root's key.
-    fn held(security_version: u32) -> (PublicKey, Certificate)
+    /// The cache entry of the certificate of a record that passes, under
+    /// the root's key.
+    fn held(security_version: u32) -> [u8; HASH_LEN]
     {
-        (
-            keys().root.public,
-            certified(security_version).certificate.unwrap(),
-        )
+        let cert = Certificate::parse(certified(security_version).certificate.unwrap()).unwrap();
+        CertificateCache::entry(&keys().root.public, &cert)
+    }
+
+    /// The record of `spec` with its certificate's signature byte `at`
+    /// flipped.
+    fn with_certificate_byte_flipped(spec: RecordSpec<'static>, at: usize) -> RecordSpec<'static>
+    {
+        let mut cert = *spec.certificate.unwrap();
+        cert[crate::cert::SIGNED_LEN + at] ^= 1;
+        RecordSpec {
+            certificate: Some(leak(cert)),
+            ..spec
+        }
     }
 
     #[test]
@@ -750,11 +768,7 @@ mod tests
         assert_eq!(cache.entries[0], Some(held(3)));
         // The same certificate with another signature is no match, and is
         // refused and not held.
-        let mut tampered = certified(3);
-        if let Some(cert) = tampered.certificate.as_mut()
-        {
-            cert.signature[0] ^= 1;
-        }
+        let tampered = with_certificate_byte_flipped(certified(3), 0);
         let bytes = object(BODY, &[tampered]);
         assert_eq!(
             verify_cached(&bytes, &store, &EXPECT, &mut cache).map(|_| ()),
@@ -762,7 +776,7 @@ mod tests
         );
         assert_eq!(cache.entries[1], None);
         // The held certificate under another issuer key is no match.
-        let (_, cert) = held(3);
+        let cert = Certificate::parse(certified(3).certificate.unwrap()).unwrap();
         assert!(!cache.verify(&keys().second_root.public, &cert));
         assert!(cache.verify(&keys().root.public, &cert));
     }
@@ -772,16 +786,13 @@ mod tests
     {
         let store_bytes = root_store();
         let store = TrustStore::parse(&store_bytes).unwrap();
-        let mut tampered = certified(3);
-        if let Some(cert) = tampered.certificate.as_mut()
-        {
-            cert.signature[0] ^= 1;
-        }
+        let tampered = with_certificate_byte_flipped(certified(3), 0);
         let bytes = object(BODY, &[tampered]);
         // A cache that holds the pair answers for it without the signature
         // check, which this signature would fail.
         let mut cache = CertificateCache::new();
-        cache.entries[0] = Some((keys().root.public, tampered.certificate.unwrap()));
+        let cert = Certificate::parse(tampered.certificate.unwrap()).unwrap();
+        cache.entries[0] = Some(CertificateCache::entry(&keys().root.public, &cert));
         verify_cached(&bytes, &store, &EXPECT, &mut cache).unwrap();
         assert_eq!(
             verify(&bytes, &store, &EXPECT).map(|_| ()),
@@ -793,31 +804,69 @@ mod tests
     fn a_full_cache_replaces_its_oldest_certificate()
     {
         let k = keys();
-        let issued: Vec<Certificate> = (9u32..)
+        let issued: Vec<Certificate<'_>> = (9u32..)
             .take(CERTIFICATE_CACHE_LEN + 1)
-            .map(|max| certify(&k.root, &k.signer, RoleSet::ALL, 0, max))
+            .map(|max| {
+                Certificate::parse(certify(&k.root, &k.signer, RoleSet::ALL, 0, max)).unwrap()
+            })
             .collect();
         let mut cache = CertificateCache::new();
         for cert in &issued
         {
             assert!(cache.verify(&k.root.public, cert));
         }
-        let held: Vec<_> = cache.entries.iter().flatten().map(|(_, c)| *c).collect();
+        let entry = |cert| CertificateCache::entry(&k.root.public, cert);
+        let held: Vec<_> = cache.entries.iter().flatten().copied().collect();
         assert_eq!(held.len(), CERTIFICATE_CACHE_LEN);
-        assert!(!held.contains(&issued[0]));
-        assert!(issued[1..].iter().all(|cert| held.contains(cert)));
+        assert!(!held.contains(&entry(&issued[0])));
+        assert!(issued[1..].iter().all(|cert| held.contains(&entry(cert))));
+    }
+
+    /// The refusal test of a record's composite signature: a record whose
+    /// signature has either half invalid, the other half valid, is refused.
+    #[test]
+    fn refuses_a_record_signature_with_either_half_invalid()
+    {
+        for at in [0, 63, 64, 64 + 1700, crate::trailer::SIGNATURE_LEN - 1]
+        {
+            for spec in [direct(3), certified(3)]
+            {
+                let mut signature = *spec.signature;
+                signature[at] ^= 0x10;
+                let tampered = RecordSpec {
+                    signature: leak(signature),
+                    ..spec
+                };
+                assert_eq!(
+                    run(&root_store(), &[tampered], &EXPECT),
+                    failed(RecordFailure::Signature),
+                    "byte {at}"
+                );
+            }
+        }
+    }
+
+    /// The refusal test of a certificate's composite signature: a record
+    /// whose certificate's signature has either half invalid, the other half
+    /// valid, is refused.
+    #[test]
+    fn refuses_a_certificate_signature_with_either_half_invalid()
+    {
+        for at in [0, 63, 64, 64 + 1700, crate::trailer::SIGNATURE_LEN - 1]
+        {
+            let tampered = with_certificate_byte_flipped(certified(3), at);
+            assert_eq!(
+                run(&root_store(), &[tampered], &EXPECT),
+                failed(RecordFailure::CertificateSignature),
+                "byte {at}"
+            );
+        }
     }
 
     #[test]
     fn refuses_a_bad_record_signature()
     {
         let k = keys();
-        let mut tampered = direct(3);
-        tampered.signature[63] ^= 0x10;
-        assert_eq!(
-            run(&root_store(), &[tampered], &EXPECT),
-            failed(RecordFailure::Signature)
-        );
         // The stranger's signature under the root's key id.
         let mut forged = stranger();
         forged.signer_key_id = k.root.id();
@@ -846,14 +895,14 @@ mod tests
                 bytes[BODY.len()..BODY.len() + 4].try_into().unwrap(),
             ))
             .unwrap();
-        bytes[second + 4] = 2;
+        bytes[second + 4] = 1;
         assert_eq!(
             verify(&bytes, &store, &EXPECT),
             Err(Refusal::Parse(ParseError::Algorithm))
         );
         let mut bytes = object(BODY, &[direct(3)]);
         let end = bytes.len();
-        bytes[end - 10] = 2;
+        bytes[end - 10] = 1;
         assert_eq!(
             verify(&bytes, &store, &EXPECT),
             Err(Refusal::Parse(ParseError::Version))
@@ -865,6 +914,14 @@ mod tests
     }
 
     /// Every bit of a signed object is bound: a flip anywhere refuses it.
+    /// Each bit of the body, the record's fixed fields, its attributes, its
+    /// certificate's fields and the footer is flipped. In the 1,984-byte
+    /// subject key and the two 3,373-byte signatures, which the signature
+    /// scheme binds rather than the format, one bit of the first and last
+    /// byte and of every 61st byte between, the bit varying from byte to
+    /// byte: one flip of each byte would be some 8,700 more composite
+    /// verifications, minutes under the riscv64 test emulator. The
+    /// either-half refusal tests cover both halves of both signatures.
     #[test]
     fn refuses_every_bit_flip()
     {
@@ -872,10 +929,29 @@ mod tests
         let store = TrustStore::parse(&store_bytes).unwrap();
         let good = object(BODY, &[certified(3)]);
         verify(&good, &store, &EXPECT).unwrap();
+        let record = BODY.len();
+        let cert = record + 24 + crate::attrs::FIXED_LEN + NAME.len();
+        let key = cert + 16..cert + 16 + crate::composite::PUBLIC_KEY_LEN;
+        let cert_signature = cert + crate::cert::SIGNED_LEN..cert + crate::cert::LEN;
+        let signature = cert + crate::cert::LEN..good.len() - 16;
         for index in 0..good.len()
         {
+            let sampled = [&key, &cert_signature, &signature]
+                .into_iter()
+                .find(|region| region.contains(&index));
+            if let Some(region) = sampled
+                && index != region.start
+                && index != region.end - 1
+                && (index - region.start) % 61 != 0
+            {
+                continue;
+            }
             for bit in 0..8
             {
+                if sampled.is_some() && bit != index % 8
+                {
+                    continue;
+                }
                 let mut bytes = good.clone();
                 bytes[index] ^= 1 << bit;
                 verify(&bytes, &store, &EXPECT).expect_err("a flipped bit verified");

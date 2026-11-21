@@ -81,11 +81,10 @@ use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::{DataPlacement, DiskLayout};
 use crate::error::{Context as _, Result, bail};
-use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    EDU_DMA_MASK, GdbMode, HOTPLUG_DISK_PORT_ID, HOTPLUG_PORT_ID, HotplugControl, HotplugPort,
-    Iommu, PORT_DISK_ID, PortDisk, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk,
-    X86Paging, X86ShadowStack, build_qemu_argv, port_disk_properties, prepare_riscv_firmware,
+    EDU_DMA_MASK, Firmware, GdbMode, HOTPLUG_DISK_PORT_ID, HOTPLUG_PORT_ID, HotplugControl,
+    HotplugPort, Iommu, PORT_DISK_ID, PortDisk, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr,
+    SecondDisk, X86Paging, X86ShadowStack, build_qemu_argv, port_disk_properties,
     validate_sysroot_for_launch,
 };
 use crate::qmp::{self, Property};
@@ -406,15 +405,8 @@ fn boot(
     check: impl FnOnce(&mut Lines, &Path) -> Result<()>,
 ) -> Result<()>
 {
-    let (firmware_code, firmware_vars) = match args.arch
-    {
-        Arch::X86_64 => (find_ovmf_code()?, None),
-        Arch::Riscv64 =>
-        {
-            let (code, vars) = prepare_riscv_firmware(ctx)?;
-            (code, Some(vars))
-        }
-    };
+    let firmware = Firmware::prepare(ctx, args.arch)?;
+    let vars = firmware.launch_vars()?;
     let sock_dir = ctx.target_dir.join("xtask");
     std::fs::create_dir_all(&sock_dir)
         .with_context(|| format!("creating {}", sock_dir.display()))?;
@@ -426,8 +418,8 @@ fn boot(
         disk_path: &disk_path,
         disk_block_size: crate::disk::logical_block_size(&disk_path)?,
         second_disk: second_disk.map(SecondDisk::of_image).transpose()?,
-        firmware_code_path: &firmware_code,
-        firmware_vars_path: firmware_vars.as_deref(),
+        firmware_code_path: &firmware.code,
+        firmware_vars_path: vars.path(),
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,

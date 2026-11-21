@@ -35,11 +35,9 @@ use crate::cli::{CrashReportExpect, RunArgs};
 use crate::context::Context as BuildContext;
 use crate::crash_log::{SysrootImages, symbolize_log};
 use crate::disk::{logical_block_size, second_disk_block_size};
-use crate::firmware::find_ovmf_code;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
-    validate_sysroot_for_launch,
+    Firmware, GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::regex::Regex;
 use crate::term::filter::FilterWriter;
@@ -132,16 +130,6 @@ struct RunOutcome
     matched: Option<String>,
 }
 
-/// Per-arch firmware resolution: x86 uses OVMF; riscv64 uses cached padded
-/// pflash images.
-struct FirmwareSet
-{
-    code: PathBuf,
-    /// For riscv64 this is the template that gets copied per-slot; on x86 it
-    /// is unused.
-    vars_template: Option<PathBuf>,
-}
-
 /// Entry point for `cargo xtask run --runs <runs>`.
 pub fn run(ctx: &BuildContext, args: &RunArgs, runs: u32) -> Result<()>
 {
@@ -190,7 +178,9 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
     // worker threads.
     let qemu_binary = require_tool(args.launch.arch.qemu_binary())?;
 
-    let firmware = resolve_firmware(ctx, args.launch.arch)?;
+    // Each run boots on a variable store of its own, which its thread holds
+    // until its QEMU has exited.
+    let firmware = Arc::new(Firmware::prepare(ctx, args.launch.arch)?);
 
     let workdir = ctx.target_dir.join("xtask").join("run");
     std::fs::create_dir_all(&workdir)
@@ -243,12 +233,10 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
             let log_path = workdir.join(run_log_name(IN_FLIGHT_LOG_PREFIX, run_id));
             let disk_dst = slot_dir.join("disk.img");
             let second_dst = slot_dir.join("disk2.img");
-            let vars_dst = slot_dir.join("VARS.fd");
 
             let disk_src = disk_src.clone();
             let second_src = second_src.clone();
-            let firmware_code = firmware.code.clone();
-            let firmware_vars_template = firmware.vars_template.clone();
+            let firmware = Arc::clone(&firmware);
             let arch = args.launch.arch;
             let cpus = args.launch.cpus;
             let threads_per_core = args.launch.threads_per_core;
@@ -300,24 +288,7 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                         )
                     })?;
                 }
-                let vars_path_for_qemu = if arch == Arch::Riscv64
-                {
-                    let template = firmware_vars_template
-                        .as_ref()
-                        .context("riscv64 must produce a vars template")?;
-                    std::fs::copy(template, &vars_dst).with_context(|| {
-                        format!(
-                            "copying vars template {} -> {}",
-                            template.display(),
-                            vars_dst.display()
-                        )
-                    })?;
-                    Some(vars_dst.clone())
-                }
-                else
-                {
-                    None
-                };
+                let vars = firmware.launch_vars()?;
 
                 let spec = QemuLaunchSpec {
                     arch,
@@ -328,8 +299,8 @@ fn run_waves(ctx: &BuildContext, args: &RunArgs, runs: u32, display: QemuDisplay
                         block_size,
                         line: second_line,
                     }),
-                    firmware_code_path: &firmware_code,
-                    firmware_vars_path: vars_path_for_qemu.as_deref(),
+                    firmware_code_path: &firmware.code,
+                    firmware_vars_path: vars.path(),
                     cpus,
                     threads_per_core,
                     mem_mib,
@@ -593,25 +564,6 @@ impl PassChecks
             return (Status::Fail, Some(format!("--crash-reports: {err:#}")));
         }
         (status, matched)
-    }
-}
-
-fn resolve_firmware(ctx: &BuildContext, arch: Arch) -> Result<FirmwareSet>
-{
-    match arch
-    {
-        Arch::X86_64 => Ok(FirmwareSet {
-            code: find_ovmf_code()?,
-            vars_template: None,
-        }),
-        Arch::Riscv64 =>
-        {
-            let (code, vars) = prepare_riscv_firmware(ctx)?;
-            Ok(FirmwareSet {
-                code,
-                vars_template: Some(vars),
-            })
-        }
     }
 }
 

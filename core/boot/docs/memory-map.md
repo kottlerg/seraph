@@ -20,7 +20,7 @@ The implementation lives in [`core/boot/src/memory_map.rs`](../src/memory_map.rs
 | `EfiLoaderCode` / `EfiLoaderData` | `Loaded` | Every bootloader allocation and the bootloader's own loaded image (enumerated in § Allocation-Class Classification). |
 | `EfiACPIReclaimMemory` | `AcpiReclaimable` | Firmware tables; exposed to userspace read-only as Map-only Memory caps (one per region) and never returned to the allocator; see [initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system). |
 | `EfiACPIMemoryNVS` | `Reserved` | Firmware-reserved. |
-| `EfiRuntimeServicesCode` / `EfiRuntimeServicesData` | `Reserved` | Seraph does not use UEFI runtime services; treat as off-limits. |
+| `EfiRuntimeServicesCode` / `EfiRuntimeServicesData` | `Reserved` | Seraph calls no UEFI runtime service after `ExitBootServices`; treat as off-limits. |
 | `EfiMemoryMappedIO` / `EfiMemoryMappedIOPortSpace` | `Reserved` | Device space, not RAM. |
 | `EfiPersistentMemory` | `Persistent` | NVDIMM or similar. |
 | Any unrecognised type | `Reserved` | Conservative default. |
@@ -33,7 +33,7 @@ zeroes every page it drains from them before minting it to userspace
 ([initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)).
 `EfiRuntimeServices*` → `Reserved` keeps firmware runtime
 code and data out of every allocator and reclaim path even though Seraph never
-calls into it.
+calls into it after `ExitBootServices`.
 
 ---
 

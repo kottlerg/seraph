@@ -23,6 +23,7 @@ bootloader runs on, memory map acquisition, `ExitBootServices`, and error handli
 | `EFI_RNG_PROTOCOL` | `LocateProtocol` | Draw the 32-byte entropy-pool seed and an independent 16-byte KASLR draw (two words; step 5c) | No |
 | `EFI_RISCV_BOOT_PROTOCOL` | `LocateProtocol` | Read the boot hart ID (RISC-V only; 0 when absent) | No |
 | All handles | `LocateHandleBuffer(AllHandles)` + `ConnectController` | Bind drivers (e.g. virtio-gpu to GOP) not auto-connected during BDS, before the GOP query | No |
+| Variable services | `RuntimeServices->GetVariable` / `SetVariable` | Read and raise the machine's security floor (§ Variable Services) | No |
 
 `EFI_GRAPHICS_OUTPUT_PROTOCOL` is optional — its absence is handled gracefully by
 zeroing the `framebuffer.physical_base` field in `BootInfo`. A headless system or a
@@ -184,6 +185,27 @@ type in Seraph's memory model is authoritative there.
 
 ---
 
+## Variable Services
+
+The bootloader reads and writes UEFI variables for one purpose, the machine's security floor
+([docs/signing.md](../../../docs/signing.md) § Rollback Floor), through the `VariableServices`
+trait of [`core/boot/src/uefi.rs`](../src/uefi.rs). `FirmwareVariables` implements it over the
+system table's `RuntimeServices->GetVariable` and `SetVariable`; host tests implement it over a
+store in memory. `GetVariable` returns one of four outcomes (`VariableRead`): the variable and its
+attributes, no such variable, a variable larger than the caller's buffer (with its length), or a
+failure status. A system table with no runtime services, or a name without its terminating NUL,
+fails without a call.
+
+Every Seraph variable is named under the Seraph vendor GUID (`SERAPH_VENDOR_GUID`) and carries
+`NON_VOLATILE | BOOTSERVICE_ACCESS` and never `RUNTIME_ACCESS`, so nothing reaches it once boot
+services have exited. Every variable call is made before `ExitBootServices`, and none after it:
+the floor is read once the trust store parses (step 1 of
+[boot-flow.md](boot-flow.md)) and written once every object has verified (step 4), ahead of the
+memory-map reads of steps 6 and 7. A variable service the firmware lacks or fails is a warning,
+not a halt; only a floor that refuses the bootloader, or a malformed one, is fatal.
+
+---
+
 ## ExitBootServices
 
 The call sequence:
@@ -222,7 +244,8 @@ After `ExitBootServices` returns:
 
 - `BootServices` pointer is invalid; calling any boot service causes undefined behaviour
 - `RuntimeServices` pointer remains technically valid (UEFI runtime services), but
-  Seraph does not use runtime services and makes no runtime calls
+  Seraph makes no runtime-services call after the exit; its variable calls all come
+  before it (§ Variable Services)
 - Memory descriptors in the acquired map buffer remain valid; the buffer was allocated
   as `EfiLoaderData` and is not reclaimed by UEFI. Step 9 zeroes it after its last read
   and records it in `BootInfo.reclaim_ranges`

@@ -319,7 +319,8 @@ args! {
         /// Skip the formatting check (`cargo fmt --check`) and the
         /// per-component `cargo check` (clippy), which would otherwise double
         /// the cargo invocations per component. `cargo xtask compare-images`
-        /// and `cargo xtask test signing` set it for the builds they run.
+        /// and `cargo xtask test signing` and `rollback` set it for the builds
+        /// they run.
         /// Use `cargo xtask build` without it for the full lint pass.
         #[arg(long, hide = true)]
         pub skip_lints: bool,
@@ -873,8 +874,9 @@ args! {
         #[arg(long, requires = "case")]
         pub gdb: Option<String>,
 
-        /// Build the `signing` case's revoking bootloader in release mode, as
-        /// the sysroot's was built (default: debug).
+        /// Build the bootloader the `signing` case revokes under, or the
+        /// `rollback` case raises the floor with, in release mode, as the
+        /// sysroot's was built (default: debug).
         #[arg(long)]
         pub release: bool,
 
@@ -938,6 +940,9 @@ value_enum! {
         /// entry, a revoked key, and tampered, wrong-role and foreign-signed
         /// rootfs images.
         Signing,
+        /// The bootloader writes the machine's security floor in firmware
+        /// storage, raises it, and refuses itself below it.
+        Rollback,
         /// The softlockup watchdog reports a CPU wedged with interrupts off.
         Wedge,
         /// The kernel detects a VM generation change across a snapshot

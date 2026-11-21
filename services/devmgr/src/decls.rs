@@ -11,7 +11,10 @@
 //!
 //! init forwards its boot modules untagged; [`classify_modules`] tells each
 //! by its content: an ELF executable is a driver module, anything else a
-//! platform description table (`firmware::platform`).
+//! platform description table (`firmware::platform`). The one exception is
+//! the boot-time policy (`boot_protocol::bundle::POLICY_ENTRY_NAME`), which
+//! it tells by its name and reads into `caps::DevmgrCaps::dma_confinement`
+//! (docs/device-management.md § DMA Safety Model).
 //!
 //! The reads are bounded, as § Declaration Bounds requires: the ELF header
 //! page, the section header table, the section name table, and the one note
@@ -208,16 +211,28 @@ pub struct BootModules
 /// module is a platform description table, parsed from its body
 /// ([`firmware::platform::parse_module`]) and released. A driver module with
 /// no declaration, and a module that is neither, are logged and released, as
-/// is every module when the lists cannot grow.
+/// is every module when the lists cannot grow. The boot-time policy module,
+/// told by its name, sets `caps.dma_confinement` and is released; with none,
+/// or one that does not parse, the setting stays required
+/// (`boot_policy::Policy::FAIL_CLOSED`). The setting is logged.
 pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
 {
     let mut out = BootModules {
         drivers: Vec::new(),
         tables: Vec::new(),
     };
+    let mut policy = None;
+    let mut policy_seen = false;
     for module in core::mem::take(&mut caps.modules)
     {
         let module_cap = module.cap;
+        if *module.name == *boot_protocol::bundle::POLICY_ENTRY_NAME
+        {
+            policy_seen = true;
+            policy = with_module(caps, module_cap, module.size, read_policy).flatten();
+            let _ = syscall::cap_delete(module_cap);
+            continue;
+        }
         match with_module(caps, module_cap, module.size, classify)
         {
             Some(Classified::Driver(decl)) if out.drivers.try_reserve(1).is_ok() =>
@@ -245,7 +260,41 @@ pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
         }
         let _ = syscall::cap_delete(module_cap);
     }
+    if !policy_seen
+    {
+        std::os::seraph::log!(error: "boot policy: no policy module; every requirement on");
+    }
+    let policy = policy.unwrap_or(boot_policy::Policy::FAIL_CLOSED);
+    caps.dma_confinement = policy.dma_confinement;
+    std::os::seraph::log!(
+        "boot policy: {} = {}",
+        boot_policy::DmaConfinement::KEY,
+        policy.dma_confinement.value()
+    );
     out
+}
+
+/// The boot-time policy the policy module `bytes` holds; `None`, logged,
+/// when it is refused, so every requirement holds.
+fn read_policy(bytes: &[u8]) -> Option<boot_policy::Policy>
+{
+    match boot_policy::parse_module(bytes)
+    {
+        Ok(policy) => Some(policy),
+        Err(boot_policy::ModuleError::Trailer(e)) =>
+        {
+            std::os::seraph::log!(
+                error: "boot policy: not a signed object ({:?}); every requirement on",
+                e
+            );
+            None
+        }
+        Err(boot_policy::ModuleError::Policy(e)) =>
+        {
+            std::os::seraph::log!(error: "boot policy: refused ({}); every requirement on", e);
+            None
+        }
+    }
 }
 
 /// What a boot module's content is.

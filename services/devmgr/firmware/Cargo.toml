@@ -8,6 +8,8 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The boot-time policy's `dma-confinement` setting, which `dma::admits` applies.
+boot-policy = { path = "../../../shared/boot-policy" }
 # The AML encodings and the resource-template decoder the static namespace
 # walk and the `_CRS` adapter are built on (its alloc-free modules only).
 aml = { path = "../../../shared/aml" }

@@ -34,12 +34,14 @@ use std::time::{Duration, Instant};
 use arch::{ARCH, BREAKPOINT_PC_ADVANCE, StepUndo};
 use device_tracker::Device;
 use gdb_rsp::PACKET_SIZE;
-use gdb_rsp::command::{BreakpointType, Command, ThreadId, ThreadOp, VContActions};
+use gdb_rsp::command::{
+    BreakpointType, Command, Resume, ThreadId, ThreadOp, VContAction, VContActions,
+};
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
 use gdb_rsp::target::TARGET_XML_ANNEX;
 use gdbstub::breakpoints;
 use gdbstub::control::{self, Plan};
-use gdbstub::session::{self, Kernel, Page, RegisterAccess, Resumed, Session, Stop};
+use gdbstub::session::{self, Idle, Kernel, Page, RegisterAccess, Resumed, Session, Stop};
 use gdbstub::{regs, signal, stop_signal};
 use ipc::{
     IpcMessage, procmgr_errors, procmgr_labels, serial_errors, serial_labels, svcmgr_labels,
@@ -165,6 +167,7 @@ fn main()
         },
         session: None,
         bias: 0,
+        no_resumed: false,
     };
     stub.attach(FIND_ATTEMPTS);
     stub.serve(ipc_buf);
@@ -717,6 +720,9 @@ struct Stub
     session: Option<Session>,
     /// The attached image's load bias.
     bias: u64,
+    /// GDB's last `qSupported` offered `no-resumed+`: it takes the `N` stop
+    /// reply, which says that no thread it resumed is left running.
+    no_resumed: bool,
 }
 
 impl Stub
@@ -828,7 +834,36 @@ impl Stub
             {}
             return;
         };
-        if let Some((index, stop)) = session.poll(&mut self.sys)
+        let stopped = match session.poll(&mut self.sys)
+        {
+            Some(stop) => Some(stop),
+            None => match session.idle(&mut self.sys, self.no_resumed)
+            {
+                None => None,
+                Some(Idle::Stopped(index, stop)) => Some((index, stop)),
+                Some(Idle::NoResumed) =>
+                {
+                    // No thread GDB resumed is left running: GDB stops
+                    // waiting and holds the others stopped.
+                    self.send(ipc_buf, |w| {
+                        w.bytes(b"N");
+                    });
+                    None
+                }
+                Some(Idle::Exited) =>
+                {
+                    if let Some(session) = self.session.take()
+                    {
+                        session.drop_all(&mut self.sys);
+                    }
+                    self.send(ipc_buf, |w| {
+                        w.exited(0);
+                    });
+                    None
+                }
+            },
+        };
+        if let Some((index, stop)) = stopped
         {
             let sig = stop_signal(stop.kind, stop.detail);
             self.send(ipc_buf, |w| {
@@ -999,9 +1034,13 @@ impl Stub
         }
         match command
         {
-            Command::Supported(_) => self.send(ipc_buf, |w| {
-                w.supported();
-            }),
+            Command::Supported(features) =>
+            {
+                self.no_resumed = features.split(|&b| b == b';').any(|f| f == b"no-resumed+");
+                self.send(ipc_buf, |w| {
+                    w.supported();
+                });
+            }
             Command::StartNoAckMode =>
             {
                 self.ok(ipc_buf);
@@ -1057,9 +1096,9 @@ impl Stub
                     w.current_thread(thread);
                 });
             }
-            Command::SetThread { op, thread } => match (op, self.select(thread))
+            Command::SetThread { op, thread } => match (op, thread, self.select(thread))
             {
-                (ThreadOp::General, Some(i)) =>
+                (ThreadOp::General, _, Some(i)) =>
                 {
                     if let Some(s) = &mut self.session
                     {
@@ -1067,10 +1106,30 @@ impl Stub
                     }
                     self.ok(ipc_buf);
                 }
-                (_, Some(_)) | (ThreadOp::Resume, None) => self.ok(ipc_buf),
-                (ThreadOp::General, None) =>
+                // `Hc0` and `Hc-1`: a `c` or `s` resumes every thread.
+                (ThreadOp::Resume, ThreadId::Any | ThreadId::All, _) =>
                 {
-                    let code = self.log_refused_select(thread);
+                    if let Some(s) = &mut self.session
+                    {
+                        s.resume_thread = None;
+                    }
+                    self.ok(ipc_buf);
+                }
+                (ThreadOp::Resume, ThreadId::Id(_), Some(i)) =>
+                {
+                    if let Some(s) = &mut self.session
+                    {
+                        s.resume_thread = Some(i);
+                    }
+                    self.ok(ipc_buf);
+                }
+                (ThreadOp::Resume, ThreadId::Id(_), None) if self.session.is_none() =>
+                {
+                    self.ok(ipc_buf);
+                }
+                (_, _, None) =>
+                {
+                    let code = self.log_refused_select(op, thread);
                     self.error(ipc_buf, code);
                 }
             },
@@ -1132,13 +1191,11 @@ impl Stub
             }
             Command::Continue { addr, signal } =>
             {
-                let plan = control::plan_continue(signal, self.current());
-                self.resume(plan, addr, ipc_buf);
+                self.resume_packet(Resume::Continue, signal, addr, ipc_buf);
             }
             Command::Step { addr, signal } =>
             {
-                let plan = control::plan_step(signal, self.current());
-                self.resume(plan, addr, ipc_buf);
+                self.resume_packet(Resume::Step, signal, addr, ipc_buf);
             }
             Command::VContQuery => self.send(ipc_buf, |w| {
                 w.vcont_actions();
@@ -1179,23 +1236,28 @@ impl Stub
         self.session.as_ref()?.select(thread)
     }
 
-    /// Log why `Hg` of `thread` is refused, no session or the state of the
-    /// slot it names, and return the error number that answers it
-    /// ([`session::SlotState::refusal_code`]).
-    fn log_refused_select(&self, thread: ThreadId) -> u8
+    /// Log why `Hg` or `Hc` (`op`) of `thread` is refused, no session or
+    /// the state of the slot it names, and return the error number that
+    /// answers it ([`session::SlotState::refusal_code`]).
+    fn log_refused_select(&self, op: ThreadOp, thread: ThreadId) -> u8
     {
+        let op = match op
+        {
+            ThreadOp::General => 'g',
+            ThreadOp::Resume => 'c',
+        };
         match &self.session
         {
             None =>
             {
-                std::os::seraph::log!(warn: "Hg {thread:?} refused: no session");
+                std::os::seraph::log!(warn: "H{op} {thread:?} refused: no session");
                 1
             }
             Some(s) =>
             {
                 let (state, slots) = s.slot_state(thread);
                 std::os::seraph::log!(
-                    warn: "Hg {thread:?} refused: slot {state:?} of {slots}"
+                    warn: "H{op} {thread:?} refused: slot {state:?} of {slots}"
                 );
                 state.refusal_code()
             }
@@ -1212,8 +1274,37 @@ impl Stub
     fn vcont(&mut self, actions: VContActions<'_>, ipc_buf: *mut u64)
     {
         let actions: Vec<_> = actions.iter().collect();
-        let plan = control::plan_vcont(actions.iter().copied(), self.current(), |t| self.select(t));
+        let plan = self.plan(&actions);
         self.resume(plan, None, ipc_buf);
+    }
+
+    /// `c`, `C`, `s` or `S`: `resume` the thread `Hc` selected alone, or
+    /// the current one with the others continuing when it selected every
+    /// thread ([`control::packet_actions`]), its pointer set to `addr`
+    /// first when the packet gives one.
+    fn resume_packet(
+        &mut self,
+        resume: Resume,
+        signal: Option<u8>,
+        addr: Option<u64>,
+        ipc_buf: *mut u64,
+    )
+    {
+        let selected = self.session.as_ref().and_then(|s| s.resume_thread);
+        let actions = control::packet_actions(resume, signal, selected);
+        let plan = self.plan(&actions);
+        self.resume(plan, addr, ipc_buf);
+    }
+
+    /// The plan of `actions` over the session's live threads
+    /// ([`control::plan_vcont`]); nothing without a session.
+    fn plan(&self, actions: &[VContAction]) -> Plan
+    {
+        self.session.as_ref().map_or(Plan::Nothing, |s| {
+            control::plan_vcont(actions.iter().copied(), s.current, s.live_slots(), |t| {
+                s.select(t)
+            })
+        })
     }
 
     /// The current thread's register file, read for a request that does

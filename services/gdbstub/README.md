@@ -142,8 +142,11 @@ stub's endpoint.
   and restarts every held breakpoint hit or fault GDB has not been told of, since any of them can
   be a new thread's (below). A thread whose upcall does not arrive in time runs on and is not
   reported held. The all-stop's end makes every held stop one GDB has been told of. An upcall that
-  arrives while the target runs was posted to a thread that had stopped on a fault first, or that
-  was held in a call; its stop is over, and the stub resumes it at once. A thread the upcall finds
+  arrives while the target runs, of a thread GDB resumed, was posted to it when it had stopped on a
+  fault first, or while it was held in a call; its stop is over, and the stub resumes it at once.
+  Any stop of a thread GDB did not resume is held as it arrives, a breakpoint hit set back, as GDB
+  holds the thread: the upcall of one held in a call, and any stop of one the all-stop could not
+  hold (**Resuming** below). A thread the upcall finds
   blocked in any other interruptible syscall returns from it with `Interrupted`
   ([docs/fault-handling.md](../../docs/fault-handling.md) § Asynchronous Upcalls, Blocking
   syscalls), so each all-stop can end a sleep or a wait of the target early, as any stop can. A
@@ -234,7 +237,9 @@ stub's endpoint.
   `int3` leaves the pointer past it, the stub sets that thread's pointer back to the breakpoint, so
   its resume runs the breakpoint again and the hit is reported then.
 - **Single-step.** `s`, or a `vCont` step action, runs one instruction of one thread, the others
-  held: on x86-64 by the trap flag, on riscv64 by a `c.ebreak` planted at the successor the
+  held, those a continue action of the same packet names among them, since another thread could take
+  the riscv64 step's planted `c.ebreak` (GDB's own software step resumes only the stepped thread for
+  that reason): on x86-64 by the trap flag, on riscv64 by a `c.ebreak` planted at the successor the
   instruction's decode gives, through the text write of **Breakpoints** (a page the target shares
   becomes its own first), and removed at the step's stop, with the hazards
   [docs/fault-handling.md](../../docs/fault-handling.md) § Debugging lists for that route. An
@@ -244,11 +249,25 @@ stub's endpoint.
   once more and writes the `c.ebreak` back whatever comes; a trap flag on an x86-64 thread that
   never stopped stays set, which the stub logs, and the thread's next instruction then traps to
   the crash endpoint.
-- **Resuming.** `c`, `C`, `s`, `S`, and `vCont` act on the current thread or the one the action
-  names; an address the packet gives becomes that thread's pointer first. A signal passed to a
-  thread stopped on a fault declines the fault (`FAULT_REPLY_KILL`), so a step that passes one is a
-  continue passing it. A `vCont` whose actions name no live thread is answered `E01`; a resume with
-  no target, or after which every thread has exited, is answered `W00`.
+- **Resuming.** A `vCont` resumes only the threads its actions name, as the remote protocol has
+  it: each thread takes the leftmost action that names it, an action with no thread id or with `-1`
+  naming every thread and one with `0` the current thread, and a thread no action names stays held;
+  a step runs alone, as above. `c`, `C`, `s`, and `S` act on the thread `Hc` selected, alone, or,
+  after `Hc0` or `Hc-1`, on the current thread with every other thread continuing; an address the
+  packet gives becomes that thread's pointer first. `Hc` of a thread `Hg` would refuse is refused
+  as `Hg` is. A signal passed to a thread stopped on a fault declines the fault
+  (`FAULT_REPLY_KILL`), so a step that passes one is a continue passing it. A thread GDB did not
+  resume stays held while the target runs, one the all-stop could not hold from its next stop on,
+  and a stop is reported only for a thread GDB resumed, or one spawned while the target ran: a stop
+  GDB did not ask for would break its own run control, as a software step's breakpoint taken by
+  another thread does. GDB's interrupt reports the current thread when GDB resumed it, and
+  otherwise the first thread it resumed, held or else in a call. A `vCont` whose actions name no
+  live thread is answered `E01`; a resume with no target, or after which every thread has exited,
+  is answered `W00`, as is a target whose threads all exit while it runs, but only when the stub's
+  table holds every thread of the target, since threads it could not take may run on. Once no
+  thread GDB resumed runs on, each having exited, while others are held, the stub stops the target
+  and answers `N` when GDB's `qSupported` offered `no-resumed+`; otherwise the target waits for
+  GDB's interrupt.
 - **Memory.** `m`, `M`, and `X` read and write the target's address space through any held
   thread's cap; a write that a read-only page refuses goes through the text route, which reaches
   text, mapped through a capability that carries Execute, but not read-only data such as `.rodata`
@@ -266,7 +285,7 @@ stub's endpoint.
 
 | Packet | Answer |
 |---|---|
-| `qSupported` | `PacketSize`, `QStartNoAckMode+`, `qXfer:features:read+`, `vContSupported+`; attaches first when detached |
+| `qSupported` | `PacketSize`, `QStartNoAckMode+`, `qXfer:features:read+`, `vContSupported+`; attaches first when detached, and notes whether GDB offered `no-resumed+` |
 | `QStartNoAckMode` | `OK`, then no acknowledgements |
 | `?` | `T05` for the current thread; `W00` when detached |
 | `qAttached` | `1`: GDB detaches on quit rather than killing the target |
@@ -277,7 +296,7 @@ stub's endpoint.
 | `g`, `G`, `p`, `P` | the current thread's registers, read and written through its register file; a thread held in a call reads, and `G` and `P` of it are answered `E06` |
 | `m`, `M`, `X` | target memory |
 | `Z0`, `z0` | software breakpoints |
-| `c`, `C`, `s`, `S`, `vCont?`, `vCont` | resume and step, as above |
+| `c`, `C`, `s`, `S`, `vCont?`, `vCont` | resume and step, as above; `N` once no resumed thread runs on |
 | `D` | detach ([Detach](#detach)), then `OK` |
 | `k` | detach; the target is not killed |
 | the interrupt byte `0x03` | stop every thread; `T02` |
@@ -358,16 +377,21 @@ Each bound's entry is in [docs/limits.md](../../docs/limits.md) § Other service
 The host tests cover the register map, the breakpoint table and instructions, the stop signals,
 the binding badges, the credit of a stop to its thread, the origin, settling, and decline of a stop
 no thread claims, the slot a new thread takes, the rewind of an unreported breakpoint hit, and the
-resume plans of `c`, `s`, and `vCont`. They drive the stop state machine against a simulated
-kernel through the interleavings that can break it: a spawner and a thread it spawned after the
-attach at one breakpoint, in either order and with the spawner's stop late; a fault of a thread
-the stub cannot bind; a new thread in its exited spawner's slot; stops during a step; a repeat of
-a stop GDB knows of, and the kernel's second delivery of one; a restart at a breakpoint built into
-the target; a thread's own upcall beside a stop that was not its; stops racing a resume or an
-all-stop, and an all-stop that holds no thread; an attach before the target's start, holding its
-main thread once started, and one whose target is not started within the all-stop, or starts after
-its last read; a start late in the all-stop, alone or beside a thread a refresh adds unstarted;
-a continue that ends every thread; and a detach with a stop pending, with every thread exited, and
+resume plans of `c`, `s`, and `vCont`: each thread takes its leftmost action, a thread no action
+names stays held, a step runs alone, and `c` and `s` resume the thread `Hc` selected alone. They
+drive the stop state machine against a simulated kernel through the interleavings that can break
+it: a spawner and a thread it spawned after the attach at one breakpoint, in either order and with
+the spawner's stop late; a fault of a thread the stub cannot bind; a new thread in its exited
+spawner's slot; stops during a step; a repeat of a stop GDB knows of, and the kernel's second
+delivery of one; a restart at a breakpoint built into the target; a thread's own upcall beside a
+stop that was not its; stops racing a resume or an all-stop, and an all-stop that holds no thread;
+an attach before the target's start, holding its main thread once started, and one whose target is
+not started within the all-stop, or starts after its last read; a start late in the all-stop, alone
+or beside a thread a refresh adds unstarted; a continue that ends every thread, or whose threads all
+exit while the target runs; a continue of one thread with another held at the same breakpoint,
+whose stop alone is reported, a held thread's call returning meanwhile, an interrupt meanwhile, the
+restart of the resumed thread's stop, and a continue or step whose one thread exits; and a detach
+with a stop pending, with every thread exited, and
 with the step's thread exited or never stopped. `cargo xtask test-gdb` boots the `gdb-target`
 fixture (`programs/debugger --gdb-target`,
 [programs/debugger/README.md](../../programs/debugger/README.md)) with the stub and runs a batch

@@ -382,6 +382,10 @@ pub fn run_case(ctx: &Context, name: TestCase, args: &TestArgs) -> Result<()>
 /// request and to the images.
 trait Staging
 {
+    /// Refuse before anything changes when the images cannot be packed for
+    /// the cases: a sysroot built for another architecture, which a pack
+    /// would sign for the wrong one and leave unable to pack.
+    fn check(&mut self) -> Result<()>;
     /// Remove the staged request.
     fn clear(&mut self) -> Result<()>;
     /// Stage `bytes`, a request, again.
@@ -408,6 +412,11 @@ impl<'a> SysrootStaging<'a>
 
 impl Staging for SysrootStaging<'_>
 {
+    fn check(&mut self) -> Result<()>
+    {
+        crate::sysroot::check_arch(self.ctx, self.arch)
+    }
+
     fn clear(&mut self) -> Result<()>
     {
         request::clear(self.ctx)
@@ -446,6 +455,7 @@ fn read_staged(ctx: &Context) -> Result<Option<Vec<u8>>>
 /// 60 seconds when it is unsigned. A case that boots requests of its own
 /// (`enrolment`) stages them itself. A failure to restore is reported ahead
 /// of the cases' outcome, since every later pack would then lack the request.
+/// Nothing changes when [`Staging::check`] refuses the images first.
 fn without_staged_request<T>(
     staged: Option<Vec<u8>>,
     staging: &mut impl Staging,
@@ -457,6 +467,7 @@ fn without_staged_request<T>(
     {
         return cases();
     };
+    staging.check()?;
     step("setting the staged trust request aside for the cases");
     let ran = staging
         .clear()
@@ -711,16 +722,27 @@ mod tests
         assert_eq!((args.arch, args.cpus, args.mem), (Arch::Riscv64, 2, 1024));
     }
 
-    /// A [`Staging`] that records each change in `log`, failing the
-    /// restaging when `fail_stage` holds.
+    /// A [`Staging`] that records each change in `log`, failing the check
+    /// when `fail_check` holds and the restaging when `fail_stage` holds.
     struct Recorder
     {
         log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        fail_check: bool,
         fail_stage: bool,
     }
 
     impl Staging for Recorder
     {
+        fn check(&mut self) -> Result<()>
+        {
+            self.log.borrow_mut().push("check".into());
+            if self.fail_check
+            {
+                bail!("the sysroot was built for riscv64");
+            }
+            Ok(())
+        }
+
         fn clear(&mut self) -> Result<()>
         {
             self.log.borrow_mut().push("clear".into());
@@ -750,6 +772,7 @@ mod tests
     {
         Recorder {
             log: std::rc::Rc::default(),
+            fail_check: false,
             fail_stage: false,
         }
     }
@@ -770,7 +793,7 @@ mod tests
         assert_eq!(ran.unwrap(), 7);
         assert_eq!(
             *staging.log.borrow(),
-            ["clear", "repack", "cases", "stage req", "repack"]
+            ["check", "clear", "repack", "cases", "stage req", "repack"]
         );
     }
 
@@ -798,7 +821,7 @@ mod tests
         assert!(format!("{:#}", ran.unwrap_err()).contains("case failed"));
         assert_eq!(
             *staging.log.borrow(),
-            ["clear", "repack", "stage req", "repack"]
+            ["check", "clear", "repack", "stage req", "repack"]
         );
     }
 
@@ -815,5 +838,24 @@ mod tests
             message.contains("restoring the staged trust request"),
             "{message}"
         );
+    }
+
+    // Defect caught: a cell run for an architecture the sysroot was not built
+    // for, which packed the sysroot for the wrong one before any case's
+    // readiness check refused it, and left it unable to pack.
+    #[test]
+    fn a_sysroot_of_another_architecture_is_refused_before_anything_changes()
+    {
+        let mut staging = Recorder {
+            fail_check: true,
+            ..recorder()
+        };
+        let log = staging.log.clone();
+        let ran = without_staged_request(Some(b"req".to_vec()), &mut staging, || {
+            log.borrow_mut().push("cases".into());
+            Ok(())
+        });
+        assert!(format!("{:#}", ran.unwrap_err()).contains("built for riscv64"));
+        assert_eq!(*staging.log.borrow(), ["check"]);
     }
 }

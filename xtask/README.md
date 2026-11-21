@@ -705,7 +705,8 @@ case option it does not take, and `--cause`, `--port`, `--gdb`, `--riscv-mmu` an
 require a case.
 
 A case or a cell boots images that carry no trust request: when one is staged in the sysroot's ESP
-([`cargo xtask trust-request`](#cargo-xtask-trust-request)), the runner removes it and packs the
+([`cargo xtask trust-request`](#cargo-xtask-trust-request)), the runner checks that the sysroot was
+built for the architecture, changing nothing when it was not, then removes the request and packs the
 images again before the cases, then stages it and packs them again after them, whatever their
 outcome, since each boot of a case starts on a fresh variable store and would decide the request
 again. The `enrolment` case stages requests of its own for its boots.

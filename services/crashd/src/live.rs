@@ -62,8 +62,10 @@ enum Fail
     /// The process declared that no core of it is written
     /// (`DECLARE_NO_CORE`).
     NoCore,
-    /// procmgr refused the snapshot, or the attach after it, with this label.
+    /// procmgr refused the snapshot with this label.
     Refused(u64),
+    /// procmgr refused the attach after the capture with this label.
+    AttachRefused(u64),
     /// The core was not written, for this reason; a `.part` file may remain.
     NotWritten(&'static str),
     /// The bound passed.
@@ -102,9 +104,12 @@ pub fn serve(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64, dump: Dump)
                     .build(),
                 Err(Fail::NotFound) => IpcMessage::new(crashd_errors::NOT_FOUND),
                 Err(Fail::NoCore) => IpcMessage::new(crashd_errors::NO_CORE),
-                Err(Fail::Refused(label)) => IpcMessage::builder(crashd_errors::SNAPSHOT_REFUSED)
-                    .word(0, label)
-                    .build(),
+                Err(Fail::Refused(label) | Fail::AttachRefused(label)) =>
+                {
+                    IpcMessage::builder(crashd_errors::SNAPSHOT_REFUSED)
+                        .word(0, label)
+                        .build()
+                }
                 Err(Fail::NotWritten(_)) => IpcMessage::new(crashd_errors::NOT_WRITTEN),
                 Err(Fail::TimedOut) => IpcMessage::new(crashd_errors::TIMED_OUT),
             }
@@ -181,6 +186,10 @@ fn log(name: &[u8], ended: &Result<Written, Fail>)
         Err(Fail::Refused(label)) => std::os::seraph::log!(
             warn: "live core of {name} not written: {} (label={label:#x})",
             refusal(*label)
+        ),
+        Err(Fail::AttachRefused(label)) => std::os::seraph::log!(
+            warn: "live core of {name} not written: {} (label={label:#x})",
+            attach_refusal(*label)
         ),
         Err(Fail::NotWritten(why)) =>
         {
@@ -401,6 +410,20 @@ fn refusal(code: u64) -> &'static str
     }
 }
 
+/// Why procmgr refused the attach after the capture, for the log line.
+fn attach_refusal(code: u64) -> &'static str
+{
+    match code
+    {
+        procmgr_errors::NOT_ATTACHABLE =>
+        {
+            "the process declared itself undebuggable since the capture"
+        }
+        procmgr_errors::OUT_OF_MEMORY => "procmgr could not attach the process",
+        _ => "the attach after the capture was refused",
+    }
+}
+
 /// Lay out and write the core of `object`, the snapshot of the process
 /// `process` named `name`, whose checked layout `layout` holds, with the
 /// auxiliary vector `auxv`.
@@ -496,7 +519,7 @@ fn read_layout(object: &Object, ipc_buf: *mut u64) -> Result<(Snapshot, Window),
 /// # Errors
 /// [`Fail::NoCore`] when the process declared no core; [`Fail::NotFound`]
 /// when it ended before the attach, its declarations then unknown;
-/// [`Fail::Refused`] with procmgr's label when procmgr refused the attach
+/// [`Fail::AttachRefused`] with procmgr's label when procmgr refused the attach
 /// otherwise (`NOT_ATTACHABLE` for a process that declared itself
 /// undebuggable since the capture); [`Fail::NotWritten`] when the call
 /// failed; [`Fail::TimedOut`] when the bound passed first.
@@ -510,7 +533,7 @@ fn vet(process: u64, bias: u64, authority: u64, ipc_buf: *mut u64) -> Result<Opt
         {
             return Err(Fail::NotFound);
         }
-        Err(crate::AttachFailed::Refused(Some(label))) => return Err(Fail::Refused(label)),
+        Err(crate::AttachFailed::Refused(Some(label))) => return Err(Fail::AttachRefused(label)),
         Err(crate::AttachFailed::Refused(None)) =>
         {
             return Err(Fail::NotWritten("the process's declarations were not read"));

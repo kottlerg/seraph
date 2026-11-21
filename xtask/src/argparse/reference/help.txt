@@ -24,8 +24,7 @@ Commands:
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
   pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check    Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger   Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
@@ -55,8 +54,7 @@ Commands:
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
   pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check    Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger   Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
@@ -828,48 +826,30 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
-=== xtask review-check -h
-Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-
-Usage: xtask review-check <PR>
-
-Arguments:
-  <PR>  The pull request's number
-
-Options:
-  -h, --help  Print help
-=== xtask review-check --help
-Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-
-Usage: xtask review-check <PR>
-
-Arguments:
-  <PR>  The pull request's number
-
-Options:
-  -h, --help  Print help
 === xtask review-ledger -h
-Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
 
 Usage: xtask review-ledger [OPTIONS] [PR]
 
 Arguments:
-  [PR]  The pull request's number: write `ledger.json` beside its records
+  [PR]  The pull request's number: validate its records and write `ledger.json` beside them, or nothing when one is malformed
 
 Options:
+      --check              Validate the pull request's records alone and write nothing
       --release <RELEASE>  The target version `X.Y.Z` of a release review: print its ledger, the entries of the range's pull requests and of the release's own runs
       --from <FROM>        The previous release tag, where the release's range starts
       --file <FILE>        With `--release`, print only the entries for this file; repeatable
   -h, --help               Print help
 === xtask review-ledger --help
-Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
 
 Usage: xtask review-ledger [OPTIONS] [PR]
 
 Arguments:
-  [PR]  The pull request's number: write `ledger.json` beside its records
+  [PR]  The pull request's number: validate its records and write `ledger.json` beside them, or nothing when one is malformed
 
 Options:
+      --check              Validate the pull request's records alone and write nothing
       --release <RELEASE>  The target version `X.Y.Z` of a release review: print its ledger, the entries of the range's pull requests and of the release's own runs
       --from <FROM>        The previous release tag, where the release's range starts
       --file <FILE>        With `--release`, print only the entries for this file; repeatable
@@ -1527,8 +1507,7 @@ Commands:
   commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
   pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
   compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check    Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger   Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
   release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
   issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
   issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)

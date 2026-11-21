@@ -1509,13 +1509,20 @@ The command does not judge what needs a reader: whether the body's claims match 
 an acceptance item is delivered, and which local host runs the change owes. Those stay with the
 pre-merge review's audit.
 
-### `cargo xtask review-check`
+### `cargo xtask review-ledger`
 
-Validate the saved run records of a pull request's pre-merge review.
+Validate the saved run records of a review and build its ledger: the findings a later run must
+not re-raise ([docs/conventions.md](../docs/conventions.md) § Ledger).
 
 ```
-cargo xtask review-check <N>
+cargo xtask review-ledger <N> [--check]
+cargo xtask review-ledger --release <X.Y.Z> --from <previous tag> [--file <path>]...
 ```
+
+With a pull request's number it checks every run record of `target/xtask/review/pr<N>/` against
+the record shape below, then writes `ledger.json` beside them. A record that departs from the
+shape fails the command, which then writes nothing, so the ledger and the merge gate read only
+what they expect. With `--check` it validates alone and writes nothing.
 
 A run record is `target/xtask/review/pr<N>/<mode>-<head>.json`, where `<mode>` is `full`, `delta`,
 or `audit` and `<head>` is the head the run reviewed, at least its first 8 hexadecimal digits. A
@@ -1559,20 +1566,9 @@ which only an `audit` record's run kind selects (`.claude/agents/pr-auditor.md` 
 and 12), so the audit of that run with the reviewer is run again with the run-kind line
 `Run kind: with-reviewer` (`.claude/skills/pr-review/SKILL.md` § The record).
 
-### `cargo xtask review-ledger`
-
-Build the ledger of a review: the findings a later run must not re-raise
-([docs/conventions.md](../docs/conventions.md) § Ledger).
-
-```
-cargo xtask review-ledger <N>
-cargo xtask review-ledger --release <X.Y.Z> --from <previous tag> [--file <path>]...
-```
-
-With a pull request's number it reads every run record of `target/xtask/review/pr<N>/` and
-writes `ledger.json` beside them: a sorted list without duplicates of each record's `recorded`
-and `dropped` findings, its `contested` findings, and, in an earlier-form record whose verdict
-is `NON-BLOCKING ISSUES ONLY`, all its `findings`. Each entry carries the finding's fields and
+The ledger is a sorted list without duplicates of each record's `recorded` and `dropped`
+findings, its `contested` findings, and, in an earlier-form record whose verdict is
+`NON-BLOCKING ISSUES ONLY`, all its `findings`. Each entry carries the finding's fields and
 `run`, the first eight digits of the head of the run that reported it.
 
 With `--release` it prints the release review's ledger as JSON on stdout: the entries of every
@@ -1580,10 +1576,12 @@ pull request a first-parent merge `Merge pull request #N` of `<previous tag>..HE
 those of the release's own records in `target/xtask/review/release-v<X.Y.Z>/`, sorted and
 without duplicates, limited to the files `--file` names when it is given. A release record's
 finding the workflow left undecided (one in its `undecided` list, or a `contested` one, whose
-refuters split, in its `findings`) enters only once the maintainer's decision is saved on
-it as `ruling`. Only run records are read
-(`<mode>-<head>[-<n>].json`); a pull request without records adds nothing. The count goes to
-stderr, so stdout holds the JSON alone.
+refuters split, in its `findings`) enters only once the maintainer's decision is saved on it as
+`ruling`. Only run records are read (`<mode>-<head>[-<n>].json`); a pull request without
+records adds nothing. A record that is not a JSON object fails the command, which then prints no
+ledger; the record shape above is not applied, since a release record has its own and an older
+pull request's record has the form of its time. The count goes to stderr, so stdout holds the
+JSON alone.
 
 ### `cargo xtask release-scope`
 

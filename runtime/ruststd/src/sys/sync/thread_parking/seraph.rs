@@ -15,7 +15,7 @@
 
 use crate::pin::Pin;
 use crate::sync::atomic::{AtomicU32, AtomicU64};
-use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+use crate::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 use crate::time::Duration;
 
 const EMPTY: u32 = 0;
@@ -25,6 +25,12 @@ const PARKED: u32 = 2;
 pub struct Parker {
     state: AtomicU32,
     notification: AtomicU64,
+    /// The restores the process had run when `notification` was made
+    /// (`os::seraph::checkpoint::restores`). A Notification made before a
+    /// restore names a slot of the captured process: the main thread's
+    /// Parker, the one that reaches a restore, drops it unused and makes
+    /// another.
+    made_under: AtomicU64,
 }
 
 impl Parker {
@@ -32,7 +38,11 @@ impl Parker {
     /// `parker` must be a properly-aligned, writable `*mut Parker`.
     pub unsafe fn new_in_place(parker: *mut Parker) {
         unsafe {
-            parker.write(Self { state: AtomicU32::new(EMPTY), notification: AtomicU64::new(0) });
+            parker.write(Self {
+                state: AtomicU32::new(EMPTY),
+                notification: AtomicU64::new(0),
+                made_under: AtomicU64::new(0),
+            });
         }
     }
 
@@ -44,7 +54,7 @@ impl Parker {
         }
         // Allocate before publishing PARKED, so an `unpark` that sees PARKED
         // finds the cap to send on.
-        let sig = ensure_notification(&self.notification);
+        let sig = self.ensure_notification();
         // Only this thread sets PARKED and only `unpark` sets NOTIFIED, so
         // the state is EMPTY or NOTIFIED here.
         if self.state.compare_exchange(EMPTY, PARKED, AcqRel, Acquire).is_err() {
@@ -74,7 +84,7 @@ impl Parker {
             return;
         }
         // Allocate before publishing PARKED, as `park` does.
-        let sig = ensure_notification(&self.notification);
+        let sig = self.ensure_notification();
         // An `unpark` that lands before PARKED is published leaves NOTIFIED:
         // consume it and return at once rather than wait out `dur`.
         if self.state.compare_exchange(EMPTY, PARKED, AcqRel, Acquire).is_err() {
@@ -112,7 +122,7 @@ impl Parker {
         // Acquire pairs with the parker's PARKED publication, which follows
         // its notification-cap store, so the load below sees the cap.
         if self.state.swap(NOTIFIED, AcqRel) == PARKED {
-            let sig = self.notification.load(Acquire);
+            let sig = self.current_notification();
             if sig != 0 {
                 let _ = syscall::notification_send(sig, 1);
             }
@@ -122,7 +132,7 @@ impl Parker {
 
 impl Drop for Parker {
     fn drop(&mut self) {
-        let sig = *self.notification.get_mut();
+        let sig = self.current_notification();
         if sig != 0 {
             let _ = syscall::cap_delete(sig);
         }
@@ -144,24 +154,39 @@ fn back_off(backoff: &mut spin_wait::Backoff) {
     }
 }
 
-/// Lazily allocate the Parker's Notification cap on its first blocking park.
-/// Returns 0 if allocation fails; the park then backs off instead of waiting.
-fn ensure_notification(slot: &AtomicU64) -> u64 {
-    let existing = slot.load(Acquire);
-    if existing != 0 {
-        return existing;
+impl Parker {
+    /// The Parker's Notification, or 0 when it has none or holds one made
+    /// before a restore, which names nothing in this process.
+    fn current_notification(&self) -> u64 {
+        // `made_under` first: seeing the current count, under the Release
+        // store of `ensure_notification` that followed its clearing of a
+        // stale cap, the load below reads 0 or the fresh cap.
+        let made_under = self.made_under.load(Acquire);
+        let sig = self.notification.load(Acquire);
+        if made_under == crate::os::seraph::checkpoint::restores() { sig } else { 0 }
     }
-    let bytes = syscall_abi::NOTIFICATION_RETYPE_BYTES;
-    let Some(fresh) = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
-        syscall::cap_create_notification(slab).ok()
-    }) else {
-        return 0;
-    };
-    match slot.compare_exchange(0, fresh, AcqRel, Acquire) {
-        Ok(_) => fresh,
-        Err(other) => {
-            let _ = syscall::cap_delete(fresh);
-            other
+
+    /// Lazily allocate the Parker's Notification cap on its first blocking
+    /// park in this process: the first park, or the first after a restore,
+    /// which drops the one made before it unused. Only the owning thread
+    /// calls it. Returns 0 if allocation fails; the park then backs off
+    /// instead of waiting.
+    fn ensure_notification(&self) -> u64 {
+        let existing = self.current_notification();
+        if existing != 0 {
+            return existing;
         }
+        let bytes = syscall_abi::NOTIFICATION_RETYPE_BYTES;
+        let Some(fresh) = crate::sys::alloc::seraph::object_slab_retype(bytes, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        }) else {
+            return 0;
+        };
+        // A stale cap is cleared before the count moves on (see
+        // `current_notification`).
+        self.notification.store(0, Relaxed);
+        self.made_under.store(crate::os::seraph::checkpoint::restores(), Release);
+        self.notification.store(fresh, Release);
+        fresh
     }
 }

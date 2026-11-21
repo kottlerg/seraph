@@ -853,39 +853,77 @@ signals no more.
 ## Checkpoint
 
 `std::os::seraph::checkpoint` is the process's side of the checkpoint protocol
-([docs/checkpoint-restore.md](../../docs/checkpoint-restore.md) § Quiesce point, § Checkpoint):
+([docs/checkpoint-restore.md](../../docs/checkpoint-restore.md) § Quiesce point, § Checkpoint,
+§ Restore entry and handle rebinding):
 
 - `quiesce(timeout)` quiesces the process at the call, for its controller to take a checkpoint
   of it. It is refused, capturing nothing, off the main thread (`InvalidInput`), in a process that
-  is not demand-paged or that procmgr refuses as one no restore can reproduce (`Unsupported`), and
-  while a resource a restore cannot reproduce is held (`ResourceBusy`). Otherwise it creates a
-  Notification, sends procmgr `QUIESCE` with a Notify-only derivation of it and an address in its
-  own frame as the restore stack pointer, waits on the Notification for at most `timeout` (without
-  bound for a `timeout` past `Instant`'s range), and then sends the `QUIESCE` that ends the point,
-  made again while it is interrupted, so the thread returns only after procmgr has ended it. Both
-  calls are made outside any call deadline (§ Call deadline), and a failed entry is followed by an
-  end, since it may have reached procmgr. It returns `Quiesced::Captured` when the Notification was
-  signalled, its controller then holding a complete checkpoint of the point, and
-  `Quiesced::NotCaptured` otherwise.
+  is not demand-paged, whose heap grows by grants since its demand floor could not be registered,
+  or that procmgr refuses as one no restore can reproduce (`Unsupported`), and
+  while a value holding a capability of the process is alive (`ResourceBusy`, below). Otherwise it
+  saves the caller's callee-saved registers, stack pointer and return address in a resume record
+  on its stack, creates a Notification, sends procmgr `QUIESCE` with a Notify-only derivation of
+  it and a stack address below the resume record as the restore stack pointer, waits on the
+  Notification for at most `timeout` (without bound for a `timeout` past `Instant`'s range), and
+  then sends the `QUIESCE` that ends the point, made again while it is interrupted, so the thread
+  returns only after procmgr has ended it. Both calls are made outside any call deadline (§ Call
+  deadline), and a failed entry is followed by an end, since it may have reached procmgr. It
+  returns `Quiesced::Captured` when the Notification was signalled, its controller then holding a
+  complete checkpoint of the point, and `Quiesced::NotCaptured` otherwise. In a process a restore
+  created, the restore entry resumes the record and `quiesce` returns `Quiesced::Restored` with a
+  `RollbackNotice`, whose `quiesced_at` is the monotonic time of the point.
 - `take(process_handle)` sends procmgr `CHECKPOINT` on a process handle
   ([Child process handles](#child-process-handles)), with a copy of the caller's own memmgr
   endpoint as the account the checkpoint is charged to, and returns a `Checkpoint`: the object's
-  pages, whether the capture is complete, and its handle, which `into_raw` hands over and a drop
-  releases (`OBJECT_RELEASE`, made again while a stop interrupts it, since nothing else releases
-  it). A process at no quiesce point is refused `ResourceBusy`.
+  pages, whether the capture is complete, and its handle, which `handle` lends, `into_raw` hands
+  over and a drop releases (`OBJECT_RELEASE`, made again while a stop interrupts it, since nothing
+  else releases it). A process at no quiesce point is refused `ResourceBusy`, and one procmgr
+  could not mark (`NOT_RESTORABLE`) `Unsupported`.
+- `CommandExt::restore(object)` makes a `Command` spawn a restore of the checkpoint whose handle
+  `object` is (`CREATE_RESTORE`): the spawn sends a copy of the handle, which procmgr deletes, and
+  no argv or env, since the restored process has its checkpoint's. procmgr refuses a pinned
+  restore (`InvalidInput`), a handle memmgr does not take (`InvalidInput`), and an object that is
+  no checkpoint of the binary (`Unsupported`).
 
-The resources `quiesce` refuses are counted by values that live as long as each resource: a
-thread the application spawned, until its cleanup has run (`src/sys/thread/seraph.rs`), an open
-`std::fs::File`, a held `std::process::Child`, and an open pipe end other than the process's own
-stdio, which `_start` attaches for the life of the process. The counter is a zero-sized field of
-the resource, so it adds no bytes to it. The runtime's own threads, the fs release handler and a
-child's death bridge, are spawned through `thread::runtime_spawn` and not counted: they are idle
-at their wait whenever the counters are zero.
+`quiesce` is refused while any std value that holds a capability of the process is alive, the
+process's own stdio pipes aside, which `_start` attaches for the life of the process and the
+restore entry replaces. Such a value names a slot or a server's request that a restore does not
+reproduce. A thread the application spawned, until its cleanup has run (`src/sys/thread/seraph.rs`),
+an open `std::fs::File`, a held `std::process::Child` and an open pipe end are such values, and so
+are, among others, the `JoinHandle` of a thread that has ended until it is joined or dropped, a
+`std::fs::ReadDir`, a `VerifiedData` and a `Checkpoint`. A thread detached by dropping its
+`JoinHandle` holds nothing once it has ended. Each value counts itself through a field of the
+runtime's `checkpoint::Held` type: the count is taken when the value is made and released when it is
+dropped, so it cannot drift from the values alive. A value the application forgets
+(`mem::forget`) keeps its count, and every later `quiesce` of the process is refused; that is
+accepted, as the leak of the capability is. The runtime's own threads, the fs release handler and
+a child's death bridge, are spawned through `thread::runtime_spawn` and not counted: they are idle
+at their wait whenever the counts are zero.
 
-The runtime keeps no resume record yet, and `quiesce` returns no `Restored`: the restore entry
-comes with procmgr's restore creation
-([docs/checkpoint-restore.md](../../docs/checkpoint-restore.md#implementation-status)
-§ Implementation Status).
+### Restore classes
+
+A restore keeps the runtime's memory as captured, and every value in it that names a capability of
+the captured process names a slot the new process does not hold. Every `static` of the crates whose
+code runs in the restored process before `quiesce` returns (`runtime/ruststd/src/`, `shared/log/`
+and `shared/registry-client/`), a `thread_local!` one among them, therefore carries its restore
+class on a `// restore: <class>` line among the comment and attribute lines directly above it:
+
+- `rebound`: its value names a capability of the process or state made from one (a cap slot, a
+  mapping, a Notification, a registration with a server), or is a value two restores of one
+  checkpoint must not share. A function marked `// restore: reset` in its own file names it, and
+  sets it anew from the new process's caps without using the captured ones; the restore entry,
+  `restore_entry` in `src/os/seraph.rs`, marked `// restore: entry`, calls every reset and resets
+  the statics of its own file.
+- `none`: a restore keeps its value as captured, since the value names no capability (a counter,
+  a flag, a byte buffer) or names only what the restore remakes as it was (a memmgr region, the
+  heap's bytes).
+
+The `src-restore-class` rule of `cargo xtask lint-docs` ([xtask/README.md](../../xtask/README.md)
+§ `cargo xtask lint-docs`) fails on a static without a class, an unknown class, a `rebound`
+static no reset of its file names, and a reset the entry does not call. A runtime value that holds
+a capability past a quiesce point outside a static, which only the main thread's `Parker` does,
+records the restore count it was made under and drops the capability unused once the count moved
+on.
 
 ---
 

@@ -56,7 +56,8 @@ pub const START_PROCESS: u64 = 2;
 /// * bit `34` — [`CREATE_CHARGE_NODE`]
 /// * bit `35` — [`CREATE_CONTAIN`]
 /// * bit `36` — [`CREATE_PRIVATE_IMAGE`]
-/// * bits `[37..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+/// * bit `37` — [`CREATE_RESTORE`]
+/// * bits `[38..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
 ///
 /// IPC data words:
 /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
@@ -252,11 +253,22 @@ pub const CREATE_CONTAIN: u64 = 1 << 35;
 /// in `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
 /// (**Private image**).
 pub const CREATE_PRIVATE_IMAGE: u64 = 1 << 36;
-/// Still-reserved bits `[37..64]` of a create label. Procmgr rejects
+/// Label flag (bit 37) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+/// restore the checkpoint whose memmgr object handle the request carries
+/// as a tail cap, before the death relay, in the place an argv/env cap
+/// takes (docs/checkpoint-restore.md § Restore creation). The object must
+/// carry memmgr's checkpoint mark and be a checkpoint of the verified body;
+/// otherwise the create is refused `NOT_RESTORABLE`. Refused
+/// `INVALID_ARGUMENT` with [`CREATE_ARGV_ENV`], [`CREATE_PINNED`],
+/// [`CREATE_PHYS_ACCESS`] or [`CREATE_DMA_HOLD`]. Specified in
+/// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
+/// (**Restore**).
+pub const CREATE_RESTORE: u64 = 1 << 37;
+/// Still-reserved bits `[38..64]` of a create label. Procmgr rejects
 /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
 /// addition is provably additive: existing senders are known to send
 /// zeros.
-pub const CREATE_RESERVED_MASK: u64 = !((1 << 37) - 1);
+pub const CREATE_RESERVED_MASK: u64 = !((1 << 38) - 1);
 /// Data words an [`ArgvEnvHeader`] takes in a create request.
 pub const ARGV_ENV_HEADER_WORDS: usize = 4;
 /// The first data word of a create request after its fixed word 0, the

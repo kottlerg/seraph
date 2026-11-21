@@ -100,6 +100,7 @@ use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE};
 mod release_handler;
 
 use release_handler::{FileEntry, OutstandingMapping};
+pub(crate) use release_handler::rebind_release_handler;
 
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
@@ -298,6 +299,8 @@ pub struct ReadDir
     /// failure). A rejected entry name is an error for that entry alone;
     /// the iteration continues past it.
     done: bool,
+    /// The directory cap, which a quiesce point refuses.
+    _held: crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CAP }>,
 }
 
 impl ReadDir
@@ -2187,6 +2190,7 @@ pub fn readdir(path: &Path) -> io::Result<ReadDir>
         next_idx: 0,
         parent_path: PathBuf::from(path_str),
         done: false,
+        _held: crate::os::seraph::checkpoint::Held::new(),
     })
 }
 

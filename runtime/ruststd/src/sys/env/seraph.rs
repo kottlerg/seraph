@@ -25,6 +25,7 @@ use crate::os::seraph::try_startup_info;
 use crate::path::{Path, PathBuf};
 use crate::sync::{Mutex, OnceLock};
 
+// restore: none
 static ENV: OnceLock<Mutex<BTreeMap<OsString, OsString>>> = OnceLock::new();
 
 fn env_map() -> &'static Mutex<BTreeMap<OsString, OsString>> {

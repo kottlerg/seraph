@@ -49,11 +49,15 @@ struct StdioCell(UnsafeCell<[Option<Pipe>; 3]>);
 // SAFETY: `stdio_init` writes the slots once, from `_start` before any
 // other thread runs and before `STDIO_READY` is set (Release); every later
 // access is a shared borrow taken after the `STDIO_READY` Acquire load,
-// and nothing writes or drops the slots again, so the `&'static Pipe`s
-// `pipe_for` hands out stay valid for the process lifetime.
+// and nothing writes or drops the slots again but the restore entry
+// (`rebind_stdio`), which runs on the process's one thread with no borrow
+// live: its frames above the quiesce point hold none across the call. The
+// `&'static Pipe`s `pipe_for` hands out stay valid until then.
 unsafe impl Sync for StdioCell {}
 
+// restore: rebound
 static STDIO: StdioCell = StdioCell(UnsafeCell::new([None, None, None]));
+// restore: none
 static STDIO_READY: AtomicBool = AtomicBool::new(false);
 
 const IDX_STDIN: usize = 0;
@@ -148,6 +152,51 @@ pub fn stdio_init(
         );
     }
     STDIO_READY.store(true, Ordering::Release);
+}
+
+/// Rebind stdio to the process a restore created
+/// (docs/checkpoint-restore.md § Restore entry and handle rebinding): discard
+/// the captured process's pipe ends unused (`Pipe::discard_restored`) and
+/// attach the new process's, as `stdio_init` does. Runs on the restore
+/// entry's one thread, with no `pipe_for` borrow live (`StdioCell`).
+// restore: reset
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rebind_stdio takes stdio_init's arguments, one per cap"
+)]
+pub fn rebind_stdio(
+    stdin_memory: u64,
+    stdin_data_sig: u64,
+    stdin_space_sig: u64,
+    stdout_memory: u64,
+    stdout_data_sig: u64,
+    stdout_space_sig: u64,
+    stderr_memory: u64,
+    stderr_data_sig: u64,
+    stderr_space_sig: u64,
+    aspace: u64,
+) {
+    STDIO_READY.store(false, Ordering::Release);
+    // SAFETY: the one thread, with no borrow of the slots live (above).
+    let slots = unsafe { STDIO.0.as_mut_unchecked() };
+    for slot in slots.iter_mut() {
+        if let Some(pipe) = slot.take() {
+            pipe.discard_restored();
+            crate::os::seraph::checkpoint::STDIO_PIPES.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+    stdio_init(
+        stdin_memory,
+        stdin_data_sig,
+        stdin_space_sig,
+        stdout_memory,
+        stdout_data_sig,
+        stdout_space_sig,
+        stderr_memory,
+        stderr_data_sig,
+        stderr_space_sig,
+        aspace,
+    );
 }
 
 // ── Stdin ──────────────────────────────────────────────────────────────────
@@ -301,6 +350,7 @@ pub fn close_all() {
 /// forwarded to it instead. A process that serves the log endpoint (logd)
 /// registers a serial-driver sink so its own faults never self-IPC into
 /// the endpoint it serves.
+// restore: none
 static PANIC_SINK: AtomicUsize = AtomicUsize::new(0);
 
 /// Register `sink` as this process's panic-output sink. `sink` must be

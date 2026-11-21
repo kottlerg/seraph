@@ -354,6 +354,32 @@ impl ImageBuffer
         }
     }
 
+    /// A buffer of `pages` pages in one run of frames requested on `memmgr`
+    /// (the child's account), for the reads of a restore creation's object
+    /// (`crate::restore`), which copy into the run's cap ([`Self::run_cap`]).
+    ///
+    /// # Errors
+    /// As the constructor's.
+    pub fn window(self_aspace: u64, memmgr: u64, pages: u64, ipc_buf: *mut u64)
+    -> Result<Self, u64>
+    {
+        let len = pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+        Self::new(self_aspace, memmgr, len, ipc_buf, Shape::Contiguous)
+    }
+
+    /// The Memory cap of the buffer's one run; `None` for a buffer of
+    /// several runs.
+    pub fn run_cap(&self) -> Option<u64>
+    {
+        match *self.caps.as_slice()
+        {
+            [cap] => Some(cap),
+            _ => None,
+        }
+    }
+
     /// The object's bytes, to fill.
     pub fn bytes_mut(&mut self) -> &mut [u8]
     {

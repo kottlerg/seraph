@@ -23,9 +23,13 @@
 //! its code. A thread stopped while
 //! blocked, without the upcall, would have its syscall's `Interrupted` written
 //! over those registers when started. The instruction is a `syscall` or
-//! `ecall` found in the text page the thread was blocked in, other than the
-//! one it was blocked at: the riscv64 kernel steps past the `ecall` a
+//! `ecall` in an executable page of the process, other than the one the
+//! thread was blocked at: the riscv64 kernel steps past the `ecall` a
 //! syscall-point delivery names unless the handler wrote another `pc`.
+//! svctest looks first in the page the thread was blocked in, and then in the
+//! process's other executable pages (`SYS_THREAD_LIST_PAGES`), since where a
+//! build places its syscall instructions decides whether that page holds
+//! another.
 //! svctest then starts the other thread, and the main thread once the other
 //! reads `Exited`.
 //!
@@ -41,8 +45,9 @@ use std::time::{Duration, Instant};
 
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
-    CAP_INFO_THREAD_STATE, FAULT_CLASS_UPCALL, FAULT_KIND_UPCALL, FAULT_LABEL, MAX_THREAD_MEM_COPY,
-    PAGE_SIZE, RIGHTS_THREAD_OBSERVE, SYS_ASPACE_EXIT, THREAD_STATE_EXITED, UPCALL_ANY_INSTRUCTION,
+    CAP_INFO_THREAD_STATE, FAULT_CLASS_UPCALL, FAULT_KIND_UPCALL, FAULT_LABEL, MAX_PAGE_RUNS,
+    MAX_THREAD_MEM_COPY, PAGE_RUN_EXECUTE, PAGE_RUN_NO_COPY, PAGE_SIZE, PageRun,
+    RIGHTS_THREAD_OBSERVE, SYS_ASPACE_EXIT, THREAD_STATE_EXITED, UPCALL_ANY_INSTRUCTION,
 };
 
 use crate::arch::current::{
@@ -156,8 +161,9 @@ fn hold(thread: u64, endpoint: u64, send: u64, code: u32, what: &str)
     syscall::thread_read_regs(thread, &mut regs)
         .unwrap_or_else(|e| panic!("{what}: reading a stopped thread's registers ({e})"));
     let own = word(&regs, IP_OFFSET).wrapping_sub(SYSCALL_INSN_BEFORE_IP);
-    let site = syscall_site(thread, own)
-        .unwrap_or_else(|| panic!("{what}: no other syscall instruction in the page of {own:#x}"));
+    let site = syscall_site(thread, own).unwrap_or_else(|| {
+        panic!("{what}: no executable page holds a syscall instruction but {own:#x}")
+    });
     let (nr, arg0) = (SYS_ASPACE_EXIT, u64::from(code));
     for (offset, value) in [
         (IP_OFFSET, site),
@@ -171,17 +177,64 @@ fn hold(thread: u64, endpoint: u64, send: u64, code: u32, what: &str)
     }
     // SAFETY: the thread is the attached process's, bound to its address
     // space, so the frame it resumes on touches none of svctest's memory; it
-    // resumes at a syscall instruction of its own text and ends there.
+    // resumes at a syscall instruction of its own executable pages and ends
+    // there.
     unsafe { syscall::thread_write_regs(thread, &regs) }
         .unwrap_or_else(|e| panic!("{what}: writing a stopped thread's registers ({e})"));
 }
 
-/// The address of a syscall instruction in the text page of `own`, the one
-/// `thread` was blocked at, other than `own`; `None` when the page holds
-/// no other or does not read.
+/// The address of a syscall instruction in an executable page of `thread`'s
+/// address space, other than `own`, the one `thread` was blocked at: the
+/// first in the page of `own`, else the first in the lowest other
+/// executable page that holds one. `None` when no page holds one, or the
+/// pages do not list. Every byte of an executable page executes, so the
+/// instruction need not be one the compiler emitted there.
 fn syscall_site(thread: u64, own: u64) -> Option<u64>
 {
-    let page = own & !(PAGE_SIZE - 1);
+    let own_page = own & !(PAGE_SIZE - 1);
+    if let Some(site) = site_in_page(thread, own_page, own)
+    {
+        return Some(site);
+    }
+    let mut runs = vec![PageRun::default(); usize::try_from(MAX_PAGE_RUNS).ok()?];
+    let mut start = 0;
+    loop
+    {
+        let (count, resume) = syscall::thread_list_pages(thread, start, &mut runs).ok()?;
+        for run in runs.get(..count)?
+        {
+            if run.prot & (PAGE_RUN_EXECUTE | PAGE_RUN_NO_COPY) != PAGE_RUN_EXECUTE
+            {
+                continue;
+            }
+            for index in 0..run.pages
+            {
+                let page = run.va.checked_add(index.checked_mul(PAGE_SIZE)?)?;
+                if page == own_page
+                {
+                    continue;
+                }
+                if let Some(site) = site_in_page(thread, page, own)
+                {
+                    return Some(site);
+                }
+            }
+        }
+        // Only a call at the top of the user half lists no run and returns
+        // its own start.
+        if count == 0 && resume == start
+        {
+            return None;
+        }
+        start = resume;
+    }
+}
+
+/// The address of the first syscall instruction in `page` of `thread`'s
+/// address space other than `own`; `None` when the page holds no other or
+/// does not read.
+fn site_in_page(thread: u64, page: u64, own: u64) -> Option<u64>
+{
     let page_bytes = usize::try_from(PAGE_SIZE).ok()?;
     let chunk = MAX_THREAD_MEM_COPY.min(page_bytes);
     let mut text = vec![0u8; page_bytes];

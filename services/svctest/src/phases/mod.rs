@@ -103,6 +103,7 @@ pub mod pwrmgr;
 pub mod random;
 pub mod recv_guard;
 pub mod recv_pool;
+pub mod restore;
 pub mod sessiond;
 pub mod shmem;
 pub mod snapshot;
@@ -151,6 +152,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(image_sharing::phases());
     out.extend_from_slice(snapshot::phases());
     out.extend_from_slice(checkpoint::phases());
+    out.extend_from_slice(restore::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

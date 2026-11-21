@@ -233,6 +233,25 @@ unsafe impl Send for Pipe {}
 unsafe impl Sync for Pipe {}
 
 impl Pipe {
+    /// Give up this end in the process a restore created, where its caps
+    /// name slots of the captured process and its ring page is not mapped:
+    /// return its ring's VA to the arena and drop the value without its
+    /// `Drop`, which would close, unmap and delete through them. Its count
+    /// among the open pipes is released.
+    pub(crate) fn discard_restored(self) {
+        let mut this = crate::mem::ManuallyDrop::new(self);
+        if let Some(range) = this.reserved_va.take() {
+            crate::sys::reserve::unreserve_pages(range);
+        }
+        // SAFETY: each field is read out once and `this` is never used or
+        // dropped again; the rest are plain integers.
+        unsafe {
+            drop(crate::ptr::read(&this.peer_dead));
+            drop(crate::ptr::read(&this.ring_release));
+            drop(crate::ptr::read(&this._held));
+        }
+    }
+
     fn header(&self) -> &SpscHeader {
         // SAFETY: ring_vaddr points at a page mapped read-write for the
         // lifetime of this Pipe; layout starts with SpscHeader.

@@ -243,6 +243,15 @@ impl<T> Registry<T>
         }
     }
 
+    /// Consume the registry and yield the resources its slots hold: those
+    /// of every detached thread whose death post has not been taken. A
+    /// process a restore created discards them so, its threads being the
+    /// captured process's, gone without a post.
+    pub fn into_held(self) -> impl Iterator<Item = T>
+    {
+        self.slots.into_iter().filter_map(|slot| slot.res)
+    }
+
     /// Hand a detached thread's resources to `slot` (or a joined thread's
     /// whose join wait failed). See [`Detached`] for the outcomes.
     pub fn detach(&mut self, slot: u32, generation: u32, res: T) -> Detached<T>
@@ -343,6 +352,22 @@ mod tests
         assert_eq!(c, a);
         assert_ne!(gc, ga);
         assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn into_held_yields_the_detached_resources_alone()
+    {
+        let mut reg = Registry::<u32>::new();
+        let (a, ga) = reg.reserve().expect("room");
+        let (b, gb) = reg.reserve().expect("room");
+        let (c, gc) = reg.reserve().expect("room");
+        let (_d, _) = reg.reserve().expect("room");
+        assert_eq!(reg.detach(a, ga, 10), Detached::Held);
+        assert_eq!(reg.detach(b, gb, 20), Detached::Held);
+        reg.release(c, gc);
+        let mut held: Vec<u32> = reg.into_held().collect();
+        held.sort_unstable();
+        assert_eq!(held, [10, 20]);
     }
 
     #[test]

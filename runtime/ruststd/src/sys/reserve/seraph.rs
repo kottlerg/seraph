@@ -256,6 +256,7 @@ unsafe impl Send for Arena {}
 
 /// The process's arena, under the byte heap's spin mutex type. Nothing
 /// under it blocks or allocates: the table grows with the lock released.
+// restore: none
 static ARENA: SpinMutex<Arena> = SpinMutex::new(Arena::new());
 
 /// Reserve `n` contiguous pages of unmapped VA from the per-process

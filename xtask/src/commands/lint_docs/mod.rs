@@ -20,6 +20,7 @@
 
 mod cells;
 mod commands;
+mod restore;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -69,6 +70,7 @@ const RULES: &[(&str, Level)] = &[
     ("md-coverage-symbols", Level::Error),
     ("md-test-cells", Level::Error),
     ("xtask-commands", Level::Error),
+    ("src-restore-class", Level::Error),
     ("md-bare-cite", Level::Warning),
 ];
 
@@ -132,6 +134,7 @@ pub fn run(ctx: &BuildContext, _args: &LintDocsArgs) -> Result<()>
     diags.extend(check_summarized_by(&pat, &markdown));
     diags.extend(check_reachable(&pat, &markdown));
     diags.extend(check_coverage_symbols(&markdown, &sources, &paths));
+    diags.extend(restore::check(&sources));
     diags.extend(cells::check(&markdown));
     let commands: Vec<&SourceFile> = files.iter().collect();
     diags.extend(commands::check(&commands));

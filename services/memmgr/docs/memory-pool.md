@@ -780,7 +780,7 @@ parent outside the reserve; procmgr relays the max the node took to the creator 
 usage with `QUERY_MEMORY_USAGE`.
 
 **Server-side charges.** Memory a server spends on a client's behalf is charged to the server's
-node, not to the client's. procmgr keeps, for each live process, its process-table entry (440
+node, not to the client's. procmgr keeps, for each live process, its process-table entry (448
 bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two death-observer nodes
 (24 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and 96 bytes for each
 thread it registers. Every page of the process itself, at least 55 (its address-space and `CSpace`
@@ -1160,16 +1160,16 @@ pages the attachment is charged for. A copy is never evicted, as no page of an a
 is freed with its attachment.
 
 **Read and fill.** `OBJECT_READ` ([ipc-interface.md](ipc-interface.md) § Label 35) copies pages of
-an object, over its handle, from memmgr's own view into Memory caps the caller presents, mapped at
-the scrub window only while the copy runs; a process with no pager, procmgr among them, reads an
-object so. `FILL_REGION` (§ Label 36) backs pages of the caller's own demand regions, or of its
-private zero-object attachments, with copies of an object's pages, as a write fault backs a page:
-the run selection, the charge to the caller's budget node, the page-table funding and the chunk
-record are the fault's ([Demand faults](#demand-faults)), with the copy from the own view in place
-of the scrub. A named page that holds data already is left as it is, so a repeated request, after a
-failure part way or a lost reply, backs only the pages still holding none; a chunk the clock has
-taken takes no run, and a request naming a page of it that holds no data is refused. The pages are
-the caller's own, sharing no frame with the object, so the object can be released once the fill
+an object whose handle the caller presents from memmgr's own view into Memory caps it presents,
+mapped at the scrub window only while the copy runs; a process with no pager, procmgr among them,
+reads an object so. `FILL_REGION` (§ Label 36) backs pages of the caller's own demand regions, or of
+its private zero-object attachments, with copies of an object's pages, as a write fault backs a
+page: the run selection, the charge to the caller's budget node, the page-table funding and the
+chunk record are the fault's ([Demand faults](#demand-faults)), with the copy from the own view in
+place of the scrub. A named page that holds data already is left as it is, so a repeated request,
+after a failure part way or a lost reply, backs only the pages still holding none; a chunk the clock
+has taken takes no run, and a request naming a page of it that holds no data is refused. The pages
+are the caller's own, sharing no frame with the object, so the object can be released once the fill
 replies.
 
 **Checkpoint mark.** An object carries a checkpoint mark (`MemObject.checkpoint`) once procmgr's

@@ -61,9 +61,8 @@ Two privilege classes:
   `SEND|GRANT` badged `SWAP_AUTHORITY` (bit 61) alone, which init mints on
   memmgr's endpoint and svcmgr publishes seed-only as `memmgr.swap`: the swap
   service's interface to the disk tier (§ Labels 22 to 26).
-- The **object** labels (`OBJECT_RELEASE`, `OBJECT_READ`) are callable only
-  over an object handle, and act on the memory object it names (§ Object
-  Handles).
+- The **object** label (`OBJECT_RELEASE`) is callable only over an object
+  handle, and acts on the memory object it names (§ Object Handles).
 
 memmgr tells the classes apart by three verb bits, the node-handle bit
 `NODE_HANDLE_TAG` (bit 62), the swap authority's `SWAP_AUTHORITY` (bit 61)
@@ -184,11 +183,22 @@ An object handle is the authority to attach one memory object, to read its pages
 endpoint whose badge is `OBJECT_HANDLE_TAG` and a key of 58 random bits outside `VERB_BIT_MASK`,
 drawn as a node handle's key is (§ Node Handles). memmgr derives one, in the reply of `SEAL_OBJECT`
 (§ Label 27), for the object it seals. A holder can derive copies of it, which carry the same badge,
-and pass one to any process, which attaches the object with it (§ Label 28), reads it over it (§
+and pass one to any process, which attaches the object with it (§ Label 28), reads it with it (§
 Label 35), or presents it to back its own pages with copies of the object's (§ Label 36). The
 object's handle state belongs to its sealer and goes on `OBJECT_RELEASE` (§ Label 29) or the
 sealer's `PROCESS_DIED`; from then on memmgr refuses every handle carrying its key with
 `INVALID_ARGUMENT`. The object outlives its handle state while a region attaches it.
+
+A process relies on an answer about an object only when the answer comes over its own memmgr
+capability, never over a handle another party gave it. A handle so given may be a SEND on that
+party's own endpoint, which the process cannot tell from a SEND on memmgr's, since
+`SYS_ENDPOINT_BADGE` needs a receive right on the endpoint, and a request sent on it would be
+answered by that party in memmgr's place. So every label that answers about an object or acts on
+it for the caller, `ATTACH_OBJECT`, `OBJECT_READ` and `FILL_REGION`, is sent on the caller's own
+memmgr SEND and carries the handle as `cap[0]`, whose badge memmgr reads with `SYS_ENDPOINT_BADGE`,
+refusing a cap that is not a SEND on its endpoint carrying a live object handle. Only
+`OBJECT_RELEASE` is sent on the handle itself: its sender is the sealer, which holds the handle
+memmgr returned to it on its own capability (§ Label 27).
 
 ---
 
@@ -203,10 +213,10 @@ object handle. Every label but the node labels also replies `UNAUTHORIZED`
 over a node handle, every label but `NODE_QUERY_USAGE` and
 `NODE_CHARGE_HANDLE` over a charge-only one, every label but the swap labels
 over the swap authority,
-and every label but the object labels (`OBJECT_RELEASE`, `OBJECT_READ`) over
-an object handle (§ Badge Discipline); the node labels' tables list the
-refusal over any other badge, as § Labels 22 to 26 does for the swap labels
-and § Label 29 and § Label 35 for the object labels.
+and every label but the object label (`OBJECT_RELEASE`) over an object handle
+(§ Badge Discipline); the node labels' tables list the refusal over any other
+badge, as § Labels 22 to 26 does for the swap labels and § Label 29 for the
+object label.
 
 ### Label 1: `REQUEST_MEMORY_CAPS`
 
@@ -1755,8 +1765,8 @@ of it ([`memory-pool.md`](memory-pool.md#memory-objects) § Memory objects, Own 
 #### Label 35: `OBJECT_READ`
 
 Copy pages of a memory object into Memory caps the caller presents, and report the object's pages
-and its checkpoint mark. Privilege: an object label, callable only over an object handle, which is
-the authority to read every page of the object (§ Object Handles).
+and its checkpoint mark. Privilege: universal, sent on the caller's own memmgr SEND; the object
+handle, the authority to read every page of the object (§ Object Handles), comes as `cap[0]`.
 
 **Request:**
 
@@ -1764,15 +1774,26 @@ the authority to read every page of the object (§ Object Handles).
 |---|---|
 | label | 35 |
 | data[0] | The first object page to copy |
-| data[1] | The page offset into `cap[0]` at which the destination starts |
-| data[2 + i] | The destination pages of `cap[i]`, counted from the offset for `cap[0]` |
-| cap[*] | Memory caps with the map and write rights, at most `MSG_CAP_SLOTS_MAX` (4); none to read only the reply's words. memmgr deletes them, whatever the reply |
+| data[1] | The page offset into `cap[1]` at which the destination starts |
+| data[2 + i] | The destination pages of `cap[1 + i]`, counted from the offset for `cap[1]` |
+| cap[0] | The object handle, a SEND on memmgr's endpoint whose badge memmgr reads with `SYS_ENDPOINT_BADGE` |
+| cap[1..] | Memory caps with the map and write rights, at most three; none to read only the reply's words |
 
-memmgr copies the object's pages from `data[0]` on, in order, into the destination, `cap[0]`'s
+memmgr deletes every cap, whatever the reply.
+
+memmgr copies the object's pages from `data[0]` on, in order, into the destination, `cap[1]`'s
 pages first, at most `OBJECT_READ_PAGES` (64) of them and none past the object's end. The
-destination is mapped in memmgr's own address space only while the copy runs. A request with no
-caps reads the object's pages and its mark alone, as procmgr's restore does before it reads the
+destination is mapped in memmgr's own address space only while the copy runs. A request with the
+handle alone reads the object's pages and its mark, as procmgr's restore does before it reads the
 layout.
+
+The handle comes as a cap, not as the endpoint the request is sent on, because a process relies on
+the reply: procmgr restores a process from an object only when the reply says the object carries
+the checkpoint mark, and builds it from the bytes the copy writes. A request sent on a cap another
+party handed the caller reaches whatever endpoint that cap names, and the caller cannot tell a
+SEND on memmgr's endpoint from one on the giver's own, since `SYS_ENDPOINT_BADGE` needs a receive
+right on the endpoint. Sent on the caller's own memmgr SEND, the request is answered by memmgr,
+which refuses a handle that is not a SEND on its own endpoint (§ Object Handles).
 
 **Reply (success):** label 0, `data[0]` the pages copied, `data[1]` the object's flags
 (`OBJECT_CHECKPOINT`, bit 0: the object carries the checkpoint mark, § Label 37), `data[2]` the
@@ -1783,8 +1804,8 @@ object's pages; no caps.
 | Code | Name | Meaning |
 |---|---|---|
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | A destination page could not be mapped: a cap without the map and write rights, or memmgr's page tables could not be funded |
-| 4 | `INVALID_ARGUMENT` | The handle's state is gone (§ Label 29), `data[0]` is past the object's end, or a destination page count is missing for a cap |
-| 5 | `UNAUTHORIZED` | The badge is not an object handle |
+| 4 | `INVALID_ARGUMENT` | No cap, a `cap[0]` that is not a SEND on memmgr's endpoint carrying a live object handle (one whose state is gone included, § Label 29), `data[0]` past the object's end, or a destination page count missing for a cap |
+| 5 | `UNAUTHORIZED` | The badge is a node handle, the swap authority or an object handle |
 
 #### Label 36: `FILL_REGION`
 

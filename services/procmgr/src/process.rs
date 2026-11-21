@@ -846,6 +846,61 @@ impl ChildArgvEnv
     }
 }
 
+/// The argv/env region of a restored child: pages on its account, at
+/// `child_memmgr_send`, holding the checkpoint's blobs, which `fill`
+/// writes, located by `header`
+/// (`process_table::restore::Layout::argv_env_header`) and checked as a
+/// create's copy is (`process_table::ArgvEnvTally`).
+///
+/// # Errors
+/// [`crate::memmgr_alloc_pages_contig`]'s code when memmgr does not supply
+/// the pages; `OUT_OF_MEMORY` when they cannot be mapped in procmgr;
+/// `fill`'s code; `NOT_RESTORABLE` when the blobs do not hold the strings
+/// the header counts.
+pub fn restored_argv_env(
+    self_aspace: u64,
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    header: ipc::procmgr_labels::ArgvEnvHeader,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), u64>,
+) -> Result<ChildArgvEnv, u64>
+{
+    // The header was bounded by `ARGV_ENV_MAX_BYTES`, so neither sum overflows.
+    let total = header.args_bytes.saturating_add(header.env_bytes);
+    if total == 0
+    {
+        return Ok(ChildArgvEnv::empty());
+    }
+    let pages = total.div_ceil(PAGE_SIZE);
+    let memory = CapGuard::new(crate::memmgr_alloc_pages_contig(
+        child_memmgr_send,
+        pages,
+        ipc_buf,
+    )?);
+    let scratch = ScratchMapping::map(self_aspace, memory.cap(), pages, syscall::MAP_WRITABLE)
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    // SAFETY: the scratch VA is mapped writable for `pages` pages, procmgr's
+    // own, until `scratch` drops below; no other reference points into it.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            scratch.va() as *mut u8,
+            // At most `ARGV_ENV_MAX_BYTES`, page-rounded.
+            pages.saturating_mul(PAGE_SIZE) as usize,
+        )
+    };
+    fill(bytes)?;
+    let mut tally = process_table::ArgvEnvTally::new(header);
+    tally.feed(bytes.get(..total as usize).unwrap_or_default());
+    drop(scratch);
+    let name = tally.finish().map_err(|_| procmgr_errors::NOT_RESTORABLE)?;
+    Ok(ChildArgvEnv {
+        memory,
+        pages,
+        header,
+        name,
+    })
+}
+
 /// Why [`copy_argv_env`] took no copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArgvEnvCopyError
@@ -1382,6 +1437,7 @@ unsafe fn populate_child_info(
     process_badge: u64,
     sched: ChildSched,
     layout: &ProcessLayout,
+    restore_sp: u64,
 ) -> Result<ChildInfoCaps, u64>
 {
     // Guarded from allocation: every early `Err` below deletes the slot.
@@ -1612,6 +1668,10 @@ unsafe fn populate_child_info(
     // TLS block base, or zero when the binary has no PT_TLS (mirrors
     // `tls_template_memsz == 0`); the block is mapped only in the TLS case.
     pi.main_tls_vaddr = if tls.memsz != 0 { layout.tls_base } else { 0 };
+    // The restore word: zero for a fresh process, the checkpoint's restore
+    // stack pointer for a restored one, where its main thread starts
+    // (docs/checkpoint-restore.md § Restore entry and handle rebinding).
+    pi.restore_sp = restore_sp;
     // The pager fields stay zero here: `finalize_creation` writes them only
     // once the pager binding has taken effect (`advertise_pager`).
 
@@ -1915,6 +1975,144 @@ unsafe fn prepare_main_tls_from_bytes(
     unsafe { finalize_main_tls(alloc, self_aspace, child_aspace) }
 }
 
+/// Allocate the main thread's TLS block of a restored process, fill all of
+/// it with `fill`, the checkpoint's bytes of the block, and map it as
+/// [`finalize_main_tls`] does.
+///
+/// # Errors
+/// [`alloc_main_tls_memory`]'s codes; `fill`'s; [`finalize_main_tls`]'s.
+///
+/// # Safety
+/// As [`prepare_main_tls_from_bytes`]'s.
+unsafe fn prepare_main_tls_restored(
+    self_aspace: u64,
+    child_aspace: u64,
+    tls: &ChildTlsTemplate,
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    layout: &ProcessLayout,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), u64>,
+) -> Result<MainTls, u64>
+{
+    let alloc = alloc_main_tls_memory(self_aspace, tls, child_memmgr_send, ipc_buf, layout)?;
+    // SAFETY: the scratch VA is mapped writable for the whole block until
+    // finalize drops the scratch mapping; no other reference points into it.
+    let block = unsafe {
+        core::slice::from_raw_parts_mut(
+            alloc.scratch_va() as *mut u8,
+            // At most `PROCESS_MAIN_TLS_MAX_PAGES` pages, checked at allocation.
+            alloc.scratch_bytes() as usize,
+        )
+    };
+    fill(block)?;
+    // SAFETY: the caller's contract covers `child_aspace`.
+    unsafe { finalize_main_tls(alloc, self_aspace, child_aspace) }
+}
+
+/// Map the stack of a restored process, filled by `fill` from the
+/// stack's base with the checkpoint's bytes, and a fresh IPC buffer page,
+/// at the layout's addresses.
+///
+/// # Errors
+/// `fill`'s code; `OUT_OF_MEMORY` for a stack or IPC-buffer page that
+/// cannot be had or mapped, as [`map_child_stack_and_ipc`]'s caller
+/// answers it.
+///
+/// # Safety
+/// As [`map_child_stack_and_ipc`]'s.
+unsafe fn map_restored_stack_and_ipc(
+    self_aspace: u64,
+    child_aspace: u64,
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    stack_pages: u32,
+    layout: &ProcessLayout,
+    fill: impl FnOnce(u64, &mut [u8]) -> Result<(), u64>,
+) -> Result<(), u64>
+{
+    let stack_base = u64::from(stack_pages)
+        .checked_mul(PAGE_SIZE)
+        .and_then(|bytes| layout.stack_top.checked_sub(bytes))
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    let mut filled = Ok(());
+    // SAFETY: the caller's contract covers `child_aspace`.
+    unsafe {
+        loader::load_elf_segment_into_child(
+            stack_base,
+            u64::from(stack_pages),
+            syscall::MAP_WRITABLE,
+            None,
+            self_aspace,
+            child_aspace,
+            child_memmgr_send,
+            ipc_buf,
+            |stack| filled = fill(stack_base, stack),
+        )
+    }
+    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    filled?;
+    // SAFETY: the caller's contract covers `child_aspace`.
+    unsafe {
+        map_fresh_child_page(
+            child_aspace,
+            child_memmgr_send,
+            ipc_buf,
+            layout.ipc_buffer_va,
+        )
+    }
+    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)
+}
+
+/// Map the child's stack and IPC buffer page: a restored process's
+/// stack holds its checkpoint's bytes ([`map_restored_stack_and_ipc`]), a
+/// fresh process's is zeroed ([`map_child_stack_and_ipc`]).
+///
+/// # Errors
+/// `OUT_OF_MEMORY` for a page that cannot be had or mapped, whatever cause
+/// the helper reports (§ Label 1 and § Label 13); the checkpoint's code for
+/// a stack it cannot fill.
+///
+/// # Safety
+/// As [`map_child_stack_and_ipc`]'s.
+unsafe fn map_stack_and_ipc(
+    restore: Option<&crate::restore::Source>,
+    self_aspace: u64,
+    child_aspace: u64,
+    child_memmgr_send: u64,
+    ipc_buf: *mut u64,
+    stack_pages: u32,
+    layout: &ProcessLayout,
+) -> Result<(), u64>
+{
+    match restore
+    {
+        Some(source) =>
+        // SAFETY: the caller's contract covers `child_aspace`.
+        unsafe {
+            map_restored_stack_and_ipc(
+                self_aspace,
+                child_aspace,
+                child_memmgr_send,
+                ipc_buf,
+                stack_pages,
+                layout,
+                |base, stack| source.fill(base, stack),
+            )
+        },
+        // SAFETY: as above.
+        None => unsafe {
+            map_child_stack_and_ipc(
+                child_aspace,
+                child_memmgr_send,
+                ipc_buf,
+                stack_pages,
+                layout,
+            )
+        }
+        .map_err(|_| procmgr_errors::OUT_OF_MEMORY),
+    }
+}
+
 /// Map stack and IPC buffer pages into a child address space.
 ///
 /// No explicit guard-page map. The page immediately below the stack
@@ -2164,6 +2362,9 @@ fn finalize_creation(
         entry_point,
         tls_base_va: main_tls.base_va,
         stack_top_vaddr: layout.stack_top,
+        // A restored process's start pointer is set once the entry exists
+        // (`restore_entry`).
+        start_sp: 0,
         process_info_va: layout.process_info_va,
         started: false,
         dma_hold: false,
@@ -2782,6 +2983,7 @@ pub fn create_process_from_bytes(
     sched: ChildSched,
     image_key: &ImageKey,
     sharing: Sharing,
+    restore: Option<&crate::restore::Source>,
     ipc_buf: *mut u64,
 ) -> Result<CreateResult, u64>
 {
@@ -2790,17 +2992,7 @@ pub fn create_process_from_bytes(
         elf::validate_executable(module_bytes, machine).map_err(|_| procmgr_errors::INVALID_ELF)?;
     // `validate_executable` returns the header decoded; the parsers borrow it.
     let ehdr = &ehdr;
-    let bias = match kind
-    {
-        elf::ElfKind::Exec => 0,
-        elf::ElfKind::Dyn => choose_image_bias_or_default(),
-    };
-    let (span_min, span_end) =
-        elf::load_span(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
-    if kind == elf::ElfKind::Dyn && !child_image_fits(bias, span_min, span_end)
-    {
-        return Err(procmgr_errors::INVALID_ELF);
-    }
+    let (bias, span_min, span_end) = image_bias(ehdr, module_bytes, kind, restore)?;
     let entry = elf::entry_point(ehdr)
         .checked_add(bias)
         .ok_or(procmgr_errors::INVALID_ELF)?;
@@ -2840,7 +3032,38 @@ pub fn create_process_from_bytes(
     // A note outside `1..=MAX_PROCESS_STACK_PAGES` refuses the binary.
     let stack_pages = resolve_stack_pages(elf::parse_stack_note(ehdr, module_bytes))
         .ok_or(procmgr_errors::INVALID_ELF)?;
-    let layout = choose_child_layout();
+
+    let tls_seg = elf::tls_segment(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
+    let tls_vaddr = match tls_seg
+    {
+        Some(s) => s
+            .vaddr
+            .checked_add(bias)
+            .ok_or(procmgr_errors::INVALID_ELF)?,
+        None => 0,
+    };
+    let tls_template = tls_seg.map_or_default(|s| ChildTlsTemplate {
+        vaddr: tls_vaddr,
+        filesz: s.filesz,
+        memsz: s.memsz,
+        align: s.align,
+    });
+
+    let segments = elf::load_segments(ehdr, module_bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| procmgr_errors::INVALID_ELF)?;
+    // A restore takes the checkpoint's bootstrap layout, and only a
+    // checkpoint of this body whose executable pages are all this image's
+    // own (docs/checkpoint-restore.md § Restore creation); both are checked
+    // before anything is acquired for the child.
+    let layout = match restore
+    {
+        None => choose_child_layout(),
+        Some(source) =>
+        {
+            restored_layout(source.layout(), image_key, &segments, bias, &tls_template)?
+        }
+    };
 
     // The child's kernel objects and per-child memory caps are guarded from
     // creation: every early return below releases them, and only a successful
@@ -2859,9 +3082,6 @@ pub fn create_process_from_bytes(
 
     let child_memmgr_send = universals.memmgr_endpoint;
 
-    let segments = elf::load_segments(ehdr, module_bytes)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| procmgr_errors::INVALID_ELF)?;
     // Declared after the child's guards, so a failed create drops the
     // reference before they release the child.
     let shared = share_image(
@@ -2875,6 +3095,8 @@ pub fn create_process_from_bytes(
     );
 
     let mut applied_relocs = 0u64;
+    // A restore's first failed fill of a segment, which ends the loading.
+    let mut filled = Ok(());
     let mut image = ImageSpan {
         load_bias: bias,
         ..ImageSpan::default()
@@ -2947,6 +3169,16 @@ pub fn create_process_from_bytes(
                 child_memmgr_send,
                 ipc_buf,
                 |buf| {
+                    // A restored process's writable segments hold the
+                    // checkpoint's bytes, relocated when they were first
+                    // loaded; its other segments are the image's, as a fresh
+                    // process's.
+                    if seg.writable
+                        && let Some(source) = restore
+                    {
+                        filled = source.fill(first_page, buf);
+                        return;
+                    }
                     let copy_len = file_data.len().min(seg.memsz as usize);
                     // `buf` spans `num_pages` pages from `first_page`, which
                     // hold `dest_offset + memsz`, and `copy_len` is at most
@@ -2975,10 +3207,16 @@ pub fn create_process_from_bytes(
                 },
             )
         }?;
+        if filled.is_err()
+        {
+            break;
+        }
     }
+    filled?;
     // Every pre-validated record must have landed in exactly one segment;
-    // a shortfall means a target in a gap between segments.
-    if applied_relocs != total_relocs
+    // a shortfall means a target in a gap between segments. A restore
+    // applies none: its writable segments hold relocated bytes.
+    if restore.is_none() && applied_relocs != total_relocs
     {
         std::os::seraph::log!(
             warn: "reloc application mismatch applied={applied_relocs} expected={total_relocs}"
@@ -2986,27 +3224,30 @@ pub fn create_process_from_bytes(
         return Err(procmgr_errors::INVALID_ELF);
     }
 
-    let tls_seg = elf::tls_segment(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
-    let tls_vaddr = match tls_seg
+    // One `?` for every arm keeps this frame under the stack threshold.
+    let main_tls = if tls_template.memsz == 0
     {
-        Some(s) => s
-            .vaddr
-            .checked_add(bias)
-            .ok_or(procmgr_errors::INVALID_ELF)?,
-        None => 0,
-    };
-    let tls_template = tls_seg.map_or_default(|s| ChildTlsTemplate {
-        vaddr: tls_vaddr,
-        filesz: s.filesz,
-        memsz: s.memsz,
-        align: s.align,
-    });
-
-    let main_tls = if let Some(seg) = tls_seg
-        && tls_template.memsz != 0
+        Ok(MainTls::default())
+    }
+    else if let Some(source) = restore
     {
-        let tdata =
-            file_range(module_bytes, seg.offset, seg.filesz).ok_or(procmgr_errors::INVALID_ELF)?;
+        // SAFETY: `child_aspace` is the fresh address space
+        // `create_child_kernel_objects` retyped for this child above.
+        unsafe {
+            prepare_main_tls_restored(
+                self_aspace,
+                child_aspace,
+                &tls_template,
+                child_memmgr_send,
+                ipc_buf,
+                &layout,
+                |block| source.fill(layout.tls_base, block),
+            )
+        }
+    }
+    else if let Some(seg) = tls_seg
+        && let Some(tdata) = file_range(module_bytes, seg.offset, seg.filesz)
+    {
         // SAFETY: `child_aspace` is the fresh address space
         // `create_child_kernel_objects` retyped for this child above.
         unsafe {
@@ -3029,12 +3270,13 @@ pub fn create_process_from_bytes(
                     }
                 },
             )
-        }?
+        }
     }
     else
     {
-        MainTls::default()
-    };
+        // A TLS template outside the file.
+        Err(procmgr_errors::INVALID_ELF)
+    }?;
 
     let main_tls_memory = CapGuard::new(main_tls.memory_cap);
 
@@ -3057,22 +3299,22 @@ pub fn create_process_from_bytes(
             process_badge,
             sched,
             &layout,
+            restore.map_or(0, |source| source.layout().checkpoint.restore_sp),
         )
     }?;
     // SAFETY: `child_aspace` is the fresh address space
     // `create_child_kernel_objects` retyped for this child above.
     unsafe {
-        map_child_stack_and_ipc(
+        map_stack_and_ipc(
+            restore,
+            self_aspace,
             child_aspace,
             child_memmgr_send,
             ipc_buf,
             stack_pages,
             &layout,
         )
-    }
-    // § Label 1 and § Label 13 answer a failed stack or IPC-buffer page
-    // `OUT_OF_MEMORY`, whatever cause the helper reports.
-    .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+    }?;
 
     // The guards stay armed across `finalize_creation`, so its failure
     // releases every resource; on success the table entry owns them.
@@ -3109,7 +3351,165 @@ pub fn create_process_from_bytes(
     let _ = main_tls_memory.disarm();
     // The entry holds the reference now; its teardown releases it.
     let _ = shared.map(|s| s.object.into_id());
+    if let Some(source) = restore
+    {
+        restore_entry(tables, result.badge, &source.layout().checkpoint);
+    }
     Ok(result)
+}
+
+/// The load bias of the image `ehdr` heads in `module_bytes`, of `kind`,
+/// and its `[span_min, span_end)` before the bias: a restored image takes
+/// its checkpoint's bias, a fully linked one 0, a position-independent one a
+/// chosen bias.
+///
+/// # Errors
+/// `INVALID_ELF` when the image's span cannot be read, or a chosen bias
+/// does not place it; `NOT_RESTORABLE` when the checkpoint's bias does not
+/// (a fully linked image cannot move from 0).
+fn image_bias(
+    ehdr: &elf::Elf64Ehdr,
+    module_bytes: &[u8],
+    kind: elf::ElfKind,
+    restore: Option<&crate::restore::Source>,
+) -> Result<(u64, u64, u64), u64>
+{
+    let (bias, unplaced) = match (restore, kind)
+    {
+        (Some(source), _) => (
+            source.layout().header.load_bias,
+            procmgr_errors::NOT_RESTORABLE,
+        ),
+        (None, elf::ElfKind::Exec) => (0, procmgr_errors::INVALID_ELF),
+        (None, elf::ElfKind::Dyn) => (choose_image_bias_or_default(), procmgr_errors::INVALID_ELF),
+    };
+    let (span_min, span_end) =
+        elf::load_span(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
+    let placed = match kind
+    {
+        elf::ElfKind::Exec => bias == 0,
+        elf::ElfKind::Dyn => child_image_fits(bias, span_min, span_end),
+    };
+    if placed
+    {
+        Ok((bias, span_min, span_end))
+    }
+    else
+    {
+        Err(unplaced)
+    }
+}
+
+/// The page-rounded `[start, end)` spans of the executable segments of
+/// `segments` at `bias`; `None` when an address overflows.
+fn text_spans(segments: &[elf::LoadSegment], bias: u64) -> Option<Vec<(u64, u64)>>
+{
+    segments
+        .iter()
+        .filter(|seg| seg.executable && seg.memsz != 0)
+        .map(|seg| {
+            let start = seg.vaddr.checked_add(bias)?;
+            let end = start.checked_add(seg.memsz)?.checked_add(0xFFF)?;
+            Some((start & !0xFFF, end & !0xFFF))
+        })
+        .collect()
+}
+
+/// The bootstrap layout of a process restored from `checkpoint`'s layout
+/// into the image `image_key` names, loaded at `bias` from `segments`,
+/// with the TLS template `tls`: the checkpoint's `ProcessInfo` page, stack top and IPC buffer, and the TLS
+/// block whose thread pointer is the checkpoint's.
+///
+/// # Errors
+/// `NOT_RESTORABLE` when the checkpoint is not of this body or its
+/// executable pages are not all the image's own
+/// (`process_table::restore::Layout::binds`), or its words do not fit the
+/// image: a TLS base without a template or a template without one, a block
+/// base off a page, or a restore stack pointer outside the stack's
+/// reservation, the `MAX_PROCESS_STACK_PAGES` pages below its top that hold
+/// its committed pages and its demand growth;
+/// `INVALID_ELF` when a segment's address overflows.
+fn restored_layout(
+    checkpoint: &process_table::restore::Layout,
+    image_key: &process_table::image_share::ImageKey,
+    segments: &[elf::LoadSegment],
+    bias: u64,
+    tls: &ChildTlsTemplate,
+) -> Result<ProcessLayout, u64>
+{
+    let image = ipc::procmgr_snapshot::Image {
+        hash: image_key.hash,
+        len: image_key.len,
+    };
+    let text = text_spans(segments, bias).ok_or(procmgr_errors::INVALID_ELF)?;
+    if !checkpoint.binds(image, &text)
+    {
+        return Err(procmgr_errors::NOT_RESTORABLE);
+    }
+    fitted_layout(checkpoint, tls).ok_or(procmgr_errors::NOT_RESTORABLE)
+}
+
+/// [`restored_layout`]'s placement of the checkpoint's words, `None` when
+/// they do not fit the image.
+fn fitted_layout(
+    checkpoint: &process_table::restore::Layout,
+    tls: &ChildTlsTemplate,
+) -> Option<ProcessLayout>
+{
+    let c = &checkpoint.checkpoint;
+    let tls_base = if tls.memsz == 0
+    {
+        (c.tls_base == 0).then_some(0)?
+    }
+    else
+    {
+        let (_, _, offset) = process_abi::tls_block_layout(tls.memsz, tls.align);
+        c.tls_base
+            .checked_sub(offset)
+            .filter(|base| *base != 0 && base.is_multiple_of(PAGE_SIZE))?
+    };
+    // The point's frame may lie below the committed pages, in the demand
+    // growth the runtime registers below them, which the restore remakes
+    // with the checkpoint's other regions; the layout leaves the whole
+    // reservation to the stack.
+    let reservation = c
+        .stack_top
+        .checked_sub(u64::from(process_abi::MAX_PROCESS_STACK_PAGES).checked_mul(PAGE_SIZE)?)?;
+    (reservation..c.stack_top)
+        .contains(&c.restore_sp)
+        .then_some(ProcessLayout {
+            process_info_va: c.process_info_va,
+            stack_top: c.stack_top,
+            tls_base,
+            ipc_buffer_va: c.ipc_buffer_va,
+        })
+}
+
+/// Give the entry of the restored process `badge` its start pointer, the
+/// checkpoint's restore stack pointer, and the declarations the checkpoint
+/// records, as `DECLARE_NO_DEBUG` and `DECLARE_NO_CORE` give them
+/// (docs/checkpoint-restore.md § Restore creation). The create still owns
+/// the entry, so it is there and has no debugger and no registered thread.
+fn restore_entry(tables: &Tables, badge: u64, checkpoint: &ipc::procmgr_snapshot::Checkpoint)
+{
+    use ipc::procmgr_snapshot::{CHECKPOINT_NO_CORE, CHECKPOINT_NO_DEBUG};
+    let mut state = tables.lock();
+    let table = &mut state.table;
+    if let Some(entry) = table.find_mut_by_badge(badge)
+    {
+        entry.start_sp = checkpoint.restore_sp;
+    }
+    if checkpoint.declarations & CHECKPOINT_NO_CORE != 0
+    {
+        let _ = table.declare_no_core(badge);
+    }
+    if checkpoint.declarations & CHECKPOINT_NO_DEBUG != 0
+        && let Some(declared) = table.declare_no_debug(badge)
+        && let Some(entry) = table.find_mut_by_badge(badge)
+    {
+        unbind_declared(entry, declared.thread_cap);
+    }
+    drop(state);
 }
 
 /// The image object a child attaches its segments that are not writable
@@ -4079,7 +4479,14 @@ pub fn start_process(badge: u64, table: &mut ProcessTable, self_aspace: u64) -> 
         syscall::thread_configure_with_tls(
             entry.thread_cap,
             entry.entry_point,
-            entry.stack_top_vaddr,
+            if entry.start_sp != 0
+            {
+                entry.start_sp
+            }
+            else
+            {
+                entry.stack_top_vaddr
+            },
             entry.process_info_va,
             entry.tls_base_va,
         )

@@ -4816,7 +4816,7 @@ fn route_object(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, 
     {
         memmgr_labels::SEAL_OBJECT => handle_seal_object(req, ipc_buf, service_ep),
         memmgr_labels::ATTACH_OBJECT => handle_attach_object(req, kept, ipc_buf, service_ep),
-        memmgr_labels::OBJECT_READ => object::handle_object_read(req, kept, ipc_buf),
+        memmgr_labels::OBJECT_READ => object::handle_object_read(req, kept, ipc_buf, service_ep),
         memmgr_labels::FILL_REGION => object::handle_fill_region(req, kept, ipc_buf, service_ep),
         _ => handle_object_release(req, ipc_buf),
     }
@@ -5079,8 +5079,8 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     delete_caps(stray);
     // A node handle is served the node labels and nothing else, a
     // charge-only one only the charge-only labels, the swap authority the
-    // swap labels and nothing else, an object handle the object labels
-    // (`OBJECT_RELEASE`, `OBJECT_READ`) and nothing else, and every other
+    // swap labels and nothing else, an object handle the object label
+    // (`OBJECT_RELEASE`) and nothing else, and every other
     // badge everything else
     // (services/memmgr/docs/ipc-interface.md § Node Handles, § Object Handles,
     // § Badge Discipline).

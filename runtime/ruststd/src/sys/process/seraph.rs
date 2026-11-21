@@ -177,10 +177,20 @@ pub struct Command {
     /// the child inherits a copy of the spawner's band. Set via
     /// `CommandExt::sched_max`.
     sched_max: u8,
+    /// The memmgr object handle of the checkpoint the next spawn restores
+    /// (`CREATE_RESTORE`), borrowed: the spawn sends a copy. Zero (the
+    /// default) creates the child from its binary. Set via
+    /// `CommandExt::restore`.
+    restore: u64,
     /// Caps the child takes over the bootstrap protocol, positional, `0`
     /// for an absent slot. Set via `CommandExt::bootstrap_caps`; empty (the
     /// default) gives the child no creator endpoint.
     bootstrap: BootstrapCaps,
+    /// Counted while `namespace_cap` or `cwd_dir_cap` holds a cap this
+    /// `Command` owns, which a quiesce point refuses
+    /// (docs/checkpoint-restore.md § Quiesce point); a spawn ends it once it
+    /// has sent both.
+    overrides_held: Option<crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CAP }>>,
 }
 
 impl Command {
@@ -197,9 +207,11 @@ impl Command {
             cwd_dir_cap: 0,
             pinned: false,
             private_image: false,
+            restore: 0,
             priority: 0,
             sched_max: 0,
-            bootstrap: BootstrapCaps(Vec::new()),
+            bootstrap: BootstrapCaps::new(Vec::new()),
+            overrides_held: None,
         }
     }
 
@@ -209,12 +221,28 @@ impl Command {
     /// the cap to this `Command` (consumed by the next `spawn`).
     pub fn set_namespace_cap(&mut self, cap: u64) {
         self.namespace_cap = cap;
+        self.count_overrides();
     }
 
     /// Install a per-spawn override for the child's
     /// `ProcessInfo.current_dir_cap`. Called by `CommandExt::cwd_dir_cap`.
     pub fn set_cwd_dir_cap(&mut self, cap: u64) {
         self.cwd_dir_cap = cap;
+        self.count_overrides();
+    }
+
+    /// Count the cap overrides while either holds a cap (`overrides_held`).
+    fn count_overrides(&mut self) {
+        let owned = self.namespace_cap != 0 || self.cwd_dir_cap != 0;
+        if owned != self.overrides_held.is_some() {
+            self.overrides_held = owned.then(crate::os::seraph::checkpoint::Held::new);
+        }
+    }
+
+    /// Restore the checkpoint `object` names on the next spawn, or create
+    /// the child from its binary for `0`. Called by `CommandExt::restore`.
+    pub fn set_restore(&mut self, object: u64) {
+        self.restore = object;
     }
 
     /// Request a private-image child. Called by `CommandExt::private_image`.
@@ -243,7 +271,7 @@ impl Command {
     /// Hand the child `slots` over the bootstrap protocol. Called by
     /// `CommandExt::bootstrap_caps`; the caps of an earlier call are deleted.
     pub fn set_bootstrap_caps(&mut self, slots: &[u64]) {
-        self.bootstrap = BootstrapCaps(slots.to_vec());
+        self.bootstrap = BootstrapCaps::new(slots.to_vec());
     }
 
     pub fn arg(&mut self, arg: &OsStr) {
@@ -344,7 +372,7 @@ impl Command {
 
         // The bootstrap caps leave the `Command` here, so every return below
         // deletes those no round moved to the child, as the guard's drop does.
-        let mut bootstrap = core::mem::replace(&mut self.bootstrap, BootstrapCaps(Vec::new()));
+        let mut bootstrap = core::mem::replace(&mut self.bootstrap, BootstrapCaps::new(Vec::new()));
 
         let path_bytes = self.program.as_encoded_bytes();
         if path_bytes.is_empty() {
@@ -419,9 +447,14 @@ impl Command {
         // with nothing to unwind. `ArgvEnvCap::settle` after the create call
         // returns its run to memmgr (procmgr has copied the blobs by then),
         // or withholds it on `ARGV_ENV_STILL_MAPPED`.
-        let argv_env = crate::os::seraph::process::ArgvEnvCap::new(
-            &args_blob, args_count, &env_blob, env_count,
-        )?;
+        // A restore carries no argv or env: the child takes the checkpoint's.
+        let argv_env = if self.restore == 0 {
+            crate::os::seraph::process::ArgvEnvCap::new(
+                &args_blob, args_count, &env_blob, env_count,
+            )?
+        } else {
+            None
+        };
 
         // Walk the spawner's namespace cap to the binary node. The
         // resulting badged SEND on the owning fs driver's namespace
@@ -498,11 +531,30 @@ impl Command {
             }
         };
 
-        // Caps: [file_cap, creator_endpoint?, argv_env?, death_relay]. The
-        // creator endpoint is present only for a child given bootstrap caps;
-        // the argv/env cap (flagged by `CREATE_ARGV_ENV`) and the death relay
-        // (flagged by `CREATE_DEATH_RELAY`) are the trailing caps, the relay
-        // last.
+        // The copy of the checkpoint's object handle a restore sends, which
+        // procmgr owns from the call on.
+        let restore_copy = match self.restore {
+            0 => 0,
+            object => match syscall::cap_derive(object, syscall::RIGHTS_EP_SEND) {
+                Ok(copy) => copy,
+                Err(_) => {
+                    let _ = syscall::cap_delete(death_relay);
+                    let _ = syscall::cap_delete(death_eq);
+                    let _ = syscall::cap_delete(file_cap);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Command::spawn: the restore's object handle cannot be copied",
+                    ));
+                }
+            },
+        };
+
+        // Caps: [file_cap, creator_endpoint?, argv_env? | object?,
+        // death_relay]. The creator endpoint is present only for a child
+        // given bootstrap caps; the argv/env cap (flagged by
+        // `CREATE_ARGV_ENV`) or a restore's object handle (flagged by
+        // `CREATE_RESTORE`) and the death relay (flagged by
+        // `CREATE_DEATH_RELAY`) are the trailing caps, the relay last.
         let pinned_flag = if self.pinned {
             procmgr_labels::CREATE_PINNED
         } else {
@@ -518,7 +570,8 @@ impl Command {
             | private_image_flag
             | procmgr_labels::CREATE_DEATH_RELAY
             | procmgr_labels::create_sched_bits(self.priority, self.sched_max)
-            | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 };
+            | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 }
+            | if restore_copy != 0 { procmgr_labels::CREATE_RESTORE } else { 0 };
         let builder = ipc::IpcMessage::builder(label).word(0, file_size).cap(file_cap);
         let builder = match &creator {
             Some(creator) => builder.cap(creator.send),
@@ -528,11 +581,13 @@ impl Command {
             Some(memory) => builder
                 .words(procmgr_labels::CREATE_FIRST_WORD, &memory.header_words())
                 .cap(memory.cap()),
+            None if restore_copy != 0 => builder.cap(restore_copy),
             None => builder,
         };
         // The binary's path, the name procmgr verifies it was signed under,
         // rides in the name block after the header.
         let Some(builder) = procmgr_labels::with_create_name(builder, label, &name) else {
+            let _ = syscall::cap_delete(restore_copy);
             let _ = syscall::cap_delete(death_relay);
             let _ = syscall::cap_delete(death_eq);
             let _ = syscall::cap_delete(file_cap);
@@ -561,6 +616,7 @@ impl Command {
             // it carried are still here; a handle that moved is stale and
             // its delete fails harmlessly.
             let _ = syscall::cap_delete(file_cap);
+            let _ = syscall::cap_delete(restore_copy);
             let _ = syscall::cap_delete(death_relay);
             let _ = syscall::cap_delete(death_eq);
             call_failed(e, "CREATE_FROM_FILE syscall failed")
@@ -757,6 +813,7 @@ impl Command {
         let ns_cap_to_send: u64 = if self.namespace_cap != 0 {
             let cap = self.namespace_cap;
             self.namespace_cap = 0;
+            self.count_overrides();
             cap
         } else {
             match syscall::cap_copy(parent_root, info.self_cspace, syscall::RIGHTS_EP_SEND) {
@@ -767,6 +824,7 @@ impl Command {
         let cwd_resolution: io::Result<u64> = if self.cwd_dir_cap != 0 {
             let cap = self.cwd_dir_cap;
             self.cwd_dir_cap = 0;
+            self.count_overrides();
             Ok(cap)
         } else if let Some(cwd_os) = self.cwd.as_ref() {
             match cwd_os.to_str() {
@@ -957,8 +1015,16 @@ const BOOTSTRAP_BADGE: u64 = 1;
 /// (`CommandExt::bootstrap_caps`), positional, `0` for an absent slot or
 /// one a round has moved to the child. Dropping it deletes every cap still
 /// held, so caps no round delivered, through a failed spawn or a `Command`
-/// dropped unspawned, are released.
-struct BootstrapCaps(Vec<u64>);
+/// dropped unspawned, are released. A value that holds a cap is counted for a
+/// quiesce point to refuse (docs/checkpoint-restore.md § Quiesce point).
+struct BootstrapCaps(Vec<u64>, Option<crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CAP }>>);
+
+impl BootstrapCaps {
+    fn new(slots: Vec<u64>) -> Self {
+        let held = slots.iter().any(|&cap| cap != 0).then(crate::os::seraph::checkpoint::Held::new);
+        BootstrapCaps(slots, held)
+    }
+}
 
 impl Drop for BootstrapCaps {
     fn drop(&mut self) {
@@ -1714,6 +1780,9 @@ fn map_procmgr_error(code: u64) -> io::Error {
         }
         procmgr_errors::ARGV_ENV_STILL_MAPPED => {
             io::Error::new(io::ErrorKind::OutOfMemory, "ARGV_ENV_STILL_MAPPED")
+        }
+        procmgr_errors::NOT_RESTORABLE => {
+            io::Error::new(io::ErrorKind::Unsupported, "NOT_RESTORABLE")
         }
         procmgr_errors::UNKNOWN_OPCODE => io::Error::other("UNKNOWN_OPCODE"),
         other => io::Error::other(format!("procmgr error {other}")),

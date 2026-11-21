@@ -59,10 +59,14 @@ pub use ipc::svcmgr_labels::{NAME_MAX, NAME_WORDS, pack_name};
 /// "no registry available" — `_start` did not install one, or the
 /// process was spawned before svcmgr existed. `AtomicU64` because a cap
 /// handle is `u64` in the syscall ABI.
+// restore: rebound
 static REGISTRY_CAP: AtomicU64 = AtomicU64::new(0);
 
-/// Install the per-process registry cap. Called once by `_start` from
-/// `ProcessInfo.service_registry_cap`. Idempotent; last writer wins.
+/// Install the per-process registry cap. Called by `_start` from
+/// `ProcessInfo.service_registry_cap`, and by its restore entry with the new
+/// process's (docs/checkpoint-restore.md § Restore entry and handle
+/// rebinding). Idempotent; last writer wins.
+// restore: reset
 pub fn install_registry_cap(cap: u64)
 {
     REGISTRY_CAP.store(cap, Ordering::Release);

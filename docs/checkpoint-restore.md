@@ -7,20 +7,18 @@ one boot, as a new process created from its signed image.
 
 ## Implementation Status
 
-Partly implemented. The quiesce point and the checkpoint are implemented: the runtime's `quiesce`
-and `take` ([runtime/ruststd/README.md](../runtime/ruststd/README.md#checkpoint) § Checkpoint),
-procmgr's `QUIESCE` and `CHECKPOINT` labels ([procmgr IPC
-Interface](../services/procmgr/docs/ipc-interface.md) § Label 34: `QUIESCE`, § Label 35:
-`CHECKPOINT`), the snapshot layout's checkpoint section (§ Snapshot object layout there), and
-memmgr's `OBJECT_READ`, `FILL_REGION` and `MARK_CHECKPOINT` labels and its checkpoint mark ([memmgr
-IPC Interface](../services/memmgr/docs/ipc-interface.md) § Label 35 to § Label 37), which
-`CHECKPOINT` sets on a complete capture. Design intent, which no code implements yet: procmgr's
-restore creation, `ProcessInfo`'s restore word, and the runtime's resume record and restore entry.
-Until the resume record exists, the restore stack pointer `quiesce` gives is an address in its own
-frame rather than below a resume record. The live capture this protocol builds on is implemented:
-procmgr's debug-authority `SNAPSHOT` and the snapshot object layout ([procmgr IPC
-Interface](../services/procmgr/docs/ipc-interface.md) § Label 33: `SNAPSHOT`, § Snapshot object
-layout), and the kernel's address-space hold
+Implemented. The runtime's `quiesce`, `take` and `CommandExt::restore`, its resume record and
+its restore entry ([runtime/ruststd/README.md](../runtime/ruststd/README.md#checkpoint)
+§ Checkpoint); procmgr's `QUIESCE` and `CHECKPOINT` labels and its restore creation
+(`CREATE_RESTORE`) ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 1,
+§ Label 34: `QUIESCE`, § Label 35: `CHECKPOINT`); the snapshot layout's checkpoint section
+(§ Snapshot object layout there); `ProcessInfo`'s restore word `restore_sp`
+([abi/process-abi/README.md](../abi/process-abi/README.md)); and memmgr's `OBJECT_READ`,
+`FILL_REGION` and `MARK_CHECKPOINT` labels and its checkpoint mark ([memmgr IPC
+Interface](../services/memmgr/docs/ipc-interface.md) § Label 35 to § Label 37). The live capture
+this protocol builds on is procmgr's debug-authority `SNAPSHOT` and the snapshot object layout
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 33: `SNAPSHOT`,
+§ Snapshot object layout), and the kernel's address-space hold
 ([core/kernel/docs/syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_ASPACE_HOLD` (71)).
 
 ---
@@ -98,9 +96,20 @@ holds, since a restore can reproduce none of what they exclude:
 
 - the caller is the main thread, and no other thread the application spawned is alive;
 - the process is demand-paged (`ProcessInfo.pager_endpoint_cap` nonzero), so its memory is held
-  in memmgr regions a restore can replay;
-- no `std::fs::File` is open, no `std::process::Child` is held, and no pipe other than stdio is
-  open, so no server holds a request or a mapping of the process's that a restore would orphan.
+  in memmgr regions a restore can replay, its heap among them: a heap whose demand floor could not
+  be registered grows by grants, which no region holds;
+- no std value that holds a capability of the process is alive, the process's own
+  stdio pipes aside, which the restore entry replaces, so no server holds a request or a mapping of
+  the process's that a restore would orphan, and no value of the application names a slot the
+  restore does not fill. An open `std::fs::File` or pipe, a held `std::process::Child`, and, among
+  others, the unjoined `JoinHandle` of a thread that has ended, a `std::fs::ReadDir`, a
+  `VerifiedData` and a `Checkpoint` are such values.
+
+The runtime counts these values: each takes its count when it is made and releases it when it is
+dropped, so a count cannot drift from the values alive. A thread detached by dropping its
+`JoinHandle` holds no count once it has ended. A value the application forgets (`mem::forget`)
+keeps its count, and every later quiesce of the process is refused; that is accepted, as the leak
+of the capability it holds is.
 
 The runtime's own threads (the fs release handler, a child's death bridge) are idle at their wait
 when these hold, and hold no lock of the runtime's; the restore discards them.
@@ -211,12 +220,14 @@ The restored process is then created as any other, with three differences:
   snapshot's bytes, and the new `ProcessInfo` the checkpoint's argv and env header, so the `'static`
   slices the runtime and `std::env::args()` hold into the region read the same bytes after the
   restore. A restore create carries no argv or env of its own: procmgr refuses one with
-  `CREATE_ARGV_ENV` as `INVALID_ARGUMENT`. Every region of the snapshot is made again on the new
-  process's memmgr record, by the arguments its entry holds (`REGISTER_REGION`, or `ATTACH_OBJECT`
-  of the zero object), and each of its pages the snapshot holds bytes of is backed with a copy of
-  them (`FILL_REGION`, below); a zero run stays unbacked. A region of the image is the new image
-  attachment, and a copy of an image page the process held (a debugger's breakpoint) is not
-  restored. Nothing else is restored: a region attaching another memory object, and every run
+  `CREATE_ARGV_ENV` as `INVALID_ARGUMENT`, and one asking for a pinned, phys-class or DMA-held
+  process (`CREATE_PINNED`, `CREATE_PHYS_ACCESS`, `CREATE_DMA_HOLD`) the same way, since a restored
+  process is demand-paged and holds no device memory. Every region of the snapshot is made again on
+  the new process's memmgr record, by the arguments its entry holds (`REGISTER_REGION`, or
+  `ATTACH_OBJECT` of the zero object), and each of its pages the snapshot holds bytes of is backed
+  with a copy of them (`FILL_REGION`, below); a zero run stays unbacked. A region of the image is
+  the new image attachment, and a copy of an image page the process held (a debugger's breakpoint)
+  is not restored. Nothing else is restored: a region attaching another memory object, and every run
   outside the regions but those above (grants, shared memory, device memory, a `File`'s pages), was
   mapped from a capability.
 - **Entry.** procmgr starts the main thread at the image's entry with the checkpoint's restore stack
@@ -237,14 +248,20 @@ memmgr serves the checkpoint and the restore with three labels:
   `UNAUTHORIZED` ([memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md) § Badge
   Discipline). memmgr keeps the mark with the object for its life; no other label sets or clears it.
 - **`OBJECT_READ`**, open to any process, copies pages of a memory object into Memory caps the
-  caller presents, over the object's handle, and its reply says whether the object carries the
-  checkpoint mark. procmgr, which has no pager and so cannot attach an object, reads the mark, the
+  caller presents, and its reply says whether the object carries the checkpoint mark. The caller
+  sends it on its own memmgr SEND and presents the object's handle as a cap: a handle the restorer
+  hands procmgr may be a SEND on the restorer's own endpoint, which procmgr cannot tell from
+  memmgr's, and a request sent on it would be answered by the restorer, mark and bytes alike. An
+  answer a process relies on about an object comes over its own memmgr capability, never over a
+  handle another party gave it ([memmgr IPC Interface](../services/memmgr/docs/ipc-interface.md)
+  § Object Handles). procmgr, which has no pager and so cannot attach an object, reads the mark, the
   layout and the bytes of the argv and env region, the writable segments, the stack and the TLS
   block with it.
 - **`FILL_REGION`**, open to any process for its own memory, backs pages of the caller's own region
-  that no fault has backed with copies of a memory object's pages, over the object's handle, as a
-  write fault would back them. procmgr sends it, and `REGISTER_REGION`, on the new process's memmgr
-  SEND, so memmgr attributes and charges each to that process, as it does the image's attachment.
+  that no fault has backed with copies of a memory object's pages, the object's handle presented
+  as a cap in the same way, as a write fault would back them. procmgr sends it, and
+  `REGISTER_REGION`, on the new process's memmgr SEND, so memmgr attributes and charges each to
+  that process, as it does the image's attachment.
 
 ---
 
@@ -256,14 +273,21 @@ the restore stack pointer, on the restored stack, and rebinds before it resumes:
 - it registers the new IPC buffer and rebuilds `StartupInfo` from the new `ProcessInfo`, so every
   cap the runtime reaches through it names the new process's slot;
 - it drops every runtime state that names a capability of the captured process without using the
-  capability: the object slab, the `CSpace` slot reserve, the memory-pressure registration, the
-  stdio rings and their page reservations, the main thread's `Parker` Notification, the fs release
-  handler and the thread reaper's queues, and releases the regions it holds for the threads it
-  discards; then takes each anew from the new process's caps, as a fresh `_start` does;
-- it keeps the heap, the page-reservation arena and every memmgr region, which the restore holds as
-  captured;
-- it draws the main thread's `HashMap` key seed again, so maps the clones of one snapshot create
+  capability: the thread's own cap, the root and current-directory caps and the current-directory
+  path, the allocator's memmgr endpoint, address space, object slabs and `CSpace` slot reserve,
+  the memory-pressure registration, the stdio rings and their page reservations, the thread
+  registry and the reaper's death queues, the fs release handler, the time service's cap, the log
+  cap, the service-registry cap, and the main thread's `Parker` Notification; it releases the
+  regions it holds for the threads it discards; then it takes each anew from the new process's
+  caps, as a fresh `_start` does;
+- it keeps the heap's bytes, the page-reservation arena and every memmgr region, which the
+  restore holds as captured;
+- it draws the process's `HashMap` key seed again, so maps the clones of one snapshot create
   take distinct keys.
+
+Every runtime static carries a restore class, and each one the restore rebinds is reset by the
+restore entry, which `cargo xtask lint-docs` checks
+([runtime/ruststd/README.md](../runtime/ruststd/README.md#restore-classes) § Restore classes).
 
 It then resumes the resume record: `quiesce` returns `Restored` with the rollback notice, on the
 main thread of the new process. A `ProcessInfo` capability slot the application read before its
@@ -312,6 +336,7 @@ system can make, which the mark does not replace.
 | `NOT_RESTORABLE` | `CHECKPOINT` | The account is no memmgr account, so memmgr refused the mark |
 | `NOT_RESTORABLE` | `CREATE_RESTORE` | The object carries no checkpoint mark, or is not a checkpoint of the verified body |
 | `INVALID_ARGUMENT` | `CREATE_RESTORE` | The create carries argv and env (`CREATE_ARGV_ENV`) |
+| `INVALID_ARGUMENT` | `CREATE_RESTORE` | The create asks for a pinned, phys-class or DMA-held process, or memmgr takes the handle for no object handle |
 
 A `CHECKPOINT` is refused as a `SNAPSHOT` is for a missing account, an ended target, a held space
 and a refused allocation, and a restore creation as any create is.

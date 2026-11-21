@@ -53,6 +53,7 @@ pub mod init_reap;
 pub mod names;
 pub mod quiesce;
 pub mod request_caps;
+pub mod restore;
 pub mod sign_policy;
 pub mod snapshot;
 pub mod threads;
@@ -169,6 +170,11 @@ pub struct ProcessEntry
     /// for this child. Passed to `thread_configure_with_tls` at start so the
     /// process is launched at the same VA its stack was mapped to.
     pub stack_top_vaddr: u64,
+    /// The stack pointer `start_process` starts the main thread at in place
+    /// of `stack_top_vaddr`: a restored process's restore stack pointer,
+    /// below its resume record (docs/checkpoint-restore.md § Restore
+    /// creation); zero for every other process.
+    pub start_sp: u64,
     /// VA of the read-only `ProcessInfo` page the loader mapped into the child.
     /// Delivered to the child in its entry register at start, so the child reads
     /// its handover struct from the address the loader chose.
@@ -2140,6 +2146,7 @@ mod tests
             entry_point: 0,
             tls_base_va: 0,
             stack_top_vaddr: 0,
+            start_sp: 0,
             process_info_va: 0,
             started: false,
             dma_hold: false,
@@ -3389,7 +3396,7 @@ mod tests
     #[test]
     fn the_per_process_state_has_the_documented_size()
     {
-        assert_eq!(core::mem::size_of::<ProcessEntry>(), 440);
+        assert_eq!(core::mem::size_of::<ProcessEntry>(), 448);
         assert_eq!(core::mem::size_of::<threads::RegisteredThread>(), 24);
     }
 

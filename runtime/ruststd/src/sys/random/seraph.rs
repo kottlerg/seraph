@@ -41,3 +41,20 @@ pub fn hashmap_random_keys() -> (u64, u64) {
     let k1 = u64::from_ne_bytes(buf[8..].try_into().unwrap());
     (k0, k1)
 }
+
+crate::thread_local! {
+    /// The calling thread's `RandomState` keys (std's `hash/random.rs`,
+    /// pointed here by the toolchain overlay): drawn on the thread's first
+    /// `RandomState::new`, then the first key advanced on each.
+    // restore: rebound
+    pub static HASHMAP_KEYS: crate::cell::Cell<(u64, u64)> =
+        crate::cell::Cell::new(hashmap_random_keys());
+}
+
+/// Draw the calling thread's `RandomState` keys again: the restore entry's,
+/// so the maps the restores of one checkpoint create take distinct keys
+/// (docs/checkpoint-restore.md § Restore entry and handle rebinding).
+// restore: reset
+pub fn reseed_hashmap_keys() {
+    HASHMAP_KEYS.with(|keys| keys.set(hashmap_random_keys()));
+}

@@ -190,9 +190,10 @@ The full memmgr IPC specification is in
   an immutable memory object
 - `ATTACH_OBJECT(va, len, prot, first_page, flags[, object_handle])` — attach an object, or the
   zero object without a handle, as a region of the caller, shared or `ATTACH_PRIVATE`
-- Over an object handle only: `OBJECT_RELEASE` — drop the object's handle state;
-  `OBJECT_READ(first_page, offset, pages…) → copied, flags, object_pages` — copy pages of the
-  object into the Memory caps the request carries, and report its checkpoint mark
+- Over an object handle only: `OBJECT_RELEASE` — drop the object's handle state
+- `OBJECT_READ(first_page, offset, pages…, object_handle[, memory…]) → copied, flags,
+  object_pages` — copy pages of an object into the Memory caps the request carries, and report
+  its checkpoint mark
 - `FILL_REGION(first_page, n, (chunk_va, mask)…[, object_handle]) → backed` — back the masked pages
   of chunks of the caller's own regions with copies of an object's pages, as write faults would
 - `MARK_CHECKPOINT(object_handle, account)` — mark an object sealed on the account as a

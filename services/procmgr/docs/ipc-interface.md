@@ -99,8 +99,8 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 1 |
-| label bits `[16..37]` | Create flags and scheduling fields (see **Pinned flag**, **Death relay**, **Containment**, **Private image**, **Scheduling fields**, **argv and env**, **Physical-address flag**, and **Memory max and reserve** below) |
-| label bits `[37..64]` | Reserved, zero |
+| label bits `[16..38]` | Create flags and scheduling fields (see **Pinned flag**, **Death relay**, **Containment**, **Private image**, **Restore**, **Scheduling fields**, **argv and env**, **Physical-address flag**, and **Memory max and reserve** below) |
+| label bits `[38..64]` | Reserved, zero |
 | data[0] | The object's exact length in bytes, at byte 0 of cap[0] (§ Image Verification) |
 | data[1..5] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, `args_bytes`, `args_count`, `env_bytes`, `env_count`, one `u64` each |
 | data[1], or data[5] with `CREATE_ARGV_ENV` | When `CREATE_MEMORY_MAX` is set: the child's memory max in pages (**Memory max and reserve** below) |
@@ -108,7 +108,7 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | cap[0] | Memory capability holding the signed object |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
 | the cap before the argv/env cap, or before the relay without one, or last without either | When `CREATE_CHARGE_NODE` is set: the node handle the child is charged to (**Memory max and reserve** below) |
-| next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: Memory cap holding the argv and env blobs |
+| next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: Memory cap holding the argv and env blobs; when `CREATE_RESTORE` is set: the checkpoint's object handle (**Restore** below) |
 | last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap (**Death relay** below) |
 
 procmgr maps the module's Memory cap read-only, copies the object out and verifies it
@@ -159,12 +159,13 @@ holds a handle to it.
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
 | 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built, the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[37..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded or before procmgr's reply delivers it, or a destroy marked the child itself (`DESTROY_CHILD`, or a destroy of a subtree it is in) before procmgr's reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below) |
+| 7 | `INVALID_ARGUMENT` | No module capability, the length is zero or past the cap's pages, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY` or `CREATE_CHARGE_NODE` set without a cap of its own (**Death relay** below), reserved label bits `[38..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process or one a destroy has begun on (§ Process Tree), as when the creator's destroy begins before the child is recorded or before procmgr's reply delivers it, or a destroy marked the child itself (`DESTROY_CHILD`, or a destroy of a subtree it is in) before procmgr's reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (**Memory max and reserve** below), `CREATE_RESTORE` comes with `CREATE_ARGV_ENV`, `CREATE_PINNED`, `CREATE_PHYS_ACCESS` or `CREATE_DMA_HOLD`, or memmgr takes its handle for no object handle (**Restore** below) |
 | 11 | `MAP_FAILED` | The module cap, a copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | The module cap lacks the map right, or a rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 | 18 | `SIGNATURE_REFUSED` | The object does not verify under the name, in a role of the creator's signature policy, for this architecture (§ Image Verification) |
 | 21 | `LIMIT` | The max of the child's budget node or of an ancestor refused a charge procmgr made on the child's account (`memmgr_errors::LIMIT`): a kernel-object slab, a page, the argv and env copy, the copy of the object or a shared attachment, against the node's `CREATE_MEMORY_MAX`, the node a `CREATE_CHARGE_NODE` handle names, or the creator's own node (**Memory max and reserve**, § Label 1); the child is not created and its pages are returned |
+| 23 | `NOT_RESTORABLE` | With `CREATE_RESTORE`: the object carries no checkpoint mark, or is not a complete checkpoint of the verified body (**Restore** below) |
 
 **argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
 `CREATE_FROM_FILE`) marks a request that carries the child's argv and env in a Memory cap the caller
@@ -255,6 +256,27 @@ way. A key-holding service asks for it, since text it shares lets the other proc
 observe, by cache timing, which of its code runs. std sets it with `CommandExt::private_image`,
 and svcmgr for a recipe that sets `private_image = yes`.
 
+**Restore.** The label's bit 37 (`CREATE_RESTORE`, shared with `CREATE_FROM_FILE`) creates the child
+as a restore of a checkpoint ([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md) §
+Restore creation): the request carries the checkpoint's object handle as a cap of its own, in the
+argv/env cap's place, and no argv or env, since the child takes its checkpoint's. procmgr reads the
+object with memmgr's `OBJECT_READ` on its own memmgr cap, the handle presented as a cap
+([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 35), and
+refuses the create `NOT_RESTORABLE` (23), having created nothing, unless memmgr reports the object
+marked as a checkpoint, the verified body's SHA-512 and length are the checkpoint's, and its layout
+is a complete checkpoint's whose executable runs lie in the image's executable segments. It then
+loads the image at the checkpoint's load bias and its bootstrap surfaces at the checkpoint's
+addresses, gives the child the checkpoint's argv and env and the bytes of its writable segments,
+stack and TLS block, private when the checkpoint declares its image private, applies its
+declarations, and sets `ProcessInfo.restore_sp` to its restore stack pointer. Once the child exists
+it makes every region of the checkpoint again on the child's memmgr record and backs each page the
+checkpoint holds bytes of (`REGISTER_REGION`, `ATTACH_OBJECT` of the zero object, `FILL_REGION` on a
+copy of the child's memmgr SEND), charged to the child; a refusal there destroys the child and fails
+the create with memmgr's code. procmgr deletes its copy of the handle on every path. A request that
+sets the flag with `CREATE_ARGV_ENV`, `CREATE_PINNED`, `CREATE_PHYS_ACCESS` or `CREATE_DMA_HOLD` is
+refused `INVALID_ARGUMENT` before any resource is acquired, as is one whose handle memmgr takes for
+no object handle.
+
 **DMA hold flag.** The label's bit 28 (`CREATE_DMA_HOLD`, in the window shared
 with `CREATE_FROM_FILE`) holds back the child's memory reclaim. Once the child
 has been started, its teardown, however it comes (its death, a death resync, or
@@ -325,7 +347,7 @@ which the kernel forwards to the faulting thread's exception handler
 § Kernel-origin fault message).
 
 procmgr's own state for a child is charged to procmgr's node, not to the child's: its process-table
-entry (440 bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two
+entry (448 bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two
 death-observer nodes (24 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and
 96 bytes for each thread it registers (Label 22). Every page of the child itself, at least 55, is
 charged to the child's node, so that state is at most 0.85% of what the child's node already pays,
@@ -381,7 +403,7 @@ carries at most two of the creator endpoint, the argv/env cap and the relay.
 
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
 (`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and
-`CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[35..64]`
+`CREATE_FROM_FILE` — carry the child's scheduling placement; bits `[38..64]`
 remain reserved and MUST be zero (`INVALID_ARGUMENT` otherwise, which keeps a
 future field addition provably additive). Resolution, against the **creator's
 band ceiling** (badge 0 = init, ceiling `sched_policy::BASELINE_PRIORITY_MAX`;
@@ -591,16 +613,16 @@ Create a suspended process from an ELF binary the caller has already resolved: t
 own namespace cap to the binary node and transfers the resulting file cap. procmgr opens it
 (`FS_OPEN`), copies the signed object out with `FS_READ_MEMORY` against its own open and verifies it
 (§ Image Verification), and never holds a namespace cap of its own. Loading, the **Pinned flag**,
-the **Death relay**, **Containment**, **Private image**, **Memory max and reserve**, the
-**Scheduling fields**, and **argv and env** are as for `CREATE_PROCESS`.
+the **Death relay**, **Containment**, **Private image**, **Restore**, **Memory max and reserve**,
+the **Scheduling fields**, and **argv and env** are as for `CREATE_PROCESS`.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 13 |
-| label bits `[16..37]` | As for `CREATE_PROCESS` |
-| label bits `[37..64]` | Reserved, zero |
+| label bits `[16..38]` | As for `CREATE_PROCESS` |
+| label bits `[38..64]` | Reserved, zero |
 | data[0] | `file_size` in bytes, from the caller's `NS_LOOKUP` size hint: the signed object's length (§ Image Verification) |
 | data[1..5] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, as for `CREATE_PROCESS` |
 | data[1], or data[5] with `CREATE_ARGV_ENV` | When `CREATE_MEMORY_MAX` is set: the child's memory max in pages, as for `CREATE_PROCESS` |
@@ -608,7 +630,7 @@ the **Death relay**, **Containment**, **Private image**, **Memory max and reserv
 | cap[0] | File cap for the binary |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
 | the cap before the argv/env cap, or before the relay without one, or last without either | When `CREATE_CHARGE_NODE` is set: the charge node's handle, as for `CREATE_PROCESS` |
-| next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: the argv/env Memory cap, as for `CREATE_PROCESS` |
+| next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: the argv/env Memory cap; when `CREATE_RESTORE` is set: the checkpoint's object handle; as for `CREATE_PROCESS` |
 | last cap | When `CREATE_DEATH_RELAY` is set: the death-relay cap, as for `CREATE_PROCESS` |
 
 procmgr deletes the file cap once it has opened it, `FS_CLOSE`s and deletes its open once the object
@@ -637,13 +659,14 @@ included, as for `CREATE_PROCESS`.
 |---|---|---|
 | 1 | `INVALID_ELF` | The verified body's ELF validation or relocation failed (the TLS block's checks aside, see `OUT_OF_MEMORY`) |
 | 2 | `OUT_OF_MEMORY` | procmgr's own `CSpace` is short of its headroom and its top-up was refused ([README.md](../README.md) § CSpace headroom), or memory-cap, kernel-object, or badge allocation failed, the copy of the object among them, for a reason other than a max (`LIMIT`), the main thread's TLS block could not be built (an oversized or overaligned `PT_TLS`, or a mapping), the stack or IPC-buffer pages could not be mapped, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[37..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, a destroy that marked the child itself before the reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1) |
+| 7 | `INVALID_ARGUMENT` | No file cap, `file_size` zero, no name block or a name not in the canonical form (§ Image Verification), `CREATE_DEATH_RELAY`, `CREATE_ARGV_ENV` or `CREATE_CHARGE_NODE` set without a cap of its own, reserved label bits `[38..64]` set, `CREATE_PHYS_ACCESS` from a creator that is not phys-class (Label 1's **Physical-address flag**), a badge that names no live process or one a destroy has begun on before the reply delivers the child, a destroy that marked the child itself before the reply delivered it (§ Process Tree), `CREATE_MEMORY_MAX` without its data word, or `CREATE_RESERVE` from a creator outside the system reserve or with `CREATE_CHARGE_NODE` (Label 1's **Memory max and reserve**), the scheduling fields violate the resolution rules (band above the creator's ceiling, or priority above the resolved band), or the argv and env violate the rules of **argv and env** (§ Label 1), `CREATE_RESTORE` comes with `CREATE_ARGV_ENV`, `CREATE_PINNED`, `CREATE_PHYS_ACCESS` or `CREATE_DMA_HOLD`, or memmgr takes its handle for no object handle (**Restore**, § Label 1) |
 | 10 | `IO_ERROR` | The `FS_OPEN` of the file cap failed or went unanswered for `FILE_CAP_CALL_TIMEOUT_MS`, or the object's bytes did not all arrive: an `FS_READ_MEMORY` against procmgr's open failed, went unanswered for that long or returned zero bytes before `file_size`, its cache page could not be mapped, or its reply named a range past that page |
 | 11 | `MAP_FAILED` | A copy frame or a segment could not be mapped |
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
 | 18 | `SIGNATURE_REFUSED` | As for `CREATE_PROCESS` (§ Image Verification) |
 | 21 | `LIMIT` | As for `CREATE_PROCESS` (§ Label 1) |
+| 23 | `NOT_RESTORABLE` | With `CREATE_RESTORE`: the object carries no checkpoint mark, or is not a complete checkpoint of the verified body (**Restore**, § Label 1) |
 
 ### Label 25: `BIND_DEATH_OBSERVER`
 

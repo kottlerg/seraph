@@ -30,6 +30,7 @@ mod image_cache;
 mod init_reap;
 mod loader;
 mod process;
+mod restore;
 mod snapshot;
 mod trust_store;
 
@@ -1936,7 +1937,9 @@ struct CheckedCreate<'a>
 /// (`process_table::sign_policy::requested_name`), and, when the label sets
 /// `CREATE_ARGV_ENV`, the header of its argv and env against the
 /// `argv_env_cap` that holds them (`process::check_argv_env`). Its data
-/// word 0, the object's length, must be nonzero. `None` means the request
+/// word 0, the object's length, must be nonzero, and a `CREATE_RESTORE`
+/// label sets none of `CREATE_PINNED`, `CREATE_PHYS_ACCESS` and
+/// `CREATE_DMA_HOLD`. `None` means the request
 /// must be rejected with `INVALID_ARGUMENT`.
 fn check_create_request<'a>(
     req: &'a IpcMessage,
@@ -1954,6 +1957,17 @@ fn check_create_request<'a>(
     if req.word(0) == 0
     {
         std::os::seraph::log!(warn: "create of a zero-length object refused");
+        return None;
+    }
+    // A restored process is demand-paged and holds no device memory: its
+    // regions are made again on memmgr and backed by its faults
+    // (docs/checkpoint-restore.md § Restore creation).
+    let unrestorable = procmgr_labels::CREATE_PINNED
+        | procmgr_labels::CREATE_PHYS_ACCESS
+        | procmgr_labels::CREATE_DMA_HOLD;
+    if req.label & procmgr_labels::CREATE_RESTORE != 0 && req.label & unrestorable != 0
+    {
+        std::os::seraph::log!(warn: "restore with a pinned, physical or DMA-hold flag refused");
         return None;
     }
     let argv_env = if req.label & procmgr_labels::CREATE_ARGV_ENV == 0
@@ -2246,13 +2260,15 @@ enum ObjectSource
 /// [`procmgr_labels::CREATE_FROM_FILE`]; both lay out their data words alike:
 /// word 0 the object's length, then the argv/env header, the memory max and
 /// the name block, each present or not. Caps: `[source, creator_endpoint?,
-/// charge?, argv_env?, relay?]`, `charge` only with `CREATE_CHARGE_NODE`,
-/// `argv_env` only with `CREATE_ARGV_ENV` and `relay` only with
-/// `CREATE_DEATH_RELAY`; caps between the creator endpoint and them are
-/// deleted. procmgr owns every transferred cap: the source is deleted once
+/// charge?, argv_env? | snapshot?, relay?]`, `charge` only with
+/// `CREATE_CHARGE_NODE`, `argv_env` only with `CREATE_ARGV_ENV`, the
+/// checkpoint's object handle `snapshot` only with `CREATE_RESTORE` and
+/// `relay` only with `CREATE_DEATH_RELAY`; caps between the creator
+/// endpoint and them are deleted. procmgr owns every transferred cap: the source is deleted once
 /// its object is copied (a file's opened, read and closed first), the creator
 /// endpoint once the child holds its own copy, the argv/env cap once its
-/// blobs are copied, the charge node's handle goes to memmgr with the
+/// blobs are copied, the object handle once the create is done with the
+/// checkpoint, the charge node's handle goes to memmgr with the
 /// registration, and the relay is kept in the child's table entry by
 /// `finalize_creation` on success; every cap of a refused request is
 /// deleted here. Stdio pipe
@@ -2288,6 +2304,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
             caps.source,
             caps.creator,
             caps.argv_env,
+            caps.snapshot,
             caps.relay,
             caps.charge,
         ]);
@@ -2305,6 +2322,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
         creator_ep: caps.creator,
         argv_env: checked.argv_env,
         argv_env_cap: caps.argv_env,
+        snapshot: caps.snapshot,
         relay: caps.relay,
     };
     let result = create_child(ctx, request, &mut checked.sched, ipc_buf);
@@ -2788,6 +2806,9 @@ struct CreateRequest<'a>
     creator_ep: u64,
     argv_env: Option<process::ArgvEnvRequest>,
     argv_env_cap: u64,
+    /// The checkpoint's object handle of a `CREATE_RESTORE` request, zero
+    /// otherwise; `create_child` owns it.
+    snapshot: u64,
     relay: u64,
 }
 
@@ -2802,10 +2823,21 @@ struct CreateRequest<'a>
 /// before the registration settles. Single exit: any failure, a refused
 /// signature among them, creates nothing and releases what it took.
 ///
+/// A restore (`procmgr_labels::CREATE_RESTORE`) first opens the checkpoint
+/// whose object handle the request carries ([`restore::Source::open`]),
+/// takes the child's argv and env from it, loads the verified body at the
+/// checkpoint's layout with its bootstrap surfaces' bytes, private when the
+/// checkpoint declares its image private, and, once the child exists,
+/// makes its regions again ([`restore::Regions::remake`]); a failure there
+/// destroys the child (docs/checkpoint-restore.md § Restore creation).
+///
 /// # Errors
 /// `OUT_OF_MEMORY` when memmgr does not register the child; the argv/env
 /// copy's code ([`process::ArgvEnvCopyError::code`]); the read's code;
-/// `SIGNATURE_REFUSED` when the object does not verify; the load's code.
+/// `SIGNATURE_REFUSED` when the object does not verify; the load's code;
+/// for a restore, the checkpoint's codes (`INVALID_ARGUMENT` for a handle
+/// memmgr does not take, `NOT_RESTORABLE` for an object or a layout that
+/// is not a restorable checkpoint of this body) and the regions'.
 fn create_child(
     ctx: &ProcmgrCtx,
     request: CreateRequest<'_>,
@@ -2813,6 +2845,8 @@ fn create_child(
     ipc_buf: *mut u64,
 ) -> Result<process::CreateResult, u64>
 {
+    // procmgr owns the object handle from here on every path.
+    let snapshot = (request.snapshot != 0).then(|| process::CapGuard::new(request.snapshot));
     // memmgr's badged SEND for the child: every page procmgr takes for the
     // child, the object's buffer included, is billed to the child's record
     // from the moment it leaves the pool. The guard owns the registration
@@ -2827,16 +2861,17 @@ fn create_child(
         return Err(procmgr_errors::OUT_OF_MEMORY);
     }
 
+    // A restore's checkpoint, read through a window on the child's account,
+    // which drops before the registration settles.
+    let source = snapshot
+        .map(|handle| {
+            restore::Source::open(handle, ctx.memmgr_ep, ctx.self_aspace, mms.cap(), ipc_buf)
+        })
+        .transpose()?;
+
     // The child's checked copy of the argv and env, on its account; a
-    // malformed blob refuses the create here. The caller's cap is no longer
-    // needed once it is taken.
-    let argv_env = match &request.argv_env
-    {
-        Some(argv_env) => process::copy_argv_env(ctx.self_aspace, mms.cap(), ipc_buf, argv_env),
-        None => Ok(process::ChildArgvEnv::empty()),
-    };
-    release_caps(&[request.argv_env_cap]);
-    let argv_env = match argv_env
+    // malformed blob refuses the create here.
+    let argv_env = match child_argv_env(ctx, &request, source.as_ref(), mms.cap(), ipc_buf)
     {
         Ok(argv_env) => argv_env,
         Err(e) =>
@@ -2895,6 +2930,15 @@ fn create_child(
         hash: verified.attrs.body_hash,
         len: verified.attrs.body_len,
     };
+    // A checkpoint of a private image restores private.
+    let sharing = if source.as_ref().is_some_and(restore::Source::private_image)
+    {
+        process::Sharing::Private
+    }
+    else
+    {
+        process::Sharing::of_label(request.label)
+    };
     let mut result = process::create_process_from_bytes(
         verified.body,
         ctx.self_aspace,
@@ -2907,15 +2951,96 @@ fn create_child(
         request.relay,
         *sched,
         &image_key,
-        process::Sharing::of_label(request.label),
+        sharing,
+        source.as_ref(),
         ipc_buf,
     );
     // The segments are copied into the child's own frames or the image
-    // object's; the buffer's frames go back to memmgr before the registration
-    // settles.
+    // object's; the buffer's frames, and a restore's window, go back to
+    // memmgr before the registration settles.
     drop(buffer);
+    let regions = source.map(restore::Source::into_regions);
     mms.settle(&mut result);
+    if let (Ok(created), Some(regions)) = (&result, &regions)
+        && let Err(code) = remake_regions(ctx, created.badge, regions, ipc_buf)
+    {
+        discard_created(created, ctx, ipc_buf);
+        return Err(code);
+    }
     result
+}
+
+/// The child's argv and env, on its account at `child_memmgr`: a restored
+/// child's are its checkpoint's ([`restore::Source::argv_env`]), any
+/// other's a checked copy of the request's blobs
+/// ([`process::copy_argv_env`]). The caller's argv/env cap is released once
+/// its blobs are taken.
+///
+/// # Errors
+/// The copy's error; a restore's code as an
+/// [`process::ArgvEnvCopyError::Reply`].
+fn child_argv_env(
+    ctx: &ProcmgrCtx,
+    request: &CreateRequest<'_>,
+    source: Option<&restore::Source>,
+    child_memmgr: u64,
+    ipc_buf: *mut u64,
+) -> Result<process::ChildArgvEnv, process::ArgvEnvCopyError>
+{
+    if let Some(source) = source
+    {
+        return source
+            .argv_env(ctx.self_aspace, child_memmgr, ipc_buf)
+            .map_err(process::ArgvEnvCopyError::Reply);
+    }
+    let argv_env = match &request.argv_env
+    {
+        Some(argv_env) => process::copy_argv_env(ctx.self_aspace, child_memmgr, ipc_buf, argv_env),
+        None => Ok(process::ChildArgvEnv::empty()),
+    };
+    release_caps(&[request.argv_env_cap]);
+    argv_env
+}
+
+/// Make the regions of the restored child `badge` again
+/// ([`restore::Regions::remake`]) on a copy of its memmgr SEND, which its
+/// entry holds; the create still owns the entry, so it is there. The copy
+/// carries the grant right, since each `FILL_REGION` carries the object's
+/// handle.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when the copy cannot be had; the remake's codes.
+fn remake_regions(
+    ctx: &ProcmgrCtx,
+    badge: u64,
+    regions: &restore::Regions,
+    ipc_buf: *mut u64,
+) -> Result<(), u64>
+{
+    let memmgr = ctx
+        .tables
+        .lock()
+        .table
+        .find_by_badge(badge)
+        .and_then(|entry| {
+            syscall::cap_derive(entry.memmgr_send_cap, syscall::RIGHTS_EP_SEND_GRANT).ok()
+        })
+        .map(process::CapGuard::new)
+        .ok_or(procmgr_errors::OUT_OF_MEMORY)?;
+    regions.remake(memmgr.cap(), ipc_buf)
+}
+
+/// Delete the caps a create's reply would have carried and destroy the
+/// child, which the create still owns: a restore whose regions could not be
+/// made again ([`remake_regions`]).
+fn discard_created(created: &process::CreateResult, ctx: &ProcmgrCtx, ipc_buf: *mut u64)
+{
+    release_caps(&[
+        created.thread_for_caller,
+        created.process_handle,
+        created.node_handle,
+    ]);
+    process::destroy_created(created.badge, ctx.memmgr_ep, ipc_buf, &ctx.tables);
 }
 
 /// Log a created child's image bias and its scheduling placement, after the

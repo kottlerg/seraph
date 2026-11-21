@@ -10,7 +10,8 @@
 //! § Capability Transfer). The handlers therefore split the transferred caps
 //! into the ones the layout names and the rest, which procmgr deletes. The
 //! create split is the one with a client-controlled shape (the death-relay
-//! and argv/env caps are peeled off the tail), so it lives here, host-tested.
+//! cap, and the argv/env Memory cap or the snapshot's object handle, are
+//! peeled off the tail), so it lives here, host-tested.
 
 use ipc::procmgr_labels;
 
@@ -26,11 +27,14 @@ pub struct CreateCaps<'a>
     /// The argv/env Memory cap when `CREATE_ARGV_ENV` is set: the last cap
     /// before the relay, or the last cap without one. Zero otherwise.
     pub argv_env: u64,
+    /// The snapshot's object handle when `CREATE_RESTORE` is set, in the
+    /// argv/env cap's place, which a restore does not carry. Zero otherwise.
+    pub snapshot: u64,
     /// The last cap when `CREATE_DEATH_RELAY` is set; zero otherwise.
     pub relay: u64,
     /// The node handle when `CREATE_CHARGE_NODE` is set: the cap before the
-    /// argv/env cap, before the relay without one, or the last without
-    /// either. Zero otherwise.
+    /// argv/env cap or the snapshot handle, before the relay without one, or
+    /// the last without either. Zero otherwise.
     pub charge: u64,
     /// Caps the layout does not name, which procmgr deletes.
     pub extra: &'a [u64],
@@ -38,9 +42,14 @@ pub struct CreateCaps<'a>
 
 /// The tail caps a create label flags: whether the request carries the
 /// charge node's handle (`CREATE_CHARGE_NODE`), the argv/env Memory cap
-/// (`CREATE_ARGV_ENV`) and the death-relay cap (`CREATE_DEATH_RELAY`) after
-/// its creator endpoint.
+/// (`CREATE_ARGV_ENV`) or the snapshot's object handle (`CREATE_RESTORE`),
+/// and the death-relay cap (`CREATE_DEATH_RELAY`) after its creator
+/// endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field is one independent label flag, read as the label sets it"
+)]
 pub struct CreateTailCaps
 {
     /// The label sets `CREATE_ARGV_ENV`.
@@ -49,12 +58,14 @@ pub struct CreateTailCaps
     pub death_relay: bool,
     /// The label sets `CREATE_CHARGE_NODE`.
     pub charge_node: bool,
+    /// The label sets `CREATE_RESTORE`.
+    pub restore: bool,
 }
 
 impl CreateTailCaps
 {
     /// The tail caps of a `CREATE_PROCESS` or `CREATE_FROM_FILE` label: both
-    /// opcodes read the three flags alike.
+    /// opcodes read the four flags alike.
     #[must_use]
     pub const fn of_create(label: u64) -> Self
     {
@@ -62,27 +73,31 @@ impl CreateTailCaps
             argv_env: label & procmgr_labels::CREATE_ARGV_ENV != 0,
             death_relay: label & procmgr_labels::CREATE_DEATH_RELAY != 0,
             charge_node: label & procmgr_labels::CREATE_CHARGE_NODE != 0,
+            restore: label & procmgr_labels::CREATE_RESTORE != 0,
         }
     }
 }
 
 /// Split the caps of a create request whose label flags `tail`.
 ///
-/// The relay cap is then the last cap, the argv/env cap the one before it
-/// (or the last, without a relay), and the charge node's handle the one
-/// before those it follows; each must be a cap of its own, so a
+/// The relay cap is then the last cap, the argv/env cap or the snapshot
+/// handle the one before it (or the last, without a relay), and the charge
+/// node's handle the one before those it follows; each must be a cap of its
+/// own, so a
 /// request needs one cap past the source cap for each tail cap it flags. The
 /// creator endpoint is cap[1] when a cap sits between the source cap and the
 /// flagged tail caps; every cap after it, up to them, is extra.
 ///
-/// Returns `None` when no cap arrived, cap[0] is zero, or the label flags
-/// more tail caps than arrived after the source cap. The caller then
-/// releases every transferred cap and refuses the request.
+/// Returns `None` when no cap arrived, cap[0] is zero, the label flags
+/// more tail caps than arrived after the source cap, or it flags both
+/// `CREATE_ARGV_ENV` and `CREATE_RESTORE`, since a restore carries the
+/// checkpoint's argv and env (docs/checkpoint-restore.md § Restore creation).
+/// The caller then releases every transferred cap and refuses the request.
 #[must_use]
 pub fn split_create_caps(caps: &[u64], tail: CreateTailCaps) -> Option<CreateCaps<'_>>
 {
     let (&source, rest) = caps.split_first()?;
-    if source == 0
+    if source == 0 || (tail.argv_env && tail.restore)
     {
         return None;
     }
@@ -95,15 +110,16 @@ pub fn split_create_caps(caps: &[u64], tail: CreateTailCaps) -> Option<CreateCap
     {
         (rest, 0)
     };
-    let (rest, argv_env) = if tail.argv_env
+    let (rest, blob) = if tail.argv_env || tail.restore
     {
-        let (&argv_env, rest) = rest.split_last()?;
-        (rest, argv_env)
+        let (&blob, rest) = rest.split_last()?;
+        (rest, blob)
     }
     else
     {
         (rest, 0)
     };
+    let (argv_env, snapshot) = if tail.restore { (0, blob) } else { (blob, 0) };
     let (middle, charge) = if tail.charge_node
     {
         let (&charge, middle) = rest.split_last()?;
@@ -122,6 +138,7 @@ pub fn split_create_caps(caps: &[u64], tail: CreateTailCaps) -> Option<CreateCap
         source,
         creator,
         argv_env,
+        snapshot,
         relay,
         charge,
         extra,
@@ -137,21 +154,20 @@ mod tests
         argv_env: false,
         death_relay: false,
         charge_node: false,
+        restore: false,
     };
     const RELAY: CreateTailCaps = CreateTailCaps {
-        argv_env: false,
         death_relay: true,
-        charge_node: false,
+        ..NONE
     };
     const ARGV: CreateTailCaps = CreateTailCaps {
         argv_env: true,
-        death_relay: false,
-        charge_node: false,
+        ..NONE
     };
     const BOTH: CreateTailCaps = CreateTailCaps {
         argv_env: true,
         death_relay: true,
-        charge_node: false,
+        ..NONE
     };
 
     // Defect guarded: a label decode that reads a tail flag from the wrong
@@ -199,10 +215,37 @@ mod tests
             source,
             creator,
             argv_env,
+            snapshot: 0,
             relay,
             charge: 0,
             extra,
         }
+    }
+
+    // Defect guarded: a restore's object handle taken from the wrong
+    // position, or bound as an argv/env cap, or a restore that also carries
+    // argv and env taken as well-formed.
+    #[test]
+    fn a_restore_takes_its_object_handle_in_the_argv_env_place()
+    {
+        use ipc::procmgr_labels::{
+            CREATE_ARGV_ENV, CREATE_CHARGE_NODE, CREATE_DEATH_RELAY, CREATE_PROCESS, CREATE_RESTORE,
+        };
+        let restore = CreateTailCaps::of_create(CREATE_PROCESS | CREATE_RESTORE);
+        assert!(restore.restore && !restore.argv_env);
+        let split = split_create_caps(&[5, 6, 8], restore).unwrap();
+        assert_eq!((split.creator, split.argv_env, split.snapshot), (6, 0, 8));
+        let all = CreateTailCaps::of_create(
+            CREATE_PROCESS | CREATE_RESTORE | CREATE_DEATH_RELAY | CREATE_CHARGE_NODE,
+        );
+        let split = split_create_caps(&[5, 7, 8, 9], all).unwrap();
+        assert_eq!(
+            (split.charge, split.snapshot, split.relay, split.argv_env),
+            (7, 8, 9, 0)
+        );
+        assert_eq!(split_create_caps(&[5], restore), None);
+        let both = CreateTailCaps::of_create(CREATE_PROCESS | CREATE_RESTORE | CREATE_ARGV_ENV);
+        assert_eq!(split_create_caps(&[5, 6, 8], both), None);
     }
 
     #[test]

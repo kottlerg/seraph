@@ -283,6 +283,19 @@ store version 1), is not read.
   key is derived from the other's, nor from a seed they share. Each half derives its key from its
   seed as its standard specifies (RFC 8032 § 5.1.5, FIPS 204 Algorithm 6).
 
+**Cost.** In the bootloader, the Ed25519 half of a verification takes about 0.9 ms and the
+ML-DSA-65 half about 0.13 ms on x86_64 under KVM, which runs the code at the speed of the host's
+CPU, and about 6.6 to 7.2 ms and 0.7 to 0.8 ms on riscv64 under QEMU's TCG emulation: the
+ML-DSA-65 half is the cheaper on both. The SHA-512 of the body, which every verification adds,
+runs at about 600 MB/s on x86_64 and 120 to 170 MB/s on riscv64. A boot of the default image
+verifies ten objects (the kernel and the bundle's entries) and the signer's certificate once
+(§ Verification), in about 16 to 18 ms on x86_64 and 100 to 120 ms on riscv64, the hashes
+included. A verification with an empty certificate cache, the deepest, uses under 11 KiB of
+stack, against the 128 KiB of firmware stack the bootloader runs on
+([core/boot/docs/uefi-environment.md](../core/boot/docs/uefi-environment.md) § Stack). The
+figures were measured in the debug and the release build, which differ by little here, at
+4 vCPUs beside no other QEMU; the riscv64 figures are the emulator's, and no rule bounds the cost.
+
 The messages are short and carry their own domain tags (`seraph/obj/v3` for a record's signed
 attributes, `seraph/cert/v2` for a certificate's signed bytes), so neither half hashes the message
 first and the Ed25519 half needs no context of its own. Seraph's encoding of the composite is its
@@ -506,17 +519,18 @@ Each create therefore costs one composite verification of its image, with the SH
 image, and one more, of the signer's certificate, when procmgr's certificate cache
 (`CERTIFICATE_CACHE_LEN`, 4, the oldest replaced first) does not hold it, or when another create's
 write-back of the cache lost it ([`shared/objsig`](../shared/objsig/README.md)). A composite
-verification is one Ed25519 verification and one ML-DSA-65 verification (§ Composite Signature).
-The ML-DSA-65 half's cost is not yet measured
-([#1076](https://github.com/kottlerg/seraph/issues/1076)). On riscv64 under QEMU's TCG emulation
-the Ed25519 half is several times slower in procmgr than in the bootloader: about 50 to 70 ms per
-verification (a debug build at 4 vCPUs), against about 10 ms for the same code built without the
-vector extension. Userspace is built for
+verification is one Ed25519 verification and one ML-DSA-65 verification (§ Composite Signature
+states their cost in the bootloader). On x86_64 under KVM they cost procmgr about what they cost
+the bootloader: about 0.9 to 1.4 ms and 0.12 to 0.19 ms. On riscv64 under QEMU's TCG emulation
+both are slower in procmgr than in the bootloader, at 4 vCPUs: the Ed25519 half about 50 to 70 ms
+per verification in a debug build and 10 ms in a release build, against about 10 ms for the same
+debug code built without the vector extension, and the ML-DSA-65 half about 1.4 ms in a debug
+build and 3.9 ms in a release build. Userspace is built for
 `xtask/targets/riscv64a23-seraph.json`, which enables the vector extension (`+v`), so LLVM
 vectorizes the field multiplication, the conditional swap and the point addition of
 [`shared/crypto`](../shared/crypto/README.md) with RVV instructions; the bootloader's target has
 no vector extension, and its copy is scalar. TCG emulates each vector instruction element by
-element through helper calls, so the vector code is the slower one there. The figure is the
+element through helper calls, so the vector code is the slower one there. The figures are the
 emulator's: the code is the one the target's hardware runs, and no rule bounds the cost.
 
 ---

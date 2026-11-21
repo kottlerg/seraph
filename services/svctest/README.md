@@ -105,7 +105,9 @@ services/svctest/
         │                      #   MAKE_PRIVATE, the free RAM a shared instance saves
         ├── snapshot.rs        # procmgr SNAPSHOT of a live child: one point in time against a
         │                      #   writer thread that never registered, the child resumed, the
-        │                      #   object charged to svctest and released; the refusals
+        │                      #   object charged to svctest and released; the regions and
+        │                      #   every page origin: image, object, zero and demand pages
+        │                      #   the child never touched; the refusals
         ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
         │                      #   held `LOW` level and restores them: debugger reads and
         │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
@@ -525,7 +527,7 @@ through to the normal run.
 | `memory-object-limited`     | `memory_objects` | `memmgr_memory_objects` (4096-page max)   |
 | `memory-object-text`        | `memory_object_text` | `memmgr_memory_object_text` (calls an executable attachment) |
 | `image-sharing`             | `image_sharing` | `procmgr_image_sharing` (reports its image base, waits) |
-| `snapshot-child`            | `snapshot`     | `procmgr_snapshot` (an unregistered writer thread, reports its pages) |
+| `snapshot-child`            | `snapshot`     | `procmgr_snapshot` (an unregistered writer thread, an object, a zero and a demand fixture, reports their addresses) |
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the free frames) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |

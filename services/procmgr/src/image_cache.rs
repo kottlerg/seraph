@@ -151,6 +151,26 @@ pub fn object_for(
     }
 }
 
+/// A SEND copy of the handle of the object the reference `id` names (`0` for
+/// none), taken under the cache's lock so a release meanwhile cannot delete
+/// the handle first, and the key of its binary's body: for `SNAPSHOT`, which
+/// names the image (`ipc::procmgr_snapshot::Header::image`). `None` when
+/// the cache holds no such reference or the copy fails.
+pub fn snapshot_image(id: u64) -> Option<(u64, ImageKey)>
+{
+    if id == 0
+    {
+        return None;
+    }
+    let cache = crate::lock(&CACHE);
+    let copy = cache.find(id).and_then(|(key, handle)| {
+        let copy = syscall::cap_derive(handle, syscall::RIGHTS_EP_SEND).ok()?;
+        Some((copy, key))
+    });
+    drop(cache);
+    copy
+}
+
 /// Drop the reference `id` (`0` for none): the last reference releases the
 /// object.
 pub fn release(id: u64, ipc_buf: *mut u64)

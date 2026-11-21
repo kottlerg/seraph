@@ -1010,20 +1010,23 @@ pub const READ_VERIFIED: u64 = 31;
 /// Specified in `services/procmgr/docs/ipc-interface.md` § `MAKE_PRIVATE`.
 pub const MAKE_PRIVATE: u64 = 32;
 
-/// Capture a live process's mapped pages into a memory object for a
-/// debugger or a core writer: procmgr holds the target's address space
+/// Capture a live process's pages into a memory object for a debugger or a
+/// core writer: procmgr holds the target's address space
 /// (`SYS_ASPACE_HOLD`), so no thread of it runs, whether it registered or
-/// not, copies every page the space maps into frames granted on the
-/// sender's memmgr account, releases the space, and seals the copy into an
-/// immutable memory object on that account (`memmgr_labels::SEAL_OBJECT`),
-/// charged in full to it. Served only on a badge carrying
-/// [`DEBUG_AUTHORITY`]. `data[0]` is the target's process badge;
-/// `caps[0]` the sender's own memmgr SEND, the account procmgr requests the
-/// frames on and seals through, each call on it bounded. The object starts
-/// with a layout of the space's runs, laid out as `crate::procmgr_snapshot`
-/// states. Replies `SUCCESS` with `caps[0]` the object's handle, `data[0]`
-/// the object's pages and `data[1]` `crate::procmgr_snapshot::SNAPSHOT_COMPLETE`
-/// when no run is absent, else `0`; `UNAUTHORIZED` without the authority;
+/// not, records every page of its user half that a read could reach, each
+/// as bytes copied into frames granted on the sender's memmgr account, as
+/// zero, as the page of the target's image object the layout names, as a
+/// page with no copy (device memory) or as absent, releases the space, and
+/// seals the copy into an immutable memory object on that account
+/// (`memmgr_labels::SEAL_OBJECT`), charged in full to it. Served only on a
+/// badge carrying [`DEBUG_AUTHORITY`]. `data[0]` is the target's process
+/// badge; `caps[0]` the sender's own memmgr SEND, the account procmgr
+/// requests the frames on and seals through, each call on it bounded. The
+/// object starts with a layout of the space's regions and runs, laid out as
+/// `crate::procmgr_snapshot` states. Replies `SUCCESS` with `caps[0]` the
+/// object's handle, `data[0]` the object's pages and `data[1]`
+/// `crate::procmgr_snapshot::SNAPSHOT_COMPLETE` when no run is absent, else
+/// `0`; `UNAUTHORIZED` without the authority;
 /// `INVALID_ARGUMENT` without `caps[0]`; `INVALID_BADGE` when no live
 /// process carries the badge, or it ended during the capture;
 /// `NOT_ATTACHABLE` when it declared itself undebuggable; `SPACE_HELD` when

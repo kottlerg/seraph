@@ -4899,7 +4899,7 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         | memmgr_labels::MAKE_PRIVATE
         | memmgr_labels::CAPTURE_CHUNKS =>
         {
-            route_procmgr(opcode, req, kept, ipc_buf, boot.procmgr_badge);
+            route_procmgr(opcode, req, kept, ipc_buf, boot);
         }
         memmgr_labels::NODE_SET_MAX =>
         {
@@ -4938,13 +4938,20 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
 
 /// Hand a request of a label only procmgr's badge may send (`MAKE_RESIDENT`,
 /// `MAKE_PRIVATE`, `CAPTURE_CHUNKS`) to its handler, which checks the badge.
-fn route_procmgr(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, procmgr_badge: u64)
+fn route_procmgr(
+    opcode: u64,
+    req: &IpcMessage,
+    kept: &[u64],
+    ipc_buf: *mut u64,
+    boot: &InitBootstrap,
+)
 {
+    let procmgr_badge = boot.procmgr_badge;
     match opcode
     {
         memmgr_labels::MAKE_RESIDENT => handle_make_resident(req, ipc_buf, procmgr_badge),
         memmgr_labels::MAKE_PRIVATE => handle_make_private(req, ipc_buf, procmgr_badge),
-        _ => capture::handle_capture_chunks(req, kept, ipc_buf, procmgr_badge),
+        _ => capture::handle_capture_chunks(req, kept, ipc_buf, procmgr_badge, boot.service_ep),
     }
 }
 

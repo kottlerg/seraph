@@ -510,12 +510,15 @@ devmgr's responsibilities are:
     rounds. devmgr tells a module by its content, after taking the body of each through the
     parse-only `objsig::split` (`decls::classify`; a module whose trailer does not parse is logged
     and released): an ELF image is a driver, read for its declaration (one without a declaration is
-    logged and released); valid UTF-8 text is a platform description table, parsed by
-    `firmware::platform::parse_module` (one rejected is logged and released); anything else is
-    logged and released. devmgr spawns the drivers during initial enumeration, before the registry
-    loop opens: the IOMMU driver, matched against the IOMMU family record in a pass of its own, and
-    every other module by the declaration it carries, read from the module mapped read-only and
-    bound in the boot pass (above). Every module cap is released once its pass ends.
+    logged and released); valid UTF-8 text named under `/config/devmgr/platform/`
+    (`boot_protocol::bundle::is_platform_table`, which binds a table to the boot-module role the
+    bootloader verified it in; [docs/signing.md](../../../docs/signing.md) § Configuration) is a
+    platform description table, parsed by `firmware::platform::parse_module` (one rejected is
+    logged and released); anything else is logged and released. devmgr spawns the drivers during
+    initial enumeration, before the registry loop opens: the IOMMU driver, matched against the
+    IOMMU family record in a pass of its own, and every other module by the declaration it
+    carries, read from the module mapped read-only and bound in the boot pass (above). Every
+    module cap is released once its pass ends.
   - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among
     them the per-arch RTC, virtio-input, virtio-console, virtio-rng, test-dma, and a copy
     of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr

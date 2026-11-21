@@ -10,9 +10,12 @@
 //! hands it at `SET_DRIVERS_DIR`.
 //!
 //! init forwards its boot modules untagged; [`classify_modules`] tells each
-//! by its content: an ELF executable is a driver module, anything else a
-//! platform description table (`firmware::platform`). The one exception is
-//! the boot-time policy (`boot_protocol::bundle::POLICY_ENTRY_NAME`), which
+//! by its content: an ELF executable is a driver module, and text named
+//! under `boot_protocol::bundle::PLATFORM_TABLE_PREFIX` a platform
+//! description table (`firmware::platform`), the name binding it to the
+//! boot-module role the bootloader verified it in (docs/signing.md
+//! § Configuration); anything else is released. The one exception is the
+//! boot-time policy (`boot_protocol::bundle::POLICY_ENTRY_NAME`), which
 //! it tells by its name and reads into `caps::DevmgrCaps::dma_confinement`
 //! (docs/device-management.md § DMA Safety Model).
 //!
@@ -206,10 +209,10 @@ pub struct BootModules
     pub tables: Vec<PlatformTable>,
 }
 
-/// Take every boot module of `caps` and tell each by its content: an ELF
-/// executable is a driver module, kept with its declaration; a module named
-/// under `boot_protocol::bundle::PLATFORM_TABLE_PREFIX` is a platform
-/// description table, parsed from its body
+/// Take every boot module of `caps` and tell each by its content and
+/// name: an ELF executable is a driver module, kept with its declaration; a
+/// module named under `boot_protocol::bundle::PLATFORM_TABLE_PREFIX` is a
+/// platform description table, parsed from its body
 /// ([`firmware::platform::parse_module`]) and released. The name binds a
 /// table to the boot-module role the bootloader verified it in, so a key
 /// trusted for configuration alone supplies none. A driver module with

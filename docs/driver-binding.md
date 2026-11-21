@@ -181,8 +181,9 @@ table's device records after the records it enumerated at boot, and deletes the 
 pass that follows binds them, `qemu-virt.platform`'s RTC among them.
 
 A table that does describe a device the root mount needs is a boot module of the bundle, by its
-install path, which the bootloader verified; init forwards it to devmgr with the driver modules,
-devmgr tells it from a driver image by its content and parses its body after the parse-only split
+install path, which the bootloader verified in the boot-module role; init forwards it to devmgr with
+the driver modules, devmgr tells it from a driver image by its content and its name under
+`/config/devmgr/platform/` (§ Driver Declarations) and parses its body after the parse-only split
 of its trailer (`firmware::platform::parse_module`). When a boot module's table matches the
 machine, devmgr reads no table from the root filesystem.
 
@@ -232,9 +233,11 @@ devmgr collects declarations from two places:
   content, apart from the boot-time policy (`/config/boot/policy.conf`), which it tells by its name
   and reads ([device-management.md](device-management.md#required-dma-confinement) § Required DMA
   Confinement): an ELF image is a driver, whose `.note.seraph.driver` note devmgr decodes; valid
-  UTF-8 text is a platform description table (§ Platform Description Tables). A driver image whose
-  note is missing or does not decode, a table that is rejected, and any other module are logged and
-  released.
+  UTF-8 text named under `/config/devmgr/platform/` (`boot_protocol::bundle::is_platform_table`)
+  is a platform description table (§ Platform Description Tables), the name binding it to the
+  boot-module role the bootloader verified it in, so a key trusted for configuration alone supplies
+  none ([signing.md](signing.md) § Configuration). A driver image whose note is missing or does
+  not decode, a table that is rejected, and any other module are logged and released.
 - **The drivers directory.** On `SET_DRIVERS_DIR` devmgr lists `/services/drivers/`
   (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`) and
   reads the note of each entry. A binary whose declaration matches no recorded device is not

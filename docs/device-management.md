@@ -757,12 +757,13 @@ devmgr loads driver binaries from one of two places:
   bootstrap rounds, with any platform description table a root mount needs; each module's round
   words carry its size and its bundle entry name, which devmgr gives procmgr to verify the module
   under. devmgr tells a module by its content: it reads the declaration of each ELF image, parses
-  valid UTF-8 text as a platform description table, and logs and releases anything else. It binds
-  the PCI and platform records those declarations match in the boot settle batch (the IOMMU family
-  record in a batch of its own before it), and spawns every driver via
-  `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only in the pass that binds it, apart from
-  devmgr's copy of the IOMMU driver's image, from which every restart of that driver starts
-  (§ IOMMU Driver Restart); a device added later, a disk included, binds the copy under
+  valid UTF-8 text named under `/config/devmgr/platform/` as a platform description table (a
+  bundled table keeps the boot-module role, [signing.md](signing.md) § Configuration), and logs and
+  releases anything else. It binds the PCI and platform records those declarations match in the
+  boot settle batch (the IOMMU family record in a batch of its own before it), and spawns every
+  driver via `procmgr_labels::CREATE_PROCESS`. A bundle copy runs only in the pass that binds it,
+  apart from devmgr's copy of the IOMMU driver's image, from which every restart of that driver
+  starts (§ IOMMU Driver Restart); a device added later, a disk included, binds the copy under
   `/services/drivers/` at the auxiliary tier ([driver-binding.md](driver-binding.md) § Declaration
   Bounds).
 - **On-disk rootfs** — non-essentials (the serial and framebuffer drivers of the consoles, the

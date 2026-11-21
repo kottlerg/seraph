@@ -119,8 +119,9 @@ identical; only the seed material differs.
 
 ## Keccak duplex construction
 
-The cryptographic core is the Keccak-f[1600] permutation (FIPS 202), in
-`entropy::keccak`. `entropy::sponge::Prng` runs it as a sponge in duplex mode:
+The cryptographic core is the Keccak-f[1600] permutation (FIPS 202), which the kernel takes
+from [`shared/crypto`](../../../shared/crypto/README.md) (`crypto::keccak`), the one copy the
+kernel and the crate's SHAKE share. `entropy::sponge::Prng` runs it as a sponge in duplex mode:
 
 - **Rate** `RATE` = 136 bytes (1088-bit), matching SHAKE256.
 - **Capacity** = 512 bits, never output — the perpetual secret carried forward,
@@ -133,7 +134,8 @@ The cryptographic core is the Keccak-f[1600] permutation (FIPS 202), in
   unrecoverable from the post-fill state.
 
 The absorb/squeeze plumbing is anchored against the NIST `SHAKE256("")` known
-answer; the permutation against the FIPS-202 zero-state vector (see Testing).
+answer, and the permutation against the FIPS-202 zero-state vector in `shared/crypto` (see
+Testing).
 
 ## Central pool and multi-source mixing
 
@@ -392,18 +394,21 @@ validates the API once per boot.
 
 ## Testing
 
-- **Host known-answer and property tests** (`cargo xtask test`): the
-  Keccak-f[1600] zero-state vector; the NIST `SHAKE256("")` FIPS-202 vector and
-  a multi-block squeeze; sponge determinism, seed-sensitivity, fill advancement,
-  and forward-secrecy erasure; health-test cutoffs and stuck/biased-source
-  trips; the full reseed-policy decision matrix (boundaries included); the
-  `SYS_ENTROPY_CONTRIBUTE` argument checks in their order (`WouldBlock`
-  included, which no process can reach) and the wipe of its stack copy; the
-  Phase 7 mint of the `EntropyControl` capability and its descriptor; and the
-  bootloader's VGIA scanner. The permutation, sponge, health tests, and reseed
-  policy are pure and host-testable; the pool, per-CPU generators, jitter,
-  VMGENID consumer, self-test, and draw API are hardware-coupled and built only
-  for the kernel target.
+- **Host known-answer and property tests** (`cargo xtask test`): the NIST
+  `SHAKE256("")` FIPS-202 vector and a multi-block squeeze; sponge
+  determinism, seed-sensitivity, fill advancement, and forward-secrecy erasure;
+  health-test cutoffs and stuck/biased-source trips; the full reseed-policy
+  decision matrix (boundaries included); the `SYS_ENTROPY_CONTRIBUTE` argument
+  checks in their order (`WouldBlock` included, which no process can reach)
+  and the wipe of its stack copy; the Phase 7 mint of the `EntropyControl`
+  capability and its descriptor; and the bootloader's VGIA scanner. The sponge,
+  health tests, and reseed policy are pure and host-testable; the pool,
+  per-CPU generators, jitter, VMGENID consumer, self-test, and draw API are
+  hardware-coupled and built only for the kernel target.
+- **Permutation known answers**: the Keccak-f[1600] zero-state vector and the
+  SHAKE known answers are `shared/crypto`'s, run on the host and on target on
+  both architectures by ktest's `crypto::shake_kats`
+  ([shared/crypto/README.md](../../../shared/crypto/README.md) § Validation).
 - **In-kernel power-on self-test**: each CPU captures a sample from its own
   generator as it comes online; after SMP bringup the BSP asserts every sample
   is non-trivial, samples are pairwise distinct (per-CPU independence), and the

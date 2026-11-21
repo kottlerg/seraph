@@ -14,8 +14,8 @@
 //! `core/kernel/docs/entropy.md`.
 //!
 //! Layering:
-//! - [`keccak`] — the Keccak-f[1600] permutation (FIPS 202).
-//! - [`sponge`] — forward-secure duplex PRNG over the permutation.
+//! - [`sponge`] — forward-secure duplex PRNG over the Keccak-f[1600]
+//!   permutation (FIPS 202) of `crypto::keccak`.
 //! - [`pool`] — central multi-source entropy pool (seed authority).
 //! - [`cpurng`] — per-CPU generators reseeded from the pool.
 //! - [`reseed_policy`] — pure reseed decision function.
@@ -24,13 +24,11 @@
 //! - [`health`] — NIST SP 800-90B continuous health tests gating the hardware RNG.
 //! - [`selftest`] — boot-time power-on self-test of the per-CPU generators.
 //!
-//! The permutation, sponge, health tests, and reseed policy are pure and
-//! host-testable; the pool, per-CPU generators, jitter source, VMGENID
-//! detector, self-test, and draw API are hardware-coupled and compiled only
-//! for the kernel target.
+//! The sponge, health tests, and reseed policy are pure and host-testable;
+//! the pool, per-CPU generators, jitter source, VMGENID detector, self-test,
+//! and draw API are hardware-coupled and compiled only for the kernel target.
 
 pub mod health;
-pub mod keccak;
 pub mod reseed_policy;
 pub mod sponge;
 

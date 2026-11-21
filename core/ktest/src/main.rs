@@ -6,7 +6,7 @@
 //! ktest — Seraph kernel test binary.
 //!
 //! Loaded by the kernel in place of real init. Swap the harness by
-//! re-composing the bootloader bundle with `cargo xtask compose-bundle
+//! re-composing the bootloader bundle with `cargo xtask mkdisk
 //! --harness ktest` (and revert via `--harness init`); the bundle's
 //! `init` entry decides which binary the bootloader hands off to.
 //! Receives the same initial capability set that init would, then:

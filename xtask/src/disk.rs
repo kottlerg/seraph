@@ -12,7 +12,8 @@
 //! 4096 bytes, is chosen per authoring. Every pack signs the sysroot for the
 //! harness whose bundle it composes ([`crate::signing::sign_sysroot`]), then
 //! composes the ESP from the installed files ([`crate::esp::compose`]), then
-//! writes the images. The refusal boots of `test-signing` pack through
+//! writes the images, then checks what it wrote ([`crate::image_check`]). The
+//! refusal boots of `test-signing` pack through
 //! [`create_disk_image_substituting`], which writes bytes the harness staged
 //! in place of named sysroot files and leaves the sysroot as it was.
 
@@ -297,9 +298,8 @@ fn pack(
 
     // Every pack signs what it packs, so no path writes an unsigned image,
     // and composes the ESP from what it signed, so the ESP of every image is
-    // copies of the installed files: `build`, `mkdisk`, `compose-bundle` and
-    // every harness that repacks. ktest is signed `init` only in an image
-    // whose bundle boots it.
+    // copies of the installed files: `build`, `mkdisk` and every harness that
+    // repacks. ktest is signed `init` only in an image whose bundle boots it.
     sign_for_harness(ctx, arch, harness)?;
     crate::esp::compose(ctx, arch, harness)?;
 
@@ -315,6 +315,23 @@ fn pack(
     {
         step(&format!("Data partition image: {}", data_image.display()));
     }
+    // An independent reader checks every image a pack writes, so none exists
+    // unchecked; a substitute is a deliberate difference from the installed
+    // files, so such an image's ESP is not held to them.
+    let esp = if sources.substitutes.is_empty()
+    {
+        crate::image_check::EspCheck::Copies
+    }
+    else
+    {
+        crate::image_check::EspCheck::Skipped
+    };
+    crate::image_check::check(
+        &image_path,
+        (layout.data == DataPlacement::SecondImage).then_some(data_image.as_path()),
+        esp,
+        &ctx.target_dir.join("xtask").join("image-check"),
+    )?;
 
     step("Disk image complete");
     Ok(())

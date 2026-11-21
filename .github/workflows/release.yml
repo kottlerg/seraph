@@ -80,11 +80,12 @@ jobs:
 
       # `cargo xtask build` boots nothing under QEMU, so this job installs
       # no QEMU or firmware; only the jobs that boot (docs/build-system.md
-      # § Continuous Integration) do.
-      - name: Install zstd
+      # § Continuous Integration) do. Its pack checks the image it writes
+      # with dosfstools' fsck.fat (xtask/README.md § The image check).
+      - name: Install zstd and dosfstools
         run: |
           sudo apt-get update
-          sudo apt-get install -y zstd
+          sudo apt-get install -y zstd dosfstools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

@@ -29,7 +29,7 @@ const HARNESS_FILE: &str = ".harness";
 
 /// Record `harness` as the one whose bundle every later pack composes
 /// (`crate::disk::create_disk_image`): `build` records the init harness,
-/// `compose-bundle` the one it is given.
+/// `mkdisk --harness` the one it is given.
 ///
 /// # Errors
 ///
@@ -60,7 +60,7 @@ pub fn recorded_harness(ctx: &BuildContext) -> Result<Harness>
     };
     Harness::parse(text.trim()).map_err(|e| {
         crate::error::err!(
-            "{} names no harness ({e}): run `cargo xtask compose-bundle --harness <h>`",
+            "{} names no harness ({e}): run `cargo xtask mkdisk --harness <h>`",
             path.display()
         )
     })
@@ -178,8 +178,9 @@ const EMPTY_DIRS: &[&str] = &["crash"];
 /// data-file or synthesised-fixture origin) are removed, so deleting a file from `rootfs/` is
 /// reflected in the sysroot and the disk image on the next build. Build-owned
 /// subtrees are never touched. `mkdisk --repack-only` bypasses this whole step
-/// to pack a hand-staged sysroot as it stands, its objects re-signed as every
-/// pack signs them.
+/// to pack a hand-staged sysroot as it stands, except for the data files it
+/// still installs ([`install_data_files`]), its objects re-signed as every pack
+/// signs them.
 pub fn install_rootfs(ctx: &BuildContext, arch: Arch) -> Result<()>
 {
     let src_root = ctx.root.join("rootfs");
@@ -637,7 +638,7 @@ mod tests
     }
 
     // Defect caught: a pack that composes another harness's bundle than the
-    // one `build` or `compose-bundle` chose, or an unreadable record taken
+    // one `build` or `mkdisk --harness` chose, or an unreadable record taken
     // for the init harness, which would sign and boot the wrong `init`.
     #[test]
     fn the_recorded_harness_is_the_last_one_recorded_and_init_by_default()

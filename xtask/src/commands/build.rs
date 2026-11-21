@@ -654,7 +654,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
             build_all_specs(ctx, args)?;
             sysroot::install_rootfs(ctx, args.arch)?;
             // A full build records the init harness, whose bundle every later
-            // pack composes until `cargo xtask compose-bundle` records
+            // pack composes until `cargo xtask mkdisk --harness` records
             // another; the pack signs the sysroot and composes the ESP from
             // it.
             sysroot::record_harness(ctx, crate::bundle::Harness::Init)?;

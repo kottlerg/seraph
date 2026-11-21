@@ -60,12 +60,14 @@ jobs:
 
       # `cargo xtask test` also runs the tests built for riscv64 under QEMU's
       # user-mode emulator, linked by the riscv64 Linux cross compiler against
-      # its C library (xtask/README.md § `cargo xtask test`).
-      - name: Install the riscv64 test emulation
+      # its C library (xtask/README.md § `cargo xtask test`), and the image
+      # check's tests run dosfstools' fsck.fat (xtask/README.md § The image
+      # check).
+      - name: Install the riscv64 test emulation and dosfstools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
+            qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross dosfstools
 
       - name: cargo xtask test
         run: cargo xtask test
@@ -149,8 +151,10 @@ jobs:
         # directory); cp into services/ to enable. `cargo xtask mkdisk`
         # re-mirrors rootfs and repacks the FAT image without invoking
         # cargo. ktest swaps the bundle's `init` entry via
-        # `cargo xtask compose-bundle --harness ktest`, which repacks
-        # the disk image as part of the compose step.
+        # `cargo xtask mkdisk --harness ktest`, which repacks the disk
+        # image with the ktest bundle. Every pack checks the images it
+        # writes (fsck.fat -n on every FAT volume, then the ESP against the
+        # root partition; xtask/README.md § The image check).
         #
         # The svctest cell also co-stages crasher (the restart-path
         # fixture), its worker-fault recipe (crasher-worker.svc) and its
@@ -209,16 +213,9 @@ jobs:
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
               ;;
             ktest)
-              cargo xtask compose-bundle --arch ${{ matrix.arch }} --harness ktest
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest
               ;;
           esac
-
-      - name: Check the disk image
-        # fsck.fat -n, a reader independent of xtask's FAT writer, on every
-        # FAT volume of the image the cell boots, then that every object on
-        # its ESP equals its installed file on the root partition; see
-        # xtask/README.md § cargo xtask check-disk.
-        run: cargo xtask check-disk
 
       - name: Run ${{ matrix.tester }}
         # Per-cell boot budget, for HANG classification, derived as
@@ -285,7 +282,7 @@ jobs:
             # Extra boots: the KASLR randomization test (#252). Boots the
             # ktest bundle already composed above twice and asserts the
             # image slide and direct-map base differ, then asserts the
-            # --no-kaslr knob yields the deterministic layout. Host-side
+            # nokaslr knob yields the deterministic layout. Host-side
             # (it must observe the layout differing across separate boots),
             # so it cannot ride `run --runs`; both arches.
             cargo xtask test-kaslr --arch ${{ matrix.arch }}

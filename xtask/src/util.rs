@@ -108,12 +108,14 @@ pub const CI_CARGO_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
 
 // ── Tool discovery ────────────────────────────────────────────────────────────
 
-/// Resolve `name` on PATH, returning a clear error with per-tool
-/// install hints if missing. Use this before `Command::new(name)` for
-/// tools that aren't part of xtask's own dependency chain (qemu,
-/// llvm-objcopy from rustup, etc.) so a missing tool produces an
-/// actionable message instead of the OS's opaque "No such file or
-/// directory" from `Command::spawn`.
+/// Resolve `name` on `PATH`, then, on a Unix host, in `SBIN_DIRS`,
+/// returning a clear error with per-tool install hints if missing. Use this
+/// for tools that aren't part of xtask's own dependency chain (qemu,
+/// llvm-objcopy from rustup, etc.) and spawn the returned path, not `name`:
+/// `Command::new(name)` searches `PATH` alone, so a tool found only in an
+/// sbin directory would fail to spawn with the OS's opaque "No such file or
+/// directory", which this function exists to replace with an actionable
+/// message.
 pub fn require_tool(name: &str) -> Result<PathBuf>
 {
     let path = tool_search_path(std::env::var_os("PATH").as_deref());

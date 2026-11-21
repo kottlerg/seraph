@@ -410,10 +410,12 @@ worker; the others go on serving, and the reaper goes on reaping. A file server 
 choose, so each call on a caller-supplied file cap is bounded at `FILE_CAP_CALL_TIMEOUT_MS` (10 s),
 past which the create, or the verified read (`READ_VERIFIED`), fails with `IO_ERROR`
 ([docs/ipc-interface.md](docs/ipc-interface.md) § Label 13: `CREATE_FROM_FILE`). A `SNAPSHOT`
-holds one worker, and the target's address space, for its capture; each call on the account the
-sender presents is bounded at `ACCOUNT_CALL_TIMEOUT_MS` (10 s) in the same way, and under the hold
-the worker calls only memmgr and writes no log line, so no held target can stall it
-([docs/ipc-interface.md](docs/ipc-interface.md) § Label 33: `SNAPSHOT`). A caller past the
+or a `CHECKPOINT` holds one worker, and the target's address space, for its capture; each call on
+the account the sender presents is bounded at `ACCOUNT_CALL_TIMEOUT_MS` (10 s) in the same way, and
+under the hold the worker calls only memmgr and writes no log line, so no held target can stall it
+([docs/ipc-interface.md](docs/ipc-interface.md) § Label 33: `SNAPSHOT`, § Label 35:
+`CHECKPOINT`). A `CHECKPOINT` takes the table lock under the hold too, once, to check that the
+quiesce point it found is still recorded. A caller past the
 four workers waits in the endpoint's queue. procmgr's own `ProcessInfo` names no procmgr endpoint,
 so its threads send no `REGISTER_THREAD` and start without waiting on one
 ([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Thread registration).

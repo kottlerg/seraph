@@ -13,7 +13,8 @@
 //! from byte [`HEADER_BYTES`], then [`Header::run_count`] [`Run`]s, each
 //! entry [`ENTRY_BYTES`] long, both in ascending address order, then
 //! [`Header::thread_count`] [`ThreadRecord`]s, [`Header::thread_bytes`]
-//! long together, each a thread's state as the capture's hold left it. Every
+//! long together, each a thread's state as the capture's hold left it, then,
+//! with [`SNAPSHOT_CHECKPOINT`], a [`Checkpoint`] section. Every
 //! field is a little-endian `u64`. The data pages follow the layout: a run
 //! with bytes names its first page's place in the object
 //! ([`Run::object_page`]), and its pages follow one another there.
@@ -35,7 +36,7 @@ use syscall_abi::PAGE_SIZE;
 pub const MAGIC: u64 = u64::from_le_bytes(*b"SRPHSNAP");
 
 /// [`Header`] word 1: the version of this layout. A reader refuses any other.
-pub const LAYOUT_VERSION: u64 = 3;
+pub const LAYOUT_VERSION: u64 = 4;
 
 /// Bytes of the image's hash in the [`Header`]: a SHA-512.
 pub const IMAGE_HASH_BYTES: usize = 64;
@@ -63,8 +64,33 @@ pub const SNAPSHOT_COMPLETE: u64 = 1 << 0;
 /// run is [`RUN_IMAGE`].
 pub const SNAPSHOT_IMAGE: u64 = 1 << 1;
 
+/// [`Header::flags`] bit: the capture is a checkpoint of a process at its
+/// quiesce point (`procmgr_labels::CHECKPOINT`), and a [`Checkpoint`]
+/// section of [`CHECKPOINT_BYTES`] follows the thread records
+/// ([`checkpoint_offset`]).
+pub const SNAPSHOT_CHECKPOINT: u64 = 1 << 2;
+
 /// The [`Header::flags`] bits.
-pub const SNAPSHOT_FLAGS: u64 = SNAPSHOT_COMPLETE | SNAPSHOT_IMAGE;
+pub const SNAPSHOT_FLAGS: u64 = SNAPSHOT_COMPLETE | SNAPSHOT_IMAGE | SNAPSHOT_CHECKPOINT;
+
+/// Bytes of a [`Checkpoint`] section: thirteen words, then the image's hash.
+pub const CHECKPOINT_BYTES: usize = 13 * 8 + IMAGE_HASH_BYTES;
+
+/// [`Checkpoint::declarations`] bit: the process declared itself
+/// undebuggable (`procmgr_labels::DECLARE_NO_DEBUG`).
+pub const CHECKPOINT_NO_DEBUG: u64 = 1 << 0;
+
+/// [`Checkpoint::declarations`] bit: the process declared itself on the
+/// core path (`procmgr_labels::DECLARE_NO_CORE`).
+pub const CHECKPOINT_NO_CORE: u64 = 1 << 1;
+
+/// [`Checkpoint::declarations`] bit: the process's image was loaded
+/// private, procmgr sharing no image object with it.
+pub const CHECKPOINT_PRIVATE_IMAGE: u64 = 1 << 2;
+
+/// The [`Checkpoint::declarations`] bits.
+pub const CHECKPOINT_DECLARATIONS: u64 =
+    CHECKPOINT_NO_DEBUG | CHECKPOINT_NO_CORE | CHECKPOINT_PRIVATE_IMAGE;
 
 /// [`Run::flags`] bit: the run's pages, in the space's content at the
 /// capture, were not captured, and the object holds no bytes of them. The
@@ -155,6 +181,44 @@ pub struct Header
     pub thread_bytes: u64,
 }
 
+/// The checkpoint section of a layout with [`SNAPSHOT_CHECKPOINT`]: what a
+/// restore of the process needs beside its pages and regions
+/// (docs/checkpoint-restore.md § Checkpoint). Thirteen words in this order,
+/// then the image's hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpoint
+{
+    /// The restore stack pointer the process gave at its quiesce point
+    /// (`procmgr_labels::QUIESCE`).
+    pub restore_sp: u64,
+    /// The address of the process's `ProcessInfo` page.
+    pub process_info_va: u64,
+    /// The main thread's IPC buffer, as `ProcessInfo` names it.
+    pub ipc_buffer_va: u64,
+    /// The top of the main thread's stack, where it started.
+    pub stack_top: u64,
+    /// The main thread's TLS base; zero without a TLS block.
+    pub tls_base: u64,
+    /// The argv blob's offset from the `ProcessInfo` page, as `ProcessInfo`
+    /// names it.
+    pub args_offset: u64,
+    /// The argv blob's bytes.
+    pub args_bytes: u64,
+    /// The argv blob's entries.
+    pub args_count: u64,
+    /// The env blob's offset from the `ProcessInfo` page.
+    pub env_offset: u64,
+    /// The env blob's bytes.
+    pub env_bytes: u64,
+    /// The env blob's entries.
+    pub env_count: u64,
+    /// [`CHECKPOINT_NO_DEBUG`], [`CHECKPOINT_NO_CORE`] and
+    /// [`CHECKPOINT_PRIVATE_IMAGE`].
+    pub declarations: u64,
+    /// The process's image, whether or not procmgr shares an object with it.
+    pub image: Image,
+}
+
 /// One region the process registered with memmgr, by the arguments of the
 /// `REGISTER_REGION` or `ATTACH_OBJECT` that made it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,16 +288,25 @@ pub struct ThreadRecord<'a>
     pub ext: &'a [u8],
 }
 
-/// Pages of a layout of `entries` regions and runs and `thread_bytes` of
-/// thread records; `None` on overflow.
+/// Pages of a layout of `entries` regions and runs and `tail` bytes after
+/// them (the thread records, and a checkpoint section's
+/// [`CHECKPOINT_BYTES`] with [`SNAPSHOT_CHECKPOINT`]); `None` on overflow.
 #[must_use]
-pub fn layout_pages(entries: u64, thread_bytes: u64) -> Option<u64>
+pub fn layout_pages(entries: u64, tail: u64) -> Option<u64>
 {
     let bytes = entries
         .checked_mul(ENTRY_BYTES as u64)?
         .checked_add(HEADER_BYTES as u64)?
-        .checked_add(thread_bytes)?;
+        .checked_add(tail)?;
     Some(bytes.div_ceil(PAGE_SIZE))
+}
+
+/// Byte offset of the checkpoint section in a layout of `entries` regions
+/// and runs and `thread_bytes` of thread records; `None` on overflow.
+#[must_use]
+pub fn checkpoint_offset(entries: u64, thread_bytes: u64) -> Option<usize>
+{
+    threads_offset(entries)?.checked_add(usize::try_from(thread_bytes).ok()?)
 }
 
 /// Byte offset of the first thread record in a layout of `entries` regions
@@ -315,12 +388,85 @@ impl Header
             thread_count: word(bytes, HASH_END.checked_add(8)?)?,
             thread_bytes: word(bytes, HASH_END.checked_add(16)?)?,
         };
+        let section = if header.flags & SNAPSHOT_CHECKPOINT == 0
+        {
+            0
+        }
+        else
+        {
+            CHECKPOINT_BYTES as u64
+        };
         let fits = header
             .region_count
             .checked_add(header.run_count)
-            .and_then(|entries| layout_pages(entries, header.thread_bytes))
+            .zip(header.thread_bytes.checked_add(section))
+            .and_then(|(entries, tail)| layout_pages(entries, tail))
             .is_some_and(|pages| pages <= header.layout_pages && header.layout_pages != 0);
         (fits && header.flags & !SNAPSHOT_FLAGS == 0).then_some(header)
+    }
+}
+
+impl Checkpoint
+{
+    /// Write the section at byte `at` of `bytes`; `None` when it does not
+    /// fit.
+    pub fn encode(&self, bytes: &mut [u8], at: usize) -> Option<()>
+    {
+        let words = [
+            self.restore_sp,
+            self.process_info_va,
+            self.ipc_buffer_va,
+            self.stack_top,
+            self.tls_base,
+            self.args_offset,
+            self.args_bytes,
+            self.args_count,
+            self.env_offset,
+            self.env_bytes,
+            self.env_count,
+            self.declarations,
+            self.image.len,
+        ];
+        for (i, w) in words.into_iter().enumerate()
+        {
+            put(bytes, at.checked_add(i.checked_mul(8)?)?, w)?;
+        }
+        let hash_at = at.checked_add(13 * 8)?;
+        bytes
+            .get_mut(hash_at..hash_at.checked_add(IMAGE_HASH_BYTES)?)?
+            .copy_from_slice(&self.image.hash);
+        Some(())
+    }
+
+    /// The section at byte `at` of `bytes`; `None` when it is not all in
+    /// `bytes` or its declarations set a bit this layout does not define.
+    #[must_use]
+    pub fn decode(bytes: &[u8], at: usize) -> Option<Self>
+    {
+        let w = |i: usize| word(bytes, at.checked_add(i.checked_mul(8)?)?);
+        let hash_at = at.checked_add(13 * 8)?;
+        let section = Self {
+            restore_sp: w(0)?,
+            process_info_va: w(1)?,
+            ipc_buffer_va: w(2)?,
+            stack_top: w(3)?,
+            tls_base: w(4)?,
+            args_offset: w(5)?,
+            args_bytes: w(6)?,
+            args_count: w(7)?,
+            env_offset: w(8)?,
+            env_bytes: w(9)?,
+            env_count: w(10)?,
+            declarations: w(11)?,
+            image: Image {
+                len: w(12)?,
+                hash: bytes
+                    .get(hash_at..hash_at.checked_add(IMAGE_HASH_BYTES)?)?
+                    .try_into()
+                    .ok()?,
+            },
+        };
+        (section.declarations & !CHECKPOINT_DECLARATIONS == 0).then_some(section)
     }
 }
 
@@ -599,7 +745,7 @@ mod tests
         bytes[0] ^= 1;
         assert_eq!(Header::decode(&bytes), None);
         bytes[0] ^= 1;
-        put(&mut bytes, 16, 1 << 2).unwrap();
+        put(&mut bytes, 16, 1 << 3).unwrap();
         assert_eq!(Header::decode(&bytes), None);
     }
 
@@ -727,5 +873,72 @@ mod tests
         assert_eq!(layout_pages(u64::MAX, 0), None);
         assert_eq!(layout_pages(0, u64::MAX), None);
         assert_eq!(threads_offset(2), Some(HEADER_BYTES + 64));
+        assert_eq!(checkpoint_offset(2, 40), Some(HEADER_BYTES + 64 + 40));
+        assert_eq!(checkpoint_offset(0, u64::MAX), None);
+    }
+
+    const CHECKPOINT: Checkpoint = Checkpoint {
+        restore_sp: 0x7fff_e000,
+        process_info_va: 0x1000_0000,
+        ipc_buffer_va: 0x1000_2000,
+        stack_top: 0x8000_0000,
+        tls_base: 0x1000_4000,
+        args_offset: 4096,
+        args_bytes: 12,
+        args_count: 2,
+        env_offset: 4108,
+        env_bytes: 9,
+        env_count: 1,
+        declarations: CHECKPOINT_NO_CORE | CHECKPOINT_PRIVATE_IMAGE,
+        image: IMAGE,
+    };
+
+    #[test]
+    fn a_checkpoint_section_reads_back_as_written()
+    {
+        let mut bytes = layout_of(&[], &[], SNAPSHOT_CHECKPOINT);
+        let at = checkpoint_offset(0, 0).unwrap();
+        CHECKPOINT.encode(&mut bytes, at).unwrap();
+        let header = Header::decode(&bytes).unwrap();
+        assert_eq!(header.flags, SNAPSHOT_CHECKPOINT);
+        assert_eq!(Checkpoint::decode(&bytes, at), Some(CHECKPOINT));
+        // The section's last byte is the hash's.
+        assert_eq!(bytes[at + CHECKPOINT_BYTES - 1], 0xa5);
+    }
+
+    #[test]
+    fn a_checkpoint_section_with_another_declaration_or_past_its_buffer_is_refused()
+    {
+        let mut bytes = layout_of(&[], &[], SNAPSHOT_CHECKPOINT);
+        let at = checkpoint_offset(0, 0).unwrap();
+        Checkpoint {
+            declarations: 1 << 3,
+            ..CHECKPOINT
+        }
+        .encode(&mut bytes, at)
+        .unwrap();
+        assert_eq!(Checkpoint::decode(&bytes, at), None);
+        let end = PAGE_SIZE as usize - CHECKPOINT_BYTES;
+        CHECKPOINT.encode(&mut bytes, end).unwrap();
+        assert_eq!(Checkpoint::decode(&bytes, end), Some(CHECKPOINT));
+        assert_eq!(CHECKPOINT.encode(&mut bytes, end + 1), None);
+        assert_eq!(Checkpoint::decode(&bytes, end + 1), None);
+    }
+
+    #[test]
+    fn a_checkpoint_header_counts_its_section_in_its_layout_pages()
+    {
+        let mut bytes = layout_of(&[], &[], SNAPSHOT_CHECKPOINT);
+        // One entry leaves 4096 - 152 - 32 = 3912 bytes for the records and
+        // the section.
+        put(&mut bytes, 48, 1).unwrap();
+        let fits = 3912 - CHECKPOINT_BYTES as u64;
+        put(&mut bytes, 144, fits).unwrap();
+        assert!(Header::decode(&bytes).is_some());
+        put(&mut bytes, 144, fits + 1).unwrap();
+        assert_eq!(Header::decode(&bytes), None);
+        // Without the flag the same records fit.
+        put(&mut bytes, 16, 0).unwrap();
+        assert!(Header::decode(&bytes).is_some());
     }
 }

@@ -699,10 +699,12 @@ impl Command {
                     exit_reason: exit_reason.clone(),
                     peer_dead: peer_dead.clone(),
                 };
-                let handle = crate::thread::Builder::new()
-                    .name(crate::string::String::from("seraph-deathbridge"))
-                    .spawn(move || bridge_main(handles))
-                    .map_err(|e| io::Error::other(crate::format!(
+                let handle = crate::os::seraph::thread::runtime_spawn(|| {
+                    crate::thread::Builder::new()
+                        .name(crate::string::String::from("seraph-deathbridge"))
+                        .spawn(move || bridge_main(handles))
+                })
+                .map_err(|e| io::Error::other(crate::format!(
                         "spawn death-bridge thread failed: {e}"
                     )))?;
                 Ok(Bridge {
@@ -935,6 +937,7 @@ impl Command {
                 death_eq,
                 bridge,
                 exit_status: None,
+                _held: crate::os::seraph::checkpoint::Held::new(),
             },
             StdioPipes {
                 stdin: child_stdin_pipe,
@@ -1218,6 +1221,8 @@ pub struct Process {
     /// thread per spawn.
     bridge: Option<Bridge>,
     exit_status: Option<ExitStatus>,
+    /// The child among the held ones (`os::seraph::checkpoint::CHILD`).
+    _held: crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::CHILD }>,
 }
 
 impl Process {

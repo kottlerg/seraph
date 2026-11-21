@@ -1985,7 +1985,7 @@ returns.
 
 ### `SYS_THREAD_READ_REGS` (39)
 
-Read the full register state of a stopped thread into a caller-supplied buffer.
+Read the full register state of a stopped or blocked thread into a caller-supplied buffer.
 
 **Arguments:**
 
@@ -1995,11 +1995,25 @@ Read the full register state of a stopped thread into a caller-supplied buffer.
 | 1 | `buf_ptr` | Pointer to buffer in caller's address space |
 | 2 | `buf_size` | Size of the buffer in bytes |
 
-**Return:** `rax`/`a0`: number of bytes written on success; `SyscallError` on failure.
+**Return:** `rax`/`a0`: number of bytes written on success; `rdx`/`a1`: the state the thread
+was held in, written only after the copy: `THREAD_REGS_STOPPED` (0), `THREAD_REGS_FAULT` (1) or
+`THREAD_REGS_SYSCALL` (2); `SyscallError` on failure.
 
-The thread MUST be in `Stopped` state, or fault-blocked awaiting a fault-handler
-reply (`BlockedOnFault`) — the latter lets a bound fault handler inspect the
-faulting registers (see [`docs/fault-handling.md`](../../../docs/fault-handling.md)).
+The thread MUST be `Stopped` (`THREAD_REGS_STOPPED`), or `Blocked`: in a fault or an upcall
+delivery (`THREAD_REGS_FAULT`), awaiting a fault-handler reply (`BlockedOnFault`), which lets a
+bound fault handler inspect the faulting registers (see
+[`docs/fault-handling.md`](../../../docs/fault-handling.md)), or queued for the handler's receive
+(`BlockedOnSend` with the delivery marked), or blocked in a syscall in any other state
+(`THREAD_REGS_SYSCALL`): a call, a receive, a wait, or a sleep. The kernel decides the reported
+state under the same scheduling-lock hold as its copy of the frame, so the two agree. The frame of
+a thread blocked in a syscall is the one its syscall entry saved: its instruction pointer is as that
+frame holds it, past the `syscall` instruction on x86-64 and at the `ecall` on riscv64, as for a
+fault-blocked thread at a syscall-point upcall
+([docs/fault-handling.md § Delivery points](../../../docs/fault-handling.md#delivery-points)), and
+its result registers are unspecified until the syscall returns, since they still hold what the
+thread entered the syscall with. A read of a blocked thread races its wake: the call returns the
+frame or `InvalidState`, never a torn frame, so an observer that meets `InvalidState` looks at the
+thread again.
 The buffer receives the kernel's architecture-specific `TrapFrame`
 (`core/kernel/src/arch/x86_64/trap_frame.rs`, `core/kernel/src/arch/riscv64/trap_frame.rs`);
 `abi/syscall` publishes its size and its instruction- and stack-pointer offsets per architecture,
@@ -2015,14 +2029,14 @@ lock, which every dispatch, start, and stop takes. The stop call that stopped th
 only once it has left its CPU with its save published (see
 [`SYS_THREAD_STOP`](#sys_thread_stop-20)), except a restarted
 stopper's call whose slot no longer names the target, so a caller that issues this after its own
-stop returns is not refused for this reason. A fault-blocked thread is accessed once it is
-`current` on no CPU with its save published; a call that finds it still switching out waits for
-that switch to finish.
+stop returns is not refused for this reason. A `Blocked` thread is accessed once it is `current`
+on no CPU with its save published; a call that finds it still switching out waits for that switch
+to finish.
 
 **Capability requirement:** `thread_cap` MUST have Observe rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState`
-(thread neither stopped and descheduled nor fault-blocked), `InvalidArgument` (buffer too small,
+(thread neither stopped and descheduled nor blocked), `InvalidArgument` (buffer too small,
 null pointer, or no register frame), `InvalidAddress` (buffer outside the user half, or a fault on
 it that is unhandled; restartable, § Restartable Syscalls).
 
@@ -2045,7 +2059,9 @@ Write register state into a stopped thread from a caller-supplied buffer.
 The thread MUST be in `Stopped` state, or fault-blocked awaiting a fault-handler
 reply (`BlockedOnFault`) — the latter lets a bound fault handler advance the PC
 or otherwise edit the faulting thread before replying (see
-[`docs/fault-handling.md`](../../../docs/fault-handling.md)). The kernel sanitizes
+[`docs/fault-handling.md`](../../../docs/fault-handling.md)). A thread blocked in a syscall in any
+other state, which `SYS_THREAD_READ_REGS` reads, is refused with `InvalidState`: the syscall's
+return still writes the frame. The kernel sanitizes
 the frame per architecture ([arch-interface.md](arch-interface.md) § `trap_frame` —
 `arch::current::trap_frame`): a non-user instruction pointer (on x86-64, also a non-user
 stack pointer) is rejected with `InvalidArgument`; x86-64 forces ring-3 selectors and
@@ -2067,8 +2083,9 @@ that switch to finish.
 **Capability requirement:** `thread_cap` MUST have Control rights.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState`
-(thread neither stopped and descheduled nor fault-blocked), `InvalidArgument` (buffer too small,
-null pointer, no register frame, or illegal register values), `InvalidAddress` (buffer outside
+(thread neither stopped and descheduled nor fault-blocked, a thread blocked in a syscall
+included), `InvalidArgument` (buffer too small, null pointer, no register frame, or illegal
+register values), `InvalidAddress` (buffer outside
 the user half, or a fault on it that is unhandled; restartable, § Restartable Syscalls).
 
 ---
@@ -2232,8 +2249,8 @@ Syscalls).
 
 ### `SYS_THREAD_READ_EXT_REGS` (68)
 
-Copy part of a stopped thread's extended register state (floating point, SIMD and vector) into a
-caller-supplied buffer.
+Copy part of a stopped or blocked thread's extended register state (floating point, SIMD and
+vector) into a caller-supplied buffer.
 
 **Arguments:**
 
@@ -2265,7 +2282,9 @@ the thread's own register state. The image is read in parts because riscv64's gr
 past what one call copies.
 
 The thread MUST be held still as for `SYS_THREAD_READ_REGS`: `Stopped` and `current` on no CPU
-with its last save published, or fault-blocked; the kernel copies the requested bytes into the
+with its last save published, or `Blocked` (fault-blocked, or blocked in a syscall), which the call
+waits to finish switching out; the state it was held in is reported by `SYS_THREAD_READ_REGS`, not
+here. The kernel copies the requested bytes into the
 CPU's syscall scratch buffer under the target's scheduling lock, then copies them to `buf_ptr` and
 writes `size` only after that copy.
 
@@ -2273,7 +2292,7 @@ writes `size` only after that copy.
 the state is register state.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState` (thread
-neither stopped and descheduled nor fault-blocked), `InvalidArgument` (`len` 0 or above
+neither stopped and descheduled nor blocked), `InvalidArgument` (`len` 0 or above
 `MAX_THREAD_MEM_COPY`, or the thread has no save area), `InvalidAddress` (a null buffer, the buffer
 not wholly in the user half, or a fault on it that is unhandled; restartable, § Restartable
 Syscalls).

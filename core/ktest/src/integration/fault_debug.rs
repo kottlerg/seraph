@@ -15,6 +15,12 @@
 //! architecture needs it and resumes the thread, which returns from the
 //! breakpoint and reports the breakpoint's address.
 //!
+//! Before it receives, the handler reads the child's registers while the
+//! delivery waits on the endpoint's send queue: the read reports the hold
+//! `THREAD_REGS_FAULT` and the instruction pointer the message then carries,
+//! and a write is refused `InvalidState`, since the kernel writes a delivery
+//! only once its handler holds it. It reads again once it holds the fault.
+//!
 //! On x86-64 the breakpoint gate is DPL 3, so a user `int3` raises `#BP`; a
 //! DPL-0 gate would raise `#GP` instead and the message would carry
 //! `FAULT_EXC_PROTECTION`.
@@ -24,11 +30,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use ipc::IpcMessage;
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, notification_wait_timeout,
-    thread_read_regs, thread_write_regs,
+    thread_read_regs, thread_sleep, thread_write_regs,
 };
 use syscall_abi::{
     FAULT_CLASS_EXCEPTION, FAULT_EXC_BREAKPOINT, FAULT_KIND_EXCEPTION, FAULT_LABEL,
-    FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY,
+    FAULT_REPLY_RESUME, RIGHTS_NTF_NOTIFY, SyscallError, THREAD_REGS_FAULT,
 };
 
 use crate::arch::{BREAKPOINT_RESUME_ADVANCE, IP_OFFSET, breakpoint_reported_ip};
@@ -40,6 +46,10 @@ const BADGE: u64 = 0x0DEB_0001;
 /// Bound, in milliseconds, on the wait for the child's report. Applied
 /// through [`crate::scaled_bound`].
 const REPORT_MS: u64 = 1000;
+
+/// Bound on the reads of the child before its delivery queues, in 1 ms
+/// polls. Applied through [`crate::scaled_polls`].
+const QUEUE_POLLS: u32 = 2000;
 
 /// Register-file buffer size; holds the arch `TrapFrame`.
 const BUF: usize = 512;
@@ -104,6 +114,7 @@ fn breakpoint(ctx: &TestContext, child: &spawn::SpawnedChild, ep: u64, sig: u64)
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, breakpoint_entry, stack, 0) }
         .map_err(|_| "integration::fault_debug: start failed")?;
+    let queued = queued_ip(child.th)?;
 
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
     let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
@@ -119,11 +130,21 @@ fn breakpoint(ctx: &TestContext, child: &spawn::SpawnedChild, ep: u64, sig: u64)
     let reported = msg.word(3);
 
     let mut regs = [0u8; BUF];
-    thread_read_regs(child.th, &mut regs[..BUF])
+    let (_, held) = thread_read_regs(child.th, &mut regs[..BUF])
         .map_err(|_| "integration::fault_debug: thread_read_regs failed")?;
+    if held != THREAD_REGS_FAULT
+    {
+        return Err("integration::fault_debug: the read did not report the fault-blocked hold");
+    }
     if crate::spawn::reg_word(&regs, IP_OFFSET)? != reported
     {
         return Err("integration::fault_debug: register IP does not match the message's");
+    }
+    if queued != reported
+    {
+        return Err(
+            "integration::fault_debug: the queued delivery's IP does not match the message's",
+        );
     }
     let resume = reported
         .checked_add(BREAKPOINT_RESUME_ADVANCE)
@@ -150,6 +171,48 @@ fn breakpoint(ctx: &TestContext, child: &spawn::SpawnedChild, ep: u64, sig: u64)
         return Err("integration::fault_debug: the reported IP is not the architecture's");
     }
     Ok(())
+}
+
+/// The instruction pointer of `th`, read while its breakpoint's delivery
+/// waits on the endpoint's send queue, no handler receiving: reads until the
+/// read reports `THREAD_REGS_FAULT` (a read of the child still running is
+/// refused `InvalidState`), at most the scaled [`QUEUE_POLLS`] 1 ms polls,
+/// and requires a write of the queued thread to be refused `InvalidState`.
+fn queued_ip(th: u64) -> Result<u64, &'static str>
+{
+    let mut regs = [0u8; BUF];
+    for _ in 0..crate::scaled_polls(QUEUE_POLLS)
+    {
+        match thread_read_regs(th, &mut regs[..BUF])
+        {
+            Ok((_, THREAD_REGS_FAULT)) =>
+            {
+                // SAFETY: the kernel refuses the write (the check below), so
+                // the thread's frame is not changed; were it written, the file
+                // is the thread's own frame, as read.
+                let wrote = unsafe { thread_write_regs(th, &regs[..BUF]) };
+                if wrote != Err(SyscallError::InvalidState as i64)
+                {
+                    return Err(
+                        "integration::fault_debug: a write of a queued delivery was not refused \
+                         with InvalidState",
+                    );
+                }
+                return crate::spawn::reg_word(&regs, IP_OFFSET);
+            }
+            Ok(_) =>
+            {
+                return Err(
+                    "integration::fault_debug: the child read held other than at its fault",
+                );
+            }
+            Err(e) if e == SyscallError::InvalidState as i64 =>
+            {}
+            Err(_) => return Err("integration::fault_debug: thread_read_regs failed"),
+        }
+        let _ = thread_sleep(1);
+    }
+    Err("integration::fault_debug: the child's queued delivery never read")
 }
 
 /// Child entry: hit a software breakpoint, then report its address.

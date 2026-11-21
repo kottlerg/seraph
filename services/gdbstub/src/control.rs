@@ -56,9 +56,9 @@ pub enum Credit
 
 /// Credit a stop whose badge names a thread that is already `held` or not,
 /// whose register file reads `regs_pc` (`None` when the read is refused, as
-/// it is for a thread that is neither stopped nor fault-blocked), carrying
-/// the instruction pointer `stop_ip` (data word 3 of the message). The
-/// thread is blocked at the stop's pointer, or at `set_back`, the
+/// it is for a running thread, or finds the thread blocked in a syscall),
+/// carrying the instruction pointer `stop_ip` (data word 3 of the message).
+/// The thread is blocked at the stop's pointer, or at `set_back`, the
 /// breakpoint the stop reports a hit of ([`rewound_pc`]), where a restart
 /// set the thread's pointer while this delivery waited.
 #[must_use]

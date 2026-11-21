@@ -378,13 +378,21 @@ impl Signer
 ///
 /// # Errors
 ///
-/// When `object` ends in the trailer magic but does not parse.
+/// When `object` ends in the trailer magic but does not parse; a trailer of
+/// another format version is refused naming the version as the reason, since
+/// a sysroot an earlier tree signed holds such objects until a build installs
+/// them again.
 pub fn body_of(object: &[u8]) -> Result<&[u8]>
 {
     match objsig::split(object)
     {
         Ok(signed) => Ok(signed.body()),
         Err(ParseError::TooShort | ParseError::Magic) => Ok(object),
+        Err(ParseError::Version) => bail!(
+            "the object ends in a signature trailer of a format version this tree does not \
+             read, as an object an earlier tree signed does: run `cargo xtask build` to \
+             install it again (docs/signing.md § Composite Signature)"
+        ),
         Err(e) => bail!("the object ends in a malformed signature trailer ({e:?})"),
     }
 }
@@ -992,22 +1000,41 @@ mod tests
     }
 
     // Defect caught: an image ending in a damaged trailer signed whole, so
-    // the damaged trailer becomes part of the signed body.
+    // the damaged trailer becomes part of the signed body; an object an
+    // earlier tree signed, whose footer carries another format version,
+    // refused without naming the build that installs it again.
     #[test]
     fn an_object_ending_in_a_malformed_trailer_is_refused()
     {
         let root = scratch("malformed");
         let signer = signer(&root.join("keys"), Arch::Riscv64);
-        let mut object = signer
+        let good = signer
             .sign(b"\x7fELF image", set(&[Role::Service]), "/services/x")
             .unwrap();
         // The footer's version field: 8 bytes of magic end the footer, after
-        // the 2-byte version.
-        let version = object.len() - 10;
-        object[version] = 3;
-        signer
+        // the 2-byte version; its record count lies before the version.
+        let version = good.len() - 10;
+        for earlier in [1, 3]
+        {
+            let mut object = good.clone();
+            object[version] = earlier;
+            let error = signer
+                .sign(&object, set(&[Role::Service]), "/services/x")
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("cargo xtask build"),
+                "{error:#}"
+            );
+        }
+        let mut object = good;
+        object[version - 2] = 0;
+        let error = signer
             .sign(&object, set(&[Role::Service]), "/services/x")
             .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("malformed signature trailer"),
+            "{error:#}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

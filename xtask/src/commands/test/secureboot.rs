@@ -282,27 +282,49 @@ struct PeLayout
 const PE32_PLUS: u16 = 0x20b;
 
 /// The section characteristic of code.
-const SCN_CNT_CODE: u32 = 0x20;
+const SCN_CNT_CODE: usize = 0x20;
 
 /// The index of the certificate table among the data directories.
 const SECURITY_DIRECTORY: usize = 4;
 
-fn read_u16(image: &[u8], at: usize) -> Result<u16>
+/// `base + offset`, a file offset, or an error past `usize`.
+fn add(base: usize, offset: usize) -> Result<usize>
 {
-    let bytes = image
-        .get(at..at.saturating_add(2))
-        .with_context(|| format!("a PE field at {at:#x} past the image's end"))?;
-    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+    base.checked_add(offset).context("a PE offset past usize")
+}
+
+/// The `N` bytes of `image` at `at`.
+fn field<const N: usize>(image: &[u8], at: usize) -> Result<[u8; N]>
+{
+    image
+        .get(at..add(at, N)?)
+        .and_then(|bytes| <[u8; N]>::try_from(bytes).ok())
+        .with_context(|| format!("a PE field at {at:#x} past the image's end"))
+}
+
+fn read_u16(image: &[u8], at: usize) -> Result<usize>
+{
+    Ok(usize::from(u16::from_le_bytes(field(image, at)?)))
 }
 
 fn read_u32(image: &[u8], at: usize) -> Result<usize>
 {
-    let bytes = image
-        .get(at..at.saturating_add(4))
-        .with_context(|| format!("a PE field at {at:#x} past the image's end"))?;
-    usize::try_from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .context("a PE field past usize")
+    usize::try_from(u32::from_le_bytes(field(image, at)?)).context("a PE field past usize")
 }
+
+/// The file offset of the header of section `index` in the table at `table`.
+fn section_header(table: usize, index: usize) -> Result<usize>
+{
+    add(
+        table,
+        index
+            .checked_mul(SECTION_HEADER_SIZE)
+            .context("a section index past usize")?,
+    )
+}
+
+/// The size of one section header.
+const SECTION_HEADER_SIZE: usize = 40;
 
 /// Read `image`'s [`PeLayout`].
 ///
@@ -315,36 +337,42 @@ fn pe_layout(image: &[u8]) -> Result<PeLayout>
     ensure!(image.starts_with(b"MZ"), "not a PE image: no MZ header");
     let pe = read_u32(image, 0x3c)?;
     ensure!(
-        image.get(pe..pe.saturating_add(4)) == Some(b"PE\0\0".as_slice()),
+        field::<4>(image, pe).ok() == Some(*b"PE\0\0"),
         "not a PE image: no PE signature at {pe:#x}"
     );
-    let sections = usize::from(read_u16(image, pe + 6)?);
-    let optional_size = usize::from(read_u16(image, pe + 20)?);
-    let optional = pe + 24;
-    ensure!(read_u16(image, optional)? == PE32_PLUS, "not a PE32+ image");
+    let sections = read_u16(image, add(pe, 6)?)?;
+    let optional_size = read_u16(image, add(pe, 20)?)?;
+    let optional = add(pe, 24)?;
     ensure!(
-        read_u32(image, optional + 108)? > SECURITY_DIRECTORY,
+        read_u16(image, optional)? == usize::from(PE32_PLUS),
+        "not a PE32+ image"
+    );
+    ensure!(
+        read_u32(image, add(optional, 108)?)? > SECURITY_DIRECTORY,
         "the image has no certificate-table entry"
     );
-    let security_entry = optional + 112 + SECURITY_DIRECTORY * 8;
+    let security_entry = add(optional, 112 + SECURITY_DIRECTORY * 8)?;
     let security = (
         read_u32(image, security_entry)?,
-        read_u32(image, security_entry + 4)?,
+        read_u32(image, add(security_entry, 4)?)?,
     );
-    let table = optional + optional_size;
-    let code = (0..sections)
-        .map(|index| table + index * 40)
-        .find_map(|header| {
-            let characteristics = read_u32(image, header + 36).ok()?;
-            let size = read_u32(image, header + 16).ok()?;
-            let offset = read_u32(image, header + 20).ok()?;
-            (characteristics & SCN_CNT_CODE as usize != 0 && size != 0).then_some((offset, size))
-        })
-        .context("the image has no code section with raw data")?;
+    let table = add(optional, optional_size)?;
+    let mut code = None;
+    for index in 0..sections
+    {
+        let header = section_header(table, index)?;
+        let characteristics = read_u32(image, add(header, 36)?)?;
+        let size = read_u32(image, add(header, 16)?)?;
+        if characteristics & SCN_CNT_CODE != 0 && size != 0
+        {
+            code = Some((read_u32(image, add(header, 20)?)?, size));
+            break;
+        }
+    }
     Ok(PeLayout {
         security_entry,
         security,
-        code,
+        code: code.context("the image has no code section with raw data")?,
     })
 }
 
@@ -368,8 +396,13 @@ fn strip_signatures(image: &[u8]) -> Result<Vec<u8>>
         "the certificate table ({offset:#x}, {size:#x} bytes) does not end the {}-byte image",
         image.len()
     );
-    let mut out = image[..offset].to_vec();
-    out[layout.security_entry..layout.security_entry + 8].fill(0);
+    let mut out = image
+        .get(..offset)
+        .context("a certificate table past the image")?
+        .to_vec();
+    out.get_mut(layout.security_entry..add(layout.security_entry, 8)?)
+        .context("a certificate-table entry inside the table")?
+        .fill(0);
     Ok(out)
 }
 
@@ -382,7 +415,7 @@ fn strip_signatures(image: &[u8]) -> Result<Vec<u8>>
 fn flip_code_byte(image: &[u8]) -> Result<Vec<u8>>
 {
     let (offset, size) = pe_layout(image)?.code;
-    let at = offset + size / 2;
+    let at = add(offset, size / 2)?;
     let mut out = image.to_vec();
     let byte = out
         .get_mut(at)
@@ -414,7 +447,7 @@ mod tests
         let section = optional + usize::from(optional_size);
         out[section + 16..section + 20].copy_from_slice(&16u32.to_le_bytes());
         out[section + 20..section + 24].copy_from_slice(&0x200u32.to_le_bytes());
-        out[section + 36..section + 40].copy_from_slice(&SCN_CNT_CODE.to_le_bytes());
+        out[section + 36..section + 40].copy_from_slice(&0x20u32.to_le_bytes());
         out.extend_from_slice(&[0x90; 16]);
         if !table.is_empty()
         {

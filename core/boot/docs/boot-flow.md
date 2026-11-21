@@ -33,7 +33,13 @@ handle, and GOP handles are enumerated with `BootServices->LocateHandleBuffer` a
 with `HandleProtocol`. Failure to locate either of the first two is fatal; an absent GOP
 is not.
 
-After step 1 the bootloader parses the trust store its build embedded
+After step 1 the bootloader reads the firmware's UEFI Secure Boot state, its `SecureBoot` and
+`SetupMode` variables, and logs it in one line: `on`, `off` with the reason (the firmware does
+not implement it, setup mode, or keys enrolled with verification off), or `unknown` when a
+variable is not of the shape the firmware gives it
+([docs/signing.md](../../../docs/signing.md) § Secure Boot). No state stops the boot.
+
+It then parses the trust store its build embedded
 ([docs/signing.md](../../../docs/signing.md) § Trust Store), against which steps 3 and 4
 verify every object they load, and logs each anchor's label and key id, an anchor marked
 `LOCAL` as locally generated, and the store's security floor. The verifier holds each

@@ -157,6 +157,14 @@ it is missing, holds no marker or two, or embeds another store; the error names 
 to run `cargo xtask build` (docs/signing.md § Signing). Signing a pack's images takes about half a
 second (`src/signing/`).
 
+The build also Authenticode-signs the installed bootloader for UEFI Secure Boot, in place once it is
+compiled, when `SERAPH_SECURE_BOOT_KEY` and `SERAPH_SECURE_BOOT_CERT` name a db key (the table
+below; [docs/signing.md](../docs/signing.md) § Secure Boot): `sbsign` (sbsigntools), then
+`sbverify` against the certificate, so a key that does not match its certificate fails the build.
+That signature is the firmware's, apart from the objects' signatures above: the packs copy the
+signed file to the ESP and read the trust store out of it as out of an unsigned one. With neither
+variable set, the bootloader is not signed, and the build says so.
+
 The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
 one, whose canonical path lies inside it, `target/` included. When the directory is absent or
 empty and no external signer is named, the first build generates a local identity in it: a root

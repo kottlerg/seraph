@@ -698,13 +698,43 @@ it builds the bootloader, which embeds it.
 ## Secure Boot
 
 Firmware verifies the bootloader only when the platform enables UEFI Secure Boot. Secure Boot is
-preferred and never required: [platform-requirements.md](platform-requirements.md) lists it as no
-boot dependency, and the chain from the bootloader onward does not depend on it. Without it, the
-chain is as strong as the ESP's integrity. The project ships no shim and relies on no third-party
-certificate authority; a deployer remains free to boot through a shim of their own. The preferred
-path is a bootloader Authenticode-signed with a key the deployer enrols in the firmware's db
-(design intent; not yet implemented, [#1075](https://github.com/kottlerg/seraph/issues/1075)).
-Secure Boot is also what makes the machine's security floor a boundary (§ Rollback Floor).
+used when it is enabled and is never a default boot dependency
+([platform-requirements.md](platform-requirements.md)): the chain from the bootloader onward does
+not depend on it, and without it the chain is as strong as the ESP's integrity. Secure Boot is
+also what makes the machine's security floor a boundary (§ Rollback Floor). The project ships no
+shim and relies on no third-party certificate authority; a deployer remains free to boot through a
+shim of their own.
+
+**Signing.** The bootloader is Authenticode-signed with a key the deployer enrols in the
+firmware's db. `cargo xtask build` signs the installed bootloader, `/boot/boot.efi`, in place
+with the db key that `SERAPH_SECURE_BOOT_KEY` and `SERAPH_SECURE_BOOT_CERT` name, a PEM key and
+its X.509 certificate set together, and checks the signature against the certificate before the
+image is packed; both ESP copies are then the signed file
+([xtask/README.md](../xtask/README.md#signing)). With neither set, the bootloader is not signed.
+The signature is a PE Authenticode signature (`sbsign`) on both architectures, the hand-built
+riscv64 PE included, which carries the certificate-table slot it needs. Until the project's db
+certificate exists (§ Roots), every deployer signs with a key of their own.
+
+**Enrolment.** The firmware verifies the bootloader against its db once its platform key (PK) is
+enrolled; with no PK it is in setup mode and verifies nothing. A deployer enrols, through the
+firmware's setup menu or an enrolment tool that runs in setup mode, a PK of their own, a key
+exchange key (KEK) the PK signs, and the certificate the bootloader is signed with in db. Keys
+already in db, a vendor's or the Microsoft UEFI CA, may stay beside it; the project needs none of
+them. Each key is RSA-2048 with SHA-256, the form every UEFI implementation takes. Secure Boot is
+then turned on in the firmware's setup, which with a PK enrolled refuses every image db does not
+admit, a tampered bootloader among them.
+
+**State.** The bootloader reads the firmware's `SecureBoot` and `SetupMode` variables, under the
+global GUID, and logs the state on every boot: `on`, `off` with its reason (the firmware does
+not implement Secure Boot, setup mode, or keys enrolled with verification off), or `unknown` for
+a variable of another shape. A variable that is not exactly one byte of 0 or 1 with the
+boot-services and runtime attributes is not the firmware's, and never reads as `on`. No state
+stops the boot: that Secure Boot is on is reported, not required. A system's signed configuration
+may require it (design intent; [#1416](https://github.com/kottlerg/seraph/issues/1416)).
+
+**Testing.** `cargo xtask test secureboot` signs the bootloader with development keys, enrols
+them in a variable store, and checks that the firmware boots the signed bootloader and refuses it
+tampered or unsigned, on both architectures ([testing.md](testing.md) § Gating, Secure Boot).
 
 ---
 

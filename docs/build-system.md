@@ -51,6 +51,14 @@ check's host tests that `cargo xtask test` runs, so both need the `dosfstools` p
 when it finds no `fsck.fat` on `PATH` or, on a Unix host, in `/usr/local/sbin`, `/usr/sbin` or
 `/sbin`, where distributions install it and which an unprivileged user's `PATH` can lack.
 
+A build with `SERAPH_SECURE_BOOT_KEY` and `SERAPH_SECURE_BOOT_CERT` set Authenticode-signs the
+bootloader with `sbsign` and checks it with `sbverify`, from sbsigntools (`sbsigntool` on Debian
+and Ubuntu, `sbsigntools` on Fedora and Arch); a build without them needs neither
+([signing.md](signing.md) § Secure Boot). `cargo xtask test secureboot` needs them too, with
+`openssl`, which generates its keys, and virt-firmware's `virt-fw-vars`, which enrols them in a
+variable store (`python3-virt-firmware` on Debian, Ubuntu and Fedora; `pip install virt-firmware`
+elsewhere). Each fails, naming the tool, when one is missing.
+
 `cargo xtask symbolize` reads DWARF and symbol tables in Rust, with the `addr2line` and `object`
 crates the toolchain's sysroot ships ([coding-standards.md](coding-standards.md#dependencies)
 § Dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
@@ -526,6 +534,25 @@ its own, a fresh copy of the firmware's template beside the read-only code image
 sees a variable another wrote; the `rollback` case keeps one store across its boots
 ([xtask/README.md](../xtask/README.md#environment-variables)).
 
+**Secure Boot:** the `secureboot` case ([xtask/README.md](../xtask/README.md#the-secureboot-case))
+boots on a firmware pair of its own, one built with Secure Boot, found by
+`SERAPH_OVMF_SECURE_CODE` with `SERAPH_OVMF_SECURE_VARS` and `SERAPH_RISCV_SECURE_CODE` with
+`SERAPH_RISCV_SECURE_VARS` or a per-platform default search; no other launch uses it. A firmware
+built without Secure Boot boots every image whatever keys its store holds, so the case fails on
+one, naming it. The builds tested, with the store's keys enrolled by `virt-fw-vars`:
+
+| Firmware | Secure Boot |
+|---|---|
+| OVMF `OVMF_CODE_4M.secboot.fd` (Ubuntu `ovmf` 2025.11), `OVMF_CODE.secboot.4m.fd` (Arch `edk2-ovmf` 202608) | enforces, run with `-machine smm=on` and its variable store behind SMM |
+| OVMF `OVMF_CODE_4M.fd`, `OVMF_CODE.4m.fd`, the default pair | built without it |
+| RISC-V `RISCV_VIRT_CODE.fd` of Arch's `edk2-riscv64` 202608-1 | enforces |
+| RISC-V `RISCV_VIRT_CODE.fd` of Ubuntu's `qemu-efi-riscv64` 2025.11-3ubuntu7.3 (CI's default pair), 7.4 and 2026.05-2ubuntu3, and of Fedora's `edk2-riscv64` | built without it |
+
+CI's riscv64 cells take Arch's `edk2-riscv64` 202608-1 for the case alone (§ Continuous
+Integration), its package pinned by URL and SHA-256. A refresh of it is a new version's URL and
+hash in `.github/actions/qemu-packages/action.yml` and a passing `secureboot` case on it. Any
+EDK2 `RiscVVirtQemu` build with `SECURE_BOOT_ENABLE` serves as well.
+
 **TPM (opt-in):** `cargo xtask test tpm` (x86-64) attaches a TPM 2.0 to the guest, QEMU's
 `tpm-tis` or `tpm-crb` device backed by `swtpm`, a software TPM 2.0 emulator, which it
 starts on a fresh state directory for each boot; it needs the `swtpm` package on the host. No
@@ -633,7 +660,7 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages and dosfstools, `cargo xtask test`, which checks the formatting of the Rust source and lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`, `crasher-worker`, `crasher-boot`, `memhog` and `stopsrc` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `mkdisk --harness ktest`, each pack checking the images it writes (each FAT volume with `fsck.fat -n`, then that every object on the ESP equals its installed file on the root partition), and runs one `run --runs 1` boot with `--save-logs`, under a per-cell `--timeout`, svctest's with `--crash-reports none` and usertest's with `--crash-reports reports`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes, which a pass taking more than half its budget flags with a warning annotation on the run; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run` writes beside its logs; each cell then runs `mkdisk --arch A` (the plain repack: it re-mirrors the rootfs with the repository's log levels and no knobs, and keeps the recorded harness) and `cargo xtask test --cell <tester> --arch A`, which runs every case the registry assigns to that tester: usertest runs `terminal`, `signing`, `rollback`, `wedge`, `vmgenid` (x86_64 only) and `shutdown`, ktest runs `kaslr`, and svctest runs none; the ktest cell stages the `mapredo` knob (`mkdisk --harness ktest --knob mapredo`) and its own boot carries the redo check, and the usertest cell packs `services/init/log-levels-vfsd-debug.conf` (`mkdisk --repack-only --log-levels`) and its own boot carries the log-level check. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages and dosfstools, `cargo xtask test`, which checks the formatting of the Rust source and lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`, `crasher-worker`, `crasher-boot`, `memhog` and `stopsrc` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `mkdisk --harness ktest`, each pack checking the images it writes (each FAT volume with `fsck.fat -n`, then that every object on the ESP equals its installed file on the root partition), and runs one `run --runs 1` boot with `--save-logs`, under a per-cell `--timeout`, svctest's with `--crash-reports none` and usertest's with `--crash-reports reports`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes, which a pass taking more than half its budget flags with a warning annotation on the run; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run` writes beside its logs; each cell then runs `mkdisk --arch A` (the plain repack: it re-mirrors the rootfs with the repository's log levels and no knobs, and keeps the recorded harness) and `cargo xtask test --cell <tester> --arch A`, which runs every case the registry assigns to that tester: usertest runs `terminal`, `signing`, `rollback`, `secureboot`, `wedge`, `vmgenid` (x86_64 only) and `shutdown`, ktest runs `kaslr`, and svctest runs none; the ktest cell stages the `mapredo` knob (`mkdisk --harness ktest --knob mapredo`) and its own boot carries the redo check, and the usertest cell packs `services/init/log-levels-vfsd-debug.conf` (`mkdisk --repack-only --log-levels`) and its own boot carries the log-level check. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `mkdisk --harness ktest`), then burns it in with `run --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, installing zstd and the dosfstools whose `fsck.fat` the build's pack runs, compresses each and the archive of its build's symbols store (§ Symbols Store) with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
@@ -643,7 +670,8 @@ in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner
 image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
 package (QEMU 10.2). The composite action
 `.github/actions/qemu-packages/action.yml` holds the install list (QEMU,
-its firmware, and dosfstools, whose `fsck.fat` every pack runs) and the
+its firmware, dosfstools, whose `fsck.fat` every pack runs, and the
+`secureboot` case's sbsigntool, openssl and python3-virt-firmware) and the
 apt flags (no recommends) once; its `mode` input selects the cache key, the
 download, or the install, and the download and install calls pass the
 package directory as its `dir` input. Every booting cell `needs:` its
@@ -664,7 +692,13 @@ not resolve against the cell's image, the cell runs the same bounded
 download itself and installs offline from it. When the `qemu-debs` job
 fails, the booting cells are skipped and the run fails. An entry saved on
 `master` is readable from every branch and tag, so both workflows and later
-runs share one entry per key. The pin, the install list and the cache key
+runs share one entry per key. The download also fetches the riscv64 Secure
+Boot firmware, Arch's `edk2-riscv64` package, from the URL the action pins,
+into the same entry, and fails the job unless its SHA-256 is the pinned
+one; each booting cell checks the hash again before it extracts the
+package's two images outside the checkout, and sets
+`SERAPH_RISCV_SECURE_CODE` and `SERAPH_RISCV_SECURE_VARS` to them for the
+job's later steps. The pin, the install list and the cache key
 move together: the key derives from the image version and the action, so a
 change to the list, the flags or the pinned image yields a new entry.
 

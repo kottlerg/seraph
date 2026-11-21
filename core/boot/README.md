@@ -42,6 +42,7 @@ core/boot/
     ├── error.rs                # Bootloader error type
     ├── signing.rs              # Embedded trust store; signature verification of loaded objects
     ├── rollback.rs             # The machine's security floor in a boot-services UEFI variable
+    ├── secure_boot.rs          # The firmware's UEFI Secure Boot state, read and logged
     └── arch/
         ├── mod.rs              # Re-exports the active arch module
         ├── x86_64/

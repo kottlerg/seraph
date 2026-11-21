@@ -704,9 +704,9 @@ The Secure Boot boots run on a firmware pair of their own, since the default pai
 Boot on x86_64, and on riscv64 has it only on some distributions; CI takes Arch's `edk2-riscv64`
 for riscv64 ([build-system.md](build-system.md) § QEMU and Firmware). A firmware that does not
 enforce Secure Boot fails the case, naming the firmware, so the case never passes on one that boots
-what it should refuse. See [xtask/README.md § The `secureboot` case](../xtask/README.md#the-secureboot-case)
-for the lines, the firmware search and the logs. CI runs it in each usertest cell after the
-`rollback` case.
+what it should refuse. See
+[xtask/README.md § The `secureboot` case](../xtask/README.md#the-secureboot-case) for the lines,
+the firmware search and the logs. CI runs it in each usertest cell after the `rollback` case.
 
 ### GDB stub (`debug-port` case)
 

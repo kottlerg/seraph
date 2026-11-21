@@ -183,8 +183,7 @@ The model sets these constraints for work it does not design. Each is met by the
   [#1071](https://github.com/kottlerg/seraph/issues/1071).
 - **Secure Boot.** Firmware verifies the bootloader, the bootloader verifies the kernel and each
   bundle entry, and procmgr verifies every later file; a copied ESP verifies as the installed
-  files do ([signing.md](signing.md) § Secure Boot;
-  [#1075](https://github.com/kottlerg/seraph/issues/1075)).
+  files do ([signing.md](signing.md) § Secure Boot).
 - **Update.** Composition on the machine is the same copy-only step the build runs. Between an
   update of the root filesystem and the recomposition of the ESP the two can disagree, which the
   updater detects ([#683](https://github.com/kottlerg/seraph/issues/683)). The release key never

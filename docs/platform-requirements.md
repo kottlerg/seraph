@@ -173,6 +173,12 @@ Each feature is classified per architecture as one of:
   ([services/drivers/docs/tpm.md](../services/drivers/docs/tpm.md)). It is not a boot dependency:
   without a TPM, or with one the driver does not start, the system runs unchanged. No other TPM
   function (measured boot, sealing, attestation) is used.
+- **UEFI Secure Boot** — the firmware verifies the bootloader, Authenticode-signed with a key the
+  deployer enrols in its db, before it runs it ([signing.md](signing.md) § Secure Boot). Used when
+  the platform enables it, and never a default boot dependency: without it the system boots
+  unchanged, and the bootloader logs on every boot whether it is on. A system's signed
+  configuration may require it (design intent;
+  [#1416](https://github.com/kottlerg/seraph/issues/1416)).
 - **RTC (CMOS / MC146818)** — the wall clock: when firmware describes one, the `cmos-rtc` driver
   answers `timed`'s wall-time reads ([services/drivers/README.md](../services/drivers/README.md)
   § Existing Drivers). It is not a boot dependency: without one, wall-time reads fail and the
@@ -200,7 +206,6 @@ Each feature is classified per architecture as one of:
   pursued
   ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 - **Legacy BIOS / multiboot** — boot is UEFI-only.
-- **Secure Boot** — not a boot dependency.
 
 ---
 
@@ -296,6 +301,8 @@ Each feature is classified per architecture as one of:
   § Existing Drivers). It is not a boot dependency: without one, wall-time reads fail and the
   system runs unchanged.
 - **GOP framebuffer, PCIe ECAM** — as on x86-64.
+- **UEFI Secure Boot** — as on x86-64. It needs an EDK2 build with Secure Boot, which not every
+  distribution's RISC-V firmware is ([build-system.md](build-system.md) § QEMU and Firmware).
 - **Zicfiss** — supervisor shadow stacks, return-address integrity for the kernel, enabled
   through the SBI Firmware Features extension; an RVA23 option, not mandatory. Used only when
   the firmware tables advertise it for every hart, so a machine on which only some harts have it
@@ -316,7 +323,7 @@ Each feature is classified per architecture as one of:
   cache-coherent DMA, and denies U-mode `cbo.zero`, `cbo.clean`, `cbo.flush` and `cbo.inval`
   (`senvcfg` written whole with 0). (Distinct from Svpbmt: the PBMT memory type governs how a
   hart's own accesses to a mapping behave, not DMA cache coherence.)
-- **Secure Boot, TPM** — not boot dependencies.
+- **TPM** — not a boot dependency.
 - **Sdtrig debug triggers (SBI Debug Triggers, DBTR)** — not used: the kernel programs no trigger.
   The reference platform (QEMU `-cpu max` under OpenSBI) offers two triggers through DBTR, of the
   address-match types, and no instruction-count (`icount`) trigger, which a single-step would

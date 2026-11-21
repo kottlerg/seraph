@@ -187,22 +187,29 @@ type in Seraph's memory model is authoritative there.
 
 ## Variable Services
 
-The bootloader reads and writes UEFI variables for one purpose, the machine's security floor
-([docs/signing.md](../../../docs/signing.md) § Rollback Floor), through the `VariableServices`
-trait of [`core/boot/src/uefi.rs`](../src/uefi.rs). `FirmwareVariables` implements it over the
-system table's `RuntimeServices->GetVariable` and `SetVariable`; host tests implement it over a
-store in memory. `GetVariable` returns one of four outcomes (`VariableRead`): the variable and its
-attributes, no such variable, a variable larger than the caller's buffer (with its length), or a
-failure status. A system table with no runtime services, or a name without its terminating NUL,
-fails without a call.
+The bootloader reads the firmware's UEFI Secure Boot state
+([docs/signing.md](../../../docs/signing.md) § Secure Boot), and reads and writes the machine's
+security floor ([docs/signing.md](../../../docs/signing.md) § Rollback Floor), through the
+`VariableServices` trait of [`core/boot/src/uefi.rs`](../src/uefi.rs). `FirmwareVariables`
+implements it over the system table's `RuntimeServices->GetVariable` and `SetVariable`; host
+tests implement it over a store in memory. `GetVariable` returns one of four outcomes
+(`VariableRead`): the variable and its attributes, no such variable, a variable larger than the
+caller's buffer (with its length), or a failure status. A system table with no runtime services,
+or a name without its terminating NUL, fails without a call.
 
 Every Seraph variable is named under the Seraph vendor GUID (`SERAPH_VENDOR_GUID`) and carries
 `NON_VOLATILE | BOOTSERVICE_ACCESS` and never `RUNTIME_ACCESS`, so nothing reaches it once boot
-services have exited. Every variable call is made before `ExitBootServices`, and none after it:
-the floor is read once the trust store parses (step 1 of
-[boot-flow.md](boot-flow.md)) and written once every object has verified (step 4), ahead of the
-memory-map reads of steps 6 and 7. A variable service the firmware lacks or fails is a warning,
-not a halt; only a floor that refuses the bootloader, or a malformed one, is fatal.
+services have exited. The Secure Boot state is the firmware's `SecureBoot` and `SetupMode`,
+under the global variable GUID (`EFI_GLOBAL_VARIABLE_GUID`), each one byte of 0 or 1 with
+`BOOTSERVICE_ACCESS | RUNTIME_ACCESS` and not `NON_VOLATILE`, as the firmware sets them; the
+bootloader reads them and never writes them, and a variable of another shape, a
+non-volatile copy among them, reads as `unknown`, never as `on`
+(`core/boot/src/secure_boot.rs`). Every variable call is made before `ExitBootServices`, and
+none after it: the state is read right after step 1 of [boot-flow.md](boot-flow.md), the floor
+once the trust store parses and written once every object has verified (step 4), ahead of the
+memory-map reads of steps 6 and 7. A variable service the firmware lacks or fails is a warning or
+a logged state, not a halt; only a floor that refuses the bootloader, or a malformed one, is
+fatal.
 
 ---
 

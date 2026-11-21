@@ -1569,25 +1569,29 @@ fn preferred_display_backend(qemu_binary: &str) -> Option<String>
     None
 }
 
-/// Returns true if `cached` is missing, wrong-sized, or older than `source`.
+/// Returns true unless `cached` is `source` padded with zero bytes to
+/// `target_size`. The copy is compared by content, not by time, so a source
+/// of another build, at another path or with an older time, is never served
+/// from the copy of the one before it.
 fn pflash_cache_stale(cached: &Path, source: &Path, target_size: u64) -> Result<bool>
 {
-    let Ok(cached_md) = std::fs::metadata(cached)
+    let Ok(cached_bytes) = std::fs::read(cached)
     else
     {
         return Ok(true);
     };
-    if cached_md.len() != target_size
+    if u64::try_from(cached_bytes.len()).ok() != Some(target_size)
     {
         return Ok(true);
     }
-    let source_md =
-        std::fs::metadata(source).with_context(|| format!("stat {}", source.display()))?;
-    match (source_md.modified(), cached_md.modified())
+    let source_bytes =
+        std::fs::read(source).with_context(|| format!("reading {}", source.display()))?;
+    let Some((copy, padding)) = cached_bytes.split_at_checked(source_bytes.len())
+    else
     {
-        (Ok(s), Ok(c)) => Ok(s > c),
-        _ => Ok(true),
-    }
+        return Ok(true);
+    };
+    Ok(copy != source_bytes.as_slice() || padding.iter().any(|&byte| byte != 0))
 }
 
 /// Extend a file with zero bytes until it reaches `target_size`.
@@ -1963,6 +1967,34 @@ mod tests
         let cached = dir.join("cached.fd");
         padded_copy(&template, &cached).unwrap();
         assert_eq!(std::fs::metadata(&cached).unwrap().len(), PFLASH_SIZE);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Defect caught: a padded copy judged fresh by time, so a source of
+    // another build with an older time (a firmware override pointed at
+    // another distribution's image) boots the copy of the one before it.
+    #[test]
+    fn a_padded_copy_follows_its_source_whatever_its_time()
+    {
+        let dir = std::env::temp_dir().join(format!("xtask-padded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cached = dir.join("code.32M.fd");
+        let first = dir.join("first.fd");
+        std::fs::write(&first, b"first build").unwrap();
+        padded_copy(&first, &cached).unwrap();
+        let older = dir.join("older.fd");
+        std::fs::write(&older, b"older build").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        padded_copy(&older, &cached).unwrap();
+        let bytes = std::fs::read(&cached).unwrap();
+        assert!(bytes.starts_with(b"older build"));
+        assert_eq!(u64::try_from(bytes.len()).unwrap(), PFLASH_SIZE);
+        assert!(!pflash_cache_stale(&cached, &older, PFLASH_SIZE).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

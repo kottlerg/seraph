@@ -139,6 +139,7 @@ services/svctest/
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
         ├── fs_ipc.rs          # Raw `FS_*` IPC against vfsd and fatfs
         ├── fs_opens.rs        # Per-open fatfs state: dead-open reclaim, close, eviction routing
+        ├── fs_sessions.rs     # fatfs sessions: charge on the client's node, LIMIT, return
         ├── fs_std.rs          # `std::fs` over the FS IPC contract
         ├── fs_faults/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
@@ -510,6 +511,7 @@ through to the normal run.
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
 | `open-undeliverable-child`  | `fs_opens`     | `fs_reclaims_dead_opens` (failed reply)     |
+| `fs-session-client`         | `fs_sessions`  | `fs_sessions` (exits holding a session)     |
 | `reclaim-child`             | `memmgr`       | `frame_reclaim_live_object` (held endpoint) |
 | `scrub-child`               | `memmgr`       | `memmgr_frame_scrub` (frames of a death)    |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |

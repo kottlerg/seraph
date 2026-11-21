@@ -48,8 +48,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ipc::procmgr_snapshot::{
-    Header, REGION_DEMAND, REGION_IMAGE, REGION_OBJECT, REGION_PRIVATE, REGION_ZERO, RUN_IMAGE,
-    RUN_ZERO, RegionEntry, Run, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE, ThreadRecord, threads_offset,
+    Checkpoint, Header, REGION_DEMAND, REGION_IMAGE, REGION_OBJECT, REGION_PRIVATE, REGION_ZERO,
+    RUN_IMAGE, RUN_ZERO, RegionEntry, Run, SNAPSHOT_CHECKPOINT, SNAPSHOT_COMPLETE, SNAPSHOT_IMAGE,
+    ThreadRecord, checkpoint_offset, threads_offset,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use syscall_abi::{MAP_READ, MAP_WRITABLE, PAGE_SIZE};
@@ -569,6 +570,8 @@ pub(super) struct Attached
     regions: Vec<RegionEntry>,
     runs: Vec<Run>,
     threads: Vec<Recorded>,
+    /// The checkpoint section, when the header marks the layout a checkpoint.
+    checkpoint: Option<Checkpoint>,
     /// The caller's phase, which a failure names.
     phase: String,
 }
@@ -632,6 +635,16 @@ impl Attached
             })
             .collect();
         let threads = decode_threads(layout, &header, phase);
+        let checkpoint = (header.flags & SNAPSHOT_CHECKPOINT != 0).then(|| {
+            checkpoint_offset(
+                header.region_count.saturating_add(header.run_count),
+                header.thread_bytes,
+            )
+            .and_then(|at| Checkpoint::decode(layout, at))
+            .unwrap_or_else(|| {
+                panic!("{phase}: the checkpoint section of {header:?} does not decode")
+            })
+        });
         Self {
             handle,
             va,
@@ -641,8 +654,15 @@ impl Attached
             regions,
             runs,
             threads,
+            checkpoint,
             phase: phase.to_owned(),
         }
+    }
+
+    /// The object's checkpoint section, when it is a checkpoint.
+    pub(super) fn checkpoint(&self) -> Option<&Checkpoint>
+    {
+        self.checkpoint.as_ref()
     }
 
     /// The object's thread records, in the layout's order.

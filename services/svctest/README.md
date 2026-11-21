@@ -111,6 +111,9 @@ services/svctest/
         │                      #   object charged to svctest and released; the regions and
         │                      #   every page origin: image, object, zero and demand pages
         │                      #   the child never touched; the refusals
+        ├── checkpoint.rs      # procmgr CHECKPOINT of a child at its quiesce point: the
+        │                      #   runtime's refusals, the section read back, Captured; the
+        │                      #   refusals of a child at no point and of a pinned child
         ├── swap.rs            # memmgr evicts a child's cold chunks into its store under a
         │                      #   held `LOW` level and restores them: debugger reads and
         │                      #   `MAKE_RESIDENT`; at `CRITICAL`, restores from the restore
@@ -532,6 +535,8 @@ through to the normal run.
 | `memory-object-text`        | `memory_object_text` | `memmgr_memory_object_text` (calls an executable attachment) |
 | `image-sharing`             | `image_sharing` | `procmgr_image_sharing` (reports its image base, waits) |
 | `snapshot-child`            | `snapshot`     | `procmgr_snapshot` (an unregistered writer thread, an object, a zero and a demand fixture, reports their addresses) |
+| `checkpoint-child`          | `checkpoint`   | `procmgr_checkpoint` (quiesces on command, reports each outcome) |
+| `checkpoint-pinned`         | `checkpoint`   | `procmgr_checkpoint` (pinned; sends `QUIESCE`, reports the reply) |
 | `swap-fixture`              | `swap`         | `memmgr_swap`, `memmgr_swap_client`, `memmgr_swap_raw`, `swapd` (evicted regions, threads) |
 | `swap-commit-writer`        | `swap_commit`  | `memmgr_swap_commit` (writes past the free frames) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`shutdown` case) |

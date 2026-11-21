@@ -1369,6 +1369,8 @@ pub struct File
     /// effective offset as `max(pos, size)` so the bytes always land
     /// at EOF even if another writer extended the file since open.
     append: bool,
+    /// The file among the open ones (`os::seraph::checkpoint::FILE`).
+    _held: crate::os::seraph::checkpoint::Held<{ crate::os::seraph::checkpoint::FILE }>,
 }
 
 impl File
@@ -1536,6 +1538,7 @@ impl File
             size: AtomicU64::new(size),
             writable,
             append: opts.append,
+            _held: crate::os::seraph::checkpoint::Held::new(),
         })
     }
 

@@ -99,6 +99,9 @@ services/svctest/
         │                      #   shared and private attachments in svctest and a child, a
         │                      #   private write seen by no other attacher, a shared write kills
         │                      #   its writer, release, the zero object
+        ├── object_io.rs       # OBJECT_READ, FILL_REGION and MARK_CHECKPOINT: an object's pages
+        │                      #   read into a grant and filled into a demand region, the
+        │                      #   refusals, no mark from svctest
         ├── memory_object_text.rs # executable memory objects: svctest and children call a sealed
         │                      #   function; a text write refused until MAKE_PRIVATE, then
         │                      #   patching one child alone; MAKE_PRIVATE refusals

@@ -7,7 +7,8 @@
 //! deferred list of reclaimed frames not yet pooled, the process index, the
 //! budget nodes processes are charged to, the chunk table of each demand
 //! region, the commitment bounds of a committed region, the memory-pressure
-//! levels, and the demand-region interval arithmetic and protection check.
+//! levels, the demand-region interval arithmetic and protection check, and
+//! the chunks a `FILL_REGION` request names.
 //!
 //! The crate performs no IPC and issues no syscalls. Storage arrives through
 //! the [`SlotStore`] and [`WordStore`] traits (mapped pool pages in memmgr, a
@@ -28,6 +29,7 @@ pub mod commit;
 pub mod compress;
 pub mod deferred;
 pub mod disk;
+pub mod fill;
 pub mod index;
 pub mod ledger;
 pub mod object_va;
@@ -52,6 +54,7 @@ pub use disk::{
     CaptureSource, FaultPath, Posted, Registered, ResidentPath, SlotError, SwapSlots, WANT_WORDS,
     WantList, capture_source, fault_path, pending_from, resident_path,
 };
+pub use fill::{FILL_CHUNKS, FillChunk, fill_chunks};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
 pub use ledger::{
     BackError, ClockHand, Commit, Ledger, RegionError, ResizeError, SWEEP_SPAN_CHUNKS, SealError,

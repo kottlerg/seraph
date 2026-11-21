@@ -138,11 +138,13 @@ const _: () = core::assert!(
 /// Badge bit of an object handle: a SEND on memmgr's endpoint badged with
 /// this bit and a random key, which names one memory object
 /// ([`SEAL_OBJECT`]). It is the authority to attach the object
-/// ([`ATTACH_OBJECT`], which takes it as a cap) and to serve
-/// [`OBJECT_RELEASE`] on it. No process badge, node handle or swap
-/// authority carries it, so memmgr serves [`OBJECT_RELEASE`] only on a badge
-/// carrying it and the other labels only on one without it, and refuses the
-/// rest with `UNAUTHORIZED`. Specified in
+/// ([`ATTACH_OBJECT`], which takes it as a cap), to back the caller's own
+/// pages with copies of its pages ([`FILL_REGION`], likewise), and to serve
+/// the object labels ([`is_object_label`]: [`OBJECT_RELEASE`],
+/// [`OBJECT_READ`]) on it. No process badge, node handle or swap authority
+/// carries it, so memmgr serves the object labels only on a badge carrying it
+/// and the other labels only on one without it, and refuses the rest with
+/// `UNAUTHORIZED`. Specified in
 /// `services/memmgr/docs/ipc-interface.md` § Object Handles.
 pub const OBJECT_HANDLE_TAG: u64 = 1 << 60;
 const _: () = core::assert!(
@@ -798,6 +800,88 @@ pub const NODE_CHARGE_HANDLE: u64 = 33;
 /// `REGISTER_DONATION_END`.
 pub const REGISTER_DONATION_END: u64 = 34;
 
+/// Copy pages of a memory object into Memory caps the request carries, on an
+/// object handle ([`OBJECT_HANDLE_TAG`]), which is the authority to read it.
+///
+/// Wire format:
+/// * `data[0]` — the first object page to copy.
+/// * `data[1]` — the page offset into `caps[0]` at which the destination
+///   starts.
+/// * `data[2 + i]` — the destination pages of `caps[i]`, from that offset
+///   for `caps[0]`.
+/// * `caps` — Memory caps with the map and write rights, at most
+///   `syscall_abi::MSG_CAP_SLOTS_MAX`; none to read only the reply's words.
+///   memmgr deletes them, whatever the reply.
+///
+/// memmgr copies the object's pages from `data[0]` on, in order, into the
+/// destination, at most [`OBJECT_READ_PAGES`] of them and none past the
+/// object's end. Reply: `SUCCESS` with `data[0]` the pages copied,
+/// `data[1]` the object's flags ([`OBJECT_CHECKPOINT`]) and `data[2]` its
+/// pages; `INVALID_ARGUMENT` (a handle already released, a first page past
+/// the object's end, or a destination page count missing for a cap);
+/// `UNAUTHORIZED` (no object handle); or `OUT_OF_MEMORY_BEST_EFFORT` (a
+/// destination page could not be mapped). Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 35: `OBJECT_READ`.
+pub const OBJECT_READ: u64 = 35;
+/// The most pages one [`OBJECT_READ`] copies.
+pub const OBJECT_READ_PAGES: u64 = 64;
+/// [`OBJECT_READ`] reply flag (`data[1]` bit 0): the object carries the
+/// checkpoint mark ([`MARK_CHECKPOINT`]).
+pub const OBJECT_CHECKPOINT: u64 = 1 << 0;
+
+/// Back pages of chunks of the caller's own regions with copies of a memory
+/// object's pages, as a write fault backs a page, attributed by
+/// `recv.badge`. `caps[0]` is the object handle ([`OBJECT_HANDLE_TAG`]),
+/// which memmgr deletes.
+///
+/// Wire format:
+/// * `data[0]` — the first object page the copies take.
+/// * `data[1]` — `n`, the chunks, 1 to [`FILL_CHUNKS`].
+/// * `data[2 + 2i]` — chunk `i`'s base: a chunk's base in a demand region
+///   of the caller, or in a private attachment of the zero object; the
+///   chunks in ascending order.
+/// * `data[3 + 2i]` — chunk `i`'s page mask, bit `j` for its page `j`,
+///   none past the chunk's pages.
+///
+/// Each page a mask names takes the next object page, in chunk and page
+/// order, so the request copies as many object pages as its masks name bits.
+/// The page is backed, charged and mapped as a write fault backs it; a page
+/// no mask names stays as it is. A chunk any page of which is backed already
+/// is passed over whole, its object pages with it, so a repeat of a request
+/// whose reply did not arrive changes nothing. Reply: `SUCCESS` with
+/// `data[0]` the pages backed; `INVALID_ARGUMENT` (unknown badge, no
+/// delegated address space, a count out of range, a base off a chunk of such
+/// a region or not above the one before, mask bits past a chunk, a cap that
+/// is no live object handle, or object pages past its end); `UNAUTHORIZED`
+/// (a badge that is a handle or the swap authority); `LIMIT`,
+/// `OUT_OF_MEMORY_BEST_EFFORT` or `QUOTA` as for the fault that would back
+/// the page, the chunks before it staying backed. Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 36: `FILL_REGION`.
+pub const FILL_REGION: u64 = 36;
+/// The most chunks one [`FILL_REGION`] names: a bound on the pages one
+/// request backs, 64, as for [`OBJECT_READ_PAGES`].
+pub const FILL_CHUNKS: u64 = 4;
+
+/// procmgr only: mark a memory object as a checkpoint. `caps[0]` is the
+/// object handle and `caps[1]` the account, a SEND on memmgr's endpoint;
+/// memmgr deletes both. memmgr marks the object when the handle names a live
+/// object and the account's badge is that of the process record that sealed
+/// it; the mark stays with the object for its life, and [`OBJECT_READ`]
+/// reports it. Reply: `SUCCESS`; `INVALID_ARGUMENT` (a cap missing, a
+/// handle that names no live object, or an account that is not memmgr's or
+/// names another record than the object's sealer); or `UNAUTHORIZED` (the
+/// caller is not procmgr). Specified in
+/// `services/memmgr/docs/ipc-interface.md` § Label 37: `MARK_CHECKPOINT`.
+pub const MARK_CHECKPOINT: u64 = 37;
+
+/// Whether `opcode` is an object label, served only over an object handle
+/// ([`OBJECT_HANDLE_TAG`]): [`OBJECT_RELEASE`] and [`OBJECT_READ`].
+#[must_use]
+pub const fn is_object_label(opcode: u64) -> bool
+{
+    opcode == OBJECT_RELEASE || opcode == OBJECT_READ
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -825,9 +909,26 @@ mod tests
     }
 
     #[test]
+    fn the_object_labels_are_object_release_and_object_read()
+    {
+        assert!(is_object_label(OBJECT_RELEASE));
+        assert!(is_object_label(OBJECT_READ));
+        for op in [
+            SEAL_OBJECT,
+            ATTACH_OBJECT,
+            FILL_REGION,
+            MARK_CHECKPOINT,
+            MAKE_PRIVATE,
+        ]
+        {
+            assert!(!is_object_label(op), "label {op}");
+        }
+    }
+
+    #[test]
     fn a_charge_only_handle_is_served_node_query_usage_and_node_charge_handle_alone()
     {
-        for op in 0..=REGISTER_DONATION_END
+        for op in 0..=MARK_CHECKPOINT
         {
             let served = op == NODE_QUERY_USAGE || op == NODE_CHARGE_HANDLE;
             assert_eq!(is_charge_only_label(op), served, "label {op}");

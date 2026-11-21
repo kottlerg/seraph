@@ -90,6 +90,7 @@ pub mod namespace;
 pub mod no_receiver;
 pub mod node_handle;
 pub mod node_reclaim;
+pub mod object_io;
 pub mod oom;
 pub mod pager;
 pub mod pipes;
@@ -143,6 +144,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(heap_commit::phases());
     out.extend_from_slice(discard::phases());
     out.extend_from_slice(memory_objects::phases());
+    out.extend_from_slice(object_io::phases());
     out.extend_from_slice(memory_object_text::phases());
     out.extend_from_slice(image_sharing::phases());
     out.extend_from_slice(snapshot::phases());

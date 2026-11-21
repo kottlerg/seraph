@@ -279,7 +279,9 @@ own address space (`SYS_ASPACE_BIND_NOTIFICATION`, through `ProcessInfo.self_asp
 first terminal end of any svcmgr thread posts to; and the same two on memmgr and on procmgr,
 through the thread cap and the Control-only address-space cap init endows for each in its
 `SUBSTRATE` round, before svcmgr's reconciliation. Each binding carries its member's correlator
-(`ipc::pwrmgr_labels::CORE_DEATH_SVCMGR`, `CORE_DEATH_MEMMGR`, `CORE_DEATH_PROCMGR`). svcmgr keeps
+(`ipc::pwrmgr_labels::CORE_DEATH_SVCMGR`, `CORE_DEATH_MEMMGR`, `CORE_DEATH_PROCMGR`), the
+address-space one with `ipc::pwrmgr_labels::CORE_DEATH_ADDRESS_SPACE` ORed in, so an entry says
+which end it is. svcmgr keeps
 the queue's original and delivers a derivation carrying only the receive right to the shutdown
 actuator, pwrmgr, in the bootstrap round of each of its launches
 ([`shutdown_actuator`](../services/svcmgr/docs/service-definitions.md#shutdown_actuator)). pwrmgr

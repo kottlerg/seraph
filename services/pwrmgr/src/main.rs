@@ -287,7 +287,10 @@ fn arm_core_death(
 /// thread. Nothing between the wake and the power-off allocates, frees, logs
 /// or calls a service, so it needs neither memmgr, a dead member's pages, nor
 /// any service that waits on them. Only when the platform keeps running, or
-/// no immediate power-off is held, does pwrmgr disarm, log the death, and
+/// no immediate power-off is held, does pwrmgr disarm, drain what was posted
+/// since, log each entry of the first entry's member as the end it is (its
+/// main thread's or its address space's, which can carry different reasons:
+/// `pwrmgr::core_death`), and
 /// take the ordinary shutdown through `actuator` (acpid's `SLEEP(5)` on
 /// x86-64, which runs `\_PTS`), as a `SHUTDOWN` request does; when that too
 /// fails it logs it and serves on.
@@ -298,29 +301,32 @@ fn core_died(
     ipc_buf: *mut u64,
 )
 {
-    ALLOCATOR.arm();
-    let death = pwrmgr::core_death::first(|| {
+    let next = || {
         syscall::event_try_recv_death(core_death)
             .ok()
             .map(|d| (d.correlator, d.exit_reason))
-    });
+    };
+    ALLOCATOR.arm();
+    let mut deaths = pwrmgr::core_death::Deaths::new();
+    deaths.drain(next);
     if let Some(power_off) = power_off
     {
         arch::current::power_off_now(power_off);
     }
     ALLOCATOR.disarm();
 
-    let member = death
-        .and_then(|d| d.member)
-        .map_or("a core member", pwrmgr::core_death::CoreMember::name);
-    match death
+    deaths.drain(next);
+    let first = deaths.first().and_then(|d| d.member);
+    let member = first.map_or("a core member", pwrmgr::core_death::CoreMember::name);
+    for d in deaths.of(first)
     {
-        Some(d) => std::os::seraph::log!(
-            error: "{member} died (exit reason {:#x}); powering off",
+        std::os::seraph::log!(
+            error: "{member}: {} (exit reason {:#x})",
+            d.end.name(),
             d.exit_reason
-        ),
-        None => std::os::seraph::log!(error: "{member} died; powering off"),
+        );
     }
+    std::os::seraph::log!(error: "{member} died; powering off");
     if power_off.is_some()
     {
         std::os::seraph::log!(error: "core-death power-off did not take effect");

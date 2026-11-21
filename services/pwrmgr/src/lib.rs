@@ -10,7 +10,7 @@
 //! x86-64 power-off writes ([`power_off`]).
 //!
 //! The binary (`main.rs`) installs the guard as its global allocator and
-//! drains the queue svcmgr serves it with [`core_death::first`].
+//! drains the queue svcmgr serves it into a [`core_death::Deaths`].
 
 #![cfg_attr(not(test), no_std)]
 

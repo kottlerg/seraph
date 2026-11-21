@@ -237,8 +237,10 @@ fn observe_core_deaths(info: &StartupInfo, pending: &[PendingRegistration]) -> u
 
 /// Bind the core member `name`'s main-thread observer through `thread` and
 /// its address-space observer through `aspace` (`0`: none endowed) on
-/// `queue`, both under `correlator`. Each observer that does not bind is
-/// logged at error level; whether either bound.
+/// `queue`, under `correlator`, the address-space one with
+/// the flag `pwrmgr_labels::CORE_DEATH_ADDRESS_SPACE` set, so pwrmgr tells the
+/// two ends apart. Each observer that does not bind is logged at error level;
+/// whether either bound.
 fn bind_core_member(queue: u64, name: &str, thread: u64, aspace: u64, correlator: u64) -> bool
 {
     let thread_bound = syscall::thread_bind_notification(thread, queue, correlator).is_ok();
@@ -249,8 +251,13 @@ fn bind_core_member(queue: u64, name: &str, thread: u64, aspace: u64, correlator
              unobserved"
         );
     }
-    let aspace_bound =
-        aspace != 0 && syscall::aspace_bind_notification(aspace, queue, correlator).is_ok();
+    let aspace_bound = aspace != 0
+        && syscall::aspace_bind_notification(
+            aspace,
+            queue,
+            correlator | ipc::pwrmgr_labels::CORE_DEATH_ADDRESS_SPACE,
+        )
+        .is_ok();
     if !aspace_bound
     {
         std::os::seraph::log!(

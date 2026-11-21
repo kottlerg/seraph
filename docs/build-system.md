@@ -563,8 +563,10 @@ one, naming it. The builds tested, with the store's keys enrolled by `virt-fw-va
 | RISC-V `RISCV_VIRT_CODE.fd` of Ubuntu's `qemu-efi-riscv64` 2025.11-3ubuntu7.3 (CI's default pair), 7.4 and 2026.05-2ubuntu3, and of Fedora's `edk2-riscv64` | built without it |
 
 CI's riscv64 cells take Arch's `edk2-riscv64` 202608-1 for the case alone (§ Continuous
-Integration), its package pinned by URL and SHA-256. A refresh of it is a new version's URL and
-hash in `.github/actions/qemu-packages/action.yml` and a passing `secureboot` case on it. Any
+Integration), its package pinned by version and SHA-256 and fetched from Arch's package mirror,
+which holds it while it is the current version, or else from `archive.archlinux.org`, which
+keeps every version. A refresh of it is a new version's file name, URLs and hash in
+`.github/actions/qemu-packages/action.yml` and a passing `secureboot` case on it. Any
 EDK2 `RiscVVirtQemu` build with `SECURE_BOOT_ENABLE` serves as well.
 
 **TPM (opt-in):** `cargo xtask test tpm` (x86-64) attaches a TPM 2.0 to the guest, QEMU's
@@ -711,8 +713,10 @@ it runs on. The `.deb` download fetches the list's resolved set from the
 image's apt mirror; a fetch that fails or exceeds 120 s rewrites the apt
 sources, the image's `/etc/apt/apt-mirrors.txt` mirror list included, from
 `azure.archive.ubuntu.com` to `archive.ubuntu.com` and retries once,
-bounded at 1200 s. The firmware download fetches the package from the URL
-the action pins and fails the job unless its SHA-256 is the pinned one.
+bounded at 1200 s. The firmware download tries the sources the action pins
+in turn, Arch's package mirror and then `archive.archlinux.org`, each with
+a 30 s connect bound, keeps the first package whose SHA-256 is the pinned
+one, and fails the job when no source serves it.
 When the `qemu-debs` job fails, the booting cells are skipped and the run
 fails.
 
@@ -725,9 +729,9 @@ itself, installs offline from it, and saves the entry under its own key
 when the restore missed, so the next run on that version restores it. The
 `.deb` fallback leaves the firmware package alone: the cell checks the
 restored package's SHA-256 against the pin and keeps it, and fetches it
-from `archive.archlinux.org` only when the firmware entry is absent or the
-hash differs, so a cell needs only the Ubuntu mirror while the firmware
-entry exists. It then checks the hash again, extracts the package's two
+from Arch's sources only when the firmware entry is absent or the hash
+differs, so a cell needs only the Ubuntu mirror while the firmware entry
+exists. It then checks the hash again, extracts the package's two
 images outside the checkout, and sets `SERAPH_RISCV_SECURE_CODE` and
 `SERAPH_RISCV_SECURE_VARS` to them for the job's later steps. An entry is
 saved only after its content is in place, a cell's `.deb` set only after

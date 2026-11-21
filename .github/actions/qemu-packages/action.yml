@@ -60,7 +60,10 @@ runs:
           echo 'flags=-y --no-install-recommends'
           echo 'offline=-o Dir::Etc::SourceList=/dev/null -o Dir::Etc::SourceParts=-'
           echo 'sb_riscv_pkg=edk2-riscv64-202608-1-any.pkg.tar.zst'
-          echo 'sb_riscv_url=https://archive.archlinux.org/packages/e/edk2-riscv64/edk2-riscv64-202608-1-any.pkg.tar.zst'
+          # Its sources, in the order the fetch tries them: Arch's package
+          # mirror, which holds the version while it is current and fails
+          # at once after, then Arch's archive, which keeps every version.
+          echo 'sb_riscv_urls=https://geo.mirror.pkgbuild.com/extra/os/x86_64/edk2-riscv64-202608-1-any.pkg.tar.zst https://archive.archlinux.org/packages/e/edk2-riscv64/edk2-riscv64-202608-1-any.pkg.tar.zst'
           echo "sb_riscv_sha256=$sb_sha256"
           # The .deb set resolves against the installed packages of the
           # image it was downloaded on, so its key names that image. The
@@ -154,14 +157,15 @@ runs:
 
     - name: Check or fetch the firmware package
       # `install` checks the restored package against the pin and keeps
-      # it; the package is fetched from the pinned URL only when it is
-      # absent or its hash differs. `cache` fetches it only when its entry
+      # it; the package is fetched from the pinned sources only when it is
+      # absent or its hash differs, and the first one whose package
+      # matches the pin serves. `cache` fetches it only when its entry
       # is absent.
       if: inputs.mode == 'install' || steps.firmware.outputs.cache-hit != 'true'
       shell: sh
       env:
         SB_PKG: ${{ steps.apt.outputs.sb_riscv_pkg }}
-        SB_URL: ${{ steps.apt.outputs.sb_riscv_url }}
+        SB_URLS: ${{ steps.apt.outputs.sb_riscv_urls }}
         SB_SHA256: ${{ steps.apt.outputs.sb_riscv_sha256 }}
       run: |
         pkg="qemu-firmware/$SB_PKG"
@@ -169,11 +173,19 @@ runs:
             echo "keeping the restored $SB_PKG"
             exit 0
         fi
-        echo "::warning::$SB_PKG is absent or does not match the pinned SHA-256; fetching it from $SB_URL"
+        echo "::warning::$SB_PKG is absent or does not match the pinned SHA-256; fetching it"
         rm -rf qemu-firmware
         mkdir -p qemu-firmware
-        curl -fsSL --retry 3 --max-time 300 -o "$pkg" "$SB_URL"
-        echo "$SB_SHA256  $pkg" | sha256sum -c -
+        for url in $SB_URLS; do
+            if curl -fsSL --connect-timeout 30 --retry 2 --max-time 300 -o "$pkg" "$url" &&
+                echo "$SB_SHA256  $pkg" | sha256sum -c -; then
+                exit 0
+            fi
+            echo "::warning::no package matching the pin from $url"
+            rm -f "$pkg"
+        done
+        echo "::error::no source served $SB_PKG with the pinned SHA-256"
+        exit 1
 
     # A save runs only for an entry the restore missed, after its content
     # is in place (and, in `install`, after the set installed), so an

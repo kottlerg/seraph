@@ -560,13 +560,11 @@ const MAIN_EXIT_CODE: u32 = 44;
 /// thread's observers, carries the other code.
 fn end_from_a_worker(authority: u64, driver: u64)
 {
-    use super::thread_exits::{End, First, end_two};
-    end_two(
+    super::thread_exits::end_two(
         authority,
         driver,
-        End::Process(MAIN_EXIT_CODE),
-        End::Process(WORKER_EXIT_CODE),
-        First::Other,
+        MAIN_EXIT_CODE,
+        WORKER_EXIT_CODE,
         "vfsd_driver_death: the /data fatfs",
     );
 }

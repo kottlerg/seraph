@@ -3,10 +3,12 @@
 
 // services/svctest/src/phases/thread_exits.rs
 
-//! Ending two threads of another process in an order the phase chooses, each
-//! with an end the phase chooses, through the debug authority svctest holds:
-//! the order in which a main thread's own end and its process's end reach a
-//! supervisor (`docs/process-lifecycle.md` § Exit reason).
+//! Ending a process from a thread other than its main thread, and then its
+//! main thread, each by `SYS_ASPACE_EXIT` with a code of its own, through
+//! the debug authority svctest holds: the process's reason is the other
+//! thread's, and the main thread's own end, which posts to its thread's
+//! observers, carries the other code (`docs/process-lifecycle.md` § Exit
+//! reason).
 //!
 //! svctest attaches to the process (`ATTACH_PROCESS`), which gives it each
 //! listed thread's cap with `CONTROL`, `OBSERVE` and `UPCALL`, binds the
@@ -17,29 +19,30 @@
 //! fault-blocked with the syscall's result already in its registers. svctest
 //! stops it, which drops the upcall and leaves the thread to resume at its
 //! registers when next started, and points it at a syscall instruction with
-//! the syscall number and first argument of the end it is to make:
-//! `SYS_THREAD_EXIT`, or `SYS_ASPACE_EXIT` with a code. A thread stopped while
+//! the syscall number and first argument of its end, `SYS_ASPACE_EXIT` with
+//! its code. A thread stopped while
 //! blocked, without the upcall, would have its syscall's `Interrupted` written
 //! over those registers when started. The instruction is a `syscall` or
 //! `ecall` found in the text page the thread was blocked in, other than the
 //! one it was blocked at: the riscv64 kernel steps past the `ecall` a
 //! syscall-point delivery names unless the handler wrote another `pc`.
-//! svctest then starts the first thread, and the second once the first reads
-//! `Exited`.
+//! svctest then starts the other thread, and the main thread once the other
+//! reads `Exited`.
 //!
-//! The second end lands before procmgr's teardown of the process unless
-//! procmgr reaps the first in the moment between the two starts; the
-//! teardown then stops the second thread, which ends with no post. A check
-//! built on the order therefore never fails for that, and catches a defect
-//! whenever the second end lands first.
+//! The other thread's end is the address space's first terminal end, which
+//! the kernel retains before the main thread starts, so every reader of the
+//! process's reason gets the other thread's code whatever the order of its
+//! reads. The main thread's end lands, and posts, unless procmgr's teardown
+//! of the process stops it first; a check that the main thread's code is not
+//! taken for the process's therefore never fails for that order, and catches
+//! a defect whenever the main thread's end lands.
 
 use std::time::{Duration, Instant};
 
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::{
     CAP_INFO_THREAD_STATE, FAULT_CLASS_UPCALL, FAULT_KIND_UPCALL, FAULT_LABEL, MAX_THREAD_MEM_COPY,
-    PAGE_SIZE, RIGHTS_THREAD_OBSERVE, SYS_ASPACE_EXIT, SYS_THREAD_EXIT, THREAD_STATE_EXITED,
-    UPCALL_ANY_INSTRUCTION,
+    PAGE_SIZE, RIGHTS_THREAD_OBSERVE, SYS_ASPACE_EXIT, THREAD_STATE_EXITED, UPCALL_ANY_INSTRUCTION,
 };
 
 use crate::arch::current::{
@@ -55,45 +58,12 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// procmgr requires of a debugger's binding.
 const DEBUGGER_BADGE: u64 = procmgr_labels::DEBUGGER_BADGE_TAG | 2;
 
-/// The end a thread is made to take.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum End
-{
-    /// `SYS_THREAD_EXIT`: the thread's own end, which ends no address space.
-    Thread,
-    /// `SYS_ASPACE_EXIT` with the code: the process's end, unless another
-    /// thread's end came first.
-    Process(u32),
-}
-
-impl End
-{
-    /// The syscall number and first argument of the end.
-    fn syscall(self) -> (u64, u64)
-    {
-        match self
-        {
-            Self::Thread => (SYS_THREAD_EXIT, 0),
-            Self::Process(code) => (SYS_ASPACE_EXIT, u64::from(code)),
-        }
-    }
-}
-
-/// Which of the two threads ends first.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum First
-{
-    /// The main thread, then another thread of the process.
-    Main,
-    /// Another thread of the process, then the main thread.
-    Other,
-}
-
-/// End the main thread of `process` with `main` and the first other thread
-/// it lists with `other`, in the order `first` names, as the module
-/// documentation describes. `authority` is the debug authority; `what`
-/// names the phase and the process in a failure.
-pub(crate) fn end_two(authority: u64, process: u64, main: End, other: End, first: First, what: &str)
+/// End `process` from the first thread other than its main thread it lists,
+/// with `SYS_ASPACE_EXIT` of `other_code`, and then end its main thread with
+/// `SYS_ASPACE_EXIT` of `main_code`, as the module documentation
+/// describes. `authority` is the debug authority; `what` names the phase
+/// and the process in a failure.
+pub(crate) fn end_two(authority: u64, process: u64, main_code: u32, other_code: u32, what: &str)
 {
     let threads = attach(authority, process, what);
     let (&main_cap, &other_cap) = threads.first().zip(threads.get(1)).unwrap_or_else(|| {
@@ -109,13 +79,9 @@ pub(crate) fn end_two(authority: u64, process: u64, main: End, other: End, first
         .unwrap_or_else(|| panic!("{what}: an upcall endpoint"));
     let send = syscall::cap_derive_badge(endpoint, syscall::RIGHTS_EP_SEND, DEBUGGER_BADGE)
         .unwrap_or_else(|e| panic!("{what}: an upcall SEND ({e})"));
-    hold(main_cap, endpoint, send, main, what);
-    hold(other_cap, endpoint, send, other, what);
-    let (one, two) = match first
-    {
-        First::Main => (main_cap, other_cap),
-        First::Other => (other_cap, main_cap),
-    };
+    hold(main_cap, endpoint, send, main_code, what);
+    hold(other_cap, endpoint, send, other_code, what);
+    let (one, two) = (other_cap, main_cap);
     syscall::thread_start(one).unwrap_or_else(|e| panic!("{what}: starting the first ({e})"));
     let start = Instant::now();
     while syscall::cap_info(one, CAP_INFO_THREAD_STATE)
@@ -164,8 +130,9 @@ fn attach(authority: u64, process: u64, what: &str) -> Vec<u64>
 
 /// Take `thread` out of the syscall it is blocked in through an upcall to
 /// `endpoint`, bound through `send`, stop it there, and point it at a
-/// syscall instruction with the syscall number and argument of `end`.
-fn hold(thread: u64, endpoint: u64, send: u64, end: End, what: &str)
+/// syscall instruction with the syscall number of `SYS_ASPACE_EXIT` and
+/// `code` as its argument.
+fn hold(thread: u64, endpoint: u64, send: u64, code: u32, what: &str)
 {
     syscall::thread_set_fault_handler(thread, send, FAULT_CLASS_UPCALL)
         .unwrap_or_else(|e| panic!("{what}: binding a thread's upcall class ({e})"));
@@ -191,7 +158,7 @@ fn hold(thread: u64, endpoint: u64, send: u64, end: End, what: &str)
     let own = word(&regs, IP_OFFSET).wrapping_sub(SYSCALL_INSN_BEFORE_IP);
     let site = syscall_site(thread, own)
         .unwrap_or_else(|| panic!("{what}: no other syscall instruction in the page of {own:#x}"));
-    let (nr, arg0) = end.syscall();
+    let (nr, arg0) = (SYS_ASPACE_EXIT, u64::from(code));
     for (offset, value) in [
         (IP_OFFSET, site),
         (SYSCALL_NR_OFFSET, nr),

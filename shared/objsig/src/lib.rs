@@ -24,6 +24,7 @@
 //! - [`store`]: the trust store: anchors, revoked key ids, security floor.
 //! - [`embed`]: the trust store as the bootloader image embeds it.
 //! - [`name`]: the canonical form of the name an object is signed under.
+//! - [`index`]: the signed index of a configuration directory's files.
 //! - [`verify()`]: the verifier and its policy.
 
 #![no_std]
@@ -32,6 +33,7 @@ pub mod attrs;
 pub mod cert;
 pub mod composite;
 pub mod embed;
+pub mod index;
 pub mod name;
 pub mod store;
 pub mod trailer;
@@ -44,7 +46,8 @@ mod testutil;
 
 pub use attrs::Attributes;
 pub use cert::{Certificate, CertificateBody};
-pub use name::{NAME_MAX, name_is_canonical, name_is_install_path};
+pub use index::{INDEX_NAME, Index, IndexError};
+pub use name::{NAME_MAX, name_is_canonical, name_is_component, name_is_install_path};
 pub use store::{Anchor, AnchorSpec, TrustStore};
 pub use trailer::{Record, RecordSpec, Records, Signed, encode_trailer, split, trailer_len};
 pub use verify::{
@@ -98,14 +101,17 @@ pub enum Role
     Driver = 5,
     /// A program image.
     Program = 6,
-    /// A data file.
+    /// A data file procmgr verifies for its reader.
     Data = 7,
+    /// A policy-bearing configuration file procmgr verifies for its
+    /// consumer, or the index of a directory of them.
+    Configuration = 8,
 }
 
 impl Role
 {
     /// Every role, in bit order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Kernel,
         Self::Init,
         Self::BootModule,
@@ -113,6 +119,7 @@ impl Role
         Self::Driver,
         Self::Program,
         Self::Data,
+        Self::Configuration,
     ];
 
     /// The role's bit in a [`RoleSet`] and in a usage mask.
@@ -162,7 +169,7 @@ impl RoleSet
     pub const EMPTY: Self = Self(0);
 
     /// Every role.
-    pub const ALL: Self = Self(0xfe);
+    pub const ALL: Self = Self(0x1fe);
 
     /// The set of the given roles.
     #[must_use]
@@ -315,6 +322,8 @@ pub enum EncodeError
     /// A body ends in the trailer magic, so its signed object would parse as
     /// a nested trailer.
     NestedTrailer,
+    /// A directory index would not parse (`index::Index::parse`).
+    Index,
 }
 
 /// Why a signed object, a record, its attributes or its certificate do not

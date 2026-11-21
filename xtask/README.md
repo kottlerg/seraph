@@ -137,25 +137,30 @@ and the boot-module role when a bundle list names it as an entry; `/services/ini
 the init role, and `/tests/ktest` too when the pack composes the ktest harness's bundle), every
 regular file under a data tree (`DATA_TREES` in `src/signing/mod.rs`: `config/devmgr/platform/` and
 `data/svctest/signed/`), under its install path with the data role alone, which procmgr's verified
-read accepts, and every other file a bundle list names, the data files installed under `/config/`
-(the boot-module role). A pack signs for the harness recorded in `sysroot/.harness`
-([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot), then composes the ESP
-(`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and composes the bundle by
-copying the installed files the harness's list in `config/bundle/` names (`src/bundle.rs`). The
-composition signs nothing and reads no key; it verifies the kernel and each bundle entry as the
-bootloader will before it writes them, and once it has written the ESP, reads it back and refuses it
-unless every object on it equals its installed file and it holds no other file than a presence-only
-knob ([docs/boot-media.md](../docs/boot-media.md) § The ESP; [§ The image check](#the-image-check)
-makes the same check of the image the pack writes). Every signed object is verified under the
-build's trust store, with each of its roles, its name and the architecture its loaders expect,
-before it is written. Each command derives the store from the signing identity and the deployer's
-store its environment names. `cargo xtask build` passes the store's path to the bootloader's build
-in `SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader embeds it. Every pack
-after that (the build's own, `mkdisk` including `--repack-only`, and the harness commands that
-repack) reads the store out of the installed bootloader, `boot/boot.efi`, and refuses to sign when
-it is missing, holds no marker or two, or embeds another store; the error names the image and tells
-to run `cargo xtask build` (docs/signing.md § Signing). Signing a pack's images takes about half a
-second (`src/signing/`).
+read accepts, every regular file of a configuration directory (`CONFIG_TREES` in
+`src/signing/mod.rs`: `config/svcmgr/services/`, whose files are `.svc` recipes, and
+`config/devmgr/classes/`, whose files are `.class` files) under its install path in the
+configuration role, the directory's `index`, which the pack writes from the files the directory
+holds and signs in the configuration role under `<dir>/index` (a subdirectory or a file of another
+suffix in those directories fails the pack), and every other file a bundle list names, the data
+files installed under `/config/` (the boot-module role). A pack signs for the harness recorded in
+`sysroot/.harness` ([docs/build-system.md](../docs/build-system.md) § Build Output: the Sysroot),
+then composes the ESP (`src/esp.rs`): it copies the installed bootloader and kernel to the ESP and
+composes the bundle by copying the installed files the harness's list in `config/bundle/` names
+(`src/bundle.rs`). The composition signs nothing and reads no key; it verifies the kernel and each
+bundle entry as the bootloader will before it writes them, and once it has written the ESP, reads it
+back and refuses it unless every object on it equals its installed file and it holds no other file
+than a presence-only knob ([docs/boot-media.md](../docs/boot-media.md) § The ESP; [§ The image
+check](#the-image-check) makes the same check of the image the pack writes). Every signed object is
+verified under the build's trust store, with each of its roles, its name and the architecture its
+loaders expect, before it is written. Each command derives the store from the signing identity and
+the deployer's store its environment names. `cargo xtask build` passes the store's path to the
+bootloader's build in `SERAPH_BOOT_TRUST_STORE` (set by xtask, not by a user), and the bootloader
+embeds it. Every pack after that (the build's own, `mkdisk` including `--repack-only`, and the
+harness commands that repack) reads the store out of the installed bootloader, `boot/boot.efi`, and
+refuses to sign when it is missing, holds no marker or two, or embeds another store; the error names
+the image and tells to run `cargo xtask build` (docs/signing.md § Signing). Signing a pack's images
+takes about half a second (`src/signing/`).
 
 The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
 one, whose canonical path lies inside it, `target/` included. When the directory is absent or
@@ -175,7 +180,7 @@ bootloader embeds.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
+| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65-roles-1-8` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused, and so is a signing key the build's trust store does not trust for every role, the error naming the roles it lacks. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
 | `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 3,373-byte composite signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
 | `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
 | `SERAPH_TRUST_STORE_MODE` | `merge` | `merge`: the union of both stores' anchors and revoked key ids, under the higher floor; two anchors of one key that differ are refused. `replace`: the deployer's store alone. Set without `SERAPH_TRUST_STORE`, it is refused |
@@ -1027,7 +1032,7 @@ Check that every signature verifier refuses an object that does not verify, with
 owes, on either arch ([docs/signing.md](../docs/signing.md) § Which Stage Verifies What). The
 case packs the disk images once with the default-init bundle, so the sysroot is signed and the
 ESP holds that bundle, composed from the installed files; writes each boot's objects into
-`target/xtask/test/signing/<arch>/` from the signed ones; and boots the current sysroot four
+`target/xtask/test/signing/<arch>/` from the signed ones; and boots the current sysroot six
 times, each from images packed with the default-init bundle and those objects in place of the
 ESP's or the sysroot's files (`disk::create_disk_image_substituting`):
 
@@ -1037,6 +1042,8 @@ ESP's or the sysroot's files (`disk::create_disk_image_substituting`):
 | `bundle` | the bundle with a body byte of its `/services/drivers/virtio-blk` entry flipped | `SERAPH BOOT FATAL: signature verification refused: /services/drivers/virtio-blk: Failed(BodyHash)` |
 | `revoked` | both ESP copies of the bootloader, built under the build's trust store with the signing key's id revoked | `SERAPH BOOT FATAL: signature verification refused: kernel: Failed(Revoked)` |
 | `rootfs` | `/services/timed` with a body byte flipped, `/services/pwrmgr` signed with the data role alone, `/services/crashd` signed by a key no anchor holds; the kernel and `/programs/terminal` each with a record of that key before their own; on riscv64 also `/config/devmgr/platform/qemu-virt.platform` with a body byte flipped | procmgr's `signature verification refused: <path>: <refusal>` (`Failed(BodyHash)`, `Failed(Role)`, `Untrusted`) and svcmgr's `create: "<path>" refused: its signature did not verify` for each of the three, and `terminal: READY for injection`; on riscv64 also procmgr's `signature verification refused: /config/devmgr/platform/qemu-virt.platform: Failed(BodyHash)` and devmgr's `platform table /config/devmgr/platform/qemu-virt.platform: procmgr's verified read refused it (InvalidData); passed over` and `no platform description table for this machine; no platform-table records` |
+| `configuration` | a bootloader built under the build's trust store with two more anchors, one trusted for every role but configuration and one for configuration alone; in `/config/svcmgr/services/`, `timed.svc` with a body byte flipped, `pwrmgr.svc` unsigned, `crashd.svc` signed by the first anchor's key, `oomd.svc` signed by the second's, which signs `/services/oomd` as a service too, `entropyd.svc` validly signed over a body other than the one the index holds, and an index, validly signed, that names a `removed.svc` the directory lacks and omits the `swapd.svc` it holds; `/config/devmgr/classes/rtc.class` with a body byte flipped | procmgr's `signature verification refused: <path>: <refusal>` for `timed.svc` (`Failed(BodyHash)`), `pwrmgr.svc` (`Parse(Magic)`), `crashd.svc` (`Failed(KeyUsage)`) and `rtc.class` (`Failed(BodyHash)`), each followed by svcmgr's `<path>: named by the index, not read (InvalidData); dropped` (for `rtc.class`, `...; class not configured`); procmgr's refusal of `/services/oomd` (`Failed(KeyUsage)`) and svcmgr's `create: "/services/oomd" refused: its signature did not verify`; svcmgr's `/config/svcmgr/services/entropyd.svc: its body is not the one the directory's index was signed with; refused`, followed by its `named by the index, not read (InvalidData); dropped`; `/config/svcmgr/services/removed.svc: named by the index, not read (NotFound); dropped`; `/config/svcmgr/services/swapd.svc: not named by the directory's index; not read`; and `terminal: READY for injection` |
+| `index` | the indexes of `/config/svcmgr/services/` and `/config/devmgr/classes/` each with a body byte flipped | procmgr's `signature verification refused: <index path>: Failed(BodyHash)` for each, svcmgr's `<index path> not read (InvalidData); no recipe is read` and `<index path> not read (InvalidData); no device class configured`, and `svcmgr: registered without definition: ` |
 
 The untrusted key is a local identity generated for the run in a directory under the host's
 temporary directory, outside the work tree, and removed again. A boot passes once every owed line

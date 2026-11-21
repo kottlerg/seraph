@@ -2324,9 +2324,9 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
     }
 }
 
-/// Handle `READ_VERIFIED`: read the data file `caps[0]` names once into one
-/// run of frames on the sender's memmgr account, verify the copy in the data
-/// role under the name the request gives, and give the sender the run
+/// Handle `READ_VERIFIED`: read the file `caps[0]` names once into one run of
+/// frames on the sender's memmgr account, verify the copy in the role (data
+/// or configuration) and under the name the request gives, and give the sender the run
 /// read-only (docs/signing.md § Verifier Discipline). Wire layout:
 /// [`procmgr_labels::READ_VERIFIED`].
 ///
@@ -2342,7 +2342,7 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     let caps = req.caps();
     let file_cap = caps.first().copied().unwrap_or(0);
     release_caps(caps.get(1..).unwrap_or(&[]));
-    let read = process_table::sign_policy::data_read(req).filter(|_| file_cap != 0);
+    let read = process_table::sign_policy::verified_read(req).filter(|_| file_cap != 0);
     let Some(read) = read
     else
     {
@@ -2392,15 +2392,10 @@ fn handle_read_verified(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         image::Shape::Contiguous,
     )
     .and_then(|buffer| {
-        let body_len = image::verify(
-            ctx,
-            buffer.bytes(),
-            read.name,
-            process_table::sign_policy::DATA,
-        )
-        .map_err(|_| procmgr_errors::SIGNATURE_REFUSED)?
-        .body
-        .len();
+        let body_len = image::verify(ctx, buffer.bytes(), read.name, read.roles())
+            .map_err(|_| procmgr_errors::SIGNATURE_REFUSED)?
+            .body
+            .len();
         let run = buffer.into_read_only()?;
         Ok((body_len, run))
     });

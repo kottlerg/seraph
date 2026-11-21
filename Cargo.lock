@@ -843,6 +843,7 @@ dependencies = [
  "death-set",
  "ipc",
  "namespace-protocol",
+ "objsig",
  "registry",
  "restart-budget",
  "svcmgr-defs",

@@ -27,39 +27,65 @@ pub fn requested_name(req: &IpcMessage) -> Option<&[u8]>
     ipc::procmgr_labels::create_name(req).filter(|name| objsig::name_is_install_path(name))
 }
 
-/// The roles a `READ_VERIFIED` copy is verified in: the data role alone, so a
-/// process image (service, driver, program) or a bundle-only object is never
-/// handed to a reader as trusted input, and a data file is never code.
-pub const DATA: RoleSet = RoleSet::of(&[Role::Data]);
+/// The role a `READ_VERIFIED` request's role word names
+/// (`ipc::procmgr_labels::READ_VERIFIED_ROLE_WORD`): data or configuration,
+/// the two roles of a file a reader takes as trusted input. `None` for any
+/// other value, so a process image (service, driver, program) or a
+/// bundle-only object is never handed to a reader as trusted input, and a
+/// file read this way is never code.
+#[must_use]
+pub const fn readable_role(word: u64) -> Option<Role>
+{
+    match word
+    {
+        ipc::procmgr_labels::READ_VERIFIED_DATA => Some(Role::Data),
+        ipc::procmgr_labels::READ_VERIFIED_CONFIGURATION => Some(Role::Configuration),
+        _ => None,
+    }
+}
 
 /// What a checked `READ_VERIFIED` request asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DataRead<'a>
+pub struct VerifiedRead<'a>
 {
     /// The file's length in bytes, 1 to `READ_VERIFIED_MAX`.
     pub len: u64,
+    /// The role the file must be signed in ([`readable_role`]).
+    pub role: Role,
     /// The install path the file must be signed under.
     pub name: &'a [u8],
 }
 
-/// The read a `READ_VERIFIED` request `req` asks for: its length,
-/// `data[0]`, when it is 1 to `ipc::procmgr_labels::READ_VERIFIED_MAX`,
-/// and its name block, when that is a canonical install path
-/// (`objsig::name_is_install_path`). `None`, which procmgr refuses
-/// `INVALID_ARGUMENT` before it opens the file, otherwise: a length past
-/// the bound would have procmgr reserve and map a copy the request does not
-/// bound.
-#[must_use]
-pub fn data_read(req: &IpcMessage) -> Option<DataRead<'_>>
+impl VerifiedRead<'_>
 {
+    /// The roles the copy is verified in: [`Self::role`] alone.
+    #[must_use]
+    pub const fn roles(&self) -> RoleSet
+    {
+        RoleSet::of(&[self.role])
+    }
+}
+
+/// The read a `READ_VERIFIED` request `req` asks for: its length,
+/// `data[0]`, when it is 1 to `ipc::procmgr_labels::READ_VERIFIED_MAX`;
+/// its role word, when it names a [`readable_role`]; and its name block,
+/// when that is a canonical install path (`objsig::name_is_install_path`).
+/// `None`, which procmgr refuses `INVALID_ARGUMENT` before it opens the
+/// file, otherwise: a length past the bound would have procmgr reserve and
+/// map a copy the request does not bound.
+#[must_use]
+pub fn verified_read(req: &IpcMessage) -> Option<VerifiedRead<'_>>
+{
+    use ipc::procmgr_labels::{READ_VERIFIED_MAX, READ_VERIFIED_ROLE_WORD};
     let len = req.word(0);
-    if req.word_count() == 0 || len == 0 || len > ipc::procmgr_labels::READ_VERIFIED_MAX
+    if req.word_count() <= READ_VERIFIED_ROLE_WORD || len == 0 || len > READ_VERIFIED_MAX
     {
         return None;
     }
+    let role = readable_role(req.word(READ_VERIFIED_ROLE_WORD))?;
     let name = ipc::procmgr_labels::read_verified_name(req)
         .filter(|name| objsig::name_is_install_path(name))?;
-    Some(DataRead { len, name })
+    Some(VerifiedRead { len, role, name })
 }
 
 /// The un-badged creator's set (init, and svcmgr's mint source): every role
@@ -150,56 +176,88 @@ mod tests
 
     fn data_request(len: u64, name: &[u8]) -> IpcMessage
     {
-        use ipc::procmgr_labels::{READ_VERIFIED, READ_VERIFIED_NAME_WORD};
-        let builder = IpcMessage::builder(READ_VERIFIED).word(0, len);
+        role_request(len, ipc::procmgr_labels::READ_VERIFIED_DATA, name)
+    }
+
+    fn role_request(len: u64, role: u64, name: &[u8]) -> IpcMessage
+    {
+        use ipc::procmgr_labels::{
+            READ_VERIFIED, READ_VERIFIED_NAME_WORD, READ_VERIFIED_ROLE_WORD,
+        };
+        let builder = IpcMessage::builder(READ_VERIFIED)
+            .word(0, len)
+            .word(READ_VERIFIED_ROLE_WORD, role);
         ipc::with_name_block(builder, READ_VERIFIED_NAME_WORD, name, CREATE_NAME_MAX)
             .unwrap()
             .build()
     }
 
     #[test]
-    fn a_data_read_within_the_bound_under_an_install_path_is_admitted()
+    fn a_read_within_the_bound_under_an_install_path_is_admitted()
     {
-        use ipc::procmgr_labels::READ_VERIFIED_MAX;
+        use ipc::procmgr_labels::{READ_VERIFIED_CONFIGURATION, READ_VERIFIED_MAX};
         let name = &b"/config/devmgr/platform/qemu-virt.platform"[..];
         for len in [1, 4096, READ_VERIFIED_MAX]
         {
             assert_eq!(
-                data_read(&data_request(len, name)),
-                Some(DataRead { len, name }),
+                verified_read(&data_request(len, name)),
+                Some(VerifiedRead {
+                    len,
+                    role: Role::Data,
+                    name
+                }),
                 "{len}"
             );
         }
+        let name = &b"/config/svcmgr/services/index"[..];
+        let request = role_request(64, READ_VERIFIED_CONFIGURATION, name);
+        let read = verified_read(&request).unwrap();
+        assert_eq!(read.roles(), RoleSet::of(&[Role::Configuration]));
     }
 
     // Defect guarded: a request past the size bound, or of no bytes, reaching
     // the read, so procmgr reserves and maps a copy no bound limits; a
     // request whose name names the file another way reaching the verifier.
     #[test]
-    fn a_data_read_past_the_bound_empty_or_misnamed_is_refused()
+    fn a_read_past_the_bound_empty_or_misnamed_is_refused()
     {
         use ipc::procmgr_labels::{READ_VERIFIED, READ_VERIFIED_MAX};
         let name = &b"/data/x"[..];
-        assert_eq!(data_read(&data_request(0, name)), None);
-        assert_eq!(data_read(&data_request(READ_VERIFIED_MAX + 1, name)), None);
-        assert_eq!(data_read(&data_request(u64::MAX, name)), None);
+        assert_eq!(verified_read(&data_request(0, name)), None);
+        assert_eq!(
+            verified_read(&data_request(READ_VERIFIED_MAX + 1, name)),
+            None
+        );
+        assert_eq!(verified_read(&data_request(u64::MAX, name)), None);
         for name in [&b"/data//x"[..], b"data/x", b"init", b"kernel"]
         {
-            assert_eq!(data_read(&data_request(64, name)), None, "{name:?}");
+            assert_eq!(verified_read(&data_request(64, name)), None, "{name:?}");
         }
         let bare = IpcMessage::builder(READ_VERIFIED).word(0, 64).build();
-        assert_eq!(data_read(&bare), None);
-        assert_eq!(data_read(&IpcMessage::new(READ_VERIFIED)), None);
+        assert_eq!(verified_read(&bare), None);
+        assert_eq!(verified_read(&IpcMessage::new(READ_VERIFIED)), None);
     }
 
-    // Defect guarded: a verified read accepting an image role, so a reader
-    // is handed a signed program as configuration it trusts.
+    // Defect guarded: a verified read accepting an image or bundle role, so
+    // a reader is handed a signed program as configuration it trusts; or a
+    // role word read in another numbering than the signed one.
     #[test]
-    fn a_data_read_accepts_the_data_role_alone()
+    fn a_read_names_the_data_or_configuration_role_alone()
     {
         for role in Role::ALL
         {
-            assert_eq!(DATA.contains(role), role == Role::Data, "{role:?}");
+            let readable = matches!(role, Role::Data | Role::Configuration);
+            assert_eq!(
+                readable_role(role as u64),
+                readable.then_some(role),
+                "{role:?}"
+            );
+            let request = role_request(64, role as u64, b"/data/x");
+            assert_eq!(verified_read(&request).is_some(), readable, "{role:?}");
+        }
+        for word in [0, 9, 31, u64::MAX]
+        {
+            assert_eq!(readable_role(word), None, "{word}");
         }
     }
 

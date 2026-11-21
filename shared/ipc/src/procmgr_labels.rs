@@ -968,13 +968,14 @@ pub const MAKE_RESIDENT: u64 = 30;
 /// carries.
 ///
 /// `data[0]` is the file's length in bytes, 1 to [`READ_VERIFIED_MAX`];
-/// from word [`READ_VERIFIED_NAME_WORD`] the name block
-/// (`crate::with_name_block`, at most [`CREATE_NAME_MAX`] bytes): the
-/// install path the file must be signed under, in the data role. `caps[0]`
-/// is the file cap, which procmgr opens, reads once (`FS_READ_MEMORY`) into
-/// one run of frames it requests on the sender's memmgr account and maps
-/// in its own address space alone, and deletes. procmgr verifies the copy
-/// in the data role under the name, for this architecture.
+/// `data[1]` the role the file must be signed in, [`READ_VERIFIED_DATA`] or
+/// [`READ_VERIFIED_CONFIGURATION`]; from word [`READ_VERIFIED_NAME_WORD`]
+/// the name block (`crate::with_name_block`, at most [`CREATE_NAME_MAX`]
+/// bytes): the install path the file must be signed under. `caps[0]` is the
+/// file cap, which procmgr opens, reads once (`FS_READ_MEMORY`) into one run
+/// of frames it requests on the sender's memmgr account and maps in its own
+/// address space alone, and deletes. procmgr verifies the copy in that role
+/// under the name, for this architecture.
 ///
 /// Replies `SUCCESS` with `data[0]` the body's length, `data[1]` the
 /// run's region id on the sender's account and `data[2]` its pages, and
@@ -984,7 +985,8 @@ pub const MAKE_RESIDENT: u64 = 30;
 /// deletes the cap and releases the region (`memmgr_labels::RELEASE_MEMORY_CAPS`
 /// on its own memmgr cap) when done; its death releases it with its
 /// record. Refusals: `INVALID_ARGUMENT` for a missing cap, a length of zero
-/// or past the bound, or a missing or non-canonical name, before any read;
+/// or past the bound, a role other than the two, or a missing or
+/// non-canonical name, before any read;
 /// `SIGNATURE_REFUSED` when the copy does not verify; `LIMIT` when the max of
 /// the sender's budget node or of an ancestor refuses the run; `IO_ERROR`,
 /// `OUT_OF_MEMORY` and `MAP_FAILED` as for [`CREATE_FROM_FILE`]'s read.
@@ -1047,9 +1049,22 @@ pub const SNAPSHOT: u64 = 33;
 /// files. procmgr refuses a longer request before it reads anything.
 pub const READ_VERIFIED_MAX: u64 = 32 * 1024;
 
+/// The data word of a [`READ_VERIFIED`] request holding the role the file
+/// must be signed in.
+pub const READ_VERIFIED_ROLE_WORD: usize = 1;
+
+/// The role word of a [`READ_VERIFIED`] request for a data file: role 7,
+/// data, in the numbering of docs/signing.md § Signed Attributes.
+pub const READ_VERIFIED_DATA: u64 = 7;
+
+/// The role word of a [`READ_VERIFIED`] request for a policy-bearing
+/// configuration file or a directory's index: role 8, configuration, in the
+/// numbering of docs/signing.md § Signed Attributes.
+pub const READ_VERIFIED_CONFIGURATION: u64 = 8;
+
 /// The data word of a [`READ_VERIFIED`] request holding the name block's
 /// length, whose bytes follow.
-pub const READ_VERIFIED_NAME_WORD: usize = 1;
+pub const READ_VERIFIED_NAME_WORD: usize = 2;
 
 /// The name a [`READ_VERIFIED`] request carries in its name block: `None`
 /// when the request delivers no length word, the length is zero or above

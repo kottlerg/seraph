@@ -173,10 +173,10 @@ services and the `terminal` program, which autostarts from
 `/config/svcmgr/services/terminal.svc` and is the keyboard consumer (see
 [programs/terminal/README.md](../programs/terminal/README.md)).
 
-`svcmgr` walks `/config/svcmgr/services/` and launches every `.svc` recipe
-it finds (see [services/svcmgr/README.md](../services/svcmgr/README.md)).
+`svcmgr` reads the recipes `/config/svcmgr/services/`'s signed index names and launches each
+(see [services/svcmgr/README.md](../services/svcmgr/README.md)).
 Test-harness recipes are not shipped there by default. Instead they live
-in a sibling directory that `svcmgr` does not scan:
+in a sibling directory that `svcmgr` does not read:
 
 ```
 rootfs/config/svcmgr/
@@ -639,7 +639,7 @@ device cell of the local and release host runs (Coverage tiers below).
 
 Every verifier of [signing.md](signing.md) § Which Stage Verifies What refuses an object that
 does not verify, and a refusal path no boot takes is not shown to work. `cargo xtask test signing
-[--arch] [--release]` (both arches) boots the current sysroot four times from disk images that
+[--arch] [--release]` (both arches) boots the current sysroot six times from disk images that
 carry objects no build makes, written in place of the sysroot's files at pack time, so the
 sysroot itself is never changed:
 
@@ -657,6 +657,23 @@ sysroot itself is never changed:
    the platform description table `/config/devmgr/platform/qemu-virt.platform` also has a body
    byte flipped: procmgr refuses devmgr's verified read of it, `Failed(BodyHash)`, and devmgr
    passes it over and adds no platform-table record.
+5. `configuration`: a bootloader built under the build's trust store with two more anchors, one
+   trusted for every role but configuration and one for configuration alone, and, in
+   `/config/svcmgr/services/`, `timed.svc` with a body byte flipped, `pwrmgr.svc` unsigned,
+   `crashd.svc` signed by the first anchor's key, and `oomd.svc` by the second's, which signs
+   `/services/oomd` as a service too; `entropyd.svc` validly signed over a body other than the one
+   the index holds, as an older signed copy is; the directory's index, validly signed, names a
+   `removed.svc` the directory lacks and omits the `swapd.svc` it holds; and
+   `/config/devmgr/classes/rtc.class` has a body byte flipped. procmgr refuses each configuration
+   file at svcmgr's verified read (`Failed(BodyHash)`, `Parse(Magic)`, `Failed(KeyUsage)`) and
+   svcmgr reports it passed over; svcmgr refuses `entropyd.svc`, whose body does not match its index
+   line; procmgr refuses the service `oomd.svc`'s anchor signs (`Failed(KeyUsage)`); svcmgr reports
+   the file the index names but the directory lacks, and the file it does not name; the boot reaches
+   the terminal's READY line.
+6. `index`: the indexes of `/config/svcmgr/services/` and `/config/devmgr/classes/` each with a
+   body byte flipped. procmgr refuses both (`Failed(BodyHash)`), svcmgr reports that it read no
+   recipe and configured no class, and reports every service init registered as one without a
+   definition.
 
 A boot passes when every line it owes appears, and fails on any other refusal or fatal line, or at
 its deadline. The images are packed again from the sysroot afterwards, whatever the outcome. See
@@ -956,7 +973,7 @@ service (see Crash reports above).
 CI matrix cells follow these rules per boot. The `usertest` cell runs its boots in sequence:
 `usertest` (via `run --runs`, terminal dropped), then, after `cargo xtask mkdisk` restores the
 default boot (terminal present), `cargo xtask test --cell usertest` runs the cell's cases: the
-`terminal` case's boot, the `signing` case's four boots, the `rollback` case's three boots, the
+`terminal` case's boot, the `signing` case's six boots, the `rollback` case's three boots, the
 `wedge` case's boot pair, on x86_64 the `vmgenid` case's save/restore boot pair, and the `shutdown`
 case's boots, nine on x86_64 (the reboot, the power button and the seven core deaths) and eight on
 riscv64. The `ktest` cell's cases are the `kaslr` case's three boots; the `svctest` cell has none.

@@ -155,26 +155,27 @@ pub fn binary_for(ctx: &Context, target: &str) -> Option<PathBuf>
 /// finds it.
 fn installed_binary_for(ctx: &Context, target: &str) -> Option<PathBuf>
 {
-    let dir = ctx.sysroot.join("config/svcmgr/services");
-    if let Ok(entries) = std::fs::read_dir(&dir)
+    if let Some(binary) = recipe_binary_in(&ctx.sysroot.join("config/svcmgr/services"), target)
     {
-        for entry in entries.flatten()
-        {
-            let Ok(text) = std::fs::read_to_string(entry.path())
-            else
-            {
-                continue;
-            };
-            if let Some(binary) = recipe_binary_named(&text, target)
-            {
-                return Some(ctx.sysroot.join(binary.trim_start_matches('/')));
-            }
-        }
+        return Some(ctx.sysroot.join(binary.trim_start_matches('/')));
     }
     ["programs", "services"]
         .iter()
         .map(|d| ctx.sysroot.join(d).join(target))
         .find(|p| p.is_file())
+}
+
+/// The `binary` of the first recipe in `dir` whose `argv` begins with
+/// `target`. A recipe the last pack signed carries a trailer, so its text is
+/// its body (docs/signing.md § Configuration); a file that is not a recipe is
+/// passed over.
+fn recipe_binary_in(dir: &Path, target: &str) -> Option<String>
+{
+    std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let object = std::fs::read(entry.path()).ok()?;
+        let text = std::str::from_utf8(crate::signing::body_of(&object).ok()?).ok()?;
+        recipe_binary_named(text, target).map(str::to_owned)
+    })
 }
 
 /// The `binary` of `recipe` when its `argv` begins with `name`.
@@ -381,5 +382,33 @@ mod tests
             Some("/programs/debugger")
         );
         assert_eq!(recipe_binary_named(recipe, "debugger"), None);
+    }
+
+    // Defect caught: a recipe the pack signed, whose trailer is not UTF-8,
+    // passed over, so the GDB command names no symbols for a target whose
+    // binary is not its argv[0].
+    #[test]
+    fn a_signed_recipe_names_its_binary()
+    {
+        use crate::signing::testing::{scratch, signer};
+        let dir = scratch("debug-stub-recipe");
+        let signer = signer(&dir.join("keys"), crate::arch::Arch::Riscv64);
+        let services = dir.join("services");
+        std::fs::create_dir_all(&services).unwrap();
+        let body = b"binary = /programs/debugger\nargv = gdb-target\n";
+        let recipe = signer
+            .sign(
+                body,
+                objsig::RoleSet::of(&[objsig::Role::Configuration]),
+                "/config/svcmgr/services/gdb-target.svc",
+            )
+            .unwrap();
+        std::fs::write(services.join("gdb-target.svc"), &recipe).unwrap();
+        assert_eq!(
+            recipe_binary_in(&services, "gdb-target").as_deref(),
+            Some("/programs/debugger")
+        );
+        assert_eq!(recipe_binary_in(&services, "debugger"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

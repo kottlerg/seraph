@@ -139,7 +139,7 @@ endowed thread cap (`EXIT_KILLED` for a revoked one), then, while memmgr and pro
 `QUERY_PROCESS` on the endowed process handle, which reports a worker-thread fault procmgr has not
 yet torn down. A dead server ends the step. A dead devmgr is then recorded by reconciliation, and
 the resync after it routes its death, as above. A dead vfsd found at the handover, before or during
-the recipe scan, is system death with no recipe to supervise by: svcmgr records and launches
+the recipe read, is system death with no recipe to supervise by: svcmgr records and launches
 nothing, releases every substrate registration (each such service runs on unsupervised, logged), and
 takes the graceful shutdown path, which, with no shutdown actuator recorded, logs the degraded state
 (§ Decision tree). A server that dies after a check, while svcmgr's next call to it waits
@@ -441,7 +441,7 @@ svcmgr binds no death notification for it and records no `ServiceEntry`
 ([service-definitions.md](service-definitions.md#reconciliation)).
 
 `svctest`, `usertest`, and `crasher` are test-tier fixtures: their recipes
-live in `/config/svcmgr/tests/` (svcmgr does not scan it) and are staged
+live in `/config/svcmgr/tests/` (svcmgr does not read it) and are staged
 into `/config/svcmgr/services/` only for test boots — `crasher` is
 co-staged with `svctest` (per [testing.md](../../../docs/testing.md#gating)).
 Every other recipe in `/config/svcmgr/tests/` is `restart = never`,

@@ -1068,10 +1068,34 @@ impl Drop for VerifiedData {
     }
 }
 
-/// Have procmgr read the data file `file_cap` names, `len` bytes long (the
-/// size hint of the lookup that resolved it, [`namespace_lookup_file`]),
-/// verify it as signed in the data role under the install path `name`, and
-/// map the verified body read-only (`procmgr_labels::READ_VERIFIED`). The
+/// The role a file read through [`read_verified`] must be signed in
+/// (docs/signing.md § Signed Attributes).
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifiedRole {
+    /// A data file: a platform description table, a test fixture.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    Data,
+    /// A policy-bearing configuration file, or a configuration directory's
+    /// index.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    Configuration,
+}
+
+impl VerifiedRole {
+    /// The role word of a `READ_VERIFIED` request for this role.
+    const fn word(self) -> u64 {
+        match self {
+            Self::Data => ipc::procmgr_labels::READ_VERIFIED_DATA,
+            Self::Configuration => ipc::procmgr_labels::READ_VERIFIED_CONFIGURATION,
+        }
+    }
+}
+
+/// Have procmgr read the file `file_cap` names, `len` bytes long (the size
+/// hint of the lookup that resolved it, [`namespace_lookup_file`]), verify it
+/// as signed in `role` under the install path `name`, and map the verified
+/// body read-only (`procmgr_labels::READ_VERIFIED`). The
 /// file cap moves to procmgr, which deletes it, and is deleted here when the
 /// request is not delivered; the caller holds it no longer either way.
 ///
@@ -1087,11 +1111,18 @@ impl Drop for VerifiedData {
 /// `PermissionDenied` when procmgr does not
 /// know this process; `Other` for a failed read or IPC.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
-pub fn read_verified(file_cap: u64, len: u64, name: &str) -> crate::io::Result<VerifiedData> {
+pub fn read_verified(
+    file_cap: u64,
+    len: u64,
+    name: &str,
+    role: VerifiedRole,
+) -> crate::io::Result<VerifiedData> {
     use crate::io::{Error, ErrorKind};
     let ipc_buf = current_ipc_buf();
     let info = startup_info();
-    let builder = ipc::IpcMessage::builder(ipc::procmgr_labels::READ_VERIFIED).word(0, len);
+    let builder = ipc::IpcMessage::builder(ipc::procmgr_labels::READ_VERIFIED)
+        .word(0, len)
+        .word(ipc::procmgr_labels::READ_VERIFIED_ROLE_WORD, role.word());
     let builder = ipc::with_name_block(
         builder,
         ipc::procmgr_labels::READ_VERIFIED_NAME_WORD,

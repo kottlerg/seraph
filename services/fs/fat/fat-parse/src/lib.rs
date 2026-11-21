@@ -39,6 +39,7 @@ use core::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 
 pub mod node_slab;
 pub mod open_slab;
+pub mod session_pool;
 
 // ── BIOS Parameter Block ────────────────────────────────────────────────────
 

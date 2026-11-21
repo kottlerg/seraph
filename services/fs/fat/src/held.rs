@@ -99,6 +99,7 @@ fn label_name(opcode: u64) -> &'static str
         fs_labels::FS_RENAME => "FS_RENAME",
         fs_labels::FS_TRUNCATE => "FS_TRUNCATE",
         fs_labels::FS_OPEN => "FS_OPEN",
+        fs_labels::FS_SESSION => "FS_SESSION",
         fs_labels::FS_UNMOUNT => "FS_UNMOUNT",
         ns_labels::NS_LOOKUP => "NS_LOOKUP",
         ns_labels::NS_STAT => "NS_STAT",

@@ -12,7 +12,7 @@
 //!
 //! 1. [`startup`] first — argv/env/stack/TLS bring-up before anything
 //!    else touches them.
-//! 2. [`fs_opens`], [`fs_ipc`], [`fs_std`], and [`fs_faults`] near the end
+//! 2. [`fs_opens`], [`fs_ipc`], [`fs_std`], [`fs_sessions`], and [`fs_faults`] near the end
 //!    (but before [`pwrmgr`]). [`fs_opens`] comes before
 //!    [`fs_ipc`]: its eviction phase needs `/data`'s page cache cold (slots
 //!    not yet provisioned), and it writes the slot-reuse file that
@@ -76,6 +76,7 @@ pub mod exit_code;
 pub mod fs_faults;
 pub mod fs_ipc;
 pub mod fs_opens;
+pub mod fs_sessions;
 pub mod fs_std;
 pub mod heap_commit;
 pub mod image_sharing;
@@ -158,6 +159,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_opens::phases());
     out.extend_from_slice(fs_ipc::phases_pre_relative());
     out.extend_from_slice(fs_std::phases());
+    out.extend_from_slice(fs_sessions::phases());
     out.extend_from_slice(fs_faults::phases());
     out.extend_from_slice(verified_read::phases());
     out.extend_from_slice(namespace::late());

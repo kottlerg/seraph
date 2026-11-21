@@ -2920,8 +2920,10 @@ pub fn thread_set_upcall_mask(masked: bool) -> Result<bool, i64>
 /// bytes (architecture-defined). Returns the number of bytes written and the
 /// state the thread was read in: `THREAD_REGS_STOPPED`, `THREAD_REGS_FAULT`,
 /// or `THREAD_REGS_SYSCALL`, whose result registers the syscall's return has
-/// not yet written. A caller that looks for the thread held at a fault or a
-/// stop checks this state: a thread blocked in a syscall reads too.
+/// not yet written. A thread an address-space hold stopped inside a delivery
+/// or a syscall reads as that delivery or syscall. A caller that looks for the
+/// thread held at a fault or a stop checks this state: a thread blocked in a
+/// syscall reads too.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` (the thread cap
@@ -3010,7 +3012,8 @@ pub unsafe fn thread_read_regs_raw(
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidCapability` (the thread cap
 /// is invalid), `InsufficientRights` (it lacks Control), `InvalidState` (the
-/// thread is neither fault-blocked nor `Stopped` and descheduled),
+/// thread is neither fault-blocked nor `Stopped` and descheduled, or an
+/// address-space hold stopped it),
 /// `InvalidArgument` (`buf` is shorter than the frame, the thread has no
 /// register frame, or the instruction pointer, on x86-64 also the stack
 /// pointer, is not a user address), or `InvalidAddress` (`buf` is not wholly

@@ -2011,7 +2011,9 @@ bound fault handler inspect the faulting registers (see
 [`docs/fault-handling.md`](../../../docs/fault-handling.md)), or queued for the handler's receive
 (`BlockedOnSend` with the delivery marked), or blocked in a syscall in any other state
 (`THREAD_REGS_SYSCALL`): a call, a receive, a wait, or a sleep. The kernel decides the reported
-state under the same scheduling-lock hold as its copy of the frame, so the two agree. The frame of
+state under the same scheduling-lock hold as its copy of the frame, so the two agree. A thread an
+address-space hold stopped inside a delivery or a syscall is reported as that delivery or syscall,
+which it resumes at the release ([`SYS_ASPACE_HOLD`](#sys_aspace_hold-71)). The frame of
 a thread blocked in a syscall is the one its syscall entry saved: its instruction pointer is as that
 frame holds it, past the `syscall` instruction on x86-64 and at the `ecall` on riscv64, as for a
 fault-blocked thread at a syscall-point upcall
@@ -2067,7 +2069,8 @@ reply (`BlockedOnFault`) — the latter lets a bound fault handler advance the P
 or otherwise edit the faulting thread before replying (see
 [`docs/fault-handling.md`](../../../docs/fault-handling.md)). A thread blocked in a syscall in any
 other state, which `SYS_THREAD_READ_REGS` reads, is refused with `InvalidState`: the syscall's
-return still writes the frame. The kernel sanitizes
+return still writes the frame. So is a thread an address-space hold stopped, which resumes its
+delivery or syscall at the release ([`SYS_ASPACE_HOLD`](#sys_aspace_hold-71)). The kernel sanitizes
 the frame per architecture ([arch-interface.md](arch-interface.md) § `trap_frame` —
 `arch::current::trap_frame`): a non-user instruction pointer (on x86-64, also a non-user
 stack pointer) is rejected with `InvalidArgument`; x86-64 forces ring-3 selectors and
@@ -2090,8 +2093,8 @@ that switch to finish.
 
 **Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState`
 (thread neither stopped and descheduled nor fault-blocked, a thread blocked in a syscall
-included), `InvalidArgument` (buffer too small, null pointer, no register frame, or illegal
-register values), `InvalidAddress` (buffer outside
+included, or stopped by an address-space hold), `InvalidArgument` (buffer too small, null
+pointer, no register frame, or illegal register values), `InvalidAddress` (buffer outside
 the user half, or a fault on it that is unhandled; restartable, § Restartable Syscalls).
 
 ---
@@ -3373,6 +3376,15 @@ marked thread running on another CPU leaves it at its next slice expiry or its o
 so the call takes up to the stop latency of § `SYS_THREAD_STOP` (20), its latency contract, for
 the slowest thread of the space. The caller spins meanwhile, preemption disabled and interrupts
 enabled.
+
+`SYS_THREAD_READ_REGS` reports each thread of a held space as the state it resumes in at the
+release. A marked `Blocked` thread is reported as any `Blocked` thread is. A thread the hold
+stopped inside a fault or an upcall delivery is reported `THREAD_REGS_FAULT`. One it stopped
+inside a syscall (its park's wake came during the hold, or it was runnable in the kernel) is
+reported `THREAD_REGS_SYSCALL`, its result registers unspecified until the syscall returns after
+the release. One it stopped in user mode is reported `THREAD_REGS_STOPPED`.
+`SYS_THREAD_WRITE_REGS` refuses a thread the hold stopped with `InvalidState`, since the
+delivery or syscall it resumes at the release still writes its frame.
 
 No kernel path writes a held space's user memory on behalf of its threads. A wake's deposit stays
 in the thread's kernel state (an IPC reply in its message staging, a fault reply as its fault

@@ -3811,7 +3811,8 @@ pub enum FrameAccess
     Read,
     /// A write: a `Stopped` thread, or a fault-blocked one. A thread blocked
     /// in a syscall is refused, since the syscall's return still writes its
-    /// frame.
+    /// frame, and so is a thread an address-space hold stopped, which resumes
+    /// its park or syscall at the release.
     Write,
 }
 
@@ -3823,10 +3824,88 @@ pub enum FrameHold
     Stopped,
     /// `Blocked` in a fault or an upcall delivery: awaiting its handler's
     /// reply (`BlockedOnFault`), or queued for its handler's receive
-    /// (`BlockedOnSend` with `in_fault_delivery` set).
+    /// (`BlockedOnSend` with `in_fault_delivery` set); or stopped by an
+    /// address-space hold inside such a delivery, which it finishes at the
+    /// release.
     Fault,
-    /// `Blocked` in a syscall, in any other IPC state.
+    /// `Blocked` in a syscall, in any other IPC state; or stopped by an
+    /// address-space hold inside a syscall, which it returns from at the
+    /// release.
     Syscall,
+}
+
+/// What [`with_held_frame`] decides of a thread from the fields its
+/// `sched_lock` serialises.
+#[cfg(not(test))]
+struct FrameLook
+{
+    /// The state reported with the frame.
+    hold: FrameHold,
+    /// An address-space hold stopped the thread (`HoldMark::Stopped`).
+    hold_stopped: bool,
+    /// The thread is `Blocked`.
+    blocked: bool,
+    /// `mode` admits the thread's state.
+    admitted: bool,
+}
+
+/// Decide what a register access in `mode` may do with `tcb`.
+///
+/// # Safety
+/// `tcb` must be valid, and the caller must hold its `sched_lock`.
+#[cfg(not(test))]
+unsafe fn frame_look(tcb: *mut ThreadControlBlock, mode: FrameAccess) -> FrameLook
+{
+    // SAFETY: tcb valid (contract); state is written under the held sched_lock.
+    let state = unsafe { (*tcb).state };
+    // SAFETY: tcb valid; ipc_state is written under the held sched_lock.
+    let ipc_state = unsafe { (*tcb).ipc_state };
+    // SAFETY: tcb valid; in_fault_delivery is written by the thread under
+    // its sched_lock, held here.
+    let in_delivery = unsafe { (*tcb).in_fault_delivery };
+    // SAFETY: tcb valid; the hold mark is written under the held sched_lock.
+    let hold_stopped = unsafe { (*tcb).hold } == hold::HoldMark::Stopped;
+    let blocked = state == thread::ThreadState::Blocked;
+    let fault_parked = ipc_state == thread::IpcThreadState::BlockedOnFault;
+    // A delivery no handler was receiving for waits on the send queue
+    // until a receive rebinds it to BlockedOnFault; its frame is the
+    // delivery's, as a fault-parked one's. A thread an address-space hold
+    // stopped is reported as the park or the run the hold ended, since it
+    // resumes there at the release: a fault delivery it has not finished
+    // is a fault, a syscall it has not returned from (refined below, once
+    // its save is seen) a syscall.
+    let hold = if blocked
+    {
+        if fault_parked || (ipc_state == thread::IpcThreadState::BlockedOnSend && in_delivery)
+        {
+            FrameHold::Fault
+        }
+        else
+        {
+            FrameHold::Syscall
+        }
+    }
+    else if hold_stopped && in_delivery
+    {
+        FrameHold::Fault
+    }
+    else
+    {
+        FrameHold::Stopped
+    };
+    // A write keeps the fault-parked set: a delivery its handler holds. A
+    // thread a hold stopped runs to its debugger, and the park or syscall
+    // it resumes at the release still writes its frame, so only a read
+    // admits it.
+    let admitted = (state == thread::ThreadState::Stopped
+        && (mode == FrameAccess::Read || !hold_stopped))
+        || (blocked && (mode == FrameAccess::Read || fault_parked));
+    FrameLook {
+        hold,
+        hold_stopped,
+        blocked,
+        admitted,
+    }
 }
 
 /// Run `access` on `tcb`'s register frame (`trap_frame`, possibly null) while
@@ -3835,8 +3914,9 @@ pub enum FrameHold
 /// thread's state, or the thread is `Stopped` but not yet settled.
 ///
 /// Held still means `current` on no CPU with the last register save
-/// published (`context_saved`), and in a state `mode` admits: `Stopped`,
-/// or `Blocked` (fault-blocked only, for a write). A thread stopped while it
+/// published (`context_saved`), and in a state `mode` admits: `Stopped`
+/// (not by an address-space hold, for a write), or `Blocked` (fault-blocked
+/// only, for a write). A thread stopped while it
 /// runs on another CPU is `Stopped` from the stop's commit but executes, and
 /// may enter or leave the kernel through its frame, until that CPU
 /// deschedules it; such a thread is refused. A `Blocked` thread is waited for
@@ -3881,34 +3961,13 @@ pub unsafe fn with_held_frame<R>(
         // SAFETY: the caller holds no sched_lock and no scheduler lock;
         // lock_raw paired with the unlock below.
         let saved = unsafe { tcb_lock.lock_raw() };
-        // SAFETY: tcb valid; state is written under the held sched_lock.
-        let state = unsafe { (*tcb).state };
-        // SAFETY: tcb valid; ipc_state is written under the held sched_lock.
-        let ipc_state = unsafe { (*tcb).ipc_state };
-        // SAFETY: tcb valid; in_fault_delivery is written by the thread under
-        // its sched_lock, held here.
-        let in_delivery = unsafe { (*tcb).in_fault_delivery };
-        let blocked = state == thread::ThreadState::Blocked;
-        let fault_parked = ipc_state == thread::IpcThreadState::BlockedOnFault;
-        // A delivery no handler was receiving for waits on the send queue
-        // until a receive rebinds it to BlockedOnFault; its frame is the
-        // delivery's, as a fault-parked one's.
-        let hold = if !blocked
-        {
-            FrameHold::Stopped
-        }
-        else if fault_parked
-            || (ipc_state == thread::IpcThreadState::BlockedOnSend && in_delivery)
-        {
-            FrameHold::Fault
-        }
-        else
-        {
-            FrameHold::Syscall
-        };
-        // A write keeps the fault-parked set: a delivery its handler holds.
-        let admitted = state == thread::ThreadState::Stopped
-            || (blocked && (mode == FrameAccess::Read || fault_parked));
+        // SAFETY: tcb valid; its sched_lock is held.
+        let FrameLook {
+            hold,
+            hold_stopped,
+            blocked,
+            admitted,
+        } = unsafe { frame_look(tcb, mode) };
         let look = if admitted
         {
             // No admitted state can become `current` while this sched_lock
@@ -3931,7 +3990,13 @@ pub unsafe fn with_held_frame<R>(
             let saved_regs = unsafe { (*tcb).context_saved.load(Ordering::Acquire) } != 0;
             if off_cpu && saved_regs
             {
-                Look::Held(hold)
+                // The thread stored its syscall number before the save the
+                // Acquire above observed.
+                let in_syscall = hold_stopped
+                    && hold == FrameHold::Stopped
+                    // SAFETY: tcb valid; syscall_nr is an atomic.
+                    && unsafe { (*tcb).syscall_nr.load(Ordering::Relaxed) } != u64::MAX;
+                Look::Held(if in_syscall { FrameHold::Syscall } else { hold })
             }
             else if blocked
             {

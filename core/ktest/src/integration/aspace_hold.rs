@@ -26,9 +26,13 @@
 //!   hold does not run until the release.
 //! - Reply during the hold (D): a call parked on its reply, answered while the
 //!   hold stands, delivers the reply and the result only after the release.
+//!   Its registers read `THREAD_REGS_SYSCALL` while it is parked under the
+//!   hold and after the reply stopped it, and a register write is refused
+//!   once the hold has stopped it.
 //! - Fault resumed during the hold (E): a fault-blocked thread, resumed while
 //!   the hold stands, does not run until the release; the handler maps the
-//!   code page into the held space.
+//!   code page into the held space. Its registers read `THREAD_REGS_FAULT`
+//!   before and after the resume, and a register write is refused after it.
 //! - Deadline during the hold (F): a call whose timeout expires during the
 //!   hold reports it only after the release.
 //! - Own space (H): a thread's hold of its own space, through a capability
@@ -40,13 +44,15 @@ use ipc::IpcMessage;
 use syscall::{
     aspace_hold, aspace_release, cap_copy, cap_create_aspace, cap_create_cspace,
     cap_create_endpoint, cap_create_thread, cap_delete, mem_map, mem_unmap, thread_configure,
-    thread_sleep, thread_start, thread_stop,
+    thread_read_regs, thread_sleep, thread_start, thread_stop, thread_write_regs,
 };
 use syscall_abi::{
     EXIT_KILLED, FAULT_KIND_VM, FAULT_LABEL, FAULT_REPLY_RESUME, MAP_WRITABLE, RIGHTS_ALL,
-    SYS_ASPACE_HOLD, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SyscallError, ipc_call_count_arg,
+    SYS_ASPACE_HOLD, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SyscallError, THREAD_REGS_FAULT,
+    THREAD_REGS_SYSCALL, ipc_call_count_arg,
 };
 
+use crate::arch::TRAP_FRAME_BYTES;
 use crate::{TestContext, TestResult};
 
 /// VA of the stub page in each space. Canonical in every paging mode (below
@@ -92,6 +98,9 @@ const SETTLE_MS: u64 = 10;
 const MAX_POLLS: u32 = 2000;
 
 const INVALID_ARGUMENT: Result<(), i64> = Err(SyscallError::InvalidArgument as i64);
+/// Register-file buffer size; holds the arch `TrapFrame`.
+const REGS_BUF: usize = 512;
+const _: () = assert!(REGS_BUF as u64 >= TRAP_FRAME_BYTES);
 
 /// One call of a program: the syscall number and its first four arguments.
 type Call = [u64; 5];
@@ -532,8 +541,22 @@ fn reply_during_hold(ctx: &TestContext) -> TestResult
     sp.start(0)?;
     receive_request(ctx, sp.ep)?;
     sp.hold()?;
+    expect_regs(
+        &sp,
+        THREAD_REGS_SYSCALL,
+        "aspace_hold: the held, parked caller does not read as in a syscall",
+    )?;
     send_reply(ctx, REPLY_WORD)?;
     thread_sleep(SETTLE_MS).ok();
+    expect_regs(
+        &sp,
+        THREAD_REGS_SYSCALL,
+        "aspace_hold: the caller the hold stopped at its reply does not read as in a syscall",
+    )?;
+    expect_write_refused(
+        &sp,
+        "aspace_hold: a register write to the caller the hold stopped was not refused",
+    )?;
     if ibuf_word(0) != REQUEST_WORD
     {
         return Err("aspace_hold: the reply reached the held caller's buffer");
@@ -594,6 +617,11 @@ fn fault_resumed_during_hold(ctx: &TestContext) -> TestResult
     sp.start(0)?;
     receive_fault(ctx, sp.ep)?;
     sp.hold()?;
+    expect_regs(
+        &sp,
+        THREAD_REGS_FAULT,
+        "aspace_hold: the held, fault-blocked thread does not read as in a fault",
+    )?;
     sp.stubs[1] = crate::spawn::install_stub(
         ctx,
         sp.aspace,
@@ -609,6 +637,15 @@ fn fault_resumed_during_hold(ctx: &TestContext) -> TestResult
     }
     .map_err(|_| "aspace_hold: ipc_reply(RESUME) failed")?;
     thread_sleep(SETTLE_MS).ok();
+    expect_regs(
+        &sp,
+        THREAD_REGS_FAULT,
+        "aspace_hold: the thread the hold stopped at its fault reply does not read as in a fault",
+    )?;
+    expect_write_refused(
+        &sp,
+        "aspace_hold: a register write to the thread the hold stopped was not refused",
+    )?;
     if crate::spawn::is_exited(sp.thread(0))?
     {
         return Err("aspace_hold: the resumed thread exited");
@@ -624,6 +661,40 @@ fn fault_resumed_during_hold(ctx: &TestContext) -> TestResult
         0,
         "aspace_hold: the resumed thread did not run after the release",
     )
+}
+
+/// Read thread 0's registers and check that they report the hold `want`.
+fn expect_regs(sp: &Space, want: u64, why: &'static str) -> TestResult
+{
+    let mut regs = [0u8; REGS_BUF];
+    match thread_read_regs(sp.thread(0), &mut regs)
+    {
+        Ok((bytes, held)) if bytes == TRAP_FRAME_BYTES && held == want => Ok(()),
+        _ => Err(why),
+    }
+}
+
+/// Write thread 0's registers back as read, and check that the write is
+/// refused with `InvalidState`.
+fn expect_write_refused(sp: &Space, why: &'static str) -> TestResult
+{
+    let mut regs = [0u8; REGS_BUF];
+    let (bytes, _) = thread_read_regs(sp.thread(0), &mut regs).map_err(|_| why)?;
+    let frame = usize::try_from(bytes)
+        .ok()
+        .and_then(|n| regs.get(..n))
+        .ok_or(why)?;
+    // SAFETY: the thread is bound to the child space, not ktest's, so a write
+    // touches none of ktest's memory, and the frame is the one just read.
+    let wrote = unsafe { thread_write_regs(sp.thread(0), frame) };
+    if wrote == Err(SyscallError::InvalidState as i64)
+    {
+        Ok(())
+    }
+    else
+    {
+        Err(why)
+    }
 }
 
 /// Receive the child's instruction-fetch fault and check its shape.

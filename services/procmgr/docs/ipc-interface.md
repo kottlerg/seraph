@@ -24,25 +24,27 @@ Label numbers, error codes, and query states are defined in
 [`procmgr_errors`](../../../shared/ipc/src/procmgr_errors.rs), and
 [`procmgr_process_state`](../../../shared/ipc/src/procmgr_process_state.rs). `START_PROCESS`,
 `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`, `BIND_DEATH_OBSERVER`,
-`LIST_CHILDREN` and `DESTROY_CHILD` are sent on a **process handle** (the badged endpoint a create
-call returns), and `RELEASE_HOLD` on a **release token** (the third cap a `CREATE_DMA_HOLD` create
-returns); procmgr identifies the target process by the badge `ipc_recv` delivers. A process handle
-is badged with the child's process badge and `procmgr_labels::PROCESS_HANDLE_TAG` (bit 59, a bit of
-`ipc::VERB_BIT_MASK`, which no process badge carries), which tells it from the child's own procmgr
-cap (`ProcessInfo.procmgr_endpoint_cap`), badged with the process badge alone. procmgr clears the
-tag before it serves a request, so a handle names its child to every label, and refuses
-`DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`, `REGISTER_THREAD`, `REGISTER_END_QUEUE` and `READ_VERIFIED`,
-which name their sender, on a badge carrying it with `INVALID_BADGE`, deleting the caps the request
-carried: only the process itself sends them (§ Label 21, § Label 22, § Label 26, § Label 29, § Label
-31). `BIND_DEATH_OBSERVER`, `LIST_CHILDREN` and `DESTROY_CHILD` are served on a process handle only,
-and refused on any other cap with `UNAUTHORIZED` (§ Label 25, § Process Tree).
-Labels 14–18 are specified in § `REGISTER_DEATH_EQ`, § `REGISTER_INIT_TEARDOWN`, §
+`LIST_CHILDREN`, `DESTROY_CHILD` and `CHECKPOINT` are sent on a **process handle** (the badged
+endpoint a create call returns), and `RELEASE_HOLD` on a **release token** (the third cap a
+`CREATE_DMA_HOLD` create returns); procmgr identifies the target process by the badge `ipc_recv`
+delivers. A process handle is badged with the child's process badge and
+`procmgr_labels::PROCESS_HANDLE_TAG` (bit 59, a bit of `ipc::VERB_BIT_MASK`, which no process badge
+carries), which tells it from the child's own procmgr cap (`ProcessInfo.procmgr_endpoint_cap`),
+badged with the process badge alone. procmgr clears the tag before it serves a request, so a handle
+names its child to every label, and refuses `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`,
+`REGISTER_THREAD`, `REGISTER_END_QUEUE`, `READ_VERIFIED` and `QUIESCE`, which name their sender, on
+a badge carrying it with `INVALID_BADGE`, deleting the caps the request carried: only the process
+itself sends them (§ Label 21, § Label 22, § Label 26, § Label 29, § Label 31, § Label 34).
+`BIND_DEATH_OBSERVER`, `LIST_CHILDREN`, `DESTROY_CHILD` and `CHECKPOINT` are served on a process
+handle only, and refused on any other cap with `UNAUTHORIZED` (§ Label 25, § Process Tree, § Label
+35). Labels 14–18 are specified in § `REGISTER_DEATH_EQ`, § `REGISTER_INIT_TEARDOWN`, §
 `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and § `QUERY_LIVE_PROCESSES` below, labels 19–24 and 26
-in § Crash Endpoint and Debug Authority, label 25 in § Label 25: `BIND_DEATH_OBSERVER`, labels
-27–29 in § Process Tree, label 30 in § Label 30: `MAKE_RESIDENT`, label 31 in § Label 31:
-`READ_VERIFIED`, label 32 in § Label 32: `MAKE_PRIVATE`, and label 33 in § Label 33: `SNAPSHOT`.
-Labels 4–7 and 10 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
-other unknown opcode, and deletes the caps such a request carried (see § Capability Transfer).
+in § Crash Endpoint and Debug Authority, label 25 in § Label 25: `BIND_DEATH_OBSERVER`, labels 27–29
+in § Process Tree, label 30 in § Label 30: `MAKE_RESIDENT`, label 31 in § Label 31: `READ_VERIFIED`,
+label 32 in § Label 32: `MAKE_PRIVATE`, label 33 in § Label 33: `SNAPSHOT`, label 34 in § Label 34:
+`QUIESCE`, and label 35 in § Label 35: `CHECKPOINT`. Labels 4–7 and 10 are unassigned; procmgr
+replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any other unknown opcode, and deletes the caps
+such a request carried (see § Capability Transfer).
 
 Memory-cap allocation is owned by memmgr, not procmgr, per
 [docs/process-lifecycle.md](../../../docs/process-lifecycle.md)
@@ -323,10 +325,10 @@ which the kernel forwards to the faulting thread's exception handler
 § Kernel-origin fault message).
 
 procmgr's own state for a child is charged to procmgr's node, not to the child's: its process-table
-entry (336 bytes), 6 to 12 capability slots in procmgr's `CSpace` (72 bytes each) and two
-death-observer nodes (24 bytes each), about 0.8 to 1.6 KiB with the growth of their containers, and
+entry (440 bytes), 6 to 13 capability slots in procmgr's `CSpace` (72 bytes each) and two
+death-observer nodes (24 bytes each), about 0.9 to 1.8 KiB with the growth of their containers, and
 96 bytes for each thread it registers (Label 22). Every page of the child itself, at least 55, is
-charged to the child's node, so that state is at most 0.75% of what the child's node already pays,
+charged to the child's node, so that state is at most 0.85% of what the child's node already pays,
 and it goes with the child
 ([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md) § Distribution policy,
 Server-side charges).
@@ -1661,21 +1663,86 @@ grants, or when procmgr's heap or address space refused the capture's own memory
 `procmgr_snapshot` phase snapshots a child whose writer thread never registered, and checks the
 refusals without the authority, without an account, and for an exited child.
 
+### Label 34: `QUIESCE`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::QUIESCE` (34) |
+| caller's cap | The process's own procmgr cap; on a process handle the request is refused (§ Messages) |
+| `data[0]` | To enter the point, the **restore stack pointer**, nonzero; to end it, 0 |
+| `caps[0]` | To enter the point, a Notification cap with `RIGHTS_NTF_NOTIFY`, which procmgr keeps for the point; to end it, none. procmgr deletes any further cap |
+
+A process enters its quiesce point here, and leaves it
+([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#quiesce-point) § Quiesce point);
+its runtime sends both (`std::os::seraph::checkpoint::quiesce`,
+[runtime/ruststd/README.md](../../../runtime/ruststd/README.md#checkpoint) § Checkpoint). With a
+stack pointer and a Notification, procmgr records the point in the sender's entry under the table
+lock, holding the Notification in its own `CSpace`, and numbers it among every point it has
+recorded, so a checkpoint that found the point tells it from a later one (§ Label 35). With neither,
+it ends the sender's point, when it is at one, and deletes the point's Notification. A process's
+teardown ends its point too.
+
+Replies `SUCCESS`. Refusals, in order: `INVALID_ARGUMENT` when the request carries only one of the
+stack pointer and the Notification, or `caps[0]` is not a Notification cap with
+`RIGHTS_NTF_NOTIFY`; `INVALID_BADGE` when the sender's process is gone; `NOT_RESTORABLE` (23) for a
+process no restore can reproduce: one procmgr did not create demand-paged (`CREATE_PINNED`, or a
+pager binding that did not take), or created phys-class (`CREATE_PHYS_ACCESS`) or with a DMA hold
+(`CREATE_DMA_HOLD`); and `INVALID_ARGUMENT` when the sender is at a point already. procmgr deletes
+the Notification of a refused request.
+
+### Label 35: `CHECKPOINT`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::CHECKPOINT` (35) |
+| caller's cap | A process handle (§ Messages), which names the process |
+| `caps[0]` | The **account**, a memmgr SEND as `SNAPSHOT` takes one (§ Label 33). procmgr deletes it, and any further cap the message carried, before it replies |
+
+The process's controller, a holder of its process handle, takes a checkpoint of it at its quiesce
+point here ([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#checkpoint)
+§ Checkpoint); the runtime's call is `std::os::seraph::checkpoint::take`. procmgr finds the
+process's point under the table lock, derives the caps of the capture and reads the process's image
+there as `SNAPSHOT` does, and captures it as `SNAPSHOT` does (§ Label 33, steps 1 to 3), with two
+differences. Under the hold, at once after it takes, procmgr checks under the table lock that the
+point it found is still recorded, derives a Notify-only copy of the point's Notification, and reads
+the process's `ProcessInfo` page through its main thread (`SYS_THREAD_READ_MEM`) for the bootstrap
+words of the checkpoint section. The layout carries that section and the header's
+`SNAPSHOT_CHECKPOINT` flag (§ Snapshot object layout). A process that ended its point before the
+hold may have written its memory since, and the checkpoint is refused; one that ends it after the
+hold began was held in its `QUIESCE` call and wrote nothing. The process's consent replaces the
+debug authority, so a process that declared itself undebuggable (Label 21) can be checkpointed.
+
+Replies as `SNAPSHOT` does. Once a complete capture's reply is delivered, procmgr signals its copy
+of the Notification (bit 1), which tells the process that its controller holds a checkpoint of the
+point; any other outcome signals nothing and leaves the process at its point, for the controller to
+take again. The copy is deleted on every path. procmgr does not yet mark the object a checkpoint
+with memmgr
+([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#implementation-status)
+§ Implementation Status). Refusals, in order: `UNAUTHORIZED` on a cap that is not a process handle;
+`INVALID_ARGUMENT` without `caps[0]`; `INVALID_BADGE` when no live process carries the badge, or
+the process ended during the capture; `NOT_QUIESCED` (22) when the process is at no quiesce point,
+or left the one procmgr found before the hold; and `SPACE_HELD`, `LIMIT` and `OUT_OF_MEMORY` as for
+`SNAPSHOT`. svctest's `procmgr_checkpoint` phase checkpoints a quiesced child and reads the
+section back, and checks the refusals of a child at no point, after its point ended and after a
+point that timed out, without an account, on a cap that is no process handle, and of a pinned
+child's `QUIESCE`.
+
 ### Snapshot object layout
 
 The object's first `layout_pages` pages are the layout, its next `data_pages` pages the captured
 bytes; any page past both is padding. The layout is a header at byte 0, then `region_count` region
 entries from byte 152, then `run_count` run entries, each entry 32 bytes, both lists in ascending
-address order, then `thread_count` thread records, `thread_bytes` long together. Every field is a
-little-endian `u64`, the image's hash and a thread record's state bytes aside.
+address order, then `thread_count` thread records, `thread_bytes` long together, then, in a
+checkpoint's layout (`SNAPSHOT_CHECKPOINT`), the checkpoint section. Every field is a little-endian
+`u64`, the image's hash and a thread record's state bytes aside.
 [`shared/ipc/src/procmgr_snapshot.rs`](../../../shared/ipc/src/procmgr_snapshot.rs) defines the
 constants and the encoder and decoder procmgr and a reader share.
 
 | Header word | Content |
 |---|---|
 | 0 | `MAGIC`, the bytes `SRPHSNAP` |
-| 1 | `LAYOUT_VERSION`, `3`; a reader refuses any other |
-| 2 | flags: bit 0 `SNAPSHOT_COMPLETE`, as in the reply's `data[1]`; bit 1 `SNAPSHOT_IMAGE`, the header names the target's image |
+| 1 | `LAYOUT_VERSION`, `4`; a reader refuses any other |
+| 2 | flags: bit 0 `SNAPSHOT_COMPLETE`, as in the reply's `data[1]`; bit 1 `SNAPSHOT_IMAGE`, the header names the target's image; bit 2 `SNAPSHOT_CHECKPOINT`, the layout is a checkpoint's (§ Label 35) and ends with the checkpoint section |
 | 3 | `layout_pages`: pages of the layout, at least 1 |
 | 4 | `data_pages`: data pages the runs use, from object page `layout_pages` |
 | 5 | `region_count`: region entries after the header |
@@ -1753,6 +1820,23 @@ the extended state, each padded with zeros to a multiple of 8 bytes:
 | 1 | the state word `SYS_THREAD_READ_REGS` returned (`THREAD_REGS_*`) |
 | 2 | the register file's bytes, as `SYS_THREAD_READ_REGS` writes them for the architecture |
 | 3 | the extended state's bytes, as `SYS_THREAD_READ_EXT_REGS` writes them; 0 when it could not be read |
+
+The checkpoint section, `CHECKPOINT_BYTES` (168) long, holds what a restore of the process needs
+beside its pages and regions
+([docs/checkpoint-restore.md](../../../docs/checkpoint-restore.md#checkpoint) § Checkpoint):
+
+| Checkpoint word | Content |
+|---|---|
+| 0 | the restore stack pointer the process gave at its point (§ Label 34) |
+| 1 | the address of the process's `ProcessInfo` page |
+| 2 | the main thread's IPC buffer, as `ProcessInfo` names it |
+| 3 | the top of the main thread's stack, where it started |
+| 4 | the main thread's TLS base; 0 without a TLS block |
+| 5 to 7 | the argv blob's offset from the `ProcessInfo` page, its bytes and its entries, as `ProcessInfo` names them |
+| 8 to 10 | the env blob's offset, bytes and entries, likewise |
+| 11 | declarations: bit 0 `CHECKPOINT_NO_DEBUG` (Label 21), bit 1 `CHECKPOINT_NO_CORE` (Label 26), bit 2 `CHECKPOINT_PRIVATE_IMAGE`, procmgr sharing no image object with the process; a reader refuses any other bit |
+| 12 | the length of the process's verified image body, whether or not procmgr shares an image object with it |
+| 13 to 20 | the body's SHA-512, its 64 bytes in order |
 
 ---
 

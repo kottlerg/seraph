@@ -180,8 +180,9 @@ pub struct Layout
 /// The layout of a capture whose listed pages outside every region are
 /// `outside` ([`outside`]), copied from data page `first_copy` on, whose
 /// copy failed for the pages at the addresses `failed` (ascending), of
-/// whose regions memmgr described `described`, and whose thread records
-/// take `thread_bytes` after the runs, in the layout's pages.
+/// whose regions memmgr described `described`, and whose thread records, and
+/// checkpoint section when it has one, take `tail_bytes` after the runs, in
+/// the layout's pages.
 ///
 /// Outside the regions, each page of `outside` that is not
 /// `PAGE_RUN_NO_COPY` and whose copy held takes the next data page, in
@@ -207,7 +208,7 @@ pub fn layout(
     first_copy: u64,
     failed: &[u64],
     described: &Described,
-    thread_bytes: u64,
+    tail_bytes: u64,
 ) -> Result<Layout, TryReserveError>
 {
     let mut runs = Runs::default();
@@ -250,7 +251,7 @@ pub fn layout(
         let end = runs.push_region(index as u64, region, described)?;
         data_end = data_end.max(end);
     }
-    runs.finish(regions, data_end, thread_bytes)
+    runs.finish(regions, data_end, tail_bytes)
 }
 
 /// The layout entry of `region`.
@@ -465,12 +466,12 @@ impl Runs
 
     /// Sort the runs by address, join each to the one before it where it
     /// continues it in its region, and place their bytes after the layout's
-    /// pages, which hold `thread_bytes` of thread records after the runs.
+    /// pages, which hold `tail_bytes` after the runs.
     fn finish(
         mut self,
         regions: Vec<RegionEntry>,
         data_pages: u64,
-        thread_bytes: u64,
+        tail_bytes: u64,
     ) -> Result<Layout, TryReserveError>
     {
         self.runs.sort_by_key(|t| t.run.va);
@@ -491,7 +492,7 @@ impl Runs
         runs.try_reserve(joined.len())?;
         // The heap holds the entries, so their layout's bytes fit a `u64`.
         let entries = (regions.len() as u64).saturating_add(joined.len() as u64);
-        let layout_pages = layout_pages(entries, thread_bytes).unwrap_or(u64::MAX);
+        let layout_pages = layout_pages(entries, tail_bytes).unwrap_or(u64::MAX);
         for t in joined
         {
             let mut run = t.run;

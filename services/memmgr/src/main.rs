@@ -1639,13 +1639,13 @@ fn handle_register_process(
         return;
     };
 
-    // The record, its caps, its budget node and, with `REGISTER_NODE_HANDLE`,
-    // the node's handle state are arena nodes and the index grows with them,
-    // so the table refuses for want of room only when the arena cannot grow:
-    // system RAM is exhausted.
+    // The record, its caps, its budget node, the node's reclaim state and,
+    // with `REGISTER_NODE_HANDLE`, the node's handle state are arena nodes and
+    // the index grows with them, so the table refuses for want of room only
+    // when the arena cannot grow: system RAM is exhausted.
     let want_handle = flags & memmgr_labels::REGISTER_NODE_HANDLE != 0;
     ensure_index(l);
-    if !ensure_slots(l, if want_handle { 4 } else { 3 })
+    if !ensure_slots(l, if want_handle { 5 } else { 4 })
     {
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
@@ -3893,6 +3893,42 @@ fn handle_node_set_max(req: &IpcMessage, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+// The weight range the wire states is the one the ledger keeps.
+const _: () = assert!(
+    memmgr_labels::NODE_WEIGHT_MIN == free_pool::budget::WEIGHT_MIN
+        && memmgr_labels::NODE_WEIGHT_DEFAULT == free_pool::budget::WEIGHT_DEFAULT
+        && memmgr_labels::NODE_WEIGHT_MAX == free_pool::budget::WEIGHT_MAX
+);
+
+/// `NODE_SET_RECLAIM`: set the floor of the handle's node to `data[0]` pages
+/// and its weight to `data[1]`, and reply both
+/// (services/memmgr/docs/ipc-interface.md § Label 32). A weight outside
+/// `NODE_WEIGHT_MIN..=NODE_WEIGHT_MAX` is refused. The floor reserves no free
+/// page: it keeps eviction off the subtree's pages, and admission is
+/// unchanged.
+fn handle_node_set_reclaim(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let l = ledger_mut();
+    let weight = u32::try_from(req.word(1))
+        .ok()
+        .filter(|w| (memmgr_labels::NODE_WEIGHT_MIN..=memmgr_labels::NODE_WEIGHT_MAX).contains(w));
+    let set = weight
+        .zip(handle_of(l, req.badge))
+        .and_then(|(weight, (_, s))| l.set_node_reclaim(s.node, req.word(0), weight));
+    let Some(weight) = set
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, req.word(0))
+        .word(1, u64::from(weight))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
 /// `NODE_CREATE` on a node handle and `CREATE_SUB_NODE` on a process badge:
 /// make a sub-node, with the max `data[0]` clamped to the parent chain's
 /// headroom, under the handle's node or the caller's own, and reply its max
@@ -3933,7 +3969,7 @@ fn handle_create_sub_node(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
         return;
     };
     ensure_index(l);
-    if !ensure_slots(l, 2)
+    if !ensure_slots(l, 3)
     {
         reply_label(ipc_buf, memmgr_errors::QUOTA);
         return;
@@ -3977,12 +4013,18 @@ fn handle_create_sub_node(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
 }
 
 /// `NODE_QUERY_USAGE`: reply the own pages, max and subtree pages of the
-/// handle's node (services/memmgr/docs/ipc-interface.md § Label 16).
+/// handle's node, its floor and weight, and its subtree's evictable resident
+/// pages (services/memmgr/docs/ipc-interface.md § Label 16).
 fn handle_node_query_usage(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let l = ledger_mut();
-    let Some(node) =
-        handle_of(l, req.badge).and_then(|(_, s)| free_pool::budget::node(&l.arena, s.node))
+    let found = handle_of(l, req.badge).and_then(|(_, s)| {
+        Some((
+            free_pool::budget::node(&l.arena, s.node)?,
+            l.node_reclaim(s.node)?,
+        ))
+    });
+    let Some((node, (floor, weight, resident))) = found
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -3992,6 +4034,9 @@ fn handle_node_query_usage(req: &IpcMessage, ipc_buf: *mut u64)
         .word(0, node.own)
         .word(1, node.max)
         .word(2, node.subtree)
+        .word(3, floor)
+        .word(4, u64::from(weight))
+        .word(5, resident)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -4754,7 +4799,7 @@ fn insert_boot_records(procmgr_badge: u64) -> bool
         .into_iter()
         .all(|badge| {
             ensure_index(l);
-            ensure_slots(l, 3) && l.insert_process(badge, NodeSpec::TOP_RESERVE).is_ok()
+            ensure_slots(l, 4) && l.insert_process(badge, NodeSpec::TOP_RESERVE).is_ok()
         })
 }
 
@@ -4819,7 +4864,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     // `OBJECT_RELEASE` and nothing else, and every other badge everything else
     // (services/memmgr/docs/ipc-interface.md § Node Handles, § Object Handles,
     // § Badge Discipline).
-    let node_label = (memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE).contains(&opcode);
+    let node_label = memmgr_labels::is_node_label(opcode);
     let swap_label = (memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED).contains(&opcode);
     let object_label = opcode == memmgr_labels::OBJECT_RELEASE;
     if node_label != (req.badge & memmgr_labels::NODE_HANDLE_TAG != 0)
@@ -4831,6 +4876,43 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         return;
     }
     route(opcode, req, kept, ipc_buf, boot);
+}
+
+/// Hand a budget-node request to its label's handler, with the caps its
+/// contract keeps ([`route`]).
+fn route_node(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, service_ep: u64)
+{
+    match opcode
+    {
+        memmgr_labels::NODE_SET_MAX =>
+        {
+            handle_node_set_max(req, ipc_buf);
+        }
+        memmgr_labels::NODE_CREATE | memmgr_labels::CREATE_SUB_NODE =>
+        {
+            handle_create_sub_node(req, ipc_buf, service_ep);
+        }
+        memmgr_labels::NODE_QUERY_USAGE =>
+        {
+            handle_node_query_usage(req, ipc_buf);
+        }
+        memmgr_labels::NODE_REGISTER_LIMIT =>
+        {
+            handle_node_register_limit(req, kept, ipc_buf, service_ep);
+        }
+        memmgr_labels::NODE_RELEASE =>
+        {
+            handle_node_release(req, ipc_buf);
+        }
+        memmgr_labels::NODE_SET_RECLAIM =>
+        {
+            handle_node_set_reclaim(req, ipc_buf);
+        }
+        _ =>
+        {
+            reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        }
+    }
 }
 
 /// Hand a request a client sent to its label's handler, with the caps its
@@ -4901,25 +4983,11 @@ fn route(opcode: u64, req: &IpcMessage, kept: &[u64], ipc_buf: *mut u64, boot: &
         {
             route_procmgr(opcode, req, kept, ipc_buf, boot);
         }
-        memmgr_labels::NODE_SET_MAX =>
+        memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE
+        | memmgr_labels::CREATE_SUB_NODE
+        | memmgr_labels::NODE_SET_RECLAIM =>
         {
-            handle_node_set_max(req, ipc_buf);
-        }
-        memmgr_labels::NODE_CREATE | memmgr_labels::CREATE_SUB_NODE =>
-        {
-            handle_create_sub_node(req, ipc_buf, boot.service_ep);
-        }
-        memmgr_labels::NODE_QUERY_USAGE =>
-        {
-            handle_node_query_usage(req, ipc_buf);
-        }
-        memmgr_labels::NODE_REGISTER_LIMIT =>
-        {
-            handle_node_register_limit(req, kept, ipc_buf, boot.service_ep);
-        }
-        memmgr_labels::NODE_RELEASE =>
-        {
-            handle_node_release(req, ipc_buf);
+            route_node(opcode, req, kept, ipc_buf, boot.service_ep);
         }
         memmgr_labels::SWAP_REGISTER..=memmgr_labels::SWAP_WANTED =>
         {

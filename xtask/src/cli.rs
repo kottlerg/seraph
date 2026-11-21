@@ -147,13 +147,9 @@ subcommands! {
         CompareImages(CompareImagesArgs),
 
         /// Validate the saved run records of a pull request's pre-merge review
-        /// (`target/xtask/review/pr<N>/`) against the record shape (see
-        /// xtask/README.md).
-        ReviewCheck(ReviewCheckArgs),
-
-        /// Build `ledger.json` from the saved run records of a pull request's
-        /// pre-merge review, or print a release review's ledger for the files
-        /// named: the findings a later run must not re-raise (see
+        /// (`target/xtask/review/pr<N>/`) against the record shape and build
+        /// `ledger.json` from them, or print a release review's ledger for the
+        /// files named: the findings a later run must not re-raise (see
         /// xtask/README.md).
         ReviewLedger(ReviewLedgerArgs),
 
@@ -217,7 +213,6 @@ impl CliCommand
             | Self::LintDocs(_)
             | Self::CommitCheck(_)
             | Self::PrCheck(_)
-            | Self::ReviewCheck(_)
             | Self::ReviewLedger(_)
             | Self::ReleaseScope(_)
             | Self::IssueEdit(_)
@@ -1191,22 +1186,19 @@ args! {
     }
 }
 
-// ── ReviewCheck / ReviewLedger ────────────────────────────────────────────────
-
-args! {
-    pub struct ReviewCheckArgs
-    {
-        /// The pull request's number.
-        pub pr: u64,
-    }
-}
+// ── ReviewLedger ──────────────────────────────────────────────────────────────
 
 args! {
     pub struct ReviewLedgerArgs
     {
-        /// The pull request's number: write `ledger.json` beside its records.
+        /// The pull request's number: validate its records and write
+        /// `ledger.json` beside them, or nothing when one is malformed.
         #[arg(conflicts_with = "release")]
         pub pr: Option<u64>,
+
+        /// Validate the pull request's records alone and write nothing.
+        #[arg(long, requires = "pr", conflicts_with = "release")]
+        pub check: bool,
 
         /// The target version `X.Y.Z` of a release review: print its ledger, the
         /// entries of the range's pull requests and of the release's own runs.

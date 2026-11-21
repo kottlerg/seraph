@@ -189,16 +189,18 @@ The full memmgr IPC specification is in
   — describe a held target's regions, and write what memmgr holds of each into the Memory caps the
   request carries, for procmgr's `SNAPSHOT` (procmgr-only)
 - Over a node handle only: `NODE_SET_MAX(max) → max`, `NODE_CREATE(max) → max, node_handle`,
-  `NODE_QUERY_USAGE`, `NODE_REGISTER_LIMIT(bits, notification_cap, registrant_send)` and
-  `NODE_RELEASE` — set, divide, read and watch the budget node the handle names, and drop a
-  sub-node's handle state
+  `NODE_QUERY_USAGE`, `NODE_REGISTER_LIMIT(bits, notification_cap, registrant_send)`,
+  `NODE_SET_RECLAIM(floor, weight) → floor, weight` and `NODE_RELEASE` — set, divide, read and
+  watch the budget node the handle names, set the floor eviction leaves it and the weight that
+  divides eviction between nodes, and drop a sub-node's handle state
 
 ---
 
 ## Sizing constants
 
 memmgr's bookkeeping is RAM-bound, not capped by a constant: free runs,
-process records, their budget nodes, node handle states and limit registrations, memory
+process records, their budget nodes and the nodes' reclaim states, node handle states and limit
+registrations, memory
 objects, per-process region, commitment and frame descriptors, and the regions' chunk-table nodes
 are nodes in a self-hosted metadata arena carved from memmgr's own pool, indexed by `u64` (see
 [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records are
@@ -226,6 +228,7 @@ The remaining constants are tuning values that bound no capacity:
 | `DEFERRED_RECHECK_WINDOWS` | 256 windows | Mapping-count windows one recheck spends; the run that crosses the budget is still read whole |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
 | `SYSTEM_RESERVE_DIVISOR` | 64 | The system reserve is `pool_total / 64` free pages, which only a reserve budget node's charge may take; the pressure level is `CRITICAL` at or below the growth floor, the reserve and, while chunks are swapped, the restore headroom ([`docs/memory-pool.md`](docs/memory-pool.md) § Eviction) |
+| `WEIGHT_MIN`, `WEIGHT_DEFAULT`, `WEIGHT_MAX` | 1, 100, 10000 | The weights `NODE_SET_RECLAIM` takes, and that of a node none was set on: the eviction clock reclaims from a node in inverse proportion to its weight ([`docs/memory-pool.md`](docs/memory-pool.md) § Distribution policy, Floors and weights) |
 | `PRESSURE_LOW_DIVISOR` | 16 | The pressure level is `LOW` below `pool_total / 16` free pages outside `promised` ([`docs/memory-pool.md`](docs/memory-pool.md) § Memory pressure) |
 | `PRESSURE_BAND_DIVISOR` | 128 | Hysteresis band of `pool_total / 128` pages, at least one, that the free pool clears before the level improves |
 

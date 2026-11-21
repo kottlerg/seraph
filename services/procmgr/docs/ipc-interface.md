@@ -341,7 +341,8 @@ The label's bit 33 (`CREATE_NODE_HANDLE`) asks for a node handle to the child's 
 reply's last cap. procmgr registers the child with memmgr's `REGISTER_NODE_HANDLE` and passes on
 the handle memmgr returns; without the flag it asks for none, and deletes any handle a reply
 carries unasked. The handle lets the creator set the child's max while it runs, make sub-nodes
-under it, read its usage and register for its limit event
+under it, read its usage, set the floor and the weight that steer eviction from it, and register
+for its limit event
 ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Node Handles). Its
 handle state belongs to the child's memmgr record, so the handle is refused once the child is
 gone, and a failed create, which deletes every cap procmgr holds for the child, leaves none

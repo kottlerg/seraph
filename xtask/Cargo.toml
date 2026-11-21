@@ -19,7 +19,7 @@ gdb-rsp = { path = "../shared/gdb-rsp" }
 # The FAT encodings mkdisk's volume writer shares with the fatfs service: FAT
 # entries, long-name slots and their checksum, and short names' numeric tails.
 fat_parse = { path = "../services/fs/fat/fat-parse", package = "fatfs-parse" }
-# `pr-check`, `review-check`, `review-ledger`, `issue-edit`, `issue-file`: the
+# `pr-check`, `review-ledger`, `issue-edit`, `issue-file`: the
 # GitHub CLI answers in JSON, and the review's run records are JSON files.
 json = { path = "../shared/json" }
 # The crash-report block's parser: xtask's crash_check module, which

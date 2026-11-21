@@ -482,7 +482,9 @@ enum Need
 }
 
 /// Whether the victim `v` may still be evicted, as a chunk idle for `idle`
-/// sweeps of an eligible region of a process memmgr can unmap, and whether
+/// sweeps of an eligible region of a process memmgr can unmap whose eviction
+/// leaves every budget node of the process's chain at its floor or above
+/// ([`free_pool::Ledger::above_floor`]), and whether
 /// evicting it gives what `need` asks: free pages above the growth floor
 /// ([`free_pool::Ledger::evicting_opens`]) for [`Need::Draw`], any for
 /// [`Need::Frames`].
@@ -491,6 +493,7 @@ fn still_victim(l: &MemLedger, v: &Victim, idle: u8, need: Need) -> bool
     l.region_for(v.rec, v.page_base)
         .is_some_and(|(reg, _)| reg == v.reg)
         && l.evictable(v.rec, v.reg)
+        && l.above_floor(v.rec, v.reg, v.page_base)
         && match need
         {
             Need::Draw => l.evicting_opens(v.reg, pool_total_pages()),

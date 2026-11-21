@@ -323,7 +323,7 @@ mod live
     /// [`enable`], the only writer of `IA32_S_CET`, sets `SH_STK_EN`. A report
     /// with `CR4.CET` set, `SH_STK_EN` clear, and a zero table address is
     /// therefore of CET state lost outside the kernel, which `cargo xtask
-    /// test-cet` tells apart from a kernel fault
+    /// test cet` tells apart from a kernel fault
     /// (core/kernel/docs/return-address-integrity.md § x86-64 Mechanism).
     pub fn report_registers()
     {

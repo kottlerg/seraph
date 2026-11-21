@@ -250,9 +250,10 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     files](../../svcmgr/docs/service-definitions.md#device-class-files)):
     `programs/terminal` seeds `devmgr.class.input`, `devmgr.class.framebuffer`, and
     `devmgr.class.serial`; timed seeds `devmgr.class.rtc`; the `debug-echo` fixture, which
-    only `cargo xtask test-debug-port` stages, and the GDB stub, which only the
+    only the `debug-port` case stages, and the GDB stub, which only the
     `--debug-target` option of `cargo xtask run`, and
-    `test-gdb`, stage, are the only recipes seeding `devmgr.class.debug-port`.
+    the `debug-port` case's GDB stub boot, stage, are the only recipes seeding
+    `devmgr.class.debug-port`.
   - `vfsd.mount` / `vfsd.deny` — the endowed `MOUNT_AUTHORITY`-badged and
     `DENY_BADGE`-badged SENDs on vfsd's service endpoint, published as
     they arrive; svctest is the only recipe seeding them.
@@ -432,10 +433,11 @@ from there into the boot bundle as the module of that name, so an edit needs no 
   vfsd's level sets its drivers' too. A spawner at info passes no env.
   svcmgr passes nothing on: a service it launches takes its env from its
   `.svc` recipe alone.
-- **Check.** `cargo xtask test-log-level` boots the bundle with vfsd at
+- **Check.** The usertest cell packs `services/init/log-levels-vfsd-debug.conf`
+  (`cargo xtask mkdisk --repack-only --log-levels`), boots the bundle with vfsd at
   debug and checks that vfsd's and fatfs's debug lines appear and devmgr's
   and procmgr's do not
-  ([xtask/README.md](../../../xtask/README.md#cargo-xtask-test-log-level)).
+  ([docs/testing.md](../../../docs/testing.md#log-levels-usertest-cell)).
 
 ---
 

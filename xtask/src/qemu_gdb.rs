@@ -5,14 +5,14 @@
 
 //! A client of QEMU's own gdbstub (`-gdb unix:...`), which the host-driven
 //! tests use to act on a running guest at the hardware boundary, so the
-//! kernel carries no test code: `test-wedge` moves a CPU's program counter,
-//! `test-cet` corrupts a kernel return address, and `test-core-death` moves
+//! kernel carries no test code: the `wedge` case moves a CPU's program counter,
+//! the `cet` case corrupts a kernel return address, and the `shutdown` case moves
 //! a core service's thread. It also holds the helpers those tests share:
 //! kernel symbol spans and the serial lines' hex fields.
 //!
 //! The same client speaks to the GDB stub service (`services/gdbstub`), which
 //! debugs a userspace process over the debug port, a TCP port on the host
-//! ([`Stub::connect_tcp`]); `test-core-death` moves its target's thread
+//! ([`Stub::connect_tcp`]); the `shutdown` case moves its target's thread
 //! through it.
 
 use std::fmt::Write as _;

@@ -82,7 +82,7 @@ static NOKASLR_PATH: [u16; 20] = [
 /// `\EFI\seraph\mapredo` as a NUL-terminated UTF-16 path — the presence of
 /// this file makes the first attempt of steps 6 and 7 redo whatever its
 /// map's size, so a boot runs the redo path ([`MapRedo`]; staged by
-/// `cargo xtask test-map-redo`).
+/// `cargo xtask mkdisk --knob mapredo`).
 // rustfmt::skip keeps the UTF-16 code units in rows of five, which rustfmt would
 // spread one per line.
 #[rustfmt::skip]

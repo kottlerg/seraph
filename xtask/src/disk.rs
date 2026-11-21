@@ -13,7 +13,7 @@
 //! harness whose bundle it composes ([`crate::signing::sign_sysroot`]), then
 //! composes the ESP from the installed files ([`crate::esp::compose`]), then
 //! writes the images, then checks what it wrote ([`crate::image_check`]). The
-//! refusal boots of `test-signing` pack through
+//! refusal boots of the `signing` case pack through
 //! [`create_disk_image_substituting`], which writes bytes the harness staged
 //! in place of named sysroot files and leaves the sysroot as it was.
 
@@ -1188,7 +1188,7 @@ mod tests
         assert!(!data_image.exists());
     }
 
-    // Defect caught: test-debug-port restored a 4Kn or split image as a
+    // Defect caught: the debug-port case restored a 4Kn or split image as a
     // 512-byte single image, deleting disk-data.img.
     #[test]
     fn the_layout_read_back_is_the_one_authored_and_survives_a_repack()

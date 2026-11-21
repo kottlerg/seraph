@@ -12,7 +12,7 @@
 //! which checks the crash service's hold of a fault memmgr declined for want
 //! of memory ([`check_oom_hold`]). The report block each
 //! death leaves in the log is checked host-side, from the boot's serial log,
-//! by `cargo xtask test-crash-report` (docs/testing.md § Crash reports).
+//! by `cargo xtask run --crash-reports` (docs/testing.md § Crash reports).
 //!
 //! The usertest boot stages a crash service whose `CORE_DUMP` names
 //! crashme, so each faulting mode also leaves one ELF core in `/crash`; the

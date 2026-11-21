@@ -246,7 +246,7 @@ fn observe_core(service_ep: u64, core_death: u64) -> u64
 /// ([`observe_core`]), resolve the architecture's immediate power-off
 /// through `actuator`, and log whether it is armed: the queue is observed,
 /// the power-off is held, and pwrmgr has no pager, so it takes no page fault
-/// on memmgr. `cargo xtask test-core-death` waits for the armed line before
+/// on memmgr. The `shutdown` case's death boots wait for the armed line before
 /// it kills memmgr or procmgr. When the power-off is held but pwrmgr is
 /// demand-paged it still runs on a core death; when it is not held a core
 /// death takes the ordinary shutdown. Returns the wait set (`0` when the

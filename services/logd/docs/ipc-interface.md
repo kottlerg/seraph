@@ -597,7 +597,7 @@ exit reason, and svctest's `logd_death_forward` phase checks the forward that
 way. The line names a crashed process: a crash report block carries the process
 badge, and a reader finds the process's log name in this line for that badge
 ([services/crashd/docs/block-format.md](../../crashd/docs/block-format.md)
-§ Symbolizing), as `cargo xtask test-crash-report` does.
+§ Symbolizing), as `cargo xtask run --crash-reports` does.
 `logd_codec::reclaim` formats it.
 
 ## Death-queue resync

@@ -1,7 +1,7 @@
 # Crash Block Format
 
 The format of the block crashd logs for each faulting process: the contract the host-side
-symbolizer and `cargo xtask test-crash-report` read.
+symbolizer and `cargo xtask run --crash-reports` read.
 
 ---
 

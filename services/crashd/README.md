@@ -92,7 +92,7 @@ replies ([docs/operation.md](docs/operation.md) § Hold).
 
 The `crashme` fixture faults on purpose in both kinds, on its main thread and on a spawned one
 ([programs/crashme/README.md](../../programs/crashme/README.md)); the usertest boot runs it, and
-``cargo xtask test-crash-report` checks the blocks in that boot's log
+`cargo xtask run --crash-reports` checks the blocks in that boot's log
 ([docs/testing.md](../../docs/testing.md) § Crash reports). That boot stages a crashd recipe whose
 `CORE_DUMP` names crashme, and the fixture's tester checks the core each faulting mode leaves in
 `/crash`. It also sets a stall of 3000 ms, and the tester has the fixture write a page while

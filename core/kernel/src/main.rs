@@ -843,7 +843,7 @@ unsafe fn kernel_entry_post_rebase(
             }
             // The hardware ids of this and each AP's `online` line map the
             // logical CPU indices the watchdog names to the platform's CPUs
-            // (`cargo xtask test-wedge` selects a CPU by it).
+            // (`cargo xtask test wedge` selects a CPU by it).
             // SAFETY: CPU 0 is below CPU_COUNT, and the APIC id slab was
             // filled in Phase 4.
             let bsp_hw_id = unsafe { percpu::apic_id_for(0) };

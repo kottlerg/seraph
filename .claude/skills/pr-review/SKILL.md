@@ -100,6 +100,11 @@ defines the record. Six points it leaves to you:
   `AUDIT PASS` in the last record at the head, so the audit it leaves owed is a later `audit`
   record there.
 
+Save each record file, the `.md` and the `.json`, as its own step: a plain file write with
+nothing else in it, never inside a script that also runs `review-check` or the gate. The
+statement of a verdict and its use are then separate, visible actions, and the harness's
+permission check refuses the two bundled in one.
+
 Run `cargo xtask review-check <N>` and fix the record until it passes: the ledger and the gate
 read these files. Its `error record-run-kind` means the audit of a `full` or `delta` run
 applied the checks of another run kind: run `pr-auditor` again with `Run kind: with-reviewer`,

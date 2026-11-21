@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_tpm.rs
+// xtask/src/commands/test/tpm.rs
 
 //! TPM 2.0 driver test. `x86_64` only: QEMU's TPM devices sit in the PC
 //! Client TPM range, which the riscv64 `virt` machine does not decode.
@@ -15,7 +15,7 @@
 //! its first `READ` answered with bytes from the TPM, and entropyd's first
 //! accepted contribution, which can then only have come from the TPM.
 //!
-//! A pure runner like `test-vmgenid`: requires a populated `x86_64` sysroot
+//! A pure runner like the `vmgenid` case: requires a populated `x86_64` sysroot
 //! with the default boot set and a repacked `disk.img`, and `swtpm` on the
 //! host.
 
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
-use crate::cli::TestTpmArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
@@ -126,7 +126,7 @@ fn start_swtpm(swtpm: &Path, state: &Path, socket: &Path) -> Result<Swtpm>
 fn launch(
     qemu_binary: &Path,
     ctx: &Context,
-    args: &TestTpmArgs,
+    args: &CaseArgs,
     interface: TpmInterface,
     socket: &Path,
 ) -> Result<Guest>
@@ -179,11 +179,11 @@ fn emulator_paths(work_dir: &Path, interface: TpmInterface) -> (PathBuf, PathBuf
     )
 }
 
-pub fn run(ctx: &Context, args: &TestTpmArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, Arch::X86_64)?;
     let swtpm = require_tool("swtpm")?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
 

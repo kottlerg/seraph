@@ -98,7 +98,7 @@ holder: the badge gates, an open under an unregistered nonce, a session that run
 its job and has it stopped, then exits, and a session stopped whole. Its `oom_policy` phase opens a
 session whose shell runs a job larger than the `stopsrc` fixture's, and checks that oomd stops that
 job first, then `stopsrc`'s, then the session, then `memhog`
-([services/svctest/README.md](../svctest/README.md)). `cargo xtask test-terminal` drives the
+([services/svctest/README.md](../svctest/README.md)). `cargo xtask test terminal` drives the
 terminal's session end to end.
 
 ---

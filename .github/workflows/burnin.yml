@@ -119,6 +119,9 @@ jobs:
         # oomd stops first and whose source svcmgr lists.
         # The usertest cell also stages crashd's test recipe over the default
         # one: its `CORE_DUMP` names crashme, whose tester checks the cores.
+        # Unlike build-test.yml's, the usertest and ktest images keep the
+        # repository's log levels and stage no bootloader knob, so the boot
+        # burned in is the default one.
         run: |
           case "${{ matrix.tester }}" in
             svctest)

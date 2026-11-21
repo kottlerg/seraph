@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_kaslr.rs
+// xtask/src/commands/test/kaslr.rs
 
 //! KASLR randomization test (#252). Both arches.
 //!
@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
-use crate::cli::TestKaslrArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::esp::{Knob, remove_knob, stage_knob};
 use crate::firmware::find_ovmf_code;
@@ -76,7 +76,7 @@ impl Guest
     fn launch(
         qemu_binary: &Path,
         ctx: &Context,
-        args: &TestKaslrArgs,
+        args: &CaseArgs,
         firmware_code: &Path,
         firmware_vars: Option<&Path>,
         data_image: Option<&Path>,
@@ -209,10 +209,10 @@ fn parse_hex_field(field: &str) -> Option<u64>
     u64::from_str_radix(hex, 16).ok()
 }
 
-pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
     // Every boot attaches the images of this layout, and the knob boot's
@@ -299,7 +299,7 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
 
 /// The deterministic direct-map floor for the launch's arch/mode, matching
 /// the bootloader's `default_direct_map_base`.
-fn mode_floor(args: &TestKaslrArgs) -> u64
+fn mode_floor(args: &CaseArgs) -> u64
 {
     use crate::qemu::{RiscvMmu, X86Paging};
     match args.arch

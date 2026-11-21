@@ -160,13 +160,20 @@ pub const FS_RENAME: u64 = 16;
 pub const FS_TRUNCATE: u64 = 17;
 /// Open a file: mint a per-open cap on the driver's endpoint.
 ///
-/// Request: badge = file-node cap (any non-empty rights), empty body,
-/// `caps[0]` = optional release-endpoint SEND for the open's cooperative
-/// [`FS_RELEASE_MEMORY`] (omitted to opt out). Reply (label
-/// `fs_errors::SUCCESS`): `caps[0]` = the open cap, carrying the node
-/// cap's rights; its badge names the open
-/// (`namespace_protocol::OPEN_INSTANCE`). `caps[1]` = the open's liveness
-/// cap, a zero-rights Notification cap: the open lives while a copy of
+/// Request: badge = file-node cap (any non-empty rights), empty body. In a
+/// session ([`FS_SESSION`]): `caps[0]` = a copy of the session cap, which
+/// the driver reads and deletes, `caps[1]` = optional release-endpoint SEND
+/// for the open's cooperative [`FS_RELEASE_MEMORY`] (omitted to opt out).
+/// The open's records then live in the session's pages, charged to the
+/// session's node, and the reply carries the open cap alone: the open lives
+/// until its [`FS_CLOSE`], its node's removal, or its session's end.
+/// Without a session (the unpaid path, which a later wire revision
+/// removes): `caps[0]` = the optional release SEND, a cap on another
+/// endpoint. Reply (label `fs_errors::SUCCESS`): `caps[0]` = the open
+/// cap, carrying the node cap's rights; its badge names the open
+/// (`namespace_protocol::OPEN_INSTANCE`, with `namespace_protocol::SESSION`
+/// for an open in a session). Without a session, `caps[1]` = the open's
+/// liveness cap, a zero-rights Notification cap: the open lives while a copy of
 /// it lives outside the driver, and once every copy is gone (deleted, or
 /// with its holder's `CSpace`) the driver may release the open as
 /// [`FS_CLOSE`] would; a release revokes the copies still in the
@@ -176,13 +183,41 @@ pub const FS_TRUNCATE: u64 = 17;
 /// deletes it after [`FS_CLOSE`].
 /// [`FS_READ_MEMORY`], [`FS_RELEASE_MEMORY`], and [`FS_CLOSE`] go to the
 /// open cap; the stateless file labels accept either cap. Errors:
-/// `INVALID_BADGE` (no such node, a directory, or an open cap),
-/// `PERMISSION_DENIED`, `TOO_MANY_OPEN` (the driver's open table is
-/// full, or its heap or `CSpace` cannot grow, or it cannot create the
-/// liveness object), `IO_ERROR` (the driver could not mint the open
-/// cap). Every refusal deletes the carried SEND. Specified in
+/// `INVALID_BADGE` (no such node, a directory, an open cap, or a cap on the
+/// driver's endpoint that names no live session), `PERMISSION_DENIED`,
+/// `LIMIT` (the session needs a page its node's max refuses),
+/// `INVALID_ARGUMENT` (memmgr refuses the session's handle),
+/// `TOO_MANY_OPEN` (the driver's open table is full, its open ids are
+/// spent, or its heap or `CSpace` cannot grow, or it cannot create the
+/// liveness object), `IO_ERROR` (the driver could not mint the open cap,
+/// or memmgr has no page for the session). Every refusal deletes the
+/// carried caps. Specified in
 /// `services/fs/docs/fs-driver-protocol.md` § Label 18: `FS_OPEN`.
 pub const FS_OPEN: u64 = 18;
+/// Start a filesystem session: the records of the opens made in it live in
+/// pages charged to a node of the client.
+///
+/// Request: badge = any node cap (any non-empty rights), empty body,
+/// `caps[0]` = a charge-only handle to the client's node
+/// (`services/memmgr/docs/ipc-interface.md` § Node Handles), which the
+/// driver keeps for the session's life. The driver takes the session's
+/// first page, charged to that node, and holds it until the session ends.
+/// Reply (label `fs_errors::SUCCESS`): `caps[0]` = the session cap, a
+/// SEND on the driver's endpoint whose badge names the session
+/// (`namespace_protocol::SESSION`), which [`FS_OPEN`] carries; `caps[1]`
+/// = the session's liveness cap, a zero-rights Notification cap: the
+/// session lives while a copy of it lives outside the driver, and once every
+/// copy is gone the driver may end the session, with every open made in it,
+/// and give its pages back. An open handed to another process lives only
+/// while that process, or another, holds a copy of the liveness cap.
+/// Errors: `INVALID_BADGE` (an open cap or a session cap),
+/// `PERMISSION_DENIED`, `INVALID_ARGUMENT` (no handle, or memmgr refuses
+/// it), `LIMIT` (the node's max refuses the first page), `IO_ERROR`
+/// (memmgr has no page), `TOO_MANY_OPEN` (the driver's session ids are
+/// spent, or its heap or `CSpace` cannot grow, or it cannot create the
+/// liveness object). Every refusal deletes the handle. Specified in
+/// `services/fs/docs/fs-driver-protocol.md` § Label 23: `FS_SESSION`.
+pub const FS_SESSION: u64 = 23;
 /// Unmount: the driver ends its service and exits.
 ///
 /// Request: un-badged, on the driver's service endpoint, as [`FS_MOUNT`];

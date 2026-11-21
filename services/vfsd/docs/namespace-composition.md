@@ -88,21 +88,25 @@ the mount's driver and to tear it down:
 | `disk` | The index, in vfsd's disk list, of the disk that holds the partition |
 | `first_lba` | The partition's first LBA on that disk; with `disk`, it names the partition, so a `MOUNT` of a partition a record holds, mounted or being removed, is refused before its driver is spawned and one driver serves a partition |
 
-The death queue is an event queue of capacity 2 with 1 death-observer
-node, the main thread's binding. vfsd binds the driver's main thread to
-it with the create reply's `Thread` cap before `START_PROCESS`, so the
-main thread's exit or terminal fault posts to it, and then deletes the
-`Thread` cap. The create request carries a `POST`-only derivation of the
-queue under `CREATE_DEATH_RELAY`, to which procmgr posts the driver's
-end once, whoever ends it, a terminal fault in any of its threads
-included
-([procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)
-§ Label 1, **Death relay**); the post takes no observer node, and the
-two posts fill the queue's two entries. Both spawn paths,
-`CREATE_PROCESS` from the boot module and `CREATE_FROM_FILE`, set up
-both. While lookups cross the mount, the queue is a member of the watch
-set, and its death restarts the mount's driver or ends the mount (§ Driver
-restart); an unmount waits on it for the driver's death (§ Unmount).
+The death queue is an event queue of capacity 1 with no death-observer
+node. The create request carries a `POST`-only derivation of the queue
+under `CREATE_DEATH_RELAY`, to which procmgr posts the driver's end
+once, after its teardown, whoever ends it, a terminal fault in any of
+its threads included, with the one exit reason procmgr gives the process
+([procmgr IPC
+interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)
+§ Label 1, **Death relay**). That post is the queue's only entry. vfsd
+binds no thread of the driver to the queue, and deletes the create
+reply's `Thread` cap unused: a thread's own end is the process's only
+when it is the first
+([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)
+§ Exit reason), so a main-thread binding could post a reason the driver
+did not end with ahead of the relay's. Both spawn paths,
+`CREATE_PROCESS` from the boot module and `CREATE_FROM_FILE`, carry the
+relay. While lookups cross the mount, the queue is a member of the watch
+set, and its death restarts the mount's driver or ends the mount
+(§ Driver restart); an unmount waits on it for the driver's death
+(§ Unmount).
 
 A record is in one of three states. While *mounted*, lookups cross it.
 While *restarting*, its driver has died and vfsd is starting another
@@ -217,9 +221,8 @@ remover claimed the mount, or one for a node a later mount reuses, finds nothing
 - **The root.** Once vfsd has mounted the root, before it serves anything, it sends
   `DECLINE_RESTART` on its `block` class SEND for the root disk's ordinal, so devmgr does not
   restart that disk's driver. The death of the root mount's driver, or the loss of its disk, ends
-  vfsd: it logs `FATAL: root filesystem lost` with the cause and exits with code 1, on the main
-  thread, since the exit syscall ends only the thread that makes it and procmgr tears a process
-  down at its main thread's death
+  vfsd: it logs `FATAL: root filesystem lost` with the cause and exits with code 1 through
+  `sys_aspace_exit`, which ends the whole process whichever thread makes it
   ([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)
   § Exit reason). vfsd is critical and never restarted
   ([vfsd.svc](../../../rootfs/config/svcmgr/services/vfsd.svc)), so svcmgr shuts the system down

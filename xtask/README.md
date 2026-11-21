@@ -162,6 +162,14 @@ refuses to sign when it is missing, holds no marker or two, or embeds another st
 the image and tells to run `cargo xtask build` (docs/signing.md § Signing). Signing a pack's images
 takes about half a second (`src/signing/`).
 
+The build also Authenticode-signs the installed bootloader for UEFI Secure Boot, in place once it is
+compiled, when `SERAPH_SECURE_BOOT_KEY` and `SERAPH_SECURE_BOOT_CERT` name a db key (the table
+below; [docs/signing.md](../docs/signing.md) § Secure Boot): `sbsign` (sbsigntools), then
+`sbverify` against the certificate, so a key that does not match its certificate fails the build.
+That signature is the firmware's, apart from the objects' signatures above: the packs copy the
+signed file to the ESP and read the trust store out of it as out of an unsigned one. With neither
+variable set, the bootloader is not signed, and the build says so.
+
 The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
 one, whose canonical path lies inside it, `target/` included. When the directory is absent or
 empty and no external signer is named, the first build generates a local identity in it: a root
@@ -183,6 +191,8 @@ bootloader embeds.
 | `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65-roles-1-8` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused, and so is a signing key the build's trust store does not trust for every role, the error naming the roles it lacks. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
 | `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 3,373-byte composite signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
 | `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
+| `SERAPH_SECURE_BOOT_KEY` | (none) | The PEM private key of the db key `build` Authenticode-signs the installed bootloader, `/boot/boot.efi`, with (`sbsign`, then `sbverify` against the certificate), so a firmware that enrols its certificate in db boots it under UEFI Secure Boot ([docs/signing.md](../docs/signing.md) § Secure Boot). Set together with `SERAPH_SECURE_BOOT_CERT`; with neither set the bootloader is not signed, and one alone is refused |
+| `SERAPH_SECURE_BOOT_CERT` | (none) | The PEM X.509 certificate of `SERAPH_SECURE_BOOT_KEY`, the one a machine enrols in its db |
 | `SERAPH_TRUST_STORE_MODE` | `merge` | `merge`: the union of both stores' anchors and revoked key ids, under the higher floor; two anchors of one key that differ are refused. `replace`: the deployer's store alone. Set without `SERAPH_TRUST_STORE`, it is refused |
 
 ---
@@ -327,6 +337,10 @@ and the distro ships standard firmware packages.
 | `SERAPH_OVMF_VARS` | Direct path to the OVMF variable-store template of the same build (`OVMF_VARS.fd`). See the pairing rule of `SERAPH_RISCV_CODE`. |
 | `SERAPH_RISCV_CODE` | Direct path to `RISCV_VIRT_CODE.fd`. Must be set together with `SERAPH_RISCV_VARS` — partial overrides are rejected (a custom code image paired against the system vars template corrupts NVRAM state). |
 | `SERAPH_RISCV_VARS` | Direct path to `RISCV_VIRT_VARS.fd`. See pairing rule above. |
+| `SERAPH_OVMF_SECURE_CODE` | Direct path to an OVMF code image built with Secure Boot and SMM, for the Secure Boot boots (`cargo xtask test secureboot`) alone. Set together with `SERAPH_OVMF_SECURE_VARS`. |
+| `SERAPH_OVMF_SECURE_VARS` | Direct path to the variable-store template of the same build. |
+| `SERAPH_RISCV_SECURE_CODE` | Direct path to a `RISCV_VIRT_CODE.fd` built with Secure Boot, for the Secure Boot boots alone. Set together with `SERAPH_RISCV_SECURE_VARS`. CI sets the pair to Arch's `edk2-riscv64` images ([docs/build-system.md](../docs/build-system.md) § QEMU and Firmware). |
+| `SERAPH_RISCV_SECURE_VARS` | Direct path to the variable-store template of the same build. |
 | `SERAPH_ACCEL` | One of `auto` / `tcg` / `kvm` / `hvf` / `whpx` / `nvmm`. `auto` (the default) runs per-host detection. Cross-arch guests (e.g. riscv64 on x86) always resolve to `tcg`; an explicit non-`tcg`/`auto` override in that case emits a stderr warning. Unrecognized values also warn and fall through to detection. |
 
 Default firmware search paths per host:
@@ -338,6 +352,12 @@ Default firmware search paths per host:
   `/usr/share/edk2-ovmf/x64/OVMF_CODE.fd` with `OVMF_VARS.fd` (older Arch),
   `/usr/share/OVMF/OVMF_CODE.fd` with `OVMF_VARS.fd` (older Debian and Ubuntu)
 - **Linux** RISC-V: `/usr/share/edk2/riscv`, `/usr/share/edk2-riscv`, `/usr/share/qemu-efi-riscv64`
+- **Linux** Secure Boot, for the `secureboot` case alone: OVMF's SMM build with the template of
+  its default pair, `/usr/share/OVMF/OVMF_CODE_4M.secboot.fd` (Debian, Ubuntu),
+  `/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd` (Fedora) or
+  `/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd` (Arch); RISC-V `/usr/share/edk2/riscv64`
+  (Arch's `edk2-riscv64`, the one distribution build known to have Secure Boot). On macOS and
+  BSD, QEMU's `edk2-x86_64-secure-code.fd` with `edk2-i386-vars.fd`, and no RISC-V default
 - **macOS** (both): `/opt/homebrew/share/qemu`, `/usr/local/share/qemu`; OVMF is QEMU's
   `edk2-x86_64-code.fd` with `edk2-i386-vars.fd`
 - **BSD** (both): `/usr/local/share/qemu`, `/usr/local/share/uefi-firmware`; OVMF is QEMU's pair
@@ -696,6 +716,7 @@ options it takes:
 | `debug-port` | x86_64 (2), riscv64 (2) | init | host run | `--port`, `--gdb` |
 | `signing` | x86_64 (4), riscv64 (4) | init | usertest | `--release` |
 | `rollback` | x86_64 (3), riscv64 (3) | init | usertest | `--release` |
+| `secureboot` | x86_64 (4), riscv64 (4) | init | usertest | none |
 | `hotplug` | x86_64 (4), riscv64 (3) | init | host run | none |
 
 Before a case runs, `test` checks that the case runs on the architecture, that the sysroot was
@@ -1106,6 +1127,48 @@ cargo xtask test rollback [--arch x86_64|riscv64] [--release] [--cpus N] [--mem 
 | Option | Default | Description |
 |---|---|---|
 | `--release` | `false` | Build the `raised` boot's bootloader in release mode, as the sysroot's was built; a cell passes it on |
+
+#### The `secureboot` case
+
+Check UEFI Secure Boot of the bootloader on either arch ([docs/signing.md](../docs/signing.md)
+§ Secure Boot): the firmware boots the bootloader signed with an enrolled key and refuses it
+tampered or unsigned, and the bootloader logs the state. The case generates a development platform
+key, key exchange key and db key (`openssl`, RSA-2048 with SHA-256) into
+`target/xtask/test/secureboot/<arch>/keys/`; strips any signature from the installed bootloader
+and signs it with the db key (`sbsign`, checked with `sbverify`); flips a byte of the signed
+image's code section, a byte the signature covers, and checks that `sbverify` then refuses it;
+and boots the current sysroot four times, each on a variable store of its own, the image in place
+of both ESP copies of the installed bootloader:
+
+| Boot | Firmware and store | Bootloader | Owed line |
+|---|---|---|---|
+| `enrolled` | the Secure Boot firmware, the three keys enrolled (`virt-fw-vars`) | signed | the bootloader's `boot: Secure Boot: on` |
+| `tampered` | as `enrolled` | signed, a code byte flipped | the firmware's `Access Denied -- rejected probably by Secure Boot` |
+| `unsigned` | as `enrolled` | no signature | the firmware's refusal, as `tampered` |
+| `default` | the default firmware, its template's store | the installed one | the bootloader's `boot: Secure Boot: off` |
+
+The Secure Boot firmware is a pair of its own (`SERAPH_OVMF_SECURE_CODE` with
+`SERAPH_OVMF_SECURE_VARS`, `SERAPH_RISCV_SECURE_CODE` with `SERAPH_RISCV_SECURE_VARS`, else the
+default paths of [§ Environment variables](#environment-variables)): the default pair has no
+Secure Boot on x86_64, and on riscv64 has it only on some distributions. On x86_64 it is OVMF's
+SMM build, which QEMU runs with `-machine smm=on` and its variable store behind SMM
+(`-global driver=cfi.pflash01,property=secure,value=on`). A host with no such pair fails the case
+before any boot, naming the paths it tried; a pair built without Secure Boot boots every image, so
+the first three boots fail, each naming the firmware and where to find one that enforces it
+([docs/build-system.md](../docs/build-system.md) § QEMU and Firmware). The case never passes on a
+firmware that does not refuse. A boot is judged as the `signing` case judges one, with a deadline
+of three minutes; every boot is made whatever another's outcome. Every boot's serial log is saved
+as `target/xtask/test/secureboot/<arch>/<boot>.log`, beside the keys and images. The images are
+packed again from the sysroot in the layout they had, with the recorded harness's bundle, whatever
+the outcome.
+
+The case builds nothing. It needs sbsigntools (`sbsign`, `sbverify`), `openssl` and
+virt-firmware's `virt-fw-vars` on the host, and a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64] [--release]
+cargo xtask test secureboot [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
 
 #### The `hotplug` case
 

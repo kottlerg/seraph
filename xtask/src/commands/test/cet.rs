@@ -345,6 +345,7 @@ fn cet_spec<'a>(
         second_disk: None,
         firmware_code_path: firmware_code,
         firmware_vars_path: firmware_vars,
+        smm: false,
         cpus: args.cpus,
         threads_per_core: 1,
         mem_mib: args.mem,

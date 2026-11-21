@@ -664,6 +664,11 @@ pub struct QemuLaunchSpec<'a>
     pub second_disk: Option<SecondDisk<'a>>,
     pub firmware_code_path: &'a Path,
     pub firmware_vars_path: &'a Path,
+    /// `x86_64`: the firmware requires SMM, as OVMF's Secure Boot build does
+    /// ([`Firmware::smm`]): the machine runs with SMM, and only SMM code
+    /// writes the variable store, so the operating system cannot rewrite the
+    /// enrolled keys. Ignored on riscv64.
+    pub smm: bool,
     pub cpus: u32,
     /// Logical CPUs per core the guest's topology reports (QEMU
     /// `-smp <cpus>,threads=<n>`): 1 makes each vCPU a core of its own, 2 pairs
@@ -1054,6 +1059,19 @@ fn check_x86_paging(paging: X86Paging, accel: Accel, host_has_la57: bool) -> Res
     Ok(())
 }
 
+/// The arguments of an SMM firmware's launch ([`QemuLaunchSpec::smm`]): a
+/// `-machine` option, which QEMU merges into the machine's, and the pflash
+/// devices' `secure` property.
+fn smm_args() -> [String; 4]
+{
+    [
+        "-machine".into(),
+        "smm=on".into(),
+        "-global".into(),
+        "driver=cfi.pflash01,property=secure,value=on".into(),
+    ]
+}
+
 fn extend_x86(
     args: &mut Vec<String>,
     spec: &QemuLaunchSpec,
@@ -1081,6 +1099,10 @@ fn extend_x86(
         "q35"
     };
     args.extend(["-machine".into(), machine.into()]);
+    if spec.smm
+    {
+        args.extend(smm_args());
+    }
 
     // VT-d DMA and interrupt remapping, with 32-bit (x2APIC) destinations
     // offered.
@@ -1308,8 +1330,14 @@ pub struct Firmware
 {
     /// The read-only code image, `-drive if=pflash` unit 0.
     pub code: PathBuf,
+    /// The code image as found, which `code` is a padded copy of on
+    /// riscv64: the firmware a message names.
+    pub source: PathBuf,
     /// The variable-store template each launch's store is copied from.
     vars_template: PathBuf,
+    /// Whether the code image requires SMM ([`QemuLaunchSpec::smm`]): the
+    /// x86-64 Secure Boot build ([`Firmware::prepare_secure_boot`]).
+    pub smm: bool,
     /// Where the per-launch stores are created.
     vars_dir: PathBuf,
 }
@@ -1361,32 +1389,69 @@ impl Firmware
     ///
     /// On riscv64, QEMU's `virt` machine needs pflash images of exactly
     /// 32 MiB: the two images are copied padded under
-    /// `target/xtask/firmware/riscv/`, again only when the source is newer or
-    /// the copy is missing or of another size. The x86-64 images are used
+    /// `target/xtask/firmware/riscv/`, again only when the copy is not the
+    /// source padded ([`pflash_cache_stale`]). The x86-64 images are used
     /// where they are installed.
     pub fn prepare(ctx: &Context, arch: Arch) -> Result<Self>
+    {
+        let (source, vars) = match arch
+        {
+            Arch::X86_64 => firmware::find_ovmf_firmware()?,
+            Arch::Riscv64 => firmware::find_riscv_firmware()?,
+        };
+        Self::from_pair(ctx, arch, source, &vars, "")
+    }
+
+    /// Resolve `arch`'s Secure Boot firmware
+    /// ([`firmware::find_secure_boot_firmware`]): on x86-64 OVMF's SMM build,
+    /// launched with SMM; on riscv64 an EDK2 build with Secure Boot, its two
+    /// images padded as [`Firmware::prepare`] pads the default pair, under
+    /// their own names. Whether it enforces Secure Boot is the caller's to
+    /// test.
+    pub fn prepare_secure_boot(ctx: &Context, arch: Arch) -> Result<Self>
+    {
+        let (source, vars) = firmware::find_secure_boot_firmware(arch)?;
+        Ok(Self {
+            smm: arch == Arch::X86_64,
+            ..Self::from_pair(ctx, arch, source, &vars, ".secure")?
+        })
+    }
+
+    /// The firmware of the pair `source` and `vars` found for `arch`: on
+    /// riscv64 both padded under `target/xtask/firmware/riscv/`, named
+    /// `RISCV_VIRT_CODE<tag>.32M.fd` and `RISCV_VIRT_VARS<tag>.32M.fd`;
+    /// launched without SMM.
+    fn from_pair(ctx: &Context, arch: Arch, source: PathBuf, vars: &Path, tag: &str)
+    -> Result<Self>
     {
         let vars_dir = launch_vars_dir(ctx);
         std::fs::create_dir_all(&vars_dir)
             .with_context(|| format!("creating {}", vars_dir.display()))?;
         let (code, vars_template) = match arch
         {
-            Arch::X86_64 => firmware::find_ovmf_firmware()?,
+            Arch::X86_64 => (source.clone(), vars.to_path_buf()),
             Arch::Riscv64 =>
             {
-                let (src_code, src_vars) = firmware::find_riscv_firmware()?;
                 let cache_dir = ctx.target_dir.join("xtask").join("firmware").join("riscv");
                 std::fs::create_dir_all(&cache_dir)
                     .with_context(|| format!("creating firmware cache {}", cache_dir.display()))?;
                 (
-                    padded_copy(&src_code, &cache_dir.join("RISCV_VIRT_CODE.32M.fd"))?,
-                    padded_copy(&src_vars, &cache_dir.join("RISCV_VIRT_VARS.32M.fd"))?,
+                    padded_copy(
+                        &source,
+                        &cache_dir.join(format!("RISCV_VIRT_CODE{tag}.32M.fd")),
+                    )?,
+                    padded_copy(
+                        vars,
+                        &cache_dir.join(format!("RISCV_VIRT_VARS{tag}.32M.fd")),
+                    )?,
                 )
             }
         };
         Ok(Self {
             code,
+            source,
             vars_template,
+            smm: false,
             vars_dir,
         })
     }
@@ -1506,25 +1571,29 @@ fn preferred_display_backend(qemu_binary: &str) -> Option<String>
     None
 }
 
-/// Returns true if `cached` is missing, wrong-sized, or older than `source`.
+/// Returns true unless `cached` is `source` padded with zero bytes to
+/// `target_size`. The copy is compared by content, not by time, so a source
+/// of another build, at another path or with an older time, is never served
+/// from the copy of the one before it.
 fn pflash_cache_stale(cached: &Path, source: &Path, target_size: u64) -> Result<bool>
 {
-    let Ok(cached_md) = std::fs::metadata(cached)
+    let Ok(cached_bytes) = std::fs::read(cached)
     else
     {
         return Ok(true);
     };
-    if cached_md.len() != target_size
+    if u64::try_from(cached_bytes.len()).ok() != Some(target_size)
     {
         return Ok(true);
     }
-    let source_md =
-        std::fs::metadata(source).with_context(|| format!("stat {}", source.display()))?;
-    match (source_md.modified(), cached_md.modified())
+    let source_bytes =
+        std::fs::read(source).with_context(|| format!("reading {}", source.display()))?;
+    let Some((copy, padding)) = cached_bytes.split_at_checked(source_bytes.len())
+    else
     {
-        (Ok(s), Ok(c)) => Ok(s > c),
-        _ => Ok(true),
-    }
+        return Ok(true);
+    };
+    Ok(copy != source_bytes.as_slice() || padding.iter().any(|&byte| byte != 0))
 }
 
 /// Extend a file with zero bytes until it reaches `target_size`.
@@ -1567,6 +1636,7 @@ mod tests
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: Path::new("vars.fd"),
+            smm: false,
             cpus,
             threads_per_core: 1,
             mem_mib,
@@ -1734,6 +1804,7 @@ mod tests
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: Path::new("vars.fd"),
+            smm: false,
             cpus: 4,
             threads_per_core: 1,
             mem_mib: 512,
@@ -1772,6 +1843,7 @@ mod tests
             second_disk: None,
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: Path::new("vars.fd"),
+            smm: false,
             cpus: 4,
             threads_per_core: 1,
             mem_mib: 512,
@@ -1789,6 +1861,28 @@ mod tests
             test_devices: false,
             hotplug_port: None,
         }
+    }
+
+    // Defect caught: OVMF's Secure Boot build launched without SMM, where it
+    // does not start, or without the secured pflash, where the guest can
+    // rewrite the enrolled keys; or SMM forced on every other launch.
+    #[test]
+    fn only_an_smm_firmware_launches_with_smm_and_a_secured_store()
+    {
+        let secured = |spec: &QemuLaunchSpec| {
+            let argv = build_qemu_argv(spec).unwrap();
+            argv.windows(2).any(|w| w == ["-machine", "smm=on"])
+                && argv
+                    .windows(2)
+                    .any(|w| w == ["-global", "driver=cfi.pflash01,property=secure,value=on"])
+        };
+        let mut spec = x86_spec(X86Paging::Four);
+        assert!(!secured(&spec));
+        spec.smm = true;
+        assert!(secured(&spec));
+        let mut riscv = riscv_spec(4, 512);
+        riscv.smm = true;
+        assert!(!secured(&riscv));
     }
 
     // Defect caught: a launch with no writable variable store (x86-64 ran on
@@ -1828,7 +1922,9 @@ mod tests
         std::fs::write(&template, b"vars").unwrap();
         let firmware = Firmware {
             code: dir.join("code.fd"),
+            source: dir.join("code.fd"),
             vars_template: template,
+            smm: false,
             vars_dir: dir.clone(),
         };
         let (a, b) = (
@@ -1874,6 +1970,34 @@ mod tests
         let cached = dir.join("cached.fd");
         padded_copy(&template, &cached).unwrap();
         assert_eq!(std::fs::metadata(&cached).unwrap().len(), PFLASH_SIZE);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Defect caught: a padded copy judged fresh by time, so a source of
+    // another build with an older time (a firmware override pointed at
+    // another distribution's image) boots the copy of the one before it.
+    #[test]
+    fn a_padded_copy_follows_its_source_whatever_its_time()
+    {
+        let dir = std::env::temp_dir().join(format!("xtask-padded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cached = dir.join("code.32M.fd");
+        let first = dir.join("first.fd");
+        std::fs::write(&first, b"first build").unwrap();
+        padded_copy(&first, &cached).unwrap();
+        let older = dir.join("older.fd");
+        std::fs::write(&older, b"older build").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        padded_copy(&older, &cached).unwrap();
+        let bytes = std::fs::read(&cached).unwrap();
+        assert!(bytes.starts_with(b"older build"));
+        assert_eq!(u64::try_from(bytes.len()).unwrap(), PFLASH_SIZE);
+        assert!(!pflash_cache_stale(&cached, &older, PFLASH_SIZE).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

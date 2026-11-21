@@ -126,6 +126,7 @@ fn boot_qemu(
         second_disk,
         firmware_code_path: firmware_code,
         firmware_vars_path: firmware_vars,
+        smm: false,
         cpus: launch.cpus,
         threads_per_core: launch.threads_per_core,
         mem_mib: launch.mem,

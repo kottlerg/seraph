@@ -72,6 +72,7 @@ mod qemu_gdb;
 mod qmp;
 mod regex;
 mod rust_src;
+mod secure_boot;
 mod signing;
 mod stack_sizes;
 mod symbolize;

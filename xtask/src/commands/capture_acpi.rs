@@ -172,6 +172,7 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         second_disk: None,
         firmware_code_path: code,
         firmware_vars_path: vars.path(),
+        smm: false,
         cpus: CPUS,
         threads_per_core: 1,
         mem_mib: MEM_MIB,

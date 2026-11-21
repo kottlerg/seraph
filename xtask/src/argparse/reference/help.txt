@@ -393,7 +393,7 @@ Run Seraph's tests: without a case, check formatting and lint the test code, the
 Usage: xtask test [OPTIONS] [CASE]
 
 Arguments:
-  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, rollback, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 Options:
       --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
@@ -427,6 +427,7 @@ Arguments:
           - kaslr:      The kernel's randomized layout differs between boots, and the `nokaslr` knob gives the deterministic one
           - signing:    Each signature verifier refuses a tampered kernel, a tampered bundle entry, a revoked key, and tampered, wrong-role and foreign-signed rootfs images
           - rollback:   The bootloader writes the machine's security floor in firmware storage, raises it, and refuses itself below it
+          - secureboot: The firmware boots the bootloader signed with an enrolled key and refuses it tampered or unsigned, under UEFI Secure Boot
           - wedge:      The softlockup watchdog reports a CPU wedged with interrupts off
           - vmgenid:    The kernel detects a VM generation change across a snapshot restore (`x86_64` only)
           - hotplug:    PCI Express hotplug of a device and of a disk behind root ports

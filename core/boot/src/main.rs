@@ -24,6 +24,7 @@ mod framebuffer;
 mod memory_map;
 mod paging;
 mod rollback;
+mod secure_boot;
 mod signing;
 mod uefi;
 
@@ -449,6 +450,13 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
 {
     // SAFETY: caller guarantees image and st are the UEFI-provided handles.
     let ctx = unsafe { step1_locate_uefi_protocols(image, st)? };
+    // The firmware's Secure Boot state, logged on every boot (docs/signing.md
+    // § Secure Boot); no state stops the boot.
+    // SAFETY: ctx.st is the valid system table; boot services have not exited,
+    // and the value is dropped at the end of the statement.
+    secure_boot::log_state(secure_boot::read_state(&mut unsafe {
+        FirmwareVariables::new(ctx.st)
+    }));
     // The trust store every object is verified against (docs/signing.md
     // § Trust Store); one that does not parse halts the boot here.
     let store_bytes = signing::embedded_store();

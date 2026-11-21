@@ -13,6 +13,7 @@ mod host;
 mod hotplug;
 mod kaslr;
 mod rollback;
+mod secureboot;
 mod shutdown;
 mod signing;
 mod terminal;

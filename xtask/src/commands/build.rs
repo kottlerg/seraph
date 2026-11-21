@@ -705,6 +705,25 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     let dst_boot = ctx.installed_bootloader();
     compile_boot(ctx, args, &store, &dst_boot)?;
     step(&format!("Bootloader: {}", dst_boot.display()));
+    // The Authenticode signature UEFI Secure Boot verifies, with the
+    // configured db key; with none the bootloader is not signed
+    // (docs/signing.md § Secure Boot).
+    match crate::secure_boot::DbKey::from_env()?
+    {
+        Some(key) =>
+        {
+            crate::secure_boot::sign(&dst_boot, &dst_boot, &key)?;
+            step(&format!(
+                "Bootloader: Authenticode-signed with {}",
+                key.cert.display()
+            ));
+        }
+        None => step(&format!(
+            "Bootloader: not Authenticode-signed ({} and {} unset)",
+            crate::secure_boot::ENV_SECURE_BOOT_KEY,
+            crate::secure_boot::ENV_SECURE_BOOT_CERT
+        )),
+    }
     keep_boot_symbols(ctx, args)
 }
 

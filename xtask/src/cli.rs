@@ -943,6 +943,9 @@ value_enum! {
         /// The bootloader writes the machine's security floor in firmware
         /// storage, raises it, and refuses itself below it.
         Rollback,
+        /// The firmware boots the bootloader signed with an enrolled key and
+        /// refuses it tampered or unsigned, under UEFI Secure Boot.
+        Secureboot,
         /// The softlockup watchdog reports a CPU wedged with interrupts off.
         Wedge,
         /// The kernel detects a VM generation change across a snapshot

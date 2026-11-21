@@ -36,9 +36,12 @@ pub const EFI_NOT_FOUND: EfiStatus = 0x8000_0000_0000_000E;
 /// `EFI_VARIABLE_NON_VOLATILE`: the variable is kept across resets.
 pub const EFI_VARIABLE_NON_VOLATILE: u32 = 0x0000_0001;
 /// `EFI_VARIABLE_BOOTSERVICE_ACCESS`: the variable is reachable before
-/// `ExitBootServices`. Without `EFI_VARIABLE_RUNTIME_ACCESS` (`0x4`), which
-/// no Seraph variable carries, it is reachable then alone.
+/// `ExitBootServices`. Without [`EFI_VARIABLE_RUNTIME_ACCESS`], which no
+/// Seraph variable carries, it is reachable then alone.
 pub const EFI_VARIABLE_BOOTSERVICE_ACCESS: u32 = 0x0000_0002;
+/// `EFI_VARIABLE_RUNTIME_ACCESS`: the variable is reachable after
+/// `ExitBootServices` too, as the firmware's Secure Boot state variables are.
+pub const EFI_VARIABLE_RUNTIME_ACCESS: u32 = 0x0000_0004;
 
 /// Allocate pages at any available physical address.
 pub const ALLOCATE_ANY_PAGES: u32 = 0;
@@ -116,6 +119,16 @@ pub static EFI_RNG_PROTOCOL_GUID: EfiGuid = EfiGuid {
     data2: 0xEADE,
     data3: 0x433D,
     data4: [0x86, 0x2E, 0xC0, 0x1C, 0xDC, 0x29, 0x1F, 0x44],
+};
+
+/// `EFI_GLOBAL_VARIABLE`, the vendor GUID of the variables the UEFI
+/// specification defines, the Secure Boot state among them
+/// `{8BE4DF61-93CA-11D2-AA0D-00E098032B8C}`
+pub static EFI_GLOBAL_VARIABLE_GUID: EfiGuid = EfiGuid {
+    data1: 0x8BE4_DF61,
+    data2: 0x93CA,
+    data3: 0x11D2,
+    data4: [0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C],
 };
 
 /// The Seraph vendor GUID, which names every Seraph UEFI variable

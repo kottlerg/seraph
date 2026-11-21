@@ -2874,7 +2874,7 @@ help xtask test --help
 ["test","bogus"]
 InvalidValue
 error: invalid value 'bogus' for '[CASE]'
-  [possible values: terminal, kaslr, signing, rollback, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["test","--bogus"]
 UnknownArgument
@@ -2883,7 +2883,7 @@ error: unexpected argument '--bogus' found
 ["test","--","x"]
 InvalidValue
 error: invalid value 'x' for '[CASE]'
-  [possible values: terminal, kaslr, signing, rollback, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["test","-h","bogus"]
 help xtask test -h
@@ -2891,7 +2891,7 @@ help xtask test -h
 ["test","bogus","-h"]
 InvalidValue
 error: invalid value 'bogus' for '[CASE]'
-  [possible values: terminal, kaslr, signing, rollback, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["help","test"]
 help xtask test --help
@@ -3068,12 +3068,12 @@ ok test case=["debug-port"]
 ["test","7"]
 InvalidValue
 error: invalid value '7' for '[CASE]'
-  [possible values: terminal, kaslr, signing, rollback, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["test",""]
 InvalidValue
 error: a value is required for '[CASE]' but none was supplied
-  [possible values: terminal, kaslr, signing, rollback, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
+  [possible values: terminal, kaslr, signing, rollback, secureboot, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 ["test","terminal","kaslr"]
 UnknownArgument

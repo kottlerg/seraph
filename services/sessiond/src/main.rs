@@ -821,15 +821,18 @@ impl Sessiond
     }
 
     /// End the session of each death the queue holds. An entry whose key
-    /// names no session is of a leader sessiond ended already.
+    /// names no session is of a leader sessiond ended already. The line says
+    /// how the leader ended by the reason procmgr gives the process
+    /// ([`leader_end`]), not by the entry's: the first entry may be the main
+    /// thread's own end, which is the process's only when it is the first.
     fn drain_deaths(&mut self)
     {
         while let Ok(entry) = syscall::event_recv_entry(self.death_queue, syscall::WAIT_TRY_ONCE)
         {
             let death = syscall::DeathEvent::from_entry(entry);
-            if self.sessions.get(death.correlator).is_some()
+            if let Some(handle) = self.sessions.get(death.correlator).map(|s| s.handle)
             {
-                let why = if death.exit_reason == 0
+                let why = if self.leader_end(handle, death.exit_reason) == 0
                 {
                     "its leader exited"
                 }
@@ -839,6 +842,28 @@ impl Sessiond
                 };
                 self.end_session(death.correlator, why);
             }
+        }
+    }
+
+    /// The exit reason of the ended leader `handle` names: the one procmgr
+    /// gives the process, which `QUERY_PROCESS` answers once it has ended
+    /// and the relay, logd and the end queue carry (docs/process-lifecycle.md
+    /// § Exit reason), or `posted`, the death entry's, when procmgr does not
+    /// answer `EXITED`.
+    #[inline(never)]
+    fn leader_end(&self, handle: u64, posted: u64) -> u64
+    {
+        let query = IpcMessage::new(procmgr_labels::QUERY_PROCESS);
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        match unsafe { ipc::ipc_call(handle, &query, self.ipc_buf) }
+        {
+            Ok(reply)
+                if reply.label == procmgr_errors::SUCCESS
+                    && reply.word(0) == ipc::procmgr_process_state::EXITED =>
+            {
+                reply.word(1)
+            }
+            Ok(_) | Err(_) => posted,
         }
     }
 

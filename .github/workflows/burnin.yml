@@ -28,8 +28,9 @@ jobs:
     uses: ./.github/workflows/qemu-debs.yml
 
   burnin:
-    # Pinned with the qemu-debs job's image; see docs/build-system.md
-    # § Continuous Integration.
+    # After the qemu-debs job, which seeds the firmware entry and the .deb
+    # set of its own image; see docs/build-system.md § Continuous
+    # Integration.
     needs: qemu-debs
     runs-on: ubuntu-26.04
     strategy:
@@ -47,18 +48,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Restore QEMU and firmware packages
-        uses: actions/cache/restore@v6
-        with:
-          path: qemu-debs
-          key: ${{ needs.qemu-debs.outputs.key }}
-
       - name: Install QEMU and firmware
-        # See docs/build-system.md § Continuous Integration.
+        # From the cache entry of this cell's own runner image; see
+        # docs/build-system.md § Continuous Integration.
         uses: ./.github/actions/qemu-packages
         with:
           mode: install
-          dir: qemu-debs
 
       - name: Log QEMU versions
         # A missing binary fails here rather than at the first boot. The

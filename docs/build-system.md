@@ -563,8 +563,10 @@ one, naming it. The builds tested, with the store's keys enrolled by `virt-fw-va
 | RISC-V `RISCV_VIRT_CODE.fd` of Ubuntu's `qemu-efi-riscv64` 2025.11-3ubuntu7.3 (CI's default pair), 7.4 and 2026.05-2ubuntu3, and of Fedora's `edk2-riscv64` | built without it |
 
 CI's riscv64 cells take Arch's `edk2-riscv64` 202608-1 for the case alone (§ Continuous
-Integration), its package pinned by URL and SHA-256. A refresh of it is a new version's URL and
-hash in `.github/actions/qemu-packages/action.yml` and a passing `secureboot` case on it. Any
+Integration), its package pinned by version and SHA-256 and fetched from Arch's package mirror,
+which holds it while it is the current version, or else from `archive.archlinux.org`, which
+keeps every version. A refresh of it is a new version's file name, URLs and hash in
+`.github/actions/qemu-packages/action.yml` and a passing `secureboot` case on it. Any
 EDK2 `RiscVVirtQemu` build with `SECURE_BOOT_ENABLE` serves as well.
 
 **TPM (opt-in):** `cargo xtask test tpm` (x86-64) attaches a TPM 2.0 to the guest, QEMU's
@@ -676,45 +678,77 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 |---|---|---|
 | `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages and dosfstools, `cargo xtask test`, which checks the formatting of the Rust source and lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher`, `crasher-worker`, `crasher-boot`, `memhog` and `stopsrc` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `mkdisk --harness ktest`, each pack checking the images it writes (each FAT volume with `fsck.fat -n`, then that every object on the ESP equals its installed file on the root partition), and runs one `run --runs 1` boot with `--save-logs`, under a per-cell `--timeout`, svctest's with `--crash-reports none` and usertest's with `--crash-reports reports`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes, which a pass taking more than half its budget flags with a warning annotation on the run; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run` writes beside its logs; each cell then runs `mkdisk --arch A` (the plain repack: it re-mirrors the rootfs with the repository's log levels and no knobs, and keeps the recorded harness) and `cargo xtask test --cell <tester> --arch A`, which runs every case the registry assigns to that tester: usertest runs `terminal`, `signing`, `dma-confinement`, `rollback`, `enrolment`, `secureboot`, `wedge`, `vmgenid` (x86_64 only) and `shutdown`, ktest runs `kaslr`, and svctest runs none; the ktest cell stages the `mapredo` knob (`mkdisk --harness ktest --knob mapredo`) and its own boot carries the redo check, and the usertest cell packs `services/init/log-levels-vfsd-debug.conf` (`mkdisk --repack-only --log-levels`) and its own boot carries the log-level check. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `mkdisk --harness ktest`), then burns it in with `run --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
-| `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
+| `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job seeds the cache entries of the QEMU and firmware packages the caller's booting cells install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, installing zstd and the dosfstools whose `fsck.fat` the build's pack runs, compresses each and the archive of its build's symbols store (§ Symbols Store) with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
 
 The jobs that boot under QEMU (`validate` in `build-test.yml` and `burnin`
-in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner
-image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
-package (QEMU 10.2). The composite action
+in `burnin.yml`) install it and run on the `ubuntu-26.04` runner label,
+whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
+package (QEMU 10.2). The label names an image, not a version of it: while
+GitHub rolls out a new version, the label resolves to more than one
+`ImageVersion` within one run, so two cells of one run can run on different
+image versions. The composite action
 `.github/actions/qemu-packages/action.yml` holds the install list (QEMU,
 its firmware, dosfstools, whose `fsck.fat` every pack runs, and the
-`secureboot` case's sbsigntool, openssl and python3-virt-firmware) and the
-apt flags (no recommends) once; its `mode` input selects the cache key, the
-download, or the install, and the download and install calls pass the
-package directory as its `dir` input. Every booting cell `needs:` its
-workflow's `qemu-debs` job, which runs on the same pinned image because the
-downloaded set is resolved against that image's installed packages. The job
-downloads the list's resolved `.deb` set once into an `actions/cache` entry
-keyed `qemu-debs-<ImageOS>-<ImageVersion>-<action hash>` (the runner
-image's version variables and the first 16 hex digits of the action file's
-`hashFiles` digest), and downloads nothing
-when the entry exists. A download whose fetch from the image's apt mirror
-fails or exceeds 120 s rewrites the apt sources, the image's
-`/etc/apt/apt-mirrors.txt` mirror list included, from
-`azure.archive.ubuntu.com` to `archive.ubuntu.com` and retries once, bounded
-at 1200 s. Each booting cell restores the entry by the key the job outputs
-and installs from it with apt's sources disabled, so it fetches nothing.
-When that offline install fails, as when the entry is absent or the set does
-not resolve against the cell's image, the cell runs the same bounded
-download itself and installs offline from it. When the `qemu-debs` job
-fails, the booting cells are skipped and the run fails. An entry saved on
-`master` is readable from every branch and tag, so both workflows and later
-runs share one entry per key. The download also fetches the riscv64 Secure
-Boot firmware, Arch's `edk2-riscv64` package, from the URL the action pins,
-into the same entry, and fails the job unless its SHA-256 is the pinned
-one; each booting cell checks the hash again before it extracts the
-package's two images outside the checkout, and sets
-`SERAPH_RISCV_SECURE_CODE` and `SERAPH_RISCV_SECURE_VARS` to them for the
-job's later steps. The pin, the install list and the cache key
-move together: the key derives from the image version and the action, so a
-change to the list, the flags or the pinned image yields a new entry.
+`secureboot` case's sbsigntool, openssl and python3-virt-firmware), the
+apt flags (no recommends), and the riscv64 Secure Boot firmware pin once;
+its `mode` input selects `cache` or `install`. The action keeps two
+`actions/cache` entries:
+
+- The `.deb` set, keyed `qemu-debs-<ImageOS>-<ImageVersion>-<action hash>`
+  (the runner image's version variables and the first 16 hex digits of the
+  action file's `hashFiles` digest), in the `qemu-debs` directory. The set
+  is resolved against the installed packages of the image version it was
+  downloaded on, and a set from another version can fail to install, so
+  each version has its own entry.
+- The riscv64 Secure Boot firmware, Arch's `edk2-riscv64` package, keyed
+  `qemu-firmware-<pin>` (the first 16 hex digits of its pinned SHA-256), in
+  the `qemu-firmware` directory. The package is the same file on every image
+  version, so every cell reads the one entry.
+
+Every booting cell `needs:` its workflow's `qemu-debs` job, which runs the
+action in `cache` mode on the same label: it looks both entries up and
+downloads and saves each one that is absent, the `.deb` set for the version
+it runs on. The `.deb` download fetches the list's resolved set from the
+image's apt mirror; a fetch that fails or exceeds 120 s rewrites the apt
+sources, the image's `/etc/apt/apt-mirrors.txt` mirror list included, from
+`azure.archive.ubuntu.com` to `archive.ubuntu.com` and retries once,
+bounded at 1200 s. The firmware download tries the sources the action pins
+in turn, Arch's package mirror and then `archive.archlinux.org`, each with
+a 30 s connect bound, keeps the first package whose SHA-256 is the pinned
+one, and fails the job when no source serves it.
+When the `qemu-debs` job fails, the booting cells are skipped and the run
+fails.
+
+Each booting cell runs the action in `install` mode. It computes the key
+of the image version it runs on itself, restores that `.deb` entry and the
+firmware entry, and installs the set with apt's sources disabled, so a cell
+whose version has an entry fetches nothing. When the entry is absent, or
+its set does not install, the cell runs the same bounded `.deb` download
+itself, installs offline from it, and saves the entry under its own key
+when the restore missed, so the next run on that version restores it. The
+`.deb` fallback leaves the firmware package alone: the cell checks the
+restored package's SHA-256 against the pin and keeps it, and fetches it
+from Arch's sources only when the firmware entry is absent or the hash
+differs, so a cell needs only the Ubuntu mirror while the firmware entry
+exists. It then checks the hash again, extracts the package's two
+images outside the checkout, and sets `SERAPH_RISCV_SECURE_CODE` and
+`SERAPH_RISCV_SECURE_VARS` to them for the job's later steps. An entry is
+saved only after its content is in place, a cell's `.deb` set only after
+it installed. The cells of one version that miss its entry together each
+download the set once, and each tries to save the one key: the first save
+wins, and the others log that the key is taken and do not fail.
+
+An entry saved by a run on `master` (a push run) is readable from every
+branch and tag, so both workflows and later runs share one entry per key.
+An entry saved by a pull-request run is readable only by runs of that pull
+request, so the `master` push runs seed the entries every pull request and
+tag run restores: the firmware entry once per pin, and a `.deb` entry for
+each image version a `master` run's job or cells land on. The pin, the
+install list and the keys move together: the `.deb` key derives from the
+image version and the action, and the firmware key from the pin, so a
+change to the list, the flags, the pin or the image version yields a new
+entry.
 
 The `validate`, `burnin` and `build-image` jobs each have a step that sets
 `SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing`, so each job generates its signing keys outside

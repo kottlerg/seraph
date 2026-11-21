@@ -40,7 +40,7 @@ Labels 14–18 are specified in § `REGISTER_DEATH_EQ`, § `REGISTER_INIT_TEARDO
 `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and § `QUERY_LIVE_PROCESSES` below, labels 19–24 and 26
 in § Crash Endpoint and Debug Authority, label 25 in § Label 25: `BIND_DEATH_OBSERVER`, labels
 27–29 in § Process Tree, label 30 in § Label 30: `MAKE_RESIDENT`, label 31 in § Label 31:
-`READ_VERIFIED`, and label 32 in § Label 32: `MAKE_PRIVATE`.
+`READ_VERIFIED`, label 32 in § Label 32: `MAKE_PRIVATE`, and label 33 in § Label 33: `SNAPSHOT`.
 Labels 4–7 and 10 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see § Capability Transfer).
 
@@ -1022,13 +1022,14 @@ has with no handler bound, and the kernel's decline line for a forwarded fault i
 pager's own decline printed. The decliner shares nothing with procmgr's request workers but a wake
 notification, so a receive on the endpoint never waits behind a request.
 
-Labels 19–21, 23, 24, 30 and 32 are the **debug authority**, label 22 the **thread registry** it
-reads, and label 26 the **core-path declaration** its `ATTACH_PROCESS` reply reports.
-`REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `MAKE_RESIDENT` and
-`MAKE_PRIVATE` are served only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr
-mints, from the un-badged procmgr source init endows it, for a service whose definition sets
-`debug_authority = yes` ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)); no
-other path mints it, so an image that stages no such service has no attach path. The crash service
+Labels 19–21, 23, 24, 30, 32 and 33 are the **debug authority**, label 22 the **thread registry**
+it reads, and label 26 the **core-path declaration** its `ATTACH_PROCESS` reply reports.
+`REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `MAKE_RESIDENT`,
+`MAKE_PRIVATE` and `SNAPSHOT` are served only on a badge carrying
+`procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the un-badged procmgr source init endows
+it, for a service whose definition sets `debug_authority = yes`
+([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)); no other path mints it,
+so an image that stages no such service has no attach path. The crash service
 ([services/crashd/README.md](../../crashd/README.md)) and the GDB stub
 ([services/gdbstub/README.md](../../gdbstub/README.md)) are its consumers.
 
@@ -1544,6 +1545,102 @@ space, and `OUT_OF_MEMORY` when memmgr could not make a copy or the call to it f
 svctest's `memmgr_memory_object_text` phase makes a child's executable attachment private this way
 before it writes a breakpoint into it, and checks the refusals without the authority and for
 svctest itself.
+
+### Label 33: `SNAPSHOT`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::SNAPSHOT` (33) |
+| caller's cap badge | MUST carry `DEBUG_AUTHORITY` |
+| `data[0]` | The target's process badge |
+| `caps[0]` | The sender's own memmgr SEND, the **account**: procmgr requests the snapshot's frames on it and seals them through it. procmgr deletes it, and any further cap the message carried, before it replies |
+
+A debugger or a core writer that needs a consistent copy of a live process's memory asks for one
+here. procmgr finds the target under the table lock and derives copies of its `AddressSpace` cap
+and its main thread's cap there, so a teardown meanwhile leaves caps that name the same objects or
+that the kernel refuses. After the lock:
+
+1. procmgr asks memmgr to make the target's evicted pages resident over the whole user half, in
+   report mode ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) §
+   Label 21: `RESIDENT_REPORT`), lists the pages the space maps (`SYS_THREAD_LIST_PAGES`), and
+   requests frames on the account for every page it will copy.
+2. It holds the target's address space (`SYS_ASPACE_HOLD`,
+   [core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md) § `SYS_ASPACE_HOLD`
+   (71)): no thread of the target runs in user mode until the release, whether it registered with
+   procmgr (Label 22) or not. Under the hold it asks memmgr again in report mode, keeping what
+   memmgr reports, lists the pages again, requests frames for the pages the second listing adds, and
+   copies each page, but those of `PAGE_RUN_NO_COPY` runs, with `SYS_THREAD_READ_MEM` into the
+   next data frame, in address order, through a window of 64 pages of its own address space. Then
+   it releases the space.
+3. It builds the layout (§ Snapshot object layout), returns to the account each data grant the copy
+   did not use, requests frames for the layout on the account, writes it, and seals the layout's
+   grants and then the data grants into one memory object
+   ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 27:
+   `SEAL_OBJECT`).
+
+The account is a cap the sender presents, and procmgr cannot tell that it names memmgr: each call
+on it (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`, `SEAL_OBJECT`, `OBJECT_RELEASE`) waits at
+most `ACCOUNT_CALL_TIMEOUT_MS` (10 s), and a server behind it that does not answer fails the
+capture, and releases a held target, once the bound passes. The first failure of any step fails
+the capture: procmgr releases the hold and returns every grant it took to the account. Under the
+hold procmgr calls only memmgr, on its own endpoint and on the account, and writes no log line, so a
+held target that serves procmgr, logd among them, cannot stall the capture.
+
+The copy is one point in time for every page only the target writes. A page another process maps
+writable too, or a device writes, is copied as it stands when the copy reads it: the snapshot holds
+it at one point in time only when every space that writes it is held too. A page memmgr could not
+make resident in the hold's turn (a chunk on disk, a lost chunk, or a restore that failed) is not
+copied, and neither is a page the copy finds not present: the layout marks each such run absent.
+
+Every frame of the object is granted on the account, so the snapshot is charged in full to the
+sender, as a seal leaves its frames charged to the sealer
+([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md#memory-objects) § Memory
+objects), and the target's usage does not change. procmgr's own cost is one capture's listing and
+layout on its heap, a heap refusal failing the capture, and the window's page tables.
+
+Replies `SUCCESS` with `caps[0]` the object's handle, which `ATTACH_OBJECT` and `OBJECT_RELEASE`
+take; `data[0]` the object's pages; and `data[1]` `procmgr_snapshot::SNAPSHOT_COMPLETE` (1) when no
+run of the layout is absent, else `0`. A reply procmgr cannot deliver releases the object.
+Refusals, in order: `UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` without `caps[0]`;
+`INVALID_BADGE` when no live process carries the badge, or the target ended during the capture;
+`NOT_ATTACHABLE` for a process that declared itself undebuggable (Label 21); `SPACE_HELD` (20)
+when the target's space is held already, by another capture of it, or the hold was interrupted,
+when nothing was captured and the sender may ask again; and `OUT_OF_MEMORY` when the account
+refused a request, failed a call or did not answer within the bound, granted a cap whose size is not
+the pages its reply names, or the object would take more than `SEAL_OBJECT_MAX_GRANTS` (63) grants,
+or when procmgr's heap or address space refused the capture's own memory. svctest's
+`procmgr_snapshot` phase snapshots a child whose writer thread never registered, and checks the
+refusals without the authority, without an account, and for an exited child.
+
+### Snapshot object layout
+
+The object's first `layout_pages` pages are the layout, its next `data_pages` pages the captured
+bytes; any page past both is padding. The layout is a header at byte 0, then `run_count` run
+entries from byte 48, 32 bytes each, in ascending address order. Every field is a little-endian
+`u64`. [`shared/ipc/src/procmgr_snapshot.rs`](../../../shared/ipc/src/procmgr_snapshot.rs) defines
+the constants and the encoder and decoder procmgr and a reader share.
+
+| Header word | Content |
+|---|---|
+| 0 | `MAGIC`, the bytes `SRPHSNAP` |
+| 1 | `LAYOUT_VERSION`, `1`; a reader refuses any other |
+| 2 | flags: bit 0 `SNAPSHOT_COMPLETE`, as in the reply's `data[1]` |
+| 3 | `layout_pages`: pages of the layout, at least 1 |
+| 4 | `data_pages`: data pages the runs use, from object page `layout_pages` |
+| 5 | `run_count`: run entries after the header |
+
+| Run word | Content |
+|---|---|
+| 0 | the run's first address in the captured space, page-aligned |
+| 1 | its pages, at least 1 |
+| 2 | flags: the `PAGE_RUN_*` protection bits of `SYS_THREAD_LIST_PAGES`, and bit 8 `RUN_ABSENT` |
+| 3 | the object page holding the run's first page, its other pages following; `NO_OBJECT_PAGE` (`u64::MAX`) for a run with no bytes in the object |
+
+A run with bytes is a run of listed pages that were copied. A `PAGE_RUN_NO_COPY` run, device memory
+`SYS_THREAD_READ_MEM` refuses, has no bytes and is not absent. An absent run has no bytes: listed
+pages whose copy failed, with the listed protection, or a range memmgr reported that no listed page
+covers, with its region's protection. Adjacent runs with the same flags whose bytes follow one
+another in the object, or which have none, are one run.
 
 ---
 

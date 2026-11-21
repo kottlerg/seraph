@@ -424,8 +424,8 @@ svcmgr mints a `SEND|GRANT` on procmgr badged `procmgr_labels::DEBUG_AUTHORITY` 
 procmgr source init endows it, and delivers it in the bootstrap slot after the `seed` caps (after a
 `provides` service's own RECV and its seeds; `cap[0]` for a service with neither). A derive that
 fails leaves the slot absent. The authority serves procmgr's `REGISTER_CRASH_SERVICE`,
-`ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `MAKE_RESIDENT` and `MAKE_PRIVATE`
-([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
+`ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `MAKE_RESIDENT`, `MAKE_PRIVATE` and
+`SNAPSHOT` ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
 Authority); this key is the only path that mints it, so an image whose recipes set it nowhere has
 no attach path. A holder declares itself undebuggable to procmgr itself (`DECLARE_NO_DEBUG`), so no
 holder attaches to another or to itself. The crash service's recipe, `crashd.svc`, sets it

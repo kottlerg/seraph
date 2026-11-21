@@ -20,7 +20,9 @@ extern crate alloc;
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 use ipc::procmgr_snapshot::{NO_OBJECT_PAGE, RUN_ABSENT, Run, layout_pages};
-use syscall_abi::{PAGE_RUN_NO_COPY, PAGE_SIZE, PageRun};
+use syscall_abi::{
+    PAGE_RUN_EXECUTE, PAGE_RUN_NO_COPY, PAGE_RUN_READ, PAGE_RUN_WRITE, PAGE_SIZE, PageRun,
+};
 
 /// The runs of one listing of a space, in ascending address order, a run
 /// that continues the one before it with its protection joined to it, as the
@@ -82,8 +84,28 @@ pub struct Reported
     pub va: u64,
     /// End, exclusive, page-aligned.
     pub end: u64,
-    /// The region's protection, `MAP_*` bits.
+    /// The region's protection, `PAGE_RUN_*` bits.
     pub prot: u64,
+}
+
+impl Reported
+{
+    /// The range of `len` bytes at `va` that memmgr reported, of a region
+    /// registered with the `MAP_*` bits `region_prot`. Every page memmgr
+    /// maps is readable, whether or not the region names `MAP_READ` (the
+    /// kernel lists a resident page of a region registered `MAP_WRITABLE`
+    /// alone as `PAGE_RUN_READ | PAGE_RUN_WRITE`), so the range takes
+    /// `PAGE_RUN_READ` beside the region's write and execute bits, as its
+    /// listed pages would.
+    #[must_use]
+    pub fn new(va: u64, len: u64, region_prot: u64) -> Self
+    {
+        Self {
+            va,
+            end: va.saturating_add(len),
+            prot: (region_prot & (PAGE_RUN_WRITE | PAGE_RUN_EXECUTE)) | PAGE_RUN_READ,
+        }
+    }
 }
 
 /// The layout of a capture: its runs, in ascending address order, with
@@ -535,5 +557,28 @@ mod tests
         assert!(!l.complete);
         let second = &l.runs[1];
         assert_eq!((second.pages, second.object_page), (1, l.layout_pages));
+    }
+
+    #[test]
+    fn a_reported_range_is_readable_with_its_regions_write_and_execute_bits()
+    {
+        use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_RUN_EXECUTE};
+
+        // A heap region registered MAP_WRITABLE alone.
+        let r = Reported::new(0x4000, 3 * P, MAP_WRITABLE);
+        assert_eq!(r.va, 0x4000);
+        assert_eq!(r.end, 0x4000 + 3 * P);
+        assert_eq!(r.prot, RW);
+        assert_eq!(Reported::new(0x4000, P, MAP_READ).prot, PAGE_RUN_READ);
+        assert_eq!(
+            Reported::new(0x4000, P, MAP_READ | MAP_EXECUTABLE).prot,
+            PAGE_RUN_READ | PAGE_RUN_EXECUTE
+        );
+        // Bits outside the protection, PAGE_RUN_NO_COPY's among them, are not
+        // a region's.
+        assert_eq!(
+            Reported::new(0x4000, P, PAGE_RUN_NO_COPY | (1 << 9)).prot,
+            PAGE_RUN_READ
+        );
     }
 }

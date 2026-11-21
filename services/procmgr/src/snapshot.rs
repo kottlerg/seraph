@@ -33,8 +33,7 @@ use process_table::snapshot::{Layout, Listing, Reported, layout};
 use std::collections::TryReserveError;
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use syscall_abi::{
-    MAX_PAGE_RUNS, MAX_THREAD_MEM_COPY, PAGE_RUN_EXECUTE, PAGE_RUN_NO_COPY, PAGE_RUN_READ,
-    PAGE_RUN_WRITE, PAGE_SIZE, PageRun, SyscallError,
+    MAX_PAGE_RUNS, MAX_THREAD_MEM_COPY, PAGE_RUN_NO_COPY, PAGE_SIZE, PageRun, SyscallError,
 };
 
 /// How long procmgr waits, at most, on each call it makes on the
@@ -56,9 +55,6 @@ const _: () = assert!(MAX_THREAD_MEM_COPY as u64 == PAGE_SIZE);
 
 /// Region ids one `RELEASE_MEMORY_CAPS` names: every data word after the count.
 const RELEASE_IDS_PER_CALL: usize = syscall_abi::MSG_DATA_WORDS_MAX - 1;
-
-/// The protection bits a layout run carries from a listing or a report.
-const PROT_BITS: u64 = PAGE_RUN_READ | PAGE_RUN_WRITE | PAGE_RUN_EXECUTE | PAGE_RUN_NO_COPY;
 
 /// What a capture needs of procmgr.
 pub struct Context
@@ -194,11 +190,7 @@ fn make_resident(ctx: &Context, memmgr_badge: u64, top: u64) -> Result<Vec<Repor
             reported
                 .try_reserve(1)
                 .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-            reported.push(Reported {
-                va: start,
-                end: start.saturating_add(len),
-                prot: prot & PROT_BITS,
-            });
+            reported.push(Reported::new(start, len, prot));
         }
         // memmgr moves forward on every reply; one that did not would loop.
         if reached <= at
@@ -395,14 +387,19 @@ impl<'a> Grants<'a>
                 crate::release_caps(reply.caps());
                 return Err(procmgr_errors::OUT_OF_MEMORY);
             };
-            if reply.label != memmgr_errors::SUCCESS || reply.caps().len() != regions.len()
+            if reply.label != memmgr_errors::SUCCESS
             {
                 crate::release_caps(reply.caps());
                 return Err(procmgr_errors::OUT_OF_MEMORY);
             }
-            self.list
-                .try_reserve(regions.len())
-                .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+            if reply.caps().len() != regions.len() || self.list.try_reserve(regions.len()).is_err()
+            {
+                // The grants of a reply that is not kept go back at once:
+                // none of them is in `list` for `Drop` to return.
+                crate::release_caps(reply.caps());
+                release_regions(self.account, regions.iter().copied());
+                return Err(procmgr_errors::OUT_OF_MEMORY);
+            }
             let mut whole = true;
             for ((&cap, &count), &region) in reply.caps().iter().zip(counts).zip(regions)
             {
@@ -438,11 +435,12 @@ impl<'a> Grants<'a>
                 past
             })
             .unwrap_or(self.list.len());
-        let rest: Vec<Grant> = self.list.drain(first..).collect();
+        let rest = self.list.get(first..).unwrap_or(&[]);
         self.pages = self
             .pages
             .saturating_sub(rest.iter().fold(0, |n, g| n.saturating_add(g.pages)));
-        release(self.account, &rest);
+        release(self.account, rest);
+        self.list.truncate(first);
     }
 
     /// The grant holding page `index` of the grants, and the page's offset in
@@ -479,11 +477,29 @@ fn release(account: &Account, grants: &[Grant])
     {
         let _ = syscall::cap_delete(grant.cap);
     }
-    let ids: Vec<u64> = grants.iter().map(|g| g.region).collect();
-    for ids in ids.chunks(RELEASE_IDS_PER_CALL)
+    release_regions(account, grants.iter().map(|g| g.region));
+}
+
+/// Return the regions `ids` to the account (`RELEASE_MEMORY_CAPS`), as
+/// many to a call as one names. It allocates nothing, so it runs after a
+/// heap refusal too.
+fn release_regions(account: &Account, mut ids: impl Iterator<Item = u64>)
+{
+    let mut batch = [0u64; RELEASE_IDS_PER_CALL];
+    loop
     {
+        let n = batch
+            .iter_mut()
+            .zip(ids.by_ref())
+            .map(|(slot, id)| *slot = id)
+            .count();
+        let Some(ids) = batch.get(..n).filter(|ids| !ids.is_empty())
+        else
+        {
+            return;
+        };
         let msg = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
-            .word(0, ids.len() as u64)
+            .word(0, n as u64)
             .words(1, ids)
             .build();
         let _ = account.call(&msg);
@@ -532,10 +548,14 @@ impl Window
         self.unmap()?;
         let (grant, offset) = data.locate(index).ok_or(procmgr_errors::OUT_OF_MEMORY)?;
         let count = grant.pages.saturating_sub(offset).min(WINDOW_PAGES);
+        // Recorded before the map, which can fail with pages before the
+        // failing one mapped: `unmap` then covers them, and a window that
+        // will not unmap them stays reserved.
+        self.mapped = Some((index, count));
         // SAFETY: the window's pages are unmapped (`unmap` above) pages of its
         // own reservation, and `count` is at most its size; no Rust object or
         // IPC page occupies them.
-        unsafe {
+        let map = unsafe {
             std::os::seraph::mem_map_funded(
                 grant.cap,
                 self.self_aspace,
@@ -544,9 +564,12 @@ impl Window
                 count,
                 syscall::MAP_WRITABLE,
             )
+        };
+        if map.is_err()
+        {
+            let _ = self.unmap();
+            return Err(procmgr_errors::OUT_OF_MEMORY);
         }
-        .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
-        self.mapped = Some((index, count));
         Ok(self.va() as *mut u8)
     }
 

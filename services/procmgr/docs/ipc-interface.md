@@ -1639,7 +1639,8 @@ the constants and the encoder and decoder procmgr and a reader share.
 A run with bytes is a run of listed pages that were copied. A `PAGE_RUN_NO_COPY` run, device memory
 `SYS_THREAD_READ_MEM` refuses, has no bytes and is not absent. An absent run has no bytes: listed
 pages whose copy failed, with the listed protection, or a range memmgr reported that no listed page
-covers, with its region's protection. Adjacent runs with the same flags whose bytes follow one
+covers, with its region's write and execute bits and `PAGE_RUN_READ`, as the kernel lists every
+page memmgr maps. Adjacent runs with the same flags whose bytes follow one
 another in the object, or which have none, are one run.
 
 ---

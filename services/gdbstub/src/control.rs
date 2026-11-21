@@ -329,6 +329,34 @@ pub fn packet_actions(
     }
 }
 
+/// What `Hc` selects for a later `c`, `C`, `s` or `S` ([`packet_actions`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeSelect
+{
+    /// `Hc0` or `Hc-1`: every thread.
+    Every,
+    /// The thread, by table index.
+    Thread(usize),
+    /// No live thread: `Hc` is refused, as `Hg` of the same id is.
+    Refused,
+}
+
+/// What `Hc` of `thread` selects, with `selected` the live thread's index
+/// the stub's selection of `thread` gives (none without a session): every
+/// thread for `0` and `-1`, which name no thread and so are accepted
+/// whatever the stub holds, else the thread `selected` names, or a refusal
+/// when it names none, as `Hg` of an id that selects no thread is refused.
+#[must_use]
+pub fn resume_select(thread: ThreadId, selected: Option<usize>) -> ResumeSelect
+{
+    match (thread, selected)
+    {
+        (ThreadId::Any | ThreadId::All, _) => ResumeSelect::Every,
+        (ThreadId::Id(_), Some(i)) => ResumeSelect::Thread(i),
+        (ThreadId::Id(_), None) => ResumeSelect::Refused,
+    }
+}
+
 /// The plan of a `vCont` packet's `actions` over the live threads `live`,
 /// by table index, with `select` mapping a thread id to a live thread's
 /// index and `current` the thread "any" names.
@@ -767,5 +795,21 @@ mod tests
                 releases: releases(&[(0, Some(5)), (1, None), (2, None)])
             }
         );
+    }
+
+    // `Hc` of an id no live thread holds is refused, a session's or none
+    // (`selected` `None`), as `Hg` of it is; `Hc0` and `Hc-1` name no thread
+    // and are accepted either way.
+    #[test]
+    fn hc_of_an_id_that_selects_no_thread_is_refused()
+    {
+        assert_eq!(
+            resume_select(ThreadId::Id(2), Some(1)),
+            ResumeSelect::Thread(1)
+        );
+        assert_eq!(resume_select(ThreadId::Id(4), None), ResumeSelect::Refused);
+        assert_eq!(resume_select(ThreadId::Any, None), ResumeSelect::Every);
+        assert_eq!(resume_select(ThreadId::All, None), ResumeSelect::Every);
+        assert_eq!(resume_select(ThreadId::All, Some(0)), ResumeSelect::Every);
     }
 }

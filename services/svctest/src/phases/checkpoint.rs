@@ -17,21 +17,27 @@
 //! - the child's quiesce with a `std::fs::File` open is refused
 //!   `ResourceBusy`, and once the file is closed the fs release handler, the
 //!   runtime's own thread, does not refuse it;
-//! - a checkpoint of the quiesced child is complete, its header marks it a
+//! - a checkpoint of the child quiesced with no time bound
+//!   (`Duration::MAX`) is complete, its header marks it a
 //!   checkpoint, and its section holds the child's bootstrap layout: two
 //!   argv entries, a page-aligned IPC buffer, a restore stack pointer below
 //!   the stack top in a page the object holds bytes of, the `ProcessInfo`
 //!   page among the pages it holds, and the image the header names, which
 //!   the child shares, so its declarations do not mark it private; the
 //!   child's quiesce then returns `Captured`;
-//! - a `CHECKPOINT` after the point ended, and after a point that timed out
-//!   with `NotCaptured`, is refused `NOT_QUIESCED`;
+//! - a second checkpoint, dropped past svctest's call deadline, is released:
+//!   svctest's usage falls by its pages;
+//! - a quiesce inside a call deadline that has passed still enters its
+//!   point, and ends it with `NotCaptured`;
+//! - a `CHECKPOINT` after the point ended, after the point under the passed
+//!   deadline, and after a point that timed out with `NotCaptured`, is
+//!   refused `NOT_QUIESCED`;
 //! - a pinned child's `QUIESCE` is refused `NOT_RESTORABLE`.
 
 use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::os::seraph::checkpoint::{Quiesced, quiesce, take};
+use std::os::seraph::checkpoint::{Checkpoint, Quiesced, quiesce, take};
 use std::os::seraph::process::{ChildExt, CommandExt};
-use std::os::seraph::startup_info;
+use std::os::seraph::{startup_info, with_call_deadline};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -42,6 +48,7 @@ use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use syscall_abi::PAGE_SIZE;
 
 use crate::bootstrap::Caps;
+use crate::phases::heap_commit::own_usage;
 use crate::phases::memory_objects::call;
 use crate::phases::snapshot::{Attached, account};
 use crate::runner::Phase;
@@ -121,6 +128,18 @@ fn child_main() -> !
             {
                 println!("quiescing");
                 println!("{}", outcome(quiesce(Duration::from_millis(ms))));
+            }
+            (Some("forever"), None) =>
+            {
+                println!("quiescing");
+                println!("{}", outcome(quiesce(Duration::MAX)));
+            }
+            (Some("deadline"), None) =>
+            {
+                println!("quiescing");
+                let result =
+                    with_call_deadline(Instant::now(), || quiesce(Duration::from_millis(100)));
+                println!("{}", outcome(result));
             }
             _ =>
             {
@@ -240,8 +259,65 @@ fn checkpoint_phase(_: &Caps)
         "{PHASE}: a quiesce with a file open"
     );
 
-    child.say(&format!("quiesce {}", POINT_BOUND.as_millis()));
+    // A point with no time bound, which waits for the checkpoint.
+    child.say("forever");
     assert_eq!(child.line("quiescing"), "quiescing");
+    let checkpoint = take_at_point(handle);
+    let (object, pages) = checkpoint.into_raw();
+    let object = Attached::attach(object, pages, PHASE);
+    check_section(&object);
+    object.release();
+    assert_eq!(child.line("quiesce outcome"), "captured");
+    assert_eq!(
+        take(handle).map(|_| ()).map_err(|e| e.kind()),
+        Err(ErrorKind::ResourceBusy),
+        "{PHASE}: a CHECKPOINT after the point ended"
+    );
+
+    // A checkpoint dropped past the caller's call deadline is released.
+    child.say("forever");
+    assert_eq!(child.line("quiescing"), "quiescing");
+    let checkpoint = take_at_point(handle);
+    let pages = checkpoint.pages();
+    let held = own_usage();
+    with_call_deadline(Instant::now(), || drop(checkpoint));
+    let released = own_usage();
+    assert!(
+        released.saturating_add(pages) <= held,
+        "{PHASE}: svctest's usage went from {held} to {released} on the drop of a \
+         {pages}-page checkpoint past its call deadline"
+    );
+    assert_eq!(child.line("second outcome"), "captured");
+
+    // A quiesce inside a call deadline that has passed still enters and
+    // ends its point.
+    child.say("deadline");
+    assert_eq!(child.line("quiescing"), "quiescing");
+    assert_eq!(child.line("deadline outcome"), "not-captured");
+    assert_eq!(
+        take(handle).map(|_| ()).map_err(|e| e.kind()),
+        Err(ErrorKind::ResourceBusy),
+        "{PHASE}: a CHECKPOINT after a point under a passed deadline"
+    );
+
+    child.say("quiesce 100");
+    assert_eq!(child.line("quiescing"), "quiescing");
+    assert_eq!(child.line("timed-out outcome"), "not-captured");
+    assert_eq!(
+        take(handle).map(|_| ()).map_err(|e| e.kind()),
+        Err(ErrorKind::ResourceBusy),
+        "{PHASE}: a CHECKPOINT after a point timed out"
+    );
+    child.finish();
+
+    pinned();
+    std::os::seraph::log!("procmgr_checkpoint phase passed");
+}
+
+/// A complete checkpoint of the child `handle` names, taken once the child
+/// has entered its point.
+fn take_at_point(handle: u64) -> Checkpoint
+{
     let start = Instant::now();
     let checkpoint = loop
     {
@@ -259,29 +335,7 @@ fn checkpoint_phase(_: &Caps)
         checkpoint.is_complete(),
         "{PHASE}: the checkpoint is incomplete"
     );
-    let (object, pages) = checkpoint.into_raw();
-    let object = Attached::attach(object, pages, PHASE);
-    check_section(&object);
-    object.release();
-    assert_eq!(child.line("quiesce outcome"), "captured");
-    assert_eq!(
-        take(handle).map(|_| ()).map_err(|e| e.kind()),
-        Err(ErrorKind::ResourceBusy),
-        "{PHASE}: a CHECKPOINT after the point ended"
-    );
-
-    child.say("quiesce 100");
-    assert_eq!(child.line("quiescing"), "quiescing");
-    assert_eq!(child.line("timed-out outcome"), "not-captured");
-    assert_eq!(
-        take(handle).map(|_| ()).map_err(|e| e.kind()),
-        Err(ErrorKind::ResourceBusy),
-        "{PHASE}: a CHECKPOINT after a point timed out"
-    );
-    child.finish();
-
-    pinned();
-    std::os::seraph::log!("procmgr_checkpoint phase passed");
+    checkpoint
 }
 
 /// The refusals before the child quiesces.

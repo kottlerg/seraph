@@ -9,7 +9,8 @@ log.
 
 The fixture's per-program tester, `crashme-tester`, runs it once in each of the `vm`, `exception`,
 `worker`, and `registry-declare` modes, then twice in the `oom-touch` mode, with 1024 pages,
-beside the `oom-fill` mode, and the `usertest` orchestrator discovers and runs that tester.
+beside the `oom-fill` mode, then once in each of the `live` and `live-no-core` modes, and the
+`usertest` orchestrator discovers and runs that tester.
 svctest's `crash_endpoint` phase also spawns it, in the `vm`, `exception`, `registry-main`,
 `registry-worker`, and `debugger-tag` modes, and its `oom_policy` phase in the `oom-touch` mode,
 with 1024 pages, and, through the shell of an operator session it opens, in the `oom-hold` mode
@@ -29,6 +30,8 @@ Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
 | `oom-fill <ms>` | None: through [`mem-fill`](../../shared/mem-fill/README.md), shared with the `memhog` fixture, it commits what memmgr can still promise a process outside the system reserve, through its heap and then by one-page grants, until nothing is left and the pressure level has read `CRITICAL` for 500 ms, prints `full`, keeps taking what other processes free for `<ms>` milliseconds, and exits 0, which gives it all back |
 | `oom-hold <pages>` | None: it touches `<pages>` pages of heap, prints `holding <pages>`, and waits to be destroyed: a job of an operator session, which oomd stops before any service ([docs/session-supervision.md](../../docs/session-supervision.md)) |
 | `registry-declare` | None: with a registered thread parked, it sends `DECLARE_NO_DEBUG` and checks that the thread's crash binding, under a badge other than the main thread's, is unbound with the main thread's; it prints `registry-declare: PASS` and exits 0 when so |
+| `live` | None: it parks two registered threads, fills 4096 bytes of its heap with a known word, prints `ready mark=<address>`, and waits for a line on stdin while the crash service writes a live core of it; it then checks that its threads are still parked and the bytes still hold the word, prints `live: PASS` or `live: FAIL`, and exits 0 when both hold |
+| `live-no-core` | None: it declares itself on the core path (`DECLARE_NO_CORE`), prints `ready`, waits for a line on stdin, and exits 0; it exits 1 when procmgr refuses the declaration |
 
 In each faulting mode the fixture registers the log name `crashme` and logs a line first, so logd's
 `reclaim:` line at its death names it, and prints `faulting (<mode>)` to stdout. It reaches the
@@ -62,6 +65,19 @@ blocks themselves are checked host-side, in the boot's serial log, by `cargo xta
 run --crash-reports` ([docs/testing.md](../../docs/testing.md) § Crash reports), which ties each
 block to `crashme` through the badge logd's `reclaim:` line names.
 
+The tester also takes `crashd.core`, the one seed usertest's recipe declares for it
+([services/usertest/README.md](../../services/usertest/README.md) § Seeds), and asks the crash
+service for live cores ([services/crashd/docs/operation.md](../../services/crashd/docs/operation.md)
+§ Live Core), each charged to a copy of its own memmgr account. Of `crashme live` it checks that the
+reply is `SUCCESS` and names the one new core, whose bytes match the reply's, that the fixture ran
+on unchanged and exited 0, and that the core is an `ET_CORE` of the machine with an `NT_PRSTATUS` of
+signal 0 for each of the fixture's three threads, each stack pointer inside a `PT_LOAD` whose bytes
+the core holds, every word of the marked bytes inside one, holding the word, and the main thread's
+instruction pointer, in the binary's text, inside none, so a debugger reads the text from the
+binary. Of `crashme live-no-core` it checks that the reply is `NO_CORE`, that no core was written,
+that the pages charged to its account (`QUERY_MEMORY_USAGE`) are the same after the reply as before
+the request, so the refused capture was released, and that the fixture exited 0.
+
 ---
 
 ## Source Layout
@@ -82,7 +98,7 @@ crashme/
 └── tester/
     ├── Cargo.toml
     └── src/
-        └── main.rs        # Runs the modes; checks each death, its core, the declaration, the hold
+        └── main.rs        # Runs the modes; checks deaths, cores, declaration, hold, live cores
 ```
 
 ---
@@ -93,7 +109,7 @@ crashme/
 |---|---|
 | [services/crashd/README.md](../../services/crashd/README.md) | The crash service the fixture's deaths are reported by |
 | [services/crashd/docs/core-format.md](../../services/crashd/docs/core-format.md) | The core the tester checks |
-| [services/crashd/docs/operation.md](../../services/crashd/docs/operation.md) | § Hold: the hold the `oom-` modes drive |
+| [services/crashd/docs/operation.md](../../services/crashd/docs/operation.md) | § Hold: the hold the `oom-` modes drive; § Live Core: the live cores the tester asks for |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | § Crash Reports, § Reply |
 | [docs/testing.md](../../docs/testing.md) | § Per-program tester protocol, § Crash reports |
 

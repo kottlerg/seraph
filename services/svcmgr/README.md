@@ -19,7 +19,8 @@ caps init endows it with at handover, and from each provider's launch. Consumers
 through their `.svc` `seed = ...` line at launch time, and the public names (`svcmgr`,
 `pwrmgr.deny`, `acpid.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority
 is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields `GRANT`;
-a seed is `SEND` except `devmgr.bind`, `memmgr.swap` and each `:grant` name (`sessiond.operator`),
+a seed is `SEND` except `devmgr.bind`, `memmgr.swap` and each `:grant` name (`sessiond.operator`,
+`crashd.core`),
 which are `SEND|GRANT`. The endowment and registry wire format are in
 [docs/ipc-interface.md](docs/ipc-interface.md).
 

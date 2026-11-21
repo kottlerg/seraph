@@ -7,8 +7,9 @@
 //! (services/crashd/docs/operation.md § Hold).
 //!
 //! With a stall set (`CRASHD_OOM_STALL_MS`), crashd's thread waits on a wait
-//! set of procmgr's crash endpoint and the runtime's memory-pressure
-//! Notification, with a timeout of the earliest hold's deadline. A fault that
+//! set of procmgr's crash endpoint, the live-core endpoint and the runtime's
+//! memory-pressure Notification, with a timeout of the earliest hold's
+//! deadline. A fault that
 //! memmgr declined with code 6, 7 or 8 while the level is `CRITICAL`, or with
 //! code 11 while memmgr's draw room is short of a demand chunk, is redirected
 //! (`FAULT_REPLY_REDIRECT`) to one of [`SLOTS`] endpoints crashd made at
@@ -35,31 +36,26 @@ use syscall_abi::{
     FAULT_REPLY_RESUME, PAGE_SIZE, SyscallError,
 };
 
-use crate::{Dump, FAULT_BOUND, deadline_in, delete_caps, handle_fault, now_ms};
-
-/// The wait-set badge of procmgr's crash endpoint.
-const WAKE_FAULT: u64 = 0;
+use crate::{
+    Dump, WAIT_RETRY_MS, WAKE_FAULT, WAKE_LIVE, bounded, delete_caps, handle_fault, now_ms,
+};
 
 /// The wait-set badge of the memory-pressure Notification.
-const WAKE_PRESSURE: u64 = 1;
+const WAKE_PRESSURE: u64 = 2;
 
 /// The wait-set badge of slot 0's endpoint; slot `n`'s is this plus `n`.
-const WAKE_SLOT: u64 = 2;
+const WAKE_SLOT: u64 = 3;
 
 /// One past the wait-set badge of the last slot's endpoint.
 const WAKE_SLOT_END: u64 = WAKE_SLOT + SLOTS as u64;
 
-/// Members of the wait set: the crash endpoint, the Notification, and each
-/// slot's endpoint.
+/// Members of the wait set: the crash endpoint, the live-core endpoint, the
+/// Notification, and each slot's endpoint.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "SLOTS is 16; the sum fits a u32 at compile time"
 )]
-const WAIT_SET_MEMBERS: u32 = 2 + SLOTS as u32;
-
-/// How long crashd waits before it waits on its wait set again after the
-/// wait failed with an error a retry does not clear at once.
-const WAIT_RETRY_MS: u64 = 100;
+const WAIT_SET_MEMBERS: u32 = 3 + SLOTS as u32;
 
 /// A held fault's message as it reached crashd. A redirect delivers the fault
 /// again with the slot endpoint's badge and the slot in its reason word, so
@@ -132,12 +128,20 @@ struct Hold
 }
 
 /// Serve the crash endpoint `endpoint` with the hold of faults for at most
-/// `stall_ms` each, as crashd's main loop, after touching the thread's stack
-/// and the heap a report under `CRITICAL` uses; return, with nothing made,
-/// when the hold cannot start, logged, for the loop without it.
-pub fn serve(stall_ms: u64, endpoint: u64, policy: &Policy, authority: u64, ipc_buf: *mut u64)
+/// `stall_ms` each, and the live-core endpoint `live` when it is nonzero,
+/// as crashd's main loop, after touching the thread's stack and the heap a
+/// report under `CRITICAL` uses; return, with nothing made, when the hold
+/// cannot start, logged, for the loop without it.
+pub fn serve(
+    stall_ms: u64,
+    endpoint: u64,
+    live: u64,
+    policy: &Policy,
+    authority: u64,
+    ipc_buf: *mut u64,
+)
 {
-    let Some(hold) = Hold::start(stall_ms, endpoint)
+    let Some(hold) = Hold::start(stall_ms, endpoint, live)
     else
     {
         return;
@@ -146,16 +150,17 @@ pub fn serve(stall_ms: u64, endpoint: u64, policy: &Policy, authority: u64, ipc_
     crate::touch_heap();
     std::os::seraph::log!("holding faults declined for want of memory up to {stall_ms} ms");
     std::os::seraph::log!("reporting crashes");
-    hold.serve(endpoint, policy, authority, ipc_buf);
+    hold.serve(endpoint, live, policy, authority, ipc_buf);
 }
 
 impl Hold
 {
     /// Make the slots' endpoints and the wait set of the crash endpoint
-    /// `endpoint` and the pressure Notification, and read memmgr's memory; `None`,
-    /// logged, with nothing left made, when the process has no pressure
-    /// registration or an object cannot be made.
-    fn start(stall_ms: u64, endpoint: u64) -> Option<Self>
+    /// `endpoint`, the live-core endpoint `live` when it is nonzero, and the
+    /// pressure Notification, and read memmgr's memory; `None`, logged, with
+    /// nothing left made, when the process has no pressure registration or an
+    /// object cannot be made.
+    fn start(stall_ms: u64, endpoint: u64, live: u64) -> Option<Self>
     {
         let Some(pressure) = std::os::seraph::memory_pressure_notification()
         else
@@ -186,7 +191,8 @@ impl Hold
         .unwrap_or(0);
         let joined = wait_set != 0
             && syscall::wait_set_add(wait_set, endpoint, WAKE_FAULT).is_ok()
-            && syscall::wait_set_add(wait_set, pressure, WAKE_PRESSURE).is_ok();
+            && syscall::wait_set_add(wait_set, pressure, WAKE_PRESSURE).is_ok()
+            && (live == 0 || syscall::wait_set_add(wait_set, live, WAKE_LIVE).is_ok());
         if !joined
         {
             // Deleting the set removes the members it took.
@@ -207,10 +213,20 @@ impl Hold
         })
     }
 
-    /// Serve the crash endpoint `endpoint` with the hold: end each hold whose
-    /// memory is there or whose deadline passed, then wait for a fault, a
-    /// signal from memmgr, or the next deadline.
-    fn serve(mut self, endpoint: u64, policy: &Policy, authority: u64, ipc_buf: *mut u64) -> !
+    /// Serve the crash endpoint `endpoint` with the hold, and the live-core
+    /// endpoint `live`: end each hold whose memory is there or whose
+    /// deadline passed, then wait for a fault, a live-core request, a signal
+    /// from memmgr, or the next deadline. A live core delays the holds' ends
+    /// and the faults that arrive meanwhile by at most the dump's bound, as a
+    /// crash core does.
+    fn serve(
+        mut self,
+        endpoint: u64,
+        live: u64,
+        policy: &Policy,
+        authority: u64,
+        ipc_buf: *mut u64,
+    ) -> !
     {
         loop
         {
@@ -234,6 +250,15 @@ impl Hold
                     if let Ok(msg) = unsafe { ipc::ipc_try_recv(endpoint, ipc_buf) }
                     {
                         self.dispatch(&msg, policy, authority, ipc_buf);
+                    }
+                }
+                Ok(WAKE_LIVE) =>
+                {
+                    // SAFETY: ipc_buf is the registered IPC buffer page.
+                    if let Ok(msg) = unsafe { ipc::ipc_try_recv(live, ipc_buf) }
+                    {
+                        self.refresh_rooms();
+                        crate::live::serve(&msg, authority, ipc_buf, self.dump());
                     }
                 }
                 // A held fault reached its slot's endpoint; memory that came
@@ -613,12 +638,4 @@ const fn came_back(waits: Waits) -> &'static str
 fn held_ms(held: &Held) -> u64
 {
     now_ms().saturating_sub(held.since)
-}
-
-/// Run `log`, a log write outside a fault's report, under a call deadline
-/// of [`FAULT_BOUND`], so a log write that waits on a stuck driver does not
-/// stop crashd serving faults and ending holds.
-fn bounded(log: impl FnOnce())
-{
-    std::os::seraph::with_call_deadline(deadline_in(FAULT_BOUND), log);
 }

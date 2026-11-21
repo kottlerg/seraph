@@ -79,6 +79,7 @@ dependencies = [
 name = "crashd-core-file"
 version = "0.1.4"
 dependencies = [
+ "ipc",
  "syscall-abi",
 ]
 
@@ -107,6 +108,10 @@ dependencies = [
 [[package]]
 name = "crashme-tester"
 version = "0.1.4"
+dependencies = [
+ "ipc",
+ "syscall",
+]
 
 [[package]]
 name = "crypto"

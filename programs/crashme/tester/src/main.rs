@@ -22,6 +22,13 @@
 //! for the modes that execute it) and a stack pointer in one, and, for
 //! `worker`, more than one thread.
 //!
+//! It also asks the crash service for a live core of `crashme live`
+//! ([`check_live`]) through the `crashd.core` seed usertest's recipe declares
+//! for it, and checks the fixture ran on unchanged and the core holds every
+//! registered thread, stopped nowhere, and the fixture's marked page; then
+//! asks for one of `crashme live-no-core`, which declared itself on the core
+//! path, and checks the refusal ([`check_live_no_core`]).
+//!
 //! See [docs/testing.md](../../../docs/testing.md) for the protocol.
 
 #![expect(
@@ -192,13 +199,15 @@ fn usize_at(bytes: &[u8], offset: usize) -> Result<usize, String>
     usize::try_from(value).map_err(|_| format!("{value:#x} at {offset:#x} is not an offset"))
 }
 
-/// One program header: type, file offset, address, and file bytes.
+/// One program header: type, file offset, address, file bytes and memory
+/// bytes.
 struct Segment
 {
     kind: u32,
     offset: usize,
     vaddr: u64,
     filesz: usize,
+    memsz: u64,
 }
 
 impl Segment
@@ -209,10 +218,21 @@ impl Segment
         let into = usize::try_from(va.checked_sub(self.vaddr)?).ok()?;
         (self.kind == PT_LOAD && into < self.filesz).then(|| self.offset.saturating_add(into))
     }
+
+    /// Whether the segment is a `PT_LOAD` whose memory holds `va`, file
+    /// bytes or none.
+    fn covers(&self, va: u64) -> bool
+    {
+        self.kind == PT_LOAD
+            && va
+                .checked_sub(self.vaddr)
+                .is_some_and(|into| into < self.memsz)
+    }
 }
 
-/// Check the core of a death in `mode`.
-fn check_core(core: &[u8], mode: &str) -> Result<(), String>
+/// The program headers of `core`, an `ET_CORE` of this machine, and the
+/// descriptors of its `NT_PRSTATUS` notes, in order.
+fn read_core(core: &[u8]) -> Result<(Vec<Segment>, Vec<&[u8]>), String>
 {
     if core.get(..4) != Some(b"\x7fELF".as_slice()) || core.get(4..6) != Some([2, 1].as_slice())
     {
@@ -239,6 +259,7 @@ fn check_core(core: &[u8], mode: &str) -> Result<(), String>
                 offset: usize_at(core, at.saturating_add(8))?,
                 vaddr: u64_at(core, at.saturating_add(16))?,
                 filesz: usize_at(core, at.saturating_add(32))?,
+                memsz: u64_at(core, at.saturating_add(40))?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -250,6 +271,13 @@ fn check_core(core: &[u8], mode: &str) -> Result<(), String>
         core.get(note.offset..note.offset.saturating_add(note.filesz))
             .ok_or("PT_NOTE past the file")?,
     )?;
+    Ok((segments, statuses))
+}
+
+/// Check the core of a death in `mode`.
+fn check_core(core: &[u8], mode: &str) -> Result<(), String>
+{
+    let (segments, statuses) = read_core(core)?;
     let first = statuses.first().ok_or("no NT_PRSTATUS")?;
     let signal = u32_at(first, 0)?;
     let expected = if mode == "vm" { SIGSEGV } else { SIGILL };
@@ -544,6 +572,301 @@ fn check_oom_hold()
     }
 }
 
+/// Threads `crashme live` runs: its main thread and the two it parks.
+const LIVE_THREADS: usize = 3;
+/// The word `crashme live` fills its marked page with.
+const LIVE_MARK: u64 = 0x4c49_5645_434f_5245;
+/// Bytes of the marked page.
+const LIVE_MARK_BYTES: usize = 4096;
+
+/// Take the one seed usertest's recipe declares for this tester
+/// (`crashd.core`) over the bootstrap protocol, start `crashme live`, and
+/// ask the crash service for a live core of it, charged to this tester's own
+/// memmgr account. Check the reply, that the fixture then ran on with its
+/// threads and its marked page unchanged and exited cleanly, and the core
+/// ([`check_live_core`]).
+/// Defect guarded: a live core that stops or changes its process, or one
+/// that does not record its threads, their stacks or its memory.
+fn check_live(crashd: u64)
+{
+    let info = std::os::seraph::startup_info();
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    let before = cores();
+    let mut child = Command::new("/programs/crashme")
+        .arg("live")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn /programs/crashme live");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    stdout
+        .read_line(&mut line)
+        .expect("read crashme live stdout");
+    let mark = line
+        .trim()
+        .strip_prefix("ready mark=0x")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| fail(&format!("live: expected ready, read {line:?}")));
+
+    let request = live_core_request("live");
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = match unsafe { ipc::ipc_call(crashd, &request, ipc_buf) }
+    {
+        Ok(reply) => reply,
+        Err(e) => fail(&format!("live: the LIVE_CORE call failed ({e})")),
+    };
+    if reply.label != ipc::crashd_errors::SUCCESS
+    {
+        fail(&format!(
+            "live: LIVE_CORE answered {:#x} ({:#x})",
+            reply.label,
+            reply.word(0)
+        ));
+    }
+
+    stdin.write_all(b"check\n").expect("write to crashme live");
+    line.clear();
+    stdout
+        .read_line(&mut line)
+        .expect("read crashme live stdout");
+    let status = child.wait().expect("wait /programs/crashme live");
+    if !status.success() || !line.contains("live: PASS")
+    {
+        fail(&format!(
+            "live: the fixture did not run on unchanged: {status}, {line:?}"
+        ));
+    }
+
+    let new: Vec<String> = cores().difference(&before).cloned().collect();
+    let [name] = new.as_slice()
+    else
+    {
+        fail(&format!(
+            "live: expected one new core in {CORE_DIR}, found {new:?}"
+        ));
+    };
+    if !name.starts_with(&format!("{:010}-", reply.word(1)))
+    {
+        fail(&format!(
+            "live: the new core {name} is not core {}",
+            reply.word(1)
+        ));
+    }
+    let path = format!("{CORE_DIR}/{name}");
+    let core = std::fs::read(&path).expect("read the live core");
+    if core.len() as u64 != reply.word(2)
+    {
+        fail(&format!(
+            "live: {path} holds {} bytes, the reply named {}",
+            core.len(),
+            reply.word(2)
+        ));
+    }
+    if let Err(why) = check_live_core(&core, mark)
+    {
+        fail(&format!("live: {path}: {why}"));
+    }
+}
+
+/// Take the one seed usertest's recipe declares for this tester
+/// (`crashd.core`) over the bootstrap protocol.
+fn crashd_seed() -> u64
+{
+    let info = std::os::seraph::startup_info();
+    if info.creator_endpoint == 0
+    {
+        fail("live: no creator endpoint for the declared seed");
+    }
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    // SAFETY: the IPC buffer is registered by `_start` and page-aligned.
+    let slots = unsafe { ipc::bootstrap::request_slots::<1>(info.creator_endpoint, ipc_buf) };
+    match slots
+    {
+        Ok([cap]) if cap != 0 => cap,
+        other => fail(&format!(
+            "live: the declared seed was not delivered: {other:?}"
+        )),
+    }
+}
+
+/// A `LIVE_CORE` request for the fixture, charged to a copy of this tester's
+/// own memmgr account. It names the fixture by its whole path: `crashme`
+/// alone would name this tester too, `/tests/programs/crashme`, by its last
+/// component.
+fn live_core_request(what: &str) -> ipc::IpcMessage
+{
+    let account = syscall::cap_derive(
+        std::os::seraph::startup_info().memmgr_endpoint,
+        syscall::RIGHTS_EP_SEND,
+    )
+    .unwrap_or_else(|e| fail(&format!("{what}: no copy of the memmgr account ({e})")));
+    ipc::with_name_block(
+        ipc::IpcMessage::builder(ipc::crashd_labels::LIVE_CORE),
+        0,
+        b"/programs/crashme",
+        ipc::svcmgr_labels::NAME_MAX,
+    )
+    .expect("a name within NAME_MAX")
+    .cap(account)
+    .build()
+}
+
+/// The pages charged to this tester's own memmgr account
+/// (`QUERY_MEMORY_USAGE` `data[0]`).
+fn own_charge(ipc_buf: *mut u64) -> u64
+{
+    let request = ipc::IpcMessage::new(ipc::memmgr_labels::QUERY_MEMORY_USAGE);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    match unsafe {
+        ipc::ipc_call(
+            std::os::seraph::startup_info().memmgr_endpoint,
+            &request,
+            ipc_buf,
+        )
+    }
+    {
+        Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => reply.word(0),
+        Ok(reply) => fail(&format!("QUERY_MEMORY_USAGE answered {:#x}", reply.label)),
+        Err(e) => fail(&format!("QUERY_MEMORY_USAGE failed ({e})")),
+    }
+}
+
+/// Start `crashme live-no-core`, which declares itself on the core path, and
+/// ask the crash service for a live core of it, charged to this tester's own
+/// account. Check that the crash service refused with `NO_CORE`, wrote no
+/// core, and left the account charged as before the request, its snapshot
+/// released; and that the fixture ran on and exited cleanly.
+/// Defect guarded: a live core of a process on the core path (a core of
+/// another process's pages it handled), or a refused snapshot left charged to
+/// the requester.
+fn check_live_no_core(crashd: u64)
+{
+    let info = std::os::seraph::startup_info();
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    let before = cores();
+    let mut child = Command::new("/programs/crashme")
+        .arg("live-no-core")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn /programs/crashme live-no-core");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    stdout
+        .read_line(&mut line)
+        .expect("read crashme live-no-core stdout");
+    if line.trim() != "ready"
+    {
+        fail(&format!("live-no-core: expected ready, read {line:?}"));
+    }
+
+    // Nothing between the two reads of the charge allocates or touches a new
+    // page of this tester.
+    let request = live_core_request("live-no-core");
+    let charged = own_charge(ipc_buf);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(crashd, &request, ipc_buf) };
+    let after = own_charge(ipc_buf);
+    match reply
+    {
+        Ok(r) if r.label == ipc::crashd_errors::NO_CORE =>
+        {}
+        Ok(r) => fail(&format!(
+            "live-no-core: LIVE_CORE answered {:#x}, expected NO_CORE",
+            r.label
+        )),
+        Err(e) => fail(&format!("live-no-core: the LIVE_CORE call failed ({e})")),
+    }
+    if after != charged
+    {
+        fail(&format!(
+            "live-no-core: the account holds {after} pages after the refusal, {charged} before"
+        ));
+    }
+
+    stdin
+        .write_all(b"exit\n")
+        .expect("write to crashme live-no-core");
+    let status = child.wait().expect("wait /programs/crashme live-no-core");
+    if !status.success()
+    {
+        fail(&format!("live-no-core: the fixture exited {status}"));
+    }
+    let new: Vec<String> = cores().difference(&before).cloned().collect();
+    if !new.is_empty()
+    {
+        fail(&format!("live-no-core: a core was written: {new:?}"));
+    }
+}
+
+/// Check a live core of `crashme live`, whose marked page is at `mark`: an
+/// `ET_CORE` of this machine with an `NT_PRSTATUS` of signal 0 for each of
+/// its [`LIVE_THREADS`] threads, each stack pointer in a written `PT_LOAD`,
+/// and every word of the marked bytes in one, holding the mark.
+fn check_live_core(core: &[u8], mark: u64) -> Result<(), String>
+{
+    let (segments, statuses) = read_core(core)?;
+    if statuses.len() < LIVE_THREADS
+    {
+        return Err(format!(
+            "{} threads recorded, expected {LIVE_THREADS}",
+            statuses.len()
+        ));
+    }
+    for status in &statuses
+    {
+        let signal = u32_at(status, 0)?;
+        if signal != 0
+        {
+            return Err(format!("signal {signal}, expected 0 for a live core"));
+        }
+        let sp = u64_at(status, PRSTATUS_HEAD + 8 * machine::SP_INDEX)?;
+        if !segments.iter().any(|s| s.file_offset(sp).is_some())
+        {
+            return Err(format!("sp {sp:#x} is in no written PT_LOAD"));
+        }
+    }
+    // The main thread waits in the binary's text, whose pages the image
+    // shares: a live core lists none of them, so a debugger reads them from
+    // the binary rather than as zeros.
+    let first = statuses.first().ok_or("no NT_PRSTATUS")?;
+    let ip = u64_at(first, PRSTATUS_HEAD + 8 * machine::IP_INDEX)?;
+    if segments.iter().any(|s| s.covers(ip))
+    {
+        return Err(format!("ip {ip:#x}, in the image's text, is in a PT_LOAD"));
+    }
+    // The mark spans two pages, which may lie in two runs.
+    for offset in (0..LIVE_MARK_BYTES).step_by(8)
+    {
+        let va = mark.saturating_add(offset as u64);
+        let at = segments
+            .iter()
+            .find_map(|s| s.file_offset(va))
+            .ok_or_else(|| format!("the marked word at {va:#x} is in no written PT_LOAD"))?;
+        if u64_at(core, at)? != LIVE_MARK
+        {
+            return Err(format!("the marked word at {va:#x} does not hold the mark"));
+        }
+    }
+    Ok(())
+}
+
 fn main()
 {
     check("vm");
@@ -551,5 +874,8 @@ fn main()
     check("worker");
     check_declare();
     check_oom_hold();
+    let crashd = crashd_seed();
+    check_live(crashd);
+    check_live_no_core(crashd);
     println!("[crashme-tester] PASS");
 }

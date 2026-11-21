@@ -26,6 +26,7 @@
 mod arch;
 mod dump;
 mod hold;
+mod live;
 
 use std::os::seraph::call_time_left;
 use std::time::{Duration, Instant};
@@ -74,6 +75,24 @@ fn expired() -> bool
     call_time_left().is_some_and(|left| left.is_zero())
 }
 
+/// Run `log`, a log write outside a fault's report, under a call deadline
+/// of [`FAULT_BOUND`], so a log write that waits on a stuck driver does not
+/// stop crashd serving faults, live cores and holds.
+fn bounded(log: impl FnOnce())
+{
+    std::os::seraph::with_call_deadline(deadline_in(FAULT_BOUND), log);
+}
+
+/// The wait-set badge of procmgr's crash endpoint.
+const WAKE_FAULT: u64 = 0;
+
+/// The wait-set badge of the live-core endpoint.
+const WAKE_LIVE: u64 = 1;
+
+/// How long crashd waits before it waits on its wait set again after the
+/// wait failed with an error a retry does not clear at once.
+const WAIT_RETRY_MS: u64 = 100;
+
 fn main() -> !
 {
     std::os::seraph::log::register_name(b"crashd");
@@ -95,19 +114,24 @@ fn main() -> !
         )
     };
 
-    // The recipe's `debug_authority = yes` delivers the authority cap in the
-    // slot after the (absent) seeds.
+    // The recipe's `provides` delivers the live-core endpoint's RECV in slot
+    // 0, and its `debug_authority = yes` the authority cap in the slot after
+    // the (absent) seeds.
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let authority =
-        match unsafe { ipc::bootstrap::request_slots::<1>(info.creator_endpoint, ipc_buf) }
+    let (live, authority) =
+        match unsafe { ipc::bootstrap::request_slots::<2>(info.creator_endpoint, ipc_buf) }
         {
-            Ok([cap]) if cap != 0 => cap,
+            Ok([live, authority]) if authority != 0 => (live, authority),
             _ =>
             {
                 std::os::seraph::log!(error: "no debug authority delivered; not reporting crashes");
                 syscall::thread_exit();
             }
         };
+    if live == 0
+    {
+        std::os::seraph::log!(warn: "no live-core endpoint delivered; writing no live core");
+    }
     let policy = core_policy();
     let stall_ms = stall_ms();
     let Some(endpoint) = register(authority, ipc_buf)
@@ -117,9 +141,13 @@ fn main() -> !
     };
     if stall_ms != 0
     {
-        hold::serve(stall_ms, endpoint, &policy, authority, ipc_buf);
+        hold::serve(stall_ms, endpoint, live, &policy, authority, ipc_buf);
     }
     std::os::seraph::log!("reporting crashes");
+    if let Some(wait_set) = wait_set_of(endpoint, live)
+    {
+        serve_both(wait_set, endpoint, live, &policy, authority, ipc_buf);
+    }
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
@@ -138,16 +166,96 @@ fn main() -> !
                 continue;
             }
         };
-        if msg.label != FAULT_LABEL
-        {
-            // Only procmgr holds a SEND on the endpoint, and it sends crashd
-            // none; answer anything else without acting on it.
-            // SAFETY: ipc_buf is the registered IPC buffer page.
-            let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_KILL), ipc_buf) };
-            continue;
-        }
-        handle_fault(&msg, &policy, authority, ipc_buf, Dump::Allowed);
+        serve_fault(&msg, &policy, authority, ipc_buf);
     }
+}
+
+/// A wait set of the crash endpoint `endpoint` and the live-core endpoint
+/// `live`; `None`, with nothing made, when `live` is 0 or the set cannot be
+/// made, logged, for the loop on the crash endpoint alone.
+fn wait_set_of(endpoint: u64, live: u64) -> Option<u64>
+{
+    if live == 0
+    {
+        return None;
+    }
+    let wait_set =
+        std::os::seraph::object_slab_retype(std::os::seraph::wait_set_retype_bytes(2), |s| {
+            syscall::wait_set_create(s, 2).ok()
+        })
+        .unwrap_or(0);
+    let joined = wait_set != 0
+        && syscall::wait_set_add(wait_set, endpoint, WAKE_FAULT).is_ok()
+        && syscall::wait_set_add(wait_set, live, WAKE_LIVE).is_ok();
+    if !joined
+    {
+        // Deleting the set removes the members it took.
+        delete_caps(&[wait_set]);
+        std::os::seraph::log!(warn: "wait set not made; writing no live core");
+        return None;
+    }
+    Some(wait_set)
+}
+
+/// Serve the crash endpoint `endpoint` and the live-core endpoint `live`
+/// from `wait_set`, which holds both, one request at a time, as crashd's
+/// main loop. A live core delays the faults that arrive meanwhile by at most
+/// the dump's bound, as a crash core does.
+fn serve_both(
+    wait_set: u64,
+    endpoint: u64,
+    live: u64,
+    policy: &Policy,
+    authority: u64,
+    ipc_buf: *mut u64,
+) -> !
+{
+    loop
+    {
+        match syscall::wait_set_wait(wait_set)
+        {
+            Ok(WAKE_FAULT) =>
+            {
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                if let Ok(msg) = unsafe { ipc::ipc_try_recv(endpoint, ipc_buf) }
+                {
+                    serve_fault(&msg, policy, authority, ipc_buf);
+                }
+            }
+            Ok(WAKE_LIVE) =>
+            {
+                // SAFETY: ipc_buf is the registered IPC buffer page.
+                if let Ok(msg) = unsafe { ipc::ipc_try_recv(live, ipc_buf) }
+                {
+                    live::serve(&msg, authority, ipc_buf, Dump::Allowed);
+                }
+            }
+            Ok(_) =>
+            {}
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {}
+            Err(e) =>
+            {
+                bounded(|| std::os::seraph::log!(warn: "wait failed (err={e})"));
+                std::thread::sleep(Duration::from_millis(WAIT_RETRY_MS));
+            }
+        }
+    }
+}
+
+/// Answer `msg`, received on the crash endpoint, with no hold: report and
+/// decline a fault.
+fn serve_fault(msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut u64)
+{
+    if msg.label != FAULT_LABEL
+    {
+        // Only procmgr holds a SEND on the endpoint, and it sends crashd
+        // none; answer anything else without acting on it.
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_KILL), ipc_buf) };
+        return;
+    }
+    handle_fault(msg, policy, authority, ipc_buf, Dump::Allowed);
 }
 
 /// [`ipc::recv_guard::RecvGuard`] hook of crashd's receive loop: log the first
@@ -423,7 +531,7 @@ fn log_core(id: u64, outcome: &dump::Outcome)
 {
     match outcome
     {
-        dump::Outcome::Written(name, bytes) =>
+        dump::Outcome::Written { name, bytes, .. } =>
         {
             std::os::seraph::log!("core id={id:016x} written /crash/{name} bytes={bytes}");
         }
@@ -457,10 +565,10 @@ struct Gathered
 }
 
 /// Why [`attach`] returned no reply.
-enum AttachFailed
+pub(crate) enum AttachFailed
 {
-    /// procmgr refused, or the call failed.
-    Refused,
+    /// procmgr refused with this label, or the call failed (`None`).
+    Refused(Option<u64>),
     /// The calling thread's call deadline passed first.
     Expired,
 }
@@ -470,7 +578,7 @@ enum AttachFailed
 /// attach waits past the bound, and none is sent once it has passed. An
 /// interrupted call is sent again; an attach is a read, which procmgr may
 /// serve twice.
-fn attach(
+pub(crate) fn attach(
     badge: u64,
     first: u64,
     authority: u64,
@@ -497,10 +605,10 @@ fn attach(
         Ok(r) =>
         {
             delete_caps(r.caps());
-            Err(AttachFailed::Refused)
+            Err(AttachFailed::Refused(Some(r.label)))
         }
         Err(e) if e == SyscallError::WouldBlock as i64 => Err(AttachFailed::Expired),
-        Err(_) => Err(AttachFailed::Refused),
+        Err(_) => Err(AttachFailed::Refused(None)),
     }
 }
 
@@ -530,7 +638,7 @@ fn gather(badge: u64, ip: u64, authority: u64, ipc_buf: *mut u64) -> Gathered
             out.status = Status::Timeout;
             return out;
         }
-        Err(AttachFailed::Refused) => return out,
+        Err(AttachFailed::Refused(_)) => return out,
     };
     out.status = Status::Complete;
     out.badge = reply.word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE);
@@ -571,7 +679,7 @@ fn gather(badge: u64, ip: u64, authority: u64, ipc_buf: *mut u64) -> Gathered
                 out.status = Status::Timeout;
                 None
             }
-            Err(AttachFailed::Refused) => None,
+            Err(AttachFailed::Refused(_)) => None,
         },
     };
     match thread
@@ -759,7 +867,7 @@ fn le_word(bytes: &[u8]) -> u64
 }
 
 /// Delete each nonzero cap of `caps`.
-fn delete_caps(caps: &[u64])
+pub(crate) fn delete_caps(caps: &[u64])
 {
     for &cap in caps
     {

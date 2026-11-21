@@ -1013,27 +1013,30 @@ pub const MAKE_PRIVATE: u64 = 32;
 /// Capture a live process's pages into a memory object for a debugger or a
 /// core writer: procmgr holds the target's address space
 /// (`SYS_ASPACE_HOLD`), so no thread of it runs, whether it registered or
-/// not, records every page of its user half that a read could reach, each
-/// as bytes copied into frames granted on the sender's memmgr account, as
-/// zero, as the page of the target's image object the layout names, as a
-/// page with no copy (device memory) or as absent, releases the space, and
-/// seals the copy into an immutable memory object on that account
+/// not, records every page of its user half that a read could reach, each as
+/// bytes copied into frames granted on the memmgr account the sender
+/// presents, as zero, as the page of the target's image object the layout
+/// names, as a page with no copy (device memory) or as absent, releases the
+/// space, and seals the copy into an immutable memory object on that account
 /// (`memmgr_labels::SEAL_OBJECT`), charged in full to it. Served only on a
 /// badge carrying [`DEBUG_AUTHORITY`]. `data[0]` is the target's process
-/// badge; `caps[0]` the sender's own memmgr SEND, the account procmgr
+/// badge; `caps[0]` a memmgr SEND the sender presents, its own or one handed
+/// to it (crashd forwards its live-core requester's), the account procmgr
 /// requests the frames on and seals through, each call on it bounded. The
-/// object starts with a layout of the space's regions and runs, laid out as
+/// object starts with a layout of the space's regions and runs, the state of
+/// each thread procmgr holds a cap to (the main thread and each registered
+/// one) as the hold left it, and the image's load bias, laid out as
 /// `crate::procmgr_snapshot` states. Replies `SUCCESS` with `caps[0]` the
 /// object's handle, `data[0]` the object's pages and `data[1]`
 /// `crate::procmgr_snapshot::SNAPSHOT_COMPLETE` when no run is absent, else
-/// `0`; `UNAUTHORIZED` without the authority;
-/// `INVALID_ARGUMENT` without `caps[0]`; `INVALID_BADGE` when no live
-/// process carries the badge, or it ended during the capture;
-/// `NOT_ATTACHABLE` when it declared itself undebuggable; `SPACE_HELD` when
-/// its space is held already; `OUT_OF_MEMORY` when the account refused or
-/// failed a call, granted a run procmgr refuses, or the object would take
-/// more grants than one seal names. Specified in
-/// `services/procmgr/docs/ipc-interface.md` § Label 33: `SNAPSHOT`.
+/// `0`; `UNAUTHORIZED` without the authority; `INVALID_ARGUMENT` without
+/// `caps[0]`; `INVALID_BADGE` when no live process carries the badge, or it
+/// ended during the capture; `NOT_ATTACHABLE` when it declared itself
+/// undebuggable; `SPACE_HELD` when its space is held already;
+/// `OUT_OF_MEMORY` when the account refused or failed a call, granted a run
+/// procmgr refuses, or the object would take more grants than one seal
+/// names. Specified in `services/procmgr/docs/ipc-interface.md` § Label 33:
+/// `SNAPSHOT`.
 pub const SNAPSHOT: u64 = 33;
 
 /// The most bytes a [`READ_VERIFIED`] file may hold, its trailer included:

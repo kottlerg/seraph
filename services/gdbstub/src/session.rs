@@ -78,10 +78,12 @@ pub const IN_CALL_CODE: u8 = 6;
 
 /// How many times a register request reads its thread
 /// ([`Session::read_registers`]). A read the kernel refuses with
-/// `InvalidState` found the thread gone from the call [`Session::await_call`]
-/// found it in; the thread then takes its upcall at the call's return before
-/// any instruction, so the second `await_call` waits for that upcall and the
-/// second read finds the thread fault-blocked.
+/// `InvalidState`, and a write's read of a thread neither held by the session
+/// nor still in its call, found the thread gone from the call
+/// [`Session::await_call`] found it in; the thread then takes its upcall at
+/// the call's return before any instruction, or waits in that delivery for
+/// the stub's receive, so the second `await_call` takes that upcall and the
+/// second read finds the thread held.
 const READ_TRIES: usize = 2;
 
 /// What a register request does with the file it reads.
@@ -1380,7 +1382,11 @@ impl Session
     /// ([`READ_TRIES`]), since the thread can leave the call `await_call`
     /// found it in before the read. A thread held in a call reads as blocked
     /// in a syscall; a [`RegisterAccess::Write`] of it is refused, since the
-    /// kernel writes only a stopped or fault-blocked thread's registers.
+    /// kernel writes only a stopped or fault-blocked thread's registers. A
+    /// write needs the thread stopped or held by the session: once the call
+    /// returned, its upcall's delivery can wait queued for the stub's
+    /// receive, which reads as fault-blocked but which the kernel writes only
+    /// once the session holds it, so the write's read is made again.
     /// Returns the error number the request answers on a refusal
     /// ([`Self::register_refusal`]).
     ///
@@ -1407,9 +1413,13 @@ impl Session
             {
                 Ok(held)
                     if access == RegisterAccess::Write
-                        && held == syscall_abi::THREAD_REGS_SYSCALL =>
+                        && held != syscall_abi::THREAD_REGS_STOPPED
+                        && !self.is_held(index) =>
                 {
-                    break;
+                    if k.in_call(cap)
+                    {
+                        break;
+                    }
                 }
                 Ok(_) => return Ok(()),
                 Err(e) if e == syscall_abi::SyscallError::InvalidState as i64 =>
@@ -1622,6 +1632,10 @@ mod tests
         /// Threads whose call returns between the session's look at them and
         /// their next register read, which the kernel then refuses.
         leave_at_read: Vec<usize>,
+        /// Threads whose call returns between the session's look at them and
+        /// their next register read, which then finds the upcall's delivery
+        /// queued for the session's receive (`THREAD_REGS_FAULT`).
+        queue_at_read: Vec<usize>,
     }
 
     fn cap_of(t: usize) -> u64
@@ -1662,6 +1676,7 @@ mod tests
                 spawn_at: Vec::new(),
                 exit_mid_list: Vec::new(),
                 leave_at_read: Vec::new(),
+                queue_at_read: Vec::new(),
             };
             sim.spawn(None, true);
             sim
@@ -1988,6 +2003,18 @@ mod tests
                     due.1 = now;
                 }
                 return Err(refused);
+            }
+            if let Some(i) = self.queue_at_read.iter().position(|&u| u == t)
+            {
+                // The reply comes first and the upcall's delivery queues;
+                // the read finds the thread blocked in it, not held.
+                self.queue_at_read.remove(i);
+                call.2 = now;
+                for due in self.due.iter_mut().filter(|due| due.0 == t)
+                {
+                    due.1 = now;
+                }
+                return Ok(syscall_abi::THREAD_REGS_FAULT);
             }
             Ok(syscall_abi::THREAD_REGS_SYSCALL)
         }
@@ -3057,6 +3084,30 @@ mod tests
             Ok(())
         );
         assert!(sim.leave_at_read.is_empty(), "the race was not run");
+        assert!(s.is_held(a));
+        assert!(sim.held_live(&s));
+        assert!(s.detach(&mut sim));
+        sim.assert_sound();
+    }
+
+    // Defect caught: a write whose read found the thread's upcall delivery
+    // queued for the session's receive, once its call returned, went on to a
+    // write the kernel refuses, or answered `E01` without taking the stop.
+    #[test]
+    fn a_write_read_of_a_queued_delivery_writes_the_thread_once_held()
+    {
+        let mut sim = Sim::new();
+        let a = sim.spawn(Some(0), true);
+        sim.calls.push((a, 0, STOP_WAIT * 3));
+        let page = sim.page();
+        let mut s = Session::attach(&mut sim, ADVANCE, page);
+        sim.queue_at_read.push(a);
+        let mut file = [0u8; 8];
+        assert_eq!(
+            s.read_registers(&mut sim, a, &mut file, RegisterAccess::Write),
+            Ok(())
+        );
+        assert!(sim.queue_at_read.is_empty(), "the race was not run");
         assert!(s.is_held(a));
         assert!(sim.held_live(&s));
         assert!(s.detach(&mut sim));

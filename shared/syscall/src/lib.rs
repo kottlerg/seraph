@@ -2862,8 +2862,8 @@ pub fn thread_set_upcall_mask(masked: bool) -> Result<bool, i64>
 /// Copy the register state of a stopped or blocked thread into `buf`.
 ///
 /// The thread must be `Stopped` and descheduled (off every CPU, its register
-/// save published), or `Blocked`: fault-blocked awaiting a fault-handler
-/// reply, or blocked in a syscall; a `Stopped` thread still on a CPU is
+/// save published), or `Blocked`: in a fault or an upcall delivery, awaiting a
+/// fault-handler reply or queued for its receive, or blocked in a syscall; a `Stopped` thread still on a CPU is
 /// refused with `InvalidState` (`core/kernel/docs/syscalls.md`
 /// § `SYS_THREAD_READ_REGS`). `buf` must be at least `size_of::<TrapFrame>()`
 /// bytes (architecture-defined). Returns the number of bytes written and the

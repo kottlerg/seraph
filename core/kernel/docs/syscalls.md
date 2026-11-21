@@ -1999,14 +1999,16 @@ Read the full register state of a stopped or blocked thread into a caller-suppli
 was held in, written only after the copy: `THREAD_REGS_STOPPED` (0), `THREAD_REGS_FAULT` (1) or
 `THREAD_REGS_SYSCALL` (2); `SyscallError` on failure.
 
-The thread MUST be `Stopped` (`THREAD_REGS_STOPPED`), or `Blocked`: fault-blocked awaiting a
-fault-handler reply (`BlockedOnFault`, `THREAD_REGS_FAULT`), which lets a bound fault handler
-inspect the faulting registers (see [`docs/fault-handling.md`](../../../docs/fault-handling.md)), or
-blocked in a syscall in any other state (`THREAD_REGS_SYSCALL`): a call, a receive, a wait, or a
-sleep. The kernel decides the reported state under the same scheduling-lock hold as its copy of the
-frame, so the two agree. The frame of a thread blocked in a syscall is the one its syscall entry
-saved: its instruction pointer is as that frame holds it, past the `syscall` instruction on x86-64
-and at the `ecall` on riscv64, as for a fault-blocked thread at a syscall-point upcall
+The thread MUST be `Stopped` (`THREAD_REGS_STOPPED`), or `Blocked`: in a fault or an upcall
+delivery (`THREAD_REGS_FAULT`), awaiting a fault-handler reply (`BlockedOnFault`), which lets a
+bound fault handler inspect the faulting registers (see
+[`docs/fault-handling.md`](../../../docs/fault-handling.md)), or queued for the handler's receive
+(`BlockedOnSend` with the delivery marked), or blocked in a syscall in any other state
+(`THREAD_REGS_SYSCALL`): a call, a receive, a wait, or a sleep. The kernel decides the reported
+state under the same scheduling-lock hold as its copy of the frame, so the two agree. The frame of
+a thread blocked in a syscall is the one its syscall entry saved: its instruction pointer is as that
+frame holds it, past the `syscall` instruction on x86-64 and at the `ecall` on riscv64, as for a
+fault-blocked thread at a syscall-point upcall
 ([docs/fault-handling.md § Delivery points](../../../docs/fault-handling.md#delivery-points)), and
 its result registers are unspecified until the syscall returns, since they still hold what the
 thread entered the syscall with. A read of a blocked thread races its wake: the call returns the

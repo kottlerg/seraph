@@ -210,8 +210,9 @@ stub's endpoint.
   (core/kernel/docs/syscalls.md § `SYS_THREAD_READ_REGS`); `G` and `P` of it are answered
   `E06`, since the kernel writes only a stopped or fault-blocked thread's registers, the call's
   return still writing them. A read the kernel refuses because the thread left its call after the
-  stub found it there is made again once the stub has waited for the upcall the call's return
-  takes. `qThreadExtraInfo` shows such a thread as `held in a call`.
+  stub found it there, or a write's read that finds the upcall the call's return takes queued for
+  the stub's receive, is made again once the stub has waited for that upcall. `qThreadExtraInfo`
+  shows such a thread as `held in a call`.
 - **Memory.** `m` reads and `M` and `X` write the target's memory through a live thread of it, in
   the chunks the kernel copies at once. A chunk on a page memmgr evicted, into its compressed store
   or to disk, is not present to the kernel's copy, so the stub asks procmgr, through its debug

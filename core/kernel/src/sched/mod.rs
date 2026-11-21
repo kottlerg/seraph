@@ -3806,8 +3806,9 @@ pub enum FrameHold
 {
     /// `Stopped`.
     Stopped,
-    /// Fault-blocked (`Blocked` with `BlockedOnFault`): a fault or an upcall
-    /// delivery awaits its handler's reply.
+    /// `Blocked` in a fault or an upcall delivery: awaiting its handler's
+    /// reply (`BlockedOnFault`), or queued for its handler's receive
+    /// (`BlockedOnSend` with `in_fault_delivery` set).
     Fault,
     /// `Blocked` in a syscall, in any other IPC state.
     Syscall,
@@ -3869,12 +3870,20 @@ pub unsafe fn with_held_frame<R>(
         let state = unsafe { (*tcb).state };
         // SAFETY: tcb valid; ipc_state is written under the held sched_lock.
         let ipc_state = unsafe { (*tcb).ipc_state };
+        // SAFETY: tcb valid; in_fault_delivery is written by the thread under
+        // its sched_lock, held here.
+        let in_delivery = unsafe { (*tcb).in_fault_delivery };
         let blocked = state == thread::ThreadState::Blocked;
+        let fault_parked = ipc_state == thread::IpcThreadState::BlockedOnFault;
+        // A delivery no handler was receiving for waits on the send queue
+        // until a receive rebinds it to BlockedOnFault; its frame is the
+        // delivery's, as a fault-parked one's.
         let hold = if !blocked
         {
             FrameHold::Stopped
         }
-        else if ipc_state == thread::IpcThreadState::BlockedOnFault
+        else if fault_parked
+            || (ipc_state == thread::IpcThreadState::BlockedOnSend && in_delivery)
         {
             FrameHold::Fault
         }
@@ -3882,8 +3891,9 @@ pub unsafe fn with_held_frame<R>(
         {
             FrameHold::Syscall
         };
+        // A write keeps the fault-parked set: a delivery its handler holds.
         let admitted = state == thread::ThreadState::Stopped
-            || (blocked && (mode == FrameAccess::Read || hold == FrameHold::Fault));
+            || (blocked && (mode == FrameAccess::Read || fault_parked));
         let look = if admitted
         {
             // No admitted state can become `current` while this sched_lock

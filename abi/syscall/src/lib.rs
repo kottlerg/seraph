@@ -1536,8 +1536,9 @@ pub const FAULT_CLASS_ALL: u64 = !0u64;
 
 /// `SYS_THREAD_READ_REGS` secondary return: the thread was `Stopped`.
 pub const THREAD_REGS_STOPPED: u64 = 0;
-/// `SYS_THREAD_READ_REGS` secondary return: the thread was fault-blocked, a
-/// fault or an upcall delivery awaiting its handler's reply.
+/// `SYS_THREAD_READ_REGS` secondary return: the thread was blocked in a fault
+/// or an upcall delivery, awaiting its handler's reply or queued for its
+/// handler's receive.
 pub const THREAD_REGS_FAULT: u64 = 1;
 /// `SYS_THREAD_READ_REGS` secondary return: the thread was blocked in a
 /// syscall. The frame is the one its syscall entry built; the result

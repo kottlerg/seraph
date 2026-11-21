@@ -1023,9 +1023,10 @@ pub const MAKE_PRIVATE: u64 = 32;
 /// badge; `caps[0]` the sender's own memmgr SEND, the account procmgr
 /// requests the frames on and seals through, each call on it bounded. The
 /// object starts with a layout of the space's regions and runs, laid out as
-/// `crate::procmgr_snapshot` states. Replies `SUCCESS` with `caps[0]` the object's handle, `data[0]`
-/// the object's pages and `data[1]` `crate::procmgr_snapshot::SNAPSHOT_COMPLETE`
-/// when no run is absent, else `0`; `UNAUTHORIZED` without the authority;
+/// `crate::procmgr_snapshot` states. Replies `SUCCESS` with `caps[0]` the
+/// object's handle, `data[0]` the object's pages and `data[1]`
+/// `crate::procmgr_snapshot::SNAPSHOT_COMPLETE` when no run is absent, else
+/// `0`; `UNAUTHORIZED` without the authority;
 /// `INVALID_ARGUMENT` without `caps[0]`; `INVALID_BADGE` when no live
 /// process carries the badge, or it ended during the capture;
 /// `NOT_ATTACHABLE` when it declared itself undebuggable; `SPACE_HELD` when

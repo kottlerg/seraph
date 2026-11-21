@@ -1,4 +1,6 @@
 # The bundle of the ktest harness, on every architecture: ktest in the `init`
-# slot alone. ktest is monolithic and spawns no module (docs/boot-media.md
-# § The ESP).
+# slot, and the boot-time policy the bootloader requires of every bundle
+# (docs/signing.md § Configuration), which ktest does not read. ktest is
+# monolithic and spawns no module (docs/boot-media.md § The ESP).
 init /tests/ktest
+/config/boot/policy.conf

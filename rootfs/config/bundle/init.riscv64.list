@@ -22,3 +22,6 @@ init /services/init
 /services/drivers/iommu-riscv
 # The log-level configuration init reads at boot.
 /config/init/log-levels.conf
+# The boot-time policy devmgr reads before the first driver starts, which
+# the bootloader requires of every bundle (docs/signing.md § Configuration).
+/config/boot/policy.conf

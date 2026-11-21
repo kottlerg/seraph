@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "boot-policy"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `no_std`, no allocation: the parser of the boot-time policy, the
+# `/config/boot/policy.conf` bundle entry, shared by devmgr, which applies
+# it, and xtask, which refuses to pack a policy it does not accept.
+[lib]
+doctest = false
+
+[dependencies]
+# `split`: the policy's boot module is a signed object, whose body is the
+# policy.
+objsig = { path = "../objsig" }
+# The `key = value` line grammar.
+svc-grammar = { path = "../svc-grammar" }
+
+[lints]
+workspace = true

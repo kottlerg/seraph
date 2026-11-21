@@ -65,6 +65,28 @@ pub const BODY_ALIGNMENT: u64 = 4096;
 /// module it adds.
 pub const INIT_ENTRY_NAME: &[u8] = b"init";
 
+/// The prefix of the name of every bundle entry that is configuration: the
+/// bootloader verifies an entry whose install path lies under `/config/` in
+/// the configuration role, and every other entry but [`INIT_ENTRY_NAME`] in
+/// the boot-module role (docs/signing.md § Which Stage Verifies What).
+pub const CONFIG_PREFIX: &[u8] = b"/config/";
+
+/// Name of the bundle entry that holds the boot-time policy
+/// (docs/signing.md § Configuration), a configuration entry
+/// ([`CONFIG_PREFIX`]). Exactly one entry MUST carry this name: the bundle
+/// container is not signed, so a requirement the policy sets would be turned
+/// off by deleting the entry, and the bootloader refuses a bundle without
+/// it, or with two.
+pub const POLICY_ENTRY_NAME: &[u8] = b"/config/boot/policy.conf";
+
+/// Whether the bundle entry `name` (NUL-trimmed) is configuration, verified
+/// in the configuration role: an install path under [`CONFIG_PREFIX`].
+#[must_use]
+pub fn is_configuration(name: &[u8]) -> bool
+{
+    name.starts_with(CONFIG_PREFIX)
+}
+
 /// On-disk size of [`BundleHeader`] in bytes.
 ///
 /// `magic (8) + version (4) + entry_count (4)` with no padding.
@@ -269,6 +291,26 @@ pub fn name_str(name: &[u8; ENTRY_NAME_LEN]) -> &[u8]
 mod tests
 {
     use super::*;
+
+    // Defect caught: an entry outside `/config/` whose first component only
+    // begins with `config` verified as configuration, or a configuration
+    // entry verified as a boot module.
+    #[test]
+    fn configuration_is_an_install_path_under_config()
+    {
+        assert!(is_configuration(POLICY_ENTRY_NAME));
+        assert!(is_configuration(b"/config/init/log-levels.conf"));
+        for name in [
+            &b"/configs/x"[..],
+            b"/config",
+            b"/services/devmgr",
+            b"init",
+            b"config/x",
+        ]
+        {
+            assert!(!is_configuration(name), "{name:?}");
+        }
+    }
 
     /// The fixture's body offset: the header and one entry header, padded to
     /// [`BODY_ALIGNMENT`].

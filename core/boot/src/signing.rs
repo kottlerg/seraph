@@ -176,11 +176,17 @@ pub(crate) mod testing
     /// A store of one anchor, the key of `seed`, which may sign every role.
     pub(crate) fn store_of(seed: &[u8; SEED_LEN]) -> Vec<u8>
     {
+        store_scoped(seed, RoleSet::ALL)
+    }
+
+    /// A store of one anchor, the key of `seed`, which may sign `roles`.
+    pub(crate) fn store_scoped(seed: &[u8; SEED_LEN], roles: RoleSet) -> Vec<u8>
+    {
         let key = composite::public_key(seed);
         let spec = AnchorSpec {
             key: &key,
             usage: Usage {
-                roles: RoleSet::ALL,
+                roles,
                 certify: true,
             },
             local: true,

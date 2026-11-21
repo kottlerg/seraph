@@ -13,6 +13,8 @@ path = "src/main.rs"
 # Seraph-minted GPT partition type GUIDs are defined here so xtask
 # (producer) and vfsd (consumer) reference the same byte arrays.
 boot-protocol = { path = "../abi/boot-protocol" }
+# The boot-time policy's parser: a pack refuses a policy it does not accept.
+boot-policy = { path = "../shared/boot-policy" }
 # The `debug-port` case: the GDB remote serial protocol's framing, shared with the
 # guest fixture it drives.
 gdb-rsp = { path = "../shared/gdb-rsp" }

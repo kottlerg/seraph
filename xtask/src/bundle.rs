@@ -239,19 +239,24 @@ pub fn esp_path(ctx: &BuildContext) -> PathBuf
 /// file its bundle list names ([`read_list`]) and verified first as the
 /// bootloader will verify it ([`check_entry`]), under the trust store the
 /// installed bootloader embeds; the sysroot must be signed for `harness`
-/// already ([`crate::signing::sign_for_harness`]).
+/// already ([`crate::signing::sign_for_harness`]). The bundle carries the
+/// boot-time policy, which the bootloader requires, and a policy its
+/// consumers accept ([`check_policy`]).
 ///
 /// # Errors
 ///
-/// Those of [`read_list`]; when an installed file is missing or unreadable,
-/// when an entry does not verify as the bootloader will, when the installed
-/// bootloader holds no trust store, and on an I/O failure writing the bundle.
+/// Those of [`read_list`] and [`check_policy`]; when an installed file is
+/// missing or unreadable, when an entry does not verify as the bootloader
+/// will, when the installed bootloader holds no trust store, and on an I/O
+/// failure writing the bundle.
 pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness, out: &Path) -> Result<()>
 {
     let list = read_list(ctx, arch, harness)?;
     let store = installed_store(ctx)?;
     let entries = entries(ctx, &list)?;
     let bodies = bodies(&store, arch, &entries)?;
+    check_policy(&bodies)
+        .with_context(|| format!("bundle: the {} harness's list", harness.name()))?;
 
     let parent = out.parent().context("bundle: bundle path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("bundle: create {}", parent.display()))?;
@@ -278,18 +283,30 @@ struct Entry
 
 impl Entry
 {
-    /// The role the bootloader verifies the entry in: init for the `init`
-    /// slot, boot module for every other entry.
+    /// The role the bootloader verifies the entry in ([`entry_role`]).
     fn role(&self) -> Role
     {
-        if self.name == INIT_SLOT
-        {
-            Role::Init
-        }
-        else
-        {
-            Role::BootModule
-        }
+        entry_role(&self.name)
+    }
+}
+
+/// The role the bootloader verifies the bundle entry `name` in: init for the
+/// `init` slot, configuration for an install path under `/config/`
+/// ([`fmt::is_configuration`]), boot module for every other entry
+/// (docs/signing.md § Which Stage Verifies What).
+pub fn entry_role(name: &str) -> Role
+{
+    if name == INIT_SLOT
+    {
+        Role::Init
+    }
+    else if fmt::is_configuration(name.as_bytes())
+    {
+        Role::Configuration
+    }
+    else
+    {
+        Role::BootModule
     }
 }
 
@@ -341,6 +358,28 @@ fn bodies(store: &[u8], arch: Arch, entries: &[Entry]) -> Result<Vec<(String, Ve
             Ok((entry.name.clone(), bytes))
         })
         .collect()
+}
+
+/// Check that the bundle entries `bodies` carry the boot-time policy
+/// (`fmt::POLICY_ENTRY_NAME`), whose absence the bootloader refuses, with a
+/// body its consumers accept (`boot_policy::parse_module`): a body they
+/// refuse would put every requirement on (docs/signing.md § Configuration).
+///
+/// # Errors
+///
+/// When no entry is the policy, or its body is refused.
+fn check_policy(bodies: &[(String, Vec<u8>)]) -> Result<()>
+{
+    let policy = String::from_utf8_lossy(fmt::POLICY_ENTRY_NAME);
+    let (_, object) = bodies
+        .iter()
+        .find(|(name, _)| name.as_bytes() == fmt::POLICY_ENTRY_NAME)
+        .with_context(|| {
+            format!("no {policy} entry, without which the bootloader refuses the bundle")
+        })?;
+    boot_policy::parse_module(object)
+        .map(|_| ())
+        .map_err(|e| err!("{policy} is refused ({e:?}), which would put every requirement on"))
 }
 
 /// Check `object` as the bootloader will check the bundle entry `name`
@@ -556,7 +595,7 @@ mod tests
             assert_eq!(repository_list(arch, Harness::Init).init, "/services/init");
             let ktest = repository_list(arch, Harness::Ktest);
             assert_eq!(ktest.init, "/tests/ktest");
-            assert_eq!(ktest.entries, Vec::<String>::new());
+            assert_eq!(ktest.entries, [POLICY]);
         }
         let x86 = repository_list(Arch::X86_64, Harness::Init).entries;
         let riscv = repository_list(Arch::Riscv64, Harness::Init).entries;
@@ -566,6 +605,7 @@ mod tests
         for list in [&x86, &riscv]
         {
             assert!(has(list, crate::sysroot::LOG_LEVELS.install));
+            assert!(has(list, POLICY));
             // The bootstrap closure (docs/boot-media.md): the consoles and
             // the platform description tables load from the root filesystem.
             for outside in [
@@ -664,6 +704,7 @@ mod tests
             };
             fs::write(&path, body).unwrap();
         }
+        crate::signing::testing::install_policy(&ctx);
         let mut image = b"bootloader code".to_vec();
         image.extend_from_slice(&objsig::embed::MARKER);
         let len = u32::try_from(signer.store().len()).unwrap();
@@ -732,12 +773,13 @@ mod tests
         let other = root.join("elsewhere").join("bootstrap.bundle");
         compose(&ctx, arch, Harness::Ktest, &other).unwrap();
         let entries = read_entries(&other);
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, INIT_SLOT);
         assert_eq!(
             entries[0].1,
             fs::read(ctx.sysroot.join("tests/ktest")).unwrap()
         );
+        assert_eq!(entries[1].0, POLICY);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -808,6 +850,66 @@ mod tests
         check_entry(&store, arch, "/services/x", Role::BootModule, &object).unwrap();
         check_entry(&store, arch, &long, Role::BootModule, &object).unwrap_err();
         check_entry(&store, arch, "services/x", Role::BootModule, &object).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The install path of the boot-time policy.
+    const POLICY: &str = "/config/boot/policy.conf";
+
+    // Defect caught: a configuration entry signed or checked in the
+    // boot-module role, which the bootloader refuses; a bundle written
+    // without the boot-time policy, which the bootloader refuses, or with a
+    // policy devmgr refuses, which puts every requirement on.
+    #[test]
+    fn the_policy_and_each_configuration_entry_are_checked_as_configuration()
+    {
+        assert_eq!(POLICY.as_bytes(), fmt::POLICY_ENTRY_NAME);
+        assert_eq!(entry_role(INIT_SLOT), Role::Init);
+        assert_eq!(entry_role(POLICY), Role::Configuration);
+        assert_eq!(
+            entry_role("/config/init/log-levels.conf"),
+            Role::Configuration
+        );
+        assert_eq!(entry_role("/services/vfsd"), Role::BootModule);
+
+        let arch = Arch::X86_64;
+        let (root, ctx, signer) = fixture("policy", arch);
+        let out = esp_path(&ctx);
+        sign_sysroot(&ctx, &signer, arch, Harness::Init).unwrap();
+        compose(&ctx, arch, Harness::Init, &out).unwrap();
+        let policy = ctx.sysroot.join(&POLICY[1..]);
+        let good = fs::read(&policy).unwrap();
+        let body = objsig::split(&good).unwrap().body().to_vec();
+
+        // Signed in the boot-module role.
+        fs::write(&policy, &body).unwrap();
+        signer
+            .sign_file(&policy, RoleSet::of(&[Role::BootModule]), POLICY)
+            .unwrap();
+        compose(&ctx, arch, Harness::Init, &out).unwrap_err();
+
+        // A policy its consumers refuse.
+        fs::write(&policy, b"dma-confinement = on\n").unwrap();
+        signer
+            .sign_file(&policy, RoleSet::of(&[Role::Configuration]), POLICY)
+            .unwrap();
+        let error = compose(&ctx, arch, Harness::Init, &out).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("UnknownValue(1)"),
+            "{error:#}"
+        );
+        fs::write(&policy, &good).unwrap();
+        compose(&ctx, arch, Harness::Init, &out).unwrap();
+
+        // A list without the policy.
+        let list = ctx.sysroot.join(LIST_DIR).join("ktest.list");
+        fs::write(&list, "init /tests/ktest\n").unwrap();
+        sign_sysroot(&ctx, &signer, arch, Harness::Ktest).unwrap();
+        let error = compose(&ctx, arch, Harness::Ktest, &out).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no /config/boot/policy.conf entry"),
+            "{error:#}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

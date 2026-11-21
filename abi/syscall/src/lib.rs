@@ -684,11 +684,15 @@ pub const SYS_ASPACE_HOLD: u64 = 71;
 /// stopped, through a capability carrying [`RIGHTS_AS_CONTROL`]. See
 /// `core/kernel/docs/syscalls.md` § `SYS_ASPACE_RELEASE` (72).
 pub const SYS_ASPACE_RELEASE: u64 = 72;
+/// Endpoint: answer whether a capability the caller holds names the endpoint
+/// of a capability carrying [`RIGHTS_EP_IDENTIFY`], and nothing else. See
+/// `core/kernel/docs/syscalls.md` § `SYS_ENDPOINT_IDENTIFY` (73).
+pub const SYS_ENDPOINT_IDENTIFY: u64 = 73;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_ASPACE_RELEASE + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_ENDPOINT_IDENTIFY + 1;
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.
@@ -1129,6 +1133,14 @@ pub const RIGHTS_EP_RECEIVE: u64 = 1 << 1;
 
 /// Endpoint: may include capabilities in IPC messages.
 pub const RIGHTS_EP_GRANT: u64 = 1 << 2;
+
+/// Endpoint: may ask whether another capability the holder has names this
+/// endpoint ([`SYS_ENDPOINT_IDENTIFY`]), and learn nothing else.
+///
+/// `SYS_CAP_CREATE_ENDPOINT` mints it on the creator's capability, and a copy
+/// or derive keeps it only when its mask does: every narrower mask,
+/// [`RIGHTS_EP_SEND`] and [`RIGHTS_EP_SEND_GRANT`] among them, strips it.
+pub const RIGHTS_EP_IDENTIFY: u64 = 1 << 3;
 
 /// Endpoint: send + grant — may call and include capabilities in messages.
 pub const RIGHTS_EP_SEND_GRANT: u64 = RIGHTS_EP_SEND | RIGHTS_EP_GRANT;
@@ -2121,7 +2133,12 @@ mod tests
             // AddressSpace
             &[RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_AS_CONTROL],
             // Endpoint
-            &[RIGHTS_EP_SEND, RIGHTS_EP_RECEIVE, RIGHTS_EP_GRANT],
+            &[
+                RIGHTS_EP_SEND,
+                RIGHTS_EP_RECEIVE,
+                RIGHTS_EP_GRANT,
+                RIGHTS_EP_IDENTIFY,
+            ],
             // Notification
             &[RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT],
             // EventQueue

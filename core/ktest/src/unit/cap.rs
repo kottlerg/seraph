@@ -7,8 +7,8 @@
 //!
 //! Covers: `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (both auto-allocate and
 //! explicit-slot paths), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
-//! `SYS_ENDPOINT_BADGE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, `CSpace` teardown (batched drain,
-//! bound-thread stop), and the bounds of handle resolution itself.
+//! `SYS_ENDPOINT_BADGE`, `SYS_ENDPOINT_IDENTIFY`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, `CSpace`
+//! teardown (batched drain, bound-thread stop), and the bounds of handle resolution itself.
 //!
 //! Each function tests one syscall or one distinct behaviour. Tests clean up
 //! caps they create where convenient, but leaks are acceptable — ktest exits
@@ -17,8 +17,8 @@
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_delete, cap_derive, cap_derive_badge, cap_info, cap_insert, cap_move, cap_revoke,
-    endpoint_badge, event_queue_create, event_try_recv, notification_send, notification_wait,
-    thread_bind_notification,
+    endpoint_badge, endpoint_identify, event_queue_create, event_try_recv, notification_send,
+    notification_wait, thread_bind_notification,
 };
 use syscall_abi::SyscallError;
 
@@ -1123,6 +1123,129 @@ pub fn endpoint_badge_refusals(ctx: &TestContext) -> TestResult
     cap_delete(sig).map_err(|_| "cap_delete sig failed")?;
     cap_delete(other).map_err(|_| "cap_delete other failed")?;
     cap_delete(ep).map_err(|_| "cap_delete ep after endpoint_badge_refusals failed")?;
+    Ok(())
+}
+
+// ── SYS_ENDPOINT_IDENTIFY ───────────────────────────────────────────────────
+
+/// `endpoint_identify` answers `true` for every capability on the key's
+/// endpoint, however badged, derived, or copied, through the creator's cap and
+/// through a key carrying `IDENTIFY` alone, and `false` for a capability on
+/// another endpoint or of another type.
+pub fn endpoint_identify_matches(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "create_endpoint for endpoint_identify_matches failed")?;
+    let other = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "second create_endpoint for endpoint_identify_matches failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for endpoint_identify_matches failed")?;
+    let key = cap_derive(ep, syscall_abi::RIGHTS_EP_IDENTIFY)
+        .map_err(|_| "cap_derive(IDENTIFY) failed")?;
+    let send =
+        cap_derive(ep, syscall_abi::RIGHTS_EP_SEND).map_err(|_| "cap_derive(SEND) failed")?;
+    let badged = cap_derive_badge(ep, syscall_abi::RIGHTS_EP_SEND, 11)
+        .map_err(|_| "cap_derive_badge(11) failed")?;
+    let badged_grant = cap_derive_badge(ep, syscall_abi::RIGHTS_EP_SEND_GRANT, 12)
+        .map_err(|_| "cap_derive_badge(12) failed")?;
+    let rederived =
+        cap_derive(badged, syscall::RIGHTS_ALL).map_err(|_| "cap_derive of a badged cap failed")?;
+    let copied = cap_copy(badged_grant, ctx.cspace_cap, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_copy of a badged cap failed")?;
+
+    for cap in [ep, key, send, badged, badged_grant, rederived, copied]
+    {
+        if endpoint_identify(ep, cap) != Ok(true)
+        {
+            return Err("the creator's cap did not identify a cap on its endpoint");
+        }
+        if endpoint_identify(key, cap) != Ok(true)
+        {
+            return Err("a key with IDENTIFY alone did not identify a cap on its endpoint");
+        }
+        if endpoint_identify(other, cap) != Ok(false)
+        {
+            return Err("another endpoint's key identified a cap on this endpoint");
+        }
+    }
+    if endpoint_identify(ep, other) != Ok(false)
+    {
+        return Err("endpoint_identify matched a cap on another endpoint");
+    }
+    if endpoint_identify(ep, sig) != Ok(false)
+    {
+        return Err("endpoint_identify matched a Notification cap");
+    }
+
+    for cap in [
+        copied,
+        rederived,
+        badged_grant,
+        badged,
+        send,
+        key,
+        sig,
+        other,
+        ep,
+    ]
+    {
+        cap_delete(cap).map_err(|_| "cap_delete after endpoint_identify_matches failed")?;
+    }
+    Ok(())
+}
+
+/// `endpoint_identify` refuses a key without `IDENTIFY` (`InsufficientRights`),
+/// Receive and Grant included, and a key narrowed without it never regains it:
+/// a `RIGHTS_ALL` derive, badged derive, or copy of it is refused too. A
+/// non-endpoint key and a deleted handle in either position are
+/// `InvalidCapability`.
+pub fn endpoint_identify_refusals(ctx: &TestContext) -> TestResult
+{
+    let invalid_cap = Err(SyscallError::InvalidCapability as i64);
+    let no_right = Err(SyscallError::InsufficientRights as i64);
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "create_endpoint for endpoint_identify_refusals failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for endpoint_identify_refusals failed")?;
+    let send =
+        cap_derive(ep, syscall_abi::RIGHTS_EP_SEND).map_err(|_| "cap_derive(SEND) failed")?;
+    let without = cap_derive(
+        ep,
+        syscall_abi::RIGHTS_EP_SEND | syscall_abi::RIGHTS_EP_RECEIVE | syscall_abi::RIGHTS_EP_GRANT,
+    )
+    .map_err(|_| "cap_derive(SEND | RECEIVE | GRANT) failed")?;
+    let rederived =
+        cap_derive(send, syscall::RIGHTS_ALL).map_err(|_| "cap_derive(RIGHTS_ALL) failed")?;
+    let rebadged = cap_derive_badge(without, syscall::RIGHTS_ALL, 13)
+        .map_err(|_| "cap_derive_badge(RIGHTS_ALL) failed")?;
+    let recopied = cap_copy(without, ctx.cspace_cap, syscall::RIGHTS_ALL)
+        .map_err(|_| "cap_copy(RIGHTS_ALL) failed")?;
+
+    for key in [send, without, rederived, rebadged, recopied]
+    {
+        if endpoint_identify(key, ep) != no_right
+        {
+            return Err("endpoint_identify accepted a key without IDENTIFY");
+        }
+    }
+    if endpoint_identify(sig, ep) != invalid_cap
+    {
+        return Err("endpoint_identify accepted a Notification as the key");
+    }
+    cap_delete(recopied).map_err(|_| "cap_delete recopied failed")?;
+    if endpoint_identify(recopied, ep) != invalid_cap
+    {
+        return Err("endpoint_identify accepted a deleted key");
+    }
+    if endpoint_identify(ep, recopied) != invalid_cap
+    {
+        return Err("endpoint_identify answered for a deleted handle");
+    }
+
+    for cap in [rebadged, rederived, without, send, sig, ep]
+    {
+        cap_delete(cap).map_err(|_| "cap_delete after endpoint_identify_refusals failed")?;
+    }
     Ok(())
 }
 

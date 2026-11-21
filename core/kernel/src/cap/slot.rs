@@ -421,6 +421,9 @@ define_typed_rights! {
         RECEIVE = syscall::RIGHTS_EP_RECEIVE;
         /// May include capabilities in IPC messages.
         GRANT = syscall::RIGHTS_EP_GRANT;
+        /// May ask whether another capability of the holder names this
+        /// endpoint (`SYS_ENDPOINT_IDENTIFY`).
+        IDENTIFY = syscall::RIGHTS_EP_IDENTIFY;
     }
 }
 

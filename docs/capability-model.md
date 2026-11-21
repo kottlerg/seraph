@@ -264,11 +264,22 @@ A capability to an IPC endpoint. Rights:
 - **Receive** — may accept calls on this endpoint, and read the badge of a capability on it
   (`SYS_ENDPOINT_BADGE`, § Badges) (held only by the server)
 - **Grant** — may include capabilities in the message's capability slots
+- **Identify** — may ask whether another capability the holder has names this endpoint
+  (`SYS_ENDPOINT_IDENTIFY`), and learn nothing else
 
 A send capability without grant right cannot pass capabilities to the server.
 A server that should not receive unexpected resources from clients distributes only
 send capabilities without the grant right; the receive path does not consult the
 receiver's Grant right.
+
+A new endpoint's capability carries all four rights, and Identify reaches another holder
+only where the endpoint's owner keeps it in a mask: the masks a server hands its clients
+(Send, Send + Grant) strip it. Holding neither it nor Receive, a holder cannot tell which
+endpoint a capability reaches, nor relate two capabilities it holds, so a server can be proxied,
+replaced, or split without its clients learning it. An owner that wants a holder to
+recognize its endpoint hands Identify on one capability, and the holder can then find
+which of its other capabilities reach the same endpoint, and nothing more. A Receive
+holder learns as much through `SYS_ENDPOINT_BADGE` (§ Badges).
 
 An endpoint may additionally be designated a thread's **fault handler** — a protocol
 specified in [Fault Handling](fault-handling.md), with no distinct
@@ -817,7 +828,7 @@ argument; the kernel constructs the new object inside that Memory's
 backing region, debiting bytes from the Memory's available-bytes ledger.
 
 ```
-SYS_CAP_CREATE_ENDPOINT(memory)               → endpoint_cap     (Send + Receive + Grant)
+SYS_CAP_CREATE_ENDPOINT(memory)               → endpoint_cap     (Send + Receive + Grant + Identify)
 SYS_CAP_CREATE_NOTIFICATION(memory)           → notification_cap (Notify + Wait)
 SYS_CAP_CREATE_EVENT_Q(memory, capacity)      → queue_cap        (Post + Recv)
 SYS_CAP_CREATE_THREAD(memory, aspace, cspace, sched, priority)

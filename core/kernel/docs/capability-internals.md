@@ -657,7 +657,7 @@ Per-type vocabularies (bit positions within each type's own space):
 ```text
 Memory        MAP=0  WRITE=1  EXECUTE=2  RETYPE=3
 AddressSpace  MAP=0  READ=1   CONTROL=2
-Endpoint      SEND=0 RECEIVE=1 GRANT=2
+Endpoint      SEND=0 RECEIVE=1 GRANT=2 IDENTIFY=3
 Notification  NOTIFY=0 WAIT=1
 EventQueue    POST=0 RECV=1
 Interrupt     NOTIFY=0

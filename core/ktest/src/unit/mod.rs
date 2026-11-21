@@ -128,6 +128,14 @@ pub fn run_all(ctx: &TestContext)
         cap::endpoint_badge_refusals(ctx)
     );
     run_test!(
+        "cap::endpoint_identify_matches",
+        cap::endpoint_identify_matches(ctx)
+    );
+    run_test!(
+        "cap::endpoint_identify_refusals",
+        cap::endpoint_identify_refusals(ctx)
+    );
+    run_test!(
         "cap::cspace_teardown_multibatch",
         cap::cspace_teardown_multibatch(ctx)
     );

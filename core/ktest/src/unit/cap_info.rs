@@ -475,7 +475,10 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
         .map_err(|_| "creation_masks: cap_create_endpoint failed")?;
     let r = check_mask(
         ep,
-        syscall_abi::RIGHTS_EP_SEND | syscall_abi::RIGHTS_EP_RECEIVE | syscall_abi::RIGHTS_EP_GRANT,
+        syscall_abi::RIGHTS_EP_SEND
+            | syscall_abi::RIGHTS_EP_RECEIVE
+            | syscall_abi::RIGHTS_EP_GRANT
+            | syscall_abi::RIGHTS_EP_IDENTIFY,
         "creation_masks: endpoint mint mask mismatch",
     );
     cap_delete(ep).map_err(|_| "creation_masks: cap_delete(endpoint) failed")?;

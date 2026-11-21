@@ -222,9 +222,10 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  70  SYS_MMIO_MERGE
                                  71  SYS_ASPACE_HOLD
                                  72  SYS_ASPACE_RELEASE
+                                 73  SYS_ENDPOINT_IDENTIFY
 ```
 
-**Implementation status.** Every number 0–72 has a handler; unallocated numbers
+**Implementation status.** Every number 0–73 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -696,7 +697,7 @@ call's `OutOfMemory` for its Memory cap region covers this refusal.
 ### `SYS_CAP_CREATE_ENDPOINT` (7)
 
 Retype a Memory capability into a new IPC endpoint. Returns a capability with
-Send + Receive + Grant rights.
+Send + Receive + Grant + Identify rights.
 
 **Arguments:**
 
@@ -1029,6 +1030,37 @@ call creates no capability, changes neither slot, and returns no kernel address 
 **Errors:** `InvalidCapability` (either handle null, stale, empty, or not an Endpoint
 capability), `InsufficientRights` (`recv_cap` lacks Receive), `InvalidArgument` (the two
 capabilities name different endpoints).
+
+---
+
+### `SYS_ENDPOINT_IDENTIFY` (73)
+
+Answer whether a capability the caller holds names the endpoint of an Endpoint capability carrying
+Identify, and nothing else (see [capability-model.md](../../../docs/capability-model.md) § IPC
+Endpoint).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `key` | Endpoint capability (Identify rights) |
+| 1 | `cap` | Capability of any type, the one asked about |
+
+**Return:** `rax`/`a0`: `1` when `cap` names the Endpoint object `key` names, `0` otherwise, or
+a `SyscallError`.
+
+A capability on another endpoint and a capability of another type both answer `0`, so the call
+tells its caller only whether `cap` reaches the endpoint of `key`. Only the creator's capability
+carries Identify at creation, and a copy or derive keeps it only where its mask does, so a holder
+recognizes an endpoint only where the endpoint's owner handed the right on: an owner that withholds
+it leaves every capability on its endpoint opaque. The call creates no capability, changes neither
+slot, and returns no badge, rights word, or kernel address (see
+[cross-boundary-disclosure.md](cross-boundary-disclosure.md)).
+
+**Capability requirement:** `key` MUST have Identify rights; `cap` needs none.
+
+**Errors:** `InvalidCapability` (`key` null, stale, empty, or not an Endpoint capability; `cap`
+null, stale, or empty), `InsufficientRights` (`key` lacks Identify).
 
 ---
 

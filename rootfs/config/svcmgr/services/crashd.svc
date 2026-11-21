@@ -3,9 +3,10 @@
 # crashd reports each process that dies on a fault to the system log, as one
 # marked block (services/crashd/docs/block-format.md). `debug_authority =
 # yes` makes svcmgr mint a DEBUG_AUTHORITY SEND|GRANT on procmgr and deliver
-# it in the bootstrap slot after the seeds (cap[0] here, with no seeds):
-# crashd registers with it as the receiver of procmgr's crash endpoint and
-# attaches to each faulting process. Removing this recipe from the image
+# it in the bootstrap slot after the seeds (cap[1] here, after the RECV
+# `provides` delivers, with no seeds): crashd registers with it as the
+# receiver of procmgr's crash endpoint, attaches to each faulting process,
+# and asks procmgr for the snapshot a live core is written from. Removing this recipe from the image
 # removes the reports: procmgr then declines every fault on that endpoint,
 # and a fault kills as it does with no handler.
 #
@@ -18,6 +19,13 @@
 # dump a fault memmgr declined for want of memory while the free pool is
 # spent. A reserve holder has a core role: no stop-authority holder may stop
 # crashd.
+#
+# `provides = crashd.core:grant` makes svcmgr create crashd's live-core
+# endpoint and publish one SEND on it, seed-only, carrying the authority to
+# ask for a live core: an ELF core of a process that keeps running
+# (services/crashd/docs/operation.md § Live Core). It is `:grant` because the
+# request moves the memmgr account the capture is charged to. No recipe here
+# seeds it; a recipe that seeds it can copy any live process's memory.
 #
 # `CORE_DUMP` names the processes whose faults leave an ELF core in /crash:
 # `no` (the default) writes none, a comma-separated list of process names
@@ -35,6 +43,7 @@ binary          = /services/crashd
 priority        = 20
 restart         = on_failure
 critical        = no
+provides        = crashd.core:grant
 env             = CORE_DUMP=no CRASHD_OOM_STALL_MS=10000
 namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes

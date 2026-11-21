@@ -15,6 +15,7 @@ test = true
 doctest = false
 
 [dependencies]
+ipc = { path = "../../../shared/ipc" }
 syscall-abi = { path = "../../../abi/syscall" }
 
 [lints]

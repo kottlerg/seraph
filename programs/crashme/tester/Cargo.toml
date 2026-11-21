@@ -9,5 +9,10 @@ name = "crashme-tester"
 path = "src/main.rs"
 test = false
 
+[dependencies]
+# The bootstrap protocol and crashd's labels, for the live core's seed.
+ipc = { path = "../../../shared/ipc" }
+syscall = { path = "../../../shared/syscall" }
+
 [lints]
 workspace = true

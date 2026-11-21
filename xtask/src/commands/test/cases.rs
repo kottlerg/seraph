@@ -53,7 +53,8 @@ pub enum CaseOption
 impl CaseOption
 {
     /// The option as the command line writes it.
-    fn flag(self) -> &'static str
+    #[must_use]
+    pub fn flag(self) -> &'static str
     {
         match self
         {
@@ -98,8 +99,9 @@ impl Case
 }
 
 /// The registry: every case's entry. The match names every case, so a new
-/// one is added here and nowhere else (`TestCase` names it, xtask/README.md
-/// § `cargo xtask test` describes it).
+/// one is added here and nowhere else in the code (`TestCase` names it);
+/// `cargo xtask lint-docs` fails until xtask/README.md § `cargo xtask test`
+/// and docs/testing.md state it (its `md-test-cells` rule).
 #[must_use]
 pub fn case(case: TestCase) -> Case
 {

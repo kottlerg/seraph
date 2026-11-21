@@ -700,21 +700,20 @@ that records it. A case is a pure runner: it builds nothing but the `signing` ca
 bootloader and the `rollback` case's raising one, boots the sysroot as the last pack left it,
 stages and removes only what it needs itself, and leaves the images in the layout it found them
 in; the sections below state each one's staging. A new host-driven QEMU test is a case, added to
-the registry and to `TestCase` in `src/cli.rs`, not a command. See
+the registry and to `TestCase` in `src/cli.rs`, not a command; `cargo xtask lint-docs` fails until
+the table above, a section of its own below, a heading of
+[docs/testing.md](../docs/testing.md#gating) § Gating, and the cell table of its § Coverage tiers
+state it (its `md-test-cells` rule, [§ `cargo xtask lint-docs`](#cargo-xtask-lint-docs)). See
 [docs/testing.md](../docs/testing.md) for the harness model.
 
 #### Cells
 
-`cargo xtask test --cell T` runs every case the registry assigns to CI tester T's cells, on the
-architecture and in the registry's order, each whatever another's outcome, and fails naming the
-cases that failed. A cell takes no case option but `--release`, which it passes on to `signing`
-and `rollback`.
-
-| Tester | Cases |
-|---|---|
-| `usertest` | `terminal`, `signing`, `rollback`, `wedge`, `vmgenid` (x86_64 only), `shutdown` |
-| `ktest` | `kaslr` |
-| `svctest` | none: the command says so and succeeds |
+`cargo xtask test --cell T` runs every case the registry assigns to CI tester T's cells (the Cell
+column above), on the architecture and in the registry's order, each whatever another's outcome,
+and fails naming the cases that failed; for a tester with no case, `svctest` today, it says so and
+succeeds. A cell takes no case option but `--release`, which it passes on to `signing` and
+`rollback`. The cell table of [docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers
+lists every cell with the cases it runs.
 
 CI (`.github/workflows/build-test.yml`) runs, in every cell after the cell's own boot,
 `cargo xtask mkdisk --arch A` (the plain repack: the `rootfs/` re-mirror, the repository's log
@@ -1445,9 +1444,10 @@ cargo xtask lint-docs
 Each violation prints as `<level> <rule>: <path>:<line>: <message>`; any
 error-level diagnostic fails the command. The rules check what a script can
 decide, including that every name the surface list of docs/testing.md
-§ Coverage tiers states still names code, a file, or a directory in the tree; whether a
-passage is a summary, or any other statement matches the code, is the
-pre-merge review's.
+§ Coverage tiers states still names code, a file, or a directory in the tree, that every
+`cargo xtask` command line names a command, case and option the command table has, and that the
+documents stating the case registry state it as it is; whether a passage is a summary, or any other
+statement matches the code, is the pre-merge review's.
 
 | Rule | Level | Check |
 |---|---|---|
@@ -1458,7 +1458,9 @@ pre-merge review's.
 | `md-summarized-by-order` | error | The `## Summarized By` entries are sorted by the repository path each link resolves to, byte by byte, and none is listed twice. |
 | `md-summarized-by-label` | error | Each `## Summarized By` entry for a `README.md` is labelled with its repository path, and each other entry with the linked document's `# Title`. |
 | `md-reachable` | error | Every authoritative document is reachable by links from the root `README.md`; the root README links every `docs/*.md` and every other README links each document in its own `docs/`, per [docs/documentation-standards.md](../docs/documentation-standards.md) § Discoverability and Linking. |
-| `md-coverage-symbols` | error | Every name the surface list of [docs/testing.md](../docs/testing.md) § Coverage tiers states resolves: from the paragraph starting `**Boundary surface.**` up to the one starting `**Repeat count.**`, each code span naming an item, field path, or `_*` family, and each alternative of the `S`, `M`, and `D` screen variables (groups expanded, character classes kept), matches as a whole word in the code of a tracked Rust source outside `xtask/` with `//` comments stripped, or, from the paragraph starting `**Device surfaces.**` on, in that of one inside `xtask/` other than the rule's own `lint_docs.rs`; each listed `.rs` path (`*` within one component; a bare file name in any directory) names a tracked file; and each listed directory, written with a trailing `/` (`*` within one component), has a tracked file beneath it. |
+| `md-coverage-symbols` | error | Every name the surface list of [docs/testing.md](../docs/testing.md) § Coverage tiers states resolves: from the paragraph starting `**Boundary surface.**` up to the one starting `**Repeat count.**`, each code span naming an item, field path, or `_*` family, and each alternative of the `S`, `M`, and `D` screen variables (groups expanded, character classes kept), matches as a whole word in the code of a tracked Rust source outside `xtask/` with `//` comments stripped, or, from the paragraph starting `**Device surfaces.**` on, in that of one inside `xtask/` other than the lint's own `src/commands/lint_docs/`; each listed `.rs` path (`*` within one component; a bare file name in any directory) names a tracked file; and each listed directory, written with a trailing `/` (`*` within one component), has a tracked file beneath it. |
+| `md-test-cells` | error | The documents that state the case registry of `cargo xtask test` (`src/commands/test/cases.rs`) state it as it is: the Cases table of § `cargo xtask test` has one row per case, equal to its registry entry (architectures with their boots, bundle, cell, case options); each case has a ``#### The `<case>` case`` section here and a heading naming ``(`<case>` case)`` in [docs/testing.md](../docs/testing.md) § Gating; and the cell table of docs/testing.md § Coverage tiers (the table whose first column is `Cell`) lists each case once, a CI case in its tester's row and a host-run case in a row of its own, on the architectures the registry runs it on (a parenthesis after the case naming them when they are fewer than the row's). |
+| `xtask-commands` | error | Every `cargo xtask` command line resolves against the command table (`src/cli.rs`): in every tracked `.md` but the per-tag release notes `docs/releases/v*.md`, in code spans and fenced blocks, and on every line of the `.yml`, `.sh`, `.js` and `.json` files under `.github/` and `.claude/`. Its literal words name a command and each sub-command level, a fixed-value first positional (the case of `test`) names one of its values, and each `--option` is one of the command it resolves to, up to a positional that takes the rest of the line (the commands of `orch grant set`), which the rule does not read; a placeholder where a sub-command stands checks the options after it against every command below. A command line ends at the end of its code span or line (a trailing `\` continues it), a shell separator, a redirection, or a `#` comment; in a `.js` or `.json` file, at a quote. |
 | `md-bare-cite` | warning | A `(see <name>.md)` citation outside link syntax. |
 
 The lint treats as authoritative every tracked `.md` except the root `README.md`, `.claude/`,

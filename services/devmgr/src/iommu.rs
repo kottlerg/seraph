@@ -2416,8 +2416,11 @@ fn spawn_and_settle(
         spawn::DriverSpawn::Refused(_) | spawn::DriverSpawn::Failed => return Settled::NotStarted,
     };
     // devmgr keeps a copy of the process handle for the instance's life
-    // ([`Kit::serving`]); the registry's record releases the one it holds
-    // once the instance is served.
+    // ([`Kit::serving`]), through which it destroys the instance. The
+    // registry's record keeps the one it holds while the instance is served,
+    // to read the reason procmgr gives the process when it dies
+    // (`QUERY_PROCESS`), and deletes it when the record is withdrawn
+    // (`Registry::withdraw_dead`, `Registry::forget_iommu_instance`).
     let Ok(kept_handle) = syscall::cap_derive(child.process_handle, syscall::RIGHTS_ALL)
     else
     {

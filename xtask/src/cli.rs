@@ -70,9 +70,11 @@ subcommands! {
         /// `--all` cargo's target/).
         Clean(CleanArgs),
 
-        /// Check formatting and lint the test code, then run Seraph unit tests on
-        /// the host and, built for riscv64, under QEMU's user-mode emulator (see
-        /// xtask/README.md).
+        /// Run Seraph's tests: without a case, check formatting and lint the test
+        /// code, then run the unit tests on the host and, built for riscv64,
+        /// under QEMU's user-mode emulator; with a CASE, boot the current
+        /// sysroot for that host-driven QEMU case; with `--cell`, run every
+        /// case a CI validate cell runs (see xtask/README.md).
         Test(TestArgs),
 
         /// Regenerate the reference vectors of shared/crypto/testkit with
@@ -110,124 +112,6 @@ subcommands! {
         /// prior `cargo xtask build`.
         Mkdisk(MkdiskArgs),
 
-        /// Boot the terminal interactive test: launch QEMU with a QMP control
-        /// socket, wait for the guest terminal's READY marker, inject a known key
-        /// sequence through the virtio-input driver, and assert the echoed input
-        /// and the relayed child output appear on the serial stream. Requires a
-        /// populated sysroot with `terminal.svc` staged (the default boot set
-        /// already includes it) and `disk.img` repacked — see xtask/README.md.
-        TestTerminal(TestTerminalArgs),
-
-        /// Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed
-        /// generation GUID, save the guest via QMP migrate-to-file, restore it
-        /// under a different GUID with `-incoming`, and assert the kernel's
-        /// generation-change detection plus post-resume liveness. Requires the
-        /// same populated sysroot as `test-terminal`.
-        TestVmgenid(TestVmgenidArgs),
-
-        /// Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot
-        /// set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each
-        /// backed by a fresh `swtpm` emulator in place of the virtio RNG, and
-        /// assert the TPM driver's interface line and its first answered READ,
-        /// and entropyd's accepted contribution. Requires the same populated
-        /// sysroot as `test-terminal`, and `swtpm` (see xtask/README.md).
-        TestTpm(TestTpmArgs),
-
-        /// Boot the KASLR randomization test: boot twice, scrape the kernel's
-        /// serial-only `kaslr:` line, and assert the image slide and direct-map
-        /// base differ between boots; then boot once with the `nokaslr` knob
-        /// staged and assert the deterministic layout. Requires a populated
-        /// sysroot with the ktest bundle composed (see xtask/README.md).
-        TestKaslr(TestKaslrArgs),
-
-        /// Check the crash service's report blocks in a boot's saved serial log:
-        /// every block well-formed, and the `crashme` fixture's three reports
-        /// present (`--expect reports`), or no block at all (`--expect none`)
-        /// (see xtask/README.md).
-        TestCrashReport(TestCrashReportArgs),
-
-        /// Check that a boot whose bootloader redoes its steps 6 and 7 completes:
-        /// stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot
-        /// once as `run --runs 1` boots it, assert the bootloader's knob line and the
-        /// pass marker, and remove the knob again (see xtask/README.md).
-        TestMapRedo(TestMapRedoArgs),
-
-        /// Check that the log-level configuration reaches the services init
-        /// spawns: install a configuration with vfsd set to debug and pack the
-        /// default-init bundle, boot the current sysroot once as `run --runs 1`
-        /// boots it, assert that vfsd's and fatfs's debug lines appear and
-        /// devmgr's and procmgr's do not, and restore the configuration and the
-        /// recorded harness's bundle (see xtask/README.md).
-        TestLogLevel(TestLogLevelArgs),
-
-        /// Check the debug port's transport: stage the `debug-echo` fixture,
-        /// boot the current sysroot once with `--debug-port`, exchange GDB remote
-        /// serial protocol packets with the fixture over the port's TCP end, and
-        /// unstage the fixture again (see xtask/README.md).
-        TestDebugPort(TestDebugPortArgs),
-
-        /// Check that each signature verifier refuses what it is owed to: boot
-        /// the current sysroot four times from disk images carrying a tampered
-        /// kernel, a tampered bundle entry, a bootloader revoking the signing
-        /// key, and tampered, wrong-role and foreign-signed rootfs images, and
-        /// assert each refusal line. Builds that bootloader; leaves the
-        /// sysroot as it was and packs the disk images again (see
-        /// xtask/README.md).
-        TestSigning(TestSigningArgs),
-
-        /// Check the reboot path: stage the `reboot` fixture, boot the current
-        /// sysroot once with a QMP socket, and pass when the fixture's REBOOT
-        /// resets the machine (QMP's SHUTDOWN event with reason `guest-reset`)
-        /// and QEMU exits on its own, through acpid's `RESET_REG` write on
-        /// `x86_64`; unstage the fixture again (see xtask/README.md).
-        TestReboot(TestRebootArgs),
-
-        /// Check the power button (`x86_64` only): boot the current sysroot once
-        /// with a QMP socket, press the ACPI power button with QMP
-        /// `system_powerdown` once acpid has armed its events, and pass when
-        /// acpid reports the press, pwrmgr powers off through acpid's SLEEP(5),
-        /// QMP's SHUTDOWN event gives reason `guest-shutdown`, and QEMU exits on
-        /// its own (see xtask/README.md).
-        TestPowerbutton(TestPowerbuttonArgs),
-
-        /// Check that the death of a core or critical service powers the
-        /// system off: boot once per target, kill it by a terminal fault made
-        /// from outside the guest (the GDB stub service for svcmgr, devmgr,
-        /// vfsd and logd, logd until its restart budget is spent; QEMU's
-        /// gdbstub and a hardware breakpoint for memmgr and procmgr), and pass
-        /// when QMP's SHUTDOWN event gives reason `guest-shutdown` and QEMU
-        /// exits on its own (see xtask/README.md).
-        TestCoreDeath(TestCoreDeathArgs),
-        /// Check PCI Express hotplug: stage the `hotplug-check` fixture and the
-        /// `test-dma` class, boot the current sysroot with two empty root ports
-        /// (on `x86_64` once under the machine's default, the firmware's ACPI PCI
-        /// hotplug through acpid, then with native control), hot-add, remove and
-        /// hot-add again QEMU's `edu` device behind one over QMP, check the
-        /// fixture's verdict, then hot-add a `virtio-blk-pci` disk behind the
-        /// other and check that devmgr binds it from the drivers directory's
-        /// driver, and unstage both again (see xtask/README.md).
-        TestHotplug(TestHotplugArgs),
-
-        /// Check the GDB stub: stage it and its `gdb-target` process, boot the
-        /// current sysroot once with `--debug-port`, run the host's GDB in batch
-        /// mode against the port, check what it reports, and unstage both
-        /// again (see xtask/README.md).
-        TestGdb(TestGdbArgs),
-
-        /// Check the softlockup watchdog's report of a CPU wedged with interrupts
-        /// off: boot the default boot set twice with QEMU's gdbstub on a unix
-        /// socket, move an idle AP (then the BSP) to the kernel's `halt_loop`
-        /// over the GDB remote serial protocol, and check the watchdog's report,
-        /// with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md).
-        TestWedge(TestWedgeArgs),
-
-        /// Check the x86-64 kernel's CET supervisor shadow stacks on a host
-        /// whose CPU has them, under KVM, failing on any other: boot the current
-        /// sysroot's ktest bundle on shadow stacks to its pass marker, then boot
-        /// it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return
-        /// address, and check the `#CP` it raises (see xtask/README.md).
-        TestCet(TestCetArgs),
-
         /// Capture the ACPI tables of one QEMU configuration into the `shared/aml`
         /// fixtures: boot the firmware alone on a blank disk, save the guest's
         /// memory over QMP once the firmware has installed its tables, find the
@@ -263,13 +147,9 @@ subcommands! {
         CompareImages(CompareImagesArgs),
 
         /// Validate the saved run records of a pull request's pre-merge review
-        /// (`target/xtask/review/pr<N>/`) against the record shape (see
-        /// xtask/README.md).
-        ReviewCheck(ReviewCheckArgs),
-
-        /// Build `ledger.json` from the saved run records of a pull request's
-        /// pre-merge review, or print a release review's ledger for the files
-        /// named: the findings a later run must not re-raise (see
+        /// (`target/xtask/review/pr<N>/`) against the record shape and build
+        /// `ledger.json` from them, or print a release review's ledger for the
+        /// files named: the findings a later run must not re-raise (see
         /// xtask/README.md).
         ReviewLedger(ReviewLedgerArgs),
 
@@ -322,34 +202,17 @@ impl CliCommand
         {
             Self::Build(args) => Some(&args.host),
             Self::Clean(args) => Some(&args.host),
-            Self::Test(args) => Some(&args.host),
+            Self::Test(args) => args.unit_tests().then_some(&args.host.common),
             Self::CryptoVectors(args) => Some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
-            Self::TestSigning(args) => Some(&args.host.common),
             Self::Run(_)
             | Self::KtestTiming(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
-            | Self::TestTerminal(_)
-            | Self::TestVmgenid(_)
-            | Self::TestTpm(_)
-            | Self::TestKaslr(_)
-            | Self::TestCrashReport(_)
-            | Self::TestMapRedo(_)
-            | Self::TestLogLevel(_)
-            | Self::TestDebugPort(_)
-            | Self::TestReboot(_)
-            | Self::TestPowerbutton(_)
-            | Self::TestCoreDeath(_)
-            | Self::TestHotplug(_)
-            | Self::TestGdb(_)
-            | Self::TestWedge(_)
-            | Self::TestCet(_)
             | Self::CaptureAcpi(_)
             | Self::LintDocs(_)
             | Self::CommitCheck(_)
             | Self::PrCheck(_)
-            | Self::ReviewCheck(_)
             | Self::ReviewLedger(_)
             | Self::ReleaseScope(_)
             | Self::IssueEdit(_)
@@ -456,7 +319,7 @@ args! {
         /// Skip the formatting check (`cargo fmt --check`) and the
         /// per-component `cargo check` (clippy), which would otherwise double
         /// the cargo invocations per component. `cargo xtask compare-images`
-        /// and `cargo xtask test-signing` set it for the builds they run.
+        /// and `cargo xtask test signing` set it for the builds they run.
         /// Use `cargo xtask build` without it for the full lint pass.
         #[arg(long, hide = true)]
         pub skip_lints: bool,
@@ -579,7 +442,7 @@ args! {
         /// property, so the host's CPU never decides it; a QEMU without the
         /// property cannot offer them and gets no pin. `on` boots the kernel on
         /// shadow stacks, or refuses to boot when the accelerator or the QEMU
-        /// cannot offer them; the cet cell (`cargo xtask test-cet`) is where they
+        /// cannot offer them; the cet cell (`cargo xtask test cet`) is where they
         /// are tested.
         #[arg(long, default_value = "off")]
         pub x86_shadow_stack: X86ShadowStack,
@@ -753,9 +616,8 @@ args! {
         #[arg(long, value_name = "REGEX", requires = "runs")]
         pub require: Vec<String>,
 
-        /// Check the crash service's report blocks in each passing run's log as
-        /// `cargo xtask test-crash-report --expect` checks a saved log: every
-        /// block well-formed, and `reports` the `crashme` fixture's three
+        /// Check the crash service's report blocks in each passing run's log:
+        /// every block well-formed, and `reports` the `crashme` fixture's three
         /// reports, `none` no block at all. A run whose check fails is FAIL; a
         /// QEMU-CRASH run is not checked.
         #[arg(long, requires = "runs")]
@@ -809,6 +671,21 @@ pub const DEFAULT_PASS_REGEX: &str = "ALL TESTS PASSED";
 
 /// Default `run --fail-grace-secs`.
 pub const DEFAULT_FAIL_GRACE_SECS: u64 = 10;
+
+value_enum! {
+    /// What `run --crash-reports` expects of each passing run's log
+    /// (`crate::crash_check`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CrashReportExpect
+    {
+        /// The `crashme` fixture's `vm` and `exception` reports of its main
+        /// thread and its `worker` report of a spawned thread: a usertest boot
+        /// with crashd staged.
+        Reports,
+        /// No report block: a boot of an image that stages no crashd.
+        None,
+    }
+}
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
 
@@ -864,477 +741,6 @@ args! {
         /// four and a `disk-data.img` an earlier authoring left is removed.
         #[arg(long)]
         pub split_data: bool,
-    }
-}
-
-// ── TestTerminal ──────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestTerminalArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestVmgenid ───────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestVmgenidArgs
-    {
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestTpm ───────────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestTpmArgs
-    {
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestKaslr ─────────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestKaslrArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// riscv64 paging mode to negotiate (ignored on x86-64).
-        #[arg(long, default_value = "sv48")]
-        pub riscv_mmu: RiscvMmu,
-
-        /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
-        /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging
-        /// when CPUID reports LA57, so this selects the depth a run exercises.
-        #[arg(long, default_value = "4")]
-        pub x86_paging: X86Paging,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestCrashReport ───────────────────────────────────────────────────────────
-
-value_enum! {
-    /// What `test-crash-report` expects of a log.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum CrashReportExpect
-    {
-        /// The `crashme` fixture's `vm` and `exception` reports of its main
-        /// thread and its `worker` report of a spawned thread: a usertest boot
-        /// with crashd staged.
-        Reports,
-        /// No report block: a boot of an image that stages no crashd.
-        None,
-    }
-}
-
-args! {
-    pub struct TestCrashReportArgs
-    {
-        /// A boot's saved serial log to check (a `run --runs N --save-logs`
-        /// log). Nothing boots.
-        #[arg(long, value_name = "FILE")]
-        pub log: PathBuf,
-
-        /// What the log must hold beyond well-formed blocks.
-        #[arg(long, default_value = "reports")]
-        pub expect: CrashReportExpect,
-    }
-}
-
-// ── TestMapRedo ───────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestMapRedoArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Boot timeout, in seconds, for HANG classification.
-        #[arg(long, default_value = "900")]
-        pub timeout: u64,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// riscv64 paging mode to negotiate (ignored on x86-64).
-        #[arg(long, default_value = "sv48")]
-        pub riscv_mmu: RiscvMmu,
-
-        /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64).
-        #[arg(long, default_value = "4")]
-        pub x86_paging: X86Paging,
-
-        /// Attach the test devices, as `run --test-devices` does: a staged
-        /// svctest needs them to reach its pass marker.
-        #[arg(long)]
-        pub test_devices: bool,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestLogLevel ──────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestLogLevelArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Boot timeout, in seconds, for HANG classification.
-        #[arg(long, default_value = "900")]
-        pub timeout: u64,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// Attach the test devices, as `run --test-devices` does: a staged
-        /// svctest needs them to reach its pass marker.
-        #[arg(long)]
-        pub test_devices: bool,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestWedge ─────────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestWedgeArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp); at least 2.
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestCet ───────────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestCetArgs
-    {
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestDebugPort ─────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestDebugPortArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// The host TCP port the debug port is served on; without it, a port
-        /// free on `127.0.0.1` when the boot starts.
-        #[arg(long)]
-        pub port: Option<u16>,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestSigning ──────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestSigningArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Build the revoking bootloader in release mode, as the sysroot's
-        /// was built (default: debug).
-        #[arg(long)]
-        pub release: bool,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestReboot ───────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestRebootArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestPowerbutton ──────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestPowerbuttonArgs
-    {
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestCoreDeath ────────────────────────────────────────────────────────────
-
-value_enum! {
-    /// A service `test-core-death` kills.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum CoreDeathTarget
-    {
-        /// memmgr's thread, in an allocation.
-        Memmgr,
-        /// A procmgr request worker, in a create.
-        Procmgr,
-        /// procmgr's reaper thread, in a reap.
-        ProcmgrReaper,
-        /// svcmgr's main thread.
-        Svcmgr,
-        /// devmgr's main thread.
-        Devmgr,
-        /// vfsd's main thread.
-        Vfsd,
-        /// logd's main thread, once per restart its budget allows and once
-        /// more.
-        Logd,
-    }
-}
-
-impl CoreDeathTarget
-{
-    /// Every target, in the order a run without `--target` kills them.
-    pub const ALL: [Self; 7] = [
-        Self::Memmgr,
-        Self::Procmgr,
-        Self::ProcmgrReaper,
-        Self::Svcmgr,
-        Self::Devmgr,
-        Self::Vfsd,
-        Self::Logd,
-    ];
-}
-
-args! {
-    pub struct TestCoreDeathArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// The services to kill, one boot each (default: every one).
-        /// Repeatable, or comma-separated.
-        #[arg(long, value_delimiter = ',')]
-        pub target: Vec<CoreDeathTarget>,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestHotplug ──────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestHotplugArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
-    }
-}
-
-// ── TestGdb ──────────────────────────────────────────────────────────────────
-
-args! {
-    pub struct TestGdbArgs
-    {
-        /// Target architecture.
-        #[arg(long, default_value = "x86_64")]
-        pub arch: Arch,
-
-        /// The host TCP port the debug port is served on; without it, a port
-        /// free on `127.0.0.1` when the boot starts.
-        #[arg(long)]
-        pub port: Option<u16>,
-
-        /// The host GDB to run (it must debug the architecture).
-        #[arg(long, default_value = "gdb")]
-        pub gdb: String,
-
-        /// Number of vCPUs to expose to the guest (QEMU -smp).
-        #[arg(long, default_value = "4")]
-        pub cpus: u32,
-
-        /// Guest memory size in MiB (QEMU -m).
-        #[arg(long, default_value = "512")]
-        pub mem: u32,
-
-        /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
-        #[command(flatten)]
-        pub host: BootHostArgs,
     }
 }
 
@@ -1423,14 +829,81 @@ args! {
 args! {
     pub struct TestArgs
     {
-        /// Test a single component (default: all).
-        #[arg(long, default_value = "all")]
+        /// The host-driven QEMU case to run against the populated sysroot (see
+        /// xtask/README.md for each). Without a case or `--cell`, `test`
+        /// checks formatting, lints the test code and runs the unit tests.
+        #[arg(value_name = "CASE", conflicts_with = "cell")]
+        pub case: Option<TestCase>,
+
+        /// Run every case the CI validate cell of TESTER runs on `--arch`, in
+        /// the registry's order, each whatever another's outcome, and fail when
+        /// one failed.
+        #[arg(long, value_name = "TESTER")]
+        pub cell: Option<Tester>,
+
+        /// The unit tests' component. Unit tests only.
+        #[arg(long, default_value = "all", conflicts_with_all = ["case", "cell"])]
         pub component: TestComponent,
 
+        /// Target architecture of a case or a cell (default: `x86_64`).
+        #[arg(long)]
+        pub arch: Option<Arch>,
+
+        /// Number of vCPUs a case's boots expose to the guest (QEMU -smp;
+        /// default: 4).
+        #[arg(long)]
+        pub cpus: Option<u32>,
+
+        /// Guest memory size in MiB of a case's boots (QEMU -m; default: 512).
+        #[arg(long)]
+        pub mem: Option<u32>,
+
+        /// The `shutdown` case's causes, one boot each (default: every cause
+        /// the architecture has). Repeatable, or comma-separated.
+        #[arg(long, value_delimiter = ',', requires = "case")]
+        pub cause: Vec<ShutdownCause>,
+
+        /// The `debug-port` case's host TCP port for the debug port; without
+        /// it, a port free on `127.0.0.1` when each boot starts.
+        #[arg(long, requires = "case")]
+        pub port: Option<u16>,
+
+        /// The host GDB the `debug-port` case runs, which must debug the
+        /// architecture (default: `gdb`).
+        #[arg(long, requires = "case")]
+        pub gdb: Option<String>,
+
+        /// Build the `signing` case's revoking bootloader in release mode, as
+        /// the sysroot's was built (default: debug).
+        #[arg(long)]
+        pub release: bool,
+
+        /// The `kaslr` case's riscv64 paging-mode ceiling (default: sv48;
+        /// ignored on `x86_64`).
+        #[arg(long, requires = "case")]
+        pub riscv_mmu: Option<RiscvMmu>,
+
+        /// The `kaslr` case's guest x86-64 paging depth (default: 4; ignored
+        /// on riscv64).
+        #[arg(long, requires = "case")]
+        pub x86_paging: Option<X86Paging>,
+
         /// The shared host's launch rules (see xtask/README.md "Host launch
-        /// rules").
+        /// rules"). A case admits each of its boots; the unit tests are
+        /// admitted as a build.
         #[command(flatten)]
-        pub host: HostArgs,
+        pub host: BootHostArgs,
+    }
+}
+
+impl TestArgs
+{
+    /// Whether the command line runs the unit tests: neither a case nor a
+    /// cell. `main` admits that form as a build; a case admits its own boots.
+    #[must_use]
+    pub fn unit_tests(&self) -> bool
+    {
+        self.case.is_none() && self.cell.is_none()
     }
 }
 
@@ -1444,6 +917,99 @@ value_enum! {
         Kernel,
         Init,
         All,
+    }
+}
+
+value_enum! {
+    /// A host-driven QEMU case: one or more boots of the current sysroot that
+    /// the host drives or watches, which no in-guest harness can check alone.
+    /// The registry (`crate::commands::test::cases`) states each one's
+    /// architectures, bundle, boots and cell.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TestCase
+    {
+        /// Keyboard and serial input through the terminal, and keyboard input
+        /// again after a restart of the input driver.
+        Terminal,
+        /// The kernel's randomized layout differs between boots, and the
+        /// `nokaslr` knob gives the deterministic one.
+        Kaslr,
+        /// Each signature verifier refuses a tampered kernel, a tampered bundle
+        /// entry, a revoked key, and tampered, wrong-role and foreign-signed
+        /// rootfs images.
+        Signing,
+        /// The softlockup watchdog reports a CPU wedged with interrupts off.
+        Wedge,
+        /// The kernel detects a VM generation change across a snapshot
+        /// restore (`x86_64` only).
+        Vmgenid,
+        /// PCI Express hotplug of a device and of a disk behind root ports.
+        Hotplug,
+        /// The kernel's CET supervisor shadow stacks, under KVM (`x86_64`
+        /// only).
+        Cet,
+        /// The TPM 2.0 driver behind `tpm-tis` and `tpm-crb` (`x86_64`
+        /// only).
+        Tpm,
+        /// The machine shuts down for each cause: a reboot, the power button,
+        /// and the death of each core or critical service.
+        Shutdown,
+        /// The debug port's transport, then the GDB stub driven by the host's
+        /// GDB over it.
+        DebugPort,
+    }
+}
+
+value_enum! {
+    /// The tester of a CI validate cell (`.github/workflows/build-test.yml`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Tester
+    {
+        /// The services harness.
+        Svctest,
+        /// The userspace harness.
+        Usertest,
+        /// The kernel-test harness.
+        Ktest,
+    }
+}
+
+value_enum! {
+    /// A cause the `shutdown` case boots once for.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ShutdownCause
+    {
+        /// pwrmgr's `REBOOT`, which the `reboot` fixture sends: QMP's reason
+        /// `guest-reset`.
+        Reboot,
+        /// The ACPI power button, pressed over QMP (`x86_64` only).
+        PowerButton,
+        /// The death of memmgr's thread, in an allocation.
+        Memmgr,
+        /// The death of a procmgr request worker, in a create.
+        Procmgr,
+        /// The death of procmgr's reaper thread, in a reap.
+        ProcmgrReaper,
+        /// The death of svcmgr's main thread.
+        Svcmgr,
+        /// The permanent death of devmgr's main thread.
+        Devmgr,
+        /// The permanent death of vfsd's main thread.
+        Vfsd,
+        /// The permanent death of logd's main thread: once per restart its
+        /// budget allows and once more.
+        Logd,
+    }
+}
+
+impl ShutdownCause
+{
+    /// Whether the cause exists on `arch`: QEMU's riscv64 `virt` machine has
+    /// no fixed power button.
+    #[must_use]
+    pub fn on(self, arch: Arch) -> bool
+    {
+        self != Self::PowerButton || arch == Arch::X86_64
     }
 }
 
@@ -1620,22 +1186,19 @@ args! {
     }
 }
 
-// ── ReviewCheck / ReviewLedger ────────────────────────────────────────────────
-
-args! {
-    pub struct ReviewCheckArgs
-    {
-        /// The pull request's number.
-        pub pr: u64,
-    }
-}
+// ── ReviewLedger ──────────────────────────────────────────────────────────────
 
 args! {
     pub struct ReviewLedgerArgs
     {
-        /// The pull request's number: write `ledger.json` beside its records.
+        /// The pull request's number: validate its records and write
+        /// `ledger.json` beside them, or nothing when one is malformed.
         #[arg(conflicts_with = "release")]
         pub pr: Option<u64>,
+
+        /// Validate the pull request's records alone and write nothing.
+        #[arg(long, requires = "pr", conflicts_with = "release")]
+        pub check: bool,
 
         /// The target version `X.Y.Z` of a release review: print its ledger, the
         /// entries of the range's pull requests and of the release's own runs.
@@ -2043,6 +1606,9 @@ mod tests
         assert!(build_host_of(&["xtask", "run"]).is_none());
         assert!(build_host_of(&["xtask", "lint-docs"]).is_none());
         assert!(build_host_of(&["xtask", "host", "status"]).is_none());
+        // A case or a cell boots, and admits each boot itself.
+        assert!(build_host_of(&["xtask", "test", "kaslr"]).is_none());
+        assert!(build_host_of(&["xtask", "test", "--cell", "usertest"]).is_none());
     }
 
     /// Parse `words` as the process's argv, the word `BAD` standing for an

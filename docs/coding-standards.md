@@ -126,7 +126,7 @@ to the configuration above except for nine lints, which that pass allows: `unwra
 panic in a function that returns `Result`, an out-of-range index, a slice off a character boundary
 and an overflow each fail the test, which is how a test reports a defect; the lints exist to keep
 those outcomes out of production code (§ Error Handling). The list `TEST_RELAXED_LINTS` in
-`xtask/src/commands/test.rs` is the one place the relaxation is stated, and a test does not
+`xtask/src/commands/test/host.rs` is the one place the relaxation is stated, and a test does not
 suppress these lints at its own site. The pass sees the code outside the test modules too, as
 the test configuration compiles it; the build's pass lints that code without the relaxation.
 

@@ -4,7 +4,7 @@
 // services/debug-echo/src/main.rs
 
 //! Debug-port fixture: answers fixed GDB remote serial protocol packets on
-//! the debug port, so `cargo xtask test-debug-port` proves the transport from
+//! the debug port, so the `debug-port` case proves the transport from
 //! the host to a guest service and back without a debugger stub.
 //!
 //! It follows the debug port across devmgr's restart of its driver
@@ -26,7 +26,7 @@ use ipc::{IpcMessage, serial_errors, serial_labels};
 
 /// Logged once the fixture holds the debug port and waits for packets: the
 /// host test connects on seeing it. Kept in sync with
-/// `xtask/src/commands/test_debug_port.rs`.
+/// `xtask/src/commands/test/debug_port/echo.rs`.
 const READY_MARKER: &str = "READY on the debug port";
 
 /// The vendor query the fixture echoes: `qSeraph.Echo:<data>` is answered

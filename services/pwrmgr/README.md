@@ -53,8 +53,8 @@ It exposes a small IPC surface (`shared/ipc/src/pwrmgr_labels.rs`):
 - `SHUTDOWN` — power off the platform (ACPI S5 through acpid on x86-64, SBI SRST type 0
   on RISC-V).
 - `REBOOT` — cold reboot the platform (the FADT's `RESET_REG` through acpid on x86-64, SBI SRST
-  type 1 on RISC-V). `cargo xtask test-reboot` checks it on both
-  ([docs/testing.md](../../docs/testing.md#reboot-test-reboot) § Reboot).
+  type 1 on RISC-V). `cargo xtask test shutdown --cause reboot` checks it on both
+  ([docs/testing.md](../../docs/testing.md#reboot-shutdown-case) § Reboot).
 
 On x86-64 pwrmgr also acts on the power button. A thread of its own calls acpid's
 `WAIT_EVENT` through `acpid.power` with no bound
@@ -62,8 +62,8 @@ On x86-64 pwrmgr also acts on the power button. A thread of its own calls acpid'
 `power button: shutting down` and powers off as `SHUTDOWN` does. A call that fails in transit
 (acpid died while holding it) is made again after one second, and a superseded one at once; a
 `NO_DEVICE` reply (no SCI or no fixed power button) or any other refusal ends the thread, logged,
-and pwrmgr goes on serving its labels. `cargo xtask test-powerbutton` checks the press
-([docs/testing.md](../../docs/testing.md#power-button-test-powerbutton) § Power button). RISC-V
+and pwrmgr goes on serving its labels. `cargo xtask test shutdown --cause power-button` checks the
+press ([docs/testing.md](../../docs/testing.md#power-button-shutdown-case) § Power button). RISC-V
 has no ACPI power button, and no such thread runs.
 
 For both labels, on the success path the platform powers off or resets and
@@ -115,9 +115,10 @@ off at once, by a path that needs no other service and none of the dead member's
   serves on.
 
 Without the queue, or when the wait set cannot be made, pwrmgr logs that a core death is
-unobserved and receives on its endpoint alone. `cargo xtask test-core-death` kills svcmgr,
-memmgr and procmgr, the last two once pwrmgr has logged that its power-off is armed, and checks
-the power-off ([docs/testing.md](../../docs/testing.md#core-death-test-core-death) § Core death).
+unobserved and receives on its endpoint alone. `cargo xtask test shutdown --cause
+svcmgr,memmgr,procmgr` kills svcmgr, memmgr and procmgr, the last two once pwrmgr has logged that
+its power-off is armed, and checks the power-off
+([docs/testing.md](../../docs/testing.md#core-death-shutdown-case) § Core death).
 ---
 
 ## Cap flow

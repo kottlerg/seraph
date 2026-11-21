@@ -11,44 +11,27 @@ Seraph build task runner — invoke via `cargo xtask`
 Usage: xtask <COMMAND>
 
 Commands:
-  build              Build Seraph components and populate the sysroot
-  run                Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
-  clean              Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
-  crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
-  ktest-timing       Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
-  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
-  mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
-  test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
-  test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
-  test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
-  test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `nokaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
-  test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
-  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
-  test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
-  test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
-  test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
-  test-powerbutton   Check the power button (`x86_64` only): boot the current sysroot once with a QMP socket, press the ACPI power button with QMP `system_powerdown` once acpid has armed its events, and pass when acpid reports the press, pwrmgr powers off through acpid's SLEEP(5), QMP's SHUTDOWN event gives reason `guest-shutdown`, and QEMU exits on its own (see xtask/README.md)
-  test-core-death    Check that the death of a core or critical service powers the system off: boot once per target, kill it by a terminal fault made from outside the guest (the GDB stub service for svcmgr, devmgr, vfsd and logd, logd until its restart budget is spent; QEMU's gdbstub and a hardware breakpoint for memmgr and procmgr), and pass when QMP's SHUTDOWN event gives reason `guest-shutdown` and QEMU exits on its own (see xtask/README.md)
-  test-hotplug       Check PCI Express hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with two empty root ports (on `x86_64` once under the machine's default, the firmware's ACPI PCI hotplug through acpid, then with native control), hot-add, remove and hot-add again QEMU's `edu` device behind one over QMP, check the fixture's verdict, then hot-add a `virtio-blk-pci` disk behind the other and check that devmgr binds it from the drivers directory's driver, and unstage both again (see xtask/README.md)
-  test-gdb           Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
-  test-wedge         Check the softlockup watchdog's report of a CPU wedged with interrupts off: boot the default boot set twice with QEMU's gdbstub on a unix socket, move an idle AP (then the BSP) to the kernel's `halt_loop` over the GDB remote serial protocol, and check the watchdog's report, with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md)
-  test-cet           Check the x86-64 kernel's CET supervisor shadow stacks on a host whose CPU has them, under KVM, failing on any other: boot the current sysroot's ktest bundle on shadow stacks to its pass marker, then boot it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return address, and check the `#CP` it raises (see xtask/README.md)
-  capture-acpi       Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
-  lint-docs          Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
-  commit-check       Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
-  pr-check           Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
-  compare-images     Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check       Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger      Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
-  release-scope      Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
-  issue-edit         Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
-  issue-file         File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
-  orch               Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)
-  host               Show the shared host's state as the launch rules read it: the load, the exclusive grant, the commands holding the host, and the QEMUs running (see xtask/README.md "Host launch rules")
-  hook               Answer a hook of the assistant's harness: read the event's JSON on stdin and print the answer the harness reads. `.claude/settings.json` names these commands (see xtask/README.md)
-  help               Print this message or the help of the given subcommand(s)
+  build           Build Seraph components and populate the sysroot
+  run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
+  clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
+  ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
+  mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
+  capture-acpi    Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
+  lint-docs       Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
+  commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
+  pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
+  compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
+  issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
+  issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
+  orch            Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)
+  host            Show the shared host's state as the launch rules read it: the load, the exclusive grant, the commands holding the host, and the QEMUs running (see xtask/README.md "Host launch rules")
+  hook            Answer a hook of the assistant's harness: read the event's JSON on stdin and print the answer the harness reads. `.claude/settings.json` names these commands (see xtask/README.md)
+  help            Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -58,44 +41,27 @@ Seraph build task runner — invoke via `cargo xtask`
 Usage: xtask <COMMAND>
 
 Commands:
-  build              Build Seraph components and populate the sysroot
-  run                Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
-  clean              Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
-  crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
-  ktest-timing       Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
-  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
-  mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
-  test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
-  test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
-  test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
-  test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `nokaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
-  test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
-  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
-  test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
-  test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
-  test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
-  test-powerbutton   Check the power button (`x86_64` only): boot the current sysroot once with a QMP socket, press the ACPI power button with QMP `system_powerdown` once acpid has armed its events, and pass when acpid reports the press, pwrmgr powers off through acpid's SLEEP(5), QMP's SHUTDOWN event gives reason `guest-shutdown`, and QEMU exits on its own (see xtask/README.md)
-  test-core-death    Check that the death of a core or critical service powers the system off: boot once per target, kill it by a terminal fault made from outside the guest (the GDB stub service for svcmgr, devmgr, vfsd and logd, logd until its restart budget is spent; QEMU's gdbstub and a hardware breakpoint for memmgr and procmgr), and pass when QMP's SHUTDOWN event gives reason `guest-shutdown` and QEMU exits on its own (see xtask/README.md)
-  test-hotplug       Check PCI Express hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with two empty root ports (on `x86_64` once under the machine's default, the firmware's ACPI PCI hotplug through acpid, then with native control), hot-add, remove and hot-add again QEMU's `edu` device behind one over QMP, check the fixture's verdict, then hot-add a `virtio-blk-pci` disk behind the other and check that devmgr binds it from the drivers directory's driver, and unstage both again (see xtask/README.md)
-  test-gdb           Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
-  test-wedge         Check the softlockup watchdog's report of a CPU wedged with interrupts off: boot the default boot set twice with QEMU's gdbstub on a unix socket, move an idle AP (then the BSP) to the kernel's `halt_loop` over the GDB remote serial protocol, and check the watchdog's report, with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md)
-  test-cet           Check the x86-64 kernel's CET supervisor shadow stacks on a host whose CPU has them, under KVM, failing on any other: boot the current sysroot's ktest bundle on shadow stacks to its pass marker, then boot it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return address, and check the `#CP` it raises (see xtask/README.md)
-  capture-acpi       Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
-  lint-docs          Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
-  commit-check       Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
-  pr-check           Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
-  compare-images     Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check       Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger      Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
-  release-scope      Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
-  issue-edit         Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
-  issue-file         File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
-  orch               Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)
-  host               Show the shared host's state as the launch rules read it: the load, the exclusive grant, the commands holding the host, and the QEMUs running (see xtask/README.md "Host launch rules")
-  hook               Answer a hook of the assistant's harness: read the event's JSON on stdin and print the answer the harness reads. `.claude/settings.json` names these commands (see xtask/README.md)
-  help               Print this message or the help of the given subcommand(s)
+  build           Build Seraph components and populate the sysroot
+  run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
+  clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
+  ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
+  mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
+  capture-acpi    Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
+  lint-docs       Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
+  commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
+  pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
+  compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
+  issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
+  issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
+  orch            Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)
+  host            Show the shared host's state as the launch rules read it: the load, the exclusive grant, the commands holding the host, and the QEMUs running (see xtask/README.md "Host launch rules")
+  hook            Answer a hook of the assistant's harness: read the event's JSON on stdin and print the answer the harness reads. `.claude/settings.json` names these commands (see xtask/README.md)
+  help            Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -167,7 +133,7 @@ Options:
       --x86-paging <X86_PAGING>
           Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `la57` property; the bootloader enables 5-level paging when CPUID reports LA57, so this selects the depth a run exercises [default: 4] [possible values: 4, 5]
       --x86-shadow-stack <X86_SHADOW_STACK>
-          Whether the guest x86-64 CPU offers CET supervisor shadow stacks (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss` property, so the host's CPU never decides it; a QEMU without the property cannot offer them and gets no pin. `on` boots the kernel on shadow stacks, or refuses to boot when the accelerator or the QEMU cannot offer them; the cet cell (`cargo xtask test-cet`) is where they are tested [default: off] [possible values: off, on]
+          Whether the guest x86-64 CPU offers CET supervisor shadow stacks (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss` property, so the host's CPU never decides it; a QEMU without the property cannot offer them and gets no pin. `on` boots the kernel on shadow stacks, or refuses to boot when the accelerator or the QEMU cannot offer them; the cet cell (`cargo xtask test cet`) is where they are tested [default: off] [possible values: off, on]
       --iommu <IOMMU>
           Whether the machine's IOMMU is attached, with the driven `virtio-pci` devices behind it. `absent` boots the no-IOMMU variant, the no-iommu device cell of the local and release host runs (docs/testing.md "Coverage tiers"), which keeps devmgr's unconfined path covered while the attached IOMMU confines every device a driver binds [default: attached] [possible values: attached, absent]
       --second-disk <PATH>
@@ -205,7 +171,7 @@ Options:
       --require <REGEX>
           A regex a line of the log must match for a run of `--runs` to pass; repeatable, each must match. A run whose `--pass` pattern matched but whose log has no line matching one of these is FAIL, naming the pattern
       --crash-reports <CRASH_REPORTS>
-          Check the crash service's report blocks in each passing run's log as `cargo xtask test-crash-report --expect` checks a saved log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked [possible values: reports, none]
+          Check the crash service's report blocks in each passing run's log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked [possible values: reports, none]
       --hold-on-hang
           On a hard-timeout HANG of `--runs`, do not kill the QEMU instance: print the attach instructions and block until it is terminated externally, preserving the wedged guest for inspection (pair with `--debug-listen`). Requires `--parallel 1`
       --fail-grace-secs <FAIL_GRACE_SECS>
@@ -283,7 +249,7 @@ Options:
           [default: 4]
 
       --x86-shadow-stack <X86_SHADOW_STACK>
-          Whether the guest x86-64 CPU offers CET supervisor shadow stacks (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss` property, so the host's CPU never decides it; a QEMU without the property cannot offer them and gets no pin. `on` boots the kernel on shadow stacks, or refuses to boot when the accelerator or the QEMU cannot offer them; the cet cell (`cargo xtask test-cet`) is where they are tested
+          Whether the guest x86-64 CPU offers CET supervisor shadow stacks (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss` property, so the host's CPU never decides it; a QEMU without the property cannot offer them and gets no pin. `on` boots the kernel on shadow stacks, or refuses to boot when the accelerator or the QEMU cannot offer them; the cet cell (`cargo xtask test cet`) is where they are tested
 
           Possible values:
           - off: No `CET_SS` in the guest's CPUID (`cet-ss=off`) — the default
@@ -367,7 +333,7 @@ Options:
           A regex a line of the log must match for a run of `--runs` to pass; repeatable, each must match. A run whose `--pass` pattern matched but whose log has no line matching one of these is FAIL, naming the pattern
 
       --crash-reports <CRASH_REPORTS>
-          Check the crash service's report blocks in each passing run's log as `cargo xtask test-crash-report --expect` checks a saved log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked
+          Check the crash service's report blocks in each passing run's log: every block well-formed, and `reports` the `crashme` fixture's three reports, `none` no block at all. A run whose check fails is FAIL; a QEMU-CRASH run is not checked
 
           Possible values:
           - reports: The `crashme` fixture's `vm` and `exception` reports of its main thread and its `worker` report of a spawned thread: a usertest boot with crashd staged
@@ -422,25 +388,135 @@ Options:
       --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
   -h, --help              Print help
 === xtask test -h
-Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
+Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
 
-Usage: xtask test [OPTIONS]
+Usage: xtask test [OPTIONS] [CASE]
+
+Arguments:
+  [CASE]  The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests [possible values: terminal, kaslr, signing, wedge, vmgenid, hotplug, cet, tpm, shutdown, debug-port]
 
 Options:
-      --component <COMPONENT>  Test a single component (default: all) [default: all] [possible values: boot, protocol, kernel, init, all]
-      --wait-host <SECS>       When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-  -h, --help                   Print help
+      --cell <TESTER>            Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed [possible values: svctest, usertest, ktest]
+      --component <COMPONENT>    The unit tests' component. Unit tests only [default: all] [possible values: boot, protocol, kernel, init, all]
+      --arch <ARCH>              Target architecture of a case or a cell (default: `x86_64`) [possible values: x86_64, riscv64]
+      --cpus <CPUS>              Number of vCPUs a case's boots expose to the guest (QEMU -smp; default: 4)
+      --mem <MEM>                Guest memory size in MiB of a case's boots (QEMU -m; default: 512)
+      --cause <CAUSE>            The `shutdown` case's causes, one boot each (default: every cause the architecture has). Repeatable, or comma-separated [possible values: reboot, power-button, memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
+      --port <PORT>              The `debug-port` case's host TCP port for the debug port; without it, a port free on `127.0.0.1` when each boot starts
+      --gdb <GDB>                The host GDB the `debug-port` case runs, which must debug the architecture (default: `gdb`)
+      --release                  Build the `signing` case's revoking bootloader in release mode, as the sysroot's was built (default: debug)
+      --riscv-mmu <RISCV_MMU>    The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`) [possible values: sv39, sv48, sv57]
+      --x86-paging <X86_PAGING>  The `kaslr` case's guest x86-64 paging depth (default: 4; ignored on riscv64) [possible values: 4, 5]
+      --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+      --host-override            Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --alone                    Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
+      --timing                   A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
+      --grant <HOLDER>           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
+  -h, --help                     Print help (see more with '--help')
 === xtask test --help
-Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
+Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
 
-Usage: xtask test [OPTIONS]
+Usage: xtask test [OPTIONS] [CASE]
+
+Arguments:
+  [CASE]
+          The host-driven QEMU case to run against the populated sysroot (see xtask/README.md for each). Without a case or `--cell`, `test` checks formatting, lints the test code and runs the unit tests
+
+          Possible values:
+          - terminal:   Keyboard and serial input through the terminal, and keyboard input again after a restart of the input driver
+          - kaslr:      The kernel's randomized layout differs between boots, and the `nokaslr` knob gives the deterministic one
+          - signing:    Each signature verifier refuses a tampered kernel, a tampered bundle entry, a revoked key, and tampered, wrong-role and foreign-signed rootfs images
+          - wedge:      The softlockup watchdog reports a CPU wedged with interrupts off
+          - vmgenid:    The kernel detects a VM generation change across a snapshot restore (`x86_64` only)
+          - hotplug:    PCI Express hotplug of a device and of a disk behind root ports
+          - cet:        The kernel's CET supervisor shadow stacks, under KVM (`x86_64` only)
+          - tpm:        The TPM 2.0 driver behind `tpm-tis` and `tpm-crb` (`x86_64` only)
+          - shutdown:   The machine shuts down for each cause: a reboot, the power button, and the death of each core or critical service
+          - debug-port: The debug port's transport, then the GDB stub driven by the host's GDB over it
 
 Options:
-      --component <COMPONENT>  Test a single component (default: all) [default: all] [possible values: boot, protocol, kernel, init, all]
-      --wait-host <SECS>       When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-  -h, --help                   Print help
+      --cell <TESTER>
+          Run every case the CI validate cell of TESTER runs on `--arch`, in the registry's order, each whatever another's outcome, and fail when one failed
+
+          Possible values:
+          - svctest:  The services harness
+          - usertest: The userspace harness
+          - ktest:    The kernel-test harness
+
+      --component <COMPONENT>
+          The unit tests' component. Unit tests only
+          
+          [default: all]
+          [possible values: boot, protocol, kernel, init, all]
+
+      --arch <ARCH>
+          Target architecture of a case or a cell (default: `x86_64`)
+
+          Possible values:
+          - x86_64:  x86-64 (Intel/AMD 64-bit)
+          - riscv64: RISC-V 64-bit
+
+      --cpus <CPUS>
+          Number of vCPUs a case's boots expose to the guest (QEMU -smp; default: 4)
+
+      --mem <MEM>
+          Guest memory size in MiB of a case's boots (QEMU -m; default: 512)
+
+      --cause <CAUSE>
+          The `shutdown` case's causes, one boot each (default: every cause the architecture has). Repeatable, or comma-separated
+
+          Possible values:
+          - reboot:         pwrmgr's `REBOOT`, which the `reboot` fixture sends: QMP's reason `guest-reset`
+          - power-button:   The ACPI power button, pressed over QMP (`x86_64` only)
+          - memmgr:         The death of memmgr's thread, in an allocation
+          - procmgr:        The death of a procmgr request worker, in a create
+          - procmgr-reaper: The death of procmgr's reaper thread, in a reap
+          - svcmgr:         The death of svcmgr's main thread
+          - devmgr:         The permanent death of devmgr's main thread
+          - vfsd:           The permanent death of vfsd's main thread
+          - logd:           The permanent death of logd's main thread: once per restart its budget allows and once more
+
+      --port <PORT>
+          The `debug-port` case's host TCP port for the debug port; without it, a port free on `127.0.0.1` when each boot starts
+
+      --gdb <GDB>
+          The host GDB the `debug-port` case runs, which must debug the architecture (default: `gdb`)
+
+      --release
+          Build the `signing` case's revoking bootloader in release mode, as the sysroot's was built (default: debug)
+
+      --riscv-mmu <RISCV_MMU>
+          The `kaslr` case's riscv64 paging-mode ceiling (default: sv48; ignored on `x86_64`)
+
+          Possible values:
+          - sv39: Cap the guest at Sv39 (`sv57=off,sv48=off`)
+          - sv48: Cap the guest at Sv48 (`sv57=off`) — the default
+          - sv57: Enable Sv57 (`sv57=on`, explicit against QEMU default drift)
+
+      --x86-paging <X86_PAGING>
+          The `kaslr` case's guest x86-64 paging depth (default: 4; ignored on riscv64)
+
+          Possible values:
+          - 4: 4-level paging (`la57=off`) — the default
+          - 5: 5-level paging (`la57=on`)
+
+      --wait-host <SECS>
+          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+
+      --host-override
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+
+      --alone
+          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
+
+      --timing
+          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
+
+      --grant <HOLDER>
+          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
+
+  -h, --help
+          Print help (see a summary with '-h')
 === xtask crypto-vectors -h
 Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
 
@@ -588,867 +664,6 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
-=== xtask test-terminal -h
-Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
-
-Usage: xtask test-terminal [OPTIONS]
-
-Options:
-      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help (see more with '--help')
-=== xtask test-terminal --help
-Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
-
-Usage: xtask test-terminal [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-vmgenid -h
-Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
-
-Usage: xtask test-vmgenid [OPTIONS]
-
-Options:
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help
-=== xtask test-vmgenid --help
-Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
-
-Usage: xtask test-vmgenid [OPTIONS]
-
-Options:
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help
-=== xtask test-tpm -h
-Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
-
-Usage: xtask test-tpm [OPTIONS]
-
-Options:
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help
-=== xtask test-tpm --help
-Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
-
-Usage: xtask test-tpm [OPTIONS]
-
-Options:
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help
-=== xtask test-kaslr -h
-Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `nokaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
-
-Usage: xtask test-kaslr [OPTIONS]
-
-Options:
-      --arch <ARCH>              Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --cpus <CPUS>              Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>                Guest memory size in MiB (QEMU -m) [default: 512]
-      --riscv-mmu <RISCV_MMU>    riscv64 paging mode to negotiate (ignored on x86-64) [default: sv48] [possible values: sv39, sv48, sv57]
-      --x86-paging <X86_PAGING>  Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `la57` property; the bootloader enables 5-level paging when CPUID reports LA57, so this selects the depth a run exercises [default: 4] [possible values: 4, 5]
-      --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override            Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone                    Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing                   A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help                     Print help (see more with '--help')
-=== xtask test-kaslr --help
-Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `nokaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
-
-Usage: xtask test-kaslr [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --riscv-mmu <RISCV_MMU>
-          riscv64 paging mode to negotiate (ignored on x86-64)
-
-          Possible values:
-          - sv39: Cap the guest at Sv39 (`sv57=off,sv48=off`)
-          - sv48: Cap the guest at Sv48 (`sv57=off`) — the default
-          - sv57: Enable Sv57 (`sv57=on`, explicit against QEMU default drift)
-          
-          [default: sv48]
-
-      --x86-paging <X86_PAGING>
-          Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `la57` property; the bootloader enables 5-level paging when CPUID reports LA57, so this selects the depth a run exercises
-
-          Possible values:
-          - 4: 4-level paging (`la57=off`) — the default
-          - 5: 5-level paging (`la57=on`)
-          
-          [default: 4]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-crash-report -h
-Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
-
-Usage: xtask test-crash-report [OPTIONS] --log <FILE>
-
-Options:
-      --log <FILE>       A boot's saved serial log to check (a `run --runs N --save-logs` log). Nothing boots
-      --expect <EXPECT>  What the log must hold beyond well-formed blocks [default: reports] [possible values: reports, none]
-  -h, --help             Print help (see more with '--help')
-=== xtask test-crash-report --help
-Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
-
-Usage: xtask test-crash-report [OPTIONS] --log <FILE>
-
-Options:
-      --log <FILE>
-          A boot's saved serial log to check (a `run --runs N --save-logs` log). Nothing boots
-
-      --expect <EXPECT>
-          What the log must hold beyond well-formed blocks
-
-          Possible values:
-          - reports: The `crashme` fixture's `vm` and `exception` reports of its main thread and its `worker` report of a spawned thread: a usertest boot with crashd staged
-          - none:    No report block: a boot of an image that stages no crashd
-          
-          [default: reports]
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-map-redo -h
-Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-
-Usage: xtask test-map-redo [OPTIONS]
-
-Options:
-      --arch <ARCH>              Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --timeout <TIMEOUT>        Boot timeout, in seconds, for HANG classification [default: 900]
-      --cpus <CPUS>              Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>                Guest memory size in MiB (QEMU -m) [default: 512]
-      --riscv-mmu <RISCV_MMU>    riscv64 paging mode to negotiate (ignored on x86-64) [default: sv48] [possible values: sv39, sv48, sv57]
-      --x86-paging <X86_PAGING>  Guest x86-64 paging depth (`x86_64` only; ignored on riscv64) [default: 4] [possible values: 4, 5]
-      --test-devices             Attach the test devices, as `run --test-devices` does: a staged svctest needs them to reach its pass marker
-      --wait-host <SECS>         When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override            Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone                    Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing                   A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>           Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help                     Print help (see more with '--help')
-=== xtask test-map-redo --help
-Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-
-Usage: xtask test-map-redo [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --timeout <TIMEOUT>
-          Boot timeout, in seconds, for HANG classification
-          
-          [default: 900]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --riscv-mmu <RISCV_MMU>
-          riscv64 paging mode to negotiate (ignored on x86-64)
-
-          Possible values:
-          - sv39: Cap the guest at Sv39 (`sv57=off,sv48=off`)
-          - sv48: Cap the guest at Sv48 (`sv57=off`) — the default
-          - sv57: Enable Sv57 (`sv57=on`, explicit against QEMU default drift)
-          
-          [default: sv48]
-
-      --x86-paging <X86_PAGING>
-          Guest x86-64 paging depth (`x86_64` only; ignored on riscv64)
-
-          Possible values:
-          - 4: 4-level paging (`la57=off`) — the default
-          - 5: 5-level paging (`la57=on`)
-          
-          [default: 4]
-
-      --test-devices
-          Attach the test devices, as `run --test-devices` does: a staged svctest needs them to reach its pass marker
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-log-level -h
-Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
-
-Usage: xtask test-log-level [OPTIONS]
-
-Options:
-      --arch <ARCH>        Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --timeout <TIMEOUT>  Boot timeout, in seconds, for HANG classification [default: 900]
-      --cpus <CPUS>        Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>          Guest memory size in MiB (QEMU -m) [default: 512]
-      --test-devices       Attach the test devices, as `run --test-devices` does: a staged svctest needs them to reach its pass marker
-      --wait-host <SECS>   When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override      Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone              Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing             A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>     Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help               Print help (see more with '--help')
-=== xtask test-log-level --help
-Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
-
-Usage: xtask test-log-level [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --timeout <TIMEOUT>
-          Boot timeout, in seconds, for HANG classification
-          
-          [default: 900]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --test-devices
-          Attach the test devices, as `run --test-devices` does: a staged svctest needs them to reach its pass marker
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-debug-port -h
-Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
-
-Usage: xtask test-debug-port [OPTIONS]
-
-Options:
-      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --port <PORT>       The host TCP port the debug port is served on; without it, a port free on `127.0.0.1` when the boot starts
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help (see more with '--help')
-=== xtask test-debug-port --help
-Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
-
-Usage: xtask test-debug-port [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --port <PORT>
-          The host TCP port the debug port is served on; without it, a port free on `127.0.0.1` when the boot starts
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-signing -h
-Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
-
-Usage: xtask test-signing [OPTIONS]
-
-Options:
-      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --release           Build the revoking bootloader in release mode, as the sysroot's was built (default: debug)
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help (see more with '--help')
-=== xtask test-signing --help
-Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
-
-Usage: xtask test-signing [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --release
-          Build the revoking bootloader in release mode, as the sysroot's was built (default: debug)
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-reboot -h
-Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
-
-Usage: xtask test-reboot [OPTIONS]
-
-Options:
-      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help (see more with '--help')
-=== xtask test-reboot --help
-Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
-
-Usage: xtask test-reboot [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-powerbutton -h
-Check the power button (`x86_64` only): boot the current sysroot once with a QMP socket, press the ACPI power button with QMP `system_powerdown` once acpid has armed its events, and pass when acpid reports the press, pwrmgr powers off through acpid's SLEEP(5), QMP's SHUTDOWN event gives reason `guest-shutdown`, and QEMU exits on its own (see xtask/README.md)
-
-Usage: xtask test-powerbutton [OPTIONS]
-
-Options:
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help
-=== xtask test-powerbutton --help
-Check the power button (`x86_64` only): boot the current sysroot once with a QMP socket, press the ACPI power button with QMP `system_powerdown` once acpid has armed its events, and pass when acpid reports the press, pwrmgr powers off through acpid's SLEEP(5), QMP's SHUTDOWN event gives reason `guest-shutdown`, and QEMU exits on its own (see xtask/README.md)
-
-Usage: xtask test-powerbutton [OPTIONS]
-
-Options:
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help
-=== xtask test-core-death -h
-Check that the death of a core or critical service powers the system off: boot once per target, kill it by a terminal fault made from outside the guest (the GDB stub service for svcmgr, devmgr, vfsd and logd, logd until its restart budget is spent; QEMU's gdbstub and a hardware breakpoint for memmgr and procmgr), and pass when QMP's SHUTDOWN event gives reason `guest-shutdown` and QEMU exits on its own (see xtask/README.md)
-
-Usage: xtask test-core-death [OPTIONS]
-
-Options:
-      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --target <TARGET>   The services to kill, one boot each (default: every one). Repeatable, or comma-separated [possible values: memmgr, procmgr, procmgr-reaper, svcmgr, devmgr, vfsd, logd]
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help (see more with '--help')
-=== xtask test-core-death --help
-Check that the death of a core or critical service powers the system off: boot once per target, kill it by a terminal fault made from outside the guest (the GDB stub service for svcmgr, devmgr, vfsd and logd, logd until its restart budget is spent; QEMU's gdbstub and a hardware breakpoint for memmgr and procmgr), and pass when QMP's SHUTDOWN event gives reason `guest-shutdown` and QEMU exits on its own (see xtask/README.md)
-
-Usage: xtask test-core-death [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --target <TARGET>
-          The services to kill, one boot each (default: every one). Repeatable, or comma-separated
-
-          Possible values:
-          - memmgr:         memmgr's thread, in an allocation
-          - procmgr:        A procmgr request worker, in a create
-          - procmgr-reaper: procmgr's reaper thread, in a reap
-          - svcmgr:         svcmgr's main thread
-          - devmgr:         devmgr's main thread
-          - vfsd:           vfsd's main thread
-          - logd:           logd's main thread, once per restart its budget allows and once more
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-hotplug -h
-Check PCI Express hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with two empty root ports (on `x86_64` once under the machine's default, the firmware's ACPI PCI hotplug through acpid, then with native control), hot-add, remove and hot-add again QEMU's `edu` device behind one over QMP, check the fixture's verdict, then hot-add a `virtio-blk-pci` disk behind the other and check that devmgr binds it from the drivers directory's driver, and unstage both again (see xtask/README.md)
-
-Usage: xtask test-hotplug [OPTIONS]
-
-Options:
-      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help (see more with '--help')
-=== xtask test-hotplug --help
-Check PCI Express hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with two empty root ports (on `x86_64` once under the machine's default, the firmware's ACPI PCI hotplug through acpid, then with native control), hot-add, remove and hot-add again QEMU's `edu` device behind one over QMP, check the fixture's verdict, then hot-add a `virtio-blk-pci` disk behind the other and check that devmgr binds it from the drivers directory's driver, and unstage both again (see xtask/README.md)
-
-Usage: xtask test-hotplug [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-gdb -h
-Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
-
-Usage: xtask test-gdb [OPTIONS]
-
-Options:
-      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --port <PORT>       The host TCP port the debug port is served on; without it, a port free on `127.0.0.1` when the boot starts
-      --gdb <GDB>         The host GDB to run (it must debug the architecture) [default: gdb]
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help (see more with '--help')
-=== xtask test-gdb --help
-Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
-
-Usage: xtask test-gdb [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --port <PORT>
-          The host TCP port the debug port is served on; without it, a port free on `127.0.0.1` when the boot starts
-
-      --gdb <GDB>
-          The host GDB to run (it must debug the architecture)
-          
-          [default: gdb]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp)
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-wedge -h
-Check the softlockup watchdog's report of a CPU wedged with interrupts off: boot the default boot set twice with QEMU's gdbstub on a unix socket, move an idle AP (then the BSP) to the kernel's `halt_loop` over the GDB remote serial protocol, and check the watchdog's report, with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md)
-
-Usage: xtask test-wedge [OPTIONS]
-
-Options:
-      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp); at least 2 [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help (see more with '--help')
-=== xtask test-wedge --help
-Check the softlockup watchdog's report of a CPU wedged with interrupts off: boot the default boot set twice with QEMU's gdbstub on a unix socket, move an idle AP (then the BSP) to the kernel's `halt_loop` over the GDB remote serial protocol, and check the watchdog's report, with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md)
-
-Usage: xtask test-wedge [OPTIONS]
-
-Options:
-      --arch <ARCH>
-          Target architecture
-
-          Possible values:
-          - x86_64:  x86-64 (Intel/AMD 64-bit)
-          - riscv64: RISC-V 64-bit
-          
-          [default: x86_64]
-
-      --cpus <CPUS>
-          Number of vCPUs to expose to the guest (QEMU -smp); at least 2
-          
-          [default: 4]
-
-      --mem <MEM>
-          Guest memory size in MiB (QEMU -m)
-          
-          [default: 512]
-
-      --wait-host <SECS>
-          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-
-      --host-override
-          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-
-      --alone
-          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-
-      --timing
-          A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-
-      --grant <HOLDER>
-          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-
-  -h, --help
-          Print help (see a summary with '-h')
-=== xtask test-cet -h
-Check the x86-64 kernel's CET supervisor shadow stacks on a host whose CPU has them, under KVM, failing on any other: boot the current sysroot's ktest bundle on shadow stacks to its pass marker, then boot it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return address, and check the `#CP` it raises (see xtask/README.md)
-
-Usage: xtask test-cet [OPTIONS]
-
-Options:
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help
-=== xtask test-cet --help
-Check the x86-64 kernel's CET supervisor shadow stacks on a host whose CPU has them, under KVM, failing on any other: boot the current sysroot's ktest bundle on shadow stacks to its pass marker, then boot it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return address, and check the `#CP` it raises (see xtask/README.md)
-
-Usage: xtask test-cet [OPTIONS]
-
-Options:
-      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
-      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
-      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
-      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
-      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
-      --timing            A timing-sensitive measurement: run beside no other QEMU, under the load limit of 10 of a boot that needs the host to itself, and refuse builds while it runs
-      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
-  -h, --help              Print help
 === xtask capture-acpi -h
 Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
 
@@ -1611,48 +826,30 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
-=== xtask review-check -h
-Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-
-Usage: xtask review-check <PR>
-
-Arguments:
-  <PR>  The pull request's number
-
-Options:
-  -h, --help  Print help
-=== xtask review-check --help
-Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-
-Usage: xtask review-check <PR>
-
-Arguments:
-  <PR>  The pull request's number
-
-Options:
-  -h, --help  Print help
 === xtask review-ledger -h
-Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
 
 Usage: xtask review-ledger [OPTIONS] [PR]
 
 Arguments:
-  [PR]  The pull request's number: write `ledger.json` beside its records
+  [PR]  The pull request's number: validate its records and write `ledger.json` beside them, or nothing when one is malformed
 
 Options:
+      --check              Validate the pull request's records alone and write nothing
       --release <RELEASE>  The target version `X.Y.Z` of a release review: print its ledger, the entries of the range's pull requests and of the release's own runs
       --from <FROM>        The previous release tag, where the release's range starts
       --file <FILE>        With `--release`, print only the entries for this file; repeatable
   -h, --help               Print help
 === xtask review-ledger --help
-Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
 
 Usage: xtask review-ledger [OPTIONS] [PR]
 
 Arguments:
-  [PR]  The pull request's number: write `ledger.json` beside its records
+  [PR]  The pull request's number: validate its records and write `ledger.json` beside them, or nothing when one is malformed
 
 Options:
+      --check              Validate the pull request's records alone and write nothing
       --release <RELEASE>  The target version `X.Y.Z` of a release review: print its ledger, the entries of the range's pull requests and of the release's own runs
       --from <FROM>        The previous release tag, where the release's range starts
       --file <FILE>        With `--release`, print only the entries for this file; repeatable
@@ -2297,41 +1494,24 @@ Print this message or the help of the given subcommand(s)
 Usage: xtask help [COMMAND]
 
 Commands:
-  build              Build Seraph components and populate the sysroot
-  run                Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
-  clean              Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
-  test               Check formatting and lint the test code, then run Seraph unit tests on the host and, built for riscv64, under QEMU's user-mode emulator (see xtask/README.md)
-  crypto-vectors     Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
-  ktest-timing       Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
-  symbolize          Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
-  mkdisk             Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
-  test-terminal      Boot the terminal interactive test: launch QEMU with a QMP control socket, wait for the guest terminal's READY marker, inject a known key sequence through the virtio-input driver, and assert the echoed input and the relayed child output appear on the serial stream. Requires a populated sysroot with `terminal.svc` staged (the default boot set already includes it) and `disk.img` repacked — see xtask/README.md
-  test-vmgenid       Boot the VMGENID snapshot-resume test (`x86_64` only): boot with a fixed generation GUID, save the guest via QMP migrate-to-file, restore it under a different GUID with `-incoming`, and assert the kernel's generation-change detection plus post-resume liveness. Requires the same populated sysroot as `test-terminal`
-  test-tpm           Boot the TPM 2.0 driver test (`x86_64` only): boot the default boot set once with QEMU's `tpm-tis` device and once with `tpm-crb`, each backed by a fresh `swtpm` emulator in place of the virtio RNG, and assert the TPM driver's interface line and its first answered READ, and entropyd's accepted contribution. Requires the same populated sysroot as `test-terminal`, and `swtpm` (see xtask/README.md)
-  test-kaslr         Boot the KASLR randomization test: boot twice, scrape the kernel's serial-only `kaslr:` line, and assert the image slide and direct-map base differ between boots; then boot once with the `nokaslr` knob staged and assert the deterministic layout. Requires a populated sysroot with the ktest bundle composed (see xtask/README.md)
-  test-crash-report  Check the crash service's report blocks in a boot's saved serial log: every block well-formed, and the `crashme` fixture's three reports present (`--expect reports`), or no block at all (`--expect none`) (see xtask/README.md)
-  test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once as `run --runs 1` boots it, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
-  test-log-level     Check that the log-level configuration reaches the services init spawns: install a configuration with vfsd set to debug and pack the default-init bundle, boot the current sysroot once as `run --runs 1` boots it, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and restore the configuration and the recorded harness's bundle (see xtask/README.md)
-  test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
-  test-signing       Check that each signature verifier refuses what it is owed to: boot the current sysroot four times from disk images carrying a tampered kernel, a tampered bundle entry, a bootloader revoking the signing key, and tampered, wrong-role and foreign-signed rootfs images, and assert each refusal line. Builds that bootloader; leaves the sysroot as it was and packs the disk images again (see xtask/README.md)
-  test-reboot        Check the reboot path: stage the `reboot` fixture, boot the current sysroot once with a QMP socket, and pass when the fixture's REBOOT resets the machine (QMP's SHUTDOWN event with reason `guest-reset`) and QEMU exits on its own, through acpid's `RESET_REG` write on `x86_64`; unstage the fixture again (see xtask/README.md)
-  test-powerbutton   Check the power button (`x86_64` only): boot the current sysroot once with a QMP socket, press the ACPI power button with QMP `system_powerdown` once acpid has armed its events, and pass when acpid reports the press, pwrmgr powers off through acpid's SLEEP(5), QMP's SHUTDOWN event gives reason `guest-shutdown`, and QEMU exits on its own (see xtask/README.md)
-  test-core-death    Check that the death of a core or critical service powers the system off: boot once per target, kill it by a terminal fault made from outside the guest (the GDB stub service for svcmgr, devmgr, vfsd and logd, logd until its restart budget is spent; QEMU's gdbstub and a hardware breakpoint for memmgr and procmgr), and pass when QMP's SHUTDOWN event gives reason `guest-shutdown` and QEMU exits on its own (see xtask/README.md)
-  test-hotplug       Check PCI Express hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with two empty root ports (on `x86_64` once under the machine's default, the firmware's ACPI PCI hotplug through acpid, then with native control), hot-add, remove and hot-add again QEMU's `edu` device behind one over QMP, check the fixture's verdict, then hot-add a `virtio-blk-pci` disk behind the other and check that devmgr binds it from the drivers directory's driver, and unstage both again (see xtask/README.md)
-  test-gdb           Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
-  test-wedge         Check the softlockup watchdog's report of a CPU wedged with interrupts off: boot the default boot set twice with QEMU's gdbstub on a unix socket, move an idle AP (then the BSP) to the kernel's `halt_loop` over the GDB remote serial protocol, and check the watchdog's report, with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md)
-  test-cet           Check the x86-64 kernel's CET supervisor shadow stacks on a host whose CPU has them, under KVM, failing on any other: boot the current sysroot's ktest bundle on shadow stacks to its pass marker, then boot it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return address, and check the `#CP` it raises (see xtask/README.md)
-  capture-acpi       Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
-  lint-docs          Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
-  commit-check       Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
-  pr-check           Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
-  compare-images     Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
-  review-check       Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape (see xtask/README.md)
-  review-ledger      Build `ledger.json` from the saved run records of a pull request's pre-merge review, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
-  release-scope      Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
-  issue-edit         Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
-  issue-file         File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
-  orch               Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)
-  host               Show the shared host's state as the launch rules read it: the load, the exclusive grant, the commands holding the host, and the QEMUs running (see xtask/README.md "Host launch rules")
-  hook               Answer a hook of the assistant's harness: read the event's JSON on stdin and print the answer the harness reads. `.claude/settings.json` names these commands (see xtask/README.md)
-  help               Print this message or the help of the given subcommand(s)
+  build           Build Seraph components and populate the sysroot
+  run             Boot Seraph under QEMU against the populated sysroot (run `cargo xtask build` first): one interactive boot, or with `--runs N` N unattended boots, each classified by its log
+  clean           Remove the sysroot, the symbols store and the disk images (and with `--all` cargo's target/)
+  test            Run Seraph's tests: without a case, check formatting and lint the test code, then run the unit tests on the host and, built for riscv64, under QEMU's user-mode emulator; with a CASE, boot the current sysroot for that host-driven QEMU case; with `--cell`, run every case a CI validate cell runs (see xtask/README.md)
+  crypto-vectors  Regenerate the reference vectors of shared/crypto/testkit with OpenSSL, or with `--check` fail unless they regenerate identically
+  ktest-timing    Read preserved ktest boot logs (from `run --runs N --save-logs`) and print per-tier and per-cell wall times; with `--base` and `--wide`, compare two widths against their width factor; with `--baseline`, compare one log against a checked-in baseline of the same width; with `--write-baseline`, write one. Report-only: a flagged row never fails the command. See xtask/README.md for the tables and the baseline format
+  symbolize       Resolve runtime addresses in a loaded ELF image (a binary, or the sysroot's kernel) to function, file, and line from its DWARF, or to the nearest function symbol when no DWARF covers an address; a stripped image's symbols are the symbols store's file of its build id. Each output line names the source it used. With `--log`, print every crash-report block of a serial log with its addresses resolved against the sysroot's binaries. See xtask/README.md
+  mkdisk          Mirror `rootfs/` into the sysroot, re-synthesise test fixtures, choose the harness, the bootloader knobs and the log-level configuration the image boots, and regenerate `disk.img` without invoking cargo. The mirror is authoritative over `config/`+`data/` (deletions in `rootfs/` are pruned); use `--repack-only` to pack a hand-staged sysroot without it (the repository's data files, the log-level configuration among them, are installed either way; pack another configuration with `--log-levels`). Every pack re-signs the sysroot's signed objects in place, then checks the images it wrote with `fsck.fat -n` (dosfstools) and reads their ESP back against the root partition. Requires an arch-tagged sysroot from a prior `cargo xtask build`
+  capture-acpi    Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures: boot the firmware alone on a blank disk, save the guest's memory over QMP once the firmware has installed its tables, find the RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of the capture (see xtask/README.md)
+  lint-docs       Check the mechanical documentation and source-header rules: Markdown column limit, file-header layout, `## Summarized By` shape, forward links, order, and labels, and document reachability from the root README. Runs in CI's host-tests job; see xtask/README.md for the rule list and levels
+  commit-check    Check the commits of a range against the commit-message rules of docs/conventions.md: subject form and width, Issue references and planning labels in the subject, closing keywords, attribution, and signatures. Runs in CI's host-tests job on a pull request; see xtask/README.md for the rule list and levels
+  pr-check        Check a pull request against the rules of docs/conventions.md a script can decide: its commits, its body's boxes and validated head, its milestone, and the Issues it closes or references; with `--gate`, the merge gate too. Reads GitHub through `gh` (see xtask/README.md)
+  compare-images  Build two commits (by default the merge base with `origin/master` and `HEAD`) for each architecture and profile in one scratch worktree, and compare every installed image in the parts a loader reads; print each image and part that differs and a verdict line, and fail when one differs (see xtask/README.md)
+  review-ledger   Validate the saved run records of a pull request's pre-merge review (`target/xtask/review/pr<N>/`) against the record shape and build `ledger.json` from them, or print a release review's ledger for the files named: the findings a later run must not re-raise (see xtask/README.md)
+  release-scope   Print the scope of a release review as JSON, in pages of bounded size with a digest each: the range's files, its first-parent units and their files, and the open Issues (see xtask/README.md)
+  issue-edit      Replace a GitHub Issue's body from a file, refusing an empty body or one that lost task-list items, keeping a backup, and verifying the edit (see xtask/README.md)
+  issue-file      File a GitHub Issue with the labels and milestone docs/conventions.md requires, and verify that both were applied (see xtask/README.md)
+  orch            Keep the on-disk state of an orchestration batch (`target/xtask/orchestration/state.json`) and its log: the orchestrator, the exclusive grant, the workers, the merge order, the open questions and the rulings in force. `orch state` prints it (see xtask/README.md)
+  host            Show the shared host's state as the launch rules read it: the load, the exclusive grant, the commands holding the host, and the QEMUs running (see xtask/README.md "Host launch rules")
+  hook            Answer a hook of the assistant's harness: read the event's JSON on stdin and print the answer the harness reads. `.claude/settings.json` names these commands (see xtask/README.md)
+  help            Print this message or the help of the given subcommand(s)

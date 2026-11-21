@@ -392,9 +392,12 @@ After every run:
   maintainer's approval (docs/conventions.md § Contested findings). Do not waive or rule on a
   finding yourself.
 
-The review records stay under `target/xtask/review/pr<N>/` in your worktree. The gate report
-names that path and each run's mode and head, and the orchestrator copies them: the harness
-refuses your own file writes outside your worktree and the session's scratchpad. The files
+The review records stay under `target/xtask/review/pr<N>/` in your worktree. Each record file is
+saved as its own step, a plain file write with nothing else in it, and `review-ledger` and the
+gate run in a later step, never in the script that writes a record (the `pr-review` skill § The
+record says why). The gate report names that path and each run's mode and head, and the
+orchestrator copies them: the harness refuses your own file writes outside your worktree and the
+session's scratchpad. The files
 `cargo xtask` writes for you outside them (the orchestration record in the main checkout, the
 host lock in the git common directory) are the other exception, as § Reporting and § Host runs
 use them.

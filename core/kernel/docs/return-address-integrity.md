@@ -312,14 +312,14 @@ shadow stacks on or off.
 - **Without CET.** `CR4.CET` stays clear and every shadow-stack instruction of the switch and
   the syscall path is skipped by a branch on `shadow_stack::ENABLED`. No page is kept or
   converted, and the Thread slot keeps its size.
-- **Test.** `cargo xtask test-cet` ([docs/testing.md](../../../docs/testing.md) § CET shadow
-  stacks) boots the kernel under KVM with `-cpu host,cet-ss=on,enforce`. ktest must pass with
-  `shadow stacks: on`, and a return address of `syscall::dispatch` that the host overwrites
-  through QEMU's gdbstub must raise `#CP` with error code 1. The kernel carries no test code for
-  it. QEMU refuses to start where KVM cannot give the guest `CET_SS`, and the command then fails,
-  naming the feature. A boot whose exception report shows the CET state lost outside the kernel,
-  as the Faults item above describes, is inconclusive on a host that is itself a guest, by the
-  CPUID hypervisor bit, and is run again, up to four runs, passing only on a run without it; on
+- **Test.** `cargo xtask test cet` ([docs/testing.md](../../../docs/testing.md) § CET shadow
+  stacks (`cet` case)) boots the kernel under KVM with `-cpu host,cet-ss=on,enforce`. ktest must
+  pass with `shadow stacks: on`, and a return address of `syscall::dispatch` that the host
+  overwrites through QEMU's gdbstub must raise `#CP` with error code 1. The kernel carries no test
+  code for it. QEMU refuses to start where KVM cannot give the guest `CET_SS`, and the command then
+  fails, naming the feature. A boot whose exception report shows the CET state lost outside the
+  kernel, as the Faults item above describes, is inconclusive on a host that is itself a guest, by
+  the CPUID hypervisor bit, and is run again, up to four runs, passing only on a run without it; on
   any other host it fails. The host tests of `shadow_stack.rs` model `RSTORSSP`, `SAVEPREVSSP`,
   `CALL`, and `RET` over the token layout.
 
@@ -384,18 +384,19 @@ throwaway and are not in the tree.
    options as RVA23U64. It lists Zimop and Zcmop among the RVA23U64 mandatory extensions, which
    RVA23S64 includes.
 5. **KVM gives a guest supervisor shadow stacks, and the x86-64 mechanism enforces them.**
-   `cargo xtask test-cet` ([docs/testing.md](../../../docs/testing.md) § CET shadow stacks) ran
+   `cargo xtask test cet` ([docs/testing.md](../../../docs/testing.md) § CET shadow stacks (`cet`
+   case)) ran
    at 4 vCPUs under KVM with QEMU 11.1.3 on a CET-capable Intel part, on a host that is itself a
    guest of another hypervisor (nested virtualization). With `-cpu host,cet-ss=on,enforce` QEMU
    started, the kernel printed `shadow stacks: on`, and ktest passed. In a second boot, a return
    address of `syscall::dispatch` overwritten on the ordinary stack through QEMU's gdbstub raised
    `#CP` with error code 1 (`NEAR-RET`) at the first attempt.
 6. **On a host that is itself a guest, a guest's CET state can be lost at run time.** On that
-   host, 8 of 47 x86_64 ktest boots at 4 vCPUs on shadow stacks, `test-cet`'s first boot among
+   host, 8 of 47 x86_64 ktest boots at 4 vCPUs on shadow stacks, the `cet` case's first boot among
    them, ended in a kernel `#UD` at `setssbsy` or `rstorssp`. Each report showed `CR4.CET` set,
    `SH_STK_EN` clear, and the interrupt SSP table address 0. The kernel writes `IA32_S_CET` and
    that address once per CPU and never with 0 (§ x86-64 Mechanism, Faults), so the state was
-   lost outside the kernel, and `test-cet` counts such a boot as inconclusive on a host that is
+   lost outside the kernel, and the `cet` case counts such a boot as inconclusive on a host that is
    itself a guest (§ x86-64 Mechanism, Test). The kernel has not run on shadow stacks on a host
    that is not a guest ([#1160](https://github.com/kottlerg/seraph/issues/1160)).
 

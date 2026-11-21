@@ -293,6 +293,20 @@ mod tests
         assert_eq!(parse_ok(committed), Levels::default());
     }
 
+    // Defect caught: the usertest cell's configuration moving a service other
+    // than vfsd off info, or vfsd to another level, so the cell's boot looks
+    // for lines its configuration does not produce.
+    #[test]
+    fn the_usertest_cell_s_configuration_sets_vfsd_alone_to_debug()
+    {
+        let levels = parse_ok(include_str!("../../log-levels-vfsd-debug.conf"));
+        for s in Service::ALL
+        {
+            let expected = (s == Service::Vfsd).then(|| log::parse_level(b"debug").unwrap());
+            assert_eq!(levels.get(s), expected, "{s:?}");
+        }
+    }
+
     // Defect caught: a setting read for the wrong service, or not read.
     #[test]
     fn each_service_s_setting_sets_its_level_alone()

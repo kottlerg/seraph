@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_gdb.rs
+// xtask/src/commands/test/debug_port/gdb.rs
 
 //! GDB stub batch test: the host's GDB debugs a guest process through the
 //! stub over the debug port.
@@ -38,7 +38,7 @@ use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::breakpoint_kill;
-use crate::cli::TestGdbArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::debug_stub;
 use crate::disk::DiskLayout;
@@ -127,10 +127,10 @@ const SCRIPT: &[&str] = &[
     "detach",
 ];
 
-pub fn run(ctx: &Context, args: &TestGdbArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let gdb = require_tool(&args.gdb)?;
     let target_staged = ctx
@@ -191,7 +191,7 @@ enum Serial
 
 /// Boot the images of `layout` with the debug port, wait for the stub, run
 /// GDB, wait for the stub's detach line, kill QEMU.
-fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Result<Session>
+fn boot(ctx: &Context, args: &CaseArgs, gdb: &Path, layout: DiskLayout) -> Result<Session>
 {
     // Picked here, right before QEMU binds it, to keep the window in which
     // another process could take it short.

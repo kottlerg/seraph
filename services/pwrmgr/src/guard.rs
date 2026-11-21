@@ -13,7 +13,7 @@
 //! fail and its frees are withheld, so neither reaches the heap; every other
 //! thread allocates as usual. A failed allocation ends pwrmgr through the
 //! runtime's allocation-failure handler, so the platform does not power off,
-//! and `cargo xtask test-core-death`, which kills memmgr and requires the
+//! and the `shutdown` case's death boots, which kills memmgr and requires the
 //! power-off, fails on any allocation the power-off makes, whatever the
 //! heap's state at the kill.
 

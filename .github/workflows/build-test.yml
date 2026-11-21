@@ -88,12 +88,12 @@ jobs:
         # One harness per cell: each cell builds once, stages exactly one
         # recipe (or swaps boot.conf for ktest), then runs once. Avoids
         # back-to-back fatfs/sysroot state accumulation across harnesses
-        # and lets a failing tier surface as a single named cell. The
-        # usertest cell additionally runs the terminal interactive test as
-        # a further boot — it needs the QMP `test-terminal` runner (not
-        # `run --runs`), and colocating it (both programs-surface) avoids a
-        # matrix dimension that would multiply with every arch. See
-        # docs/testing.md.
+        # and lets a failing tier surface as a single named cell. After its
+        # boot, each cell runs the host-driven cases `cargo xtask test`'s
+        # registry assigns to its tester (`cargo xtask test --cell`): they
+        # need a runner that drives QEMU from the host (QMP, a gdbstub), not
+        # `run --runs`, and colocating them avoids a matrix dimension that
+        # would multiply with every arch. See docs/testing.md.
         tester: [svctest, usertest, ktest]
     steps:
       - uses: actions/checkout@v6
@@ -173,8 +173,17 @@ jobs:
         # (a user-facing program, not part of the services/programs substrate
         # under test) so the boot is controlled. `--repack-only` makes the
         # removal stick: a normal repack re-mirrors rootfs, which would restore
-        # terminal.svc. The terminal is exercised in its own boot
-        # (test-terminal, below).
+        # terminal.svc. The terminal is exercised in its own boot (the
+        # `terminal` case, below).
+        #
+        # The usertest cell also packs the log-level configuration that sets
+        # vfsd to debug (services/init/log-levels-vfsd-debug.conf), and its
+        # boot checks that the level reached vfsd and the fatfs it spawns and
+        # no other service. The ktest cell also stages the `mapredo` knob, so
+        # the bootloader redoes the first attempt of its steps 6 and 7, and
+        # its boot checks the bootloader's line for the redo; the boot host
+        # test `the_mapredo_knob_redoes_the_first_attempt_alone` holds the redo
+        # to one.
         #
         # The svctest cell also drops crashd (the crash service, default-on), so
         # one boot per arch and profile runs an image without it: its faults,
@@ -210,20 +219,23 @@ jobs:
                  sysroot/config/svcmgr/tests/crashd.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only \
+                --log-levels services/init/log-levels-vfsd-debug.conf
               ;;
             ktest)
-              cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest
+              cargo xtask mkdisk --arch ${{ matrix.arch }} --harness ktest \
+                --knob mapredo
               ;;
           esac
 
       - name: Run ${{ matrix.tester }}
         # Per-cell boot budget, for HANG classification, derived as
         # docs/build-system.md § Continuous Integration states from each
-        # cell's worst pass, over every boot the budget bounds (run,
-        # test-map-redo, test-log-level), in the 174 build-test runs from
-        # 2026-11-17 22:44 to 2026-11-18 15:28 UTC (the latest attempt of
-        # each); the worst passes are beside the values. riscv64 debug
+        # cell's worst pass, over the boots of its image (the cell's boot, and
+        # on usertest and ktest the log-level and mapredo boots whose checks
+        # its boot carries), in the 174 build-test runs from 2026-11-17 22:44 to
+        # 2026-11-18 15:28 UTC (the latest attempt of each); the worst passes
+        # are beside the values. riscv64 debug
         # svctest's three runs that the previous 300 s budget cut short were
         # still passing phases; its worst is the slowest one's projected
         # completion (the phases it had left, at its own pace, from a passing
@@ -274,94 +286,43 @@ jobs:
             svctest)  crash_reports="--crash-reports none" ;;
             usertest) crash_reports="--crash-reports reports" ;;
           esac
+          # The usertest boot also checks the log-level configuration its
+          # staging packed: a debug line of vfsd and of the fatfs vfsd spawns,
+          # and none of devmgr or procmgr. The ktest boot also checks the
+          # bootloader's line for the mapredo knob its staging staged.
+          checks=()
+          case "${{ matrix.tester }}" in
+            usertest)
+              checks=(--require '\[vfsd\] DEBUG ' --require '\[fatfs\] DEBUG '
+                      --fail-also '\[(devmgr|procmgr)\] DEBUG ') ;;
+            ktest)
+              checks=(--require 'mapredo knob present; redoing steps 6 and 7') ;;
+          esac
           budgeted cargo xtask run \
             --arch ${{ matrix.arch }} \
             --runs 1 --timeout "$budget" \
-            --save-logs target/xtask/run-saved $test_devices $crash_reports
-          if [ "${{ matrix.tester }}" = "ktest" ]; then
-            # Extra boots: the KASLR randomization test (#252). Boots the
-            # ktest bundle already composed above twice and asserts the
-            # image slide and direct-map base differ, then asserts the
-            # nokaslr knob yields the deterministic layout. Host-side
-            # (it must observe the layout differing across separate boots),
-            # so it cannot ride `run --runs`; both arches.
-            cargo xtask test-kaslr --arch ${{ matrix.arch }}
-            # Extra boot: the steps 6 and 7 redo test (#754). Stages the
-            # mapredo knob, so the bootloader redoes its first page-table and
-            # memory-map attempt, and boots the ktest bundle to its pass
-            # marker under the cell's budget; the knob is removed afterwards.
-            budgeted cargo xtask test-map-redo --arch ${{ matrix.arch }} --timeout "$budget"
+            --save-logs target/xtask/run-saved $test_devices $crash_reports \
+            "${checks[@]}"
+
+      - name: Run ${{ matrix.tester }}'s cases
+        # The host-driven cases of `cargo xtask test`'s registry this cell's
+        # tester runs (xtask/README.md § `cargo xtask test`; docs/testing.md
+        # § Coverage tiers): on usertest the terminal, wedge, shutdown and
+        # signing cases, and vmgenid on x86_64; on ktest the kaslr case;
+        # svctest has none. Each case boots the default image of its bundle,
+        # so the plain repack first re-mirrors rootfs (dropping the staged
+        # test recipes and restoring terminal.svc), installs the repository's
+        # log-level configuration, and removes the knobs, keeping the
+        # recorded harness. The signing case builds its revoking bootloader
+        # in the cell's profile. Each case runs whatever another's outcome,
+        # and the step fails naming the cases that failed.
+        run: |
+          cargo xtask mkdisk --arch ${{ matrix.arch }}
+          release=
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            release=--release
           fi
-          if [ "${{ matrix.tester }}" = "usertest" ]; then
-            # Second boot: the log-level configuration test (#936). Installs a
-            # configuration setting vfsd to debug and packs the default-init
-            # bundle, boots the usertest staging above under the cell's budget,
-            # and checks that vfsd's and fatfs's debug lines appear and
-            # devmgr's and procmgr's do not; the installed configuration and
-            # the recorded harness's bundle are put back afterwards.
-            budgeted cargo xtask test-log-level --arch ${{ matrix.arch }} --timeout "$budget"
-            # Third boot: the terminal interactive test (keyboard and serial
-            # input through the terminal, and keyboard input again after a
-            # restart of the input driver, killed through the GDB stub the
-            # test stages and removes). It needs the QMP `test-terminal` runner
-            # (host-side key injection) and so cannot ride `run --runs`;
-            # colocated here (both programs-surface) to avoid a separate
-            # matrix dimension. Drop usertest.svc and repack with the rootfs
-            # re-mirror, which restores terminal.svc — yielding exactly the
-            # default interactive boot that `cargo xtask run` produces.
-            rm -f sysroot/config/svcmgr/services/usertest.svc
-            cargo xtask mkdisk --arch ${{ matrix.arch }}
-            cargo xtask test-terminal --arch ${{ matrix.arch }}
-            # Fourth boot pair: the interrupts-off wedge test (#33). Wedges an
-            # idle AP, then the BSP, through QEMU's gdbstub and checks the
-            # softlockup watchdog's report, on x86_64 with the wedged CPU's
-            # own NMI frame; host-side over the gdbstub, so it cannot ride
-            # `run --runs`. Reuses the default interactive boot.
-            cargo xtask test-wedge --arch ${{ matrix.arch }}
-            # Fifth boot: the reboot test. Stages the reboot fixture, whose
-            # pwrmgr REBOOT must reset the machine (through acpid's
-            # RESET_REG write on x86_64, SBI on riscv64), read from QMP's
-            # SHUTDOWN event; host-side over QMP, so it cannot ride
-            # `run --runs`. Restores the default interactive boot after.
-            cargo xtask test-reboot --arch ${{ matrix.arch }}
-            # Sixth boot set: the core-death test (#262). One boot per core or
-            # critical service (memmgr, procmgr and its reaper thread, svcmgr,
-            # devmgr, vfsd, logd until its restart budget is spent), each
-            # killed by a terminal fault made from outside the guest (the GDB
-            # stub service, or QEMU's gdbstub for the init-created memmgr and
-            # procmgr), and each must power the system off, read from QMP's
-            # SHUTDOWN event; host-side, so it cannot ride `run --runs`.
-            # Reuses the default interactive boot, and repacks it as it was
-            # after each stub boot.
-            cargo xtask test-core-death --arch ${{ matrix.arch }}
-            # Seventh boot set: the signature refusal test (#124). Builds a
-            # bootloader under a store revoking the signing key in the cell's
-            # profile, then boots four images carrying a tampered kernel, a
-            # tampered bundle entry, that bootloader, and tampered,
-            # wrong-role and foreign-signed rootfs images, and checks each
-            # verifier's refusal line; host-side, so it cannot ride
-            # `run --runs`. Packs the default interactive boot again after.
-            if [ "${{ matrix.profile }}" = "release" ]; then
-              cargo xtask test-signing --arch ${{ matrix.arch }} --release
-            else
-              cargo xtask test-signing --arch ${{ matrix.arch }}
-            fi
-            if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              # Eighth boot pair: the VMGENID snapshot-resume test (#395).
-              # x86_64 only (QEMU's riscv64 virt machine has no VMGENID);
-              # host-side QMP migrate/restore, so it cannot ride
-              # `run --runs`. Reuses the default interactive boot the
-              # test-reboot restore left.
-              cargo xtask test-vmgenid
-              # Ninth boot: the power-button test. x86_64 only (QEMU's
-              # riscv64 virt machine has no fixed power button); presses the
-              # ACPI power button over QMP once acpid has armed its events,
-              # and pwrmgr must power off through acpid. Host-side over QMP,
-              # so it cannot ride `run --runs`. Reuses the default
-              # interactive boot.
-              cargo xtask test-powerbutton
-            fi
-          fi
+          cargo xtask test --cell ${{ matrix.tester }} --arch ${{ matrix.arch }} $release
 
       - name: Upload run logs
         if: always()
@@ -371,7 +332,7 @@ jobs:
           path: |
             target/xtask/run/**/*.log
             target/xtask/run/**/*.crash.txt
-            target/xtask/test-signing/*/*.log
+            target/xtask/test/signing/*/*.log
           if-no-files-found: ignore
 
       - name: Upload saved run logs

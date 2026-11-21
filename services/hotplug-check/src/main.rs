@@ -9,7 +9,7 @@
 //! and its MSI work; then, once the host has removed the device, that devmgr
 //! withdrew its driver, and once the host has added it again, that the new
 //! device is served at the next ordinal, works, and holds none of its
-//! predecessor's IOMMU faults. So `cargo xtask test-hotplug` proves devmgr's
+//! predecessor's IOMMU faults. So `cargo xtask test hotplug` proves devmgr's
 //! native hotplug add and removal paths from the slot to a bound driver and
 //! back. The disk mode (`disk`, [`disk`]) follows a disk the host hot-adds,
 //! removes and adds again through vfsd's mounts, and the loss of the root
@@ -27,24 +27,24 @@ use ipc::test_dma_labels::{DMA_PROBE, INTERRUPT_PROBE, PROBE_PASSED};
 
 /// Logged once the fixture watches the `test-dma` class and devmgr serves no
 /// driver of it: the host hot-adds the device on seeing it. Kept in sync
-/// with `xtask/src/commands/test_hotplug.rs`.
+/// with `xtask/src/commands/test/hotplug.rs`.
 const READY_MARKER: &str = "READY for the hot-added device";
 
 /// Logged once the hot-added device passed its probes: the host removes it
-/// on seeing it. Kept in sync with `xtask/src/commands/test_hotplug.rs`.
+/// on seeing it. Kept in sync with `xtask/src/commands/test/hotplug.rs`.
 const REMOVE_MARKER: &str = "READY for the removal";
 
 /// Logged once devmgr withdrew the removed device's driver: the host adds
 /// the device again on seeing it. Kept in sync with
-/// `xtask/src/commands/test_hotplug.rs`.
+/// `xtask/src/commands/test/hotplug.rs`.
 const READD_MARKER: &str = "WITHDRAWN at ordinal 0; READY for the re-added device";
 
 /// Logged when every check passed, in either mode. Kept in sync with
-/// `xtask/src/commands/test_hotplug.rs`.
+/// `xtask/src/commands/test/hotplug.rs`.
 pub(crate) const PASS_MARKER: &str = "PASS";
 
 /// Logged, with the reason, when a check failed, in either mode. Kept in
-/// sync with `xtask/src/commands/test_hotplug.rs`.
+/// sync with `xtask/src/commands/test/hotplug.rs`.
 pub(crate) const FAIL_MARKER: &str = "FAIL";
 
 /// How long the fixture waits for devmgr to serve the hot-added device's

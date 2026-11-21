@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_vmgenid.rs
+// xtask/src/commands/test/vmgenid.rs
 
 //! VMGENID snapshot-resume test (#395). `x86_64` only — the `riscv64` `virt`
 //! machine has no VMGENID ACPI support in QEMU.
@@ -24,7 +24,7 @@
 //!    QMP and assert the shell's output, proving the resumed system draws
 //!    randomness and schedules normally after the forced reseed.
 //!
-//! A pure runner like `test-terminal`: requires a populated `x86_64` sysroot
+//! A pure runner like the `terminal` case: requires a populated `x86_64` sysroot
 //! with the default boot set (terminal + shell) and a repacked `disk.img`.
 
 use std::path::Path;
@@ -34,7 +34,7 @@ use std::time::Duration;
 use crate::error::{Context as _, Result};
 
 use crate::arch::Arch;
-use crate::cli::TestVmgenidArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
@@ -86,7 +86,7 @@ const MIGRATE_TIMEOUT: Duration = Duration::from_mins(2);
 fn launch(
     qemu_binary: &Path,
     ctx: &Context,
-    args: &TestVmgenidArgs,
+    args: &CaseArgs,
     sock_path: &Path,
     guid: &str,
     incoming: Option<&str>,
@@ -130,10 +130,10 @@ fn launch(
     Guest::from_child(child)
 }
 
-pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, Arch::X86_64)?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
 

@@ -149,10 +149,10 @@ death svcmgr routes to the graceful shutdown above ([Storage § Failure and Revo
 Invariants](storage.md#failure-and-revocation-invariants)).
 
 The path from a core or critical death to power-off MUST NOT depend on the service that died.
-`cargo xtask test-core-death` kills memmgr, procmgr (a request worker, and its reaper thread),
+`cargo xtask test shutdown` kills memmgr, procmgr (a request worker, and its reaper thread),
 svcmgr, devmgr, vfsd and logd (until svcmgr's restart budget for it is spent), one boot each, by a
 terminal fault made from outside the guest, and checks that the system powers off, on both
-architectures ([Testing § Core death](testing.md#core-death-test-core-death)). It kills devmgr and
+architectures ([Testing § Core death](testing.md#core-death-shutdown-case)). It kills devmgr and
 vfsd once svcmgr has reconciled its recipes, and logd from the stub's first attach to it, which can
 fall before logd asks svcmgr for its bootstrap round. svcmgr does not wait for good on a service
 that dies after its start and before that request: its wait for the request ends at the death,

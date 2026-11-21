@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_core_death.rs
+// xtask/src/commands/test/shutdown/core_death.rs
 
 //! Core-death power-off test (#262): the death of a core service (memmgr,
 //! procmgr, svcmgr), or the permanent death of a critical one (devmgr, vfsd,
@@ -52,8 +52,8 @@ use std::time::{Duration, Instant};
 
 use crate::arch::Arch;
 use crate::breakpoint_kill;
-use crate::cli::{CoreDeathTarget, TestCoreDeathArgs};
 use crate::commands::run::classified::HANDOVER_MARKER;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::debug_stub;
 use crate::disk::DiskLayout;
@@ -62,7 +62,7 @@ use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
     GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
-    X86ShadowStack, build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
+    X86ShadowStack, build_qemu_argv, prepare_riscv_firmware,
 };
 use crate::qemu_gdb::{Stub, field_hex};
 use crate::qmp;
@@ -173,6 +173,20 @@ const ARMED_MARKER: &str = "pwrmgr] core-death power-off armed";
 /// sync with `services/svcmgr/src/main.rs`.
 const RECONCILED_MARKER: &str = "service(s) after reconciliation";
 
+/// A core or critical service the case kills: the `shutdown` causes that are
+/// a death (`crate::cli::ShutdownCause`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Target
+{
+    Memmgr,
+    Procmgr,
+    ProcmgrReaper,
+    Svcmgr,
+    Devmgr,
+    Vfsd,
+    Logd,
+}
+
 /// A function of an init-created service, by which a hardware breakpoint
 /// stops one of its threads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,7 +202,7 @@ struct Breakpoint
 }
 
 /// The route to `target`'s thread.
-fn route(target: CoreDeathTarget) -> Route
+fn route(target: Target) -> Route
 {
     const MEMMGR_BIAS: &str = "init: memmgr image bias=";
     const PROCMGR_BIAS: &str = "init: procmgr image bias=";
@@ -197,71 +211,33 @@ fn route(target: CoreDeathTarget) -> Route
         // memmgr's receive loop, in the admission of an allocation the spawn
         // charges. A function the release build keeps out of line, as it
         // does not `memmgr::select`.
-        CoreDeathTarget::Memmgr => Route::Hardware(Breakpoint {
+        Target::Memmgr => Route::Hardware(Breakpoint {
             binary: "services/memmgr",
             bias_line: MEMMGR_BIAS,
             function: "memmgr::admit",
         }),
         // A request worker (the main thread is one), in the spawn's create.
-        CoreDeathTarget::Procmgr => Route::Hardware(Breakpoint {
+        Target::Procmgr => Route::Hardware(Breakpoint {
             binary: "services/procmgr",
             bias_line: PROCMGR_BIAS,
             function: "procmgr::handle_create",
         }),
         // The reaper thread, never the main thread, in the program's reap.
-        CoreDeathTarget::ProcmgrReaper => Route::Hardware(Breakpoint {
+        Target::ProcmgrReaper => Route::Hardware(Breakpoint {
             binary: "services/procmgr",
             bias_line: PROCMGR_BIAS,
             function: "procmgr::process::reap_dead",
         }),
-        CoreDeathTarget::Svcmgr => Route::Stub("svcmgr", KillPoint::Attach, Contact::Attached),
-        CoreDeathTarget::Devmgr => Route::Stub("devmgr", KillPoint::SystemUp, Contact::Attached),
-        CoreDeathTarget::Vfsd => Route::Stub("vfsd", KillPoint::SystemUp, Contact::Attached),
-        CoreDeathTarget::Logd => Route::Stub("logd", KillPoint::RestartsSpent, Contact::Launched),
+        Target::Svcmgr => Route::Stub("svcmgr", KillPoint::Attach, Contact::Attached),
+        Target::Devmgr => Route::Stub("devmgr", KillPoint::SystemUp, Contact::Attached),
+        Target::Vfsd => Route::Stub("vfsd", KillPoint::SystemUp, Contact::Attached),
+        Target::Logd => Route::Stub("logd", KillPoint::RestartsSpent, Contact::Launched),
     }
 }
 
-pub fn run(ctx: &Context, args: &TestCoreDeathArgs) -> Result<()>
-{
-    validate_sysroot_for_launch(ctx, args.arch)?;
-    let targets = if args.target.is_empty()
-    {
-        CoreDeathTarget::ALL.to_vec()
-    }
-    else
-    {
-        args.target.clone()
-    };
-    // Held until the command returns, after its last QEMU has exited.
-    let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
-    let mut failed = Vec::new();
-    for target in &targets
-    {
-        step(&format!("core-death test: killing {target:?}"));
-        match boot_once(ctx, args, *target)
-        {
-            Ok(()) => step(&format!(
-                "core-death test: {target:?}: the system powered off"
-            )),
-            Err(e) =>
-            {
-                eprintln!("core-death test: {target:?}: FAIL: {e:#}");
-                failed.push(*target);
-            }
-        }
-    }
-    if !failed.is_empty()
-    {
-        bail!("core-death test: FAIL for {failed:?}");
-    }
-    step(&format!(
-        "core-death test: PASS ({targets:?} each powered the system off)"
-    ));
-    Ok(())
-}
-
-/// One boot: kill `target` and judge the power-off.
-fn boot_once(ctx: &Context, args: &TestCoreDeathArgs, target: CoreDeathTarget) -> Result<()>
+/// One boot: kill `target` and judge the power-off. The caller has checked the
+/// sysroot and admitted the boot.
+pub(super) fn run(ctx: &Context, args: &CaseArgs, target: Target) -> Result<()>
 {
     match route(target)
     {
@@ -277,7 +253,7 @@ fn boot_once(ctx: &Context, args: &TestCoreDeathArgs, target: CoreDeathTarget) -
     }
 }
 
-fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Route) -> Result<()>
+fn boot(ctx: &Context, args: &CaseArgs, layout: DiskLayout, route: Route) -> Result<()>
 {
     let function = match route
     {
@@ -399,7 +375,7 @@ fn boot(ctx: &Context, args: &TestCoreDeathArgs, layout: DiskLayout, route: Rout
 /// (`-serial stdio`).
 fn launch(
     ctx: &Context,
-    args: &TestCoreDeathArgs,
+    args: &CaseArgs,
     layout: DiskLayout,
     qmp_sock: &Path,
     gdb: GdbMode<'_>,
@@ -635,11 +611,7 @@ mod tests
     #[test]
     fn init_created_services_are_reached_through_qemu()
     {
-        for target in [
-            CoreDeathTarget::Memmgr,
-            CoreDeathTarget::Procmgr,
-            CoreDeathTarget::ProcmgrReaper,
-        ]
+        for target in [Target::Memmgr, Target::Procmgr, Target::ProcmgrReaper]
         {
             assert!(matches!(route(target), Route::Hardware(_)), "{target:?}");
         }
@@ -650,25 +622,20 @@ mod tests
         // logd never shows it.
         for (target, name, point, contact) in [
             (
-                CoreDeathTarget::Svcmgr,
+                Target::Svcmgr,
                 "svcmgr",
                 KillPoint::Attach,
                 Contact::Attached,
             ),
             (
-                CoreDeathTarget::Devmgr,
+                Target::Devmgr,
                 "devmgr",
                 KillPoint::SystemUp,
                 Contact::Attached,
             ),
+            (Target::Vfsd, "vfsd", KillPoint::SystemUp, Contact::Attached),
             (
-                CoreDeathTarget::Vfsd,
-                "vfsd",
-                KillPoint::SystemUp,
-                Contact::Attached,
-            ),
-            (
-                CoreDeathTarget::Logd,
+                Target::Logd,
                 "logd",
                 KillPoint::RestartsSpent,
                 Contact::Launched,
@@ -677,7 +644,7 @@ mod tests
         {
             assert_eq!(route(target), Route::Stub(name, point, contact));
         }
-        let Route::Hardware(reaper) = route(CoreDeathTarget::ProcmgrReaper)
+        let Route::Hardware(reaper) = route(Target::ProcmgrReaper)
         else
         {
             unreachable!()

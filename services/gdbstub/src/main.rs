@@ -49,7 +49,7 @@ use ipc::{
 
 /// Logged once the stub is attached and serves the debug port; the batch
 /// test connects GDB on seeing it. Kept in sync with
-/// `xtask/src/commands/test_gdb.rs`.
+/// `xtask/src/commands/test/debug_port/gdb.rs`.
 const READY_MARKER: &str = "attached; serving the debug port";
 
 /// How long, and how often, the stub looks for its target in procmgr's

@@ -1113,7 +1113,6 @@ dependencies = [
  "init-log-levels",
  "ipc",
  "json",
- "log",
  "logd-codec",
  "objsig",
  "procmgr-process-table",

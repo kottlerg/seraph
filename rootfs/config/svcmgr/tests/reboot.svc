@@ -1,13 +1,13 @@
 # /tests/svctest reboot — the reboot test's fixture.
 #
 # Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
-# `cargo xtask test-reboot` stages it into /config/svcmgr/services/ for one
+# the `shutdown` case's reboot boot stages it into /config/svcmgr/services/ for one
 # boot with a QMP socket. svctest's `reboot` role sends pwrmgr REBOOT through
 # its one seed, pwrmgr.shutdown, the SHUTDOWN_AUTHORITY-tokened SEND; the
 # machine resets, which ends QEMU under -no-reboot, and the host test reads
 # the reset from QMP's SHUTDOWN event. A REBOOT that returns, or a missing
 # seed, is logged and the role exits 1. See xtask/README.md
-# § `cargo xtask test-reboot`.
+# § The `shutdown` case.
 binary    = /tests/svctest
 argv      = svctest reboot
 restart   = never

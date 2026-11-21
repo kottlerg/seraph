@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_cet.rs
+// xtask/src/commands/test/cet.rs
 
 //! CET supervisor shadow-stack test (#1083): the `x86_64` kernel runs on
 //! shadow stacks when the CPU offers them and its transient-execution
@@ -12,13 +12,13 @@
 //! Neither the CI runners nor TCG emulate CET, so only a host whose CPU has
 //! CET shadow stacks (`CET_SS`) and enhanced or Automatic IBRS, under KVM,
 //! can run the enabled path: without either IBRS the kernel takes the
-//! retpoline sequence and keeps shadow stacks off, and the command fails,
+//! retpoline sequence and keeps shadow stacks off, and the case fails,
 //! naming that cause. The
 //! guest CPU is `-cpu host,cet-ss=on,enforce`: QEMU refuses to start when KVM
-//! cannot give the guest the feature, and the command then fails, naming
+//! cannot give the guest the feature, and the case then fails, naming
 //! it. It never passes on a host that did not run the shadow stacks. Every
 //! other launch pins the feature off, or runs a QEMU that cannot offer it
-//! ([`X86ShadowStack`]), so this command is where shadow stacks are
+//! ([`X86ShadowStack`]), so this case is where shadow stacks are
 //! booted: the cet cell (docs/testing.md "Coverage tiers").
 //!
 //! Two boots of the current sysroot, which must hold the composed ktest
@@ -36,7 +36,7 @@
 //!    [`CORRUPT_ATTEMPTS`] times.
 //!
 //! The kernel carries no test code for either boot: the fault is made at the
-//! hardware boundary, as `test-wedge` makes its wedge.
+//! hardware boundary, as the `wedge` case makes its wedge.
 //!
 //! A boot whose kernel faults with `CR4.CET` set, `SH_STK_EN` clear and a
 //! zero interrupt SSP table address in its exception report, a state the
@@ -56,7 +56,7 @@ use object::{Object as _, ObjectSymbol as _, SymbolKind};
 
 use crate::accel::{self, Accel};
 use crate::arch::Arch;
-use crate::cli::TestCetArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
@@ -119,13 +119,13 @@ const FAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const RSP: usize = 7;
 const RIP: usize = 16;
 
-pub fn run(ctx: &Context, args: &TestCetArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     let accel = accel::detect_for_arch(Arch::X86_64);
     if accel != Accel::Kvm
     {
         bail!(
-            "test-cet needs KVM: CET shadow stacks reach a guest only from the host CPU, and this \
+            "the cet case needs KVM: CET shadow stacks reach a guest only from the host CPU, and this \
              host's accelerator is {}",
             accel.name()
         );
@@ -136,7 +136,7 @@ pub fn run(ctx: &Context, args: &TestCetArgs) -> Result<()>
         .with_context(|| format!("reading {}", kernel_path.display()))?;
     let dispatch = dispatch_span(&kernel)
         .with_context(|| format!("finding syscall::dispatch in {}", kernel_path.display()))?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
 
     let host = this_host();
@@ -159,7 +159,7 @@ enum Attempt
     HostLostCetState,
 }
 
-/// Whether the machine this command runs on is itself a guest of another
+/// Whether the machine this case runs on is itself a guest of another
 /// hypervisor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Host
@@ -229,7 +229,7 @@ fn lost_cet_state(lines: &[String]) -> bool
     seen
 }
 
-/// The machine this command runs on, by the CPUID hypervisor bit
+/// The machine this case runs on, by the CPUID hypervisor bit
 /// (`CPUID.1:ECX[31]`).
 #[cfg(target_arch = "x86_64")]
 fn this_host() -> Host
@@ -286,8 +286,8 @@ impl Launch
         match refusal(&qemu)
         {
             Some(line) => crate::error::err!(
-                "the host cannot give the guest CET shadow stacks (QEMU: {line}); test-cet needs \
-                 a CPU with CET_SS and a KVM that passes it through"
+                "the host cannot give the guest CET shadow stacks (QEMU: {line}); the cet case \
+                 needs a CPU with CET_SS and a KVM that passes it through"
             ),
             None if qemu.trim().is_empty() => err,
             None => err.context(format!("QEMU stderr:\n{}", qemu.trim_end())),
@@ -295,7 +295,7 @@ impl Launch
     }
 }
 
-fn launch(ctx: &Context, args: &TestCetArgs, gdb: GdbMode<'_>, name: &str) -> Result<Launch>
+fn launch(ctx: &Context, args: &CaseArgs, gdb: GdbMode<'_>, name: &str) -> Result<Launch>
 {
     let firmware_code = find_ovmf_code()?;
     let disk_path = ctx.disk_image();
@@ -326,7 +326,7 @@ fn cet_spec<'a>(
     disk_path: &'a Path,
     disk_block_size: u32,
     firmware_code: &'a Path,
-    args: &TestCetArgs,
+    args: &CaseArgs,
     gdb: GdbMode<'a>,
 ) -> QemuLaunchSpec<'a>
 {
@@ -357,7 +357,7 @@ fn cet_spec<'a>(
 }
 
 /// Boot 1: ktest to its pass marker, on shadow stacks.
-fn ktest_boot(ctx: &Context, args: &TestCetArgs) -> Result<Attempt>
+fn ktest_boot(ctx: &Context, args: &CaseArgs) -> Result<Attempt>
 {
     step("Launching QEMU for the CET ktest boot");
     let mut run = launch(ctx, args, GdbMode::Off, "ktest")?;
@@ -386,7 +386,7 @@ fn ktest_boot(ctx: &Context, args: &TestCetArgs) -> Result<Attempt>
 }
 
 /// Boot 2: corrupt a `dispatch` return address and expect the `#CP`.
-fn corrupt_boot(ctx: &Context, args: &TestCetArgs, dispatch: Span) -> Result<Attempt>
+fn corrupt_boot(ctx: &Context, args: &CaseArgs, dispatch: Span) -> Result<Attempt>
 {
     let sock = ctx
         .target_dir
@@ -613,9 +613,7 @@ mod tests
     #[test]
     fn both_boots_ask_for_shadow_stacks()
     {
-        use crate::argparse::Args as _;
-
-        let args = TestCetArgs::try_parse_from(["test-cet"]).unwrap();
+        let args = CaseArgs::default();
         let spec = cet_spec(
             Path::new("disk.img"),
             512,

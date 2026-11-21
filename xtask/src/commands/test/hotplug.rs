@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/commands/test_hotplug.rs
+// xtask/src/commands/test/hotplug.rs
 
 //! PCI Express hotplug test: a device hot-added behind a root port is found by
 //! devmgr, given its BARs, recorded, and bound, and its driver's DMA and MSI
@@ -65,7 +65,7 @@
 //!
 //! The staged files are always removed and the images repacked in their
 //! layout afterwards. The host kills QEMU after a boot that does not shut
-//! down, as `test-debug-port` does.
+//! down, as the `debug-port` case does.
 //!
 //! A pure runner: requires a populated sysroot from `cargo xtask build`.
 
@@ -77,7 +77,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::arch::Arch;
-use crate::cli::TestHotplugArgs;
+use crate::commands::test::cases::CaseArgs;
 use crate::context::Context;
 use crate::disk::{DataPlacement, DiskLayout};
 use crate::error::{Context as _, Result, bail};
@@ -250,10 +250,10 @@ const REMOVAL_TIMEOUT: Duration = Duration::from_mins(1);
 /// abort window for a removal, vfsd's exit, and svcmgr's graceful shutdown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_mins(2);
 
-pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
+pub fn run(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     validate_sysroot_for_launch(ctx, args.arch)?;
-    // Held until the command returns, after its last QEMU has exited.
+    // Held until the case returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let config = ctx.sysroot.join("config");
     let staged = |dir: &str, into: &str, file: &str| {
@@ -332,7 +332,7 @@ fn unstage(staged: &[(PathBuf, PathBuf)]) -> Result<()>
 /// The device boots: on `x86_64` the machine's default first, the
 /// firmware's hotplug through acpid, then native control; on riscv64 native
 /// control (the platform table's grant).
-fn device_boots(ctx: &Context, args: &TestHotplugArgs, layout: DiskLayout) -> Result<()>
+fn device_boots(ctx: &Context, args: &CaseArgs, layout: DiskLayout) -> Result<()>
 {
     let data_image = layout.second_image(ctx);
     let disk_image = ctx.target_dir.join("xtask").join("hotplug-disk.img");
@@ -362,7 +362,7 @@ fn device_boots(ctx: &Context, args: &TestHotplugArgs, layout: DiskLayout) -> Re
 /// The storage boots, on the split-data layout under native control: the
 /// data disk behind the port removed and added again, then the root driver
 /// killed; and the boot disk behind the port removed.
-fn storage_boots(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
+fn storage_boots(ctx: &Context, args: &CaseArgs) -> Result<()>
 {
     let data_image = ctx.data_disk_image();
     let block_size = crate::disk::logical_block_size(&data_image)?;
@@ -400,7 +400,7 @@ fn storage_boots(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
 /// socket, and kill QEMU.
 fn boot(
     ctx: &Context,
-    args: &TestHotplugArgs,
+    args: &CaseArgs,
     second_disk: Option<&Path>,
     port: HotplugPort<'_>,
     check: impl FnOnce(&mut Lines, &Path) -> Result<()>,

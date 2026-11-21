@@ -29,7 +29,7 @@ rootfs/
       tests/          # Opt-in test-harness recipes; staged by hand
         *.svc
       debug/          # The GDB stub's recipe template; staged by xtask (run
-        gdbstub.svc   #   --debug-target, test-gdb), naming its target
+        gdbstub.svc   #   --debug-target, `debug-port` case), naming its target
   data/
     test.txt          # Marker fixture for svctest fs / namespace phases
     crasher-boot/

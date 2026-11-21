@@ -336,7 +336,7 @@ owing a run with the reviewer, takes a run with the reviewer.
 The auditor applies the checks of this run, and those of the audit that completes a run of the
 reviewer alone (§ Pre-merge review), only when its invocation names that run kind in the fixed
 line `.claude/skills/pr-review/SKILL.md` gives; a `since` head or a record path alone never
-selects them. `cargo xtask review-check` rejects the record of a run with the reviewer whose
+selects them. `cargo xtask review-ledger` rejects the record of a run with the reviewer whose
 audit carries either check.
 
 ### Syncing with `master`
@@ -650,9 +650,9 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    second-disk boots, on both architectures), the no-IOMMU variant
    (`--iommu absent`, svctest, on both architectures), the framebuffer
    cell (`--display framebuffer`, svctest, on both architectures), the
-   debug-port cell (`test-debug-port` and `test-gdb`, on both architectures),
-   the hotplug cell (`test-hotplug`, on both architectures),
-   the CET cell (`test-cet`, on x86_64), and the TPM cell (`test-tpm`,
+   debug-port cell (`test debug-port`, on both architectures),
+   the hotplug cell (`test hotplug`, on both architectures),
+   the CET cell (`test cet`, on x86_64), and the TPM cell (`test tpm`,
    on x86_64) once each. A run at an earlier `master` commit that contains the bump
    stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)

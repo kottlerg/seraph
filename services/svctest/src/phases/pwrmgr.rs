@@ -4,7 +4,7 @@
 // services/svctest/src/phases/pwrmgr.rs
 
 //! pwrmgr service surface: cap-deny enforcement, terminal shutdown, and the
-//! `reboot` re-entry role `cargo xtask test-reboot` stages.
+//! `reboot` re-entry role the `shutdown` case's reboot boot stages.
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -45,8 +45,8 @@ pub fn pwrmgr_cap_deny_phase(caps: &Caps)
 }
 
 /// The `reboot` role, run by the `reboot` test recipe
-/// (`rootfs/config/svcmgr/tests/reboot.svc`, which `cargo xtask
-/// test-reboot` stages): drain the one-seed bootstrap round
+/// (`rootfs/config/svcmgr/tests/reboot.svc`, which the
+/// `shutdown` case's reboot boot stages): drain the one-seed bootstrap round
 /// (`pwrmgr.shutdown`) and send `REBOOT` through it. On the success path
 /// the machine resets, which ends QEMU under `-no-reboot`; a reply, or no
 /// cap, is logged and the role exits 1. Returns on any other role.

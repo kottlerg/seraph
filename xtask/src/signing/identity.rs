@@ -9,10 +9,12 @@
 //!
 //! The directory holds:
 //!
-//! - `signer.seed`: the signing key's 32-byte Ed25519 secret seed, absent when
-//!   an external signer holds the key;
-//! - `signer.cert`: the signing key's 148-byte certificate, or, for a signing
-//!   key that is itself a root, `signer.pub`, its 32-byte public key;
+//! - `signer.seed`: the signing key's 64-byte secret, the Ed25519 seed and the
+//!   ML-DSA-65 seed of its composite key, absent when an external signer holds
+//!   the key;
+//! - `signer.cert`: the signing key's 5,409-byte certificate, or, for a signing
+//!   key that is itself a root, `signer.pub`, its 1,984-byte composite public
+//!   key;
 //! - `trust.store`: a trust store of the anchors the identity contributes.
 //!
 //! An absent or empty directory gets a local identity on first use
@@ -25,10 +27,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use objsig::composite::{self, PUBLIC_KEY_LEN, SEED_LEN, SIGNATURE_LEN};
 use objsig::store::LABEL_LEN;
 use objsig::{
     AnchorSpec, Certificate, CertificateBody, PublicKey, RoleSet, Signature, TrustStore, Usage,
-    key_id,
+    cert, key_id,
 };
 
 use crate::error::{Context, Result, bail, ensure, err};
@@ -53,23 +56,34 @@ const _: () = assert!(
     "an anchor label fits its field"
 );
 
-/// A 32-byte Ed25519 secret seed, overwritten when dropped.
-pub struct Seed([u8; 32]);
+/// The secret of a composite key: the Ed25519 seed, then the ML-DSA-65
+/// seed, 32 bytes each; overwritten when dropped.
+pub struct Seed([u8; SEED_LEN]);
 
 impl Seed
 {
-    /// A seed of 32 bytes `fill` draws.
+    /// A secret of two seeds `fill` draws, the Ed25519 seed first, each
+    /// drawn on its own so neither half's key is derived from the other's.
     pub fn drawn(fill: &mut dyn FnMut(&mut [u8; 32])) -> Self
     {
-        let mut seed = Self([0; 32]);
-        fill(&mut seed.0);
+        let mut seed = Self([0; SEED_LEN]);
+        for half in seed.0.as_chunks_mut::<32>().0
+        {
+            fill(half);
+        }
         seed
     }
 
-    /// The seed's Ed25519 public key.
+    /// The secret's composite public key.
     fn public_key(&self) -> PublicKey
     {
-        crypto::ed25519_public_key(&self.0)
+        composite::public_key(&self.0)
+    }
+
+    /// The composite signature of `message`.
+    fn sign(&self, message: &[u8]) -> Result<Signature>
+    {
+        composite::sign(&self.0, message).map_err(|e| err!("signing ({e:?})"))
     }
 }
 
@@ -96,7 +110,7 @@ enum KeySource
     /// The seed, signed with in this process.
     Seed(Seed),
     /// A program that reads the signed bytes on its standard input and
-    /// writes the 64-byte signature to its standard output.
+    /// writes the composite signature to its standard output.
     External(PathBuf),
 }
 
@@ -104,8 +118,8 @@ enum KeySource
 pub struct Identity
 {
     key: KeySource,
-    public: PublicKey,
-    certificate: Option<Certificate>,
+    public: Box<PublicKey>,
+    certificate: Option<Box<[u8; cert::LEN]>>,
     store: Vec<u8>,
 }
 
@@ -163,22 +177,32 @@ impl Identity
         let certificate = read_optional(&dir.join(CERT_FILE))?
             .map(|bytes| parse_certificate(&bytes))
             .transpose()
-            .with_context(|| format!("reading {}", dir.join(CERT_FILE).display()))?;
+            .with_context(|| format!("reading {}", dir.join(CERT_FILE).display()))
+            .with_context(|| format_hint(dir))?;
         let public = match &certificate
         {
-            Some(cert) => cert.body.subject_key,
-            None => read_exact::<32>(&dir.join(PUB_FILE)).with_context(|| {
-                format!("{} has neither {CERT_FILE} nor {PUB_FILE}", dir.display())
-            })?,
+            Some(bytes) => Box::new(
+                *Certificate::parse(bytes)
+                    .map_err(|e| err!("not a certificate ({e:?})"))?
+                    .body
+                    .subject_key,
+            ),
+            None => read_exact::<PUBLIC_KEY_LEN>(&dir.join(PUB_FILE))
+                .with_context(|| {
+                    format!("{} has neither {CERT_FILE} nor {PUB_FILE}", dir.display())
+                })
+                .with_context(|| format_hint(dir))?,
         };
         let store = fs::read(dir.join(STORE_FILE))
             .with_context(|| format!("reading {}", dir.join(STORE_FILE).display()))?;
-        TrustStore::parse(&store).map_err(|e| {
-            err!(
-                "{}: not a trust store ({e:?})",
-                dir.join(STORE_FILE).display()
-            )
-        })?;
+        TrustStore::parse(&store)
+            .map_err(|e| {
+                err!(
+                    "{}: not a trust store ({e:?})",
+                    dir.join(STORE_FILE).display()
+                )
+            })
+            .with_context(|| format_hint(dir))?;
         let key = match signer
         {
             Some(program) => KeySource::External(program.to_path_buf()),
@@ -198,10 +222,10 @@ impl Identity
         &self.public
     }
 
-    /// The signing key's certificate; `None` when the key is a root.
-    pub fn certificate(&self) -> Option<Certificate>
+    /// The signing key's encoded certificate; `None` when the key is a root.
+    pub fn certificate(&self) -> Option<&[u8; cert::LEN]>
     {
-        self.certificate
+        self.certificate.as_deref()
     }
 
     /// The encoded trust store of the anchors the identity contributes.
@@ -215,15 +239,28 @@ impl Identity
     /// # Errors
     ///
     /// When the external signer cannot be run, exits unsuccessfully, or
-    /// writes anything but 64 bytes.
-    pub fn sign(&self, message: &[u8]) -> Result<Signature>
+    /// writes anything but a composite signature's length.
+    pub fn sign(&self, message: &[u8]) -> Result<Box<Signature>>
     {
         match &self.key
         {
-            KeySource::Seed(seed) => Ok(crypto::ed25519_sign(&seed.0, message)),
+            KeySource::Seed(seed) => seed.sign(message).map(Box::new),
             KeySource::External(program) => sign_external(program, message),
         }
     }
+}
+
+/// What a failure to read the identity in `dir` adds: an identity of an
+/// earlier signature format does not load.
+fn format_hint(dir: &Path) -> String
+{
+    format!(
+        "{} does not hold a signing identity of the composite signature format \
+         (Ed25519 and ML-DSA-65, docs/signing.md § Signing); an identity of an earlier \
+         format does not load: remove the directory to have a local one generated, or provide \
+         one of this format",
+        dir.display()
+    )
 }
 
 /// The seed in `dir`, which is the secret key of `public`.
@@ -231,12 +268,12 @@ impl Identity
 /// # Errors
 ///
 /// When the seed file lies inside `work_tree`, cannot be read, does not hold
-/// 32 bytes, or is not the secret key of `public`.
+/// 64 bytes, or is not the secret key of `public`.
 fn load_seed(dir: &Path, work_tree: &Path, public: &PublicKey) -> Result<Seed>
 {
     let path = dir.join(SEED_FILE);
     refuse_inside(&path, work_tree)?;
-    let seed = Seed(read_exact::<32>(&path)?);
+    let seed = Seed(*read_exact::<SEED_LEN>(&path).with_context(|| format_hint(dir))?);
     ensure!(
         seed.public_key() == *public,
         "{} is not the secret key of the signing key {CERT_FILE} or {PUB_FILE} names",
@@ -246,7 +283,7 @@ fn load_seed(dir: &Path, work_tree: &Path, public: &PublicKey) -> Result<Seed>
 }
 
 /// Run the external signer `program` on `message`.
-fn sign_external(program: &Path, message: &[u8]) -> Result<Signature>
+fn sign_external(program: &Path, message: &[u8]) -> Result<Box<Signature>>
 {
     let mut child = Command::new(program)
         .stdin(Stdio::piped())
@@ -254,9 +291,9 @@ fn sign_external(program: &Path, message: &[u8]) -> Result<Signature>
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("running the external signer {}", program.display()))?;
-    // The message (the signed attributes, at most 64 KiB) and the signature
-    // are small, so writing all of one before reading the other cannot fill
-    // both pipes.
+    // The signer reads the whole message (the signed attributes, at most
+    // 64 KiB) before it writes the signature, so writing all of one before
+    // reading the other cannot fill both pipes.
     let mut stdin = child
         .stdin
         .take()
@@ -273,11 +310,11 @@ fn sign_external(program: &Path, message: &[u8]) -> Result<Signature>
         program.display(),
         output.status
     );
-    Signature::try_from(output.stdout.as_slice()).map_err(|_| {
+    Box::<Signature>::try_from(output.stdout.into_boxed_slice()).map_err(|bytes| {
         err!(
-            "the external signer {} wrote {} bytes, not a 64-byte signature",
+            "the external signer {} wrote {} bytes, not a {SIGNATURE_LEN}-byte composite signature",
             program.display(),
-            output.stdout.len()
+            bytes.len()
         )
     })
 }
@@ -383,7 +420,7 @@ pub fn generate(dir: &Path, fill: &mut dyn FnMut(&mut [u8; 32])) -> Result<()>
 struct LocalFiles
 {
     seed: Seed,
-    certificate: [u8; objsig::cert::LEN],
+    certificate: Box<[u8; cert::LEN]>,
     store: Vec<u8>,
 }
 
@@ -393,8 +430,9 @@ fn local_identity(fill: &mut dyn FnMut(&mut [u8; 32])) -> Result<LocalFiles>
     let root = Seed::drawn(fill);
     let seed = Seed::drawn(fill);
     let root_key = root.public_key();
+    let subject_key = seed.public_key();
     let body = CertificateBody {
-        subject_key: seed.public_key(),
+        subject_key: &subject_key,
         issuer_key_id: key_id(&root_key),
         serial: 1,
         usage: Usage {
@@ -404,17 +442,14 @@ fn local_identity(fill: &mut dyn FnMut(&mut [u8; 32])) -> Result<LocalFiles>
         min_security_version: 0,
         max_security_version: u32::MAX,
     };
-    let signed = body
-        .signed_bytes()
-        .map_err(|e| err!("encoding the signing key's certificate ({e:?})"))?;
-    let certificate = Certificate {
-        body,
-        signature: crypto::ed25519_sign(&root.0, &signed),
-    }
-    .encode()
-    .map_err(|e| err!("encoding the signing key's certificate ({e:?})"))?;
+    let encoding = |e| err!("encoding the signing key's certificate ({e:?})");
+    let mut signed = Box::new([0u8; cert::SIGNED_LEN]);
+    body.encode_signed(&mut signed).map_err(encoding)?;
+    let mut certificate = Box::new([0u8; cert::LEN]);
+    body.encode(&root.sign(&signed[..])?, &mut certificate)
+        .map_err(encoding)?;
     let anchor = AnchorSpec {
-        key: root_key,
+        key: &root_key,
         usage: Usage {
             roles: RoleSet::ALL,
             certify: true,
@@ -435,7 +470,7 @@ fn write_identity(staging: &Path, files: &LocalFiles) -> Result<()>
 {
     create_private_dir(staging)?;
     write_new(&staging.join(SEED_FILE), &files.seed.0)?;
-    write_new(&staging.join(CERT_FILE), &files.certificate)?;
+    write_new(&staging.join(CERT_FILE), &files.certificate[..])?;
     write_new(&staging.join(STORE_FILE), &files.store)
 }
 
@@ -502,24 +537,25 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>>
 }
 
 /// The `N` bytes of `path`, which holds exactly `N`.
-fn read_exact<const N: usize>(path: &Path) -> Result<[u8; N]>
+fn read_exact<const N: usize>(path: &Path) -> Result<Box<[u8; N]>>
 {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    <[u8; N]>::try_from(bytes.as_slice())
-        .map_err(|_| err!("{} holds {} bytes, not {N}", path.display(), bytes.len()))
+    Box::<[u8; N]>::try_from(bytes.into_boxed_slice())
+        .map_err(|bytes| err!("{} holds {} bytes, not {N}", path.display(), bytes.len()))
 }
 
-/// Decode a certificate file, which holds exactly one certificate.
-fn parse_certificate(bytes: &[u8]) -> Result<Certificate>
+/// A certificate file's bytes, checked to be exactly one certificate.
+fn parse_certificate(bytes: &[u8]) -> Result<Box<[u8; cert::LEN]>>
 {
-    let raw = <&[u8; objsig::cert::LEN]>::try_from(bytes).map_err(|_| {
+    let raw = <&[u8; cert::LEN]>::try_from(bytes).map_err(|_| {
         err!(
             "{} bytes, not a {}-byte certificate",
             bytes.len(),
-            objsig::cert::LEN
+            cert::LEN
         )
     })?;
-    Certificate::parse(raw).map_err(|e| err!("not a certificate ({e:?})"))
+    Certificate::parse(raw).map_err(|e| err!("not a certificate ({e:?})"))?;
+    Ok(Box::new(*raw))
 }
 
 #[cfg(test)]
@@ -556,22 +592,22 @@ mod tests
         let first = Identity::load(&dir, None, &work_tree(), &mut counter(1)).unwrap();
         assert_eq!(names(&dir), [CERT_FILE, SEED_FILE, STORE_FILE]);
 
-        let cert = first.certificate().unwrap();
-        assert_eq!(cert.body.subject_key, *first.public_key());
+        let cert = Certificate::parse(first.certificate().unwrap()).unwrap();
+        assert_eq!(cert.body.subject_key, first.public_key());
         let store = TrustStore::parse(first.store()).unwrap();
         let anchors: Vec<_> = store.anchors().collect();
         assert_eq!(anchors.len(), 1);
         let anchor = anchors[0];
         assert!(anchor.local && anchor.usage.certify);
         assert_eq!(anchor.key_id, cert.body.issuer_key_id);
-        crypto::ed25519_verify(
-            &anchor.key,
-            &cert.body.signed_bytes().unwrap(),
-            &cert.signature,
-        )
-        .unwrap();
+        composite::verify(anchor.key, cert.signed(), cert.signature).unwrap();
         let signature = first.sign(b"message").unwrap();
-        crypto::ed25519_verify(first.public_key(), b"message", &signature).unwrap();
+        composite::verify(first.public_key(), b"message", &signature).unwrap();
+        // The seed is the signing key's two seeds, each drawn on its own:
+        // the root took the first two draws.
+        let mut drawn = [3u8; SEED_LEN];
+        drawn[32..].fill(4);
+        assert_eq!(fs::read(dir.join(SEED_FILE)).unwrap(), drawn);
 
         let again = Identity::load(&dir, None, &work_tree(), &mut no_draw).unwrap();
         assert_eq!(again.public_key(), first.public_key());
@@ -673,11 +709,12 @@ mod tests
         generate(&dir, &mut counter(1)).unwrap();
         // The external signer holds the key: no seed is read.
         fs::remove_file(dir.join(SEED_FILE)).unwrap();
-        // `cat` writes back what it reads: a 64-byte message comes back as
-        // its signature.
+        // `cat` writes back what it reads: a message of a composite
+        // signature's length comes back as its signature.
         let cat = Identity::load(&dir, Some(Path::new("cat")), &work_tree(), &mut no_draw).unwrap();
-        let message = [7u8; 64];
-        assert_eq!(cat.sign(&message).unwrap(), message);
+        let message = [7u8; SIGNATURE_LEN];
+        assert_eq!(*cat.sign(&message).unwrap(), message);
+        cat.sign(&[7u8; 64]).unwrap_err();
         cat.sign(b"short").unwrap_err();
 
         let fails =
@@ -691,6 +728,26 @@ mod tests
         )
         .unwrap();
         absent.sign(&message).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: an identity of the retired Ed25519 format (a 32-byte
+    // seed, a 148-byte certificate) loaded, or refused without saying that
+    // its format is the reason.
+    #[test]
+    fn an_identity_of_an_earlier_format_is_refused()
+    {
+        let root = scratch("earlier");
+        let dir = root.join("keys");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(SEED_FILE), [1u8; 32]).unwrap();
+        fs::write(dir.join(CERT_FILE), [2u8; 148]).unwrap();
+        fs::write(dir.join(STORE_FILE), [3u8; 90]).unwrap();
+        let error = Identity::load(&dir, None, &work_tree(), &mut no_draw).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("composite signature format"),
+            "{error:#}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

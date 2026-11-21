@@ -31,6 +31,14 @@ impl<'a> Reader<'a>
         Some(head)
     }
 
+    /// The next `N` bytes, borrowed; `None` when fewer remain.
+    pub(crate) fn array_ref<const N: usize>(&mut self) -> Option<&'a [u8; N]>
+    {
+        let (head, tail) = self.rest.split_first_chunk::<N>()?;
+        self.rest = tail;
+        Some(head)
+    }
+
     /// The next `N` bytes; `None` when fewer remain.
     pub(crate) fn array<const N: usize>(&mut self) -> Option<[u8; N]>
     {

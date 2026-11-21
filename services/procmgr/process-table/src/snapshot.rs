@@ -8,17 +8,24 @@
 //! several calls, the pages a capture copies, and the layout's runs built from
 //! what the capture found.
 //!
-//! A capture lists the held space's mapped pages ([`Listing`]), copies each
-//! into the next data page of the object, in address order, a page whose copy
-//! failed taking none, and records the pages whose copy failed and the ranges
-//! memmgr reported it could not make resident. [`layout`] turns the three into the object's runs
-//! (`ipc::procmgr_snapshot::Run`): the listed runs, cut where a copy failed,
-//! and the reported ranges no listed page covers, each marked absent.
+//! Under the hold, a capture lists the held space's mapped pages ([`Listing`])
+//! and has memmgr supply the content of every demand chunk with an entry,
+//! wherever memmgr holds it (`memmgr_labels::CAPTURE_CHUNKS`), each chunk
+//! described by a [`Chunk`]: the backed pages of the chunks memmgr supplied
+//! take the first data pages of the object, in the order memmgr wrote them,
+//! with any pages the capture passed over to give memmgr room left unused. It
+//! then copies the listed pages outside every chunk ([`outside`]) into the
+//! next data pages, in address order, a page whose copy failed taking none.
+//! [`layout`] turns the three into the object's runs
+//! (`ipc::procmgr_snapshot::Run`): the pages outside the chunks, cut where a
+//! copy failed, and the backed pages of each chunk, those memmgr did not
+//! supply marked absent.
 
 extern crate alloc;
 
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
+use ipc::memmgr_capture::{Descriptor, Supply};
 use ipc::procmgr_snapshot::{NO_OBJECT_PAGE, RUN_ABSENT, Run, layout_pages};
 use syscall_abi::{
     PAGE_RUN_EXECUTE, PAGE_RUN_NO_COPY, PAGE_RUN_READ, PAGE_RUN_WRITE, PAGE_SIZE, PageRun,
@@ -63,49 +70,118 @@ impl Listing
         &self.runs
     }
 
-    /// Pages the capture copies: every listed page but those of
-    /// `PAGE_RUN_NO_COPY` runs, which `SYS_THREAD_READ_MEM` refuses.
+    /// Pages a copy of the listing takes ([`copied_pages`]).
     #[must_use]
     pub fn copied_pages(&self) -> u64
     {
-        self.runs
-            .iter()
-            .filter(|r| r.prot & PAGE_RUN_NO_COPY == 0)
-            .fold(0u64, |n, r| n.saturating_add(r.pages))
+        copied_pages(&self.runs)
     }
 }
 
-/// A range memmgr reported it could not make resident (`RESIDENT_REPORT`):
-/// `[va, end)`, with its region's protection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Reported
+/// Pages a copy of `runs` takes: every page but those of `PAGE_RUN_NO_COPY`
+/// runs, which `SYS_THREAD_READ_MEM` refuses.
+#[must_use]
+pub fn copied_pages(runs: &[PageRun]) -> u64
 {
-    /// First address, page-aligned.
-    pub va: u64,
-    /// End, exclusive, page-aligned.
-    pub end: u64,
-    /// The region's protection, `PAGE_RUN_*` bits.
-    pub prot: u64,
+    runs.iter()
+        .filter(|r| r.prot & PAGE_RUN_NO_COPY == 0)
+        .fold(0u64, |n, r| n.saturating_add(r.pages))
 }
 
-impl Reported
+/// A demand chunk of the held space that memmgr reached
+/// (`memmgr_labels::CAPTURE_CHUNKS`): its range, its backed pages, their
+/// protection, what memmgr did with it, and where the object holds its pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Chunk
 {
-    /// The range of `len` bytes at `va` that memmgr reported, of a region
-    /// registered with the `MAP_*` bits `region_prot`. Every page memmgr
-    /// maps is readable, whether or not the region names `MAP_READ` (the
-    /// kernel lists a resident page of a region registered `MAP_WRITABLE`
-    /// alone as `PAGE_RUN_READ | PAGE_RUN_WRITE`), so the range takes
-    /// `PAGE_RUN_READ` beside the region's write and execute bits, as its
-    /// listed pages would.
+    /// The chunk's base, page-aligned.
+    pub va: u64,
+    /// The chunk's pages.
+    pub pages: u64,
+    /// The chunk's backed pages, bit `i` for its page `i`.
+    pub backed: u16,
+    /// The protection of its pages, `PAGE_RUN_*` bits.
+    pub prot: u64,
+    /// What memmgr did with the chunk. The object holds its pages only when
+    /// memmgr supplied them; a chunk still pending when the capture stops
+    /// waiting is absent, as an absent one is.
+    pub supply: Supply,
+    /// The data page of the chunk's first backed page, when supplied: the
+    /// others follow it in page order.
+    pub data: u64,
+}
+
+impl Chunk
+{
+    /// The chunk memmgr's descriptor `d` names, whose pages, when supplied,
+    /// take the data pages from `data`. Every page memmgr maps is readable,
+    /// whether or not the region names `MAP_READ` (the kernel lists a resident
+    /// page of a region registered `MAP_WRITABLE` alone as
+    /// `PAGE_RUN_READ | PAGE_RUN_WRITE`), so the chunk's pages take
+    /// `PAGE_RUN_READ` beside the region's write and execute bits (`MAP_*`,
+    /// the same bits), as its listed pages would.
     #[must_use]
-    pub fn new(va: u64, len: u64, region_prot: u64) -> Self
+    pub fn new(d: &Descriptor, data: u64) -> Self
     {
         Self {
-            va,
-            end: va.saturating_add(len),
-            prot: (region_prot & (PAGE_RUN_WRITE | PAGE_RUN_EXECUTE)) | PAGE_RUN_READ,
+            va: d.va,
+            pages: d.pages,
+            backed: d.backed,
+            prot: (d.prot & (PAGE_RUN_WRITE | PAGE_RUN_EXECUTE)) | PAGE_RUN_READ,
+            supply: d.supply,
+            data,
         }
     }
+
+    /// The chunk's end, exclusive.
+    #[must_use]
+    pub fn end(&self) -> u64
+    {
+        self.va.saturating_add(self.pages.saturating_mul(PAGE_SIZE))
+    }
+}
+
+/// The parts of the listed runs `listed` outside every chunk of `chunks`
+/// (ascending, disjoint), in address order: the pages a capture copies from
+/// the space itself, since memmgr supplies, or reports, every page of a chunk.
+///
+/// # Errors
+/// The heap's refusal of the runs' memory.
+pub fn outside(listed: &[PageRun], chunks: &[Chunk]) -> Result<Vec<PageRun>, TryReserveError>
+{
+    let mut out = Vec::new();
+    let mut next = 0usize;
+    for run in listed
+    {
+        let end = run.va.saturating_add(run.pages.saturating_mul(PAGE_SIZE));
+        let mut at = run.va;
+        while at < end
+        {
+            while chunks.get(next).is_some_and(|c| c.end() <= at)
+            {
+                next = next.saturating_add(1);
+            }
+            let stop = match chunks.get(next)
+            {
+                // Inside the chunk: its pages are memmgr's to give.
+                Some(c) if c.va <= at =>
+                {
+                    at = c.end().min(end);
+                    continue;
+                }
+                Some(c) => c.va.min(end),
+                None => end,
+            };
+            out.try_reserve(1)?;
+            out.push(PageRun {
+                va: at,
+                pages: stop.saturating_sub(at) / PAGE_SIZE,
+                prot: run.prot,
+            });
+            at = stop;
+        }
+    }
+    Ok(out)
 }
 
 /// The layout of a capture: its runs, in ascending address order, with
@@ -123,38 +199,33 @@ pub struct Layout
     pub complete: bool,
 }
 
-/// The layout of a capture whose listing under the hold is `listed`, whose
-/// copy failed for the pages at the addresses `failed` (ascending), and for
-/// which memmgr reported the ranges `reported` (ascending). Each page of a
-/// listed run that is not `PAGE_RUN_NO_COPY` and whose copy held takes the
-/// next data page, in address order, as the copy placed it. A run is cut
-/// where a copy failed, the failed pages marked [`RUN_ABSENT`] with no object
-/// page; a `PAGE_RUN_NO_COPY` run has no object page and is not absent; a reported
-/// range is absent wherever no listed page covers it. Adjacent runs of one
-/// flag word whose bytes follow one another in the object, or which have
-/// none, are joined.
+/// The layout of a capture whose listed pages outside every chunk are
+/// `outside` ([`outside`]), copied from data page `first_copy` on, whose copy
+/// failed for the pages at the addresses `failed` (ascending), and whose
+/// demand chunks are `chunks`. Each page of `outside` that is not
+/// `PAGE_RUN_NO_COPY` and whose copy held takes the next data page, in
+/// address order, as the copy placed it; a run is cut where a copy failed, the
+/// failed pages marked [`RUN_ABSENT`] with no object page; a
+/// `PAGE_RUN_NO_COPY` run has no object page and is not absent. Each backed
+/// page of a chunk memmgr supplied takes its place from the chunk's data
+/// page; those of any other chunk are absent. Adjacent runs of one flag word
+/// whose bytes follow one another in the object, or which have none, are
+/// joined.
 ///
 /// # Errors
 /// The heap's refusal of the runs' memory.
 pub fn layout(
-    listed: &[PageRun],
+    outside: &[PageRun],
+    first_copy: u64,
     failed: &[u64],
-    reported: &[Reported],
+    chunks: &[Chunk],
 ) -> Result<Layout, TryReserveError>
 {
     let mut runs = Runs::default();
     let mut failed = failed.iter().copied().peekable();
-    let mut data = 0u64;
-    let mut gaps = Gaps { listed, next: 0 };
-    let mut reported = reported.iter().copied().peekable();
-    for run in listed
+    let mut data = first_copy;
+    for run in outside
     {
-        // The reported ranges below this run, and the parts of those that
-        // reach into it, below it.
-        while let Some(r) = reported.next_if(|r| r.va < run.va)
-        {
-            gaps.absent(&mut runs, r)?;
-        }
         let end = run.va.saturating_add(run.pages.saturating_mul(PAGE_SIZE));
         if run.prot & PAGE_RUN_NO_COPY != 0
         {
@@ -181,9 +252,9 @@ pub fn layout(
             }
         }
     }
-    for r in reported
+    for chunk in chunks
     {
-        gaps.absent(&mut runs, r)?;
+        runs.push_chunk(chunk)?;
     }
     runs.finish(data)
 }
@@ -217,6 +288,41 @@ impl Runs
             flags,
             object_page,
         });
+        Ok(())
+    }
+
+    /// Add a run for each span of consecutive backed pages of `chunk`: with
+    /// their data pages when memmgr supplied it, else absent.
+    fn push_chunk(&mut self, chunk: &Chunk) -> Result<(), TryReserveError>
+    {
+        let supplied = chunk.supply == Supply::Supplied;
+        let held = |page: u64| {
+            u32::try_from(page)
+                .ok()
+                .and_then(|p| chunk.backed.checked_shr(p))
+                .is_some_and(|b| b & 1 != 0)
+        };
+        let (mut page, mut rank) = (0u64, 0u64);
+        while page < chunk.pages
+        {
+            if !held(page)
+            {
+                page = page.saturating_add(1);
+                continue;
+            }
+            let span = (page..chunk.pages).take_while(|&p| held(p)).count() as u64;
+            let va = chunk.va.saturating_add(page.saturating_mul(PAGE_SIZE));
+            if supplied
+            {
+                self.push(va, span, chunk.prot, chunk.data.saturating_add(rank))?;
+            }
+            else
+            {
+                self.push(va, span, chunk.prot | RUN_ABSENT, NO_OBJECT_PAGE)?;
+            }
+            rank = rank.saturating_add(span);
+            page = page.saturating_add(span);
+        }
         Ok(())
     }
 
@@ -272,64 +378,11 @@ fn continues(last: &Run, run: &Run) -> bool
     end == run.va && last.flags == run.flags && bytes_follow
 }
 
-/// The parts of reported ranges no listed run covers, found by a walk of the
-/// listed runs that only moves forward, as the ranges come in address order.
-struct Gaps<'a>
-{
-    listed: &'a [PageRun],
-    /// The first listed run that may end above the next range.
-    next: usize,
-}
-
-impl Gaps<'_>
-{
-    /// Add the parts of `r` no listed run covers to `runs`, absent.
-    fn absent(&mut self, runs: &mut Runs, r: Reported) -> Result<(), TryReserveError>
-    {
-        let flags = r.prot | RUN_ABSENT;
-        let mut at = r.va;
-        while let Some(run) = self.listed.get(self.next)
-            && at < r.end
-        {
-            let end = run.va.saturating_add(run.pages.saturating_mul(PAGE_SIZE));
-            if end <= at
-            {
-                self.next = self.next.saturating_add(1);
-                continue;
-            }
-            if run.va >= r.end
-            {
-                break;
-            }
-            if run.va > at
-            {
-                runs.push(
-                    at,
-                    run.va.saturating_sub(at) / PAGE_SIZE,
-                    flags,
-                    NO_OBJECT_PAGE,
-                )?;
-            }
-            at = end;
-        }
-        if at < r.end
-        {
-            runs.push(
-                at,
-                r.end.saturating_sub(at) / PAGE_SIZE,
-                flags,
-                NO_OBJECT_PAGE,
-            )?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests
 {
     use super::*;
-    use syscall_abi::{PAGE_RUN_READ, PAGE_RUN_WRITE};
+    use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_RUN_READ, PAGE_RUN_WRITE};
 
     const P: u64 = PAGE_SIZE;
     const RW: u64 = PAGE_RUN_READ | PAGE_RUN_WRITE;
@@ -337,6 +390,20 @@ mod tests
     fn listed(va: u64, pages: u64, prot: u64) -> PageRun
     {
         PageRun { va, pages, prot }
+    }
+
+    fn chunk(va: u64, pages: u64, backed: u16, supply: Supply, data: u64) -> Chunk
+    {
+        Chunk::new(
+            &Descriptor {
+                va,
+                pages,
+                backed,
+                prot: MAP_READ | MAP_WRITABLE,
+                supply,
+            },
+            data,
+        )
     }
 
     fn run(va: u64, pages: u64, flags: u64, object_page: u64) -> Run
@@ -408,6 +475,7 @@ mod tests
     {
         let l = layout(
             &[listed(0x1000, 2, RW), listed(0x8000, 3, PAGE_RUN_READ)],
+            0,
             &[],
             &[],
         )
@@ -422,7 +490,7 @@ mod tests
     #[test]
     fn a_failed_copy_cuts_its_run_and_takes_no_data_page()
     {
-        let l = layout(&[listed(0x1000, 4, RW)], &[0x2000, 0x3000], &[]).unwrap();
+        let l = layout(&[listed(0x1000, 4, RW)], 0, &[0x2000, 0x3000], &[]).unwrap();
         assert_eq!(
             l.runs,
             [
@@ -443,6 +511,7 @@ mod tests
                 listed(0x2000, 4, RW | PAGE_RUN_NO_COPY),
                 listed(0x6000, 1, RW),
             ],
+            0,
             &[],
             &[],
         )
@@ -459,69 +528,81 @@ mod tests
     }
 
     #[test]
-    fn a_reported_range_is_absent_where_no_listed_page_covers_it()
+    fn the_copy_leaves_out_every_chunks_pages()
     {
-        // The range covers the listed run at 0x3000 and reaches past it; the
-        // one at 0x20000 lies above every listed run.
-        let l = layout(
-            &[listed(0x3000, 1, RW), listed(0x9000, 1, RW)],
-            &[],
+        // A run that holds two chunks, one that lies inside a third, and a
+        // chunk no listed page covers.
+        let chunks = [
+            chunk(0x2000, 4, 0xF, Supply::Supplied, 0),
+            chunk(0x8000, 2, 0x3, Supply::Absent, 0),
+            chunk(0x20000, 16, 0x1, Supply::Supplied, 4),
+            chunk(0x40000, 16, 0x1, Supply::Pending, 0),
+        ];
+        let out = outside(
             &[
-                Reported {
-                    va: 0x1000,
-                    end: 0x5000,
-                    prot: RW,
-                },
-                Reported {
-                    va: 0x20000,
-                    end: 0x22000,
-                    prot: PAGE_RUN_READ,
-                },
+                listed(0x1000, 20, RW),
+                listed(0x21000, 2, RW),
+                listed(0x50000, 1, PAGE_RUN_READ),
             ],
+            &chunks,
         )
         .unwrap();
         assert_eq!(
-            l.runs,
+            out,
             [
-                run(0x1000, 2, RW | RUN_ABSENT, NO_OBJECT_PAGE),
-                run(0x3000, 1, RW, 1),
-                run(0x4000, 1, RW | RUN_ABSENT, NO_OBJECT_PAGE),
-                run(0x9000, 1, RW, 2),
-                run(0x20000, 2, PAGE_RUN_READ | RUN_ABSENT, NO_OBJECT_PAGE)
+                listed(0x1000, 1, RW),
+                listed(0x6000, 2, RW),
+                listed(0xa000, 11, RW),
+                listed(0x50000, 1, PAGE_RUN_READ)
             ]
         );
-        assert!(!l.complete);
+        assert_eq!(copied_pages(&out), 15);
     }
 
     #[test]
-    fn adjacent_absent_runs_of_one_protection_join()
+    fn supplied_chunks_take_their_data_pages_and_the_copy_follows_them()
     {
-        // Two reported chunks back to back, and a failed page right after
-        // the listed run below them.
-        let l = layout(
-            &[listed(0x1000, 2, RW)],
-            &[0x2000],
-            &[
-                Reported {
-                    va: 0x3000,
-                    end: 0x5000,
-                    prot: RW,
-                },
-                Reported {
-                    va: 0x5000,
-                    end: 0x7000,
-                    prot: RW,
-                },
-            ],
-        )
-        .unwrap();
+        // memmgr wrote the first chunk's three backed pages to data pages 0
+        // to 2 and the second's two to 3 and 4; the copy starts at 5.
+        let chunks = [
+            chunk(0x10000, 16, 0b1011, Supply::Supplied, 0),
+            chunk(0x20000, 4, 0b0110, Supply::Supplied, 3),
+        ];
+        let out = outside(&[listed(0x1000, 2, RW), listed(0x10000, 2, RW)], &chunks).unwrap();
+        let l = layout(&out, 5, &[], &chunks).unwrap();
         assert_eq!(
             l.runs,
             [
-                run(0x1000, 1, RW, 1),
-                run(0x2000, 5, RW | RUN_ABSENT, NO_OBJECT_PAGE)
+                run(0x1000, 2, RW, 6),
+                run(0x10000, 2, RW, 1),
+                run(0x13000, 1, RW, 3),
+                run(0x21000, 2, RW, 4)
             ]
         );
+        assert_eq!((l.layout_pages, l.data_pages, l.complete), (1, 7, true));
+    }
+
+    #[test]
+    fn a_chunk_memmgr_did_not_supply_is_absent_over_its_backed_pages()
+    {
+        // An absent chunk and a pending one back to back join; a failed
+        // page and the supplied chunk keep the capture's data pages.
+        let chunks = [
+            chunk(0x30000, 16, 0xFFFF, Supply::Absent, 0),
+            chunk(0x40000, 16, 0x0003, Supply::Pending, 0),
+            chunk(0x50000, 16, 0x0004, Supply::Supplied, 0),
+        ];
+        let l = layout(&[listed(0x1000, 2, RW)], 1, &[0x2000], &chunks).unwrap();
+        assert_eq!(
+            l.runs,
+            [
+                run(0x1000, 1, RW, 2),
+                run(0x2000, 1, RW | RUN_ABSENT, NO_OBJECT_PAGE),
+                run(0x30000, 18, RW | RUN_ABSENT, NO_OBJECT_PAGE),
+                run(0x52000, 1, RW, 1)
+            ]
+        );
+        assert_eq!((l.data_pages, l.complete), (2, false));
     }
 
     #[test]
@@ -537,7 +618,7 @@ mod tests
                 )
             })
             .collect();
-        let l = layout(&runs, &[], &[]).unwrap();
+        let l = layout(&runs, 0, &[], &[]).unwrap();
         assert_eq!(l.layout_pages, 2);
         assert_eq!(l.runs.first().map(|r| r.object_page), Some(2));
         assert_eq!(l.runs.last().map(|r| r.object_page), Some(128));
@@ -550,7 +631,7 @@ mod tests
         // them, with no count bounding it.
         const PAGES: u64 = 40_000;
         let failed: Vec<u64> = (0..PAGES).step_by(2).map(|i| 0x1000 + i * P).collect();
-        let l = layout(&[listed(0x1000, PAGES, RW)], &failed, &[]).unwrap();
+        let l = layout(&[listed(0x1000, PAGES, RW)], 0, &failed, &[]).unwrap();
         assert_eq!(l.runs.len() as u64, PAGES);
         assert_eq!(Some(l.layout_pages), layout_pages(PAGES));
         assert_eq!(l.data_pages, PAGES / 2);
@@ -560,25 +641,35 @@ mod tests
     }
 
     #[test]
-    fn a_reported_range_is_readable_with_its_regions_write_and_execute_bits()
+    fn a_chunk_is_readable_with_its_regions_write_and_execute_bits()
     {
-        use syscall_abi::{MAP_EXECUTABLE, MAP_READ, MAP_WRITABLE, PAGE_RUN_EXECUTE};
+        use syscall_abi::PAGE_RUN_EXECUTE;
 
+        let with = |prot: u64| {
+            Chunk::new(
+                &Descriptor {
+                    va: 0x4000,
+                    pages: 3,
+                    backed: 0b111,
+                    prot,
+                    supply: Supply::Supplied,
+                },
+                9,
+            )
+        };
         // A heap region registered MAP_WRITABLE alone.
-        let r = Reported::new(0x4000, 3 * P, MAP_WRITABLE);
-        assert_eq!(r.va, 0x4000);
-        assert_eq!(r.end, 0x4000 + 3 * P);
-        assert_eq!(r.prot, RW);
-        assert_eq!(Reported::new(0x4000, P, MAP_READ).prot, PAGE_RUN_READ);
+        let c = with(MAP_WRITABLE);
         assert_eq!(
-            Reported::new(0x4000, P, MAP_READ | MAP_EXECUTABLE).prot,
+            (c.va, c.end(), c.prot, c.data),
+            (0x4000, 0x4000 + 3 * P, RW, 9)
+        );
+        assert_eq!(with(MAP_READ).prot, PAGE_RUN_READ);
+        assert_eq!(
+            with(MAP_READ | MAP_EXECUTABLE).prot,
             PAGE_RUN_READ | PAGE_RUN_EXECUTE
         );
         // Bits outside the protection, PAGE_RUN_NO_COPY's among them, are not
         // a region's.
-        assert_eq!(
-            Reported::new(0x4000, P, PAGE_RUN_NO_COPY | (1 << 9)).prot,
-            PAGE_RUN_READ
-        );
+        assert_eq!(with(PAGE_RUN_NO_COPY).prot, PAGE_RUN_READ);
     }
 }

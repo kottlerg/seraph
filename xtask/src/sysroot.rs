@@ -333,15 +333,12 @@ const SVCTEST_VERIFIED_BODY: &[u8] = b"seraph: the body procmgr's verified read 
 /// `procmgr_read_verified` phase reads through procmgr's verified read: a
 /// file under a data tree, which the sign before every pack signs in the
 /// data role under its install path (`crate::signing::sign_sysroot`).
-/// Written only when absent, so the signed file a pack left stands. Returns
-/// the destination path (kept through the prune pass).
+/// Written unsigned on every install, as the installed data files are, so the
+/// pack signs the body afresh and never meets a trailer an earlier format
+/// signed. Returns the destination path (kept through the prune pass).
 fn synthesise_svctest_verified(ctx: &BuildContext) -> Result<PathBuf>
 {
     let dst = ctx.sysroot.join("data/svctest/signed/verified.dat");
-    if dst.exists()
-    {
-        return Ok(dst);
-    }
     if let Some(parent) = dst.parent()
     {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -556,6 +553,16 @@ mod tests
         let bin_dir = sysroot.join("services");
         fs::create_dir_all(&bin_dir).unwrap();
         fs::write(bin_dir.join("procmgr"), b"\x7fELF").unwrap();
+        // The verified-read fixture as an earlier pack left it, its body
+        // followed by a trailer: one of an earlier signature format, which
+        // the signer before the next pack refuses.
+        let verified = sysroot.join("data/svctest/signed/verified.dat");
+        fs::create_dir_all(verified.parent().unwrap()).unwrap();
+        fs::write(
+            &verified,
+            [SVCTEST_VERIFIED_BODY, b"old trailer SERAPHSG"].concat(),
+        )
+        .unwrap();
 
         let ctx = BuildContext {
             root: root.clone(),
@@ -583,7 +590,7 @@ mod tests
         assert_eq!(
             fs::read(sysroot.join("data/svctest/signed/verified.dat")).unwrap(),
             SVCTEST_VERIFIED_BODY,
-            "verified-read fixture kept"
+            "verified-read fixture written unsigned over the signed one"
         );
         assert!(
             !sys_services.join("stale.svc").exists(),

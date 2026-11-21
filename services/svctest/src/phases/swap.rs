@@ -37,7 +37,10 @@
 //!   read before the hog reads while the hog holds the level (logd's budget
 //!   node is in the system reserve);
 //! * the child reads every page of both regions, and its threads read their
-//!   arrays, while the hog still holds the level.
+//!   arrays, while the hog still holds the level;
+//! * a snapshot (procmgr's `SNAPSHOT`) taken while chunks of the main region are
+//!   evicted, with the hog giving back more than the region's pages, is complete
+//!   and holds every page's pattern but the hole chunk's.
 //!
 //! After the hog's grants are released and the child has exited, the phase
 //! makes every process resident, and requires the store and the swapped total
@@ -55,11 +58,13 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use ipc::procmgr_snapshot::SNAPSHOT_COMPLETE;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 use syscall_abi::{PAGE_SIZE, SyscallError};
 
 use crate::arch::current::REGS_SIZE;
 use crate::bootstrap::Caps;
+use crate::phases::snapshot::{Attached, account, snapshot};
 use crate::runner::Phase;
 
 pub fn phases() -> &'static [Phase]
@@ -475,6 +480,17 @@ impl Hog
             reply.label
         );
         self.pages = self.pages.saturating_sub(count);
+    }
+
+    /// Return grants, last first, until at least `pages` pages are returned or
+    /// none is left.
+    pub(super) fn release_pages(&mut self, pages: u64)
+    {
+        let target = self.pages.saturating_sub(pages);
+        while self.pages > target && !self.grants.is_empty()
+        {
+            self.release_one();
+        }
     }
 
     /// Return every grant: delete the caps, then release the regions in
@@ -1045,6 +1061,56 @@ pub(super) fn require_stack(authority: u64, before: &StackPages, what: &str)
     );
 }
 
+/// SNAPSHOT `process`, the fixture, over `authority` and require the object
+/// complete and every page of its main region but the hole's chunk to hold its
+/// pattern. `phase` names the caller in a failure.
+pub(super) fn require_snapshot(authority: u64, process: u64, ready: &Ready, phase: &str)
+{
+    let reply = snapshot(authority, process, Some(account()), phase);
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "{phase}: SNAPSHOT of the fixture replied {:#x}",
+        reply.label
+    );
+    assert_eq!(
+        reply.word(1),
+        SNAPSHOT_COMPLETE,
+        "{phase}: SNAPSHOT of the fixture replied flags {:#x} with label {:#x}",
+        reply.word(1),
+        reply.label
+    );
+    let handle = *reply.caps().first().expect("SNAPSHOT replied no handle");
+    let object = Attached::attach(handle, reply.word(0), phase);
+    let mut first: Option<String> = None;
+    let mut failures: u64 = 0;
+    for page in 0..ready.chunks.saturating_mul(CHUNK_PAGES)
+    {
+        if page / CHUNK_PAGES == HOLE_CHUNK
+        {
+            continue;
+        }
+        let va = page_va(ready.region, page);
+        let what = match object.page(va)
+        {
+            None => "missing",
+            Some(bytes) if bytes_intact(bytes, va, ready.region, MAIN_XOR, Fill::Page) => continue,
+            Some(_) => "wrong",
+        };
+        failures = failures.saturating_add(1);
+        if first.is_none()
+        {
+            first = Some(format!("{va:#x} {what}"));
+        }
+    }
+    object.release();
+    assert!(
+        failures == 0,
+        "{phase}: {failures} pages of the snapshot of the main region fail; the first is {}",
+        first.unwrap_or_default()
+    );
+}
+
 // ── The phase ────────────────────────────────────────────────────────────────
 
 /// The phase (see the module documentation).
@@ -1078,6 +1144,28 @@ fn swap_phase(caps: &Caps)
     hog.fill_to_low();
     require_no_evict(thread, &ready);
     require_stack(authority, &logd, "logd");
+
+    // A snapshot taken while chunks of the main region are evicted holds every
+    // page's pattern.
+    let mut from = 0;
+    let evicted = next_evicted(thread, &ready, &mut from);
+    hog.release_pages(
+        ready
+            .chunks
+            .saturating_mul(CHUNK_PAGES)
+            .saturating_add(1024),
+    );
+    // The snapshot's grants take the level back toward `LOW`, so the clock
+    // may evict the fixture's chunks while procmgr holds it: memmgr supplies
+    // each chunk wherever it is.
+    let evictions = pool().evictions;
+    require_snapshot(authority, process, &ready, PHASE);
+    let during = pool().evictions.saturating_sub(evictions);
+    hog.fill_to_low();
+    std::os::seraph::log!(
+        "{PHASE}: snapshot complete with the chunk at {evicted:#x} of the main region evicted, \
+         {during} evictions begun during it"
+    );
 
     // The fixture reads everything while the hog holds the level.
     fixture.send("verify");
@@ -1558,13 +1646,32 @@ const fn noise(seed: u64) -> u64
 /// Whether each word of the page at `va` reads as [`fill_page`] wrote it.
 fn page_intact(va: u64, base: u64, xor: u64, fill: Fill) -> bool
 {
-    (0..PAGE_WORDS).all(|word| {
-        let at = va.saturating_add(word.saturating_mul(8));
+    let mut bytes = [0u8; PAGE_LEN];
+    for (word, chunk) in bytes.as_chunks_mut::<8>().0.iter_mut().enumerate()
+    {
+        let at = va.saturating_add((word as u64).saturating_mul(8));
         // SAFETY: as in [`fill_page`]; the read restores the page when memmgr
         // evicted it.
         let got = unsafe { std::ptr::read_volatile(at as *const u64) };
-        got == fill.word(at, base, xor)
-    })
+        *chunk = got.to_ne_bytes();
+    }
+    bytes_intact(&bytes, va, base, xor, fill)
+}
+
+/// Whether `bytes`, a copy of the page at `va` of the region at `base`, hold
+/// each word as [`fill_page`] wrote it.
+pub(super) fn bytes_intact(bytes: &[u8], va: u64, base: u64, xor: u64, fill: Fill) -> bool
+{
+    bytes.len() == PAGE_LEN
+        && bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .enumerate()
+            .all(|(word, chunk)| {
+                let at = va.saturating_add((word as u64).saturating_mul(8));
+                u64::from_ne_bytes(*chunk) == fill.word(at, base, xor)
+            })
 }
 
 /// Fixture thread `index`: fill a 64 KiB array on its own stack, keep it live,

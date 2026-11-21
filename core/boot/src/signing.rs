@@ -157,6 +157,7 @@ impl core::fmt::Display for KeyIdHex<'_>
 #[cfg(test)]
 pub(crate) mod testing
 {
+    use objsig::composite::{self, SEED_LEN};
     use objsig::{
         AnchorSpec, Attributes, RecordSpec, Role, RoleSet, TrustStore, Usage, encode_trailer,
         key_id, trailer_len,
@@ -164,16 +165,17 @@ pub(crate) mod testing
 
     use super::ARCH;
 
-    /// The seed of the root the test stores trust.
-    pub(crate) const ROOT_SEED: [u8; 32] = [7; 32];
-    /// The seed of a key no test store trusts.
-    pub(crate) const STRANGER_SEED: [u8; 32] = [9; 32];
+    /// The composite secret of the root the test stores trust.
+    pub(crate) const ROOT_SEED: [u8; SEED_LEN] = [7; SEED_LEN];
+    /// The composite secret of a key no test store trusts.
+    pub(crate) const STRANGER_SEED: [u8; SEED_LEN] = [9; SEED_LEN];
 
     /// A store of one anchor, the key of `seed`, which may sign every role.
-    pub(crate) fn store_of(seed: &[u8; 32]) -> Vec<u8>
+    pub(crate) fn store_of(seed: &[u8; SEED_LEN]) -> Vec<u8>
     {
+        let key = composite::public_key(seed);
         let spec = AnchorSpec {
-            key: crypto::ed25519_public_key(seed),
+            key: &key,
             usage: Usage {
                 roles: RoleSet::ALL,
                 certify: true,
@@ -188,7 +190,8 @@ pub(crate) mod testing
 
     /// `body` signed by the key of `seed` with the set of `roles`, named
     /// `name`.
-    pub(crate) fn signed(seed: &[u8; 32], body: &[u8], roles: &[Role], name: &[u8]) -> Vec<u8>
+    pub(crate) fn signed(seed: &[u8; SEED_LEN], body: &[u8], roles: &[Role], name: &[u8])
+    -> Vec<u8>
     {
         let attrs = Attributes {
             body_len: u64::try_from(body.len()).unwrap(),
@@ -200,11 +203,12 @@ pub(crate) mod testing
         };
         let mut message = vec![0u8; attrs.encoded_len().unwrap()];
         attrs.encode(&mut message).unwrap();
+        let signature = Box::new(composite::sign(seed, &message).unwrap());
         let record = RecordSpec {
-            signer_key_id: key_id(&crypto::ed25519_public_key(seed)),
+            signer_key_id: key_id(&composite::public_key(seed)),
             attrs,
             certificate: None,
-            signature: crypto::ed25519_sign(seed, &message),
+            signature: &signature,
         };
         let mut trailer = vec![0u8; trailer_len(&[record]).unwrap()];
         encode_trailer(body, &[record], &mut trailer).unwrap();

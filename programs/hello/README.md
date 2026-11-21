@@ -19,7 +19,8 @@ programs/hello/
     ├── Cargo.toml         # Crate hello-tester
     └── src/
         └── main.rs        # Spawns /programs/hello, checks its stdout line and exit,
-                           # and that a program may not start a service
+                           # that a program may not start a service, and its
+                           # declared seed
 ```
 
 ---
@@ -41,10 +42,16 @@ The `hello-tester` crate installs at `/tests/programs/hello`, per the
 `/programs/hello` with a piped stdout, reads the stream to EOF, and waits for the child. Then,
 being a program itself, it spawns the service `/tests/crasher`, which procmgr refuses, since
 a program may start programs only
-([docs/signing.md](../../docs/signing.md) § Signature Policy in procmgr).
+([docs/signing.md](../../docs/signing.md) § Signature Policy in procmgr). Before all that, it
+takes the one seed usertest's recipe declares for it, `pwrmgr.deny`, over the bootstrap protocol
+([services/usertest/README.md](../../services/usertest/README.md) § Seeds) and sends pwrmgr
+`SHUTDOWN` on it, which pwrmgr refuses, so the cap that arrived is that seed.
 
 | Check | On failure |
 |---|---|
+| The tester has a creator endpoint | Prints `[hello-tester] FAIL no creator endpoint for the declared seed`; exits `5` |
+| Its one bootstrap slot holds a cap | Prints `[hello-tester] FAIL declared seed not delivered: …`; exits `6` |
+| pwrmgr answers `SHUTDOWN` on that cap `UNAUTHORIZED` | Prints `[hello-tester] FAIL the declared seed's SHUTDOWN answered …` and exits `7` on another answer; prints `[hello-tester] FAIL the declared seed's SHUTDOWN call failed: …` and exits `8` when the call fails |
 | A stdout line contains `hello from seraph userspace` | Prints `[hello-tester] FAIL expected line missing: …` and the captured stdout; exits `1` |
 | The child exited successfully | Prints `[hello-tester] FAIL non-zero exit: …`; exits `2` |
 | Spawning `/tests/crasher` fails with `PermissionDenied` | Prints `[hello-tester] FAIL starting /tests/crasher: …` and exits `3` on another error; kills it, prints `[hello-tester] FAIL a program started the service …` and exits `4` when it starts |

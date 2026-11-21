@@ -343,7 +343,7 @@ impl Snapped
 }
 
 /// A `SNAPSHOT` of `badge` over `procmgr`, carrying `account` as `caps[0]`.
-fn snapshot(procmgr: u64, badge: u64, account: Option<u64>) -> IpcMessage
+pub(super) fn snapshot(procmgr: u64, badge: u64, account: Option<u64>, phase: &str) -> IpcMessage
 {
     let b = IpcMessage::builder(procmgr_labels::SNAPSHOT).word(0, badge);
     let msg = match account
@@ -353,11 +353,11 @@ fn snapshot(procmgr: u64, badge: u64, account: Option<u64>) -> IpcMessage
     };
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
     unsafe { ipc::ipc_call(procmgr, &msg, current_ipc_buf()) }
-        .unwrap_or_else(|e| panic!("{PHASE}: SNAPSHOT: ipc_call failed ({e})"))
+        .unwrap_or_else(|e| panic!("{phase}: SNAPSHOT: ipc_call failed ({e})"))
 }
 
 /// A copy of svctest's own memmgr SEND, the account a `SNAPSHOT` carries.
-fn account() -> u64
+pub(super) fn account() -> u64
 {
     let info = startup_info();
     syscall::cap_copy(
@@ -387,7 +387,7 @@ fn capture(authority: u64, child: &mut Snapped)
     let mut values = Vec::with_capacity(PAGES);
     let child_before = child.usage();
     let before = own_usage();
-    let reply = snapshot(authority, child.badge, Some(account()));
+    let reply = snapshot(authority, child.badge, Some(account()), PHASE);
     let after = own_usage();
     assert_eq!(
         reply.label,
@@ -438,98 +438,164 @@ fn capture(authority: u64, child: &mut Snapped)
     );
 }
 
-/// Attach the `pages`-page object `handle` names, read the writer's pages
-/// from it to `values` ([`read_pages`]), detach it and release it.
-fn read_object(handle: u64, pages: u64, base: u64, values: &mut Vec<u64>)
+/// The object of a snapshot, attached read-only and private to svctest, its
+/// layout decoded.
+pub(super) struct Attached
 {
-    let range = std::os::seraph::reserve_pages(pages).expect("snapshot: reserving a range failed");
-    let va = range.va_start();
-    let attach = IpcMessage::builder(memmgr_labels::ATTACH_OBJECT)
-        .word(0, va)
-        .word(1, page_at(0, pages))
-        .word(2, MAP_READ)
-        .word(3, 0)
-        .word(4, memmgr_labels::ATTACH_PRIVATE)
-        .cap(handle_copy(handle))
-        .build();
-    let got = call(startup_info().memmgr_endpoint, &attach, "ATTACH_OBJECT").label;
-    assert_eq!(
-        got,
-        memmgr_errors::SUCCESS,
-        "{PHASE}: ATTACH_OBJECT replied {got:#x}"
-    );
-    read_pages(va, pages, base, values);
-    expect_region_reply(
-        memmgr_labels::UNREGISTER_REGION,
-        va,
-        page_at(0, pages),
-        memmgr_errors::SUCCESS,
-        "UNREGISTER_REGION of the snapshot",
-    );
-    std::os::seraph::unreserve_pages(range);
-    let got = call(
-        handle,
-        &IpcMessage::new(memmgr_labels::OBJECT_RELEASE),
-        "OBJECT_RELEASE",
-    )
-    .label;
-    assert_eq!(
-        got,
-        memmgr_errors::SUCCESS,
-        "{PHASE}: OBJECT_RELEASE replied {got:#x}"
-    );
+    handle: u64,
+    va: u64,
+    pages: u64,
+    range: std::os::seraph::ReservedRange,
+    header: Header,
+    runs: Vec<Run>,
+    /// The caller's phase, which a failure names.
+    phase: String,
 }
 
-/// Decode the layout of the `pages`-page object attached at `va`, and push
-/// the first word of the object page of each of the [`PAGES`] pages from
-/// `base` in the child's space to `values`.
-fn read_pages(va: u64, pages: u64, base: u64, values: &mut Vec<u64>)
+impl Attached
 {
-    let page_bytes = |at: u64, count: u64| {
-        let len = usize::try_from(count.saturating_mul(PAGE_SIZE)).unwrap_or(0);
-        // SAFETY: the `count` pages at `at` lie in the object's attachment,
-        // read-only and private; the slice is read here only, while attached.
-        unsafe { std::slice::from_raw_parts(at as *const u8, len) }
-    };
-    let header = Header::decode(page_bytes(va, 1))
-        .unwrap_or_else(|| panic!("{PHASE}: the snapshot's header does not decode"));
-    assert!(
-        header.layout_pages.saturating_add(header.data_pages) <= pages,
-        "{PHASE}: the header {header:?} names more than the object's {pages} pages"
-    );
-    assert_eq!(
-        header.flags, SNAPSHOT_COMPLETE,
-        "{PHASE}: the header {header:?} of a complete snapshot"
-    );
-    let layout = page_bytes(va, header.layout_pages);
-    let count = usize::try_from(header.run_count).unwrap_or(usize::MAX);
-    let runs: Vec<Run> = (0..count)
-        .map(|i| {
-            Run::decode(layout, i)
-                .unwrap_or_else(|| panic!("{PHASE}: run {i} of {header:?} does not decode"))
-        })
-        .collect();
-    for page in 0..PAGES as u64
+    /// Attach the `pages`-page object `handle` names and decode its layout,
+    /// requiring the header's pages to lie within the object. `phase` names the
+    /// caller in a failure.
+    pub(super) fn attach(handle: u64, pages: u64, phase: &str) -> Self
     {
-        let at = page_at(base, page);
-        let run = runs
-            .iter()
-            .find(|r| at >= r.va && at < page_at(r.va, r.pages))
-            .unwrap_or_else(|| panic!("{PHASE}: no run of the snapshot covers {at:#x}"));
-        assert!(
-            run.flags & RUN_ABSENT == 0 && run.object_page != NO_OBJECT_PAGE,
-            "{PHASE}: the run {run:?} covering {at:#x} holds no bytes"
+        let range = std::os::seraph::reserve_pages(pages)
+            .unwrap_or_else(|_| panic!("{phase}: reserving a range for the snapshot failed"));
+        let va = range.va_start();
+        let attach = IpcMessage::builder(memmgr_labels::ATTACH_OBJECT)
+            .word(0, va)
+            .word(1, page_at(0, pages))
+            .word(2, MAP_READ)
+            .word(3, 0)
+            .word(4, memmgr_labels::ATTACH_PRIVATE)
+            .cap(handle_copy(handle))
+            .build();
+        let got = call(startup_info().memmgr_endpoint, &attach, "ATTACH_OBJECT").label;
+        assert_eq!(
+            got,
+            memmgr_errors::SUCCESS,
+            "{phase}: ATTACH_OBJECT replied {got:#x}"
         );
+        let page_bytes = |at: u64, count: u64| {
+            let len = usize::try_from(count.saturating_mul(PAGE_SIZE)).unwrap_or(0);
+            // SAFETY: the `count` pages at `at` lie in the object's attachment,
+            // read-only and private; the slice is read here only, while attached.
+            unsafe { std::slice::from_raw_parts(at as *const u8, len) }
+        };
+        let header = Header::decode(page_bytes(va, 1))
+            .unwrap_or_else(|| panic!("{phase}: the snapshot's header does not decode"));
+        assert!(
+            header.layout_pages.saturating_add(header.data_pages) <= pages,
+            "{phase}: the header {header:?} names more than the object's {pages} pages"
+        );
+        let layout = page_bytes(va, header.layout_pages);
+        let count = usize::try_from(header.run_count).unwrap_or(usize::MAX);
+        let runs: Vec<Run> = (0..count)
+            .map(|i| {
+                Run::decode(layout, i)
+                    .unwrap_or_else(|| panic!("{phase}: run {i} of {header:?} does not decode"))
+            })
+            .collect();
+        Self {
+            handle,
+            va,
+            pages,
+            range,
+            header,
+            runs,
+            phase: phase.to_owned(),
+        }
+    }
+
+    /// The object's header.
+    pub(super) fn header(&self) -> &Header
+    {
+        &self.header
+    }
+
+    /// The object page holding the target's page at address `at`: `None` when
+    /// no run covers it, or its run is absent or places no object page. Panics
+    /// when the run places it outside the object's data pages.
+    pub(super) fn page(&self, at: u64) -> Option<&[u8]>
+    {
+        let run = self
+            .runs
+            .iter()
+            .find(|r| at >= r.va && at < page_at(r.va, r.pages))?;
+        if run.flags & RUN_ABSENT != 0 || run.object_page == NO_OBJECT_PAGE
+        {
+            return None;
+        }
+        let header = &self.header;
         let object_page = run
             .object_page
             .saturating_add(at.saturating_sub(run.va) / PAGE_SIZE);
         assert!(
             object_page >= header.layout_pages
                 && object_page < header.layout_pages.saturating_add(header.data_pages),
-            "{PHASE}: the run {run:?} places {at:#x} at object page {object_page}"
+            "{}: the run {run:?} places {at:#x} at object page {object_page}",
+            self.phase
         );
-        values.push(first_word(page_at(va, object_page)));
+        // SAFETY: the page lies in the object's attachment, read-only and
+        // private, which lasts until `release` consumes `self`.
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                page_at(self.va, object_page) as *const u8,
+                usize::try_from(PAGE_SIZE).unwrap_or(0),
+            )
+        })
     }
+
+    /// Detach the object and release it.
+    pub(super) fn release(self)
+    {
+        expect_region_reply(
+            memmgr_labels::UNREGISTER_REGION,
+            self.va,
+            page_at(0, self.pages),
+            memmgr_errors::SUCCESS,
+            "UNREGISTER_REGION of the snapshot",
+        );
+        std::os::seraph::unreserve_pages(self.range);
+        let got = call(
+            self.handle,
+            &IpcMessage::new(memmgr_labels::OBJECT_RELEASE),
+            "OBJECT_RELEASE",
+        )
+        .label;
+        assert_eq!(
+            got,
+            memmgr_errors::SUCCESS,
+            "{}: OBJECT_RELEASE replied {got:#x}",
+            self.phase
+        );
+    }
+}
+
+/// Attach the `pages`-page object `handle` names, read the writer's pages
+/// from it to `values`, detach it and release it.
+fn read_object(handle: u64, pages: u64, base: u64, values: &mut Vec<u64>)
+{
+    let object = Attached::attach(handle, pages, PHASE);
+    assert_eq!(
+        object.header().flags,
+        SNAPSHOT_COMPLETE,
+        "{PHASE}: the header {:?} of a complete snapshot",
+        object.header()
+    );
+    for page in 0..PAGES as u64
+    {
+        let at = page_at(base, page);
+        let bytes = object
+            .page(at)
+            .unwrap_or_else(|| panic!("{PHASE}: the snapshot holds no bytes of {at:#x}"));
+        let word = bytes
+            .first_chunk::<8>()
+            .copied()
+            .map_or(0, u64::from_ne_bytes);
+        values.push(word);
+    }
+    object.release();
 }
 
 /// The refusals: `UNAUTHORIZED` over svctest's procmgr cap, which carries no
@@ -559,7 +625,7 @@ fn refusals(authority: u64, gone: u64)
         ),
     ]
     {
-        let reply = snapshot(cap, gone, account);
+        let reply = snapshot(cap, gone, account, PHASE);
         assert_eq!(
             reply.label, want,
             "{PHASE}: SNAPSHOT {what} replied {:#x}",

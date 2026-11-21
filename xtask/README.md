@@ -165,8 +165,8 @@ The directory holds:
 
 | File | Content |
 |---|---|
-| `signer.seed` | The signing key's 32-byte Ed25519 secret seed (mode `0600`, the directory `0700`); absent when an external signer holds the key |
-| `signer.cert` | The signing key's 148-byte certificate, or, for a key that is itself a root, `signer.pub`, its 32-byte public key |
+| `signer.seed` | The signing key's 64-byte secret, its Ed25519 seed and its ML-DSA-65 seed ([docs/signing.md](../docs/signing.md) § Composite Signature; mode `0600`, the directory `0700`); absent when an external signer holds the key |
+| `signer.cert` | The signing key's 5,409-byte certificate, or, for a key that is itself a root, `signer.pub`, its 1,984-byte composite public key |
 | `trust.store` | The trust store of the anchors the identity contributes |
 
 The build writes the trust store it signs under to `target/xtask/signing/trust-store`, before
@@ -175,8 +175,8 @@ bootloader embeds.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SERAPH_SIGNING_DIR` | `seraph/signing` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
-| `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 64-byte Ed25519 signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
+| `SERAPH_SIGNING_DIR` | `seraph/signing/ed25519-ml-dsa-65` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory; one that holds an identity of the earlier Ed25519 format is refused. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
+| `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 3,373-byte composite signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
 | `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
 | `SERAPH_TRUST_STORE_MODE` | `merge` | `merge`: the union of both stores' anchors and revoked key ids, under the higher floor; two anchors of one key that differ are refused. `replace`: the deployer's store alone. Set without `SERAPH_TRUST_STORE`, it is refused |
 

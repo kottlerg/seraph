@@ -20,8 +20,8 @@
 //! * The write-out thread, while memmgr's level reads `CRITICAL`, takes
 //!   chunks (`SWAP_TAKE`), writes them to their slots, and ends each write
 //!   (`SWAP_DONE`), so their store pages return to the free pool.
-//! * The want thread restores the chunks a debugger's `MAKE_RESIDENT` asked
-//!   for (`SWAP_WANTED`), ahead of any fault.
+//! * The want thread restores the chunks a debugger's `MAKE_RESIDENT` or
+//!   procmgr's `CAPTURE_CHUNKS` asked for (`SWAP_WANTED`), ahead of any fault.
 //!
 //! The decisions are [`layout`]'s, host-tested. The recipe sets
 //! `reserve = yes`: swapd acts to end a pressure episode.

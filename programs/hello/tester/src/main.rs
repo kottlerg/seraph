@@ -6,7 +6,10 @@
 //! Per-program tester for `/programs/hello`. Spawns it with a piped stdout,
 //! asserts the expected line appears, and asserts a clean exit. Then, as a
 //! program, which may start programs only (docs/signing.md § Signature Policy
-//! in procmgr), asserts that starting a service is refused. See
+//! in procmgr), asserts that starting a service is refused. Before all that,
+//! it checks the seed usertest's recipe declares for it, `pwrmgr.deny`: it
+//! takes the cap over the bootstrap protocol, which usertest's spawn waits
+//! on, and pwrmgr refuses it `SHUTDOWN`. See
 //! [docs/testing.md](../../../docs/testing.md) for the protocol.
 
 #![expect(
@@ -27,6 +30,8 @@ const SERVICE_IMAGE: &str = "/tests/crasher";
 
 fn main()
 {
+    check_declared_seed();
+
     let mut child = Command::new("/programs/hello")
         .stdout(Stdio::piped())
         .spawn()
@@ -74,4 +79,55 @@ fn main()
     }
 
     println!("[hello-tester] PASS");
+}
+
+/// Take the one seed usertest's recipe declares for this tester
+/// (`TESTER_SEEDS=hello:1`, `pwrmgr.deny`) over the bootstrap protocol and
+/// check it is that cap: pwrmgr answers its `SHUTDOWN` `UNAUTHORIZED`.
+/// Defect guarded: a declared seed that does not reach its tester, or one
+/// that reaches it as another seed's cap.
+fn check_declared_seed()
+{
+    let info = std::os::seraph::startup_info();
+    if info.creator_endpoint == 0
+    {
+        println!("[hello-tester] FAIL no creator endpoint for the declared seed");
+        std::process::exit(5);
+    }
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
+    let ipc_buf = info.ipc_buffer.cast::<u64>();
+    // SAFETY: the IPC buffer is registered by `_start` and page-aligned.
+    let slots = unsafe { ipc::bootstrap::request_slots::<1>(info.creator_endpoint, ipc_buf) };
+    let deny = match slots
+    {
+        Ok([cap]) if cap != 0 => cap,
+        other =>
+        {
+            println!("[hello-tester] FAIL declared seed not delivered: {other:?}");
+            std::process::exit(6);
+        }
+    };
+    let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    match unsafe { ipc::ipc_call(deny, &msg, ipc_buf) }
+    {
+        Ok(reply) if reply.label == ipc::pwrmgr_errors::UNAUTHORIZED =>
+        {}
+        Ok(reply) =>
+        {
+            println!(
+                "[hello-tester] FAIL the declared seed's SHUTDOWN answered {:#x}, not UNAUTHORIZED",
+                reply.label
+            );
+            std::process::exit(7);
+        }
+        Err(e) =>
+        {
+            println!("[hello-tester] FAIL the declared seed's SHUTDOWN call failed: {e}");
+            std::process::exit(8);
+        }
+    }
 }

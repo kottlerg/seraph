@@ -18,8 +18,11 @@
 //! (`std::os::seraph::with_call_deadline`): a runtime call and a call of the
 //! fixture's own, each on an endpoint nobody receives on, end `TimedOut` and
 //! `WouldBlock` at the deadline, a later deadline nested inside does not
-//! extend it, and a call under a deadline already passed is not sent. The
-//! fixture prints `PASS` once both parts hold.
+//! extend it, and a call under a deadline already passed is not sent. A
+//! spawn whose child is given bootstrap caps it never asks for
+//! (`CommandExt::bootstrap_caps`) ends `TimedOut` at the deadline and
+//! releases the caps, and the fixture, spawned with none, holds no creator
+//! endpoint. The fixture prints `PASS` once both parts hold.
 //!
 //! Driven by its per-program tester (`tester/`), which `usertest` runs.
 
@@ -31,7 +34,8 @@
 )]
 
 use std::io::ErrorKind;
-use std::os::seraph::{call_time_left, with_call_deadline};
+use std::os::seraph::process::CommandExt;
+use std::os::seraph::{call_time_left, startup_info, with_call_deadline};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -55,6 +59,15 @@ const CALL_WAIT_MIN: Duration = Duration::from_millis(50);
 /// The most a bounded call may take: past it the deadline did not end the
 /// call, which would otherwise wait for good.
 const CALL_WAIT_MAX: Duration = Duration::from_secs(5);
+
+/// The call deadline of a spawn whose child never asks for its bootstrap
+/// caps: long enough for the create and start calls before the serve, so the
+/// serve is what the deadline ends.
+const SPAWN_BOUND: Duration = Duration::from_secs(2);
+
+/// The least such a spawn waits: half [`SPAWN_BOUND`], as [`CALL_WAIT_MIN`]
+/// is of [`CALL_BOUND`].
+const SPAWN_WAIT_MIN: Duration = Duration::from_secs(1);
 
 /// The cookie the supervisor posts, read back from the upcall message.
 const COOKIE: u64 = 0xDEAD_11E0;
@@ -110,6 +123,13 @@ fn main()
     {
         idle();
     }
+    // Defect guarded: a child spawned without bootstrap caps handed a creator
+    // endpoint all the same.
+    assert_eq!(
+        startup_info().creator_endpoint,
+        0,
+        "the fixture, spawned with no bootstrap caps, holds a creator endpoint"
+    );
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let ep = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
         syscall::cap_create_endpoint(slab).ok()
@@ -272,6 +292,7 @@ fn call_deadline(ipc_buf: *mut u64)
     );
     child.kill().expect("kill the idle child");
     child.wait().expect("wait for the idle child");
+    let spawn_waited = bootstrap_deadline(ep);
     let err = refused.expect_err("a lookup under a passed deadline was answered");
     assert_eq!(
         err.kind(),
@@ -283,11 +304,45 @@ fn call_deadline(ipc_buf: *mut u64)
         "a call under a passed deadline waited {passed_waited:?}"
     );
     println!(
-        "deadline: a call deadline ended a runtime call after {} ms and a call of the \
-         fixture's after {} ms",
+        "deadline: a call deadline ended a runtime call after {} ms, a call of the \
+         fixture's after {} ms, and a bootstrap serve after {} ms",
         waited.as_millis(),
-        own_waited.as_millis()
+        own_waited.as_millis(),
+        spawn_waited.as_millis()
     );
+}
+
+/// Spawn the idle child, which never asks for its bootstrap caps, with a copy
+/// of `ep` as its one cap, under a call deadline [`SPAWN_BOUND`] ahead: the
+/// spawn fails `TimedOut` at the deadline, having torn the child down, and
+/// the copy it did not deliver is deleted. Returns how long the spawn took.
+fn bootstrap_deadline(ep: u64) -> Duration
+{
+    let cap = syscall::cap_copy(ep, startup_info().self_cspace, syscall::RIGHTS_EP_SEND)
+        .expect("copy the endpoint to hand the idle child");
+    let start = Instant::now();
+    let spawned = with_call_deadline(at(start, SPAWN_BOUND), || {
+        std::process::Command::new("/programs/deadline")
+            .arg(IDLE_ARG)
+            .bootstrap_caps(&[cap])
+            .spawn()
+    });
+    let waited = start.elapsed();
+    let err = spawned.expect_err("a child that never asked for its bootstrap caps was spawned");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::TimedOut,
+        "the spawn whose child never asked failed {err}"
+    );
+    assert!(
+        (SPAWN_WAIT_MIN..CALL_WAIT_MAX).contains(&waited),
+        "the spawn whose child never asked ended after {waited:?}, not at its deadline"
+    );
+    assert!(
+        syscall::cap_info(cap, syscall_abi::CAP_INFO_TAG_RIGHTS).is_err(),
+        "the bootstrap cap the spawn did not deliver was not deleted"
+    );
+    waited
 }
 
 /// The cancellation routine the supervisor redirects the worker into: mark the

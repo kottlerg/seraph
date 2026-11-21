@@ -17,6 +17,8 @@
 //!
 //! - [`trailer`]: the signed object, `body || records || footer`; [`split`]
 //!   parses it, [`encode_trailer`] writes a trailer.
+//! - [`composite`]: the composite signature, Ed25519 and ML-DSA-65, that
+//!   every record and certificate carries.
 //! - [`attrs`]: the signed attributes a record's signature covers.
 //! - [`cert`]: the fixed-layout certificate a root issues to a signing key.
 //! - [`store`]: the trust store: anchors, revoked key ids, security floor.
@@ -28,6 +30,7 @@
 
 pub mod attrs;
 pub mod cert;
+pub mod composite;
 pub mod embed;
 pub mod name;
 pub mod store;
@@ -55,14 +58,16 @@ pub const KEY_ID_LEN: usize = 16;
 /// A key id ([`KEY_ID_LEN`] bytes).
 pub type KeyId = [u8; KEY_ID_LEN];
 
-/// An Ed25519 public key.
-pub type PublicKey = [u8; 32];
+/// A composite public key: the Ed25519 public key, then the ML-DSA-65 public
+/// key ([`composite`]).
+pub type PublicKey = [u8; composite::PUBLIC_KEY_LEN];
 
-/// An Ed25519 signature.
-pub type Signature = [u8; 64];
+/// A composite signature: the Ed25519 signature, then the ML-DSA-65 signature
+/// ([`composite`]).
+pub type Signature = [u8; composite::SIGNATURE_LEN];
 
-/// The key id of an Ed25519 public key: the first [`KEY_ID_LEN`] bytes of
-/// its SHA-512.
+/// The key id of a composite public key: the first [`KEY_ID_LEN`] bytes of
+/// the SHA-512 of the whole key, both halves.
 #[must_use]
 pub fn key_id(key: &PublicKey) -> KeyId
 {
@@ -111,9 +116,9 @@ impl Role
     ];
 
     /// The role's bit in a [`RoleSet`] and in a usage mask.
-    const fn bit(self) -> u8
+    const fn bit(self) -> u32
     {
-        1u8.wrapping_shl(self as u32)
+        1u32.wrapping_shl(self as u32)
     }
 }
 
@@ -145,9 +150,11 @@ impl Arch
 }
 
 /// A set of [`Role`]s: those a record grants, those a key may sign, or
-/// those a caller accepts.
+/// those a caller accepts. Role `n` is bit `n` of the set's 32 bits, as in a
+/// usage mask; bit 0, bit 31 (`CERTIFY` in a usage mask) and every bit no
+/// role has are clear.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct RoleSet(u8);
+pub struct RoleSet(u32);
 
 impl RoleSet
 {
@@ -161,7 +168,7 @@ impl RoleSet
     #[must_use]
     pub const fn of(roles: &[Role]) -> Self
     {
-        let mut bits = 0u8;
+        let mut bits = 0u32;
         let mut rest = roles;
         while let [role, tail @ ..] = rest
         {
@@ -171,11 +178,11 @@ impl RoleSet
         Self(bits)
     }
 
-    /// The set a signed `roles` byte encodes; `None` unless it obeys
-    /// docs/signing.md § Signed Attributes: bit 0 clear, at least one role,
-    /// and kernel or init only alone.
+    /// The set a signed `roles` field encodes; `None` unless it obeys
+    /// docs/signing.md § Signed Attributes: no bit outside the roles', at
+    /// least one role, and kernel or init only alone.
     #[must_use]
-    pub const fn from_signed(bits: u8) -> Option<Self>
+    pub const fn from_signed(bits: u32) -> Option<Self>
     {
         let set = Self(bits);
         if set.is_signable() { Some(set) } else { None }
@@ -193,9 +200,9 @@ impl RoleSet
             && (self.0 & slot == 0 || self.0.is_power_of_two())
     }
 
-    /// The set's byte, bit `n` for role `n`.
+    /// The set's bits, bit `n` for role `n`.
     #[must_use]
-    pub const fn bits(self) -> u8
+    pub const fn bits(self) -> u32
     {
         self.0
     }
@@ -257,7 +264,7 @@ impl Usage
     #[must_use]
     pub fn from_bits(bits: u32) -> Option<Self>
     {
-        let roles = u8::try_from(bits & !Self::CERTIFY_BIT).ok()?;
+        let roles = bits & !Self::CERTIFY_BIT;
         if roles & !RoleSet::ALL.0 != 0
         {
             return None;
@@ -273,9 +280,14 @@ impl Usage
     pub fn to_bits(self) -> u32
     {
         let certify = if self.certify { Self::CERTIFY_BIT } else { 0 };
-        u32::from(self.roles.0) | certify
+        self.roles.0 | certify
     }
 }
+
+const _: () = assert!(
+    RoleSet::ALL.0 & Usage::CERTIFY_BIT == 0,
+    "no role takes the CERTIFY bit"
+);
 
 /// Why an encoder refused to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,7 +327,7 @@ pub enum ParseError
     TooShort,
     /// The footer's magic is not `SERAPHSG`.
     Magic,
-    /// The footer's version is not 1.
+    /// The footer's version is not 2.
     Version,
     /// `record_count` is 0 or above [`trailer::MAX_RECORDS`].
     RecordCount,
@@ -323,15 +335,15 @@ pub enum ParseError
     RecordsLength,
     /// The records overrun the record block or leave bytes of it unused.
     RecordBlock,
-    /// A record's `record_len` is not 88 + `attrs_len` + 148 ×
+    /// A record's `record_len` is not 3,397 + `attrs_len` + 5,409 ×
     /// `cert_count`.
     RecordLength,
-    /// A record's `algorithm` is not 1 (Ed25519).
+    /// A record's `algorithm` is not 2 (the composite).
     Algorithm,
     /// A record's `cert_count` is above 1.
     CertificateCount,
     /// The signed attributes are shorter than their fixed part, longer than
-    /// a record holds, or not 96 + `name_len` bytes long.
+    /// a record holds, or not 99 + `name_len` bytes long.
     AttributesLength,
     /// The signed attributes do not begin with their domain tag.
     AttributesDomain,
@@ -365,7 +377,7 @@ pub enum StoreError
     Length,
     /// The magic is not `SRPHTRST`.
     Magic,
-    /// The version is not 1.
+    /// The version is not 2.
     Version,
     /// `anchor_count` is 0.
     NoAnchor,

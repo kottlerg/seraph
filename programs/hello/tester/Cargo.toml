@@ -9,5 +9,9 @@ name = "hello-tester"
 path = "src/main.rs"
 test = false
 
+[dependencies]
+# The bootstrap protocol and pwrmgr's labels, for the seed usertest declares.
+ipc = { path = "../../../shared/ipc" }
+
 [lints]
 workspace = true

@@ -1560,21 +1560,30 @@ here. procmgr finds the target under the table lock and derives copies of its `A
 and its main thread's cap there, so a teardown meanwhile leaves caps that name the same objects or
 that the kernel refuses. After the lock:
 
-1. procmgr asks memmgr to make the target's evicted pages resident over the whole user half, in
-   report mode ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) §
-   Label 21: `RESIDENT_REPORT`), lists the pages the space maps (`SYS_THREAD_LIST_PAGES`), and
-   requests frames on the account for every page it will copy.
+1. procmgr asks memmgr to count the target's evicted pages over the whole user half and to post
+   each of its chunks on disk to the swap service
+   ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 31:
+   `CAPTURE_CHUNKS`, `CAPTURE_COUNT`), and asks again after each pause of `CAPTURE_PAUSE_MS`
+   (10 ms) while chunks on disk remain, until none does or `CAPTURE_STALL_PAUSES` (100) pauses in
+   a row leave no fewer. It lists the pages the space maps (`SYS_THREAD_LIST_PAGES`) and requests
+   frames on the account for them and the evicted pages.
 2. It holds the target's address space (`SYS_ASPACE_HOLD`,
    [core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md) § `SYS_ASPACE_HOLD`
    (71)): no thread of the target runs in user mode until the release, whether it registered with
-   procmgr (Label 22) or not. Under the hold it asks memmgr again in report mode, keeping what
-   memmgr reports, lists the pages again, requests frames for the pages the second listing adds, and
-   copies each page, but those of `PAGE_RUN_NO_COPY` runs, with `SYS_THREAD_READ_MEM` into the
-   next data frame, in address order, through a window of 64 pages of its own address space. Then
-   it releases the space.
-3. It builds the layout (§ Snapshot object layout), returns to the account each data grant the copy
-   did not use, requests frames for the layout on the account, writes it, and seals the layout's
-   grants and then the data grants into one memory object
+   procmgr (Label 22) or not. Under the hold it lists the pages again and has memmgr write the
+   content of every demand chunk of the target into the first data frames
+   (`CAPTURE_CHUNKS`), from wherever memmgr holds each chunk in that turn, carrying caps derived
+   from its grants and requesting more frames on the account when memmgr needs them. memmgr reads
+   a chunk once, from one place, so an eviction of the target's chunks meanwhile cannot take a
+   chunk's content out of the capture. A chunk on disk memmgr posts to the swap service: procmgr
+   asks for each such chunk again after each pause of `CAPTURE_PAUSE_MS` until the swap service
+   has restored it, or `CAPTURE_STALL_PAUSES` pauses in a row restore none. It then copies every
+   listed page outside the chunks, but those of `PAGE_RUN_NO_COPY` runs, with
+   `SYS_THREAD_READ_MEM` into the next data frame, in address order, through a window of 64 pages
+   of its own address space, and releases the space.
+3. It builds the layout (§ Snapshot object layout), returns to the account each data grant the
+   capture did not use, requests frames for the layout on the account, writes it, and seals the
+   layout's grants and then the data grants into one memory object
    ([services/memmgr/docs/ipc-interface.md](../../memmgr/docs/ipc-interface.md) § Label 27:
    `SEAL_OBJECT`).
 
@@ -1583,14 +1592,15 @@ on it (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`, `SEAL_OBJECT`, `OBJECT_RELE
 most `ACCOUNT_CALL_TIMEOUT_MS` (10 s), and a server behind it that does not answer fails the
 capture, and releases a held target, once the bound passes. The first failure of any step fails
 the capture: procmgr releases the hold and returns every grant it took to the account. Under the
-hold procmgr calls only memmgr, on its own endpoint and on the account, and writes no log line, so a
-held target that serves procmgr, logd among them, cannot stall the capture.
+hold procmgr calls only memmgr, on its own endpoint and on the account, waits on the swap service
+for at most `CAPTURE_STALL_PAUSES` pauses in a row that restore nothing, and writes no log line,
+so a held target that serves procmgr or the swap service, logd among them, cannot stall the
+capture.
 
 The copy is one point in time for every page only the target writes. A page another process maps
 writable too, or a device writes, is copied as it stands when the copy reads it: the snapshot holds
-it at one point in time only when every space that writes it is held too. A page memmgr could not
-make resident in the hold's turn (a chunk on disk, a lost chunk, or a restore that failed) is not
-copied, and neither is a page the copy finds not present: the layout marks each such run absent.
+it at one point in time only when every space that writes it is held too. A page whose content the
+capture could not take is absent (§ Snapshot object layout).
 
 Every frame of the object is granted on the account, so the snapshot is charged in full to the
 sender, as a seal leaves its frames charged to the sealer
@@ -1637,10 +1647,23 @@ the constants and the encoder and decoder procmgr and a reader share.
 | 3 | the object page holding the run's first page, its other pages following; `NO_OBJECT_PAGE` (`u64::MAX`) for a run with no bytes in the object |
 
 A run with bytes is a run of listed pages that were copied. A `PAGE_RUN_NO_COPY` run, device memory
-`SYS_THREAD_READ_MEM` refuses, has no bytes and is not absent. An absent run has no bytes: listed
-pages whose copy failed, with the listed protection, or a range memmgr reported that no listed page
-covers, with its region's write and execute bits and `PAGE_RUN_READ`, as the kernel lists every
-page memmgr maps. Adjacent runs with the same flags whose bytes follow one
+`SYS_THREAD_READ_MEM` refuses, has no bytes and is not absent. The pages of a demand chunk memmgr
+supplied are a run with bytes too, with its region's write and execute bits and `PAGE_RUN_READ`, as
+the kernel lists every page memmgr maps, whether the chunk was mapped at the capture or not.
+
+An absent run has no bytes: a range of the target's pages, mapped or backed at the capture, whose
+content the object does not hold. A page is absent for one of these reasons, and for no other:
+
+- its chunk was on disk, and the swap service did not restore it within the capture's wait: none
+  is registered with a want Notification, it did not answer, or it is the held target or waits on
+  it;
+- its chunk was lost, its swap slot's bytes having failed authentication;
+- its chunk's stored bytes failed to decode, or memmgr could not map the chunk's frames or store
+  runs to read them;
+- it is a listed page outside the chunks whose copy failed.
+
+An absent run of a chunk carries the chunk's protection as a supplied one does; an absent listed
+page carries its listed protection. Adjacent runs with the same flags whose bytes follow one
 another in the object, or which have none, are one run.
 
 ---

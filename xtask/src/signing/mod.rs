@@ -46,8 +46,9 @@ pub use store::StoreMode;
 /// unbootable.
 pub const SECURITY_VERSION: u32 = 1;
 
-/// The directory of the signing identity; by default `seraph/signing` in the
-/// user's data directory ([`default_dir`]).
+/// The directory of the signing identity; by default
+/// `seraph/signing/ed25519-ml-dsa-65` in the user's data directory
+/// ([`default_dir`]).
 pub const ENV_SIGNING_DIR: &str = "SERAPH_SIGNING_DIR";
 
 /// An external signer program, which holds the signing key in place of the
@@ -61,6 +62,10 @@ pub const ENV_TRUST_STORE: &str = "SERAPH_TRUST_STORE";
 /// How [`ENV_TRUST_STORE`] combines with the identity's store: `merge` (the
 /// default) or `replace`.
 pub const ENV_TRUST_STORE_MODE: &str = "SERAPH_TRUST_STORE_MODE";
+
+/// The last component of the default identity directory: the signature
+/// algorithm of the identity it holds.
+const ALGORITHM_DIR: &str = "ed25519-ml-dsa-65";
 
 /// The first four bytes of an ELF image.
 const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
@@ -144,8 +149,11 @@ impl Config
 }
 
 /// The default directory of the signing identity, from the variables `var`
-/// returns: `seraph/signing` in `XDG_DATA_HOME`, in `.local/share` of
-/// `HOME`, or in `LOCALAPPDATA`, the first of them set to an absolute path.
+/// returns: `seraph/signing/ed25519-ml-dsa-65` in `XDG_DATA_HOME`, in
+/// `.local/share` of `HOME`, or in `LOCALAPPDATA`, the first of them set to
+/// an absolute path. The last component names the signature algorithm, so an
+/// identity of an earlier algorithm, in its own directory, is never loaded as
+/// this one's (docs/signing.md § Signing).
 fn default_dir(var: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf>
 {
     let absolute = |name: &str| {
@@ -156,7 +164,7 @@ fn default_dir(var: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf>
     absolute("XDG_DATA_HOME")
         .or_else(|| absolute("HOME").map(|home| home.join(".local").join("share")))
         .or_else(|| absolute("LOCALAPPDATA"))
-        .map(|data| data.join("seraph").join("signing"))
+        .map(|data| data.join("seraph").join("signing").join(ALGORITHM_DIR))
         .with_context(|| format!("no per-user data directory: set {ENV_SIGNING_DIR}"))
 }
 
@@ -300,11 +308,12 @@ impl Signer
         };
         let mut signed = vec![0u8; attrs.encoded_len().map_err(refused)?];
         attrs.encode(&mut signed).map_err(refused)?;
+        let signature = self.identity.sign(&signed)?;
         let record = RecordSpec {
             signer_key_id: self.key_id(),
             attrs,
             certificate: self.identity.certificate(),
-            signature: self.identity.sign(&signed)?,
+            signature: &signature,
         };
         let trailer = objsig::trailer_len(&[record]).map_err(refused)?;
         let mut out = body.to_vec();
@@ -369,13 +378,22 @@ impl Signer
 ///
 /// # Errors
 ///
-/// When `object` ends in the trailer magic but does not parse.
+/// When `object` ends in the trailer magic but does not parse; a trailer of
+/// another format version is refused naming the version as the reason, since
+/// a sysroot an earlier tree signed holds such objects until a build installs
+/// them again or a clean removes them.
 pub fn body_of(object: &[u8]) -> Result<&[u8]>
 {
     match objsig::split(object)
     {
         Ok(signed) => Ok(signed.body()),
         Err(ParseError::TooShort | ParseError::Magic) => Ok(object),
+        Err(ParseError::Version) => bail!(
+            "the object ends in a signature trailer of a format version this tree does not \
+             read, as an object an earlier tree signed does: run `cargo xtask build` to \
+             install it again, or `cargo xtask clean` when no build of this tree installs it \
+             (docs/signing.md § Composite Signature)"
+        ),
         Err(e) => bail!("the object ends in a malformed signature trailer ({e:?})"),
     }
 }
@@ -983,22 +1001,41 @@ mod tests
     }
 
     // Defect caught: an image ending in a damaged trailer signed whole, so
-    // the damaged trailer becomes part of the signed body.
+    // the damaged trailer becomes part of the signed body; an object an
+    // earlier tree signed, whose footer carries another format version,
+    // refused without naming the build that installs it again or the clean
+    // that removes one no build installs.
     #[test]
     fn an_object_ending_in_a_malformed_trailer_is_refused()
     {
         let root = scratch("malformed");
         let signer = signer(&root.join("keys"), Arch::Riscv64);
-        let mut object = signer
+        let good = signer
             .sign(b"\x7fELF image", set(&[Role::Service]), "/services/x")
             .unwrap();
         // The footer's version field: 8 bytes of magic end the footer, after
-        // the 2-byte version.
-        let version = object.len() - 10;
-        object[version] = 2;
-        signer
+        // the 2-byte version; its record count lies before the version.
+        let version = good.len() - 10;
+        for earlier in [1, 3]
+        {
+            let mut object = good.clone();
+            object[version] = earlier;
+            let error = signer
+                .sign(&object, set(&[Role::Service]), "/services/x")
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("cargo xtask build"), "{error}");
+            assert!(error.contains("cargo xtask clean"), "{error}");
+        }
+        let mut object = good;
+        object[version - 2] = 0;
+        let error = signer
             .sign(&object, set(&[Role::Service]), "/services/x")
             .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("malformed signature trailer"),
+            "{error:#}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1306,13 +1343,16 @@ mod tests
     fn the_configuration_defaults_to_the_user_data_directory_and_a_merged_store()
     {
         let home = config_of(&[("HOME", "/home/u"), ("SERAPH_TRUST_STORE", "/s")]).unwrap();
-        assert_eq!(home.dir, Path::new("/home/u/.local/share/seraph/signing"));
+        assert_eq!(
+            home.dir,
+            Path::new("/home/u/.local/share/seraph/signing/ed25519-ml-dsa-65")
+        );
         assert_eq!(
             home.deployer_store,
             Some((PathBuf::from("/s"), StoreMode::Merge))
         );
         let xdg = config_of(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/x")]).unwrap();
-        assert_eq!(xdg.dir, Path::new("/x/seraph/signing"));
+        assert_eq!(xdg.dir, Path::new("/x/seraph/signing/ed25519-ml-dsa-65"));
         let named = config_of(&[("HOME", "/home/u"), ("SERAPH_SIGNING_DIR", "/k")]).unwrap();
         assert_eq!(named.dir, Path::new("/k"));
         assert_eq!(named.deployer_store, None);

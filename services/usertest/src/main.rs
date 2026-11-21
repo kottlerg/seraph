@@ -19,19 +19,42 @@
               the whole harness, so the suppression is crate-wide"
 )]
 
+use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use usertest::{OWN_SLOT, SeedPlan, TESTER_SEEDS};
+
 const TESTERS_DIR: &str = "/tests/programs";
+
+/// The recipe seed slots usertest takes: its own `pwrmgr.shutdown` at
+/// [`OWN_SLOT`] and the authorities its testers are declared to take. A seed
+/// past them is released at bootstrap, and a declaration naming one is
+/// refused.
+const SEED_SLOTS: usize = 8;
 
 fn main()
 {
     std::os::seraph::log::register_name(b"usertest");
 
-    let pwrmgr_auth = bootstrap_pwrmgr_auth();
+    let seeds = bootstrap_seeds();
+    let pwrmgr_auth = seeds[OWN_SLOT];
 
     std::os::seraph::log!("starting");
+
+    let decl = std::env::var(TESTER_SEEDS).unwrap_or_default();
+    let plan = match SeedPlan::parse(&decl, SEED_SLOTS)
+    {
+        Ok(plan) => plan,
+        Err(e) =>
+        {
+            std::os::seraph::log!("{TESTER_SEEDS} refused: {e:?}");
+            std::os::seraph::log!("SOME TESTS FAILED");
+            shutdown(pwrmgr_auth);
+            return;
+        }
+    };
 
     let testers = discover_testers();
     if testers.is_empty()
@@ -48,7 +71,7 @@ fn main()
                 .unwrap_or("<unnamed>");
             std::os::seraph::log!("running {}", path.display());
 
-            match run_one(path)
+            match run_one(path, name, &seeds, &plan)
             {
                 Ok(()) =>
                 {
@@ -98,23 +121,46 @@ fn discover_testers() -> Vec<PathBuf>
     out
 }
 
-/// Spawn one tester, forward its stdout and stderr to the boot log under a
-/// per-tester prefix, both at once, and turn the exit status into a
-/// pass/fail.
-fn run_one(path: &Path) -> Result<(), String>
+/// Spawn one tester, `name`, with a copy of each seed `plan` declares for
+/// it as its bootstrap caps, forward its stdout and stderr to the boot log
+/// under a per-tester prefix, both at once, and turn the exit status into a
+/// pass/fail. A tester with no declared seeds gets no creator endpoint.
+fn run_one(
+    path: &Path,
+    name: &str,
+    seeds: &[u64; SEED_SLOTS],
+    plan: &SeedPlan,
+) -> Result<(), String>
 {
     let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_string())?;
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("<unnamed>")
-        .to_string();
+    let name = name.to_string();
 
-    let mut child = Command::new(path_str)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
+    // `SeedPlan::parse` kept every declared slot below `SEED_SLOTS`. A copy
+    // that fails releases the copies made before it.
+    let mut caps = Vec::new();
+    for &slot in plan.slots_for(&name)
+    {
+        match copy_seed(seeds.get(slot).copied().unwrap_or(0))
+        {
+            Ok(cap) => caps.push(cap),
+            Err(e) =>
+            {
+                for &cap in caps.iter().filter(|&&cap| cap != 0)
+                {
+                    let _ = syscall::cap_delete(cap);
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    let mut command = Command::new(path_str);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if !caps.is_empty()
+    {
+        command.bootstrap_caps(&caps);
+    }
+    let mut child = command.spawn().map_err(|e| format!("spawn: {e}"))?;
 
     // The two streams are drained at once, stderr on its own thread: a
     // tester blocked on a full pipe ring of one stream would otherwise never
@@ -201,16 +247,33 @@ fn forward_lines<R: std::io::Read>(tester: &str, stream: &str, mut r: R)
     }
 }
 
-/// Bootstrap one cap from the creator-endpoint round: pwrmgr's SHUTDOWN-
-/// badged SEND (slot 0). The recipe seeds `pwrmgr.shutdown` first; absent
-/// caps come back as zero and the shutdown step logs a skip instead of
-/// powering off (boot stays up for inspection).
-fn bootstrap_pwrmgr_auth() -> u64
+/// A copy of `seed` with its own rights, for one tester to take; `0` for an
+/// absent seed, which the tester's slot then shows absent.
+fn copy_seed(seed: u64) -> Result<u64, String>
+{
+    if seed == 0
+    {
+        return Ok(0);
+    }
+    let tag_rights = syscall::cap_info(seed, syscall_abi::CAP_INFO_TAG_RIGHTS)
+        .map_err(|e| format!("seed rights: {e}"))?;
+    // CAP_INFO_TAG_RIGHTS packs the tag above bit 32 and the rights below it.
+    let rights = tag_rights & 0xFFFF_FFFF;
+    syscall::cap_copy(seed, startup_info().self_cspace, rights)
+        .map_err(|e| format!("seed copy: {e}"))
+}
+
+/// Bootstrap the recipe's seeds from the creator-endpoint rounds: pwrmgr's
+/// SHUTDOWN-badged SEND at [`OWN_SLOT`], which the recipe seeds first, then
+/// the authorities the testers are declared to take. Absent caps come back as
+/// zero; without the shutdown authority the shutdown step logs a skip instead
+/// of powering off (boot stays up for inspection).
+fn bootstrap_seeds() -> [u64; SEED_SLOTS]
 {
     let info = startup_info();
     if info.creator_endpoint == 0
     {
-        return 0;
+        return [0; SEED_SLOTS];
     }
     #[expect(
         clippy::cast_ptr_alignment,
@@ -220,9 +283,9 @@ fn bootstrap_pwrmgr_auth() -> u64
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
     // boot protocol.
     // Only the present caps ride, named by each round's presence word; an
-    // absent slot decodes as `0`. The recipe's later seeds are released.
-    unsafe { ipc::bootstrap::request_slots::<1>(info.creator_endpoint, ipc_buf) }
-        .map_or(0, |[pwrmgr_auth]| pwrmgr_auth)
+    // absent slot decodes as `0`. Seeds past `SEED_SLOTS` are released.
+    unsafe { ipc::bootstrap::request_slots::<SEED_SLOTS>(info.creator_endpoint, ipc_buf) }
+        .unwrap_or([0; SEED_SLOTS])
 }
 
 /// Terminal — pwrmgr powers off and QEMU exits. A reply arrives only on

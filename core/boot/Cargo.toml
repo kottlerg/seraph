@@ -14,9 +14,11 @@ objsig = { path = "../../shared/objsig" }
 text = { workspace = true }
 
 [dev-dependencies]
-# Host tests only: Ed25519 signing, to sign the objects they verify. The
+# Host tests only: the SHA-512 of the bodies they sign.
+crypto = { path = "../../shared/crypto" }
+# Host tests only: composite signing, to sign the objects they verify. The
 # bootloader's own build never enables `sign` (shared/crypto/README.md).
-crypto = { path = "../../shared/crypto", features = ["sign"] }
+objsig = { path = "../../shared/objsig", features = ["sign"] }
 
 [lints]
 workspace = true

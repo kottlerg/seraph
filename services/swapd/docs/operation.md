@@ -45,12 +45,12 @@ staying on disk.
 
 ## Want
 
-A debugger's or crashd's `MAKE_RESIDENT` over a chunk on disk has memmgr post the chunk's slot word
-and send on swapd's Notification ([memmgr IPC Interface](../../memmgr/docs/ipc-interface.md)
-§ Label 21). The want thread wakes, takes the words posted (`SWAP_WANTED`, at most eight), and
-restores each as the main thread restores a fault's, ahead of any fault; the reader asks again and
-finds the chunk resident. A word whose chunk a fault restored meanwhile is `RESTORE_STALE` and
-changes nothing.
+A debugger's or crashd's `MAKE_RESIDENT`, or procmgr's `CAPTURE_CHUNKS` for a `SNAPSHOT`, over a
+chunk on disk has memmgr post the chunk's slot word and send on swapd's Notification ([memmgr IPC
+Interface](../../memmgr/docs/ipc-interface.md) § Label 21, § Label 31). The want thread wakes,
+takes the words posted (`SWAP_WANTED`, at most eight), and restores each as the main thread
+restores a fault's, ahead of any fault; the reader asks again and finds the chunk resident. A word
+whose chunk a fault restored meanwhile is `RESTORE_STALE` and changes nothing.
 
 ## Write-out
 

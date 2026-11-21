@@ -49,8 +49,8 @@ pub use chunk::{COLD_SWEEPS, ChunkEntry, ChunkError, ChunkState};
 pub use commit::{CommitNeed, PT_DONATION_PAGES, attach_promise};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use disk::{
-    FaultPath, Posted, Registered, ResidentMode, ResidentPath, SlotError, SwapSlots, WANT_WORDS,
-    WantList, fault_path, pending_from, resident_path,
+    CaptureSource, FaultPath, Posted, Registered, ResidentPath, SlotError, SwapSlots, WANT_WORDS,
+    WantList, capture_source, fault_path, pending_from, resident_path,
 };
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore, key_of};
 pub use ledger::{
